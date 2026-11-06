@@ -819,8 +819,8 @@ struct BreakerState {
     consuming: bool,
     /// The store as the last consumed step rendered it.
     snapshot: Option<Tile>,
-    /// How many of the store's inputs have finished: the store settles at
-    /// the last of them ([`finish_store`]).
+    /// How many of the store's inputs have finished: the store settles at the last of them
+    /// ([`finish_store`]).
     last_finishes: usize,
 }
 
@@ -1027,8 +1027,27 @@ impl Breaker for InductionStoreProducer {
 }
 
 impl BreakingProducer for InductionStoreProducer {
+    /// Everything once the store is terminal. Before it is terminal, the positions the store has
+    /// run and decided, which its pushes name as its rounds decide them, so a feed read from the
+    /// store streams: a store that resumed its predecessor's run holds none of the positions
+    /// through `resumed_after`, since its consumers took those from the predecessor
+    /// ([`CommitEngine::seeded_at`]). A store with rows above its positions, and one over a
+    /// concatenation's tagged positions, holds nothing short of terminal
+    /// ([`pushes_decided_positions`]).
     fn held(&self) -> TileGuard {
-        self.breaker.held(self.tiling())
+        if self.breaker.terminal() || !pushes_decided_positions(self.tiling()) {
+            return self.breaker.held(self.tiling());
+        }
+        let decided = self.decided();
+        match &self.resumed_after {
+            Some(resumed) => guard_minus(
+                &decided,
+                &TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(
+                    resumed.value().clone(),
+                ))),
+            ),
+            None => decided,
+        }
     }
 
     fn seed_placements(&self) -> Vec<crate::interpreter::dispatcher::Placement> {
@@ -1036,8 +1055,7 @@ impl BreakingProducer for InductionStoreProducer {
     }
 
     /// The positions the last step decided, row by row under rows: the store tile's own
-    /// statement (`Tile::to_guard`), though it holds nothing short of terminal, since a reader
-    /// pulls the tile whole.
+    /// statement (`Tile::to_guard`).
     fn decided(&self) -> TileGuard {
         match &self.breaker.snapshot {
             Some(tile) => tile.to_guard(),
@@ -1052,9 +1070,10 @@ impl BreakingProducer for InductionStoreProducer {
         self.held()
     }
 
-    /// The store pushes once, at the finish where it is terminal.
+    /// The store pushes after each round its loop's scope consumes: what it holds is decided
+    /// positions, or nothing short of terminal ([`held`](BreakingProducer::held)).
     fn pushes_while_consuming(&self) -> bool {
-        false
+        true
     }
 
     /// The snapshot of the last step. A nested store's readers release its rows as they finish
@@ -1067,6 +1086,22 @@ impl BreakingProducer for InductionStoreProducer {
         }
         tile
     }
+}
+
+/// Whether an induction store over `tiling` pushes its positions as it decides them: a flat store
+/// over positions a prefix of which has a spelling. A store with rows above its positions holds
+/// nothing short of terminal, and so does one over a concatenation's tagged positions, whose
+/// prefix `row_frontier` cannot spell without the domain's tags.
+pub(crate) fn pushes_decided_positions(tiling: &Tiling) -> bool {
+    fn tagged(extent: &Extent) -> bool {
+        match extent {
+            Extent::Union(_) => true,
+            Extent::Restricted { base, .. } => tagged(base),
+            Extent::Record(fields) => fields.values().any(tagged),
+            _ => false,
+        }
+    }
+    matches!(tiling, Tiling::Store { domain, .. } if !tagged(domain))
 }
 
 /// The source of the transaction drive under `producer`, a writer of a transaction store: the
@@ -1345,8 +1380,8 @@ impl Breaker for CommitProducer {
 impl BreakingProducer for CommitProducer {
     /// The commit ticks the store has decided, through its watermark, and everything once it is
     /// terminal. A reader of the store's changelog (`StoreValueStream`) takes the ticks as they are
-    /// decided, and a reader of its final value takes it once the store's pipeline has finished the
-    /// run, once the store is terminal (`Dispatcher::read_whole`).
+    /// decided, and a reader of its final value takes it once the store is terminal
+    /// (`Dispatcher::read_whole`).
     fn held(&self) -> TileGuard {
         if self.breaker.terminal() {
             return self.tiling().universal_guard();
@@ -4832,7 +4867,7 @@ impl TileOperator for StoreDenseRead {
         // read has. Kick once to start.
         let (consumer, gate) = shared_consumer(consumer);
         consumer.notify(&Projection::Everything);
-        let store_producer = subscribe_forwarding(&mut *self.store_op, &consumer, cx);
+        let store_producer = subscribe_forwarding_keeping_keys(&mut *self.store_op, &consumer, cx);
         Box::new(StoreDenseReadProducer {
             base: ProducerBase::new(
                 StoreDenseReadProducer::alloc_id(),
@@ -5014,7 +5049,7 @@ impl TileProducer for StoreDenseReadProducer {
 
     impl_producer_base!();
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         // Sample the store (consumer-driven; no producer-side drive-to-fixpoint) and
         // fold `key` at each position it has decided. The cycle advances one position
         // per pull, so a batch source converges over several pulls rather than in one
@@ -5030,9 +5065,9 @@ impl TileProducer for StoreDenseReadProducer {
         // The changelog is keyed by those same positions, so position `p` reads at `p`
         // — the accumulator *after* iteration `p`. `store_value_at` scans changes ≤
         // `p`, so a carry position inherits the latest earlier write and a leading
-        // carry folds to the store's seed: no external default, and never `None`. The
-        // `store.is_terminal()` gate below keeps this read non-terminal until the
-        // store is fully decided, so the consumer re-pulls.
+        // carry folds to the store's seed: no external default, and never `None`. The read
+        // states complete only what the store's guard (`Tile::to_guard`) names, so the
+        // consumer re-pulls until the store is terminal.
         let sg = self.store_producer.tiling().universal_guard();
         let store = self.store_producer.get(sg);
         if !self.enclosing.is_empty() {
@@ -5074,10 +5109,20 @@ impl TileProducer for StoreDenseReadProducer {
         // The released prefix is folded, so a carry is built across it, and dropped
         // here: a consumer that has taken a position must not be handed it again, and
         // the store keeps the position until *every* reader has released it.
+        // A pull at a region of positions is answered there, less what the read released,
+        // as every pull is (`Tile::within`).
+        let pulled = match Projection::of(&projection_guard) {
+            Ok(Projection::Keys { level, keys }) if level == CurryLevel::OUTERMOST => Some(keys),
+            _ => None,
+        };
         let mut kept: Vec<Position> = Vec::with_capacity(sorted.len());
         let mut values: Vec<Value> = Vec::with_capacity(sorted.len());
         for (p, v) in sorted.iter().zip(folded) {
-            if self.release_cursor.is_released(p) {
+            if self.release_cursor.is_released(p)
+                || pulled
+                    .as_ref()
+                    .is_some_and(|keys| !keys.contains(p.value()))
+            {
                 continue;
             }
             if let Some(v) = v {
@@ -5089,16 +5134,19 @@ impl TileProducer for StoreDenseReadProducer {
             kept.into_iter().map(|p| p.into_value()).collect(),
             &self.domain,
         );
-        // Once the store is terminal its domain is complete, so this read is too and
-        // a downstream terminal read resolves. Before that it is decided over exactly
-        // the positions emitted above — which are final, every one of them being a
-        // position the recurrence has run — so report those rather than `False`: a
-        // consumer may take the prefix, and a `Memo` may cache it, without waiting for
-        // the loop to end.
-        let domain_predicate = if store.is_terminal() {
-            Predicate::True
-        } else {
-            Predicate::from_column_value(&positions)
+        // The read is decided where the store is: at every position its rounds have run, the
+        // positions a round wrote no tap value at and those its source never delivered included
+        // (`Tile::to_guard`), and everywhere once it is terminal. A consumer may take that prefix,
+        // and a `Memo` may cache it, without waiting for the loop to end, and it releases what the
+        // store pushed of it.
+        let domain_predicate = match store.to_guard() {
+            TileGuard::Function(FunctionGuard::Domain(decided)) => decided,
+            other => unreachable!("a flat store's guard names its positions: {other:?}"),
+        };
+        // A pull at a region states completeness there alone: a position outside it is not read.
+        let domain_predicate = match &pulled {
+            Some(keys) => domain_predicate.intersect(keys),
+            None => domain_predicate,
         };
         read_tile(positions, values, &self.value_extent, domain_predicate)
     }
@@ -11835,6 +11883,39 @@ mod tests {
             &[(1, &[("alice", 70)]), (2, &[("bob", 40)])],
             Predicate::at_or_below(Value::UInt(w)),
         )
+    }
+
+    /// A flat induction store over untagged positions pushes its positions as it decides them; a
+    /// store with rows above its positions, and one over a concatenation's tagged positions at
+    /// the top or inside a record, holds nothing short of terminal.
+    #[test]
+    fn only_a_flat_store_over_untagged_positions_pushes_what_it_decides() {
+        let store = |domain: Extent| Tiling::Store {
+            domain,
+            codomain: Box::new(Tiling::Record(HashMap::new())),
+        };
+        let tagged = Extent::Union(TagMap::from_positional(vec![
+            Extent::Base(BaseType::UInt),
+            Extent::Base(BaseType::UInt),
+        ]));
+        let record = Extent::Record(
+            [
+                (SmolStr::new("_0"), Extent::Base(BaseType::UInt)),
+                (SmolStr::new("_1"), tagged.clone()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert!(pushes_decided_positions(&store(Extent::Base(
+            BaseType::UInt
+        ))));
+        assert!(!pushes_decided_positions(&store(tagged)));
+        assert!(!pushes_decided_positions(&store(record)));
+        let nested = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            store(Extent::Base(BaseType::UInt)),
+        );
+        assert!(!pushes_decided_positions(&nested));
     }
 
     #[test]

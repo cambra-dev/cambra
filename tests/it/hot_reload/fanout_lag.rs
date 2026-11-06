@@ -237,10 +237,18 @@ fn a_feed_repeats_the_position_the_recurrence_still_reads() {
 /// ["a", "ab", "abc"]
 /// ```
 ///
-/// Pinned in pull mode:
+/// Pinned in pull mode, which repeats the value at the cut:
 ///
 /// ```text
 /// ["a", "ab", "ab", "abc"]
+/// ```
+///
+/// Pinned dispatched, which repeats every value before the cut: the store pushes each position it
+/// decides, and the rebuilt tap reader's slot starts at the intersection of every slot's release,
+/// which the store's recurrence slots hold empty.
+///
+/// ```text
+/// ["a", "ab", "a", "ab", "abc"]
 /// ```
 ///
 /// The program of
@@ -268,12 +276,12 @@ fn a_stdin_feed_repeats_the_value_at_the_cut_when_its_other_writer_is_edited(
         .filter_map(|l| l.strip_prefix('"')?.strip_suffix("\","))
         .collect();
     let expected = match dispatch {
-        "1" => vec!["a", "ab", "abc"],
+        "1" => vec!["a", "ab", "a", "ab", "abc"],
         _ => vec!["a", "ab", "ab", "abc"],
     };
     assert_eq!(
         printed, expected,
-        "the printed values changed. If pull mode's replay was fixed, pin the correct \
+        "the printed values changed. If the replay was fixed, pin the correct \
          [\"a\", \"ab\", \"abc\"] in both modes: {out}"
     );
 }

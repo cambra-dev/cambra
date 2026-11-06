@@ -1528,7 +1528,7 @@ fn deliveries() -> [(&'static str, Vec<Batch>); 3] {
 /// A loop or a transaction over a live source whose drive reads past positions it runs no round
 /// or attempt at: positions a filter on the drive's source drops, and keys a delivery calls
 /// complete and holds nothing at while more are to come. The drive states them complete, so the
-/// store releases them as they arrive.
+/// store releases them in the pass that delivered them.
 #[rstest_log::rstest]
 #[case::a_filter_on_the_drive_s_source(
     indoc! {"
@@ -1821,11 +1821,40 @@ fn a_feed_inside_a_transaction_over_a_live_source(
     );
 }
 
+/// A feed out of a loop over a live source reads the loop's store, which pushes the positions its
+/// rounds decide, so the sink holds part of the feed before the source yields everything.
+#[rstest_log::rstest]
+#[case::two_batches(two_batches(), vec![(0, 1), (1, 3), (2, 6), (3, 10), (4, 15)])]
+#[case::one_key_batches(one_key_batches(4), vec![(0, 1), (1, 3), (2, 6), (3, 10)])]
+fn a_feed_out_of_a_loop_over_a_live_source(
+    #[case] batches: Vec<Batch>,
+    #[case] expected: Vec<(u64, i64)>,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let source = indoc! {"
+        out = test_sink()
+        n := 0
+        for x in source1():
+            n := n + x
+            out << n
+    "};
+    let mut written_before_the_end = Vec::new();
+    let (written, _) = dispatched_live_observed(source, rows, batches, |sink, _| {
+        written_before_the_end
+            .push(sink.value() == Err(crate::interpreter::SinkReadError::Incomplete));
+    });
+    assert_eq!(keyed_ints(&written), expected);
+    assert!(
+        written_before_the_end.first() == Some(&true),
+        "the first delivery's positions reach the sink before the next: {written_before_the_end:?}"
+    );
+}
+
 /// A loop over a let-bound list of a live source steps at each position the list has decided,
 /// before the source yields everything: the list's memo pushes its decided keys, which the drive
 /// reads by pull, and the entry in front of the drive's source records them at the loop's scope as
-/// decided positions. The store pushes only once terminal, so what shows the steps is what the
-/// store holds at each idle.
+/// decided positions. What shows the steps is the store's decided region at each idle, which grows
+/// a delivery at a time; the values it holds shrink where its readers release them.
 #[rstest_log::rstest]
 fn a_loop_over_a_let_bound_live_list_steps_before_the_source_ends(
     #[values(1, usize::MAX)] rows: usize,
@@ -1838,26 +1867,29 @@ fn a_loop_over_a_let_bound_live_list_steps_before_the_source_ends(
             n := n + x
             out << n
     "};
-    fn held_by_store(producer: &mut dyn TileProducer) -> Option<usize> {
+    fn decided_by_store(producer: &mut dyn TileProducer) -> Option<crate::interpreter::TileGuard> {
         if producer.name().starts_with("InductionStore") {
-            return Some(producer.state_info().values);
+            return producer.as_breaking_mut().map(|store| store.decided());
         }
-        let mut held = None;
+        let mut decided = None;
         producer.visit_input_producers_mut(&mut |_, input| {
-            held = held.or_else(|| held_by_store(input));
+            decided = decided.take().or_else(|| decided_by_store(input));
         });
-        held
+        decided
     }
-    let mut held = Vec::new();
+    let mut decided = Vec::new();
     let (value, _) = dispatched_live_observed(source, rows, one_key_batches(4), |_, root| {
         let mut root = root.borrow_mut();
         let producer = root.as_mut().expect("a root holds its producer");
-        held.push(held_by_store(producer.as_mut()).expect("the sink reads the loop's store"));
+        decided.push(decided_by_store(producer.as_mut()).expect("the sink reads the loop's store"));
     });
     assert_eq!(keyed_ints(&value), [(0, 1), (1, 3), (2, 6), (3, 10)]);
     assert!(
-        held.windows(2).all(|pair| pair[0] < pair[1]),
-        "the store steps at each delivery, before the source yields everything: {held:?}"
+        decided.windows(2).all(|pair| {
+            super::guard_minus(&pair[0], &pair[1]).is_empty()
+                && !super::guard_minus(&pair[1], &pair[0]).is_empty()
+        }),
+        "the store steps at each delivery, before the source yields everything: {decided:?}"
     );
 }
 
@@ -2362,9 +2394,9 @@ fn one_key_batches(batches: u64) -> Vec<Batch> {
         .collect()
 }
 
-/// A source delivering many passes runs each delivery before polling the next.
+/// A sum over a source delivering one key per pass, over ten passes.
 #[test]
-fn a_sum_over_many_deliveries() {
+fn a_sum_over_ten_deliveries() {
     let (value, _) = dispatched_live(
         indoc! {"
             out = test_sink()
@@ -3049,6 +3081,26 @@ fn a_pipeline_notified_of_arrivals_takes_rows_no_arrival_names(
     assert_eq!(rendered_in_key_order(&live.value), expected, "{source}");
 }
 
+/// `value` rendered, a collection's entries in the order of their rendered keys.
+fn rendered_in_key_order(value: &Value) -> String {
+    match value {
+        Value::Function(_) => {
+            let mut entries: Vec<(String, String)> = value
+                .as_function()
+                .iter()
+                .map(|binding| (binding.input.to_string(), binding.output.to_string()))
+                .collect();
+            entries.sort();
+            let entries: Vec<String> = entries
+                .into_iter()
+                .map(|(key, value)| format!("{key} -> {value}"))
+                .collect();
+            format!("[{}]", entries.join(", "))
+        }
+        other => other.to_string(),
+    }
+}
+
 /// A loop or a transaction over a live source whose body or seed reads a pipeline: the scope or
 /// the store takes each delivery once the pipelines it reads have decided it. Where one of them is
 /// final only once a live source yields everything, the scope or the store holds its
@@ -3630,22 +3682,21 @@ fn a_reader_of_two_pipelines_decided_apart(
     assert_eq!(binding.output, Value::Int(150), "{source}");
 }
 
-/// `value` rendered, a collection's entries in the order of their rendered keys.
-fn rendered_in_key_order(value: &Value) -> String {
-    match value {
-        Value::Function(_) => {
-            let mut entries: Vec<(String, String)> = value
-                .as_function()
-                .iter()
-                .map(|binding| (binding.input.to_string(), binding.output.to_string()))
-                .collect();
-            entries.sort();
-            let entries: Vec<String> = entries
-                .into_iter()
-                .map(|(key, value)| format!("{key} -> {value}"))
-                .collect();
-            format!("[{}]", entries.join(", "))
-        }
-        other => other.to_string(),
-    }
+/// A feed out of a loop over a let-bound filter of a live source: a delivery decides a position at
+/// which the loop writes nothing, the key the filter drops, and the read of the feed states it
+/// decided and absent, so the pipeline that consumed the store's push of it releases it.
+#[rstest_log::rstest]
+fn a_feed_out_of_a_loop_over_a_let_bound_filter_of_a_live_source(
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let source = indoc! {"
+        out = test_sink()
+        ys = [x for x in source1() if x != 2]
+        n := 0
+        for y in ys:
+            n := n + y
+            out << n
+    "};
+    let (written, _) = dispatched_live_written(source, rows, one_key_batches(4));
+    assert_eq!(keyed_ints(&written), [(0, 1), (2, 4), (3, 8)]);
 }

@@ -187,8 +187,8 @@ fn pull_sinks(targets: &[RunTarget]) {
 pub trait RunObserver {
     /// The pass has polled its live sources and notified no pipeline yet.
     fn polled(&mut self) {}
-    /// No package is in flight and none is claimable. `changed` says whether
-    /// the pass notified a pipeline or closed one. `Break` ends the run here.
+    /// No package is in flight and none is claimable. `changed` says whether the pass notified a
+    /// pipeline or closed one. `Break` ends the run here.
     fn drained(&mut self, changed: bool) -> ControlFlow<()>;
 }
 
@@ -207,8 +207,8 @@ impl RunObserver for Idle<'_> {
 
 /// How a run ended, with what it planned for each pipeline.
 pub enum Ended {
-    /// Every live source yields everything and every pipeline has finished. The
-    /// run has taken its last pull of each sink.
+    /// Every live source yields everything and every pipeline has finished. The run has taken its
+    /// last pull of each sink.
     Done(Vec<Planned>),
     /// The observer broke at a drained boundary. The run left nothing placed and pulled no sink.
     Paused(Vec<Planned>),
@@ -686,8 +686,10 @@ fn run_targets(
     for (reader, read) in reads_as_keys {
         dispatcher.queue_pushes_of(PipelineId(reader), PipelineId(read));
     }
-    // A live main output hands each package's answer immediately; a static one merges them
-    // until its single finish.
+    // Over a live source a `main` output hands each package's answer as it consumes it, since
+    // the run finishes it only once every source yields everything. A run with no live source
+    // finishes it once its input is whole, so it merges its packages' answers until then and
+    // hands one, as pull mode's one pull does.
     if !live.is_empty() {
         for ((_, _, entry), breaker) in targets.iter().zip(&sink_breakers) {
             if let TargetEntry::Main(_) = entry {
@@ -828,11 +830,11 @@ pub(super) enum Consumes {
     /// What the pipelines it reads push, as its edges' probes plan.
     Pushes,
     /// Its input whole, in order, once every pipeline it reads has finished, or over a live
-    /// source each delivery once they have decided it: a store that steps itself, or a
-    /// loop's scope.
+    /// source each delivery once they have decided it: a store that steps itself, or a loop's
+    /// scope.
     Whole,
-    /// One region per round, which the scope it runs in queues it, once every pipeline it reads
-    /// is quiescent: the scope of a loop nested in the scope's loop, one row per round.
+    /// One row per round of the scope it runs in, which queues it the row, once every pipeline it
+    /// reads is quiescent: the scope of a loop nested in the scope's loop.
     Rounds,
 }
 
@@ -953,8 +955,8 @@ pub(super) fn plan_edges(
         let mut seen: Vec<usize> = Vec::new();
         let read_all = read;
         for &read in read {
-            // A nested loop's scope pushes its store once it is terminal, at its finish,
-            // so a reader inside the cycle around it waits for its finish of each round instead.
+            // A nested loop's scope runs a row per round of the scope around it, and a reader
+            // inside the cycle around it reads the row once the nested scope is quiescent.
             if kinds[read] == Consumes::Rounds {
                 follows.push(read);
                 continue;

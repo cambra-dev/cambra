@@ -1426,6 +1426,15 @@ pub trait Breaker {
     /// that answers `None` pushes nothing, after a consume or at a finish.
     fn as_producer(&self) -> Option<&dyn BreakingProducer>;
 
+    /// Hand `push` the producer whose decided region this breaker's pipeline pushes to the
+    /// pipelines that read it: the breaker itself where it is a producer, and nothing for a breaker
+    /// no pipeline reads. A loop's scope, which is no producer, hands its store.
+    fn pushing(&self, push: &mut dyn FnMut(&dyn BreakingProducer)) {
+        if let Some(producer) = self.as_producer() {
+            push(producer);
+        }
+    }
+
     /// How many inputs the breaker consumes, each the input of a pipeline of its own: one, but for
     /// a transaction store, which consumes one per writer.
     fn inputs(&self) -> usize {
@@ -1445,14 +1454,6 @@ pub trait Breaker {
     /// breaker is a transaction store, whose writer's drive caches what it read of its source. A
     /// no-op for every other breaker.
     fn read_source_again(&mut self, _source: &Rc<RefCell<dyn DataSourceDomainExtentImpl>>) {}
-
-    /// Hand `push` the producer whose decided region this breaker's pipeline pushes: itself
-    /// where it is a producer, or the store of a loop's scope.
-    fn pushing(&self, push: &mut dyn FnMut(&dyn BreakingProducer)) {
-        if let Some(producer) = self.as_producer() {
-            push(producer);
-        }
-    }
 
     /// Finish once the pipeline has consumed every package and nothing more can be queued for it,
     /// the breaker's last call. The default pushes what a

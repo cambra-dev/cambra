@@ -967,11 +967,28 @@ fn a_fed_accumulator_is_observable_across_the_swap(#[values("0", "1")] dispatch:
         reply.contains("reloaded"),
         "the reload should be accepted: {reply}"
     );
-    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
     // `4` is the step that can only happen if the swap resumed from `2`; a
-    // restart would report `2` again.
-    assert!(flat.contains("Ints([4,],)"), "want a step to 4: {out}");
-    assert!(flat.contains("Ints([6,],)"), "want a step to 6: {out}");
+    // restart would report `2` again. Pull mode prints a step per line and a
+    // dispatched run a delivery's steps together, so the values are read in
+    // order across the printed tiles.
+    assert_eq!(printed_ints(&out), [1, 2, 4, 6], "{out}");
+}
+
+/// The integers of every value column `out` prints, `codomain: Scalar(Ints(…))`, in the order
+/// printed.
+fn printed_ints(out: &str) -> Vec<i64> {
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    flat.split("codomain:Scalar(Ints([")
+        .skip(1)
+        .flat_map(|column| {
+            let column = column.split(']').next().unwrap_or_default();
+            column
+                .split(',')
+                .filter(|cell| !cell.is_empty())
+                .map(|cell| cell.parse::<i64>().expect("an `Ints` cell is an integer"))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// The state guard covers a `stdin`-sourced loop, not just an `http_serve` one.
