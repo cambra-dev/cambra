@@ -670,6 +670,10 @@ pub struct LoweringContext {
     /// Where each run of the linked program is brought in
     /// ([`modules::RunSites`]).
     pub(crate) run_sites: modules::RunSites,
+    /// How many errors lowering reported at a statement it stood the placeholder in for
+    /// (`stmts::stand_in_for_failed`). The tree lowering returns is one inference can read
+    /// when these are all its errors; another error can leave it inconsistent elsewhere.
+    pub(crate) stood_in: usize,
     /// Every binder the module being lowered writes, with its span, for the rule
     /// that none takes a name that denotes a module ([`module_name_binders`]).
     pub(super) module_binders: Vec<(SmolStr, Span)>,

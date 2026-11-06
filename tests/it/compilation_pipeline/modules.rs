@@ -1065,6 +1065,32 @@ fn a_reference_into_a_module_with_errors_adds_no_error(#[case] root: &str) {
     assert!(!errors.contains("missing"), "{errors}");
 }
 
+/// A statement lowering fails in, in a module the root imports, hides no inference error:
+/// the statement stands in, its names are poisons, and a reference to one reports nothing
+/// (`src/ccl/design/type-inference.md`, "An error stops its statement, not the pass").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_failed_statement_of_an_imported_module_hides_no_inference_error() {
+    let root = indoc! {r#"
+        import lib
+        z = [1, "a"]
+        (lib::y, z)
+    "#};
+    let errors = compile_errors(&program(
+        root,
+        &[("lib", "pub x: Mut(Int) = 3\npub y = x + 1\n")],
+    ));
+    assert!(
+        errors.contains("introduces a mutable with the immutable"),
+        "{errors}"
+    );
+    assert!(
+        errors.contains("The values that meet here have no common type"),
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
 /// A module two others import is evaluated once: its bindings stand once in the
 /// linked tree, ahead of both importers' (`docs/chl-spec.md`, "9.7 Importing
 /// asserts no IO and no state").

@@ -745,6 +745,11 @@ pub(crate) fn run_with_params(
         Ok(typed) => return Ok(typed),
         Err(failure) => failure,
     };
+    // A tree lowering failed in holds statements left out already, which may be what
+    // determines a value, as a run that starts over does.
+    if holds_stand_in(&pristine) {
+        errors.retain(|e| !e.error.is_undetermined());
+    }
     let mut stood_in: HashMap<NodeId, StandIn> = HashMap::new();
     loop {
         // A statement recovered from stands in; one that is recovered from as a stand-in
@@ -826,6 +831,13 @@ fn drop_met_downstream(tree: &Expr, errors: &mut Vec<LocatedInferError>) {
                         if joined.contains(&node))
         })
     });
+}
+
+/// Whether `expr` holds the [`Error`](crate::ccl::TypedExprNode::Error) placeholder of a
+/// statement lowering failed in.
+fn holds_stand_in(expr: &Expr) -> bool {
+    matches!(expr.node, crate::ccl::TypedExprNode::Error)
+        || !expr.all_children(|c| !holds_stand_in(c))
 }
 
 /// Why one run of inference ([`run_once`]) failed.
