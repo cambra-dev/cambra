@@ -227,31 +227,37 @@ fn a_feed_repeats_the_position_the_recurrence_still_reads() {
     assert_cuts_pinned(&emitted_at_each_cut(false), &pinned);
 }
 
-/// PINNED FAILURE through the real binary. The new version prints again the last value
-/// the old version printed.
+/// A real-binary reload preserves the pull reader's release at the cut. A deferred release from
+/// the store's recurrence settles before its mutable borrow ends, so the new version starts
+/// after the last value the old version printed.
 ///
-/// With `a` and `b` sent before the reload and `c` after, correct:
+/// With `a` and `b` sent before the reload and `c` after, correct, and observed in pull mode:
 ///
 /// ```text
 /// ["a", "ab", "abc"]
 /// ```
 ///
-/// Pinned:
+/// Pinned dispatched, which repeats every value before the cut: the store pushes each position it
+/// decides, and the rebuilt tap reader's slot starts at the intersection of every slot's release,
+/// which the store's recurrence slots hold empty.
 ///
 /// ```text
-/// ["a", "ab", "ab", "abc"]
+/// ["a", "ab", "a", "ab", "abc"]
 /// ```
 ///
 /// The program of
 /// [`a_feed_read_by_a_sibling_that_takes_nothing_repeats_the_position_at_the_cut`], over
 /// `stdin`, reloaded through `--control` at a quiet point between lines.
-#[test]
-fn a_stdin_feed_repeats_the_value_at_the_cut_when_its_other_writer_is_edited() {
+#[rstest::rstest]
+fn a_stdin_feed_repeats_the_value_at_the_cut_when_its_other_writer_is_edited(
+    #[values("0", "1")] dispatch: &str,
+) {
     let (reply, out) = stdin_across_reload(
         &feed("stdin()", true, ""),
         &feed("stdin()", true, "!"),
         "a\nb",
         "c",
+        dispatch,
     );
     assert!(
         reply.contains("reloaded"),
@@ -263,11 +269,14 @@ fn a_stdin_feed_repeats_the_value_at_the_cut_when_its_other_writer_is_edited() {
         .map(str::trim)
         .filter_map(|l| l.strip_prefix('"')?.strip_suffix("\","))
         .collect();
+    let expected = match dispatch {
+        "1" => vec!["a", "ab", "a", "ab", "abc"],
+        _ => vec!["a", "ab", "abc"],
+    };
     assert_eq!(
-        printed,
-        vec!["a", "ab", "ab", "abc"],
+        printed, expected,
         "the printed values changed. If the replay was fixed, pin the correct \
-         [\"a\", \"ab\", \"abc\"] instead: {out}"
+         [\"a\", \"ab\", \"abc\"] in both modes: {out}"
     );
 }
 

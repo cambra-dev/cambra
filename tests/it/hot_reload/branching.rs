@@ -1081,12 +1081,14 @@ fn a_lagging_branch_does_not_make_a_new_branch_fold_twice() {
 /// The branch is created after the first line has been answered, so its new
 /// producer starts where `main`'s stopped: it transforms the second line and
 /// never the first.
-#[test]
-fn the_driver_pulls_every_branch_and_exits_when_all_have_finished() {
+#[rstest::rstest]
+fn the_driver_pulls_every_branch_and_exits_when_all_have_finished(
+    #[values("0", "1")] dispatch: &str,
+) {
     use std::io::Write;
     use std::time::Duration;
 
-    let mut launched = launch_under_control("[\"A\" + line for line in stdin()]\n");
+    let mut launched = launch_under_control("[\"A\" + line for line in stdin()]\n", dispatch);
     let control = launched.control;
     let mut input = launched.input.take().expect("piped stdin");
     let reader = launched.reader.take().expect("reader thread");

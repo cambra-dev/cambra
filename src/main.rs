@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path, thread, time::Duration};
+use std::{collections::HashMap, ops::ControlFlow, path::Path, thread, time::Duration};
 
 use cambra::{
     ccl::{
@@ -6,10 +6,11 @@ use cambra::{
         load::LoadedProgram,
         provenance::NodeId,
     },
-    control_port::{ControlPort, service},
+    control_port::{ControlMessage, ControlPort, ControlReply, ControlRequest, service},
     inspector_server::{ServedSnapshot, live::LiveChannel, serve_compiled},
     interpreter::{
-        ColumnValue, Consumer, DataSink, Scheduler, dispatcher,
+        ColumnValue, Consumer, DataSink, Scheduler,
+        dispatcher::{self, Ended, RunObserver},
         operator_graph::source_nodes,
         tile_operators::{FunctionGuard, Tile, TileGuard, TileProducer},
         value_probe::{
@@ -36,6 +37,41 @@ fn poll_control(
     let Some(message) = port.poll() else { return };
     let reply = service(message.request(), ctx, live, main_consumer);
     message.answer(reply);
+}
+
+/// Keep retirement, inspector version advancement and source windows in one publication boundary.
+fn service_inspected(
+    request: &ControlRequest,
+    ctx: &mut GlobalContext,
+    live: &mut LiveProgram,
+    main_consumer: &dyn Fn() -> Box<dyn Consumer>,
+    inspection: Option<&mut Inspection>,
+    publisher: Option<&Publisher>,
+) -> ControlReply {
+    let mut publication = publisher.map(|publisher| {
+        #[cfg(test)]
+        if publisher.shared.windows.try_lock().is_err()
+            && let Some(hook) = publisher.shared.handover_blocked.lock().unwrap().take()
+        {
+            hook();
+        }
+        publisher
+            .shared
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
+    let reply = service(request, ctx, live, main_consumer);
+    if let Some(inspection) = inspection
+        && inspection.follow(live)
+        && let Some(publisher) = publisher
+    {
+        publisher.followed();
+        if let Some(windows) = publication.as_mut() {
+            **windows = inspection.sample_sources(ctx.scheduler());
+        }
+    }
+    reply
 }
 
 /// Pull one branch's `main` output once, print what it delivered, and answer
@@ -88,14 +124,7 @@ fn dispatch_requested() -> bool {
 ///
 /// Where [`MORSEL_ROWS_VAR`] is set to anything but a positive count.
 fn run_dispatched(loaded: &LoadedProgram) -> Result<(), ()> {
-    let rows = match std::env::var(MORSEL_ROWS_VAR) {
-        Ok(rows) => rows
-            .parse::<usize>()
-            .ok()
-            .filter(|rows| *rows > 0)
-            .unwrap_or_else(|| panic!("{MORSEL_ROWS_VAR} is a positive count of rows: {rows}")),
-        Err(_) => DEFAULT_MORSEL_ROWS,
-    };
+    let rows = morsel_rows();
     let mut ctx = GlobalContext::default();
     ctx.defer_sink_pulls();
     let mut program = match compile_program(&mut ctx, loaded, Box::new(|| {})) {
@@ -117,6 +146,23 @@ fn run_dispatched(loaded: &LoadedProgram) -> Result<(), ()> {
     Ok(())
 }
 
+/// The most rows a dispatched run's work package names: [`MORSEL_ROWS_VAR`], or
+/// [`DEFAULT_MORSEL_ROWS`] where it is unset.
+///
+/// # Panics
+///
+/// Where [`MORSEL_ROWS_VAR`] is set to anything but a positive count.
+fn morsel_rows() -> usize {
+    match std::env::var(MORSEL_ROWS_VAR) {
+        Ok(rows) => rows
+            .parse::<usize>()
+            .ok()
+            .filter(|rows| *rows > 0)
+            .unwrap_or_else(|| panic!("{MORSEL_ROWS_VAR} is a positive count of rows: {rows}")),
+        Err(_) => DEFAULT_MORSEL_ROWS,
+    }
+}
+
 /// The `main` output of a dispatched run, which prints each answer it is handed as
 /// [`pull_main`] prints a pull's: one that holds a key or a value, or that is terminal.
 struct PrintedMain;
@@ -125,6 +171,202 @@ impl DataSink for PrintedMain {
     fn process(&self, tile: &Tile) {
         if !tile_is_empty(tile) || tile.is_terminal() {
             println!("Got value: {tile:#?}");
+        }
+    }
+}
+
+/// [`PrintedMain`] for a branch other than `main`, printing `Got value from <branch>: …` as
+/// [`pull_main`] does.
+struct PrintedBranch(String);
+
+impl DataSink for PrintedBranch {
+    fn process(&self, tile: &Tile) {
+        if !tile_is_empty(tile) || tile.is_terminal() {
+            println!("Got value from {}: {tile:#?}", self.0);
+        }
+    }
+}
+
+/// The printer of a branch's `main` answers in a dispatched run.
+fn print_main(branch: &str) -> std::sync::Arc<dyn DataSink> {
+    match branch == MAIN_BRANCH {
+        true => std::sync::Arc::new(PrintedMain),
+        false => std::sync::Arc::new(PrintedBranch(branch.to_string())),
+    }
+}
+
+/// The observer of a dispatched run under `--control` or `--inspect`: it records the source
+/// windows where a pass has polled, for the publisher ([`Publisher`]) to send with its next frame,
+/// and ends the run at the first drained boundary after a control request arrives, which the
+/// driver services between two runs.
+struct Driver<'a> {
+    control: Option<&'a ControlPort>,
+    pending: &'a mut Option<ControlMessage>,
+    inspection: Option<&'a Inspection>,
+    publisher: Option<&'a Publisher>,
+    scheduler: &'a Scheduler,
+}
+
+impl RunObserver for Driver<'_> {
+    /// Probing switches on here where a client watches, as well as on the publisher's timer, and
+    /// only the publisher switches it off. `LiveServer::accept` counts a client as watching before
+    /// it answers the handshake, so input the client sends after it is taken by a poll that sees
+    /// the count, and its readings are recorded.
+    ///
+    /// The source windows are sampled here, between the poll and the pass's consumes, so a window
+    /// holds the arrivals the poll took. The handles are `Rc`, so the run's thread samples them.
+    fn polled(&mut self) {
+        let (Some(inspection), Some(publisher)) = (self.inspection, self.publisher) else {
+            return;
+        };
+        if inspection.channel.is_watched() && !inspection.probes.is_enabled() {
+            inspection.probes.enable();
+        }
+        if inspection.probes.is_enabled() {
+            publisher.record_windows(inspection.sample_sources(self.scheduler));
+        }
+    }
+
+    fn drained(&mut self, changed: bool) -> ControlFlow<()> {
+        if let Some(message) = self.control.and_then(ControlPort::poll) {
+            *self.pending = Some(message);
+            return ControlFlow::Break(());
+        }
+        if !changed {
+            thread::sleep(Duration::from_millis(1));
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// How often the [`Publisher`] reads the probe table.
+const PUBLISH_INTERVAL: Duration = Duration::from_millis(100);
+
+/// A thread that publishes probe frames on a timer, independent of a dispatched run's boundaries
+/// (`src/inspector_model/design.md`, "Probing follows the live route").
+///
+/// It switches probing to match whether a client is connected, and sends a frame where a probe took
+/// a reading that carried rows since the last frame, or where `main`'s version changed since it. It
+/// renders each frame from a copy of the table ([`ProbeSlot::snapshot`]), so no `get` waits on a
+/// render.
+struct Publisher {
+    shared: std::sync::Arc<Published>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+/// What the run's thread shares with the publisher's.
+struct Published {
+    probes: ProbeSlot,
+    channel: LiveChannel,
+    /// Source windows and the publication boundary. Reload holds this lock through teardown,
+    /// snapshot replacement and version advancement; a publisher holds it through publication.
+    windows: std::sync::Mutex<Vec<SourceWindow>>,
+    /// Set where [`Inspection::follow`] took up a new version: the next frame is sent whatever the
+    /// table holds.
+    followed: std::sync::atomic::AtomicBool,
+    stop: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    after_snapshot: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    handover_blocked: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl Publisher {
+    fn start(probes: ProbeSlot, channel: LiveChannel) -> Self {
+        let shared = std::sync::Arc::new(Published {
+            probes,
+            channel,
+            windows: std::sync::Mutex::new(Vec::new()),
+            followed: std::sync::atomic::AtomicBool::new(false),
+            stop: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            after_snapshot: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            handover_blocked: std::sync::Mutex::new(None),
+        });
+        let publishing = shared.clone();
+        let thread = thread::spawn(move || publishing.run());
+        Self {
+            shared,
+            thread: Some(thread),
+        }
+    }
+
+    fn record_windows(&self, windows: Vec<SourceWindow>) {
+        *self
+            .shared
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = windows;
+    }
+
+    fn followed(&self) {
+        self.shared
+            .followed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Stop the thread and wait for it, so a frame published after this is the driver's. A
+    /// publisher dropped without this, as on an error return, stops the same way.
+    fn stop(self) {}
+}
+
+impl Drop for Publisher {
+    fn drop(&mut self) {
+        self.shared
+            .stop
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("the publisher thread does not panic");
+        }
+    }
+}
+
+impl Published {
+    fn run(&self) {
+        use std::sync::atomic::Ordering;
+        // `ProbeTable::flows` at the last frame, as `Inspection::published_through` keeps it for
+        // pull mode: `None` from a follow until the next frame, `Some(0)` again at each switch.
+        let mut published_through = Some(0);
+        // Whether probing was on at the last tick. The run's poll can switch it on between two
+        // ticks (`Driver::polled`), which starts a fresh table as a switch here does.
+        let mut was_enabled = self.probes.is_enabled();
+        while !self.stop.load(Ordering::Acquire) {
+            let mut windows = self
+                .windows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.followed.swap(false, Ordering::AcqRel) {
+                published_through = None;
+            }
+            let watched = self.channel.is_watched();
+            if watched != self.probes.is_enabled() {
+                if watched {
+                    self.probes.enable();
+                } else {
+                    self.probes.disable();
+                    self.channel.forget_frame();
+                    windows.clear();
+                }
+            }
+            let enabled = self.probes.is_enabled();
+            if enabled != was_enabled && published_through.is_some() {
+                published_through = Some(0);
+            }
+            was_enabled = enabled;
+            if watched
+                && let Some(table) = self.probes.snapshot()
+                && Some(table.flows()) != published_through
+            {
+                #[cfg(test)]
+                if let Some(hook) = self.after_snapshot.lock().unwrap().take() {
+                    hook();
+                }
+                published_through = Some(table.flows());
+                self.channel.publish_probes(&table, &windows);
+            }
+            drop(windows);
+            thread::sleep(PUBLISH_INTERVAL);
         }
     }
 }
@@ -173,10 +415,15 @@ fn run_in_pull_mode(ctx: &mut GlobalContext, program: &mut CompiledProgram) {
 /// Returns `Err(())` if compilation failed; the errors have already been
 /// rendered to stderr by [`eprint_errors`], so the caller's job is just to exit
 /// non-zero.
+///
+/// `dispatch` runs every branch through the dispatcher with work packages of at most that many
+/// rows ([`LiveProgram::run`]), servicing each control request between two runs; `None` runs in
+/// pull mode.
 fn run_program(
     loaded: &LoadedProgram,
     inspect_port: Option<u16>,
     control_port: Option<u16>,
+    dispatch: Option<usize>,
 ) -> Result<(), ()> {
     // Each branch's `main` consumer marks that branch as having something to
     // pull ([`LiveProgram::pull_mains`]); the driver polls those marks, so the
@@ -188,6 +435,9 @@ fn run_program(
     };
 
     let mut ctx = GlobalContext::default();
+    if dispatch.is_some() {
+        ctx.defer_sink_pulls();
+    }
     let mut live = match LiveProgram::start(&mut ctx, loaded, &main_consumer) {
         Ok(p) => p,
         Err(errs) => {
@@ -212,7 +462,7 @@ fn run_program(
                     snapshot,
                     src_name,
                     version,
-                    ctx.scheduler().probes().clone(),
+                    ctx.subscribe_context().probes().clone(),
                     source_nodes(&program.operator_graph),
                 )),
                 Err(e) => {
@@ -238,6 +488,80 @@ fn run_program(
     // them this loop runs until the process exits. The control port is serviced
     // once per pass: a swap sits between two pulls, so a source delivering
     // without pause must not be able to starve it of its turn.
+    if let Some(rows) = dispatch {
+        let mut pending: Option<ControlMessage> = None;
+        // Whether a run has started. A refusal of the first run ran nothing, so the process falls
+        // back to pull mode; a later run starts over breakers that consumed, which pull mode cannot
+        // drive.
+        let mut ran = false;
+        let publisher = inspection.as_ref().map(|inspection| {
+            Publisher::start(inspection.probes.clone(), inspection.channel.clone())
+        });
+        loop {
+            if let Some(message) = pending.take() {
+                let reply = service_inspected(
+                    message.request(),
+                    &mut ctx,
+                    &mut live,
+                    &main_consumer,
+                    inspection.as_mut(),
+                    publisher.as_ref(),
+                );
+                message.answer(reply);
+            }
+            let mut driver = Driver {
+                control: control.as_ref(),
+                pending: &mut pending,
+                inspection: inspection.as_ref(),
+                publisher: publisher.as_ref(),
+                scheduler: ctx.scheduler(),
+            };
+            let ended = live.run(rows, &print_main, &mut driver);
+            match ended {
+                Ok(Ended::Paused(_)) => {}
+                Ok(Ended::Done(_)) if pending.is_none() && live.poll_finished() => break,
+                // Nothing runs until a request changes the table.
+                Ok(Ended::Done(_)) => {
+                    if pending.is_none() {
+                        pending = control.as_ref().and_then(ControlPort::poll);
+                    }
+                    if pending.is_none() {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                Err(refused) if !ran => {
+                    eprintln!("note: {DISPATCH_VAR}: {refused}; running in pull mode");
+                    // Pull mode switches probing itself before each pull, from a slot the
+                    // publisher may have filled.
+                    if let Some(inspection) = inspection.as_ref() {
+                        inspection.probes.disable();
+                    }
+                    ctx.resume_sink_pulls();
+                    live.pull_sinks();
+                    break;
+                }
+                Err(refused) => {
+                    eprintln!("error: {DISPATCH_VAR}: {refused}, after a run has consumed");
+                    return Err(());
+                }
+            }
+            ran = true;
+        }
+        if let Some(publisher) = publisher {
+            publisher.stop();
+        }
+        if ran {
+            if let Some(inspection) = inspection.as_ref() {
+                inspection.publish_final(ctx.scheduler());
+            }
+            return Ok(());
+        }
+        if let Some(message) = pending.take() {
+            let reply = service(message.request(), &mut ctx, &mut live, &main_consumer);
+            message.answer(reply);
+        }
+    }
+
     loop {
         poll_control(control.as_ref(), &mut ctx, &mut live, &main_consumer);
         if let Some(inspection) = inspection.as_mut() {
@@ -374,18 +698,21 @@ impl Inspection {
     /// it. Another branch's reload changes nothing here, and neither does
     /// deleting `main`: the panes keep describing the last version it ran
     /// (`src/inspector_model/design.md`, "A reload of main is followed").
-    fn follow(&mut self, live: &LiveProgram) {
+    ///
+    /// Answers whether it took up a new version, which a [`Publisher`] sends a frame for.
+    fn follow(&mut self, live: &LiveProgram) -> bool {
         let Some((version, program)) = live.program(MAIN_BRANCH) else {
-            return;
+            return false;
         };
         if version == self.following {
-            return;
+            return false;
         }
         self.snapshot.replace(program, &self.name, version);
         self.source_node_ids = source_nodes(&program.operator_graph);
         self.channel.follow(version);
         self.following = version;
         self.published_through = None;
+        true
     }
 
     /// Switch probing to match whether a client is connected, and sample the
@@ -625,11 +952,13 @@ fn main() {
             inspect_port,
             control_port,
         } => {
-            let dispatched =
-                dispatch_requested() && inspect_port.is_none() && control_port.is_none();
-            let result = match dispatched {
-                true => run_dispatched(&loaded),
-                false => run_program(&loaded, inspect_port, control_port),
+            let served = inspect_port.is_some() || control_port.is_some();
+            let result = match (dispatch_requested(), served) {
+                (true, false) => run_dispatched(&loaded),
+                (true, true) => {
+                    run_program(&loaded, inspect_port, control_port, Some(morsel_rows()))
+                }
+                (false, _) => run_program(&loaded, inspect_port, control_port, None),
             };
             if result.is_err() {
                 std::process::exit(1);
@@ -654,7 +983,132 @@ mod tests {
     use test_log::test;
 
     #[test]
+    fn a_reload_waits_for_an_in_flight_probe_snapshot() {
+        use super::*;
+        use cambra::inspector_server::live::LiveServer;
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        use tungstenite::Message;
+
+        let mut ctx = GlobalContext::default();
+        let probes = ctx.subscribe_context().probes().clone();
+        probes.enable();
+        let loaded = LoadedProgram::test("42");
+        let consumer = || -> Box<dyn Consumer> { Box::new(|| {}) };
+        let mut program = LiveProgram::start(&mut ctx, &loaded, &consumer).unwrap();
+        let producer = program.main_producer_mut(MAIN_BRANCH).unwrap();
+        producer.get(producer.tiling().universal_guard());
+        let live = Arc::new(LiveServer::start());
+        let channel = live.channel();
+        channel.follow(1);
+        let (_, compiled) = program.program(MAIN_BRANCH).unwrap();
+        let (_, served) = serve_compiled(compiled, "test", 0, 1).unwrap();
+        let mut inspection = Inspection::new(
+            channel.clone(),
+            served,
+            "test",
+            1,
+            probes.clone(),
+            source_nodes(&compiled.operator_graph),
+        );
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let serving = live.clone();
+        let server_thread = thread::spawn(move || serving.accept(server.recv().unwrap()).unwrap());
+        let stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let (mut socket, _) =
+            tungstenite::client::client(format!("ws://127.0.0.1:{port}/api/live"), stream).unwrap();
+        // A previous source's anchors and window must not survive a scalar replacement.
+        inspection
+            .source_node_ids
+            .insert("retired-source".into(), Vec::new());
+        let stale_window = SourceWindow {
+            node_ids: Vec::new(),
+            name: "retired-source".into(),
+            rows: Vec::new(),
+            total: 1,
+        };
+        let (copied, snapshot) = mpsc::sync_channel(0);
+        let (resume, proceed) = mpsc::sync_channel(0);
+        let (contended, contention) = mpsc::sync_channel(0);
+        let published = Arc::new(Published {
+            probes: probes.clone(),
+            channel: channel.clone(),
+            windows: Mutex::new(vec![stale_window]),
+            followed: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            after_snapshot: Mutex::new(Some(Box::new(move || {
+                copied.send(()).unwrap();
+                proceed.recv_timeout(Duration::from_secs(5)).unwrap();
+            }))),
+            handover_blocked: Mutex::new(Some(Box::new(move || {
+                contended.send(()).unwrap();
+            }))),
+        });
+        let worker = published.clone();
+        let publishing = thread::spawn(move || worker.run());
+        snapshot.recv_timeout(Duration::from_secs(5)).unwrap();
+        let publisher = Publisher {
+            shared: published.clone(),
+            thread: Some(publishing),
+        };
+        published.stop.store(true, Ordering::Release);
+        let resume_publication = thread::spawn(move || {
+            contention.recv_timeout(Duration::from_secs(5)).unwrap();
+            resume.send(()).unwrap();
+        });
+        let reply = service_inspected(
+            &ControlRequest::Reload {
+                branch: MAIN_BRANCH.into(),
+                code: "43".into(),
+            },
+            &mut ctx,
+            &mut program,
+            &consumer,
+            Some(&mut inspection),
+            Some(&publisher),
+        );
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        resume_publication.join().unwrap();
+        publisher.stop();
+        assert_eq!(inspection.following, 2);
+        let (_, compiled) = program.program(MAIN_BRANCH).unwrap();
+        assert_eq!(
+            inspection.source_node_ids,
+            source_nodes(&compiled.operator_graph)
+        );
+        assert_eq!(
+            *published.windows.lock().unwrap(),
+            inspection.sample_sources(ctx.scheduler())
+        );
+        let Message::Text(text) = socket.read().unwrap() else {
+            panic!("probe frame")
+        };
+        let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(frame["version"], 1);
+        assert!(!frame["nodes"].as_array().unwrap().is_empty());
+        {
+            let windows = published.windows.lock().unwrap();
+            channel.publish_probes(&probes.snapshot().unwrap(), &windows);
+        }
+        let Message::Text(text) = socket.read().unwrap() else {
+            panic!("probe frame")
+        };
+        let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(frame["version"], 2);
+        assert!(frame["nodes"].as_array().unwrap().is_empty());
+        drop(socket);
+        server_thread.join().unwrap();
+    }
+
+    #[test]
     fn test_run_program() {
-        run_program(&LoadedProgram::test("x = 1; x"), None, None).unwrap();
+        run_program(&LoadedProgram::test("x = 1; x"), None, None, None).unwrap();
     }
 }

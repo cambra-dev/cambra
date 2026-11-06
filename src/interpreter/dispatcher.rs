@@ -5,7 +5,7 @@
 //! is a [`BreakingProducer`]. The dispatcher holds the graph of pipelines and a queue of work
 //! packages per pipeline, each package one morsel of at most `morsel_rows` held rows. Each pipeline
 //! finishes once, when nothing more can be queued for it. A queue is appended to while it is open,
-//! each slot written once, and read through atomic counters, so a claim takes no lock. A worker
+//! each slot written once, and read through atomic counters, so claiming a package takes no lock. A worker
 //! takes a lock to sleep while there is nothing to claim, and a change that can end a sleep takes
 //! it to wake the sleepers, only while there are some. The dispatcher holds no breaker, so it is
 //! `Sync` while the breakers are not `Send`. The single-threaded driver, [`run`], reaches the
@@ -32,7 +32,10 @@ use crate::interpreter::{
 pub(crate) mod loop_scope;
 mod plan;
 
-pub use plan::{Planned, Refused, Run, run_program, run_program_into, run_program_polling};
+pub use plan::{
+    Ended, Planned, Refused, Run, RunObserver, Targets, run_program, run_program_into,
+    run_program_polling,
+};
 
 /// A pipeline, by its index in the [`Dispatcher`].
 #[derive(Clone, Copy)]
@@ -125,7 +128,7 @@ const BUCKETS: usize = (usize::BITS - FIRST_BUCKET.trailing_zeros()) as usize;
 
 /// The work packages queued for one pipeline. Packages are appended while the queue
 /// is open, and a claim takes one by its index. An append reserves its indices and then writes
-/// their slots, once, so a claim takes no lock: it reads a slot only once it is written. Nothing
+/// their slots, once, so claiming a package takes no lock: it reads a slot only once it is written. Nothing
 /// is appended once the queue is closed, so a closed queue whose every package is acknowledged is
 /// consumed.
 struct Queue {
@@ -371,7 +374,8 @@ struct ParkedState {
     brought: Option<TileGuard>,
 }
 
-/// One pipeline's queue, progress, and record of pushed and decided regions.
+/// What the dispatcher keeps of one pipeline in the run: its queue and progress, which a claim
+/// reads without a lock, and what it has pushed, decided and parked.
 struct PipelineState {
     queue: Queue,
     /// The index of the next package to claim. It never passes `queue.reserved`.
@@ -386,7 +390,7 @@ struct PipelineState {
     // shared-state-ok: the region a pipeline has pushed, which its pushes read and grow under the
     // lock; what crosses it is a guard naming a region, never a tile.
     pushed: Mutex<Option<TileGuard>>,
-    /// Serializes source arrival admission with closure.
+    /// Serializes arrival admission with closure, including admission into the parked set.
     // shared-state-ok: arrival lifecycle only; no tiles cross this lock.
     closed: Mutex<bool>,
     /// Per source of its breaker's input, what that source has decided of it: one per pipeline it
@@ -399,13 +403,12 @@ struct PipelineState {
     acknowledged: AtomicUsize,
     /// For an ordered pipeline, whether a package of it is in flight.
     in_flight: AtomicBool,
-    /// For a pipeline that parks its arrivals ([`Dispatcher::park`]), the morsels notified that
-    /// the pipelines it reads have not decided yet.
-    // shared-state-ok: guards naming regions of the pipeline's input, which its notifies and the
-    // decided pushes that release them read and write under the lock; never a tile.
-    parked: Mutex<ParkedState>,
+    /// Whether this pipeline waits for its loop's round to settle before following its reads.
     followers_held: AtomicBool,
     held: AtomicBool,
+    /// Parked regions and the union of rows already admitted by pushes.
+    // shared-state-ok: guards naming input regions, never tiles.
+    parked: Mutex<ParkedState>,
 }
 
 /// What one source of a pipeline's breaker's input has decided of that input: a pipeline it
@@ -452,14 +455,14 @@ impl PipelineState {
             pushed: Mutex::new(None),
             closed: Mutex::new(false),
             decided: Mutex::new(Vec::new()),
-            parked: Mutex::new(ParkedState {
-                morsels: Vec::new(),
-                brought: None,
-            }),
             acknowledged: AtomicUsize::new(0),
             in_flight: AtomicBool::new(false),
             followers_held: AtomicBool::new(false),
             held: AtomicBool::new(false),
+            parked: Mutex::new(ParkedState {
+                morsels: Vec::new(),
+                brought: None,
+            }),
         }
     }
 
@@ -577,7 +580,7 @@ impl Dispatcher {
             .collect();
         let states = infos
             .iter()
-            .map(|info| PipelineState::new(info.reads.len()))
+            .map(|info: &PipelineInfo| PipelineState::new(info.reads.len()))
             .collect();
         Self {
             morsel_rows,
@@ -634,6 +637,7 @@ impl Dispatcher {
         self.states.append(&mut graph.states);
         offset
     }
+
     /// Add a pipeline after its dependencies, before execution starts.
     pub(crate) fn add_pipeline(&mut self, reads: Vec<PipelineId>) -> PipelineId {
         let pipeline = self.infos.len();
@@ -665,6 +669,7 @@ impl Dispatcher {
         *self.unfinished.get_mut() += 1;
         PipelineId(pipeline)
     }
+
     /// Accept pushes at this entry only from the configured input graph.
     pub(crate) fn restrict_ingress(&mut self, pipeline: PipelineId, from: std::ops::Range<usize>) {
         assert!(
@@ -673,6 +678,7 @@ impl Dispatcher {
         );
         self.infos[pipeline.0].ingress = Some(from);
     }
+
     /// Hold a pipeline's packages and finish until it is activated by its execution handler.
     /// The serial coordinator changes holds between claims; a hold does not revoke a claim.
     pub(crate) fn hold_pipeline(&self, pipeline: PipelineId, held: bool) {
@@ -680,6 +686,7 @@ impl Dispatcher {
             self.advance();
         }
     }
+
     /// The count of the dispatcher's changes so far ([`Generation`]): an equal count read twice
     /// says nothing was queued, consumed or finished between.
     pub(crate) fn changes(&self) -> u64 {
@@ -710,11 +717,10 @@ impl Dispatcher {
         acknowledged == state.queue.reserved.load(Ordering::SeqCst) & !CLOSED
     }
 
-    /// Queue `guard`, a guard of the input of `reader`'s breaker, as a package of `reader` in the
-    /// run, less what is queued for it there already: at the start, what a range brings
-    /// that no push names ([`run_program`]), and in a loop's round, the row of a nested loop's
-    /// store, which follows the pipelines inside the cycle around it ([`follow`](Self::follow),
-    /// the induction run controller).
+    /// Queue `guard`, a guard of the input of `reader`'s breaker, as a package of `reader`, less
+    /// what is queued for it already: at the start, what a range brings that no push names
+    /// ([`run_program`]). A reader that parks parks what the pipelines it reads have not decided,
+    /// and a release hands out the part they decide.
     ///
     /// # Panics
     ///
@@ -725,7 +731,7 @@ impl Dispatcher {
 
     /// [`queue_for`](Self::queue_for) for a loop's round: the row of a nested loop's store, which
     /// follows the pipelines inside the cycle around it ([`follow`](Self::follow)), or a row the
-    /// closing round has every inner pipeline read again (`InductionStoreProducer`). A reader that
+    /// closing round has every inner pipeline read again. A reader that
     /// parks takes the row again whatever it took before, and only once the pipelines it reads
     /// have decided all of it, the row's end with its rows ([`Parked`]).
     pub(crate) fn queue_round(&self, reader: PipelineId, guard: &TileGuard) {
@@ -1347,26 +1353,34 @@ impl Dispatcher {
         }
     }
 
-    /// Queue a source pipeline's input whole and close the source: `input`,
-    /// the tiling its breaker's input answers, as one package per morsel ([`seed`]). It queues as
-    /// [`notify`](Self::notify) would, without waiting for any limit, the universal guard cut by
-    /// the range of positions `input` states, then [`close`](Self::close)s the source.
+    /// Queue a source pipeline's input and close the source: `input`, the
+    /// tiling its breaker's input answers, less `released`, what the breaker's input has already
+    /// released, as one package per morsel ([`seed`]). A run's first start passes nothing
+    /// released; a run after a pause or a reload starts over a breaker that consumed, and queues
+    /// it nothing it has finished with. It queues as [`notify`](Self::notify) would, without
+    /// waiting for any limit, then [`close`](Self::close)s the source.
     ///
     /// # Panics
     ///
-    /// When `pipeline` reads a pipeline, or is closed.
-    pub fn start_source(&self, pipeline: PipelineId, input: &Tiling) {
+    /// When `pipeline` reads a pipeline, or is closed, and where the guard algebra has no exact
+    /// difference of a morsel and `released` ([`guard_minus`]).
+    pub fn start_source(&self, pipeline: PipelineId, input: &Tiling, released: &TileGuard) {
         self.ensure(self.infos[pipeline.0].reads.is_empty(), || {
             format!(
                 "pipeline {} starts whole only as a source, which reads no pipeline",
                 pipeline.0
             )
         });
-        let morsels = seed(input, self.morsel_rows);
+        let left = guard_minus(&input.universal_guard(), released).closed_over(input);
+        let morsels: Vec<TileGuard> = seed(input, self.morsel_rows)
+            .iter()
+            .map(|morsel| guard_minus(morsel, released).closed_over(input))
+            .filter(|morsel| !morsel.is_empty())
+            .collect();
         debug_assert!(
-            partition_gap(&input.universal_guard(), &morsels).is_none(),
-            "the morsels of a source's input partition it: {}",
-            partition_gap(&input.universal_guard(), &morsels).unwrap_or_default()
+            partition_gap(&left, &morsels).is_none(),
+            "the morsels of a source's unreleased input partition it: {}",
+            partition_gap(&left, &morsels).unwrap_or_default()
         );
         self.append_to_source(pipeline, &morsels);
         self.close(pipeline);
@@ -1475,7 +1489,6 @@ impl Dispatcher {
             }
             false => morsels,
         };
-
         let appended = self.states[p].queue.append(p, morsels);
         self.ensure(appended, || {
             format!("pipeline {p} is queued nothing once it is closed")
@@ -1943,8 +1956,8 @@ impl Dispatcher {
                 .unwrap_or_else(PoisonError::into_inner);
             self.ensure(parked.morsels.is_empty(), || {
                 format!(
-                    "pipeline {p} finishes with rows parked that the \
-                     pipelines it reads never decided: {:?}",
+                    "pipeline {p} finishes with rows parked that the pipelines it reads never \
+                     decided: {:?}",
                     parked.morsels
                 )
             });
@@ -2873,7 +2886,9 @@ fn start_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>) {
                 input = Some(breaker.input_tiling(at));
             });
             let input = input.expect("a reach calls the breaker it reaches");
-            dispatcher.start_source(PipelineId(pipeline), &input);
+            // A run with no live source has no boundary to pause at, so it starts over breakers
+            // that have consumed nothing.
+            dispatcher.start_source(PipelineId(pipeline), &input, &input.empty_guard());
         }
     }
 }
@@ -3004,85 +3019,6 @@ mod tests {
     use super::*;
     use crate::interpreter::BaseType;
 
-    #[rstest::rstest]
-    fn overlapping_rows_are_queued_once_as_their_read_decides(
-        #[values(false, true)] decided_first: bool,
-    ) {
-        use crate::interpreter::tile_operators::test_helpers::keys_between;
-
-        let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
-        let reader = PipelineId(1);
-        dispatcher.park(reader);
-        let first = keys_between(0, 2);
-        let second = keys_between(1, 3);
-        let beginning = keys_between(0, 0);
-        let rest = keys_between(1, 3);
-        let mut claimed = Vec::new();
-        if decided_first {
-            dispatcher.record_decided(1, 0, Some(&beginning));
-        }
-        dispatcher.queue_for(reader, &first);
-        dispatcher.queue_for(reader, &second);
-        while let Some(package) = dispatcher.claim_of(reader) {
-            claimed.push(package.guard.clone());
-            dispatcher.acknowledge(package);
-        }
-        assert_eq!(claimed.len(), usize::from(decided_first));
-        if decided_first {
-            assert_eq!(claimed[0], beginning);
-        }
-        dispatcher.record_decided(1, 0, Some(&beginning));
-        while let Some(package) = dispatcher.claim_of(reader) {
-            claimed.push(package.guard.clone());
-            dispatcher.acknowledge(package);
-        }
-        assert_eq!(claimed, [beginning]);
-        let before = dispatcher.changes();
-        dispatcher.record_decided(1, 0, Some(&keys_between(0, 0)));
-        assert_eq!(dispatcher.changes(), before);
-        assert!(dispatcher.claim_of(reader).is_none());
-        dispatcher.record_decided(1, 0, Some(&rest));
-        while let Some(package) = dispatcher.claim_of(reader) {
-            claimed.push(package.guard.clone());
-            dispatcher.acknowledge(package);
-        }
-        assert_eq!(partition_gap(&keys_between(0, 3), &claimed), None);
-    }
-
-    #[rstest::rstest]
-    fn repeated_rounds_wait_for_their_whole_row(#[values(false, true)] decided_first: bool) {
-        use crate::interpreter::tile_operators::test_helpers::keys_between;
-
-        let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
-        let reader = PipelineId(1);
-        dispatcher.park(reader);
-        let row = keys_between(0, 3);
-        dispatcher.record_decided(1, 0, Some(&keys_between(0, 1)));
-        if decided_first {
-            dispatcher.record_decided(1, 0, Some(&keys_between(2, 3)));
-        }
-        dispatcher.queue_round(reader, &row);
-        if !decided_first {
-            assert!(dispatcher.claim_of(reader).is_none());
-            let before = dispatcher.changes();
-            dispatcher.record_decided(1, 0, Some(&keys_between(0, 2)));
-            assert_eq!(dispatcher.changes(), before);
-            assert!(dispatcher.claim_of(reader).is_none());
-            dispatcher.record_decided(1, 0, Some(&keys_between(3, 3)));
-        }
-        let package = dispatcher.claim_of(reader).expect("the row is decided");
-        assert_eq!(package.guard, row);
-        dispatcher.acknowledge(package);
-        assert!(dispatcher.claim_of(reader).is_none());
-        dispatcher.queue_round(reader, &row);
-        let package = dispatcher
-            .claim_of(reader)
-            .expect("a round reads the row again");
-        assert_eq!(package.guard, row);
-        dispatcher.acknowledge(package);
-        assert!(dispatcher.claim_of(reader).is_none());
-    }
-
     #[test]
     fn an_empty_dispatcher_is_done_until_a_pipeline_is_added() {
         let mut dispatcher = Dispatcher::new(vec![], 1);
@@ -3165,76 +3101,6 @@ mod tests {
             dispatcher.finish(dispatcher.pushes(PipelineId(0)));
             assert!(matches!(dispatcher.try_claim(None), Next::Done));
         }
-    }
-
-    /// A range covering every `u64` is cut without overflowing its count of positions.
-    #[test]
-    fn a_seed_over_every_u64_is_cut_at_the_multiples_of_rows() {
-        let input = Tiling::data_function(
-            Extent::UIntRange(IntervalSet::from(Interval::closed(0, u64::MAX))),
-            Tiling::Scalar(Extent::Base(BaseType::Int)),
-        );
-        let morsels = seed(&input, 1 << 63);
-        assert_eq!(morsels.len(), 2);
-        assert_eq!(partition_gap(&input.universal_guard(), &morsels), None);
-        let TileGuard::Function(FunctionGuard::Domain(second)) = &morsels[1] else {
-            panic!("a morsel of keys")
-        };
-        assert!(second.contains(&Value::UInt(1 << 63)));
-        assert!(!second.contains(&Value::UInt((1 << 63) - 1)));
-    }
-
-    /// A range of several runs is cut every `rows` positions counted across the runs: positions
-    /// `0..=3` and `6..=8` at `rows` 2 are cut before `2`, `6` and `8`.
-    #[test]
-    fn a_seed_over_several_runs_counts_positions_across_them() {
-        let runs = IntervalSet::new(vec![Interval::closed(0, 3), Interval::closed(6, 8)]);
-        let input = Tiling::data_function(
-            Extent::UIntRange(runs),
-            Tiling::Scalar(Extent::Base(BaseType::Int)),
-        );
-        let morsels = seed(&input, 2);
-        assert_eq!(partition_gap(&input.universal_guard(), &morsels), None);
-        let held: Vec<Vec<u64>> = morsels
-            .iter()
-            .map(|morsel| {
-                let TileGuard::Function(FunctionGuard::Domain(keys)) = morsel else {
-                    panic!("a morsel of keys")
-                };
-                [0, 1, 2, 3, 6, 7, 8]
-                    .into_iter()
-                    .filter(|key| keys.contains(&Value::UInt(*key)))
-                    .collect()
-            })
-            .collect();
-        assert_eq!(held, vec![vec![0, 1], vec![2, 3], vec![6, 7], vec![8]]);
-    }
-}
-
-#[cfg(test)]
-mod in_a_run_tests {
-    use super::*;
-    use crate::interpreter::tile_operators::Arrivals;
-
-    /// A consumer notified inside a compiled program's dispatched run panics in a debug build.
-    #[test]
-    #[cfg_attr(
-        debug_assertions,
-        should_panic(expected = "a dispatched run notifies no consumer")
-    )]
-    fn a_consumer_notified_inside_a_run_panics() {
-        let mut consumer = Arrivals::new().consumer(Box::new(|| {}));
-        in_a_run(|| consumer.notify(&Projection::Everything));
-    }
-
-    /// A run that panics leaves the thread outside a run, so a later notification passes.
-    #[test]
-    fn a_run_that_panics_leaves_the_thread_outside_a_run() {
-        let unwound = std::panic::catch_unwind(|| in_a_run(|| panic!("the run fails")));
-        assert!(unwound.is_err());
-        assert!(!is_in_a_run());
-        let mut consumer = Arrivals::new().consumer(Box::new(|| {}));
-        consumer.notify(&Projection::Everything);
     }
 
     #[rstest::rstest]
@@ -3322,5 +3188,154 @@ mod in_a_run_tests {
                 .is_empty()
         );
         assert!(matches!(dispatcher.try_claim(None), Next::Failed));
+    }
+
+    #[rstest::rstest]
+    fn overlapping_rows_are_queued_once_as_their_read_decides(
+        #[values(false, true)] decided_first: bool,
+    ) {
+        use crate::interpreter::tile_operators::test_helpers::keys_between;
+
+        let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
+        let reader = PipelineId(1);
+        dispatcher.park(reader);
+        let first = keys_between(0, 2);
+        let second = keys_between(1, 3);
+        let beginning = keys_between(0, 0);
+        let rest = keys_between(1, 3);
+        let mut claimed = Vec::new();
+        if decided_first {
+            dispatcher.record_decided(1, 0, Some(&beginning));
+        }
+        dispatcher.queue_for(reader, &first);
+        dispatcher.queue_for(reader, &second);
+        while let Some(package) = dispatcher.claim_of(reader) {
+            claimed.push(package.guard.clone());
+            dispatcher.acknowledge(package);
+        }
+        assert_eq!(claimed.len(), usize::from(decided_first));
+        if decided_first {
+            assert_eq!(claimed[0], beginning);
+        }
+        dispatcher.record_decided(1, 0, Some(&beginning));
+        while let Some(package) = dispatcher.claim_of(reader) {
+            claimed.push(package.guard.clone());
+            dispatcher.acknowledge(package);
+        }
+        assert_eq!(claimed, [beginning]);
+        let before = dispatcher.changes();
+        dispatcher.record_decided(1, 0, Some(&keys_between(0, 0)));
+        assert_eq!(dispatcher.changes(), before);
+        assert!(dispatcher.claim_of(reader).is_none());
+        dispatcher.record_decided(1, 0, Some(&rest));
+        while let Some(package) = dispatcher.claim_of(reader) {
+            claimed.push(package.guard.clone());
+            dispatcher.acknowledge(package);
+        }
+        assert_eq!(partition_gap(&keys_between(0, 3), &claimed), None);
+    }
+
+    #[rstest::rstest]
+    fn repeated_rounds_wait_for_their_whole_row(#[values(false, true)] decided_first: bool) {
+        use crate::interpreter::tile_operators::test_helpers::keys_between;
+
+        let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
+        let reader = PipelineId(1);
+        dispatcher.park(reader);
+        let row = keys_between(0, 3);
+        dispatcher.record_decided(1, 0, Some(&keys_between(0, 1)));
+        if decided_first {
+            dispatcher.record_decided(1, 0, Some(&keys_between(2, 3)));
+        }
+        dispatcher.queue_round(reader, &row);
+        if !decided_first {
+            assert!(dispatcher.claim_of(reader).is_none());
+            let before = dispatcher.changes();
+            dispatcher.record_decided(1, 0, Some(&keys_between(0, 2)));
+            assert_eq!(dispatcher.changes(), before);
+            assert!(dispatcher.claim_of(reader).is_none());
+            dispatcher.record_decided(1, 0, Some(&keys_between(3, 3)));
+        }
+        let package = dispatcher.claim_of(reader).expect("the row is decided");
+        assert_eq!(package.guard, row);
+        dispatcher.acknowledge(package);
+        assert!(dispatcher.claim_of(reader).is_none());
+        dispatcher.queue_round(reader, &row);
+        let package = dispatcher
+            .claim_of(reader)
+            .expect("a round reads the row again");
+        assert_eq!(package.guard, row);
+        dispatcher.acknowledge(package);
+        assert!(dispatcher.claim_of(reader).is_none());
+    }
+
+    /// A range covering every `u64` is cut without overflowing its count of positions.
+    #[test]
+    fn a_seed_over_every_u64_is_cut_at_the_multiples_of_rows() {
+        let input = Tiling::data_function(
+            Extent::UIntRange(IntervalSet::from(Interval::closed(0, u64::MAX))),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let morsels = seed(&input, 1 << 63);
+        assert_eq!(morsels.len(), 2);
+        assert_eq!(partition_gap(&input.universal_guard(), &morsels), None);
+        let TileGuard::Function(FunctionGuard::Domain(second)) = &morsels[1] else {
+            panic!("a morsel of keys")
+        };
+        assert!(second.contains(&Value::UInt(1 << 63)));
+        assert!(!second.contains(&Value::UInt((1 << 63) - 1)));
+    }
+
+    /// A range of several runs is cut every `rows` positions counted across the runs: positions
+    /// `0..=3` and `6..=8` at `rows` 2 are cut before `2`, `6` and `8`.
+    #[test]
+    fn a_seed_over_several_runs_counts_positions_across_them() {
+        let runs = IntervalSet::new(vec![Interval::closed(0, 3), Interval::closed(6, 8)]);
+        let input = Tiling::data_function(
+            Extent::UIntRange(runs),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let morsels = seed(&input, 2);
+        assert_eq!(partition_gap(&input.universal_guard(), &morsels), None);
+        let held: Vec<Vec<u64>> = morsels
+            .iter()
+            .map(|morsel| {
+                let TileGuard::Function(FunctionGuard::Domain(keys)) = morsel else {
+                    panic!("a morsel of keys")
+                };
+                [0, 1, 2, 3, 6, 7, 8]
+                    .into_iter()
+                    .filter(|key| keys.contains(&Value::UInt(*key)))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(held, vec![vec![0, 1], vec![2, 3], vec![6, 7], vec![8]]);
+    }
+}
+
+#[cfg(test)]
+mod in_a_run_tests {
+    use super::*;
+    use crate::interpreter::tile_operators::Arrivals;
+
+    /// A consumer notified inside a compiled program's dispatched run panics in a debug build.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "a dispatched run notifies no consumer")
+    )]
+    fn a_consumer_notified_inside_a_run_panics() {
+        let mut consumer = Arrivals::new().consumer(Box::new(|| {}));
+        in_a_run(|| consumer.notify(&Projection::Everything));
+    }
+
+    /// A run that panics leaves the thread outside a run, so a later notification passes.
+    #[test]
+    fn a_run_that_panics_leaves_the_thread_outside_a_run() {
+        let unwound = std::panic::catch_unwind(|| in_a_run(|| panic!("the run fails")));
+        assert!(unwound.is_err());
+        assert!(!is_in_a_run());
+        let mut consumer = Arrivals::new().consumer(Box::new(|| {}));
+        consumer.notify(&Projection::Everything);
     }
 }

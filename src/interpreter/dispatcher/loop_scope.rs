@@ -602,15 +602,19 @@ impl InductionStoreProducer {
             .collect()
     }
 
+    /// The consumer the scope's pipeline pushes to, the store's, and whether the store pushes a
+    /// region of its keys: a nested store pushes rows, and a flat store the positions its rounds
+    /// decide where it pushes any before it is terminal (`pushes_decided_positions`). Any other
+    /// pushes everything, once it is terminal.
     pub(super) fn pushing_end(&self) -> (SharedConsumer, bool) {
-        let keyed = matches!(self.tiling(), Tiling::DataFunction { .. });
-        (
-            self.base()
-                .downstream
-                .clone()
-                .expect("an induction store has readers"),
-            keyed,
-        )
+        let keyed = matches!(self.tiling(), Tiling::DataFunction { .. })
+            || crate::interpreter::commit_operator::pushes_decided_positions(self.tiling());
+        let downstream = self
+            .base()
+            .downstream
+            .clone()
+            .unwrap_or_else(|| panic!("{} is read, so it pushes to a consumer", self.name()));
+        (downstream, keyed)
     }
 }
 
@@ -925,8 +929,8 @@ mod tests {
         assert_eq!(compiled.value(), Value::Int(5));
     }
 
-    /// A static store knows decided positions before it is terminal, but publishes only when
-    /// terminal.
+    /// The store holds the positions its rounds decided before it is terminal, and everything
+    /// after.
     #[test]
     fn the_store_holds_its_decided_positions_then_everything_once_terminal() {
         let compiled = Compiled::of(SUM);
@@ -936,7 +940,7 @@ mod tests {
             (store.final_guard(), store.decided())
         };
         assert!(
-            held.is_empty() && !decided.is_empty() && !decided.is_universal(),
+            !held.is_empty() && !held.is_universal() && held == decided,
             "{held:?}, deciding {decided:?}"
         );
         compiled.consume(keys_between(1, 2));

@@ -1,7 +1,7 @@
 use super::*;
 use crate::interpreter::operator_graph::value;
 use crate::{
-    interpreter::{ColumnValue, Consumer, Projection, Scheduler, Value},
+    interpreter::{ColumnValue, Consumer, Projection, SubscribeContext, Value},
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
 };
@@ -84,26 +84,24 @@ impl TileOperator for ExtractFinal {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        let input = BreakerInput::new(consumer, self.source.tiling(), false, scheduler);
+        let input = BreakerInput::new(consumer, self.source.tiling(), false, cx);
         // Only source notifications reach the consumer. The default is subscribed eagerly
         // but pulled only after a terminal source has no live positions.
-        let source_producer = self.source.subscribe(
-            self.source.tiling().universal_guard(),
-            input.consumer,
-            scheduler,
-        );
+        let source_producer =
+            self.source
+                .subscribe(self.source.tiling().universal_guard(), input.consumer, cx);
         let default_producer = self
             .default
             .as_mut()
-            .map(|d| d.subscribe(d.tiling().universal_guard(), Box::new(|| {}), scheduler));
+            .map(|d| d.subscribe(d.tiling().universal_guard(), Box::new(|| {}), cx));
         Box::new(ExtractFinalProducer::new(
             ProducerBase::new(
                 ExtractFinalProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             )
             .breaking(input.downstream, input.placement),
             source_producer,
@@ -533,7 +531,7 @@ mod tests {
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
-            _scheduler: &mut Scheduler,
+            _cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             Box::new(PartialSourceProducer {
                 base: ProducerBase::unowned(PartialSourceProducer::alloc_id(), &self.tiling),
@@ -585,7 +583,7 @@ mod tests {
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
-            _scheduler: &mut Scheduler,
+            _cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             Box::new(TerminalSourceProducer {
                 base: ProducerBase::unowned(TerminalSourceProducer::alloc_id(), &self.tiling),
@@ -637,7 +635,7 @@ mod tests {
             &mut self,
             _intent_guard: TileGuard,
             consumer: Box<dyn Consumer>,
-            _scheduler: &mut Scheduler,
+            _cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             *self.consumer.borrow_mut() = Some(consumer);
             Box::new(DelayedDefaultProducer {
@@ -692,7 +690,7 @@ mod tests {
         let mut producer = op.subscribe(
             guard.clone(),
             Box::new(move || observed.set(observed.get() + 1)),
-            &mut Scheduler::new(),
+            &mut SubscribeContext::new(),
         );
         assert!(!producer.get(guard.clone()).is_terminal());
 
@@ -726,7 +724,8 @@ mod tests {
             let default = Constant::new(Value::Int(42), Extent::Base(BaseType::Int));
             let mut op = ExtractFinal::new(Box::new(source), Box::new(default));
             let guard = op.tiling().universal_guard();
-            let mut producer = op.subscribe(guard.clone(), Box::new(|| {}), &mut Scheduler::new());
+            let mut producer =
+                op.subscribe(guard.clone(), Box::new(|| {}), &mut SubscribeContext::new());
             assert!(producer.get(guard.clone()).is_terminal());
             assert!(producer.state_info().values > 0);
             producer.release(guard.clone());
@@ -746,7 +745,8 @@ mod tests {
         let mut op =
             ExtractFinal::without_default(Box::new(int_source(vec![2, 0, 1], vec![20, 0, 10])));
         let guard = op.tiling().universal_guard();
-        let mut producer = op.subscribe(guard.clone(), Box::new(|| {}), &mut Scheduler::new());
+        let mut producer =
+            op.subscribe(guard.clone(), Box::new(|| {}), &mut SubscribeContext::new());
         let Tile::Scalar(result) = producer.get(guard) else {
             panic!("expected a scalar final value");
         };
@@ -799,7 +799,7 @@ mod tests {
         );
         let mut op = ExtractFinal::new(Box::new(source), Box::new(default));
         let guard = op.tiling().universal_guard();
-        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
         let tile = producer.get(producer.tiling().universal_guard());
 
         let Tile::Scalar(cv) = tile else {
@@ -835,7 +835,7 @@ mod tests {
         );
         let mut op = ExtractFinal::new(Box::new(source), Box::new(default));
         let guard = op.tiling().universal_guard();
-        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
         let tile = producer.get(producer.tiling().universal_guard());
 
         let Tile::Scalar(cv) = tile else {
@@ -863,7 +863,7 @@ mod tests {
         let default = Constant::new(Value::Int(0), Extent::Base(BaseType::Int));
         let mut op = ExtractFinal::new(Box::new(source), Box::new(default));
         let guard = op.tiling().universal_guard();
-        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
 
         // Non-terminal source → ExtractFinal emits empty but releases `[0, max)`.
         let tile = producer.get(producer.tiling().universal_guard());
@@ -904,7 +904,7 @@ mod projection_tests {
             Box::new(Constant::new(Value::Int(0), int())),
         );
         let guard = op.tiling().universal_guard();
-        let producer = op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let producer = op.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
         (producer, pulled)
     }
 

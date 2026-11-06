@@ -34,18 +34,27 @@ Runtime filtering uses `Filter` operators, not a populated `Restriction` handle;
 
 ### Cartesian iteration
 
-`IterateExtentProducer` retains each dimension of a live record extent. Its output is the identity
-function over record keys. The extent's decided region is the conjunction of record fields or the
-tagged regions of a union, including keys that hold no value.
+`IterateExtentProducer` owns the retained keys and decided regions of a live record extent.
+It remains a leaf producer. Each dimension is enumerated on `get`; keys already retained or
+released are excluded before merging new information. The output is the identity over record keys.
 
-A pull enumerates each dimension, excludes keys already held or released, and merges its new keys
-and decided predicate into a retained tile. Each output projection is cut from the Cartesian
-product of those keys, excluding released pairs.
+The dispatcher polls every physical source in a live range's extent once per pass. The extent's
+decided region is the conjunction of record fields or the tagged regions of a union. Each range
+announces its new region through its consumer; the receiving pipeline subtracts its input release.
+The iterator introduces no breaker or pipeline. A loop receives compound arrivals as rounds only
+when all dimensions after the first are static and the first yields an ordered prefix. Other
+compound loop sources are read whole once their sources close.
 
-Releasing one pair retains either input key that a future partner can still need. A dimension's
-keys are reclaimed where the released region covers every other dimension without restriction.
-Each dimension registers separately with every source it reads. Source values under a compound
-dimension remain retained until that dimension is released whole.
+The retained tiles include each field's decided predicate, including keys that hold no value.
+Each output projection is cut from the product of the retained keys, with the accumulated output
+release removed. Releasing one pair retains either input key that a future partner can still need.
+A field's keys are reclaimed where the released region covers every other field without
+restriction. A universal output release releases every dimension.
+
+Each dimension registers separately with every source it reads, so releasing one dimension cannot
+reclaim values another dimension still needs. These registrations keep source values
+available to downstream lookups. Source values under a compound field are retained until that
+field is released whole.
 
 ### Tiling
 
@@ -490,12 +499,12 @@ enclosing decision's variant payload; the channel then flattens the two collecti
 ## The producer protocol
 
 A subscription connects one producer to one consumer. `TileOperator::subscribe` constructs
-that producer with an intent guard, a consumer notification handle and a scheduler.
+that producer with an intent guard, a consumer notification handle and a `SubscribeContext`.
 `FanOut` shares an input through separate slot producers; each slot still has one consumer.
 
 | Call | Contract |
 | --- | --- |
-| `subscribe(intent, consumer, scheduler)` | Establish the subscription for the requested region of the output tiling. |
+| `subscribe(intent, consumer, cx)` | Establish the subscription for the requested region of the output tiling. |
 | `Consumer::notify(region)` | Signal that the consumer should pull again. It carries no tile and does not count individual changes. |
 | `get(projection)` | Request the current tile for a projection. Tile values cross the edge only through this call. |
 | `release(obsolete)` | Permanently relinquish a region; see [The release contract](#the-release-contract). |
@@ -613,7 +622,7 @@ Each operator answers a projection as its row of this table states.
 ### Producer attribution and probes
 
 Each `subscribe` returns one producer attributed to the operator that constructs it.
-`ProducerBase::new` records the operator's `node_id` and the scheduler's `ProbeSlot`.
+`ProducerBase::new` records the operator's `node_id` and the subscribe context's `ProbeSlot`.
 Input producers are constructed by their own operators' subscriptions.
 
 Probe keys are `(node_id, producer_id)`. `alloc_id` counts by producer display name, so two
@@ -839,12 +848,6 @@ a reload replaces hands its state to its successor only if it was pulled.
   or completeness without notification. It also continues probing drained inputs; if such a
   pull changes the cache without a notification, `Memo` queues a wake for its consumer.
 
-The test helper `pull_laps` alternates notification delivery and pulls. It returns when its
-completion predicate succeeds, the lap limit is reached, or a lap after the first delivers
-no notification, returns the previous tile, and leaves both wakeup and sink-pull queues empty.
-That last case is quiescence relative to the current inputs, not proof that no source can change
-later.
-
 ## Pipeline breakers
 
 A pipeline breaker is the end of a pipeline: it consumes the pipeline's work packages into state of
@@ -866,7 +869,7 @@ the placement of the entry at an input, which a planner sets to that input's pip
 | `enter_consuming_mode()` | Puts the breaker in consuming mode for a dispatched run, before its first `consume_impl`; nothing else changes the mode. |
 | `as_producer()` | The breaker as a `BreakingProducer`, or `None` for a breaker that is no producer. |
 | `finish(pushes)` | Finishes once the pipeline has consumed every package and nothing more can be queued for it, the breaker's last call. The default pushes, through `as_producer`, what the breaker holds and no push named before, one morsel of its outermost keys per work package, through its consumer to the pipelines that read it; a breaker that is no producer pushes nothing. An empty guard pushes nothing. It wakes no one. |
-| `morsels(guard, rows)` | Cuts a guard the breaker pushes into morsels of at most `rows` held rows, which partition it. The default answers the guard whole. |
+| `morsels(guard, rows)` | Partitions a pushed guard, targeting `rows` held keys where the shape supports cutting. Other shapes remain whole. |
 | `pushes_while_consuming()` | Whether the driver also pushes after each `consume_impl`. The default answers `true`. |
 | `offer_impl(guard)` | Answers from the state `consume_impl` built and pulls nothing. The breaker's own `get_impl` calls it once the breaker is consuming. |
 
@@ -889,12 +892,13 @@ up to the path `(𝑘, 𝑗)` leaves of a held row 𝑘 its paths past 𝑗, whi
 drops where the row's level is a finite range of positions with none past 𝑗; `final_guard` closes
 the difference over the producer's tiling. A state of another shape has no spelling, and a push
 after the first panics naming the gap instead of answering a smaller or larger region.
-`MapAggregate` holds state released beneath a group's keys. A release there leaves a region beneath
-the outermost keys, which a reader's chain may be unable to restate (`TileProducer::restates`). It
-returns `false` from `pushes_while_consuming`. It publishes at finish and during explicit held-state
-publication passes (`dispatcher::push_held`), including loop-body settlement. A push beneath the
-outermost keys lands in each reader as a projection at its level ([The
-dispatcher](design-dispatcher.md#the-dispatcher)).
+`MapAggregate` holds a state released beneath the keys of a group, and what a release beneath them
+leaves is a region beneath the outermost keys. A reader's chain may restate only the outermost keys
+(`TileProducer::restates`), so it answers `pushes_while_consuming` with `false` and pushes at
+`finish`, and inside a loop's rounds where each round has every inner pipeline push what it holds
+through the execution handler's scope-local publication pass. A push beneath the outermost keys lands
+in each reader as a projection at
+its level ([The dispatcher](design-dispatcher.md#the-dispatcher)).
 
 ### Memo
 
@@ -986,19 +990,19 @@ stays until the consumer releases the output, which is all or nothing.
 A transaction store (`CommitProducer`, `commit_operator.rs`) is the breaker of one pipeline per
 writer (`Breaker::inputs`): a writer's cycle, the store, the writer and its drive, is the pipeline
 of the writer's input, and the operators inside it stay in pull mode. An induction store
-(`InductionStoreProducer`) implements `Breaker` and owns its request and store-step control through
-per-run `InductionRun` metadata. Its body runs before each store step ([A loop in
-rounds](design-dispatcher.md#a-loop-in-rounds)). A nested request names one row of the nested store and remains in
-flight until that row finishes. A cyclic `FanOut` holds its store in a cell of its own
-(`Inner::Store`, `tile_operators/fanout.rs`) and hands the store a `Cycle` when it subscribes it
+(`InductionStoreProducer`) owns both accumulator state and optional per-run control. Its request and
+ordered step pipelines target that same producer. The loop runs in rounds
+([A loop in rounds](design-dispatcher.md#a-loop-in-rounds)), and its store steps once per round. A nested request covers
+one row of its store per enclosing round. A cyclic `FanOut` holds its store in a cell of its own (`Inner::Store`,
+`tile_operators/fanout.rs`) and hands the store a `Cycle` when it subscribes it
 (`TileProducer::enter_cycle`). The call that steps the store holds the store's cell, so the
 recurrence's pull of the store finds the cell borrowed and is answered from the snapshot the store
 published after its previous step. The fan-out forwards the intersection of its live slots' release
 guards to the store. A release that finds the store borrowed joins its pending release guard. A
 mutable store borrow applies that guard after its operation returns, before ending the borrow,
-including a direct dispatcher operation or a borrow mapped to concrete induction state. Read borrows
-defer settlement until the last read borrow ends. Settlement drains releases queued by release
-callbacks before returning.
+including a direct dispatcher operation or a borrow mapped to concrete induction state. Read
+borrows defer settlement until the last read borrow ends. Settlement drains releases queued by
+release callbacks before returning.
 
 A store's input is what a morsel names: an induction store's body, its decision stream, whose
 positions are the loop's, and a transaction store's input 𝑘, writer 𝑘's source, whose positions are
@@ -1015,22 +1019,25 @@ a step that changes neither the store nor its input's release panics, and so doe
 terminal at its finish. A transaction's deny commits nothing and progresses through its
 source's release alone.
 
-An induction store holds everything once it is terminal and nothing before, since a reader pulls the
-store tile, which `restrict_to` cannot cut to part of its positions, and it pushes once, at the
-finish where it is terminal (`pushes_while_consuming` answers `false`). A transaction store holds
-the commit ticks it has decided, through its watermark (`store_frontier`), and everything once it is
-terminal, and it pushes the ticks each consume decides (`pushes_while_consuming` answers `true`). A
-store pushes to its reader slots and not its recurrence slots (`FanOutInput::push`), and every
-reader pulls the store whole. `StoreValueStream`, a reader of a transaction store's changelog, keeps
-the store's keys and cuts its answer to the ticks a pull names, so a feed inside a transaction takes
-the ticks as they are decided; any other reader widens the push, so its pipeline takes a package of
-the store only once it is terminal ([The dispatcher](design-dispatcher.md#the-dispatcher)). A store's `final_guard` is `held()`. A release of
-a store with no rows above it names the positions a reader reads no more and removes nothing from
-the store tile; a nested store's offer cuts the rows its readers released ([A loop in
-rounds](design-dispatcher.md#a-loop-in-rounds)). A consuming store answers a pull from its snapshot. Its first
-consume opens it, and a pull before that answers the unopened store, which states nothing final.
-It steps only at its pipeline's consumes, or its scope's. A transaction store's writers decide only
-against a tile it published. In pull mode a store steps itself at a pull.
+An induction store with no rows above it holds the positions it has run and decided, its decided
+region (`Tile::to_guard`), and everything once it is terminal, so its loop's scope pushes them at
+each finish and a feed read from the store streams. A store that resumed its predecessor's run holds
+none of the positions through `resumed_after`, which its consumers took from the predecessor. A
+nested store, and one over a concatenation's tagged positions, whose prefix has no spelling without
+the domain's tags, holds nothing short of terminal (`pushes_decided_positions`). A transaction store
+holds the commit ticks it has decided, through its watermark (`store_frontier`), and everything once
+it is terminal, and it pushes the ticks each consume decides (`pushes_while_consuming` answers
+`true`). A store pushes to its reader slots and not its recurrence slots (`FanOutInput::push`).
+`StoreValueStream`, a reader of a transaction store's changelog, keeps the store's keys and cuts its
+answer to the ticks a pull names, so a feed inside a transaction takes the ticks as they are
+decided. `StoreDenseRead` answers every decided position its reader has not released. A store's
+`final_guard` is `held()`. A release of a store with no rows above it names the positions a reader
+reads no more and removes nothing from the store tile; a nested store's offer cuts the rows its
+readers released ([A loop in rounds](design-dispatcher.md#a-loop-in-rounds)). A consuming store answers a pull from its
+snapshot. Its first consume opens it, and a pull before that answers the unopened store, which
+states nothing final. It steps only at its pipeline's consumes, or its scope's. A transaction
+store's writers decide only against a tile it published. In pull mode a store steps itself at a
+pull.
 
 In pull mode an induction store releases its body whole once the body is terminal and every decision
 is stepped, and a transaction drive releases its source whole once it is done. A nested induction
@@ -1045,7 +1052,8 @@ no push of it, since the store reads it by pull at a step, and records what the 
 transaction store reads its seeds as its input 0 instead (below). A drive with no
 rows above it states complete every position below its next one that its source calls complete along
 with every position before, so a position it reads past, one the source filtered out or holds
-nothing at, is stated as one it emitted (`complete_prefix_below`). An induction store with no rows
+nothing at, is stated as one it emitted. This progress is a region over the source extent,
+including record-keyed product positions. An induction store with no rows
 above it releases its body through what the body states complete and holds no decision at, and a
 transaction drive releases its source through what it has read past, so either releases such a
 position without waiting for a later one to be decided. The dispatcher's finish checks that a
@@ -1125,7 +1133,8 @@ end asserts that no retry remains. A store in pull mode and an induction store s
 
 The planner places the transaction drive's source entry in its writer's store pipeline. Source
 pushes therefore reach that entry in source keys, before the drive converts them to attempt
-counters.
+counters. A transaction over a memoized product inherits that product's live regions, parks them
+until the memo decides them, and consumes them without waiting for either source to close.
 
 The store reclaims its changelog where every fan-out slot has released it
 (`CommitProducer::release_impl`), bounded strictly below the oldest held proposal's snapshot. The
@@ -1136,7 +1145,8 @@ A dispatched run runs no program that another takes over
 ([Running a compiled program](design-dispatcher.md#running-a-compiled-program)). A resuming drive under a store that
 states `writer_takes` panics: a source release can include an item taken but not yet committed.
 
-The dispatcher is described in [Pipeline dispatch](design-dispatcher.md).
+Dispatcher planning, execution, pause and reload are specified in
+[Pipeline dispatch](design-dispatcher.md).
 
 ## Tile Operators
 
@@ -1215,7 +1225,7 @@ derived from the edges on both sides of the wire rather than serialized separate
 | Operator | Input Tiling(s) | Output Tiling | Description |
 |---|---|---|---|
 | `Constant` | None | `Scalar` from `Constant::new`, `DataFunction(domain → Scalar(codomain))` from `Constant::from_bindings`, any tiling from `Constant::collection` | Produces a fixed tile. Which of the two a bindings table is cannot be read off the value: in function position it is one value the consumer applies (a list literal's table), and as a collection it is what a map iterates. Every operator below derives its tiling from its input's, so the choice decides whether a map transforms the table or each of its outputs — and the call site states it. |
-| `IterateExtent` | None | `DataFunction(extent → Scalar(extent))` | Enumerates all values in an `Extent`, producing an identity-mapping function (domain = codomain = extent). Holds no input, so it is the root a data source is read from: it registers a wake-up against each source its extent reaches (`Extent::for_each_source`), and its tiling names them. |
+| `IterateExtent` | None | `DataFunction(extent → Scalar(extent))` | Enumerates all values in an `Extent`, producing an identity-mapping function (domain = codomain = extent). A live record extent retains each field ([Cartesian iteration](#cartesian-iteration)). Other extents enumerate directly and register a wake-up against each source they reach (`Extent::for_each_source`). |
 | `MapResultWithSource` | `DataFunction(DataSourceDomain → Scalar(DataSourceDomain))` | `DataFunction(DataSourceDomain → Scalar)` | Looks up each key of a data-source domain via `DataSourceDomainExtentImpl::get` to produce a function from keys to their output values.  Built with paths (`MapResultWithSource::projecting`, from `Source(name, paths)`: an empty list reads the whole value), it returns the leaf at the one path, or the tuple of the leaves in the order named, and its output extent is that of the leaf or tuple. |
 | `Zip` | `N` inputs of `DataFunction(shared_extent → *)` tilings |  `DataFunction(shared_domain → Record(_0, … _N))` | Merges N function operators that share a domain into one function whose codomain is a Record Tiling of all their codomains. Prefer the free `zip_arms_at` factory at op-conversion call sites: it dispatches to `Zip` (function-tiled arms) or `MakeRecord` (scalar arms) based on the compiled arms' tilings, since the same CCL-level `zip` maps to either tile shape depending on upstream `input`. |
 | `MakeRecord` | `N` inputs at any tilings | `Record(name: input's own tiling, …)` | Builds a product value ([A product value is a record of tiles](#a-product-value-is-a-record-of-tiles)). Pulls every operand whole, and forwards each field's release to that field's operand. |

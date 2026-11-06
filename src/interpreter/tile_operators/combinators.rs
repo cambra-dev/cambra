@@ -6,7 +6,7 @@ use std::iter::repeat_n;
 use super::*;
 use crate::interpreter::operator_graph::value;
 use crate::interpreter::{
-    ColumnValue, Consumer, Extent, Projection, Scheduler, Value, live_keys, shared_consumer,
+    ColumnValue, Consumer, Extent, Projection, SubscribeContext, Value, live_keys, shared_consumer,
     tuple_field,
 };
 
@@ -71,30 +71,25 @@ impl TileOperator for Converse {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // Inverting a level puts the input's keys there one level in, beneath the values, so a
         // region of them restates exactly there and the inverse reads only the rows it names. It
         // keeps of earlier pulls only what a release and the absent keys rest on
         // (`ConverseProducer::held`, `read`, `seen`).
         let (shared, gate) = shared_consumer(consumer);
-        let wakeups = scheduler.wakeup_queue();
+        let wakeups = cx.scheduler().wakeup_queue();
         let input = self.input.subscribe(
             self.input.tiling().universal_guard(),
             crate::interpreter::scheduler::one_level_in(
                 self.level,
                 forwarding_consumer_keeping_keys(&shared, &wakeups),
             ),
-            scheduler,
+            cx,
         );
         Box::new(ConverseProducer::new(
-            ProducerBase::new(
-                ConverseProducer::alloc_id(),
-                self.tiling(),
-                &self.base,
-                scheduler,
-            )
-            .sharing(gate),
+            ProducerBase::new(ConverseProducer::alloc_id(), self.tiling(), &self.base, cx)
+                .sharing(gate),
             input,
             self.level,
             self.tiling().values_at(self.level).empty_at_no_rows(),
@@ -619,19 +614,14 @@ impl TileOperator for MapDomain {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // Every level's keys stand.
         Box::new(MapDomainProducer {
-            base: ProducerBase::new(
-                MapDomainProducer::alloc_id(),
-                self.tiling(),
-                &self.base,
-                scheduler,
-            ),
+            base: ProducerBase::new(MapDomainProducer::alloc_id(), self.tiling(), &self.base, cx),
             input: self
                 .input
-                .subscribe(self.tiling().universal_guard(), consumer, scheduler),
+                .subscribe(self.tiling().universal_guard(), consumer, cx),
             level: self.level,
         })
     }
@@ -767,7 +757,7 @@ impl TileOperator for Uncurry {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // Beneath standing levels the input's outermost keys are the result's, and a region at or
         // beneath the paired level names the pairs it heads. Pairing the whole tile re-keys, so a
@@ -784,15 +774,10 @@ impl TileOperator for Uncurry {
             ),
         };
         Box::new(UncurryProducer {
-            base: ProducerBase::new(
-                UncurryProducer::alloc_id(),
-                self.tiling(),
-                &self.base,
-                scheduler,
-            ),
+            base: ProducerBase::new(UncurryProducer::alloc_id(), self.tiling(), &self.base, cx),
             input: self
                 .input
-                .subscribe(self.tiling().universal_guard(), consumer, scheduler),
+                .subscribe(self.tiling().universal_guard(), consumer, cx),
             level: self.level,
             empty_pair: self.tiling().values_at(self.level).empty_at_no_rows(),
         })
@@ -1197,7 +1182,7 @@ impl TileOperator for Filter {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let (shared, gate) = shared_consumer(consumer);
         // A side that is a collection is pulled at the projection and shares the mask's keys; a
@@ -1206,22 +1191,17 @@ impl TileOperator for Filter {
             self.predicate.tiling().is_data_function(),
             &mut *self.predicate,
             &shared,
-            scheduler,
+            cx,
         );
         let input_producer = subscribe_forwarding_keeping_keys_if(
             self.input.tiling().is_data_function(),
             &mut *self.input,
             &shared,
-            scheduler,
+            cx,
         );
         Box::new(FilterProducer {
-            base: ProducerBase::new(
-                FilterProducer::alloc_id(),
-                self.tiling(),
-                &self.base,
-                scheduler,
-            )
-            .sharing(gate),
+            base: ProducerBase::new(FilterProducer::alloc_id(), self.tiling(), &self.base, cx)
+                .sharing(gate),
             input: input_producer,
             predicate: predicate_producer,
             level: self.level,
@@ -1520,21 +1500,14 @@ impl TileOperator for Restrict {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // The restricted domain is the predicate's keys that pass, so a region of them is a region of the result's.
-        let predicate_producer = self.predicate.subscribe(
-            self.predicate.tiling().universal_guard(),
-            consumer,
-            scheduler,
-        );
+        let predicate_producer =
+            self.predicate
+                .subscribe(self.predicate.tiling().universal_guard(), consumer, cx);
         Box::new(RestrictProducer {
-            base: ProducerBase::new(
-                RestrictProducer::alloc_id(),
-                self.tiling(),
-                &self.base,
-                scheduler,
-            ),
+            base: ProducerBase::new(RestrictProducer::alloc_id(), self.tiling(), &self.base, cx),
             predicate: predicate_producer,
         })
     }
@@ -1920,7 +1893,7 @@ impl TileOperator for Product {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let (shared, gate) = shared_consumer(consumer);
         let level = self
@@ -1929,16 +1902,11 @@ impl TileOperator for Product {
             .unwrap_or_else(|| unreachable!("the paired level is beneath a row"));
         let empty_level = self.tiling().values_at(level).empty_at_no_rows();
         Box::new(ProductProducer {
-            base: ProducerBase::new(
-                ProductProducer::alloc_id(),
-                self.tiling(),
-                &self.base,
-                scheduler,
-            )
-            .sharing(gate),
+            base: ProducerBase::new(ProductProducer::alloc_id(), self.tiling(), &self.base, cx)
+                .sharing(gate),
             // Both sides are pulled at the projection, aligned row for row.
-            outer: subscribe_forwarding_keeping_keys(&mut *self.outer, &shared, scheduler),
-            inner: subscribe_forwarding_keeping_keys(&mut *self.inner, &shared, scheduler),
+            outer: subscribe_forwarding_keeping_keys(&mut *self.outer, &shared, cx),
+            inner: subscribe_forwarding_keeping_keys(&mut *self.inner, &shared, cx),
             level,
             empty_level,
             pair: self.tiling().deepest_values().clone(),
@@ -2126,7 +2094,7 @@ mod nested_projection_tests {
             let mut converse = Converse::new_at(Box::new(spy), CurryLevel::new(1));
             let guard = converse.tiling().universal_guard();
             (
-                converse.subscribe(guard, Box::new(|| {}), &mut Scheduler::new()),
+                converse.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new()),
                 pulled,
             )
         };
@@ -2158,7 +2126,7 @@ mod nested_projection_tests {
             CurryLevel::new(1),
         );
         let guard = product.tiling().universal_guard();
-        let mut producer = product.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let mut producer = product.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
         producer.get(paths_guard(Predicate::qualified(
             Predicate::point(Value::UInt(0)),
             Predicate::point(Value::UInt(1)),
@@ -3225,12 +3193,9 @@ mod tests {
             "the standing level stays, and each row's values become its keys"
         );
         let out_tiling = converse.tiling().clone();
-        let mut scheduler = Scheduler::new();
-        let mut producer = converse.subscribe(
-            out_tiling.universal_guard(),
-            Box::new(|| {}),
-            &mut scheduler,
-        );
+        let mut cx = SubscribeContext::new();
+        let mut producer =
+            converse.subscribe(out_tiling.universal_guard(), Box::new(|| {}), &mut cx);
         let out = producer.get(out_tiling.universal_guard());
         let groups: Vec<(Value, Value, Value)> = out
             .paths_at(CurryLevel::new(2))
@@ -3509,12 +3474,9 @@ mod tests {
             CurryLevel::new(1),
         );
         let out_tiling = product.tiling().clone();
-        let mut scheduler = Scheduler::new();
-        let mut producer = product.subscribe(
-            out_tiling.universal_guard(),
-            Box::new(|| {}),
-            &mut scheduler,
-        );
+        let mut cx = SubscribeContext::new();
+        let mut producer =
+            product.subscribe(out_tiling.universal_guard(), Box::new(|| {}), &mut cx);
         let out = producer.get(out_tiling.universal_guard());
         let Tile::DataFunction { codomain, .. } = &out else {
             panic!("Product tiles as a collection of collections, got {out:?}")
