@@ -216,7 +216,6 @@ impl Store {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn borrow(&self) -> StoreRef<'_> {
         self.try_borrow()
             .expect("a store is not mutably borrowed while read")
@@ -288,7 +287,6 @@ pub(crate) struct StoreBorrow<'a, T: TileProducer + ?Sized> {
 
 impl<'a, T: TileProducer + ?Sized> StoreBorrow<'a, T> {
     /// View the same store through its concrete producer type, retaining release settlement.
-    #[cfg(test)]
     pub(crate) fn map<U: TileProducer + ?Sized>(
         mut self,
         map: impl FnOnce(&mut T) -> &mut U,
@@ -335,9 +333,7 @@ impl<T: TileProducer + ?Sized> Drop for StoreBorrow<'_, T> {
     }
 }
 
-/// A cyclic fan-out as a reader slot of it names it to a test driver
-/// (`TileProducer::store_read`).
-#[cfg(test)]
+/// A cyclic fan-out as a reader slot of it names it to a planner (`TileProducer::store_read`).
 pub struct StoreRead {
     /// The fan-out's id, which every slot's producer names.
     pub(crate) fan: usize,
@@ -989,7 +985,6 @@ impl TileProducer for FanOutProducer {
         }
     }
 
-    #[cfg(test)]
     fn store_read(&self) -> Option<StoreRead> {
         let FanHold::Reader { shared, .. } = &self.hold else {
             return None;
@@ -1526,7 +1521,6 @@ impl TileProducer for MemoProducer {
         self.arrivals.record(&Projection::Everything);
     }
 
-    #[cfg(test)]
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
         Some(self)
     }

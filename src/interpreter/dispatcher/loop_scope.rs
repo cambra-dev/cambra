@@ -1,15 +1,15 @@
 //! Loop request control and body graph planning for the run's shared dispatcher.
 //! See `src/interpreter/design-dispatcher.md`, "A loop in rounds".
 
+use super::plan::{Planned, reach_in_chain};
 use super::*;
-use super::{Planned, reach_in_chain};
 use crate::interpreter::commit_operator::InductionStoreProducer;
 use crate::interpreter::tile_operators::{StoreCell, TileProducer};
 
 /// Where a loop scope finds the breaker of one of its inner pipelines.
 #[derive(Clone)]
 pub(super) enum Member {
-    /// In the store's chain, by its address (`super::address`).
+    /// In the store's chain, by its address (`plan::address`).
     Chain(usize),
     /// The scope of a loop nested in this one, which runs the rounds of one row of its store per
     /// round, the row of the round's position.
@@ -588,7 +588,7 @@ impl Drop for Placed<'_> {
 mod tests {
     use indoc::indoc;
 
-    use super::super::{Execution, InductionRuns, Planner};
+    use super::super::plan::{Execution, InductionRuns, Planner};
     use super::*;
     use crate::ccl::context::{GlobalContext, compile_program};
     use crate::ccl::load::LoadedProgram;

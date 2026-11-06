@@ -101,6 +101,15 @@ released  = Or [ Domain(k = 0), Codomain(Record { _0: ∅, _1: Domain(Qualified 
 held − released = Domain(k ≠ 0)
 ```
 
+An arm of cells that names part of what is left leaves a record guard beneath the held keys, which
+is no region of keys, and `guard_minus` panics on it. A push names a region of keys
+(`Dispatcher::land_in` reads it with `Projection::of`), so a breaker's final guard is its held keys
+less the keys its readers released whole (`keys_released_whole`, `BreakingProducer::final_guard`). A
+key some of whose cells a reader released stays held, and the push names it. `SelectField` restates
+every level above the record: a selector pulled at a path leaves the inner loop's drive holding the
+other fields' cells of the path released, the drive's push names the path, and the selector takes
+its field there.
+
 A round pushes per position, so it needs the difference, where a push at a finish only names the
 breaker's whole held region.
 
@@ -120,10 +129,10 @@ A loop nested in another runs as a scope inside the outer loop's scope, queued a
 per outer round: the inner scope's rounds are the positions `(k, j)` of row `k` the inner drive
 emits, and a round at the row closes it.
 
-The planner panics on a nested loop where an operator its rounds pull beneath the outermost keys
-restates no projection there (`Planner::refusal_of_nested`). It composes the levels along each path
-from an inner pipeline's breaker: `TileProducer::restates` says what an operator accepts, and
-`TileProducer::input_level` the level it pulls each input at.
+A round of a nested loop pulls each operator beneath the outermost keys at a level it restates,
+and the planner asserts it (`Planner::unrestated_in_rounds`). The check composes the levels along
+each path from an inner pipeline's breaker: `TileProducer::restates` says what an operator accepts,
+and `TileProducer::input_level` the level it pulls each input at.
 
 ## Decisions
 
@@ -133,5 +142,5 @@ from an inner pipeline's breaker: `TileProducer::restates` says what an operator
   pushing only at a finish.
 - A difference closes an arm against the extent of the row it names, so an arm that names no
   position of its row reads as `Nothing`.
-- A nested loop whose rounds pull an operator with no nested row is refused; no loop folds into the
-  scope around it.
+- A round of a nested loop pulls only operators that restate its level, which the planner asserts;
+  no loop folds into the scope around it.

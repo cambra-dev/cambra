@@ -388,7 +388,8 @@ impl TileProducer for ZipProducer {
         // arms are pulled from their own branches, so one may already hold a row under a
         // key the other has not reached, and beneath a standing level a key alone does not
         // name that row — it repeats across its siblings' groups. So the arms are aligned
-        // over whole paths, level by level: each keeps the paths every arm holds.
+        // over whole paths, level by level: each keeps the paths every arm holds or has given
+        // back.
         //
         // Level by level rather than by extension, because a group may legitimately be
         // empty. A key holding nothing extends to no path of the level below, and reading
@@ -408,13 +409,12 @@ impl TileProducer for ZipProducer {
                         .iter()
                         .map(|tile| tile.paths_at(level).into_iter().collect())
                         .collect();
-                    let rows = depth == above.index();
                     held.iter()
                         .flatten()
                         .filter(|path| {
-                            held.iter().enumerate().all(|(arm, paths)| {
-                                paths.contains(*path) || (rows && gave_back(arm, path))
-                            })
+                            held.iter()
+                                .enumerate()
+                                .all(|(arm, paths)| paths.contains(*path) || gave_back(arm, path))
                         })
                         .cloned()
                         .collect()
@@ -445,21 +445,18 @@ impl TileProducer for ZipProducer {
                 // fully-valid concrete rows.
                 let mut presence: Option<Predicate> = None;
                 let mut domain_pred: Option<Predicate> = None;
-                // Beneath a standing level the rows were aligned by path above, so only the
-                // outermost keys of a flat pair are read here.
-                let flat = self.level.index() == 1;
-                let outermost: Vec<Value> = match flat {
-                    true => tiles
-                        .iter()
-                        .flat_map(|t| match t {
-                            Tile::DataFunction { domain, .. } => {
-                                (0..domain.len()).map(|k| domain.index_at(k)).collect()
-                            }
-                            _ => Vec::new(),
-                        })
-                        .collect(),
-                    false => Vec::new(),
-                };
+                // An outermost key an arm has given back stays where another arm holds it, at a
+                // flat pair and beneath a standing level alike. Beneath a standing level the
+                // alignment above has already kept the key's paths in the arms that hold it.
+                let outermost: Vec<Value> = tiles
+                    .iter()
+                    .flat_map(|t| match t {
+                        Tile::DataFunction { domain, .. } => {
+                            (0..domain.len()).map(|k| domain.index_at(k)).collect()
+                        }
+                        _ => Vec::new(),
+                    })
+                    .collect();
                 for (arm, t) in tiles.iter().enumerate() {
                     let Tile::DataFunction {
                         domain,
@@ -470,7 +467,7 @@ impl TileProducer for ZipProducer {
                         panic!("Zip: cannot mix function and non-function tiles")
                     };
                     let mut p = Predicate::from_column_value(domain);
-                    if flat && released[arm].is_some() {
+                    if released[arm].is_some() {
                         let given: Vec<Predicate> = outermost
                             .iter()
                             .filter(|key| gave_back(arm, std::slice::from_ref(*key)))
@@ -1050,6 +1047,16 @@ impl SelectFieldProducer {
 impl TileProducer for SelectFieldProducer {
     impl_producer_base!();
 
+    /// A stream of records keeps its keys at every level above the record, so its input is pulled
+    /// at a projection there; the levels of a field that is itself a collection are inside the
+    /// record's values. A product of collections is pulled whole and cut at the projection.
+    fn restates(&self) -> Restates {
+        match self.input.tiling().is_data_function() {
+            true => Restates::Above(CurryLevel::values_of(self.input.tiling())),
+            false => Restates::Every,
+        }
+    }
+
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("input", &*self.input);
     }
@@ -1062,7 +1069,7 @@ impl TileProducer for SelectFieldProducer {
     /// projection. A product of collections has no projection guard of its own: it is pulled
     /// whole, and the field cut after.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let projection = projection_guard.projection(&self.name());
+        let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
@@ -1876,6 +1883,179 @@ mod tests {
                 log.borrow()
             );
         }
+    }
+
+    /// Beneath a standing level, an arm whose field the consumer released at every path holds no
+    /// row of its own afterwards, and the rows the other arm holds stay: a released arm has given
+    /// those rows back rather than lacking them, at the outermost keys as at the rows.
+    #[test]
+    fn rows_an_arm_gave_back_beneath_a_standing_level_stay() {
+        let uint = || Extent::Base(BaseType::UInt);
+        let int = || Extent::Base(BaseType::Int);
+        let arm0_tiling =
+            Tiling::data_function(uint(), Tiling::data_function(uint(), Tiling::Scalar(int())));
+        let arm1_tiling = Tiling::data_function(
+            uint(),
+            Tiling::data_function(uint(), Tiling::data_function(uint(), Tiling::Scalar(int()))),
+        );
+        let arm1 = Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1]),
+            Box::new(Tile::grouped(
+                vec![0, 1],
+                ColumnValue::from_uints(vec![7, 7]),
+                Box::new(Tile::grouped(
+                    vec![0, 1],
+                    ColumnValue::from_uints(vec![3, 3]),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(vec![30, 31]))),
+                    Predicate::False,
+                    BitSet::new(),
+                )),
+                Predicate::False,
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let out_tiling = Tiling::data_function(
+            uint(),
+            Tiling::data_function(
+                uint(),
+                Tiling::Record(HashMap::from([
+                    (tuple_field(0), Tiling::Scalar(int())),
+                    (
+                        tuple_field(1),
+                        Tiling::data_function(uint(), Tiling::Scalar(int())),
+                    ),
+                ])),
+            ),
+        );
+        let (spy0, _) = QuietSpy::new(arm0_tiling.empty_tile(), arm0_tiling.clone());
+        let (spy1, _) = QuietSpy::new(arm1, arm1_tiling);
+        let mut zip = ZipProducer {
+            base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
+            names: vec![tuple_field(0), tuple_field(1)],
+            inputs: vec![Box::new(spy0), Box::new(spy1)],
+            level: CurryLevel::new(2),
+        };
+        // The consumer reads field `_1` only, so it releases field `_0` at every path.
+        let every_path = |field: TileGuard| {
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+                FunctionGuard::Codomain(Box::new(field)),
+            ))))
+        };
+        zip.release(every_path(TileGuard::Record(HashMap::from([
+            (tuple_field(0), TileGuard::Scalar(TileGuard::leaf(true))),
+            (
+                tuple_field(1),
+                TileGuard::Function(FunctionGuard::Domain(Predicate::False)),
+            ),
+        ]))));
+        let out = zip.get(out_tiling.universal_guard());
+        let Tile::DataFunction { domain, .. } = &out else {
+            panic!("the zip is a collection")
+        };
+        assert_eq!(
+            *domain,
+            ColumnValue::from_uints(vec![0, 1]),
+            "both rows stay"
+        );
+        assert_eq!(
+            out.paths_at(CurryLevel::new(1)),
+            vec![
+                vec![Value::UInt(0), Value::UInt(7)],
+                vec![Value::UInt(1), Value::UInt(7)]
+            ],
+            "the rows beneath stay"
+        );
+        let Tile::Record { fields, absent } = out.values_at(CurryLevel::new(2)) else {
+            panic!("the pair is a record: {out:?}")
+        };
+        assert_eq!(
+            absent.get(&tuple_field(0)),
+            Some(&BitSet::from_iter([0, 1])),
+            "no row holds a cell of the field given back: {out:?}"
+        );
+        let Some(Tile::DataFunction { codomain, .. }) = fields.get(&tuple_field(1)) else {
+            panic!("the other field is a collection: {out:?}")
+        };
+        assert_eq!(
+            **codomain,
+            Tile::Scalar(ColumnValue::Ints(vec![30, 31])),
+            "the other arm's values are paired at their rows"
+        );
+    }
+
+    /// Beneath a standing level, an arm that lacks a row it has not given back drops the row from
+    /// every arm: only a release counts as giving a row back.
+    #[test]
+    fn a_row_an_arm_lacks_without_a_release_drops_beneath_a_standing_level() {
+        let uint = || Extent::Base(BaseType::UInt);
+        let int = || Extent::Base(BaseType::Int);
+        let arm0_tiling =
+            Tiling::data_function(uint(), Tiling::data_function(uint(), Tiling::Scalar(int())));
+        let arm1_tiling = Tiling::data_function(
+            uint(),
+            Tiling::data_function(uint(), Tiling::data_function(uint(), Tiling::Scalar(int()))),
+        );
+        let arm0 = Tile::data_function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(Tile::grouped(
+                vec![0],
+                ColumnValue::from_uints(vec![7]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![5]))),
+                Predicate::False,
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let arm1 = Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1]),
+            Box::new(Tile::grouped(
+                vec![0, 1],
+                ColumnValue::from_uints(vec![7, 7]),
+                Box::new(Tile::grouped(
+                    vec![0, 1],
+                    ColumnValue::from_uints(vec![3, 3]),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(vec![30, 31]))),
+                    Predicate::False,
+                    BitSet::new(),
+                )),
+                Predicate::False,
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let out_tiling = Tiling::data_function(
+            uint(),
+            Tiling::data_function(
+                uint(),
+                Tiling::Record(HashMap::from([
+                    (tuple_field(0), Tiling::Scalar(int())),
+                    (
+                        tuple_field(1),
+                        Tiling::data_function(uint(), Tiling::Scalar(int())),
+                    ),
+                ])),
+            ),
+        );
+        let (spy0, _) = QuietSpy::new(arm0, arm0_tiling);
+        let (spy1, _) = QuietSpy::new(arm1, arm1_tiling);
+        let mut zip = ZipProducer {
+            base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
+            names: vec![tuple_field(0), tuple_field(1)],
+            inputs: vec![Box::new(spy0), Box::new(spy1)],
+            level: CurryLevel::new(2),
+        };
+        let Tile::DataFunction { domain, .. } = zip.get(out_tiling.universal_guard()) else {
+            panic!("the zip is a collection")
+        };
+        assert_eq!(
+            domain,
+            ColumnValue::from_uints(vec![0]),
+            "row 1 waits for arm 0"
+        );
     }
 }
 

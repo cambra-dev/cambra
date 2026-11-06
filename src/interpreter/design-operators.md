@@ -585,7 +585,7 @@ Each operator answers a projection as its row of this table states.
 | `MapResultToConst` | A collection input is pulled at the projection where the constant applies one level in or deeper. At the outermost level the constant replaces the whole input, so the input is read whole. The constant is read whole, since every row reads all of it. A projection beneath the outermost keys is answered above the constant's level (`Restates::Above`), and one at or beneath it panics. |
 | `MapResultWithSource` | The input is pulled at the projection, at any level (`Restates::Every`), so a morsel reads only its own keys from the source. |
 | `RecordWrap` | The input is pulled at the projection, which beneath the outermost keys is one above the wrapped level (`Restates::Above`). |
-| `SelectField` | A stream of records is pulled at the projection. A product of collections is pulled whole and the selected field is cut. Releasing enclosing keys releases those records only; partial cell releases retain collection-valued sibling fields for later rows, while unused keyless fields can be released whole. A bare product releases unused fields whole. |
+| `SelectField` | A stream of records is pulled at the projection, which beneath the outermost keys is one above the record's level (`Restates::Above`). A product of collections is pulled whole and the selected field is cut. Releasing enclosing keys releases those records only; partial cell releases retain collection-valued sibling fields for later rows, while unused keyless fields can be released whole. A bare product releases unused fields whole. A breaker's final guard names each key under which a cell is still held ([Differences of nested guards](design-path-projections.md#differences-of-nested-guards)). |
 | `Zip` | Every arm is pulled at the projection, since the arms share the pair's keys. The pair is complete only where every arm is. A projection beneath the outermost keys is answered above the record's level (`Restates::Above`). |
 | `MakeRecord` | A record of values has no keys: the projection is the whole record or nothing, and a guard naming keys panics. |
 | `VariantWrap` | A payload stream is pulled at the projection. A payload that is itself a collection becomes one union column and is read whole. A projection beneath the outermost keys is answered above the wrapped level (`Restates::Above`). |
@@ -1026,15 +1026,20 @@ pipeline consumed.
 that reaches no recurrence slot of the store (`reaches_recurrence`) is planned as any chain is, and
 inside the cycle a breaker is no pipeline. A store's pipeline is ordered, since a store decides its
 positions in order. A store that steps itself runs in the run's dispatcher, and one that reads
-pipelines reads its input whole; an induction store runs in a loop's scope instead ([A loop in
-rounds](design-dispatcher.md#a-loop-in-rounds)). The planner refuses:
+pipelines reads its input whole. A store reads its seed by pull when it opens, so its pipeline reads
+the seed's pipelines, and a push from one stops in front of the store (`subscribe_pulled`); an
+induction store runs in a loop's scope instead ([A loop in rounds](design-dispatcher.md#a-loop-in-rounds)). The planner
+refuses:
 
-- outside a loop's scope, a nested store, one per enclosing row, whose frontier a flat morsel does
-  not name, and a store whose seed reads a pipeline;
+- outside a loop's scope, a nested transaction store, one per enclosing row, whose frontier a flat
+  morsel does not name;
 - a store over a live source, whose arrivals no run notifies;
 - a store inside the cycle of a store that steps itself, which no round reaches;
-- a transaction store of any number of writers but one, since a morsel names positions of one
-  source.
+- a transaction store of several writers, since a morsel names positions of one source.
+
+The planner asserts that a transaction store has a writer: its keys are the footprints of its
+`with begin():` blocks, each one of its writers
+([How many commit stores a program has](../ccl/design/mutability.md#how-many-commit-stores-a-program-has)).
 
 The dispatcher is described in [Pipeline dispatch](design-dispatcher.md).
 

@@ -89,8 +89,8 @@ holds through the push, and a producer's notifications queue on the scheduler as
 
 ### Running a compiled program
 
-`dispatcher::run_program`, a test-only driver, runs a compiled program's pipelines on the calling
-thread. It walks the producer chains under the program's sinks with
+`dispatcher::run_program` (`dispatcher/plan.rs`) runs a compiled program's pipelines on the calling
+thread. It walks the producer chains under the program's sinks and `main` outputs with
 `TileProducer::visit_input_producers_mut`, the mutable twin of `visit_input_producers`, and takes
 each producer whose `as_breaking_mut` answers one as a pipeline breaker. A breaker's pipeline reads
 the pipelines of the nearest breakers beneath it, which are numbered before it, and the walk places
@@ -144,12 +144,40 @@ universal guard. The sink's pipeline is not ordered: a tile carries its keys, an
 each answer by key, as `TestSink` merges it and the HTTP sink answers each request by its index. A
 package's answer states only its own region complete, so it is terminal only where the package is
 the producer's whole input. A sink is done once its producer is released whole, however many
-packages that took. The run leaves that to its caller to read, and a pull of the sink afterwards
-finds it done (`DoneNotifier::signal`), since its producer answers from what its breakers consumed.
+packages that took. The run ends with one pull of each sink, as pull mode's last: the producer
+answers from what its breakers consumed and is released whole, so the pull hands the sink nothing
+new and finds it done (`DoneNotifier::signal`), which fires `CompiledProgram::done` once every sink
+has. The pull closes its answer's outermost statement over the producer's tiling
+(`Tile::closed_over`): an answer assembled arm by arm of a tagged union, as a sink fed from two
+sites is, states each arm complete on its own, and only the closed statement reads as terminal.
 
-The run pulls only the breakers' inputs. A test compiles the program with
+A `main` output's producer is the driver's to pull. The run takes it into a slot and makes it the
+root of a sink's pipeline whose `DataSink` merges what it is handed (`Collected`); no push reaches
+the driver's consumer, so that pipeline reads its input whole. The run answers the `main`
+output's merged tile (`Run::main`) and hands the producer back; a program has at most one.
+
+The run pulls only the breakers' inputs. The program is compiled with
 `GlobalContext::defer_sink_pulls`, which leaves out the pull each sink takes once subscribed, and
-runs the pipelines, the sinks' among them.
+`CompiledProgram::sink_pulls_deferred` records it. The planner refuses, before anything runs, with
+a `Refused` error that names the shape, and pull mode runs every refused program:
+
+- a program compiled with its sinks pulled;
+- a program that reads a live source (`CompiledProgram::source_producers`), whose arrivals no run
+  notifies;
+- a pipeline read directly by a pipeline another pipeline reads;
+- a breaker with no consuming mode (`Breaker::no_consuming_mode`): a transaction store of several
+  writers;
+- the stores [A store as a breaker](design-operators.md#a-store-as-a-breaker) lists.
+
+The binary runs a program dispatched where `CAMBRA_DISPATCH` is set to anything but `0` or the empty
+string, and neither `--inspect` nor `--control` is given, at morsels of `CAMBRA_MORSEL_ROWS` rows
+(1024 unset; a value that is no positive count panics). It prints the `main` output's value once. A
+refused program runs in pull mode after a note on stderr, in the context the dispatched run compiled
+it in: the compile has opened its sources and sinks, a port bound or stdin taken, which a second
+compile could not open again.
+
+Every program of the differential suite (`tests/it/differential_interp.rs`) runs dispatched too, at
+morsels of one row and of every row, and answers what pull mode answers, or the planner refuses it.
 
 ### Completeness in pushes
 
@@ -181,8 +209,8 @@ pipelines share the run's dispatcher. The request and store-step pipelines targe
 `InductionStoreProducer`. Its optional `InductionRun` retains the pending request package, current
 round and global pipeline IDs. The producer retains the accumulator and its published snapshot;
 scheduling metadata contains no handle back to its own store cell. `Dispatcher` queues guards and
-tracks claims, acknowledgements and finishes; it holds no loop or operator state. The test-only
-`run_program` planner and execution handler live in `dispatcher.rs`.
+tracks claims, acknowledgements and finishes; it holds no loop or operator state. The
+`run_program` planner and execution handler live in `dispatcher/plan.rs`.
 
 `Execution` uses one handler table indexed by global pipeline ID. A body handler records its owning
 store and breaker address; a request or step handler names the induction store. Lookup reaches the
