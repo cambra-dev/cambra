@@ -221,20 +221,6 @@ fn blame_node_for_place(
         .unwrap_or_else(|| expr.node_id())
 }
 
-/// The node of `expr` whose id is `id`.
-fn find_node(expr: &Expr, id: crate::ccl::provenance::NodeId) -> Option<&Expr> {
-    if expr.node_id() == id {
-        return Some(expr);
-    }
-    let mut found = None;
-    expr.walk_children(|child| {
-        if found.is_none() {
-            found = find_node(child, id);
-        }
-    });
-    found
-}
-
 /// Why two functions' kinds do not relate, read off what each side's kind settled to.
 fn kind_mismatch_reason(lhs: &Type, rhs: &Type) -> &'static str {
     use crate::ccl::ty::KindPin;
@@ -564,15 +550,11 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
 pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferError {
     match err {
         CoalesceError::IncompatibleBounds {
-            polarity,
-            vars,
-            details,
+            polarity, details, ..
         } => InferError::IncompatibleBounds {
             polarity,
             conflicting: details,
-            vars,
             origin: ctx_label.to_string(),
-            context: vec![],
         },
         CoalesceError::TupleWidthConflict { widths, .. } => InferError::TupleWidthConflict {
             widths,
@@ -592,13 +574,12 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
             expected: Some(Box::new(Type::sum_over(type_kind, None, Type::Hole))),
             ctx: "collection annotation".to_string(),
         },
-        CoalesceError::UnresolvedPartial { kind, details } => InferError::UnresolvedPartial {
-            kind: format!("{:?} ({})", kind, details),
+        CoalesceError::UnresolvedPartial { details, .. } => InferError::UnresolvedPartial {
+            keys: details,
             at: ctx_label.to_string(),
         },
         CoalesceError::RecursiveType { details } => InferError::Unsupported(format!(
-            "recursive type at {}: {} (residual μ-types are forbidden)",
-            ctx_label, details
+            "recursive type: {details} (residual μ-types are forbidden)"
         )),
         CoalesceError::DomainJoinConflict { domains } => InferError::DomainJoinConflict {
             domains,
@@ -619,13 +600,12 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
         // made: a materialized type carrying a witness reference no binder covers. A
         // compiler bug in whatever built the position, like `KindConflict` below.
         CoalesceError::WitnessScope { details } => InferError::Unsupported(format!(
-            "a witness reference escaped its binder at {ctx_label}: {details} (a \
+            "a witness reference escaped its binder: {details} (a \
              `WitnessRef` denotes \"whichever domain\", so outside its sum it denotes nothing)"
         )),
         CoalesceError::KindConflict { details } => InferError::Unsupported(format!(
-            "one function was required to be both a compute function ⇒ and a data collection ⤇ \
-             at {}: {} (the two kinds are incomparable, so no function is both)",
-            ctx_label, details
+            "one function was required to be both a compute function ⇒ and a data collection ⤇: \
+             {details} (the two kinds are incomparable, so no function is both)"
         )),
     }
 }
@@ -794,12 +774,7 @@ pub(crate) fn run_with_params(
     // Check each barrier variable's upper bounds against its resolution. The checks add
     // bounds, so they run before anything reads the graph: compaction reads a barrier
     // variable's lower bounds and nothing else (`solver::barrier`).
-    push_barrier_failures(&mut errors, expr.node_id(), |node| {
-        find_node(expr, node).map_or_else(
-            || "a function's result".to_string(),
-            crate::ccl::symbolic::symbolic_head,
-        )
-    });
+    push_barrier_failures(&mut errors, expr.node_id(), "this value");
     if !errors.is_empty() {
         return Err(errors);
     }

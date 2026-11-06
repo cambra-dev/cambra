@@ -201,7 +201,7 @@ fn a_nominal_type_satisfies_no_trait() {
 
                 Price::new(3) + 1
             "#},
-            "No Addable instance for BinOp: operand 1 is Price",
+            "No Addable instance for `+`: operand 1 is Price",
         ),
         (
             indoc! {r#"
@@ -209,7 +209,7 @@ fn a_nominal_type_satisfies_no_trait() {
 
                 Price::new(3) == Price::new(3)
             "#},
-            "No Equatable instance for BinOp: operand 1 is Price",
+            "No Equatable instance for `==`: operand 1 is Price",
         ),
         (
             indoc! {r#"
@@ -218,7 +218,7 @@ fn a_nominal_type_satisfies_no_trait() {
                 xs = [K::new(1), K::new(2)]
                 groupby(xs, \k -> k)
             "#},
-            "No Equatable instance for BinOp: operand 1 is K",
+            "No Equatable instance for `==`: operand 1 is K",
         ),
     ] {
         check_compile_error(src, needle);
@@ -288,7 +288,7 @@ fn a_covariant_parameter_refuses_a_narrower_argument() {
 
             narrow(Box::boxed((a=1)))
         "#},
-        "No field .b for Apply: {a: {Int where _ == 1}} has no such field",
+        "No field .b: {a: {Int where _ == 1}} has no such field",
     );
 }
 
@@ -329,7 +329,7 @@ fn a_contravariant_parameter_refuses_a_wider_argument() {
 
             take(Handler::on(\r -> r.a + r.b))
         "#},
-        "No field .b for Apply: {a: Int} has no such field",
+        "No field .b: {a: Int} has no such field",
     );
 }
 
@@ -421,7 +421,7 @@ fn a_join_at_different_arguments_of_an_equality_position_is_refused() {
             x = Index::index(map([(1, 10)])) if c else Index::index(map([(2, 20)]))
             7
         "#},
-        "Incompatible",
+        "have no common type",
     );
 }
 
@@ -1020,7 +1020,7 @@ fn match_errors_name_what_is_wrong() {
                     case `off:
                         0
             "#},
-            "Type mismatch for Case scrutinee: expected {`off{",
+            "Type mismatch for the matched value: expected {`off{",
         ),
         (
             indoc! {r#"
@@ -1151,7 +1151,7 @@ fn match_errors_name_what_is_wrong() {
 
                 lit(Light::on)
             "#},
-            "Type mismatch for Case scrutinee: expected Door, found Light",
+            "Type mismatch for the matched value: expected Door, found Light",
         ),
         (
             indoc! {r#"
@@ -2779,7 +2779,7 @@ fn a_nullary_constructor_nothing_determines_is_unresolved() {
 
             Opt::none
         "#},
-        "Unresolved inference variable",
+        "Nothing determines the type of this expression",
     );
 }
 

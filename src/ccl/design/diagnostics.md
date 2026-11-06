@@ -4,6 +4,20 @@ How an inference diagnostic writes the types it reports, and the source position
 
 ---
 
+## What a message names
+
+A message names what failed by its role in the program, and its span says where.
+
+- **A mismatch names the role of the failing value.** `Type mismatch for {role}` reads
+  `this call`, `this argument`, `the matched value`, `a write in the transaction`, or the operator
+  `` `+` ``, never the name of a node or the expression written in CCL.
+- **A trait failure names the operator or function**: ``No Addable instance for `+` ``, or
+  `Iterable::elements` for a function a construct calls.
+- **No message prints an expression.** The error's node is its location
+  (`LocatedInferError::node_id`), which `compile_program` resolves to a span.
+
+---
+
 ## How a diagnostic writes a type
 
 A diagnostic writes every type in CHL with `chl_print::chl_type`. An annotation mismatch writes
@@ -71,7 +85,7 @@ holds.
 
   | Part | Written |
   | --- | --- |
-  | an inference variable, whose occurrences are one type | `‹?7›` |
+  | an inference variable, numbered within the message so its occurrences read as one type (`chl_print::Writer`) | `‹?1›` |
   | a reference to a function parameter or collection key bound outside the written type | `‹outer argument›` |
   | a sum's witness read inside the sum's values | `‹outer keys›` |
   | the witness projected through a value `c` | `‹the keys of c›` |

@@ -7,7 +7,7 @@
   "diagnostics": [
     {
       "severity": "error",
-      "message": "Type mismatch for BinOp: expected Bool, found Int",
+      "message": "Type mismatch for `and`: expected Bool, found Int",
       "span": {
         "file": 0,
         "start": 0,

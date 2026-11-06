@@ -97,6 +97,6 @@ fn list_lookup_rejected() {
 xs = [1,2,3]
 xs[int_to_uint(5)]! == 2
         "#},
-        "Type mismatch for Apply: expected {UInt where _ < 3}, found {UInt where 5 == _}",
+        "Type mismatch for this call: expected {UInt where _ < 3}, found {UInt where 5 == _}",
     )
 }

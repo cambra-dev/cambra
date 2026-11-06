@@ -178,7 +178,7 @@ fn an_empty_literal_read_at_two_types_is_a_type_error() {
             strings: List(String) = box(xs)
             1
         "#},
-        "empty collection literal pinned to",
+        "Type mismatch for this empty collection",
     );
 }
 
@@ -278,7 +278,7 @@ fn a_checked_lookup_on_the_empty_map_is_none() {
 #[case::bare("empty_map()")]
 #[case::let_bound("m = empty_map()\nm")]
 fn an_unannotated_empty_map_is_rejected(#[case] code: &str) {
-    check_compile_error(code, "Unresolved inference variable");
+    check_compile_error(code, "Nothing determines the type of this expression");
 }
 
 // The re-keying constructors do not accept an empty literal: their key domain is
@@ -295,14 +295,14 @@ fn an_unannotated_empty_map_is_rejected(#[case] code: &str) {
 // each entry, so the literal's width is what nothing fixes.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::map("map([])", "is never fixed in []")]
-#[case::set("set([])", "Unresolved inference variable")]
+#[case::map("map([])", "is never fixed:")]
+#[case::set("set([])", "Nothing determines the type of this expression")]
 #[case::map_under_an_annotation(
     indoc! {r#"
         m: Map(String, Int) = box(map([]))
         m
     "#},
-    "is never fixed in []"
+    "is never fixed:"
 )]
 fn a_re_keying_constructor_rejects_an_empty_literal(#[case] code: &str, #[case] reported: &str) {
     check_compile_error(code, reported);

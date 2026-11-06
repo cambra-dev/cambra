@@ -994,12 +994,12 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
 
         TypedExprNode::BinOp { left, op, right } => {
             let sig = ctx.schemes.binop(*op);
-            emit_binop(node_id, left, right, &sig, ctx)?
+            emit_binop(node_id, *op, left, right, &sig, ctx)?
         }
 
         TypedExprNode::UnaryOp(op, inner) => {
             let sig = ctx.schemes.unary(*op);
-            emit_unary(inner, node_id, &sig, ctx)?
+            emit_unary(*op, inner, node_id, &sig, ctx)?
         }
 
         TypedExprNode::Aggregate { input, kind } => {

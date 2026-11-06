@@ -12,11 +12,14 @@
 //! dependent function `(k: …) |=> …` or `(x: …) => …`, an index range written as
 //! `{UInt where _ < n}`. What the notation has no form for at all is described between
 //! `‹…›`, never dropped and never written with a name the program did not write: an
-//! inference variable as `‹?7›`, an argument outside the written type as [`OUTER_ARGUMENT`], and
+//! inference variable as `‹?1›`, numbered within its message ([`Writer`]), an argument outside
+//! the written type as [`OUTER_ARGUMENT`], and
 //! anything else as [`NOT_PRINTABLE`].
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fmt;
+use std::rc::Rc;
 
 use smol_str::SmolStr;
 
@@ -38,7 +41,56 @@ pub const OUTER_KEYS: &str = "‹outer keys›";
 
 /// `ty` written in CHL.
 pub fn chl_type(ty: &Type) -> String {
-    Printer::for_type(ty).annotation(ty)
+    Writer::default().ty(ty)
+}
+
+/// Types written for one message. Each inference variable is numbered `‹?1›`, `‹?2›`, … in
+/// the order the message first writes it, so one variable reads the same in every type
+/// the message writes.
+#[derive(Default)]
+pub struct Writer {
+    /// Each variable written so far, by its checker's spelling, in the order first written.
+    variables: Rc<RefCell<Vec<String>>>,
+}
+
+impl Writer {
+    /// `ty` written in CHL ([`chl_type`]).
+    pub fn ty(&self, ty: &Type) -> String {
+        self.ty_in(ty, None)
+    }
+
+    fn ty_in(&self, ty: &Type, home: Option<&[SmolStr]>) -> String {
+        Printer {
+            home: home.map(<[SmolStr]>::to_vec),
+            variables: Rc::clone(&self.variables),
+            ..Printer::for_type(ty)
+        }
+        .annotation(ty)
+    }
+
+    /// An inferred polymorphic type written in CHL ([`chl_inferred_poly`]).
+    pub fn inferred_poly(&self, inferred: &InferredPoly) -> String {
+        self.inferred_poly_in(inferred, None)
+    }
+
+    fn inferred_poly_in(&self, inferred: &InferredPoly, home: Option<&[SmolStr]>) -> String {
+        let mut p = Printer {
+            joins: inferred.join_texts(|ty| self.ty_in(ty, home)),
+            home: home.map(<[SmolStr]>::to_vec),
+            variables: Rc::clone(&self.variables),
+            ..Printer::for_type(&Type::Poly(Rc::new(inferred.poly.clone())))
+        };
+        if inferred.poly.params.is_empty() {
+            p.ty(&inferred.poly.body)
+        } else {
+            p.poly(&inferred.poly)
+        }
+    }
+}
+
+/// An operator as a diagnostic names it: its CHL spelling, in backticks.
+pub fn chl_operator(op: &BinOpKind) -> String {
+    format!("`{}`", binop_text(op))
 }
 
 /// Whether two types have the same diagnostic text, including any descriptions that hide
@@ -65,11 +117,7 @@ pub fn chl_type_in(ty: &Type, home: &[SmolStr]) -> String {
 }
 
 fn written_in(ty: &Type, home: Option<&[SmolStr]>) -> String {
-    Printer {
-        home: home.map(<[SmolStr]>::to_vec),
-        ..Printer::for_type(ty)
-    }
-    .annotation(ty)
+    Writer::default().ty_in(ty, home)
 }
 
 /// An inferred polymorphic type written in CHL: its `Poly`, or its body alone when it
@@ -82,16 +130,7 @@ pub fn chl_inferred_poly(inferred: &InferredPoly) -> String {
 /// [`chl_inferred_poly`], written as the module at `home` writes it when there is one
 /// ([`chl_type_in`]).
 pub fn chl_inferred_poly_in(inferred: &InferredPoly, home: Option<&[SmolStr]>) -> String {
-    let mut p = Printer {
-        joins: inferred.join_texts(|ty| written_in(ty, home)),
-        home: home.map(<[SmolStr]>::to_vec),
-        ..Printer::for_type(&Type::Poly(std::rc::Rc::new(inferred.poly.clone())))
-    };
-    if inferred.poly.params.is_empty() {
-        p.ty(&inferred.poly.body)
-    } else {
-        p.poly(&inferred.poly)
-    }
+    Writer::default().inferred_poly_in(inferred, home)
 }
 
 #[derive(Default)]
@@ -116,6 +155,8 @@ struct Printer {
     /// The path of the module the text is written in, whose own nominal types are written
     /// by their names alone ([`chl_type_in`]).
     home: Option<Vec<SmolStr>>,
+    /// The variables of the message the text is part of ([`Writer`]).
+    variables: Rc<RefCell<Vec<String>>>,
 }
 
 /// Binding tightness of a CHL expression, loosest first.
@@ -185,10 +226,19 @@ impl Printer {
         }
     }
 
-    /// An inference variable in the checker's notation between `‹…›`: its occurrences
+    /// An inference variable, numbered within its message ([`Writer`]): its occurrences
     /// are one type, which `_` would not say.
     fn variable(&mut self, ty: &Type) -> String {
-        format!("‹{ty}›")
+        let key = ty.to_string();
+        let mut variables = self.variables.borrow_mut();
+        let number = match variables.iter().position(|v| *v == key) {
+            Some(i) => i + 1,
+            None => {
+                variables.push(key);
+                variables.len()
+            }
+        };
+        format!("‹?{number}›")
     }
 
     /// `forall (T, U <: B) V requires …`.
