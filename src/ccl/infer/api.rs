@@ -297,19 +297,14 @@ impl std::fmt::Display for StatedRequirement {
 
 /// Errors that can occur during limited type inference.
 ///
-/// # The `at` / `ctx` / `origin` label fields are for *display*, not location
+/// # Labels: a role is printed, a site is not
 ///
-/// Several variants carry a rendered symbolic label (`at`, `ctx`, `origin`,
-/// `context`) naming the offending expression. Those are message text — they end
-/// up verbatim in this type's hand-written `Debug`, which is the human-facing
-/// message — and they predate the compiler having any way to point at a node.
-/// They are **not** the authoritative location: that is
-/// [`LocatedInferError::node_id`], which every error raised by inference now
-/// carries, and which `compile_program` resolves to a source span. A consumer
-/// that wants to *locate* an error reads the node; a consumer that wants to
-/// *print* it reads these. The labels are consequently redundant with the node
-/// for anything but rendering, and are kept only because the message text is
-/// built from them.
+/// `TypeMismatch::ctx` and the `at` of a trait error name the role of what failed in
+/// the program's terms, `this argument` or `` `+` ``, and the message prints them.
+/// Every other label (`at`, `origin`) is the offending expression written in CCL,
+/// which tells two errors equal in all else apart ([`Self::same_defect`]); the
+/// message prints none of them. The location is [`LocatedInferError::node_id`],
+/// which `compile_program` resolves to a source span.
 #[derive(Clone, PartialEq)]
 pub enum InferError {
     /// A variable was referenced but not bound in the current scope.
@@ -651,10 +646,10 @@ pub enum InferError {
         /// The type the value already has.
         found: Box<Type>,
     },
-    /// A partial tuple or partial record was not resolved to a concrete type.
+    /// A value read both by position and by field name, which no tuple or record is.
     UnresolvedPartial {
-        /// Display string of the partial type.
-        kind: String,
+        /// The keys it is read at, written `.0`, `.foo`.
+        keys: String,
         /// Display label for the message (see the type docs — not the location).
         at: String,
     },
@@ -699,12 +694,8 @@ pub enum InferError {
         polarity: bool,
         /// Display string of the conflicting types, e.g. `"handle(0) | handle(1)"`.
         conflicting: String,
-        /// UIDs of the inference variables whose bounds conflicted.
-        vars: Vec<InferVarId>,
         /// The innermost expression label where the conflict was first detected.
         origin: String,
-        /// Enclosing expression labels, innermost-first.
-        context: Vec<String>,
     },
     /// A [`Type::History`]-typed expression appears in a value position but is not
     /// a bare variable reference — the second-class discipline's rule 1 (see
@@ -758,10 +749,8 @@ impl InferError {
     pub fn same_defect(&self, other: &InferError) -> bool {
         fn anonymous(e: &InferError) -> InferError {
             let mut e = e.clone();
-            match &mut e {
-                InferError::IncompatibleBounds { vars, .. } => vars.clear(),
-                InferError::UnresolvedInfer { id, .. } => *id = InferVarId(0),
-                _ => {}
+            if let InferError::UnresolvedInfer { id, .. } = &mut e {
+                *id = InferVarId(0);
             }
             e
         }
@@ -1261,7 +1250,11 @@ fn product_keying_hint(expected: &Type, found: &Type) -> Option<&'static str> {
 /// The proven/checked operator pair this points at is specified in `docs/chl-spec.md`,
 /// "3.9 Subscript and attribute access"; the discharge it rests on is
 /// `src/ccl/design/collections.md`, "Lookup: membership discharge".
-fn undischarged_index_hint(type_a: &Type, type_b: &Type) -> Option<String> {
+fn undischarged_index_hint(
+    type_a: &Type,
+    type_b: &Type,
+    w: &crate::ccl::chl_print::Writer,
+) -> Option<String> {
     /// A **present-key domain** — `{𝐾 | __elem ▷ (𝑚 ▷ collection_contains)}`, how a keyed
     /// collection states which keys it holds. Its sole producer is `present_key_domain` in
     /// `src/ccl/lower/exprs.rs`, and the test is the shape that function builds.
@@ -1299,13 +1292,15 @@ fn undischarged_index_hint(type_a: &Type, type_b: &Type) -> Option<String> {
          not provably total. A proven lookup needs an index whose type carries that proof \
          (one drawn from the collection itself); write `c[k]` for the checked form, which \
          answers `some(v)`/`none` for any key.",
-        chl_type(index),
-        chl_type(domain)
+        w.ty(index),
+        w.ty(domain)
     ))
 }
 
 impl std::fmt::Debug for InferError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // One numbering of inference variables for every type the message writes.
+        let w = crate::ccl::chl_print::Writer::default();
         match self {
             InferError::UnboundVariable(name) => write!(f, "Unbound variable: '{}'", name),
             InferError::TypeMismatch {
@@ -1318,8 +1313,8 @@ impl std::fmt::Debug for InferError {
                     write!(
                         f,
                         "Type mismatch for {ctx}: expected {}, found {}",
-                        chl_type(expected),
-                        chl_type(found)
+                        w.ty(expected),
+                        w.ty(found)
                     )?;
                     if let Some(hint) = product_keying_hint(expected, found) {
                         write!(f, "\n  {hint}")?;
@@ -1327,7 +1322,7 @@ impl std::fmt::Debug for InferError {
                     if let Some(hint) = option_variant_hint(expected, found) {
                         write!(f, "\n  {hint}")?;
                     }
-                    if let Some(hint) = undischarged_index_hint(found, expected) {
+                    if let Some(hint) = undischarged_index_hint(found, expected, &w) {
                         write!(f, "\n  {hint}")?;
                     }
                     // Last: it fires only when the two render identically, which the
@@ -1339,7 +1334,7 @@ impl std::fmt::Debug for InferError {
                 }
                 // A one-sided violation (`ExtraTag`): the `ctx` says what is wrong and
                 // there is no second type the demand could be.
-                None => write!(f, "Type mismatch for {ctx}: found {}", chl_type(found)),
+                None => write!(f, "Type mismatch for {ctx}: found {}", w.ty(found)),
             },
             InferError::NoTraitInstance {
                 trait_,
@@ -1350,7 +1345,7 @@ impl std::fmt::Debug for InferError {
             } => {
                 // A trait with no instance accepting anything at the position, as one a
                 // module declares no instance of, has no type to list.
-                let found = chl_type(found);
+                let found = w.ty(found);
                 if accepted.is_empty() {
                     return write!(
                         f,
@@ -1361,7 +1356,7 @@ impl std::fmt::Debug for InferError {
                 }
                 let accepted = accepted
                     .iter()
-                    .map(chl_type)
+                    .map(|t| w.ty(t))
                     .collect::<Vec<_>>()
                     .join(" or ");
                 write!(
@@ -1403,9 +1398,9 @@ impl std::fmt::Debug for InferError {
                     ts.iter()
                         .map(|(name, t)| {
                             if name.is_empty() {
-                                format!("`{}`", chl_type(t))
+                                format!("`{}`", w.ty(t))
                             } else {
-                                format!("`{name} = {}`", chl_type(t))
+                                format!("`{name} = {}`", w.ty(t))
                             }
                         })
                         .collect::<Vec<_>>()
@@ -1469,7 +1464,7 @@ impl std::fmt::Debug for InferError {
             InferError::UnresolvedMethod {
                 method,
                 receiver: Some(ty @ Type::Nominal(..)),
-            } => write!(f, "`{}` has no method `{method}`", chl_type(ty)),
+            } => write!(f, "`{}` has no method `{method}`", w.ty(ty)),
             InferError::UnresolvedMethod {
                 method,
                 receiver: Some(ty),
@@ -1477,7 +1472,7 @@ impl std::fmt::Debug for InferError {
                 f,
                 "`.{method}(…)` calls a method, and `{}` is not a nominal type, so it has no \
                  methods; the function a field holds is called as `(r.{method})(…)`",
-                chl_type(ty)
+                w.ty(ty)
             ),
             InferError::ParamReadsBinder { param, binder } => match binder {
                 Some(binder) => write!(
@@ -1507,7 +1502,7 @@ impl std::fmt::Debug for InferError {
                      family as a lambda that names the key"
                 ),
             },
-            InferError::TypeParamEscapes { param, target, at } => match target {
+            InferError::TypeParamEscapes { param, target, .. } => match target {
                 Some(EscapeTarget::Argument { function }) => write!(
                     f,
                     "cannot pass a value of type parameter `{param}` to `{function}`: \
@@ -1523,7 +1518,7 @@ impl std::fmt::Debug for InferError {
                 None => write!(
                     f,
                     "a value of type parameter `{param}` reaches a type fixed outside \
-                     `{param}`'s definition at {at}, so that type cannot depend on `{param}`"
+                     `{param}`'s definition, so that type cannot depend on `{param}`"
                 ),
             },
             InferError::MissingRequirement {
@@ -1533,8 +1528,8 @@ impl std::fmt::Debug for InferError {
                 at,
             } => write!(
                 f,
-                "No requirement states that `{param}` is {trait_} at {at}: operand {} is the \
-                 type parameter `{param}`, which supports only what its bound and \
+                "No requirement states that `{param}` is {trait_}, which {at} needs: operand {} \
+                 is the type parameter `{param}`, which supports only what its bound and \
                  `requires` clause state",
                 position + 1,
             ),
@@ -1558,43 +1553,35 @@ impl std::fmt::Debug for InferError {
                     f,
                     "This value is already {}, but it is required to be {}, so it can never \
                      be called:",
-                    chl_type(found),
-                    chl_type(required)
+                    w.ty(found),
+                    w.ty(required)
                 )?;
                 for r in requirements {
                     writeln!(f, "  {r}")?;
                 }
                 Ok(())
             }
-            InferError::MissingField { key, found, at } => match (key, &**found) {
+            InferError::MissingField { key, found, .. } => match (key, &**found) {
                 // A tuple's positions are its width, so that is the fact to state: the
                 // projection asked for a position past the end.
                 (FieldKey::Index(i), Type::Tuple(elems)) => write!(
                     f,
-                    "No position .{i} for {at}: {} is a tuple with {} position{}",
-                    chl_type(found),
+                    "No position .{i}: {} is a tuple with {} position{}",
+                    w.ty(found),
                     elems.len(),
                     if elems.len() == 1 { "" } else { "s" },
                 ),
                 // A written record already lists its fields, so naming the absent
                 // one against it is the whole message.
                 (FieldKey::Name(name), _) => {
-                    write!(
-                        f,
-                        "No field .{name} for {at}: {} has no such field",
-                        chl_type(found)
-                    )
+                    write!(f, "No field .{name}: {} has no such field", w.ty(found))
                 }
                 // `found` degraded to a shape whose keying the message cannot lean on
                 // (`coalesce_for_error` falls back to `Type::Hole`).
-                _ => write!(f, "No field .{key} for {at}: {}", chl_type(found)),
+                _ => write!(f, "No field .{key}: {}", w.ty(found)),
             },
-            InferError::ExpectedFunction { found, at } => {
-                write!(
-                    f,
-                    "Expected function type at {at}, found {}",
-                    chl_type(found)
-                )?;
+            InferError::ExpectedFunction { found, .. } => {
+                write!(f, "Expected a function, found {}", w.ty(found))?;
                 if matches!(found, Type::Tuple(_) | Type::Record(_)) {
                     write!(
                         f,
@@ -1615,8 +1602,8 @@ impl std::fmt::Debug for InferError {
                 write!(
                     f,
                     "Annotation mismatch: annotated as {}, but inferred as {}",
-                    chl_type(annotation),
-                    chl_type(inferred)
+                    w.ty(annotation),
+                    w.ty(inferred)
                 )?;
                 if let Some(hint) = product_keying_hint(annotation, inferred) {
                     write!(f, "\n  {hint}")?;
@@ -1637,7 +1624,7 @@ impl std::fmt::Debug for InferError {
                 )?;
                 match &**inferred {
                     Type::Tuple(found) => write!(f, "a {}-tuple", found.len())?,
-                    found => write!(f, "{}", chl_type(found))?,
+                    found => write!(f, "{}", w.ty(found))?,
                 }
                 let pattern = Type::Tuple(vec![Type::Hole; *positions]);
                 if let Some(hint) = product_keying_hint(&pattern, inferred) {
@@ -1652,29 +1639,34 @@ impl std::fmt::Debug for InferError {
                 write!(
                     f,
                     "Annotation mismatch: annotated as {}, but inferred as {}",
-                    chl_type(annotation),
-                    crate::ccl::chl_print::chl_inferred_poly(inferred)
+                    w.ty(annotation),
+                    w.inferred_poly(inferred)
                 )
             }
             InferError::Unsupported(msg) => write!(f, "Unsupported: {}", msg),
-            InferError::EmptyCase { at } => {
-                write!(f, "Case expression must have at least one branch (at {at})")
+            InferError::EmptyCase { .. } => {
+                write!(f, "A `match` must have at least one `case`")
             }
-            InferError::UnresolvedHole { at } => {
-                write!(f, "Unresolved type hole in expression: {at}")
+            InferError::UnresolvedHole { .. } => {
+                write!(f, "Nothing determines the type this `_` stands for")
             }
-            InferError::UnresolvedBoundedHole { at } => {
-                write!(f, "Unresolved bounded annotation `<:` in expression: {at}")
+            InferError::UnresolvedBoundedHole { .. } => {
+                write!(
+                    f,
+                    "Nothing determines the type this `<:` annotation stands for"
+                )
             }
-            InferError::UnresolvedInfer { id, at } => {
-                write!(f, "Unresolved inference variable {id} in expression: {at}")
+            InferError::UnresolvedInfer { .. } => {
+                write!(f, "Nothing determines the type of this expression")
             }
-            InferError::UnresolvedPartial { kind, at } => {
-                write!(f, "Unresolved partial {kind} in expression: {at}")
-            }
-            InferError::UnresolvedTupleWidth { open, at } => write!(
+            InferError::UnresolvedPartial { keys, .. } => write!(
                 f,
-                "The width of the tuple {open} is never fixed in {at}: the program reads its \
+                "This value is read both by position and by field name ({keys}), so it is \
+                 neither a tuple nor a record"
+            ),
+            InferError::UnresolvedTupleWidth { open, .. } => write!(
+                f,
+                "The width of the tuple {open} is never fixed: the program reads its \
                  positions, and nothing gives it a width\n  hint: a tuple value has one \
                  width; pass this a tuple, or annotate it with a tuple type"
             ),
@@ -1689,7 +1681,7 @@ impl std::fmt::Debug for InferError {
                     "this function's result type {} refines a parameter by {names}, which \
                      the function body binds opaquely; annotate the function's result type \
                      with a type that does not name {names}",
-                    chl_type(ty)
+                    w.ty(ty)
                 )
             }
             InferError::ScopeViolation { at, ty, unbound } => {
@@ -1699,32 +1691,19 @@ impl std::fmt::Debug for InferError {
                      references out-of-scope binder(s) {unbound:?}"
                 )
             }
+            // Values flowing together form a join, demands a meet; neither exists here, and a
+            // join of unrelated types is not taken as their untagged sum.
             InferError::IncompatibleBounds {
                 polarity,
                 conflicting,
-                vars,
-                origin,
-                context,
+                ..
             } => {
-                let bound_kind = if *polarity { "lower" } else { "upper" };
-                let aligned_origin = origin.replace('\n', "\n  ");
-                let var_ids: Vec<_> = vars.iter().map(|v| v.0).collect();
-                write!(
-                    f,
-                    "Type Inference Error: Incompatible {bound_kind} bounds\nRejected by: structural inference (won't infer an untagged sum from a collision)\nConflicting Types: {conflicting}\nVariables: {var_ids:?}\n\nError originated at:\n  {aligned_origin}"
-                )?;
-                if !context.is_empty() {
-                    write!(f, "\n\nIn context of:")?;
-                    for (i, ctx) in context.iter().enumerate() {
-                        // "  N. " prefix; continuation lines must align with the
-                        // first character of content (i.e. same width of spaces).
-                        let prefix = format!("  {}. ", i + 1);
-                        let cont_indent = " ".repeat(prefix.len());
-                        let aligned = ctx.replace('\n', &format!("\n{cont_indent}"));
-                        write!(f, "\n{prefix}{aligned}")?;
-                    }
-                }
-                Ok(())
+                let what = if *polarity {
+                    "The values that meet here have no common type"
+                } else {
+                    "This value is required to be types that have no common subtype"
+                };
+                write!(f, "{what}\nConflicting Types: {conflicting}")
             }
             InferError::TupleWidthConflict { widths, origin: _ } => {
                 write!(
@@ -1736,10 +1715,10 @@ impl std::fmt::Debug for InferError {
                 // Joined with `vs`, not commas: a domain is often a tuple and renders with
                 // commas of its own, so a comma-separated list of them reads as one long
                 // tuple.
-                let listed: Vec<String> = domains.iter().map(chl_type).collect();
+                let listed: Vec<String> = domains.iter().map(|t| w.ty(t)).collect();
                 write!(
                     f,
-                    "Type Inference Error: collection domains have no common answer\n\
+                    "Collection domains have no common answer\n\
                      Conflicting Domains: {}\n\
                      A collection's domain is its data, so a join may not narrow it. Wrap each \
                      arm in `box` to keep them.",
@@ -1774,7 +1753,7 @@ impl std::fmt::Debug for InferError {
                 match position {
                     JoinedPosition::Keys => write!(
                         f,
-                        "Type Inference Error: the keys of a collection written to a feed or \
+                        "The keys of a collection written to a feed or \
                          mutable variable depend on {depends}\n\
                          Keys: {predicate}\n\
                          The target's type is the join of every value written to it, and \
@@ -1782,7 +1761,7 @@ impl std::fmt::Debug for InferError {
                     )?,
                     JoinedPosition::Parameter => write!(
                         f,
-                        "Type Inference Error: the parameter of a function written to a feed or \
+                        "The parameter of a function written to a feed or \
                          mutable variable depends on {depends}\n\
                          Parameter: {predicate}\n\
                          The target's type is the join of every value written to it, and the \
@@ -1800,26 +1779,26 @@ impl std::fmt::Debug for InferError {
                 }
                 Ok(())
             }
-            InferError::MutNotBareVariable { at } => {
+            InferError::MutNotBareVariable { .. } => {
                 write!(
                     f,
-                    "a mutable-reference value must be a bare variable reference \
-                     (Mut second-class rule 1): {at}"
+                    "a value of a `Mut(…)` type must be a mutable variable named where it is \
+                     used, not a computed expression"
                 )
             }
-            InferError::MutInCompositeType { at, ty } => {
+            InferError::MutInCompositeType { ty, .. } => {
                 write!(
                     f,
-                    "a mutable-reference type may not appear inside a composite type \
-                     (Mut second-class rule 2): {} at {at}",
-                    chl_type(ty)
+                    "a `Mut(…)` type cannot be part of another type, such as a tuple, a \
+                     record, a feed's values or a function's result: {}",
+                    w.ty(ty)
                 )
             }
-            InferError::MutArgNotMutable { at } => {
+            InferError::MutArgNotMutable { .. } => {
                 write!(
                     f,
                     "argument to a `Mut` parameter must be a mutable variable, not a \
-                     plain value (Mut second-class rule 1): {at}"
+                     plain value"
                 )
             }
             InferError::MutWriteToNonMutable { name } => {
@@ -5570,8 +5549,9 @@ mod tests {
                 morphism,
             ))),
         );
-        let hint = undischarged_index_hint(&key_domain, &Type::Base(BaseType::Int))
-            .expect("a bare index against a present-key domain is an undischarged lookup");
+        let hint =
+            undischarged_index_hint(&key_domain, &Type::Base(BaseType::Int), &Default::default())
+                .expect("a bare index against a present-key domain is an undischarged lookup");
         assert!(
             hint.contains("write `c[k]` for the checked"),
             "the hint names the checked form: {hint}"
@@ -5579,11 +5559,19 @@ mod tests {
 
         // A literal on one side of an ordinary mismatch is not a lookup.
         assert_eq!(
-            undischarged_index_hint(&int_lit_ty(7), &Type::Base(BaseType::String)),
+            undischarged_index_hint(
+                &int_lit_ty(7),
+                &Type::Base(BaseType::String),
+                &Default::default()
+            ),
             None
         );
         assert_eq!(
-            undischarged_index_hint(&str_lit_ty("nope"), &Type::Base(BaseType::Int)),
+            undischarged_index_hint(
+                &str_lit_ty("nope"),
+                &Type::Base(BaseType::Int),
+                &Default::default()
+            ),
             None
         );
     }

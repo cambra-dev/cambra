@@ -1468,7 +1468,7 @@ fn test_conditional_collection_heterogeneous_domains_rejected() {
         infer_program_with_sources_err("[1, 2, 3] if True else mysrc()", &[("mysrc", int())]);
     let rendered = format!("{errs:?}");
     assert!(
-        rendered.contains("collection domains have no common answer"),
+        rendered.contains("Collection domains have no common answer"),
         "expected the domain-join rejection, got:\n{rendered}"
     );
     // **Both** domains are named. The merged position is neither of them where a meet had
@@ -5809,7 +5809,7 @@ fn an_unrelated_defect_of_the_same_content_is_reported() {
     "#}));
     let at_r = errs
         .iter()
-        .filter(|e| format!("{e:?}").contains("in expression: r"))
+        .filter(|e| matches!(e, InferError::UnresolvedPartial { at, .. } if at == "r"))
         .count();
     assert!(at_r > 0, "`r`'s own conflict must be reported: {errs:?}");
 }

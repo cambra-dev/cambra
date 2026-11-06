@@ -10,6 +10,6 @@ use super::common::expect_compile_error;
 fn type_error_is_rejected() {
     expect_compile_error(
         include_str!("program.cambra"),
-        "Type mismatch for BinOp: expected Bool, found Int",
+        "Type mismatch for `and`: expected Bool, found Int",
     );
 }

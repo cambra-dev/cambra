@@ -2106,6 +2106,9 @@ fn check_modules(
         let derivation = DerivationSession::install();
         tree = comprehension::run(tree, ctx.lowering_ctx().shared_holes());
         blame.derive(&derivation.into_log(), Phase::Comprehension);
+        // As in `run_passes`: an error in a definition inference drops reads a binding the
+        // tree it leaves no longer holds.
+        let reads_named = mut_read::read_respelling(&tree);
         let checked = check_module(&mut tree, ctx.inference_ctx(), &check.params, &wanted);
         if checked.is_ok() {
             note_parameter_types(
@@ -2133,7 +2136,8 @@ fn check_modules(
             }
             Err(errors) => errors,
         };
-        let respelling = mut_read::read_respelling(&tree);
+        let respelling =
+            crate::ccl::subst::Subst::then(&mut_read::read_respelling(&tree), &reads_named);
         let errors = errors
             .into_iter()
             .map(|mut located| {
@@ -2506,6 +2510,9 @@ fn run_passes(
     // Once inference has settled each `unbox`'s argument, one over a plain collection is that
     // collection, and `drop_plain_unboxes` drops it. Its predicate rebuilds are this session's
     // copies.
+    // The reads named before inference, for an error inference raises in a definition it then
+    // drops, whose bindings the tree it leaves no longer holds.
+    let reads_named = mut_read::read_respelling(&expr);
     let infer_outcome = recorded(capture_provenance, Phase::Infer, || {
         let out = infer(&mut expr, ctx.inference_ctx());
         if out.is_ok() {
@@ -2524,7 +2531,7 @@ fn run_passes(
         // erases them below) and nothing types the error's types again.
         let respelling = crate::ccl::subst::Subst::then(
             &anf::temp_respelling(&expr),
-            &mut_read::read_respelling(&expr),
+            &crate::ccl::subst::Subst::then(&mut_read::read_respelling(&expr), &reads_named),
         );
         let errors = errors
             .into_iter()

@@ -219,7 +219,7 @@ fn test_function_def_polymorphic_used_at_two_types() {
 // supplied something concrete, so a difference confined to such a position keyed
 // equal. `\a, b -> a + b` at `(1, 2)` and `(1, 5)` both keyed on
 // `((1, Int) ⇒ Int)`, shared a clone typing `.1` as `2`, and the post-inline
-// consistency wall then panicked ("Type mismatch for Apply: expected 5, found
+// consistency wall then panicked ("Type mismatch for this call: expected 5, found
 // 2"). `SpecKey` reads both bound directions, so the two key apart.
 //
 // The controls matter as much as the cases: a difference in the *first* argument
@@ -454,7 +454,7 @@ fn a_call_of_a_definition_wrong_alone_reports_the_definition() {
             a
         f(True, 2)
     "#};
-    check_compile_error(code, "Unresolved partial Record");
+    check_compile_error(code, "neither a tuple nor a record");
     check_compile_error(code, "[<test>:1:1]");
 }
 
@@ -667,7 +667,8 @@ fn test_unexercised_generic_definition_is_an_error_not_a_panic() {
     };
     let rendered = format!("{errs:?}");
     assert!(
-        rendered.starts_with("[Infer") && rendered.contains("Unresolved inference variable"),
+        rendered.starts_with("[Infer")
+            && rendered.contains("Nothing determines the type of this expression"),
         "expected the residual-inference-variable wall, got: {rendered}"
     );
 }
@@ -904,7 +905,7 @@ fn alias_of_a_monomorphic_binding_is_monomorphic() {
             g = m
             (g(1), g("s"))
         "#},
-        "Incompatible lower bounds",
+        "The values that meet here have no common type",
     );
 }
 

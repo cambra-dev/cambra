@@ -14,8 +14,8 @@ use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::ty::FunKind;
 use crate::ccl::{
-    AggregateKind, BaseType, Branch, Expr, Name, PatternHead, ProjKey, Refinement, TransactKey,
-    Type, TypedBinding, TypedExprNode, V_ABORT, V_COMMIT, WriterSite,
+    AggregateKind, BaseType, BinOpKind, Branch, Expr, Name, PatternHead, ProjKey, Refinement,
+    TransactKey, Type, TypedBinding, TypedExprNode, UnaryOpKind, V_ABORT, V_COMMIT, WriterSite,
 };
 
 use super::context::InferCtx;
@@ -71,12 +71,10 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Loc
 /// wrapper for the `current_node_id` bookkeeping.
 fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedInferError> {
     // Compute the label before the mutable borrow so Case can pass it to emit_case. Only
-    // the rules that read it pay for it: a label spells the node's whole subtree, so one per
+    // the rule that reads it pays for it: a label spells the node's whole subtree, so one per
     // node is quadratic in the tree.
     let label = match &expr.node {
-        TypedExprNode::Case { .. } | TypedExprNode::Feed { .. } | TypedExprNode::Define { .. } => {
-            symbolic(expr)
-        }
+        TypedExprNode::Case { .. } => symbolic(expr),
         _ => String::new(),
     };
     // The literal's own id, taken before the walk borrows the node — the node the
@@ -226,12 +224,12 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // are `Rc`-shaped, so the clone is cheap.
         TypedExprNode::BinOp { left, op, right } => {
             let sig = ctx.schemes.binop(*op);
-            emit_binop(node_id, left, right, &sig, ctx)?
+            emit_binop(node_id, *op, left, right, &sig, ctx)?
         }
 
         TypedExprNode::UnaryOp(op, inner) => {
             let sig = ctx.schemes.unary(*op);
-            emit_unary(inner, node_id, &sig, ctx)?
+            emit_unary(*op, inner, node_id, &sig, ctx)?
         }
 
         TypedExprNode::Aggregate { input, kind } => {
@@ -353,7 +351,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // returns the param type verbatim.
         TypedExprNode::Feed { name, value } => {
             let target_ty = ctx.instantiate_binding(name)?;
-            emit_feed(name, &target_ty, value, &label, ctx).map_err(|e| {
+            emit_feed(name, &target_ty, value, &feed_role(name), ctx).map_err(|e| {
                 e.with_escape_target(EscapeTarget::Feed {
                     channel: name.to_string(),
                 })
@@ -362,7 +360,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
 
         TypedExprNode::Define { name, value } => {
             let target_ty = ctx.instantiate_binding(name)?;
-            emit_define(name, &target_ty, value, &label, ctx)?
+            emit_define(name, &target_ty, value, &feed_role(name), ctx)?
         }
 
         TypedExprNode::Copair(exprs) => emit_copair(exprs, ctx)?,
@@ -1049,7 +1047,7 @@ pub(super) fn emit_cast<C: Typing>(
 ) -> Result<Type, LocatedInferError> {
     let value_ty = emit_value_read(value, ctx)?;
     // Re-view `value : D ⇒ V` as `{D | r} ⇒ V` (the refinement on the domain).
-    let (d, v) = ctx.as_function(&value_ty, &|| "cast value".to_string())?;
+    let (d, v) = ctx.as_function(&value_ty, &|| "this expression".to_string())?;
     // Type the domain-refinement's bare predicate with the implicit binder
     // bound to the (unrefined) domain `d`, enforcing `Bool` (§6.2). Rebuilding
     // it on the `target` slot is what carries the typed predicate onto the
@@ -1153,11 +1151,11 @@ pub(super) fn emit_apply<C: Typing>(
         // `Let` yielding one — so the pair is required as a term here, and its absence is a
         // diagnosable shape failure like the two above rather than an impossibility.
         let TypedExprNode::Tuple(pair) = &argument.node else {
-            return Err(ctx.raise(InferError::Unsupported(format!(
+            return Err(ctx.raise(InferError::Unsupported(
                 "`lookup?` needs its `(collection, key)` pair as a term, so that the key can \
-                 discharge a dependent codomain's binder; got `{}`",
-                symbolic(argument)
-            ))));
+                 discharge a dependent codomain's binder"
+                    .to_string(),
+            )));
         };
         let [_, key] = pair.as_slice() else {
             unreachable!("`lookup?`'s argument typed as a two-element Tuple");
@@ -1182,7 +1180,9 @@ pub(super) fn emit_apply<C: Typing>(
         && matches!(param.ty, Type::Hole)
     {
         let slot = ctx.binding_slot(&mut param.ty);
-        ctx.require_sub(&read_through(&raw_arg_ty), &slot, &|| "Apply".to_string())?;
+        ctx.require_sub(&read_through(&raw_arg_ty), &slot, &|| {
+            "this argument".to_string()
+        })?;
     }
     // `(𝑟 ▷ 𝑠) ▷ (λ 𝑥 → body)` is a loop's step at the position `𝑟`, the form a `for` loop
     // lowers to (`lower::loops::tagged_for_loop`): `𝑥` is `𝑠`'s value at `𝑟`.
@@ -1279,8 +1279,8 @@ pub(super) fn emit_apply<C: Typing>(
         TypedExprNode::TraitFn {
             trait_, function, ..
         } => format!("{trait_}::{function}"),
-        TypedExprNode::Proj(key @ ProjKey::Index(_)) => format!("projection `.{key}`"),
-        _ => "Apply".to_string(),
+        TypedExprNode::Proj(key @ ProjKey::Index(_)) => projection(key),
+        _ => "this call".to_string(),
     };
     let applied = ctx.apply(&fn_ty, &arg_ty, argument, declared.as_ref(), &|| at.clone());
     if applied.is_ok() && matches!(function.node, TypedExprNode::TraitFn { .. }) {
@@ -1552,6 +1552,7 @@ fn parameter_type<'t>(function: &'t Expr, fn_ty: &'t Type) -> Option<&'t Type> {
 
 pub(super) fn emit_binop<C: Typing>(
     operator_node_id: NodeId,
+    op: BinOpKind,
     left: &mut Expr,
     right: &mut Expr,
     sig: &OpSignature,
@@ -1559,7 +1560,7 @@ pub(super) fn emit_binop<C: Typing>(
 ) -> Result<Type, LocatedInferError> {
     let left_ty = emit_value_read(left, ctx)?;
     let right_ty = emit_value_read(right, ctx)?;
-    let at = || "BinOp".to_string();
+    let at = || crate::ccl::chl_print::chl_operator(&op);
     match sig {
         OpSignature::Scheme(scheme) => apply_binary_scheme(ctx, scheme, &left_ty, &right_ty, &at),
         OpSignature::SingleObligation { trait_, result } => require_single_obligation(
@@ -1575,13 +1576,17 @@ pub(super) fn emit_binop<C: Typing>(
 }
 
 pub(super) fn emit_unary<C: Typing>(
+    op: UnaryOpKind,
     inner: &mut Expr,
     operator_node_id: NodeId,
     sig: &OpSignature,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let inner_ty = emit_value_read(inner, ctx)?;
-    let at = || "UnaryOp".to_string();
+    let at = || match op {
+        UnaryOpKind::Neg => "`-`".to_string(),
+        UnaryOpKind::Not => "`not`".to_string(),
+    };
     match sig {
         OpSignature::Scheme(scheme) => apply_unary_scheme(ctx, scheme, &inner_ty, &at),
         OpSignature::SingleObligation { trait_, result } => require_single_obligation(
@@ -1764,6 +1769,15 @@ fn emit_value_read<C: Typing>(e: &mut Expr, ctx: &mut C) -> Result<Type, Located
 /// rather than a free `Infer`, and `channelize` erases `ChanDom(d)` to the
 /// concrete channel domain (a source domain, or a `Variant` union of feed
 /// sites) by substitution.
+/// A feed or define into `target` as a diagnostic names it: by the target's name, or as
+/// `this feed` for a target the compiler minted, a generator's result.
+fn feed_role(target: &Name) -> String {
+    match target.source_spelling() {
+        Some(name) => format!("a feed to `{name}`"),
+        None => "this feed".to_string(),
+    }
+}
+
 pub(super) fn emit_feed(
     target: &Name,
     target_ty: &Type,
@@ -1785,9 +1799,7 @@ pub(super) fn emit_feed(
     // where the feed stands ([`InferCtx::require_feed`]).
     if target_ty.as_feed().is_some() {
         let channel = target_ty.read_view().into_owned();
-        ctx.require_feed(target, &value_ty, &channel, &|| {
-            format!("contribution to {label}")
-        })?;
+        ctx.require_feed(target, &value_ty, &channel, &|| label.to_string())?;
         return Ok(prim(BaseType::Unit));
     }
     // A **data** function: the contribution is one row of the channel's collection,
@@ -1836,9 +1848,7 @@ fn constrain_into_feed(
             // collection for a define). A **data** function, so a collection fed into it
             // meets a collection.
             let rho = target_ty.read_view().into_owned();
-            ctx.require_contribution(target, payload_sub, &rho, &|| {
-                format!("contribution to {label}")
-            })?;
+            ctx.require_contribution(target, payload_sub, &rho, &|| label.to_string())?;
         }
         None => {
             // Opaque target (a lambda parameter receiving the handle —
@@ -1849,13 +1859,9 @@ fn constrain_into_feed(
             let rho_value = ctx.fresh();
             let rho_domain = ctx.fresh();
             let required = Type::feed(rho_domain.clone(), rho_value.clone());
-            ctx.require_sub(target_ty, &required, &|| {
-                format!("feed target of {label} must be a feed handle")
-            })?;
+            ctx.require_sub(target_ty, &required, &|| format!("the target of {label}"))?;
             let rho = Type::data_fun(rho_domain, rho_value);
-            ctx.require_contribution(target, payload_sub, &rho, &|| {
-                format!("contribution to {label}")
-            })?;
+            ctx.require_contribution(target, payload_sub, &rho, &|| label.to_string())?;
         }
     }
     Ok(prim(BaseType::Unit))
@@ -1899,7 +1905,7 @@ pub(super) fn emit_copair<C: Typing>(
         let ty = emit_value_read(e, ctx)?;
         // Each operand is a collection (function); its codomain joins into the
         // shared `cod_var`, its domain becomes the variant tag for operand `i`.
-        let (dom, cod) = ctx.as_function(&ty, &|| "Copair element".to_string())?;
+        let (dom, cod) = ctx.as_function(&ty, &|| "an operand of `++`".to_string())?;
         // The codomain left this element's Σ behind, so the edge carries it.
         let binders = ty.peel_refinements().sum().unwrap_or(&[]).to_vec();
         ctx.require_sub_under(&cod, &binders, &cod_var, &[], &|| {
@@ -1951,7 +1957,7 @@ pub(super) fn emit_disjoint_join<C: Typing>(
             None => ty,
         };
         let ty = ctx.open_generic(ty);
-        let (dom, cod) = ctx.as_function(&ty, &|| "DisjointJoin element".to_string())?;
+        let (dom, cod) = ctx.as_function(&ty, &|| "this expression".to_string())?;
         // One shared domain: each operand's domain flows into the same variable, so
         // operands over genuinely different index sets are a type error here rather
         // than being silently tagged apart.
@@ -2011,7 +2017,12 @@ pub(super) fn emit_aggregate<C: Typing>(
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let input_ty = emit_value_read(input, ctx)?;
-    let at = || "Aggregate".to_string();
+    let at = || match kind {
+        AggregateKind::Sum | AggregateKind::Max | AggregateKind::Min => {
+            format!("`{}`", crate::ccl::Builtin::for_aggregate(kind).name())
+        }
+        AggregateKind::Drain | AggregateKind::Sole => "this expression".to_string(),
+    };
     let result = apply_unary_scheme(ctx, scheme, &input_ty, &at)?;
     // `max` and `min` return an element of what they consume, so the scheme already gives it a
     // type; what the scheme cannot say is that the elements must be *orderable*
@@ -2791,12 +2802,10 @@ pub(super) fn emit_for<C: Typing>(
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let iter_ty = emit_value_read(iter, ctx)?;
-    let iter_label = symbolic(iter);
     // The element is the source's value at the position, so its type is the codomain at the
     // position's name: a group's reads its key.
-    let (position_ty, item_ty) = ctx.as_function_at(&iter_ty, position, &|| {
-        format!("for-loop source `{iter_label}`")
-    })?;
+    let (position_ty, item_ty) =
+        ctx.as_function_at(&iter_ty, position, &|| "the loop's source".to_string())?;
 
     // The position ranges over the source's domain, a part of the demand as an application's
     // binder is (`Typing::apply`): a sum's domain is its witness, which only the demand's
@@ -2873,13 +2882,18 @@ fn proj_requirement<C: Typing>(key: &ProjKey, field_ty: Type, ctx: &mut C) -> Ty
 /// mentions the projected pair. The comparison below puts that codomain beside the
 /// domain it was read off, which is the domain's coordinate, so it is opened first —
 /// the same reading [`compose_chain`] takes on a chain adjacency.
+/// A projection as a diagnostic names it.
+fn projection(key: &ProjKey) -> String {
+    format!("projection `.{key}`")
+}
+
 pub(super) fn emit_proj<C: Typing>(
     key: &ProjKey,
     node_ty: &Type,
     node_id: NodeId,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    let (domain, codomain) = ctx.provide_function(node_ty, &|| "Proj".to_string())?;
+    let (domain, codomain) = ctx.provide_function(node_ty, &|| projection(key))?;
     let codomain = crate::ccl::subst::open_codomain(node_ty, &codomain);
     // A dependent tuple's component is its type opened at the earlier components
     // of the projected value (`src/ccl/design/type-inference.md`, "Projection"),
@@ -2914,12 +2928,12 @@ pub(super) fn emit_proj<C: Typing>(
             )
             .with_ty(ty.clone())
         }) {
-            ctx.require_sub(&component, &codomain, &|| "Proj".to_string())?;
+            ctx.require_sub(&component, &codomain, &|| projection(key))?;
             return Ok(node_ty.clone());
         }
     }
     let requirement = proj_requirement(key, codomain, ctx);
-    ctx.require_sub(&domain, &requirement, &|| "Proj".to_string())?;
+    ctx.require_sub(&domain, &requirement, &|| projection(key))?;
     Ok(node_ty.clone())
 }
 
@@ -2962,7 +2976,7 @@ pub(super) fn emit_list<C: Typing>(
     let elem_ty = ctx.fresh();
     for elt in elts.iter_mut() {
         let t = emit_value_read(elt, ctx)?;
-        ctx.require_sub(&t, &elem_ty, &|| "List element".to_string())?;
+        ctx.require_sub(&t, &elem_ty, &|| "a list element".to_string())?;
     }
     let n = elts.len();
     // Deref a bare mutable read to its value, as in `emit_tuple`: the list's
@@ -3059,7 +3073,7 @@ pub(super) fn emit_case<C: Typing>(
         } else {
             variant_type(expected_tags)
         };
-        ctx.require_sub(&scrut_ty, &expected, &|| "Case scrutinee".to_string())?;
+        ctx.require_sub(&scrut_ty, &expected, &|| "the matched value".to_string())?;
         // An arm that names no payload claims the tag carries nothing. The claim is
         // checked per arm rather than folded into the variant above so that the
         // rejection names the arm, and the message can point at `` case `some(_): ``.
@@ -3096,7 +3110,7 @@ pub(super) fn emit_case<C: Typing>(
             Some((name, ty)) => ctx.scoped(&name, &ty, |ctx| emit_case_branch(b, ctx))?,
             None => emit_case_branch(b, ctx)?,
         };
-        ctx.require_sub(&body_ty, &result_ty, &|| "Case arm".to_string())?;
+        ctx.require_sub(&body_ty, &result_ty, &|| "this branch".to_string())?;
     }
     Ok(result_ty)
 }
@@ -3117,7 +3131,7 @@ fn emit_nominal_scrutinee<C: Typing>(
     let scrut_ty = emit_value_read(scrut, ctx)?;
     let args = fresh_nominal_args(decl, ctx);
     let expected = Type::Nominal(decl.clone(), args.clone());
-    ctx.require_sub(&scrut_ty, &expected, &|| "Case scrutinee".to_string())?;
+    ctx.require_sub(&scrut_ty, &expected, &|| "the matched value".to_string())?;
     for b in branches.iter_mut() {
         let Some(p) = &mut b.pattern else {
             continue;
@@ -3780,7 +3794,7 @@ fn compose_chain<C: Typing>(
     // morphism is read at its body, and the chain's type is generic in it as well
     // (`emit_compose`).
     let ty = ctx.open_generic(ty);
-    let (dom, cod) = ctx.as_function(&ty, &|| format!("Compose[{i}]"))?;
+    let (dom, cod) = ctx.as_function(&ty, &|| "this expression".to_string())?;
     let binders = ty.peel_refinements().sum().unwrap_or(&[]).to_vec();
     if let Some((prev, prev_binders)) = prev_cod {
         ctx.require_sub_under(&prev, &prev_binders, &dom, &binders, &|| {
@@ -3878,7 +3892,7 @@ pub(super) fn emit_compose<C: Typing>(
                     item,
                 ));
             ctx.scoped(&position, &first_dom, |ctx| {
-                ctx.apply(&last_ty, item, &at, None, &|| format!("Compose[{last}]"))
+                ctx.apply(&last_ty, item, &at, None, &|| "this expression".to_string())
             })?
         }
         _ => cod,
@@ -4106,12 +4120,12 @@ fn emit_transact_writer<C: Typing>(
         // parameter states (`src/ccl/design/type-parameters.md`, "Generalized types").
         Some(p) => {
             let s_ty = ctx.instantiate_generalized(&s_ty, &enclosing_component(p));
-            ctx.as_function(&s_ty, &|| "nested transaction source".to_string())?
+            ctx.as_function(&s_ty, &|| "the transaction's source".to_string())?
                 .1
         }
         None => s_ty,
     };
-    let (_d, item) = ctx.as_function(&s_ty, &|| "transaction source".to_string())?;
+    let (_d, item) = ctx.as_function(&s_ty, &|| "the transaction's source".to_string())?;
 
     let mut snaps: Vec<Type> = Vec::with_capacity(writer.read_keys.len());
     for rk in &writer.read_keys {
@@ -4172,9 +4186,11 @@ fn emit_transact_writer<C: Typing>(
         Some(p) => fun(Type::Tuple(vec![p.clone(), body_dom]), decision_codom),
         None => fun(body_dom, decision_codom),
     };
-    ctx.require_sub(&body_ty, &expected, &|| "transaction body".to_string())?;
+    ctx.require_sub(&body_ty, &expected, &|| {
+        "the transaction's body".to_string()
+    })?;
     for (new, contrib) in news {
-        ctx.require_sub(&new, &contrib, &|| "transaction write".to_string())?;
+        ctx.require_sub(&new, &contrib, &|| "a write in the transaction".to_string())?;
     }
     Ok(())
 }
@@ -4238,7 +4254,9 @@ pub(super) fn emit_transact<C: Typing>(
             Some(p) => fun(enclosing_component(p), value_ty.clone()),
             None => value_ty.clone(),
         };
-        ctx.require_sub(&init_ty, &seeded, &|| "transact init".to_string())?;
+        ctx.require_sub(&init_ty, &seeded, &|| {
+            "the variable's initial value".to_string()
+        })?;
         fields.push((k.name.field_key(), read_ty));
         key_types.insert(k.name.clone(), value_ty);
     }

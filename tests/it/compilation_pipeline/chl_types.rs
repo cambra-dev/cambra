@@ -121,6 +121,25 @@ fn a_collection_is_written_in_chl(#[case] binding: &str, #[case] inferred: &str)
     );
 }
 
+/// A collection in a function nothing calls is written as it is at the top level: inference
+/// drops the definition, and the message still names `xs` rather than the binder that named
+/// the source.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_collection_in_a_function_nothing_calls_is_written_in_chl() {
+    check_compile_error(
+        indoc! {"
+            def f(u):
+                xs = [1, 2, 3]
+                ys = [x for x in xs if x > 1]
+                z: Int = ys
+                1
+            1
+        "},
+        "annotated as Int, but inferred as {UInt where _ < 3 and xs[_]! > 1} |=> Int",
+    );
+}
+
 /// A predicate's operators and an inference variable, written in CHL.
 #[rstest]
 #[timeout(Duration::from_secs(10))]

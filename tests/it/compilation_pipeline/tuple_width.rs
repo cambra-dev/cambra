@@ -212,7 +212,7 @@ fn a_width_conflict_is_reported_once(#[case] code: &str) {
         1,
         "{errors}"
     );
-    assert!(!errors.contains("Incompatible"), "{errors}");
+    assert!(!errors.contains("have no common type"), "{errors}");
     assert!(
         errors.contains("hint: a tuple's width is part of its type"),
         "{errors}"
@@ -246,13 +246,10 @@ fn a_width_nothing_fixes_is_reported_once_per_tuple() {
         1
     "}));
     assert_eq!(errors.matches("is never fixed").count(), 2, "{errors}");
+    assert!(errors.contains("{_, _, ..} is never fixed:"), "{errors}");
+    assert!(errors.contains("{_, ..} is never fixed:"), "{errors}");
     assert!(
-        errors.contains("{_, _, ..} is never fixed in t:"),
-        "{errors}"
-    );
-    assert!(errors.contains("{_, ..} is never fixed in []:"), "{errors}");
-    assert!(
-        !errors.contains("Unresolved inference variable"),
+        !errors.contains("Nothing determines the type of this expression"),
         "the positions the widths leave unresolved are not reported beside them: {errors}"
     );
 }
