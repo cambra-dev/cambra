@@ -33,8 +33,8 @@
 //! **A body that never applies the inner source leaves nothing to name.** `sum([r for v in
 //! xs])` under a correlated site reads the outer binder alone, so `𝑔` is `.0` and the source
 //! occurs nowhere in the term. `𝐾` is then `iterate` over the type's domain, which answers
-//! for a list literal. A map read that way is refused by name, as the same comprehension is
-//! without an enclosing one (`a_map_comprehension_that_ignores_the_element_does_not_compile`).
+//! for a list literal. A map read that way is refused by name
+//! (`a_correlated_comprehension_over_an_unnamed_map_source_is_unsupported`).
 //!
 //! **A dependent site stays one node.** A correlated filter narrows the inner domain by the
 //! outer value, so `curry(𝑔)`'s type is `(𝑟 : 𝑋) ⇒ ({𝑣 : 𝐷 | 𝑣 > 𝑟} ⤇ 𝑊)`, and the chain has
