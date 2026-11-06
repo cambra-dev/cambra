@@ -126,7 +126,7 @@ EXPECTED_EXCEPTIONS = [
     # The rows a pipeline parked until the pipelines it reads have decided them, which pushes and
     # decided pushes read and write on any thread. What crosses it is guards naming regions, never
     # a tile.
-    ("src/interpreter/dispatcher.rs", "cell of `Vec<TileGuard>`"),
+    ("src/interpreter/dispatcher.rs", "cell of `Vec<Parked>`"),
     # The lock that orders a dispatcher's seals and closes; it guards no data.
     ("src/interpreter/dispatcher.rs", "cell of `()`"),
     # The lock a dispatcher's sleeping worker waits under; it guards no data.
@@ -139,6 +139,10 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `usize`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),
+    # A cyclic fan-out's store, held in a cell apart from the fan-out's state so a pull that
+    # re-enters through the store's recurrence finds it borrowed and reads the snapshot; what
+    # crosses it is the producer, never a tile passed between operators.
+    ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileProducer>`"),
     ("src/interpreter/tile_operators/mod.rs", "ambient mutable state"),
     ("src/interpreter/types/extent.rs", "shared cell of `Restriction`"),
     ("src/interpreter/types/extent.rs", "shared cell of `Restriction`"),
