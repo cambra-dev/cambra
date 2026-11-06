@@ -2601,6 +2601,17 @@ They do not denote the immutable value required by this substitution: a mutable 
 its seed, and a write is not the written value. They are eliminated before consumers of the
 lifted type use that representation.
 
+A collection over the witness of a sum the binder holds, `σᵢ(𝑥) ⤇ 𝑉`, leaves the scope packed
+when the definition is no name and the witness's kind lists no candidates: the discharge gives
+`Σ (𝜎 : 𝐾). 𝜎 ⤇ 𝑉` over a fresh witness of the kind `𝐾` the binder's sum binds, which stands for
+`σᵢ(𝑥)` throughout the collection's type (`Subst::repacked`). This is how an opened existential
+leaves its scope. Projected through the definition instead, `σᵢ(definition)` would quote a term
+that passes go on to respell in the tree, lambda elimination pointfree and planning into its
+bucketize chain, while the quote keeps the spelling it was taken at. A witness whose kind lists its
+candidates stays projected: a collection read out of a conditional or a jagged row is plain, keyed
+by the candidate its source carries. A name stays projected too, being quotable where the discharge
+reaches.
+
 Coalescing closes the result using the resolved body and definition. Nested lets close from
 inside outward. If lambda elimination rewrites a definition quoted by the result type, its let
 rebuild must discharge the rewritten definition again. The post-pass check likewise reconstructs

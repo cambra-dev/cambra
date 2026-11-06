@@ -1296,6 +1296,55 @@ fn a_keyed_annotation_compiles_and_runs(#[case] code: &str, #[case] expected: Va
     check_scalar(code, expected);
 }
 
+/// A collection read out of a named abstract sum leaves the name's scope over a domain the type
+/// cannot quote: under an exact annotation the box's witness is undetermined, and its projection
+/// through the definition would go stale as passes respell the definition. The collection is
+/// repacked instead, a sum over some domain of the annotation's key type
+/// (`src/ccl/design/type-inference.md`, "`let` binders and scope exit").
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[case::a_map(
+    "m: Map(Int, Int) = box(map([(1, 10), (2, 20)]))\nout << [v for v in m]",
+    "[() -> [1 -> 10, 2 -> 20]]"
+)]
+#[case::a_group_by(
+    "g: Map(_, _) = box(groupby([1, 2, 3], \\x -> x > 1))\nout << [sum(v) for v in g]",
+    "[() -> [false -> 1, true -> 5]]"
+)]
+fn a_collection_read_out_of_an_abstract_sum_is_repacked(
+    #[case] code: &str,
+    #[case] expected: &str,
+) {
+    check_sink(&format!("out = test_sink()\n{code}\n"), expected);
+}
+
+/// [`a_collection_read_out_of_an_abstract_sum_is_repacked`] as the program's value.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[case::a_map("m: Map(Int, Int) = box(map([(1, 10), (2, 20)]))\n[v for v in m]", 30)]
+#[case::a_group_by(
+    "g: Map(_, _) = box(groupby([1, 2, 3], \\x -> x > 1))\n[sum(v) for v in g]",
+    6
+)]
+fn a_collection_value_read_out_of_an_abstract_sum_is_repacked(
+    #[case] code: &str,
+    #[case] total: i64,
+) {
+    let Tile::DataFunction { codomain, .. } = run_pipeline(code) else {
+        panic!("the program's value is a collection");
+    };
+    let Tile::Scalar(values) = *codomain else {
+        panic!("the collection's values are a column");
+    };
+    let sum: i64 = (0..values.len())
+        .map(|i| match values.index_at(i) {
+            Value::Int(n) => n,
+            other => panic!("an Int value, got {other:?}"),
+        })
+        .sum();
+    assert_eq!(sum, total);
+}
+
 /// A binop over **two projections of one grouped row** — the shape that pins a fan-in's
 /// pairing depth.
 ///

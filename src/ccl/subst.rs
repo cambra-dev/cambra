@@ -1519,6 +1519,7 @@ impl Subst {
         if !self.elims.is_empty() {
             return self.without_elim().apply_expr(e);
         }
+        let _in_a_term = InTerm::enter();
         // Both early returns build a term the caller owns while `e` stays live in
         // whatever tree holds it, so the result is a genuinely new node even
         // though the substitution changed nothing. It freshens and is **recorded**
@@ -1798,6 +1799,68 @@ impl Subst {
             }
         }
         (at != *w).then_some(Type::WitnessRef(at))
+    }
+
+    /// `ty`, a collection over the witness `σᵢ(𝑚)` a sum `𝑚` carries, repacked where this
+    /// substitution discharges `𝑚` to a term that is no name: `Σ (𝜎 : 𝐾). 𝜎 ⤇ 𝑉`, over a fresh
+    /// witness of the kind `𝑚`'s binds, which stands for `σᵢ(𝑚)` throughout. `None` where `ty` is
+    /// no such collection.
+    ///
+    /// The witness leaves the scope of the name that carries it. Projected through the term,
+    /// `σᵢ(𝑡)`, it would quote `𝑡` into the type, and a pass that respells `𝑡` in the tree leaves
+    /// the quote at the spelling it was taken at. Repacked, the collection is one over some
+    /// domain of `𝐾`, which is what `𝑚`'s type says of it: an opened existential leaves its
+    /// scope packed (`src/ccl/design/type-inference.md`, "`let` binders and scope exit").
+    ///
+    /// Only a witness whose kind lists no candidates is repacked. One that lists them stays
+    /// projected: a collection read out of a conditional or a jagged row is plain, keyed by the
+    /// candidate its source carries, and a determined witness is its one candidate wherever it
+    /// is read. Nor is a name repacked, which the type can quote in the scope the discharge
+    /// reaches.
+    ///
+    /// The type a scope exit lifts is repacked, and no type slot of a term it quotes: a term's
+    /// slot says what that node is, and a node typed as a sum would bind a witness its own
+    /// parameter's slot, which mirrors the domain, reads unbound.
+    fn repacked(&self, ty: &Type) -> Option<Type> {
+        let Type::Fun {
+            name,
+            fun_kind: crate::ccl::FunKind::Data(slot),
+            domain,
+            codomain,
+        } = ty
+        else {
+            return None;
+        };
+        let Type::WitnessProjection(p) = domain.as_ref() else {
+            return None;
+        };
+        let TypedExprNode::Var(binder) = &p.term.node else {
+            return None;
+        };
+        match self.binders.get(&Binder::from(binder.clone())) {
+            Some(Mapping::Discharge(t)) if !matches!(t.node, TypedExprNode::Var(_)) => {}
+            _ => return None,
+        }
+        if InTerm::inside() {
+            return None;
+        }
+        let witness = p.witness()?;
+        if matches!(witness.type_kind(), crate::ccl::ty::TypeKind::Enumerated(_)) {
+            return None;
+        }
+        let kind = witness.type_kind().map_children(|t| self.apply_type(t));
+        let fresh = crate::ccl::ty::Witness::mint(kind);
+        let packed = Type::WitnessRef(*fresh.id());
+        let position = p.position;
+        let mut opened = (**codomain).clone();
+        replace_projections(&mut opened, binder, position, &packed);
+        let body = Type::Fun {
+            name: name.clone(),
+            fun_kind: self.apply_fun_kind(&crate::ccl::FunKind::Data(slot.clone())),
+            domain: Box::new(packed),
+            codomain: Box::new(self.apply_type(&opened)),
+        };
+        Some(Type::sum_binding(fresh, body))
     }
 
     /// The binder `p` reads back as ([`Elim::ReadBack`]), where an entry reads its term back.
@@ -2697,6 +2760,9 @@ impl Subst {
     fn apply_type_inner(&self, ty: &Type) -> Type {
         if let Some((c, rest)) = self.top_elim() {
             return self.eliminate_top(&c, &rest, ty);
+        }
+        if let Some(repacked) = self.repacked(ty) {
+            return repacked;
         }
         match ty {
             Type::BoundedHole(t) => Type::BoundedHole(Box::new(self.apply_type_inner(t))),
@@ -4426,6 +4492,45 @@ mod capture_assert_probe {
         body();
         COUNT.with(Cell::get)
     }
+}
+
+thread_local! {
+    /// How many [`Subst::apply_expr`] calls are running: a type reached inside one is a term's
+    /// slot, which [`Subst::repacked`] leaves alone.
+    static IN_TERM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One [`Subst::apply_expr`] running, counted in [`IN_TERM`] until dropped.
+struct InTerm;
+
+impl InTerm {
+    fn enter() -> InTerm {
+        IN_TERM.with(|n| n.set(n.get() + 1));
+        InTerm
+    }
+
+    fn inside() -> bool {
+        IN_TERM.with(|n| n.get() > 0)
+    }
+}
+
+impl Drop for InTerm {
+    fn drop(&mut self) {
+        IN_TERM.with(|n| n.set(n.get() - 1));
+    }
+}
+
+/// `ty` with each `σ_position(binder)` it holds outside refinement predicates replaced by
+/// `packed`: the projections a repack ([`Subst::repacked`]) binds.
+fn replace_projections(ty: &mut Type, binder: &Name, position: usize, packed: &Type) {
+    if let Type::WitnessProjection(p) = ty
+        && p.position == position
+        && matches!(&p.term.node, TypedExprNode::Var(n) if n == binder)
+    {
+        *ty = packed.clone();
+        return;
+    }
+    ty.walk_children_mut(|c| replace_projections(c, binder, position, packed));
 }
 
 #[cfg(test)]
