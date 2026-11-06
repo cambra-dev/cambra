@@ -120,6 +120,13 @@ EXPECTED_EXCEPTIONS = [
     # (`Decided`), which the decided pushes grow on any thread. What crosses it is guards naming
     # regions, never a tile.
     ("src/interpreter/dispatcher.rs", "cell of `Vec<Decided>`"),
+    # Every row a push has brought a pipeline that parks, so it reads each row once. What crosses
+    # it is a guard naming a region, never a tile.
+    ("src/interpreter/dispatcher.rs", "cell of `Option<TileGuard>`"),
+    # The rows a pipeline parked until the pipelines it reads have decided them, which pushes and
+    # decided pushes read and write on any thread. What crosses it is guards naming regions, never
+    # a tile.
+    ("src/interpreter/dispatcher.rs", "cell of `Vec<TileGuard>`"),
     # The lock that orders a dispatcher's seals and closes; it guards no data.
     ("src/interpreter/dispatcher.rs", "cell of `()`"),
     # The lock a dispatcher's sleeping worker waits under; it guards no data.

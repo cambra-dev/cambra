@@ -851,8 +851,10 @@ of its own. `Breaker` (`src/interpreter/tile_operators/mod.rs`) is what the disp
 `consume_impl`, `input_tiling`, `input_released`, `as_producer` and `finish`. A breaker that other
 pipelines read is also a producer, which answers pulls from that state: `BreakingProducer`, a
 subtrait of `TileProducer` and `Breaker`, adds `held`, `final_guard`, `morsels`,
-`pushes_while_consuming` and `offer_impl`. Its `as_producer` answers itself, and `Breaker`'s
-default `finish` pushes through that producer.
+`pushes_while_consuming` and `offer_impl`. Its `as_producer` answers itself, and the driver's push
+after each consume and `Breaker`'s default `finish` push through that producer. A sink's breaker is
+no producer, so its `as_producer` answers `None`: no pipeline reads it, and it holds, offers and
+pushes nothing.
 
 | Call | What it does |
 |---|---|
@@ -864,21 +866,21 @@ default `finish` pushes through that producer.
 | `pushes_while_consuming()` | Whether the driver also pushes after each `consume_impl`. The default answers `true`. |
 | `offer_impl(guard)` | Answers from the state `consume_impl` built and pulls nothing. The breaker's own `get_impl` calls it once the breaker is consuming. |
 
-An operator that consumes its input into state of its own is a breaker. A breaker starts in the pull
-mode described in [The producer protocol](#the-producer-protocol) and is a consuming producer from
-its first `consume_impl`, which it stays. `final_guard` is provided over `held()`: it is `held()`
-less the guard released to the breaker, and the driver pushes the part of it no earlier push named,
-after each consume and at `finish`. When a pipeline may finish is the
-dispatcher's to check ([The dispatcher](design-dispatcher.md#the-dispatcher)). A release removes rows from the state and
-leaves the statement of the tile as it was, so the difference is taken in the guard algebra.
-`guard_minus` (`tile_operators/mod.rs`) spells it for guards of a collection's outermost keys, of a
-scalar and of an aggregation, none of them qualified by an enclosing path, and for a record of such
-guards field by field. Two guards of a collection's keys at any levels differ as their projections
-do: a release up to the path `(𝑘, 𝑗)` leaves of a held row 𝑘 its paths past 𝑗, which
-`TileGuard::closed_over` drops where the row's level is a finite range of positions with none past
-𝑗; `final_guard` closes the difference over the producer's tiling. A state of another shape has no
-spelling, and a push after the first panics naming the gap instead of answering a smaller or larger
-region. `MapAggregate` holds a state released beneath the keys of a group, and what a release
+An operator that consumes its input into state of its own is a breaker. One that answers pulls from
+that state is a producer; `SinkBreaker`, the breaker of a sink's pipeline, is one that is not. A
+breaker starts in the pull mode described in [The producer protocol](#the-producer-protocol) and is
+a consuming producer from its first `consume_impl`, which it stays. `final_guard` is provided over
+`held()`: it is `held()` less the guard released to the breaker, and the driver pushes the part of
+it no earlier push named, after each consume and at `finish`. When a pipeline may finish is the dispatcher's to check ([The dispatcher](design-dispatcher.md#the-dispatcher)). A release removes rows
+from the state and leaves the statement of the tile as it was, so the difference is taken in the
+guard algebra. `guard_minus` (`tile_operators/mod.rs`) spells it for guards of a collection's
+outermost keys, of a scalar and of an aggregation, none of them qualified by an enclosing path, and
+for a record of such guards field by field. Two guards of a collection's keys at any levels differ
+as their projections do: a release up to the path `(𝑘, 𝑗)` leaves of a held row 𝑘 its paths past 𝑗,
+which `TileGuard::closed_over` drops where the row's level is a finite range of positions with none
+past 𝑗; `final_guard` closes the difference over the producer's tiling. A state of another shape has
+no spelling, and a push after the first panics naming the gap instead of answering a smaller or
+larger region. `MapAggregate` holds a state released beneath the keys of a group, and what a release
 beneath them leaves is a region beneath the outermost keys. A reader's chain may restate only the
 outermost keys (`TileProducer::restates`), so it answers `pushes_while_consuming` with `false` and
 pushes at `finish`. A push beneath the outermost keys lands in each reader as a

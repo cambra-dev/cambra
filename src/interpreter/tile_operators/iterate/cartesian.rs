@@ -39,7 +39,8 @@ pub(super) fn subscribe(
     let leaf = wakeup.shared().clone();
     IterateExtent::add_all_source_handles(&op.extent, leaf.clone(), cx);
     let base = ProducerBase::new(IterateExtentProducer::alloc_id(), op.tiling(), &op.base, cx)
-        .sharing(gate);
+        .sharing(gate)
+        .leaf(leaf.clone());
     let mut holds = Vec::new();
     for (side, (_, extent)) in fields.iter().enumerate() {
         let mut sources = Vec::new();
