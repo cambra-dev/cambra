@@ -32,6 +32,21 @@ Source-domain availability and release are delegated to the source implementatio
 Runtime filtering uses `Filter` operators, not a populated `Restriction` handle;
 `iterate_extent` panics on `Extent::Restricted`.
 
+### Cartesian iteration
+
+`IterateExtentProducer` retains each dimension of a live record extent. Its output is the identity
+function over record keys. The extent's decided region is the conjunction of record fields or the
+tagged regions of a union, including keys that hold no value.
+
+A pull enumerates each dimension, excludes keys already held or released, and merges its new keys
+and decided predicate into a retained tile. Each output projection is cut from the Cartesian
+product of those keys, excluding released pairs.
+
+Releasing one pair retains either input key that a future partner can still need. A dimension's
+keys are reclaimed where the released region covers every other dimension without restriction.
+Each dimension registers separately with every source it reads. Source values under a compound
+dimension remain retained until that dimension is released whole.
+
 ### Tiling
 
 [`Tiling`](tiling/tiling_kind.rs) specifies the tiles a `TileOperator` produces.
