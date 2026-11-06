@@ -1009,6 +1009,7 @@ pub fn freshen_above(
                     ty: freshen_above(lim, &b.ty, target, cache),
                     ty_subst: freshen_subst_payloads(lim, &b.ty_subst, target, cache),
                     rendered: Default::default(),
+                    equation: b.equation,
                 })
                 .collect();
             let new_ups: Vec<_> = ups
@@ -1019,6 +1020,7 @@ pub fn freshen_above(
                     ty: freshen_above(lim, &b.ty, target, cache),
                     ty_subst: freshen_subst_payloads(lim, &b.ty_subst, target, cache),
                     rendered: Default::default(),
+                    equation: b.equation,
                 })
                 .collect();
             // Every instantiation gets its own copy of the kinding constraints. A
@@ -1102,6 +1104,7 @@ pub fn freshen_above(
                 ty: freshen_above(lim, &b.ty, target, cache),
                 ty_subst: freshen_subst_payloads(lim, &b.ty_subst, target, cache),
                 rendered: Default::default(),
+                equation: b.equation,
             };
             let new_lows: Vec<_> = lows.iter().map(&mut freshen_bound).collect();
             let new_ups: Vec<_> = ups

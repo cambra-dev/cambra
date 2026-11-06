@@ -3162,6 +3162,71 @@ else:
     );
 }
 
+/// The same arms **consumed**, unboxed. The consumer's domain receives each arm's domain as an
+/// equation, and pairing the two equations gives neither arm the other's filter, so the arms keep
+/// their own domains and the join reports them (`src/ccl/design/type-inference.md`, "Two
+/// equations meet without filtering").
+#[rstest]
+#[case::literal_sources(
+    indoc! {"
+        c = 1 > 0
+        sum([x for x in [1, 2, 3] if x > 1] if c else [x for x in [1, 2, 3] if x > 2])
+    "}
+)]
+#[case::one_source(
+    indoc! {"
+        xs = [1, 2, 3]
+        c = 1 > 0
+        sum([x for x in xs if x > 1] if c else [x for x in xs if x > 2])
+    "}
+)]
+#[case::let_bound_arms(
+    indoc! {"
+        xs = [1, 2, 3]
+        c = 1 > 0
+        a = [x for x in xs if x > 1]
+        b = [x for x in xs if x > 2]
+        sum(a if c else b)
+    "}
+)]
+#[case::in_a_definition(
+    indoc! {"
+        def f(c: Bool) => Int:
+            xs = [1, 2, 3]
+            sum([x for x in xs if x > 1] if c else [x for x in xs if x > 2])
+        f(1 > 0)
+    "}
+)]
+#[case::max(
+    indoc! {"
+        xs = [1, 2, 3]
+        c = 1 > 0
+        max([x for x in xs if x > 1] if c else [x for x in xs if x > 2])
+    "}
+)]
+fn consumed_arms_with_different_filters_have_no_join(#[case] code: &str) {
+    let rendered = format!("{:?}", infer_program_err(code));
+    assert!(
+        rendered.contains("collection domains have no common answer")
+            && rendered.contains("x > 1")
+            && rendered.contains("x > 2"),
+        "expected the domain-join rejection naming both filters, got:\n{rendered}"
+    );
+}
+
+/// Consumed arms under one filter are one domain, and join.
+#[test]
+fn consumed_arms_with_one_filter_join() {
+    assert_eq!(
+        infer_program(indoc! {"
+            xs = [1, 2, 3]
+            c = 1 > 0
+            sum([x for x in xs if x > 1] if c else [x for x in xs if x > 1])
+        "}),
+        int()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Defer / Feed / Define typing rules (pre-channelize trees)
 // ---------------------------------------------------------------------------
