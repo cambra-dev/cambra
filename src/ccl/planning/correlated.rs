@@ -690,11 +690,7 @@ fn emit_pair_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, String>
         return Ok(false);
     }
     let pair_ty = (**bare).clone();
-    let predicates: Vec<Rc<TypedExpr>> = filters
-        .as_slice()
-        .iter()
-        .map(|r| Rc::clone(&r.predicate))
-        .collect();
+    let predicates = applied_last_first(filters.as_slice(), &pair_ty);
     let old_domain = (**domain).clone();
     // The binder stays: a row whose keys depend on the pair reads it in the codomain, which
     // is stored closed against it.
@@ -731,6 +727,18 @@ fn emit_pair_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, String>
     Ok(true)
 }
 
+/// The predicates of `filters` on `base`, the one applied last first: each is composed in
+/// front of the chain built so far, which puts the first one applied at the chain's head. The
+/// order is [`application_order`](crate::ccl::application_order)'s, so a filter reading a value
+/// another narrowed, as a group read at a key is defined only at its group's keys, runs after it.
+fn applied_last_first(filters: &[crate::ccl::Refinement], base: &Type) -> Vec<Rc<TypedExpr>> {
+    let mut ordered: Vec<Rc<TypedExpr>> = crate::ccl::application_order(filters, base)
+        .map(|(r, _)| Rc::clone(&r.predicate))
+        .collect();
+    ordered.reverse();
+    ordered
+}
+
 /// Emit the filter a dependent pair's second component carries: `(𝑎 : 𝐴) × {𝐾 | 𝑝(𝑎, ·)}`, a
 /// correlated filter that `lambda_elim` keeps on the component. Each row ranges over `𝐾`'s keys,
 /// so the site runs over the product `(𝐴, 𝐾)`, or `(𝑎 : 𝐴) × 𝐾(𝑎)` where the keys read the row,
@@ -748,11 +756,11 @@ fn emit_component_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, St
     let a = first_name.clone().unwrap_or_else(|| Name::fresh("__x"));
     let second =
         crate::ccl::subst::open_pi_binder(&crate::ccl::subst::Mapping::Rename(a.clone()), second);
-    let filters: Vec<Rc<TypedExpr>> = second
+    let filters: Vec<crate::ccl::Refinement> = second
         .refinements()
         .iter()
         .filter(|r| !r.is_collection_membership())
-        .map(|r| Rc::clone(&r.predicate))
+        .cloned()
         .collect();
     if filters.is_empty()
         || second
@@ -820,7 +828,7 @@ fn emit_component_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, St
         unreachable!("matched a function")
     };
     let mut kept = Type::fun(product.clone(), dependent.clone());
-    for predicate in filters {
+    for predicate in applied_last_first(&filters, &keys) {
         // The element read first, then `𝑎`, which a nested refinement reads as `__elem^1.0`
         // (`src/ccl/design/type-inference.md`, "Lifting a filter onto the pair").
         let on_element =
