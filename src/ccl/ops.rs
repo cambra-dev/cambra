@@ -230,6 +230,16 @@ impl BinOpKind {
         }
     }
 
+    /// Returns the operator's CHL spelling: [`BinOpKind::sym`], except xor, which CHL writes
+    /// `^`, and string concatenation, which it writes `+`.
+    pub fn chl_sym(&self) -> &'static str {
+        match self {
+            Self::BoolLogic(LogicKind::Xor) => "^",
+            Self::Concat => "+",
+            _ => self.sym(),
+        }
+    }
+
     /// Returns the function-style name used when this operator is referenced as
     /// a built-in primitive (e.g. `"add"`, `"lt"`, `"concat"`).
     ///
