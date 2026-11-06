@@ -497,7 +497,9 @@ and once every argument is settled the pipeline removes each `unbox` of a plain 
 (`drop_plain_unboxes` in `src/ccl/context.rs`). The post-inference check, which knows the
 argument's sum, stamps `(𝑐 : Σ (σ : 𝐾). 𝐷[σ] ⤇ 𝑉) ⇒ 𝐷[σ ↦ σ₁(𝑐)] ⤇ 𝑉` (`ty::unbox_type`) and
 holds it to that rule (`check_unbox`), as it does `strength_over`'s. Applying either type
-discharges `𝑐` to the argument. A key typed `σ₁(𝑐)` then applies to `unbox(𝑐)` as to any
+discharges `𝑐` to the argument. A determined witness projects to its one candidate
+(`ty::projected_witness`), so where every witness is determined the result reads no `𝑐`, and the
+type binds none. A key typed `σ₁(𝑐)` then applies to `unbox(𝑐)` as to any
 collection over that domain. Two projections are equal when their positions are and their terms
 are equal by normal form.
 
