@@ -2015,8 +2015,8 @@ fn run_frontend(
     // The parse and lower phases accumulate errors before bailing: when the
     // parser recovers from a syntax error it still produces a partial AST, which
     // lowering can run on and report its own errors against, so the user sees
-    // everything at once. Inference and below assume a well-typed tree with no
-    // `Error` placeholders, so they are skipped when anything earlier failed.
+    // everything at once. A tree only lowering failed in is inferred too, and the
+    // compile stops after inference; past a parse or load error nothing is.
     let mut errors: Vec<CompileError> = Vec::new();
 
     // Keep the table across phase scopes and possible audits. Early returns drop
@@ -2052,17 +2052,24 @@ fn run_frontend(
     let checks = std::mem::take(&mut ctx.lowering_ctx().module_checks);
     let run_sites = std::mem::take(&mut ctx.lowering_ctx().run_sites);
     let resolved_names = ctx.lowering_ctx().take_resolved_names();
+    let stood_in = std::mem::take(&mut ctx.lowering_ctx().stood_in);
+    let contained = lower_result.errors.len() == stood_in;
     errors.extend(lower_result.errors.into_iter().map(CompileError::Lower));
     let Some(mut expr) = lower_result.value else {
         return Err(errors);
     };
 
-    // Anything wrong earlier in the pipeline means `expr` may contain
-    // `TypedExprNode::Error` placeholders; inference and below would
-    // panic on them via [`crate::unexpected_error_node!`]. Bail here.
-    if !errors.is_empty() {
+    // A statement lowering failed in is the `TypedExprNode::Error` placeholder, binding
+    // the names it introduces (`lower::stmts::stand_in_for_failed`), which the passes up
+    // to and including inference read as a statement that failed. A statement the parser
+    // could not read names nothing it binds, a module that did not load nothing it
+    // declares, and a lowering error no placeholder stands for, such as a run missing a
+    // type argument, can leave the tree inconsistent where it is read: past any of those,
+    // bail here.
+    if !contained || errors.iter().any(|e| !matches!(e, CompileError::Lower(_))) {
         return Err(errors);
     }
+    let lowering_errors = errors;
 
     // Fold anything this pass opened into the source/sink registry before the
     // per-compilation registries are drained, so the next version inherits it.
@@ -2098,6 +2105,9 @@ fn run_frontend(
 
     let mut panes = BTreeMap::new();
     if at_phase_output(Phase::Lower, &expr, stop, capture, &mut panes) {
+        if !lowering_errors.is_empty() {
+            return Err(lowering_errors);
+        }
         return Ok(Frontend {
             expr,
             panes,
@@ -2115,15 +2125,27 @@ fn run_frontend(
     // binders are distinct names. (Channelize now runs after inference; see below.)
     expr = uniquify::run(expr);
 
+    let blame = Blame::new(&lowering_projection, sources).with_runs(&run_sites);
+    // Past a lowering error, the passes run to inference and no further: what inference
+    // reports is added to lowering's.
+    if !lowering_errors.is_empty() {
+        let mut errors = lowering_errors;
+        let inferred = run_passes(
+            ctx,
+            expr,
+            checks,
+            Phase::Infer,
+            &[],
+            record,
+            blame,
+            &mut panes,
+            true,
+        );
+        errors.extend(inferred.err().unwrap_or_default());
+        return Err(merged_copies(errors));
+    }
     let expr = run_passes(
-        ctx,
-        expr,
-        checks,
-        stop,
-        capture,
-        record,
-        Blame::new(&lowering_projection, sources).with_runs(&run_sites),
-        &mut panes,
+        ctx, expr, checks, stop, capture, record, blame, &mut panes, false,
     )
     .map_err(merged_copies)?;
     Ok(Frontend {
@@ -2484,7 +2506,8 @@ pub fn check_program(
 /// Split out of [`run_frontend`] only so each phase boundary can `return` the
 /// tree; the two are one pipeline. Every phase ends with one
 /// [`at_phase_output`] call, which is both where a pane is taken and where a
-/// stop happens.
+/// stop happens. With `lowering_failed`, the tree holds statements lowering failed in,
+/// and the sequence stops once inference has run, before any check of its result.
 #[allow(clippy::too_many_arguments)]
 fn run_passes(
     ctx: &mut GlobalContext,
@@ -2495,6 +2518,7 @@ fn run_passes(
     record: bool,
     mut blame: Blame<'_>,
     panes: &mut BTreeMap<Phase, Expr>,
+    lowering_failed: bool,
 ) -> Result<Expr, Vec<CompileError>> {
     // Phase recording for the rows the pane-pair folds read. One scope per
     // phase, opened and closed in place: a phase scope is per-thread and
@@ -2632,6 +2656,10 @@ fn run_passes(
             })
             .collect();
         return Err(blame.infer(errors, &expr));
+    }
+    // The checks below read a tree that typed, which a statement lowering failed in is not.
+    if lowering_failed {
+        return Ok(expr);
     }
     // Inference mints predicates (`lit_singleton`) and clones a definition per
     // instantiation (`specialize_use`), so its output is checked before the pane

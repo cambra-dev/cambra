@@ -352,6 +352,17 @@ undeclared. That is a statement whose annotation fails on its own, `def f(x) => 
 with no `r` in scope. Each statement goes the two steps at most, and a run that recovers from no
 statement an earlier run did not, or recovers only from bare ones, is the last.
 
+Lowering stands the same placeholder in for a top-level statement it fails in
+(`stand_in_for_failed` in `lower/stmts.rs`): each name the statement introduces is a `let` of the
+placeholder, so the uses below it, which lowering lowered first, read a poison, and a statement that
+introduces nothing is an expression statement of it. A failed last statement leaves the placeholder
+as the block's value, which emission types as a fresh variable. When every lowering error is one
+such placeholder stands for, the passes run on to inference and stop after it, and what inference
+reports is added to lowering's; an undetermined type is not reported, as in a run that starts over.
+A parse or load error, or a lowering error no placeholder stands for, such as a `run` missing a type
+argument, stops the compile after lowering as before: the tree can be inconsistent where nothing
+marks it, and a statement the parser could not read names nothing it binds.
+
 Each later run's errors are added to the earlier runs', but for those saying the program does not
 determine a type (`InferError::is_undetermined`): an unresolved variable or tuple width, or a
 method call with no receiver type. The constraints a stand-in removed may be what determines such a

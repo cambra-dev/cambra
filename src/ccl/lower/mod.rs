@@ -678,6 +678,10 @@ pub struct LoweringContext {
     /// ([`ResolvedName`]). Behind a cell because the lookups that resolve them borrow
     /// the context immutably.
     resolved_names: RefCell<Vec<ResolvedName>>,
+    /// How many errors lowering reported at a statement it stood the placeholder in for
+    /// (`stmts::stand_in_for_failed`). The tree lowering returns is one inference can read
+    /// when these are all its errors; another error can leave it inconsistent elsewhere.
+    pub(crate) stood_in: usize,
     /// Every binder the module being lowered writes, with its span, for the rule
     /// that none takes a name that denotes a module ([`module_name_binders`]).
     pub(super) module_binders: Vec<(SmolStr, Span)>,
