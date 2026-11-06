@@ -763,6 +763,7 @@ pub(crate) fn reveal(root: &mut Expr) {
     let mut definiens = Definiens::new();
     let mut last = Vec::new();
     number(root, &loops, &mut definiens, &mut last);
+
     reveal_go(
         root,
         &mut Vec::new(),

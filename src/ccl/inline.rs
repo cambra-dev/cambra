@@ -1618,7 +1618,7 @@ fn beta_reduce(
 
 /// `body` with each `let` binding a name in `names` renamed fresh, so a term reading those
 /// names can be substituted into it without capture.
-fn refresh_lets_binding(mut body: Expr, names: &HashSet<Name>) -> Expr {
+fn refresh_lets_binding(mut body: Expr, names: &std::collections::BTreeSet<Name>) -> Expr {
     if names.is_empty() {
         return body;
     }

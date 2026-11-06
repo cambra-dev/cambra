@@ -2005,7 +2005,7 @@ fn channelize_cluster(
 fn assert_no_shadowed_captures(body: &Expr, channels: &HashMap<Name, Expr>) {
     // Scope-aware in types too: a node's type stands where the node does, so a dependent
     // type under a `let` names the `let`'s binder without capturing it.
-    let channel_fvs: HashSet<Name> = channels
+    let channel_fvs: std::collections::BTreeSet<Name> = channels
         .values()
         .flat_map(crate::ccl::ccl_utils::free_names)
         .collect();
