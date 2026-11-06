@@ -2255,9 +2255,10 @@ impl Typing for InferCtx {
         let kind = crate::ccl::ty::FunKind::fresh_var();
         let d = self.fresh_part(&kind);
         let c = self.fresh_part(&kind);
-        // Destructuring is kind-agnostic — see `Type::fun_eliminated`. Stamping
-        // the demand `Compute` would make "what is this function's domain?" reject
-        // every collection.
+        // Destructuring is kind-agnostic: `Data` and `Compute` are incomparable, so the
+        // demand's kind stays a fresh variable that `t`'s own kind pins through
+        // `require_sub`. Stamping the demand `Compute` would make "what is this function's
+        // domain?" reject every collection.
         let shape = Type::Fun {
             name: None,
             fun_kind: kind,
