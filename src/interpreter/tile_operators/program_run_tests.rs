@@ -3,7 +3,7 @@
 //! sink's own pipeline pulls its producer one package at a time. Each answer is checked against
 //! the program's pull-mode answer.
 
-use indoc::indoc;
+use indoc::{formatdoc, indoc};
 
 use crate::ccl::context::{GlobalContext, compile_program};
 use crate::ccl::load::LoadedProgram;
@@ -133,8 +133,27 @@ fn pulls_beneath_breakers(roots: &[crate::interpreter::sinks::ProducerSlot]) -> 
         .sum()
 }
 
-/// `source` answers through the dispatcher what it answers in pull mode, at morsels of one row,
-/// three, and one per guard, with a pipeline whose breaker's name starts with each of `kinds`.
+/// `source` answers the value rendered as `expected` through the dispatcher, at morsels of one
+/// row, three, and one per guard, with a pipeline whose breaker's name starts with each of `kinds`.
+fn answers(source: &str, expected: &str, kinds: &[&str]) {
+    for rows in [1, 3, usize::MAX] {
+        let (value, breakers) = dispatched(source, rows);
+        assert_eq!(
+            value.to_string(),
+            expected,
+            "{source} at morsels of {rows}: {breakers:?}"
+        );
+        for kind in kinds {
+            assert!(
+                breakers
+                    .iter()
+                    .any(|planned| planned.name.starts_with(kind)),
+                "{source} runs a {kind} pipeline: {breakers:?}"
+            );
+        }
+    }
+}
+
 fn answers_as_pull_mode_does(source: &str, kinds: &[&str]) {
     let expected = pulled(source);
     for rows in [1, 3, usize::MAX] {
@@ -995,8 +1014,8 @@ fn a_store_per_row_of_a_comprehension(
     assert_eq!(value.to_string(), expected, "{source} at morsels of {rows}");
 }
 
-/// A transaction store is the breaker of a pipeline of its own; its input is its one writer's
-/// source, cut into morsels of items, and the sink reads the store once it is terminal.
+/// A transaction store of one writer is the breaker of a pipeline of its own; its input is the
+/// writer's source, cut into morsels of items, and the sink reads the store once it is terminal.
 #[rstest_log::rstest]
 #[case::a_counter(indoc! {"
     out = test_sink()
@@ -1069,26 +1088,287 @@ fn a_transaction_seeded_from_a_pipeline(#[case] source: &str) {
     answers_as_pull_mode_does(source, &["Commit", "SinkBreaker"]);
 }
 
-/// A store of two writers has no consuming mode: a morsel names positions of one source.
-#[test]
-#[should_panic(expected = "a transaction store of 2 writers has no consuming mode")]
-fn a_transaction_store_of_two_writers_is_refused() {
-    dispatched(
-        indoc! {"
-            out = test_sink()
-            pool: Mut(Int, Txn) := 100
-            for r in [60]:
-                with begin():
-                    if pool >= r:
-                        pool := pool - r
-            for r in [60]:
-                with begin():
-                    if pool >= r:
-                        pool := pool - r
-            out << await_final(pool)
-        "},
-        1,
+/// A transaction store of several writers is the breaker of one pipeline per writer, each
+/// consuming its writer's source, and answers what pull mode answers.
+#[rstest_log::rstest]
+// Both writers contend for one key: the first commits and the second denies.
+#[case::contending(indoc! {"
+    out = test_sink()
+    pool: Mut(Int, Txn) := 100
+    for r in [60]:
+        with begin():
+            if pool >= r:
+                pool := pool - r
+    for r in [60]:
+        with begin():
+            if pool >= r:
+                pool := pool - r
+    out << await_final(pool)
+"}, "40")]
+// Writer 0 denies its second item at the pool its first item leaves, 20, which it decides
+// before its first item commits: the deny stands only once decided again at that pool.
+#[case::a_deny_decided_ahead_of_a_commit(indoc! {"
+    out = test_sink()
+    pool: Mut(Int, Txn) := 10
+    for r in [-10, 15]:
+        with begin():
+            if pool >= r:
+                pool := pool - r
+    for r in [0]:
+        with begin():
+            pool := pool - r
+    out << await_final(pool)
+"}, "5")]
+// Three writers contend for one key.
+#[case::three_writers(indoc! {"
+    out = test_sink()
+    pool: Mut(Int, Txn) := 100
+    for r in [30, 30]:
+        with begin():
+            pool := pool - r
+    for r in [20]:
+        with begin():
+            pool := pool - r
+    for r in [r for r in [40, 5] if r > 10]:
+        with begin():
+            pool := pool - r
+    out << await_final(pool)
+"}, "-20")]
+// Writer 0 reads its items from a let-bound list, whose memo is a pipeline its store's pipeline
+// reads whole.
+#[case::a_writer_over_a_pipeline(indoc! {"
+    out = test_sink()
+    rs = [10, 20]
+    pool: Mut(Int, Txn) := 100
+    for r in rs:
+        with begin():
+            pool := pool - r
+    for r in [5]:
+        with begin():
+            pool := pool - r
+    out << await_final(pool)
+"}, "65")]
+// Each writer writes a key of its own.
+#[case::disjoint(indoc! {"
+    out = test_sink()
+    a: Mut(Int, Txn) := 0
+    b: Mut(Int, Txn) := 0
+    for r in [1, 2, 3]:
+        with begin():
+            a := a + r
+    for r in [10, 20]:
+        with begin():
+            b := b + r
+    out << await_final(a) + await_final(b)
+"}, "36")]
+#[case::seeded_from_a_pipeline(indoc! {"
+    out = test_sink()
+    pool: Mut(Int, Txn) := sum([y * 2 for y in [1, 2]]) + 100
+    for r in [60]:
+        with begin():
+            pool := pool - r
+    for r in [50]:
+        with begin():
+            pool := pool - r
+    out << await_final(pool)
+"}, "-4")]
+#[case::seeded_from_a_sum(indoc! {"
+    out = test_sink()
+    ys = [1, 2]
+    pool: Mut(Int, Txn) := sum(ys)
+    for r in [1]:
+        with begin():
+            pool := pool - r
+    for r in [1]:
+        with begin():
+            pool := pool - r
+    out << await_final(pool)
+"}, "1")]
+#[case::a_writer_over_a_concatenation(indoc! {"
+    out = test_sink()
+    pool: Mut(Int, Txn) := 100
+    for r in [1, 2] ++ [3]:
+        with begin():
+            pool := pool - r
+    for r in [5]:
+        with begin():
+            pool := pool - r
+    out << await_final(pool)
+"}, "89")]
+#[case::two_writers_over_concatenations(indoc! {"
+    out = test_sink()
+    pool: Mut(Int, Txn) := 100
+    for r in [1] ++ [2, 3]:
+        with begin():
+            pool := pool - r
+    for r in [10] ++ [20]:
+        with begin():
+            pool := pool - r
+    out << await_final(pool)
+"}, "64")]
+fn a_transaction_store_of_several_writers(#[case] source: &str, #[case] expected: &str) {
+    answers(source, expected, &["Commit", "SinkBreaker"]);
+    let (_, planned) = dispatched(source, 1);
+    let writers = source.matches("with begin()").count();
+    assert_eq!(
+        planned
+            .iter()
+            .filter(|plan| plan.name.starts_with("Commit"))
+            .count(),
+        writers,
+        "the store is the breaker of one pipeline per writer: {planned:?}"
     );
+}
+
+/// Final balances admitted by serially attempting every withdrawal in any order.
+fn serial_withdrawal_balances(
+    balance: i64,
+    remaining: &mut Vec<i64>,
+    answers: &mut std::collections::BTreeSet<i64>,
+) {
+    if remaining.is_empty() {
+        answers.insert(balance);
+        return;
+    }
+    for at in 0..remaining.len() {
+        let amount = remaining.remove(at);
+        serial_withdrawal_balances(
+            if amount <= balance {
+                balance - amount
+            } else {
+                balance
+            },
+            remaining,
+            answers,
+        );
+        remaining.insert(at, amount);
+    }
+}
+
+/// Conflicting writers serialize without comparing their source domains. The result is one
+/// admitted by a serial execution of all withdrawals, with no overdraft or lost transaction.
+#[rstest_log::rstest]
+#[case::a_uint_writer_beside_a_concatenation("", "[60] ++ [10]", "[50]")]
+#[case::a_concatenation_beside_a_uint_writer("", "[50]", "[60] ++ [10]")]
+#[case::two_concatenations("", "[60] ++ [10]", "[50] ++ [5]")]
+#[case::uint_items_beside_a_concatenation("", "[60] ++ [10]", "[50, 30]")]
+#[case::concatenations_of_different_depth("xs = [60] ++ [10]", "xs ++ [5]", "[50] ++ [20]")]
+#[case::three_sides_beside_two("", "[60] ++ [10] ++ [5]", "[50] ++ [20]")]
+#[case::record_beside_uint("", "[r + y for r in [60, 10] for y in [0]]", "[50]")]
+#[case::uint_beside_record("", "[50]", "[r + y for r in [60, 10] for y in [0]]")]
+#[case::two_records(
+    "",
+    "[r + y for r in [60, 10] for y in [0]]",
+    "[r + y for r in [50, 5] for y in [0]]"
+)]
+#[case::records_of_different_widths(
+    "",
+    "[r + y for r in [60, 10] for y in [0]]",
+    "[r + y for r in [50, 5] for y in [0, 0]]"
+)]
+#[case::record_beside_tagged("", "[r + y for r in [60, 10] for y in [0]]", "[50] ++ [5]")]
+#[case::records_of_different_arities(
+    "",
+    "[r + y for r in [60, 10] for y in [0]]",
+    "[r + y + z for r in [50, 5] for y in [0] for z in [0, 0]]"
+)]
+fn several_writers_serialize_ready_proposals(
+    #[case] prelude: &str,
+    #[case] first: &str,
+    #[case] second: &str,
+    #[values(1, 2, usize::MAX)] rows: usize,
+) {
+    let source = formatdoc! {"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 100
+        {prelude}
+        for r in {first}:
+            with begin():
+                if pool >= r:
+                    pool := pool - r
+        for r in {second}:
+            with begin():
+                if pool >= r:
+                    pool := pool - r
+        out << await_final(pool)
+    "};
+    let amounts = |items: &str| {
+        let pure = formatdoc! {r#"
+            out = test_sink()
+            {prelude}
+            out << {items}
+        "#};
+        dispatched(&pure, rows)
+            .0
+            .as_function()
+            .iter()
+            .map(|binding| {
+                let Value::Int(amount) = binding.output else {
+                    panic!("integer withdrawal")
+                };
+                amount
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut withdrawals = amounts(first);
+    withdrawals.extend(amounts(second));
+    let mut possible = std::collections::BTreeSet::new();
+    serial_withdrawal_balances(100, &mut withdrawals, &mut possible);
+    let actual = dispatched(&source, rows).0;
+    let Value::Int(balance) = actual else {
+        panic!("integer balance: {actual}")
+    };
+    assert!(
+        possible.contains(&balance),
+        "{source} at morsels of {rows}: {balance}, admitted {possible:?}"
+    );
+}
+
+/// Writers of different lengths commit every withdrawal once in one serial history.
+#[rstest_log::rstest]
+fn two_ready_writers_over_sources_of_different_lengths(#[values(1, 2, usize::MAX)] rows: usize) {
+    let source = indoc! {"
+        a = test_sink()
+        b = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for r in [10, 20, 30]:
+            with begin():
+                pool := pool - r
+                a << pool
+        for r in [1]:
+            with begin():
+                pool := pool - r
+                b << pool
+    "};
+    let mut ctx = GlobalContext::default();
+    ctx.defer_sink_pulls();
+    let sinks = [ctx.register_test_sink("a"), ctx.register_test_sink("b")];
+    let loaded = LoadedProgram::test(source);
+    let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
+    let _operators = ctx.take_operator_map();
+    run_program(&mut program, rows).unwrap_or_else(|refused| panic!("{refused}"));
+    assert!(program.done.try_recv().is_ok(), "both sinks are done");
+    let written: Vec<Vec<(u64, i64)>> = sinks
+        .iter()
+        .map(|sink| keyed_ints(&sink.value().expect("the sink holds a value")))
+        .collect();
+    let mut commits: Vec<_> = written
+        .iter()
+        .enumerate()
+        .flat_map(|(site, values)| values.iter().map(move |&(tick, pool)| (tick, site, pool)))
+        .collect();
+    commits.sort();
+    let mut amounts = [Vec::new(), Vec::new()];
+    let mut previous = 100;
+    for (at, &(tick, site, pool)) in commits.iter().enumerate() {
+        assert_eq!(tick, at as u64 + 1);
+        amounts[site].push(previous - pool);
+        previous = pool;
+    }
+    amounts[0].sort();
+    assert_eq!(amounts, [vec![10, 20, 30], vec![1]]);
+    assert_eq!(previous, 39);
 }
 
 /// A loop over a live source runs in a scope whose pipeline the run notifies of the positions each
@@ -1275,6 +1555,152 @@ fn a_transaction_over_a_live_source(
             .iter()
             .any(|plan| plan.live && plan.name.starts_with("Commit")),
         "the transaction store is the live source pipeline: {planned:?}"
+    );
+}
+
+/// Two writers of one transaction store over one live source: each writer's pipeline is a live
+/// source pipeline the run notifies of the items each delivery adds. Neither writer denies, so the
+/// store's final value is the one pull mode answers whatever the order of the commits.
+#[rstest_log::rstest]
+fn two_writers_over_a_live_source(
+    #[values(two_batches(), one_key_batches(10), with_an_empty_last_delivery())] batches: Vec<
+        Batch,
+    >,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let source = indoc! {"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 1000
+        for r in source1():
+            with begin():
+                pool := pool - r
+        for r in source1():
+            with begin():
+                pool := pool - 2 * r
+        out << await_final(pool)
+    "};
+    let expected = pulled_live(source, batches.clone());
+    let (value, planned) = dispatched_live(source, rows, batches);
+    assert_eq!(value, expected);
+    assert_eq!(
+        planned
+            .iter()
+            .filter(|plan| plan.live && plan.name.starts_with("Commit"))
+            .count(),
+        2,
+        "each writer's pipeline is a live source pipeline: {planned:?}"
+    );
+}
+
+/// Check commit ticks, serial store reads and the multiset of each writer's withdrawals.
+fn assert_serial_withdrawals(written: &Value, initial: i64, expected: &[Vec<i64>]) -> i64 {
+    let mut fed: Vec<_> = written
+        .as_function()
+        .iter()
+        .map(|binding| {
+            let (Value::Union { tag, inner }, Value::Int(pool)) = (&binding.input, &binding.output)
+            else {
+                panic!("tagged commit feed: {binding:?}")
+            };
+            let Value::UInt(tick) = **inner else {
+                panic!("commit tick")
+            };
+            (tick, tag.to_string().parse::<usize>().unwrap(), *pool)
+        })
+        .collect();
+    fed.sort();
+    let mut amounts = vec![Vec::new(); expected.len()];
+    let mut previous = initial;
+    for (at, &(tick, site, pool)) in fed.iter().enumerate() {
+        assert_eq!(tick, at as u64 + 1);
+        amounts[site].push(previous - pool);
+        previous = pool;
+    }
+    for (mut actual, mut expected) in amounts.into_iter().zip(expected.iter().cloned()) {
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected, "{written:?}");
+    }
+    previous
+}
+
+/// Both writers commit every arrived product row before the next source delivery. Commit
+/// ticks form one serial history; each writer withdraws each delivered amount exactly once.
+#[rstest_log::rstest]
+#[case::uint("source1()", 1, 1)]
+fn live_writers_commit_ready_product_rows(
+    #[case] items: &str,
+    #[case] multiplicity: usize,
+    #[case] minimum: i64,
+    #[values(two_batches(), one_key_batches(5))] batches: Vec<Batch>,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let source = formatdoc! {"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 1000
+        for r in {items}:
+            with begin():
+                pool := pool - r
+                out << pool
+        for r in {items}:
+            with begin():
+                pool := pool - r
+                out << pool
+    "};
+    let mut delivered = 0;
+    let partial_counts: Vec<_> = batches
+        .iter()
+        .map(|(entries, _)| {
+            delivered += entries
+                .iter()
+                .filter(|(_, value)| matches!(value, Value::Int(amount) if *amount >= minimum))
+                .count();
+            delivered * multiplicity * 2
+        })
+        .collect();
+    let mut idle = 0;
+    let (written, _) = dispatched_live_observed(&source, rows, batches, |sink| {
+        let partial = sink.written_so_far();
+        let count = match &partial {
+            Ok(value) => value.as_function().len(),
+            Err(crate::interpreter::test_sink::SinkReadError::NothingWritten) => 0,
+            Err(error) => panic!("valid partial feed: {error:?}"),
+        };
+        assert_eq!(count, partial_counts[idle], "delivery {idle}: {partial:?}");
+        idle += 1;
+    });
+    let expected: Vec<_> = (minimum..=5)
+        .flat_map(|r| std::iter::repeat_n(r, multiplicity))
+        .collect();
+    let final_balance = 1000 - expected.iter().sum::<i64>() * 2;
+    assert_eq!(
+        assert_serial_withdrawals(&written, 1000, &[expected.clone(), expected]),
+        final_balance
+    );
+}
+
+/// A concatenation writer progresses beside a live writer without comparing their keys.
+#[rstest_log::rstest]
+fn a_writer_over_a_concatenation_beside_one_over_a_live_source(
+    #[values(two_batches(), one_key_batches(5))] batches: Vec<Batch>,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let source = indoc! {"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for r in source1():
+            with begin():
+                pool := pool - r
+                out << pool
+        for r in [1] ++ [2]:
+            with begin():
+                pool := pool - r
+                out << pool
+    "};
+    let (written, _) = dispatched_live_written(source, rows, batches);
+    assert_eq!(
+        assert_serial_withdrawals(&written, 100, &[vec![1, 2, 3, 4, 5], vec![1, 2]]),
+        82
     );
 }
 

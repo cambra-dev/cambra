@@ -3768,11 +3768,13 @@ pub(super) fn emit_compose<C: Typing>(
     })
 }
 
-/// The body domain for a mutation loop accumulator step and a transaction
-/// writer: `Tuple(slot_0, …, slot_{n-1}, item)` — the read-set snapshot slots
-/// followed by the iteration item, matching the body lambda's `let s_i = p.i …
-/// let item = p.n` destructuring.
-fn accumulator_body_domain(slots: impl IntoIterator<Item = Type>, item: Type) -> Type {
+/// The body domain of a transaction writer: `Tuple(slot_0, …, slot_{n-1}, item)` — the
+/// read-set snapshot slots followed by the iteration item, matching the body lambda's
+/// `let s_i = p.i … let item = p.n` destructuring. The drive's row also carries the item's source
+/// position after the item, for the writer to copy into its proposal
+/// (`src/interpreter/design-operators.md`, "Ready transaction decisions"). The body reads no position,
+/// and a tuple's width is part of its type, so the domain lists only what the body reads.
+fn transaction_body_domain(slots: impl IntoIterator<Item = Type>, item: Type) -> Type {
     let mut dom: BTreeMap<FieldKey, Type> = BTreeMap::new();
     for (i, slot) in slots.into_iter().enumerate() {
         dom.insert(FieldKey::Index(i), slot);
@@ -3943,7 +3945,7 @@ fn emit_transact_writer<C: Typing>(
         }
         None => s_ty,
     };
-    let (_d, item) = ctx.as_function(&s_ty, &|| "transaction source".to_string())?;
+    let (_positions, item) = ctx.as_function(&s_ty, &|| "transaction source".to_string())?;
 
     let mut snaps: Vec<Type> = Vec::with_capacity(writer.read_keys.len());
     for rk in &writer.read_keys {
@@ -3954,7 +3956,7 @@ fn emit_transact_writer<C: Typing>(
         })?;
         snaps.push(snap);
     }
-    let body_dom = accumulator_body_domain(snaps, item);
+    let body_dom = transaction_body_domain(snaps, item);
 
     // One fresh `new_j` per write key, bounded above by `write_keys[j]`'s value
     // type. They become the `writes: {k_j: new_j…}` field of the decision

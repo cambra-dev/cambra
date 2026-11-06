@@ -847,19 +847,22 @@ later.
 
 ## Pipeline breakers
 
-A pipeline breaker is the end of a pipeline: it consumes the pipeline's work packages into state
-of its own. `Breaker` (`src/interpreter/tile_operators/mod.rs`) is what the dispatcher drives:
-`consume_impl`, `input_tiling`, `input_released`, `as_producer` and `finish`. A breaker that other
-pipelines read is also a producer, which answers pulls from that state: `BreakingProducer`, a
-subtrait of `TileProducer` and `Breaker`, adds `held`, `final_guard`, `morsels`,
-`pushes_while_consuming` and `offer_impl`. Its `as_producer` answers itself, and the driver's push
-after each consume and `Breaker`'s default `finish` push through that producer. A sink's breaker is
-no producer, so its `as_producer` answers `None`: no pipeline reads it, and it holds, offers and
-pushes nothing.
+A pipeline breaker is the end of a pipeline: it consumes the pipeline's work packages into state of
+its own. `Breaker` (`src/interpreter/tile_operators/mod.rs`) is what the dispatcher drives:
+`consume_impl`, `input_tiling`, `input_released`, `inputs`, `as_producer` and `finish`. A breaker
+consumes one input per pipeline it is the breaker of: `inputs` answers how many, one but for a
+transaction store, which consumes one per writer. `consume_impl`, `input_tiling` and
+`input_released` name the input (`InputId`). A breaker that other pipelines read is also a producer,
+which answers pulls from that state: `BreakingProducer`, a subtrait of `TileProducer` and `Breaker`,
+adds `held`, `final_guard`, `morsels`, `pushes_while_consuming`, `offer_impl` and `entry_placement`,
+the placement of the entry at an input, which a planner sets to that input's pipeline. Its
+`as_producer` answers itself, and the driver's push after each consume and `Breaker`'s default
+`finish` push through that producer. A sink's breaker is no producer, so its `as_producer` answers
+`None`: no pipeline reads it, and it holds, offers and pushes nothing.
 
 | Call | What it does |
 |---|---|
-| `consume_impl(input, guard)` | Pulls input `input` at `guard`, a guard of the tiling that input answers, merges the answer into the breaker's state, and releases the input at the guard the answer states once it has taken delivery of the answer. The caller handles no tile. |
+| `consume_impl(input, guard)` | Pulls the input `input` at `guard`, a guard of the tiling the input answers, merges the answer into the breaker's state, and releases the input at the guard the answer states once it has taken delivery of the answer. The caller handles no tile. |
 | `enter_consuming_mode()` | Puts the breaker in consuming mode for a dispatched run, before its first `consume_impl`; nothing else changes the mode. |
 | `as_producer()` | The breaker as a `BreakingProducer`, or `None` for a breaker that is no producer. |
 | `finish(pushes)` | Finishes once the pipeline has consumed every package and nothing more can be queued for it. The default pushes, through `as_producer`, what the breaker holds and no push named before, one morsel of its outermost keys per work package, through its consumer to the pipelines that read it; a breaker that is no producer pushes nothing. This is the last call to the breaker. An empty guard pushes nothing. It wakes no one. |
@@ -970,27 +973,29 @@ final from then, and stays until the consumer releases the output, which is all 
 
 ### A store as a breaker
 
-An induction store (`InductionStoreProducer`) and a transaction store of one writer
-(`CommitProducer`, `commit_operator.rs`) are pipeline breakers. A transaction's whole cycle, the
-store, its writer and its drive, is one pipeline, and the operators inside it stay in pull mode. An
-induction loop runs in rounds ([A loop in rounds](design-dispatcher.md#a-loop-in-rounds)), and its store steps once per
-round; a loop nested in it runs as a scope inside that loop's scope, a row of its store per round. A
-cyclic `FanOut` holds its store in a cell of its own (`Inner::Store`, `tile_operators/fanout.rs`)
-and hands the store a `Cycle` when it subscribes it (`TileProducer::enter_cycle`). The call that
-steps the store holds the store's cell, so the recurrence's pull of the store finds the cell
-borrowed and is answered from the snapshot the store published after its previous step. The fan-out
-forwards the intersection of its live slots' release guards to the store. A release that finds the
-store borrowed joins its pending release guard. A mutable store borrow applies that guard after its
-operation returns, before ending the borrow, including a direct dispatcher operation or a borrow
-mapped to concrete induction state. Read borrows defer settlement until the last read borrow ends.
-Settlement drains releases queued by release callbacks before returning.
+A transaction store (`CommitProducer`, `commit_operator.rs`) is the breaker of one pipeline per
+writer (`Breaker::inputs`): a writer's cycle, the store, the writer and its drive, is the pipeline
+of the writer's input, and the operators inside it stay in pull mode. An induction store
+(`InductionStoreProducer`) implements `Breaker`, but in a run its loop's scope (`LoopScope`) is the
+breaker: the loop runs in rounds ([A loop in rounds](design-dispatcher.md#a-loop-in-rounds)), and its store steps once
+per round; a loop nested in it runs as a scope inside that loop's scope, a row of its store per
+round. A cyclic `FanOut` holds its store in a cell of its own (`Inner::Store`,
+`tile_operators/fanout.rs`) and hands the store a `Cycle` when it subscribes it
+(`TileProducer::enter_cycle`). The call that steps the store holds the store's cell, so the
+recurrence's pull of the store finds the cell borrowed and is answered from the snapshot the store
+published after its previous step. The fan-out forwards the intersection of its live slots' release
+guards to the store. A release that finds the store borrowed joins its pending release guard. A
+mutable store borrow applies that guard after its operation returns, before ending the borrow,
+including a direct dispatcher operation or a borrow mapped to concrete induction state. Read borrows
+defer settlement until the last read borrow ends. Settlement drains releases queued by release
+callbacks before returning.
 
 A store's input is what a morsel names: an induction store's body, its decision stream, whose
-positions are the loop's, and a transaction store's writer's source, whose positions are its items.
-`consume_impl` steps the store until its input has released the morsel. Before each step the store
-has the operators inside its cycle read again (`read_cycle_again`, `commit_operator.rs`): every
-producer in its chain on a path to a recurrence slot of its fan-out reads that input again at its
-next pull (`TileProducer::read_again`, through `read_again_toward`). A `Memo` there reads every
+positions are the loop's, and a transaction store's input 𝑘, writer 𝑘's source, whose positions are
+its items. `consume_impl` steps the store until the input has released the morsel. Before each step
+the store has the operators inside its cycle read again (`read_cycle_again`, `commit_operator.rs`):
+every producer in its chain on a path to a recurrence slot of its fan-out reads that input again at
+its next pull (`TileProducer::read_again`, through `read_again_toward`). A `Memo` there reads every
 region again, as after a notification of `Everything`, and a drive reads its source again where that
 input is on such a path. The store then clears its gate, as a pull does
 (`ProducerBase::clear_gate`): no pull of the store clears it while the store steps itself, since a
@@ -1033,24 +1038,84 @@ and a transaction drive releases its source through what it has read past, so ei
 position without waiting for a later one to be decided. The dispatcher's finish checks that a
 store's input released every morsel the pipeline consumed.
 
-`run_program` plans a store's pipeline where it reaches a reader slot of the store's fan-out
-(`TileProducer::store_read`). The pipeline reads the pipelines beneath the store's cycle: a subtree
-that reaches no recurrence slot of the store (`reaches_recurrence`) is planned as any chain is, and
-inside the cycle a breaker is no pipeline. A store's pipeline is ordered, since a store decides its
-positions in order. A store that steps itself runs in the run's dispatcher, and one that reads
-pipelines reads its input whole. A store reads its seed by pull when it opens, so its pipeline reads
-the seed's pipelines, and a push from one stops in front of the store (`subscribe_pulled`); an
-induction store runs in a loop's scope instead ([A loop in rounds](design-dispatcher.md#a-loop-in-rounds)). The planner
-refuses:
+`run_program` plans a transaction store's pipelines where it reaches a reader slot of the store's
+fan-out (`TileProducer::store_read`), one per input, numbered one after another. The pipeline of an
+input reads the pipelines beneath the store's cycle under that input: a subtree that reaches no
+recurrence slot of the store (`reaches_recurrence`) is planned as any chain is, and inside the cycle
+a breaker is no pipeline. A store's pipelines are ordered, since a store decides its positions in
+order. A store that steps itself runs in the run's dispatcher, and the pipeline of an input that
+reads pipelines reads the input whole. A store reads its seed by pull when it opens, at the first
+consume of any input, so every input's pipeline reads the seed's pipelines, and a push from one
+stops in front of the store (`subscribe_pulled`); an induction store runs in a loop's scope instead
+([A loop in rounds](design-dispatcher.md#a-loop-in-rounds)). A reader of a store reads every pipeline of it, so its
+queue closes once the last of them has finished. The pipelines of one store
+share one record of what the store has pushed (`Dispatcher::share_pushes`), so no tick is pushed
+twice, and one record of what it has decided at each reader. `plan_edges` plans their edges into one
+reader as one. The planner refuses:
 
 - outside a loop's scope, a nested transaction store, one per enclosing row, whose frontier a flat
   morsel does not name;
-- a store inside the cycle of a store that steps itself, which no round reaches;
-- a transaction store of several writers, since a morsel names positions of one source.
+- a store inside the cycle of a store that steps itself, which no round reaches.
+
+The source positions of different transaction writers need no common ordering.
 
 The planner asserts that a transaction store has a writer: its keys are the footprints of its
 `with begin():` blocks, each one of its writers
 ([How many commit stores a program has](../ccl/design/mutability.md#how-many-commit-stores-a-program-has)).
+
+#### Ready transaction decisions
+
+A consuming transaction store attempts ready decisions without comparing different writers' source
+positions. Each writer has a pipeline whose packages make its source rows ready. A step of that
+pipeline pulls its writer and takes the decisions it brings (`CommitProducer::take`), then attempts
+held decisions in rotating writer order (`CommitProducer::commit_ready`). An idle writer holds no
+other writer back. The dispatcher orders packages within each writer's pipeline; product deliveries
+need not arrive in source-key order. Commit ticks, allocated only for successful proposals, define
+the serialization. Pull mode rotates its initial writer on each drain. Neither mode guarantees a
+particular winner among independent transactions
+([8.5 Ordering and concurrency](../../docs/chl-spec.md#85-ordering-and-concurrency)).
+
+The store, its writers and their drives speak through tiles. Each body-input row carries its item's
+source position after the read slots and the item (`item_position_field`, `_{r+1}`). The body reads
+no position (`transaction_body_domain`, `src/ccl/infer/emit.rs`). Its writer copies the position
+into the proposal `{snap, reads, writes, pos}` (`proposal_stream_tiling`). A source position
+identifies an item to retry; it is not a priority among writers.
+
+A drive and its writer each output `{rows, decided}` (`transact_stream_tiling`). `decided` is a
+collection holding no key, whose predicate states the exact acknowledged or decided-absent source
+region (`decided_tile`). The statement grows and becomes universal once the source is exhausted.
+Acknowledging a product key releases that key alone; a later delivery may contain a smaller key.
+The drive caches source rows between notifications, removes an acknowledged row by key, and releases
+decided-absent positions when it reads a new source tile. An induction drive retains its prefix
+ordering instead.
+
+From its first step a consuming store states `WriterTakes` for each writer in the store tile's
+`writer_takes`: `settled`, the exact region whose decisions committed or stood, and `again`, the
+unsettled items to re-evaluate. Joining statements unions settled regions and retry items, excluding
+items already settled. The drive and writer read these statements through the recurrence.
+
+Taking a decision releases its proposal step to the writer, which acknowledges its attempt. The
+drive releases the source item and keeps its own copy until `settled` includes it. A deny or grant
+that writes nothing is handed to the consuming store as an empty-write proposal; the store holds
+its snapshot as `Held::Local`. It stands only if the commit frontier has not moved. A writing
+proposal commits only after read-set validation. A stale decision is named in `again`; the store
+publishes its current tile, pulls the writer and takes the fresh decision
+(`CommitProducer::drive_again`). The drive retries from its kept item before choosing another
+source item. A missing retry panics. Retried decisions resolve during the arbitration pass, whose
+end asserts that no retry remains. A store in pull mode and an induction store state no takes.
+
+The planner places the transaction drive's source entry in its writer's store pipeline. Source
+pushes therefore reach that entry in source keys, before the drive converts them to attempt
+counters.
+
+The store reclaims its changelog where every fan-out slot has released it
+(`CommitProducer::release_impl`), bounded strictly below the oldest held proposal's snapshot. The
+engine can still validate that proposal's reads at its snapshot. The last input finish takes and
+attempts all remaining decisions until every writer is terminal (`CommitProducer::settle_ready`).
+
+A dispatched run runs no program that another takes over
+([Running a compiled program](design-dispatcher.md#running-a-compiled-program)). A resuming drive under a store that
+states `writer_takes` panics: a source release can include an item taken but not yet committed.
 
 The dispatcher is described in [Pipeline dispatch](design-dispatcher.md).
 
@@ -1300,23 +1365,25 @@ evaluate the operation, so an empty division by a constant zero does not fault.
 The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md#transact--the-domain-parameterized-recurrence-carrier) store: concurrent writers propose transactions against a shared multi-key mutable variable, and the operator serializes them onto one monotonic commit-time clock with optimistic-concurrency validation (allocate-on-commit + backward validation + serialize-and-retry). Op-conversion's `build_commit_store` assembles it. The design splits into a **pure engine** and its **tile adapters**:
 
 - **`CommitEngine`** (tile-free, unit-tested) — the serialization logic. The store is `Position ⇀ {key: value}`, held as one changelog per key. `attempt(proposal)` allocates the next tick and commits iff no read key was overwritten after the proposal's snapshot (else `Stale`, and the writer retries at the advanced watermark). `read_as_of(t, key)` folds the key's changelog.
-- **`CommitOperator` / `CommitProducer`** — the store's tile adapter. It owns the engine, publishes its history as one [`Tile::Store`] output, drains each writer's new proposals in writer-index order (the serialization order, rotated per pull so no writer is starved), and acknowledges a commit by `release`ing that step back to its writer. Writer inputs are wired *after* construction, so the operator sits inside a cyclic `FanOut` and every writer reads the store back before proposing — the cyclic-`FanOut` feedback idiom, one writer per key.
+- **`CommitOperator` / `CommitProducer`** — the store's tile adapter. It owns the engine, publishes its history as one [`Tile::Store`] output, drains each writer's new proposals in writer-index order in pull mode (the serialization order, rotated per pull so no writer is starved), and acknowledges a commit by `release`ing that step back to its writer. A consuming store takes each decision ahead of its commit and arbitrates ready decisions instead ([Ready transaction decisions](#ready-transaction-decisions)), and each proposal carries its item's source position (`pos`) for it. Writer inputs are wired *after* construction, so the operator sits inside a cyclic `FanOut` and every writer reads the store back before proposing — the cyclic-`FanOut` feedback idiom, one writer per key.
 - **`TransactDriver` / `TransactDriverProducer`** — one per `with begin():` site: it owns the
   transaction source, folds `(frontier, snapshot)` for the site's read keys out of the cyclic store,
   and produces the decision body's `(snap…, item)` input. A row is emitted once per `(item,
   frontier)`, so a retry at a moved frontier is a fresh position and a re-pull at an unchanged one
   emits nothing. It closes (terminal) once every transaction has been attempted and acked over a
   source that can deliver no more — the writer's completeness signal, since the writer owns no
-  source of its own. It releases the source through each finished item on its ack, and through each
-  filtered row once it reads past it, since no ack comes for a row nothing attempts. It decodes the
-  source after a notification or a source delivery consumed by its store, and answers other pulls
-  from the last decode (`DecodedSource`, with each position a path of one component). A consuming
-  delivery invalidates the source once before its attempts; retries do not by themselves discard the
-  decoded source. It also releases the store below the decided frontier, through the last change
-  strictly below it, so the commit store can reclaim its changelog.
-- **`TransactWriter` / `TransactWriterProducer`** — one *fused* writer per site (fused, not fanned: a stateful append-only proposal stream cannot be split across fanned slots without desyncing). Each pull it decides the driver's newest live position and appends a `{snap, reads, writes}` proposal when the body's decision is `` `commit ``, or advances locally when it is `` `abort ``. When the decision also reads an induction accumulator, that value arrives co-iterated in the writer *source* or broadcast as a constant — see [mutability.md](../ccl/design/mutability.md#reading-an-induction-accumulator-in-a-commit-decision), "Reading an induction accumulator in a commit decision".
+  source of its own. It releases each finished source key on its ack and releases decided-absent
+  regions when reading source news. A product's next delivery may contain keys smaller than one
+  already acknowledged. Under a consuming store an ack is the store's take of the attempt's
+  decision, and the drive keeps the item, to emit it again, until the store lets go of it. It
+  decodes the source after a notification or a source delivery consumed by its store, and answers
+  other pulls from the last decode (`DecodedSource`, with each position a path of one component). A
+  consuming delivery invalidates the source once before its attempts; retries do not by themselves
+  discard the decoded source. It also releases the store below the decided frontier, through the
+  last change strictly below it, so the commit store can reclaim its changelog.
+- **`TransactWriter` / `TransactWriterProducer`** — one *fused* writer per site (fused, not fanned: a stateful append-only proposal stream cannot be split across fanned slots without desyncing). Each pull it decides the driver's newest live position and appends a `{snap, reads, writes, pos}` proposal when the body's decision is `` `commit ``, or advances locally when it is `` `abort `` and the store states no `writer_takes`; `pos` is the item's source position, copied from the driver's row. When the decision also reads an induction accumulator, that value arrives co-iterated in the writer *source* or broadcast as a constant — see [mutability.md](../ccl/design/mutability.md#reading-an-induction-accumulator-in-a-commit-decision), "Reading an induction accumulator in a commit decision".
 
-  **The ack is a release intersection.** The driver sits behind a `FanOut` with two slots — the body and the writer — and advances its item cursor on what they *both* release. A body releases a row as soon as it has consumed it, which says nothing about commitment; the writer releases it when the attempt has finished, committed or denied without proposing. Only the intersection means "this item is done", which is why the writer holds a driver slot it barely reads: that slot is the ack channel.
+  **The ack is a release intersection.** The driver sits behind a `FanOut` with two slots — the body and the writer — and acknowledges its source item on what they *both* release. A body releases a row as soon as it has consumed it, which says nothing about commitment; the writer releases it when the attempt has finished, committed or denied without proposing. Only the intersection means "this item is done", which is why the writer holds a driver slot it barely reads: that slot is the ack channel.
 
   Both slots of that intersection are load-bearing, including the body's. A compiled body
   fans its input through a `Memo`, which releases each row as it *consumes* it — and it is
@@ -1851,10 +1918,9 @@ completeness reads over the undelivered paths, so a nested loop keeps the quadra
 The driver releases the source prefix it has consumed: every position it has emitted, and every
 filtered row it has read past. A filtered row stays in the source tile, marked deleted, and no
 decision or ack ever names it, so the driver releases it once the source calls it complete along
-with every path before it (`source_read_through` states the rule for a drive with no rows above
-it, and a nested drive reads it over paths). Releasing a prefix the source has not called
+with every path before it. Releasing a prefix the source has not called
 complete would name a position still to arrive, and a drive placed across a reload resumes past
-whatever its predecessor released. The transaction driver releases filtered rows by the same rule.
+whatever its predecessor released. A transaction driver releases exact decided-absent regions without requiring a prefix.
 
 A **nested drive** is the same driver at a deeper path, carrying two additions in `NestedDrive`.
 It **reseeds** at each enclosing position: a boundary is a position whose enclosing components
