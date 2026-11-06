@@ -43,8 +43,8 @@ pub enum CoalesceError {
         /// `true` = positive polarity (lower bounds forming a union);
         /// `false` = negative polarity (upper bounds forming an intersection).
         polarity: bool,
-        /// UIDs of the inference variables that contributed these bounds.
-        vars: Vec<InferVarId>,
+        /// The position that failed.
+        position: FailedPosition,
         /// Pretty representation of the conflicting bounds.
         details: String,
     },
@@ -53,8 +53,8 @@ pub enum CoalesceError {
     /// [`IncompatibleBounds`](Self::IncompatibleBounds) with the fact that matters kept, the
     /// widths, which a caller says as the tuples' own and not as a collision of untagged sums.
     TupleWidthConflict {
-        /// UIDs of the inference variables that contributed these bounds.
-        vars: Vec<InferVarId>,
+        /// The position that failed.
+        position: FailedPosition,
         /// The widths found to have no merge, as `a 2-tuple and a 3-tuple`.
         widths: String,
     },
@@ -81,6 +81,8 @@ pub enum CoalesceError {
         kind: PartialKind,
         /// Pretty representation of the partial fields.
         details: String,
+        /// The position that failed.
+        position: FailedPosition,
     },
     /// A recursive (cyclic) type was inferred. The solver deliberately
     /// rejects these per the plan's R2 review note; they would otherwise
@@ -113,6 +115,8 @@ pub enum CoalesceError {
         /// neither of the two a conditional's arms were written over, so reporting the
         /// position names a domain that appears nowhere in the source.
         domains: Vec<Type>,
+        /// The position that failed.
+        position: FailedPosition,
     },
     /// A single function slot whose kind resolved contradictorily: one kind
     /// variable at [`crate::ccl::ty::KindPin::Conflict`].
@@ -127,6 +131,8 @@ pub enum CoalesceError {
     KindConflict {
         /// Pretty representation of the offending function slot.
         details: String,
+        /// The position that failed.
+        position: FailedPosition,
     },
     /// A witness reference materialized with no binder over it.
     ///
@@ -139,6 +145,37 @@ pub enum CoalesceError {
         /// What the position was materializing, and which binder had no scope.
         details: String,
     },
+}
+
+/// The position a [`CoalesceError`] failed at, as what identifies its defect: the inference
+/// variables merged there and where its concrete contributions were born.
+#[derive(Debug, Clone)]
+pub struct FailedPosition {
+    pub vars: Vec<InferVarId>,
+    pub origins: super::compact::ContributionOrigins,
+}
+
+impl FailedPosition {
+    fn of(ct: &CompactType) -> Self {
+        FailedPosition {
+            vars: ct.vars.iter().copied().collect(),
+            origins: ct.origins.clone(),
+        }
+    }
+}
+
+impl CoalesceError {
+    /// The position the error failed at, for an error raised at one.
+    pub fn position(&self) -> Option<&FailedPosition> {
+        match self {
+            CoalesceError::IncompatibleBounds { position, .. }
+            | CoalesceError::TupleWidthConflict { position, .. }
+            | CoalesceError::UnresolvedPartial { position, .. }
+            | CoalesceError::DomainJoinConflict { position, .. }
+            | CoalesceError::KindConflict { position, .. } => Some(position),
+            _ => None,
+        }
+    }
 }
 
 /// Distinguishes a partial tuple (Index keys) from a partial record
@@ -239,7 +276,7 @@ fn param_beside_an_outer_variable(ct: &CompactType) -> Option<CoalesceError> {
         .any(|id| crate::ccl::infer_var::lookup(id).is_some_and(|v| v.level() < param.level()));
     outer.then(|| CoalesceError::IncompatibleBounds {
         polarity: true,
-        vars: ct.vars.iter().copied().collect(),
+        position: FailedPosition::of(ct),
         details: format!(
             "{} | a type chosen outside `{}`'s definition",
             param.spelling, param.spelling
@@ -361,6 +398,7 @@ fn relate_params_by_bounds(ct: &CompactType, polarity: bool) -> Option<CompactTy
             if meets_as_p {
                 ct = CompactType {
                     vars: ct.vars.clone(),
+                    origins: ct.origins.clone(),
                     kinds: ct.kinds.clone(),
                     refinements: ct.refinements.clone(),
                     atoms: std::iter::once(AtomKey::Param(Rc::clone(p))).collect(),
@@ -580,12 +618,11 @@ fn coalesce_compact_go(
     let mut shapes: Vec<Type> = Vec::new();
 
     if let Some(rec) = &ct.rec {
-        let vars: Vec<InferVarId> = ct.vars.iter().copied().collect();
         shapes.push(materialize_record(
             rec,
             ct.width.as_ref(),
             polarity,
-            &vars,
+            &FailedPosition::of(ct),
             scope,
         )?);
     }
@@ -676,6 +713,7 @@ fn coalesce_compact_go(
                 );
                 return Err(CoalesceError::KindConflict {
                     details: format!("a compute function (capability) over {type_kind}"),
+                    position: FailedPosition::of(ct),
                 });
             }
             _ if domains_disagree => {
@@ -701,7 +739,10 @@ fn coalesce_compact_go(
                         _ => Vec::new(),
                     },
                 };
-                return Err(CoalesceError::DomainJoinConflict { domains });
+                return Err(CoalesceError::DomainJoinConflict {
+                    domains,
+                    position: FailedPosition::of(ct),
+                });
             }
             // Nothing pinned this kind, so the capability default applies — the
             // same shape as `Compute`, decided here rather than at the merge, where
@@ -739,6 +780,7 @@ fn coalesce_compact_go(
                 if domains.len() > 1 {
                     return Err(CoalesceError::DomainJoinConflict {
                         domains: domains.clone(),
+                        position: FailedPosition::of(ct),
                     });
                 }
                 // **A binder's name is the binder's**, minted on the kind variable
@@ -786,7 +828,7 @@ fn coalesce_compact_go(
         let w = Writer::default();
         return Err(CoalesceError::IncompatibleBounds {
             polarity,
-            vars: ct.vars.iter().copied().collect(),
+            position: FailedPosition::of(ct),
             details: format!(
                 "two `{}` values at different arguments of an invariant parameter: {} and {}",
                 decl.name,
@@ -853,10 +895,9 @@ fn coalesce_compact_go(
             // the `fun` slot above (`CompactFun::merge`), not through atoms.
             let w = Writer::default();
             let pretty = all.iter().map(|t| w.ty(t)).collect::<Vec<_>>().join(" | ");
-            let vars: Vec<InferVarId> = ct.vars.iter().copied().collect();
             return Err(CoalesceError::IncompatibleBounds {
                 polarity,
-                vars,
+                position: FailedPosition::of(ct),
                 details: pretty,
             });
         }
@@ -877,7 +918,7 @@ fn coalesce_compact_go(
     // reaches carries.
     if !matches!(out.peel_refinements(), Type::Infer(_)) {
         for k in &ct.kinds {
-            record_membership(&out, k, scope);
+            record_membership(&out, k, scope, FailedPosition::of(ct));
         }
     }
     Ok(out)
@@ -987,7 +1028,7 @@ fn materialize_record(
     rec: &BTreeMap<FieldKey, CompactType>,
     width: Option<&super::compact::TupleWidth>,
     polarity: bool,
-    vars: &[InferVarId],
+    position: &FailedPosition,
     scope: &[crate::ccl::ty::Witness],
 ) -> Result<Type, CoalesceError> {
     // No zero-field product exists, and `Unit` is not one: it is a base type, and
@@ -1000,7 +1041,7 @@ fn materialize_record(
     if rec.is_empty() {
         return Err(CoalesceError::IncompatibleBounds {
             polarity,
-            vars: vars.to_vec(),
+            position: position.clone(),
             details: format!("{} products sharing no field", polarity_word(polarity)),
         });
     }
@@ -1032,7 +1073,7 @@ fn materialize_record(
                 Ok(Type::OpenTuple(out))
             }
             Some(conflict @ TupleWidth::Conflict(_)) => Err(CoalesceError::TupleWidthConflict {
-                vars: vars.to_vec(),
+                position: position.clone(),
                 widths: conflict.to_string(),
             }),
             None => unreachable!("an index-keyed product carries its tuple width"),
@@ -1055,6 +1096,7 @@ fn materialize_record(
         Ok(Type::Record(out))
     } else {
         Err(CoalesceError::UnresolvedPartial {
+            position: position.clone(),
             kind: PartialKind::Record,
             details: rec
                 .keys()
@@ -1072,6 +1114,9 @@ pub(crate) struct PendingMembership {
     pub found: Type,
     pub kind: crate::ccl::ty::TypeKind,
     pub witnesses: Vec<crate::ccl::ty::Witness>,
+    /// The position, which fails as a [`CoalesceError::KindMismatch`] where `found` is not in
+    /// `kind`.
+    pub position: FailedPosition,
 }
 
 thread_local! {
@@ -1094,6 +1139,7 @@ fn record_membership(
     found: &Type,
     kind: &crate::ccl::ty::TypeKind,
     witnesses: &[crate::ccl::ty::Witness],
+    position: FailedPosition,
 ) {
     PENDING_MEMBERSHIPS.with(|p| {
         if let Some(top) = p.borrow_mut().last_mut() {
@@ -1101,6 +1147,7 @@ fn record_membership(
                 found: found.clone(),
                 kind: kind.clone(),
                 witnesses: witnesses.to_vec(),
+                position,
             });
         }
     });
@@ -1233,7 +1280,7 @@ mod tests {
         };
         assert!(matches!(
             coalesce_compact(&graph),
-            Err(CoalesceError::DomainJoinConflict { domains })
+            Err(CoalesceError::DomainJoinConflict { domains, .. })
                 if domains == [Type::UIntRange(2), Type::UIntRange(3)]
         ));
     }

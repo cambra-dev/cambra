@@ -456,6 +456,7 @@ fn simplify_reconstruct(
         dep_tuple: new_dep_tuple,
         family: new_family,
         nominal: new_nominal,
+        origins: ct.origins,
         nominal_conflict: ct.nominal_conflict.map(|(decl, a, b)| {
             (
                 decl,

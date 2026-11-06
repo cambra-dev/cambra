@@ -23,6 +23,7 @@ mod chl_types;
 mod comprehensions;
 mod conditionals;
 mod constants;
+mod defect_reports;
 mod family_parameters;
 mod feeds_cases;
 mod generators_udf_poly;

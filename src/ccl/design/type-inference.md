@@ -501,15 +501,15 @@ both sides record the same one.
 
 A `Conflict` is absorbing and materializes as `CoalesceError::TupleWidthConflict` naming both
 widths, so `(1, 2) if c else (1, 2, 3)` is refused at the join rather than read as its common
-positions. The error is reported once: a later node whose type reaches the same variable raises
-the same widths and is dropped (`push_coalesce_err`).
+positions. The error is reported once per position
+([diagnostics.md, "One report per defect"](diagnostics.md#one-report-per-defect)).
 
 A width is fixed where a position materializes. A parameter that projections reach reads its
 argument's closed tuple from the opposite side
 ([Closing the single-sided blind spots](#closing-the-single-sided-blind-spots-no-separate-pass)),
 and a specialization fixes it per use. An open tuple left on a node or a binder after coalescing
 is `InferError::UnresolvedTupleWidth`, which the post-inference wall reports as a user error, once
-per tuple (`one_per_unfixed_width`). A candidate is a node whose subtree raises no other. The
+per tuple (`one_per_value`). A candidate is a node whose subtree raises no other. The
 candidates are grouped by the tuple they hold: a variable holds its binder's, a `let` binder holds
 its bound expression's, a lambda applied to an argument holds the argument's, and an application
 holds the tuple of a function or argument that is itself open, as do a lambda, a cast and a

@@ -1,6 +1,7 @@
 # Diagnostics
 
-How an inference diagnostic writes the types it reports, and the source positions it labels.
+How an inference diagnostic writes the types it reports, the source positions it labels, and which
+errors are one report.
 
 ---
 
@@ -15,6 +16,39 @@ A message names what failed by its role in the program, and its span says where.
   `Iterable::elements` for a function a construct calls.
 - **No message prints an expression.** The error's node is its location
   (`LocatedInferError::node_id`), which `compile_program` resolves to a span.
+
+---
+
+## One report per defect
+
+A defect is reported once per site: at the first node inference meets it at, and at each use of
+a generic definition whose instantiation fails it. `defect_reports.rs` checks each rule below.
+
+- **Carriers report nothing.** Every node whose type reads a failing position meets the failure
+  again: the literal `[1, "a"]`, the binding holding it, each use of it. A failure with a reported
+  failure's message at the same position, by its variables or by where its concrete bounds were
+  born, joins that report's `also` (`meets_reported`). Children resolve before their parent, so the
+  report stands at the innermost node.
+- **Two positions are two defects.** `[1, "a"]` and `[2, "b"]` fail at positions merging
+  different variables, with bounds born at different lists, and each is reported. So are
+  `[a, b]` and `[a, b]` over concretely typed `a` and `b`: each list records its own bounds.
+- **Each use is a site.** A use of a generic definition instantiates it with fresh variables, so
+  two failing uses fail at two positions, and each is reported at its use
+  ([type-inference.md, "Checking a definition alone"](type-inference.md#checking-a-definition-alone)).
+- **A copy is not a site.** A dead definition nested in a generic one is walked once in each
+  specialization of the enclosing definition. An error such a walk raises at a copy of a node an
+  earlier walk raised the same error at is dropped (`typecheck_discarded_definition`).
+- **The checks after coalescing report once per value.** An unfixed tuple width, an undetermined
+  type and a `Mut` inside another type reach every node holding the value. `one_per_value` keeps
+  the innermost reports and groups them by the value the tree shows them holding: a variable holds
+  its binder's, a `let` binder its bound expression's, an application its function's or
+  argument's.
+- **A module sound at its parameters' types reports nothing a run raises in it.** A run whose
+  argument does not fit its parameter reports the argument; an error that run's copy of the module
+  raises is dropped (`check_modules`).
+- **One span and one message are one diagnostic.** `compile_program` merges inference errors
+  that underline one span with one message, keeping the secondary labels of each
+  (`Blame::infer`).
 
 ---
 
