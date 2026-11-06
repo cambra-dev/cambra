@@ -181,6 +181,8 @@ pub(super) struct CoalesceCtx {
     /// ([`LetScheme::Generalized`](super::typing::LetScheme::Generalized)), whose
     /// specializations [`specialize_use`] pins one way.
     bound_at_annotation: std::collections::HashSet<Name>,
+    /// The scope each generalized binding's definition stands in, as emission recorded it.
+    definition_telescopes: HashMap<Name, crate::ccl::infer_var::Telescope>,
     /// Errors raised by the walk, each paired with the node whose rule raised it.
     /// Coalesce accumulates — it visits every node and collects what it finds —
     /// so the blame is per error, stamped at the raise site from
@@ -699,6 +701,9 @@ struct SpecializeFrame {
     /// it: what a specialization's obligation copies stop assuming
     /// ([`TraitObligation::reset_for_specialization`](crate::ccl::infer::solver::traits::TraitObligation::reset_for_specialization)).
     own_params: Rc<[TypeParamId]>,
+    /// The scope the definition stands in: where a variable a specialization mints for one
+    /// of [`own_params`](Self::own_params) stands, with the binders its placement enters.
+    telescope: crate::ccl::infer_var::Telescope,
     /// The binding's own type parameters that stand for an associated type of a requirement
     /// its clause names, `a::Output` under `requires a: Addable(T, T)`, each with the
     /// requirement and the associated type: what a specialization defines it as, the
@@ -1612,6 +1617,7 @@ pub(super) fn push_barrier_failures(
 pub(super) fn coalesce_pass(
     expr: &mut Expr,
     bound_at_annotation: std::collections::HashSet<Name>,
+    definition_telescopes: HashMap<Name, crate::ccl::infer_var::Telescope>,
     instances: Rc<InstanceTable>,
 ) -> Vec<LocatedInferError> {
     let mut ctx = CoalesceCtx {
@@ -1621,6 +1627,7 @@ pub(super) fn coalesce_pass(
         scope: Vec::new(),
         binders: Default::default(),
         bound_at_annotation,
+        definition_telescopes,
         current_node: expr.node_id(),
         failed_type_vars: HashMap::new(),
         lambda_params: Vec::new(),
@@ -3618,17 +3625,20 @@ pub(super) fn specialize_use(
     let mut clone = frame.def.clone();
     let mut origins = HashMap::new();
     copied_nodes(&frame.def, &clone, &mut origins);
+    let entered_binders = placement
+        .as_ref()
+        .map(|(_, entered)| entered.clone())
+        .unwrap_or_default();
+    // A variable minted for one of the binding's own parameters has no original whose scope it
+    // could inherit, so it stands where the clone does: where the definition stands, under the
+    // binders the placement enters.
+    let param_telescope = frame
+        .telescope
+        .rescoped(|_| false, entered_binders.iter().cloned());
     let mut fresh = FreshenCache {
         own_params: Some(Rc::clone(&frame.own_params)),
-        entered_binders: placement
-            .as_ref()
-            .map(|(_, entered)| entered.clone())
-            .unwrap_or_default(),
-        // A type parameter has no variable whose scope its copy could inherit, so a placed
-        // clone's stand under the binders the clone entered.
-        param_telescope: placement.as_ref().map(|(_, entered)| {
-            crate::ccl::infer_var::Telescope::empty().rescoped(|_| false, entered.iter().cloned())
-        }),
+        param_telescope: Some(param_telescope),
+        entered_binders,
         ..FreshenCache::new()
     };
     // Quantified channel-domain names must instantiate to the SAME names the
@@ -4012,6 +4022,16 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
         })
         .collect();
     let bound_at_annotation = ctx.bound_at_annotation.contains(&binding.name);
+    let telescope = ctx
+        .definition_telescopes
+        .get(&binding.name)
+        .unwrap_or_else(|| {
+            panic!(
+                "emission records the scope of every binding it generalizes, and not `{}`'s",
+                binding.name
+            )
+        })
+        .clone();
     ctx.scope
         .push(ScopeEntry::Generalized(Box::new(SpecializeFrame {
             name: binding.name,
@@ -4019,6 +4039,7 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
             cutoff: level,
             bound_at_annotation,
             own_params,
+            telescope,
             members,
             transparency,
             inside_discarded: ctx.discarding,

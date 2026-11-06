@@ -233,6 +233,9 @@ pub(super) struct InferCtx {
     /// The generalized bindings bound at their exact annotation
     /// ([`LetScheme::Generalized`]), which the coalesce walk pins one way.
     pub(super) bound_at_annotation: HashSet<Name>,
+    /// The scope each generalized binding's definition stands in, which the coalesce walk's
+    /// specializations of it stand in too ([`FreshenCache::param_telescope`](super::solver::scheme::FreshenCache::param_telescope)).
+    pub(super) definition_telescopes: HashMap<Name, Telescope>,
     /// The errors emission recovered from ([`Typing::recover`]), in the order it
     /// raised them, which is source order.
     pub(super) errors: Vec<LocatedInferError>,
@@ -460,6 +463,7 @@ impl InferCtx {
             telescope: Telescope::empty(),
             opaque_binders: HashMap::new(),
             bound_at_annotation: HashSet::new(),
+            definition_telescopes: HashMap::new(),
             scope_exits: HashMap::new(),
             varies_with: HashMap::new(),
             loop_sources: HashMap::new(),
@@ -603,6 +607,10 @@ impl InferCtx {
             })
         {
             self.bound_at_annotation.insert(name.clone());
+        }
+        if generalize {
+            self.definition_telescopes
+                .insert(name.clone(), self.telescope.clone());
         }
         let scheme = if generalize {
             // Polymorphic: generalize at the outer level. Each `Var` use

@@ -962,16 +962,18 @@ definition does. `specialize_use` places it under the innermost binder between t
 the use that the resolved instance or an argument reaching it reads (`argument_reads`). The pin
 gives the clone each argument's type, so an argument whose candidates meet its parameter's kind at
 none, which leaves the resolved instance reading less, still places the clone where its membership
-is decided. Its variables stand where the definition's did, with
-every binder from the definition to that one entered (`FreshenCache::entered_binders`), and the
-walk of the clone sees those binders as in scope, so a use inside the clone that reads one of them
-is placed there too. The clone is recorded on `CoalesceCtx::placed` with its binder. The walk
-leaving the binder's body splices the clones placed under it around that body (`splice_placed`),
-outermost first in the order they were made, so a clone that a later one calls encloses it. Uses
-under the same binder share a placed clone by the rules a definition-site clone is shared by. A
-binder whose scope is not one body, a `match` pattern's or a `letrec`'s, takes no placed clone:
-placing one there panics. A use whose instance reads no such binder is specialized at the
-definition, as before.
+is decided. Its variables stand where the definition's did, with every binder from the definition to
+that one entered (`FreshenCache::entered_binders`), and the walk of the clone sees those binders as
+in scope, so a use inside the clone that reads one of them is placed there too. A variable the clone
+mints for one of the definition's own type parameters has no original to inherit a scope from. It
+stands in the scope emission recorded for the definition (`InferCtx::definition_telescopes`), with
+the same binders entered (`FreshenCache::param_telescope`). The clone is recorded on
+`CoalesceCtx::placed` with its binder. The walk leaving the binder's body splices the clones placed
+under it around that body (`splice_placed`), outermost first in the order they were made, so a clone
+that a later one calls encloses it. Uses under the same binder share a placed clone by the rules a
+definition-site clone is shared by. A binder whose scope is not one body, a `match` pattern's or a
+`letrec`'s, takes no placed clone: placing one there panics. A use whose instance reads no such
+binder is specialized at the definition, as before.
 
 #### Coalesce ordering and read stability
 

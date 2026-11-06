@@ -881,6 +881,7 @@ pub(crate) fn run_with_params(
     let mut errors = coalesce_pass(
         expr,
         std::mem::take(&mut sub_ctx.bound_at_annotation),
+        std::mem::take(&mut sub_ctx.definition_telescopes),
         Rc::clone(instances),
     );
     sub_ctx.name_varying_binders(&mut errors);
