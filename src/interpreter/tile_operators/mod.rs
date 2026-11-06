@@ -24,6 +24,7 @@ use std::{
 
 use log::trace;
 
+use crate::interpreter::DataSourceDomainExtentImpl;
 use crate::interpreter::dispatcher::Pushes;
 use crate::interpreter::tiling::Restates;
 pub use crate::interpreter::tiling::{
@@ -1794,6 +1795,13 @@ pub trait TileProducer {
     /// same producers, in the same order, under the same roles. A dispatched run walks it to reach
     /// the pipeline breakers inside a chain ([`as_breaking_mut`](Self::as_breaking_mut)).
     fn visit_input_producers_mut(&mut self, _visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {}
+
+    /// The data sources this producer reads its keys from, where it is a range over a source's
+    /// domain: a dispatched run notifies the pipeline above it of what each source yields.
+    /// Empty for every other producer.
+    fn data_sources(&self) -> Vec<Rc<RefCell<dyn DataSourceDomainExtentImpl>>> {
+        Vec::new()
+    }
 
     /// This producer as a pipeline breaker, where it is one.
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {

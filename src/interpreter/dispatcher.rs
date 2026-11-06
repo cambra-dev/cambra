@@ -32,7 +32,7 @@ use crate::interpreter::{
 mod loop_scope;
 mod plan;
 
-pub use plan::{Planned, Refused, Run, run_program};
+pub use plan::{Planned, Refused, Run, run_program, run_program_polling};
 
 /// A pipeline, by its index in the [`Dispatcher`].
 #[derive(Clone, Copy)]
@@ -1792,6 +1792,8 @@ pub(crate) struct Arrival {
     pub(crate) pipeline: PipelineId,
     /// The region as a guard of that pipeline's breaker's input.
     pub(crate) guard: TileGuard,
+    /// Whether an operator on its path widened it ([`Landing::widened`]).
+    pub(crate) widened: bool,
 }
 
 impl Landing<'_> {
@@ -1843,6 +1845,7 @@ impl Landing<'_> {
                 arrivals.push(Arrival {
                     pipeline: reader,
                     guard: guard.clone(),
+                    widened: self.widened,
                 });
                 return;
             }
