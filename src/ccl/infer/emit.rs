@@ -4131,17 +4131,58 @@ fn emit_transact_writer<C: Typing>(
     // A nested `Transact`'s components are lifted pointwise over its enclosing context,
     // so the source is an iteration source under that context: peel the context function
     // and the iteration source is what a top-level `Transact`'s is.
+    // A nested writer's body takes the `(enclosing, position)` pair, which an item read at the
+    // pair reads by its halves: the source's enclosing binder is the pair's first and the
+    // collection's own key its second.
+    let pair = parameter.map(|p| (Name::fresh("__pair"), p));
+    // The reads are minted for the writer's body, whose input they type.
+    let _g = crate::ccl::provenance::enter(
+        writer.body.node_id(),
+        "infer.nested_writer_pair",
+        crate::ccl::provenance::Nature::Machinery,
+    );
+    let half = |i: usize| -> Option<std::rc::Rc<Expr>> {
+        let (pair, p) = pair.as_ref()?;
+        let whole = Expr::var(pair.clone()).with_ty((*p).clone());
+        let ty = match (i, p.peel_refinements()) {
+            (0, _) => enclosing_component(p),
+            (_, Type::DepTuple(parts)) => {
+                let first = std::rc::Rc::new(projected(whole.clone(), 0, enclosing_component(p)));
+                crate::ccl::subst::open_tuple_components(parts, |_, _| {
+                    crate::ccl::subst::Mapping::Discharge(std::rc::Rc::clone(&first))
+                })
+                .pop()
+                .unwrap_or_else(|| unreachable!("the pair has two components"))
+            }
+            (_, Type::Tuple(parts)) => parts[1].clone(),
+            _ => panic!("a nested `Transact`'s parameter is the (enclosing, position) pair: {p}"),
+        };
+        Some(std::rc::Rc::new(projected(whole, i, ty)))
+    };
     let s_ty = match parameter {
         // A source generic in the enclosing rows' domain is read at the enclosing value the
         // parameter states (`src/ccl/design/type-parameters.md`, "Generalized types").
         Some(p) => {
             let s_ty = ctx.instantiate_generalized(&s_ty, &enclosing_component(p));
-            ctx.as_function(&s_ty, &|| "nested transaction source".to_string())?
-                .1
+            let codomain = ctx
+                .as_function(&s_ty, &|| "nested transaction source".to_string())?
+                .1;
+            match (s_ty.peel_refinements(), half(0)) {
+                (Type::Fun { name: Some(e), .. }, Some(first)) => {
+                    crate::ccl::subst::discharge_codomain(e, &first, &codomain)
+                }
+                _ => codomain,
+            }
         }
         None => s_ty,
     };
     let (_d, item) = ctx.as_function(&s_ty, &|| "transaction source".to_string())?;
+    let item = match (s_ty.peel_refinements(), half(1)) {
+        (Type::Fun { name: Some(k), .. }, Some(second)) => {
+            crate::ccl::subst::discharge_codomain(k, &second, &item)
+        }
+        _ => item,
+    };
 
     let mut snaps: Vec<Type> = Vec::with_capacity(writer.read_keys.len());
     for rk in &writer.read_keys {
@@ -4198,8 +4239,11 @@ fn emit_transact_writer<C: Typing>(
     let body_ty = ctx.subexpr(&mut writer.body)?;
     // A nested writer's body takes the pair `lambda_elim` merged its binders into
     // alongside the slots, which is the term as elimination leaves it.
-    let expected = match parameter {
-        Some(p) => fun(Type::Tuple(vec![p.clone(), body_dom]), decision_codom),
+    let expected = match &pair {
+        Some((pair, p)) => fun(
+            Type::dep_tuple(vec![(Some(pair.clone()), (*p).clone()), (None, body_dom)]),
+            decision_codom,
+        ),
         None => fun(body_dom, decision_codom),
     };
     ctx.require_sub(&body_ty, &expected, &|| "transaction body".to_string())?;
@@ -4325,6 +4369,12 @@ fn nested_parameter_parts(parameter: &Type) -> (Option<Name>, Type) {
             panic!("a nested `Transact`'s parameter is the (enclosing, position) pair: {parameter}")
         }
     }
+}
+
+/// `whole ▷ .i`, typed `ty`: a component of a tuple read in a type.
+fn projected(whole: Expr, i: usize, ty: Type) -> Expr {
+    let proj = Expr::proj_index(i).with_ty(Type::fun(whole.ty.clone(), ty.clone()));
+    Expr::apply(whole, proj).with_ty(ty)
 }
 
 /// The enclosing half of a nested `Transact`'s `(enclosing, position)` parameter.
