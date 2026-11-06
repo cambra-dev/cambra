@@ -8,7 +8,7 @@ use indoc::{formatdoc, indoc};
 use crate::ccl::context::{GlobalContext, compile_program};
 use crate::ccl::load::LoadedProgram;
 use crate::interpreter::Value;
-use crate::interpreter::dispatcher::{Planned, Refused, run_program};
+use crate::interpreter::dispatcher::{Planned, run_program};
 
 use super::TileProducer;
 
@@ -3263,58 +3263,45 @@ fn a_sum_over_a_live_source_reading_a_sum_over_it(#[values(1, usize::MAX)] rows:
     assert_eq!(value, Value::Int(15));
 }
 
-/// Why the planner refuses `source`, which reads the live source `source1`.
-fn live_refusal(source: &str) -> Refused {
-    let mut ctx = GlobalContext::default();
-    ctx.defer_sink_pulls();
-    ctx.register_source(std::rc::Rc::new(std::cell::RefCell::new(
-        crate::interpreter::TestDataSource::new(
-            "source1",
-            crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
-            crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
-        ),
-    )));
-    ctx.register_test_sink("out");
-    let mut program = compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {}))
-        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
-    let _operators = ctx.take_operator_map();
-    let main = std::sync::Arc::new(MainAnswers::default());
-    match crate::interpreter::dispatcher::run_program_into(&mut program, 1, main, &mut || {
-        panic!("{source}: a refused run polls nothing")
-    }) {
-        Err(refused) => refused,
-        Ok(planned) => panic!("{source} is refused: {planned:?}"),
-    }
-}
-
-/// A pipeline notified of a live source's arrivals takes no other package, so the planner refuses
-/// one whose input has rows no arrival names: a range no live source yields, as a static arm of a
-/// concatenation, or a pipeline it reads whose pushes arrive as its own keys, as a let-bound arm or
-/// a field of a let-bound record, whose memo holds one value.
+/// A pipeline notified of a live source's arrivals takes the rows no arrival names: a range no live
+/// source yields, as a static arm of a concatenation, with the first notification, and the rows a
+/// pipeline it reads pushes as its own keys, as a let-bound arm or a field of a let-bound record,
+/// from that pipeline's pushes.
 #[rstest_log::rstest]
-#[case::a_static_arm_reading_a_sum("[x for x in source1()] ++ [y + sum([10, 20]) for y in [0]]")]
+#[case::a_static_arm_reading_a_sum(
+    "[x for x in source1()] ++ [y + sum([10, 20]) for y in [0]]",
+    "[`0(u0) -> 1, `0(u1) -> 2, `0(u2) -> 3, `0(u3) -> 4, `0(u4) -> 5, `1(u0) -> 30]"
+)]
 #[case::a_sum_of_a_static_arm_reading_a_sum(
-    "sum([x for x in source1()] ++ [y + sum([10, 20]) for y in [0]])"
+    "sum([x for x in source1()] ++ [y + sum([10, 20]) for y in [0]])",
+    "45"
 )]
 #[case::a_sum_of_an_arm_reading_a_sum(
-    "sum([x + sum([10, 20]) for x in source1()] ++ [y for y in [100]])"
+    "sum([x + sum([10, 20]) for x in source1()] ++ [y for y in [100]])",
+    "265"
 )]
-#[case::a_sum_of_a_static_arm("sum([x for x in source1()] ++ [y * 2 for y in [10, 20]])")]
-#[case::a_let_bound_arm(indoc! {"
-    ys = [y * 10 for y in [1, 2]]
-    [x for x in source1()] ++ ys
-"})]
-#[case::a_field_of_a_let_bound_record(indoc! {"
-    r = (a=[y * 2 for y in [10, 20]], b=1)
-    sum([x for x in source1()] ++ r.a) + r.b
-"})]
-fn a_pipeline_notified_of_arrivals_with_rows_no_arrival_names_is_refused(#[case] source: &str) {
-    let refused = live_refusal(source);
-    assert!(
-        refused.to_string().contains("which no arrival names")
-            || refused.to_string().contains("whose rows no arrival names"),
-        "{refused}"
-    );
+#[case::a_sum_of_a_static_arm("sum([x for x in source1()] ++ [y * 2 for y in [10, 20]])", "75")]
+#[case::a_let_bound_arm(
+    indoc! {"
+        ys = [y * 10 for y in [1, 2]]
+        [x for x in source1()] ++ ys
+    "},
+    "[`0(u0) -> 1, `0(u1) -> 2, `0(u2) -> 3, `0(u3) -> 4, `0(u4) -> 5, `1(u0) -> 10, `1(u1) -> 20]"
+)]
+#[case::a_field_of_a_let_bound_record(
+    indoc! {"
+        r = (a=[y * 2 for y in [10, 20]], b=1)
+        sum([x for x in source1()] ++ r.a) + r.b
+    "},
+    "76"
+)]
+fn a_pipeline_notified_of_arrivals_takes_rows_no_arrival_names(
+    #[case] source: &str,
+    #[case] expected: &str,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let live = dispatched_live_main(source, rows, two_batches());
+    assert_eq!(rendered_in_key_order(&live.value), expected, "{source}");
 }
 
 /// A loop or a transaction over a live source whose body or seed reads a pipeline: the scope or
@@ -3507,6 +3494,36 @@ fn a_writer_over_a_concatenation_with_a_live_source(#[values(1, usize::MAX)] row
             .any(|plan| plan.live && plan.whole && plan.name.starts_with("Commit")),
         "the store takes its input whole: {planned:?}"
     );
+}
+
+/// A pipeline notified of a live source's arrivals reads the rows of another pipeline as keys of
+/// its own, which no arrival names, from that pipeline's pushes: a let-bound map over the live
+/// source pushes the keys each delivery adds, and each push queues the rows it names.
+#[rstest_log::rstest]
+#[case::in_a_sum(indoc! {"
+    out = test_sink()
+    ys = [y * 10 for y in source1()]
+    out << sum([x for x in source1()] ++ ys)
+"}, "165")]
+#[case::a_sum_beside_a_constant(indoc! {"
+    out = test_sink()
+    s = sum(source1())
+    out << sum([x + s for x in source1()] ++ [7])
+"}, "97")]
+#[case::at_main(indoc! {"
+    ys = [y * 10 for y in source1()]
+    [x for x in source1()] ++ ys
+"}, "[`0(u0) -> 1, `0(u1) -> 2, `0(u2) -> 3, `0(u3) -> 4, `0(u4) -> 5, `1(u0) -> 10, `1(u1) -> 20, `1(u2) -> 30, `1(u3) -> 40, `1(u4) -> 50]")]
+fn an_arm_of_a_live_concatenation_reading_a_live_map(
+    #[case] source: &str,
+    #[case] expected: &str,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let value = match source.starts_with("out") {
+        true => dispatched_live(source, rows, two_batches()).0,
+        false => dispatched_live_main(source, rows, two_batches()).value,
+    };
+    assert_eq!(rendered_in_key_order(&value), expected, "{source}");
 }
 
 /// A loop or a transaction over a live source whose body reads a sum of a second live source,

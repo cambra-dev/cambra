@@ -385,6 +385,7 @@ fn run_targets(
         }
     }
     let mut live = Vec::new();
+    let mut reads_as_keys = Vec::new();
     for (pipeline, leaves) in live_ranges.iter().enumerate() {
         if leaves.is_empty() {
             continue;
@@ -394,6 +395,7 @@ fn run_targets(
             input = Some(breaker.input_tiling(at))
         });
         let input = input.expect("a reach calls the breaker it reaches");
+        let mut starts: Vec<TileGuard> = Vec::new();
         let notifies = match (&members.located[pipeline], scopes[pipeline].as_ref()) {
             _ if !inherited_whole[pipeline].is_empty() => Notifies::Whole,
             // A transaction store places the entry before its writer's source, so its items
@@ -470,18 +472,30 @@ fn run_targets(
                         )));
                     }
                 }
-                // A pipeline notified of arrivals takes no package but theirs, so every row of its
-                // input has to be a delivery's: a range of its own no source yields, or a pipeline
-                // it reads whose pushes arrive as its own keys, brings rows no arrival names.
+                // A range of the pipeline's own that no source yields brings its rows once: its
+                // probe's region is queued with the first notification. A range whose route
+                // widens names every key of the input, which the pipeline then reads whole.
                 if matches!(notifies, Notifies::Arrivals) {
-                    if !members.leaves[pipeline].is_empty() {
-                        unplace(&planner.placements, targets);
-                        return Err(Refused(format!(
-                            "{} is notified of a live source's arrivals beside a range no live \
-                             source yields, whose rows no arrival names",
-                            members.names[pipeline]
-                        )));
+                    for range in &members.leaves[pipeline] {
+                        if routes_to(range, pipeline)
+                            .iter()
+                            .all(|route| route.keeps_keys)
+                        {
+                            let everything = Projection::Everything;
+                            starts.extend(
+                                probe(range, PipelineId(pipeline), &everything, pipeline)
+                                    .into_iter()
+                                    .map(|arrival| arrival.guard),
+                            );
+                        } else {
+                            notifies = Notifies::Whole;
+                        }
                     }
+                }
+                // A pipeline notified of arrivals takes no package but theirs and its ranges', so
+                // a pipeline it reads whose pushes arrive as its own keys brings rows no arrival
+                // names.
+                if matches!(notifies, Notifies::Arrivals) {
                     let everything = Projection::Everything;
                     // The region of the pipeline's input its live ranges bring.
                     let arrived_region = leaves
@@ -511,13 +525,10 @@ fn run_targets(
                                         && !guard_minus(&arrival.guard, &arrived_region).is_empty()
                                 }),
                         };
+                        // A pipeline whose pushes arrive as this one's keys brings rows no
+                        // arrival names, so each of its pushes queues the rows it names.
                         if as_keys {
-                            unplace(&planner.placements, targets);
-                            return Err(Refused(format!(
-                                "{} is notified of a live source's arrivals and reads the rows of \
-                                 {} as keys of its own, which no arrival names",
-                                members.names[pipeline], members.names[read]
-                            )));
+                            reads_as_keys.push((pipeline, read));
                         }
                     }
                 }
@@ -536,12 +547,19 @@ fn run_targets(
             dispatcher.park(PipelineId(pipeline));
             planned[pipeline].held = true;
         }
+        if matches!(notifies, Notifies::Whole) {
+            starts.clear();
+        }
         live.push(LivePipeline::new(
             PipelineId(pipeline),
             leaves.clone(),
             notifies,
             input,
+            starts,
         ));
+    }
+    for (reader, read) in reads_as_keys {
+        dispatcher.queue_pushes_of(PipelineId(reader), PipelineId(read));
     }
     // A live main output hands each package's answer immediately; a static one merges them
     // until its single finish.
@@ -2393,11 +2411,20 @@ struct LivePipeline {
     notifies: Notifies,
     /// The pipeline's breaker's input, which a notification is a guard of.
     input: Tiling,
+    /// The regions the pipeline's own ranges bring, which no live source yields and no arrival
+    /// names: notified with the first poll, and empty after.
+    starts: Vec<TileGuard>,
     closed: bool,
 }
 
 impl LivePipeline {
-    fn new(pipeline: PipelineId, leaves: Vec<LiveLeaf>, notifies: Notifies, input: Tiling) -> Self {
+    fn new(
+        pipeline: PipelineId,
+        leaves: Vec<LiveLeaf>,
+        notifies: Notifies,
+        input: Tiling,
+        starts: Vec<TileGuard>,
+    ) -> Self {
         Self {
             pipeline,
             leaves: leaves
@@ -2406,6 +2433,7 @@ impl LivePipeline {
                 .collect(),
             notifies,
             input,
+            starts,
             closed: false,
         }
     }
@@ -2418,7 +2446,10 @@ impl LivePipeline {
         if self.closed {
             return false;
         }
-        let mut changed = false;
+        let mut changed = !self.starts.is_empty();
+        for start in std::mem::take(&mut self.starts) {
+            dispatcher.notify(self.pipeline, &start);
+        }
         let mut complete = true;
         // Several ranges can read one source, so a scope or a store is notified of the positions
         // they gained together, once.
