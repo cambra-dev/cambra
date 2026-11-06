@@ -80,7 +80,10 @@ request a web page could have sent: one carrying `Origin`, one whose `Sec-Fetch-
 and the `/branch` forms that create or delete change what runs, so they require `POST` and answer
 405 to any other method (`ControlRequest::mutates`); the other verbs accept any method. A verb that
 takes a source reads it from the request body when the body is non-blank, and otherwise from the
-query string, percent-decoded. Every reply is `text/plain; charset=utf-8`.
+query string, percent-decoded. Every reply is `text/plain; charset=utf-8`. The inspector's
+`POST /api/reload` is a second door onto the same queue, for `/reload` of `main` alone: it sends a
+`ControlRequest::Reload` through a `ControlClient` and replies in JSON, with the posted version's
+compile errors as spans and the reuse tally (`src/inspector_server/reload.rs`).
 
 A `<source>` is one file, the version's root. A version that imports or runs a module therefore
 fails to load it, and the 400 says that a program of several modules cannot be reloaded yet.

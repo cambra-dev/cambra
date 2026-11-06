@@ -11,7 +11,7 @@ use serde_json::Value;
 use tungstenite::{Message, WebSocket};
 
 use super::harness::{RunningProgram, launch_under_control_with};
-use super::serving::{http_get, raw_http, reserve_test_port};
+use super::serving::{http_get, raw_http, raw_http_response, reserve_test_port};
 
 /// The served `/api/snapshot`, parsed.
 fn snapshot(port: u16) -> Value {
@@ -229,6 +229,206 @@ fn a_reload_of_main_publishes_a_frame_before_any_input() {
 
     await_reloaded_frame(&mut socket, Instant::now() + Duration::from_secs(10));
     assert_eq!(version(&snapshot(inspect)), 2);
+}
+
+/// The inspector's `POST /api/reload` with `source` as the version, sent the way
+/// the page sends it: JSON, from the page's own origin. Answers the status and
+/// the parsed body.
+fn post_reload(port: u16, source: &str) -> (u16, Value) {
+    let body = serde_json::json!({ "source": source }).to_string();
+    let response = raw_http_response(
+        port,
+        &format!(
+            "POST /api/reload HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+             Origin: http://127.0.0.1:{port}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    let (head, body) = response.split_once("\r\n\r\n").expect("a response");
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("a status line");
+    (
+        status,
+        serde_json::from_str(body).expect("the reply is JSON"),
+    )
+}
+
+/// A version posted to the inspector replaces `main`, and the served payload
+/// follows it as it follows a reload from the control port.
+#[test]
+fn the_inspector_reloads_main_with_a_posted_version() {
+    let inspect = reserve_test_port();
+    let launched = launch_under_control_with(
+        "[\"A\" + line for line in stdin()]\n",
+        &[format!("--inspect={inspect}")],
+    );
+    await_inspector(inspect);
+
+    let capabilities: Value =
+        serde_json::from_str(&http_get(inspect, "/api/capabilities")).expect("JSON");
+    assert_eq!(
+        capabilities["reload"], true,
+        "a run with a control port reloads"
+    );
+
+    let edited = "[\"C\" + line for line in stdin()]\n";
+    let (status, reply) = post_reload(inspect, edited);
+    assert_eq!(status, 200, "{reply}");
+    let (kept, bound) = (reply["kept"].as_u64(), reply["bound"].as_u64());
+    assert!(
+        kept.zip(bound).is_some_and(|(kept, bound)| kept <= bound),
+        "an accepted reload carries its tally: {reply}"
+    );
+
+    let after = settled_snapshot(inspect, launched.control);
+    assert_eq!(version(&after), 2, "the posted version is `main`'s second");
+    assert_eq!(after["source"]["text"], edited);
+}
+
+/// A posted version that does not compile is refused with diagnostics whose
+/// spans point into the posted text, and `main` keeps running the version it
+/// had.
+#[test]
+fn a_posted_version_that_does_not_compile_is_refused_with_its_spans() {
+    let inspect = reserve_test_port();
+    let launched = launch_under_control_with(
+        "[\"A\" + line for line in stdin()]\n",
+        &[format!("--inspect={inspect}")],
+    );
+    await_inspector(inspect);
+
+    let broken = "[\"A\" + nowhere for line in stdin()]\n";
+    let (status, reply) = post_reload(inspect, broken);
+    assert_eq!(status, 400, "{reply}");
+    let diagnostics = reply["diagnostics"].as_array().expect("diagnostics");
+    let span = diagnostics
+        .iter()
+        .find_map(|d| d["span"].as_object())
+        .unwrap_or_else(|| panic!("a diagnostic with a span: {reply}"));
+    let (start, end) = (
+        span["start"].as_u64().unwrap() as usize,
+        span["end"].as_u64().unwrap() as usize,
+    );
+    assert_eq!(&broken[start..end], "nowhere", "{reply}");
+
+    let after = settled_snapshot(inspect, launched.control);
+    assert_eq!(version(&after), 1, "a refused version installs nothing");
+}
+
+/// Without a control port the inspector takes no reload, and says so before the
+/// page offers one.
+#[test]
+fn an_inspector_without_a_control_port_takes_no_reload() {
+    use std::process::{Command, Stdio};
+
+    let inspect = reserve_test_port();
+    let dir = std::env::temp_dir().join(format!("cambra-inspect-{inspect}"));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let file = dir.join("prog.cambra");
+    std::fs::write(&file, "[\"A\" + line for line in stdin()]\n").expect("write the program");
+    let _program = RunningProgram {
+        child: Command::new(env!("CARGO_BIN_EXE_cambra"))
+            .arg(format!("--inspect={inspect}"))
+            .arg(&file)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cambra"),
+        dir,
+    };
+    await_inspector(inspect);
+
+    let capabilities: Value =
+        serde_json::from_str(&http_get(inspect, "/api/capabilities")).expect("JSON");
+    assert_eq!(capabilities["reload"], false);
+    let (status, reply) = post_reload(inspect, "[\"B\" + line for line in stdin()]\n");
+    assert_eq!(status, 404, "{reply}");
+}
+
+/// A page on another origin cannot reload the program, whatever it sends.
+#[test]
+fn a_reload_from_another_origin_is_refused() {
+    let inspect = reserve_test_port();
+    let launched = launch_under_control_with(
+        "[\"A\" + line for line in stdin()]\n",
+        &[format!("--inspect={inspect}")],
+    );
+    await_inspector(inspect);
+
+    let body = serde_json::json!({ "source": "[\"X\" + line for line in stdin()]\n" }).to_string();
+    let response = raw_http_response(
+        inspect,
+        &format!(
+            "POST /api/reload HTTP/1.1\r\nHost: 127.0.0.1:{inspect}\r\n\
+             Origin: http://example.com\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    assert_eq!(version(&settled_snapshot(inspect, launched.control)), 1);
+}
+
+/// A finished program takes no reload: the driver loop has ended, and the
+/// inspector goes on serving with nothing behind the control port.
+#[test]
+fn a_finished_program_takes_no_reload() {
+    use std::process::{Command, Stdio};
+
+    let inspect = reserve_test_port();
+    let control = reserve_test_port();
+    let dir = std::env::temp_dir().join(format!("cambra-finished-{inspect}"));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let file = dir.join("prog.cambra");
+    std::fs::write(&file, "[x + 1 for x in [1, 2, 3]]\n").expect("write the program");
+    let mut program = RunningProgram {
+        child: Command::new(env!("CARGO_BIN_EXE_cambra"))
+            .arg(format!("--inspect={inspect}"))
+            .arg(format!("--control={control}"))
+            .arg(&file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cambra"),
+        dir,
+    };
+    await_inspector(inspect);
+    // The program prints its value and finishes; the binary then parks. The
+    // reader thread keeps the pipe open, so the rest of the print does not fail.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let out = program.child.stdout.take().expect("piped stdout");
+    thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+    let first = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the program prints its value");
+    assert!(first.starts_with("Got value"), "{first}");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (status, reply) = loop {
+        let (status, reply) = post_reload(inspect, "[x + 2 for x in [1, 2, 3]]\n");
+        if status != 200 || Instant::now() > deadline {
+            break (status, reply);
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status, 409, "{reply}");
+    assert!(
+        reply["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("finished")),
+        "{reply}"
+    );
 }
 
 /// Under `--inspect=0 --control=0` the OS picks both ports, and each banner
