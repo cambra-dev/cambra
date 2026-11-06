@@ -417,7 +417,7 @@ fn run_program(
                     snapshot,
                     src_name,
                     version,
-                    ctx.scheduler().probes().clone(),
+                    ctx.subscribe_context().probes().clone(),
                     source_nodes(&program.operator_graph),
                 )),
                 Err(e) => {

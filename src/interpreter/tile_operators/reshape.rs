@@ -3,7 +3,9 @@ use std::collections::HashMap;
 
 use super::*;
 use crate::interpreter::operator_graph::value;
-use crate::interpreter::{ColumnValue, Consumer, Extent, Projection, Scheduler, tuple_field};
+use crate::interpreter::{
+    ColumnValue, Consumer, Extent, Projection, SubscribeContext, tuple_field,
+};
 
 /// An operator that permutes the fields of the domain of a `DataFunction`, according
 /// to a specified permutation of field indices.
@@ -64,14 +66,14 @@ impl TileOperator for PermuteRecordDomain {
         &mut self,
         intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         Box::new(PermuteRecordDomainProducer {
             base: ProducerBase::new(
                 PermuteRecordDomainProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             ),
             input: self.input.subscribe(
                 intent_guard,
@@ -86,7 +88,7 @@ impl TileOperator for PermuteRecordDomain {
                         consumer,
                     )
                 },
-                scheduler,
+                cx,
             ),
             permutation: self.permutation.clone(),
         })
@@ -506,14 +508,14 @@ impl TileOperator for FlattenTupleDomain {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         Box::new(FlattenTupleDomainProducer {
             base: ProducerBase::new(
                 FlattenTupleDomainProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             ),
             input: self.input.subscribe(
                 self.tiling().universal_guard(),
@@ -528,7 +530,7 @@ impl TileOperator for FlattenTupleDomain {
                         consumer,
                     )
                 },
-                scheduler,
+                cx,
             ),
             field_map: self.field_map.clone(),
         })

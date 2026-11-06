@@ -1752,7 +1752,7 @@ fn a_push_reaches_every_slot_of_a_fan_out() {
     let scripted = Scripted::cutting(ints().universal_guard(), vec![low.clone(), high.clone()]);
     let (feed, input) = NotifyingOp::new(ints().empty_tile(), ints());
     let fan = FanOut::new(Box::new(feed));
-    let mut scheduler = Scheduler::new();
+    let mut cx = SubscribeContext::new();
     let _slots: Vec<_> = (1..=2)
         .map(|reader| {
             let entry = crate::interpreter::dispatcher::Entry::new(
@@ -1762,7 +1762,7 @@ fn a_push_reaches_every_slot_of_a_fan_out() {
             );
             let mut slot = fan.slot();
             let guard = slot.tiling().universal_guard();
-            slot.subscribe(guard, Box::new(entry), &mut scheduler)
+            slot.subscribe(guard, Box::new(entry), &mut cx)
         })
         .collect();
     scripted

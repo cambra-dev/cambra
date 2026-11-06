@@ -6,7 +6,8 @@ use crate::interpreter::operator_graph::value_at;
 use crate::{
     ccl::TagMap,
     interpreter::{
-        ColumnValue, Consumer, Extent, Projection, Scheduler, UnionArm, Value, shared_consumer,
+        ColumnValue, Consumer, Extent, Projection, SubscribeContext, UnionArm, Value,
+        shared_consumer,
     },
 };
 
@@ -410,7 +411,7 @@ impl TileOperator for UnionOperator {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let (shared, gate) = shared_consumer(consumer);
         // The arms of a flat union are disjoint slices of one collection, pulled at the
@@ -421,25 +422,20 @@ impl TileOperator for UnionOperator {
             .iter_mut()
             .enumerate()
             .map(|(arm, op)| match flat {
-                true => subscribe_forwarding_keeping_keys(&mut **op, &shared, scheduler),
+                true => subscribe_forwarding_keeping_keys(&mut **op, &shared, cx),
                 false => {
                     let consumer = crate::interpreter::forwarding_consumer_tagging(
                         &shared,
-                        &scheduler.wakeup_queue(),
+                        &cx.scheduler().wakeup_queue(),
                         crate::ccl::FieldKey::Index(arm),
                     );
-                    op.subscribe(op.tiling().universal_guard(), consumer, scheduler)
+                    op.subscribe(op.tiling().universal_guard(), consumer, cx)
                 }
             })
             .collect();
         Box::new(UnionProducer {
-            base: ProducerBase::new(
-                UnionProducer::alloc_id(),
-                self.tiling(),
-                &self.base,
-                scheduler,
-            )
-            .sharing(gate),
+            base: ProducerBase::new(UnionProducer::alloc_id(), self.tiling(), &self.base, cx)
+                .sharing(gate),
             inputs: input_producers,
             flat: self.flat,
             level: self.level,
@@ -900,7 +896,7 @@ mod tests {
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
-            _scheduler: &mut Scheduler,
+            _cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             unimplemented!("tiling-only stub is never pulled")
         }
@@ -2010,7 +2006,7 @@ mod projection_tests {
         let union = operator.subscribe(
             operator.tiling().universal_guard(),
             Box::new(|| {}),
-            &mut Scheduler::new(),
+            &mut SubscribeContext::new(),
         );
         (union, odd_cell)
     }

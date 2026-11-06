@@ -10,7 +10,7 @@ use super::*;
 use crate::ccl::TagMap;
 use crate::interpreter::{
     BaseType, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, NotifyOrSubscribeResult,
-    Projection, Scheduler, SharedConsumer, UnionArm, Value, scheduler::shared_consumer,
+    Projection, SharedConsumer, SubscribeContext, UnionArm, Value, scheduler::shared_consumer,
 };
 
 /// Produces a function tile whose domain and codomain both equal `extent`.
@@ -36,10 +36,11 @@ impl IterateExtent {
     fn add_all_source_handles(
         extent: &Extent,
         consumer: SharedConsumer,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) {
         extent.for_each_source(&mut |source| {
-            scheduler.add_source_handle(source.clone(), Rc::downgrade(&consumer));
+            cx.scheduler()
+                .add_source_handle(source.clone(), Rc::downgrade(&consumer));
         });
     }
 }
@@ -53,7 +54,7 @@ impl TileOperator for IterateExtent {
         &mut self,
         _intent_guard: TileGuard,
         mut consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let NotifyOrSubscribeResult { notify, subscribe } =
             self.extent.subscribe_to_iteration_action();
@@ -80,7 +81,7 @@ impl TileOperator for IterateExtent {
                 IterateExtentProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             )
             .sharing(gate)
             .leaf(leaf),
@@ -89,13 +90,13 @@ impl TileOperator for IterateExtent {
             _source_wakeup: source_wakeup.as_ref().map(|w| w.shared().clone()),
         });
         if let Some(source_wakeup) = source_wakeup {
-            Self::add_all_source_handles(&self.extent, source_wakeup.shared().clone(), scheduler);
+            Self::add_all_source_handles(&self.extent, source_wakeup.shared().clone(), cx);
             let name = producer.name();
             // Register this producer with any data sources in the extent by calling release with
             // a false predicate.  This way the sources knows about all producers that read it
             //before execution starts.
             release_extent(&mut producer.extent, &Predicate::False, &name);
-            scheduler.note_source_producer(name);
+            cx.note_source_producer(name);
         }
 
         producer
