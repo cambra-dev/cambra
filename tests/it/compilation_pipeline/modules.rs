@@ -1146,6 +1146,17 @@ fn a_module_whose_check_fails_hides_no_error_of_the_root() {
     assert_eq!(report_count(&errors), 2, "{errors}");
 }
 
+/// An error a module's check raises at a node a pass or inference minted traces to the
+/// source through that node's provenance: here a copy of `sales` the comprehension phase puts
+/// in a group's predicate, which emission copies again.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_error_at_a_node_a_module_check_minted_has_a_span() {
+    let library = "pub g = [sum([s.amount for s in g]) for g in groupby(sales, \\r -> r.region)]\n";
+    let errors = compile_errors(&program("import lib\nlib::g\n", &[("lib", library)]));
+    assert!(errors.contains("Unbound variable: 'sales'"), "{errors}");
+}
+
 /// A module two others import is evaluated once: its bindings stand once in the
 /// linked tree, ahead of both importers' (`docs/chl-spec.md`, "9.7 Importing
 /// asserts no IO and no state").
