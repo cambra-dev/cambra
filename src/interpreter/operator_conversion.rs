@@ -3978,12 +3978,8 @@ fn build_commit_store(
             ))
         })?;
         let item_extent = ctx.extent_of(&item_ty)?;
-        // A drive counts commits against the positions its source offers, so
-        // where it starts is whatever the source it is handed still has. A source
-        // this version keeps has already passed some of them. A freshly-built one
-        // starts at `0` whatever the source has done: this drive finds its next
-        // item by scanning up from its cursor, so an advanced source costs it a
-        // comparison, where the induction drive's window would stall.
+        // A transaction drive attempts the source items still offered, acknowledges each key
+        // separately, and resumes with its predecessor's released prefix where one is supplied.
         let IterationInput {
             op: source_op,
             resumed_after: drive_resume,
@@ -4028,8 +4024,8 @@ fn build_commit_store(
             writer_index,
         );
         // Two slots of the driver: the body consumes rows, and the writer acks
-        // finished attempts. The driver advances its item cursor on the release
-        // *intersection*, so a body's consume-release cannot advance it past an
+        // finished attempts. The driver removes its source item on the release
+        // *intersection*, so a body's consume-release cannot acknowledge an
         // attempt still in flight — and so this is the one fan whose input is **not**
         // memoized. A `Memo` releases its input as soon as it caches, which reaches the
         // driver as an ack for an attempt no slot has finished.

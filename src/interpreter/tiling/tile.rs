@@ -197,30 +197,26 @@ pub enum Tile {
 }
 
 /// What a transaction store that takes its writers' decisions ahead of their commits says to one
-/// writer of the decisions it took: see `src/interpreter/design-operators.md`, "Commits in key
-/// order". The writer's drive reads it through the store's recurrence.
+/// writer of the decisions it took: see `src/interpreter/design-operators.md`, "Ready transaction
+/// decisions". The writer's drive reads it through the store's recurrence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WriterTakes {
-    /// The highest source position of the writer's items whose decision has committed or
-    /// stood, every item of the writer below it having done the same; `None` before the first.
-    pub settled: Option<Position>,
-    /// The source positions above `settled` of the writer's items whose decisions went stale,
+    /// The exact source region whose decisions have committed or stood.
+    pub settled: Predicate,
+    /// The unsettled source positions of the writer's items whose decisions went stale,
     /// ascending: the writer decides each again.
     pub again: Vec<Position>,
 }
 
 impl WriterTakes {
-    /// `self` joined with `other`, a later or earlier statement about one writer: the higher
-    /// `settled`, and the items either names to decide again above it.
+    /// Union the settled regions and retry items, excluding retries already settled.
     fn join(&mut self, other: WriterTakes) {
-        if other.settled > self.settled {
-            self.settled = other.settled;
-        }
+        self.settled = self.settled.union(&other.settled);
         self.again.extend(other.again);
         self.again.sort();
         self.again.dedup();
         let settled = self.settled.clone();
-        self.again.retain(|item| Some(item) > settled.as_ref());
+        self.again.retain(|item| !settled.contains(item.value()));
     }
 }
 
@@ -5962,7 +5958,7 @@ mod tests {
 
     fn takes(settled: Option<u64>, again: &[u64]) -> WriterTakes {
         WriterTakes {
-            settled: settled.map(|p| Position::new(Value::UInt(p))),
+            settled: settled.map_or(Predicate::False, |p| Predicate::at_or_below(Value::UInt(p))),
             again: again
                 .iter()
                 .map(|p| Position::new(Value::UInt(*p)))
@@ -6004,6 +6000,24 @@ mod tests {
         let mut unsettled = takes(None, &[0]);
         unsettled.join(takes(None, &[0, 1]));
         assert_eq!(unsettled, takes(None, &[0, 1]));
+    }
+
+    /// Settling a later product key does not settle an earlier key that has not arrived.
+    #[test]
+    fn writer_takes_join_preserves_unsettled_holes() {
+        let mut taken = WriterTakes {
+            settled: Predicate::point(Value::UInt(3)),
+            again: vec![Position::new(Value::UInt(1)), Position::new(Value::UInt(2))],
+        };
+        taken.join(WriterTakes {
+            settled: Predicate::point(Value::UInt(1)),
+            again: vec![Position::new(Value::UInt(3))],
+        });
+        assert!(!taken.settled.contains(&Value::UInt(0)));
+        assert!(!taken.settled.contains(&Value::UInt(2)));
+        assert!(taken.settled.contains(&Value::UInt(1)));
+        assert!(taken.settled.contains(&Value::UInt(3)));
+        assert_eq!(taken.again, vec![Position::new(Value::UInt(2))]);
     }
 
     /// Two arrivals of one store merge their writers' takes writer by writer, and one stating

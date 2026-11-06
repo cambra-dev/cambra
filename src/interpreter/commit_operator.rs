@@ -1118,7 +1118,9 @@ pub(crate) fn pushes_decided_positions(tiling: &Tiling) -> bool {
 /// slot the writer reads it through, to the drive's `source`.
 fn drive_source<R>(
     producer: &dyn TileProducer,
-    f: &mut Option<impl FnOnce(&dyn TileProducer) -> R>,
+    f: &mut Option<
+        impl FnOnce(&dyn TileProducer, Option<crate::interpreter::dispatcher::Placement>) -> R,
+    >,
 ) -> Option<R> {
     let mut found = None;
     producer.visit_input_producers(&mut |role, input| {
@@ -1126,81 +1128,12 @@ fn drive_source<R>(
             return;
         }
         found = match role {
-            "source" => f.take().map(|f| f(input)),
+            "source" => f.take().map(|f| f(input, producer.input_entry("source"))),
             "driver" | "input" => drive_source(input, f),
             _ => None,
         };
     });
     found
-}
-
-/// Whether `extent`'s values are `UInt` positions, which the positions of two sources compare as.
-fn uint_positions(extent: &Extent) -> bool {
-    match extent {
-        Extent::Base(BaseType::UInt) | Extent::UIntRange(_) => true,
-        Extent::DataSourceDomain(source) => {
-            source.borrow().element_extent() == Extent::Base(BaseType::UInt)
-        }
-        Extent::Restricted { base, .. } => uint_positions(base),
-        _ => false,
-    }
-}
-
-/// Whether `extent`'s values are positions key order compares: `UInt` positions, or the tagged
-/// positions of a concatenation whose arms' positions are such positions in turn.
-fn key_positions(extent: &Extent) -> bool {
-    match extent {
-        Extent::Union(arms) => arms.values().all(key_positions),
-        Extent::Restricted { base, .. } => key_positions(base),
-        other => uint_positions(other),
-    }
-}
-
-/// Key order between two writers' positions (`src/interpreter/design-operators.md`, "Commits in
-/// key order"), level by level: a `UInt` position comes before a tagged one, two `UInt` positions
-/// compare as their values do, and two tagged positions compare by tag and then by their arms'
-/// positions in key order.
-fn key_order(a: &Position, b: &Position) -> std::cmp::Ordering {
-    fn values(a: &Value, b: &Value) -> std::cmp::Ordering {
-        match (a, b) {
-            (Value::Union { tag: s, inner: x }, Value::Union { tag: t, inner: y }) => {
-                s.cmp(t).then_with(|| values(x, y))
-            }
-            (Value::Union { .. }, _) => std::cmp::Ordering::Greater,
-            (_, Value::Union { .. }) => std::cmp::Ordering::Less,
-            _ => a
-                .partial_cmp(b)
-                .unwrap_or_else(|| panic!("`UInt` positions compare: `{a}` and `{b}`")),
-        }
-    }
-    values(a.value(), b.value())
-}
-
-/// Whether `value` has the shape of a position of `extent`: untagged where `extent`'s positions
-/// are, and for a concatenation's, tagged by one of its arms with a payload of that arm's shape.
-fn position_of(extent: &Extent, value: &Value) -> bool {
-    match (extent, value) {
-        (Extent::Restricted { base, .. }, _) => position_of(base, value),
-        (Extent::Union(arms), Value::Union { tag, inner }) => {
-            arms.get(tag).is_some_and(|arm| position_of(arm, inner))
-        }
-        (Extent::Union(_), _) | (_, Value::Union { .. }) => false,
-        _ => true,
-    }
-}
-
-/// Whether key order puts `value` before every position of `extent`: a `UInt` before a
-/// concatenation's positions, and a tagged value before those of every arm past its tag and, at
-/// its own tag, before every position of that arm.
-fn precedes_every(value: &Value, extent: &Extent) -> bool {
-    match (extent, value) {
-        (Extent::Restricted { base, .. }, _) => precedes_every(value, base),
-        (Extent::Union(arms), Value::Union { tag, inner }) => arms
-            .iter()
-            .all(|(arm_tag, arm)| arm_tag > tag || (arm_tag == tag && precedes_every(inner, arm))),
-        (Extent::Union(_), _) => true,
-        _ => false,
-    }
 }
 
 /// The tiling of a store's seed input: one value, since the store reads every seed whole when it
@@ -1244,16 +1177,11 @@ impl CommitProducer {
     /// Call `f` with the source of writer `writer`'s drive, which the store consumes as its input
     /// `writer`, or `writer + 1` where it has a seed input.
     fn writer_source<R>(&self, writer: usize, f: impl FnOnce(&dyn TileProducer) -> R) -> R {
-        drive_source(&*self.writer_producers[writer], &mut Some(f))
-            .expect("a transaction writer reads its drive, which reads a source")
-    }
-
-    /// Per writer, the extent of its source's positions.
-    fn source_positions(&self) -> Vec<Extent> {
-        (0..self.writer_producers.len())
-            .map(|k| self.writer_source(k, |source| source.tiling().domain_extent()))
-            .map(|domain| domain.expect("a transaction source is a collection of items"))
-            .collect()
+        drive_source(
+            &*self.writer_producers[writer],
+            &mut Some(|source: &dyn TileProducer, _| f(source)),
+        )
+        .expect("a transaction writer reads its drive, which reads a source")
     }
 }
 
@@ -1268,11 +1196,10 @@ impl SteppedStore for CommitProducer {
         &mut self.breaker
     }
 
-    /// A step of the seed input opens the store, and a step of a writer's input steps in key
-    /// order.
+    /// A seed step opens the store. A writer step attempts its ready decisions.
     fn step_store(&mut self, input: InputId) -> Tile {
         match self.writer_of(input) {
-            Some(writer) => self.step_in_key_order(writer),
+            Some(writer) => self.step_ready(writer),
             None => {
                 self.taking_ahead = true;
                 if self.open_store() {
@@ -1289,20 +1216,19 @@ impl SteppedStore for CommitProducer {
     }
 
     fn settle(&mut self) {
-        self.settle_in_key_order();
+        self.settle_ready();
     }
 }
 
 /// A transaction store driven as a pipeline breaker: input `k` is writer `k`'s source, and a
 /// morsel of it is a run of that writer's items. Each writer's cycle, the store, the writer, its
 /// drive and its body, is one pipeline, all of them sharing the store; the operators inside it
-/// stay in pull mode. The store takes each decision ahead of its commit and commits in key order
-/// (`src/interpreter/design-operators.md`, "Commits in key order"). A deny commits nothing and
+/// stay in pull mode. The store takes and attempts each ready decision
+/// (`src/interpreter/design-operators.md`, "Ready transaction decisions"). A deny commits nothing and
 /// progresses through the source's release alone.
 impl Breaker for CommitProducer {
     fn enter_consuming_mode(&mut self) {
         self.breaker.consuming = true;
-        self.positions = self.source_positions();
     }
 
     fn no_consuming_mode(&self) -> Option<String> {
@@ -1311,17 +1237,7 @@ impl Breaker for CommitProducer {
             "a transaction store has a writer: its keys are the footprints of its `with \
              begin():` blocks, each one of its writers"
         );
-        // Key order compares one writer's source positions with another's: `UInt` positions, and
-        // the tagged positions of a concatenation (`key_order`).
-        let positions = self.source_positions();
-        (positions.len() > 1 && !positions.iter().all(key_positions)).then(|| {
-            format!(
-                "a transaction store of {} writers commits in key order, which compares its \
-                 writers' source positions as `UInt` positions or tagged ones; they range over \
-                 {positions:?}",
-                positions.len()
-            )
-        })
+        None
     }
 
     fn inputs(&self) -> usize {
@@ -1419,7 +1335,13 @@ impl BreakingProducer for CommitProducer {
 
     fn entry_placement(&self, input: InputId) -> Option<crate::interpreter::dispatcher::Placement> {
         match self.writer_of(input) {
-            Some(writer) => self.placements.get(writer).cloned(),
+            Some(writer) => drive_source(
+                &*self.writer_producers[writer],
+                &mut Some(|_: &dyn TileProducer, entry| entry),
+            )
+            .flatten()
+            .map(Some)
+            .expect("a transaction writer's drive exposes its source entry"),
             None => self.seed_placements.first().cloned(),
         }
     }
@@ -2317,7 +2239,7 @@ fn changelog_value(values: &Tile, i: usize) -> Value {
 const F_SNAP: &str = "snap";
 const F_READS: &str = "reads";
 /// The source position of the item a proposal is for, which a consuming store keys its take
-/// by (`src/interpreter/design-operators.md`, "Commits in key order").
+/// by (`src/interpreter/design-operators.md`, "Ready transaction decisions").
 const F_POS: &str = "pos";
 
 /// The field of a transaction drive's output, and of a writer's proposal stream, holding its rows,
@@ -2615,16 +2537,12 @@ impl TileOperator for CommitOperator {
         };
         Box::new(CommitProducer {
             base,
-            placements,
             seed_placements,
             queued: (0..n).map(|_| BTreeMap::new()).collect(),
             taking_ahead: false,
             #[cfg(debug_assertions)]
             takes_published: false,
-            decided: vec![Predicate::False; n],
-            taken_through: vec![None; n],
-            positions: Vec::new(),
-            settled: vec![None; n],
+            settled: vec![Predicate::False; n],
             again: vec![BTreeSet::new(); n],
             writer_producers,
             consumed: vec![0; n],
@@ -2646,9 +2564,6 @@ impl TileOperator for CommitOperator {
 struct CommitProducer {
     base: ProducerBase,
     writer_producers: Vec<Box<dyn TileProducer>>,
-    /// Per writer, the placement of the entry it is subscribed behind, which a planner sets to
-    /// the pipeline that consumes the writer's source.
-    placements: Vec<crate::interpreter::dispatcher::Placement>,
     /// Per seed stream, the placement of the entry it is subscribed behind, which a planner sets
     /// to the pipeline of the store's input 0 ([`Self::writer_of`]). Empty where the store has no
     /// seed stream, and then it has no seed input.
@@ -2665,18 +2580,8 @@ struct CommitProducer {
     /// nothing to the store only where it reads them.
     #[cfg(debug_assertions)]
     takes_published: bool,
-    /// Per writer, how far its drive has decided its source, as its proposal stream last stated
-    /// it ([`decided_tile`]).
-    decided: Vec<Predicate>,
-    /// Per writer, the highest item whose decision the store has taken.
-    taken_through: Vec<Option<Position>>,
-    /// Per writer, the extent of its source's positions, which key order compares with the other
-    /// writers' ([`passed`](Self::passed)). Set as the store enters consuming mode; empty in pull
-    /// mode.
-    positions: Vec<Extent>,
-    /// Per writer, the highest item whose decision has committed or stood, every item of the
-    /// writer below it having done the same ([`WriterTakes::settled`]).
-    settled: Vec<Option<Position>>,
+    /// Per writer, the exact region whose decisions committed or stood ([`WriterTakes::settled`]).
+    settled: Vec<Predicate>,
     /// Per writer, the items whose decisions went stale, which its drive emits again
     /// ([`WriterTakes::again`]).
     again: Vec<BTreeSet<Position>>,
@@ -2722,8 +2627,7 @@ struct CommitProducer {
     reported_closed: HashSet<Value>,
 }
 
-/// A writer's decision for one item, which a consuming store holds until the item's key comes up
-/// in key order (`src/interpreter/design-operators.md`, "Commits in key order").
+/// A writer's decision for one item, held until it is attempted against the committed store.
 enum Held {
     /// A proposal, which the engine validates.
     Proposal(Proposal),
@@ -2846,8 +2750,7 @@ impl TileProducer for CommitProducer {
         // below the oldest snapshot a held proposal was built against, in every build: the
         // store then still answers the proposal's reads at its snapshot, which `attempt`
         // checks in a debug build. Staleness reads each key's latest change, which no reclaim
-        // drops. The changelog behind a held proposal stays while it is held, without bound
-        // behind a writer whose live source is idle. The reclaim drops the committed versions
+        // drops. A held proposal retains its snapshot until attempted. The reclaim drops the committed versions
         // through the last tick the meet covers from the start, not through its highest point,
         // since a tick the meet skips is still read, and so is everything after it; it keeps the
         // carry source a live position reads.
@@ -2919,8 +2822,7 @@ impl CommitProducer {
     /// nor taken, with the step of each and the source position of its item.
     fn new_proposals(&mut self, k: usize) -> Vec<(u64, Position, Proposal)> {
         let guard = self.writer_producers[k].tiling().universal_guard();
-        let (tile, decided) = split_transact_stream(self.writer_producers[k].get(guard));
-        self.decided[k] = decided;
+        let (tile, _) = split_transact_stream(self.writer_producers[k].get(guard));
         let Tile::DataFunction {
             domain,
             codomain,
@@ -3133,17 +3035,17 @@ impl CommitProducer {
     }
 
     /// One step of a consuming store toward writer `k`'s release: take what writer `k` decides
-    /// ([`take`](Self::take)), then commit in key order what may commit
-    /// ([`commit_in_key_order`](Self::commit_in_key_order)). From the store's first step on it
+    /// ([`take`](Self::take)), then attempt the ready decisions
+    /// ([`commit_ready`](Self::commit_ready)). From the store's first step on it
     /// states [`WriterTakes`] for its writers.
-    fn step_in_key_order(&mut self, k: usize) -> Tile {
+    fn step_ready(&mut self, k: usize) -> Tile {
         self.debug_assert_position_invariant();
         self.taking_ahead = true;
         if !self.open_store() {
             return CommitEngine::unopened().render_full_store_tile(self.tiling());
         }
         self.take(k);
-        self.commit_in_key_order(false);
+        self.commit_ready();
         // The step's tile is what `consume_store` publishes.
         #[cfg(debug_assertions)]
         {
@@ -3172,16 +3074,8 @@ impl CommitProducer {
                 "writer {k} decides against the store as the engine holds it, which the store \
                  published before the pull"
             );
-            debug_assert!(
-                position_of(&self.positions[k], item.value()),
-                "writer {k} proposes at positions of its source's shape: {item} is none of {:?}",
-                self.positions[k]
-            );
             self.consumed[k] = step + 1;
             self.release_steps(k, step);
-            if self.taken_through[k].as_ref() < Some(&item) {
-                self.taken_through[k] = Some(item.clone());
-            }
             let held = match proposal.writes.is_empty() {
                 true => Held::Local {
                     snapshot: proposal.snapshot,
@@ -3197,31 +3091,19 @@ impl CommitProducer {
         }
     }
 
-    /// Commit the held decisions in key order, `(position, writer)`, while the least key may
-    /// commit: once every other writer has passed its position or is terminal, and at once where
-    /// `settling`, when every input has finished. A proposal commits where
-    /// the engine validates it, and a decision that proposed nothing stands where nothing has
-    /// committed since it was made. One that does neither keeps its key: its writer decides the
-    /// item again at once ([`drive_again`](Self::drive_again)), before anything with a larger key
-    /// commits.
-    fn commit_in_key_order(&mut self, settling: bool) {
-        while let Some((item, k)) = self
-            .queued
-            .iter()
-            .enumerate()
-            .filter_map(|(k, queued)| queued.keys().next().map(|item| (item.clone(), k)))
-            .min_by(|(a, k), (b, l)| key_order(a, b).then(k.cmp(l)))
+    /// Attempt ready decisions, rotating among writers after each attempt. Only positions of
+    /// the same writer are compared. A stale decision is re-evaluated against the current store.
+    fn commit_ready(&mut self) {
+        let n = self.writer_producers.len();
+        while let Some(k) = (0..n)
+            .map(|off| (self.drain_start + off) % n)
+            .find(|&k| !self.queued[k].is_empty())
         {
-            let n = self.writer_producers.len();
-            let others_passed = (0..n).all(|other| {
-                other == k || self.writer_terminal[other] || self.passed(other, &item)
-            });
-            if !settling && !others_passed {
-                break;
-            }
+            self.drain_start = (k + 1) % n;
+            let item = self.queued[k].first_key_value().unwrap().0.clone();
             let held = self.queued[k]
                 .remove(&item)
-                .expect("the least key is a held decision's");
+                .expect("the selected writer holds a decision");
             let stands = match held {
                 Held::Proposal(proposal) => {
                     #[cfg(debug_assertions)]
@@ -3237,46 +3119,19 @@ impl CommitProducer {
             };
             match stands {
                 true => {
-                    debug_assert!(
-                        self.settled[k] < Some(item.clone()),
-                        "writer {k}'s decisions settle in item order: {item} after {:?}",
-                        self.settled[k]
-                    );
                     self.again[k].remove(&item);
-                    self.settled[k] = Some(item);
+                    self.settled[k] = self.settled[k].union(&Predicate::point(item.into_value()));
                 }
                 false => self.drive_again(k, &item),
             }
         }
-        // A fresh decision is made against the store as the engine holds it and taken as the
-        // least key, so it commits or stands at once.
+        // Retried decisions read the current store and resolve during this pass.
         debug_assert!(
             self.again.iter().all(BTreeSet::is_empty),
             "every item the store names to decide again resolves in the pass that names it: \
              {:?}",
             self.again
         );
-    }
-
-    /// Whether writer `k` has passed the source position `item`, so every key the writer has
-    /// still to propose at is past `(item, k)`: its proposal stream states `item` decided
-    /// ([`decided_tile`]), or the store has taken its decision for an item at or past `item`. A
-    /// writer decides its items in order, so a decision for an item is one for every item before
-    /// it. The stream states what its drive had decided when the writer was pulled, which is
-    /// short of the decision the same pull brings.
-    ///
-    /// Where `item` is no position of writer `k`'s source, a position of a different shape from
-    /// `k`'s ([`key_order`]), `k` has passed it where key order puts `item` before every position
-    /// of `k`'s source, where its stream states every position decided, or where the store has
-    /// taken one of `k`'s decisions at a key at or past `item`.
-    fn passed(&self, k: usize, item: &Position) -> bool {
-        let positions = &self.positions[k];
-        precedes_every(item.value(), positions)
-            || self.decided[k].is_true()
-            || (position_of(positions, item.value()) && self.decided[k].contains(item.value()))
-            || self.taken_through[k]
-                .as_ref()
-                .is_some_and(|taken| key_order(taken, item).is_ge())
     }
 
     /// Have writer `k` decide `item` again, at the store's frontier, and take the decision: its
@@ -3286,15 +3141,14 @@ impl CommitProducer {
     ///
     /// # Panics
     ///
-    /// Where the pull brings no decision for `item`: a larger key would commit before it.
+    /// Where the pull brings no decision for `item`: its writer cannot advance past an unresolved decision.
     fn drive_again(&mut self, k: usize, item: &Position) {
         self.again[k].insert(item.clone());
         self.publish_commits();
         self.take(k);
         assert!(
             self.queued[k].contains_key(item),
-            "writer {k} decides {item} again at the pull after the store names it, before any \
-             larger key commits"
+            "writer {k} supplies a fresh decision for {item} on the pull after the store names it"
         );
     }
 
@@ -3317,10 +3171,10 @@ impl CommitProducer {
     }
 
     /// Commit what the store holds once every input has finished: take what
-    /// each writer still proposes, and commit in key order, until a pull of every writer brings
+    /// each writer still proposes, and attempt every ready decision, until a pull of every writer brings
     /// nothing. That last pull finds each writer terminal: its drive is done once the store has
     /// let go of all its items.
-    fn settle_in_key_order(&mut self) {
+    fn settle_ready(&mut self) {
         self.taking_ahead = true;
         if !self.open_store() {
             return;
@@ -3333,7 +3187,7 @@ impl CommitProducer {
             if self.queued.iter().all(BTreeMap::is_empty) {
                 break;
             }
-            self.commit_in_key_order(true);
+            self.commit_ready();
         }
         let tile = self.render_store();
         if let Some(cycle) = &self.breaker.cycle {
@@ -5862,11 +5716,8 @@ impl DriverWindow {
         self.inner_rows().next_back().map(|r| (&r.position, r))
     }
 
-    /// Drop the prefix a release covers and report the extent, so a caller whose cursor
-    /// advances on the release — the transaction driver's item cursor, moved by the
-    /// commit-ack — reads the classification rather than re-deriving it. A driver that
-    /// only reclaims uses [`reclaim`](Self::reclaim), which needs no cursor.
-    fn acknowledge(&mut self, pred: &Predicate) -> ReleasedExtent {
+    /// Drop the released attempt prefix of a window with no enclosing rows.
+    fn acknowledge(&mut self, pred: &Predicate) {
         let extent = self.release_cursor.advance_from(pred);
         // Only a window with no rows above its positions acknowledges, so its inner rows are
         // the one group's.
@@ -5875,10 +5726,10 @@ impl DriverWindow {
             "a release is acknowledged by a window with no rows above its positions"
         );
         let Some(group) = self.groups.first_mut() else {
-            return extent;
+            return;
         };
         let drop_through = match extent {
-            ReleasedExtent::Nothing => return extent,
+            ReleasedExtent::Nothing => return,
             ReleasedExtent::All => group.inner_rows.len(),
             // Positions ascend, so the released ones are a prefix of the window.
             ReleasedExtent::Through(ref w) => {
@@ -5886,7 +5737,6 @@ impl DriverWindow {
             }
         };
         group.inner_rows.drain(..drop_through);
-        extent
     }
 
     /// Every position the drive has emitted, as the prefix through the last one pushed.
@@ -6124,8 +5974,8 @@ struct DriverInputs {
     consumer: GatedConsumer,
     /// The gate on `consumer`, for the drive's producer to clear on every pull.
     gate: Gate,
-    /// The placement of the entry in front of the source, which a planner sets where the drive
-    /// is a pipeline breaker ([`InductionDriverProducer`]).
+    /// The source entry, placed in an induction scope's request pipeline or a transaction
+    /// store's writer pipeline.
     placement: crate::interpreter::dispatcher::Placement,
     /// Where the entry in front of the source records a decided push while unplaced.
     decides: crate::interpreter::dispatcher::DecidedTarget,
@@ -6191,10 +6041,9 @@ fn subscribe_driver_inputs(
     // The flag is set ahead of the forward, which drops a notification that re-enters a
     // consumer behind a closed gate: the flag records every arrival the gate hides.
     let source_news = Notified::flag();
-    // An unplaced entry stops a push from a pipeline beneath the source, since a drive reads its
-    // source by pull. A loop's scope places it for its rounds, where an induction drive takes the
-    // positions it emits as a pipeline breaker's packages, and the pipelines beneath the source
-    // have finished.
+    // The source entry receives pushes in source keys. The planner places it in the induction
+    // scope's request pipeline or transaction store's writer pipeline; otherwise it stops pushes
+    // and the source is read by pull.
     let forward = source_news.consumer(forwarding_consumer(
         &consumer,
         &cx.scheduler().wakeup_queue(),
@@ -6573,7 +6422,7 @@ struct InductionDriverProducer {
     emitted_through: Option<Path>,
     /// Highest source path released back upstream. The driver never re-reads a position it
     /// has emitted and never reads a filtered one, so every emitted position, and every
-    /// filtered one it has read past ([`source_read_through`]), is reclaimable; a co-iterated
+    /// filtered one it has read past , is reclaimable; a co-iterated
     /// reader keeps its own positions live through the source's cross-producer release
     /// intersection.
     source_released_through: Option<Path>,
@@ -7189,7 +7038,7 @@ impl InductionDriverProducer {
         self.stated = stated;
         // The filtered rows this drive has read past, at every depth: the highest path the
         // source holds, deleted rows included, below the next one to run, where the source
-        // calls it complete along with every path before it ([`source_read_through`] states
+        // calls it complete along with every path before it (the source states
         // the rule for a drive with no rows above it).
         let read_through = self
             .source
@@ -7232,8 +7081,8 @@ impl InductionDriverProducer {
 /// advances.
 ///
 /// An induction position is decided by the store's frontier; a transaction's is
-/// not, because a commit is what *moves* the frontier. So the item cursor
-/// advances on the **commit-ack**, delivered as a release — but a release from
+/// not, because a commit is what *moves* the frontier. Its item is acknowledged by the
+/// **commit-ack**, delivered as a release — but a release from
 /// the body alone would be wrong, because a body releases a row the moment it
 /// consumes it, long before the attempt commits. The driver therefore sits behind
 /// a `FanOut` with two slots, the body and [`TransactWriter`], and reads the
@@ -7256,14 +7105,8 @@ impl InductionDriverProducer {
 /// `a_contended_item_keeps_the_drive_window_flat`.
 pub struct TransactDriver {
     base: OperatorBase,
-    /// The first source position this drive attempts.
-    ///
-    /// `0` for a drive that starts with its source, whatever that source has
-    /// already delivered: this drive finds its next item by scanning up from its
-    /// cursor rather than being based at a position, so a position the source no
-    /// longer offers costs it a comparison where an induction drive's window
-    /// would stall. A drive continuing a retired one is told where its
-    /// predecessor had reached, so it commits no position twice.
+    /// The released prefix boundary inherited from a retired drive, or `None` for a fresh drive.
+    /// The new drive includes this prefix in its released region so those source keys are not attempted again.
     resumed_after: Option<Position>,
     /// The store read back through the cyclic `FanOut`.
     store_op: Box<dyn TileOperator>,
@@ -7360,8 +7203,8 @@ impl TileOperator for TransactDriver {
             store_producer: inputs.store_producer,
             source_producer: inputs.source_producer,
             source_news: inputs.source_news,
+            source_entry: inputs.placement,
             source: DecodedSource::default(),
-            source_complete: Predicate::False,
             consumer: inputs.consumer,
             wakeups: cx.scheduler().wakeup_queue(),
             read_keys: self.read_keys.clone(),
@@ -7374,9 +7217,13 @@ impl TileOperator for TransactDriver {
                 self.item.clone(),
                 Some(self.item_positions.clone()),
             ),
-            current: self.resumed_after.clone(),
             latest_emit: None,
-            source_released_through: self.resumed_after.clone(),
+            source_released: self
+                .resumed_after
+                .as_ref()
+                .map_or(Predicate::False, |position| {
+                    Predicate::at_or_below_in(position.value().clone(), &self.item_positions)
+                }),
             writer: self.writer,
             taken: None,
             resumed: self.resumed_after.is_some(),
@@ -7390,10 +7237,10 @@ struct TransactDriverProducer {
     source_producer: Box<dyn TileProducer>,
     /// Whether the source has notified since it was last read.
     source_news: Notified,
+    /// The entry before the source, placed in the transaction store's writer pipeline.
+    source_entry: crate::interpreter::dispatcher::Placement,
     /// The source as of its last read, with a position a path of one component.
     source: DecodedSource,
-    /// What the source called complete as of its last read.
-    source_complete: Predicate,
     /// This driver's consumer, re-armed through [`wakeups`](Self::wakeups) while a
     /// transaction remains to attempt — the one-step-per-pull cycle driver. The
     /// cycle is its own trigger: an attempt becomes emittable when the store's
@@ -7403,15 +7250,6 @@ struct TransactDriverProducer {
     /// requests its own re-pull instead of looping inside `get`.
     wakeups: WakeupQueue,
     read_keys: Vec<Value>,
-    /// The **absolute source position** of the highest item that has finished, or
-    /// `None` before the first. The drive always attempts the lowest position the
-    /// source still offers above it.
-    ///
-    /// Absolute rather than a count of the columns the source currently offers:
-    /// a column count names a position in a view, so it means nothing to a drive
-    /// that did not emit it, and a replacement drive taking over a running
-    /// program would re-attempt every transaction the retired one committed.
-    current: Option<Position>,
     /// The emitted rows — the attempts in flight, including superseded retries
     /// not yet reclaimed.
     ///
@@ -7425,9 +7263,8 @@ struct TransactDriverProducer {
     /// is a pure function of that pair, so re-emitting at an unchanged pair would
     /// duplicate a domain position against the body's `Memo`.
     latest_emit: Option<(Position, Position)>,
-    /// The source prefix this driver has released, by a finish or by reading past a
-    /// filtered row, so a pull that reads nothing new does not repeat the release.
-    source_released_through: Option<Position>,
+    /// The exact source region released by acknowledgements or decided-absent rows.
+    source_released: Predicate,
     /// The index of this drive's writer among its store's writers ([`TransactDriver::writer`]).
     writer: usize,
     /// Once the store says it takes decisions ahead of their commits, by stating
@@ -7448,7 +7285,7 @@ struct TransactDriverProducer {
 ///
 /// This bound *is* the O(1) claim the writer's supersession release exists for,
 /// and it holds only because of it. Rows are added at most one per pull and only
-/// for `current`; they leave on the release intersection. The writer contributes
+/// for one source item; they leave on the release intersection. The writer contributes
 /// two releases — everything below the position it decides (supersession) and
 /// `≤ attempt` when the item finishes (the ack) — and it is the first that caps
 /// the window. Drop it and the window instead holds one row per retry between
@@ -7457,8 +7294,7 @@ struct TransactDriverProducer {
 const MAX_LIVE_ATTEMPTS: usize = 2;
 
 impl TransactDriverProducer {
-    /// The source's positions, which a release's prefix is spelled over: a concatenation
-    /// keys them by a union.
+    /// The source's position domain, including record products and tagged positions.
     fn source_positions(&self) -> Extent {
         let Tiling::DataFunction { domain, .. } = self.source_producer.tiling() else {
             unreachable!("a transaction source is a collection of items")
@@ -7466,30 +7302,22 @@ impl TransactDriverProducer {
         domain.clone()
     }
 
-    /// Release the source through `through`, unless an earlier release already reaches it.
-    fn release_source_through(&mut self, through: Option<Position>) {
-        if let Some(through) = through
-            && !self
-                .source_released_through
-                .as_ref()
-                .is_some_and(|r| *r >= through)
-        {
-            let prefix =
-                Predicate::at_or_below_in(through.value().clone(), &self.source_positions());
-            self.source_producer
-                .release(TileGuard::Function(FunctionGuard::Domain(prefix)));
-            self.source.forget_through(&one_component(through.clone()));
-            self.source_released_through = Some(through);
+    /// Release `region`. Product arrivals need not form a
+    /// prefix, so completing one item releases no position other than that item.
+    fn release_source_region(&mut self, region: Predicate) {
+        if region.minus(&self.source_released).is_false() {
+            return;
         }
+        self.source_released = self.source_released.union(&region);
+        self.source_producer
+            .release(TileGuard::Function(FunctionGuard::Domain(region)));
     }
 
     /// The two standing facts about the live window, checked on both sides of the
-    /// only two things that move it: an emit, and the release that advances the
-    /// item cursor.
+    /// only two things that move it: an emit and the release that acknowledges its item.
     ///
     /// It is **all one item**: rows are emitted only for the lowest unfinished
-    /// source position, and `current` advances past it exactly when a release drops
-    /// its rows. That is what lets the writer decide the newest position and treat
+    /// source position currently offered, and an acknowledgement removes that item and its rows. That is what lets the writer decide the newest position and treat
     /// every older live one as superseded — if the window ever spanned two items,
     /// that rule would abandon a real attempt.
     ///
@@ -7520,6 +7348,10 @@ impl TransactDriverProducer {
 }
 
 impl TileProducer for TransactDriverProducer {
+    fn input_entry(&self, input: &str) -> Option<crate::interpreter::dispatcher::Placement> {
+        (input == "source").then(|| self.source_entry.clone())
+    }
+
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("store", &*self.store_producer);
         visit("source", &*self.source_producer);
@@ -7548,7 +7380,7 @@ impl TileProducer for TransactDriverProducer {
         // request stream) grows over time under stable append-only positions, a tile only
         // grows between its notifications and the drive's own releases, and a release removes
         // what the driver has finished with, so the last read still answers. The drive
-        // releases a prefix — `release_impl` withdraws each item as it finishes — which is why
+        // releases each finished item's exact key (`release_impl`), which is why
         // an item is named by its domain position rather than by a column index. Without the
         // cache each pull decodes and sorts every item not yet released.
         // A source released whole is not pulled again: the release promised it nothing more.
@@ -7557,7 +7389,7 @@ impl TileProducer for TransactDriverProducer {
                 .source_producer
                 .get(self.source_producer.tiling().universal_guard());
             self.source = DecodedSource::read(&src, 0);
-            self.source_complete = match &src {
+            let source_complete = match &src {
                 Tile::DataFunction {
                     domain_predicate, ..
                 } => domain_predicate.clone(),
@@ -7565,9 +7397,35 @@ impl TileProducer for TransactDriverProducer {
             };
             // A source may honour a release a pull late, so a read can still show what the
             // drive has already released.
-            if let Some(released) = &self.source_released_through {
-                self.source.forget_through(&one_component(released.clone()));
-            }
+            self.source
+                .items
+                .retain(|path, _| !self.source_released.contains(&path[0]));
+            self.source
+                .held
+                .retain(|path| !self.source_released.contains(&path[0]));
+            // Every decided position with no delivered item is finished without an attempt.
+            let pending = self
+                .source
+                .items
+                .keys()
+                .fold(Predicate::False, |pending, path| {
+                    pending.union(&Predicate::point(path[0].clone()))
+                });
+            // A terminal tile decides the entire key universe. Until this drive is exhausted,
+            // release only its held absent keys: releasing the complement of pending items would
+            // become universal on the last ack, before a pull observes exhaustion. Registration
+            // during reload distinguishes that early stop from a source released whole.
+            let complete = if self.source.terminal {
+                self.source
+                    .held
+                    .iter()
+                    .fold(Predicate::False, |held, path| {
+                        held.union(&Predicate::point(path[0].clone()))
+                    })
+            } else {
+                source_complete
+            };
+            self.release_source_region(complete.minus(&pending));
         }
         // The source is *complete* only when its tile is terminal. A batch source
         // (a list) is terminal on the first pull; a live source (an HTTP request
@@ -7575,21 +7433,9 @@ impl TileProducer for TransactDriverProducer {
         let source_complete = self.source.terminal;
         // Positioned, so an item is named by where it sits in the source's own
         // domain rather than by where it sits in the columns still on offer. The
-        // lowest position above the cursor is the next item: the cursor is
-        // the attempt in flight until its ack, and the ack both advances it and
-        // withdraws the position from the source.
-        let current = self.current.clone().map(one_component);
-        let next_item = self.source.next_delivered(current.as_ref()).cloned();
-        // A filtered row is finished once the drive reads past it: nothing attempts it, so no
-        // ack releases it. The attempt in flight, if any, is the next item, so it stays
-        // offered.
-        let read_through = source_read_through(
-            &self.source.held,
-            next_item.as_ref(),
-            &self.source_complete,
-            &self.source_positions(),
-        );
-        self.release_source_through(read_through);
+        // smallest currently delivered item is attempted next. Its acknowledgement removes it
+        // without excluding a smaller position that another product dimension may deliver later.
+        let next_item = self.source.next_delivered(None).cloned();
         let store = self
             .store_producer
             .get(self.store_producer.tiling().universal_guard());
@@ -7629,12 +7475,10 @@ impl TileProducer for TransactDriverProducer {
                  decisions ahead of their commits releases what has not committed"
             );
             let taken = self.taken.get_or_insert_with(BTreeMap::new);
-            if let Some(settled) = &takes.settled {
-                taken.retain(|item, _| item > settled);
-            }
+            taken.retain(|item, _| !takes.settled.contains(item.value()));
             // The store names an item to decide again only in the tile it publishes before the
             // pull that decides it, and the decision commits or stands before the store publishes
-            // again (`CommitProducer::commit_in_key_order`). A second pull of this drive within
+            // again (`CommitProducer::commit_ready`). A second pull of this drive within
             // that pull finds the item's row in the window, and the emit is suppressed as a
             // repeat of `(item, frontier)`.
             debug_assert!(
@@ -7722,19 +7566,12 @@ impl TileProducer for TransactDriverProducer {
         if emit.is_some() {
             self.wakeups.request(self.consumer.shared().clone());
         }
-        // How far the drive has decided its source: every item through the last one acked, and
-        // every position read past, or all of it once the source is exhausted.
+        // The exact acknowledged or decided-absent region, or everything once exhausted.
         let positions = self.source_positions();
-        let decided = match exhausted {
-            true => Predicate::True,
-            false => match self
-                .current
-                .clone()
-                .max(self.source_released_through.clone())
-            {
-                Some(through) => Predicate::at_or_below_in(through.into_value(), &positions),
-                None => Predicate::False,
-            },
+        let decided = if exhausted {
+            Predicate::True
+        } else {
+            self.source_released.clone()
         };
         // A release naming part of a row rather than the row leaves the row in the window
         // (`release_impl`), so what it names is withheld here.
@@ -7758,8 +7595,7 @@ impl TileProducer for TransactDriverProducer {
         // their **intersection**. The body releases a row as soon as it has
         // *consumed* it, which is not an ack; the writer releases it when the
         // attempt has *finished* (committed, or denied without proposing). The
-        // intersection of the two is the finish, and that is what advances the
-        // item cursor. Superseded retries for the same item ride the same prefix
+        // intersection acknowledges the item. Superseded retries for the same item share an attempt prefix
         // and give the same answer, so the rule is idempotent under any order.
         //
         // The window holds rows, so it acts on the rows the release names whole. What the
@@ -7767,7 +7603,7 @@ impl TileProducer for TransactDriverProducer {
         let pred = &obsolete_guard.whole_keys();
         // Only the **newest** live row's release is the item's finish. An older one
         // is a superseded retry, which the writer releases as soon as a newer
-        // attempt replaces it — reclaiming that row must not advance the cursor past
+        // attempt replaces it — reclaiming that row must not acknowledge
         // an item still in flight, which is the same mistake as taking the body's
         // consume-release for an ack. The window is all one item, so the newest row
         // is the last, and superseded rows are exactly the prefix compacted below.
@@ -7778,20 +7614,10 @@ impl TileProducer for TransactDriverProducer {
             if let Some(taken) = &mut self.taken {
                 taken.insert(finished.clone(), row.item.clone());
             }
-            // A max: the ack of an item emitted again leaves the cursor at the highest item
-            // acked before it.
-            self.current = Some(match self.current.take() {
-                Some(c) => c.max(finished.clone()),
-                None => finished.clone(),
-            });
-            // A prefix release, which is sound because rows are emitted for the
-            // lowest offered position only: everything at or below the one that
-            // just finished has finished too. Releasing it is what makes the
-            // source's own release state this drive's progress record, so a
-            // replacement drive is offered what this one did not finish and
-            // nothing it did or read past — see `src/ccl/design/program-evolution.md`,
-            // "Where a producer registering now starts".
-            self.release_source_through(Some(finished));
+            let path = one_component(finished.clone());
+            self.source.items.remove(&path);
+            self.source.held.remove(&path);
+            self.release_source_region(Predicate::point(finished.into_value()));
         }
         self.window.acknowledge(pred);
         self.debug_assert_window_invariants();
@@ -8000,63 +7826,6 @@ fn last_position_below(
     bound: &Position,
 ) -> Option<Position> {
     positions.into_iter().filter(|p| p < bound).max()
-}
-
-/// The highest position a drive has read past without running it, below `next` (the next
-/// position the drive will run, or `None` when there is none): the higher of the highest
-/// position the source holds, filtered rows included, that the source calls `complete` along
-/// with every position before it, and the end of the source's complete prefix of positions
-/// ([`complete_prefix_below`]), which can be a position the source holds nothing at. `held` and
-/// `next` are paths of one component.
-///
-/// A filtered row stays in the tile, marked deleted, and the drive never runs it, so no
-/// decision or ack releases it; the drive releases it on reading past it. The completeness
-/// condition keeps that release a prefix of positions that have arrived: a source delivering
-/// out of order may still send a position below one it holds, and a drive placed across a
-/// reload resumes past whatever its predecessor released.
-fn source_read_through(
-    held: &BTreeSet<Path>,
-    next: Option<&Path>,
-    complete: &Predicate,
-    positions: &Extent,
-) -> Option<Position> {
-    // A position complete along with everything before it, so the highest such position
-    // below `next` is the first one found from above.
-    let held_through = held
-        .range::<Path, _>((Unbounded, next.map_or(Unbounded, Excluded)))
-        .rfind(|p| complete.subsumes(&Predicate::at_or_below_in(p[0].clone(), positions)))
-        .map(|p| Position::new(p[0].clone()));
-    // A position the source calls complete and holds no item at, a key a live source never
-    // delivers, is read past as a filtered row is.
-    let absent_through = complete_prefix_below(complete, next.map(|p| &p[0])).map(Position::new);
-    held_through.max(absent_through)
-}
-
-/// The highest position below `next`, or of all, that `complete` calls complete along with
-/// every position before it, where the source's positions are `UInt` from 0: what a sequential
-/// drive has read past, the positions the source holds nothing at among them. `None` where
-/// `complete` names no such position; where it is no prefix of the positions from 0, which
-/// reads as naming none; and where it names every position and there is no `next`, which is the
-/// drive's end rather than a position.
-fn complete_prefix_below(complete: &Predicate, next: Option<&Value>) -> Option<Value> {
-    let before_next = match next {
-        Some(Value::UInt(0)) => return None,
-        Some(Value::UInt(n)) => Some(n - 1),
-        _ => None,
-    };
-    let through = match complete.is_true() {
-        true => before_next?,
-        false => {
-            let Value::UInt(through) = complete.max_released_position()?.into_value() else {
-                return None;
-            };
-            if !complete.subsumes(&Predicate::at_or_below(Value::UInt(through))) {
-                return None;
-            }
-            before_next.map_or(through, |before| through.min(before))
-        }
-    };
-    Some(Value::UInt(through))
 }
 
 /// Every position of a collection tile's domain. Empty for any other tile.
@@ -8326,8 +8095,7 @@ impl TileOperator for TransactWriter {
         // This writer re-arms nothing itself: the driver owns the transaction
         // source and re-arms while a transaction remains to attempt, which
         // subsumes every continuation this writer could want (an attempt is only
-        // in flight while its item is unacked, so the driver's cursor has not
-        // passed it). What the writer does need is for the driver's wakeups and
+        // in flight while its item is unacked). What the writer does need is for the driver's wakeups and
         // live arrivals to *reach* it, and through it the commit cycle and any
         // sink reading a store key or `__to_<defer>` tap — that is the forwarding
         // consumer on its driver slot below. The store and body inputs need no
@@ -8375,8 +8143,7 @@ impl TileOperator for TransactWriter {
 ///
 /// The item's source position rides along as the driver's row stated it
 /// ([`item_position_field`]): the writer copies it into the proposal for a store
-/// that keys its takes by it, and advances no cursor of its own by it. The driver
-/// owns the transaction source and therefore the item cursor. The writer names an
+/// that keys its takes by it. The driver owns the transaction source and acknowledges its items. The writer names an
 /// attempt by the driver position it came from, which is the identity the driver
 /// itself uses.
 struct InFlightProposal {
@@ -8563,7 +8330,7 @@ impl CyclicSequencingProducer for TransactWriterProducer {
         // position than the one before. A window that ever went backwards would
         // mean a position had shifted under the consumer's cursor. Driver positions
         // are the ordering because they are what the writer names an attempt by —
-        // the driver's item cursor is the driver's, and the writer keeps no copy.
+        // source positions identify items but do not order attempts.
         debug_assert!(
             self.emitted.windows(2).all(|w| w[0].attempt < w[1].attempt),
             "the live proposal window is out of attempt order: {:?}",
@@ -8848,8 +8615,8 @@ impl TileProducer for TransactWriterProducer {
                     // `ExtractFinal` is empty until the sibling loop's own cycle
                     // drains, one position per body pull. Leaving `last_decided_pos`
                     // unset is the whole handling: this position stays undecided, so
-                    // nothing acks the driver row, so the driver's item cursor does not
-                    // move and the driver keeps re-arming. Each re-pull advances the
+                    // nothing acknowledges the driver row, so the item remains in flight and
+                    // the driver keeps re-arming. Each re-pull advances the
                     // sibling loop one step until the decision fills in.
                 }
             }
@@ -8874,7 +8641,7 @@ impl TileProducer for TransactWriterProducer {
         // The entry at vector index `i` is absolute position `committed_base + i`
         // (positions are stable; the consumer releases by that absolute value).
         // A committed proposal finishes its item, so ack the driver row it was
-        // decided from — the driver is what advances the item cursor.
+        // decided from — the driver acknowledges and removes the source item.
         let ack = self
             .emitted
             .iter()
@@ -10960,7 +10727,7 @@ mod tests {
             CommitEngine::new(balances(&[("pool", 100)])).render_full_store_tile(&tiling);
         if let Tile::Store { writer_takes, .. } = &mut store {
             *writer_takes = vec![WriterTakes {
-                settled: None,
+                settled: Predicate::False,
                 again: Vec::new(),
             }];
         }

@@ -1580,6 +1580,12 @@ pub trait BreakingProducer: TileProducer + Breaker {
 /// Created by [`TileOperator::subscribe`], a producer services `get` queries
 /// and accepts `release` notifications from its consumer.
 pub trait TileProducer {
+    /// The entry before `input`, where an enclosing breaker's planner can receive that input's
+    /// pushes in its own keys. Unplaced inputs remain read by pull.
+    fn input_entry(&self, _input: &str) -> Option<crate::interpreter::dispatcher::Placement> {
+        None
+    }
+
     /// Return the shared identity/tiling state for this producer.
     fn base(&self) -> &ProducerBase;
 

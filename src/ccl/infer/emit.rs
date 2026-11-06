@@ -3772,7 +3772,7 @@ pub(super) fn emit_compose<C: Typing>(
 /// read-set snapshot slots followed by the iteration item, matching the body lambda's
 /// `let s_i = p.i … let item = p.n` destructuring. The drive's row also carries the item's source
 /// position after the item, for the writer to copy into its proposal
-/// (`src/interpreter/design-operators.md`, "Commits in key order"). The body reads no position,
+/// (`src/interpreter/design-operators.md`, "Ready transaction decisions"). The body reads no position,
 /// and a tuple's width is part of its type, so the domain lists only what the body reads.
 fn transaction_body_domain(slots: impl IntoIterator<Item = Type>, item: Type) -> Type {
     let mut dom: BTreeMap<FieldKey, Type> = BTreeMap::new();

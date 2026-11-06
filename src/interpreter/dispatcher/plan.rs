@@ -421,7 +421,9 @@ fn run_targets(
         Located::Scope { .. } => Some(induction(scope_at(pipeline)).pushing_end()),
         _ => None,
     };
-    // A loop's scope with no range of its own over a live source, which reads only pipelines that
+    // A scope or transaction writer with no live range of its own inherits ranges from pipelines
+    // whose pushes preserve its source keys. Seed-opening dependencies supply no source keys.
+    // A loop's scope, which reads only pipelines that
     // range over one, as a loop over a let-bound source reads the source's memo, takes those
     // ranges as its own where each read's pushes reach its drive as the drive's positions: the
     // scope is then notified of each delivery as rounds, as over the source itself, and parks each
@@ -429,20 +431,50 @@ fn run_targets(
     let one = Projection::admitting(Predicate::point(Value::UInt(0)));
     let inherited: Vec<Vec<LiveLeaf>> = (0..members.live.len())
         .map(|pipeline| {
-            let Some(scope) = scopes[pipeline].as_ref() else {
+            let scope = scopes[pipeline].as_ref();
+            let store = matches!(members.located[pipeline], Located::Store { .. });
+            if scope.is_none() && !store {
                 return Vec::new();
-            };
+            }
+            let mut input = None;
+            reach(PipelineId(pipeline), &mut |breaker, at| {
+                input = breaker.input_tiling(at).domain_extent();
+            });
             if !members.live[pipeline].is_empty() || members.reads[pipeline].is_empty() {
                 return Vec::new();
             }
             let mut leaves = Vec::new();
             for &read in &members.reads[pipeline] {
+                if store && members.opens_before[read] {
+                    continue;
+                }
                 if members.live[read].is_empty() || !members.reads[read].is_empty() {
                     return Vec::new();
                 }
+                if store {
+                    let (pusher, _) = end_of(PipelineId(read))
+                        .unwrap_or_else(|| pushing_end(&mut reach, PipelineId(read)));
+                    let routes = routes_to(&pusher, pipeline);
+                    if routes.is_empty()
+                        || routes.iter().any(|route| !route.keeps_keys)
+                        || members.live[read].iter().any(|leaf| {
+                            let one = leaf.probe_region();
+                            let arrived = probe(&pusher, PipelineId(read), &one, pipeline);
+                            input.as_ref() != Some(&leaf.extent)
+                                || arrived.is_empty()
+                                || arrived.iter().any(|arrival| {
+                                    Projection::of(&arrival.guard).as_ref() != Ok(&one)
+                                })
+                        })
+                    {
+                        return Vec::new();
+                    }
+                    leaves.extend(members.live[read].iter().cloned());
+                    continue;
+                }
                 let (pusher, _) = end_of(PipelineId(read))
                     .unwrap_or_else(|| pushing_end(&mut reach, PipelineId(read)));
-                let mut scope = induction(scope);
+                let mut scope = induction(scope.expect("a non-store inherits through its scope"));
                 let routes = scope.routes(&pusher);
                 let arrived = scope.arrivals(&pusher, &one);
                 let positions = !routes.is_empty()
@@ -518,12 +550,13 @@ fn run_targets(
         let notifies = match (&members.located[pipeline], scopes[pipeline].as_ref()) {
             // Inherited ranges reach the drive as its positions. Nonprefix ranges wait for
             // completion; otherwise the scope parks each delivery on the pipelines it reads.
+            (Located::Store { .. }, _) if inherits => Notifies::Items,
             _ if inherits => match leaves.iter().all(LiveLeaf::yields_prefix) {
                 true => Notifies::Rounds,
                 false => Notifies::Whole,
             },
-            // A transaction store's input is its writer's source, read behind an entry no
-            // planner places, so its items are a delivery's keys where the writer's source is
+            // A transaction store places the entry before its writer's source, so its items
+            // are a delivery's keys where the writer's source is
             // the source every range under the writer reads.
             (Located::Store { .. }, _) => {
                 let items_of =
@@ -2613,9 +2646,8 @@ impl LivePipeline {
                 }
                 Notifies::Whole => {}
                 Notifies::Rounds | Notifies::Items => {
-                    // A drive and a transaction store decide positions in order, and a round or an
-                    // attempt runs once every position before it is complete, so a source read in
-                    // positions yields a prefix of them.
+                    // A physical UInt source yields a prefix. Product regions may be nonprefix;
+                    // transaction attempts release their exact keys, while rounds require prefixes.
                     debug_assert!(
                         !matches!(leaf.extent, Extent::DataSourceDomain(_))
                             || yielded.is_true()

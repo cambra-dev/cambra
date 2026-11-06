@@ -1283,18 +1283,15 @@ fn a_transaction_seeded_from_a_pipeline(#[case] source: &str, #[case] expected: 
     pool: Mut(Int, Txn) := 100
     for r in [30, 30]:
         with begin():
-            if pool >= r:
-                pool := pool - r
+            pool := pool - r
     for r in [20]:
         with begin():
-            if pool >= r:
-                pool := pool - r
+            pool := pool - r
     for r in [r for r in [40, 5] if r > 10]:
         with begin():
-            if pool >= r:
-                pool := pool - r
+            pool := pool - r
     out << await_final(pool)
-"}, "10")]
+"}, "-20")]
 // Writer 0 reads its items from a let-bound list, whose memo is a pipeline its store's pipeline
 // reads whole.
 #[case::a_writer_over_a_pipeline(indoc! {"
@@ -1382,23 +1379,62 @@ fn a_transaction_store_of_several_writers(#[case] source: &str, #[case] expected
     );
 }
 
-/// Two writers whose transactions deny where the pool falls short, so the result names the order
-/// the store commits in: key order, `(position, writer)`, compared level by level with a `UInt`
-/// position before a tagged one (`src/interpreter/design-operators.md`, "Commits in key order").
-/// With a `UInt` writer beside a concatenation, writer 1's 50 at 0 commits first, writer 0's 60 at
-/// `` `0(0) `` is denied, and its 10 at `` `1(0) `` commits: 40.
+/// Final balances admitted by serially attempting every withdrawal in any order.
+fn serial_withdrawal_balances(
+    balance: i64,
+    remaining: &mut Vec<i64>,
+    answers: &mut std::collections::BTreeSet<i64>,
+) {
+    if remaining.is_empty() {
+        answers.insert(balance);
+        return;
+    }
+    for at in 0..remaining.len() {
+        let amount = remaining.remove(at);
+        serial_withdrawal_balances(
+            if amount <= balance {
+                balance - amount
+            } else {
+                balance
+            },
+            remaining,
+            answers,
+        );
+        remaining.insert(at, amount);
+    }
+}
+
+/// Conflicting writers serialize without comparing their source domains. The result is one
+/// admitted by a serial execution of all withdrawals, with no overdraft or lost transaction.
 #[rstest_log::rstest]
-#[case::a_uint_writer_beside_a_concatenation("", "[60] ++ [10]", "[50]", 40)]
-#[case::a_concatenation_beside_a_uint_writer("", "[50]", "[60] ++ [10]", 40)]
-#[case::two_concatenations("", "[60] ++ [10]", "[50] ++ [5]", 25)]
-#[case::uint_items_beside_a_concatenation("", "[60] ++ [10]", "[50, 30]", 10)]
-#[case::concatenations_of_different_depth("xs = [60] ++ [10]", "xs ++ [5]", "[50] ++ [20]", 15)]
-#[case::three_sides_beside_two("", "[60] ++ [10] ++ [5]", "[50] ++ [20]", 5)]
-fn several_writers_commit_in_key_order(
+#[case::a_uint_writer_beside_a_concatenation("", "[60] ++ [10]", "[50]")]
+#[case::a_concatenation_beside_a_uint_writer("", "[50]", "[60] ++ [10]")]
+#[case::two_concatenations("", "[60] ++ [10]", "[50] ++ [5]")]
+#[case::uint_items_beside_a_concatenation("", "[60] ++ [10]", "[50, 30]")]
+#[case::concatenations_of_different_depth("xs = [60] ++ [10]", "xs ++ [5]", "[50] ++ [20]")]
+#[case::three_sides_beside_two("", "[60] ++ [10] ++ [5]", "[50] ++ [20]")]
+#[case::record_beside_uint("", "[r + y for r in [60, 10] for y in [0]]", "[50]")]
+#[case::uint_beside_record("", "[50]", "[r + y for r in [60, 10] for y in [0]]")]
+#[case::two_records(
+    "",
+    "[r + y for r in [60, 10] for y in [0]]",
+    "[r + y for r in [50, 5] for y in [0]]"
+)]
+#[case::records_of_different_widths(
+    "",
+    "[r + y for r in [60, 10] for y in [0]]",
+    "[r + y for r in [50, 5] for y in [0, 0]]"
+)]
+#[case::record_beside_tagged("", "[r + y for r in [60, 10] for y in [0]]", "[50] ++ [5]")]
+#[case::records_of_different_arities(
+    "",
+    "[r + y for r in [60, 10] for y in [0]]",
+    "[r + y + z for r in [50, 5] for y in [0] for z in [0, 0]]"
+)]
+fn several_writers_serialize_ready_proposals(
     #[case] prelude: &str,
     #[case] first: &str,
     #[case] second: &str,
-    #[case] expected: i64,
     #[values(1, 2, usize::MAX)] rows: usize,
 ) {
     let source = formatdoc! {"
@@ -1415,20 +1451,37 @@ fn several_writers_commit_in_key_order(
                     pool := pool - r
         out << await_final(pool)
     "};
-    assert_eq!(
-        dispatched(&source, rows).0,
-        Value::Int(expected),
-        "{source} at morsels of {rows}"
+    let amounts = |items: &str| {
+        let pure = formatdoc!("out = test_sink()\n{prelude}\nout << {items}\n");
+        dispatched(&pure, rows)
+            .0
+            .as_function()
+            .iter()
+            .map(|binding| {
+                let Value::Int(amount) = binding.output else {
+                    panic!("integer withdrawal")
+                };
+                amount
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut withdrawals = amounts(first);
+    withdrawals.extend(amounts(second));
+    let mut possible = std::collections::BTreeSet::new();
+    serial_withdrawal_balances(100, &mut withdrawals, &mut possible);
+    let actual = dispatched(&source, rows).0;
+    let Value::Int(balance) = actual else {
+        panic!("integer balance: {actual}")
+    };
+    assert!(
+        possible.contains(&balance),
+        "{source} at morsels of {rows}: {balance}, admitted {possible:?}"
     );
 }
 
-/// Two writers over sources of different lengths, each feeding a sink of its own the pool after
-/// its commit. The store commits in key order, (source position, writer): writer 0's item 0,
-/// writer 1's item 0, then writer 0's items 1 and 2, so the ticks are 1, 2, 3 and 4 in that order.
+/// Writers of different lengths commit every withdrawal once in one serial history.
 #[rstest_log::rstest]
-fn two_writers_over_sources_of_different_lengths_commit_in_key_order(
-    #[values(1, 2, usize::MAX)] rows: usize,
-) {
+fn two_ready_writers_over_sources_of_different_lengths(#[values(1, 2, usize::MAX)] rows: usize) {
     let source = indoc! {"
         a = test_sink()
         b = test_sink()
@@ -1455,10 +1508,22 @@ fn two_writers_over_sources_of_different_lengths_commit_in_key_order(
         .iter()
         .map(|sink| keyed_ints(&sink.value().expect("the sink holds a value")))
         .collect();
-    assert_eq!(
-        written,
-        vec![vec![(1, 90), (3, 69), (4, 39)], vec![(2, 89)]]
-    );
+    let mut commits: Vec<_> = written
+        .iter()
+        .enumerate()
+        .flat_map(|(site, values)| values.iter().map(move |&(tick, pool)| (tick, site, pool)))
+        .collect();
+    commits.sort();
+    let mut amounts = [Vec::new(), Vec::new()];
+    let mut previous = 100;
+    for (at, &(tick, site, pool)) in commits.iter().enumerate() {
+        assert_eq!(tick, at as u64 + 1);
+        amounts[site].push(previous - pool);
+        previous = pool;
+    }
+    amounts[0].sort();
+    assert_eq!(amounts, [vec![10, 20, 30], vec![1]]);
+    assert_eq!(previous, 39);
 }
 
 /// A loop over a live source runs in a scope whose pipeline the run notifies of the positions each
@@ -1709,58 +1774,179 @@ fn two_writers_over_a_live_source(
     );
 }
 
-/// Two writers over one live source that deny once the pool runs short, so the order of the
-/// commits decides the answer. Key order commits writer 0's item at each position, then writer
-/// 1's: the items worth 1 to 4 commit for both writers, which leaves 0 of 20, and both writers deny
-/// the item worth 5.
-#[rstest_log::rstest]
-fn two_writers_over_a_live_source_commit_in_key_order(
-    #[values(two_batches(), one_key_batches(5))] batches: Vec<Batch>,
-    #[values(1, usize::MAX)] rows: usize,
-) {
-    let source = indoc! {"
-        out = test_sink()
-        pool: Mut(Int, Txn) := 20
-        for r in source1():
-            with begin():
-                if pool >= r:
-                    pool := pool - r
-                    out << pool
-        for r in source1():
-            with begin():
-                if pool >= r:
-                    pool := pool - r
-                    out << pool
-    "};
-    let (written, _) = dispatched_live_written(source, rows, batches);
-    // The sink holds a tagged union of its two feeds, each keyed by commit tick: the site each
-    // tick's write came from, and the pool after it.
-    let mut fed: Vec<(u64, String, i64)> = written
+/// Check commit ticks, serial store reads and the multiset of each writer's withdrawals.
+fn assert_serial_withdrawals(written: &Value, initial: i64, expected: &[Vec<i64>]) -> i64 {
+    let mut fed: Vec<_> = written
         .as_function()
         .iter()
-        .map(|binding| match (&binding.input, &binding.output) {
-            (Value::Union { tag, inner }, Value::Int(pool)) => match **inner {
-                Value::UInt(tick) => (tick, tag.to_string(), *pool),
-                ref other => panic!("a feed is keyed by commit tick: {other}"),
-            },
-            other => panic!("a sink fed from two sites holds a tagged union: {other:?}"),
+        .map(|binding| {
+            let (Value::Union { tag, inner }, Value::Int(pool)) = (&binding.input, &binding.output)
+            else {
+                panic!("tagged commit feed: {binding:?}")
+            };
+            let Value::UInt(tick) = **inner else {
+                panic!("commit tick")
+            };
+            (tick, tag.to_string().parse::<usize>().unwrap(), *pool)
         })
         .collect();
     fed.sort();
-    let sites: Vec<&str> = fed.iter().map(|(_, site, _)| site.as_str()).collect();
-    let pools: Vec<i64> = fed.iter().map(|(_, _, pool)| *pool).collect();
-    assert_eq!(
-        sites,
-        ["0", "1", "0", "1", "0", "1", "0", "1"],
-        "{written:?}"
-    );
-    assert_eq!(pools, [19, 18, 16, 14, 11, 8, 4, 0], "{written:?}");
+    let mut amounts = vec![Vec::new(); expected.len()];
+    let mut previous = initial;
+    for (at, &(tick, site, pool)) in fed.iter().enumerate() {
+        assert_eq!(tick, at as u64 + 1);
+        amounts[site].push(previous - pool);
+        previous = pool;
+    }
+    for (mut actual, mut expected) in amounts.into_iter().zip(expected.iter().cloned()) {
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected, "{written:?}");
+    }
+    previous
 }
 
-/// A writer over a concatenation beside one over a live source: key order puts every tagged
-/// position after every `UInt` one, so writer 1 commits once the source's items, worth 1 to 5,
-/// have taken 15 of 100, and feeds the pool after each of its commits, 84 and 82
-/// (`src/interpreter/design-operators.md`, "Commits in key order").
+/// Both writers commit every arrived product row before the next source delivery. Commit
+/// ticks form one serial history; each writer withdraws each delivered amount exactly once.
+#[rstest_log::rstest]
+#[case::uint("source1()", 1, 1)]
+#[case::live_outer_product("[r + y for r in source1() for y in [0, 0]]", 2, 1)]
+#[case::live_inner_product("[r + y for y in [0, 0] for r in source1()]", 2, 1)]
+#[case::filtered_outer_product("[r + y for r in source1() for y in [0, 0] if r > 2]", 2, 3)]
+#[case::filtered_inner_product("[r + y for y in [0, 0] for r in source1() if r > 2]", 2, 3)]
+fn live_writers_commit_ready_product_rows(
+    #[case] items: &str,
+    #[case] multiplicity: usize,
+    #[case] minimum: i64,
+    #[values(two_batches(), one_key_batches(5))] batches: Vec<Batch>,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let source = formatdoc! {"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 1000
+        for r in {items}:
+            with begin():
+                pool := pool - r
+                out << pool
+        for r in {items}:
+            with begin():
+                pool := pool - r
+                out << pool
+    "};
+    let mut delivered = 0;
+    let partial_counts: Vec<_> = batches
+        .iter()
+        .map(|(entries, _)| {
+            delivered += entries
+                .iter()
+                .filter(|(_, value)| matches!(value, Value::Int(amount) if *amount >= minimum))
+                .count();
+            delivered * multiplicity * 2
+        })
+        .collect();
+    let mut idle = 0;
+    let (written, _) = dispatched_live_observed(&source, rows, batches, |sink, _| {
+        let partial = sink.written_so_far();
+        let count = match &partial {
+            Ok(value) => value.as_function().len(),
+            Err(crate::interpreter::test_sink::SinkReadError::NothingWritten) => 0,
+            Err(error) => panic!("valid partial feed: {error:?}"),
+        };
+        assert_eq!(count, partial_counts[idle], "delivery {idle}: {partial:?}");
+        idle += 1;
+    });
+    let expected: Vec<_> = (minimum..=5)
+        .flat_map(|r| std::iter::repeat_n(r, multiplicity))
+        .collect();
+    let final_balance = 1000 - expected.iter().sum::<i64>() * 2;
+    assert_eq!(
+        assert_serial_withdrawals(&written, 1000, &[expected.clone(), expected]),
+        final_balance
+    );
+}
+
+/// A ready writer progresses while its sibling waits for a product dimension. Subsequent
+/// deliveries grow both dimensions without closing either source or replaying an old product row.
+#[rstest_log::rstest]
+fn a_live_product_writer_beside_an_independent_ready_writer(
+    #[values(1, usize::MAX)] rows: usize,
+    #[values(false, true)] close_left_first: bool,
+) {
+    use crate::interpreter::{BaseType, Extent, Predicate, TestDataSource};
+    let mut ctx = GlobalContext::default();
+    ctx.defer_sink_pulls();
+    let feeds: Vec<_> = ["source1", "source2"]
+        .into_iter()
+        .map(|name| {
+            let source = std::rc::Rc::new(std::cell::RefCell::new(TestDataSource::new(
+                name,
+                crate::ccl::Type::Base(BaseType::Int),
+                Extent::Base(BaseType::Int),
+            )));
+            ctx.register_source(source.clone());
+            source
+        })
+        .collect();
+    let sink = ctx.register_test_sink("out");
+    let text = indoc! {"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 1000
+        for r in [x * y for x in source1() for y in source2()]:
+            with begin():
+                pool := pool - r
+                out << pool
+        for r in source1():
+            with begin():
+                pool := pool - r
+                out << pool
+    "};
+    let loaded = LoadedProgram::test(text);
+    let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap();
+    let _operators = ctx.take_operator_map();
+    let deliver = |side: usize, key: u64, value: i64| {
+        let mut source = feeds[side].borrow_mut();
+        source.add_data(&[(Value::UInt(key), Value::Int(value))]);
+        source.set_yield_predicate(Predicate::at_or_below(Value::UInt(key)));
+    };
+    deliver(0, 0, 2);
+    let mut idle = 0;
+    crate::interpreter::dispatcher::run_program_polling(&mut program, rows, &mut || {
+        let partial = sink
+            .written_so_far()
+            .expect("ready commits before another source delivers");
+        assert_eq!(
+            partial.as_function().len(),
+            [1, 2, 4, 6, 6][idle],
+            "delivery {idle}: {partial:?}"
+        );
+        match idle {
+            0 => deliver(1, 0, 3),
+            1 => deliver(0, 1, 5),
+            2 => deliver(1, 1, 7),
+            3 => feeds[usize::from(!close_left_first)]
+                .borrow_mut()
+                .set_yield_predicate(Predicate::True),
+            4 => feeds[usize::from(close_left_first)]
+                .borrow_mut()
+                .set_yield_predicate(Predicate::True),
+            _ => panic!("run waits after both sources close"),
+        }
+        idle += 1;
+    })
+    .unwrap();
+    assert_eq!(idle, 5);
+    assert!(program.done.try_recv().is_ok());
+    assert_eq!(
+        assert_serial_withdrawals(
+            &sink.value().unwrap(),
+            1000,
+            &[vec![6, 14, 15, 35], vec![2, 5]]
+        ),
+        923
+    );
+}
+
+/// A concatenation writer progresses beside a live writer without comparing their keys.
 #[rstest_log::rstest]
 fn a_writer_over_a_concatenation_beside_one_over_a_live_source(
     #[values(two_batches(), one_key_batches(5))] batches: Vec<Batch>,
@@ -1772,20 +1958,17 @@ fn a_writer_over_a_concatenation_beside_one_over_a_live_source(
         for r in source1():
             with begin():
                 pool := pool - r
+                out << pool
         for r in [1] ++ [2]:
             with begin():
                 pool := pool - r
                 out << pool
     "};
     let (written, _) = dispatched_live_written(source, rows, batches);
-    let mut fed: Vec<(Value, Value)> = written
-        .as_function()
-        .iter()
-        .map(|binding| (binding.input.clone(), binding.output.clone()))
-        .collect();
-    fed.sort_by(|(a, _), (b, _)| a.partial_cmp(b).expect("a feed's keys are commit ticks"));
-    let pools: Vec<Value> = fed.into_iter().map(|(_, pool)| pool).collect();
-    assert_eq!(pools, [Value::Int(84), Value::Int(82)], "{written:?}");
+    assert_eq!(
+        assert_serial_withdrawals(&written, 100, &[vec![1, 2, 3, 4, 5], vec![1, 2]]),
+        82
+    );
 }
 
 /// A feed inside a transaction over a live source reads the store's decided stream, which the

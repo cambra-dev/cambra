@@ -195,7 +195,7 @@ fn a_morsel_whose_positions_have_not_arrived_panics() {
 }
 
 /// Two writers of one transaction store, each drawing its items from the pool: writer 0 takes 10
-/// and then 20, writer 1 takes 5. Key order commits 10, 5 and 20, leaving 90, 85 and 65.
+/// and then 20, writer 1 takes 5. Consuming writer 0 first commits 10 and 20 before 5.
 const TWO_WRITERS: &str = indoc! {"
     out = test_sink()
     pool: Mut(Int, Txn) := 100
@@ -261,20 +261,18 @@ fn a_consuming_store_pulled_before_its_first_consume_answers_nothing_final(#[cas
         compiled.consume_whole(writer(1));
         assert_eq!(
             committed(&compiled.snapshot()),
-            [90, 85, 65].map(Value::Int).to_vec()
+            [90, 70, 65].map(Value::Int).to_vec()
         );
     }
 }
 
-/// A consume of one writer's source takes its proposals and commits none of them while the other
-/// writer has not passed their positions, and the positions taken count as released for that
-/// writer's input.
+/// A ready writer commits and releases its input without waiting for its idle sibling.
 #[test]
-fn a_proposal_waits_for_the_other_writer_to_pass_its_position() {
+fn a_ready_writer_commits_while_its_sibling_is_idle() {
     let compiled = Compiled::of(TWO_WRITERS);
     compiled.open();
     compiled.consume_whole(writer(0));
-    assert_eq!(committed(&compiled.snapshot()), Vec::<Value>::new());
+    assert_eq!(committed(&compiled.snapshot()), [90, 70].map(Value::Int));
     compiled.breaker(|store| {
         let whole = store.input_tiling(InputId(writer(0))).universal_guard();
         let released = store.input_released(InputId(writer(0)));
@@ -285,19 +283,26 @@ fn a_proposal_waits_for_the_other_writer_to_pass_its_position() {
     });
 }
 
-/// Writer 1's proposal and writer 0's second were built before writer 0's first commit, so both
-/// go stale. Writer 1's, the smaller key, is proposed again and commits before writer 0's second
-/// does: the store commits 5 before 20.
+/// Settling takes both writers against one snapshot. After the first commit the other's
+/// proposal is stale, so retry must read the committed value rather than overwrite it.
 #[test]
-fn a_stale_proposal_is_proposed_again_before_a_larger_key_commits() {
+fn settling_retries_a_stale_ready_proposal() {
     let compiled = Compiled::of(TWO_WRITERS);
     compiled.open();
-    compiled.consume_whole(writer(0));
-    compiled.consume_whole(writer(1));
+    let dispatcher = Dispatcher::new(vec![vec![]; 3], usize::MAX);
+    for input in 1..3 {
+        dispatcher.close(PipelineId(input));
+    }
+    for input in 0..3 {
+        dispatcher.finish_by_hand(PipelineId(input), |pushes| {
+            compiled.breaker(|store| store.finish(pushes))
+        });
+    }
     assert_eq!(
         committed(&compiled.snapshot()),
-        [90, 85, 65].map(Value::Int).to_vec()
+        [90, 85, 65].map(Value::Int)
     );
+    assert!(compiled.snapshot().is_terminal());
 }
 
 /// The finish of the last input to finish commits what the store still holds and leaves the
@@ -317,13 +322,13 @@ fn the_last_finish_of_the_last_input_commits_the_rest() {
             compiled.breaker(|store| store.finish(pushes))
         });
     }
-    assert_eq!(committed(&compiled.snapshot()), Vec::<Value>::new());
+    assert_eq!(committed(&compiled.snapshot()), [90, 70].map(Value::Int));
     assert!(!compiled.snapshot().is_terminal());
     dispatcher.finish_by_hand(PipelineId(2), |pushes| {
         compiled.breaker(|store| store.finish(pushes))
     });
     let settled = compiled.snapshot();
-    assert_eq!(committed(&settled), [90, 85, 65].map(Value::Int).to_vec());
+    assert_eq!(committed(&settled), [90, 70, 65].map(Value::Int).to_vec());
     assert!(settled.is_terminal(), "{settled:?}");
 }
 
@@ -344,15 +349,7 @@ const THREE_WRITERS: &str = indoc! {"
     out << await_final(pool)
 "};
 
-/// A release of the store reclaims no version a proposal the store holds read.
-///
-/// Writer 0's proposal at position 2 is taken at tick 3, where it reads `pool`'s change at tick
-/// 3. It waits for writer 1 to pass position 2 while position 1's items commit at ticks 4 to 6.
-/// Writer 0, pulled again for its item at position 3, releases its slots below tick 6, writer 1's
-/// last pull at tick 4 released its own below tick 4, and the sink's `await_final` releases its
-/// slot through the frontier: the fan-out's meet reaches tick 3. A reclaim through tick 3 would
-/// drop the change there, since `pool` changes again at tick 4, the first tick left, and the
-/// held proposal's reads would no longer be the store's at its snapshot.
+/// Interleaved writer consumes and a sink pull preserve the committed state across reclamation.
 #[test]
 fn a_release_reclaims_no_version_a_held_proposal_read() {
     let compiled = Compiled::of(THREE_WRITERS);
@@ -385,12 +382,9 @@ fn a_release_reclaims_no_version_a_held_proposal_read() {
     assert_eq!(committed(&settled).last(), Some(&Value::Int(-18)));
 }
 
-/// Writer 1 reads a live source that has delivered its item at position 0 and called position 1
-/// complete with nothing there, so writer 1 decides nothing at 1 and has decided no item past it.
-/// Its proposal stream states position 1 decided once its drive has read past it, and writer 0's
-/// proposal at position 1 commits on that statement alone.
+/// A live writer releases a decided-absent key without producing a transaction for it.
 #[test]
-fn a_writer_stating_a_position_read_past_lets_a_larger_key_commit() {
+fn a_live_writer_releases_decided_absent_positions() {
     let feed = Rc::new(RefCell::new(TestDataSource::new(
         "source1",
         crate::ccl::Type::Base(BaseType::Int),
@@ -425,13 +419,11 @@ fn a_writer_stating_a_position_read_past_lets_a_larger_key_commit() {
     });
     assert_eq!(
         committed(&compiled.snapshot()),
-        [90, 85, 65].map(Value::Int).to_vec()
+        [90, 70, 65].map(Value::Int).to_vec()
     );
 }
 
-/// A store of several writers has a consuming mode where a writer's source positions are tagged,
-/// a concatenation's, beside another writer's `UInt` positions: key order puts every `UInt`
-/// position before every tagged one.
+/// Writers with different key constructors share a consuming transaction store.
 #[test]
 fn several_writers_over_tagged_and_uint_positions_consume() {
     let compiled = Compiled::of(indoc! {"
@@ -449,11 +441,9 @@ fn several_writers_over_tagged_and_uint_positions_consume() {
     assert_eq!(refusal, None);
 }
 
-/// A store of several writers has no consuming mode where a writer's source positions are neither
-/// `UInt` nor tagged: a comprehension of two generators ranges over pairs of positions, which key
-/// order does not compare with another writer's.
+/// A product writer needs no key comparison with its sibling.
 #[test]
-fn several_writers_over_positions_key_order_does_not_compare_are_refused() {
+fn several_writers_over_product_and_uint_positions_consume() {
     let compiled = Compiled::of(indoc! {"
         out = test_sink()
         pool: Mut(Int, Txn) := 100
@@ -466,10 +456,5 @@ fn several_writers_over_positions_key_order_does_not_compare_are_refused() {
         out << await_final(pool)
     "});
     let refusal = compiled.breaker(|store| store.no_consuming_mode());
-    assert!(
-        refusal
-            .as_deref()
-            .is_some_and(|why| why.contains("compares its writers' source positions as `UInt`")),
-        "{refusal:?}"
-    );
+    assert_eq!(refusal, None);
 }
