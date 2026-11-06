@@ -719,7 +719,7 @@ identities is not distinguishing them",
                     index: p.index - 1,
                     ..p.clone()
                 })),
-            "declaration indices run dense per chain and spelling"
+            "store positions run dense per scope and spelling"
         );
         paths
     }
@@ -4171,58 +4171,100 @@ fn build_commit_store(
     })
 }
 
-/// A mutable variable's identity across versions of a program.
+/// A mutable variable's store's identity across versions of a program: the scope the store
+/// stands in, the variable's spelling, and its position among the stores sharing both
+/// (`src/ccl/design/sites.md`, "Stores").
 ///
-/// The spelling carries the meaning and the index only disambiguates, because a
-/// spelling is not unique on its own: a declaration can be shadowed, and a
-/// function holding a whole stateful loop declares one variable per call site
-/// once inlining has cloned its body. Neither of those has a name of its own to
-/// borrow, so the index is what tells them apart.
+/// The scope is read off the site that names the store, its loop's for an induction store and
+/// its declaration's for a transactional one ([`scope_segments`]): the run, each call that
+/// reached it and the bindings the author wrote around it. A store the compiler introduced, an
+/// exception scan's, has no site, and its scope is the author-written bindings around it. `a = count_by(src, 1)` and
+/// `z = count_by(src, 10)` are two stores spelled `n`, `` `a`.`count_by()`.`n` `` and
+/// `` `z`.`count_by()`.`n` ``, distinct without either being counted, and two calls of one
+/// stateful function in one expression differ by their calls' places.
 ///
-/// The address is the source's own: the bindings whose definitions enclose the
-/// declaration, then the spelling. `a = count_by(src, 1)` and
-/// `z = count_by(src, 10)` inline to two `Transact`s under the definitions of `a`
-/// and `z`, so the two variables spelled `n` are `a`.`n` and `z`.`n` — distinct
-/// without either of them having to be counted. Reordering the two bindings, or
-/// adding a third, moves neither address.
+/// The position counts among the stores sharing the scope and the spelling, which is more than
+/// one where loops write one variable in turn. A variable moved to another loop in the same
+/// scope keeps its position and so its store. Reordering such loops moves the position, and
+/// that reload is refused rather than carried onto the wrong store, which is [`site_moved`]'s
+/// job.
 ///
-/// Only a binder the author wrote enters the chain
-/// ([`Name::source_spelling`]). A minted one is named by a uid whose value
-/// depends on how many the passes before it minted, and the bindings a pass
-/// interposes are not something the source says, so neither addresses anything
-/// two versions of a program agree on.
-///
-/// The index counts among the variables sharing *both* the chain and the
-/// spelling, which is only ever more than one where the source supplies no name
-/// to tell them apart: two anonymous call sites of one stateful function in one
-/// expression. An edit to either body leaves the index alone. Reordering them,
-/// or inserting a third ahead, moves it — and that reload is refused rather than
-/// carried onto the wrong variable, which is [`site_moved`]'s job.
-///
-/// This is not derived from anything the program computes. Two instantiations of
-/// one function can differ only in their writer bodies once arguments are
-/// substituted, so any content-derived identity either fails to tell them apart
-/// or changes under exactly the edit state has to survive. Content still decides
-/// whether a *site* is the one that held a value, which is a narrower question
-/// than which variable a value belongs to — see [`site_moved`].
+/// This is not derived from anything the program computes. Two instantiations of one function
+/// can differ only in their writer bodies once arguments are substituted, so any
+/// content-derived identity either fails to tell them apart or changes under exactly the edit
+/// state has to survive. Content still decides whether a *site* is the one that held a value,
+/// which is a narrower question than which store a value belongs to — see [`site_moved`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct VarPath {
-    /// The bindings whose definitions enclose the declaration, outermost first.
-    chain: Vec<String>,
+    /// The scope the store stands in, outermost first ([`scope_segments`]).
+    scope: Vec<String>,
     /// The variable's own spelling — [`Name::field_key`].
     name: String,
-    /// Its position among the variables sharing this chain and this spelling.
+    /// Its position among the stores sharing this scope and this spelling.
     index: usize,
 }
 
+/// The segments of the scope `site` stands in, outermost first: the run's path, then each
+/// call's module, bindings and call, then the place's module and bindings. A body a call
+/// reaches stands in the callee's own definition, whose name the call already spells, so that
+/// binding is left out after it. A `@LoadFrom` resolves outward over them
+/// ([`LoadFromSite::resolve`]).
+fn scope_segments(site: &crate::ccl::site::Site) -> Vec<String> {
+    use crate::ccl::site::Place;
+    fn indexed(text: String, place: &Place) -> String {
+        match place.index {
+            0 => text,
+            i => format!("{text}#{i}"),
+        }
+    }
+    let mut out = Vec::new();
+    let run = site.run.to_string();
+    if !run.is_empty() {
+        out.push(run);
+    }
+    let mut module: Vec<SmolStr> = Vec::new();
+    let mut callee: Option<&str> = None;
+    let mut enter = |place: &Place, callee: Option<&str>, out: &mut Vec<String>| {
+        if *place.module != *module {
+            module = place.module.to_vec();
+            if !module.is_empty() {
+                out.push(module.join("::"));
+            }
+        }
+        let skip = usize::from(
+            callee.is_some_and(|c| place.bindings.first().is_some_and(|b| b.as_str() == c)),
+        );
+        out.extend(place.bindings.iter().skip(skip).map(|b| b.to_string()));
+    };
+    for call in site.calls.iter() {
+        enter(call, callee, &mut out);
+        out.push(indexed(format!("{}()", call.spelling), call));
+        callee = call.spelling.rsplit("::").next();
+    }
+    enter(&site.place, callee, &mut out);
+    out
+}
+
+/// `scope` with each call's position dropped, `f()#1` read as `f()`: what tells a scope apart
+/// that is not the place of a call among calls of one function.
+fn unpositioned(scope: &[String]) -> Vec<&str> {
+    scope
+        .iter()
+        .map(|segment| match segment.rsplit_once("()#") {
+            Some((call, index)) if index.bytes().all(|b| b.is_ascii_digit()) => {
+                &segment[..call.len() + 2]
+            }
+            _ => segment.as_str(),
+        })
+        .collect()
+}
+
+/// `` `a`.`count_by()`.`n` (#1) ``: the scope's segments and the spelling, quoted the way the
+/// source reads, and the position only where a second store needs it.
 impl std::fmt::Display for VarPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Qualified the way the source reads, and the index only when it is
-        // doing work: an author recognizes `` `a`.`n` `` where `` `n` (#0) ``
-        // says nothing, so the suffix appears only once a second variable needs
-        // it.
-        for binding in &self.chain {
-            write!(f, "`{binding}`.")?;
+        for segment in &self.scope {
+            write!(f, "`{segment}`.")?;
         }
         write!(f, "`{}`", self.name)?;
         if self.index > 0 {
@@ -4442,9 +4484,9 @@ pub(crate) struct LoadFromSite {
     /// variable has no address to report, and the spelling is what the source
     /// contains.
     name: String,
-    /// The bindings enclosing the site, outermost first — the chain a
-    /// declaration here would take.
-    chain: Vec<String>,
+    /// The scope the load's declaration stands in ([`scope_segments`]) — the
+    /// scope a declaration here would take.
+    scope: Vec<String>,
     /// What inference concluded the value is, which the value the predecessor
     /// holds has to fit.
     ty: Type,
@@ -4496,23 +4538,19 @@ impl LoadFromSite {
     /// edit that moved it; a load edits the body of every site it sits in, so no
     /// content corresponds and the value would move between them unremarked.
     fn resolve(&self, declared: &HashSet<VarPath>) -> LoadTarget {
-        for n in (0..=self.chain.len()).rev() {
-            let at = |index| VarPath {
-                chain: self.chain[..n].to_vec(),
-                name: self.name.clone(),
-                index,
-            };
-            // Indices are dense per chain and spelling, so the first is declared
-            // wherever the chain declares the spelling at all, and the second
-            // only where it declares it more than once. Asserted where the set
-            // is built (`OperatorMap::declared_paths`).
-            if !declared.contains(&at(0)) {
+        // A scope is compared without its calls' positions: two calls of one function are
+        // told apart by position alone, which a load cannot confirm ([`unpositioned`]).
+        for n in (0..=self.scope.len()).rev() {
+            let scope = unpositioned(&self.scope[..n]);
+            let mut at = declared
+                .iter()
+                .filter(|path| path.name == self.name && unpositioned(&path.scope) == scope);
+            let Some(first) = at.next() else {
                 continue;
-            }
-            return if declared.contains(&at(1)) {
-                LoadTarget::Anonymous
-            } else {
-                LoadTarget::Variable(at(0))
+            };
+            return match at.next() {
+                Some(_) => LoadTarget::Anonymous,
+                None => LoadTarget::Variable(first.clone()),
             };
         }
         LoadTarget::Absent
@@ -4535,6 +4573,8 @@ fn state_identities(expr: &Expr) -> StateIdentities<'_> {
     type Counts = HashMap<(Vec<String>, String), usize>;
 
     struct Walk<'e> {
+        /// The author-written bindings whose definitions enclose the point, outermost first:
+        /// the scope of a store the compiler introduced, which has no site.
         chain: Vec<String>,
         counts: Counts,
         out: StateIdentities<'e>,
@@ -4547,11 +4587,18 @@ fn state_identities(expr: &Expr) -> StateIdentities<'_> {
             let site = content_hash(e);
             let value_tys = key_value_types(e);
             for k in keys {
+                // A store the source writes is named by its loop's or its declaration's
+                // site. One the compiler introduced, an exception scan's, has no place in the
+                // source and stands in the bindings around it.
+                let scope = match &k.site {
+                    Some(store) => scope_segments(store),
+                    None => w.chain.clone(),
+                };
                 let name = k.name.field_key().to_string();
-                let index = w.counts.entry((w.chain.clone(), name.clone())).or_insert(0);
+                let index = w.counts.entry((scope.clone(), name.clone())).or_insert(0);
                 w.out.variables.push(MutableVariable {
                     path: VarPath {
-                        chain: w.chain.clone(),
+                        scope,
                         name,
                         index: *index,
                     },
@@ -4564,17 +4611,17 @@ fn state_identities(expr: &Expr) -> StateIdentities<'_> {
             }
         }
         if let TypedExprNode::LoadFrom(name) = &e.node {
+            let declared_at = e.site.as_ref().unwrap_or_else(|| {
+                panic!("a `@LoadFrom({name})` reached conversion without its declaration's site")
+            });
             w.out.load_from_sites.push(LoadFromSite {
                 node: e.node_id(),
                 name: name.clone(),
-                chain: w.chain.clone(),
+                scope: scope_segments(declared_at),
                 ty: e.ty.clone(),
             });
         }
-        // A binding's definition is an address the source names, so a `Transact`
-        // inside one is addressed under that name. The binding's *body* is not:
-        // what the body declares belongs to the enclosing chain. `walk_children`
-        // visits exactly these two children for both node kinds.
+        // A binding's definition stands in the binding, and its body does not.
         let binding_parts = match &e.node {
             TypedExprNode::Let {
                 binding,
@@ -4590,17 +4637,7 @@ fn state_identities(expr: &Expr) -> StateIdentities<'_> {
         };
         match binding_parts {
             Some((binding, definition, body)) => {
-                // A `@LoadFrom`'s binding is not an address. Its definition is the
-                // leaf and nothing else, so nothing is ever declared under it,
-                // while the site inside it would otherwise start its outward
-                // search one segment too deep: a predecessor declaring a variable
-                // of the loaded spelling inside an instantiation bound to the
-                // load's own target name would answer for it, and that variable is
-                // one no source can name ([`LoadFromSite::resolve`]).
-                let named = match &definition.node {
-                    TypedExprNode::LoadFrom(_) => None,
-                    _ => binding.name.source_spelling().map(str::to_string),
-                };
+                let named = binding.name.source_spelling().map(str::to_string);
                 if let Some(spelling) = named.clone() {
                     w.chain.push(spelling);
                 }
@@ -6519,6 +6556,7 @@ mod variant_ctor_tests {
             ty,
             user_annotation: None,
             transparency: BindingTransparency::Transparent,
+            site: None,
         }
     }
 

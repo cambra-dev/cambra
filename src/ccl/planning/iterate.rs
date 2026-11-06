@@ -1628,6 +1628,7 @@ mod tests {
             keys: vec![TransactKey {
                 name: "acc".into(),
                 init: Expr::lit(Lit::Int(0)).with_ty(int.clone()),
+                site: None,
             }],
             writers: vec![WriterSite {
                 read_keys: vec!["acc".into()],

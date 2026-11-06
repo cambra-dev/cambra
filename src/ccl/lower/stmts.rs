@@ -863,10 +863,12 @@ pub(super) fn lower_middle_stmt(
                 Type::BoundedHole(t) => (**t).clone(),
                 t => t.clone(),
             };
-            let val = ctx.tag_image(
+            let mut val = ctx.tag_image(
                 Expr::load_from(source.node.as_str()).with_ty(produced),
                 source.span,
             );
+            // The declaration's place, whose scope the load's address is resolved from.
+            val.site = Some(ctx.sites.site(target.span));
             Ok(ctx.tag_image(
                 Expr::let_bind_annotated(name, val, body, annotation_ty),
                 stmt.span,
@@ -971,7 +973,9 @@ pub(super) fn lower_middle_stmt(
                 Type::Hole
             };
             let mut_ty = Type::mutable(domain, value_ty);
-            Ok(ctx.tag_image(Expr::mut_decl(name, mut_ty, val, body), stmt.span))
+            let decl =
+                Expr::mut_decl(name, mut_ty, val, body).declared_at(ctx.sites.site(target.span));
+            Ok(ctx.tag_image(decl, stmt.span))
         }
         // Desugar `x op= e` → `MutWrite(x, x op e)`. `+=` is a mutable write: the
         // check requires `x` to be a mutable variable (never a shadowing rebind of
@@ -2954,6 +2958,7 @@ pub(super) fn lower_try_over(
                 ty: Type::Hole,
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
+                site: None,
             },
             body: handler_body,
         });
@@ -4380,6 +4385,7 @@ pub(super) fn lower_match_over(
                     ty: Type::Hole,
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
+                    site: None,
                 },
                 empty_payload,
             }),

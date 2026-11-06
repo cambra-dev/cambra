@@ -746,8 +746,10 @@ leaves every branch whole and serving.
 
 **Inherit** is the default and needs no annotation. A variable the new version declares under the
 same identity takes the value it held, whether or not anything names it. Identity is a `VarPath`:
-the author-written bindings whose definitions enclose the declaration, outermost first, then the
-variable's own spelling, then its index among the variables sharing both.
+the scope the variable's store stands in, read off the site that names the store
+([sites.md](sites.md#stores)): the run, each call that reached it and the author-written bindings
+around it, outermost first. Then come the variable's own spelling and the store's position among the
+stores sharing both.
 
 **Load** is `@LoadFrom(x)`, which decorates a declaration and binds it to the value the predecessor
 held for `x`, read once when the replacement takes over ([chl-spec, "8.8
@@ -801,29 +803,28 @@ of the new version:
 qty_units: Int      # `qty_units` is the target
 ```
 
-`state_identities` assigns declarations and load sites their addresses in one walk, so the two
-cannot disagree about the binding chain at a point. A declaration's address is the chain enclosing
-it (`VarPath`). A site's address is read off the same chain and then resolved outward, the way a
-name resolves in the source: the innermost enclosing chain holding a variable of that spelling wins.
-Outward means the site's own chain and the chains enclosing it, never a chain below one of those. A
-load inside a stateful function's body finds the `` `a`.`total` `` of its own instantiation, and the
-same spelling written at the top level reaches nothing. A diagnostic names the spelling alone,
-because that is what the source contains.
+`state_identities` assigns stores and load sites their addresses in one walk, both read off sites
+([sites.md](sites.md#stores)). A store's address is the scope it stands in (`VarPath`). A load
+site's address is the scope of the declaration it decorates, resolved outward the way a name
+resolves in the source: the innermost enclosing scope holding a store of that spelling wins. Outward
+means the site's own scope and the scopes enclosing it, never a scope below one of those. A load
+inside a stateful function's body finds the `` `a`.`count_by()`.`total` `` of its own instantiation,
+and the same spelling written at the top level reaches nothing. A diagnostic names the spelling
+alone, because that is what the source contains.
 
-**The target contributes no chain segment.** A segment comes from descending into a binding's
-definition, and a load's definition is the leaf alone, so nothing is declared under the target.
-Pushing a segment for it would also move the search's innermost candidate onto a variable no source
-can mean: a predecessor's declaration of the loaded spelling inside an instantiation bound to the
-target's own spelling.
+**The target contributes no scope segment.** The declaration's place stands in the bindings around
+the statement, not in its own target, so nothing is declared under the target. A segment for it
+would also move the search's innermost candidate onto a variable no source can mean: a predecessor's
+declaration of the loaded spelling inside an instantiation bound to the target's own spelling.
 
-**A chain declaring the spelling once answers whichever site asks**: one declaration of an enclosing
-scope, reached by a site per instantiation. **A chain declaring it more than once is refused.**
-Those declarations are the anonymous call sites of one stateful function, told apart by position
-alone, and a load carries no position that confirms one. `site_moved` catches a declaration moving
-between such positions by the retired site's content, and a load has edited that content at every
-site it sits in, so pairing site 𝑖 with declaration 𝑖 would hand each site its neighbour's value on
-a reorder. Binding each call site to a name gives the load a chain that resolves, and the refusal
-says so.
+**A scope holding one store of the spelling answers whichever site asks**: one declaration of an
+enclosing scope, reached by a site per instantiation. **A scope holding more than one is refused**,
+and scopes that differ only in a call's position count as one (`unpositioned`). Such stores are the
+anonymous call sites of one stateful function, or loops writing one variable in turn, told apart by
+position alone, and a load cannot confirm a position. `site_moved` catches a store moving between
+such positions by the retired site's content, and a load has edited that content at every site it
+sits in, so pairing site 𝑖 with store 𝑖 would hand each site its neighbour's value on a reorder.
+Binding each call site to a name gives the load a scope that resolves, and the refusal says so.
 
 **Resolution reads what the predecessor declared, not what it holds a value for.** A store the
 running program never drove holds no value and is still the variable the name means. Answering from
@@ -941,17 +942,18 @@ operators outside a tile.
 shifts nothing: `` `a`.`n` `` is `` `a`.`n` `` however many other `n`s the version declares
 (`a_loop_added_ahead_of_a_same_spelled_one_starts_at_its_init`,
 `reordering_two_same_spelled_variables_keeps_their_state_apart`). The spelling carries the meaning,
-because a writer's write set is keyed by the variable written, and the chain tells two declarations
-of one spelling apart. The index is used only for the shape the source names nothing in: two
-anonymous call sites of one stateful function in one expression. A reorder that edits both bodies at
-once leaves neither site present to recognise, so the position decides and the values cross.
+because a writer's write set is keyed by the variable written, and the scope tells two declarations
+of one spelling apart. Positions are used only for the shapes the source names nothing in: two
+anonymous call sites of one stateful function in one expression, `f()` and `f()#1`, and loops
+writing one variable in turn. A reorder that edits both bodies at once leaves neither site present
+to recognise, so the position decides and the values cross.
 
 A spelling is not unique, and nothing computed can stand in for one. A declaration can be shadowed,
 and a function holding a stateful loop declares one variable per call site once inlining has cloned
 its body. Two instantiations can then differ only in their writer bodies after substitution, so a
 content-derived identity either fails to tell them apart or changes under the edit state has to
-survive. The enclosing bindings are what is left, and one walk (`state_identities`) assigns identity
-for both the guard and conversion to read.
+survive. The scope a site states is what is left, the calls and bindings around the store, and one
+walk (`state_identities`) assigns identity for both the guard and conversion to read.
 
 **The position** travels with the kept iteration operator and is not carried. A rebuilt store
 resumes one position past what its iteration operator has released (`FanOut::released_position`),
@@ -1318,8 +1320,9 @@ retired](#a-route-a-version-stops-serving-is-retired).
 A program whose output is its `main` value rather than a sink reloads the same way. `stdin` is
 unbounded, so the binary's driver loop keeps running and services the control port between pulls.
 The guard names such a program's loops by the address the source gives them: a bare `` `n` `` where
-the program declares one, and `` `a`.`n` `` where the declaration sits inside a binding (`VarPath`'s
-`Display`). Its state reads the same way as a sink program's:
+the program declares one, `` `a`.`n` `` where the declaration sits inside a binding, and
+`` `a`.`count_by()`.`n` `` where a call reached it (`VarPath`'s `Display`). Its state reads the same
+way as a sink program's:
 
 - A pure element-wise transformation splits exactly at the swap. Eight lines with the swap after the
   fourth emit four under the old rule and four under the new, each once: the stream is neither

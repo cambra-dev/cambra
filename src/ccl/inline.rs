@@ -536,6 +536,7 @@ fn split_product_let(binding: &TypedBinding, product: Expr, body: Expr) -> Expr 
                 ty: component.ty.clone(),
                 user_annotation: None,
                 transparency: binding.transparency,
+                site: None,
             };
             Expr::let_in(component_binding, component, body)
         })
@@ -1561,7 +1562,8 @@ fn collect_var_elements(tuple: &Expr, out: &mut Vec<Name>) {
 }
 
 /// Extend every site in `e`, a copy of a function's body made for a call, with that call's
-/// site ([`Site::through`]): a feed's, a call's and a reading's.
+/// site ([`Site::through`]): a feed's, a call's, a reading's, and a loop's or a mutable
+/// variable's binding's.
 fn reached_through(e: &mut Expr, call: &Site) {
     if let Some(site) = &e.site {
         e.site = Some(site.through(call));
@@ -1571,6 +1573,14 @@ fn reached_through(e: &mut Expr, call: &Site) {
             site: Some(site), ..
         } => *site = site.through(call),
         TypedExprNode::Reading(reading) => reading.through(call),
+        TypedExprNode::For {
+            target: binding, ..
+        }
+        | TypedExprNode::MutDecl { binding, .. } => {
+            if let Some(site) = &binding.site {
+                binding.site = Some(site.through(call));
+            }
+        }
         _ => {}
     }
     e.walk_children_mut(|child| reached_through(child, call));

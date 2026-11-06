@@ -665,7 +665,11 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
                     b.name
                 );
                 key_ty.push((b.name.clone(), value_ty));
-                keys.push(TransactKey { name: b.name, init });
+                keys.push(TransactKey {
+                    name: b.name,
+                    init,
+                    site: b.site,
+                });
             }
             TxnBinding::Commit => {
                 let site_dom =
@@ -1118,6 +1122,7 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
             TransactKey {
                 name: Name::fresh_for_field(&label),
                 init,
+                site: h.site.clone(),
             }
         })
         .collect();

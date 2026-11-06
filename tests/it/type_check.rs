@@ -3541,6 +3541,7 @@ mod letrec_typing {
             ty,
             user_annotation: None,
             transparency: BindingTransparency::Transparent,
+            site: None,
         }
     }
 
