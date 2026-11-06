@@ -53,16 +53,7 @@ pub(crate) fn contribution_lambda(
             },
         )
         .unwrap_or(FunKind::Compute);
-    let ty = if crate::ccl::subst::type_free_vars(&codomain).contains(&param.name) {
-        Type::pi_kinded(param.name.clone(), param.ty.clone(), codomain, fun_kind)
-    } else {
-        Type::Fun {
-            name: None,
-            fun_kind,
-            domain: Box::new(param.ty.clone()),
-            codomain: Box::new(codomain),
-        }
-    };
+    let ty = Type::fun_over(param.name.clone(), param.ty.clone(), codomain, fun_kind);
     Expr::lambda(&param.name, param.ty.clone(), body).with_ty(ty)
 }
 
@@ -577,11 +568,7 @@ fn read_level(
 /// `position`.
 fn collection_over(position: &Name, domain: Type, body: Expr) -> Expr {
     let value = body.ty.clone();
-    let ty = if crate::ccl::subst::type_free_vars(&value).contains(position) {
-        Type::pi_kinded(position.clone(), domain.clone(), value, FunKind::Data(None))
-    } else {
-        Type::data_fun(domain.clone(), value)
-    };
+    let ty = Type::fun_over(position.clone(), domain.clone(), value, FunKind::Data(None));
     Expr::lambda(position, domain, body).with_ty(ty)
 }
 

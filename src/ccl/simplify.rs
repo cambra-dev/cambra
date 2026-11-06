@@ -3140,7 +3140,8 @@ mod tests {
         let f = var("f").with_ty(fun_ty(int_ty(), int_ty()));
         let mut c = typed_const(Expr::lit(Lit::Int(7)).with_ty(int_ty()), int_ty());
         c.ty = dependent("k");
-        let mut compose = typed_compose2(f, c);
+        // Typed as the dependent chain it is, never as the plain one `typed_compose2` states.
+        let mut compose = Expr::compose(vec![f, c]);
         compose.ty = dependent("k");
         assert_eq!(simplify(compose.clone()), compose);
     }
