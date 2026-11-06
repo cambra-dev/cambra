@@ -973,7 +973,7 @@ fn pin_empty_list_element(list_ty: &Type, ctx: &mut CoalesceCtx) {
         return;
     }
     let chosen = payload_pin(codomain, ctx);
-    let pinned = pin_both_ways(&chosen, codomain);
+    let pinned = pin_both_ways(&chosen, codomain).map(|()| pin_open_components(&chosen, ctx));
     // **Reported, not asserted.** `position_type` takes the first answer, and the premise
     // that every other position still accepts it holds for the unreachable arm payload the
     // rule came from — one position, one demand. An empty literal is ordinary reachable
@@ -983,6 +983,27 @@ fn pin_empty_list_element(list_ty: &Type, ctx: &mut CoalesceCtx) {
     if let Err(err) = pinned {
         let label = format!("empty collection literal pinned to `{chosen}`");
         ctx.push_error(map_constrain_err(err, &label), label);
+    }
+}
+
+/// Pin each component of a pinned tuple that no value reaches, as the tuple was: a position
+/// can fix an empty literal's element to a product, `map`'s pair, whose components only
+/// demands reach.
+fn pin_open_components(chosen: &Type, ctx: &mut CoalesceCtx) {
+    let Type::Tuple(components) = chosen.peel_refinements() else {
+        return;
+    };
+    for component in components {
+        if value_reaches(component) {
+            continue;
+        }
+        let pinned = payload_pin(component, ctx);
+        if let Err(err) = pin_both_ways(&pinned, component) {
+            let label = format!("empty collection literal's component pinned to `{pinned}`");
+            ctx.push_error(map_constrain_err(err, &label), label);
+            continue;
+        }
+        pin_open_components(&pinned, ctx);
     }
 }
 
@@ -1475,6 +1496,17 @@ fn position_answer(
         if ty != b.ty
             && let Type::Infer(u) = &b.ty
             && let Some(answer) = position_type_go(u, index, question, partial)
+        {
+            return Some(answer);
+        }
+    }
+    // A recorded membership in `SubtypesOf(𝑈)` is a demand as an upper bound is: the variable
+    // stands for a type below `𝑈`, and `𝑈` is one.
+    let kinds = v.bounds.borrow().type_kinds.clone();
+    for k in kinds.iter() {
+        if let crate::ccl::ty::TypeKind::SubtypesOf(b) = k
+            && let Ok(resolved) = resolve_var_type(b)
+            && let Some(answer) = offer(&resolved, partial)
         {
             return Some(answer);
         }

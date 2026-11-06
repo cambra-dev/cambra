@@ -720,7 +720,7 @@ conditional's reading unchanged.
 | Site | Example | Pinned to | Pinned variable | Unobservable when | No answer from the position |
 | --- | --- | --- | --- | --- | --- |
 | Unreachable `match` arm | ``x = `a(1)``; ``case `a(v): `p(v)``; ``case `b(w): `p(w)`` | `w : Int@1`, the `` `p `` payload of the join | the payload binder's type | no value reaches it | [An unobservable arm payload is pinned to what its uses require](#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require) |
-| Empty list literal | `box([1]) if c else box([])` | element `Int@1`, the other branch's element | the element type | no value reaches it | as an arm payload ([The empty literal names no element type](collections.md#the-empty-literal-names-no-element-type)) |
+| Empty list literal | `box([1]) if c else box([])` | element `Int@1`, the other branch's element | the element type, and each component of a tuple it is pinned to that no value reaches | no value reaches it | as an arm payload ([The empty literal names no element type](collections.md#the-empty-literal-names-no-element-type)) |
 | Lambda parameter | `(\x -> 1) if c else (\y -> y + 2)` | `x : Int`, the join's domain | the parameter's type | neither a value nor a demand reaches it | the variable remains, and the post-inference check reports `UnresolvedInfer` |
 | Nominal constructor | `Opt::some(1) if c else Opt::none` | `T : Int@1`, the other branch's argument | each type argument of the value it builds, `T` in `Opt::none : Opt(T)` | neither the payload nor a demand reaches it | the variable remains, an unresolved type at the use (`docs/chl-spec.md`, "Type parameters") |
 
@@ -730,7 +730,10 @@ conditional's reading unchanged.
 
 1. **An upper bound `𝛼 <: 𝑈`.** The answer is `𝑈` resolved, with the bound's recorded substitution
    applied. Where `𝑈` resolves to a variable, the answer is the type of that variable's position.
-2. **An occurrence in a lower bound.** A variable `𝑉` has a lower bound in which `𝛼` occurs at
+2. **A recorded membership `𝛼 ∈ SubtypesOf(𝑈)`.** Membership draws no bound until
+   materialization decides it, but it is a demand as an upper bound is, and `𝑈` meets it. The
+   answer is `𝑈` resolved.
+3. **An occurrence in a lower bound.** A variable `𝑉` has a lower bound in which `𝛼` occurs at
    position `𝑝`. The answer is `𝑉`'s polarity-correct reading (`compact_type_polarity_only`) at
    `𝑝`. Where that reading leaves `𝑝` unresolved, the answer is the type of `𝑉`'s position, read at
    `𝑝`.

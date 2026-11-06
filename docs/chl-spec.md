@@ -1303,7 +1303,9 @@ see [Re-keying is explicit](#re-keying-is-explicit-decided).
 unconstrained element type becomes unit. For example, `xs: List(Int) = box([])` selects `Int`.
 A value it is joined with is a use: in `box([1]) if c else box([])`, `[]` takes the other
 branch's element type, so the empty branch is an `Array(0, {Int where _ == 1})`.
-This does not provide a key type to `map([])` or `set([])`; those constructors are rejected.
+The same holds under a re-keying constructor: in `m: Map(String, Int) = box(map([]))` the
+annotation gives `[]` its element type, `(String, Int)`, and `set([])` with no use is a set of
+`unit`.
 
 `empty_map()` directly constructs an empty keyed sum. Its annotation must determine the key
 and value types:
