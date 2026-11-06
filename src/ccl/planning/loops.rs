@@ -1186,18 +1186,16 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     let source = match &enclosing {
         None => source,
         Some(ctx_ty) => {
-            let item = source
-                .ty
-                .codomain()
-                .expect("letrec recognition: a writer source is a function");
-            crate::ccl::lambda_elim::curry_at(
-                source,
-                over_enclosing(
-                    enclosing_binder.as_ref(),
-                    ctx_ty,
-                    Type::data_fun(domain_ty.clone(), item),
-                ),
-            )
+            // The pair's halves the curried type reads are minted for the source it restates.
+            let curried = {
+                let _g = provenance::enter(
+                    source.node_id(),
+                    "planning.curried_source",
+                    provenance::Nature::Machinery,
+                );
+                curried_source_type(&source.ty, ctx_ty, &domain_ty, enclosing_binder.as_ref())
+            };
+            crate::ccl::lambda_elim::curry_at(source, curried)
         }
     };
     // Now that this writer's parameter is settled, plan what is inside it: an inner
@@ -1364,6 +1362,60 @@ struct HistReads<'a> {
     /// The name the history family gives its enclosing argument, which the history reads
     /// where it depends on it.
     enclosing_binder: Option<&'a Name>,
+}
+
+/// The type of a nested writer's source `(enclosing, position) ⇒ item` curried into one
+/// collection per enclosing position, `enclosing ⇒ (position ⤇ item)`.
+///
+/// An item that reads the pair, as a group read at the inner loop's key does, reads it by the
+/// source's binder: its enclosing half becomes the enclosing value, named `binder` where the
+/// family names it, and its position half the collection's own key.
+fn curried_source_type(source: &Type, ctx: &Type, domain: &Type, binder: Option<&Name>) -> Type {
+    let fun = crate::ccl::generalize::opened(source);
+    let item = fun
+        .codomain()
+        .expect("letrec recognition: a writer source is a function");
+    let Type::Fun {
+        name: Some(pair), ..
+    } = fun
+    else {
+        return over_enclosing(binder, ctx, Type::data_fun(domain.clone(), item));
+    };
+    let mut item = crate::ccl::subst::open_codomain(fun, &item);
+    if !crate::ccl::subst::type_free_vars(&item).contains(pair) {
+        return over_enclosing(binder, ctx, Type::data_fun(domain.clone(), item));
+    }
+    let enclosing = binder
+        .cloned()
+        .unwrap_or_else(|| Name::fresh("__enclosing"));
+    let position = Name::fresh("__pos");
+    crate::ccl::subst::rewrite_pairing_projections(
+        pair,
+        &[
+            Expr::var(enclosing.clone()).with_ty(ctx.clone()),
+            Expr::var(position.clone()).with_ty(domain.clone()),
+        ],
+        &mut item,
+    );
+    assert!(
+        !crate::ccl::subst::type_free_vars(&item).contains(pair),
+        "letrec recognition: a nested source's item reads its pair only through its halves: {item}"
+    );
+    let collection = if crate::ccl::subst::type_free_vars(&item).contains(&position) {
+        Type::pi_kinded(
+            position,
+            domain.clone(),
+            item,
+            crate::ccl::ty::FunKind::Data(None),
+        )
+    } else {
+        Type::data_fun(domain.clone(), item)
+    };
+    if crate::ccl::subst::type_free_vars(&collection).contains(&enclosing) {
+        Type::pi(enclosing, ctx.clone(), collection)
+    } else {
+        Type::fun(ctx.clone(), collection)
+    }
 }
 
 /// A morphism of a nested `Transact`'s enclosing parameter, `ctx ⇒ codomain`, dependent on it
