@@ -363,9 +363,11 @@ lowering"). A failed last statement leaves the placeholder as the block's value,
 a placeholder outside a statement as a fresh variable. When every lowering error is one such
 placeholder stands for, the passes run on to inference past parse and lowering errors and stop
 after it, and what inference reports is added to theirs; an undetermined type is not reported, as
-in a run that starts over. A load error, or a lowering error no placeholder stands for, such as a
-`run` missing a type argument, stops the compile after lowering as before: the tree can be
-inconsistent where nothing marks it.
+in a run that starts over. Past a load error too: a module that did not load is one with errors of
+its own, so a qualified reference or a `use` name into it reaches nothing and lowers to the
+placeholder, as one into a module with errors does. A lowering error no placeholder stands for,
+such as a `run` missing a type argument, stops the compile after lowering as before: the tree can
+be inconsistent where nothing marks it.
 
 Each later run's errors are added to the earlier runs', but for those saying the program does not
 determine a type (`InferError::is_undetermined`): an unresolved variable or tuple width, or a
