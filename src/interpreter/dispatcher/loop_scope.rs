@@ -305,7 +305,7 @@ impl InductionStoreProducer {
         let Some(run) = &self.run else { return };
         let count = run.members.len();
         for local in 0..count {
-            self.reach_local(PipelineId(local), &mut |breaker| {
+            self.reach_local(PipelineId(local), &mut |breaker, _| {
                 breaker.enter_consuming_mode()
             });
         }
@@ -325,7 +325,7 @@ impl InductionStoreProducer {
     fn next_round_position(&mut self) -> Option<Vec<Value>> {
         let drive = self.drive();
         let mut next = None;
-        self.reach_local(drive, &mut |breaker| {
+        self.reach_local(drive, &mut |breaker, _| {
             next = breaker
                 .as_producer()
                 .and_then(|producer| producer.next_position())
@@ -370,7 +370,7 @@ impl InductionStoreProducer {
     /// has run, so the scope reads them before it runs the row's rounds.
     fn read_source(&mut self) {
         let drive = self.drive();
-        self.reach_local(drive, &mut |breaker| {
+        self.reach_local(drive, &mut |breaker, _| {
             let none = breaker.input_tiling(InputId::ONLY).empty_guard();
             breaker.consume_impl(InputId::ONLY, none);
         });
@@ -397,7 +397,7 @@ impl InductionStoreProducer {
     ) -> Vec<(PipelineId, TileGuard)> {
         let drive = self.drive();
         let mut consumer = None;
-        self.reach_local(drive, &mut |breaker| {
+        self.reach_local(drive, &mut |breaker, _| {
             consumer = breaker
                 .as_producer()
                 .and_then(|producer| producer.base().downstream.clone());
@@ -420,7 +420,7 @@ impl InductionStoreProducer {
                     return landed;
                 }
                 let mut fits = false;
-                self.reach_local(reader, &mut |breaker| {
+                self.reach_local(reader, &mut |breaker, _| {
                     let input = InputId::ONLY;
                     fits = guard.check_from(&breaker.input_tiling(input))
                 });
@@ -562,7 +562,7 @@ impl InductionStoreProducer {
             // included, and reads it no more: it is no longer there to read. A row released in
             // part is read again whole, for its end.
             let mut released = false;
-            self.reach_local(reader, &mut |breaker| {
+            self.reach_local(reader, &mut |breaker, _| {
                 let input = InputId::ONLY;
                 released = guard_minus(&row, &breaker.input_released(input)).is_empty()
             });
@@ -596,7 +596,7 @@ pub(super) fn reach_member(
     call: &mut Call<'_>,
 ) {
     match member {
-        Member::Scope(store) => call(&mut *induction(store)),
+        Member::Scope(store) => call(&mut *induction(store), InputId::ONLY),
         Member::Chain(id) => {
             let mut call = Some(call);
             let mut found = false;
@@ -752,7 +752,7 @@ mod tests {
         fn tick(&self) -> Option<PipelineId> {
             let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
                 if pipeline == PipelineId(0) {
-                    call(&mut *induction(&self.scope));
+                    call(&mut *induction(&self.scope), InputId::ONLY);
                 } else {
                     assert!(induction(&self.scope).reach_shared(pipeline, call));
                 }
