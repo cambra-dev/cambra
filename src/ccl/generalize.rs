@@ -297,6 +297,18 @@ fn align_sub(sub: &Type, sup: &Type) -> Type {
             },
         ) => {
             let domain = Box::new(align_sub(domain, sd));
+            // A sum's candidates align as the parts they are.
+            let mut fun_kind = fun_kind.clone();
+            for part in crate::ccl::pairing::paired_parts(sub, sup_fun)
+                .map(|p| p.parts)
+                .unwrap_or_default()
+            {
+                if let crate::ccl::pairing::PartAt::Candidate { witness, index } = part.at {
+                    fun_kind.witnesses_mut()[witness].types_mut()[index] =
+                        align_sub(part.left, part.right);
+                }
+            }
+            let fun_kind = &fun_kind;
             // The codomains are aligned with the binder read by name in both: an index would
             // be loose in either alone, and a type a parameter is bound to would carry it to a
             // depth where it reads a different function.
@@ -325,12 +337,6 @@ fn align_sub(sub: &Type, sup: &Type) -> Type {
                 },
             }
         }
-        (Type::Tuple(subs), Type::Tuple(sups)) if subs.len() == sups.len() => Type::Tuple(
-            subs.iter()
-                .zip(sups)
-                .map(|(a, b)| align_sub(a, b))
-                .collect(),
-        ),
         // A tuple instantiated at a dependent tuple's components reads the earlier ones as they
         // do, by index, so it is that dependent tuple, under its names. One whose components
         // read none is the plain tuple still ([`Type::closed_dep_tuple`]).
@@ -342,24 +348,10 @@ fn align_sub(sub: &Type, sup: &Type) -> Type {
                     .collect(),
             )
         }
-        (Type::Record(subs), Type::Record(sups)) => Type::Record(
-            subs.iter()
-                .map(|(label, a)| match sups.iter().find(|(l, _)| l == label) {
-                    Some((_, b)) => (label.clone(), align_sub(a, b)),
-                    None => (label.clone(), a.clone()),
-                })
-                .collect(),
-        ),
-        (Type::Variant(subs, openness), Type::Variant(sups, _)) => Type::Variant(
-            subs.iter()
-                .map(|(key, a)| match sups.iter().find(|(k, _)| k == key) {
-                    Some((_, b)) => (key.clone(), align_sub(a, b)),
-                    None => (key.clone(), a.clone()),
-                })
-                .collect(),
-            *openness,
-        ),
-        _ => sub.clone(),
+        // Every other shape aligns position by position, a position the supertype lacks kept.
+        (sub, sup) => {
+            crate::ccl::pairing::rebuilt(sub, sup, &mut |part| align_sub(part.left, part.right))
+        }
     }
 }
 
@@ -545,86 +537,35 @@ fn match_direct(
         }
         return;
     }
-    match (pattern.peel_refinements(), actual.peel_refinements()) {
-        (
-            Type::Fun {
-                name: pn,
-                fun_kind: pk,
-                domain: pd,
-                codomain: pc,
-            },
-            Type::Fun {
-                name: an,
-                fun_kind: ak,
-                domain: ad,
-                codomain: ac,
-            },
-        ) => {
-            // A sum's candidates are parts of it, paired by position as its binders are. A sum
-            // over fewer candidates is below one over more, and is the instance whose extra
-            // candidates repeat its last: `Σ[𝑋]` is `Σ[𝑋, 𝑋]`. A planned conditional that kept
-            // one arm hands a consumer stated over both arms that arm's sum.
-            for (pw, aw) in pk.witnesses().iter().zip(ak.witnesses()) {
-                let actual = aw.types();
-                if actual.is_empty() || pw.types().len() < actual.len() {
-                    continue;
-                }
-                for (i, p) in pw.types().iter().enumerate() {
-                    let a = &actual[i.min(actual.len() - 1)];
-                    match_direct(p, a, params, pairs, out, met);
-                }
+    let (pattern, actual) = (pattern.peel_refinements(), actual.peel_refinements());
+    // Each part under the binders the pattern names around it, paired with the actual's.
+    for part in crate::ccl::pairing::paired_parts(pattern, actual)
+        .map(|p| p.parts)
+        .unwrap_or_default()
+    {
+        let mut inner = pairs.to_vec();
+        for (ours, theirs) in &part.binders {
+            if let Some(ours) = ours {
+                inner.push(((*ours).clone(), (*theirs).unwrap_or(ours).clone()));
             }
-            match_direct(pd, ad, params, pairs, out, met);
-            let mut inner = pairs.to_vec();
-            if let Some(ours) = pn {
-                inner.push((ours.clone(), an.clone().unwrap_or_else(|| ours.clone())));
-            }
-            match_direct(pc, ac, params, &inner, out, met);
         }
-        (Type::Tuple(ps), Type::Tuple(acts)) if ps.len() == acts.len() => {
-            for (p, a) in ps.iter().zip(acts) {
+        match_direct(part.left, part.right, params, &inner, out, met);
+    }
+    // A sum over fewer candidates is below one over more, and is the instance whose extra
+    // candidates repeat its last: `Σ[𝑋]` is `Σ[𝑋, 𝑋]`. A planned conditional that kept one arm
+    // hands a consumer stated over both arms that arm's sum. Candidates as many as the
+    // pattern's are paired above.
+    if let (Type::Fun { fun_kind: pk, .. }, Type::Fun { fun_kind: ak, .. }) = (pattern, actual) {
+        for (pw, aw) in pk.witnesses().iter().zip(ak.witnesses()) {
+            let actual = aw.types();
+            if actual.is_empty() || pw.types().len() <= actual.len() {
+                continue;
+            }
+            for (i, p) in pw.types().iter().enumerate() {
+                let a = &actual[i.min(actual.len() - 1)];
                 match_direct(p, a, params, pairs, out, met);
             }
         }
-        (Type::DepTuple(ps), Type::DepTuple(acts)) if ps.len() == acts.len() => {
-            let mut inner = pairs.to_vec();
-            for ((pn, p), (an, a)) in ps.iter().zip(acts) {
-                match_direct(p, a, params, &inner, out, met);
-                if let Some(ours) = pn {
-                    inner.push((ours.clone(), an.clone().unwrap_or_else(|| ours.clone())));
-                }
-            }
-        }
-        // A plain tuple is the dependent tuple whose components read none before them.
-        (Type::Tuple(ps), Type::DepTuple(acts)) if ps.len() == acts.len() => {
-            for (p, (_, a)) in ps.iter().zip(acts) {
-                match_direct(p, a, params, pairs, out, met);
-            }
-        }
-        (Type::DepTuple(ps), Type::Tuple(acts)) if ps.len() == acts.len() => {
-            let mut inner = pairs.to_vec();
-            for ((pn, p), a) in ps.iter().zip(acts) {
-                match_direct(p, a, params, &inner, out, met);
-                if let Some(ours) = pn {
-                    inner.push((ours.clone(), ours.clone()));
-                }
-            }
-        }
-        (Type::Record(ps), Type::Record(acts)) => {
-            for (label, p) in ps {
-                if let Some((_, a)) = acts.iter().find(|(l, _)| l == label) {
-                    match_direct(p, a, params, pairs, out, met);
-                }
-            }
-        }
-        (Type::Variant(ps, _), Type::Variant(acts, _)) => {
-            for (key, p) in ps {
-                if let Some((_, a)) = acts.iter().find(|(k, _)| k == key) {
-                    match_direct(p, a, params, pairs, out, met);
-                }
-            }
-        }
-        _ => {}
     }
 }
 
