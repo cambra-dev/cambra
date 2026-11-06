@@ -227,7 +227,7 @@ pub fn service(
                 Err(e) => branch_error(e, &LoadedProgram::from_text(POSTED, "")),
             }
         }
-        // A rebuilt operator's producer takes the scheduler's probe slot when it
+        // A rebuilt operator's producer takes the subscribe context's probe slot when it
         // is built, as the first compile's did; a created branch's do too.
         ControlRequest::Reload { branch, code } => {
             let posted = LoadedProgram::from_text(POSTED, code.as_str());

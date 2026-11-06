@@ -128,15 +128,15 @@ fn writer(k: usize) -> usize {
     k + 1
 }
 
-/// An induction store short of terminal holds nothing, since a reader pulls its tile whole, but
-/// states decided the positions it has stepped: its decided region grows a position a step.
+/// An induction store short of terminal holds the positions it has stepped, its decided region,
+/// which grows a position a step.
 #[test]
 fn an_induction_store_decides_each_position_it_steps() {
     let compiled = Compiled::of(SUM);
     let decided = || compiled.breaker(|store| (store.held(), store.decided()));
     compiled.breaker(|store| store.consume_impl(InputId::ONLY, keys_between(0, 0)));
     let (held, after_one) = decided();
-    assert!(held.is_empty(), "{held:?}");
+    assert_eq!(held, after_one);
     compiled.breaker(|store| store.consume_impl(InputId::ONLY, keys_between(1, 1)));
     let (_, after_two) = decided();
     assert!(
@@ -300,8 +300,8 @@ fn a_stale_proposal_is_proposed_again_before_a_larger_key_commits() {
     );
 }
 
-/// The last finish, across every input, commits what the store still
-/// holds and leaves the store terminal; the earlier inputs' last finishes leave it as it was.
+/// The finish of the last input to finish commits what the store still holds and leaves the
+/// store terminal; the earlier inputs' finishes leave it as it was.
 #[test]
 fn the_last_finish_of_the_last_input_commits_the_rest() {
     let compiled = Compiled::of(TWO_WRITERS);

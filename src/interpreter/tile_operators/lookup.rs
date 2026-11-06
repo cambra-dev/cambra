@@ -7,7 +7,7 @@ use crate::interpreter::operator_graph::value;
 use crate::{
     ccl::FieldKey,
     interpreter::{
-        ColumnValue, Consumer, Projection, Scheduler, Value, shared_consumer,
+        ColumnValue, Consumer, Projection, SubscribeContext, Value, shared_consumer,
         tiling::FunctionGuard, tuple_field,
     },
 };
@@ -176,7 +176,7 @@ impl TileOperator for CheckedLookup {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let (source, gate) = match &mut self.source {
             // Two inputs, so both wake the same consumer. The collection is what decides an
@@ -189,13 +189,9 @@ impl TileOperator for CheckedLookup {
                 // position; the collection is read whole, since every key is answered against
                 // all of it.
                 let keeps_keys = keys.tiling().is_data_function();
-                let keys = subscribe_forwarding_keeping_keys_if(
-                    keeps_keys,
-                    &mut **keys,
-                    &shared,
-                    scheduler,
-                );
-                let collection = subscribe_forwarding(&mut **collection, &shared, scheduler);
+                let keys =
+                    subscribe_forwarding_keeping_keys_if(keeps_keys, &mut **keys, &shared, cx);
+                let collection = subscribe_forwarding(&mut **collection, &shared, cx);
                 (ProducerSource::Split { collection, keys }, Some(gate))
             }
             // One input, carrying both operands, so there is nothing to share.
@@ -205,7 +201,7 @@ impl TileOperator for CheckedLookup {
                     // The pairs are pulled at the projection, and each answer sits at its
                     // row's position.
                     consumer,
-                    scheduler,
+                    cx,
                 )),
                 None,
             ),
@@ -215,7 +211,7 @@ impl TileOperator for CheckedLookup {
                 CheckedLookupProducer::alloc_id(),
                 &self.base.tiling,
                 &self.base,
-                scheduler,
+                cx,
             )
             .sharing(gate),
             source,
@@ -697,18 +693,13 @@ impl TileOperator for Lookup {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         Box::new(LookupProducer {
-            base: ProducerBase::new(
-                LookupProducer::alloc_id(),
-                self.tiling(),
-                &self.base,
-                scheduler,
-            ),
+            base: ProducerBase::new(LookupProducer::alloc_id(), self.tiling(), &self.base, cx),
             input: self
                 .input
-                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler),
+                .subscribe(self.input.tiling().universal_guard(), consumer, cx),
             level: self.level,
         })
     }

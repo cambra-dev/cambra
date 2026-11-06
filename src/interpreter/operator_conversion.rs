@@ -6441,7 +6441,7 @@ mod variant_ctor_tests {
         ProducerBase, Tile, TileProducer, impl_producer_base,
     };
     use crate::interpreter::tiling::{Predicate, TileGuard};
-    use crate::interpreter::{ColumnValue, Consumer, Scheduler, Value};
+    use crate::interpreter::{ColumnValue, Consumer, SubscribeContext, Value};
     use crate::interpreter::{Projection, UnionArm};
     use crate::pretty_graph::VizOptions;
     use crate::pretty_tree::InspectNode;
@@ -6464,8 +6464,8 @@ mod variant_ctor_tests {
     /// Drive an operator once and return its tile.
     fn drive(op: Box<dyn TileOperator>) -> Tile {
         let mut op = op;
-        let mut sched = Scheduler::new();
-        let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut cx);
         producer.get(producer.tiling().universal_guard())
     }
 
@@ -6608,7 +6608,7 @@ mod variant_ctor_tests {
             &mut self,
             _intent_guard: TileGuard,
             mut consumer: Box<dyn Consumer>,
-            _scheduler: &mut Scheduler,
+            _cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             consumer.notify(&Projection::Everything);
             Box::new(FixedStreamProducer {

@@ -44,10 +44,14 @@
 
 use crate::interpreter::Projection;
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     fmt,
     rc::{Rc, Weak},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crate::ccl::load::LoadedProgram;
@@ -62,9 +66,12 @@ use crate::ccl::{
 use crate::chl_parser::SourceMap;
 use crate::control_port::phase_spelling;
 use crate::interpreter::{
-    Consumer, Value,
+    Consumer, DataSink, Value,
+    dispatcher::{Ended, Refused, RunObserver, Targets},
     operator_conversion::{OperatorMap, ReuseTally, StateConflict, UnreadablePrefix, VarPath},
+    sinks::ProducerSlot,
     tile_operators::{FanOut, TileProducer},
+    tiling::Tile,
 };
 
 /// The branch a request that names none addresses: a control-port verb without
@@ -212,6 +219,23 @@ fn branch_main_consumer(
         notified.set(true);
         wake.notify(&Projection::Everything);
     })
+}
+
+/// A branch's `main` output in a dispatched run ([`LiveProgram::run`]): it hands each answer to
+/// the branch's printer and records whether one was terminal, after which no run pulls the output
+/// again.
+struct MainOutput {
+    print: Arc<dyn DataSink>,
+    finished: AtomicBool,
+}
+
+impl DataSink for MainOutput {
+    fn process(&self, tile: &Tile) {
+        if tile.is_terminal() {
+            self.finished.store(true, Ordering::Relaxed);
+        }
+        self.print.process(tile);
+    }
 }
 
 /// One row of [`LiveProgram::branches`], rendered as `/branches` prints it.
@@ -611,6 +635,63 @@ impl LiveProgram {
             }
         }
         pulled
+    }
+
+    /// Run every branch through one dispatcher until `observer` breaks or every live source
+    /// yields everything: one plan over each branch's sink outputs and each branch's `main` output
+    /// that has not delivered its terminal answer. `print` builds the sink a branch's `main`
+    /// answers go to, from the branch's name.
+    ///
+    /// One run plans every branch together because branches share operators: a store or a `Memo`
+    /// two branches hold is one breaker, which one plan places once.
+    ///
+    /// # Errors
+    ///
+    /// Where the planner refuses the table ([`run_program`](crate::interpreter::dispatcher::run_program)). The run then ran nothing
+    /// and placed nothing.
+    pub fn run(
+        &mut self,
+        morsel_rows: usize,
+        print: &dyn Fn(&str) -> Arc<dyn DataSink>,
+        observer: &mut dyn RunObserver,
+    ) -> Result<Ended, Refused> {
+        let mut targets = Targets::new();
+        let mut mains = Vec::new();
+        for (at, branch) in self.branches.iter_mut().enumerate() {
+            targets.add_sinks(&branch.program);
+            if branch.main_finished {
+                continue;
+            }
+            let Some(producer) = branch.main_producer.take() else {
+                continue;
+            };
+            let slot: ProducerSlot = Rc::new(RefCell::new(Some(producer)));
+            let output = Arc::new(MainOutput {
+                print: print(&branch.name),
+                finished: AtomicBool::new(false),
+            });
+            targets.add_main(&branch.program, slot.clone(), output.clone());
+            mains.push((at, slot, output));
+        }
+        let ended = targets.run(morsel_rows, observer);
+        for (at, slot, output) in mains {
+            let branch = &mut self.branches[at];
+            branch.main_producer = slot.borrow_mut().take();
+            branch.main_finished |= output.finished.load(Ordering::Relaxed);
+        }
+        ended
+    }
+
+    /// Pull every branch's sinks once, as a compile that does not defer its sink pulls does
+    /// (`GlobalContext::defer_sink_pulls`): what a driver falling back to pull mode does first.
+    pub fn pull_sinks(&self) {
+        for branch in &self.branches {
+            for output in branch.program.sinks() {
+                if let Some(consumer) = &output.sink_consumer {
+                    consumer.borrow().pull_now();
+                }
+            }
+        }
     }
 
     /// Whether some branch has a `main` output it has not finished.

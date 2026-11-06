@@ -56,7 +56,7 @@ use std::ops::Bound::{Excluded, Unbounded};
 use crate::ccl::{F_WRITES, Label};
 use crate::interpreter::{
     BaseType, ColumnValue, Consumer, CurryLevel, Extent, FunctionGuard, Gate, GatedConsumer, Path,
-    Position, Predicate, Projection, Restates, Scheduler, Tile, TileGuard, Tiling, Value,
+    Position, Predicate, Projection, Restates, SubscribeContext, Tile, TileGuard, Tiling, Value,
     WakeupQueue, WriterTakes, forwarding_consumer, shared_consumer,
     tile_operators::{
         Breaker, BreakingProducer, Cycle, CycleSlot, CyclicSequencingProducer, Memo, ProducerBase,
@@ -819,8 +819,8 @@ struct BreakerState {
     consuming: bool,
     /// The store as the last consumed step rendered it.
     snapshot: Option<Tile>,
-    /// How many of the store's inputs have finished: the store settles at
-    /// the last of them ([`finish_store`]).
+    /// How many of the store's inputs have finished: the store settles at the last of them
+    /// ([`finish_store`]).
     last_finishes: usize,
 }
 
@@ -1027,8 +1027,27 @@ impl Breaker for InductionStoreProducer {
 }
 
 impl BreakingProducer for InductionStoreProducer {
+    /// Everything once the store is terminal. Before it is terminal, the positions the store has
+    /// run and decided, which its pushes name as its rounds decide them, so a feed read from the
+    /// store streams: a store that resumed its predecessor's run holds none of the positions
+    /// through `resumed_after`, since its consumers took those from the predecessor
+    /// ([`CommitEngine::seeded_at`]). A store with rows above its positions, and one over a
+    /// concatenation's tagged positions, holds nothing short of terminal
+    /// ([`pushes_decided_positions`]).
     fn held(&self) -> TileGuard {
-        self.breaker.held(self.tiling())
+        if self.breaker.terminal() || !pushes_decided_positions(self.tiling()) {
+            return self.breaker.held(self.tiling());
+        }
+        let decided = self.decided();
+        match &self.resumed_after {
+            Some(resumed) => guard_minus(
+                &decided,
+                &TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(
+                    resumed.value().clone(),
+                ))),
+            ),
+            None => decided,
+        }
     }
 
     fn seed_placements(&self) -> Vec<crate::interpreter::dispatcher::Placement> {
@@ -1036,8 +1055,7 @@ impl BreakingProducer for InductionStoreProducer {
     }
 
     /// The positions the last step decided, row by row under rows: the store tile's own
-    /// statement (`Tile::to_guard`), though it holds nothing short of terminal, since a reader
-    /// pulls the tile whole.
+    /// statement (`Tile::to_guard`).
     fn decided(&self) -> TileGuard {
         match &self.breaker.snapshot {
             Some(tile) => tile.to_guard(),
@@ -1052,9 +1070,10 @@ impl BreakingProducer for InductionStoreProducer {
         self.held()
     }
 
-    /// The store pushes once, at the finish where it is terminal.
+    /// The store pushes after each round its loop's scope consumes: what it holds is decided
+    /// positions, or nothing short of terminal ([`held`](BreakingProducer::held)).
     fn pushes_while_consuming(&self) -> bool {
-        false
+        true
     }
 
     /// The snapshot of the last step. A nested store's readers release its rows as they finish
@@ -1067,6 +1086,22 @@ impl BreakingProducer for InductionStoreProducer {
         }
         tile
     }
+}
+
+/// Whether an induction store over `tiling` pushes its positions as it decides them: a flat store
+/// over positions a prefix of which has a spelling. A store with rows above its positions holds
+/// nothing short of terminal, and so does one over a concatenation's tagged positions, whose
+/// prefix `row_frontier` cannot spell without the domain's tags.
+pub(crate) fn pushes_decided_positions(tiling: &Tiling) -> bool {
+    fn tagged(extent: &Extent) -> bool {
+        match extent {
+            Extent::Union(_) => true,
+            Extent::Restricted { base, .. } => tagged(base),
+            Extent::Record(fields) => fields.values().any(tagged),
+            _ => false,
+        }
+    }
+    matches!(tiling, Tiling::Store { domain, .. } if !tagged(domain))
 }
 
 /// The source of the transaction drive under `producer`, a writer of a transaction store: the
@@ -1171,18 +1206,18 @@ fn seed_input_tiling() -> Tiling {
 fn subscribe_seed(
     op: &mut dyn TileOperator,
     consumer: &GatedConsumer,
-    scheduler: &mut Scheduler,
+    cx: &mut SubscribeContext,
 ) -> (
     Box<dyn TileProducer>,
     crate::interpreter::dispatcher::Placement,
 ) {
-    let forward = forwarding_consumer(consumer, &scheduler.wakeup_queue());
+    let forward = forwarding_consumer(consumer, &cx.scheduler().wakeup_queue());
     let (entry, placement) =
         crate::interpreter::dispatcher::Entry::unplaced(seed_input_tiling(), forward);
     let seed = op.subscribe(
         op.tiling().universal_guard(),
         crate::interpreter::scheduler::widening(Box::new(entry)),
-        scheduler,
+        cx,
     );
     (seed, placement)
 }
@@ -1345,8 +1380,8 @@ impl Breaker for CommitProducer {
 impl BreakingProducer for CommitProducer {
     /// The commit ticks the store has decided, through its watermark, and everything once it is
     /// terminal. A reader of the store's changelog (`StoreValueStream`) takes the ticks as they are
-    /// decided, and a reader of its final value takes it once the store's pipeline has finished the
-    /// run, once the store is terminal (`Dispatcher::read_whole`).
+    /// decided, and a reader of its final value takes it once the store is terminal
+    /// (`Dispatcher::read_whole`).
     fn held(&self) -> TileGuard {
         if self.breaker.terminal() {
             return self.tiling().universal_guard();
@@ -2509,7 +2544,7 @@ impl TileOperator for CommitOperator {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // Wake this operator's consumer whenever any writer's (live) source
         // delivers a new item: the arrival drives a commit, and that commit must
@@ -2532,7 +2567,7 @@ impl TileOperator for CommitOperator {
         let seed_producers = std::mem::take(&mut self.seed_ops)
             .into_iter()
             .map(|(key, mut op)| {
-                let (seed, placement) = subscribe_seed(&mut *op, &consumer, scheduler);
+                let (seed, placement) = subscribe_seed(&mut *op, &consumer, cx);
                 seed_placements.push(placement);
                 (key, seed)
             })
@@ -2553,20 +2588,15 @@ impl TileOperator for CommitOperator {
                          being subscribed twice (the first subscribe takes the slot)"
                     )
                 });
-                let forward = forwarding_consumer(&consumer, &scheduler.wakeup_queue());
-                let (producer, placement) = subscribe_behind_entry(&mut *input, forward, scheduler);
+                let forward = forwarding_consumer(&consumer, &cx.scheduler().wakeup_queue());
+                let (producer, placement) = subscribe_behind_entry(&mut *input, forward, cx);
                 placements.push(placement);
                 producer
             })
             .collect::<Vec<_>>();
         let n = writer_producers.len();
-        let base = ProducerBase::new(
-            CommitProducer::alloc_id(),
-            self.tiling(),
-            &self.base,
-            scheduler,
-        )
-        .sharing(gate);
+        let base = ProducerBase::new(CommitProducer::alloc_id(), self.tiling(), &self.base, cx)
+            .sharing(gate);
         // The store runs as a pipeline breaker of one pipeline per writer, each placed through
         // its writer's entry, beside one for its seeds where it has any; its own placement is
         // its first writer's.
@@ -2596,7 +2626,7 @@ impl TileOperator for CommitOperator {
             engine: None,
             output_tiling: self.tiling().clone(),
             drain_start: 0,
-            notifier: ChangeNotifier::new(consumer, scheduler),
+            notifier: ChangeNotifier::new(consumer, cx),
             breaker: BreakerState::default(),
             #[cfg(debug_assertions)]
             reported_closed: HashSet::new(),
@@ -3541,7 +3571,7 @@ impl TileOperator for InductionStore {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // Forward body progress to this store's consumer. The body's input is
         // the driver, which forwards the loop source's arrivals, so an async
@@ -3559,8 +3589,8 @@ impl TileOperator for InductionStore {
         // The body is the store's input as a pipeline breaker: the entry in front of it queues
         // what a pipeline beneath pushes for the store's pipeline once a planner places it, and
         // stops every push before then.
-        let forward = forwarding_consumer(&consumer, &scheduler.wakeup_queue());
-        let (body_producer, placement) = subscribe_behind_entry(&mut *body_op, forward, scheduler);
+        let forward = forwarding_consumer(&consumer, &cx.scheduler().wakeup_queue());
+        let (body_producer, placement) = subscribe_behind_entry(&mut *body_op, forward, cx);
         // A seed stays subscribed rather than being drained here: it is ordinary dataflow, so a
         // seed computed from a loop settles over as many pulls as that loop takes, and the
         // pull it settles on is the one that opens the store. Draining at subscribe
@@ -3572,7 +3602,7 @@ impl TileOperator for InductionStore {
         let seed_producers = std::mem::take(&mut self.seed_ops)
             .into_iter()
             .map(|(key, mut op)| {
-                let (seed, placement) = subscribe_seed(&mut *op, &consumer, scheduler);
+                let (seed, placement) = subscribe_seed(&mut *op, &consumer, cx);
                 seed_placements.push(placement);
                 (key, seed)
             })
@@ -3582,7 +3612,7 @@ impl TileOperator for InductionStore {
                 InductionStoreProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             )
             .sharing(gate)
             .breaking(consumer.shared().clone(), placement),
@@ -3602,7 +3632,7 @@ impl TileOperator for InductionStore {
             write_keys: self.write_keys.clone(),
             tap_fields: self.tap_fields.clone(),
             output_tiling: self.tiling().clone(),
-            notifier: ChangeNotifier::new(consumer, scheduler),
+            notifier: ChangeNotifier::new(consumer, cx),
             breaker: BreakerState::default(),
             #[cfg(debug_assertions)]
             stepped_through: None,
@@ -3623,10 +3653,10 @@ struct ChangeNotifier {
 }
 
 impl ChangeNotifier {
-    fn new(consumer: GatedConsumer, scheduler: &Scheduler) -> Self {
+    fn new(consumer: GatedConsumer, cx: &mut SubscribeContext) -> Self {
         Self {
             consumer,
-            wakeups: scheduler.wakeup_queue(),
+            wakeups: cx.scheduler().wakeup_queue(),
             last: None,
         }
     }
@@ -4304,7 +4334,7 @@ impl TileOperator for StoreValueStream {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // Forward store progress to this stream's consumer: a new commit on the
         // store (e.g. a live cross-endpoint read-only transaction committing its
@@ -4316,14 +4346,13 @@ impl TileOperator for StoreValueStream {
         consumer.notify(&Projection::Everything);
         // The stream is keyed by the store's commit ticks, so a region of ticks the store
         // decided names the stream's keys as it is.
-        let store_producer =
-            subscribe_forwarding_keeping_keys(&mut *self.store_op, &consumer, scheduler);
+        let store_producer = subscribe_forwarding_keeping_keys(&mut *self.store_op, &consumer, cx);
         Box::new(StoreValueStreamProducer {
             base: ProducerBase::new(
                 StoreValueStreamProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             )
             .sharing(gate),
             store_producer,
@@ -4554,20 +4583,20 @@ impl TileOperator for StoreFinalRead {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // Forward store progress downstream, as [`StoreValueStream`] does: the key is
         // not settled until the store says so, and the consumer has to be woken to
         // re-pull when that happens. Kick once to start the drain loop.
         let (consumer, gate) = shared_consumer(consumer);
         consumer.notify(&Projection::Everything);
-        let store_producer = subscribe_forwarding(&mut *self.store_op, &consumer, scheduler);
+        let store_producer = subscribe_forwarding(&mut *self.store_op, &consumer, cx);
         Box::new(StoreFinalReadProducer {
             base: ProducerBase::new(
                 StoreFinalReadProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             )
             .sharing(gate),
             store_producer,
@@ -4831,20 +4860,20 @@ impl TileOperator for StoreDenseRead {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // Wake the consumer on store progress — a newly decided position is both a
         // position to emit and the value to emit there, so it is the only news this
         // read has. Kick once to start.
         let (consumer, gate) = shared_consumer(consumer);
         consumer.notify(&Projection::Everything);
-        let store_producer = subscribe_forwarding(&mut *self.store_op, &consumer, scheduler);
+        let store_producer = subscribe_forwarding_keeping_keys(&mut *self.store_op, &consumer, cx);
         Box::new(StoreDenseReadProducer {
             base: ProducerBase::new(
                 StoreDenseReadProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             )
             .sharing(gate),
             store_producer,
@@ -5020,7 +5049,7 @@ impl TileProducer for StoreDenseReadProducer {
 
     impl_producer_base!();
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         // Sample the store (consumer-driven; no producer-side drive-to-fixpoint) and
         // fold `key` at each position it has decided. The cycle advances one position
         // per pull, so a batch source converges over several pulls rather than in one
@@ -5036,9 +5065,9 @@ impl TileProducer for StoreDenseReadProducer {
         // The changelog is keyed by those same positions, so position `p` reads at `p`
         // — the accumulator *after* iteration `p`. `store_value_at` scans changes ≤
         // `p`, so a carry position inherits the latest earlier write and a leading
-        // carry folds to the store's seed: no external default, and never `None`. The
-        // `store.is_terminal()` gate below keeps this read non-terminal until the
-        // store is fully decided, so the consumer re-pulls.
+        // carry folds to the store's seed: no external default, and never `None`. The read
+        // states complete only what the store's guard (`Tile::to_guard`) names, so the
+        // consumer re-pulls until the store is terminal.
         let sg = self.store_producer.tiling().universal_guard();
         let store = self.store_producer.get(sg);
         if !self.enclosing.is_empty() {
@@ -5080,10 +5109,20 @@ impl TileProducer for StoreDenseReadProducer {
         // The released prefix is folded, so a carry is built across it, and dropped
         // here: a consumer that has taken a position must not be handed it again, and
         // the store keeps the position until *every* reader has released it.
+        // A pull at a region of positions is answered there, less what the read released,
+        // as every pull is (`Tile::within`).
+        let pulled = match Projection::of(&projection_guard) {
+            Ok(Projection::Keys { level, keys }) if level == CurryLevel::OUTERMOST => Some(keys),
+            _ => None,
+        };
         let mut kept: Vec<Position> = Vec::with_capacity(sorted.len());
         let mut values: Vec<Value> = Vec::with_capacity(sorted.len());
         for (p, v) in sorted.iter().zip(folded) {
-            if self.release_cursor.is_released(p) {
+            if self.release_cursor.is_released(p)
+                || pulled
+                    .as_ref()
+                    .is_some_and(|keys| !keys.contains(p.value()))
+            {
                 continue;
             }
             if let Some(v) = v {
@@ -5095,16 +5134,19 @@ impl TileProducer for StoreDenseReadProducer {
             kept.into_iter().map(|p| p.into_value()).collect(),
             &self.domain,
         );
-        // Once the store is terminal its domain is complete, so this read is too and
-        // a downstream terminal read resolves. Before that it is decided over exactly
-        // the positions emitted above — which are final, every one of them being a
-        // position the recurrence has run — so report those rather than `False`: a
-        // consumer may take the prefix, and a `Memo` may cache it, without waiting for
-        // the loop to end.
-        let domain_predicate = if store.is_terminal() {
-            Predicate::True
-        } else {
-            Predicate::from_column_value(&positions)
+        // The read is decided where the store is: at every position its rounds have run, the
+        // positions a round wrote no tap value at and those its source never delivered included
+        // (`Tile::to_guard`), and everywhere once it is terminal. A consumer may take that prefix,
+        // and a `Memo` may cache it, without waiting for the loop to end, and it releases what the
+        // store pushed of it.
+        let domain_predicate = match store.to_guard() {
+            TileGuard::Function(FunctionGuard::Domain(decided)) => decided,
+            other => unreachable!("a flat store's guard names its positions: {other:?}"),
+        };
+        // A pull at a region states completeness there alone: a position outside it is not read.
+        let domain_predicate = match &pulled {
+            Some(keys) => domain_predicate.intersect(keys),
+            None => domain_predicate,
         };
         read_tile(positions, values, &self.value_extent, domain_predicate)
     }
@@ -5290,7 +5332,7 @@ impl TileOperator for AsOf {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // Both inputs wake the consumer: a new *trigger* position needs a fresh
         // latch, and *source* progress (a new commit) is what lets an
@@ -5298,20 +5340,15 @@ impl TileOperator for AsOf {
         // re-pulls until the cyclic store converges (the source's first pull may
         // only propose; later pulls commit and render).
         let (consumer, gate) = shared_consumer(consumer);
-        let trigger = subscribe_forwarding(&mut *self.trigger, &consumer, scheduler);
-        let source = subscribe_forwarding(&mut *self.source, &consumer, scheduler);
+        let trigger = subscribe_forwarding(&mut *self.trigger, &consumer, cx);
+        let source = subscribe_forwarding(&mut *self.source, &consumer, cx);
         let b_extent = match self.tiling() {
             Tiling::DataFunction { domain, .. } => domain.clone(),
             _ => unreachable!("AsOf tiles as a function"),
         };
         Box::new(AsOfProducer {
-            base: ProducerBase::new(
-                AsOfProducer::alloc_id(),
-                self.tiling(),
-                &self.base,
-                scheduler,
-            )
-            .sharing(gate),
+            base: ProducerBase::new(AsOfProducer::alloc_id(), self.tiling(), &self.base, cx)
+                .sharing(gate),
             trigger,
             source,
             output: self.output.clone(),
@@ -6093,10 +6130,10 @@ struct DriverInputs {
 fn subscribe_pulled(
     op: &mut dyn TileOperator,
     consumer: &GatedConsumer,
-    scheduler: &mut Scheduler,
+    cx: &mut SubscribeContext,
 ) -> Box<dyn TileProducer> {
-    let forward = forwarding_consumer(consumer, &scheduler.wakeup_queue());
-    subscribe_behind_entry(op, forward, scheduler).0
+    let forward = forwarding_consumer(consumer, &cx.scheduler().wakeup_queue());
+    subscribe_behind_entry(op, forward, cx).0
 }
 
 /// `op` subscribed whole in front of `consumer` behind an unplaced entry
@@ -6105,12 +6142,12 @@ fn subscribe_pulled(
 fn subscribe_behind_entry(
     op: &mut dyn TileOperator,
     consumer: Box<dyn Consumer>,
-    scheduler: &mut Scheduler,
+    cx: &mut SubscribeContext,
 ) -> (
     Box<dyn TileProducer>,
     crate::interpreter::dispatcher::Placement,
 ) {
-    let (producer, placement, _) = subscribe_deciding(op, consumer, scheduler);
+    let (producer, placement, _) = subscribe_deciding(op, consumer, cx);
     (producer, placement)
 }
 
@@ -6119,7 +6156,7 @@ fn subscribe_behind_entry(
 fn subscribe_deciding(
     op: &mut dyn TileOperator,
     consumer: Box<dyn Consumer>,
-    scheduler: &mut Scheduler,
+    cx: &mut SubscribeContext,
 ) -> (
     Box<dyn TileProducer>,
     crate::interpreter::dispatcher::Placement,
@@ -6128,7 +6165,7 @@ fn subscribe_deciding(
     let (entry, placement) =
         crate::interpreter::dispatcher::Entry::unplaced(op.tiling().clone(), consumer);
     let decides = entry.decided_target();
-    let producer = op.subscribe(op.tiling().universal_guard(), Box::new(entry), scheduler);
+    let producer = op.subscribe(op.tiling().universal_guard(), Box::new(entry), cx);
     (producer, placement, decides)
 }
 
@@ -6136,7 +6173,7 @@ fn subscribe_driver_inputs(
     store_op: &mut dyn TileOperator,
     source_op: &mut dyn TileOperator,
     consumer: Box<dyn Consumer>,
-    scheduler: &mut Scheduler,
+    cx: &mut SubscribeContext,
 ) -> DriverInputs {
     let (consumer, gate) = shared_consumer(consumer);
     // The flag is set ahead of the forward, which drops a notification that re-enters a
@@ -6146,12 +6183,15 @@ fn subscribe_driver_inputs(
     // source by pull. A loop's scope places it for its rounds, where an induction drive takes the
     // positions it emits as a pipeline breaker's packages, and the pipelines beneath the source
     // have finished.
-    let forward = source_news.consumer(forwarding_consumer(&consumer, &scheduler.wakeup_queue()));
-    let (source_producer, placement, decides) = subscribe_deciding(source_op, forward, scheduler);
+    let forward = source_news.consumer(forwarding_consumer(
+        &consumer,
+        &cx.scheduler().wakeup_queue(),
+    ));
+    let (source_producer, placement, decides) = subscribe_deciding(source_op, forward, cx);
     // The store's progress changes what the drive renders — the next position it may
     // emit, and which rows it calls complete — so the store's wakes reach the drive's
     // consumer like the source's arrivals do.
-    let store_producer = subscribe_forwarding(store_op, &consumer, scheduler);
+    let store_producer = subscribe_forwarding(store_op, &consumer, cx);
     DriverInputs {
         consumer,
         gate,
@@ -6367,22 +6407,18 @@ impl TileOperator for InductionDriver {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        let inputs = subscribe_driver_inputs(
-            &mut *self.store_op,
-            &mut *self.source_op,
-            consumer,
-            scheduler,
-        );
+        let inputs =
+            subscribe_driver_inputs(&mut *self.store_op, &mut *self.source_op, consumer, cx);
         let consumer = inputs.consumer;
         let nested = self.nested.as_mut().map(|n| NestedDrive {
             body: n.body.clone(),
-            pairs: subscribe_pulled(&mut *n.pairs, &consumer, scheduler),
+            pairs: subscribe_pulled(&mut *n.pairs, &consumer, cx),
             reseeds: n
                 .reseeds
                 .iter_mut()
-                .map(|op| subscribe_pulled(&mut **op, &consumer, scheduler))
+                .map(|op| subscribe_pulled(&mut **op, &consumer, cx))
                 .collect(),
         });
         let rendered = self.tiling().empty_tile();
@@ -6391,7 +6427,7 @@ impl TileOperator for InductionDriver {
                 InductionDriverProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             )
             .sharing(inputs.gate)
             .breaking(consumer.shared().clone(), inputs.placement),
@@ -6402,7 +6438,7 @@ impl TileOperator for InductionDriver {
             source: DecodedSource::default(),
             nested,
             consumer,
-            wakeups: scheduler.wakeup_queue(),
+            wakeups: cx.scheduler().wakeup_queue(),
             read_keys: self.read_keys.clone(),
             window: DriverWindow::new(
                 self.positions.clone(),
@@ -7293,20 +7329,16 @@ impl TileOperator for TransactDriver {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        let inputs = subscribe_driver_inputs(
-            &mut *self.store_op,
-            &mut *self.source_op,
-            consumer,
-            scheduler,
-        );
+        let inputs =
+            subscribe_driver_inputs(&mut *self.store_op, &mut *self.source_op, consumer, cx);
         Box::new(TransactDriverProducer {
             base: ProducerBase::new(
                 TransactDriverProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             )
             .sharing(inputs.gate),
             store_producer: inputs.store_producer,
@@ -7315,7 +7347,7 @@ impl TileOperator for TransactDriver {
             source: DecodedSource::default(),
             source_complete: Predicate::False,
             consumer: inputs.consumer,
-            wakeups: scheduler.wakeup_queue(),
+            wakeups: cx.scheduler().wakeup_queue(),
             read_keys: self.read_keys.clone(),
             // A transaction driver's body-input domain is its own attempt counter, not
             // its source's positions: a retried item takes a fresh attempt position.
@@ -8273,7 +8305,7 @@ impl TileOperator for TransactWriter {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // This writer re-arms nothing itself: the driver owns the transaction
         // source and re-arms while a transaction remains to attempt, which
@@ -8287,19 +8319,19 @@ impl TileOperator for TransactWriter {
         // cyclic store would loop.
         let (consumer, gate) = shared_consumer(consumer);
         let sg = self.store_op.tiling().universal_guard();
-        let store_producer = self.store_op.subscribe(sg, Box::new(|| {}), scheduler);
+        let store_producer = self.store_op.subscribe(sg, Box::new(|| {}), cx);
         let bg = self.body_op.tiling().universal_guard();
-        let body_producer = self.body_op.subscribe(bg, Box::new(|| {}), scheduler);
+        let body_producer = self.body_op.subscribe(bg, Box::new(|| {}), cx);
         // Forward the driver's notification to this writer's consumer: the driver
         // owns the transaction source, so a request arriving on a live source
         // reaches this writer, and through it the commit cycle, along this edge.
-        let driver_producer = subscribe_forwarding(&mut *self.driver_op, &consumer, scheduler);
+        let driver_producer = subscribe_forwarding(&mut *self.driver_op, &consumer, cx);
         Box::new(TransactWriterProducer {
             base: ProducerBase::new(
                 TransactWriterProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             )
             .sharing(gate),
             store_producer,
@@ -9208,7 +9240,7 @@ mod tests {
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
-            _scheduler: &mut Scheduler,
+            _cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             Box::new(ProposalSourceProducer {
                 base: ProducerBase::unowned(ProposalSourceProducer::alloc_id(), &self.tiling),
@@ -9257,7 +9289,7 @@ mod tests {
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
-            _scheduler: &mut Scheduler,
+            _cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             Box::new(RecordingSourceProducer {
                 base: ProducerBase::unowned(RecordingSourceProducer::alloc_id(), &self.tiling),
@@ -9320,11 +9352,11 @@ mod tests {
         set_body(Box::new(AddIfBody::new(Box::new(driver), i64::MIN, "acc")));
         let mut op = fan.slot();
         let guard = op.tiling().universal_guard();
-        let mut sched = Scheduler::new();
-        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut cx);
         for _ in 0..4 {
             producer.get(producer.tiling().universal_guard());
-            sched.check_for_notifications();
+            cx.scheduler().check_for_notifications();
         }
         let both = |g: &TileGuard| (0..2).all(|p| g.covers_path(&[Value::UInt(p)]));
         assert!(
@@ -9425,11 +9457,11 @@ mod tests {
             &mut self,
             _intent_guard: TileGuard,
             consumer: Box<dyn Consumer>,
-            scheduler: &mut Scheduler,
+            cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
-            let input =
-                self.input
-                    .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+            let input = self
+                .input
+                .subscribe(self.input.tiling().universal_guard(), consumer, cx);
             Box::new(AddIfBodyProducer {
                 key: self.key.clone(),
                 base: ProducerBase::unowned(AddIfBodyProducer::alloc_id(), &self.tiling),
@@ -9536,8 +9568,13 @@ mod tests {
     /// Pull until the tile goes terminal. The cycle advances one iteration
     /// position per pull, so a converging read needs one pull per position (plus
     /// the closing one); the bound is generous and failing it means divergence.
-    fn pull_to_terminal(sched: &mut Scheduler, producer: &mut Box<dyn TileProducer>) -> Tile {
-        let tile = pull_laps(sched, &mut **producer, MAX_CYCLE_PULLS, Tile::is_terminal);
+    fn pull_to_terminal(cx: &mut SubscribeContext, producer: &mut Box<dyn TileProducer>) -> Tile {
+        let tile = pull_laps(
+            cx.scheduler(),
+            &mut **producer,
+            MAX_CYCLE_PULLS,
+            Tile::is_terminal,
+        );
         assert!(
             tile.is_terminal(),
             "induction cycle did not converge within {MAX_CYCLE_PULLS} pulls"
@@ -9555,9 +9592,9 @@ mod tests {
         let (fan, _acc) = induction_cycle(items, threshold, init);
         let mut op = fan.slot();
         let guard = op.tiling().universal_guard();
-        let mut sched = Scheduler::new();
-        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut sched);
-        pull_to_terminal(&mut sched, &mut producer)
+        let mut cx = SubscribeContext::new();
+        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut cx);
+        pull_to_terminal(&mut cx, &mut producer)
     }
 
     /// `acc := 0; for i in [1,2,3,4]: if i > 2: acc += i` driven through the whole
@@ -9613,10 +9650,10 @@ mod tests {
         let (fan, acc) = induction_cycle(&[1, 2, 3], i64::MIN, 10); // unconditional
         let mut op = fan.slot();
         let guard = op.tiling().universal_guard();
-        let mut sched = Scheduler::new();
-        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut cx);
 
-        let full = pull_to_terminal(&mut sched, &mut producer);
+        let full = pull_to_terminal(&mut cx, &mut producer);
         assert_eq!(
             full.store_change_positions().len(),
             3,
@@ -9649,11 +9686,11 @@ mod tests {
         let (fan, acc) = induction_cycle(items, threshold, init);
         let mut reader = StoreDenseRead::new(fan.slot(), acc, value_extent(), true);
         let guard = reader.tiling().universal_guard();
-        let mut sched = Scheduler::new();
-        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut cx);
         // The cycle advances one position per pull, so the dense read converges
         // over several pulls rather than one.
-        let tile = pull_to_terminal(&mut sched, &mut producer);
+        let tile = pull_to_terminal(&mut cx, &mut producer);
         assert!(validate_tile(&tile));
         let Tile::DataFunction { codomain, .. } = tile else {
             panic!("dense read is a Function");
@@ -9737,14 +9774,14 @@ mod tests {
         let (fan, acc) = induction_cycle(&[5, 1, 1, 9], 3, 0);
         let mut reader = StoreDenseRead::new(fan.slot(), acc, value_extent(), true);
         let guard = reader.tiling().universal_guard();
-        let mut sched = Scheduler::new();
-        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut cx);
 
         let mut read_values = |p: &mut Box<dyn TileProducer>| -> Vec<(u64, i64)> {
             // The cycle advances one position per pull, so the first full read
             // converges over several pulls; a later re-read is already terminal
             // and returns immediately.
-            let tile = pull_to_terminal(&mut sched, p);
+            let tile = pull_to_terminal(&mut cx, p);
             let Tile::DataFunction {
                 domain, codomain, ..
             } = tile
@@ -9822,11 +9859,11 @@ mod tests {
         let (fan, acc) = induction_cycle(&[5, 1, 1, 9], 3, 0);
         let mut reader = StoreDenseRead::new(fan.slot(), acc, value_extent(), true);
         let guard = reader.tiling().universal_guard();
-        let mut sched = Scheduler::new();
-        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut cx);
 
         // The cycle advances one position per pull, so drive the fold to convergence.
-        let tile = pull_to_terminal(&mut sched, &mut producer);
+        let tile = pull_to_terminal(&mut cx, &mut producer);
         assert_eq!(dense_values(&tile), vec![5, 5, 5, 14]);
 
         producer.release(TileGuard::Function(FunctionGuard::Domain(
@@ -10341,7 +10378,7 @@ mod tests {
         let mut op = CommitOperator::new(init.clone(), keyed_like(&init), writes);
         (op.writer_input_setter(0))(input);
         let guard = op.tiling().universal_guard();
-        op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new())
+        op.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new())
     }
 
     /// A test source operator that emits a fixed proposal stream as one
@@ -10374,7 +10411,7 @@ mod tests {
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
-            _scheduler: &mut Scheduler,
+            _cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             Box::new(ProposalSourceProducer {
                 base: ProducerBase::unowned(ProposalSourceProducer::alloc_id(), &self.tiling),
@@ -10516,12 +10553,10 @@ mod tests {
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
-            scheduler: &mut Scheduler,
+            cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             let store_guard = self.store_op.tiling().universal_guard();
-            let store_producer = self
-                .store_op
-                .subscribe(store_guard, Box::new(|| {}), scheduler);
+            let store_producer = self.store_op.subscribe(store_guard, Box::new(|| {}), cx);
             Box::new(CounterBodyProducer {
                 base: ProducerBase::unowned(CounterBodyProducer::alloc_id(), &self.tiling),
                 store_producer,
@@ -10588,11 +10623,11 @@ mod tests {
 
         let mut external = store_fan.slot();
         let guard = external.tiling().universal_guard();
-        let mut sched = Scheduler::new();
-        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut cx);
 
         // Drive the cycle: bootstrap + 3 commits + a fixpoint pull, with margin.
-        let latest = pull_laps(&mut sched, &mut *producer, 7, |_| false);
+        let latest = pull_laps(cx.scheduler(), &mut *producer, 7, |_| false);
         // Store: init 0 @0, then 1@1, 2@2, 3@3 — the counter reached 3.
         assert_eq!(store_at(&latest, &acct("n")), Some((pos(3), 3)));
     }
@@ -10632,9 +10667,9 @@ mod tests {
             &mut self,
             intent_guard: TileGuard,
             consumer: Box<dyn Consumer>,
-            scheduler: &mut Scheduler,
+            cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
-            let inner = self.inner.subscribe(intent_guard, consumer, scheduler);
+            let inner = self.inner.subscribe(intent_guard, consumer, cx);
             Box::new(DriverProbeProducer {
                 base: ProducerBase::unowned(DriverProbeProducer::alloc_id(), self.inner.tiling()),
                 inner,
@@ -10693,9 +10728,9 @@ mod tests {
             Some(Position::new(Value::UInt(0))),
             0,
         );
-        let mut sched = Scheduler::new();
+        let mut cx = SubscribeContext::new();
         let guard = drive.tiling().universal_guard();
-        let mut producer = drive.subscribe(guard.clone(), Box::new(|| {}), &mut sched);
+        let mut producer = drive.subscribe(guard.clone(), Box::new(|| {}), &mut cx);
         producer.get(guard);
     }
 
@@ -10800,9 +10835,9 @@ mod tests {
 
         let mut external = store_fan.slot();
         let guard = external.tiling().universal_guard();
-        let mut sched = Scheduler::new();
-        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
-        let latest = pull_laps(&mut sched, &mut *producer, MAX_CYCLE_PULLS, |_| false);
+        let mut cx = SubscribeContext::new();
+        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut cx);
+        let latest = pull_laps(cx.scheduler(), &mut *producer, MAX_CYCLE_PULLS, |_| false);
 
         // Every draw committed exactly once: the pool conserves.
         assert_eq!(
@@ -10983,12 +11018,10 @@ mod tests {
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
-            scheduler: &mut Scheduler,
+            cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             let store_guard = self.store_op.tiling().universal_guard();
-            let store_producer = self
-                .store_op
-                .subscribe(store_guard, Box::new(|| {}), scheduler);
+            let store_producer = self.store_op.subscribe(store_guard, Box::new(|| {}), cx);
             Box::new(TokenWriterProducer {
                 base: ProducerBase::unowned(TokenWriterProducer::alloc_id(), &self.tiling),
                 store_producer,
@@ -11076,10 +11109,10 @@ mod tests {
 
         let mut external = store_fan.slot();
         let guard = external.tiling().universal_guard();
-        let mut sched = Scheduler::new();
-        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut cx);
 
-        let latest = pull_laps(&mut sched, &mut *producer, 7, |_| false);
+        let latest = pull_laps(cx.scheduler(), &mut *producer, 7, |_| false);
         // Exactly one draw commits: 100−70=30 < 50 and 100−50=50 < 70, so
         // whichever commits first, the other denies. The round-robin drain picks
         // the winner, so the resting value is schedule-dependent (30 or 50) but
@@ -11123,10 +11156,10 @@ mod tests {
 
         let mut external = store_fan.slot();
         let guard = external.tiling().universal_guard();
-        let mut sched = Scheduler::new();
-        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut cx);
 
-        let latest = pull_laps(&mut sched, &mut *producer, 11, |_| false);
+        let latest = pull_laps(cx.scheduler(), &mut *producer, 11, |_| false);
         // Which draws fit (and in what order) is schedule-dependent under the
         // round-robin drain, but the token-pool safety invariant holds under every
         // serialization: the pool is never oversold (≥ 0) and never exceeds its
@@ -11174,12 +11207,10 @@ mod tests {
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
-            scheduler: &mut Scheduler,
+            cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             let store_guard = self.store_op.tiling().universal_guard();
-            let store_producer = self
-                .store_op
-                .subscribe(store_guard, Box::new(|| {}), scheduler);
+            let store_producer = self.store_op.subscribe(store_guard, Box::new(|| {}), cx);
             Box::new(StoreReadAsOfProducer {
                 base: ProducerBase::unowned(StoreReadAsOfProducer::alloc_id(), &self.tiling),
                 store_producer,
@@ -11239,12 +11270,12 @@ mod tests {
 
         let mut reader = StoreReadAsOf::new(store_fan.slot(), acct("n"), 2);
         let guard = reader.tiling().universal_guard();
-        let mut sched = Scheduler::new();
-        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut cx);
 
         // Pulling the reader drives the cycle. Before the watermark reaches 2 the
         // read is ⊥ (empty); once it does, it resolves to the value at tick 2.
-        let latest = pull_laps(&mut sched, &mut *producer, 8, |_| false);
+        let latest = pull_laps(cx.scheduler(), &mut *producer, 8, |_| false);
         let Tile::Scalar(cv) = &latest else { panic!() };
         assert_eq!(cv.as_single(), Some(int(2)));
     }
@@ -11289,12 +11320,10 @@ mod tests {
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
-            scheduler: &mut Scheduler,
+            cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             let store_guard = self.store_op.tiling().universal_guard();
-            let store_producer = self
-                .store_op
-                .subscribe(store_guard, Box::new(|| {}), scheduler);
+            let store_producer = self.store_op.subscribe(store_guard, Box::new(|| {}), cx);
             Box::new(BankWriterProducer {
                 base: ProducerBase::unowned(BankWriterProducer::alloc_id(), &self.tiling),
                 store_producer,
@@ -11373,10 +11402,10 @@ mod tests {
 
         let mut external = store_fan.slot();
         let guard = external.tiling().universal_guard();
-        let mut sched = Scheduler::new();
-        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut cx);
 
-        pull_laps(&mut sched, &mut *producer, pulls + 1, |_| false)
+        pull_laps(cx.scheduler(), &mut *producer, pulls + 1, |_| false)
     }
 
     /// Two writers transfer over *disjoint* account pairs — A: alice→bob 30,
@@ -11439,7 +11468,7 @@ mod tests {
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
-            _scheduler: &mut Scheduler,
+            _cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             Box::new(FixedSourceProducer {
                 base: ProducerBase::unowned(FixedSourceProducer::alloc_id(), &self.tiling),
@@ -11492,7 +11521,7 @@ mod tests {
             true, // carry: hold the committed value forward
         );
         let g = stream.tiling().universal_guard();
-        let mut p = stream.subscribe(g, Box::new(|| {}), &mut Scheduler::new());
+        let mut p = stream.subscribe(g, Box::new(|| {}), &mut SubscribeContext::new());
         let t = p.get(p.tiling().universal_guard());
         assert!(!t.is_terminal());
         let Tile::DataFunction { codomain, .. } = &t else {
@@ -11525,7 +11554,7 @@ mod tests {
         let mut extract =
             crate::interpreter::tile_operators::ExtractFinal::new(Box::new(stream), default);
         let g = extract.tiling().universal_guard();
-        let mut p = extract.subscribe(g, Box::new(|| {}), &mut Scheduler::new());
+        let mut p = extract.subscribe(g, Box::new(|| {}), &mut SubscribeContext::new());
         let t = p.get(p.tiling().universal_guard());
         let Tile::Scalar(cv) = &t else { panic!() };
         assert_eq!(cv.as_single(), Some(int(60)));
@@ -11647,7 +11676,7 @@ mod tests {
     /// 90-position loop against 4 with this release.
     #[test]
     fn a_settled_read_releases_the_history_below_the_frontier() {
-        let mut sched = Scheduler::new();
+        let mut cx = SubscribeContext::new();
         let live = store_tile(
             &["alice"],
             &[("alice", 100)],
@@ -11665,7 +11694,7 @@ mod tests {
             value_extent(),
         );
         let g = read.tiling().universal_guard();
-        let mut producer = read.subscribe(g, Box::new(|| {}), &mut sched);
+        let mut producer = read.subscribe(g, Box::new(|| {}), &mut cx);
         let _ = producer.get(producer.tiling().universal_guard());
         assert_eq!(
             recorder.borrow().as_slice(),
@@ -11696,7 +11725,7 @@ mod tests {
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
-            _scheduler: &mut Scheduler,
+            _cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             Box::new(RecordingProducer {
                 base: ProducerBase::unowned(RecordingProducer::alloc_id(), &self.tiling),
@@ -11854,6 +11883,39 @@ mod tests {
             &[(1, &[("alice", 70)]), (2, &[("bob", 40)])],
             Predicate::at_or_below(Value::UInt(w)),
         )
+    }
+
+    /// A flat induction store over untagged positions pushes its positions as it decides them; a
+    /// store with rows above its positions, and one over a concatenation's tagged positions at
+    /// the top or inside a record, holds nothing short of terminal.
+    #[test]
+    fn only_a_flat_store_over_untagged_positions_pushes_what_it_decides() {
+        let store = |domain: Extent| Tiling::Store {
+            domain,
+            codomain: Box::new(Tiling::Record(HashMap::new())),
+        };
+        let tagged = Extent::Union(TagMap::from_positional(vec![
+            Extent::Base(BaseType::UInt),
+            Extent::Base(BaseType::UInt),
+        ]));
+        let record = Extent::Record(
+            [
+                (SmolStr::new("_0"), Extent::Base(BaseType::UInt)),
+                (SmolStr::new("_1"), tagged.clone()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert!(pushes_decided_positions(&store(Extent::Base(
+            BaseType::UInt
+        ))));
+        assert!(!pushes_decided_positions(&store(tagged)));
+        assert!(!pushes_decided_positions(&store(record)));
+        let nested = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            store(Extent::Base(BaseType::UInt)),
+        );
+        assert!(!pushes_decided_positions(&nested));
     }
 
     #[test]
@@ -12093,15 +12155,15 @@ mod tests {
     #[case::leader_first(false)]
     fn both_memo_readers_of_one_cycle_reach_the_final_state(#[case] laggard_first: bool) {
         let (fan, acc) = induction_cycle(&[1, 2, 3], i64::MIN, 0); // unconditional
-        let mut sched = Scheduler::new();
-        let subscribe = |sched: &mut Scheduler| {
+        let mut cx = SubscribeContext::new();
+        let subscribe = |cx: &mut SubscribeContext| {
             let reader = StoreDenseRead::new(fan.slot(), acc.clone(), value_extent(), true);
             let mut memo = Memo::new(Box::new(reader));
             let guard = memo.tiling().universal_guard();
-            memo.subscribe(guard, Box::new(|| {}), sched)
+            memo.subscribe(guard, Box::new(|| {}), cx)
         };
-        let mut lagging = subscribe(&mut sched);
-        let mut leading = subscribe(&mut sched);
+        let mut lagging = subscribe(&mut cx);
+        let mut leading = subscribe(&mut cx);
         let guard = lagging.tiling().universal_guard();
 
         // Both readers pull each lap, in the order under test, until the one pulled
@@ -12111,7 +12173,7 @@ mod tests {
             if closing.is_terminal() {
                 break;
             }
-            sched.check_for_notifications();
+            cx.scheduler().check_for_notifications();
             if laggard_first {
                 let _ = lagging.get(guard.clone());
                 closing = leading.get(guard.clone());
@@ -12129,7 +12191,7 @@ mod tests {
             if lagged.is_terminal() {
                 break;
             }
-            sched.check_for_notifications();
+            cx.scheduler().check_for_notifications();
             lagged = lagging.get(guard.clone());
         }
         assert_eq!(
@@ -12171,9 +12233,9 @@ mod tests {
         let reader = StoreDenseRead::new(fan.slot(), acc, value_extent(), true);
         let mut memo = Memo::new(Box::new(reader));
         let guard = memo.tiling().universal_guard();
-        let mut sched = Scheduler::new();
-        let mut producer = memo.subscribe(guard, Box::new(|| {}), &mut sched);
-        let tile = pull_to_terminal(&mut sched, &mut producer);
+        let mut cx = SubscribeContext::new();
+        let mut producer = memo.subscribe(guard, Box::new(|| {}), &mut cx);
+        let tile = pull_to_terminal(&mut cx, &mut producer);
         let Tile::DataFunction { codomain, .. } = &tile else {
             panic!("dense read is a Function");
         };
@@ -12211,7 +12273,7 @@ mod tests {
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
-            _scheduler: &mut Scheduler,
+            _cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             Box::new(SharedSourceProducer {
                 base: ProducerBase::unowned(SharedSourceProducer::alloc_id(), &self.tiling),
@@ -12463,8 +12525,8 @@ mod tests {
             None,
         );
         let g = driver.tiling().universal_guard();
-        let mut sched = Scheduler::new();
-        let mut producer = driver.subscribe(g, Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = driver.subscribe(g, Box::new(|| {}), &mut cx);
         let emitted = |t: &Tile| -> Vec<Vec<Value>> {
             decided_paths(t)
                 .into_iter()
@@ -12480,7 +12542,7 @@ mod tests {
             })
             .step(pos(0), Some(HashMap::from([(acc.clone(), int(1))])));
         *store.borrow_mut() = render(&engines);
-        sched.check_for_notifications();
+        cx.scheduler().check_for_notifications();
         let second = producer.get(producer.tiling().universal_guard());
         let paths = emitted(&second);
         assert!(
@@ -12586,8 +12648,8 @@ mod tests {
             None,
         );
         let g = driver.tiling().universal_guard();
-        let mut sched = Scheduler::new();
-        let mut producer = driver.subscribe(g, Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = driver.subscribe(g, Box::new(|| {}), &mut cx);
         let first = producer.get(producer.tiling().universal_guard());
         assert!(
             decided_paths(&first).is_empty(),
@@ -12617,7 +12679,7 @@ mod tests {
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
-            _scheduler: &mut Scheduler,
+            _cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             Box::new(CountingSeedProducer {
                 base: ProducerBase::unowned(CountingSeedProducer::alloc_id(), &self.tiling),
@@ -12693,14 +12755,14 @@ mod tests {
         set_body(Box::new(AddIfBody::new(Box::new(driver), i64::MIN, "acc")));
         let mut op = fan.slot();
         let guard = op.tiling().universal_guard();
-        let mut sched = Scheduler::new();
-        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut cx);
         // Pull until the store is open and has decided at least one position, but is
         // not yet terminal.
         let mut pulls_after_open = 0;
         let mut gets_at_open = None;
         for _ in 0..MAX_CYCLE_PULLS {
-            sched.check_for_notifications();
+            cx.scheduler().check_for_notifications();
             let t = producer.get(producer.tiling().universal_guard());
             if store_frontier(&t).is_some() {
                 gets_at_open.get_or_insert(*gets.borrow());
@@ -12733,11 +12795,11 @@ mod tests {
             Vec::new(),
         );
         let g = op.tiling().universal_guard();
-        let mut sched = Scheduler::new();
-        let mut producer = op.subscribe(g, Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = op.subscribe(g, Box::new(|| {}), &mut cx);
         let mut last = None;
         for _ in 0..4 {
-            sched.check_for_notifications();
+            cx.scheduler().check_for_notifications();
             last = Some(producer.get(producer.tiling().universal_guard()));
         }
         let last = last.unwrap();
@@ -12757,9 +12819,9 @@ mod tests {
         let (fan, _acc) = induction_cycle(&[1, 2, 3, 4], i64::MIN, 0);
         let mut reader = fan.slot();
         let guard = reader.tiling().universal_guard();
-        let mut sched = Scheduler::new();
-        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut sched);
-        let tile = pull_to_terminal(&mut sched, &mut producer);
+        let mut cx = SubscribeContext::new();
+        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut cx);
+        let tile = pull_to_terminal(&mut cx, &mut producer);
         let Tile::Store { decided, .. } = &tile else {
             panic!("a store")
         };
@@ -12771,7 +12833,7 @@ mod tests {
         producer.release(TileGuard::Function(FunctionGuard::Domain(
             Predicate::from_column_value(&ColumnValue::from_uints(vec![0, 2])),
         )));
-        sched.check_for_notifications();
+        cx.scheduler().check_for_notifications();
         let tile = producer.get(producer.tiling().universal_guard());
         let Tile::Store { decided, .. } = &tile else {
             panic!("a store")
@@ -12809,7 +12871,7 @@ mod tests {
             true,
         );
         let g = stream.tiling().universal_guard();
-        let mut p = stream.subscribe(g, Box::new(|| {}), &mut Scheduler::new());
+        let mut p = stream.subscribe(g, Box::new(|| {}), &mut SubscribeContext::new());
         let tile = p.get(p.tiling().universal_guard());
         // Ticks 0 and 1 were reclaimed, so the stream starts at tick 2, where the carry
         // still folds to the write made there.

@@ -8,7 +8,7 @@ use smol_str::SmolStr;
 
 use super::test_helpers::{InputConsumer, NotifyingOp, RegionLog, keys_between, notify_input};
 use super::*;
-use crate::interpreter::{BaseType, CurryLevel, Extent, Projection, Scheduler, Tiling};
+use crate::interpreter::{BaseType, CurryLevel, Extent, Projection, SubscribeContext, Tiling};
 
 /// An operator and the consumers it installed on its inputs, which a test notifies through.
 type Built = (Box<dyn TileOperator>, Vec<InputConsumer>);
@@ -42,7 +42,7 @@ fn received(build: &dyn Fn() -> Built, notified: usize, region: &Projection) -> 
     let (mut operator, inputs) = build();
     let (log, regions) = RegionLog::new();
     let guard = operator.tiling().universal_guard();
-    let _producer = operator.subscribe(guard, Box::new(log), &mut Scheduler::new());
+    let _producer = operator.subscribe(guard, Box::new(log), &mut SubscribeContext::new());
     // Some inputs notify when they are subscribed.
     regions.borrow_mut().clear();
     notify_input(&inputs[notified], region);
@@ -327,7 +327,7 @@ fn a_tagged_union_passes_the_regions_of_two_arms_between_pulls() {
     let (mut operator, inputs) = union(false);
     let (log, regions) = RegionLog::new();
     let guard = operator.tiling().universal_guard();
-    let _producer = operator.subscribe(guard, Box::new(log), &mut Scheduler::new());
+    let _producer = operator.subscribe(guard, Box::new(log), &mut SubscribeContext::new());
     regions.borrow_mut().clear();
     notify_input(&inputs[0], &region());
     notify_input(&inputs[1], &region());
@@ -350,7 +350,7 @@ fn a_region_crosses_a_fan_out_slot_and_a_tagged_union() {
     let mut union = UnionOperator::new(vec![other, fan.slot()], int());
     let (log, regions) = RegionLog::new();
     let guard = union.tiling().universal_guard();
-    let _producer = union.subscribe(guard, Box::new(log), &mut Scheduler::new());
+    let _producer = union.subscribe(guard, Box::new(log), &mut SubscribeContext::new());
     regions.borrow_mut().clear();
     notify_input(&consumer, &region());
     assert_eq!(*regions.borrow_mut(), [under_arm(1, keys_of(&region()))]);
@@ -837,14 +837,14 @@ macro_rules! fan_out_with_two_slots {
         let ($logs, mut $producers, $consumer) = {
             let (input, consumer) = feed(ints());
             let fan = FanOut::new(input);
-            let mut scheduler = Scheduler::new();
+            let mut cx = SubscribeContext::new();
             let mut logs = Vec::new();
             let mut producers = Vec::new();
             for _ in 0..2 {
                 let (log, regions) = RegionLog::new();
                 let mut slot = fan.slot();
                 let guard = slot.tiling().universal_guard();
-                producers.push(slot.subscribe(guard, Box::new(log), &mut scheduler));
+                producers.push(slot.subscribe(guard, Box::new(log), &mut cx));
                 logs.push(regions);
             }
             for regions in &logs {
@@ -889,7 +889,7 @@ fn a_zip_passes_the_regions_of_two_arms_between_pulls() {
     let (mut operator, inputs) = zip();
     let (log, regions) = RegionLog::new();
     let guard = operator.tiling().universal_guard();
-    let _producer = operator.subscribe(guard, Box::new(log), &mut Scheduler::new());
+    let _producer = operator.subscribe(guard, Box::new(log), &mut SubscribeContext::new());
     regions.borrow_mut().clear();
     notify_input(&inputs[0], &region());
     notify_input(&inputs[1], &another_region());
@@ -903,7 +903,7 @@ fn a_union_passes_the_regions_of_two_arms_between_pulls() {
     let (mut operator, inputs) = union(true);
     let (log, regions) = RegionLog::new();
     let guard = operator.tiling().universal_guard();
-    let _producer = operator.subscribe(guard, Box::new(log), &mut Scheduler::new());
+    let _producer = operator.subscribe(guard, Box::new(log), &mut SubscribeContext::new());
     regions.borrow_mut().clear();
     notify_input(&inputs[0], &region());
     notify_input(&inputs[1], &another_region());

@@ -1,6 +1,6 @@
 //! A loop run in rounds: the pipeline of a loop's scope, whose breaker runs a nested dispatcher
-//! over the pipelines inside the loop's cycle, one round per position, and steps the
-//! loop's store after each. See `src/interpreter/design-operators.md`, "A loop in rounds".
+//! over the pipelines inside the loop's cycle, one round per position, and steps the loop's store
+//! after each. See `src/interpreter/design-operators.md`, "A loop in rounds".
 
 use super::plan::{Consumes, Members, Planned, plan_edges, probe, reach_in_chain, routes_to};
 use super::*;
@@ -283,8 +283,8 @@ impl LoopScope {
         );
     }
 
-    /// Run the inner dispatcher until nothing is claimable, and answer whether it is done. On
-    /// one thread nothing else advances it, so every inner pipeline is quiescent.
+    /// Run the inner dispatcher until nothing is claimable, and answer whether it is done. On one
+    /// thread nothing else advances it, so every inner pipeline is then quiescent.
     fn run_inner(&self) -> bool {
         let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
             reach_member(&self.store, &self.members[pipeline.0], pipeline, call)
@@ -649,13 +649,14 @@ impl LoopScope {
             .collect()
     }
 
-    /// The consumer the scope's pipeline pushes to, the store's, and whether the store's output
-    /// has keys of its own.
+    /// The consumer the scope's pipeline pushes to, the store's, and whether the store pushes a
+    /// region of its keys: a nested store pushes rows, and a flat store the positions its rounds
+    /// decide where it pushes any before it is terminal (`pushes_decided_positions`). Any other
+    /// pushes everything, once it is terminal.
     pub(super) fn pushing_end(&self) -> (SharedConsumer, bool) {
-        // An induction store with no rows above it pushes once, everything at its terminal
-        // finish, so its readers are probed with everything; a nested store pushes rows.
         self.with_store(|store| {
-            let keyed = matches!(store.tiling(), Tiling::DataFunction { .. });
+            let keyed = matches!(store.tiling(), Tiling::DataFunction { .. })
+                || crate::interpreter::commit_operator::pushes_decided_positions(store.tiling());
             let downstream =
                 store.base().downstream.clone().unwrap_or_else(|| {
                     panic!("{} is read, so it pushes to a consumer", store.name())
@@ -837,17 +838,20 @@ mod tests {
         assert_eq!(compiled.value(), Value::Int(5));
     }
 
-    /// The store holds nothing to push before it is terminal, and everything after.
+    /// The store holds the positions its rounds decided before it is terminal, and everything
+    /// after.
     #[test]
-    fn the_store_holds_everything_once_terminal_and_nothing_before() {
+    fn the_store_holds_its_decided_positions_then_everything_once_terminal() {
         let mut compiled = Compiled::of(SUM);
         compiled
             .scope
             .consume_impl(InputId::ONLY, keys_between(0, 0));
+        let (held, decided) = compiled
+            .scope
+            .with_store(|store| (store.final_guard(), store.decided()));
         assert!(
-            compiled
-                .scope
-                .with_store(|store| store.final_guard().is_empty())
+            !held.is_empty() && !held.is_universal() && held == decided,
+            "{held:?}, deciding {decided:?}"
         );
         compiled
             .scope
