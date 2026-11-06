@@ -57,9 +57,7 @@ pub type Duration = Int
 
 # Returns the runtime's clock reading: the system wall clock, best effort.
 #
-# - A reading is the later of the system wall clock and the latest reading the runtime has handed
-#   out, so readings never decrease within one process. A reading taken after a restart can be
-#   earlier than one taken before it.
+# - A reading carries no order: it can be earlier than one taken before it.
 # - Each evaluation of a call reads the clock, once per iteration of each enclosing loop. Two calls
 #   can return different readings, including two in one transaction.
 # - A call at a module's top level reads the clock once, when the program starts. A reload keeps
@@ -84,9 +82,8 @@ pub def now() => Instant:
 #
 # - A row fed inside a `with begin():` block is held only if that transaction commits. A row whose
 #   `at` has passed when it is held comes out at once.
-# - The runtime releases a row at a reading of the clock `now()` reads, at or after the row's `at`.
-#   Every later reading in the same process is at or after it, so a transaction handling a released
-#   row `e` reads `now() >= e.time::at`.
+# - The runtime releases a row once its clock reads at or after the row's `at`. A reading in the
+#   transaction handling the row has no order relative to the release and can be earlier than `at`.
 # - A released row is an arrival on the source, and every loop over the source receives it. Of two
 #   rows held at once, the row with the earlier `at` arrives first; rows with equal `at` arrive in
 #   an unspecified order.
