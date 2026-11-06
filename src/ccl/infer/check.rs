@@ -595,7 +595,11 @@ impl Typing for CheckCtx {
         unreachable!("a polymorphic annotation survived inference into Check");
     }
 
-    fn close_poly(&mut self, _poly: &crate::ccl::ty::PolyType) {
+    fn close_poly(
+        &mut self,
+        _poly: &crate::ccl::ty::PolyType,
+        _complete: bool,
+    ) -> Result<(), LocatedInferError> {
         unreachable!("a polymorphic annotation survived inference into Check");
     }
 

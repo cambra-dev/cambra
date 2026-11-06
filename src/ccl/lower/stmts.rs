@@ -3006,6 +3006,17 @@ fn lower_requirement_item(
                      yet; only a `def`'s or an `instance`'s clause bounds one",
                 ));
             };
+            if !r.binders.is_empty() {
+                return Err(LoweringError::unsupported(
+                    req.span,
+                    format!(
+                        "`{0}` is a requirement under `forall`, whose `{0}::{1}` is a type for each \
+                         value it binds; it is bounded inside that `forall`, \
+                         `forall (…) ({0}: …, {0}::{1} <: …)`",
+                        instance.node, member.node
+                    ),
+                ));
+            }
             let Some((_, Type::Param(param))) = r.assoc.iter().find(|(n, _)| *n == assoc) else {
                 unreachable!("a named requirement gives each associated type a parameter")
             };
@@ -3037,7 +3048,7 @@ fn lower_requirement_item(
         Requirement::Forall {
             binders,
             requirements,
-        } => bound_family_values(binders, requirements, req.span, members, ctx),
+        } => lower_forall_requirement(binders, requirements, req.span, members, out, named, ctx),
         Requirement::Subtype { .. } => Err(LoweringError::unsupported(
             req.span,
             "a subtype requirement bounds a family parameter's values under a `forall` that \
@@ -3047,15 +3058,27 @@ fn lower_requirement_item(
     }
 }
 
-/// A `forall` requirement, `forall (k: K) V(k) <: U`: each requirement under it bounds the
-/// values of a family parameter of the definition, which the parameter's kind records
-/// ([`crate::ccl::ty::TypeKind::family`]). A requirement of any other form under `forall` is
-/// refused (`docs/chl-spec.md`, "Family parameters").
-fn bound_family_values(
+/// A `forall` requirement, `forall (k: K) R` or `forall (k: K) (R₀, R₁, …)`: requirements at
+/// every value of the binders (`docs/chl-spec.md`, "Family parameters").
+///
+/// - `V(k) <: U` bounds the values of a family parameter of the definition, which the
+///   parameter's kind records ([`crate::ccl::ty::TypeKind::family`]).
+/// - A trait requirement, `i: Iterable(V(k))`, is a [`TraitRequirement`] whose `binders` are
+///   the `forall`'s. Each associated type it gives a parameter is a member **family**
+///   parameter, a type for each value of the binders, applied to them, `i::Elements(k)`.
+/// - `i::Elements <: U` bounds such a member's values, as `V(k) <: U` bounds `V`'s.
+///
+/// The binders keep the spelling written, which `V(k)` reads; each use renames them apart
+/// before it proves the requirement.
+///
+/// [`TraitRequirement`]: crate::ccl::ty::TraitRequirement
+fn lower_forall_requirement(
     binders: &[(Spanned<SmolStr>, Spanned<ChlExpr>)],
     requirements: &[Spanned<Requirement>],
     span: Span,
     members: Option<&mut Vec<crate::ccl::ty::PolyParam>>,
+    out: &mut Vec<Rc<crate::ccl::ty::TraitRequirement>>,
+    named: &mut Vec<NamedRequirement>,
     ctx: &mut LoweringContext,
 ) -> Result<(), LoweringError> {
     let mut scope: Vec<(&Spanned<SmolStr>, Type)> = Vec::with_capacity(binders.len());
@@ -3072,28 +3095,356 @@ fn bound_family_values(
     let Some(members) = members else {
         return Err(LoweringError::unsupported(
             span,
-            "a `forall` requirement bounds a family parameter's values, and this clause belongs \
-             to no definition with type parameters",
+            "a `forall` requirement states requirements of a definition's family parameters, \
+             and this clause belongs to no definition with type parameters",
         ));
     };
-    for req in requirements {
-        let Requirement::Subtype { sub, sup } = &req.node else {
-            return Err(LoweringError::unsupported(
-                req.span,
-                "a requirement under `forall` bounds a family parameter's values, \
-                 `forall (k: K) V(k) <: U`; any other requirement under `forall` is not \
-                 supported yet",
-            ));
-        };
-        bound_family_value(&scope, sub, sup, members, ctx)?;
-    }
+    let written: Vec<(Name, Type)> = scope
+        .iter()
+        .map(|(n, t)| (Name::raw(n.node.clone()), t.clone()))
+        .collect();
+    let depth = ctx.type_binders.len();
+    ctx.type_binders
+        .extend(scope.iter().map(|(n, t)| (n.node.clone(), t.clone())));
+    let in_scope = ctx.named_requirements.len();
+    let mut stated: Vec<crate::ccl::ty::TraitRequirement> = Vec::new();
+    let mut group: Vec<NamedRequirement> = Vec::new();
+    let lowered = (|| {
+        for req in requirements {
+            match &req.node {
+                Requirement::Subtype { sub, sup } => {
+                    bound_family_value(&scope, sub, sup, members, ctx)?;
+                }
+                Requirement::Trait { binder, ty } => {
+                    let r = lower_quantified_trait(
+                        binder.as_ref(),
+                        ty,
+                        req.span,
+                        &written,
+                        members,
+                        &group,
+                        named,
+                        ctx,
+                    )?;
+                    if let Some(binder) = binder {
+                        let r = Rc::new(r.clone());
+                        group.push((binder.node.clone(), Rc::clone(&r)));
+                        ctx.named_requirements.push((binder.node.clone(), r));
+                    }
+                    stated.push(r);
+                }
+                Requirement::Bound {
+                    instance,
+                    member,
+                    bound,
+                } => {
+                    bound_quantified_member(&scope, &group, instance, member, bound, members, ctx)?;
+                }
+                Requirement::Forall { .. } => {
+                    return Err(LoweringError::unsupported(
+                        req.span,
+                        "a `forall` inside a `forall` is not supported; one `forall` binds every \
+                         value, `forall (a: A, b: B) …`",
+                    ));
+                }
+                Requirement::OrderableIfRequiredBy { .. } => {
+                    return Err(LoweringError::unsupported(
+                        req.span,
+                        "`OrderableIfRequiredBy` is not supported under `forall`",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    })();
+    ctx.named_requirements.truncate(in_scope);
+    ctx.type_binders.truncate(depth);
+    lowered?;
+    out.extend(stated.into_iter().map(Rc::new));
+    named.extend(group);
     Ok(())
+}
+
+/// A trait requirement under a `forall` binding `binders`, `i: Iterable(V(k))`
+/// ([`lower_forall_requirement`]). Its operands read the binders through family parameters
+/// applied to them. Each associated type its trait declares is a member family parameter of
+/// the definition, `i::Elements`, over the binders' types and applied to them, bounded at each
+/// value by the trait's bound on it at the requirement's operands; a hole in that bound is
+/// inferred at each value.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the clause's state the requirement is lowered into"
+)]
+fn lower_quantified_trait(
+    binder: Option<&Spanned<SmolStr>>,
+    ty: &TraitType,
+    span: Span,
+    binders: &[(Name, Type)],
+    members: &mut Vec<crate::ccl::ty::PolyParam>,
+    group: &[NamedRequirement],
+    named: &[NamedRequirement],
+    ctx: &mut LoweringContext,
+) -> Result<crate::ccl::ty::TraitRequirement, LoweringError> {
+    let mut stated = lower_trait_type(ty, span, ctx)?;
+    stated.binders = binders.to_vec();
+    if let Some(binder) = binder {
+        if is_type_name(&binder.node) {
+            return Err(LoweringError::unsupported(
+                binder.span,
+                format!(
+                    "`{}` is capitalized, so it names a type; a requirement's instance is named \
+                     in lowercase, as a module is",
+                    binder.node
+                ),
+            ));
+        }
+        if named.iter().chain(group).any(|(n, _)| *n == binder.node) {
+            return Err(LoweringError::unsupported(
+                binder.span,
+                format!("`{}` names two requirements of this clause", binder.node),
+            ));
+        }
+    }
+    let reads_a_binder = stated
+        .args
+        .iter()
+        .any(|a| binders.iter().any(|(b, _)| reads_name(a, b)));
+    if !reads_a_binder {
+        return Err(LoweringError::unsupported(
+            span,
+            "a requirement under `forall` reads the `forall`'s binders, as \
+             `forall (k: K) Iterable(V(k))` does; one that reads none states nothing per value \
+             and is written without the `forall`",
+        ));
+    }
+    let trait_ = stated.trait_.clone();
+    let mut in_bounds = HashSet::new();
+    for assoc in trait_.assocs() {
+        if let Some(bound) = trait_.assoc_bound(&assoc) {
+            collect_params(bound, &mut in_bounds);
+        }
+    }
+    let domains: Vec<Type> = binders.iter().map(|(_, t)| t.clone()).collect();
+    let terms: Vec<Rc<crate::ccl::TypedExpr>> = binders
+        .iter()
+        .map(|(n, t)| {
+            let term = Expr::var(n.clone()).with_ty(t.clone());
+            Rc::new(ctx.tag_machinery(term, span, "lower.quantified_member"))
+        })
+        .collect();
+    let mut declared: Vec<(
+        crate::ccl::infer::solver::traits::Assoc,
+        Rc<crate::ccl::ty::TypeParam>,
+    )> = Vec::new();
+    for assoc in trait_.assocs() {
+        let read_through_a_bound = trait_.assoc_bound(&assoc).is_some()
+            || trait_
+                .assoc_param(&assoc)
+                .is_some_and(|p| in_bounds.contains(&p.id));
+        if binder.is_none() && !read_through_a_bound {
+            continue;
+        }
+        let owner = binder.map_or("_", |b| b.node.as_str());
+        let param = crate::ccl::ty::TypeParam::declared_family(
+            format!("{owner}::{}", assoc.name()).as_str(),
+            binders.len(),
+        );
+        members.push(crate::ccl::ty::PolyParam {
+            param: Rc::clone(&param),
+            kind: crate::ccl::ty::TypeKind::family(domains.clone(), None),
+            bound_at: None,
+        });
+        stated.assoc.push((
+            assoc.clone(),
+            Type::FamilyApp(crate::ccl::ty::FamilyApp::new(
+                Rc::clone(&param),
+                terms.clone(),
+            )),
+        ));
+        declared.push((assoc, param));
+    }
+    // The trait's bound on each associated type, at the requirement's operands and members:
+    // a family over the binders, its holes inferred at each value.
+    let mut at: HashMap<crate::ccl::ty::TypeParamId, Type> = trait_
+        .operand_params()
+        .iter()
+        .zip(&stated.args)
+        .map(|(p, t)| (p.id, t.clone()))
+        .collect();
+    for (name, ty) in &stated.assoc {
+        if let Some(p) = trait_.assoc_param(name) {
+            at.insert(p.id, ty.clone());
+        }
+    }
+    for (assoc, param) in &declared {
+        let Some(bound) = trait_.assoc_bound(assoc) else {
+            continue;
+        };
+        let bound = crate::ccl::infer::solver::traits::replace_params(bound, &at);
+        let slot = members
+            .iter_mut()
+            .find(|m| m.param.id == param.id)
+            .expect("the member was just declared");
+        slot.kind = crate::ccl::ty::TypeKind::family(
+            domains.clone(),
+            Some(Type::family(binders.to_vec(), bound)),
+        );
+    }
+    // An operand that reads no type parameter leaves the requirement nothing to state of a
+    // parameter; a family application is one.
+    let mut check = if ctx.instances_declared {
+        Satisfiable::Now(&ctx.instances)
+    } else {
+        Satisfiable::Later(&mut ctx.pending_requirements)
+    };
+    let wildcards = family_apps_as_params(&stated);
+    match &mut check {
+        Satisfiable::Now(instances) => {
+            if !requirement_satisfiable(
+                &wildcards.trait_,
+                &wildcards.args,
+                &wildcards.assoc,
+                &[],
+                instances,
+            ) {
+                return Err(unsatisfiable_requirement(
+                    &stated.trait_,
+                    &stated.args,
+                    span,
+                ));
+            }
+        }
+        Satisfiable::Later(pending) => pending.push(PendingRequirement {
+            trait_: wildcards.trait_.clone(),
+            args: wildcards.args.clone(),
+            assoc: wildcards.assoc.clone(),
+            below: Vec::new(),
+            span,
+        }),
+    }
+    if !stated.args.iter().all(is_requirement_operand) {
+        return Err(unsatisfiable_requirement(
+            &stated.trait_,
+            &stated.args,
+            span,
+        ));
+    }
+    Ok(stated)
+}
+
+/// Replace family applications by type parameters, preserving equality of repeated
+/// applications across operands and associated types. Satisfiability must require one type
+/// at every occurrence of the same application.
+#[allow(clippy::mutable_key_type)]
+// Identity and hashing skip mutable type slots: the key is the parameter and its argument terms.
+fn family_apps_as_params(
+    requirement: &crate::ccl::ty::TraitRequirement,
+) -> crate::ccl::ty::TraitRequirement {
+    fn go(ty: &Type, params: &mut HashMap<crate::ccl::ty::FamilyApp, Type>) -> Type {
+        if let Type::FamilyApp(app) = ty {
+            return params
+                .entry(app.clone())
+                .or_insert_with(|| {
+                    Type::Param(crate::ccl::ty::TypeParam::declared(
+                        app.param.spelling.as_str(),
+                    ))
+                })
+                .clone();
+        }
+        let mut out = ty.clone();
+        out.walk_children_mut(|c| *c = go(c, params));
+        out
+    }
+    let mut params = HashMap::new();
+    requirement.map_types(|t| go(t, &mut params))
+}
+
+/// Whether `ty` reads the value `name`, through a family application or a refinement.
+fn reads_name(ty: &Type, name: &Name) -> bool {
+    crate::ccl::subst::type_free_vars(ty).contains(name)
+}
+
+/// `i::Name <: U` under a `forall` binding `scope`: `i` names a requirement of the group, whose
+/// associated type `Name` is a member family parameter, and `U` bounds its values at each value
+/// of the binders, which `U` may read ([`lower_forall_requirement`]).
+fn bound_quantified_member(
+    scope: &[(&Spanned<SmolStr>, Type)],
+    group: &[NamedRequirement],
+    instance: &Spanned<SmolStr>,
+    member: &Spanned<SmolStr>,
+    bound: &Spanned<ChlExpr>,
+    members: &mut [crate::ccl::ty::PolyParam],
+    ctx: &mut LoweringContext,
+) -> Result<(), LoweringError> {
+    let Some((_, r)) = group.iter().find(|(n, _)| *n == instance.node) else {
+        return Err(LoweringError::unsupported(
+            instance.span,
+            format!(
+                "`{0}` names no requirement before this bound in its `forall`; a bound under \
+                 `forall` reads an associated type of an instance the same `forall` names, \
+                 `forall (k: K) ({0}: Trait(…), {0}::{1} <: …)`",
+                instance.node, member.node
+            ),
+        ));
+    };
+    let Some(assoc) = r.trait_.assoc_named(member.node.as_str()) else {
+        return Err(LoweringError::unsupported(
+            member.span,
+            format!("`{}` associates no type named `{}`", r.trait_, member.node),
+        ));
+    };
+    let Some((_, Type::FamilyApp(app))) = r.assoc.iter().find(|(n, _)| *n == assoc) else {
+        unreachable!("a named requirement under `forall` gives each associated type a family")
+    };
+    let slot = members
+        .iter_mut()
+        .find(|d| d.param.id == app.param.id)
+        .expect("the family of a named requirement's associated type is a member");
+    if slot.bound_at.is_some() {
+        return Err(LoweringError::unsupported(
+            bound.span,
+            format!("`{}::{}` is bounded twice", instance.node, member.node),
+        ));
+    }
+    let lowered = lower_type_expr(bound, ctx)?;
+    refuse_reading_binders(scope, &lowered, bound.span)?;
+    let binders: Vec<(Name, Type)> = scope
+        .iter()
+        .map(|(n, t)| (Name::raw(n.node.clone()), t.clone()))
+        .collect();
+    let domains: Vec<Type> = binders.iter().map(|(_, t)| t.clone()).collect();
+    slot.kind = crate::ccl::ty::TypeKind::family(domains, Some(Type::family(binders, lowered)));
+    slot.bound_at = Some(bound.span);
+    Ok(())
+}
+
+/// Refuse a bound under a `forall` binding `scope` that reads one of its binders, written at
+/// `span`.
+fn refuse_reading_binders(
+    scope: &[(&Spanned<SmolStr>, Type)],
+    bound: &Type,
+    span: Span,
+) -> Result<(), LoweringError> {
+    let free = crate::ccl::subst::type_free_vars(bound);
+    match scope
+        .iter()
+        .find(|(b, _)| free.contains(&Name::raw(b.node.clone())))
+    {
+        Some((b, _)) => Err(LoweringError::unsupported(
+            span,
+            format!(
+                "a bound that reads the `forall`'s binder `{}` is not supported yet",
+                b.node
+            ),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// `sub <: sup` under a `forall` binding `scope`: `sub` is a family parameter of the definition
 /// applied to distinct binders of `scope`, each ranging over its index type, and `sup` reads
-/// none of them. A hole in `sup` stays a hole: opening the parameter mints one variable for it
-/// at each value (`src/ccl/design/type-parameters.md`, "Lowering").
+/// none of them. A hole in `sup` stays a hole: opening the parameter mints one
+/// variable for it at each value (`src/ccl/design/type-parameters.md`, "Lowering").
 fn bound_family_value(
     scope: &[(&Spanned<SmolStr>, Type)],
     sub: &Spanned<ChlExpr>,
@@ -3142,7 +3493,7 @@ fn bound_family_value(
             ),
         ));
     }
-    let mut seen: Vec<&str> = Vec::new();
+    let mut applied_to: Vec<(Name, Type)> = Vec::new();
     for (arg, domain) in args.iter().zip(&domains) {
         let ChlExpr::Name(n) = &arg.node else {
             return Err(LoweringError::unsupported(
@@ -3159,19 +3510,19 @@ fn bound_family_value(
                 format!("`{n}` is not bound by this `forall`: `forall ({n}: K) {v}({n}) <: U`"),
             ));
         };
-        if seen.contains(&n.as_str()) {
+        if applied_to.iter().any(|(b, _)| *b == Name::raw(n.clone())) {
             return Err(LoweringError::unsupported(
                 arg.span,
                 format!("`{v}` is applied to `{n}` twice; each of its values is a distinct binder"),
             ));
         }
-        seen.push(n.as_str());
         if !family_domains_agree(domain, ty) {
             return Err(LoweringError::unsupported(
                 arg.span,
                 format!("`{n}` ranges over `{ty}`, and `{v}` is a family over `{domain}`"),
             ));
         }
+        applied_to.push((Name::raw(n.clone()), ty.clone()));
     }
     if members[at].kind.family_bound().is_some() {
         return Err(LoweringError::unsupported(
@@ -3179,26 +3530,10 @@ fn bound_family_value(
             format!("`{v}`'s values are bounded twice"),
         ));
     }
-    let depth = ctx.type_binders.len();
-    ctx.type_binders
-        .extend(scope.iter().map(|(n, t)| (n.node.clone(), t.clone())));
-    let lowered = lower_type_expr(sup, ctx);
-    ctx.type_binders.truncate(depth);
-    let bound = lowered?;
-    let free = crate::ccl::subst::type_free_vars(&bound);
-    if let Some((b, _)) = scope
-        .iter()
-        .find(|(b, _)| free.contains(&Name::raw(b.node.clone())))
-    {
-        return Err(LoweringError::unsupported(
-            sup.span,
-            format!(
-                "a bound that reads the `forall`'s binder `{}` is not supported yet",
-                b.node
-            ),
-        ));
-    }
-    members[at].kind = crate::ccl::ty::TypeKind::family(domains, Some(bound));
+    let bound = lower_type_expr(sup, ctx)?;
+    refuse_reading_binders(scope, &bound, sup.span)?;
+    members[at].kind =
+        crate::ccl::ty::TypeKind::family(domains, Some(Type::family(applied_to, bound)));
     members[at].bound_at = Some(sup.span);
     Ok(())
 }
@@ -3257,6 +3592,7 @@ pub(super) fn lower_trait_type(
         terms: Vec::new(),
         effect_assoc: Vec::new(),
         assoc: Vec::new(),
+        binders: Vec::new(),
         at: Some(span),
     })
 }
@@ -3360,7 +3696,7 @@ fn bound_members_by_their_trait(
 /// type, or a nominal type applied to such types.
 fn is_requirement_operand(ty: &Type) -> bool {
     match ty {
-        Type::Param(_) | Type::Base(_) => true,
+        Type::Param(_) | Type::Base(_) | Type::FamilyApp(_) => true,
         Type::Nominal(_, args) => args.iter().all(is_requirement_operand),
         _ => false,
     }
@@ -3368,7 +3704,7 @@ fn is_requirement_operand(ty: &Type) -> bool {
 
 /// Whether `ty` names no type parameter.
 fn is_closed(ty: &Type) -> bool {
-    if matches!(ty, Type::Param(_)) {
+    if matches!(ty, Type::Param(_) | Type::FamilyApp(_)) {
         return false;
     }
     let mut closed = true;
@@ -3407,6 +3743,8 @@ pub(crate) struct PendingRequirement {
     trait_: crate::ccl::infer::solver::traits::Trait,
     args: Vec<Type>,
     assoc: Vec<(crate::ccl::infer::solver::traits::Assoc, Type)>,
+    /// The bounds on associated types ([`requirement_satisfiable`]).
+    below: Vec<(crate::ccl::infer::solver::traits::Assoc, Type)>,
     span: Span,
 }
 
@@ -3415,23 +3753,37 @@ pub(crate) struct PendingRequirement {
 pub(super) fn check_pending_requirements(ctx: &mut LoweringContext) -> Vec<LoweringError> {
     std::mem::take(&mut ctx.pending_requirements)
         .into_iter()
-        .filter(|r| !requirement_satisfiable(&r.trait_, &r.args, &r.assoc, &ctx.instances))
+        .filter(|r| {
+            !requirement_satisfiable(&r.trait_, &r.args, &r.assoc, &r.below, &ctx.instances)
+        })
         .map(|r| unsatisfiable_requirement(&r.trait_, &r.args, r.span))
         .collect()
 }
 
 /// Whether some instance of `trait_` can satisfy the requirement: its head and the associated
-/// types it fixes unify with the requirement's, so some types are an instance of both. The
-/// collection rule is a candidate beside the rows ([`Trait::collection_rule_admits`]).
+/// types it fixes unify with the requirement's, so some types are an instance of both, and each
+/// associated type `below` bounds, read at the types that unification gives the head's
+/// variables, may be below its bound ([`traits::may_be_below`]). The collection rule is a
+/// candidate beside the rows ([`Trait::collection_rule_admits`]), and makes the operand its own
+/// `Elements`.
 ///
 /// [`Trait::collection_rule_admits`]: crate::ccl::infer::solver::traits::Trait::collection_rule_admits
 fn requirement_satisfiable(
     trait_: &crate::ccl::infer::solver::traits::Trait,
     args: &[Type],
     assoc: &[(crate::ccl::infer::solver::traits::Assoc, Type)],
+    below: &[(crate::ccl::infer::solver::traits::Assoc, Type)],
     instances: &crate::ccl::infer::solver::traits::InstanceTable,
 ) -> bool {
-    trait_.collection_rule_admits(args, assoc)
+    use crate::ccl::infer::solver::traits::{
+        Assoc, ITERABLE_ELEMENTS_ASSOC, apply_unifier, unifier,
+    };
+    let by_rule = trait_.collection_rule_admits(args, assoc)
+        && below.iter().all(|(name, bound)| {
+            *name != Assoc::Declared(ITERABLE_ELEMENTS_ASSOC.into())
+                || traits::may_be_below(&args[0], bound)
+        });
+    by_rule
         || instances.instances(trait_).iter().any(|row| {
             let mut stated = row.operands.clone();
             let mut wanted = args.to_vec();
@@ -3441,7 +3793,12 @@ fn requirement_satisfiable(
                     wanted.push(t.clone());
                 }
             }
-            crate::ccl::infer::solver::traits::unify_all(&stated, &wanted)
+            unifier(&stated, &wanted).is_some_and(|at| {
+                below.iter().all(|(name, bound)| {
+                    row.assoc_ty(name)
+                        .is_none_or(|t| traits::may_be_below(&apply_unifier(&t, &at), bound))
+                })
+            })
         })
 }
 
@@ -3534,6 +3891,7 @@ fn expand_requirement(
                 terms: Vec::new(),
                 effect_assoc: Vec::new(),
                 assoc,
+                binders: Vec::new(),
                 at: Some(span),
             }));
             return Ok(());
@@ -3545,7 +3903,7 @@ fn expand_requirement(
     }
     match check {
         Satisfiable::Now(instances) => {
-            if !requirement_satisfiable(&trait_, &args, &assoc, instances) {
+            if !requirement_satisfiable(&trait_, &args, &assoc, &[], instances) {
                 return Err(unsatisfiable(&args));
             }
         }
@@ -3553,6 +3911,7 @@ fn expand_requirement(
             trait_: trait_.clone(),
             args: args.clone(),
             assoc: assoc.clone(),
+            below: Vec::new(),
             span,
         }),
     }
@@ -3567,6 +3926,7 @@ fn expand_requirement(
         terms: Vec::new(),
         effect_assoc: Vec::new(),
         assoc,
+        binders: Vec::new(),
         at: Some(span),
     }));
     Ok(())
@@ -4889,7 +5249,166 @@ fn nominal_application(
             );
         }
     }
+    application_may_satisfy(span, &decl, &args, ctx)?;
     Ok(Type::Nominal(decl, args))
+}
+
+/// Refuse an application of `decl` at `args` that no types its holes could stand for let
+/// satisfy the declaration's `requires` clause, as far as the written forms decide
+/// (`docs/chl-spec.md`, "Declaring a nominal type"): a family argument whose values are of no
+/// form below the bound on the family's values, and a requirement no instance could satisfy at
+/// the arguments, with the associated types the clause bounds below their bounds, a family
+/// argument read as its value at any value of its binders.
+///
+/// A type parameter of the definition around the application, or its family's value, could be
+/// any type here, as a hole could: a definition taking the type is given the clause of its own
+/// parameters ([`super::functions::lower_def_declared`]), and each construction checks the
+/// clause at its own types.
+fn application_may_satisfy(
+    span: Span,
+    decl: &NominalDecl,
+    written: &[Type],
+    ctx: &mut LoweringContext,
+) -> Result<(), LoweringError> {
+    let Some(stated) = decl.requirements() else {
+        return Ok(());
+    };
+    fn params_as_holes(ty: &Type) -> Type {
+        if matches!(ty, Type::Param(_) | Type::FamilyApp(_)) {
+            return Type::Hole;
+        }
+        let mut out = ty.clone();
+        out.walk_children_mut(|c| *c = params_as_holes(c));
+        out
+    }
+    let args: Vec<Type> = written.iter().map(params_as_holes).collect();
+    let args = &args[..];
+    // A type of the clause at the arguments: a parameter's argument in its place, a family's
+    // value at any value of its binders where it is applied, and a member parameter any type.
+    let at_args = |ty: &Type| -> Type {
+        fn go(ty: &Type, decl: &NominalDecl, args: &[Type]) -> Type {
+            match ty {
+                Type::Param(p) => {
+                    return match decl.params.iter().position(|q| q.id == p.id) {
+                        Some(i) => args[i].clone(),
+                        None => Type::Hole,
+                    };
+                }
+                Type::FamilyApp(app) => {
+                    return match decl.params.iter().position(|q| q.id == app.param.id) {
+                        Some(i) => match &args[i] {
+                            Type::Family { body, .. } => (**body).clone(),
+                            constant => constant.clone(),
+                        },
+                        None => Type::Hole,
+                    };
+                }
+                _ => {}
+            }
+            let mut out = ty.clone();
+            out.walk_children_mut(|c| *c = go(c, decl, args));
+            out
+        }
+        go(ty, decl, args)
+    };
+    let shown_application = || {
+        let written: Vec<String> = written
+            .iter()
+            .map(crate::ccl::chl_print::chl_type)
+            .collect();
+        format!("{}({})", decl.name, written.join(", "))
+    };
+    for (p, arg) in stated.params.iter().zip(args) {
+        let (Some(Type::Family { body: bound, .. }), Type::Family { body: value, .. }) =
+            (p.kind.family_bound(), arg)
+        else {
+            continue;
+        };
+        if !traits::may_be_below(value, &at_args(bound)) {
+            return Err(LoweringError::unsupported(
+                span,
+                format!(
+                    "`{}` passes `{}` a family whose values are not below the bound `{}`'s \
+                     `requires` clause states on them",
+                    shown_application(),
+                    p.param.spelling,
+                    decl.name,
+                ),
+            )
+            .with_related(p.bound_at.unwrap_or(decl.span), "the bound"));
+        }
+    }
+    // The bound the clause states on an associated type, a member parameter's or a member
+    // family's values, at the arguments.
+    let member_bound = |t: &Type| -> Option<Type> {
+        let id = match t {
+            Type::Param(p) => p.id,
+            Type::FamilyApp(app) => app.param.id,
+            _ => return None,
+        };
+        let member = stated.params.iter().find(|m| m.param.id == id)?;
+        match &member.kind {
+            crate::ccl::ty::TypeKind::SubtypesOf(bound) => Some(at_args(bound)),
+            kind => match kind.family_bound()? {
+                Type::Family { body, .. } => Some(at_args(body)),
+                constant => Some(at_args(constant)),
+            },
+        }
+    };
+    for r in &stated.requires {
+        let wildcard =
+            |t: &Type| holes_as_params(&crate::ccl::ccl_utils::strip_refinements(&at_args(t)));
+        let operands: Vec<Type> = r.args.iter().map(wildcard).collect();
+        let below: Vec<_> = r
+            .assoc
+            .iter()
+            .filter_map(|(name, t)| Some((name.clone(), holes_as_params(&member_bound(t)?))))
+            .collect();
+        let satisfiable = !ctx.instances_declared
+            || requirement_satisfiable(&r.trait_, &operands, &[], &below, &ctx.instances);
+        if !satisfiable {
+            let error = if requirement_satisfiable(&r.trait_, &operands, &[], &[], &ctx.instances) {
+                let shown: Vec<String> = operands
+                    .iter()
+                    .map(crate::ccl::chl_print::chl_type)
+                    .collect();
+                LoweringError::unsupported(
+                    span,
+                    format!(
+                        "`{}` passes types whose `{}` instance at ({}) associates a type not below                          the bound `{}`'s `requires` clause states on it",
+                        shown_application(),
+                        r.trait_,
+                        shown.join(", "),
+                        decl.name,
+                    ),
+                )
+            } else {
+                unsatisfiable_requirement(&r.trait_, &operands, span)
+            };
+            return Err(error.with_related(r.at.unwrap_or(decl.span), "the requirement"));
+        }
+        if !ctx.instances_declared {
+            ctx.pending_requirements.push(PendingRequirement {
+                trait_: r.trait_.clone(),
+                args: operands,
+                assoc: Vec::new(),
+                below,
+                span,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// `ty` with each hole a type parameter of its own, which an instance's head unifies with
+/// anything.
+fn holes_as_params(ty: &Type) -> Type {
+    if matches!(ty, Type::Hole) {
+        return Type::Param(crate::ccl::ty::TypeParam::declared("_"));
+    }
+    let mut out = ty.clone();
+    out.walk_children_mut(|c| *c = holes_as_params(c));
+    out
 }
 
 /// The family `param`, a family parameter over `domains`, takes as the argument `arg`

@@ -276,12 +276,14 @@ impl Printer {
                             .zip(&shown)
                             .map(|(k, d)| format!("{k}: {d}"))
                             .collect();
+                        let at: Vec<Name> = names.iter().map(|n| Name::raw(n.as_str())).collect();
+                        let bound = crate::ccl::subst::family_at_names(bound, &at);
                         family_bounds.push(format!(
                             "forall ({}) {}({}) <: {}",
                             binders.join(", "),
                             p.param.spelling,
                             names.join(", "),
-                            self.ty(bound)
+                            self.ty(&bound)
                         ));
                     }
                     format!("{}: {kind}", p.param.spelling)

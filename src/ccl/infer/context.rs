@@ -394,6 +394,40 @@ pub(super) struct DeferredMethod {
 }
 
 impl DeferredMethod {
+    /// Whether the call's receiver is related, through variable bounds, to a variable at or
+    /// below `cutoff`: one of the enclosing scope's, which the program after the definition
+    /// may still settle. A receiver only the definition's own variables reach, as an element
+    /// of a member family under `forall` whose bound's holes the scheme does not carry, is
+    /// settled by nothing but the definition's uses, so the call is the scheme's.
+    fn receiver_reaches_below(&self, cutoff: Level) -> bool {
+        let mut pending: Vec<Rc<InferVar>> = self
+            .obligation
+            .operands()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| match t {
+                Type::Infer(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        let mut seen = HashSet::new();
+        while let Some(v) = pending.pop() {
+            if v.level() <= cutoff {
+                return true;
+            }
+            if !seen.insert(v.uid) {
+                continue;
+            }
+            let bounds = v.bounds.borrow();
+            for bound in bounds.lower().iter().chain(bounds.upper().iter()) {
+                if let Type::Infer(u) = &bound.ty {
+                    pending.push(Rc::clone(u));
+                }
+            }
+        }
+        false
+    }
+
     /// The error for a call whose receiver's type never arrived.
     pub(super) fn unresolved(&self) -> LocatedInferError {
         LocatedInferError {
@@ -3428,7 +3462,7 @@ impl Typing for InferCtx {
             if !call.obligation.is_waiting() {
                 continue;
             }
-            if carried.contains(&call.obligation.uid) {
+            if carried.contains(&call.obligation.uid) || !call.receiver_reaches_below(self.level) {
                 errors.push(call.unresolved());
                 continue;
             }
@@ -3626,20 +3660,23 @@ impl Typing for InferCtx {
             // every value is the bound, so a hole in it is minted under the binders and may read
             // them (`docs/chl-spec.md`, "Family parameters").
             let stated = match p.kind.family_bound() {
-                Some(values) => Some(Type::family(
-                    p.kind
+                Some(family) => {
+                    let binders: Vec<(Name, Type)> = p
+                        .kind
                         .family_domains()
                         .unwrap_or_default()
                         .iter()
                         .map(|d| {
-                            (
-                                Name::fresh(format!("__{}_k", p.param.spelling.to_lowercase())),
-                                d.clone(),
-                            )
+                            let spelling = p.param.spelling.replace("::", "_").to_lowercase();
+                            (Name::fresh(format!("__{spelling}_k")), d.clone())
                         })
-                        .collect(),
-                    values.clone(),
-                )),
+                        .collect();
+                    let names: Vec<Name> = binders.iter().map(|(n, _)| n.clone()).collect();
+                    Some(Type::family(
+                        binders,
+                        crate::ccl::subst::family_at_names(family, &names),
+                    ))
+                }
                 None => p.bound().cloned(),
             };
             let bound = stated.map(|mut b| {
@@ -3740,7 +3777,11 @@ impl Typing for InferCtx {
         })
     }
 
-    fn close_poly(&mut self, poly: &crate::ccl::ty::PolyType) {
+    fn close_poly(
+        &mut self,
+        poly: &crate::ccl::ty::PolyType,
+        complete: bool,
+    ) -> Result<(), LocatedInferError> {
         let depth = self.opened_params.len() - poly.params.len();
         debug_assert!(
             self.opened_params[depth..]
@@ -3749,7 +3790,32 @@ impl Typing for InferCtx {
                 .all(|((id, _), p)| *id == p.param.id),
             "`close_poly` closes the innermost open `Poly`"
         );
+        let opened: Vec<crate::ccl::ty::TypeParamId> = self.opened_params[depth..]
+            .iter()
+            .filter_map(|(_, t)| match t {
+                Type::Param(p) => Some(p.id),
+                _ => None,
+            })
+            .collect();
+        let result = if complete {
+            self.cache.at(self.here(), self.demand_at.or(self.here()));
+            let result = crate::ccl::infer::solver::traits::settle_held_answers(
+                Some(&opened),
+                &mut self.cache,
+            );
+            let at = || "a requirement under `forall`".to_string();
+            self.cache.report_recorded(|| EdgeReport::Labeled(at()));
+            result.map_err(|e| {
+                let failure = self.cache.take_failure();
+                self.raise(map_constrain_err(e, &at()))
+                    .with_failure(failure)
+            })
+        } else {
+            crate::ccl::infer::solver::traits::discard_held_answers(&opened);
+            Ok(())
+        };
         self.opened_params.truncate(depth);
+        result
     }
 
     fn require_sub(

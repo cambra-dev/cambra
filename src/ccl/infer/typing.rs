@@ -274,9 +274,14 @@ pub(super) trait Typing {
     where
         Self: Sized;
 
-    /// Close the innermost `Poly` [`open_poly`](Self::open_poly) opened, once its
-    /// binding's right-hand side and annotation are checked.
-    fn close_poly(&mut self, poly: &crate::ccl::ty::PolyType);
+    /// Close the innermost `Poly` after checking its definition. A complete definition
+    /// deposits its families' held answers. A failed definition discards them
+    /// (`src/ccl/design/type-parameters.md`, "Obligations under assumptions").
+    fn close_poly(
+        &mut self,
+        poly: &crate::ccl::ty::PolyType,
+        complete: bool,
+    ) -> Result<(), LocatedInferError>;
 
     /// Run `f` with the demand of every edge it draws stated at `origin`, when there is
     /// one, rather than at the node under emission: a type parameter's bound or a
