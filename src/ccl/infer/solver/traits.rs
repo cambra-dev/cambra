@@ -3638,6 +3638,7 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
                 // names a binder and holds no type.
                 Type::WitnessRef(_)
                 | Type::WitnessProjection(_)
+                | Type::FamilyApp(_)
                 | Type::Base(_)
                 | Type::UIntRange(_)
                 | Type::Hole

@@ -2268,19 +2268,21 @@ impl Subst {
             // `Poly` that declares it, reached by the arm below.
             | Type::Param(_)
             | Type::BarrierVar(_) => {}
-            // The projected sum is a term the type quotes, rebuilt once per substitution
-            // as a predicate is. It binds no element, so the substitution acts on it whole,
-            // and as on a collection's domain, which a witness projection is wherever it
-            // stands ([`Self::in_data_domain`]).
-            Type::WitnessProjection(p) => {
+            // A projected sum and a family's arguments are terms the type quotes, each rebuilt
+            // once per substitution as a predicate is. They bind no element, so the
+            // substitution acts on each whole, and as on a collection's domain, which a witness
+            // projection is wherever it stands ([`Self::in_data_domain`]).
+            Type::WitnessProjection(_) | Type::FamilyApp(_) => {
                 let s = self.in_data_domain();
-                memo.rebuild(p, &s, |term| {
-                    if !s.acts_on(term) {
-                        return false;
-                    }
-                    s.rewrite_expr_go(term, memo);
-                    true
-                });
+                for quoted in ty.quoted_terms_mut() {
+                    memo.rebuild(quoted, &s, |term| {
+                        if !s.acts_on(term) {
+                            return false;
+                        }
+                        s.rewrite_expr_go(term, memo);
+                        true
+                    });
+                }
             }
             Type::Infer(v) => *ty = self.suspended(v),
             Type::Poly(poly) => Rc::make_mut(poly)
@@ -2715,21 +2717,25 @@ impl Subst {
             // is read at the key ([`Self::in_data_domain`]): whether the function around it is
             // a collection may not be known yet. A substitution acting on nothing in it keeps
             // the `Rc`.
-            Type::WitnessProjection(p) => {
+            //
+            // A family's arguments are substituted as the term a projection quotes is.
+            Type::WitnessProjection(_) | Type::FamilyApp(_) => {
                 let s = self.in_data_domain();
-                let p = if s.acts_on(&p.term) {
-                    crate::ccl::ty::WitnessProjection::new(
-                        Rc::new(s.apply_expr(&p.term)),
-                        p.position,
-                    )
-                } else {
-                    p.clone()
-                };
+                let mut out = ty.clone();
+                if ty.quoted_terms().any(|t| s.acts_on(t)) {
+                    for quoted in out.quoted_terms_mut() {
+                        let substituted = Rc::new(s.apply_expr(quoted.quoted()));
+                        quoted.requote(substituted);
+                    }
+                }
                 // Read back, the projection is a binder of the holder's function, which the
                 // substitution's witness half and eliminations act on as on any reference.
-                match self.read_back(&p) {
-                    Some(binder) => self.apply_witnesses(&binder),
-                    None => Type::WitnessProjection(p),
+                match out {
+                    Type::WitnessProjection(p) => match self.read_back(&p) {
+                        Some(binder) => self.apply_witnesses(&binder),
+                        None => Type::WitnessProjection(p),
+                    },
+                    other => other,
                 }
             }
 
@@ -3741,8 +3747,13 @@ impl<'a> PiWalk<'a> {
             // A witness reference is a leaf in its own namespace: it neither is
             // nor crosses a Pi index.
             Type::WitnessRef(_) => {}
-            // The projected sum is converted as a predicate is; it binds no element.
-            Type::WitnessProjection(p) => self.quoted(p, depth),
+            // A projected sum and a family's arguments are converted as a predicate is; they
+            // bind no element.
+            Type::WitnessProjection(_) | Type::FamilyApp(_) => {
+                for quoted in ty.quoted_terms_mut() {
+                    self.quoted(quoted, depth);
+                }
+            }
         }
     }
 
@@ -3783,7 +3794,7 @@ impl<'a> PiWalk<'a> {
 
     /// Convert a term a type quotes — a refinement's predicate or a projection's sum — once
     /// per pass, every occurrence re-pointed at the one conversion.
-    fn quoted(&mut self, r: &mut impl crate::ccl::QuotedTerm, depth: u32) {
+    fn quoted(&mut self, r: &mut (impl crate::ccl::QuotedTerm + ?Sized), depth: u32) {
         let shadow = self.shadow_key();
         let pass_key = self
             .conversion_key()
@@ -4010,10 +4021,9 @@ pub fn references_binder_within(ty: &Type, within: u32) -> bool {
             // A witness reference is a leaf in its own namespace: it neither is
             // nor crosses a Pi index.
             Type::WitnessRef(_) => false,
-            Type::WitnessProjection(p) => {
-                visited.insert((Rc::as_ptr(&p.term), depth))
-                    && expr_scan(&p.term, depth, within, visited)
-            }
+            Type::WitnessProjection(_) | Type::FamilyApp(_) => ty.quoted_terms().any(|t| {
+                visited.insert((Rc::as_ptr(t), depth)) && expr_scan(t, depth, within, visited)
+            }),
         }
     }
     fn expr_scan(
@@ -4162,18 +4172,13 @@ impl RefinementScope {
         out
     }
 
-    /// [`close`](Self::close) for a witness projection's quoted term.
-    pub(crate) fn close_projection(
-        &mut self,
-        p: &crate::ccl::ty::WitnessProjection,
-    ) -> crate::ccl::ty::WitnessProjection {
+    /// [`close`](Self::close), in place, for a term a type quotes outside a refinement
+    /// ([`Type::quoted_terms`]).
+    pub(crate) fn close_quoted(&mut self, q: &mut (impl crate::ccl::QuotedTerm + ?Sized)) {
         if self.enclosing.iter().all(Option::is_none) {
-            return p.clone();
+            return;
         }
-        let mut walk = PiWalk::new(PiMode::Close(&self.enclosing));
-        let mut out = p.clone();
-        walk.quoted(&mut out, 0);
-        out
+        PiWalk::new(PiMode::Close(&self.enclosing)).quoted(q, 0);
     }
 }
 

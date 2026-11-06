@@ -2366,6 +2366,7 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
         | Type::WitnessRef(_)
         | Type::WitnessProjection(_)
         | Type::Param(_)
+        | Type::FamilyApp(_)
         | Type::Txn => ty.clone(),
         Type::Poly(poly) => Type::Poly(Rc::new(poly.map_types(strip_refinements))),
         Type::Nominal(decl, args) => {
@@ -2921,7 +2922,7 @@ struct Entry<C> {
 
 impl<C> MemoStore<C> {
     /// Point `quoted` at `to`, counting it when the `Rc` actually changes.
-    fn point_at(&mut self, quoted: &mut impl QuotedTerm, to: Rc<Expr>) {
+    fn point_at(&mut self, quoted: &mut (impl QuotedTerm + ?Sized), to: Rc<Expr>) {
         if !Rc::ptr_eq(quoted.quoted(), &to) {
             self.revision += 1;
         }
@@ -2949,7 +2950,7 @@ impl<C: PartialEq + Clone> PredMemo<C> {
     /// See `src/ccl/design/type-inference.md`, "Predicate rebuild completion".
     pub fn rebuild(
         &self,
-        refinement: &mut impl QuotedTerm,
+        refinement: &mut (impl QuotedTerm + ?Sized),
         context: &C,
         f: impl FnOnce(&mut Expr) -> bool,
     ) -> bool {
@@ -3206,8 +3207,11 @@ where
         Type::Refinement(_, refinements) => refinements.rewrite_each(|_, refinement| {
             changed |= memo.rebuild(refinement, context, |pred| f(pred, memo));
         }),
-        Type::WitnessProjection(p) => changed |= memo.rebuild(p, context, |term| f(term, memo)),
-        _ => {}
+        _ => {
+            for quoted in ty.quoted_terms_mut() {
+                changed |= memo.rebuild(quoted, context, |term| f(term, memo));
+            }
+        }
     }
     ty.walk_children_mut(|child| changed |= walk_quoted_terms_mut(child, memo, context, f));
     changed

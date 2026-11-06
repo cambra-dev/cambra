@@ -1798,6 +1798,18 @@ the compilation declined outlives it here"
 
     /// [`Self::extent_of`], with a dependent tuple treated as `tuples` says.
     fn extent_in(&self, ty: &Type, tuples: DependentTuples) -> Result<Extent, ConversionError> {
+        // A generalized parameter stands for a domain chosen per use, below its bound, and a family
+        // for one chosen per use and per value of what it is applied to: the values either
+        // ranges over are the bound's (`src/ccl/design/type-parameters.md`, "Generalized types").
+        if let Some(p) = ty.generalized_param() {
+            let bound = p.bound.as_ref().ok_or_else(|| {
+                ConversionError::Unsupported(format!(
+                    "a domain generic over a sum's witness (`{}`) has no extent to convert",
+                    p.spelling
+                ))
+            })?;
+            return self.extent_in(bound, tuples);
+        }
         match ty {
             // Strip refinements at every level — Filter handles them instead.
             Type::Refinement(inner, _) => self.extent_in(inner, tuples),
@@ -1885,18 +1897,6 @@ the compilation declined outlives it here"
             }
             // A generalized type is stored as its body is, each parameter as its bound.
             Type::Poly(p) if p.is_generalized() => self.extent_in(&p.body, tuples),
-            // A generalized parameter stands for a domain chosen per use, below its bound: the
-            // values it ranges over are the bound's (`src/ccl/design/type-parameters.md`,
-            // "Generalized types").
-            Type::Param(p) if p.generalized => {
-                let bound = p.bound.as_ref().ok_or_else(|| {
-                    ConversionError::Unsupported(format!(
-                        "a domain generic over a sum's witness (`{}`) has no extent to convert",
-                        p.spelling
-                    ))
-                })?;
-                self.extent_in(bound, tuples)
-            }
             // Leaf types — no refinements possible, handle inline.
             Type::Base(b) => Ok(Extent::Base(b.clone())),
             Type::UIntRange(n) => Ok(Extent::uint_range(*n)),
@@ -3040,6 +3040,20 @@ fn convert_impl_inner(
                     let values = values.extent();
                     if input.tiling().domain_extent().as_ref() == Some(&*domain) {
                         Ok(input)
+                    } else if let Some(keys) = input
+                        .tiling()
+                        .values_at(ctx.level())
+                        .domain_extent()
+                        .filter(|keys| !domain.includes(keys))
+                    {
+                        // A flat merge re-views keys at a bound that includes them. A witness
+                        // erased to its one candidate can bound them more tightly than a
+                        // collection read out of a row of collections tiles them, and
+                        // narrowing is not a re-view.
+                        Err(ConversionError::Unsupported(format!(
+                            "`unbox` narrowing keys tiled as {keys} to its witness's bound \
+                             {domain} is not supported yet"
+                        )))
                     } else {
                         Ok(Box::new(UnionOperator::new_flat_over(
                             vec![input],

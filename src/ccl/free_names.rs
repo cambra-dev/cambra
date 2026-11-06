@@ -298,9 +298,11 @@ impl<'m> Walk<'m> {
             | Type::BarrierVar(_)
             | Type::Infer(_) => {}
             Type::Poly(poly) => poly.types().for_each(|t| self.ty(t)),
-            // The projected sum is a term the type quotes. It binds no element: the term is
-            // the collection, not a condition on a key.
-            Type::WitnessProjection(p) => self.quoted(&p.term, false),
+            // A projected sum and a family's arguments are terms the type quotes. They bind no
+            // element: a projected term is the collection, not a condition on a key.
+            Type::WitnessProjection(_) | Type::FamilyApp(_) => {
+                ty.quoted_terms().for_each(|t| self.quoted(t, false))
+            }
             Type::Fun {
                 name,
                 fun_kind,
