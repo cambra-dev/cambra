@@ -3398,34 +3398,6 @@ impl Type {
         }
     }
 
-    /// The function type an **elimination** demands: a Pi whose kind is a fresh
-    /// [`FunKind::Var`].
-    ///
-    /// `Data` and `Compute` are incomparable, so a demand stamped with either
-    /// one rejects the other. Application does not care: indexing a collection
-    /// and calling a capability are the same node, and the rule that types them
-    /// only needs *some* function with this domain and codomain. Leaving the kind
-    /// inferred says exactly that — the applied value's own kind flows in and
-    /// pins it, and a demand nothing pins defaults to `Compute` like any other
-    /// unconstrained kind.
-    ///
-    /// Contrast [`Type::pi`] / [`Type::fun`] / [`Type::data_fun`], which *stamp*
-    /// a kind and are for a position that means one of the two.
-    pub fn pi_eliminated(name: impl Into<crate::ccl::Name>, domain: Self, codomain: Self) -> Self {
-        Type::pi_kinded(name, domain, codomain, FunKind::fresh_var())
-    }
-
-    /// The non-dependent [`Type::pi_eliminated`] — an elimination's demand
-    /// with no Pi binder.
-    pub fn fun_eliminated(domain: Self, codomain: Self) -> Self {
-        Type::Fun {
-            name: None,
-            fun_kind: FunKind::fresh_var(),
-            domain: Box::new(domain),
-            codomain: Box::new(codomain),
-        }
-    }
-
     /// Helper for creating a non-dependent **data** function type
     /// (`name: None`, `kind: Data`) — a collection `domain ⤇ codomain`.
     pub fn data_fun(domain: Self, codomain: Self) -> Self {
