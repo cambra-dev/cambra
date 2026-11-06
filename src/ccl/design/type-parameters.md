@@ -87,21 +87,63 @@ records the kind `TypeKind::Family`: the index types, then the bound on its valu
 `requires` clause states one, all as the kind's children. `LoweringContext::end_type_params`
 leaves both scopes.
 
-The bound is a requirement, `forall (k: K) V(k) <: U`, which `bound_family_values` reads off the
-clause after the parameters are declared and writes into the parameter's kind. `V` is a family
-parameter of the definition, applied to distinct binders of the `forall`, each ranging over its
-index type up to refinements, and `U` reads none of them; any other requirement under `forall` is
-refused. A family parameter's bound is a family itself:
+A `forall` requirement, `forall (k: K) R` or a parenthesized group, lowers through
+`lower_forall_requirement`, with the binders in scope under the spellings written, so `V(k)` reads
+them. Each requirement in the group is one of three forms, and any other is refused:
 
-- **`open_poly` opens it as `\k: K -> U`**, normalized under the binders, so a hole in `U` is a
-  variable that may read them, and the opened parameter's `bound` is that family.
+- **`V(k) <: U` bounds a family parameter's values** (`bound_family_value`). `V` is a family
+  parameter of the definition, applied to distinct binders of the `forall`, each ranging over its
+  index type up to refinements. The kind records the bound as the family `\k: K -> U`, closed over
+  the binders `V` is applied to.
+- **A trait requirement is quantified** (`lower_quantified_trait`). It is a `TraitRequirement`
+  whose `binders` are the `forall`'s, and its operands read them; one that reads none is refused.
+  Each associated type it gives a member parameter is a member **family**, `i::Elements`, a
+  `TypeParam::declared_family` over the binders' types whose kind is bounded at each value by the
+  trait's bound at the requirement's operands, and the requirement associates it applied to the
+  binders, `i::Elements(k)`. A hole in the bound stays a hole.
+- **`i::Elements <: U` bounds a member family's values** (`bound_quantified_member`), for an `i`
+  the same `forall` names.
+
+A bound reading a binder is refused. A quantified requirement's name is in scope in its `forall`
+only: `traits::named_requirement` refuses `i::f` and `i::Elements` elsewhere, since each names
+an instance per value. A family parameter's bound is a family itself:
+
+- **`open_poly` opens it at fresh binders**, normalized under them, so a hole in `U` is a variable
+  that may read them, and the opened parameter's `bound` is that family.
 - **An application `V(t)` meets another type as the bound at its terms**
   (`subst::family_bound_at`, `constrain_go`'s family-bound arm). A meet of the application and a
   type above that applied bound is the application. Otherwise, at a join or a meet with any other
   contribution, another application of the family at other terms among them, the application is
-  widened to that applied bound (`relate_params_by_bounds`), as a bounded parameter is below.
+  widened to that applied bound (`relate_params_by_bounds`), as a bounded parameter is below. An
+  elimination on the edge reaches the bound, as it reaches a type parameter's (`eliminate_at`), so
+  a sum flows into a bound `_ |=> U`.
 - **Instantiating the scheme bounds the family's variable** at its own binders
-  (`subst::family_at_names`), among the bounds each use checks.
+  (`subst::family_at_names`), among the bounds each use checks, and so does each specialization
+  clone of the definition (`specialize_use`).
+
+### Requirements of a type declaration
+
+A type declaration's `requires` clause lowers through `lower_named_requirements` with the
+declaration's parameters as the members (`nominal::lower_decl_requirements`), and the declaration
+records it as `DeclRequirements`: the parameters with their kinds, the member parameters, and the
+requirements (`NominalDecl::requirements`). Three places read it:
+
+- **Each constructor and `extract`** is bound at a `Poly` over those parameters and requirements
+  (`bind_function`), so each construction is a use the `Var` rule checks the clause at.
+- **A definition taking the type** gets the clause at its own parameters
+  (`functions::imply_declaration_requirements`): for each nominal application in a value
+  parameter's annotation whose arguments are the definition's type parameters, a family one passed
+  on as itself, the clause is renamed onto them, its member parameters re-minted, and a bound on a
+  family's values bounds the definition's family where the definition leaves it unbounded. Only
+  parameters are renamed, so lowering substitutes no term.
+- **Every application in an annotation** is refused at lowering where no types its holes could
+  stand for satisfy the clause (`stmts::application_may_satisfy`): a family argument whose value
+  is not of a form below the bound (`traits::may_be_below`), an operand, a family argument read as
+  its value, that no instance accepts, or one whose every accepting instance associates a type
+  not below a bound the clause puts on it, read at the types unifying the instance's head with
+  the operand (`traits::unifier`). A type parameter of the surrounding definition, or its
+  family's value, stands as a hole there, so `Groups(K, \k -> _ |=> String)` is refused and
+  `Groups(K, V)` is not.
 
 A type-position `forall (T, U <: B) V` lowers through `lower_type_expr_or_poly`, which declares the
 parameters in an alias scope of its own and lowers `V` as the body. Only a `let` annotation
@@ -256,6 +298,31 @@ A contribution arriving at a position narrows every kind of candidate:
 | any other type parameter | its bound is offered in its place; with no bound, `MissingRequirement` | as for the bound | as for the bound |
 | a product | all dropped | applied, or pending while an assumption states the product | keep the rows stating that product there |
 
+A **family application** `V(t)` an assumption names answers as a parameter does, through a
+quantified assumption (`narrow_family`): an assumption whose operand is `V` applied to its binders,
+`forall (k: K) Iterable(V(k))`, is replaced by the requirement read at `t`
+(`TraitRequirement::at_application`), whose associated types are the member families applied to
+`t`, so the deposit is `i::Elements(t)`. With no such assumption the application offers the bound
+on its family's values at `t`, and with none it supports nothing. The terms are read where the
+operand stands: a watch carried down a variable-to-variable edge records the edge's substitution
+(`TraitObligation::frames`), and an application arriving at the variable below is renamed through
+it before it is offered (`deliver_in_frame`), as a reset copy's redelivery renames what it reads.
+A variable standing for another with the same binders in scope, an extrusion proxy
+(`constrain::copy_watches`) or a specialization's copy (`scheme::freshen_watches`), is read in the
+original's frame (`TraitObligation::copy_frame`). A loop's group reached through a dependent
+application, `(__arg: K) ⇒ V(__arg)` discharged to the key, so arrives as `V(key)`.
+
+Every later application then arrives at the same terms or holds another value. Two applications at
+different terms have no join but the bound on the family's values, as two type parameters have
+none but their bounds. With no bound, one arriving at other terms is `ConstrainError::NoJoin`,
+reported as the incompatible lower bounds coalesce would find. With a bound, the operand is the
+bound, which the assumption does not describe, so an obligation reached by an application of a
+bounded family holds the answer read at its terms (`traits::Held`) rather than depositing it. An
+application at other terms then offers the bound in its place, and the answer at one set of terms
+is deposited once every application has arrived (`settle_held_answers`): when the definition
+declaring the family closes, after its right-hand side and before its deferred method calls are
+closed (`Typing::settle_held_answers`), and after a specialization's copies are redelivered.
+
 So a requirement covering an operator on a bounded parameter answers it before the bound does. The
 obligation fails when no candidate is left. A failure that leaves only assumptions reports what
 they accept: `operand 2 is Int, but the only type accepted there is T`.
@@ -360,7 +427,9 @@ freshens the body, the bounds and the `requires` clause through one copy (`Insta
    the same cache.
 3. For each requirement of the scheme's `requires` clause, the arm calls `require_trait` over the
    substituted operands, then records `𝑜 <: 𝛼ₒ` from the obligation's associated variable `𝑜` to
-   the substituted associated type.
+   the substituted associated type. A quantified requirement is renamed to binders of the use's
+   own, which nothing it passes constrains, and its obligation is minted with them entered
+   (`require_stated`), so the use proves it with `k` abstract.
 
 A failure in 2 or 3 is blamed on the use, with a secondary label at the bound or the
 requirement as written

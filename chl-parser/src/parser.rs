@@ -1896,8 +1896,13 @@ where
                     .or_not()
                     .map(Option::unwrap_or_default),
             )
+            .then(
+                requires_clause(expr.clone())
+                    .or_not()
+                    .map(Option::unwrap_or_default),
+            )
             .then(type_body)
-            .validate(|((name, params), body), e, emitter| {
+            .validate(|(((name, params), requires), body), e, emitter| {
                 let heads = std::iter::once((&name.node, name.span, "type name")).chain(
                     params
                         .iter()
@@ -1914,7 +1919,15 @@ where
                         ));
                     }
                 }
-                Spanned::new(e.span(), Stmt::TypeDecl(TypeDecl { name, params, body }))
+                Spanned::new(
+                    e.span(),
+                    Stmt::TypeDecl(TypeDecl {
+                        name,
+                        params,
+                        requires,
+                        body,
+                    }),
+                )
             });
 
         // `def f` or `def Price::f`: a qualifying type makes the function an associated
@@ -5068,6 +5081,44 @@ mod tests {
         let transaction = requirement_trait(&requires[2].node);
         assert_eq!(transaction.name.as_str(), "Transaction");
         assert!(transaction.args.is_empty());
+    }
+
+    /// A type declaration's `requires` clause follows its parameters, before either body form.
+    #[test]
+    fn a_type_declaration_states_a_requires_clause() {
+        let m = parse_m(indoc! {"
+            type Groups(K, V: K => Type) requires forall (k: K) V(k) <: _ |=> Int = (k: K) |=> V(k)
+            type Bags(K, V: K => Type) requires forall (k: K) Iterable(V(k)):
+                new(g: (k: K) |=> V(k))
+            type Plain = Int
+        "});
+        let decls: Vec<&TypeDecl> = m
+            .body
+            .iter()
+            .map(|s| match &s.node {
+                Stmt::TypeDecl(decl) => decl,
+                other => panic!("expected a type declaration, got {other:?}"),
+            })
+            .collect();
+        let shape: Vec<(&str, usize, bool)> = decls
+            .iter()
+            .map(|d| {
+                (
+                    d.name.node.as_str(),
+                    d.requires.len(),
+                    matches!(d.body, TypeDeclBody::Single(_)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [("Groups", 1, true), ("Bags", 1, false), ("Plain", 0, true)]
+        );
+        assert!(
+            matches!(&decls[0].requires[0].node, Requirement::Forall { .. }),
+            "{:?}",
+            decls[0].requires
+        );
     }
 
     /// A `forall` in a `requires` clause binds values over one requirement, or over a

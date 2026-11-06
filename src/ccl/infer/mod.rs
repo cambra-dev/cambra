@@ -534,6 +534,17 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             domains: domains.iter().map(coalesce_for_error).collect(),
             origin: ctx_label.to_string(),
         },
+        ConstrainError::NoJoin { types } => InferError::IncompatibleBounds {
+            polarity: true,
+            conflicting: types
+                .iter()
+                .map(|t| coalesce_for_error(t).to_string())
+                .collect::<Vec<_>>()
+                .join(" | "),
+            vars: Vec::new(),
+            origin: ctx_label.to_string(),
+            context: Vec::new(),
+        },
         // TODO(smt-undecided): every arm below aborts the compiler, which is a
         // prototype tripwire rather than the policy. The policy this wants is the
         // one `constrain`'s deficit rule already applies to a predicate the
@@ -769,6 +780,19 @@ pub(crate) fn run_with_params(
     // requirement sweep and coalesce would report those gaps rather than
     // anything in the program.
     let emitted = emit_node(expr, &mut sub_ctx);
+    // Every definition settled its own families' held answers as it closed; what remains
+    // names a family no definition declares, such as a module check's parameter.
+    let emitted = emitted.and_then(|ty| {
+        solver::traits::settle_held_answers(None, &mut solver::ConstrainCache::new()).map_err(
+            |e| LocatedInferError {
+                error: map_constrain_err(e, "a requirement under `forall`"),
+                node_id: expr.node_id(),
+                also: Box::default(),
+                related: RelatedPositions::default(),
+            },
+        )?;
+        Ok(ty)
+    });
     let mut errors = std::mem::take(&mut sub_ctx.errors);
     // A method call the program's own statements deferred, and nothing after it resolved
     // or failed (`src/ccl/design/nominal-types.md`, "Method calls"). A walk an error ended leaves

@@ -811,10 +811,392 @@ fn a_functions_family_parameter_errors_name_what_is_wrong() {
             "a bound that reads the `forall`'s binder `k` is not supported yet",
         ),
         (
-            with_requires("forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int)"),
-            "any other requirement under `forall` is not supported yet",
+            with_requires(
+                "forall (k: K) (i: Iterable(V(k)), i::Elements <: {Int where _ <= 1 if k else 2} |=> Int)",
+            ),
+            "a bound that reads the `forall`'s binder `k` is not supported yet",
+        ),
+        // A trait requirement under `forall` reads its binders, a bound under it reads an
+        // instance the same `forall` names, and one `forall` binds every value.
+        (
+            with_requires("forall (k: K) Equatable(T, T)"),
+            "a requirement under `forall` reads the `forall`'s binders",
+        ),
+        (
+            with_requires("forall (k: K) (Iterable(V(k)), i::Elements <: Int)"),
+            "`i` names no requirement before this bound in its `forall`",
+        ),
+        (
+            with_requires("forall (k: K) (i: Iterable(V(k)), i::Size <: Int)"),
+            "`Iterable` associates no type named `Size`",
+        ),
+        (
+            with_requires("forall (k: K) (i: Iterable(V(k))), i::Elements <: _ |=> Int"),
+            "`i` is a requirement under `forall`, whose `i::Elements` is a type for each value",
+        ),
+        (
+            with_requires("forall (k: K) forall (j: K) V(k) <: Int"),
+            "a `forall` inside a `forall` is not supported",
         ),
     ] {
         check_compile_error(&program, message);
     }
+}
+
+/// A nominal type a module makes `Iterable`, whose `Elements` is the list it wraps.
+const BAG: &str = indoc! {"
+    type Bag = List(Int)
+    instance Iterable(Bag):
+        Elements = List(Int)
+        def elements(b):
+            b.extract()
+"};
+
+/// Bags of `Int`s, a family that is `Bag` at every key.
+const BAGS: &str = "[Bag::new(box([1, 2])), Bag::new(box([3]))]";
+
+/// A trait requirement under `forall` holds at every value of its binders, so the body iterates
+/// a family's value at whichever key it is at, through the instance its use passes: a nominal
+/// type's, with its `Elements` named and bounded or left to the trait's bound, and a structural
+/// collection's. A use inside another definition passes the requirement it is under, and a
+/// built-in trait over two operands and two binders reads the family the same way.
+#[rstest]
+#[case::a_nominal_type_s_instance(
+    indoc! {"
+        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
+            sum([sum([x for x in grp]) for grp in g])
+    "},
+    &format!("total({BAGS})"),
+    6
+)]
+#[case::an_unnamed_requirement(
+    indoc! {"
+        def count(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) Iterable(V(k)):
+            sum([sum([1 for x in grp]) for grp in g])
+    "},
+    &format!("count({BAGS})"),
+    3
+)]
+#[case::a_structural_collection(
+    indoc! {"
+        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
+            sum([sum([x for x in grp]) for grp in g])
+    "},
+    r"total(groupby([1, 2, 3], \x -> x > 1))",
+    6
+)]
+#[case::a_use_under_the_requirement(
+    indoc! {"
+        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
+            sum([sum([x for x in grp]) for grp in g])
+        def twice(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
+            total(g) + total(g)
+    "},
+    &format!("twice({BAGS})"),
+    12
+)]
+#[case::a_built_in_trait(
+    indoc! {"
+        def double(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (a: Addable(V(k), V(k)), a::Output <: Int):
+            sum([x + x for x in g])
+    "},
+    "double([1, 2, 3])",
+    12
+)]
+#[case::two_binders(
+    indoc! {"
+        def total(A, B, V: {A, B} => Type, n: (a: A) |=> (b: B) |=> V(a, b)) => Int requires forall (a: A, b: B) (r: Addable(V(a, b), V(a, b)), r::Output <: Int):
+            sum([sum([x + x for x in row]) for row in n])
+    "},
+    "total([[1, 2], [3, 4]])",
+    20
+)]
+#[case::under_a_bound_on_the_family_s_values(
+    indoc! {"
+        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (V(k) <: Bag, i: Iterable(V(k)), i::Elements <: _ |=> Int):
+            sum([sum([x for x in grp]) for grp in g])
+    "},
+    &format!("total({BAGS})"),
+    6
+)]
+#[case::a_method_on_an_element_its_member_bound_names(
+    indoc! {"
+        type Bags = List(Bag)
+        instance Iterable(Bags):
+            Elements = List(Bag)
+            def elements(b):
+                b.extract()
+        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Bag):
+            sum([sum([sum(b.extract()) for b in grp]) for grp in g])
+    "},
+    "total([Bags::new(box([Bag::new(box([1, 2]))])), Bags::new(box([Bag::new(box([3]))]))])",
+    6
+)]
+#[case::one_group_reached_through_both_arms(
+    indoc! {"
+        def total(K, V: K => Type, g: FullMap(K, V), c: Bool) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
+            sum([sum([x for x in (grp if c else grp)]) for grp in g])
+    "},
+    &format!("total({BAGS}, 1 > 0)"),
+    6
+)]
+fn a_trait_requirement_under_forall_holds_at_every_value(
+    #[case] def: &str,
+    #[case] call: &str,
+    #[case] expected: i64,
+) {
+    check_scalar(&format!("{BAG}\n{def}{call}"), Value::Int(expected));
+}
+
+/// A use is refused where a value of its family has no instance, and a body uses only what the
+/// requirement states: `Equatable` of a family's values does not iterate them.
+#[rstest]
+#[case::a_value_with_no_instance(
+    indoc! {"
+        type Bag = List(Int)
+        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
+            sum([sum([x for x in grp]) for grp in g])
+        total([Bag::new(box([1, 2])), Bag::new(box([3]))])
+    "},
+    "No Iterable instance for Apply: operand 1 is Bag"
+)]
+#[case::a_body_using_another_trait(
+    indoc! {r"
+        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) Equatable(V(k), V(k)):
+            sum([sum([x for x in grp]) for grp in g])
+        total(groupby([1, 2, 3], \x -> x > 1))
+    "},
+    "No requirement states that `V` is Iterable"
+)]
+#[case::an_instance_read_outside_its_forall(
+    indoc! {r"
+        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
+            sum([sum(i::elements(grp)) for grp in g])
+        1
+    "},
+    "`i` names an instance of `Iterable` for each value its `forall` binds"
+)]
+#[case::a_method_on_an_element_no_member_bound_names(
+    &format!("{BAG}\n{}", indoc! {"
+        type Bags = List(Bag)
+        instance Iterable(Bags):
+            Elements = List(Bag)
+            def elements(b):
+                b.extract()
+        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (i: Iterable(V(k))):
+            sum([sum([sum(b.extract()) for b in grp]) for grp in g])
+        total([Bags::new(box([Bag::new(box([1, 2]))])), Bags::new(box([Bag::new(box([3]))]))])
+    "}),
+    "nothing but the uses of a definition polymorphic over that type determines it"
+)]
+#[case::two_groups_with_no_common_type(
+    &format!("{BAG}\n{TWO_GROUPS}"),
+    "Incompatible lower bounds"
+)]
+fn a_requirement_under_forall_errors_name_what_is_wrong(#[case] code: &str, #[case] message: &str) {
+    check_compile_error(code, message);
+}
+
+/// Groups at two keys meeting where the body iterates them: values of a family at two
+/// different keys have no common type but the bound on its values.
+const TWO_GROUPS: &str = indoc! {"
+    def pick(K, V: K => Type, g: FullMap(K, V), c: Bool) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
+        sum([sum([sum([x for x in (g1 if c else g2)]) for g2 in g]) for g1 in g])
+    pick([Bag::new(box([1, 2])), Bag::new(box([3]))], 1 > 0)
+"};
+
+/// With a bound on the family's values, two groups at different keys meet at the bound, and a
+/// loop over them calls the bound's instance, whether or not a trait requirement under `forall`
+/// also states one of the family's values.
+#[rstest]
+#[case::the_bound_alone("V(k) <: Bag")]
+#[case::the_bound_and_a_trait_requirement(
+    "(V(k) <: Bag, i: Iterable(V(k)), i::Elements <: _ |=> Int)"
+)]
+fn two_groups_meeting_at_a_nominal_bound_iterate_through_its_instance(#[case] requires: &str) {
+    let bounded = TWO_GROUPS.replace("(i: Iterable(V(k)), i::Elements <: _ |=> Int)", requires);
+    check_scalar(&format!("{BAG}\n{bounded}"), Value::Int(12));
+}
+
+/// A diagnostic writes a trait requirement under `forall` with its binders, and the bounds on
+/// its associated types in the same group.
+#[test]
+fn a_polymorphic_type_writes_a_trait_requirement_under_forall() {
+    check_compile_error(
+        &format!(
+            "{GROUPS}{}",
+            indoc! {r"
+                wrap: forall (K, V: K => Type) FullMap(K, V) => Groups(K, V) requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int) = \g -> 1
+                1
+            "}
+        ),
+        "requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int), but inferred",
+    );
+}
+
+/// A loop over a family's value iterates the bound on its values, a sum among them.
+#[rstest]
+#[case::a_group_by(r"total(groupby([1, 2, 3], \x -> x > 1))", 6)]
+#[case::sums(r"total([box([1, 2]), box([3])])", 6)]
+fn a_loop_over_a_family_s_value_reads_its_bound(#[case] call: &str, #[case] expected: i64) {
+    let def = indoc! {"
+        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) V(k) <: _ |=> Int:
+            sum([sum([x for x in grp]) for grp in g])
+    "};
+    check_scalar(&format!("{def}{call}\n"), Value::Int(expected));
+}
+
+/// An element of a family's value is typed through the bound on the family's values, a hole in
+/// it inferred at each value, so arithmetic on it resolves.
+#[rstest]
+#[case::a_hole("_ |=> _")]
+#[case::int_values("_ |=> Int")]
+fn an_element_of_a_family_s_value_is_typed_through_its_bound(#[case] bound: &str) {
+    check_scalar(
+        &formatdoc! {"
+            def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) V(k) <: {bound}:
+                sum([sum([b + 1 for b in grp]) for grp in g])
+            total([box([1, 2]), box([3])])
+        "},
+        Value::Int(9),
+    );
+}
+
+/// `Groups` with a bound on its family's values, which every application satisfies.
+const BOUNDED_GROUPS: &str =
+    "type Groups(K, V: K => Type) requires forall (k: K) V(k) <: _ |=> Int = (k: K) |=> V(k)\n";
+
+/// `Groups` whose family's values are `Iterable`, with `Int` elements.
+const ITERABLE_GROUPS: &str = "type Groups(K, V: K => Type) requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int) = (k: K) |=> V(k)\n";
+
+/// A type declaration's `requires` clause holds at every application: a constructor call
+/// satisfies it, an annotation states it, and a `def` taking the type relies on it without
+/// restating it, its bound and its trait requirement alike.
+#[rstest]
+#[case::a_constructor_call(
+    BOUNDED_GROUPS,
+    indoc! {r"
+        gs = Groups::new(groupby([1, 2, 3], \x -> x > 1))
+        match gs:
+            case Groups::new(g):
+                sum([sum(grp) for grp in g])
+    "},
+    6
+)]
+#[case::an_annotation(
+    BOUNDED_GROUPS,
+    indoc! {r"
+        gs: Groups(_, _) = Groups::new(groupby([1, 2, 3], \x -> x > 1))
+        match gs:
+            case Groups::new(g):
+                sum([sum(grp) for grp in g])
+    "},
+    6
+)]
+#[case::a_def_relying_on_the_bound(
+    BOUNDED_GROUPS,
+    indoc! {r"
+        def total(K, V: K => Type, gs: Groups(K, V)) => Int:
+            match gs:
+                case Groups::new(g):
+                    sum([sum([x for x in grp]) for grp in g])
+        total(Groups::new(groupby([1, 2, 3], \x -> x > 1)))
+    "},
+    6
+)]
+#[case::a_def_relying_on_the_trait_requirement(
+    ITERABLE_GROUPS,
+    indoc! {"
+        def total(K, V: K => Type, gs: Groups(K, V)) => Int:
+            sum([sum([x for x in grp]) for grp in gs.extract()])
+        total(Groups::new([Bag::new(box([1, 2])), Bag::new(box([3]))]))
+    "},
+    6
+)]
+#[case::an_annotation_mixing_a_parameter_and_a_closed_family(
+    ITERABLE_GROUPS,
+    indoc! {"
+        def size(K, gs: Groups(K, \\k -> Bag)) => Int:
+            sum([sum([x for x in grp]) for grp in gs.extract()])
+        size(Groups::new([Bag::new(box([1, 2])), Bag::new(box([3]))]))
+    "},
+    6
+)]
+fn a_type_declaration_s_requirements_hold_at_every_application(
+    #[case] decl: &str,
+    #[case] program: &str,
+    #[case] expected: i64,
+) {
+    check_scalar(&format!("{BAG}\n{decl}{program}"), Value::Int(expected));
+}
+
+/// An application whose arguments do not satisfy the declaration's clause is refused: at a
+/// constructor call, for the bound and for the trait requirement, and at an annotation.
+#[rstest]
+#[case::a_constructor_call_outside_the_bound(
+    BOUNDED_GROUPS,
+    r#"Groups::new(groupby(["a", "bb"], \x -> x == "a"))"#,
+    "expected Int, found String"
+)]
+#[case::a_constructor_call_with_no_instance(
+    indoc! {"
+        type Groups(K, V: K => Type) requires forall (k: K) Iterable(V(k)) = (k: K) |=> V(k)
+        type Box = Int
+    "},
+    "Groups::new([Box::new(1)])",
+    "No Iterable instance for Apply: operand 1 is Box"
+)]
+#[case::an_annotation_outside_the_bound(
+    BOUNDED_GROUPS,
+    indoc! {r"
+        def f(gs: Groups(Bool, \k -> _ |=> String)) => Int:
+            1
+    "},
+    "`Groups(Bool, _ |=> String)` passes `V` a family whose values are not below the bound"
+)]
+#[case::a_let_annotation_outside_the_bound(
+    BOUNDED_GROUPS,
+    r#"gs: Groups(Bool, \k -> _ |=> String) = Groups::new(groupby(["a"], \x -> x == "a"))"#,
+    "`Groups(Bool, _ |=> String)` passes `V` a family whose values are not below the bound"
+)]
+#[case::an_annotation_with_no_instance(
+    indoc! {"
+        type Groups(K, V: K => Type) requires forall (k: K) Iterable(V(k)) = (k: K) |=> V(k)
+        type Box = Int
+    "},
+    indoc! {r"
+        def f(gs: Groups(UInt, \k -> Box)) => Int:
+            1
+    "},
+    "no instance of `Iterable` accepts (Box)"
+)]
+#[case::an_annotation_mixing_a_parameter_and_a_family_outside_the_bound(
+    BOUNDED_GROUPS,
+    indoc! {r"
+        def f(K, gs: Groups(K, \k -> _ |=> String)) => Int:
+            1
+    "},
+    "`Groups(K, _ |=> String)` passes `V` a family whose values are not below the bound"
+)]
+#[case::an_annotation_outside_a_member_bound(
+    indoc! {"
+        type Groups(K, V: K => Type) requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int) = (k: K) |=> V(k)
+        type Words = List(String)
+        instance Iterable(Words):
+            Elements = List(String)
+            def elements(w):
+                w.extract()
+    "},
+    indoc! {r"
+        def f(gs: Groups(UInt, \k -> Words)) => Int:
+            1
+    "},
+    "`Groups(UInt, Words)` passes types whose `Iterable` instance at (Words) associates a type not below"
+)]
+fn a_type_declaration_s_requirements_refuse_an_application(
+    #[case] decl: &str,
+    #[case] program: &str,
+    #[case] message: &str,
+) {
+    check_compile_error(&format!("{decl}{program}\n1"), message);
 }

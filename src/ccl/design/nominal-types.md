@@ -114,6 +114,9 @@ parameter.
   so the terms name their binders, and closes the result.
 - **Variance counts each application as an occurrence of its parameter.** A family's domains are
   equality positions, and its body stands where the family does.
+- **A `requires` clause on the declaration states what every application requires of its
+  arguments**, a family's values included
+  ([type-parameters.md, "Requirements of a type declaration"](type-parameters.md#requirements-of-a-type-declaration)).
 
 ---
 
@@ -326,9 +329,13 @@ statement collects the calls it defers (`Typing::open_method_calls`). At a `let`
 scheme carries (`display::scheme_obligations`), asking for an annotation on the receiver. A
 variable the scheme quantifies watches such a call's obligation, so each use would copy it and
 select its own method, making the definition polymorphic over every type declaring the method,
-which a trait states instead. A call the scheme does not carry waits with the enclosing
-definition's calls, at that definition's level and telescope, and its function's variable gets a
-variable of that level below it (`TraitObligation::pass_method_call`). The selected method's type
+which a trait states instead. So does a call whose receiver reaches, through variable bounds, no
+variable of the enclosing scope (`DeferredMethod::receiver_reaches_below`): only the definition's
+uses settle it, though no type of the scheme names it, as an element of `i::Elements` under
+`forall (k: K) (i: Iterable(V(k)))`, whose holes stand in the member family's bound. Any other call
+the scheme does not carry waits with the enclosing definition's calls, at that definition's level
+and telescope, and its function's variable gets a variable of that level below it
+(`TraitObligation::pass_method_call`). The selected method's type
 flows into that variable, which no use of the definition copies, so it reaches every use's copy. A
 monomorphic definition's waiting calls wait with the enclosing one's, a failed statement's report
 nothing, and the program's own are refused once emission ends.

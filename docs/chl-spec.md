@@ -3020,10 +3020,10 @@ spellings name the same nominal type is
 #### Declaring a nominal type
 
 ```ebnf
-type_stmt   ::= "type" Ident [ "(" type_param ( "," type_param )* [ "," ] ")" ] ":"
-                NEWLINE INDENT ctor_line+ DEDENT
-             |  "type" Ident [ "(" type_param ( "," type_param )* [ "," ] ")" ] "=" expression
-                NEWLINE
+type_stmt   ::= "type" Ident [ "(" type_param ( "," type_param )* [ "," ] ")" ]
+                [ requires_clause ] ":" NEWLINE INDENT ctor_line+ DEDENT
+             |  "type" Ident [ "(" type_param ( "," type_param )* [ "," ] ")" ]
+                [ requires_clause ] "=" expression NEWLINE
 type_param  ::= Ident [ ":" expression ]   (* the expression is a kind *)
 ctor_line   ::= [ "@" "RenamedFrom" "(" ident ")" NEWLINE ]
                 ident [ "(" ctor_param ( "," ctor_param )* [ "," ] ")" ] NEWLINE
@@ -3101,6 +3101,37 @@ renamed_type_stmt ::= "@" "RenamedFrom" "(" type_path ")" NEWLINE type_stmt
 - **Every type parameter appears in some constructor's parameter type.** One that no constructor
   uses is an error at the declaration. Its variance could not be read off the constructors, and
   distinct nominal types already keep values such as `UserId` and `OrderId` apart.
+- **A `requires` clause states what every application of the type requires of its arguments**,
+  in the forms a `def`'s clause takes ([Trait requirements](#trait-requirements),
+  [Family parameters](#family-parameters)):
+
+  ```python
+  type Groups(K, V: K => Type) requires forall (k: K) V(k) <: _ |=> Int = (k: K) |=> V(k)
+
+  Groups::new(groupby([1, 2, 3], \x -> x > 1))           # accepted: groups of Int
+  Groups::new(groupby(["a", "bb"], \x -> x == "a"))      # an error: groups of String
+  def f(gs: Groups(Bool, \k -> _ |=> String)) => Int: 1  # an error: no group of Int
+
+  def total(K, V: K => Type, gs: Groups(K, V)) => Int:
+      match gs:
+          case Groups::new(g):
+              sum([sum([x for x in grp]) for grp in g])  # each `grp` is a `_ |=> Int`
+  ```
+
+  - **Each constructor states the clause**, so each construction is checked against it at its own
+    types, with `k` abstract under `forall`, as a call of a `def` is checked against the `def`'s
+    clause. A construction that does not satisfy it is rejected at the construction.
+  - **An application in an annotation is rejected where its arguments cannot satisfy the clause**,
+    whatever its holes stand for: a family argument whose values have a form no subtype of the
+    bound has, or an operand no instance accepts. What a hole stands for is checked where a
+    value of the type is constructed.
+  - **A definition taking the type assumes the clause of its own parameters.** A `def` whose
+    value parameter's annotation applies `Groups` to its own type parameters, a family parameter
+    passed on as itself, has `Groups`'s clause at those parameters in its own `requires` clause,
+    without writing it. Each use satisfies it at its own
+    types, as it satisfies a written requirement, and the instance it passes is the one those
+    types pick. A bound on a family's values the definition states itself replaces the clause's
+    bound on that family.
 
 #### The single-constructor form
 
@@ -3182,8 +3213,8 @@ def first(K, V: K => Type, a: Groups(K, V), b: Groups(K, V)) => Groups(K, V):
     a
 ```
 
-A bound on a family's values is a requirement in the definition's `requires` clause, under a
-`forall` that binds the family's index:
+A requirement of a family's values is a requirement in the definition's `requires` clause, under a
+`forall` that binds the family's index: a bound on the values, or a trait requirement of them.
 
 ```ebnf
 requirement ::= …
@@ -3195,28 +3226,57 @@ requirement ::= …
 ```python
 def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) V(k) <: _ |=> Int:
     sum([sum(grp) for grp in g])
+
+type Bag = List(Int)
+instance Iterable(Bag):
+    Elements = List(Int)
+    def elements(b):
+        b.extract()
+
+def count(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
+    sum([sum([x for x in grp]) for grp in g])
+
+count([Bag::new(box([1, 2])), Bag::new(box([3]))])   # 6
 ```
 
 - **`forall (k: K)` binds `k`, a value of `K`, over exactly one requirement.** Parentheses group
   several: `requires forall (k: K) (V(k) <: U, W(k) <: X)`. Braces in a type never group
-  ([2.4 Atoms](#24-atoms)), so a bound is written bare, as above, or in parentheses.
+  ([2.4 Atoms](#24-atoms)), so a bound is written bare, as above, or in parentheses. One `forall`
+  binds every value its group reads; a `forall` inside a `forall` is an error.
 - **`forall` means every value.** A use is checked with `k` abstract, so the requirement holds at
   every value of `K`, not only at the values the use's arguments hold.
 - **`V(k) <: U` bounds the family's values.** Every value of the family is a subtype of `U`, the
   call is rejected where one is not, and the body uses `V(k)` as a `U`, as it uses a bounded type
-  parameter ([Kinds and bounds](#kinds-and-bounds)). `V` is a family parameter of the definition,
-  applied to the `forall`'s binders, each once, and bounded once. Each binder ranges over the
-  index type `V` takes it at, up to refinements.
+  parameter ([Kinds and bounds](#kinds-and-bounds)). A loop over a `V(k)` walks it as a `U`. `V`
+  is a family parameter of the definition, applied to the `forall`'s binders, each once, and
+  bounded once. Each binder ranges over the index type `V` takes it at, up to refinements.
+- **A trait requirement under `forall` holds at every value of its binders.** Its operands read the
+  binders through family applications, `Iterable(V(k))`. One that reads none states nothing per
+  value, and is an error: it is written without the `forall`. Each use proves it with `k` abstract,
+  at its own types, and the body uses it at whichever value an operand is at: a loop over a group
+  `grp` of type `V(k)` calls the `Iterable` instance of `V(k)`. Each use passes the instance its
+  types pick, decided when the program is compiled
+  ([Summoning an instance](#summoning-an-instance)), so the use of `count` above calls `Bag`'s
+  `elements` for every group.
+- **A named requirement's associated types are families.** Under
+  `forall (k: K) (i: Iterable(V(k)))`, `i::Elements` is a family parameter of the definition, the
+  `Elements` of `V(k)` at each `k`. `i::Elements <: U`, written in the same `forall`, bounds its
+  values as `V(k) <: U` bounds `V`'s, and without one it is below its trait's bound at each value
+  ([Trait requirements](#trait-requirements)). A bound naming a requirement outside its `forall` is
+  an error.
 - **A hole in a requirement under `forall` is inferred separately at each value of `k`.** It is a
   family parameter of the definition, a type for each `k`, where a hole in an unquantified clause
   is a type parameter ([Trait requirements](#trait-requirements)). So `_ |=> Int` admits groups
   whose domains differ by key.
 
 **[Planned]** — a bound that reads a `forall`'s binder,
-`requires forall (k: K) V(k) <: {Int where _ <= k}`; a trait requirement under `forall`,
-`requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int)`; a subtype requirement on
-anything but a family parameter's values; and a `requires` clause on a type declaration, which has
-none.
+`requires forall (k: K) V(k) <: {Int where _ <= k}`, or `i::Elements <: {Int where _ <= k} |=> _`;
+and a subtype requirement on anything but a family parameter's or a named requirement's values.
+
+**[Open]** — reading an instance a requirement under `forall` names outside that `forall`:
+`i::elements(grp)` in the body names an instance for each value of `k`, and which `k` a call
+reads is not decided. It is an error. A loop over `grp` reaches the instance at `grp`'s own
+value.
 
 #### A nominal type is opaque
 
@@ -3610,7 +3670,8 @@ instance ([Equality and order](#equality-and-order)).
 - **A named requirement's associated types are types.** Under `requires a: Addable(A, B)`,
   `a::Output` is `Addable`'s `Output` at `A` and `B`, the type of `a + b`, and the signature and
   the body may write it: `def add(A, B, x: A, y: B) => a::Output requires a: Addable(A, B)`. Each
-  call's types decide it.
+  call's types decide it. Under `forall (k: K)`, an associated type is a family, a type for each
+  `k` ([Family parameters](#family-parameters)).
 - **A clause bounds an associated type it names.** `a::Output <: T`, written in the clause after
   the requirement that names `a`, states that the instance's `Output` is below `T`, so `a + b`
   under `requires a: Addable(T, T), a::Output <: T` is a `T`. A call whose instance's `Output` is

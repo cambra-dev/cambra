@@ -615,11 +615,42 @@ fn lower_constructors(
                 }
             }
         }
+        head.set_requirements(lower_decl_requirements(decl, head, ctx)?);
         Ok(ctors)
     })();
     ctx.end_type_params(scoped);
     ctx.restore_type_aliases(aliases);
     result
+}
+
+/// `decl`'s `requires` clause, lowered over its type parameters, which are in scope
+/// (`docs/chl-spec.md`, "Declaring a nominal type"): what every application of the type requires
+/// of its arguments, as a `def`'s clause states what every call requires.
+fn lower_decl_requirements(
+    decl: &TypeDecl,
+    head: &Rc<NominalDecl>,
+    ctx: &mut LoweringContext,
+) -> Result<crate::ccl::nominal::DeclRequirements, LoweringError> {
+    let mut params: Vec<PolyParam> = head
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| PolyParam {
+            param: Rc::clone(p),
+            kind: if p.arity == 0 {
+                TypeKind::Type
+            } else {
+                TypeKind::family(head.family_domains(i).to_vec(), None)
+            },
+            bound_at: None,
+        })
+        .collect();
+    if decl.requires.is_empty() {
+        return Ok(crate::ccl::nominal::DeclRequirements::default());
+    }
+    let (requires, _) =
+        super::stmts::lower_named_requirements(&decl.requires, Some(&mut params), ctx)?;
+    Ok(crate::ccl::nominal::DeclRequirements { params, requires })
 }
 
 /// The order of the parameter type `ty` the declaration writes as `written`: each record it
@@ -1665,17 +1696,25 @@ fn bind_function(
     let binding = if decl.params.is_empty() {
         Expr::let_bind(name, function, acc)
     } else {
+        // A constructor states the declaration's `requires` clause, so a call is checked
+        // against it at its own types, and `extract` assumes it.
+        let (params, requires) = match decl.requirements() {
+            Some(r) => (r.params.clone(), r.requires.clone()),
+            None => (
+                decl.params
+                    .iter()
+                    .map(|p| PolyParam {
+                        param: Rc::clone(p),
+                        kind: TypeKind::Type,
+                        bound_at: None,
+                    })
+                    .collect(),
+                Vec::new(),
+            ),
+        };
         let poly = Type::Poly(Rc::new(PolyType {
-            params: decl
-                .params
-                .iter()
-                .map(|p| PolyParam {
-                    param: Rc::clone(p),
-                    kind: TypeKind::Type,
-                    bound_at: None,
-                })
-                .collect(),
-            requires: Vec::new(),
+            params,
+            requires,
             body: Type::Hole,
         }));
         Expr::let_bind_annotated(name, function, acc, poly)

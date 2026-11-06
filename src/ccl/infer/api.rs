@@ -69,6 +69,8 @@ impl InferArena {
         // resolve variables that no longer have bounds.
         #[cfg(debug_assertions)]
         crate::ccl::infer::solver::traits::clear_watch_log();
+        // Held answers are per-run too: each names a family of this run's definitions.
+        crate::ccl::infer::solver::traits::clear_held_answers();
         // So is the requirement sweep's narrowing window, and for a sharper reason:
         // its mark indexes a process-global obligation counter, so one left behind by
         // an earlier run on this thread sits below everything this run mints and would

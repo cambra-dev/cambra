@@ -546,6 +546,13 @@ impl Typing for CheckCtx {
         unreachable!("a polymorphic annotation survived inference into Check");
     }
 
+    fn settle_held_answers(
+        &mut self,
+        _poly: &crate::ccl::ty::PolyType,
+    ) -> Result<(), LocatedInferError> {
+        unreachable!("a polymorphic annotation survived inference into Check");
+    }
+
     fn with_assumptions<R>(
         &mut self,
         _assumptions: &[Rc<crate::ccl::ty::TraitRequirement>],

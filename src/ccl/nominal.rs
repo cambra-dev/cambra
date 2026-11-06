@@ -140,6 +140,26 @@ pub struct NominalDecl {
     /// The argument each of [`Self::implicit_consts`] takes in this instance, as
     /// [`Self::implicit_args`] holds the type parameters'.
     const_args: Option<Vec<ConstTerm>>,
+    /// What every application of the type requires of its arguments, its `requires` clause, set
+    /// once the constructors lower. Shared with every instance.
+    requirements: Rc<OnceCell<DeclRequirements>>,
+}
+
+/// A declaration's `requires` clause (`docs/chl-spec.md`, "Declaring a nominal type"): its type
+/// parameters with the kinds the clause gives them, a family parameter's bound on its values
+/// included, then the member parameters its named requirements' associated types are, and the
+/// requirements over them, as a `Poly` holds them ([`crate::ccl::ty::PolyType`]).
+#[derive(Debug, Default)]
+pub struct DeclRequirements {
+    pub params: Vec<crate::ccl::ty::PolyParam>,
+    pub requires: Vec<Rc<crate::ccl::ty::TraitRequirement>>,
+}
+
+impl DeclRequirements {
+    /// Whether the clause states nothing: no requirement and no bound on a family's values.
+    pub fn is_empty(&self) -> bool {
+        self.requires.is_empty() && self.params.iter().all(|p| p.kind.family_bound().is_none())
+    }
 }
 
 /// What a [`NominalDecl`] declares after its head.
@@ -389,6 +409,7 @@ impl NominalDecl {
             implicit_args: None,
             implicit_consts: Rc::new(OnceCell::new()),
             const_args: None,
+            requirements: Rc::new(OnceCell::new()),
         })
     }
 
@@ -513,7 +534,27 @@ impl NominalDecl {
             implicit_args: self.implicit_args.clone(),
             implicit_consts: Rc::clone(&self.implicit_consts),
             const_args: self.const_args.clone(),
+            requirements: Rc::clone(&self.requirements),
         }
+    }
+
+    /// Record the declaration's `requires` clause ([`DeclRequirements`]).
+    ///
+    /// # Panics
+    ///
+    /// When recorded twice.
+    pub fn set_requirements(&self, requirements: DeclRequirements) {
+        let set = self.requirements.set(requirements);
+        assert!(
+            set.is_ok(),
+            "`{}`'s requirements are recorded twice",
+            self.name
+        );
+    }
+
+    /// The declaration's `requires` clause, where it states something.
+    pub fn requirements(&self) -> Option<&DeclRequirements> {
+        self.requirements.get().filter(|r| !r.is_empty())
     }
 
     /// `self` applied to its own type parameters: the type of `self` inside a function

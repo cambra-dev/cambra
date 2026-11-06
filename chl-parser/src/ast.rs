@@ -555,6 +555,9 @@ pub struct TypeDecl {
     /// The type parameters, `T` in `type Option(T):`, each with its kind where it states one:
     /// a family parameter's is a kind arrow, `V: K => Type`.
     pub params: Vec<TypeParam>,
+    /// What every application of the type requires of its arguments, `requires forall (k: K)
+    /// V(k) <: U` (`docs/chl-spec.md`, "Declaring a nominal type"); empty without a clause.
+    pub requires: Vec<Spanned<Requirement>>,
     pub body: TypeDeclBody,
 }
 
