@@ -7,10 +7,8 @@ use indoc::indoc;
 
 use crate::ccl::context::{GlobalContext, compile_program};
 use crate::ccl::load::LoadedProgram;
+use crate::interpreter::Value;
 use crate::interpreter::dispatcher::{Planned, run_program};
-use crate::interpreter::{DataSink, Value};
-
-use std::sync::Arc;
 
 use super::TileProducer;
 
@@ -49,7 +47,7 @@ fn dispatched_with(
         .map(|name| ctx.register_test_sink(*name))
         .collect();
     let loaded = LoadedProgram::test(source);
-    let program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
+    let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
         .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
     // The operators stay alive through the run: the map holds the fan-outs the chains share.
     let _operators = ctx.take_operator_map();
@@ -64,12 +62,13 @@ fn dispatched_with(
                 .unwrap_or_else(|| panic!("{source} writes to sink {name}"))
         })
         .collect();
-    let targets: Vec<(_, Arc<dyn DataSink>)> = consumers
-        .iter()
-        .zip(&sinks)
-        .map(|(consumer, sink)| (consumer.clone(), sink.clone() as Arc<dyn DataSink>))
-        .collect();
-    let planned = run_program(&targets, rows);
+    let planned = run_program(&mut program, rows)
+        .unwrap_or_else(|refused| panic!("{refused}"))
+        .planned;
+    assert!(
+        program.done.try_recv().is_ok(),
+        "{source}: the run's last pull of each sink finds every sink done"
+    );
     let roots: Vec<_> = consumers
         .iter()
         .map(|consumer| consumer.borrow().producer_slot().clone())
@@ -109,10 +108,6 @@ fn dispatched_with(
         "{source}: a pull after the run stops at the breakers"
     );
     assert_eq!(values("holds a value after a later pull"), delivered);
-    assert!(
-        program.done.try_recv().is_ok(),
-        "{source}: a pull after the run finds every sink done"
-    );
     (delivered, planned)
 }
 
@@ -730,6 +725,25 @@ fn a_nested_loop_answers_as_pull_mode_does(#[case] source: &str) {
     answers_as_pull_mode_does(source, &["InductionRequest", "SinkBreaker"]);
 }
 
+/// A loop nested twice over nested collections: each inner loop iterates the element of the loop
+/// around it. The middle loop's store closes a row once the innermost store states that row
+/// complete, which it does once its body states every position beneath the row complete.
+#[test]
+fn a_loop_nested_twice_over_nested_collections() {
+    answers_as_pull_mode_does(
+        indoc! {"
+            out = test_sink()
+            acc := 0
+            for xss in [[[1, 2], [3, 4]], [[5, 6], [7, 8]]]:
+                for xs in xss:
+                    for x in xs:
+                        acc := acc + x
+            out << acc
+        "},
+        &["InductionRequest", "SinkBreaker"],
+    );
+}
+
 /// A loop nested in a nested loop runs as a scope inside the scope of the loop around it, itself
 /// inside the outermost loop's.
 #[test]
@@ -897,6 +911,90 @@ fn a_loop_nested_over_rows(#[case] source: &str) {
     answers_as_pull_mode_does(source, &["InductionRequest", "SinkBreaker"]);
 }
 
+/// A condition on the inner position of a loop nested over rows. Its body selects a field of the
+/// record the inner drive renders, at a path, and the selector releases the drive's other field
+/// at every path. The drive's push names the paths under which a cell is still held
+/// (`keys_released_whole`), so the reader takes each path's selected field
+/// (`src/interpreter/design-path-projections.md`, "Differences of nested guards").
+#[rstest_log::rstest]
+#[case::reading_the_inner_position(indoc! {"
+    out = test_sink()
+    acc := 0
+    for xs in [[1, 2], [3, 4]]:
+        for x in xs:
+            acc := acc + (x if x > 1 else 0)
+    out << acc
+"})]
+#[case::reading_a_sum_over_the_inner_position(indoc! {"
+    out = test_sink()
+    acc := 0
+    for xs in [[1, 2], [3, 4]]:
+        for x in xs:
+            acc := acc + sum([z * x for z in [1, 2]])
+    out << acc
+"})]
+fn a_condition_in_a_loop_nested_over_rows(#[case] source: &str) {
+    answers_as_pull_mode_does(source, &["InductionRequest", "SinkBreaker"]);
+}
+
+/// A store per row of a comprehension, from a function whose loop runs once per row, runs as a
+/// loop's scope in the run's dispatcher, its rounds at the paths of the row and the position.
+#[rstest_log::rstest]
+#[case::one_loop(indoc! {"
+    def fold_by(items) => Int:
+        n := 0
+        for x in items:
+            n := n + x
+        n
+
+    [fold_by(r) for r in [[1, 2], [3, 4]]]
+"}, "Function [ 3, 7 ]")]
+#[case::a_nested_loop(indoc! {"
+    def fold_by(items) => Int:
+        n := 0
+        for x in items:
+            for y in [1, 2]:
+                n := n + x * y
+        n
+
+    [fold_by(r) for r in [[1, 2], [3, 4]]]
+"}, "Function [ 9, 21 ]")]
+#[case::a_body_mapping_a_comprehension(indoc! {"
+    def g(items) => Int:
+        n := 0
+        for x in items:
+            n += sum([z * x for z in [1, 2]])
+        n
+
+    [g(r) for r in [[1, 2], [3, 4]]]
+"}, "Function [ 9, 21 ]")]
+fn a_store_per_row_of_a_comprehension(
+    #[case] source: &str,
+    #[case] expected: &str,
+    #[values(1, 3, usize::MAX)] rows: usize,
+) {
+    let loaded = LoadedProgram::test(source);
+    let mut ctx = GlobalContext::default();
+    ctx.defer_sink_pulls();
+    let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
+    let _operators = ctx.take_operator_map();
+    let run = run_program(&mut program, rows).unwrap_or_else(|refused| panic!("{refused}"));
+    assert!(
+        run.planned
+            .iter()
+            .any(|plan| plan.name.starts_with("InductionRequest")),
+        "the store runs as a loop's scope: {:?}",
+        run.planned
+    );
+    let sink = crate::interpreter::TestSink::default();
+    crate::interpreter::DataSink::process(&sink, &run.main.expect("the run answers `main`"));
+    let value = sink
+        .value()
+        .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+    assert_eq!(value.to_string(), expected, "{source} at morsels of {rows}");
+}
+
 /// A transaction store is the breaker of a pipeline of its own; its input is its one writer's
 /// source, cut into morsels of items, and the sink reads the store once it is terminal.
 #[rstest_log::rstest]
@@ -941,6 +1039,36 @@ fn a_transaction(#[case] source: &str) {
     answers_as_pull_mode_does(source, &["Commit", "SinkBreaker"]);
 }
 
+/// A transaction store whose seed reads a pipeline: a sum, and the final value of another
+/// transaction store, as phase separation seeds one (`docs/chl-spec.md`, "8.6 `await_final`").
+/// The store reads its seed by pull when it opens, so a push from the seed's pipeline stops in
+/// front of the store, and the store's pipeline reads it.
+#[rstest_log::rstest]
+#[case::a_sum(indoc! {"
+    out = test_sink()
+    ys = [1, 2]
+    pool: Mut(Int, Txn) := sum(ys)
+    for r in [1, 2]:
+        with begin():
+            pool := pool - r
+    out << await_final(pool)
+"})]
+#[case::another_stores_final_value(indoc! {"
+    out = test_sink()
+    a: Mut(Int, Txn) := 100
+    for r in [1, 2]:
+        with begin():
+            a := a - r
+    b: Mut(Int, Txn) := await_final(a)
+    for s in [1, 2]:
+        with begin():
+            b := b + s
+    out << await_final(b)
+"})]
+fn a_transaction_seeded_from_a_pipeline(#[case] source: &str) {
+    answers_as_pull_mode_does(source, &["Commit", "SinkBreaker"]);
+}
+
 /// A store of two writers has no consuming mode: a morsel names positions of one source.
 #[test]
 #[should_panic(expected = "a transaction store of 2 writers has no consuming mode")]
@@ -963,9 +1091,10 @@ fn a_transaction_store_of_two_writers_is_refused() {
     );
 }
 
-/// A loop over a live source runs in no pipeline: no run notifies the source's arrivals.
+/// A program that reads a live source runs in no pipeline: no run notifies the source's
+/// arrivals.
 #[test]
-#[should_panic(expected = "a store over a live source")]
+#[should_panic(expected = "reads a live source")]
 fn a_loop_over_a_live_source_is_refused() {
     dispatched_with(
         indoc! {"
@@ -1023,4 +1152,32 @@ fn a_guarded_loop_over_a_let_bound_list() {
         "},
         &["Memo", "InductionRequest", "SinkBreaker"],
     );
+}
+
+/// A sink fed from two sites holds a tagged union of its feeds, which the run hands it arm by
+/// arm: the run's last pull closes the arms' statements over the union (`Tile::closed_over`),
+/// so the sink is done and holds both arms.
+#[rstest_log::rstest]
+fn a_sink_fed_from_two_sites(#[values(1, usize::MAX)] rows: usize) {
+    let source = indoc! {r#"
+        m = map([("a", 1)])
+        r = m["a"]
+        s = m["b"]
+        out = test_sink()
+        out << r
+        out << s
+    "#};
+    let mut ctx = GlobalContext::default();
+    ctx.defer_sink_pulls();
+    let sink = ctx.register_test_sink("out");
+    let loaded = LoadedProgram::test(source);
+    let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
+    let _operators = ctx.take_operator_map();
+    run_program(&mut program, rows).unwrap_or_else(|refused| panic!("{refused}"));
+    assert!(program.done.try_recv().is_ok(), "the sink is done");
+    let written = sink
+        .value()
+        .unwrap_or_else(|error| panic!("the sink holds a value: {error:?}"));
+    assert_eq!(written.as_function().len(), 2, "both feeds: {written:?}");
 }

@@ -2,14 +2,14 @@ use std::{collections::HashMap, path::Path, thread, time::Duration};
 
 use cambra::{
     ccl::{
-        context::{GlobalContext, eprint_errors},
+        context::{CompiledProgram, GlobalContext, compile_program, eprint_errors},
         load::LoadedProgram,
         provenance::NodeId,
     },
     control_port::{ControlPort, service},
     inspector_server::{ServedSnapshot, live::LiveChannel, serve_compiled},
     interpreter::{
-        ColumnValue, Consumer, Scheduler,
+        ColumnValue, Consumer, Scheduler, dispatcher,
         operator_graph::source_nodes,
         tile_operators::{FunctionGuard, Tile, TileGuard, TileProducer},
         value_probe::{
@@ -61,6 +61,101 @@ fn pull_main(branch: &str, producer: &mut dyn TileProducer) -> bool {
         }
     }
     done
+}
+
+/// The variable that runs a program through the dispatcher where it is set and not `0`
+/// ([`run_dispatched`]).
+const DISPATCH_VAR: &str = "CAMBRA_DISPATCH";
+
+/// The variable that sets the most rows a dispatched run's work package names.
+const MORSEL_ROWS_VAR: &str = "CAMBRA_MORSEL_ROWS";
+
+/// The most rows a dispatched run's work package names where [`MORSEL_ROWS_VAR`] is unset.
+const DEFAULT_MORSEL_ROWS: usize = 1024;
+
+/// Whether [`DISPATCH_VAR`] asks for a dispatched run.
+fn dispatch_requested() -> bool {
+    std::env::var(DISPATCH_VAR).is_ok_and(|value| !value.is_empty() && value != "0")
+}
+
+/// Runs `loaded` through the dispatcher on the calling thread ([`dispatcher::run_program`]),
+/// printing the `main` output's value once, as pull mode prints its last. A program the planner
+/// refuses runs in pull mode in the same context, after a note on stderr: its compile has opened
+/// its sources and sinks, a port bound or stdin taken, so a second compile could open none of
+/// them. `Err(())` where it does not compile.
+///
+/// # Panics
+///
+/// Where [`MORSEL_ROWS_VAR`] is set to anything but a positive count.
+fn run_dispatched(loaded: &LoadedProgram) -> Result<(), ()> {
+    let rows = match std::env::var(MORSEL_ROWS_VAR) {
+        Ok(rows) => rows
+            .parse::<usize>()
+            .ok()
+            .filter(|rows| *rows > 0)
+            .unwrap_or_else(|| panic!("{MORSEL_ROWS_VAR} is a positive count of rows: {rows}")),
+        Err(_) => DEFAULT_MORSEL_ROWS,
+    };
+    let mut ctx = GlobalContext::default();
+    ctx.defer_sink_pulls();
+    let mut program = match compile_program(&mut ctx, loaded, Box::new(|| {})) {
+        Ok(program) => program,
+        Err(errs) => {
+            eprint_errors(&errs, loaded.sources());
+            return Err(());
+        }
+    };
+    match dispatcher::run_program(&mut program, rows) {
+        Ok(run) => {
+            if let Some(tile) = run.main {
+                println!("Got value: {tile:#?}");
+            }
+        }
+        Err(refused) => {
+            eprintln!("note: {DISPATCH_VAR}: {refused}; running in pull mode");
+            run_in_pull_mode(&mut ctx, &mut program);
+        }
+    }
+    Ok(())
+}
+
+/// Drive `program`, compiled in `ctx` with its sinks unpulled, in pull mode: pull each sink once,
+/// as the compile would have, then deliver what the sources bring and pull the `main` output
+/// until it is released whole and every sink is done. A sink program that serves requests never
+/// finishes, as under [`run_program`].
+fn run_in_pull_mode(ctx: &mut GlobalContext, program: &mut CompiledProgram) {
+    let sinks: Vec<_> = program
+        .outputs
+        .iter()
+        .filter_map(|output| output.sink_consumer.clone())
+        .collect();
+    for sink in &sinks {
+        sink.borrow().pull_now();
+    }
+    let mut main = program
+        .outputs
+        .iter_mut()
+        .find(|output| output.is_main())
+        .and_then(|output| output.producer.take());
+    let mut main_done = main.is_none();
+    // A program with no sink drops its done sender, so it never signals.
+    let mut sinks_done = sinks.is_empty();
+    loop {
+        let delivery = ctx.scheduler().poll_sources();
+        let delivered = ctx.scheduler().deliver(delivery);
+        if let Some(producer) = main.as_mut()
+            && !main_done
+        {
+            main_done = pull_main(MAIN_BRANCH, &mut **producer);
+        }
+        sinks_done |= program.done.try_recv().is_ok();
+        if main_done && sinks_done {
+            return;
+        }
+        if !delivered {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 /// Runs a loaded Cambra program.
@@ -520,7 +615,13 @@ fn main() {
             inspect_port,
             control_port,
         } => {
-            if run_program(&loaded, inspect_port, control_port).is_err() {
+            let dispatched =
+                dispatch_requested() && inspect_port.is_none() && control_port.is_none();
+            let result = match dispatched {
+                true => run_dispatched(&loaded),
+                false => run_program(&loaded, inspect_port, control_port),
+            };
+            if result.is_err() {
                 std::process::exit(1);
             }
 

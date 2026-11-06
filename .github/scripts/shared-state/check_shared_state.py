@@ -131,11 +131,23 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/dispatcher.rs", "cell of `()`"),
     # The lock a dispatcher's sleeping worker waits under; it guards no data.
     ("src/interpreter/dispatcher.rs", "cell of `()`"),
+    # The placement an entry and its breaker share, which the planner writes before a run; what
+    # crosses it is a pipeline's index. See `Placement`.
+    ("src/interpreter/dispatcher.rs", "shared cell of `Option<PipelineId>`"),
+    # A compiled output's handle on its sink consumer, which the planner places and reads the
+    # sink's producer through. See `SinkTarget`.
+    ("src/interpreter/dispatcher/plan.rs", "shared cell of `crate::interpreter::sinks::SinkConsumer`"),
+    # What a dispatched run's `main` output answers, merged at the I/O boundary as a sink merges
+    # what it is handed; nothing reads it back into the graph. See `Collected`.
+    ("src/interpreter/dispatcher/plan.rs", "cell of `Option<Tile>`"),
     # The dispatcher tests' typed handle on a breaker they also pass to the driver. The file is
     # a `#[cfg(test)] mod` declared in `tile_operators/mod.rs`, which `_blank_test_items` does
     # not see.
     ("src/interpreter/tile_operators/dispatcher_tests.rs", "shared cell of `T`"),
     ("src/interpreter/tile_operators/fanout.rs", "cell of `bool`"),
+    # The name of the cell `Inner::Store` holds, which a planner reaches to drive the store as a
+    # pipeline breaker. See `StoreCell`.
+    ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileProducer>`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `usize`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),

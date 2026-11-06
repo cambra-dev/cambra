@@ -1,8 +1,8 @@
 //! Loop request control and body graph planning for the run's shared dispatcher.
 //! See `src/interpreter/design-operators.md`, "A loop in rounds".
 
+use super::plan::{Planned, reach_in_chain};
 use super::*;
-use super::{Planned, reach_in_chain};
 use crate::interpreter::commit_operator::InductionStoreProducer;
 use crate::interpreter::tile_operators::{StoreCell, TileProducer};
 
@@ -643,7 +643,7 @@ impl Drop for Placed<'_> {
 mod tests {
     use indoc::indoc;
 
-    use super::super::{Execution, InductionRuns, Planner};
+    use super::super::plan::{Execution, InductionRuns, Planner};
     use super::*;
     use crate::ccl::context::{GlobalContext, compile_program};
     use crate::ccl::load::LoadedProgram;

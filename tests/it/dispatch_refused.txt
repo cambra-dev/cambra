@@ -1,0 +1,1 @@
+differential_interp::two_writer_sites_on_one_store_are_not_judged	a transaction store of 2 writers has no consuming mode
