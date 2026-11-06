@@ -1870,3 +1870,166 @@ fn a_source_started_over_an_input_released_whole_is_queued_nothing() {
         "nothing is queued, so the closed source finishes at once"
     );
 }
+
+#[test]
+fn an_appended_graph_keeps_queued_work_and_follows_its_own_dependencies() {
+    let guard = keys_between(3, 3);
+    let mut dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
+    dispatcher.close(PipelineId(0));
+    dispatcher.hold_pipeline(PipelineId(0), true);
+
+    let mut body = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    body.order(PipelineId(0));
+    body.follow(PipelineId(1), PipelineId(0));
+    body.notify(PipelineId(0), &guard);
+    body.queue_round(PipelineId(1), &guard);
+    body.close(PipelineId(0));
+    body.hold_pipeline(PipelineId(0), true);
+    assert_eq!(dispatcher.append_graph(body), 1);
+
+    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
+    dispatcher.hold_pipeline(PipelineId(1), false);
+    let Next::Package(source) = dispatcher.try_claim(None) else {
+        panic!("the appended source retains its queued package")
+    };
+    assert_eq!(source.pipeline, PipelineId(1));
+    assert_eq!(source.guard, guard);
+    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
+    dispatcher.acknowledge(source);
+
+    let Next::Package(reader) = dispatcher.try_claim(None) else {
+        panic!("the appended reader follows the appended source")
+    };
+    assert_eq!(reader.pipeline, PipelineId(2));
+    assert_eq!(reader.guard, guard);
+    dispatcher.acknowledge(reader);
+    dispatcher.hold_pipeline(PipelineId(1), true);
+    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
+
+    dispatcher.hold_pipeline(PipelineId(1), false);
+    for expected in [1, 2] {
+        let Next::Finish { pipeline, .. } = dispatcher.try_claim(None) else {
+            panic!("the appended source and reader finish in dependency order")
+        };
+        assert_eq!(pipeline, PipelineId(expected));
+        dispatcher.finish(dispatcher.pushes(pipeline));
+    }
+    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
+    dispatcher.hold_pipeline(PipelineId(0), false);
+    let Next::Finish { pipeline, .. } = dispatcher.try_claim(None) else {
+        panic!("the original source stays unfinished until its hold is released")
+    };
+    assert_eq!(pipeline, PipelineId(0));
+    dispatcher.finish(dispatcher.pushes(pipeline));
+    assert!(matches!(dispatcher.try_claim(None), Next::Done));
+}
+
+#[test]
+fn appended_shared_pushes_are_deduplicated_without_reusing_the_original_graphs_record() {
+    let reads = vec![vec![], vec![0], vec![], vec![], vec![2, 3]];
+    let breakers: Vec<BreakerHandle> = (0..reads.len())
+        .map(|_| Scripted::holding(ints().universal_guard()) as BreakerHandle)
+        .collect();
+    wire(&reads, &breakers);
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    let mut body = Dispatcher::new(vec![vec![], vec![], vec![0, 1]], UNBOUNDED);
+    body.share_pushes(&[PipelineId(0), PipelineId(1)]);
+    assert_eq!(dispatcher.append_graph(body), 2);
+
+    for pipeline in [0, 2, 3] {
+        let mut pushes = dispatcher.pushes(PipelineId(pipeline));
+        {
+            let breaker = breakers[pipeline].borrow();
+            pushes.push_final(breaker.as_producer().expect("a scripted breaker pushes"));
+        }
+        dispatcher.land(pushes);
+    }
+    for expected in [1, 4] {
+        let Next::Package(package) = dispatcher.try_claim(None) else {
+            panic!("each graph's reader receives one retained-output package")
+        };
+        assert_eq!(package.pipeline, PipelineId(expected));
+        assert_eq!(package.guard, ints().universal_guard());
+        dispatcher.acknowledge(package);
+    }
+    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
+}
+
+#[test]
+fn an_added_step_pipeline_waits_for_its_body_and_its_claim_hold() {
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![]], UNBOUNDED);
+    dispatcher.close(PipelineId(0));
+    dispatcher.hold_pipeline(PipelineId(0), true);
+    let step = dispatcher.add_pipeline(vec![PipelineId(1)]);
+    assert_eq!(step, PipelineId(2));
+    dispatcher.order(step);
+    dispatcher.follow(step, PipelineId(1));
+    dispatcher.hold_pipeline(step, true);
+    let guard = keys_between(0, 0);
+    dispatcher.notify(PipelineId(1), &guard);
+    dispatcher.queue_round(step, &guard);
+    dispatcher.close(PipelineId(1));
+
+    let Next::Package(body) = dispatcher.try_claim(None) else {
+        panic!("the body runs while the step is held")
+    };
+    assert_eq!(body.pipeline, PipelineId(1));
+    dispatcher.acknowledge(body);
+    let Next::Finish { pipeline, .. } = dispatcher.try_claim(None) else {
+        panic!("the body's close is retained")
+    };
+    assert_eq!(pipeline, PipelineId(1));
+    dispatcher.finish(dispatcher.pushes(pipeline));
+    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
+
+    dispatcher.hold_pipeline(step, false);
+    let Next::Package(package) = dispatcher.try_claim(None) else {
+        panic!("the settled step becomes claimable after releasing its hold")
+    };
+    assert_eq!(package.pipeline, step);
+    assert_eq!(package.guard, guard);
+    dispatcher.acknowledge(package);
+    let Next::Finish { pipeline, .. } = dispatcher.try_claim(None) else {
+        panic!("the step finishes after consuming its package")
+    };
+    assert_eq!(pipeline, step);
+    dispatcher.finish(dispatcher.pushes(pipeline));
+    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
+    dispatcher.hold_pipeline(PipelineId(0), false);
+    let Next::Finish { pipeline, .. } = dispatcher.try_claim(None) else {
+        panic!("the original source remains in the shared finish count")
+    };
+    assert_eq!(pipeline, PipelineId(0));
+    dispatcher.finish(dispatcher.pushes(pipeline));
+    assert!(matches!(dispatcher.try_claim(None), Next::Done));
+}
+
+#[test]
+fn appended_ingress_keeps_external_pushes_at_the_control_boundary() {
+    let input = ints();
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    dispatcher.read_whole(PipelineId(1), &input);
+    let mut body = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    body.restrict_ingress(PipelineId(1), 0..2);
+    assert_eq!(dispatcher.append_graph(body), 2);
+
+    let entry =
+        crate::interpreter::dispatcher::Entry::new(PipelineId(3), input.clone(), Box::new(|| {}));
+    *entry.decided_target().borrow_mut() = Some((PipelineId(1), input.clone()));
+    let consumer: crate::interpreter::scheduler::SharedConsumer = Rc::new(RefCell::new(entry));
+
+    for (pusher, expected_reader) in [(0, 1), (2, 3)] {
+        let breaker = Scripted::holding(input.universal_guard());
+        breaker.borrow_mut().base_mut().pushing_to(consumer.clone());
+        let mut pushes = dispatcher.pushes(PipelineId(pusher));
+        pushes.push_final(&*breaker.borrow());
+        dispatcher.land(pushes);
+        let Next::Package(package) = dispatcher.try_claim(None) else {
+            panic!("external completeness opens the control, and internal output opens the body")
+        };
+        assert_eq!(package.pipeline, PipelineId(expected_reader));
+        assert_eq!(package.guard, input.universal_guard());
+        dispatcher.acknowledge(package);
+        assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
+    }
+}

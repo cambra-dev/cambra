@@ -878,7 +878,8 @@ after the first panics naming the gap instead of answering a smaller or larger r
 leaves is a region beneath the outermost keys. A reader's chain may restate only the outermost keys
 (`TileProducer::restates`), so it answers `pushes_while_consuming` with `false` and pushes at
 `finish`, and inside a loop's rounds where each round has every inner pipeline push what it holds
-(`LoopScope::run_round`). A push beneath the outermost keys lands in each reader as a projection at
+through the execution handler's scope-local publication pass. A push beneath the outermost keys lands
+in each reader as a projection at
 its level ([The dispatcher](#the-dispatcher)).
 
 ### Memo
@@ -1525,7 +1526,7 @@ pushed. A unit of work is claimable once that union covers the region the work p
 - a row a push, an arrival or a loop's round brings
   ([Reading each row once](#reading-each-row-once)).
 
-The rule is the same in a loop's scope's dispatcher, where the keys carry the loop's position. A
+The rule is the same for a loop's body pipelines, where the keys carry the loop's position. A
 nested loop's scope there takes a round's row once the pipelines its rounds pull are quiescent
 (`Dispatcher::follow`), since it reads them by pull and no decided push of theirs reaches it.
 
@@ -1611,101 +1612,81 @@ stay parked until the source yields everything, where the sum is decided.
 
 #### A loop in rounds
 
-An induction loop runs in rounds, one per position. The breakers inside the store's cycle are the
-pipelines of a dispatcher of their own, which runs one round per position, and the store steps after
-each round. `run_program` plans the loop's scope (`LoopScope`, `dispatcher/loop_scope.rs`) as
-the breaker of a pipeline of the run's dispatcher where it reaches a reader slot of the store's
-fan-out. The walk tags each breaker with the dispatcher it runs in, the scope whose cycle it is
-inside or the run's, and a read between two dispatchers is a read of the scope's pipeline in the
-run's dispatcher. The scope's input is the store's, and its pipeline is ordered and reads its input
-whole. The store is the breaker of no pipeline, and its entry stays unplaced.
+An induction loop runs one round per source position. Its request pipeline, body pipelines and ordered
+store-step pipeline share the run's dispatcher. `LoopScope` retains per-run control state: the pending
+request package, current round and global pipeline IDs. The store retains the accumulator and its
+published snapshot. `Dispatcher` queues guards and tracks claims, acknowledgements and finishes; it
+holds no loop or operator state.
 
-The drive (`InductionDriverProducer`) is a pipeline breaker, and its pipeline is a source of the
-scope's dispatcher. A package names the position a round runs, and a consume emits it where the
-store has decided the position before it, as a pull does. A consuming drive answers a pull from
-what its last consume rendered, and wakes no consumer. The entry in front of its source stops a
-push from beneath while it is unplaced; a round places it once the pipelines beneath the source
-have finished. The drive's nested inputs sit behind entries no planner places. A consume of the
-scope runs a round per position of its morsel that the drive emits, the next its source delivers
-(`TileProducer::next_position`), until the store is terminal; a position the source filters out
-runs none:
+The planner configures each body graph locally, removes whole-input breakers that must remain in pull
+mode, and appends the configured graphs to the run. Composition remaps dependency, follower and shared
+push-record indices. The `Planned.rounds` report remains a tree with indices local to each sibling
+list; those indices describe planning and are not runtime pipeline IDs.
 
-1. The store has the operators inside its cycle read again (`TileProducer::read_cycle_again`). Its
-   last step pulled the operators in pull mode there before the pipelines they read took this
-   position.
-2. Each source is notified of the position (`Dispatcher::notify`), and the scope of each loop
-   nested in this one is queued it (`Dispatcher::queue_for`).
-3. The scope's dispatcher runs the round (`LoopScope::run_round`): every inner pipeline pushes what
-   it holds and no push named, and the dispatcher runs until nothing is claimable, again until a
-   pass changes nothing. No finish ends a round, so this is where a pipeline the round queues
-   nothing, as the drive in a closing round, states what it read past, and where a breaker that
-   pushes only at its finish, as `MapAggregate`, hands the round's groups on. The pipelines that
-   follow others are held while those passes run, and released for one claim at a time, after which
-   the passes settle again.
-4. The store consumes the position, which one step decides and releases
-   ([A store as a breaker](#a-store-as-a-breaker)).
+A scope's request pipeline is ordered. Claiming a request opens its store if necessary and queues one
+round. The execution handler retains the request's acknowledgement until every position and closing
+round in that request has stepped. Other pipelines remain claimable during that interval. A nested
+scope's request names one row of its store and remains in flight until that row finishes, so the
+outer store-step cannot pass a pending nested row.
 
-`LoopScope` retains one request across its rounds. `begin_request` opens the store on the first
-request and reads the source at a nested row's start. `queue_next_round` queues one position or a
-closing row; `complete_round` steps that round after its body settles. No next round is queued before
-the previous round steps. A request ends once its positions and any closing round have completed.
-The run's execution handler retains the claimed scope package while it advances these operations
-one round at a time. A completed request publishes the store's new held and decided regions before
-it is acknowledged. Other run pipelines can consume between rounds. The synchronous `consume_impl`
-adapter drives nested scopes through the same request operations.
+A round proceeds as follows:
 
-A consume of the drive emits a position only where the package names its whole path at the
-positions' level, so a round emits one position and a round at a row emits none; a pull in pull mode
-emits the next position whatever it names. A consume at no position reads the drive's source and
-emits nothing. A dispatched run notifies the drive of nothing. A consume of a scope whose store has
-no rows above it has the drive read its source again once it has emitted every position it read and
-the store is not terminal, at most once per consume; a consume of a nested row has it read at the
-row's start and end. The first consume of the scope has the drive consume at no position, then steps
-the store once, which opens the store at its seed and publishes it: the drive reads the open store
-before it emits a position, and emits none outside a round. The scope pushes the store at the finish
-where the store is terminal, to the readers of the store's fan-out.
+1. The store has its cycle's pull-mode operators read again (`TileProducer::read_cycle_again`). The
+   previous step pulled them before the body pipelines consumed this position.
+2. Explicitly queued source pipelines receive the position. Nested requests and closing-row readers
+   receive the region restated at their own input entries. The store-step pipeline receives one
+   package for the same round, after those body packages have been queued.
+3. The body pipelines consume through the shared dispatcher. Their held and decided output pushes
+   land before their packages are acknowledged.
+4. Once claims drain, the execution handler has the active scope's body pipelines push held state.
+   Followers remain held until that scope's publication pass changes nothing. `MapAggregate` can be
+   quiescent while it still holds unpublished groups, so quiescence alone does not release a step.
+5. The serial execution driver releases followers for one claim, then holds them again before another
+   publication pass. The ordered step follows every direct body pipeline and becomes claimable only
+   after they are quiescent. Its handler steps the store and queues the next position or closing row.
 
-The scope places its pipelines' entries only while it runs (`Placed`). A push into the cycle comes
-from a pipeline beneath it, which has finished before the scope consumes, and stops at the unplaced
-entry rather than queue for a pipeline of the scope's dispatcher. The scope reaches a breaker inside
-the cycle by walking the store's chain with the store's cell borrowed, so a read of the store
-through its recurrence is answered from the published snapshot.
+The production driver coordinates one claim at a time because breakers use `Rc<RefCell<_>>`. The
+shared graph does not establish an atomic one-claim settlement permit for several execution workers.
+A scope compares the dispatcher generation only around its own publication pass; no other claim runs
+during that pass, so another scope's work cannot be mistaken for one of these pushes.
 
-A pipeline the scope's dispatcher would read whole, which happens only once the sources beneath it
-have closed, stays in pull mode, and its readers read the pipelines beneath it; the round has it
-read again.
+Body pipelines are held from claims and finishes until their first request activates them. Their
+non-source entries then stay placed at global IDs until the scope finishes. Each body entry accepts
+pushes only from the configured body graph (`Dispatcher::restrict_ingress`); a push from outside that
+graph stops there, with decided pushes following the entry's completeness target as at an unplaced
+entry. Cross-scope dependencies are represented by request pipelines instead of entering a body
+outside its current round.
 
-A loop nested in another runs as a scope inside the scope of the loop around it: a pipeline of that
-scope's dispatcher, with a dispatcher of its own for the whole run. A scope whose store has 𝑑 row
-levels above its positions runs its rounds at paths of 𝑑 + 1 keys (`Projection::of_path`). The
-scope around it queues it each round's position, a row of its store, once the pipelines it reads
-have finished the round, and a consume of the row runs:
+The drive (`InductionDriverProducer`) is an explicitly queued source pipeline. Its source entry stays
+unplaced: external source pushes state completeness at the scope request's input through its
+`DecidedTarget`, while the controller alone queues positions for the drive. The drive consumes at an
+empty guard to read its source without emitting a position. A position package emits only the next
+position it covers; a consuming pull returns that rendering and advances nothing.
 
-1. Before the row's rounds, the drive consumes at no position: the nested loop's source is read
-   through pipelines of the scope around it, which take their packages from the dispatcher and
-   notify no one.
-2. A round per position of the row that the drive emits, each at the position's path.
-3. A round at the row, which closes it. The drive consumes at no position again, and the row is
-   queued to every other inner pipeline: a drive states a row complete only once the store has
-   decided every position of it, and a consuming memo answers from what it read. The store's step
-   then releases the row of its body whole.
+The first request has the drive read its source before the store's opening step publishes its seed.
+A flat request reads the source again after its buffered positions run out, at most once per request.
+A nested row reads at its start and end. Its closing round queues the whole row to every body pipeline
+except the sources in the store's chain, including a row containing no positions. The last position
+alone does not state the row's end, so this closing round has every reader observe that completeness
+and lets the store release the row whole.
 
-A store per row of a comprehension, as a function whose loop the comprehension calls once per row
-makes one, has a row level for the comprehension's rows. Outside every loop's cycle it runs as a
-scope in the run's dispatcher. Its pipeline reads its input whole, and its consume runs a round per
-position of every row, in order, then one round at the whole input, which closes every row.
+A flat package can name positions the source filtered out, or a delivery that only closes the source.
+If it emitted no position and its input remains unreleased, it runs a closing round at that package.
+A completed request publishes the store's new held and decided regions before acknowledging the
+request. This preserves the publication boundary for stores whose intermediate tagged frontier has
+no untyped prefix spelling. Flat stores over ordinary positions can expose their decided positions;
+other stores hold nothing short of terminal.
 
-A nested store releases its body a position at a time and each row it decides whole, at every level
-above its positions. Its readers release its rows as they finish with them, so its offer cuts the
-rows released since its last step from the snapshot.
+Finishing a request pipeline closes its body sources. The execution handler retains the finish until
+all body and step pipelines have finished in the same dispatcher. The store is terminal then; its
+final push lands before the request pipeline's finish releases its readers. A nested store releases
+its body a position at a time and each row it decides whole. Its readers release their rows as they
+finish with them, and the store's offer cuts rows released since its last step from the snapshot.
 
-A round of a scope whose store has rows above its positions pulls each operator beneath the
-outermost keys at a level the operator restates, and the planner asserts it once every scope is
-built (`Planner::unrestated_in_rounds`). Its walk starts at each breaker such a scope keeps, at the
-level of its rounds, and passes each operator's level to its inputs as `TileProducer::input_level`
-declares. It ends at every breaker that consumes, in any dispatcher, since that breaker's consume
-pulls its inputs and its own scope checks them; a breaker whose pipeline its dispatcher would read
-whole runs in pull mode and passes the pull on.
+A scope whose store has row levels above its positions pulls at paths of those rows and the position
+(`Projection::of_path`). The planner checks that every pulled operator restates that level
+(`Planner::unrestated_in_rounds`). The walk stops at consuming breakers: their consumes pull their
+own inputs, and their scopes check those pulls. A breaker left in pull mode passes the pull on.
 
 #### One finish per pipeline
 

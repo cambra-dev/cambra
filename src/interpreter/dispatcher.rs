@@ -356,6 +356,7 @@ struct PipelineInfo {
     /// Per pipeline it reads, in the order of its `reads`, whether it decides the input only once
     /// it is whole ([`decides_whole_only`](Dispatcher::decides_whole_only)).
     whole_only: Vec<bool>,
+    ingress: Option<std::ops::Range<usize>>,
 }
 
 /// A region a pipeline parked ([`Dispatcher::park`]), and whether a release may hand out the part
@@ -400,6 +401,7 @@ struct PipelineState {
     in_flight: AtomicBool,
     /// Whether this pipeline waits for its loop's round to settle before following its reads.
     followers_held: AtomicBool,
+    held: AtomicBool,
     /// For a pipeline that parks its arrivals ([`Dispatcher::park`]), the morsels notified that
     /// the pipelines it reads have not decided yet.
     // shared-state-ok: guards naming regions of the pipeline's input, which its notifies and the
@@ -449,6 +451,25 @@ impl Decided {
 }
 
 impl PipelineState {
+    fn new(reads: usize) -> Self {
+        Self {
+            queue: Queue::new(),
+            claimed: AtomicUsize::new(0),
+            phase: AtomicPhase::new(Phase::Running),
+            unfinished: AtomicUsize::new(reads),
+            pushed: Mutex::new(None),
+            closed: AtomicBool::new(false),
+            decided: Mutex::new(Vec::new()),
+            queued: AtomicUsize::new(0),
+            acknowledged: AtomicUsize::new(0),
+            in_flight: AtomicBool::new(false),
+            followers_held: AtomicBool::new(false),
+            held: AtomicBool::new(false),
+            parked: Mutex::new(Vec::new()),
+            brought: Mutex::new(None),
+        }
+    }
+
     /// How many of a source's packages are queued and not acknowledged. The acknowledgements
     /// are read first: a notify counts its packages queued before it appends them, so a package
     /// is acknowledged only after it was counted, and the queued count read after is at least as
@@ -546,25 +567,12 @@ impl Dispatcher {
                 opens: false,
                 reach: Vec::new(),
                 whole_only: Vec::new(),
+                ingress: None,
             })
             .collect();
         let states = infos
             .iter()
-            .map(|info: &PipelineInfo| PipelineState {
-                queue: Queue::new(),
-                claimed: AtomicUsize::new(0),
-                phase: AtomicPhase::new(Phase::Running),
-                unfinished: AtomicUsize::new(info.reads.len()),
-                pushed: Mutex::new(None),
-                closed: AtomicBool::new(false),
-                decided: Mutex::new(Vec::new()),
-                queued: AtomicUsize::new(0),
-                acknowledged: AtomicUsize::new(0),
-                in_flight: AtomicBool::new(false),
-                followers_held: AtomicBool::new(false),
-                parked: Mutex::new(Vec::new()),
-                brought: Mutex::new(None),
-            })
+            .map(|info: &PipelineInfo| PipelineState::new(info.reads.len()))
             .collect();
         Self {
             morsel_rows,
@@ -581,6 +589,93 @@ impl Dispatcher {
             events: Mutex::new(Vec::new()),
             #[cfg(test)]
             recording: true,
+        }
+    }
+
+    /// Append a configured graph before execution and return its pipeline offset.
+    pub(crate) fn append_graph(&mut self, mut graph: Dispatcher) -> usize {
+        assert_eq!(
+            self.morsel_rows, graph.morsel_rows,
+            "composed graphs share their morsel size"
+        );
+        assert!(
+            graph
+                .states
+                .iter()
+                .all(|state| state.claimed.load(Ordering::Relaxed) == 0
+                    && state.phase.load() == Phase::Running),
+            "a graph is composed before it executes"
+        );
+        let offset = self.infos.len();
+        for info in &mut graph.infos {
+            for pipeline in info
+                .reads
+                .iter_mut()
+                .chain(&mut info.readers)
+                .chain(&mut info.follows)
+                .chain(&mut info.pushed_rows)
+            {
+                *pipeline += offset;
+            }
+            info.pushes_with += offset;
+            if let Some(ingress) = &mut info.ingress {
+                ingress.start += offset;
+                ingress.end += offset;
+            }
+        }
+        *self.unfinished.get_mut() += graph.states.len();
+        self.infos.append(&mut graph.infos);
+        self.states.append(&mut graph.states);
+        self.done.store(false, Ordering::Relaxed);
+        offset
+    }
+
+    /// Add a pipeline after its dependencies, before execution starts.
+    pub(crate) fn add_pipeline(&mut self, reads: Vec<PipelineId>) -> PipelineId {
+        let pipeline = self.infos.len();
+        let reads: Vec<usize> = reads.into_iter().map(|read| read.0).collect();
+        for (at, &read) in reads.iter().enumerate() {
+            assert!(
+                read < pipeline && !reads[..at].contains(&read),
+                "a new pipeline reads existing pipelines once"
+            );
+            self.infos[read].readers.push(pipeline);
+        }
+        self.states.push(PipelineState::new(reads.len()));
+        self.infos.push(PipelineInfo {
+            reads,
+            readers: Vec::new(),
+            ordered: false,
+            whole: false,
+            follows: Vec::new(),
+            limit: usize::MAX,
+            pushes_with: pipeline,
+            arrivals: false,
+            pushed_rows: Vec::new(),
+            parks: false,
+            opens: false,
+            reach: Vec::new(),
+            whole_only: Vec::new(),
+            ingress: None,
+        });
+        *self.unfinished.get_mut() += 1;
+        self.done.store(false, Ordering::Relaxed);
+        PipelineId(pipeline)
+    }
+
+    /// Accept pushes at this entry only from the configured input graph.
+    pub(crate) fn restrict_ingress(&mut self, pipeline: PipelineId, from: std::ops::Range<usize>) {
+        assert!(
+            from.start <= from.end && from.end <= self.infos.len(),
+            "an ingress range names planned pipelines"
+        );
+        self.infos[pipeline.0].ingress = Some(from);
+    }
+
+    /// Hold a pipeline's packages and finish until it is activated by its execution handler.
+    pub(crate) fn hold_pipeline(&self, pipeline: PipelineId, held: bool) {
+        if self.state(pipeline).held.swap(held, Ordering::SeqCst) != held {
+            self.advance();
         }
     }
 
@@ -1076,7 +1171,8 @@ impl Dispatcher {
     /// Hold the given pipelines that follow others ([`follow`](Self::follow)) from taking a
     /// package, or release them. A loop's round holds them while the pipelines they follow push
     /// what they decided. A breaker that pushes only what `push_held` asks it to, as `MapAggregate`,
-    /// is quiescent before its readers have taken what it decided (`LoopScope::run_round`).
+    /// is quiescent before its readers have taken what it decided. See
+    /// `src/interpreter/design-operators.md`, "A loop in rounds".
     pub(crate) fn hold_followers(
         &self,
         pipelines: impl IntoIterator<Item = PipelineId>,
@@ -1410,6 +1506,9 @@ impl Dispatcher {
     /// The package at the front of `pipeline`'s queue, recorded as claimed, where a claim may take
     /// one. An ordered pipeline has at most one package in flight.
     fn claim_from(&self, pipeline: usize) -> Option<WorkPackage> {
+        if self.states[pipeline].held.load(Ordering::SeqCst) {
+            return None;
+        }
         if !self.infos[pipeline].ordered {
             return self.claim_in(pipeline);
         }
@@ -1486,7 +1585,8 @@ impl Dispatcher {
         // One read of the count and the close: nothing is reserved after the close, so the count
         // of a closed queue is its last.
         let reserved = state.queue.reserved.load(Ordering::Acquire);
-        state.phase.load() == Phase::Running
+        !state.held.load(Ordering::SeqCst)
+            && state.phase.load() == Phase::Running
             && reserved & CLOSED != 0
             && state.acknowledged.load(Ordering::Acquire) == reserved & !CLOSED
     }
@@ -2177,6 +2277,17 @@ pub(crate) struct Arrival {
 }
 
 impl Landing<'_> {
+    fn accepts_entry(&self, pipeline: PipelineId) -> bool {
+        match &self.target {
+            Target::Queue { dispatcher } | Target::Decided { dispatcher, .. } => dispatcher.infos
+                [pipeline.0]
+                .ingress
+                .as_ref()
+                .is_none_or(|from| from.contains(&self.from)),
+            Target::Probe(_) | Target::ProbeDecided(_) => true,
+        }
+    }
+
     /// A landing that records where `from`'s push arrives, and queues nothing.
     pub(crate) fn probe(from: PipelineId) -> Landing<'static> {
         Landing {
@@ -2512,7 +2623,9 @@ impl Consumer for Entry {
     }
 
     fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
-        if let Some(pipeline) = self.pipeline.get() {
+        if let Some(pipeline) = self.pipeline.get()
+            && landing.accepts_entry(pipeline)
+        {
             if let Some(guard) = pushed_guard(region, &self.input) {
                 landing.queue(pipeline, &guard);
             }
@@ -2818,18 +2931,22 @@ fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPac
     dispatcher.acknowledge(package);
 }
 
-/// Have every pipeline push what its breaker holds and no push named before. A run after a pause
+/// Have the selected pipelines push what their breakers hold and no push named before. A run after a pause
 /// or a reload starts over breakers an earlier run consumed into, and has no finish before its
 /// sources close, so its start is where its readers learn what the breakers already hold; each
 /// round of a loop, which no finish ends either, does the same ([`LoopScope`]).
 ///
 /// [`LoopScope`]: loop_scope::LoopScope
-pub(crate) fn push_held(dispatcher: &Dispatcher, reach: &mut Reach<'_>) {
-    for pipeline in 0..dispatcher.infos.len() {
+fn push_held(
+    dispatcher: &Dispatcher,
+    reach: &mut Reach<'_>,
+    pipelines: impl IntoIterator<Item = PipelineId>,
+) {
+    for pipeline in pipelines {
         let mut landed = None;
-        reach(PipelineId(pipeline), &mut |breaker, _| {
+        reach(pipeline, &mut |breaker, _| {
             breaker.pushing(&mut |producer| {
-                let mut pushes = dispatcher.pushes(PipelineId(pipeline));
+                let mut pushes = dispatcher.pushes(pipeline);
                 pushes.push_final(producer);
                 landed = Some(pushes);
             });
