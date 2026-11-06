@@ -1378,11 +1378,16 @@ in one of four ways (`LivePipeline::poll`):
   everything (`Planned::whole`). The widened pushes of several ranges, as of a sink fed from
   two sites, name their parts of the input together.
 - The range is read inside a loop's scope, whose pipeline stands for every pipeline inside it
-  (`Planner::members`). Where the range's routes reach the scope's own drive keeping its keys, and
-  a push of one key reaches the drive as that key, the scope is notified of each delivery's keys as
-  positions of its rounds. Where it reaches no drive of the scope, the source is
-  read inside a loop nested in it, whose rows end only once the source yields everything, so the
-  scope reads its input whole then, as pull mode waits for each row.
+  (`Planner::members`). Where the range's routes reach the scope's own drive keeping its keys, and a
+  push of one key reaches the drive as that key, the scope is notified of each delivery's keys as
+  positions of its rounds. Where it reaches no drive of the scope, the source is read inside a loop
+  nested in it, whose rows end only once the source yields everything, so the scope reads its input
+  whole then, as pull mode waits for each row. A loop's scope with no range of its own that reads
+  only pipelines ranging over a live source, as a loop over a let-bound source reads the source's
+  `Memo`, takes those ranges as its own where each pipeline's pushes reach its drive as the drive's
+  positions: it is notified of each delivery as rounds, and parks each until those pipelines have
+  decided it (`Dispatcher::park`). A loop over positions tagged by a concatenation's arm
+  (`stdin() ++ ["end"]`) is read whole.
 - The range is read under a writer of a transaction store, whose source is the input of the
   writer's pipeline, read behind an entry no planner places: that pipeline is notified of each
   delivery's keys as its items.

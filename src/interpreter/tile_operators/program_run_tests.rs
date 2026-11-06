@@ -1598,7 +1598,8 @@ fn a_drive_over_a_live_source_reads_past_empty_positions(
 }
 
 /// A loop over a let-bound map of a live source reads the map's `Memo`, the pipeline the run
-/// notifies of each delivery, whole once that pipeline has finished.
+/// notifies of each delivery. The map's keys reach the loop's drive as its positions, so the loop's
+/// scope is notified of each delivery as rounds too, and parks it until the `Memo` has decided it.
 #[rstest_log::rstest]
 #[case::two_batches(two_batches(), 30)]
 #[case::one_key_batches(one_key_batches(10), 110)]
@@ -1620,11 +1621,15 @@ fn a_loop_over_a_let_bound_map_of_a_live_source(
     assert!(
         planned
             .iter()
-            .any(|plan| plan.live && plan.name.starts_with("Memo"))
-            && planned
-                .iter()
-                .any(|plan| plan.whole && plan.name.starts_with("LoopScope")),
-        "the map's `Memo` is the live pipeline, and the loop's scope reads it whole: {planned:?}"
+            .any(|plan| plan.live && plan.name.starts_with("Memo")),
+        "the map's `Memo` is a live pipeline: {planned:?}"
+    );
+    assert!(
+        planned.iter().any(|plan| plan.name.starts_with("LoopScope")
+            && plan.live
+            && !plan.whole
+            && plan.held),
+        "the loop's scope takes the deliveries as rounds, parked on the `Memo`: {planned:?}"
     );
 }
 
