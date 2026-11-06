@@ -308,7 +308,7 @@ impl Refusals {
                     self.expr(&arg.value);
                 }
             }
-            ChlStmt::Return(None) | ChlStmt::Pass | ChlStmt::Error => {}
+            ChlStmt::Return(None) | ChlStmt::Pass | ChlStmt::Error { .. } => {}
         }
     }
 

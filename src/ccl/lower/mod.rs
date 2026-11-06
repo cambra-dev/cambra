@@ -180,6 +180,19 @@ pub enum LoweringError {
         /// Whether a recovery placeholder contains this failure.
         stood_in: bool,
     },
+    /// A construct holding a part the parser could not read, which lowering cannot give a
+    /// meaning: a type, where a declaration states one in full, or a statement in a block
+    /// that takes only some kinds of statement, a loop's or a transaction's. It fails the
+    /// construct as any lowering error does, and the parse error is what reports it, so the
+    /// compile does not report it again ([`LoweringError::is_parse_hole`]).
+    ParseHole {
+        /// Span of the part the parser could not read.
+        span: Span,
+        /// Labels a caller adds, as for `Unsupported`; never shown.
+        related: Vec<(Span, String)>,
+        /// Whether a recovery placeholder contains this failure.
+        stood_in: bool,
+    },
 }
 
 impl std::fmt::Display for LoweringError {
@@ -190,6 +203,7 @@ impl std::fmt::Display for LoweringError {
         match self {
             LoweringError::Unsupported { message, .. }
             | LoweringError::Internal { message, .. } => f.write_str(message),
+            LoweringError::ParseHole { .. } => f.write_str("a part the parser could not read"),
         }
     }
 }
@@ -234,20 +248,40 @@ impl LoweringError {
     /// Whether a recovery placeholder contains this failure.
     pub(crate) fn has_stand_in(&self) -> bool {
         match self {
-            Self::Unsupported { stood_in, .. } | Self::Internal { stood_in, .. } => *stood_in,
+            Self::Unsupported { stood_in, .. }
+            | Self::Internal { stood_in, .. }
+            | Self::ParseHole { stood_in, .. } => *stood_in,
         }
     }
 
     fn stand_in_mut(&mut self) -> &mut bool {
         match self {
-            Self::Unsupported { stood_in, .. } | Self::Internal { stood_in, .. } => stood_in,
+            Self::Unsupported { stood_in, .. }
+            | Self::Internal { stood_in, .. }
+            | Self::ParseHole { stood_in, .. } => stood_in,
         }
+    }
+
+    /// A [`LoweringError::ParseHole`] at `span`.
+    pub fn parse_hole(span: Span) -> Self {
+        LoweringError::ParseHole {
+            span,
+            related: Vec::new(),
+            stood_in: false,
+        }
+    }
+
+    /// Whether this error is a [`LoweringError::ParseHole`], which its parse error reports.
+    pub fn is_parse_hole(&self) -> bool {
+        matches!(self, LoweringError::ParseHole { .. })
     }
 
     /// Primary source span of this error.
     pub fn span(&self) -> Span {
         match self {
-            LoweringError::Unsupported { span, .. } | LoweringError::Internal { span, .. } => *span,
+            LoweringError::Unsupported { span, .. }
+            | LoweringError::Internal { span, .. }
+            | LoweringError::ParseHole { span, .. } => *span,
         }
     }
 
@@ -255,7 +289,8 @@ impl LoweringError {
     pub fn related(&self) -> &Vec<(Span, String)> {
         match self {
             LoweringError::Unsupported { related, .. }
-            | LoweringError::Internal { related, .. } => related,
+            | LoweringError::Internal { related, .. }
+            | LoweringError::ParseHole { related, .. } => related,
         }
     }
 
@@ -263,7 +298,8 @@ impl LoweringError {
     pub fn related_mut(&mut self) -> &mut Vec<(Span, String)> {
         match self {
             LoweringError::Unsupported { related, .. }
-            | LoweringError::Internal { related, .. } => related,
+            | LoweringError::Internal { related, .. }
+            | LoweringError::ParseHole { related, .. } => related,
         }
     }
 
@@ -506,6 +542,13 @@ pub struct LoweringContext {
     /// α-unique binding (see [`crate::ccl::transact_phase::collect_txn_mut_vars`]),
     /// so this set is no longer handed to the phase.
     pub(super) transactional_vars: HashSet<String>,
+    /// The names a statement the parser could not read binds ([`ChlStmt::Error`]), values and
+    /// modules alike, whose declarations lowering cannot see: a check that asks what one was
+    /// declared as fails as a [`LoweringError::ParseHole`] rather than refusing it.
+    pub(super) unreadable: HashSet<String>,
+    /// Whether a statement the parser could not read binds a module name no one can read, an
+    /// `import` or `run` cut off after its `as`: a qualifier that names no module may be it.
+    pub(super) unreadable_module: bool,
 
     /// Whether lowering is currently inside a `with begin():` transaction block.
     /// Inside one, a bare read of a transactional mutable variable is a snapshot read (fine)
@@ -2118,7 +2161,7 @@ pub(super) fn library_statement_refusals(stmts: &[Spanned<ChlStmt>]) -> Vec<Lowe
                 | ChlStmt::Import { .. }
                 | ChlStmt::Param { .. }
                 | ChlStmt::Pass
-                | ChlStmt::Error => return None,
+                | ChlStmt::Error { .. } => return None,
                 ChlStmt::Run { .. } => {
                     "an imported module declares no run, since the import would reach the run's \
                      state: run this module instead"

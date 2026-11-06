@@ -274,7 +274,7 @@ impl Walk {
                 }
             }
             Stmt::Pub { stmt, .. } => self.stmt(stmt),
-            Stmt::Return(None) | Stmt::Discard(_) | Stmt::Pass | Stmt::Error => {}
+            Stmt::Return(None) | Stmt::Discard(_) | Stmt::Pass | Stmt::Error { .. } => {}
         }
     }
 

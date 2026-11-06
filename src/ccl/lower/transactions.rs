@@ -331,6 +331,9 @@ fn lower_tx_block_scoped(
                     "nested `with begin():` transactions are not supported",
                 ));
             }
+            // A statement the parser could not read fails the block, which its parse error
+            // reports.
+            ChlStmt::Error { .. } => return Err(LoweringError::parse_hole(stmt.span)),
             _ => {
                 return Err(LoweringError::unsupported(
                     stmt.span,
