@@ -862,6 +862,16 @@ refined type must leave the node reconstructable under the checking rules; see
 Post-planning checks use structural predicate equality. Semantic entailment at that stage requires
 an SMT encoding for point-free expressions.
 
+#### The check after planning reads planning's rewrites back
+
+The check after planning rebuilds every node's type, a dependent result included, and compares it
+with the recorded type in full. Planning rewrites terms in the tree but not the copies of them that
+types quote, so a rebuilt type can quote the planned spelling of a term the recorded type quotes
+unplanned. Each such rewrite has a reading in the normal form under which the two spellings are
+equal ([Predicates are compared by normal form](#predicates-are-compared-by-normal-form)). A
+rewrite with no reading leaves the two types unequal, and the check reports the mismatch
+(`api::typecheck_planned`).
+
 ---
 
 ## 3. Specialization and Predicate Ownership
@@ -1323,10 +1333,13 @@ form. `ccl_utils::normal_form` computes it, and `Refinement` caches it beside th
 computed for.
 
 A type quotes terms, and passes respell the terms it quotes. A-normalization names operands,
-inlining moves a definition into place, and lambda elimination rewrites a definition point-free
-while a type's copy keeps its lambdas. The normal form is the spelling every such copy reaches:
+inlining moves a definition into place, lambda elimination rewrites a definition point-free while a
+type's copy keeps its lambdas, and planning stages a term for execution. The normal form is the
+spelling every such copy reaches. Each rule below is an equivalence: the two spellings it relates
+give the same value at every argument the term is applied at.
 
-- a transparent `let` is discharged, and an applied lambda is β-reduced;
+- a transparent `let` is discharged, and an applied lambda is β-reduced. `simplify`'s
+  `let __output = 𝑒 in __output`, rewritten to `𝑒` during planning, reads back by this rule;
 - an applied `cast` reads its value, since a cast re-views a collection's domain and leaves what
   it holds at a key unchanged;
 - an applied eliminated combinator reads back to the term it stands for: `id`, `const`, a `zip`
@@ -1334,19 +1347,29 @@ while a type's copy keeps its lambdas. The normal form is the spelling every suc
 - an applied value `Case` that lambda elimination fanned out over its input,
   `𝑥 ▷ (⊔ᵢ (π̂ᵢ ▷ filter_values ≫ 𝑒ᵢ))`, reads back as `{ 𝑔ᵢ → 𝑥 ▷ 𝑒ᵢ }`. Leg `𝑖` filters by
   the first-match predicate `π̂ᵢ = 𝑔ᵢ ∧ ¬𝑔₀ ∧ … ∧ ¬𝑔ᵢ₋₁`, and peeling the earlier guards off it
-  leaves `𝑔ᵢ`. A type quoting a conditional chosen per row then compares equal to the point-free
-  definition lambda elimination wrote for it;
-- an applied staged form reads as what it stages. Planning writes `curry(𝑔)` over a dependent
-  domain as `(𝐹, 𝑔) ▷ curry_over`, which reads as `curry(𝑔)`, and a filter as `𝑚 ▷ filter_values`,
-  the identity restricted to what `𝑚` keeps, which reads as `id`. A correlated site's keys and
-  pairing read the same way: `𝑝 ▷ iterate`, an iteration source narrowed by a filter
-  (`𝑢 ▷ (𝑝 ▷ restrict)`) and `𝑐 ▷ map_domain` map each key to itself, so a chain `iterate ≫ 𝑓`
-  reads as `𝑓` unapplied too, `𝑎 ▷ (𝑓 ▷ strength_over)`
-  is `λ 𝑘 → (𝑎, 𝑘 ▷ (𝑎 ▷ 𝑓))`, and `𝑥 ▷ (𝑐 ▷ map(𝑔))` is `(𝑥 ▷ 𝑐) ▷ 𝑔`. An application reaches
-  only keys in its function's domain, so no restriction changes the value
-  read, and a type that reads a definition planning restaged still compares equal to the copy
-  that reads it unplanned;
+  leaves `𝑔ᵢ`. A second leg guarded by the literal `true` has `true ∧ ¬𝑔₀`, which constant
+  folding reduces to `¬𝑔₀`; that reads back as the guard `true`. A type quoting a conditional
+  chosen per row then compares equal to the point-free definition lambda elimination wrote for it;
+- an applied form planning stages reads as the term it stages, since an application reaches only
+  keys in its function's domain:
+  - `𝑥 ▷ (𝑝 ▷ iterate)`, `𝑥 ▷ (𝑐 ▷ map_domain)`, an iteration source narrowed by a filter
+    `𝑥 ▷ (𝑢 ▷ (𝑝 ▷ restrict))`, and a group `𝑥 ▷ (𝑘 ▷ (𝑓 ▷ converse))` each read as `𝑥`. Each
+    maps every key of its domain to itself, and its type states that domain;
+  - `𝑥 ▷ (𝑚 ▷ filter_values)` reads as `𝑥`;
+  - a chain `iterate ≫ 𝑓` reads as `𝑓`, unapplied as well;
+  - `(𝐹, 𝑔) ▷ curry_over` reads as `𝑔 ▷ curry`, `𝑎 ▷ (𝑓 ▷ strength_over)` as
+    `λ 𝑘 → (𝑎, 𝑘 ▷ (𝑎 ▷ 𝑓))`, and `𝑥 ▷ (𝑐 ▷ map(𝑔))` as `(𝑥 ▷ 𝑐) ▷ 𝑔`;
+- a `Realize` reads as the conditional it stages, which realization keeps on the node
+  (`TypedExprNode::Realize`'s `staged`). The gated union it holds is a change of representation
+  rather than a respelling, and constant folding rewrites its gates, so no rule reads the union
+  back;
 - a projection out of a tuple or record former reads the component.
+
+The `filter_values` reading is the one rule that is an equivalence only under a condition its term
+does not state. `𝑥 ▷ (𝑚 ▷ filter_values)` equals `𝑥` where `𝑥` satisfies `𝑚`, but lambda
+elimination and correlated filters stamp `𝑚 ▷ filter_values` at the unrefined `𝐷 ⤇ 𝐷`. The
+enclosing refinement keeps the argument where `𝑚` holds, and the comparison does not check that it
+does.
 
 Normalizing is term-level: it leaves type slots as they are and mints no node identity, so an
 equality can run it. A consumer that reads a predicate as a term rather than comparing it, the SMT

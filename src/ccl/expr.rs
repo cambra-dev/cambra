@@ -301,9 +301,9 @@ pub enum TypedExprNode {
     Realize {
         /// The executable form: what op-conversion compiles.
         value: Box<TypedExpr>,
-        /// The term `value` stages — the conditional realization replaced — quoted as a
-        /// type quotes a term. Term walks do not reach it; normal form reads the node as it, so
-        /// a type quoting the conditional and the tree's realization compare as one term.
+        /// The conditional realization replaced, quoted as a type quotes a term. Term walks
+        /// do not reach it. Normal form reads the node as this term, so a type quoting the
+        /// conditional and the tree's realization compare equal.
         staged: std::rc::Rc<TypedExpr>,
     },
 
@@ -666,7 +666,18 @@ pub enum TypedExprNode {
     /// into a causal [`TypedExprNode::LetRec`]. No pass downstream of the
     /// phase may observe it; operator conversion rejects it explicitly.
     For {
-        /// The iteration binder, bound in `body` to each source element.
+        /// The loop's position, bound in `body` to each position of the source's domain.
+        /// A loop lowering builds as `𝑠 ≫ (λ 𝑥 → body)` binds its position when
+        /// `comprehension::index_loop` rewrites it before inference; a `For` reaches inference
+        /// unrewritten, so it binds its own, and the recurrence `mut_elim` builds binds the
+        /// same name.
+        /// A name with no type slot: its type is the source's domain
+        /// (`crate::ccl::mut_elim::loop_domain`).
+        /// Boxed so the variant is no larger than a `Let`, which sizes every node.
+        position: Box<Name>,
+        /// The iteration binder, bound in `body` to the source's element at `position`,
+        /// `position ▷ iter`. An element's type may read its position, as a group's reads
+        /// its key.
         target: TypedBinding,
         /// The iteration source — a `Fun(D, T)` whose domain drives the loop.
         iter: Box<TypedExpr>,
@@ -2044,8 +2055,8 @@ impl TypedExpr {
             }
             TypedExprNode::Lambda { param, .. }
             | TypedExprNode::Let { binding: param, .. }
-            | TypedExprNode::MutDecl { binding: param, .. }
-            | TypedExprNode::For { target: param, .. } => f(param),
+            | TypedExprNode::MutDecl { binding: param, .. } => f(param),
+            TypedExprNode::For { target, .. } => f(target),
             TypedExprNode::LetRec { bindings, .. } | TypedExprNode::DefGroup { bindings, .. } => {
                 bindings.iter().for_each(|(b, _)| f(b));
             }
@@ -2102,8 +2113,8 @@ impl TypedExpr {
             }
             TypedExprNode::Lambda { param, .. }
             | TypedExprNode::Let { binding: param, .. }
-            | TypedExprNode::MutDecl { binding: param, .. }
-            | TypedExprNode::For { target: param, .. } => f(param),
+            | TypedExprNode::MutDecl { binding: param, .. } => f(param),
+            TypedExprNode::For { target, .. } => f(target),
             TypedExprNode::LetRec { bindings, .. } | TypedExprNode::DefGroup { bindings, .. } => {
                 bindings.iter_mut().for_each(|(b, _)| f(b));
             }
@@ -2206,6 +2217,20 @@ impl TypedExpr {
     /// [`Type::walk_children`] — see
     /// [`crate::ccl::ccl_utils::distinct_predicate_rcs`].
     pub fn walk_type_slots<'a>(&'a self, mut f: impl FnMut(&'a Type)) {
+        self.walk_ambient_type_slots(&mut f);
+        if let TypedExprNode::For { target, .. } = &self.node {
+            f(&target.ty);
+            if let Some(annotation) = &target.user_annotation {
+                f(annotation);
+            }
+        }
+    }
+
+    /// The type slots of [`walk_type_slots`](Self::walk_type_slots) that sit in the node's own
+    /// scope: every slot but a `For` target's, which the position scopes over
+    /// ([`crate::ccl::scope::ScopedItem::TypeSlot`]). A walk reading the names a type reads
+    /// takes these here and the others from [`crate::ccl::scope::for_each_scoped_item`].
+    pub fn walk_ambient_type_slots<'a>(&'a self, mut f: impl FnMut(&'a Type)) {
         f(&self.ty);
         if let Some(annotation) = &self.user_annotation {
             f(annotation);
@@ -2234,12 +2259,14 @@ impl TypedExpr {
                 f(parameter);
             }
         }
-        self.walk_binders(|b| {
-            f(&b.ty);
-            if let Some(annotation) = &b.user_annotation {
-                f(annotation);
-            }
-        });
+        if !matches!(self.node, TypedExprNode::For { .. }) {
+            self.walk_binders(|b| {
+                f(&b.ty);
+                if let Some(annotation) = &b.user_annotation {
+                    f(annotation);
+                }
+            });
+        }
     }
 
     /// Mutable analog of [`walk_type_slots`](Self::walk_type_slots), for passes
@@ -2282,15 +2309,24 @@ impl TypedExpr {
         });
     }
 
+    /// The name of every binder this node declares, outermost first: a `For`'s position, which
+    /// is a name alone, then each [`walk_binders`](Self::walk_binders) binder's.
+    pub fn walk_bound_names<'a>(&'a self, mut f: impl FnMut(&'a Name)) {
+        if let TypedExprNode::For { position, .. } = &self.node {
+            f(position);
+        }
+        self.walk_binders(|b| f(&b.name));
+    }
+
     /// Does this node declare any binder? The cheap half of
-    /// [`walk_binders`](Self::walk_binders), for callers that only need to know
+    /// [`walk_bound_names`](Self::walk_bound_names), for callers that only need to know
     /// whether a node opens a scope at all (see
     /// [`crate::ccl::scope::for_each_scoped_item_mut`], which skips its
     /// scope-collection pass entirely for the overwhelmingly common node that
     /// binds nothing).
     pub fn binds_any(&self) -> bool {
         let mut binds = false;
-        self.walk_binders(|_| binds = true);
+        self.walk_bound_names(|_| binds = true);
         binds
     }
 

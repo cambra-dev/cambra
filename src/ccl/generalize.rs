@@ -596,6 +596,26 @@ fn walk(
         };
         return Ok(true);
     }
+    // A `let` or `letrec` binder's type is the morphism its definition is, so it is generalized
+    // as that type is where it reads a name out of scope: a writer's binding of what it writes,
+    // under a loop whose rows read the loop's position.
+    let binders: Vec<&mut crate::ccl::TypedBinding> = match &mut e.node {
+        crate::ccl::TypedExprNode::Let { binding, .. } => vec![binding],
+        crate::ccl::TypedExprNode::LetRec { bindings, .. } => {
+            bindings.iter_mut().map(|(b, _)| b).collect()
+        }
+        _ => Vec::new(),
+    };
+    for binding in binders {
+        if is_morphism(opened(&binding.ty))
+            && crate::ccl::subst::type_free_vars(&binding.ty)
+                .iter()
+                .any(out_of_scope)
+        {
+            changed = true;
+            binding.ty = generalized(&binding.ty, &out_of_scope, &binding.name.to_string(), cache)?;
+        }
+    }
     let depth = scope.len();
     crate::ccl::scope::for_each_scoped_item_mut(e, &mut |item| match item {
         crate::ccl::scope::ScopedItemMut::Scope(names) => {
@@ -1247,11 +1267,10 @@ fn drop_facts_naming(
 /// those parts read the parameters outside their `Poly`. A morphism built from such parts is
 /// generic in them the same way, so it is quantified over them again.
 pub(crate) fn close_free_params(root: &mut crate::ccl::Expr) {
+    // A parameter whose `Poly` a pass replaced is declared again from its own bound
+    // (`close_go`), so a tree declaring none can still read one.
     let mut declared = HashMap::new();
     collect_params(root, &mut declared);
-    if declared.is_empty() {
-        return;
-    }
     close_go(root, &declared);
 }
 

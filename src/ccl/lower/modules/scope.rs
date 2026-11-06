@@ -297,7 +297,7 @@ impl LoweringContext {
                     );
                 }
                 let depth = bound.len();
-                bound.extend(binders.iter().map(|b| b.name.clone()));
+                bound.extend(binders.names().cloned());
                 walk(expr, ctx, bound, out);
                 bound.truncate(depth);
             });

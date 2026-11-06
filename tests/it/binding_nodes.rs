@@ -1,13 +1,14 @@
 //! The single-binder nodes `Let`, `MutDecl` and `For` through the passes that walk their binding
 //! structure: α-uniquification's home assignment, type-blind term equality, and the content hash.
-//! `bound_expr`, `init` or `iter` sits outside the binder's scope; the binder scopes over `body`.
+//! `bound_expr`, `init` or `iter` sits outside the binder's scope; the binder scopes over `body`,
+//! beside a `For`'s position.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use cambra::ccl::content_hash::content_hash;
 use cambra::ccl::{
-    BindingTransparency, Expr, Home, Lit, SharedImport, Type, TypedBinding, TypedExpr,
+    BindingTransparency, Expr, Home, Lit, Name, SharedImport, Type, TypedBinding, TypedExpr,
     TypedExprNode, eq_term_modulo_ty_slots, uniquify,
 };
 use cambra::chl_parser::ModulePath;
@@ -40,6 +41,7 @@ fn single_binder_nodes(value: i64, annotation: Option<Type>) -> [TypedExpr; 3] {
             body: body(),
         }),
         TypedExpr::new(TypedExprNode::For {
+            position: Box::new(Name::raw("p")),
             target: b(),
             iter: e(),
             body: body(),

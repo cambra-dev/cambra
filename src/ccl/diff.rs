@@ -907,10 +907,7 @@ fn resolved_hashes(t: &Indexed<'_>, correspondent_of: &dyn Fn(usize) -> u64) -> 
             if let ScopedItem::Child { expr, binders } = item
                 && !binders.is_empty()
             {
-                introduced.insert(
-                    expr as *const TypedExpr,
-                    binders.iter().map(|b| &b.name).collect(),
-                );
+                introduced.insert(expr as *const TypedExpr, binders.names().collect());
             }
         });
 

@@ -5520,4 +5520,56 @@ mod tests {
             "{errs:?}"
         );
     }
+
+    /// The check of planning's output holds a `let` whose body type reads its binder to the
+    /// body's type closed over the definition.
+    #[test]
+    fn a_planned_let_reading_its_binder_is_checked_against_its_body() {
+        let int = Type::Base(BaseType::Int);
+        let elem = Expr::var(Name::elem()).with_ty(int.clone());
+        let y = Expr::var("y").with_ty(int.clone());
+        let at_y = Expr::binop(elem, BinOpKind::Compare(CompareKind::Equals), y)
+            .with_ty(Type::Base(BaseType::Bool));
+        let body_ty =
+            Type::refined_one(int.clone(), crate::ccl::ty::Refinement::born(Rc::new(at_y)));
+        let body = Expr::lit(Lit::Int(1)).with_ty(body_ty);
+        let bound = Expr::lit(Lit::Int(1)).with_ty(int_lit_ty(1));
+        let tree = Expr::let_bind("y", bound, body).with_ty(Type::Base(BaseType::String));
+        let errs = typecheck_planned(&tree, &HashMap::new(), &InstanceTable::builtin());
+        assert!(
+            errs.is_err(),
+            "a `let` typed `String` over an `Int` body passed the check"
+        );
+    }
+
+    /// The check of planning's output compares a dependent result's refinements, not only its
+    /// base: `let y = 1 in (1 : {Int | __elem == y})` closes to `{Int | __elem == 1}`, so a
+    /// recorded `{Int | __elem == 2}` is rejected.
+    #[test]
+    fn a_planned_let_recording_another_refinement_is_rejected() {
+        let int = Type::Base(BaseType::Int);
+        let equals = |right: Expr| {
+            let elem = Expr::var(Name::elem()).with_ty(int.clone());
+            let predicate = Expr::binop(elem, BinOpKind::Compare(CompareKind::Equals), right)
+                .with_ty(Type::Base(BaseType::Bool));
+            Type::refined_one(
+                int.clone(),
+                crate::ccl::ty::Refinement::born(Rc::new(predicate)),
+            )
+        };
+        let body = Expr::lit(Lit::Int(1)).with_ty(equals(Expr::var("y").with_ty(int.clone())));
+        let bound = Expr::lit(Lit::Int(1)).with_ty(int_lit_ty(1));
+        let let_bound =
+            |recorded: Type| Expr::let_bind("y", bound.clone(), body.clone()).with_ty(recorded);
+        let check =
+            |tree: &Expr| typecheck_planned(tree, &HashMap::new(), &InstanceTable::builtin());
+        let one = Expr::lit(Lit::Int(1)).with_ty(int_lit_ty(1));
+        let two = Expr::lit(Lit::Int(2)).with_ty(int_lit_ty(2));
+        check(&let_bound(equals(one))).expect("the closed body type is the recorded one");
+        assert!(
+            check(&let_bound(equals(two))).is_err(),
+            "a `let` recording `{{Int | __elem == 2}}` over a body closing to \
+             `{{Int | __elem == 1}}` passed the check"
+        );
+    }
 }

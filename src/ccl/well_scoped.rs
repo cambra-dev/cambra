@@ -124,7 +124,7 @@ fn innermost_reader(ty: &Type, name: &Name) -> Option<(String, Type)> {
         for_each_scoped_item(e, &mut |item| {
             if let ScopedItem::Child { expr, binders } = item
                 && found.is_none()
-                && !binders.iter().any(|b| &b.name == name)
+                && !binders.shadows(name)
             {
                 found = in_expr(expr, name);
             }
@@ -139,7 +139,7 @@ fn innermost_reader(ty: &Type, name: &Name) -> Option<(String, Type)> {
 }
 
 fn walk(e: &Expr, scope: &mut Scope, everywhere: &BTreeSet<Name>, out: &mut Vec<Violation>) {
-    e.walk_type_slots(|ty| {
+    let read = |ty: &Type, scope: &Scope, out: &mut Vec<Violation>| {
         for name in type_free_vars(ty) {
             if !scope.contains(&name) && !everywhere.contains(&name) {
                 out.push(Violation {
@@ -149,12 +149,19 @@ fn walk(e: &Expr, scope: &mut Scope, everywhere: &BTreeSet<Name>, out: &mut Vec<
                 });
             }
         }
-    });
-    for_each_scoped_item(e, &mut |item| {
-        if let ScopedItem::Child { expr, binders } = item {
-            let names: Vec<Name> = binders.iter().map(|b| b.name.clone()).collect();
+    };
+    e.walk_ambient_type_slots(|ty| read(ty, scope, out));
+    for_each_scoped_item(e, &mut |item| match item {
+        // A `for` loop's target is typed under its position, which its element's type may read.
+        ScopedItem::TypeSlot { ty, binders } => {
+            let names: Vec<Name> = binders.names().cloned().collect();
+            scope.with(&names, |scope| read(ty, scope, out));
+        }
+        ScopedItem::Child { expr, binders } => {
+            let names: Vec<Name> = binders.names().cloned().collect();
             scope.with(&names, |scope| walk(expr, scope, everywhere, out));
         }
+        ScopedItem::VarRef(_) | ScopedItem::KeyRef(_) => {}
     });
 }
 
@@ -166,4 +173,50 @@ fn opaque_lets(e: &Expr, out: &mut BTreeSet<Name>) {
         out.insert(binding.name.clone());
     }
     e.walk_children(|c| opaque_lets(c, out));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ccl::{
+        ArithmeticKind, BaseType, BinOpKind, CompareKind, Lit, TypedBinding, ty::Refinement,
+    };
+    use std::rc::Rc;
+
+    /// A `for` loop's target is typed under its position, so every walk reading the names a
+    /// type reads takes the position as bound in the target's type, and a name it reads
+    /// beside the position as free.
+    #[test]
+    fn a_loop_target_s_type_reads_its_position_bound() {
+        let int = || Type::Base(BaseType::Int);
+        let (p, q) = (Name::raw("p"), Name::raw("q"));
+        let p_plus_q = Expr::binop(
+            Expr::var(p.clone()).with_ty(int()),
+            BinOpKind::Arithmetic(ArithmeticKind::Add),
+            Expr::var(q.clone()).with_ty(int()),
+        )
+        .with_ty(int());
+        let at = Expr::binop(
+            Expr::var(Name::elem()).with_ty(int()),
+            BinOpKind::Compare(CompareKind::Equals),
+            p_plus_q,
+        )
+        .with_ty(Type::Base(BaseType::Bool));
+        let mut target = TypedBinding::new_unannotated("t");
+        target.ty = Type::refined_one(int(), Refinement::born(Rc::new(at)));
+        let looped = Expr::new(TypedExprNode::For {
+            position: Box::new(p.clone()),
+            target,
+            iter: Box::new(Expr::var("xs")),
+            body: Box::new(Expr::lit(Lit::Unit)),
+        });
+        assert_eq!(crate::ccl::ccl_utils::count_free(&p, &looped), 0);
+        assert_eq!(crate::ccl::ccl_utils::count_free(&q, &looped), 1);
+        let free = crate::ccl::ccl_utils::free_names(&looped);
+        assert!(!free.contains(&p) && free.contains(&q), "{free:?}");
+        let free = crate::ccl::subst::expr_free_vars(&looped);
+        assert!(!free.contains(&p) && free.contains(&q), "{free:?}");
+        let unbound: BTreeSet<Name> = violations(&looped).into_iter().map(|v| v.name).collect();
+        assert!(!unbound.contains(&p) && unbound.contains(&q), "{unbound:?}");
+    }
 }

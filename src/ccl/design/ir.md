@@ -89,7 +89,7 @@ are:
 | `Lambda` | `param` binds in `body`. |
 | `Let`, `MutDecl` | `binding` binds in `body`; `bound_expr` or `init` is outside its scope. |
 | `LetRec`, `DefGroup` | Every group binder binds in every definition and in `body`. |
-| `For` | `target` binds in `body`; `iter` is outside its scope. |
+| `For` | `position` and `target` bind in `body`, and `target`'s type is in `position`'s scope; `iter` is outside their scope. |
 | `Case` | A branch pattern's payload binder binds in that branch's `guard` and `body` only. |
 | `Comprehension` | A generator's `target` binds in its own `guards`, in every later generator, and in `element`; its own `iter` is outside its scope. |
 | `Feed`, `Define`, `MutWrite` | `name` is a use of an enclosing binder. |
@@ -98,19 +98,23 @@ are:
 `Binders` borrows binder slots without allocating a list and implements the `shadows` check for
 each child. A comprehension's binders come into scope one generator at a time, so its covering
 scope is a prefix of its generators (`Binders::Generators`) and the prefixes nest: each scope
-extends the one before it, and the last one matches `walk_binders`. Every other node's scopes are
-disjoint, and their concatenation matches `walk_binders`. `Transact` labels are emitted as `KeyRef`,
-distinct from the `VarRef` occurrences that free-variable analysis counts. A node's type slots and
-their refinement predicates require the caller's type walk; the term-scope walk does not traverse
-them.
+extends the one before it, and the last one matches `walk_bound_names`. Every other node's scopes
+are disjoint, and their concatenation matches `walk_bound_names`. A `For`'s position is a name with
+no type slot: its type is the domain of `iter` (`mut_elim::loop_domain`). `Transact` labels are
+emitted as `KeyRef`, distinct from the `VarRef` occurrences that free-variable analysis counts.
+
+The walk yields a type slot that a binder of the node scopes over, a `For` target's type under the
+position, as a `TypeSlot` item with those binders. The node's other type slots sit in its own scope,
+and `TypedExpr::walk_ambient_type_slots` reaches them; a walk reading the names a type reads takes
+both. The predicates those slots carry require the caller's type walk.
 
 The immutable walk lists children in `TypedExpr::walk_children` order. It groups each binder's
-children consecutively, so `for_each_scoped_item_mut` can announce a scope once and pair it with
-the mutable child walk. Tests in `scope.rs` check child order, name occurrences, and agreement with
-`TypedExpr::walk_binders`. The scope and binder enumerations are exhaustive over node variants;
-adding a binding form requires declaring its scope and its binder slot. `uniquify` walks its own
-mutable environment because it mints names before descending, but checks its result against
-`walk_binders`.
+children consecutively, so `for_each_scoped_item_mut` can announce a scope once and pair it with the
+mutable child walk. Tests in `scope.rs` check child order, name occurrences, the split of type
+slots, and agreement with `TypedExpr::walk_bound_names`. The scope and binder enumerations are
+exhaustive over node variants; adding a binding form requires declaring its scope and its binder
+slot. `uniquify` walks its own mutable environment because it mints names before descending, but
+checks its result against `walk_bound_names`.
 
 `Subst` is simultaneous: a replacement is not substituted into another replacement during the
 same application. `Subst::rewrite_expr` restricts mappings under binders that shadow their keys
@@ -128,7 +132,7 @@ to a binding. The term binders are the ones [Binding structure lives in one plac
 lists. Inside a type, that type's own binders bind too: a Pi binder over its codomain, a dependent
 tuple's component over the components after it, `__elem` over a refinement's predicate, and a
 quoted term's binders over that term. A sum binds its witnesses within its own type and nowhere
-else.
+else, and a generalized type's `Poly` binds its type parameters within that type and nowhere else.
 
 The rule does not change from phase to phase. Lowering and elimination change which form a term
 takes, not what binds where:
@@ -150,7 +154,7 @@ value each read took and makes every opaque `let` transparent
 ([A read is named while inference runs](mutability.md#a-read-is-named-while-inference-runs)).
 
 `well_scoped::assert_well_scoped` checks the rule in debug builds at every boundary `settle`
-checks, and `infer::debug_assert_no_free_witness` checks witnesses.
+checks, type parameters included, and `infer::debug_assert_no_free_witness` checks witnesses.
 
 ### Source locations on substituted parameter projections
 

@@ -2293,10 +2293,17 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
             }
             // Pre-phase markers: the target binder scopes the loop body; a
             // `MutWrite` names a mutable variable, not a feed target.
-            TypedExprNode::For { target, iter, body } => {
+            TypedExprNode::For {
+                position,
+                target,
+                iter,
+                body,
+            } => {
                 rec(iter, bound, out);
+                bound.push((**position).clone());
                 bound.push(target.name.clone());
                 rec(body, bound, out);
+                bound.pop();
                 bound.pop();
             }
             TypedExprNode::MutWrite { key, value, .. } => {

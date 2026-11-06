@@ -642,8 +642,10 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             )
         }
 
-        // Direct-mirror statement loop: `for i in xs do body`.
-        TypedExprNode::For { target, iter, body } => (
+        // Direct-mirror statement loop: `for i in xs do body`. The position is the compiler's.
+        TypedExprNode::For {
+            target, iter, body, ..
+        } => (
             Precedence::Lowest,
             format!(
                 "for {} in {} do {}",
