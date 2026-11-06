@@ -572,6 +572,33 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             }
         }
 
+        TypedExprNode::Raise { value } => (
+            Precedence::Lowest,
+            format!("raise {}", fmt(value, Precedence::Lowest, opts)),
+        ),
+        // `try { body } except T as e → handler; …`, each clause in source order.
+        TypedExprNode::Try { body, handlers } => {
+            let clauses: Vec<String> = handlers
+                .iter()
+                .map(|h| {
+                    format!(
+                        "except {} as {} → {}",
+                        h.catches,
+                        h.binding.name,
+                        fmt(&h.body, Precedence::Lowest, opts)
+                    )
+                })
+                .collect();
+            (
+                Precedence::Lowest,
+                format!(
+                    "try {{ {} }} {}",
+                    fmt(body, Precedence::Lowest, opts),
+                    clauses.join("; ")
+                ),
+            )
+        }
+
         // `method(m; Shape::m, Box::m)`: the name, then each candidate.
         TypedExprNode::Method {
             name, candidates, ..

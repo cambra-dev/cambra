@@ -373,8 +373,18 @@ fn freshen_effect_var(
     // for what each use passes (`InferCtx::open_poly`); a use's copy holds what its arguments
     // bring instead.
     for capability in v.own() {
-        if !matches!(capability.item, Item::Param(_)) {
-            f.record(capability);
+        match &capability.item {
+            Item::Param(_) => {}
+            // A use raises the exception at its own instance of the definition's types, and as
+            // an exception of its own: two uses at two types are two exceptions.
+            Item::Causes(crate::ccl::effects::Effect::Raise(raised)) => {
+                let ty = freshen_above(lim, &raised.ty, target, cache);
+                f.record(crate::ccl::effects::Capability {
+                    item: Item::Causes(crate::ccl::effects::Effect::Raise(raised.instantiated(ty))),
+                    ..capability.clone()
+                });
+            }
+            _ => f.record(capability),
         }
     }
     for (source, filter) in v.incoming() {

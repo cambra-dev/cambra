@@ -172,18 +172,17 @@ clause and `causes` a `causes` clause, which end a `def` signature or a function
 and `nothing` bound one ([Writing requirements and effects](#writing-requirements-and-effects)).
 
 > **Direction.** Planned binder/keyword vocabulary, not lexed today:
-> `rec` (recursive binding — §4.3, **[Decided]**),
+> `rec` (recursive binding — §4.3, **[Decided]**), and
 > `assert` and its `static assert` form (function contracts — §6, **[Decided]** as the
-> surface, **[Open]** as to what `static` demands), and `raise`, `try` and `except` (exceptions —
-> [6.9 Capabilities](#69-capabilities), **[Decided]**).
-> Avoid taking these names for other purposes.
+> surface, **[Open]** as to what `static` demands). Avoid taking these names for other purposes.
 > (`with`, `:=`, `match`, `case`, `where`, `forall`, `requires`, `causes`, `only`, `nothing`,
-> `type`, `impl`, `instance`, `trait` and the module keywords are **already** lexed — the first two
-> carry today's transactions and mutation, §8, `match`/`case` carry tag dispatch, §4.10, `where`
-> separates a refinement's predicate, §6.4, `forall` and `requires` begin a polymorphic type and a
-> `requires` clause, §6.10, `causes`, `only` and `nothing` write the other clause and bound both,
-> §6.9, and `type`, `impl`, `instance` and `trait` declare nominal types, their functions,
-> instances and traits, §6.8 and §6.10 — so they are not in this list.)
+> `raise`, `try`, `except`, `type`, `impl`, `instance`, `trait` and the module keywords are
+> **already** lexed — the first two carry today's transactions and mutation, §8, `match`/`case`
+> carry tag dispatch, §4.10, `where` separates a refinement's predicate, §6.4, `forall` and
+> `requires` begin a polymorphic type and a `requires` clause, §6.10, `causes`, `only` and `nothing`
+> write the other clause and bound both, §6.9, `raise`, `try` and `except` write and catch
+> exceptions, §6.9, and `type`, `impl`, `instance` and `trait` declare nominal types, their
+> functions, instances and traits, §6.8 and §6.10 — so they are not in this list.)
 
 ### 1.7 Literals
 
@@ -437,9 +436,7 @@ begin():`, §8.2, `[Decided]`); any other context is rejected. `with` does
 
 > **Direction.** Planned statement forms, not in today's grammar: `rec x = e` recursive bindings
 > (**[Decided]**, §4.3), and out-of-line collection definition through a subscript target,
-> `c[i] = v` (**[Tentative]**, §6.3 — this would relax the no-subscript-target rule above). The
-> `raise` and `try`/`except` statements are **[Decided]**, with their grammar in
-> [6.9 Capabilities](#69-capabilities). A
+> `c[i] = v` (**[Tentative]**, §6.3 — this would relax the no-subscript-target rule above). A
 > `type` declaration, a `def` whose name is qualified by a type (`def Price::discounted(…)`), and
 > `@RenamedFrom` on either a `type` or one of its constructors are **[Decided]**, with their grammar
 > in [6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided).
@@ -664,10 +661,8 @@ The effecting forms:
   visible in its type: its `causes` clause states them, written or inferred. There are **no
   implicit-effect functions**, so an inert expression statement (§4.9) stays detectable and
   rejected.
-- **An output outside the program,** such as binding a sink
-  ([6.9 Capabilities](#69-capabilities)).
-- **[Decided]** — **`raise`** and a call that may raise
-  ([6.9 Capabilities](#69-capabilities)).
+- **`raise`**, a call that may raise, and an output outside the program, such as binding a
+  sink ([6.9 Capabilities](#69-capabilities)).
 
 `yield` (§3.13) is not an effect in this sense: it adds its operand to the
 collection the enclosing generator function returns, which is that
@@ -719,9 +714,6 @@ a finite function from `0..n` to values, so `xs[i]` is well-defined
 — §3.9). A list's indices are its positions, so an ordered loop over a list runs in index order.
 
 ### Ordered loops
-
-**[Decided]** — a loop or a comprehension ordered by an exception that escapes an
-iteration ([Exceptions](#exceptions)).
 
 A loop is **ordered** when its iterations interact: its body causes `Write(x)` for an induction
 variable `x` bound outside the loop, an accumulator update made directly or by a call (§4.6), or a
@@ -3363,8 +3355,9 @@ is a trait's function, read from an instance, `summon(Area(_))::area(s)`
 
 **[Decided]** — sink functions and calls made outside the program
 ([Output outside the program](#output-outside-the-program)); keeping readings across a reload and a
-restart ([Inputs from outside the program](#inputs-from-outside-the-program)); and exceptions
-([Exceptions](#exceptions)). The rest of this section is implemented.
+restart ([Inputs from outside the program](#inputs-from-outside-the-program)); and an exception
+escaping a `with begin():` block ([Exceptions](#exceptions)). The rest of this section is
+implemented.
 
 A function's type states what a call reads from its context, in its **`requires` clause**, and what
 the call contributes besides its result, in its **`causes` clause**. A requirement is an input that

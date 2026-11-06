@@ -2612,6 +2612,19 @@ fn effects_at(
     st: &CompactState,
 ) -> crate::ccl::effects::EffectSet {
     let mut set = effects.set();
+    // Each exception stands at the type its bounds resolve to, whether or not the walk records
+    // variables: a monomorphic function's contract states it too.
+    set.causes = std::mem::take(&mut set.causes)
+        .into_iter()
+        .map(|e| match e {
+            crate::ccl::effects::Effect::Raise(raised) => {
+                let ty = crate::ccl::infer::solve::resolve_var_type(&raised.ty)
+                    .unwrap_or_else(|_| raised.ty.clone());
+                crate::ccl::effects::Effect::Raise(crate::ccl::effects::Raised { ty, ..raised })
+            }
+            e => e,
+        })
+        .collect();
     if st.effect_vars
         && let crate::ccl::effects::Repr::Var(v) = effects.repr()
     {

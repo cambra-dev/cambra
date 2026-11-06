@@ -143,9 +143,6 @@ pub(super) struct InferCtx {
     /// The function bodies under emission, innermost last, above the module's top level
     /// (`src/ccl/design/type-inference.md`, "Effect variables").
     effect_frames: Vec<EffectFrame>,
-    /// Every `with begin():` block's variable and each use's copies of them, from which coalesce
-    /// gives each block its footprint.
-    pub(super) footprints: crate::ccl::effects::Footprints,
     /// Where each mutable variable and feed in scope is bound, for the capability that names it.
     effect_binders: HashMap<Name, EffectBinder>,
     /// Each statement emitted, with the variable collecting what it causes and the one of
@@ -159,6 +156,18 @@ pub(super) struct InferCtx {
     ordered_loops: Vec<OrderedLoop>,
     /// Each `with begin():` block emitted, with the variable collecting what its body causes.
     effect_transactions: Vec<(NodeId, Rc<EffectVar>)>,
+    /// Every `with begin():` block's variable and each use's copies of them, from which coalesce
+    /// gives each block its footprint.
+    pub(super) footprints: crate::ccl::effects::Footprints,
+    /// Each `try` emitted, innermost first: a `try` is recorded once its body is emitted.
+    effect_tries: Vec<TryFrame>,
+    /// Each `raise`'s node and the type of what it raises, which must be a type an exception
+    /// may have ([`InferCtx::unraisable_exceptions`]).
+    effect_raises: Vec<(NodeId, Type)>,
+    /// Each call whose callee's type was an inference variable when the call was emitted, by
+    /// the variable collecting what the call causes, with that type. The callee may be a
+    /// parameter, whose function each use of the definition passes ([`Self::settle_catches`]).
+    effect_calls_of_variables: Vec<(Rc<EffectVar>, Type)>,
     /// What lowering marks each marked node as: an expression statement, which an inert one
     /// is refused among, or a sink binding, which causes `AffectWorld`.
     pub(super) marks: HashMap<NodeId, crate::ccl::lower::Mark>,
@@ -421,6 +430,7 @@ impl EffectFrame {
             },
             at: None,
             stated: Default::default(),
+            catches: None,
             except: Default::default(),
         }
     }
@@ -444,8 +454,9 @@ struct OrderedLoop {
 
 /// Whether what `var` collects, a loop body's effects, makes its iterations interact: a write
 /// to an induction variable not among `declared`, the ones the body declares, outlives the
-/// iteration (`docs/chl-spec.md`, "Ordered loops"). `WriteTxn(x)` orders nothing: the
-/// run's transactions commit in commit order, whatever position the iteration has.
+/// iteration, and so does an exception, which a `try` in the body would have stopped before it
+/// reached `var` (`docs/chl-spec.md`, "Ordered loops"). `WriteTxn(x)` orders nothing:
+/// the run's transactions commit in commit order, whatever position the iteration has.
 fn iterations_interact(var: &Rc<EffectVar>, declared: &HashSet<Name>) -> bool {
     interacting(var, declared).is_some()
 }
@@ -476,11 +487,54 @@ pub(super) fn positions_detail(positions: &Type) -> String {
 fn interacting(var: &Rc<EffectVar>, declared: &HashSet<Name>) -> Option<Capability> {
     var.resolved().into_iter().find(|l| match &l.item {
         Item::Causes(Effect::Write(x)) => !declared.contains(x),
+        Item::Causes(Effect::Raise(_)) => true,
         // `Effect` and `Write(_)` hold a write to every variable, the accumulators outside the
-        // loop's too.
-        Item::Every(every) => every.overlaps(&Item::Every(Family::Write.top())),
+        // loop's too, and `Raise(_)` an exception of every type.
+        Item::Every(every) => [Family::Write, Family::Raise]
+            .into_iter()
+            .any(|f| every.overlaps(&Item::Every(f.top()))),
         _ => false,
     })
+}
+
+/// A `try` emitted, for [`InferCtx::settle_catches`]: the variable collecting what its body
+/// causes, and the type and position of each clause.
+struct TryFrame {
+    var: Rc<EffectVar>,
+    clauses: Vec<Type>,
+    node: NodeId,
+}
+
+/// Whether a value other than an inference variable flows into `ty`, directly or through the
+/// lower bounds of the variables flowing into it.
+fn receives_a_value(ty: &Type) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![ty.clone()];
+    while let Some(ty) = stack.pop() {
+        let Type::Infer(v) = ty.peel_refinements() else {
+            return true;
+        };
+        if !seen.insert(Rc::as_ptr(v)) {
+            continue;
+        }
+        stack.extend(v.bounds.borrow().lower().iter().map(|b| b.ty.clone()));
+    }
+    false
+}
+
+/// Whether one of `targets` flows into `var`, through any edge whatever it filters.
+fn reaches_any(var: &Rc<EffectVar>, targets: &HashSet<EffectVarId>) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![Rc::clone(var)];
+    while let Some(v) = stack.pop() {
+        if targets.contains(&v.uid) {
+            return true;
+        }
+        if seen.insert(v.uid) {
+            stack.extend(v.incoming().into_iter().map(|(source, _)| source));
+        }
+    }
+    false
 }
 
 /// A variable standing for an associated effect type, `Writes`, at a call of a trait's
@@ -717,7 +771,6 @@ impl InferCtx {
             recoveries: 0,
             method_calls: vec![Vec::new()],
             selected_methods: Rc::default(),
-            footprints: Default::default(),
             effect_frames: vec![EffectFrame {
                 var: EffectVar::fresh(0),
                 depth: 0,
@@ -729,6 +782,10 @@ impl InferCtx {
             effect_loops: Vec::new(),
             ordered_loops: Vec::new(),
             effect_transactions: Vec::new(),
+            footprints: Default::default(),
+            effect_tries: Vec::new(),
+            effect_raises: Vec::new(),
+            effect_calls_of_variables: Vec::new(),
             marks: HashMap::new(),
             effect_calls: HashSet::new(),
             effect_public: Vec::new(),
@@ -740,6 +797,113 @@ impl InferCtx {
     /// (`docs/chl-spec.md`, "Shareable modules").
     pub(super) fn top_level_effects(&self) -> Vec<Capability> {
         self.effect_frames[0].var.resolved().into_iter().collect()
+    }
+
+    /// An error at each `raise` whose value's type, once emission has resolved it, is no type
+    /// an exception may have (`docs/chl-spec.md`, "Exceptions").
+    pub(super) fn unraisable_exceptions(&self) -> Vec<LocatedInferError> {
+        self.effect_raises
+            .iter()
+            .filter_map(|(site, ty)| {
+                let ty = crate::ccl::infer::solve::resolve_var_type(ty).ok()?;
+                // A part still a variable is reported where its type is.
+                let part = crate::ccl::effects::unraisable_part(&ty)?;
+                if matches!(part, Type::Infer(_)) {
+                    return None;
+                }
+                Some(LocatedInferError::new(
+                    InferError::NotRaisable {
+                        ty: crate::ccl::chl_print::chl_type(&ty),
+                    },
+                    *site,
+                ))
+            })
+            .collect()
+    }
+
+    /// Answer an error at each `try` clause that catches none of the exceptions its body
+    /// raises (`docs/chl-spec.md`, "Exceptions"), once emission has resolved their types.
+    ///
+    /// A `try` catches by type ([`crate::ccl::effects::Catch`]): an exception goes to the first
+    /// clause whose type does not exclude its own, which must cover it
+    /// ([`crate::ccl::effects::partly_caught`] reports one that does not). A clause names a
+    /// type an exception may have. A resolution of an effect variable computed while a type was
+    /// still open is stale, so this marks the types settled before anything reads the capabilities
+    /// a `try` stops. The `try`s are taken innermost first, because what reaches an outer one's
+    /// body is what its inner ones let through.
+    pub(super) fn settle_catches(&mut self) -> Vec<LocatedInferError> {
+        crate::ccl::effects::exceptions_settled();
+        // A call of a function no value of the definition's own flows into, such as a
+        // parameter's, causes what each use passes. A `try` reaching one may catch at any use,
+        // so none of its clauses is dead at the definition.
+        let open: HashSet<EffectVarId> = self
+            .effect_calls_of_variables
+            .iter()
+            .filter(|(_, callee)| !receives_a_value(callee))
+            .map(|(call, _)| call.uid)
+            .collect();
+        let mut errors = Vec::new();
+        for t in &self.effect_tries {
+            if reaches_any(&t.var, &open) {
+                continue;
+            }
+            // A clause catches a type an exception may have.
+            let unraisable: Vec<&Type> = t
+                .clauses
+                .iter()
+                .filter(|c| crate::ccl::effects::unraisable_part(c).is_some())
+                .collect();
+            for c in &unraisable {
+                errors.push(LocatedInferError::new(
+                    InferError::NotRaisable {
+                        ty: crate::ccl::chl_print::chl_type(c),
+                    },
+                    t.node,
+                ));
+            }
+            if !unraisable.is_empty() {
+                continue;
+            }
+            // `Effect` and `Raise(_)` raise every type, so each clause would take part of one
+            // (`docs/chl-spec.md`, "Exceptions").
+            let raises_anything = t.var.resolved().into_iter().find_map(|c| match c.item {
+                Item::Every(every) if every.raises_anything() => Some(every),
+                _ => None,
+            });
+            if let Some(top) = raises_anything {
+                errors.push(LocatedInferError::new(
+                    InferError::ExceptAroundEveryRaise {
+                        clause: crate::ccl::chl_print::chl_type(&t.clauses[0]),
+                        top: Item::Every(top).to_string(),
+                    },
+                    t.node,
+                ));
+                continue;
+            }
+            let mut hits = vec![0usize; t.clauses.len()];
+            for capability in t.var.resolved() {
+                let Item::Causes(Effect::Raise(raised)) = &capability.item else {
+                    continue;
+                };
+                // An exception whose type does not resolve is reported where its type is.
+                let Some(ty) = raised.resolved() else {
+                    continue;
+                };
+                use crate::ccl::effects::Sent;
+                if let Sent::To(i) | Sent::Partly(i) = crate::ccl::effects::sent(&t.clauses, &ty) {
+                    hits[i] += 1;
+                }
+            }
+            for (catches, _) in t.clauses.iter().zip(&hits).filter(|(_, n)| **n == 0) {
+                errors.push(LocatedInferError::new(
+                    InferError::ExceptCatchesNothing {
+                        ty: crate::ccl::chl_print::chl_type(catches),
+                    },
+                    t.node,
+                ));
+            }
+        }
+        errors
     }
 
     fn effect_frame(&self) -> &EffectFrame {
@@ -1042,6 +1206,15 @@ impl InferCtx {
             Item::Causes(Effect::Write(x)) => {
                 format!("its body writes `{x}`, a variable bound outside it")
             }
+            // A polymorphic definition is refused where it stands, and there the exception's type
+            // may be one its uses decide.
+            Item::Causes(Effect::Raise(raised)) => match raised.resolved() {
+                Some(ty) => format!(
+                    "an exception of type `{}` may escape its body",
+                    crate::ccl::chl_print::chl_type(&ty)
+                ),
+                None => "an exception may escape its body".to_string(),
+            },
             item => format!("its body causes `{item}`"),
         };
         Some(LocatedInferError::new(
@@ -3201,6 +3374,13 @@ impl Typing for InferCtx {
             )
             .collect();
         for item in written.items().chain(taken) {
+            if let Item::Causes(Effect::Raise(raised)) = &item
+                && crate::ccl::effects::unraisable_part(&raised.ty).is_some()
+            {
+                return Err(self.raise(InferError::NotRaisable {
+                    ty: crate::ccl::chl_print::chl_type(&raised.ty),
+                }));
+            }
             let Some(name) = item.variable() else {
                 continue;
             };
@@ -3346,6 +3526,48 @@ impl Typing for InferCtx {
         let positions = crate::ccl::infer::solve::resolve_var_type(positions)
             .unwrap_or_else(|_| positions.clone());
         self.unordered_loop_error(node, source, positions_detail(&positions))
+    }
+
+    fn raise_type(&mut self, _recorded: &Type) -> Type {
+        self.fresh()
+    }
+
+    fn record_raise(&mut self, site: NodeId, ty: &Type) {
+        self.effect_raises.push((site, ty.clone()));
+        self.record_effect(Item::Causes(Effect::Raise(
+            crate::ccl::effects::Raised::at(site, ty.clone()),
+        )));
+    }
+
+    fn try_body<R>(&mut self, node: NodeId, catches: &[Type], f: impl FnOnce(&mut Self) -> R) -> R {
+        // A frame of its own, as a statement's: the body's capabilities, the function's own
+        // variables included, stay on it, and only the edge out of it stops what is caught.
+        let outer = self.effect_frame();
+        let frame = EffectFrame {
+            var: EffectVar::fresh(self.level),
+            depth: outer.depth,
+            keeps_own: true,
+            transactions: outer.transactions,
+        };
+        let var = Rc::clone(&frame.var);
+        self.effect_frames.push(frame);
+        let r = f(self);
+        self.effect_frames.pop();
+        let catch = Rc::new(crate::ccl::effects::Catch::new(node, catches.to_vec()));
+        let outer = self.effect_frame();
+        outer.var.flows_from(
+            &var,
+            Filter {
+                catches: Some(catch),
+                ..outer.filter()
+            },
+        );
+        self.effect_tries.push(TryFrame {
+            var,
+            clauses: catches.to_vec(),
+            node,
+        });
+        r
     }
 
     fn note_binding(&mut self, name: &Name, ty: &Type, node: NodeId) {
@@ -3719,7 +3941,14 @@ impl Typing for InferCtx {
         // The codomain stands under the binder, so it is minted where the binder is in scope.
         let result = self.scoped(&x, &d, |ctx| ctx.fresh_part(&demand_kind));
         let expected = Type::pi_kinded(x.clone(), d.clone(), result.clone(), demand_kind);
-        let expected = expected.with_effects(self.call_effects());
+        let effects = self.call_effects();
+        if let Type::Infer(_) = fn_ty.peel_refinements()
+            && let Repr::Var(call) = effects.repr()
+        {
+            self.effect_calls_of_variables
+                .push((Rc::clone(call), fn_ty.clone()));
+        }
+        let expected = expected.with_effects(effects);
         self.require_sub(fn_ty, &expected, at)?;
         self.constrain_argument(arg_ty, &expected, at)?;
         // The application's type is `result` with the binder discharged to the

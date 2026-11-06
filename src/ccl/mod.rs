@@ -16,6 +16,7 @@ pub mod content_hash;
 pub mod context;
 pub mod diff;
 pub mod effects;
+pub mod exceptions;
 pub mod feed_nest;
 pub mod infer;
 pub mod inline;
