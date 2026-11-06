@@ -1983,8 +1983,12 @@ release names every row before the one it is running whole (`domain_prefix`), an
 the store.
 Where every branch names a row, so does the meet, and `Engines::remove_covered` drops that row in
 the same release that reclaims the rest. The next render therefore cannot rebuild what was
-released, which `TileProducer::get` asserts against. The row's watermark goes with it, since
-nothing is left to ask where that store got to.
+released, which `TileProducer::get` asserts against. The row's watermark goes with it, and a
+store whose next row has not opened then shows no frontier at all, so the driver compares its
+cursor against the furthest frontier it has read (`decided_through`). The store decides in drive
+order and never undoes a decision, so that frontier still holds. A loop over the groups beneath
+a loop over a group's elements reaches this: the next inner row's seed waits on the loop around
+it, which reads the finished row's final value and releases it first.
 
 The driver's own release runs outward, to the iteration source. It reclaims the consumed prefix as
 `emitted_through` advances and releases the source in full once the source is complete and every

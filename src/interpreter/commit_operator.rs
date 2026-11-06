@@ -4634,6 +4634,7 @@ impl TileOperator for InductionDriver {
             // and what the store's frontier is checked against. `None` for a driver
             // starting with its source, which has emitted nothing.
             emitted_through: self.resumed_after.clone().map(one_component),
+            decided_through: None,
             // And inherits the release cursor with it. A resuming driver has no
             // interest in the prefix below the position it starts at, which is
             // what this cursor records; leaving it empty would have this driver
@@ -4736,6 +4737,11 @@ struct InductionDriverProducer {
     /// item cursor, and it is not recoverable from the window, which a release compacts
     /// emitted rows away from.
     emitted_through: Option<Path>,
+    /// The furthest frontier the store has shown. A row the store has decided whole and every
+    /// reader has released leaves the store ([`Engines::remove_covered`]), and its frontier
+    /// with it, so a store whose next row has not opened shows none. The store decides in
+    /// drive order and never undoes a decision, so the frontier seen stands.
+    decided_through: Option<Path>,
     /// Highest source path released back upstream. The driver never re-reads a position it
     /// has emitted and never reads a filtered one, so every emitted position, and every
     /// filtered one it has read past ([`source_read_through`]), is reclaimable; a co-iterated
@@ -4973,7 +4979,8 @@ impl TileProducer for InductionDriverProducer {
         // state is not. The drive's cursor is a path, so the frontier it compares against
         // must be one too: a row's own watermark says nothing about which row it belongs
         // to.
-        let frontier = frontier_path(&store);
+        let frontier = frontier_path(&store).max(self.decided_through.clone());
+        self.decided_through = frontier.clone();
         let store = current_row_store(&store);
         // The store opens a row at its seed stream's value and the drive restarts the row's
         // accumulator at its reseed stream's, which is one stream behind a `FanOut`. The two
