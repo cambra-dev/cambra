@@ -7,8 +7,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ccl::ccl_utils::TermMemo;
 use crate::ccl::effects::{
-    Blame, Bound as CapabilityBound, Capability, Effect, EffectVar, Effects, Every, Filter, Item,
-    Repr, Requirement, Upper,
+    Blame, Bound as CapabilityBound, Capability, Effect, EffectSet, EffectVar, Effects, Every,
+    Filter, Item, Repr, Requirement, Upper,
 };
 use crate::ccl::infer::solver::barrier::EdgeReport;
 use crate::ccl::infer::solver::display::{poly_for_display, scheme_obligations};
@@ -238,6 +238,20 @@ pub(super) struct InferCtx {
     /// the obligation that decides which instance's, or which requirement's in scope, it is
     /// ([`InferCtx::settle_effect_links`]).
     effect_links: Vec<EffectLink>,
+    /// Each function body's result type, the depth of the body, and its lambda: a function
+    /// the body returns may name no variable the body binds
+    /// ([`InferCtx::escaping_results`]).
+    results: Vec<(Type, u32, NodeId, Declared)>,
+    /// What each function body under emission declares, innermost last, and what the last one
+    /// to finish did: a function whose type holds a top holding writes or reads names every
+    /// mutable variable, and one holding appends every feed, so it leaves no body declaring one.
+    body_binds: Vec<Declared>,
+    last_body_binds: Declared,
+    /// Each variable a write or an append hands a value to, the type it holds, the depth
+    /// from which a variable's scope ends before the target's, and the write or append: a
+    /// function the target holds may name no such variable
+    /// ([`InferCtx::escaping_results`]).
+    handed_out: Vec<HandedOut>,
     /// The generalized bindings whose schemes a module check reports, and the
     /// scheme each was bound at, written as an annotation would state it
     /// ([`Typing::note_scheme`]).
@@ -455,6 +469,17 @@ struct EffectBinder {
     escapes: bool,
 }
 
+/// A variable a write or an append hands a value to ([`InferCtx::handed_out`]).
+struct HandedOut {
+    target: Name,
+    ty: Type,
+    depth: u32,
+    appends: bool,
+    node: NodeId,
+    /// What the body handing it out declares ([`InferCtx::body_binds`]).
+    binds: Declared,
+}
+
 pub(super) struct OpenGroup {
     /// The scope the group's members are bound in.
     pub(super) depth: usize,
@@ -597,6 +622,10 @@ impl InferCtx {
             opened_clause_params: HashMap::new(),
             instance_effects: Default::default(),
             effect_links: Vec::new(),
+            results: Vec::new(),
+            body_binds: Vec::new(),
+            last_body_binds: Declared::default(),
+            handed_out: Vec::new(),
             reported: HashSet::new(),
             public: HashSet::new(),
             schemes_noted: Vec::new(),
@@ -636,7 +665,7 @@ impl InferCtx {
 
     /// What the module's top level requires and causes, less what its scopes discharge
     /// (`docs/chl-spec.md`, "Shareable modules").
-    pub(super) fn top_level_effects(&self) -> crate::ccl::effects::EffectSet {
+    pub(super) fn top_level_effects(&self) -> EffectSet {
         crate::ccl::effects::set_of(&self.effect_frames[0].var.resolved())
     }
 
@@ -655,6 +684,13 @@ impl InferCtx {
                 && matches!(history_kind, crate::ccl::ty::HistoryKind::Overwrite)
                 && matches!(domain, Type::Txn);
             let depth = self.effect_frame().depth;
+            if declares && let Some(declared) = self.body_binds.last_mut() {
+                match history_kind {
+                    crate::ccl::ty::HistoryKind::Append => declared.feed = true,
+                    _ if !transactional => declared.variable = true,
+                    _ => {}
+                }
+            }
             // Transactional state belongs to the run, so a transactional variable is declared
             // at a module's top level.
             if transactional && depth > 0 {
@@ -743,6 +779,84 @@ impl InferCtx {
             }
         }
         out
+    }
+
+    /// An error at each function body whose result is a function requiring or causing
+    /// something naming a variable the body binds, and at each write or append handing such a
+    /// function to a variable bound outside that variable's scope: the function would outlive
+    /// the variable (`docs/chl-spec.md`, "Discharging requirements and effects").
+    pub(super) fn escaping_results(&self) -> Vec<LocatedInferError> {
+        // An inference variable holds what flows into it: its lower bounds.
+        fn beyond(
+            ty: &Type,
+            depth: u32,
+            binds: Declared,
+            seen: &mut HashSet<*const InferVar>,
+        ) -> Option<Capability> {
+            if let Type::Infer(v) = ty.peel_refinements() {
+                if !seen.insert(Rc::as_ptr(v)) {
+                    return None;
+                }
+                let lowers: Vec<Type> = v
+                    .bounds
+                    .borrow()
+                    .lower()
+                    .iter()
+                    .map(|b| b.ty.clone())
+                    .collect();
+                return lowers.iter().find_map(|t| beyond(t, depth, binds, seen));
+            }
+            if let Type::Fun { effects, .. } = ty {
+                let capabilities = match effects.repr() {
+                    Repr::Var(v) => v.resolved().into_iter().collect(),
+                    _ => Effects::capabilities_of(effects),
+                };
+                // A top holding a family that names variables names every one, the body's own
+                // among them.
+                if let Some(capability) = capabilities.into_iter().find(|l| {
+                    matches!(l.bound, CapabilityBound::At(at) if at >= depth)
+                        || matches!(&l.item, Item::Every(every) if binds.named_by(every))
+                }) {
+                    return Some(capability);
+                }
+            }
+            let mut found = None;
+            ty.walk_children(|child| {
+                if found.is_none() {
+                    found = beyond(child, depth, binds, seen);
+                }
+            });
+            found
+        }
+        let located = |error, node_id| LocatedInferError {
+            error,
+            node_id,
+            also: Box::default(),
+            related: crate::ccl::infer::api::RelatedPositions::default(),
+        };
+        let returned = self.results.iter().filter_map(|(ty, depth, node, binds)| {
+            let capability = beyond(ty, *depth, *binds, &mut HashSet::new())?;
+            Some(located(
+                InferError::EscapesItsVariable {
+                    item: capability.item.to_string(),
+                    every: matches!(capability.item, Item::Every(_)),
+                },
+                *node,
+            ))
+        });
+        let handed_out = self.handed_out.iter().filter_map(|h| {
+            let capability = beyond(&h.ty, h.depth, h.binds, &mut HashSet::new())?;
+            Some(located(
+                InferError::HandsOutItsVariable {
+                    item: capability.item.to_string(),
+                    every: matches!(capability.item, Item::Every(_)),
+                    target: h.target.to_string(),
+                    appends: h.appends,
+                },
+                h.node,
+            ))
+        });
+        returned.chain(handed_out).collect()
     }
 
     /// An error at each `def` whose bounded `requires` clause a trait requirement inference
@@ -849,7 +963,7 @@ impl InferCtx {
     }
 
     /// The effect variable each parameter `set` names opened to.
-    fn clause_param_vars(&self, set: &crate::ccl::effects::EffectSet) -> Vec<Rc<EffectVar>> {
+    fn clause_param_vars(&self, set: &EffectSet) -> Vec<Rc<EffectVar>> {
         set.params
             .iter()
             .map(|p| {
@@ -877,7 +991,7 @@ impl InferCtx {
                 .or_insert_with(|| {
                     let var = EffectVar::fresh(0);
                     if !param.param.clause_except.is_empty() {
-                        let mut set = crate::ccl::effects::EffectSet::default();
+                        let mut set = EffectSet::default();
                         set.add_every(
                             Every::of_direction(param.of_causes)
                                 .less(param.param.clause_except.clone()),
@@ -886,6 +1000,7 @@ impl InferCtx {
                             set,
                             of_requires: !param.of_causes,
                             of_causes: param.of_causes,
+                            forbidden: Default::default(),
                             blame: Blame::Bound(
                                 param
                                     .param
@@ -1105,6 +1220,7 @@ impl InferCtx {
             set,
             of_requires: !open_requires,
             of_causes: !open_causes,
+            forbidden: std::collections::BTreeSet::new(),
             blame,
         });
     }
@@ -2608,7 +2724,7 @@ impl Typing for InferCtx {
                 // parameter holds none of what the bound takes away, and each use's copy of
                 // the variable keeps the bound (`freshen_effect_var`).
                 if !opened.clause_except.is_empty() {
-                    let mut set = crate::ccl::effects::EffectSet::default();
+                    let mut set = EffectSet::default();
                     set.add_every(
                         Every::of_direction(of_causes).less(opened.clause_except.clone()),
                     );
@@ -2616,6 +2732,7 @@ impl Typing for InferCtx {
                         set,
                         of_requires: !of_causes,
                         of_causes,
+                        forbidden: Default::default(),
                         blame: Blame::Bound(
                             p.bound_at.expect("a bound taking `except` is written"),
                         ),
@@ -2763,7 +2880,9 @@ impl Typing for InferCtx {
             keeps_own: false,
             transactions: 0,
         });
+        self.body_binds.push(Declared::default());
         let r = f(self);
+        self.last_body_binds = self.body_binds.pop().unwrap_or_default();
         self.effect_frames.pop();
         self.settle_by_kind(&var, recorded.fun_kind());
         (r, Effects::var(var))
@@ -2817,6 +2936,39 @@ impl Typing for InferCtx {
             },
             at: clauses.at,
             node: definition.node_id(),
+        });
+    }
+
+    fn note_result(&mut self, ty: &Type) {
+        let depth = self.effect_frame().depth + 1;
+        self.results.push((
+            ty.clone(),
+            depth,
+            self.current_node_id,
+            self.last_body_binds,
+        ));
+    }
+
+    fn note_handed_out(&mut self, target: &Name, ty: &Type, appends: bool) {
+        let Some(binder) = self.effect_binders.get(target) else {
+            return;
+        };
+        // The run's state outlives every scope, a parameter's argument the function's, and
+        // any other variable the bodies nested in its own.
+        let depth = if binder.escapes {
+            0
+        } else if binder.parameter {
+            binder.depth
+        } else {
+            binder.depth + 1
+        };
+        self.handed_out.push(HandedOut {
+            target: target.clone(),
+            ty: ty.clone(),
+            depth,
+            appends,
+            node: self.current_node_id,
+            binds: self.body_binds.last().copied().unwrap_or_default(),
         });
     }
 
@@ -2942,15 +3094,38 @@ impl Typing for InferCtx {
     }
 
     fn transaction_body<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        self.effect_frames
-            .last_mut()
-            .expect("the top level's frame stays open through emission")
-            .transactions += 1;
+        // The body collects on a variable of its own, which no commit may reach, directly or
+        // through a call: transactions do not nest (`docs/chl-spec.md`, "8.2 Transactions:
+        // `with begin():`"). The bound is copied with the variable at each instantiation, so
+        // a call through a polymorphic definition's parameter is checked at each use.
+        let node = self.current_node_id;
+        let outer = self.effect_frame();
+        let frame = EffectFrame {
+            var: EffectVar::fresh(self.level),
+            depth: outer.depth,
+            keeps_own: true,
+            transactions: outer.transactions + 1,
+        };
+        let var = Rc::clone(&frame.var);
+        var.bound_above(Upper {
+            set: EffectSet::default(),
+            of_requires: false,
+            of_causes: false,
+            forbidden: [Effect::RunTransaction].into_iter().collect(),
+            blame: Blame::NestedTransaction(node),
+        });
+        self.effect_frames.push(frame);
         let r = f(self);
-        self.effect_frames
-            .last_mut()
-            .expect("the top level's frame stays open through emission")
-            .transactions -= 1;
+        self.effect_frames.pop();
+        let outer = self.effect_frame();
+        outer.var.flows_from(
+            &var,
+            Filter {
+                discharges: [Requirement::transaction()].into_iter().collect(),
+                at: Some(node),
+                ..outer.filter()
+            },
+        );
         r
     }
 

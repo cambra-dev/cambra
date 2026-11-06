@@ -358,6 +358,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         TypedExprNode::Feed { name, value, .. } => {
             let target_ty = ctx.instantiate_binding(name)?;
             ctx.record_effect(Item::Causes(Effect::Append(name.clone())));
+            ctx.note_handed_out(name, &target_ty, true);
             emit_feed(name, &target_ty, value, &label, ctx).map_err(|e| {
                 e.with_escape_target(EscapeTarget::Feed {
                     channel: name.to_string(),
@@ -368,6 +369,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         TypedExprNode::Define { name, value } => {
             let target_ty = ctx.instantiate_binding(name)?;
             ctx.record_effect(Item::Causes(Effect::Append(name.clone())));
+            ctx.note_handed_out(name, &target_ty, true);
             emit_define(name, &target_ty, value, &label, ctx)?
         }
 
@@ -407,6 +409,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             let var_ty = ctx.instantiate_binding(name)?;
             ctx.record_effect(Item::Causes(Effect::Write(name.clone())));
             ctx.record_transactional_access(name);
+            ctx.note_handed_out(name, &var_ty, false);
             // The written value flows into the mutable variable's *value* type, not
             // the `Mut` handle itself — which is what a write means: it updates `V`.
             // Nothing would deref it on the way in, since the relation holds no
@@ -909,6 +912,7 @@ pub(super) fn emit_lambda<C: Typing>(
         })
     });
     let body_ty = body_ty?;
+    ctx.note_result(&body_ty);
 
     // Emit a *named* Pi: the parameter binds in the codomain, so a refinement
     // predicate nested in `body_ty` that closes over the parameter (the

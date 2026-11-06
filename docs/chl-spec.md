@@ -3376,10 +3376,10 @@ is a trait's function, read from an instance, `summon(Area(_))::area(s)`
 
 ### 6.9 Capabilities
 
-**[Decided]** — the rule that nothing leaving a scope names a variable whose history the scope ends;
-a written `Transaction`, a function's `Transaction` supplied by the block that calls it, and block
-footprints; outputs outside the program ([Output outside the program](#output-outside-the-program));
-readings ([Inputs from outside the program](#inputs-from-outside-the-program)); and exceptions
+**[Decided]** — a written `Transaction`, a function's `Transaction` supplied by the block that calls
+it, and block footprints; outputs outside the program
+([Output outside the program](#output-outside-the-program)); readings
+([Inputs from outside the program](#inputs-from-outside-the-program)); and exceptions
 ([Exceptions](#exceptions)). The rest of this section is implemented.
 
 A function's type states what a call reads from its context, in its **`requires` clause**, and what

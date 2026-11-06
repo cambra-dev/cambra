@@ -4267,11 +4267,12 @@ its `except` take away all the top does; a written clause bounds a use's copy of
 top less its `except` (`bound_written`, `freshen_effect_var`). A variable or a top taking away other
 than what the rest of its clause shares prints in parentheses (`effects::clauses`). A top holding
 writes or reads names every mutable variable, and one holding appends every feed
-(`Every::names_mutable_variables`, `Every::names_feeds`), so a function whose type holds one is no
-public member of a module whose top level binds what it names. A clause variable's bound, and an
-associated effect type's, may take capabilities away (`TypeParam::clause_except`): opening the
-parameter, or an instance's variable for the associated type, bounds it by `Effect` or `Context`
-less them, which each use's copy keeps (`Blame::Bound`).
+(`Every::names_mutable_variables`, `Every::names_feeds`), so a function whose type holds one leaves
+no body that declares what it names (`InferCtx::body_binds`) and is no public member of a module
+whose top level binds one. A clause variable's bound, and an associated effect type's, may take
+capabilities away (`TypeParam::clause_except`): opening the parameter, or an instance's variable for
+the associated type, bounds it by `Effect` or `Context` less them, which each use's copy keeps
+(`Blame::Bound`).
 
 **Upper bounds are checked once emission is complete.** A variable's capabilities are known only
 then, so `effects::exceeded_uppers` reads each bounded variable's resolution after the barrier
@@ -4306,6 +4307,19 @@ answering it does, which is at least what any use's does. A parameter variable w
 capability leaves its part of a bound open: it is what flows there.
 
 ### Checks that read a body's effects
+
+A `with begin():` body collects on a variable of its own (`Typing::transaction_body`), bounded by an
+upper bound that forbids `RunTransaction` (`Upper::forbidden`, `Blame::NestedTransaction`), so a
+commit reaching it, directly or through a call, is a nested transaction. The bound is copied at each
+instantiation, so a call through a polymorphic definition's parameter is refused at each use that
+passes a committing function. Each function body's result type is noted (`Typing::note_result`), and
+a function in it requiring or causing a capability bound at the body's depth or deeper is refused
+(`InferCtx::escaping_results`, `InferError::EscapesItsVariable`): it would outlive the variable. So
+is one a write or an append hands a variable bound outside that capability's scope
+(`Typing::note_handed_out`, `InferError::HandsOutItsVariable`): the target's type, read through the
+lower bounds of the inference variables in it, may hold no function with a capability bound below
+the target's scope, which for the run's state is every scope and for a `Mut` or `Feed` parameter the
+function's own.
 
 **Statements.** An expression statement a program writes before its block's last statement gets a
 frame of its own, which keeps every capability, the enclosing function's own variables' included,

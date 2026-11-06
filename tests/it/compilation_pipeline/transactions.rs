@@ -2790,10 +2790,9 @@ fn by_ref_txn_write_without_block_rejected() {
 }
 
 /// C4: a by-reference transactional writer *called inside* a `with begin():`
-/// block is a nested transaction — post-inline the callee's own transaction
-/// `For` lands in the outer block, where the phase would otherwise silently
-/// absorb it. Rejected on the inlined tree (the textual nested-`with` check
-/// cannot see a transaction reached via a call).
+/// block is a nested transaction: the call commits, and a block's body may not.
+/// Inference refuses it at the call (the textual nested-`with` check cannot see a
+/// transaction reached via a call).
 #[test]
 fn txn_writer_called_inside_block_rejected() {
     check_compile_error(
@@ -2810,7 +2809,7 @@ fn txn_writer_called_inside_block_rejected() {
                 out << pool
             out
         "#},
-        "nested",
+        "transactions do not nest",
     );
 }
 
