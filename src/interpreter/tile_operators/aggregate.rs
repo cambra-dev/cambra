@@ -1302,7 +1302,9 @@ impl BreakingProducer for MapAggregateProducer {
     }
 
     /// The guard of the output the accumulators build, less every group whose accumulator is not
-    /// terminal; empty before the first consume. A group still folding holds no decided value.
+    /// terminal; empty before the first consume. A group still folding holds no decided value, so
+    /// a push names it once its input is complete, and a reader that read it before reads it again
+    /// then (`Pushes::push_final` pushes each region once).
     fn held(&self) -> TileGuard {
         let Some(stated) = &self.stated else {
             return self.tiling().empty_guard();
