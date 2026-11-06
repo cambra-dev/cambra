@@ -254,6 +254,8 @@ pub(super) struct InferCtx {
     /// The expression of the statement each recovery was made at, in the order emission
     /// made them ([`Typing::recover`]).
     pub(super) recovered: Vec<NodeId>,
+    /// What each A-normalization temp emitted so far names ([`Typing::note_temp`]).
+    temps_written: HashMap<Name, Option<Type>>,
     /// How a type leaves the scope of each binder in scope ([`ScopeExit`]), read by
     /// [`Self::require_contribution`] and [`Typing::close_let_type`]: one per binder of the
     /// name, innermost last, pushed where the binder is entered and popped where its scope
@@ -480,6 +482,7 @@ impl InferCtx {
             trait_calls: HashMap::new(),
             recoveries: 0,
             recovered: Vec::new(),
+            temps_written: HashMap::new(),
             method_calls: vec![Vec::new()],
             selected_methods: Rc::default(),
         }
@@ -1825,6 +1828,14 @@ impl Typing for InferCtx {
 
     fn stand_in(&mut self) {
         self.recoveries += 1;
+    }
+
+    fn note_temp(&mut self, temp: &Name, written: Option<Type>) {
+        self.temps_written.insert(temp.clone(), written);
+    }
+
+    fn temp_written(&self, temp: &Name) -> Option<Option<Type>> {
+        self.temps_written.get(temp).cloned()
     }
 
     fn poisoned_reads(&self) -> usize {

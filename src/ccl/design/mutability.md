@@ -502,7 +502,12 @@ introduction every write targets. The discipline:
    pass-by-reference `Mut` parameter — both declarations by construction. Pinned
    by `infer::api::debug_assert_no_mut_var_let`.
 
-One structural check after inference enforces the two rules. The real fault line is the **merge law**,
+Inference enforces both rules. Emission refuses an argument to a `Mut` parameter that is not a bare
+variable of `Mut` type, read through the A-normalization temps naming it (each temp's `let` records
+what it names), as it refuses a write whose target is not a mutable variable (rule 1 above). The rest needs resolved
+types, so a structural pass over the coalesced tree checks it as the last step of each run
+(`check_mut_discipline`), and its errors are reported with coalesce's. The real fault line is the
+**merge law**,
 not `Feed`-vs-`Mut`. *Append-only* mutability merges commutatively — a feed by `++`, and (at
 runtime) a `Txn` mutable variable by the commit operator's timestamped merge — so multiple writers are
 already the semantics and aliasing is benign; that is why a feed handle may be aliased and

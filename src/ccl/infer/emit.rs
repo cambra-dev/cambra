@@ -410,6 +410,15 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             // Nothing would deref it on the way in, since the relation holds no
             // mutable variable rule; naming `V` here is the whole of it.
             let mut_value = var_ty.mut_value_type();
+            // A write's target is a mutable variable: a binder bound at its history, which a
+            // `:=` introduction and a pass-by-reference parameter are and nothing else is
+            // (`src/ccl/design/mutability.md`, "Mutability is the type (no lowering
+            // registry)"). `x = 0; x += 1` writes a value.
+            let Some(mut_val) = mut_value else {
+                return Err(ctx.raise(InferError::MutWriteToNonMutable {
+                    name: name.base().to_string(),
+                }));
+            };
             // The *target* is a handle, resolved by name above. The written **value** is
             // an ordinary value position, so a mutable variable mention there reads: `b := a`
             // between two mutable variables writes `a`'s current value into `b`.
@@ -430,26 +439,14 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             // Across the values one write takes — a write in a loop, once per iteration —
             // the edge joins over the binders it crosses (`require_contribution`).
             //
-            // The target is **not** relaxed. When `name` is not a mutable variable at all
-            // (`x = 0; x += 1`) the constraint is skipped outright and
-            // `check_mut_write_targets` owns the diagnosis — that is a
-            // mutability-discipline error, and a type error raised here would
-            // pre-empt it with a worse message. Relaxing the demand to buy that
-            // ordering instead would weaken a check that should hold: a mutable variable
-            // annotated `Mut({Int | p})` genuinely does demand `{Int | p}` of its
-            // writes. (That case has no surface syntax yet — a refinement is not
-            // writable in a type annotation — so what a program can exercise today is
-            // the demand on an unrefined annotation and the skip on a non-mutable one.)
-            if let Some(mut_val) = mut_value {
-                match key {
-                    None => ctx.require_contribution(name, &value_ty, mut_val, &|| {
-                        format!("write to mutable variable `{write_label}`")
-                    })?,
-                    // The key *term* is not needed: a write states its obligation on the
-                    // value, and the one shape that would discharge against the key — a
-                    // key-dependent codomain — has no write.
-                    Some(_) => emit_keyed_write(mut_val, &key_ty, &value_ty, &write_label, ctx)?,
-                }
+            match key {
+                None => ctx.require_contribution(name, &value_ty, mut_val, &|| {
+                    format!("write to mutable variable `{write_label}`")
+                })?,
+                // The key *term* is not needed: a write states its obligation on the
+                // value, and the one shape that would discharge against the key — a
+                // key-dependent codomain — has no write.
+                Some(_) => emit_keyed_write(mut_val, &key_ty, &value_ty, &write_label, ctx)?,
             }
             Type::Base(BaseType::Unit)
         }
@@ -1231,22 +1228,40 @@ pub(super) fn emit_apply<C: Typing>(
         "a pass-by-reference argument carries no annotation, got {:?}",
         argument.user_annotation
     );
+    // A pass-by-reference parameter's argument names a mutable variable where it is passed
+    // (`src/ccl/design/mutability.md`, "No aliasing: `Mut` values are second-class
+    // (downward-only)"): a bare variable whose own type is `Mut`, read through the
+    // A-normalization temps naming it ([`written_variable`]). A computed argument
+    // (`bump(x if c else y)`) has no one introduction to write, and a plain `x` holds no
+    // mutable variable for the caller to observe the write through.
+    if param_ty
+        .as_ref()
+        .is_some_and(|param| param.mut_value_type().is_some())
+    {
+        let refused = match written_variable(argument, ctx) {
+            None => Some(InferError::MutNotBareVariable {
+                at: symbolic(argument),
+            }),
+            Some(ty) if ty.mut_value_type().is_none() => Some(InferError::MutArgNotMutable {
+                at: symbolic(argument),
+            }),
+            Some(_) => None,
+        };
+        if let Some(error) = refused {
+            return Err(LocatedInferError::new(error, argument.node_id()));
+        }
+    }
     let arg_ty = match (param_ty, raw_arg_ty.mut_value_type()) {
         // A handle reaching its pass-by-reference parameter: invariance relates the two
         // value types directly, in both directions.
         (Some(param), Some(_)) if param.mut_value_type().is_some() => raw_arg_ty,
-        // A pass-by-reference parameter given something that is not a mutable variable
-        // (`bump(x)` for a plain `x`, `bump(x if c else y)` for a selection). The
-        // program is rejected either way — the discipline requires a `Mut` parameter's
-        // argument to be a mutable variable, and `check_mut_discipline` owns that diagnosis,
-        // which is the one worth reading — but the argument still has to be *typed*,
-        // since its own subtree is under-determined without an upper bound.
-        //
-        // So the value edge is emitted here, against the parameter's value, rather than
-        // left to the relation. A value meeting a handle is not a subtyping fact, and
-        // making it one is what put a coercion back in the lattice: the rule that knows
-        // this position is pass-by-reference is the rule that should read through the
-        // handle. The application edge below then relates handle to handle.
+        // A mutable variable an A-normalization temp names, which the check above passed:
+        // the temp holds the variable's value. So the value edge is emitted here, against
+        // the parameter's value, rather than left to the relation. A value meeting a handle
+        // is not a subtyping fact, and making it one is what put a coercion back in the
+        // lattice: the rule that knows this position is pass-by-reference is the rule that
+        // should read through the handle. The application edge below then relates handle
+        // to handle.
         (Some(param), None) if param.mut_value_type().is_some() => {
             let value = param
                 .mut_value_type()
@@ -1667,6 +1682,20 @@ pub(super) fn emit_expr_stmt<C: Typing>(
     Ok(read_mut(&ctx.subexpr(body)?))
 }
 
+/// The type of the variable `argument` is as the program wrote it, read through the
+/// A-normalization temps naming it ([`Typing::note_temp`]): a temp bound to a mutable
+/// variable holds that variable's value, and the variable is what the program passed.
+/// `None` for a computed argument.
+pub(super) fn written_variable<C: Typing>(argument: &Expr, ctx: &C) -> Option<Type> {
+    match &argument.node {
+        TypedExprNode::Var(name) if name.is_anf_temp() => ctx
+            .temp_written(name)
+            .unwrap_or_else(|| Some(argument.ty.clone())),
+        TypedExprNode::Var(_) => Some(argument.ty.clone()),
+        _ => None,
+    }
+}
+
 /// Type a `Defer` node: a fresh feed handle. `let d = Defer in body` binds
 /// `d : Feed(ρ)`, with `ρ` accumulating the channel's eventual type from
 /// the feeds/defines targeting `d` and discharging into the reads of `d`.
@@ -2068,6 +2097,10 @@ pub(super) fn emit_let<C: Typing>(
     // A right-hand side holding a statement recovered from has untyped nodes, so, like one
     // that did not type, it has no value to discharge.
     let defined = defined && ctx.recoveries() == recoveries_before;
+    if binding.name.is_anf_temp() {
+        let written = written_variable(bound_expr, ctx);
+        ctx.note_temp(&binding.name, written);
+    }
     let body_ty = ctx.scoped_let(binding, defined.then_some(&*bound_expr), scheme, |ctx| {
         ctx.subexpr(body)
     })?;

@@ -1128,6 +1128,9 @@ fn run_once(
     );
     sub_ctx.name_varying_binders(&mut errors);
     sub_ctx.name_other_feed_places(&mut errors);
+    // The mutability rules on resolved types read the tree coalesce left, which is
+    // whole past a node coalesce failed at.
+    errors.extend(check_mut_discipline(expr).err().unwrap_or_default());
     if !errors.is_empty() {
         return Err(failed(errors));
     }
