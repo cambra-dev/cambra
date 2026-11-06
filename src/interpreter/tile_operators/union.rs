@@ -689,6 +689,13 @@ impl TileProducer for UnionProducer {
         }
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        for (i, p) in self.inputs.iter_mut().enumerate() {
+            visit(&format!("_{i}"), &mut **p);
+        }
+    }
+
     /// It restates every level: a flat union's arms share its keys at each level, and beneath a
     /// tagged union's outermost keys each arm's keys stand under the arm's tag
     /// ([`under_arm`]).
