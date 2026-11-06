@@ -1,7 +1,9 @@
 use super::*;
 use crate::interpreter::operator_graph::value;
 use crate::interpreter::scheduler::restating;
-use crate::interpreter::{BaseType, ColumnValue, Consumer, Extent, Scheduler, Value, tuple_field};
+use crate::interpreter::{
+    BaseType, ColumnValue, Consumer, Extent, SubscribeContext, Value, tuple_field,
+};
 
 /// Re-keys a collection of pairs by each pair's first component, `𝐾 ⤇ (𝐽, 𝑉)` to `𝐽 ⤇ 𝑉`, where
 /// those keys are distinct: the `map` constructor's re-keying (group by the new key, then take the
@@ -125,14 +127,14 @@ impl TileOperator for RekeySorted {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         Box::new(RekeySortedProducer {
             base: ProducerBase::new(
                 RekeySortedProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             ),
             input: self.input.subscribe(
                 self.tiling().universal_guard(),
@@ -140,7 +142,7 @@ impl TileOperator for RekeySorted {
                     let restate = self.restate.clone();
                     restating(Box::new(move |region| restate(region)), consumer)
                 },
-                scheduler,
+                cx,
             ),
             held: Vec::new(),
             complete: Complete::new(self.order),

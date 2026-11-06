@@ -31,7 +31,7 @@ pub(super) fn subscribe(
     op: &IterateExtent,
     fields: &HashMap<SmolStr, Extent>,
     consumer: Box<dyn Consumer>,
-    cx: &mut Scheduler,
+    cx: &mut SubscribeContext,
 ) -> Box<dyn TileProducer> {
     let mut fields: Vec<_> = fields.iter().map(|(n, e)| (n.clone(), e.clone())).collect();
     fields.sort_by(|(a, _), (b, _)| a.cmp(b));
@@ -319,7 +319,7 @@ mod tests {
         op.subscribe(
             op.tiling().universal_guard(),
             Box::new(|| {}),
-            &mut Scheduler::new(),
+            &mut SubscribeContext::new(),
         )
     }
     fn rows(head: &mut dyn TileProducer) -> usize {
@@ -436,7 +436,7 @@ mod tests {
         let mut p = op.subscribe(
             op.tiling().universal_guard(),
             Box::new(|| {}),
-            &mut Scheduler::new(),
+            &mut SubscribeContext::new(),
         );
         assert_eq!(rows(&mut *p), 8);
         p.release(TileGuard::Function(FunctionGuard::Domain(

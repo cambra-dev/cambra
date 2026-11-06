@@ -14,7 +14,7 @@ use super::*;
 use crate::ccl::TagMap;
 use crate::interpreter::{
     BaseType, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, NotifyOrSubscribeResult,
-    Projection, Scheduler, SharedConsumer, UnionArm, Value, scheduler::shared_consumer,
+    Projection, SharedConsumer, SubscribeContext, UnionArm, Value, scheduler::shared_consumer,
 };
 
 /// Produces a function tile whose domain and codomain both equal `extent`.
@@ -37,9 +37,14 @@ impl IterateExtent {
         }
     }
 
-    fn add_all_source_handles(extent: &Extent, consumer: SharedConsumer, cx: &mut Scheduler) {
+    fn add_all_source_handles(
+        extent: &Extent,
+        consumer: SharedConsumer,
+        cx: &mut SubscribeContext,
+    ) {
         extent.for_each_source(&mut |source| {
-            cx.add_source_handle(source.clone(), Rc::downgrade(&consumer));
+            cx.scheduler()
+                .add_source_handle(source.clone(), Rc::downgrade(&consumer));
         });
     }
 }
@@ -53,7 +58,7 @@ impl TileOperator for IterateExtent {
         &mut self,
         _intent_guard: TileGuard,
         mut consumer: Box<dyn Consumer>,
-        cx: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         if let Extent::Record(fields) = &self.extent
             && self.extent.reads_a_source()

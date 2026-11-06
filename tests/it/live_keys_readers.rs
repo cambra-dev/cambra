@@ -10,8 +10,8 @@ use cambra::interpreter::tile_operators::{
     Converse, ExtractFinal, IterateExtent, MapResultWithSource, Restrict, TileOperator,
 };
 use cambra::interpreter::{
-    BaseType, ColumnValue, DataSourceDomainExtentImpl, Extent, FunctionGuard, Predicate, Scheduler,
-    TestDataSource, TileGuard, Value,
+    BaseType, ColumnValue, DataSourceDomainExtentImpl, Extent, FunctionGuard, Predicate,
+    SubscribeContext, TestDataSource, TileGuard, Value,
 };
 
 /// A still-open source of flags `0 ↦ true, 1 ↦ true, 2 ↦ false`, and the `Restrict` keeping
@@ -46,7 +46,7 @@ fn extract_final_releases_below_the_highest_live_position() {
     let mut producer = op.subscribe(
         op.tiling().universal_guard(),
         Box::new(|| {}),
-        &mut Scheduler::new(),
+        &mut SubscribeContext::new(),
     );
     producer.get(producer.tiling().universal_guard());
     assert_eq!(
@@ -64,7 +64,7 @@ fn converse_holds_no_deleted_row() {
     let mut producer = op.subscribe(
         op.tiling().universal_guard(),
         Box::new(|| {}),
-        &mut Scheduler::new(),
+        &mut SubscribeContext::new(),
     );
     producer.get(producer.tiling().universal_guard());
     let value_two = Predicate::from_column_value(&ColumnValue::from_uints(vec![2]));

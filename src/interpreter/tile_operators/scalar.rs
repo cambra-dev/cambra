@@ -6,8 +6,8 @@ use crate::interpreter::UnionArm;
 use crate::interpreter::operator_graph::value;
 use crate::{
     interpreter::{
-        BaseType, ColumnValue, Consumer, Extent, FunctionDef, Predicate, Projection, Scheduler,
-        Value,
+        BaseType, ColumnValue, Consumer, Extent, FunctionDef, Predicate, Projection,
+        SubscribeContext, Value,
     },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -119,16 +119,11 @@ impl TileOperator for Constant {
         &mut self,
         _intent_guard: TileGuard,
         mut consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         consumer.notify(&Projection::Everything);
         Box::new(ConstantProducer {
-            base: ProducerBase::new(
-                ConstantProducer::alloc_id(),
-                self.tiling(),
-                &self.base,
-                scheduler,
-            ),
+            base: ProducerBase::new(ConstantProducer::alloc_id(), self.tiling(), &self.base, cx),
             tile: self.tile.clone(),
             released: false,
         })
@@ -339,21 +334,21 @@ impl TileOperator for VariantWrap {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // A payload stream is pulled at the projection; a collection payload is one union column.
         let keeps_keys = self.tiling().is_data_function();
         let input = self.input.subscribe(
             self.input.tiling().universal_guard(),
             consumer_keeping_keys_if(keeps_keys, consumer),
-            scheduler,
+            cx,
         );
         Box::new(VariantWrapProducer {
             base: ProducerBase::new(
                 VariantWrapProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             ),
             level: self.level,
             input,
@@ -604,21 +599,21 @@ impl TileOperator for VariantProject {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // A union stream is pulled at the projection; a bare union has no keys of its own.
         let keeps_keys = self.input.tiling().is_data_function();
         let input = self.input.subscribe(
             self.input.tiling().universal_guard(),
             consumer_keeping_keys_if(keeps_keys, consumer),
-            scheduler,
+            cx,
         );
         Box::new(VariantProjectProducer {
             base: ProducerBase::new(
                 VariantProjectProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             ),
             input,
             tag: self.tag.clone(),
@@ -908,7 +903,7 @@ impl TileOperator for VariantIs {
         &mut self,
         intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // The scrutinee is pulled at the projection, so a region of its keys is a region of the
         // result's.
@@ -916,14 +911,14 @@ impl TileOperator for VariantIs {
         let input = self.input.subscribe(
             intent_guard,
             consumer_keeping_keys_if(keeps_keys, consumer),
-            scheduler,
+            cx,
         );
         Box::new(VariantIsProducer {
             base: ProducerBase::new(
                 VariantIsProducer::alloc_id(),
                 &self.base.tiling,
                 &self.base,
-                scheduler,
+                cx,
             ),
             input,
             tag: self.tag.clone(),
@@ -1060,7 +1055,7 @@ mod tests {
             &mut self,
             _intent_guard: TileGuard,
             mut consumer: Box<dyn Consumer>,
-            _scheduler: &mut Scheduler,
+            _cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             consumer.notify(&Projection::Everything);
             Box::new(TestTileProducer::new(
@@ -1090,8 +1085,8 @@ mod tests {
     fn variant_project_commit_arm() {
         let scrut = Box::new(commit_abort_scrutinee());
         let mut op = VariantProject::new(scrut, FieldKey::Index(0), Extent::Base(BaseType::Int));
-        let mut sched = Scheduler::new();
-        let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut cx);
         let tile = producer.get(producer.tiling().universal_guard());
 
         let Tile::DataFunction {
@@ -1110,8 +1105,8 @@ mod tests {
     fn variant_project_abort_arm() {
         let scrut = Box::new(commit_abort_scrutinee());
         let mut op = VariantProject::new(scrut, FieldKey::Index(1), Extent::Base(BaseType::Unit));
-        let mut sched = Scheduler::new();
-        let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut cx);
         let tile = producer.get(producer.tiling().universal_guard());
 
         let Tile::DataFunction {
@@ -1155,8 +1150,8 @@ mod tests {
             commit,
             Extent::Base(BaseType::Int),
         );
-        let mut sched = Scheduler::new();
-        let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut cx);
         let out = producer.get(producer.tiling().universal_guard());
 
         let Tile::DataFunction {
@@ -1210,12 +1205,9 @@ mod tests {
         ));
 
         let mut union = UnionOperator::new_flat(vec![arm0, arm1], Extent::Base(BaseType::Int));
-        let mut sched = Scheduler::new();
-        let mut producer = union.subscribe(
-            union.tiling().universal_guard(),
-            Box::new(|| {}),
-            &mut sched,
-        );
+        let mut cx = SubscribeContext::new();
+        let mut producer =
+            union.subscribe(union.tiling().universal_guard(), Box::new(|| {}), &mut cx);
         let out = producer.get(producer.tiling().universal_guard());
 
         let Tile::DataFunction {
@@ -1304,9 +1296,8 @@ mod tests {
             ops,
             CurryLevel::new(1),
         );
-        let mut sched = Scheduler::new();
-        let mut producer =
-            fan.subscribe(fan.tiling().universal_guard(), Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = fan.subscribe(fan.tiling().universal_guard(), Box::new(|| {}), &mut cx);
         let out = producer.get(producer.tiling().universal_guard());
 
         let Tile::DataFunction {
