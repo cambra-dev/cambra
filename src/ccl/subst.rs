@@ -449,7 +449,7 @@ fn compose_witness_maps(first: &WitnessMap, second: &WitnessMap) -> WitnessMap {
                 WitnessMapping::Rename(w) => {
                     second.get(w).cloned().unwrap_or(WitnessMapping::Rename(*w))
                 }
-                WitnessMapping::Discharge(d) => WitnessMapping::Discharge(after.apply_type(d)),
+                WitnessMapping::Discharge(d) => WitnessMapping::Discharge(after.transport_type(d)),
             };
             (*from, to)
         })
@@ -653,7 +653,7 @@ impl Subst {
             witnesses: self.witnesses.clone(),
             elims: kind_elims,
         }
-        .apply_type(ty)
+        .transport_type(ty)
     }
 
     /// The witness half, rendered `from -> to` per entry. Diagnostic only.
@@ -1335,7 +1335,7 @@ impl Subst {
                 .map(|(from, to)| {
                     let to = match to {
                         WitnessMapping::Discharge(candidate) => {
-                            WitnessMapping::Discharge(b.apply_type(candidate))
+                            WitnessMapping::Discharge(b.transport_type(candidate))
                         }
                         rename => rename.clone(),
                     };
@@ -1966,7 +1966,9 @@ impl Subst {
                 // A renamed reference stands where the occurrence stood, so it takes the
                 // occurrence's type under this same substitution: the type can name a binder
                 // the substitution discharges at once with the rename.
-                Some(repl @ Mapping::Rename(_)) => return repl.as_expr(&self.apply_type(&e.ty)),
+                Some(repl @ Mapping::Rename(_)) => {
+                    return repl.as_expr(&self.transport_type(&e.ty));
+                }
                 // A discharged term carries its own type/annotation, so return it wholesale
                 // rather than rebuilding `e`.
                 Some(repl) if !matches!(repl, Mapping::Join(..)) => return repl.as_expr(&e.ty),
@@ -2154,14 +2156,14 @@ impl Subst {
         if self.is_id() {
             return;
         }
-        e.walk_ambient_type_slots_mut(|ty| *ty = self.apply_type(ty));
+        e.walk_ambient_type_slots_mut(|ty| *ty = self.transport_type(ty));
         if let TypedExprNode::For {
             position, target, ..
         } = &mut e.node
         {
-            target.ty = self.under_binder_ty(position, &target.ty);
+            target.ty = self.under_binder_ty(position, &target.ty, &mut Vec::new());
             if let Some(annotation) = &mut target.user_annotation {
-                annotation.ty = self.under_binder_ty(position, &annotation.ty);
+                annotation.ty = self.under_binder_ty(position, &annotation.ty, &mut Vec::new());
             }
         }
     }
@@ -2281,6 +2283,10 @@ impl Subst {
     /// An expression walk cannot reach a binding held separately from its definition.
     /// Both slots are in the enclosing scope, so this does not shadow the binding's
     /// own name. Include only environment keys free in either slot.
+    ///
+    /// The environment's definitions replace their names throughout a term, as the expression
+    /// walk over the binding's definition replaces them, so the slots are substituted as a
+    /// term's are: nothing leaves a scope, and nothing is packed.
     pub fn discharge_env_in_binder(b: &mut TypedBinding, env: &HashMap<Name, TypedExpr>) {
         let live: BTreeMap<Binder, Mapping> = env
             .iter()
@@ -2294,9 +2300,9 @@ impl Subst {
             return;
         }
         let subst = Subst::of_binders(live);
-        b.ty = subst.apply_type(&b.ty);
+        b.ty = subst.transport_type(&b.ty);
         if let Some(annotation) = &mut b.user_annotation {
-            annotation.ty = subst.apply_type(&annotation.ty);
+            annotation.ty = subst.transport_type(&annotation.ty);
         }
     }
 
@@ -2326,7 +2332,7 @@ impl Subst {
             // A renamed reference takes the occurrence's type under this substitution, as in
             // the transport mode.
             let occurrence_ty = match repl {
-                Mapping::Rename(_) => self.apply_type(&e.ty),
+                Mapping::Rename(_) => self.transport_type(&e.ty),
                 _ => e.ty.clone(),
             };
             // The occurrence's read, renamed, stays with what replaces it.
@@ -2806,16 +2812,36 @@ impl Subst {
         out
     }
 
-    /// Apply this substitution to a **type**, rewriting the term binders that
-    /// appear inside refinement predicates. Descends into `Fun` codomains
-    /// (shadowing the Pi binder) and refinement predicates. Leaves atoms and
-    /// type *variables* untouched — a term substitution never relabels
-    /// `Infer`/`Hole` slots; those belong to freshening.
+    /// Substitute a result type leaving a binder. Pack projections through definitions whose
+    /// form may change once the result is rebuilt. Use [`transport_type`](Self::transport_type)
+    /// for a type slot inside a term.
     pub fn apply_type(&self, ty: &Type) -> Type {
         if self.is_id() {
             return ty.clone();
         }
-        with_transport_memo(|| self.apply_type_inner(ty))
+        let mut escaping = Vec::new();
+        let mut out = with_transport_memo(|| self.apply_type_inner(ty, &mut escaping));
+        if !escaping.is_empty() {
+            pack_projections_among(&mut out, &|p| escaping.contains(p));
+        }
+        out
+    }
+
+    /// Substitute a term's type slot, preserving its projected witnesses. This transport
+    /// leaves no binder scope and performs no existential packing.
+    pub fn transport_type(&self, ty: &Type) -> Type {
+        if self.is_id() {
+            return ty.clone();
+        }
+        with_transport_memo(|| self.apply_type_inner(ty, &mut Vec::new()))
+    }
+
+    /// Whether `term` reads a binder this substitution discharges to a term a projection cannot
+    /// [retain](can_keep_projection_term) across later rewrites.
+    fn discharges_to_no_path(&self, term: &TypedExpr) -> bool {
+        crate::ccl::ccl_utils::free_names(term)
+            .iter()
+            .any(|b| matches!(self.binders.get(b), Some(Mapping::Discharge(t)) if !can_keep_projection_term(t)))
     }
 
     /// [`Elim::Top`] reaching `ty`: the outermost function of `ty` is the sum read through the
@@ -2823,21 +2849,30 @@ impl Subst {
     /// opens the slot; a function whose funkind is a variable carries the elimination to its
     /// kind's binders and is plain; a variable suspends. Anything else is not a collection,
     /// and nothing is eliminated.
-    fn eliminate_top(&self, c: &Rc<TypedExpr>, rest: &Subst, ty: &Type) -> Type {
+    fn eliminate_top(
+        &self,
+        c: &Rc<TypedExpr>,
+        rest: &Subst,
+        ty: &Type,
+        escaping: &mut Vec<crate::ccl::ty::WitnessProjection>,
+    ) -> Type {
         use crate::ccl::ty::FunKind;
         let rest = rest.clone();
         match ty {
             Type::Infer(v) => self.suspended(v),
-            Type::Refinement(base, _) => match rest.apply_type_inner(ty) {
-                Type::Refinement(_, refinements) => {
-                    Type::Refinement(Box::new(self.eliminate_top(c, &rest, base)), refinements)
-                }
+            Type::Refinement(base, _) => match rest.apply_type_inner(ty, escaping) {
+                Type::Refinement(_, refinements) => Type::Refinement(
+                    Box::new(self.eliminate_top(c, &rest, base, escaping)),
+                    refinements,
+                ),
                 other => other,
             },
             Type::Fun {
                 fun_kind: FunKind::Data(Some(ws)),
                 ..
-            } => rest.discharged_through(ws, c).apply_type_inner(ty),
+            } => rest
+                .discharged_through(ws, c)
+                .apply_type_inner(ty, escaping),
             Type::Fun {
                 fun_kind: FunKind::Var(k),
                 ..
@@ -2846,7 +2881,7 @@ impl Subst {
                 into_kind
                     .elims
                     .insert(0, Elim::Kind(Rc::clone(k), Rc::clone(c)));
-                match into_kind.apply_type_inner(ty) {
+                match into_kind.apply_type_inner(ty, escaping) {
                     Type::Fun {
                         name,
                         domain,
@@ -2863,16 +2898,20 @@ impl Subst {
                     other => other,
                 }
             }
-            _ => rest.apply_type_inner(ty),
+            _ => rest.apply_type_inner(ty, escaping),
         }
     }
 
-    fn apply_type_inner(&self, ty: &Type) -> Type {
+    fn apply_type_inner(
+        &self,
+        ty: &Type,
+        escaping: &mut Vec<crate::ccl::ty::WitnessProjection>,
+    ) -> Type {
         if let Some((c, rest)) = self.top_elim() {
-            return self.eliminate_top(&c, &rest, ty);
+            return self.eliminate_top(&c, &rest, ty, escaping);
         }
         match ty {
-            Type::BoundedHole(t) => Type::BoundedHole(Box::new(self.apply_type_inner(t))),
+            Type::BoundedHole(t) => Type::BoundedHole(Box::new(self.apply_type_inner(t, escaping))),
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::DataSource(_)
@@ -2882,7 +2921,9 @@ impl Subst {
             | Type::Param(_)
             | Type::BarrierVar(_) => ty.clone(),
             Type::Infer(v) => self.suspended(v),
-            Type::Poly(poly) => Type::Poly(Rc::new(poly.map_types(|t| self.apply_type_inner(t)))),
+            Type::Poly(poly) => Type::Poly(Rc::new(
+                poly.map_types(|t| self.apply_type_inner(t, escaping)),
+            )),
 
             // **A witness reference crosses a scope change here.** The reference names the
             // binder of the sum it was written under; where this substitution records a
@@ -2923,7 +2964,14 @@ impl Subst {
                 match out {
                     Type::WitnessProjection(p) => match self.read_back(&p) {
                         Some(binder) => self.apply_witnesses(&binder),
-                        None => Type::WitnessProjection(p),
+                        None => {
+                            if let Type::WitnessProjection(before) = ty
+                                && self.discharges_to_no_path(&before.term)
+                            {
+                                escaping.push(p.clone());
+                            }
+                            Type::WitnessProjection(p)
+                        }
                     },
                     other => other,
                 }
@@ -2941,9 +2989,9 @@ impl Subst {
                 capabilities,
             } => Type::Fun {
                 name: None,
-                fun_kind: self.apply_fun_kind(fun_kind),
-                domain: Box::new(self.apply_domain(fun_kind, domain)),
-                codomain: Box::new(self.apply_type(codomain)),
+                fun_kind: self.apply_fun_kind(fun_kind, escaping),
+                domain: Box::new(self.apply_domain_inner(fun_kind, domain, escaping)),
+                codomain: Box::new(self.apply_type_inner(codomain, escaping)),
                 capabilities: self.apply_capabilities(capabilities),
             },
 
@@ -2954,11 +3002,11 @@ impl Subst {
                 codomain,
                 capabilities,
             } => {
-                let domain = Box::new(self.apply_domain(fun_kind, domain));
-                let inner = self.under_binder_ty(b, codomain);
+                let domain = Box::new(self.apply_domain_inner(fun_kind, domain, escaping));
+                let inner = self.under_binder_ty(b, codomain, escaping);
                 Type::Fun {
                     name: Some(b.clone()),
-                    fun_kind: self.apply_fun_kind(fun_kind),
+                    fun_kind: self.apply_fun_kind(fun_kind, escaping),
                     domain,
                     codomain: Box::new(inner),
                     capabilities: self.apply_capabilities(capabilities),
@@ -2971,7 +3019,7 @@ impl Subst {
                 // Substituting the predicate changes its meaning, so it builds a
                 // fresh predicate `Rc` rather than sharing the original's.
                 Type::refined(
-                    self.apply_type(base),
+                    self.apply_type_inner(base, escaping),
                     refinements
                         .iter()
                         // A refinement naming a joined binder is dropped, which is the join at
@@ -2986,8 +3034,16 @@ impl Subst {
                 )
             }
 
-            Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| self.apply_type(t)).collect()),
-            Type::OpenTuple(ts) => Type::OpenTuple(ts.iter().map(|t| self.apply_type(t)).collect()),
+            Type::Tuple(ts) => Type::Tuple(
+                ts.iter()
+                    .map(|t| self.apply_type_inner(t, escaping))
+                    .collect(),
+            ),
+            Type::OpenTuple(ts) => Type::OpenTuple(
+                ts.iter()
+                    .map(|t| self.apply_type_inner(t, escaping))
+                    .collect(),
+            ),
             // Each component under the names of the components before it, as a codomain is under
             // its function's binder ([`Self::under_binder_ty`]): restricted to the entries that
             // act on it, so a range naming an earlier component captures only where the
@@ -3001,7 +3057,7 @@ impl Subst {
                     for b in &entered {
                         acting.assert_no_capture(b);
                     }
-                    out.push((name.clone(), acting.apply_type(t)));
+                    out.push((name.clone(), acting.apply_type_inner(t, escaping)));
                     if let Some(b) = name {
                         restricted = restricted.shadow(b);
                         entered.push(b);
@@ -3023,33 +3079,36 @@ impl Subst {
                 Type::Family {
                     binders: binders
                         .iter()
-                        .map(|(n, t)| (n.clone(), self.apply_type(t)))
+                        .map(|(n, t)| (n.clone(), self.apply_type_inner(t, escaping)))
                         .collect(),
-                    body: Box::new(restricted.apply_type(body)),
+                    body: Box::new(restricted.apply_type_inner(body, escaping)),
                 }
             }
-            Type::Nominal(d, ts) => {
-                Type::Nominal(d.clone(), ts.iter().map(|t| self.apply_type(t)).collect())
-            }
+            Type::Nominal(d, ts) => Type::Nominal(
+                d.clone(),
+                ts.iter()
+                    .map(|t| self.apply_type_inner(t, escaping))
+                    .collect(),
+            ),
             Type::Split { input, output } => Type::Split {
-                input: Box::new(self.apply_type(input)),
-                output: Box::new(self.apply_type(output)),
+                input: Box::new(self.apply_type_inner(input, escaping)),
+                output: Box::new(self.apply_type_inner(output, escaping)),
             },
             Type::Record(fs) => Type::Record(
                 fs.iter()
-                    .map(|(n, t)| (n.clone(), self.apply_type(t)))
+                    .map(|(n, t)| (n.clone(), self.apply_type_inner(t, escaping)))
                     .collect(),
             ),
             Type::Variant(tags, openness) => Type::Variant(
                 tags.iter()
-                    .map(|(k, t)| (k.clone(), self.apply_type(t)))
+                    .map(|(k, t)| (k.clone(), self.apply_type_inner(t, escaping)))
                     .collect(),
                 *openness,
             ),
             Type::History {
                 function,
                 history_kind,
-            } => Type::history_over(self.apply_type(function), *history_kind),
+            } => Type::history_over(self.apply_type_inner(function, escaping), *history_kind),
         }
     }
 
@@ -3090,7 +3149,11 @@ impl Subst {
         (at != *w).then_some(WitnessMapping::Rename(at))
     }
 
-    fn apply_fun_kind(&self, fun_kind: &crate::ccl::ty::FunKind) -> crate::ccl::ty::FunKind {
+    fn apply_fun_kind(
+        &self,
+        fun_kind: &crate::ccl::ty::FunKind,
+        escaping: &mut Vec<crate::ccl::ty::WitnessProjection>,
+    ) -> crate::ccl::ty::FunKind {
         use crate::ccl::ty::FunKind;
         match fun_kind {
             // **A discharged binder leaves the slot.** Its occurrences have been answered,
@@ -3119,7 +3182,7 @@ impl Subst {
                         // A candidate is a domain the sum may take, so a joined binder's
                         // refinement on it is kept naming the binder, for compaction to widen
                         // the candidate.
-                        w.map_types(|t| self.without_joins().apply_type(t))
+                        w.map_types(|t| self.without_joins().apply_type_inner(t, escaping))
                     })
                     .collect();
                 FunKind::Data((!kept.is_empty()).then(|| Rc::new(kept)))
@@ -3140,13 +3203,31 @@ impl Subst {
         }
     }
 
+    fn apply_domain_inner(
+        &self,
+        fun_kind: &crate::ccl::ty::FunKind,
+        domain: &Type,
+        escaping: &mut Vec<crate::ccl::ty::WitnessProjection>,
+    ) -> Type {
+        if fun_kind.has_data_domain() {
+            self.in_data_domain().apply_type_inner(domain, escaping)
+        } else {
+            self.apply_type_inner(domain, escaping)
+        }
+    }
+
     /// `Fun`-codomain analogue of [`under_binder`](Self::under_binder):
     /// shadow the Pi binder in `codomain`. Capture is asserted unreachable
     /// for the same reason (see `under_binder`).
-    fn under_binder_ty(&self, binder: &Name, codomain: &Type) -> Type {
+    fn under_binder_ty(
+        &self,
+        binder: &Name,
+        codomain: &Type,
+        escaping: &mut Vec<crate::ccl::ty::WitnessProjection>,
+    ) -> Type {
         let restricted = self.shadow(binder).acting_on_type(codomain);
         restricted.assert_no_capture(binder);
-        restricted.apply_type(codomain)
+        restricted.apply_type_inner(codomain, escaping)
     }
 }
 
@@ -4613,6 +4694,134 @@ mod capture_assert_probe {
         body();
         COUNT.with(Cell::get)
     }
+}
+
+/// Whether `ty` holds no inference variable and no hole: a candidate inference has settled,
+/// which a determined witness can stand as.
+fn is_settled(ty: &Type) -> bool {
+    if matches!(ty, Type::Infer(_) | Type::Hole | Type::BarrierVar(_)) {
+        return false;
+    }
+    let mut settled = true;
+    ty.walk_children(|c| settled &= is_settled(c));
+    settled
+}
+
+/// Whether a projection can retain `e` through later rewrites: its normal form ([`crate::ccl::ccl_utils::normal_form`]) is
+/// a name, a builtin, a literal, a field or index, a tuple, list, record or constructor of paths,
+/// a path applied to a path, an operator over paths, a conditional whose guards and arms are
+/// paths, or a one-arm `match` reading its payload out of a path. Decided on the normal form, so
+/// every spelling the normal form identifies is decided alike.
+pub(crate) fn can_keep_projection_term(e: &TypedExpr) -> bool {
+    projection_term_shape_is_stable(&crate::ccl::ccl_utils::normal_form(e))
+}
+
+fn projection_term_shape_is_stable(e: &TypedExpr) -> bool {
+    use TypedExprNode::*;
+    match &e.node {
+        Var(_) | Lit(_) | Builtin(_) | Proj(_) => true,
+        List(items) | Tuple(items) => items.iter().all(projection_term_shape_is_stable),
+        Record(fields) => fields
+            .iter()
+            .all(|f| projection_term_shape_is_stable(&f.value)),
+        NominalCtor { payload, .. } => projection_term_shape_is_stable(payload),
+        Apply { function, argument } => {
+            projection_term_shape_is_stable(function) && projection_term_shape_is_stable(argument)
+        }
+        BinOp { left, right, .. } => {
+            projection_term_shape_is_stable(left) && projection_term_shape_is_stable(right)
+        }
+        UnaryOp(_, operand) => projection_term_shape_is_stable(operand),
+        Case {
+            scrutinee: None,
+            branches,
+            ..
+        } => branches.iter().all(|b| {
+            projection_term_shape_is_stable(&b.guard) && projection_term_shape_is_stable(&b.body)
+        }),
+        Case {
+            scrutinee: Some(scrutinee),
+            branches,
+            ..
+        } => {
+            matches!(branches.as_slice(), [b] if b.pattern.as_ref().is_some_and(|p| {
+                matches!(&b.body.node, Var(n) if *n == p.binding.name)
+            }) && matches!(b.guard.node, Lit(crate::ccl::Lit::Bool(true))))
+                && projection_term_shape_is_stable(scrutinee)
+        }
+        _ => false,
+    }
+}
+
+/// Pack domain projections through terms that cannot [stay held](can_keep_projection_term).
+/// A fresh sum binder replaces each packed projection throughout its data function. A single
+/// settled candidate replaces its projection directly. Projections over several candidates
+/// keep the original sum's binder.
+pub(crate) fn pack_projections(ty: &mut Type) {
+    pack_projections_among(ty, &|_| true);
+}
+
+/// [`pack_projections`], packing only the projections `among` admits.
+fn pack_projections_among(
+    ty: &mut Type,
+    among: &dyn Fn(&crate::ccl::ty::WitnessProjection) -> bool,
+) {
+    ty.walk_children_mut(|c| pack_projections_among(c, among));
+    let Type::Fun {
+        fun_kind: crate::ccl::FunKind::Data(_),
+        domain,
+        ..
+    } = ty
+    else {
+        return;
+    };
+    let mut packable = Vec::new();
+    collect_packable(domain, among, &mut packable);
+    for (p, witness) in packable {
+        match witness.sole_candidate().filter(is_settled) {
+            Some(candidate) => replace_projection(ty, &p, &candidate),
+            None => {
+                let fresh = crate::ccl::ty::Witness::mint(witness.type_kind().clone());
+                replace_projection(ty, &p, &Type::WitnessRef(*fresh.id()));
+                *ty = Type::sum_binding(fresh, std::mem::replace(ty, Type::Hole));
+            }
+        }
+    }
+}
+
+/// The projections in `ty` that [`pack_projections`] packs, each once, with the witness each
+/// projects. These read terms that cannot [stay held](can_keep_projection_term) and binders
+/// whose type kinds name at most one candidate.
+fn collect_packable(
+    ty: &Type,
+    among: &dyn Fn(&crate::ccl::ty::WitnessProjection) -> bool,
+    out: &mut Vec<(crate::ccl::ty::WitnessProjection, crate::ccl::ty::Witness)>,
+) {
+    if let Type::WitnessProjection(p) = ty {
+        if let Some(w) = p.witness()
+            && among(p)
+            && !out.iter().any(|(q, _)| q == p)
+            && (w.sole_candidate().is_some()
+                || !matches!(w.type_kind(), crate::ccl::ty::TypeKind::Enumerated(_)))
+            && !can_keep_projection_term(&p.term)
+        {
+            out.push((p.clone(), w.clone()));
+        }
+        return;
+    }
+    ty.walk_children(|c| collect_packable(c, among, out));
+}
+
+/// `ty` with each occurrence of the projection `p` outside refinement predicates replaced by
+/// `packed`.
+fn replace_projection(ty: &mut Type, p: &crate::ccl::ty::WitnessProjection, packed: &Type) {
+    if let Type::WitnessProjection(q) = ty
+        && q == p
+    {
+        *ty = packed.clone();
+        return;
+    }
+    ty.walk_children_mut(|c| replace_projection(c, p, packed));
 }
 
 #[cfg(test)]
@@ -6343,5 +6552,51 @@ mod locally_nameless_tests {
             under,
             slot()
         ])));
+    }
+}
+
+#[cfg(test)]
+mod type_transport_tests {
+    use super::*;
+    use crate::ccl::{BaseType, Expr, Lit, TypeKind};
+
+    #[test]
+    fn slot_transport_and_scope_exit_have_explicit_packing_rules() {
+        let int = Type::Base(BaseType::Int);
+        let sum = Type::sum_over(TypeKind::UIntRanges, None, int.clone());
+        let source = Rc::new(Expr::var("source").with_ty(sum.clone()));
+        let row = Type::data_fun(
+            Type::WitnessProjection(crate::ccl::ty::WitnessProjection::new(source, 0)),
+            int.clone(),
+        );
+        let domain = Type::UIntRange(3);
+        let collection_ty = Type::data_fun(domain.clone(), int.clone());
+        let collection = Expr::lambda(
+            "i",
+            crate::ccl::Occurrence::mint(),
+            domain,
+            Expr::lit(Lit::Int(1)).with_ty(int),
+        )
+        .with_ty(collection_ty.clone());
+        let computed = Expr::apply(
+            collection,
+            Expr::builtin(crate::ccl::Builtin::Box).with_ty(Type::fun(collection_ty, sum.clone())),
+        )
+        .with_ty(sum);
+        assert!(!can_keep_projection_term(&computed));
+        let exit = Subst::discharge("source", computed);
+        let transported = exit.transport_type(&row);
+        assert!(transported.sum().is_none());
+        let packed = exit.apply_type(&row);
+        assert!(packed.sum().is_some());
+        let slot = exit.apply_expr(&Expr::lit(Lit::Unit).with_ty(row.clone()));
+        assert_eq!(slot.ty, transported);
+        let packed_again = exit.apply_type(&row);
+        assert!(packed_again.sum().is_some());
+        assert_ne!(
+            packed.sum().unwrap()[0].id(),
+            packed_again.sum().unwrap()[0].id()
+        );
+        assert_eq!(exit.transport_type(&row), transported);
     }
 }
