@@ -2452,9 +2452,9 @@ references; descent into a function, application and reading a stored predicate 
 `close_pi_binder` closes occurrences of one named binder. `open_pi_binder` replaces references
 to the enclosing function with a `Mapping`, leaving references bound inside the codomain intact.
 
-**Construction closes.** `Type::pi`, `pi_kinded`, `pi_eliminated`, and `fun_like` close the
-codomain they construct. Rebuilds such as `emit_cast` and `emit_compose` also close dependent
-results. A codomain carried from another function must first be aligned with its new binder;
+**Construction closes.** `Type::pi`, `pi_kinded`, and `fun_like` close the codomain they
+construct. Rebuilds such as `emit_cast` and `emit_compose` also close dependent results. A
+codomain carried from another function must first be aligned with its new binder;
 `complete_annotation` does this before filling an annotation from an initializer.
 
 Two direct function constructions have different inputs. `emit_lambda` keeps the live in-solve
