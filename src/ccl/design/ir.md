@@ -486,7 +486,11 @@ merged the two loops' binders into, and is the top-level `Transact` lifted point
 parameter 𝑃: each writer's body takes `(𝑃, (snap…, item))`. Each `init` is `enclosing ⇒ 𝑉`, a
 morphism of the enclosing position alone, so the inner loop seeds from wherever the enclosing one
 had got to, and an enclosing position whose inner loop runs no position has a seed all the same. The
-source is curried instead, `enclosing ⤇ (domain ⤇ item)`, one collection per enclosing position. The
+source is curried instead, `enclosing ⤇ (domain ⤇ item)`, one collection per enclosing position. An
+item that reads the pair, a group read at the inner loop's key, reads its halves there: the
+enclosing value by the curried function's binder and the position by the collection's own key. A
+writer's body then takes the dependent pair `(𝑝 : 𝑃) × (snap…, item)`, the item reading `𝑝.0`
+and `𝑝.1`, and a body generic in the item's domain is instantiated at it. The
 `Transact` then denotes one history record per enclosing position, `enclosing ⇒ {key: 𝐷 ⤇ 𝑉}`, and a
 variable read is the morphism `__hist ≫ .key` of the enclosing parameter. The parameter is stated
 rather than rebuilt from `enclosing` and `domain` because the pair carries refinements neither
