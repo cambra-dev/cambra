@@ -2321,7 +2321,12 @@ Two checks hold it, because no single point sees the whole of what a variable re
 - **At resolution**, a debug build checks the type each variable resolves to against its
   telescope (`assert_resolves_in_scope`).
 
-Both are internal invariant failures, not recoverable user diagnostics.
+Both are internal invariant failures, not recoverable user diagnostics, with one exception at
+record time. A gap naming the binder of a function whose codomain edge records the bound
+(`ConstrainCache::codomain_binders`) is a variable that is one type for every value of the binder,
+which the edge would bound at each value: a meet or a join over the binder, which the solver does
+not compute. `constrain_go` reports it as not compiled yet (`codomain_binder_gap`) instead of
+recording the bound.
 
 `InferCtx::fresh` passes the current telescope to `InferVar::fresh_in`. Emission extends that
 telescope for term binders, and normalization extends it when descending dependent annotations.

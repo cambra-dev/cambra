@@ -465,6 +465,14 @@ pub(super) fn mentioned_names(expr: &ChlExpr, names: &mut HashSet<SmolStr>) {
             names.insert(first.node.clone());
         }
         ChlExpr::Call { func, args } => each(&mut std::iter::once(&**func).chain(args)),
+        // A family, `\k: K -> T`, names types in its binders' annotations and its body.
+        ChlExpr::Lambda { params, body } => each(
+            &mut params
+                .iter()
+                .filter_map(|p| p.annotation.as_ref().map(|a| &a.ty))
+                .chain(std::iter::once(&**body)),
+        ),
+        ChlExpr::TypeBinder { ty, .. } => each(&mut std::iter::once(&**ty)),
         ChlExpr::MethodCall { receiver, args, .. } => {
             each(&mut std::iter::once(&**receiver).chain(args))
         }
@@ -500,7 +508,6 @@ pub(super) fn mentioned_names(expr: &ChlExpr, names: &mut HashSet<SmolStr>) {
         | ChlExpr::Error
         | ChlExpr::Rest
         | ChlExpr::Forall { .. }
-        | ChlExpr::Lambda { .. }
         | ChlExpr::IfExp { .. }
         | ChlExpr::ListComp(_)
         | ChlExpr::GenExp(_)

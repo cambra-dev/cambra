@@ -19,7 +19,8 @@ use std::rc::Rc;
 use smol_str::SmolStr;
 
 use super::constants::Refused;
-use super::stmts::{is_mut_annotation, lower_type_expr, reserved_name};
+use super::functions::refuse_misannotated_type_binder;
+use super::stmts::{is_kind, is_mut_annotation, lower_type_expr, reserved_name};
 use super::{LoweringContext, LoweringError};
 use crate::ccl::ccl_utils::strip_refinements;
 use crate::ccl::nominal::{NominalCtor, NominalDecl, WrittenOrder};
@@ -30,9 +31,9 @@ use crate::ccl::{
 };
 use crate::ccl::{V_NONE, V_SOME};
 use crate::chl_parser::ast::{
-    AnnotationMode, ArmPattern, ConstructorPattern, Expr as ChlExpr, ImplBlock, MatchArm, Param,
-    QualifiedName, Requirement, Span, Spanned, Stmt as ChlStmt, TypeAnnotation, TypeDecl,
-    TypeDeclBody, TypeParam as ChlTypeParam,
+    AnnotationMode, ArmPattern, ConstructorPattern, Expr as ChlExpr, ImplBlock, KindAnnotation,
+    MatchArm, Param, QualifiedName, Requirement, Span, Spanned, Stmt as ChlStmt, TypeAnnotation,
+    TypeDecl, TypeDeclBody, TypeParam as ChlTypeParam,
 };
 
 /// The name the function a declaration's member `name` declares is bound to, `Shape::rect`.
@@ -195,21 +196,30 @@ pub(super) fn declare_nominal_types(
         }
         let mut params: Vec<Rc<TypeParam>> = Vec::new();
         for param in &decl.params {
-            if let Some(what) = reserved_name(&param.node) {
+            if let Some(what) = reserved_name(&param.name) {
                 errors.push(LoweringError::unsupported(
-                    param.span,
+                    param.name_span,
                     format!(
                         "`{}` is a built-in {what} and cannot name a type parameter",
-                        param.node
+                        param.name
                     ),
                 ));
-            } else if params.iter().any(|p| p.spelling == param.node) {
+            } else if params.iter().any(|p| p.spelling == param.name) {
                 errors.push(LoweringError::unsupported(
-                    param.span,
-                    format!("type parameter `{}` is declared twice", param.node),
+                    param.name_span,
+                    format!("type parameter `{}` is declared twice", param.name),
                 ));
             } else {
-                params.push(TypeParam::declared(param.node.clone()));
+                match family_indices(param) {
+                    Ok(indices) if indices.is_empty() => {
+                        params.push(TypeParam::declared(param.name.clone()))
+                    }
+                    Ok(indices) => params.push(TypeParam::declared_family(
+                        param.name.clone(),
+                        indices.len(),
+                    )),
+                    Err(e) => errors.push(e),
+                }
             }
         }
         // A declaration is at its module's path, and the root's at the empty one.
@@ -229,6 +239,119 @@ pub(super) fn declare_nominal_types(
     errors
 }
 
+/// The index types a type declaration's parameter declares, read off its kind: none for a
+/// parameter of kind `Type`, written or not, and for a family parameter its kind's domain, `K` in
+/// `V: K => Type`, one per component of a tuple domain, `K₁, K₂` in `V: {K₁, K₂} => Type`, as a
+/// function of two parameters takes their tuple, and `K` in `V: (k: K) => Type`
+/// (`docs/chl-spec.md`, "Family parameters").
+fn family_indices(param: &ChlTypeParam) -> Result<Vec<&Spanned<ChlExpr>>, LoweringError> {
+    let kind = match &param.annotation {
+        None => return Ok(Vec::new()),
+        Some(KindAnnotation::Kind(kind)) => kind,
+        Some(KindAnnotation::Bound(bound)) => {
+            return Err(LoweringError::unsupported(
+                bound.span,
+                format!(
+                    "a type declaration's parameter takes a kind, `{}: Type`, and no bound",
+                    param.name
+                ),
+            ));
+        }
+    };
+    let name = &param.name;
+    match &kind.node {
+        ChlExpr::Name(n) if n == "Type" => Ok(Vec::new()),
+        ChlExpr::FunctionType {
+            domain,
+            arrow,
+            codomain,
+        } if is_kind(&codomain.node) => {
+            if !matches!(&codomain.node, ChlExpr::Name(n) if n == "Type") {
+                let hint = if matches!(codomain.node, ChlExpr::FunctionType { .. }) {
+                    format!(
+                        "; a family over two values is `{name}: {{A, B}} => Type`, applied as \
+                         `{name}(a, b)`"
+                    )
+                } else {
+                    String::new()
+                };
+                return Err(LoweringError::unsupported(
+                    codomain.span,
+                    format!(
+                        "`{name}` is a type for each value it is indexed by, so its kind is \
+                         `K => Type`{hint}"
+                    ),
+                ));
+            }
+            if matches!(arrow, chl_parser::ast::Arrow::Data) {
+                return Err(LoweringError::unsupported(
+                    kind.span,
+                    format!("the kind arrow is `=>`: `{name}: K => Type`"),
+                ));
+            }
+            match &domain.node {
+                // The binder's name is a spelling: nothing in a kind reads it, so
+                // `V: (k: K) => Type` is `V: K => Type`.
+                ChlExpr::TypeBinder { name: binder, ty } => {
+                    refuse_misannotated_type_binder(binder, ty)?;
+                    Ok(vec![&**ty])
+                }
+                d if is_kind(d) => Err(LoweringError::unsupported(
+                    domain.span,
+                    format!(
+                        "`{name}` is indexed by values, so its kind's domain is a type, \
+                         `{name}: K => Type`, and not a kind"
+                    ),
+                )),
+                ChlExpr::BraceGroup(parts)
+                    if parts.len() > 1
+                        && !parts.iter().any(|p| {
+                            matches!(p.node, ChlExpr::Rest) || p.node.is_variant_arms()
+                        }) =>
+                {
+                    Ok(parts.iter().collect())
+                }
+                _ => Ok(vec![&**domain]),
+            }
+        }
+        _ => Err(LoweringError::unsupported(
+            kind.span,
+            format!(
+                "the kind of `{name}` is `Type`, or `K => Type` for a type for each value of `K`"
+            ),
+        )),
+    }
+}
+
+/// Lower the index types of each family parameter of `decl`, with its other parameters in
+/// scope ([`NominalDecl::set_family_domains`]).
+fn lower_family_domains(
+    decl: &TypeDecl,
+    head: &Rc<NominalDecl>,
+    ctx: &mut LoweringContext,
+) -> Result<(), LoweringError> {
+    let aliases = ctx.snapshot_type_aliases();
+    for param in head.params.iter().filter(|p| p.arity == 0) {
+        ctx.declare_type_throughout(
+            param.spelling.as_str(),
+            crate::ccl::module_type::AliasType::Type(Type::Param(Rc::clone(param))),
+        );
+    }
+    let domains = decl
+        .params
+        .iter()
+        .map(|p| {
+            family_indices(p)?
+                .into_iter()
+                .map(|d| lower_parameter_type(d, ctx))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>();
+    ctx.restore_type_aliases(aliases);
+    head.set_family_domains(domains?);
+    Ok(())
+}
+
 /// Lower the constructors of each `type` among the module's top-level `stmts`, whose
 /// heads [`declare_nominal_types`] declared, and define every declaration.
 ///
@@ -240,6 +363,19 @@ pub(super) fn define_nominal_types(
     ctx: &mut LoweringContext,
 ) -> Vec<LoweringError> {
     let mut errors = Vec::new();
+    // Every declaration's family domains before any constructor, which may apply another
+    // declaration's family parameter.
+    for (decl, _) in type_decls(stmts) {
+        let head = ctx
+            .nominal_type(&decl.name.node)
+            .expect("`declare_nominal_types` declared every head, or lowering stopped");
+        if let Err(e) = lower_family_domains(decl, &head, ctx) {
+            errors.push(e);
+        }
+    }
+    if !errors.is_empty() {
+        return errors;
+    }
     let mut lowered: Vec<(Rc<NominalDecl>, Vec<NominalCtor>)> = Vec::new();
     for (decl, _) in type_decls(stmts) {
         let head = ctx
@@ -388,11 +524,20 @@ fn lower_constructors(
 ) -> Result<Vec<NominalCtor>, LoweringError> {
     let aliases = ctx.snapshot_type_aliases();
     let scoped = ctx.type_params_in_scope.len();
-    for param in &head.params {
-        ctx.declare_type_throughout(
-            param.spelling.as_str(),
-            crate::ccl::module_type::AliasType::Type(Type::Param(Rc::clone(param))),
-        );
+    let families = ctx.family_params.len();
+    for (i, param) in head.params.iter().enumerate() {
+        if param.arity == 0 {
+            ctx.declare_type_throughout(
+                param.spelling.as_str(),
+                crate::ccl::module_type::AliasType::Type(Type::Param(Rc::clone(param))),
+            );
+        } else {
+            ctx.family_params.push((
+                param.spelling.clone(),
+                Rc::clone(param),
+                head.family_domains(i).to_vec(),
+            ));
+        }
         ctx.type_params_in_scope.push(param.spelling.to_string());
     }
     let result = (|| {
@@ -447,6 +592,7 @@ fn lower_constructors(
         Ok(ctors)
     })();
     ctx.type_params_in_scope.truncate(scoped);
+    ctx.family_params.truncate(families);
     ctx.restore_type_aliases(aliases);
     result
 }
@@ -1403,7 +1549,8 @@ fn bind_is_none(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) ->
     }
     let case = ctx.tag_machinery(Expr::match_expr(scrutinee, arms), span, label);
     let name = member_binding(decl, IS_NONE);
-    let self_ty = decl.applied_to_params();
+    let self_ty = decl
+        .applied_to_params(&mut |n, ty| ctx.tag_machinery(Expr::var(n).with_ty(ty), span, label));
     bind_function(decl, name, arg, self_ty, case, acc, span, label, ctx)
 }
 
@@ -1466,7 +1613,8 @@ fn bind_extract(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) ->
     );
     let case = ctx.tag_machinery(case, span, label);
     let name = member_binding(decl, "extract");
-    let self_ty = decl.applied_to_params();
+    let self_ty = decl
+        .applied_to_params(&mut |n, ty| ctx.tag_machinery(Expr::var(n).with_ty(ty), span, label));
     bind_function(decl, name, arg, self_ty, case, acc, span, label, ctx)
 }
 

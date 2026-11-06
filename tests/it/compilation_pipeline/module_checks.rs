@@ -321,6 +321,29 @@ fn a_checked_module_prints_its_nominal_types() {
     );
 }
 
+/// A family parameter prints with its kind, over one value and over two.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_checked_module_prints_a_family_parameter_s_kind() {
+    let program = program(
+        indoc! {"
+            pub type Groups(K, V: K => Type) = (k: K) |=> V(k)
+            pub type Pairs(A, B, V: {A, B} => Type) = (a: A) |=> (b: B) |=> V(a, b)
+        "},
+        &[],
+    );
+    let interface = check_program(&mut GlobalContext::default(), &program)
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert_eq!(
+        interface,
+        indoc! {"
+            module main
+            pub type Groups(K, V: K => Type) = (k: K) |=> V(k)  # invariant in K; covariant in V
+            pub type Pairs(A, B, V: {A, B} => Type) = (a: A) |=> (b: B) |=> V(a, b)  # invariant in A; invariant in B; covariant in V
+        "}
+    );
+}
+
 /// A `const` parameter prints with `const` and a public constant binding with a note, a type
 /// reaching a `const` parameter names it among the parameters whose arguments tell its runs'
 /// types apart, and a refinement prints the term of each constant it reads, a ternary included.

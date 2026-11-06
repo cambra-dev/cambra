@@ -345,7 +345,21 @@ impl NominalMember {
         let decl = &self.decl;
         let chl_type = |ty: &Type| crate::ccl::chl_print::chl_type_in(ty, &decl.module);
         let body = decl.body();
-        let params: Vec<&str> = decl.params.iter().map(|p| p.spelling.as_str()).collect();
+        // A family parameter is written with its kind, `V: K => Type`, and a family over
+        // several values with a tuple domain, `V: {A, B} => Type`.
+        let params: Vec<String> = decl
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| match decl.family_domains(i) {
+                [] => p.spelling.to_string(),
+                [domain] => format!("{}: {} => Type", p.spelling, chl_type(domain)),
+                domains => {
+                    let domains: Vec<String> = domains.iter().map(chl_type).collect();
+                    format!("{}: {{{}}} => Type", p.spelling, domains.join(", "))
+                }
+            })
+            .collect();
         let head = match params.as_slice() {
             [] => decl.name.to_string(),
             params => format!("{}({})", decl.name, params.join(", ")),

@@ -167,8 +167,9 @@ trait, and `trait` a trait ([6.8 Nominal types and methods [Decided]](#68-nomina
 [Declaring a trait](#declaring-a-trait), [Declaring an instance](#declaring-an-instance)).
 
 `forall` begins a polymorphic type (**[Planned]**,
-[Polymorphic type annotations](#polymorphic-type-annotations)). `requires` begins a `requires`
-clause, which ends a `def` signature or a polymorphic type
+[Polymorphic type annotations](#polymorphic-type-annotations)), and in a `requires` clause a
+requirement at every value of a type (**[Planned]**, [Family parameters](#family-parameters)).
+`requires` begins a `requires` clause, which ends a `def` signature or a polymorphic type
 ([Trait requirements](#trait-requirements)). `requires Transaction` is **[Planned]**
 ([8.7 Direction [Decided]: transactions as contextual parameters](#87-direction-decided-transactions-as-contextual-parameters)).
 
@@ -1220,7 +1221,7 @@ the current rule: a lookup decides absence only once the collection's domain is 
 ```
 \x -> body
 \x, y, z -> body
-\x: T -> body                    -- typed parameters [Planned]
+\x: T -> body                    -- a typed parameter
 \ -> body                        -- zero-arity
 ```
 
@@ -1234,14 +1235,12 @@ Like `def`-defined functions (§4.1), lambdas are uncurried: an n-arg
 lambda consumes all n arguments at once and is invoked through an
 n-arg call.
 
-Parameters are bare identifiers today. Because `->` (not `:`) terminates
-the binder list, `:` is free for a per-parameter annotation `\x: T -> body`
-(**[Planned]** — not yet parsed), which is also what makes a refinement
-unwritable on a *lambda* parameter; one parses on a `def` parameter, on a
-`def` result, and in a binding's annotation (§6.4). Some built-ins (e.g.
-`groupby`, §7.2) produce refined lambdas internally. `\x -> x -> 1` (a lambda
-returning a pair, §2.4) is unusual but unambiguous — the first `->` closes the binder, the rest is
-body.
+A parameter may state its type, `\x: T -> body` or `\x <: T -> body`, as a `def`'s parameter
+does (§4.1), refinements included: an argument outside it is refused at the call. The annotation
+ends at the `->` that ends the binder list, so a function type in it is parenthesised,
+`\f: (Int => Int) -> f(1)`. In a type, a lambda is a family
+([Family parameters](#family-parameters)). `\x -> x -> 1` (a lambda returning a pair, §2.4) is
+unambiguous: the first `->` closes the binder list, and the rest is the body.
 
 A capitalized lambda binder is an error. A capitalized name is a type, bound only by an alias
 ([6.7 Type-alias statements](#67-type-alias-statements)), a `def`'s type parameter, or a
@@ -2686,7 +2685,7 @@ the `Iterable` instance ([Membership expressions](#membership-expressions-decide
 representation is
 [Telling `Set` and `Map` apart](../src/ccl/design/collections.md#telling-set-and-map-apart-decided).
 
-A builtin differs from a declared nominal type in five ways:
+A builtin differs from a declared nominal type in four ways:
 
 - **No constructors or `extract`.** A program builds one through `set`, `map`, `groupby` or an
   empty value, and takes it apart through its operations.
@@ -2694,8 +2693,6 @@ A builtin differs from a declared nominal type in five ways:
   parameters are determined by their use ([Type parameters](#type-parameters)). A declared type
   has no spelling for an associated value
   ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
-- **A type family as a parameter.** `FullMap(K, V)`'s `V` may depend on the key, as a group-by's
-  groups do. A declared type's parameter takes a type.
 - **Trait instances.** All three satisfy `Iterable` through instances the compiler provides
   ([Trait requirements](#trait-requirements)). A declared type satisfies the traits its module
   declares instances of ([Declaring an instance](#declaring-an-instance)).
@@ -3023,9 +3020,11 @@ spellings name the same nominal type is
 #### Declaring a nominal type
 
 ```ebnf
-type_stmt   ::= "type" Ident [ "(" Ident ( "," Ident )* [ "," ] ")" ] ":"
+type_stmt   ::= "type" Ident [ "(" type_param ( "," type_param )* [ "," ] ")" ] ":"
                 NEWLINE INDENT ctor_line+ DEDENT
-             |  "type" Ident [ "(" Ident ( "," Ident )* [ "," ] ")" ] "=" expression NEWLINE
+             |  "type" Ident [ "(" type_param ( "," type_param )* [ "," ] ")" ] "=" expression
+                NEWLINE
+type_param  ::= Ident [ ":" expression ]   (* the expression is a kind *)
 ctor_line   ::= [ "@" "RenamedFrom" "(" ident ")" NEWLINE ]
                 ident [ "(" ctor_param ( "," ctor_param )* [ "," ] ")" ] NEWLINE
 ctor_param  ::= [ ident ":" ] expression
@@ -3072,7 +3071,9 @@ renamed_type_stmt ::= "@" "RenamedFrom" "(" type_path ")" NEWLINE type_stmt
   covariant. One that appears only in contravariant positions, such as the domain of
   `on(T => Int)`, is contravariant. One that appears in both, or under an invariant constructor
   such as `Mut(T)`, is invariant. `Option`'s `T` is covariant, so `Option({a: Int, b: Int})` is a
-  subtype of `Option({a: Int})`. A bound or a kind on a type parameter is **[Open]**.
+  subtype of `Option({a: Int})`. A parameter's kind is `Type`, written or not, or a family's,
+  `K => Type` ([Family parameters](#family-parameters)). A bound on a declaration's parameter is
+  **[Open]**.
   - **A position inside a position composes their variances.** Covariant inside contravariant is
     contravariant, contravariant inside contravariant is covariant, and invariant inside anything
     is invariant. `T` is covariant in `on((T => Int) => Int)`. A collection's domain is its data,
@@ -3119,6 +3120,83 @@ with patterns, even when it has one constructor.
 
 **[Tentative]** — the name `extract`. The method shares the type's namespace with its own
 associated functions, so whatever name it takes is unavailable to every type declared with `= R`.
+
+#### Family parameters
+
+A parameter whose kind is a kind arrow, `V: K => Type`, is a **family parameter**: it takes a type
+for each value of `K`. The declaration applies it to the value binders of the types it writes,
+`(k: K) |=> V(k)`. In the kind, `=>` is the kind arrow, not a function type: `K` is the type of the
+values `V` is indexed by, and `Type` is what `V` gives at each
+([Kinds and bounds](#kinds-and-bounds)).
+
+```python
+type Groups(K, V: K => Type) = (k: K) |=> V(k)
+
+gs = Groups::new(groupby([1, 2, 3], \x -> x > 1))
+# gs's type, as a diagnostic writes it:
+#   Groups({Bool where _ in [1 > 1, 2 > 1, 3 > 1]},
+#          \k: {Bool where _ in [1 > 1, 2 > 1, 3 > 1]} ->
+#              {UInt where _ < 3 and ([1, 2, 3][_]! > 1) == k} |=> Int)
+```
+
+- **A family is indexed by values.** `V: {K₁, K₂} => Type` takes a type for each pair of
+  values and is applied as `V(a, b)`, as a function over `{K₁, K₂}` takes two arguments
+  ([3.8 Function calls](#38-function-calls)). The index types name the declaration's other
+  parameters. A kind's domain is a type, so `V: Type => Type` is an error: no parameter is
+  indexed by a type. A curried kind, `K₁ => K₂ => Type`, is an error.
+- **A kind may name its domain's value, `V: (k: K) => Type`.** Nothing reads the name, so the
+  kind is `K => Type`.
+- **A function type names its domain's value as `(k: K) |=> T`**, which `T` reads in refinements
+  and family applications, in any annotation: `def f(g: (k: _) |=> (_ |=> Int))`.
+- **A family parameter is applied to distinct binders in scope.** `V(k)` names a binder of a type
+  around it, and `V(k, k)`, `V(k + 1)` and a bare `V` are errors. Passing it to another family
+  parameter passes the family: `type Outer(K, V: K => Type) = Groups(K, V)`.
+- **A family parameter's index types are its binders' types.** The binder it is applied to and
+  the family parameter it is passed to range over its index type, up to refinements:
+  `V: String => Type` is not applied to `(k: Bool)`.
+- **A family is written as a lambda, `\k: K -> T`**, a type `T` for each value `k` of `K`, which
+  `T` reads in refinements and family applications. A binder written without its type, `\k -> T`,
+  ranges over the type the family is taken at, and a family over two values is `\a, b -> T`. A
+  family stands only where one is taken: as a family parameter's argument, and as `FullMap`'s
+  value type, whose binder is the key, `FullMap(K, \k -> V)`. A `forall` binding a value,
+  `forall (k: K)`, writes no family: it states a requirement at every value of `K`, below.
+- **Any other type where a family is taken is the family constant at it**: one type for every
+  value, whose holes read no binder. `Groups(_, _ |=> Int)` refuses a group-by, whose groups'
+  domain reads the key; `Groups(_, \k -> _ |=> Int)` names the binder its holes read, and
+  `Groups(_, _)` infers the whole family.
+- **Two families relate value by value.** `\k: K -> T₁` is a subtype of `\k: K -> T₂` when `T₁`
+  is a subtype of `T₂` at every `k`. A family parameter's variance is computed from the
+  constructors as any parameter's is, and an index type is invariant.
+
+A bound on a family's values (**[Planned]**) is a requirement in a `requires` clause, under a
+`forall` that binds the family's index:
+
+```ebnf
+requirement ::= …
+             |  "forall" "(" ident ":" expression ( "," ident ":" expression )* [ "," ] ")"
+                ( requirement | "(" requirement ( "," requirement )* [ "," ] ")" )
+             |  expression "<:" expression
+```
+
+```python
+def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) V(k) <: _ |=> Int:
+    sum([sum(grp) for grp in g])
+```
+
+- **`forall (k: K)` binds `k`, a value of `K`, over exactly one requirement.** Parentheses group
+  several: `requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int), Equatable(K, K)`
+  states the first two at every `k` and the third once. Braces in a type never group
+  ([2.4 Atoms](#24-atoms)), so a bound is written bare, as above, or in parentheses.
+- **`forall` means every value.** A use is checked with `k` abstract, so the requirement holds at
+  every value of `K`, not only at the values the use's arguments hold.
+- **A requirement may bound a type, `V(k) <: U`.** Every value of the family is a subtype of `U`.
+- **A hole in a requirement under `forall` is inferred separately at each value of `k`.** It is a
+  family parameter of the definition, a type for each `k`, where a hole in an unquantified clause
+  is a type parameter ([Trait requirements](#trait-requirements)). So `_ |=> Int` admits groups
+  whose domains differ by key.
+
+**[Planned]** — a family parameter of a polymorphic type or a `def`, `forall (K, V: K => Type)`,
+and a `requires` clause on a type declaration, which has none.
 
 #### A nominal type is opaque
 
@@ -3423,9 +3501,21 @@ in the kind `K`:
 - `SubtypesOf(U)` is every subtype of `U`, `U` included. `T <: U`, the **bound** form, is
   `T: SubtypesOf(U)`. An open tuple `U` is not itself among them, no value having its type
   ([Tuple width](#tuple-width)).
+- `K => Type` is every family over the values of `K`, a type for each value. `=>` is the kind
+  arrow and `K` is a type. A parameter of this kind is a family parameter, declared on a type
+  declaration ([Family parameters](#family-parameters)); on a `def`'s or a `forall`'s it is
+  **[Planned]**.
 
-Any other kind, such as a listing `T: [Int, String]`, is **[Open]** and an error. A type written as
-a kind, as in `T: Int`, is an error.
+Any other kind, such as a listing `T: [Int, String]`, is **[Open]** and an error.
+
+**Case decides what a binder binds, and its annotation agrees.** A capitalized name binds a type
+and a lowercase name a value
+([6.1 Direction: term/type syntax split [Decided]](#61-direction-termtype-syntax-split-decided)).
+In a parameter or binder list, the name before `:` is the variable bound, and its annotation is a
+kind for a type and a type for a value: `V: K => Type` is a type parameter whose kind is
+`K => Type`, and `k: K` in `forall (k: K)` binds a value of `K`
+([Family parameters](#family-parameters)). A type written as a kind, `T: Int`, and a kind written
+as a value's type, `t: Type`, are errors.
 
 `T <: U` restricts `T` to subtypes of `U`. The body uses a value of type `T` as a `U`. The caller
 receives its own type for `T`.
@@ -3511,7 +3601,9 @@ instance ([Equality and order](#equality-and-order)).
   below that bound at the requirement's operands, unless the clause bounds it itself. A
   requirement with no name has it too, so under `requires Iterable(C)`, `C`'s collection is some
   collection of some type, and a loop over a `C` types. A hole in a bound, the trait's or the
-  clause's, is a type parameter of the definition. Under
+  clause's, is a type parameter of the definition, and one in a requirement under `forall (k: K)`
+  is a family parameter of it, a type for each `k` (**[Planned]**,
+  [Family parameters](#family-parameters)). Under
   `requires i: Iterable(C), i::Elements <: _ |=> T`, `C`'s collection has values of type `T`,
   whatever its domain.
 

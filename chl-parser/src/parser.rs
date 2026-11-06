@@ -272,6 +272,24 @@ where
             .then_ignore(just(Token::RParen))
             .map_with(|fields, e| Spanned::new(e.span(), Expr::Record(fields)));
 
+        // A binder in a type, `k: K`: a function type's parenthesised domain. A name
+        // followed by `:` begins no other expression, so the alternative commits only once
+        // the colon is seen.
+        let type_binder = select! { Token::Ident(s) => s }
+            .map_with(|s, e| Spanned::new(e.span(), s))
+            .then_ignore(just(Token::Colon))
+            .then(bracketed_expr.clone())
+            .map_with(|(name, ty), e| {
+                Spanned::new(
+                    e.span(),
+                    Expr::TypeBinder {
+                        name,
+                        ty: Box::new(ty),
+                    },
+                )
+            })
+            .boxed();
+
         // Parenthesised expression / tuple / record / generator expression.
         let paren_group = just(Token::LParen)
             .ignore_then(choice((
@@ -279,6 +297,10 @@ where
                 just(Token::RParen).map_with(|_, e| Spanned::new(e.span(), Expr::Tuple(vec![]))),
                 // Record value `(name=value, …)`.
                 paren_record,
+                // The domain of a dependent function type, `(k: K)`.
+                type_binder
+                    .then_ignore(just(Token::RParen))
+                    .map_with(|binder, e| Spanned::new(e.span(), binder.node)),
                 bracketed_expr
                     .clone()
                     .then(choice((
@@ -1078,14 +1100,21 @@ where
         // ---- Lambda (a pair's value, and a top-level expression form) ---
         //
         // A lambda is `\params -> body`: `\` introduces the binders, `->`
-        // separates them from the body. Params are bare identifiers here;
-        // the `->` terminator (rather than `:`) leaves `:` free for a future
-        // per-param annotation (`\x: T -> body`), not yet parsed.
-        let lambda_param = ident_only.map(|(name, name_span)| Param {
-            name,
-            name_span,
-            annotation: None,
-        });
+        // separates them from the body. A parameter may state its type, `\x: T -> body`,
+        // as a `def`'s does. The annotation is a ternary, below `pair`, so the `->` that
+        // ends the binders is not read as a pair inside it.
+        let lambda_param = ident_only
+            .then(
+                annotation_mode()
+                    .then(ternary.clone())
+                    .map(|(mode, ty)| TypeAnnotation { mode, ty })
+                    .or_not(),
+            )
+            .map(|((name, name_span), annotation)| Param {
+                name,
+                name_span,
+                annotation,
+            });
         let lambda = just(Token::Backslash)
             .ignore_then(
                 lambda_param
@@ -1121,8 +1150,7 @@ where
                 name,
                 name_span,
                 annotation,
-            })
-            .try_map(|param, _| type_param(param));
+            });
         let forall = just(Token::Forall)
             .ignore_then(
                 forall_param
@@ -1130,7 +1158,8 @@ where
                     .at_least(1)
                     .allow_trailing()
                     .collect::<Vec<_>>()
-                    .delimited_by(just(Token::LParen), just(Token::RParen)),
+                    .delimited_by(just(Token::LParen), just(Token::RParen))
+                    .try_map(|params, _| params.into_iter().map(type_param).collect()),
             )
             .then(expr.clone())
             .then(requires_clause(expr.clone()).or_not())
@@ -1836,10 +1865,29 @@ where
                 .then_ignore(just(Token::Dedent))
                 .map(TypeDeclBody::Constructors),
         ));
+        // A parameter with its kind, `T: K`, a family parameter's a kind arrow,
+        // `V: K => Type` (`docs/chl-spec.md`, "Family parameters").
+        let type_decl_param = binder
+            .then(
+                choice((
+                    just(Token::Colon)
+                        .ignore_then(expr.clone())
+                        .map(KindAnnotation::Kind),
+                    just(Token::LtColon)
+                        .ignore_then(expr.clone())
+                        .map(KindAnnotation::Bound),
+                ))
+                .or_not(),
+            )
+            .map(|(name, annotation)| TypeParam {
+                name: name.node,
+                name_span: name.span,
+                annotation,
+            });
         let type_stmt = just(Token::Type)
             .ignore_then(binder)
             .then(
-                binder
+                type_decl_param
                     .separated_by(just(Token::Comma))
                     .at_least(1)
                     .allow_trailing()
@@ -1850,16 +1898,18 @@ where
             )
             .then(type_body)
             .validate(|((name, params), body), e, emitter| {
-                let heads = std::iter::once((&name, "type name"))
-                    .chain(params.iter().map(|p| (p, "type parameter")));
-                for (head, what) in heads {
-                    if !is_type_name(&head.node) {
+                let heads = std::iter::once((&name.node, name.span, "type name")).chain(
+                    params
+                        .iter()
+                        .map(|p| (&p.name, p.name_span, "type parameter")),
+                );
+                for (head, span, what) in heads {
+                    if !is_type_name(head) {
                         emitter.emit(Rich::custom(
-                            head.span,
+                            span,
                             format!(
-                                "{what} `{}` begins with a lowercase letter; a type's name \
-                                 is capitalized",
-                                head.node
+                                "{what} `{head}` begins with a lowercase letter; a type's name \
+                                 is capitalized"
                             ),
                         ));
                     }
@@ -2616,8 +2666,9 @@ fn type_param<'src>(item: Param) -> Result<TypeParam, Rich<'src, Token, Span>> {
         return Err(Rich::custom(
             item.name_span,
             format!(
-                "`{}` is not capitalized, so it is not a type parameter; `forall` binds only \
-                 type parameters",
+                "`{0}` is not capitalized, so it is not a type parameter; a polymorphic type's \
+                 `forall` binds only type parameters, and a family over the values `{0}` ranges \
+                 over is a lambda, `\\{0}: K -> T`",
                 item.name
             ),
         ));
@@ -3030,7 +3081,7 @@ mod tests {
             panic!("expected a type declaration, got {:?}", m.body[0].node)
         };
         assert_eq!(decl.name.node, "Shape");
-        let params: Vec<_> = decl.params.iter().map(|p| p.node.as_str()).collect();
+        let params: Vec<_> = decl.params.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(params, ["T"]);
         let TypeDeclBody::Constructors(ctors) = &decl.body else {
             panic!("expected constructor lines, got {:?}", decl.body)
@@ -3274,6 +3325,76 @@ mod tests {
         assert!(matches!(decl.body, TypeDeclBody::Single(_)));
     }
 
+    /// A family parameter is declared with its kind, `V: K => Type`, the kind arrow from the type
+    /// of its values; the index-binder form `V(k: K)` is not a parameter.
+    #[test]
+    fn a_type_declaration_parameter_states_a_family_kind() {
+        let m = parse_m("type Groups(K, V: K => Type) = (k: K) |=> V(k)\n");
+        let Stmt::TypeDecl(decl) = &m.body[0].node else {
+            panic!("expected a type declaration, got {:?}", m.body[0].node)
+        };
+        let [k, v] = decl.params.as_slice() else {
+            panic!("expected two parameters, got {:?}", decl.params)
+        };
+        assert_eq!((k.name.as_str(), &k.annotation), ("K", &None));
+        assert_eq!(v.name, "V");
+        let Some(KindAnnotation::Kind(kind)) = &v.annotation else {
+            panic!("expected `V`'s kind, got {:?}", v.annotation)
+        };
+        assert!(
+            matches!(
+                &kind.node,
+                Expr::FunctionType { domain, arrow: Arrow::Compute, codomain }
+                    if matches!(&domain.node, Expr::Name(n) if n == "K")
+                        && matches!(&codomain.node, Expr::Name(n) if n == "Type")
+            ),
+            "the kind `K => Type`, got {:?}",
+            kind.node
+        );
+        assert!(
+            parse_mod("type Groups(K, V(k: K)) = (k: K) |=> V(k)\n")
+                .into_result()
+                .is_err(),
+            "`V(k: K)` declares no parameter"
+        );
+        let TypeDeclBody::Single(body) = &decl.body else {
+            panic!("expected the single-constructor form, got {:?}", decl.body)
+        };
+        let Expr::FunctionType { domain, .. } = &body.node else {
+            panic!("expected a function type, got {:?}", body.node)
+        };
+        assert!(
+            matches!(domain.node, Expr::TypeBinder { .. }),
+            "the domain `(k: K)` is a binder, got {:?}",
+            domain.node
+        );
+    }
+
+    /// A lambda's parameter may state its type; the annotation ends at the lambda's `->`, so a
+    /// family over two values, `\a: A, b: B -> V(a, b)`, is two annotated parameters.
+    #[test]
+    fn a_lambda_parameter_states_its_type() {
+        let Expr::Lambda { params, body } = parse_e("\\a: A, b <: B -> V(a, b)").node else {
+            panic!("expected a lambda");
+        };
+        let annotated: Vec<_> = params
+            .iter()
+            .map(|p| (p.name.as_str(), p.annotation.as_ref().map(|a| a.mode)))
+            .collect();
+        assert_eq!(
+            annotated,
+            [
+                ("a", Some(AnnotationMode::Exact)),
+                ("b", Some(AnnotationMode::Bounded))
+            ]
+        );
+        assert!(matches!(body.node, Expr::Call { .. }), "{:?}", body.node);
+        let Expr::Lambda { params, .. } = parse_e("\\k -> T").node else {
+            panic!("expected a lambda");
+        };
+        assert!(params[0].annotation.is_none());
+    }
+
     /// A type's name and parameters are capitalized and its constructors are not, and each
     /// case error names the offending identifier.
     #[test]
@@ -3281,6 +3402,7 @@ mod tests {
         for (src, needle) in [
             ("type price = Int\n", "type name `price`"),
             ("type Box(t) = t\n", "type parameter `t`"),
+            ("type Box(t: Type) = Int\n", "type parameter `t`"),
             ("type Shape:\n    Circle(Int)\n", "constructor `Circle`"),
         ] {
             let result = parse_mod(src);
@@ -5053,10 +5175,19 @@ mod tests {
         ));
     }
 
+    /// A polymorphic type's `forall` binds type parameters, and a family over values is a lambda.
     #[test]
-    fn forall_binds_only_type_parameters() {
+    fn a_polymorphic_type_s_forall_binds_only_type_parameters() {
         let msg = custom_error("f: forall (x) Int = 1");
-        assert!(msg.contains("`forall` binds only type parameters"), "{msg}");
+        assert!(
+            msg.contains("`x` is not capitalized, so it is not a type parameter"),
+            "{msg}"
+        );
+        let msg = custom_error("f: forall (k: K) Int = 1");
+        assert!(
+            msg.contains("a family over the values `k` ranges over is a lambda"),
+            "{msg}"
+        );
     }
 
     #[test]

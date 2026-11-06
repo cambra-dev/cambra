@@ -1539,11 +1539,32 @@ pub enum Type {
     ///
     /// See `src/ccl/design/type-parameters.md`.
     Param(Rc<TypeParam>),
-    /// A generalized **family** parameter applied to the terms it is indexed by, `𝐷₁(𝑘₀)`: the
-    /// type the parameter stands for at those values of the binders the terms read
-    /// (`src/ccl/design/type-parameters.md`, "Generalized types"). Born after inference, so the
-    /// solver never meets one.
+    /// A **family** parameter applied to the terms it is indexed by, `𝑉(𝑘)`: the type the
+    /// parameter stands for at those values. A generalized one, `𝐷₁(𝑘₀)`, reads binders of the
+    /// type around it (`src/ccl/design/type-parameters.md`, "Generalized types"). A declared
+    /// one, `V(k)` under `V: K => Type`, is written in a nominal type's declaration and in the
+    /// constructor functions bound over it (`src/ccl/design/nominal-types.md`, "Family
+    /// parameters").
     FamilyApp(FamilyApp),
+    /// A **family**, `\𝑘: 𝐾 -> 𝑇`: a type for each value of its binders. It is the
+    /// argument a nominal type's family parameter takes (`src/ccl/design/nominal-types.md`,
+    /// "Family parameters"), and applying the parameter discharges its binders to the
+    /// application's terms.
+    ///
+    /// Each binder ranges over its domain and scopes over the body only, in the shape of a
+    /// `Fun`'s binder: a reference from the body is a [`Name::PiBound`](crate::ccl::Name::PiBound)
+    /// whose index counts the binders crossed, so the body reaches binder `𝑗` of `𝑛` at
+    /// `𝑛 − 1 − 𝑗`. A domain reads no binder of its own family. The domains are the
+    /// declaration's index types at the nominal type's other arguments
+    /// ([`NominalDecl::family_domains_at`](crate::ccl::nominal::NominalDecl::family_domains_at)),
+    /// so subtyping does not relate them. The name slots are opening addresses and display
+    /// spellings, as `Fun::name` is.
+    ///
+    /// Built by [`Type::family`], which closes the body.
+    Family {
+        binders: Vec<(Option<crate::ccl::Name>, Type)>,
+        body: Box<Type>,
+    },
     /// A **written polymorphic type**, `forall (T, U <: B) V`: type parameters with their
     /// bounds over a body type. Lowering produces one only as a whole `let`
     /// annotation; a `def` with type parameters is a `let` annotated with one whose
@@ -1606,9 +1627,11 @@ pub struct TypeParam {
     /// scope of a binder its instance named ([`TypeParam::generalized`]). Its `Poly` stays in the
     /// tree after inference.
     pub generalized: bool,
-    /// How many terms the parameter is applied to: a generalized **family** stands for a type per
-    /// value of the type's binders it reads, and each occurrence is a [`Type::FamilyApp`] of
-    /// that many. Zero for every other parameter, each occurrence a [`Type::Param`].
+    /// How many terms the parameter is applied to. A **family** stands for a type per value of
+    /// those terms, and each occurrence is a [`Type::FamilyApp`] of that many: a generalized
+    /// one is applied to the type's binders it reads, and a declared one, `V: K => Type`, to
+    /// the terms its declaration writes. Zero for every other parameter, each occurrence a
+    /// [`Type::Param`].
     pub arity: usize,
 }
 
@@ -1651,12 +1674,38 @@ impl TypeParam {
         })
     }
 
+    /// A declared family parameter, `V` in `V: K => Type`, applied to `arity` terms
+    /// (`src/ccl/design/nominal-types.md`, "Family parameters").
+    pub fn declared_family(spelling: impl Into<SmolStr>, arity: usize) -> Rc<TypeParam> {
+        Rc::new(TypeParam {
+            id: TypeParamId(TYPE_PARAM_COUNTER.fetch_add(1, Ordering::Relaxed)),
+            spelling: spelling.into(),
+            opened_at: None,
+            bound: None,
+            bound_at: None,
+            generalized: false,
+            arity,
+        })
+    }
+
     /// An opened parameter at `level`, no other equal to it.
     pub fn opened(
         spelling: impl Into<SmolStr>,
         level: crate::ccl::Level,
         bound: Option<Type>,
         bound_at: Option<chl_parser::ast::Span>,
+    ) -> Rc<TypeParam> {
+        Self::opened_family(spelling, level, bound, bound_at, 0)
+    }
+
+    /// An opened parameter at `level` applied to `arity` terms, the one a declared family
+    /// parameter opens to.
+    pub fn opened_family(
+        spelling: impl Into<SmolStr>,
+        level: crate::ccl::Level,
+        bound: Option<Type>,
+        bound_at: Option<chl_parser::ast::Span>,
+        arity: usize,
     ) -> Rc<TypeParam> {
         Rc::new(TypeParam {
             id: TypeParamId(TYPE_PARAM_COUNTER.fetch_add(1, Ordering::Relaxed)),
@@ -1665,7 +1714,7 @@ impl TypeParam {
             bound,
             bound_at,
             generalized: false,
-            arity: 0,
+            arity,
         })
     }
 
@@ -2870,6 +2919,37 @@ fn fmt_type(
                 .collect();
             write!(f, "{}({})", app.param.spelling, args.join(", "))
         }
+        // `\\𝑘: 𝐾 -> 𝑇`: the body renders inside every binder.
+        Type::Family {
+            binders: bound,
+            body,
+        } => {
+            let mut shown = Vec::with_capacity(bound.len());
+            for (name, domain) in bound {
+                let dom = at(domain, binders).to_string();
+                match name {
+                    Some(x) => shown.push(format!("{x}: {dom}")),
+                    None => shown.push(format!("_: {dom}")),
+                }
+            }
+            // Each crossing borrows the one before it, so the binders are entered by recursion.
+            fn body_under(
+                f: &mut fmt::Formatter<'_>,
+                names: &[(Option<crate::ccl::Name>, Type)],
+                body: &Type,
+                binders: Option<&symbolic::PiBinderEnv<'_>>,
+            ) -> fmt::Result {
+                match names.split_first() {
+                    None => write!(f, "{}", at(body, binders)),
+                    Some(((name, _), rest)) => {
+                        let inner = symbolic::PiBinderEnv::crossing(binders, name.as_ref());
+                        body_under(f, rest, body, Some(&inner))
+                    }
+                }
+            }
+            write!(f, "\\{} -> ", shown.join(", "))?;
+            body_under(f, bound, body, binders)
+        }
         Type::Nominal(decl, args) if args.is_empty() => write!(f, "{}", decl.spelled()),
         Type::Nominal(decl, args) => {
             let args: Vec<String> = args.iter().map(|t| at(t, binders).to_string()).collect();
@@ -3165,6 +3245,18 @@ impl Type {
             fun_kind,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+        }
+    }
+
+    /// The family `\\𝑘₀: 𝐾₀, … -> body` ([`Type::Family`]), closing the body's references
+    /// to the binders by name into indices, as [`Type::pi`] closes a codomain.
+    pub fn family(binders: Vec<(crate::ccl::Name, Self)>, body: Self) -> Self {
+        let names: Vec<Option<crate::ccl::Name>> =
+            binders.iter().map(|(n, _)| Some(n.clone())).collect();
+        let body = crate::ccl::subst::close_pi_binders(&names, &body);
+        Type::Family {
+            binders: binders.into_iter().map(|(n, t)| (Some(n), t)).collect(),
+            body: Box::new(body),
         }
     }
 
@@ -3982,6 +4074,13 @@ impl Type {
                     .map(|(_, t)| (None, t.without_pi_names()))
                     .collect(),
             ),
+            Type::Family { binders, body } => Type::Family {
+                binders: binders
+                    .iter()
+                    .map(|(_, t)| (None, t.without_pi_names()))
+                    .collect(),
+                body: Box::new(body.without_pi_names()),
+            },
             Type::Record(fs) => Type::Record(
                 fs.iter()
                     .map(|(n, t)| (n.clone(), t.without_pi_names()))
@@ -4180,6 +4279,12 @@ impl Type {
                     f(t);
                 }
             }
+            Type::Family { binders, body } => {
+                for (_, t) in binders {
+                    f(t);
+                }
+                f(body);
+            }
             Type::Record(fields) => {
                 for (_, t) in fields {
                     f(t);
@@ -4246,6 +4351,12 @@ impl Type {
                 for (_, t) in cs {
                     f(t);
                 }
+            }
+            Type::Family { binders, body } => {
+                for (_, t) in binders {
+                    f(t);
+                }
+                f(body);
             }
             Type::Record(fields) => {
                 for (_, t) in fields {

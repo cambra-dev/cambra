@@ -152,7 +152,7 @@ fn codomain_opened_as(fun: &Type, codomain: &Type, b: &crate::ccl::Name) -> Type
 }
 
 /// `ty` with every named function's references to its own binder read by name.
-fn opened_deep(ty: &Type) -> Type {
+pub(crate) fn opened_deep(ty: &Type) -> Type {
     match ty {
         Type::Fun {
             name: Some(b),
@@ -165,6 +165,24 @@ fn opened_deep(ty: &Type) -> Type {
             domain: Box::new(opened_deep(domain)),
             codomain: Box::new(opened_deep(&crate::ccl::subst::open_codomain(ty, codomain))),
         },
+        // A family's body reads its binders by their names.
+        Type::Family { binders, body } if binders.iter().all(|(n, _)| n.is_some()) => {
+            let opened = crate::ccl::subst::open_family_body(binders.len(), body, |j| {
+                crate::ccl::subst::Mapping::Rename(
+                    binders[j]
+                        .0
+                        .clone()
+                        .unwrap_or_else(|| unreachable!("every binder is named")),
+                )
+            });
+            Type::Family {
+                binders: binders
+                    .iter()
+                    .map(|(n, t)| (n.clone(), opened_deep(t)))
+                    .collect(),
+                body: Box::new(opened_deep(&opened)),
+            }
+        }
         // A component's references to the components before it are read by their names, as a
         // codomain's to its function's binder. A tuple naming each component has them.
         Type::DepTuple(cs) if cs.iter().all(|(n, _)| n.is_some()) => {
@@ -192,7 +210,7 @@ fn opened_deep(ty: &Type) -> Type {
 }
 
 /// [`opened_deep`] undone: every named function closed over its binder (`Type::pi_kinded`).
-fn closed_deep(ty: &Type) -> Type {
+pub(crate) fn closed_deep(ty: &Type) -> Type {
     match ty {
         Type::Fun {
             name: Some(b),
@@ -204,6 +222,13 @@ fn closed_deep(ty: &Type) -> Type {
             closed_deep(domain),
             closed_deep(codomain),
             fun_kind.clone(),
+        ),
+        Type::Family { binders, body } if binders.iter().all(|(n, _)| n.is_some()) => Type::family(
+            binders
+                .iter()
+                .map(|(n, t)| (n.clone().expect("matched named"), closed_deep(t)))
+                .collect(),
+            closed_deep(body),
         ),
         // Closed over the components' names, and the plain tuple where none reads another.
         Type::DepTuple(cs) => Type::dep_tuple(
@@ -676,11 +701,13 @@ pub(crate) fn generalize_out_of_scope(root: &mut crate::ccl::Expr) -> Result<(),
 /// is generalized, which decide the result.
 type GeneralizedCache = HashMap<(Type, Vec<crate::ccl::Name>), Type>;
 
-/// The names `ty` binds over parts of itself: Pi binders and dependent-tuple components.
+/// The names `ty` binds over parts of itself: Pi binders, dependent-tuple components and
+/// family binders.
 fn type_binders(ty: &Type, out: &mut Vec<crate::ccl::Name>) {
     match ty {
         Type::Fun { name: Some(n), .. } => out.push(n.clone()),
         Type::DepTuple(cs) => out.extend(cs.iter().filter_map(|(n, _)| n.clone())),
+        Type::Family { binders, .. } => out.extend(binders.iter().filter_map(|(n, _)| n.clone())),
         _ => {}
     }
     ty.walk_children(|c| type_binders(c, out));
@@ -1268,7 +1295,8 @@ fn quantified(
     })))
 }
 
-/// The type `ty` gives its binder `b`: a function's domain, or a dependent tuple's component.
+/// The type `ty` gives its binder `b`: a function's domain, a dependent tuple's component, or a
+/// family binder's domain.
 fn binder_domain(ty: &Type, b: &crate::ccl::Name) -> Option<Type> {
     match ty {
         Type::Fun {
@@ -1276,7 +1304,7 @@ fn binder_domain(ty: &Type, b: &crate::ccl::Name) -> Option<Type> {
             domain,
             ..
         } if n == b => return Some((**domain).clone()),
-        Type::DepTuple(cs) => {
+        Type::DepTuple(cs) | Type::Family { binders: cs, .. } => {
             if let Some((_, t)) = cs.iter().find(|(n, _)| n.as_ref() == Some(b)) {
                 return Some(t.clone());
             }

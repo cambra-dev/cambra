@@ -160,6 +160,10 @@ pub enum ConstrainError {
         /// The refinement, as written.
         refinement: Refinement,
     },
+    /// A shape the solver does not compile yet, which the message names. Reported as
+    /// [`InferError::Unsupported`](crate::ccl::infer::InferError::Unsupported) rather than
+    /// left to an invariant failure further on.
+    NotCompiledYet(String),
     /// Collections over distinct domains met as **lower bounds** of one variable — the
     /// arms of a conditional flowing into one join.
     ///
@@ -238,6 +242,10 @@ pub enum ConstrainError {
 /// composites grow along lexical nesting depth, not around cycles).
 pub struct ConstrainCache {
     edges: HashMap<(Type, Type), Vec<(Subst, Subst)>>,
+    /// The binders of the functions whose codomain edges the descent is inside, innermost
+    /// last. A bound that would put one of them outside its scope on a variable is a meet or a
+    /// join over the binder, which the solver does not compute ([`codomain_binder_gap`]).
+    codomain_binders: Vec<Name>,
     /// Which derivation this cache serves: the live solve and a pass-boundary
     /// re-derivation answer `opens_unconditionally` differently
     /// (`src/ccl/design/type-inference.md`, "Where the conversions run").
@@ -314,6 +322,7 @@ impl ConstrainCache {
     pub fn for_derivation(derivation: Derivation) -> Self {
         Self {
             edges: HashMap::new(),
+            codomain_binders: Vec::new(),
             derivation,
             lctx: crate::ccl::ty::WitnessContext::default(),
             rctx: crate::ccl::ty::WitnessContext::default(),
@@ -890,11 +899,12 @@ fn distinct_data_domains(lows: &[Bound]) -> Option<(Type, Type)> {
         if low.ty.sum().is_some() {
             continue;
         }
-        // A joined binder's refinement stays on the domain, as on any data domain, so two
-        // rows over keys that differ by the binder conflict here.
-        // A dependent tuple whose components read no earlier one is the plain tuple
-        // (`Type::dep_tuple`), so the two compare as one domain.
-        let d = match low.ty_subst.apply_domain(fun_kind, domain) {
+        // Each domain is read in the holder's terms ([`Bound::render_subst`]): two bounds that
+        // reached it through applications at different binders name one domain. A joined
+        // binder's refinement stays on the domain, as on any data domain, so two rows over keys
+        // that differ by the binder conflict here. A dependent tuple whose components read no
+        // earlier one is the plain tuple (`Type::dep_tuple`), so the two compare as one domain.
+        let d = match low.render_subst().apply_domain(fun_kind, domain) {
             Type::DepTuple(components) => Type::dep_tuple(components),
             d => d,
         };
@@ -924,6 +934,29 @@ fn joined_keys(domain: &Type, subst: &Subst) -> Option<(Vec<Name>, Refinement)> 
         t = base;
     }
     None
+}
+
+/// A bound that would put the binder of a function whose codomain edge the descent is inside
+/// outside its scope on `holder`: the holder is one type for every value of the binder, and the
+/// edge would bound it at each value, a meet or a join over the binder, which the solver does
+/// not compute (`docs/chl-spec.md`, "Family parameters"). Any other gap stays
+/// [`enforce_bound_scope`](crate::ccl::infer_var::enforce_bound_scope)'s internal error.
+fn codomain_binder_gap(
+    holder: &InferVar,
+    bound: &Bound,
+    cache: &ConstrainCache,
+) -> Option<ConstrainError> {
+    if cache.codomain_binders.is_empty() {
+        return None;
+    }
+    let binder = crate::ccl::infer_var::bound_scope_gaps(&holder.telescope, bound)
+        .into_iter()
+        .find(|n| cache.codomain_binders.contains(n))?;
+    Some(ConstrainError::NotCompiledYet(format!(
+        "a value that is one type for every `{}`, related to a type that reads `{}`,",
+        binder.source_spelling().unwrap_or("k"),
+        binder.source_spelling().unwrap_or("k"),
+    )))
 }
 
 /// The two domains a failed domain edge found unequal: the comparison at the bottom of `err`'s
@@ -1700,14 +1733,20 @@ fn constrain_go_impl(
                 } else {
                     cache.swapped(|cache| constrain_go(d1, d0, sr, sl, cache, scope))?;
                 }
-                constrain_go(
+                let entered = cache.codomain_binders.len();
+                cache
+                    .codomain_binders
+                    .extend([n0, n1].into_iter().flatten().cloned());
+                let codomain = constrain_go(
                     c0_opened.as_ref().map_or(&**c0, |c| c),
                     c1_opened.as_ref().map_or(&**c1, |c| c),
                     &cod_sl,
                     sr,
                     cache,
                     scope,
-                )
+                );
+                cache.codomain_binders.truncate(entered);
+                codomain
             })
         }
 
@@ -1817,6 +1856,49 @@ fn constrain_go_impl(
             lhs: Box::new(lhs.clone()),
             rhs: Box::new(rhs.clone()),
         }),
+
+        // Family: pointwise, a family below another where at each value of the binders its
+        // body is below the other's (`src/ccl/design/nominal-types.md`, "Family parameters").
+        // The domains do not relate here: a family is the argument of a family parameter, whose
+        // domains are its declaration's index types at the other arguments
+        // (`NominalDecl::family_domains_at`), and those arguments relate where the two
+        // applications do. Relating each domain again adds a path to every index argument per
+        // family, which compaction walks once per path. The bodies relate under the two sides'
+        // binders aligned, as two codomains do (`sl.aligned`), each side opening at its names
+        // where the other side is live, as a dependent tuple's components do.
+        (
+            Type::Family {
+                binders: a,
+                body: a_body,
+            },
+            Type::Family {
+                binders: b,
+                body: b_body,
+            },
+        ) if a.len() == b.len() => {
+            let opened = |binders: &[(Option<Name>, Type)], body: &Type, other: &Type| -> Type {
+                let n = binders.len();
+                if crate::ccl::subst::references_binder_within(body, n as u32)
+                    && (cache.derivation.opens_unconditionally()
+                        || crate::ccl::subst::type_contains_infer(other))
+                {
+                    crate::ccl::subst::open_family_body(n, body, |j| {
+                        let name = binders[j].0.clone().unwrap_or_else(|| {
+                            panic!("a binder the body reads by index names itself: {lhs}")
+                        });
+                        crate::ccl::subst::Mapping::Rename(name)
+                    })
+                } else {
+                    body.clone()
+                }
+            };
+            let (a_opened, b_opened) = (opened(a, a_body, rhs), opened(b, b_body, lhs));
+            let aligned = a
+                .iter()
+                .zip(b)
+                .fold(sl.clone(), |s, ((n0, _), (n1, _))| s.aligned(n0, n1));
+            constrain_go(&a_opened, &b_opened, &aligned, sr, cache, scope)
+        }
 
         // Record: named width-subtyping. rhs's fields must all appear in lhs.
         (Type::Record(a), Type::Record(b)) => {
@@ -2036,6 +2118,9 @@ fn constrain_go_impl(
             let lows = {
                 let bound =
                     Bound::edge(sl.clone(), rhs.clone(), sr.clone()).with_origin(cache.origins.1);
+                if let Some(e) = codomain_binder_gap(lv, &bound, cache) {
+                    return Err(e);
+                }
                 crate::ccl::infer_var::enforce_bound_scope(lv, "upper", &bound);
                 let mut s = lv.bounds.borrow_mut();
                 s.upper_mut().push(bound);
@@ -2131,6 +2216,9 @@ fn constrain_go_impl(
             let ups = {
                 let bound =
                     Bound::edge(sr.clone(), lhs.clone(), sl.clone()).with_origin(cache.origins.0);
+                if let Some(e) = codomain_binder_gap(rv, &bound, cache) {
+                    return Err(e);
+                }
                 crate::ccl::infer_var::enforce_bound_scope(rv, "lower", &bound);
                 let mut s = rv.bounds.borrow_mut();
                 s.lower_mut().push(bound);
@@ -2521,6 +2609,7 @@ fn copy_watches(from: &Rc<InferVar>, to: &Rc<InferVar>) {
 fn escaping_param(ty: &Type, target_level: Level) -> Option<Rc<crate::ccl::ty::TypeParam>> {
     match ty {
         Type::Param(param) if param.level() > target_level => Some(Rc::clone(param)),
+        Type::FamilyApp(app) if app.param.level() > target_level => Some(Rc::clone(&app.param)),
         Type::Infer(_) => None,
         _ => {
             let mut found = None;
@@ -2631,6 +2720,15 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         | Type::Txn
         | Type::Hole
         | Type::SharedHole(_) => ty.clone(),
+        // A domain is an index type and extrudes as an invariant argument does; the body at
+        // the family's polarity, its binders staying its own.
+        Type::Family { binders, body } => Type::Family {
+            binders: binders
+                .iter()
+                .map(|(name, t)| (name.clone(), extrude_invariant(t, target_level, cache)))
+                .collect(),
+            body: Box::new(extrude(body, pol, target_level, cache)),
+        },
         // Componentwise, as a tuple is: a component's names stay its binders.
         Type::DepTuple(components) => Type::DepTuple(
             components
