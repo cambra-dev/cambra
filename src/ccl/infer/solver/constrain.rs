@@ -321,6 +321,10 @@ pub struct ConstrainCache {
     /// not: uses that differ only in what they cause share one clone, and relating their
     /// capabilities through it would give each the others' ([`Self::without_capabilities`]).
     relates_capabilities: bool,
+    /// Whether the edge being walked is part of an **equation**: one direction of the
+    /// invariant data-domain path, or a closure step pairing two halves of equations. A
+    /// bound recorded under it is marked so ([`Bound::equation`]).
+    equation: bool,
 }
 
 /// The derivation a [`ConstrainCache`] serves: what the solver is doing when it
@@ -374,6 +378,7 @@ impl ConstrainCache {
             unreported: Vec::new(),
             extruded: HashMap::new(),
             relates_capabilities: true,
+            equation: false,
         }
     }
 
@@ -428,6 +433,15 @@ impl ConstrainCache {
         self.origins = (origins.0.or(saved.0), origins.1.or(saved.1));
         let out = f(self);
         self.origins = saved;
+        out
+    }
+
+    /// Run `f` walking an edge that is ([`equation`](Self::equation)) or is not part of an
+    /// equation.
+    fn equating<R>(&mut self, equation: bool, f: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = std::mem::replace(&mut self.equation, equation);
+        let out = f(self);
+        self.equation = saved;
         out
     }
 
@@ -1873,10 +1887,12 @@ fn constrain_go_impl(
                 if invariant_domains {
                     // Swapped with the substitutions: this edge relates the sides the other
                     // way round, and a reference in `d1` is classified by `d1`'s binders.
-                    let decided = cache.within_data_domains(both_data, |cache| {
-                        cache
-                            .swapped(|cache| constrain_go(d1, d0, sr, sl, cache, scope))
-                            .and_then(|()| constrain_go(d0, d1, sl, sr, cache, scope))
+                    let decided = cache.equating(true, |cache| {
+                        cache.within_data_domains(both_data, |cache| {
+                            cache
+                                .swapped(|cache| constrain_go(d1, d0, sr, sl, cache, scope))
+                                .and_then(|()| constrain_go(d0, d1, sl, sr, cache, scope))
+                        })
                     });
                     // Whichever edge found the two domains unequal, the report is the
                     // inequality and not the sub-comparison that exposed it — except for
@@ -1922,20 +1938,24 @@ fn constrain_go_impl(
                         };
                     }
                 } else {
-                    cache.swapped(|cache| constrain_go(d1, d0, sr, sl, cache, scope))?;
+                    cache.equating(false, |cache| {
+                        cache.swapped(|cache| constrain_go(d1, d0, sr, sl, cache, scope))
+                    })?;
                 }
                 let entered = cache.codomain_binders.len();
                 cache
                     .codomain_binders
                     .extend([n0, n1].into_iter().flatten().cloned());
-                let codomain = constrain_go(
-                    c0_opened.as_ref().map_or(&**c0, |c| c),
-                    c1_opened.as_ref().map_or(&**c1, |c| c),
-                    &cod_sl,
-                    sr,
-                    cache,
-                    scope,
-                );
+                let codomain = cache.equating(false, |cache| {
+                    constrain_go(
+                        c0_opened.as_ref().map_or(&**c0, |c| c),
+                        c1_opened.as_ref().map_or(&**c1, |c| c),
+                        &cod_sl,
+                        sr,
+                        cache,
+                        scope,
+                    )
+                });
                 cache.codomain_binders.truncate(entered);
                 codomain
             })
@@ -2285,8 +2305,9 @@ fn constrain_go_impl(
         (Type::Infer(lv), _) if type_level(rhs) <= lv.level() => {
             crate::ccl::capabilities::lower_capability_levels(rhs, lv.level());
             let lows = {
-                let bound =
-                    Bound::edge(sl.clone(), rhs.clone(), sr.clone()).with_origin(cache.origins.1);
+                let bound = Bound::edge(sl.clone(), rhs.clone(), sr.clone())
+                    .with_origin(cache.origins.1)
+                    .in_equation(cache.equation);
                 if let Some(e) = param_reads_binder(lv, &bound, cache.value_on_right) {
                     return Err(e);
                 }
@@ -2358,19 +2379,23 @@ fn constrain_go_impl(
             if let Type::Infer(rv) = rhs {
                 link_watches(lv, rv, &edge_into_holder(sl, sr), cache)?;
             }
+            // A closure step is part of an equation when both edges it pairs are.
+            let equation = cache.equation;
             for low in lows.iter() {
                 let Some((tau_l, tau_u)) = bridge_holder_gap(&low.self_subst, sl, Some(lv)) else {
                     continue;
                 };
-                cache.with_origins((low.origin, None), |cache| {
-                    constrain_go(
-                        &low.ty,
-                        rhs,
-                        &Subst::then(&low.ty_subst, &tau_l),
-                        &Subst::then(sr, &tau_u),
-                        cache,
-                        scope,
-                    )
+                cache.equating(equation && low.equation, |cache| {
+                    cache.with_origins((low.origin, None), |cache| {
+                        constrain_go(
+                            &low.ty,
+                            rhs,
+                            &Subst::then(&low.ty_subst, &tau_l),
+                            &Subst::then(sr, &tau_u),
+                            cache,
+                            scope,
+                        )
+                    })
                 })?;
             }
             Ok(())
@@ -2387,8 +2412,9 @@ fn constrain_go_impl(
         (_, Type::Infer(rv)) if type_level(lhs) <= rv.level() => {
             crate::ccl::capabilities::lower_capability_levels(lhs, rv.level());
             let ups = {
-                let bound =
-                    Bound::edge(sr.clone(), lhs.clone(), sl.clone()).with_origin(cache.origins.0);
+                let bound = Bound::edge(sr.clone(), lhs.clone(), sl.clone())
+                    .with_origin(cache.origins.0)
+                    .in_equation(cache.equation);
                 if let Some(e) = param_reads_binder(rv, &bound, !cache.value_on_right) {
                     return Err(e);
                 }
@@ -2478,19 +2504,22 @@ fn constrain_go_impl(
                 Type::BarrierVar(barrier) => link_barrier_watches(barrier, rv, cache)?,
                 _ => {}
             }
+            let equation = cache.equation;
             for up in ups.iter() {
                 let Some((tau_l, tau_u)) = bridge_holder_gap(sr, &up.self_subst, Some(rv)) else {
                     continue;
                 };
-                cache.with_origins((None, up.origin), |cache| {
-                    constrain_go(
-                        lhs,
-                        &up.ty,
-                        &Subst::then(sl, &tau_l),
-                        &Subst::then(&up.ty_subst, &tau_u),
-                        cache,
-                        scope,
-                    )
+                cache.equating(equation && up.equation, |cache| {
+                    cache.with_origins((None, up.origin), |cache| {
+                        constrain_go(
+                            lhs,
+                            &up.ty,
+                            &Subst::then(sl, &tau_l),
+                            &Subst::then(&up.ty_subst, &tau_u),
+                            cache,
+                            scope,
+                        )
+                    })
                 })?;
             }
             Ok(())
@@ -2724,6 +2753,16 @@ fn constrain_go_impl(
             if deficit.is_empty() && !range_demand {
                 // lhs's explicit layers already supply every refinement rhs requires.
                 constrain_go(lbase, rbase, sl, sr, cache, scope)
+            } else if matches!(lbase, Type::Infer(_)) && cache.equation {
+                // **Two equations meet without filtering.** Both sides are data domains a
+                // collection was equated with, so neither acquires the refinement it lacks:
+                // the deficit would narrow one collection's domain by the other's filter,
+                // and with the reverse edge narrow each by both, after which the two agree
+                // and the join reports nothing. Whether the two are one domain is
+                // decided where they materialize, once their bases have resolved
+                // (`src/ccl/design/type-inference.md`, "Two equations meet without
+                // filtering").
+                Ok(())
             } else if matches!(lbase, Type::Infer(_)) {
                 // Variable base: flow the deficit onto it (`b₁ <: {b₂ | deficit}`)
                 // rather than rejecting; it fails later iff the variable
@@ -2900,6 +2939,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 ty: extrude(&b.ty, pol, target_level, cache),
                 ty_subst: b.ty_subst.clone(),
                 rendered: Default::default(),
+                equation: b.equation,
             };
             let new_lows: Vec<_> = lows.iter().map(&mut extrude_bound).collect();
             let new_ups: Vec<_> = ups
@@ -3132,6 +3172,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                         ty: extrude(&b.ty, pol, target_level, cache),
                         ty_subst: b.ty_subst.clone(),
                         rendered: Default::default(),
+                        equation: b.equation,
                     })
                     .collect();
                 nvs.bounds.borrow_mut().set_lower(new_lows);
@@ -3152,6 +3193,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                         ty: extrude(&b.ty, pol, target_level, cache),
                         ty_subst: b.ty_subst.clone(),
                         rendered: Default::default(),
+                        equation: b.equation,
                     })
                     .collect();
                 nvs.bounds.borrow_mut().set_upper(new_ups);
@@ -3307,6 +3349,7 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
                         ty: extrude(&b.ty, true, target_level, cache),
                         ty_subst: b.ty_subst.clone(),
                         rendered: Default::default(),
+                        equation: b.equation,
                     })
                     .collect();
                 nvs.bounds.borrow_mut().lower_mut().extend(new_lows);
@@ -3325,6 +3368,7 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
                         ty: extrude(&b.ty, false, target_level, cache),
                         ty_subst: b.ty_subst.clone(),
                         rendered: Default::default(),
+                        equation: b.equation,
                     })
                     .collect();
                 nvs.bounds.borrow_mut().upper_mut().extend(new_ups);
