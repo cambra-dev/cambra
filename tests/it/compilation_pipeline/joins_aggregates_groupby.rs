@@ -1332,6 +1332,98 @@ fn a_keyed_annotation_compiles_and_runs(#[case] code: &str, #[case] expected: Va
     check_scalar(code, expected);
 }
 
+/// A collection read out of a name an exact annotation types as an abstract sum leaves the name's
+/// scope over the domain its definition determines: the discharge installs the definition, whose
+/// own witness is determined, in place of the name whose type leaves it open
+/// (`src/ccl/design/type-inference.md`, "`let` binders and scope exit").
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[case::a_map(
+    "m: Map(Int, Int) = box(map([(1, 10), (2, 20)]))\nout << [v for v in m]",
+    "[() -> [1 -> 10, 2 -> 20]]"
+)]
+#[case::a_group_by(
+    "g: Map(_, _) = box(groupby([1, 2, 3], \\x -> x > 1))\nout << [sum(v) for v in g]",
+    "[() -> [false -> 1, true -> 5]]"
+)]
+fn a_collection_read_out_of_an_annotated_sum_takes_its_definitions_domain(
+    #[case] code: &str,
+    #[case] expected: &str,
+) {
+    check_sink(&format!("out = test_sink()\n{code}\n"), expected);
+}
+
+/// [`a_collection_read_out_of_an_annotated_sum_takes_its_definitions_domain`] as the program's value.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[case::a_map("m: Map(Int, Int) = box(map([(1, 10), (2, 20)]))\n[v for v in m]", 30)]
+#[case::a_group_by(
+    "g: Map(_, _) = box(groupby([1, 2, 3], \\x -> x > 1))\n[sum(v) for v in g]",
+    6
+)]
+fn a_collection_value_read_out_of_an_annotated_sum_takes_its_definitions_domain(
+    #[case] code: &str,
+    #[case] total: i64,
+) {
+    let Tile::DataFunction { codomain, .. } = run_pipeline(code) else {
+        panic!("the program's value is a collection");
+    };
+    let Tile::Scalar(values) = *codomain else {
+        panic!("the collection's values are a column");
+    };
+    let sum: i64 = (0..values.len())
+        .map(|i| match values.index_at(i) {
+            Value::Int(n) => n,
+            other => panic!("an Int value, got {other:?}"),
+        })
+        .sum();
+    assert_eq!(sum, total);
+}
+
+/// A collection over the witness of a sum read out of a name whose definition is no path leaves
+/// the name's scope packed wherever the witness stands in the collection's domain: alone, or
+/// beside another generator's position (`src/ccl/design/type-inference.md`, "`let` binders and
+/// scope exit"). The comprehension makes `b`'s definition no path, and `Bag`'s representation
+/// is a sum whose kind lists no candidates.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[case::the_position_then_the_witness(
+    indoc! {"
+        def f(n):
+            b = Bag::new(box([v * n for v in [1, 2]]))
+            [x * y for x in [1, 2] for y in b.extract()]
+        sum(f(1))
+    "},
+    9
+)]
+#[case::the_witness_then_the_position(
+    indoc! {"
+        def f(n):
+            b = Bag::new(box([v * n for v in [1, 2]]))
+            [x * y for y in b.extract() for x in [1, 2]]
+        sum(f(1))
+    "},
+    9
+)]
+#[case::the_witness_alone(
+    indoc! {"
+        def f(n):
+            b = Bag::new(box([v * n for v in [1, 2]]))
+            [y * 2 for y in b.extract()]
+        sum(f(1))
+    "},
+    6
+)]
+fn a_collection_over_a_witness_read_through_no_path_leaves_its_scope_packed(
+    #[case] code: &str,
+    #[case] expected: i64,
+) {
+    check_scalar(
+        &format!("type Bag = List(Int)\n{code}"),
+        Value::Int(expected),
+    );
+}
+
 /// A binop over **two projections of one grouped row** — the shape that pins a fan-in's
 /// pairing depth.
 ///

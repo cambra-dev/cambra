@@ -1723,6 +1723,7 @@ pub(super) fn coalesce_pass(
     pin_unreached_values(expr, 0, &mut ctx);
     coalesce_node(expr, 0, &mut ctx);
     decide_suspended_memberships(expr.node_id(), &mut ctx);
+    pack_node_types(expr);
     debug_assert!(
         ctx.scope.is_empty(),
         "coalesce scope must be balanced: every frame/shadow pushed during the \
@@ -1759,6 +1760,15 @@ fn settle_capabilities(expr: &mut Expr) {
         *slot = crate::ccl::capabilities::Capabilities::known(set.with_raises_resolved());
     }
     expr.walk_children_mut(settle_capabilities);
+}
+
+/// Each type slot in `expr` with its projections through terms that are no paths packed
+/// ([`crate::ccl::subst::pack_projections`]): the variable graph discharges a `let`'s
+/// definition into each type read past it one leaf at a time, so the function a projection
+/// stands in is whole only once the type is read.
+fn pack_node_types(expr: &mut Expr) {
+    expr.walk_type_slots_mut(crate::ccl::subst::pack_projections);
+    expr.walk_children_mut(pack_node_types);
 }
 
 /// Check term and witness references in each node's type against its enclosing scope.
