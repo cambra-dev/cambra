@@ -1649,7 +1649,10 @@ runs none:
 request and reads the source at a nested row's start. `queue_next_round` queues one position or a
 closing row; `complete_round` steps that round after its body settles. No next round is queued before
 the previous round steps. A request ends once its positions and any closing round have completed.
-`consume_impl` drives these operations synchronously.
+The run's execution handler retains the claimed scope package while it advances these operations
+one round at a time. A completed request publishes the store's new held and decided regions before
+it is acknowledged. Other run pipelines can consume between rounds. The synchronous `consume_impl`
+adapter drives nested scopes through the same request operations.
 
 A consume of the drive emits a position only where the package names its whole path at the
 positions' level, so a round emits one position and a round at a row emits none; a pull in pull mode

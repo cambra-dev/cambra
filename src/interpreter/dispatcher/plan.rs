@@ -704,6 +704,7 @@ fn run_targets(
             breaker.enter_consuming_mode()
         });
     }
+    let execution = Execution { scopes: &scopes };
     let done = in_a_run(|| {
         // A range over a static extent has decided every key from the start.
         for (pipeline, ranges) in members.leaves.iter().enumerate() {
@@ -713,10 +714,10 @@ fn run_targets(
         }
         match live.is_empty() {
             true => {
-                drive(&dispatcher, &mut reach);
+                execution.drive(&dispatcher, &mut reach);
                 true
             }
-            false => drive_live(&dispatcher, &mut reach, &mut live, observer),
+            false => drive_live(&dispatcher, &mut reach, &execution, &mut live, observer),
         }
     });
     // Every breaker and range is terminal at the run's end, so each pipeline has recorded as
@@ -779,6 +780,62 @@ fn run_targets(
             Ended::Paused(planned)
         }
     })
+}
+
+struct Execution<'s> {
+    scopes: &'s [Option<RefCell<loop_scope::LoopScope>>],
+}
+
+impl Execution<'_> {
+    fn consume(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPackage) {
+        match &self.scopes[package.pipeline.0] {
+            Some(scope) => scope.borrow_mut().begin_package(package),
+            None => consume_with(dispatcher, reach, package),
+        }
+    }
+
+    fn resume(&self, dispatcher: &Dispatcher) -> bool {
+        let mut progressed = false;
+        for (pipeline, scope) in self.scopes.iter().enumerate() {
+            let Some(scope) = scope else { continue };
+            if !scope.borrow().has_package() {
+                continue;
+            }
+            progressed = true;
+            let package = scope.borrow_mut().resume_package();
+            // The acknowledgement releases the next request of this ordered pipeline only
+            // after every position and closing round of this request has stepped.
+            if let Some(package) = package {
+                let mut pushes = dispatcher.pushes(PipelineId(pipeline));
+                scope.borrow().with_store(|store| {
+                    if store.pushes_while_consuming() {
+                        pushes.push_final(store);
+                    }
+                });
+                dispatcher.land(pushes);
+                dispatcher.acknowledge(package);
+            }
+        }
+        progressed
+    }
+
+    fn drive(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>) {
+        start_with(dispatcher, reach);
+        loop {
+            match dispatcher.try_claim(None) {
+                Next::Package(package) => self.consume(dispatcher, reach, package),
+                Next::Finish { pipeline, consumed } => {
+                    finish_with(dispatcher, reach, pipeline, consumed)
+                }
+                Next::Wait(_) if self.resume(dispatcher) => {}
+                Next::Wait(_) => {
+                    panic!("an acyclic run with no pending loop has a pipeline that may finish")
+                }
+                Next::Done => return,
+                Next::Failed => panic!("a run on one thread fails only by panicking on it"),
+            }
+        }
+    }
 }
 
 /// Whether `pipeline` reads a loop's scope, directly or through the pipelines it reads.
@@ -2261,6 +2318,7 @@ fn notify_unreleased(
 fn drive_live(
     dispatcher: &Dispatcher,
     reach: &mut Reach<'_>,
+    execution: &Execution<'_>,
     live: &mut [LivePipeline],
     observer: &mut dyn RunObserver,
 ) -> bool {
@@ -2295,10 +2353,11 @@ fn drive_live(
         }
         loop {
             match dispatcher.try_claim(None) {
-                Next::Package(package) => consume_with(dispatcher, reach, package),
+                Next::Package(package) => execution.consume(dispatcher, reach, package),
                 Next::Finish { pipeline, consumed } => {
                     finish_with(dispatcher, reach, pipeline, consumed)
                 }
+                Next::Wait(_) if execution.resume(dispatcher) => {}
                 Next::Wait(_) => {
                     // A breaker that pushes only at its finish, as `MapAggregate`, finishes only
                     // once every source yields everything: it pushes what it decided here, and the
@@ -2331,6 +2390,143 @@ mod tests {
     use crate::interpreter::tile_operators::{
         MemoProducer, ProducerBase, TileProducer, impl_producer_base,
     };
+
+    #[test]
+    fn execution_interleaves_loop_requests_and_publishes_before_releasing_them() {
+        use crate::ccl::context::{GlobalContext, compile_program};
+        use crate::ccl::load::LoadedProgram;
+        use crate::interpreter::Position;
+        use crate::interpreter::commit_operator::store_frontier;
+        use crate::interpreter::tile_operators::test_helpers::keys_between;
+        use indoc::indoc;
+
+        let mut contexts = Vec::new();
+        let mut operators = Vec::new();
+        let mut programs = Vec::new();
+        let mut reader_placements = Vec::new();
+        let mut scopes = Vec::new();
+        for source in [
+            indoc! {"
+                out = test_sink()
+                total := 0
+                for x in [1, 2, 3]:
+                    total += x
+                out << total
+            "},
+            indoc! {"
+                out = test_sink()
+                total := 0
+                for x in [1, 2, 3]:
+                    if x > 1:
+                        total += x
+                out << total
+            "},
+        ] {
+            let mut ctx = GlobalContext::default();
+            ctx.defer_sink_pulls();
+            let _sink = ctx.register_test_sink("out");
+            let program = compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {}))
+                .expect("the loop compiles");
+            let map = ctx.take_operator_map();
+            let stores: Vec<_> = map
+                .operators()
+                .into_iter()
+                .filter(|fan| fan.cached_tile().is_some())
+                .collect();
+            assert_eq!(stores.len(), 1);
+            let mut planner = Planner::default();
+            planner.store_pipeline(crate::interpreter::tile_operators::StoreRead {
+                fan: stores[0].id(),
+                store: stores[0].store().expect("one subscribed store"),
+            });
+            let consumer = program
+                .outputs
+                .iter()
+                .find_map(|output| output.sink_consumer.as_ref())
+                .expect("one sink");
+            let slot = consumer.borrow().producer_slot().clone();
+            planner.pipelines_under(
+                &mut **slot.borrow_mut().as_mut().expect("the sink has a producer"),
+                "sink",
+            );
+            let members = planner.members(None);
+            let scope_pipeline = members
+                .located
+                .iter()
+                .position(|located| matches!(located, Located::Scope { .. }))
+                .expect("one scope");
+            let reader = members
+                .reads
+                .iter()
+                .position(|reads| reads.contains(&scope_pipeline))
+                .expect("a reader of the scope");
+            reader_placements.push(members.placements[reader].clone());
+            let mut scope = planner.build_scope(0, usize::MAX, &mut Vec::new());
+            scope.enter_consuming_mode();
+            scopes.push(Some(RefCell::new(scope)));
+            contexts.push(ctx);
+            operators.push(map);
+            programs.push(program);
+        }
+        let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![0], vec![1]], usize::MAX);
+        for pipeline in 0..2 {
+            dispatcher.order(PipelineId(pipeline));
+            for placement in &reader_placements[pipeline] {
+                placement.set(Some(PipelineId(pipeline + 2)));
+            }
+            dispatcher.notify(PipelineId(pipeline), &keys_between(0, 2));
+        }
+        let execution = Execution { scopes: &scopes };
+        let mut unreachable = |_: PipelineId, _: &mut Call<'_>| {
+            panic!(
+                "the execution handler must retain a loop request instead of consuming it synchronously"
+            )
+        };
+        for _ in 0..2 {
+            let Next::Package(package) = dispatcher.try_claim(None) else {
+                panic!("a loop request is queued")
+            };
+            execution.consume(&dispatcher, &mut unreachable, package);
+        }
+        for position in 0..3 {
+            assert!(execution.resume(&dispatcher));
+            for scope in scopes.iter().flatten() {
+                let snapshot = scope
+                    .borrow()
+                    .with_store(|store| store.offer_impl(store.tiling().universal_guard()));
+                assert_eq!(
+                    store_frontier(&snapshot),
+                    Some(Position::new(Value::UInt(position)))
+                );
+            }
+            for pipeline in 0..2 {
+                assert_eq!(
+                    dispatcher.states[pipeline]
+                        .acknowledged
+                        .load(Ordering::SeqCst),
+                    0
+                );
+            }
+        }
+        assert!(execution.resume(&dispatcher));
+        for pipeline in 0..2 {
+            assert_eq!(
+                dispatcher.states[pipeline]
+                    .acknowledged
+                    .load(Ordering::SeqCst),
+                1
+            );
+            assert!(
+                dispatcher.states[pipeline + 2].queue.region().is_some(),
+                "the completed request publishes the store to its reader"
+            );
+            let state = operators[pipeline].live_state();
+            assert_eq!(
+                state.into_values().next(),
+                Some(Value::Int([6, 5][pipeline]))
+            );
+        }
+    }
 
     /// A memo over a producer that restates the outermost keys only.
     fn memo_over_outermost() -> MemoProducer {

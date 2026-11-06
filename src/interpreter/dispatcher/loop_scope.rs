@@ -45,6 +45,7 @@ struct Request {
     rounds: usize,
     closing: bool,
     round: Option<TileGuard>,
+    package: Option<WorkPackage>,
 }
 
 impl LoopScope {
@@ -440,7 +441,41 @@ impl LoopScope {
             rounds: 0,
             closing: false,
             round: None,
+            package: None,
         });
+    }
+
+    pub(super) fn begin_package(&mut self, package: WorkPackage) {
+        self.begin_request(package.guard.clone());
+        self.request
+            .as_mut()
+            .expect("the request just began")
+            .package = Some(package);
+    }
+
+    pub(super) fn has_package(&self) -> bool {
+        self.request
+            .as_ref()
+            .is_some_and(|request| request.package.is_some())
+    }
+
+    /// Advance one round and return the parent package only after its request completes.
+    pub(super) fn resume_package(&mut self) -> Option<WorkPackage> {
+        let package = self
+            .request
+            .as_mut()
+            .and_then(|request| request.package.take())
+            .expect("a loop resumes a claimed package");
+        if !self.queue_next_round() {
+            return Some(package);
+        }
+        self.placed(|scope| scope.run_round());
+        self.complete_round();
+        self.request
+            .as_mut()
+            .expect("the round's request remains pending")
+            .package = Some(package);
+        None
     }
 
     /// Queue one round. The request remains pending until a later call finds no more rounds.
@@ -847,6 +882,48 @@ mod tests {
             compiled.scope.input_released(InputId::ONLY).is_universal(),
             "a terminal body whose every decision is stepped is released whole"
         );
+        assert_eq!(compiled.value(), Value::Int(6));
+    }
+
+    #[test]
+    fn a_claimed_request_stays_in_flight_until_its_last_round() {
+        let mut compiled = Compiled::of(SUM);
+        let mut dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
+        dispatcher.order(PipelineId(0));
+        dispatcher.notify(PipelineId(0), &keys_between(0, 1));
+        dispatcher.notify(PipelineId(0), &keys_between(2, 2));
+        dispatcher.close(PipelineId(0));
+        let Next::Package(package) = dispatcher.try_claim(None) else {
+            panic!("the first request is queued");
+        };
+        compiled.scope.begin_package(package);
+        for position in 0..2 {
+            assert!(compiled.scope.resume_package().is_none());
+            assert_eq!(
+                store_frontier(&compiled.snapshot()),
+                Some(Position::new(Value::UInt(position)))
+            );
+            assert!(
+                matches!(dispatcher.try_claim(None), Next::Wait(_)),
+                "the second request waits while the first remains in flight"
+            );
+        }
+        let completed = compiled
+            .scope
+            .resume_package()
+            .expect("both requested positions stepped");
+        dispatcher.acknowledge(completed);
+        let Next::Package(package) = dispatcher.try_claim(None) else {
+            panic!("acknowledging the first request releases the next one");
+        };
+        compiled.scope.begin_package(package);
+        assert!(compiled.scope.resume_package().is_none());
+        assert!(compiled.snapshot().is_terminal());
+        let completed = compiled
+            .scope
+            .resume_package()
+            .expect("the final position stepped");
+        dispatcher.acknowledge(completed);
         assert_eq!(compiled.value(), Value::Int(6));
     }
 
