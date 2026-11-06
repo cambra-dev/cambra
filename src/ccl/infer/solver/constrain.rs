@@ -1883,20 +1883,11 @@ fn constrain_go_impl(
             },
         ) if a.len() == b.len() => {
             let opened = |binders: &[(Option<Name>, Type)], body: &Type, other: &Type| -> Type {
-                let n = binders.len();
-                if crate::ccl::subst::references_binder_within(body, n as u32)
-                    && (cache.derivation.opens_unconditionally()
-                        || crate::ccl::subst::type_contains_infer(other))
-                {
-                    crate::ccl::subst::open_family_body(n, body, |j| {
-                        let name = binders[j].0.clone().unwrap_or_else(|| {
-                            panic!("a binder the body reads by index names itself: {lhs}")
-                        });
-                        crate::ccl::subst::Mapping::Rename(name)
-                    })
-                } else {
-                    body.clone()
-                }
+                let live = cache.derivation.opens_unconditionally()
+                    || crate::ccl::subst::type_contains_infer(other);
+                live.then(|| crate::ccl::subst::opened_family_body(binders, body))
+                    .flatten()
+                    .unwrap_or_else(|| body.clone())
             };
             let (a_opened, b_opened) = (opened(a, a_body, rhs), opened(b, b_body, lhs));
             let aligned = a

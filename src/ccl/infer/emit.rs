@@ -627,9 +627,8 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
                 .iter()
                 .map(|(_, t)| ctx.normalize(&ctx.refinement_domain(t)))
                 .collect();
-            let mut opened = crate::ccl::subst::open_family_body(binders.len(), body, |j| {
-                crate::ccl::subst::Mapping::Rename(names[j].clone())
-            });
+            let mut opened = crate::ccl::subst::opened_family_body(binders, body)
+                .unwrap_or_else(|| (**body).clone());
             fn under<C: Typing>(
                 scope: &[(Name, Type)],
                 body: &mut Type,
