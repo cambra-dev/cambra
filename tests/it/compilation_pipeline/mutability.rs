@@ -1226,7 +1226,7 @@ fn a_diagnostic_keeps_a_user_written_opaque_binder() {
 /// escape where its writer set is no longer statically known.
 #[test]
 fn rule2_function_returning_mut_is_rejected() {
-    expect_mut_discipline_error("x := 0\nf = \\z -> x\nf", "inside a composite type");
+    expect_mut_discipline_error("x := 0\nf = \\z -> x\nf", "cannot be part of another type");
 }
 
 /// The escape is rejected **however many tail positions sit between the function
@@ -1276,7 +1276,7 @@ fn rule2_function_returning_mut_is_rejected() {
     g(5)
 "#})]
 fn rule2_is_not_evaded_by_a_tail_position(#[case] code: &str) {
-    expect_mut_discipline_error(code, "inside a composite type");
+    expect_mut_discipline_error(code, "cannot be part of another type");
 }
 
 /// The complement, and why the rule cannot simply refuse to deref a tail: a program
@@ -1307,7 +1307,7 @@ fn a_programs_tail_read_of_its_accumulator_is_a_value() {
 fn rule1_selected_mut_argument_is_rejected() {
     expect_mut_discipline_error(
         "def bump(c: Mut(Int)):\n    c += 1\nx := 0\ny := 1\nbump(x if True else y)\nx",
-        "bare variable reference",
+        "must be a mutable variable named where it is used",
     );
 }
 
@@ -1908,7 +1908,7 @@ fn a_non_mut_parameter_annotation_is_enforced_in_a_curried_function() {
             f("hello", total)
             total
         "#},
-        "Type mismatch for Apply: expected Int, found String",
+        "Type mismatch for this call: expected Int, found String",
     );
 }
 
@@ -2887,6 +2887,26 @@ for r in [1, 2]:
 sum(m)
 "#},
         "depend on `r`",
+    )
+}
+
+/// The same, in a function nothing calls: inference drops the definition, and the report
+/// still names the mutable variable whose read the keys depend on, not the binder that
+/// named the read.
+#[test]
+fn a_write_whose_keys_read_a_variable_in_an_uncalled_function_names_the_variable() {
+    check_compile_error(
+        indoc! {r#"
+def f(u):
+    o: Feed(_)
+    t := 0
+    for r in [1, 2]:
+        t += r
+        o << [v for v in [1, 2, 3] if v > t]
+    o
+1
+"#},
+        "depend on `t`, read between",
     )
 }
 

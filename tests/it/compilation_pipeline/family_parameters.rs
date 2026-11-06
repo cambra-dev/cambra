@@ -580,7 +580,7 @@ fn a_family_parameter_is_opaque_in_its_function() {
                 sum([sum(grp) for grp in g])
             total(groupby([1, 2, 3], \x -> x > 1))
         "#},
-        "Expected function type at Aggregate, found V(k)",
+        "Expected a function, found V(k)",
     );
 }
 

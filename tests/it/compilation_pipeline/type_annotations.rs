@@ -364,7 +364,7 @@ def test(x: {Int where _ >= x}) => Int:
 
 ()
 ",
-        "No Orderable instance for BinOp: operand 2 is String",
+        "No Orderable instance for `>=`: operand 2 is String",
     )
 }
 
@@ -377,7 +377,7 @@ def test(a: String, b: Int):
 
 ()
 ",
-        "No Addable instance for BinOp: operand 2 is Int, but the only type accepted there is String",
+        "No Addable instance for `+`: operand 2 is Int, but the only type accepted there is String",
     )
 }
 
@@ -872,7 +872,7 @@ def f(p) => {UInt where _ == p ^+ p}:
     p ^+ p
 f(1)
         "#},
-        "Type mismatch for Apply: expected UInt, found Int",
+        "Type mismatch for this call: expected UInt, found Int",
     )
 }
 
@@ -899,7 +899,7 @@ fn a_type_error_in_a_chain_holding_a_read() {
             y = x + "a" + 2 + 3
             y
         "#},
-        "No Addable instance for BinOp: operand 2 is String",
+        "No Addable instance for `+`: operand 2 is String",
     )
 }
 
@@ -917,7 +917,7 @@ a = f(1)
 b: {Int where _ == a} = f(2)
 a == b
         "#},
-        "Type mismatch for monomorphization specialization",
+        "Type mismatch for this use",
     )
 }
 
@@ -990,7 +990,7 @@ a = f(1)
 b: {Int where _ == a} = f(2)
 a == b
         "#},
-        "Type mismatch for Apply: expected {Int where _ == 2}, found {Int where _ == 1}",
+        "Type mismatch for this call: expected {Int where _ == 2}, found {Int where _ == 1}",
     )
 }
 
@@ -1007,7 +1007,7 @@ a = f(2)
 b: {Int where _ == a} = f(2)
 a == b
         "#},
-        "Type mismatch for monomorphization specialization: expected {Int where _ == a}, found {Int where _ == 2}",
+        "Type mismatch for this use: expected {Int where _ == a}, found {Int where _ == 2}",
     )
 }
 
@@ -1438,7 +1438,7 @@ fn a_use_meets_a_codomain_refinement_naming_an_enclosing_binder() {
             g: Int => {Int where _ > n} = \x -> 5
             g(3)
         "#},
-        "Type mismatch for monomorphization specialization: expected {Int where _ > n}, found {Int where _ == 5}",
+        "Type mismatch for this use: expected {Int where _ > n}, found {Int where _ == 5}",
     );
 }
 
@@ -1452,7 +1452,7 @@ fn a_use_meets_a_refined_domain_of_a_function_parameter() {
             g: ({Int where _ > 0} => Int) => Int = \f -> f(1)
             g(\y -> y + 1)
         "#},
-        "post-inference produced an invalid tree: [Type mismatch for Apply: expected {Int where _ > 0}, found Int]",
+        "post-inference produced an invalid tree: [Type mismatch for this call: expected {Int where _ > 0}, found Int]",
     );
 }
 
@@ -1855,7 +1855,7 @@ def f(x: Int):
 f1 = f(1)
 f1(-5)
         "#},
-        "Type mismatch for Apply: expected {Int where _ > 0}, found {Int where _ == -5}",
+        "Type mismatch for this call: expected {Int where _ > 0}, found {Int where _ == -5}",
     )
 }
 
@@ -1871,7 +1871,7 @@ def f(x: Int) => ({Int where _ > 0} => Int):
 f1 = f(1)
 f1(-5)
         "#},
-        "──── Type mismatch for Apply: expected {Int where _ > 0}, found {Int where _ == -5}",
+        "──── Type mismatch for this call: expected {Int where _ > 0}, found {Int where _ == -5}",
     )
 }
 
@@ -1887,7 +1887,7 @@ def f(x: Int) => ({Int where _ > 0} => Int):
 f1 = f(1)
 f1(-5)
         "#},
-        "──── Type mismatch for Apply: expected {Int where _ > 0}, found {Int where _ == -5}",
+        "──── Type mismatch for this call: expected {Int where _ > 0}, found {Int where _ == -5}",
     )
 }
 
@@ -1955,7 +1955,7 @@ def f(x: Int) => ({Int where _ > 0} => {Int where _ > 0}):
 f1 = f(1)
 f1(-5)
         "#},
-        "──── Type mismatch for Apply: expected {Int where _ > 0}, found {Int where _ == -5}",
+        "──── Type mismatch for this call: expected {Int where _ > 0}, found {Int where _ == -5}",
     )
 }
 
@@ -2218,7 +2218,7 @@ fn a_written_domain_admits_a_plain_collection(#[case] code: &str, #[case] expect
             sum(a) + sum(b)
         both([1, 2], [3, 4, 5])
     "},
-    "Type mismatch for Apply: expected {UInt where _ < 2}, found {UInt where _ < 3}",
+    "Type mismatch for this call: expected {UInt where _ < 2}, found {UInt where _ < 3}",
 )]
 #[case::a_sum_in_a_nominal_type(
     indoc! {"
