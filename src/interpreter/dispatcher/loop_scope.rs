@@ -2,7 +2,7 @@
 //! over the pipelines inside the loop's cycle, one round per position, and steps the
 //! loop's store after each. See `src/interpreter/design-operators.md`, "A loop in rounds".
 
-use super::plan::{Consumes, Members, Planned, plan_edges, reach_in_chain};
+use super::plan::{Consumes, Members, Planned, plan_edges, probe, reach_in_chain, routes_to};
 use super::*;
 use crate::interpreter::tile_operators::StoreCell;
 
@@ -26,7 +26,7 @@ pub(super) struct LoopScope {
     members: Vec<Member>,
     /// The placements of the inner pipelines' entries, which hold the inner pipelines only while
     /// the scope runs ([`Placed`]).
-    placements: Vec<Option<Placement>>,
+    placements: Vec<Vec<Placement>>,
     /// The inner pipelines a round queues its position for: the sources, and the nested loops,
     /// which take it once the pipelines they read have finished the round.
     starts: Vec<PipelineId>,
@@ -64,7 +64,7 @@ impl LoopScope {
                 placement.set(None);
             }
             for (at, &pipeline) in kept.iter().enumerate() {
-                if let Some(placement) = &pipelines.placements[pipeline] {
+                for placement in &pipelines.placements[pipeline] {
                     placement.set(Some(PipelineId(at)));
                 }
             }
@@ -85,6 +85,8 @@ impl LoopScope {
                 &reads,
                 &names,
                 &leaves,
+                &vec![false; names.len()],
+                false,
                 &kinds,
                 &(0..names.len()).collect::<Vec<_>>(),
                 morsel_rows,
@@ -197,6 +199,27 @@ impl LoopScope {
         *self.drive.get_or_init(|| self.find_drive())
     }
 
+    /// Have the entry in front of the drive's source record a decided push of the source's keys
+    /// at `pipeline`, this scope's pipeline in the dispatcher around it, as decided positions of
+    /// the store's input: the drive reads its source by pull, so no push of the source reaches the
+    /// scope's entry otherwise, and the scope would park each round until the source is whole.
+    pub(super) fn decide_through_drive(&self, pipeline: PipelineId) {
+        let input = self.with_store(|store| store.input_tiling(InputId::ONLY));
+        let mut target = None;
+        reach_member(
+            &self.store,
+            &self.members[self.drive().0],
+            self.drive(),
+            &mut |breaker, _| {
+                target = breaker
+                    .as_producer()
+                    .and_then(|producer| producer.decides_through());
+            },
+        );
+        let target = target.expect("a loop's drive records its source's decided pushes");
+        *target.borrow_mut() = Some((pipeline, input));
+    }
+
     fn find_drive(&self) -> PipelineId {
         let drives: Vec<PipelineId> = self
             .starts
@@ -229,20 +252,19 @@ impl LoopScope {
         *drive
     }
 
+    /// The paths a push from the range in front of `consumer` takes to the drive's entry, as the
+    /// consumers on the way declare them (`Consumer::route`).
+    pub(super) fn routes(&self, consumer: &SharedConsumer) -> Vec<Route> {
+        let drive = self.drive();
+        self.placed(|_| routes_to(consumer, drive.0))
+    }
+
     /// Where a push of `region` from the range in front of `consumer` lands at the drive's entry,
     /// as guards of the drive's input, the drive's source: a planner probes how a live source's
     /// arrivals reach the scope's rounds.
     pub(super) fn arrivals(&self, consumer: &SharedConsumer, region: &Projection) -> Vec<Arrival> {
         let drive = self.drive();
-        self.placed(|_| {
-            let mut landing = Landing::probe(drive);
-            consumer.borrow_mut().push(region, &mut landing);
-            landing
-                .arrivals()
-                .into_iter()
-                .filter(|arrival| arrival.pipeline.0 == drive.0)
-                .collect()
-        })
+        self.placed(|_| probe(consumer, drive, region, drive.0))
     }
 
     /// Have the drive read what its source holds, emitting nothing: a consume at no position. A
@@ -649,13 +671,13 @@ impl LoopScope {
 /// whole or waits for its finish, and its push stops at the unplaced entry, as a push of the
 /// enclosing dispatcher must: the entry's pipeline is the inner dispatcher's.
 struct Placed<'p> {
-    placements: &'p [Option<Placement>],
+    placements: &'p [Vec<Placement>],
 }
 
 impl<'p> Placed<'p> {
-    fn new(placements: &'p [Option<Placement>]) -> Self {
-        for (pipeline, placement) in placements.iter().enumerate() {
-            if let Some(placement) = placement {
+    fn new(placements: &'p [Vec<Placement>]) -> Self {
+        for (pipeline, placements) in placements.iter().enumerate() {
+            for placement in placements {
                 debug_assert!(
                     placement.get().is_none(),
                     "a loop scope's inner entries are unplaced while the scope does not run"
