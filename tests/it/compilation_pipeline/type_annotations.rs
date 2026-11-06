@@ -20,14 +20,14 @@ use cambra::interpreter::{BaseType, ColumnValue, Predicate, Tile, Value};
 fn refinement() {
     check_compile_error(
         include_str!("type_annotations/refined_div_zero.cambra"),
-        "expected {Int | __elem != 0}",
+        "expected {Int where _ != 0}",
     );
     // The demanded predicate reads a field of the record it refines, and the
     // argument's own type pins that field to `0`, so the rejection is a
     // refutation rather than a comparison nothing decided.
     check_compile_error(
         include_str!("type_annotations/complex_refinement.cambra"),
-        "expected {{x: Int, y: Int} | __elem.y != 0}, found {x: Int@1, y: Int@0}",
+        "expected {{x: Int, y: Int} where _.y != 0}, found {x: {Int where _ == 1}, y: {Int where _ == 0}}",
     );
     check_compile_error(
         include_str!("type_annotations/underscore.cambra"),
@@ -201,7 +201,7 @@ x = (3,-1)
 
 sum_up(x)
 ",
-        "Annotation mismatch: annotated as {Int where _ >= ‹__arg_tuple_0›.0}, but inferred as Int",
+        "Annotation mismatch: annotated as {Int where _ >= a}, but inferred as Int",
     )
 }
 
@@ -817,7 +817,7 @@ fn a_refined_map_key_in_a_mut_annotation_is_reported() {
 m: Mut(Map({String where _ != ""}, Int)) := box(map([("a", 1), ("z", 2)]))
 m
 "#,
-        r#"Type mismatch for collection annotation: expected Σ (σ : SubtypesOf({String | __elem != ""})). (σ ⤇ _), found {String | __elem ▷ ((λ __iter_record : 0..2 → __iter_record ▷ [("a", 1), ("z", 2)] ▷ (λ __map_kv : (String, Int) → __map_kv.0)) ▷ collection_contains)}"#,
+        r#"Type mismatch for collection annotation: expected Map({String where _ != ""}, _), found {String where _ in ["a", "z"]}"#,
     )
 }
 
@@ -990,7 +990,7 @@ a = f(1)
 b: {Int where _ == a} = f(2)
 a == b
         "#},
-        "Type mismatch for Apply: expected Int@2, found Int@1",
+        "Type mismatch for Apply: expected {Int where _ == 2}, found {Int where _ == 1}",
     )
 }
 
@@ -1007,7 +1007,7 @@ a = f(2)
 b: {Int where _ == a} = f(2)
 a == b
         "#},
-        "Type mismatch for monomorphization specialization: expected {Int | __elem == a}, found Int@2",
+        "Type mismatch for monomorphization specialization: expected {Int where _ == a}, found {Int where _ == 2}",
     )
 }
 
@@ -1116,7 +1116,7 @@ def h(z):
     g(z) + p(z)
 h(7)
         "#},
-        "this function's result type ({Int | __elem == r} ⇒ Int) refines a parameter by `r`",
+        "this function's result type {Int where _ == r} => Int refines a parameter by `r`",
     )
 }
 
@@ -1355,7 +1355,7 @@ fn a_lambda_parameter_s_type_is_checked_at_the_argument() {
             g = \x: {Int where _ > 0} -> x
             g(-1)
         "#},
-        "expected {Int | __elem > 0}, found Int@-1",
+        "expected {Int where _ > 0}, found {Int where _ == -1}",
     );
 }
 
@@ -1403,7 +1403,7 @@ fn a_lambda_below_a_refined_function_annotation_is_checked_at_the_argument() {
             g: {Int where _ > 0} => Int = \x -> x
             g(-1)
         "#},
-        "expected {Int | __elem > 0}, found Int@-1",
+        "expected {Int where _ > 0}, found {Int where _ == -1}",
     );
 }
 
@@ -1438,7 +1438,7 @@ fn a_use_meets_a_codomain_refinement_naming_an_enclosing_binder() {
             g: Int => {Int where _ > n} = \x -> 5
             g(3)
         "#},
-        "Type mismatch for monomorphization specialization: expected {Int | __elem > n}, found Int@5",
+        "Type mismatch for monomorphization specialization: expected {Int where _ > n}, found {Int where _ == 5}",
     );
 }
 
@@ -1452,7 +1452,7 @@ fn a_use_meets_a_refined_domain_of_a_function_parameter() {
             g: ({Int where _ > 0} => Int) => Int = \f -> f(1)
             g(\y -> y + 1)
         "#},
-        "post-inference produced an invalid tree: [Type mismatch for Apply: expected {Int | __elem > 0}, found Int]",
+        "post-inference produced an invalid tree: [Type mismatch for Apply: expected {Int where _ > 0}, found Int]",
     );
 }
 
@@ -1855,7 +1855,7 @@ def f(x: Int):
 f1 = f(1)
 f1(-5)
         "#},
-        "Type mismatch for Apply: expected {Int | __elem > 0}, found Int@-5",
+        "Type mismatch for Apply: expected {Int where _ > 0}, found {Int where _ == -5}",
     )
 }
 
@@ -1871,7 +1871,7 @@ def f(x: Int) => ({Int where _ > 0} => Int):
 f1 = f(1)
 f1(-5)
         "#},
-        "──── Type mismatch for Apply: expected {Int | __elem > 0}, found Int@-5",
+        "──── Type mismatch for Apply: expected {Int where _ > 0}, found {Int where _ == -5}",
     )
 }
 
@@ -1887,7 +1887,7 @@ def f(x: Int) => ({Int where _ > 0} => Int):
 f1 = f(1)
 f1(-5)
         "#},
-        "──── Type mismatch for Apply: expected {Int | __elem > 0}, found Int@-5",
+        "──── Type mismatch for Apply: expected {Int where _ > 0}, found {Int where _ == -5}",
     )
 }
 
@@ -1909,7 +1909,7 @@ def f(x: Int):
 f1 = f(1)
 f1(-5)
         "#},
-        "this function's result type ({Int | __elem > 0 and r == r} ⇒ Int) refines a parameter by `r`, which the function body binds opaquely; annotate the function's result type with a type that does not name `r`",
+        "this function's result type {Int where _ > 0 and r == r} => Int refines a parameter by `r`, which the function body binds opaquely; annotate the function's result type with a type that does not name `r`",
     )
 }
 
@@ -1955,7 +1955,7 @@ def f(x: Int) => ({Int where _ > 0} => {Int where _ > 0}):
 f1 = f(1)
 f1(-5)
         "#},
-        "──── Type mismatch for Apply: expected {Int | __elem > 0}, found Int@-5",
+        "──── Type mismatch for Apply: expected {Int where _ > 0}, found {Int where _ == -5}",
     )
 }
 
@@ -2218,7 +2218,7 @@ fn a_written_domain_admits_a_plain_collection(#[case] code: &str, #[case] expect
             sum(a) + sum(b)
         both([1, 2], [3, 4, 5])
     "},
-    "Type mismatch for Apply: expected 0..2, found 0..3",
+    "Type mismatch for Apply: expected {UInt where _ < 2}, found {UInt where _ < 3}",
 )]
 #[case::a_sum_in_a_nominal_type(
     indoc! {"

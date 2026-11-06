@@ -10,8 +10,10 @@
 //!
 //! Some of what it writes has no annotation syntax: a `Box`, a source's rows, a
 //! dependent function `(k: …) |=> …` or `(x: …) => …`, an index range written as
-//! `{UInt where _ < n}`. What the notation has no form for at all is written in the
-//! checker's notation between `‹…›`, never dropped.
+//! `{UInt where _ < n}`. What the notation has no form for at all is described between
+//! `‹…›`, never dropped and never written with a name the program did not write: an
+//! inference variable as `‹?7›`, a key outside the written type as [`OUTER_KEY`], and
+//! anything else as [`NOT_PRINTABLE`].
 
 use std::collections::HashSet;
 use std::fmt;
@@ -19,13 +21,35 @@ use std::fmt;
 use smol_str::SmolStr;
 
 use crate::ccl::infer::solver::display::InferredPoly;
+use crate::ccl::names::SyntheticKind;
 use crate::ccl::ty::{FunKind, PolyType, TypeKind, TypeParamId};
 use crate::ccl::{BaseType, BinOpKind, Builtin, Expr, HistoryKind, Lit, Name, Type, TypedExprNode};
-use crate::ccl::{FieldKey, UnaryOpKind};
+use crate::ccl::{FieldKey, ProjKey, UnaryOpKind};
+
+/// What a written type says for a part CHL has no spelling for and no description fits.
+pub const NOT_PRINTABLE: &str = "‹not printable yet›";
+
+/// A key of a collection outside the written type: the written type is that
+/// collection's values, or part of them, and reads the key it is at.
+pub const OUTER_KEY: &str = "‹outer key›";
+
+/// The key type of a collection outside the written type, as [`OUTER_KEY`] is its key.
+pub const OUTER_KEYS: &str = "‹outer keys›";
 
 /// `ty` written in CHL.
 pub fn chl_type(ty: &Type) -> String {
     Printer::for_type(ty).annotation(ty)
+}
+
+/// A refinement predicate written in CHL, `_` for the refined value.
+pub fn chl_predicate(predicate: &Expr) -> String {
+    let mut taken = HashSet::new();
+    expr_spellings(predicate, &mut taken);
+    Printer {
+        taken,
+        ..Printer::default()
+    }
+    .expr(predicate, Prec::Lowest, &Vec::new())
 }
 
 /// `ty` written in CHL as the module at `home` writes it: its own nominal types by their
@@ -124,9 +148,15 @@ impl Printer {
     /// for one the compiler minted, `preferred` or `preferred` numbered, whichever no
     /// other name in the type or binder in scope reads as.
     fn binder(&self, name: &Name, preferred: &str) -> String {
-        if let Some(own) = spelling(name) {
-            return own;
+        match spelling(name) {
+            Some(own) => own,
+            None => self.fresh(preferred),
         }
+    }
+
+    /// `preferred`, or `preferred` numbered, whichever no other name in the type or binder
+    /// in scope reads as.
+    fn fresh(&self, preferred: &str) -> String {
         let free = |candidate: &String| {
             !self.taken.contains(candidate)
                 && !self.spelled.iter().any(|(_, s)| s == candidate)
@@ -149,8 +179,9 @@ impl Printer {
         }
     }
 
-    /// Write `ty` in the checker's notation between `‹…›`: a form CHL has no spelling for.
-    fn fallback(&mut self, ty: &Type) -> String {
+    /// An inference variable in the checker's notation between `‹…›`: its occurrences
+    /// are one type, which `_` would not say.
+    fn variable(&mut self, ty: &Type) -> String {
         format!("‹{ty}›")
     }
 
@@ -222,14 +253,13 @@ impl Printer {
             Type::DataSource(name) => format!("Source({name})"),
             Type::Txn => "Txn".to_string(),
             Type::Hole => "_".to_string(),
-            // A variable has an identity `_` would drop: two occurrences are one type.
-            Type::SharedHole(_) | Type::BarrierVar(_) | Type::Infer(_) => self.fallback(ty),
+            Type::SharedHole(_) | Type::BarrierVar(_) | Type::Infer(_) => self.variable(ty),
             Type::Param(p) => match self.joins.iter().find(|(id, _)| *id == p.id) {
                 Some((_, text)) => text.clone(),
                 None => p.spelling.to_string(),
             },
             // A compiler-made family has no CHL spelling.
-            Type::FamilyApp(app) if app.param.generalized => self.fallback(ty),
+            Type::FamilyApp(app) if app.param.generalized => NOT_PRINTABLE.to_string(),
             Type::FamilyApp(app) => {
                 let args: Vec<String> = app.args.iter().map(|a| self.family_arg(&a.term)).collect();
                 format!("{}({})", app.param.spelling, args.join(", "))
@@ -256,8 +286,8 @@ impl Printer {
             }
             Type::Variant(tags, openness) => {
                 let named = tags.iter().all(|(k, _)| matches!(k, FieldKey::Name(_)));
-                if !named || openness.permits_extra_tags() {
-                    return self.fallback(ty);
+                if !named {
+                    return NOT_PRINTABLE.to_string();
                 }
                 let arms: Vec<(String, Option<String>)> = tags
                     .iter()
@@ -269,7 +299,12 @@ impl Printer {
                         (k.to_string(), payload)
                     })
                     .collect();
-                VariantArms(arms).to_string()
+                let closed = VariantArms(arms).to_string();
+                // A demand admitting further arms ends in `..`, as an open tuple does.
+                match openness.permits_extra_tags() {
+                    true => format!("{} | ..}}", &closed[..closed.len() - 1]),
+                    false => closed,
+                }
             }
             Type::Refinement(base, refinements) => {
                 let mut preds: Vec<String> = refinements
@@ -297,7 +332,7 @@ impl Printer {
                 fun_kind,
                 domain,
                 codomain,
-            } => self.fun(ty, name.as_ref(), fun_kind, domain, codomain),
+            } => self.fun(name.as_ref(), fun_kind, domain, codomain),
             Type::History {
                 function,
                 history_kind,
@@ -308,7 +343,9 @@ impl Printer {
                     name: Some(key),
                     codomain,
                     ..
-                } if crate::ccl::subst::codomain_depends_on(key, codomain) => self.fallback(ty),
+                } if crate::ccl::subst::codomain_depends_on(key, codomain) => {
+                    NOT_PRINTABLE.to_string()
+                }
                 Type::Fun {
                     domain, codomain, ..
                 } => match history_kind {
@@ -317,7 +354,7 @@ impl Printer {
                     }
                     _ => format!("Feed({})", self.ty(codomain)),
                 },
-                _ => self.fallback(ty),
+                _ => NOT_PRINTABLE.to_string(),
             },
             Type::Poly(poly) => self.poly(poly),
             Type::Nominal(decl, args) => {
@@ -336,11 +373,15 @@ impl Printer {
             Type::Split { input, output } => {
                 format!("in {} out {}", self.ty(input), self.ty(output))
             }
-            Type::ChanDom(..)
-            | Type::WitnessRef(_)
-            | Type::WitnessProjection(_)
-            | Type::BoundedHole(_)
-            | Type::DepTuple(_) => self.fallback(ty),
+            // A sum's witness, read inside the sum's values: the sum is a collection
+            // around the written part, and the witness is its key type.
+            Type::WitnessRef(_) => OUTER_KEYS.to_string(),
+            Type::WitnessProjection(p) => {
+                let collection = self.expr(&p.term, Prec::Lowest, &Vec::new());
+                format!("‹the keys of {collection}›")
+            }
+            Type::DepTuple(components) => self.dep_tuple(components),
+            Type::ChanDom(..) | Type::BoundedHole(_) => NOT_PRINTABLE.to_string(),
         }
     }
 
@@ -397,7 +438,6 @@ impl Printer {
     /// A function: a collection over its domain when its kind is data, a `=>` otherwise.
     fn fun(
         &mut self,
-        ty: &Type,
         name: Option<&Name>,
         fun_kind: &FunKind,
         domain: &Type,
@@ -405,7 +445,7 @@ impl Printer {
     ) -> String {
         let witnesses = fun_kind.witnesses();
         if !witnesses.is_empty() {
-            return self.sum(ty, witnesses, domain, codomain);
+            return self.sum(name, witnesses, domain, codomain);
         }
         // A function whose codomain names its binder: CHL writes the binder only in a
         // `def`'s signature, so a type spells it as the parameter of the arrow.
@@ -452,20 +492,38 @@ impl Printer {
     /// alternatives it enumerates.
     fn sum(
         &mut self,
-        ty: &Type,
+        name: Option<&Name>,
         witnesses: &[crate::ccl::ty::Witness],
         domain: &Type,
         codomain: &Type,
     ) -> String {
         let [w] = witnesses else {
-            return self.fallback(ty);
+            return NOT_PRINTABLE.to_string();
         };
-        if !matches!(domain, Type::WitnessRef(id) if id == w.id())
-            || crate::ccl::ty::has_free_witness_ref(codomain, &[])
-        {
-            return self.fallback(ty);
+        if !matches!(domain, Type::WitnessRef(id) if id == w.id()) {
+            return NOT_PRINTABLE.to_string();
         }
-        self.binders.push(None);
+        // An alternative is a collection over its own candidate, which a value reading
+        // the witness reads.
+        if let TypeKind::Enumerated(candidates) = w.type_kind() {
+            let alternatives: Vec<String> = candidates
+                .iter()
+                .map(|candidate| {
+                    let values = crate::ccl::ty::instantiate_witness(codomain, w.id(), candidate);
+                    let alternative = Type::Fun {
+                        name: name.cloned(),
+                        fun_kind: FunKind::Data(None),
+                        domain: Box::new(candidate.clone()),
+                        codomain: Box::new(values),
+                    };
+                    self.ty(&alternative)
+                })
+                .collect();
+            return format!("Box({})", alternatives.join(" | "));
+        }
+        // The collection type names no key, so a value reading it reads a key outside
+        // the written value type.
+        self.binders.push(Some(OUTER_KEY.to_string()));
         let cod = self.ty(codomain);
         self.binders.pop();
         match w.type_kind() {
@@ -481,27 +539,34 @@ impl Printer {
             TypeKind::Family { .. } => unreachable!(
                 "a family's kind is a family parameter's, and no witness ranges over it"
             ),
-            TypeKind::Enumerated(candidates) => {
-                let alternatives: Vec<String> = candidates
-                    .iter()
-                    .map(|candidate| {
-                        let alternative = Type::data_fun(candidate.clone(), codomain.clone());
-                        self.ty(&alternative)
-                    })
-                    .collect();
-                format!("Box({})", alternatives.join(" | "))
+            TypeKind::Enumerated(_) => {
+                unreachable!("an enumerated sum is written as a `Box` above")
             }
         }
     }
 
+    /// A dependent tuple as the tuple of its components, each reference to an earlier
+    /// component described by its position: CHL has no binder in a tuple type.
+    fn dep_tuple(&mut self, components: &[(Option<Name>, Type)]) -> String {
+        let mut parts = Vec::with_capacity(components.len());
+        let spelled = self.spelled.len();
+        for (position, (name, component)) in components.iter().enumerate() {
+            parts.push(self.ty(component));
+            let described = format!("‹position {position}›");
+            // A later component reads this one by index in a type and by name in a term.
+            if let Some(name) = name {
+                self.spelled.push((name.clone(), described.clone()));
+            }
+            self.binders.push(Some(described));
+        }
+        self.binders.truncate(self.binders.len() - components.len());
+        self.spelled.truncate(spelled);
+        format!("{{{}}}", parts.join(", "))
+    }
+
     /// A refinement predicate, at least as tight as `min`.
     fn expr<'a>(&mut self, e: &'a Expr, min: Prec, env: &Env<'a>) -> String {
-        let (prec, text) = self.expr_inner(e, env);
-        if prec < min {
-            format!("({text})")
-        } else {
-            text
-        }
+        at_least(self.expr_inner(e, env), min)
     }
 
     fn expr_inner<'a>(&mut self, e: &'a Expr, env: &Env<'a>) -> (Prec, String) {
@@ -518,27 +583,40 @@ impl Printer {
                 if let Some((_, s)) = self.spelled.iter().rev().find(|(n, _)| n == name) {
                     return (Prec::Atom, s.clone());
                 }
+                // A reference to a function outside the written type is to the key of
+                // the collection the written type is the values of.
                 if let Some(index) = name.pi_bound_index() {
-                    let spelling = (self.binders.len() as u32)
-                        .checked_sub(index + 1)
-                        .and_then(|i| self.binders[i as usize].clone());
-                    return match spelling {
-                        Some(s) => (Prec::Atom, s),
-                        None => (Prec::Atom, self.fallback_expr(e)),
+                    let text = match (self.binders.len() as u32).checked_sub(index + 1) {
+                        Some(i) => self.binders[i as usize]
+                            .clone()
+                            .unwrap_or_else(|| NOT_PRINTABLE.to_string()),
+                        None => OUTER_KEY.to_string(),
                     };
+                    return (Prec::Atom, text);
                 }
-                match spelling(name) {
-                    Some(s) => (Prec::Atom, s),
-                    None => (Prec::Atom, self.fallback_expr(e)),
-                }
+                let text = match (spelling(name), name) {
+                    (Some(s), _) => s,
+                    // A `def`'s parameters, which it binds as one tuple.
+                    (None, _) if let Some(positions) = name.positions() => {
+                        format!("({})", positions.join(", "))
+                    }
+                    // The binder the solver gives an application's expected function, which
+                    // the written type is the result of.
+                    (
+                        None,
+                        Name::Synthetic {
+                            kind: SyntheticKind::SolverArg,
+                            ..
+                        },
+                    ) => OUTER_KEY.to_string(),
+                    (None, _) => NOT_PRINTABLE.to_string(),
+                };
+                (Prec::Atom, text)
             }
             TypedExprNode::BinOp { left, op, right } => {
-                let Some((own, l, r)) = binop_prec(op) else {
-                    return (Prec::Atom, self.fallback_expr(e));
-                };
-                let l = self.expr(left, l, env);
-                let r = self.expr(right, r, env);
-                (own, format!("{l} {} {r}", binop_text(op)))
+                let l = self.expr_inner(left, env);
+                let r = self.expr_inner(right, env);
+                infix(op, l, r)
             }
             TypedExprNode::UnaryOp(UnaryOpKind::Neg, operand) => (
                 Prec::Unary,
@@ -574,9 +652,9 @@ impl Printer {
                     TypedExprNode::Lambda { param, body } => {
                         (Prec::Atom, self.comprehension(source, param, body, env))
                     }
-                    _ => (Prec::Atom, self.fallback_expr(e)),
+                    _ => (Prec::Atom, NOT_PRINTABLE.to_string()),
                 },
-                _ => (Prec::Atom, self.fallback_expr(e)),
+                _ => (Prec::Atom, NOT_PRINTABLE.to_string()),
             },
             TypedExprNode::Lambda { .. } if crate::ccl::ccl_utils::loop_parts(e).is_some() => {
                 let parts = crate::ccl::ccl_utils::loop_parts(e).expect("matched above");
@@ -592,7 +670,7 @@ impl Printer {
             {
                 self.expr_inner(argument, env)
             }
-            TypedExprNode::Apply { function, argument } => self.apply(e, function, argument, env),
+            TypedExprNode::Apply { function, argument } => self.apply(function, argument, env),
             // A ternary, as lowering builds one: a guard with its arm, then `True` with the
             // other.
             TypedExprNode::Case {
@@ -608,21 +686,20 @@ impl Printer {
                 let other = self.expr(&otherwise.body, Prec::Lowest, env);
                 (Prec::Lowest, format!("{arm} if {guard} else {other}"))
             }
-            _ => (Prec::Atom, self.fallback_expr(e)),
+            _ => (Prec::Atom, NOT_PRINTABLE.to_string()),
         }
     }
 
     /// `argument ▷ function`: a field read, a lambda's body at the argument, a
-    /// membership test, a proven lookup `c[k]!`, or a call. The last two differ
-    /// only in the function's kind, so a function whose type does not say which is
-    /// written in the checker's notation.
+    /// membership test, a proven lookup `c[k]!`, a call, or a point-free function read at
+    /// its argument ([`point`](Self::point)). A lookup and a call differ only in the
+    /// function's kind, so a function whose type does not say which is not printable.
     ///
     /// Only a field read of a name is what lowering builds from the text written here;
     /// each other form is the CHL a reader would write for the term, which lowers to a
     /// different term, so the type it sits in is not an annotation.
     fn apply<'a>(
         &mut self,
-        apply: &'a Expr,
         function: &'a Expr,
         argument: &'a Expr,
         env: &Env<'a>,
@@ -634,6 +711,12 @@ impl Printer {
                     let (field, depth) = field;
                     let outer: Env<'a> = env[..depth].to_vec();
                     return self.expr_inner(field, &outer);
+                }
+                // A position of a `def`'s parameter tuple is the parameter.
+                if let (TypedExprNode::Var(tuple), ProjKey::Index(i)) = (&argument.node, key)
+                    && let Some(parameter) = tuple.positions().and_then(|ps| ps.get(*i))
+                {
+                    return (Prec::Atom, parameter.to_string());
                 }
                 let target = self.expr(argument, Prec::Postfix, env);
                 (Prec::Postfix, format!("{target}.{key}"))
@@ -655,20 +738,130 @@ impl Printer {
                 let collection = self.expr(collection, Prec::Cmp.next(), env);
                 (Prec::Cmp, format!("{member} in {collection}"))
             }
-            _ => match function.ty.peel_refinements() {
-                Type::Fun { fun_kind, .. } => {
-                    let target = self.expr(function, Prec::Postfix, env);
-                    let arg = self.expr(argument, Prec::Lowest, env);
-                    let text = if fun_kind.resolved().is_data() {
-                        format!("{target}[{arg}]!")
-                    } else {
-                        format!("{target}({arg})")
-                    };
-                    (Prec::Postfix, text)
+            _ => {
+                let argument = self.val(argument, env);
+                match self.point(function, argument, env) {
+                    Some(value) => value.written(),
+                    None => (Prec::Atom, NOT_PRINTABLE.to_string()),
                 }
-                _ => (Prec::Atom, self.fallback_expr(apply)),
-            },
+            }
         }
+    }
+
+    /// `e` as a [`Val`]: a tuple literal keeps its components apart.
+    fn val<'a>(&mut self, e: &'a Expr, env: &Env<'a>) -> Val {
+        match &e.node {
+            TypedExprNode::Tuple(elts) => {
+                Val::Tuple(elts.iter().map(|x| self.val(x, env)).collect())
+            }
+            _ => {
+                let (prec, text) = self.expr_inner(e, env);
+                Val::Written(prec, text)
+            }
+        }
+    }
+
+    /// The point-free function `f` read at `argument`: the CHL expression its result is.
+    /// `None` for a function with no reading.
+    ///
+    /// `λ` elimination writes a predicate point-free (`__elem ▷ ((id, 1 ▷ const) ▷ zip ≫
+    /// eq)`), and this reads it back to the expression it came from (`_ == 1`). A function
+    /// that is neither a combinator nor an operator is a collection, read as a proven
+    /// lookup, or a function, read as a call; `box` and a trait's function are calls by
+    /// name.
+    fn point<'a>(&mut self, f: &'a Expr, argument: Val, env: &Env<'a>) -> Option<Val> {
+        let pair = |argument: Val| match argument {
+            Val::Tuple(parts) => <[Val; 2]>::try_from(parts).ok(),
+            Val::Written(..) => None,
+        };
+        let written = |(prec, text): (Prec, String)| Some(Val::Written(prec, text));
+        match &f.node {
+            // `unbox` is the second projection of a sum: the collection it holds.
+            TypedExprNode::Builtin(Builtin::Id | Builtin::Unbox) => Some(argument),
+            TypedExprNode::Builtin(Builtin::BinOp(op)) => {
+                let [l, r] = pair(argument)?;
+                written(infix(op, l.written(), r.written()))
+            }
+            // The same integer as an `Int` and a `UInt`.
+            TypedExprNode::Builtin(Builtin::IntEqUint) => {
+                let [l, r] = pair(argument)?;
+                let (l, r) = (l.written(), r.written());
+                let (l, r) = (at_least(l, Prec::Cmp.next()), at_least(r, Prec::Cmp.next()));
+                written((Prec::Cmp, format!("{l} == {r}")))
+            }
+            TypedExprNode::Builtin(Builtin::Neg) => written((
+                Prec::Unary,
+                format!("-{}", at_least(argument.written(), Prec::Unary)),
+            )),
+            TypedExprNode::Builtin(Builtin::NotFn) => written((
+                Prec::Not,
+                format!("not {}", at_least(argument.written(), Prec::Not)),
+            )),
+            TypedExprNode::Proj(key) => match (argument, key) {
+                (Val::Tuple(mut parts), ProjKey::Index(i)) if *i < parts.len() => {
+                    Some(parts.swap_remove(*i))
+                }
+                (argument, _) => {
+                    let target = at_least(argument.written(), Prec::Postfix);
+                    written((Prec::Postfix, format!("{target}.{key}")))
+                }
+            },
+            TypedExprNode::Compose(stages) => stages
+                .iter()
+                .try_fold(argument, |at, stage| self.point(stage, at, env)),
+            TypedExprNode::Apply {
+                function: combinator,
+                argument: operand,
+            } => match &combinator.node {
+                TypedExprNode::Builtin(Builtin::Const) => written(self.expr_inner(operand, env)),
+                TypedExprNode::Builtin(Builtin::Zip) => {
+                    let TypedExprNode::Tuple(fs) = &operand.node else {
+                        return None;
+                    };
+                    fs.iter()
+                        .map(|fi| self.point(fi, argument.clone(), env))
+                        .collect::<Option<Vec<Val>>>()
+                        .map(Val::Tuple)
+                }
+                TypedExprNode::Builtin(Builtin::CollectionContains) => {
+                    let member = at_least(argument.written(), Prec::Cmp.next());
+                    let collection = self.expr(operand, Prec::Cmp.next(), env);
+                    written((Prec::Cmp, format!("{member} in {collection}")))
+                }
+                _ => self.call(f, argument, env),
+            },
+            TypedExprNode::Builtin(Builtin::Box) => {
+                let (_, arg) = argument.written();
+                written((Prec::Postfix, format!("box({arg})")))
+            }
+            TypedExprNode::Builtin(_) => None,
+            // A trait function that reads a collection as itself, as a loop source's
+            // `elements` call does, is the collection the program wrote.
+            TypedExprNode::TraitFn { trait_, .. } if trait_.reads_collections() => Some(argument),
+            TypedExprNode::TraitFn {
+                trait_, function, ..
+            } => {
+                let (_, arg) = argument.written();
+                written((Prec::Postfix, format!("{trait_}::{function}({arg})")))
+            }
+            _ => self.call(f, argument, env),
+        }
+    }
+
+    /// `f` applied to `argument`: a proven lookup `f[a]!` for a collection, a call `f(a)`
+    /// for a function, and `None` for a function whose type names no kind.
+    fn call<'a>(&mut self, f: &'a Expr, argument: Val, env: &Env<'a>) -> Option<Val> {
+        let Type::Fun { fun_kind, .. } = f.ty.peel_refinements() else {
+            return None;
+        };
+        let target = self.expr(f, Prec::Postfix, env);
+        let (_, arg) = argument.written();
+        let text = if fun_kind.resolved().is_data() {
+            format!("{target}[{arg}]!")
+        } else {
+            format!("{target}({arg})")
+        };
+        Some(Val::Written(Prec::Postfix, text))
     }
 
     /// `c ≫ λ x → b` as the comprehension `[b for x in c]`, or, over a list literal,
@@ -701,11 +894,54 @@ impl Printer {
         self.spelled.pop();
         format!("[{body} for {x} in {source}]")
     }
+}
 
-    /// A predicate term CHL has no spelling for, in the checker's notation.
-    fn fallback_expr(&mut self, e: &Expr) -> String {
-        format!("‹{}›", crate::ccl::symbolic::symbolic(e))
+/// A value a point-free function is read at ([`Printer::point`]): an expression, or a
+/// tuple whose components a projection or an operator reads apart.
+#[derive(Clone)]
+enum Val {
+    Written(Prec, String),
+    Tuple(Vec<Val>),
+}
+
+impl Val {
+    fn written(self) -> (Prec, String) {
+        match self {
+            Val::Written(prec, text) => (prec, text),
+            Val::Tuple(parts) => {
+                let parts: Vec<String> = parts.into_iter().map(|v| v.written().1).collect();
+                (Prec::Atom, format!("({})", parts.join(", ")))
+            }
+        }
     }
+}
+
+/// `text`, parenthesized when it binds looser than `min`.
+fn at_least((prec, text): (Prec, String), min: Prec) -> String {
+    if prec < min {
+        format!("({text})")
+    } else {
+        text
+    }
+}
+
+/// `l op r` in CHL. `nand`, `nor` and `xnor` have no CHL operator, so each is written as
+/// the negation of the operator it complements.
+fn infix(op: &BinOpKind, l: (Prec, String), r: (Prec, String)) -> (Prec, String) {
+    use crate::ccl::LogicKind as L;
+    let complemented = match op {
+        BinOpKind::BoolLogic(L::Nand) => Some(L::And),
+        BinOpKind::BoolLogic(L::Nor) => Some(L::Or),
+        BinOpKind::BoolLogic(L::Xnor) => Some(L::Xor),
+        _ => None,
+    };
+    if let Some(kind) = complemented {
+        let (_, inner) = infix(&BinOpKind::BoolLogic(kind), l, r);
+        return (Prec::Not, format!("not ({inner})"));
+    }
+    let (own, lmin, rmin) = binop_prec(op);
+    let (l, r) = (at_least(l, lmin), at_least(r, rmin));
+    (own, format!("{l} {} {r}", binop_text(op)))
 }
 
 impl Prec {
@@ -728,22 +964,24 @@ impl Prec {
 
 /// An operator's own level and the levels its left and right operands are written at:
 /// left-grouping, except `**`, which groups right and binds a negated base tighter
-/// (`docs/chl-spec.md`, "2.3 Expression precedence"). `None` for an operator CHL has no
-/// spelling for.
-fn binop_prec(op: &BinOpKind) -> Option<(Prec, Prec, Prec)> {
+/// (`docs/chl-spec.md`, "2.3 Expression precedence"). Only for an operator CHL writes:
+/// [`infix`] writes the others as negations.
+fn binop_prec(op: &BinOpKind) -> (Prec, Prec, Prec) {
     use crate::ccl::{ArithmeticKind as A, LogicKind as L};
-    let leftward = |own: Prec| Some((own, own, own.next()));
+    let leftward = |own: Prec| (own, own, own.next());
     match op {
         BinOpKind::BoolLogic(L::Or) => leftward(Prec::Or),
         BinOpKind::BoolLogic(L::And) => leftward(Prec::And),
         BinOpKind::BoolLogic(L::Xor) => leftward(Prec::Xor),
-        BinOpKind::BoolLogic(L::Nand | L::Nor | L::Xnor) => None,
-        BinOpKind::Compare(_) => Some((Prec::Cmp, Prec::Cmp.next(), Prec::Cmp.next())),
+        BinOpKind::BoolLogic(L::Nand | L::Nor | L::Xnor) => {
+            unreachable!("`infix` writes {op:?} as the negation of the operator it complements")
+        }
+        BinOpKind::Compare(_) => (Prec::Cmp, Prec::Cmp.next(), Prec::Cmp.next()),
         BinOpKind::Arithmetic(A::Add | A::AddRefined | A::Sub) | BinOpKind::Concat => {
             leftward(Prec::Add)
         }
         BinOpKind::Arithmetic(A::Mul | A::FloorDiv) => leftward(Prec::Mul),
-        BinOpKind::Arithmetic(A::Pow) => Some((Prec::Pow, Prec::Postfix, Prec::Pow)),
+        BinOpKind::Arithmetic(A::Pow) => (Prec::Pow, Prec::Postfix, Prec::Pow),
     }
 }
 
@@ -776,9 +1014,8 @@ fn resolve<'a>(mut e: &'a Expr, env: &Env<'a>) -> (&'a TypedExprNode, usize) {
 /// The `key` field of a literal tuple or record, with the depth it is written at.
 fn project<'a>(
     (node, depth): (&'a TypedExprNode, usize),
-    key: &crate::ccl::ProjKey,
+    key: &ProjKey,
 ) -> Option<(&'a Expr, usize)> {
-    use crate::ccl::ProjKey;
     match (node, key) {
         (TypedExprNode::Tuple(elts), ProjKey::Index(i)) => elts.get(*i).map(|x| (x, depth)),
         (TypedExprNode::Record(fields), ProjKey::Field(n)) => {
@@ -851,9 +1088,14 @@ impl fmt::Display for VariantArms {
 
 #[cfg(test)]
 mod tests {
-    use super::chl_type;
+    use std::rc::Rc;
+
+    use super::{NOT_PRINTABLE, OUTER_KEY, chl_type};
     use crate::ccl::lower::test_helpers::lower_type;
-    use crate::ccl::{ChanLevel, Name, Type};
+    use crate::ccl::{
+        BaseType, BinOpKind, Builtin, ChanLevel, CompareKind, Lit, LogicKind, Name, Refinement,
+        Type, TypedExpr,
+    };
 
     /// A type an annotation writes prints as an annotation, and that annotation lowers
     /// to the same type.
@@ -917,14 +1159,89 @@ mod tests {
         );
     }
 
-    /// A form CHL has no spelling for is written in the checker's notation between
-    /// `‹…›`.
+    /// A form CHL has no spelling for is marked, never written in the checker's notation.
     #[test]
     fn a_type_chl_cannot_write_is_marked() {
         assert_eq!(
             chl_type(&Type::ChanDom(Name::raw("d"), ChanLevel(0))),
-            "‹chan(d)›"
+            NOT_PRINTABLE
         );
+    }
+
+    fn int() -> Type {
+        Type::Base(BaseType::Int)
+    }
+
+    fn elem() -> TypedExpr {
+        TypedExpr::var(Name::elem()).with_ty(int())
+    }
+
+    fn refined(predicate: TypedExpr) -> Type {
+        Type::refined_one(int(), Refinement::born(Rc::new(predicate)))
+    }
+
+    fn int_lit(n: i64) -> TypedExpr {
+        TypedExpr::lit(Lit::Int(n)).with_ty(int())
+    }
+
+    /// A predicate `λ` elimination wrote point-free reads as the expression it came from.
+    #[test]
+    fn a_point_free_predicate_reads_at_its_argument() {
+        let builtin = |b: Builtin| TypedExpr::builtin(b);
+        let one = TypedExpr::apply(int_lit(1), builtin(Builtin::Const));
+        let pair = TypedExpr::apply(
+            TypedExpr::tuple(vec![builtin(Builtin::Id), one]),
+            builtin(Builtin::Zip),
+        );
+        let eq = builtin(Builtin::BinOp(BinOpKind::Compare(CompareKind::Equals)));
+        let function = TypedExpr::compose(vec![pair, eq]);
+        let ty = refined(TypedExpr::apply(elem(), function));
+        assert_eq!(chl_type(&ty), "{Int where _ == 1}");
+    }
+
+    /// `nand`, `nor` and `xnor` have no CHL operator and read as negations.
+    #[test]
+    fn a_complemented_operator_reads_as_a_negation() {
+        let base = Type::Base(BaseType::Bool);
+        let b = TypedExpr::var(Name::elem()).with_ty(base.clone());
+        let truth = TypedExpr::lit(Lit::Bool(true)).with_ty(base.clone());
+        let predicate = TypedExpr::binop(b, BinOpKind::BoolLogic(LogicKind::Nand), truth);
+        let ty = Type::refined_one(base, Refinement::born(Rc::new(predicate)));
+        assert_eq!(chl_type(&ty), "{Bool where not (_ and True)}");
+    }
+
+    /// A reference to the binder of a function around the written type is that
+    /// collection's key.
+    #[test]
+    fn a_key_outside_the_written_type_is_the_outer_key() {
+        let k = Name::fresh("__map_k");
+        let at_k = TypedExpr::binop(
+            elem(),
+            BinOpKind::Compare(CompareKind::Equals),
+            TypedExpr::var(k.clone()).with_ty(int()),
+        );
+        let Type::Fun { codomain, .. } = Type::pi(k, int(), refined(at_k)) else {
+            unreachable!("`Type::pi` builds a function")
+        };
+        assert_eq!(
+            chl_type(&codomain),
+            format!("{{Int where _ == {OUTER_KEY}}}")
+        );
+    }
+
+    /// A dependent tuple is the tuple of its components, a read of an earlier one
+    /// described by its position.
+    #[test]
+    fn a_dependent_tuple_names_the_positions_it_reads() {
+        let i = Name::fresh("i");
+        let at_i = TypedExpr::binop(
+            elem(),
+            BinOpKind::Compare(CompareKind::Equals),
+            TypedExpr::var(i.clone()).with_ty(int()),
+        );
+        let ty = Type::dep_tuple(vec![(Some(i), int()), (None, refined(at_i))]);
+        assert!(matches!(ty, Type::DepTuple(_)), "the premise: {ty}");
+        assert_eq!(chl_type(&ty), "{Int, {Int where _ == ‹position 0›}}");
     }
 
     /// A form only a diagnostic writes reads as CHL.

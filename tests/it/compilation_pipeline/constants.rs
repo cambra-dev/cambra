@@ -206,7 +206,7 @@ fn a_declaration_refines_by_a_constant(
         Small::new(30).extract()
     "},
     "pub rate = 5\n",
-    "expected {Int | __elem <= 5}"
+    "expected {Int where _ <= 5}"
 )]
 #[case::tuple_position(
     indoc! {"
@@ -215,7 +215,7 @@ fn a_declaration_refines_by_a_constant(
         Small::new(30).extract()
     "},
     "pub rate = (2, 5).1\n",
-    "expected {Int | __elem <= 5}"
+    "expected {Int where _ <= 5}"
 )]
 #[case::tuple_element(
     indoc! {"
@@ -233,7 +233,7 @@ fn a_declaration_refines_by_a_constant(
         Small::new(30).extract()
     "},
     "pairs = (2, 5)\n(lo, hi) = pairs\npub rate = hi\n",
-    "expected {Int | __elem <= 5}"
+    "expected {Int where _ <= 5}"
 )]
 #[case::imported_not_a_constant(
     indoc! {"
@@ -310,7 +310,7 @@ fn a_run_gives_its_constant_a_value(#[case] root: &str, #[case] expected: i64) {
         run shop(max_rate=5) as eu
         eu::Capped::new(30).extract()
     "},
-    "expected {Int | __elem <= 10}"
+    "expected {Int where _ <= 10}"
 )]
 #[case::not_a_constant(
     indoc! {"
@@ -509,7 +509,7 @@ fn a_ternary_constant_refuses_what_its_arm_refuses() {
         "},
         &[("tiers", TIERS)],
     ));
-    assert!(errors.contains("expected {Int | __elem <= 1}"), "{errors}");
+    assert!(errors.contains("expected {Int where _ <= 1}"), "{errors}");
 }
 
 /// A run that gives a tuple to a `const` parameter a declaration's refinement reads is

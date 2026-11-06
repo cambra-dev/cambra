@@ -1475,7 +1475,7 @@ fn test_conditional_collection_heterogeneous_domains_rejected() {
     // to combine the two, so a diagnostic that reports the position names a domain the
     // program never wrote.
     assert!(
-        rendered.contains("0..3") && rendered.contains("source(mysrc)"),
+        rendered.contains("{UInt where _ < 3}") && rendered.contains("Source(mysrc)"),
         "expected both conflicting domains named, got:\n{rendered}"
     );
 }
@@ -1764,7 +1764,7 @@ fn a_key_from_the_source_does_not_yet_carry_its_key_domain() {
         assert!(
             errs.iter()
                 .map(|e| format!("{e:?}"))
-                .any(|m| m.contains("collection_contains")),
+                .any(|m| m.contains("where _ in ")),
             "the rejection must name the present-key domain the key fails to carry, \
              got {errs:?} for {program}"
         );
@@ -1790,7 +1790,7 @@ fn a_bare_key_lookup_on_a_groupby_is_refused() {
         assert!(
             errs.iter()
                 .map(|e| format!("{e:?}"))
-                .any(|m| m.contains("collection_contains")),
+                .any(|m| m.contains("where _ in ")),
             "the rejection must name the present-key domain the key fails to carry, \
              got {errs:?} for {program}"
         );
@@ -2572,7 +2572,7 @@ fn a_lookup_at_the_wrong_key_type_is_refused_for_membership() {
     "#});
     let msgs: Vec<String> = errs.iter().map(|e| format!("{e:?}")).collect();
     assert!(
-        msgs.iter().any(|m| m.contains("collection_contains")),
+        msgs.iter().any(|m| m.contains("where _ in ")),
         "the rejection must name the present-key domain the key fails to carry, got {errs:?}"
     );
     // The domain renders with its `String` base, so the hint is what says membership,
@@ -3914,7 +3914,7 @@ fn a_single_type_fault_prints_no_demand() {
     "#})
     );
     assert!(
-        missing.contains(".b") && missing.contains("{a: Int@1}"),
+        missing.contains(".b") && missing.contains("{a: {Int where _ == 1}}"),
         "expected a fault naming the absent field and the record, got: {missing}"
     );
     assert!(
@@ -4412,7 +4412,7 @@ fn products_sharing_a_field_join_on_it() {
 
         f(7)
     "#},
-    "{Int | __elem > n}"
+    "{Int where _ > n}"
 )]
 // A predicate that projects out of the refined element keeps the projection. The
 // argument pins `y` to `0`, which is what the projected demand refutes.
@@ -4423,11 +4423,11 @@ fn products_sharing_a_field_join_on_it() {
 
         f((x=1, y=0))
     "#},
-    "{{x: Int, y: Int} | __elem.y != 0}"
+    "{{x: Int, y: Int} where _.y != 0}"
 )]
 // An output annotation referencing a parameter is rewritten to the tuple
-// projection when uncurrying tuples the parameter list, so the refinement names the
-// binder the lambda actually binds.
+// projection when uncurrying tuples the parameter list, and the tuple's binder
+// carries the parameters' spellings, so the diagnostic names the parameter.
 #[case::uncurried_output(
     indoc! {r#"
         def f(a: Int, b: Int) => {Int where _ >= a}:
@@ -4435,7 +4435,7 @@ fn products_sharing_a_field_join_on_it() {
 
         f(1, 2)
     "#},
-    "{Int where _ >= ‹__arg_tuple_0›.0}"
+    "{Int where _ >= a}"
 )]
 fn a_user_written_refinement_keeps_its_binder_reference(
     #[case] code: &str,

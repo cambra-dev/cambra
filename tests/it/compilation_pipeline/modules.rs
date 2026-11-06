@@ -532,11 +532,11 @@ fn a_label_belongs_to_the_module_that_writes_it() {
     );
     assert_refused(
         &program(&root("catalog::item(5).price"), &[("catalog", CATALOG)]),
-        "No field .price for Apply: {catalog::cost: Int@1, catalog::price: Int@5}",
+        "No field .price for Apply: {catalog::cost: {Int where _ == 1}, catalog::price: {Int where _ == 5}}",
     );
     assert_refused(
         &program(&root("catalog::cost_of((cost=3))"), &[("catalog", CATALOG)]),
-        "No field .catalog::cost for Apply: {cost: Int@3}",
+        "No field .catalog::cost for Apply: {cost: {Int where _ == 3}}",
     );
 }
 
