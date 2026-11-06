@@ -322,11 +322,14 @@ fn underlined_by_phase(code: &str) -> Vec<(&'static str, String)> {
     errs.iter()
         .map(|e| {
             let phase = match e {
+                CompileError::Parse(_) => "parse",
                 CompileError::Lower(_) => "lower",
                 CompileError::Infer { .. } => "infer",
-                _ => panic!("expected only lowering and inference errors, got {errs:?}"),
+                _ => panic!("expected only parse, lowering and inference errors, got {errs:?}"),
             };
-            let span = e.span().expect("a lowering or inference error has a span");
+            let span = e
+                .span()
+                .expect("a parse, lowering or inference error has a span");
             (phase, code[span.start..span.end].to_string())
         })
         .collect()
@@ -406,4 +409,82 @@ fn inference_runs_past_a_statement_lowering_failed_in(
 )]
 fn a_mutability_error_is_reported_with_type_errors(#[case] code: &str, #[case] expected: &[&str]) {
     assert_eq!(underlined(code), expected);
+}
+
+/// A statement the parser could not read hides no inference error elsewhere: it binds the
+/// names its head does, as a poison, and nothing reports it again
+/// (`chl-parser/design-chl-parser.md`, "Threading partial ASTs through to lowering").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_join_past_a_broken_binding(
+    indoc! {r#"
+        x = 1 +* 2
+        z = x + 1
+        w = [1, "a"]
+        (z, w)
+    "#},
+    &[("parse", "*"), ("infer", r#"[1, "a"]"#)],
+)]
+#[case::a_join_past_a_broken_function_header(
+    indoc! {r#"
+        def f(a:
+            a
+        w = [1, "a"]
+        (f(1), w)
+    "#},
+    &[("parse", "("), ("infer", r#"[1, "a"]"#)],
+)]
+#[case::a_join_past_a_broken_bracket(
+    indoc! {r#"
+        x = (1 + ]
+        y = x + 1
+        w = [1, "a"]
+        (y, w)
+    "#},
+    &[("parse", "]"), ("infer", r#"[1, "a"]"#)],
+)]
+// A declaration states its types in full, so one it cannot read fails it, and only the
+// lexer reports it.
+#[case::a_declaration_with_a_broken_type(
+    indoc! {"
+        type Price = {Int where _ >
+        p = Price::new(3)
+        p
+    "},
+    &[("parse", "{")],
+)]
+#[case::a_loop_with_a_broken_statement(
+    indoc! {r#"
+        total := 0
+        for x in [1, 2]:
+            total +=
+        w = [1, "a"]
+        (total, w)
+    "#},
+    &[("parse", "\n"), ("infer", r#"[1, "a"]"#)],
+)]
+// A `run` cut off after its `as` binds a module name no one can read, which a qualifier
+// may be.
+#[case::a_join_past_a_run_cut_off_before_its_name(
+    indoc! {r#"
+        run nothere as
+        z = a::x + 1
+        w = [1, "a"]
+        (z, w)
+    "#},
+    &[("parse", "\n"), ("infer", r#"[1, "a"]"#)],
+)]
+#[case::an_await_of_a_broken_declaration(
+    indoc! {"
+        pool: M$ut(Int, Txn) := 100
+        await_final(pool)
+    "},
+    &[("parse", "$")],
+)]
+fn inference_runs_past_a_statement_the_parser_could_not_read(
+    #[case] code: &str,
+    #[case] expected: &[(&str, &str)],
+) {
+    let expected: Vec<(&str, String)> = expected.iter().map(|(p, s)| (*p, s.to_string())).collect();
+    assert_eq!(underlined_by_phase(code), expected);
 }

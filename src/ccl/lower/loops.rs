@@ -668,6 +668,9 @@ fn lower_for_body_stmts_scoped(
                     span: stmt.span,
                 });
             }
+            // A statement the parser could not read fails the loop, which its parse error
+            // reports.
+            ChlStmt::Error { .. } => return Err(LoweringError::parse_hole(stmt.span)),
             _ => {
                 return Err(LoweringError::unsupported(
                     stmt.span,
@@ -789,6 +792,7 @@ fn lower_for_body_stmt(
                 let feed = lower_feed(target, v, ctx)?;
                 Ok(ctx.tag_image(feed, value.span))
             }
+            ChlExpr::Error => Err(LoweringError::parse_hole(value.span)),
             _ => Err(LoweringError::unsupported(
                 value.span,
                 "for-loop body must end in a yield, `<<` feed, nested for, \
@@ -913,6 +917,7 @@ fn lower_for_body_stmt(
             "a `with begin():` transaction inside a generator/nested for-loop body \
              is not yet supported",
         )),
+        ChlStmt::Error { .. } => Err(LoweringError::parse_hole(stmt.span)),
         _ => Err(LoweringError::unsupported(
             stmt.span,
             "for-loop body must end in a yield, `<<` feed, nested for, if-guard, or match",
@@ -1850,6 +1855,9 @@ fn lower_loop_body_chain_scoped(
                 let inner = lower_nested_loop(&site, yield_defer, ctx)?;
                 ctx.tag_machinery(Expr::expr_stmt(inner, chain), stmt.span, "lower.stmt_seq")
             }
+            // A statement the parser could not read fails the loop, which its parse error
+            // reports.
+            ChlStmt::Error { .. } => return Err(LoweringError::parse_hole(stmt.span)),
             _ => {
                 return Err(LoweringError::unsupported(
                     stmt.span,

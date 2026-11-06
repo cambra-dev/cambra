@@ -412,18 +412,57 @@ fn rich_to_info(err: Rich<'_, Token, Span>) -> ParseErrorInfo {
 /// the grammar's (as returned by `into_output_errors`) with category
 /// collapsing applied.
 ///
-/// A grammar error found at a [`Token::Error`] or at a zero-width closer is
-/// dropped: the lexer synthesised that token and reported the lexical error at
-/// that place (`chl-parser/design-chl-parser.md`, "One diagnostic per lexical
-/// error"). No source text lexes to a zero-width closer.
+/// A grammar error the lexer's recovery explains is dropped
+/// (`chl-parser/design-chl-parser.md`, "One diagnostic per lexical error"):
+///
+/// - one found at a [`Token::Error`] or at a zero-width closer: the lexer synthesised that
+///   token and reported the lexical error at that place. No source text lexes to a
+///   zero-width closer.
+/// - one at the token after a zero-width closer, which stands where the lexer guessed the
+///   bracket's statement ends: `def f(a:` reads as `def f(a:)`, and the line's end is no
+///   place for that.
+/// - one inside a bracket the lexer closed with a zero-width closer, on a line after the
+///   bracket's: the lexer kept that line inside the bracket by indentation alone
+///   ("Later: parser-driven recovery for unclosed brackets").
 pub(super) fn lex_then_grammar_errors(
     lex: Vec<LexError>,
     grammar: Vec<Rich<'_, Token, Span>>,
+    tokens: &[(Token, Span)],
+    source: &str,
 ) -> Vec<ParseError> {
-    let explained_by_lexer = |err: &Rich<'_, Token, Span>| match err.found() {
-        Some(Token::Error) => true,
-        Some(Token::RParen | Token::RBracket | Token::RBrace) => err.span().start == err.span().end,
-        _ => false,
+    // Each zero-width closer with the open bracket it closes. The stream's brackets balance.
+    let mut open: Vec<Span> = Vec::new();
+    let mut closed: Vec<(Span, Span)> = Vec::new();
+    for (token, span) in tokens {
+        match token {
+            Token::LParen | Token::LBracket | Token::LBrace => open.push(*span),
+            Token::RParen | Token::RBracket | Token::RBrace => {
+                let opener = open.pop();
+                if span.start == span.end
+                    && let Some(opener) = opener
+                {
+                    closed.push((opener, *span));
+                }
+            }
+            _ => {}
+        }
+    }
+    let line_of = |offset: usize| source[..offset.min(source.len())].matches('\n').count();
+    let explained_by_lexer = |err: &Rich<'_, Token, Span>| {
+        let at = err.span();
+        match err.found() {
+            Some(Token::Error) => return true,
+            Some(Token::RParen | Token::RBracket | Token::RBrace) if at.start == at.end => {
+                return true;
+            }
+            _ => {}
+        }
+        closed.iter().any(|(opener, closer)| {
+            at.start == closer.end
+                || (opener.end <= at.start
+                    && at.start < closer.start
+                    && line_of(at.start) > line_of(opener.start))
+        })
     };
     lex.into_iter()
         .map(ParseError::Lex)

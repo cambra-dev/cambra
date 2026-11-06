@@ -394,7 +394,21 @@ pub enum Stmt {
     /// downstream passes given an error-free parse may treat this variant as
     /// unreachable. Mixing recovered ASTs into the compilation pipeline
     /// without first surfacing the parse errors is a caller bug.
-    Error,
+    Error {
+        /// The names the skipped statement's head binds, where the head reads as one:
+        /// `x = …`, `a, b = …`, `x: …`, `x ^= …`, `x := …`, `def f…` or `param x…`,
+        /// after an optional `pub`. Empty when it does not.
+        binds: Vec<SmolStr>,
+        /// Whether the head is a `:=`, which writes a name already in scope rather than
+        /// introducing it.
+        mut_assign: bool,
+        /// The module names an `import` or `run` head binds: its `as` name, or its path's
+        /// last segment when it has no `as`.
+        modules: Vec<SmolStr>,
+        /// Whether the head is an `import` or `run` cut off after its `as`, so binding a module
+        /// name no one can read.
+        unknown_module: bool,
+    },
 }
 
 /// A module path as a statement writes it, `shop::cart`, each segment with its
