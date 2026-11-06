@@ -63,7 +63,6 @@ mod map;
 mod program_run_tests;
 mod reshape;
 mod scalar;
-#[cfg(test)]
 mod sink_breaker;
 #[cfg(test)]
 mod store_breaker_tests;
@@ -81,7 +80,6 @@ pub use lookup::*;
 pub use map::*;
 pub use reshape::*;
 pub use scalar::*;
-#[cfg(test)]
 pub(crate) use sink_breaker::SinkBreaker;
 pub use union::*;
 
@@ -1415,6 +1413,14 @@ pub trait Breaker {
     /// that answers `None` pushes nothing, after a consume or at a finish.
     fn as_producer(&self) -> Option<&dyn BreakingProducer>;
 
+    /// Why this breaker has no consuming mode for its shape, where it has none: a planner asks
+    /// before it plans the breaker's pipeline, since [`consume_impl`](Self::consume_impl) and
+    /// [`input_tiling`](Self::input_tiling) panic for such a breaker. `None` for a breaker that
+    /// consumes.
+    fn no_consuming_mode(&self) -> Option<String> {
+        None
+    }
+
     /// Hand `push` the producer whose decided region this breaker's pipeline pushes: itself
     /// where it is a producer, or the store of a loop's scope.
     fn pushing(&self, push: &mut dyn FnMut(&dyn BreakingProducer)) {
@@ -1716,7 +1722,7 @@ pub trait TileProducer {
     /// whole. The default passes `level` to every input, which holds for an operator that keeps its
     /// input's keys level for level; an operator that shifts levels overrides it. The planner walks
     /// a loop's scope with it to find what a round pulls beneath the outermost keys (`unrestated`
-    /// in `dispatcher.rs`).
+    /// in `dispatcher/plan.rs`).
     fn input_level(&self, _role: &str, level: CurryLevel) -> Option<CurryLevel> {
         Some(level)
     }
@@ -1785,12 +1791,11 @@ pub trait TileProducer {
     fn visit_input_producers(&self, _visit: &mut dyn FnMut(&str, &dyn TileProducer)) {}
 
     /// [`visit_input_producers`](Self::visit_input_producers) with each producer mutable: the
-    /// same producers, in the same order, under the same roles. A test driver walks it to reach
-    /// the pipeline breakers inside a chain (`as_breaking_mut`).
+    /// same producers, in the same order, under the same roles. A dispatched run walks it to reach
+    /// the pipeline breakers inside a chain ([`as_breaking_mut`](Self::as_breaking_mut)).
     fn visit_input_producers_mut(&mut self, _visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {}
 
     /// This producer as a pipeline breaker, where it is one.
-    #[cfg(test)]
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
         None
     }
@@ -1803,16 +1808,13 @@ pub trait TileProducer {
 
     /// The cyclic fan-out this producer reads through a reader slot, where it is one: a reader
     /// of that fan-out's store.
-    #[cfg(test)]
     fn store_read(&self) -> Option<StoreRead> {
         None
     }
 
-    /// Whether this producer, a store, runs in rounds as a pipeline breaker where no loop's scope
-    /// encloses it: one round of the pipelines inside its cycle per position, in a nested
-    /// dispatcher. A store that answers `false`, or one inside a loop's scope, steps itself until
-    /// its input has released a morsel.
-    #[cfg(test)]
+    /// Whether this producer, a store, runs in rounds as a pipeline breaker: one round of the
+    /// pipelines inside its cycle per position, in the nested dispatcher of a loop's scope. A
+    /// store that answers `false` steps itself until its input has released a morsel.
     fn runs_in_rounds(&self) -> bool {
         false
     }
@@ -1821,7 +1823,6 @@ pub trait TileProducer {
     /// ([`read_again_toward`]), where it is a store that holds its cycle. A loop's scope has them
     /// read again at the start of each round: the store's last step pulled the operators in pull
     /// mode there, before the round's pipelines took its position.
-    #[cfg(test)]
     fn read_cycle_again(&mut self) {}
 
     /// Read the input `input` (a role [`visit_input_producers`](Self::visit_input_producers)
@@ -1834,7 +1835,6 @@ pub trait TileProducer {
     /// next, the next its source delivers, from the outermost level down, and `None` once the
     /// source delivers no more; `None` for any other producer. A loop's scope runs a round per
     /// position the drive emits.
-    #[cfg(test)]
     fn next_position(&self) -> Option<Option<Vec<Value>>> {
         None
     }
