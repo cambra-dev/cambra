@@ -120,6 +120,9 @@ struct TxnFrame {
     writes: BTreeSet<String>,
     /// Replies fed inside the block, held until the block commits and its commit time is known.
     replies: Vec<(String, String, Value)>,
+    /// Each cell the block writes with the value it held before the block, which an
+    /// exception escaping the block restores.
+    before: Vec<(Rc<RefCell<MutCell>>, Value)>,
     /// Whether the block wrote or replied speculatively, which leaves whether it commits
     /// undecided.
     uncertain: bool,
@@ -1822,6 +1825,7 @@ impl Interp {
             wrote: false,
             writes,
             replies: Vec::new(),
+            before: Vec::new(),
             uncertain: false,
         });
         // A block in value position ends in its value, and commits on every path where it
@@ -1834,6 +1838,23 @@ impl Interp {
             }
         });
         let frame = self.txn.take().expect("installed above");
+        // An exception escaping the block aborts it: no write commits and no reply is sent
+        // (`docs/chl-spec.md`, "Exceptions"). A block that writes takes a commit time all the
+        // same, as a path of a block in value position that writes nothing does.
+        if let Err(Error::Raised(_)) = &outcome {
+            for (cell, value) in &frame.before {
+                cell.borrow_mut().value = value.clone();
+            }
+            if frame.uncertain {
+                self.clock_known = false;
+            } else if !frame.writes.is_empty() {
+                self.commit_time += 1;
+                for watch in &mut self.order_watches {
+                    watch.moved = true;
+                }
+            }
+            return outcome;
+        }
         let value = outcome?;
         let valued_commit = valued && !frame.writes.is_empty();
 
@@ -2261,6 +2282,13 @@ impl Interp {
         cell: &Rc<RefCell<MutCell>>,
         value: Value,
     ) -> Result<(), Error> {
+        if let Some(frame) = self.txn.as_mut()
+            && !frame.before.iter().any(|(c, _)| Rc::ptr_eq(c, cell))
+        {
+            frame
+                .before
+                .push((Rc::clone(cell), cell.borrow().value.clone()));
+        }
         // A write that may not happen leaves the variable's value undecided for every later
         // read, and the block around it undecided about whether it commits.
         if self.speculating > 0 {
@@ -4256,6 +4284,36 @@ mod tests {
                     out << b
         "#});
         assert_eq!(v.to_string(), "[t1 -> 2, t2 -> 5]");
+    }
+
+    /// An exception escaping a `with begin():` block aborts it: none of its writes commits,
+    /// including one made before the raise, and none of its outputs is sent. Here the exception
+    /// also escapes the loop, so no later iteration runs.
+    #[test]
+    fn an_exception_escaping_a_block_aborts_it() {
+        let got = out(indoc! {"
+            def check(v):
+                if v > 15:
+                    raise v
+                v
+            out = test_sink()
+            pool: Mut(Int, Txn) := 100
+            y = try:
+                    for r in [10, 20, 5]:
+                        with begin():
+                            pool := pool - r
+                            out << pool
+                            check(r)
+                    0
+                except Int as e:
+                    e
+            out << y
+            out << await_final(pool)
+        "});
+        assert_eq!(
+            got.to_string(),
+            "[`out<<(()) -> 20, `out<<#1(()) -> 90, `y.out<<(t1) -> 90]"
+        );
     }
 
     #[test]

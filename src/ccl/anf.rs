@@ -801,8 +801,13 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
             )
         }
 
-        TypedExprNode::Begin { body, footprint } => rebuild(TypedExprNode::Begin {
+        TypedExprNode::Begin {
+            body,
+            commits_on,
+            footprint,
+        } => rebuild(TypedExprNode::Begin {
             body: Box::new(normalize(*body, muts)),
+            commits_on,
             footprint,
         }),
 

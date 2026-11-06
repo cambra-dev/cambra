@@ -4660,6 +4660,16 @@ fn a_block_value_in_a_list_is_refused() {
             pool
         out << left
 "}, "[90, 70, 40]")]
+#[case::a_binding_in_the_loop(indoc! {"
+    pool: Mut(Int, Txn) := 100
+    out = test_sink()
+    for r in [10, 20, 30]:
+        y = r * 2
+        left = with begin():
+            pool := pool - y
+            pool
+        out << left
+"}, "[80, 40, -20]")]
 #[case::each_branch_ends_in_its_value(indoc! {r#"
     pool: Mut(Int, Txn) := 100
     out = test_sink()
@@ -4803,6 +4813,174 @@ fn a_feed_beside_a_block_value(#[case] code: &str, #[case] expected: &str) {
     );
 }
 
+/// A writing block in a branch commits only at the positions where the branch runs: its
+/// site's source is restricted to them. Outside a loop the source is the singleton, which the
+/// `if` empties or keeps.
+#[rstest]
+#[case::an_if_that_fails(indoc! {"
+    x = 1
+    if x > 2:
+        with begin():
+            pool := pool - 1
+"}, 100)]
+#[case::an_if_that_holds(indoc! {"
+    x = 3
+    if x > 2:
+        with begin():
+            pool := pool - 1
+"}, 99)]
+#[case::an_if_in_a_loop(indoc! {"
+    for r in [10, 20, 30]:
+        if r > 15:
+            with begin():
+                pool := pool - r
+"}, 50)]
+#[case::an_else_in_a_loop(indoc! {"
+    for r in [10, 20, 30]:
+        if r > 15:
+            with begin():
+                pool := pool - r
+        else:
+            with begin():
+                pool := pool + 1
+"}, 51)]
+#[case::a_condition_on_a_binding_in_the_loop(indoc! {"
+    for r in [10, 20, 30]:
+        y = r * 2
+        if y > 30:
+            with begin():
+                pool := pool - y
+"}, 0)]
+#[case::nested_ifs(indoc! {"
+    for r in [10, 20, 30]:
+        if r > 15:
+            y = r + 1
+            if y < 25:
+                with begin():
+                    pool := pool - y
+"}, 79)]
+#[case::a_match_arm(indoc! {"
+    for r in [10, 20, 30]:
+        match (`a(r) if r > 15 else `b(r)):
+            case `a(v):
+                with begin():
+                    pool := pool - v
+            case `b(w):
+                pass
+"}, 50)]
+#[case::a_block_reading_a_binding_in_the_loop(indoc! {"
+    for r in [10, 20, 30]:
+        y = r * 2
+        with begin():
+            pool := pool - y
+"}, -20)]
+fn a_writing_block_in_a_branch(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(
+        &format!("pool: Mut(Int, Txn) := 100\n{code}\nawait_final(pool)\n"),
+        Value::Int(expected),
+    );
+}
+
+/// A block reading the value of an earlier block, in itself or in the condition it runs under,
+/// runs at a position once that block has committed its value there: its site's source carries
+/// the earlier block's values. The earlier block writes the variable the later one writes, or
+/// another one.
+#[rstest]
+#[case::another_variable(indoc! {"
+    for r in [10, 20, 30]:
+        v = with begin():
+            pool := pool - r
+            r * 2
+        with begin():
+            log := log + v
+    await_final(log)
+"}, 120)]
+#[case::a_condition_on_it(indoc! {"
+    for r in [10, 20, 30]:
+        v = with begin():
+            pool := pool - r
+            r * 2
+        if v > 30:
+            with begin():
+                log := log + v
+    await_final(log)
+"}, 100)]
+#[case::outside_a_loop(indoc! {"
+    v = with begin():
+        pool := pool - 10
+        7
+    if v > 5:
+        with begin():
+            log := log + v
+    await_final(log)
+"}, 7)]
+#[case::the_same_variable(indoc! {"
+    for r in [10, 20, 30]:
+        v = with begin():
+            pool := pool - r
+            r * 2
+        with begin():
+            pool := pool + v
+    await_final(pool)
+"}, 160)]
+#[case::a_condition_on_it_writing_the_same_variable(indoc! {"
+    for r in [10, 20, 30]:
+        v = with begin():
+            pool := pool - r
+            r * 2
+        if v > 30:
+            with begin():
+                pool := pool + 1
+    await_final(pool)
+"}, 42)]
+fn a_block_reading_another_blocks_value(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(
+        &format!("pool: Mut(Int, Txn) := 100\nlog: Mut(Int, Txn) := 0\n{code}\n"),
+        Value::Int(expected),
+    );
+}
+
+/// A block under a condition on the value of a block that writes nothing is refused: that value
+/// is a read at the iteration, which no source the site could carry holds.
+#[test]
+fn a_block_under_a_condition_on_a_read_only_value_is_refused() {
+    check_compile_error(
+        indoc! {"
+            pool: Mut(Int, Txn) := 100
+            log: Mut(Int, Txn) := 0
+            for r in [10, 20, 30]:
+                v = with begin():
+                    pool
+                if v > r:
+                    with begin():
+                        log := log + 1
+            await_final(log)
+        "},
+        "under a condition that reads an induction accumulator or the value of a",
+    );
+}
+
+/// A block reading another block's value over a concatenation is not compiled yet: the later
+/// site's source carries the earlier block's values per part of the concatenation, which no
+/// tagged form of a fed source builds. It is refused as an internal error.
+#[test]
+fn a_block_reading_another_blocks_value_over_a_concatenation_is_refused() {
+    check_compile_error(
+        indoc! {"
+            p: Mut(Int, Txn) := 0
+            q: Mut(Int, Txn) := 0
+            for x in [1, 2] ++ [3]:
+                v = with begin():
+                    p := p + x
+                    p
+                with begin():
+                    q := q + v
+            await_final(q)
+        "},
+        "no tagged fed form is built yet",
+    );
+}
+
 /// A block in value position ends in a value on every path.
 #[rstest]
 #[case::a_write(indoc! {"
@@ -4930,7 +5108,8 @@ fn a_block_value_replies_while_its_source_is_open() {
 fn a_block_value_under_a_lambda_is_refused(#[case] code: &str) {
     check_compile_error(
         code,
-        "a `with begin():` block in value position is not compiled yet",
+        "a `with begin():` block in value position, or one an exception escapes, is not \
+         compiled yet",
     );
 }
 

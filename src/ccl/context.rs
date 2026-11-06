@@ -2751,7 +2751,6 @@ fn run_passes(
     // it escapes through (`crate::ccl::exceptions`).
     expr = recorded(capture_provenance, Phase::Inline, || {
         let expr = inline::inline_capability_lambdas(expr);
-        crate::ccl::exceptions::refuse_escaping_blocks(&expr)?;
         crate::ccl::exceptions::eliminate(expr)
     })
     .map_err(|message| {
@@ -2787,6 +2786,17 @@ fn run_passes(
     // like a mutable variable is not (its binder is a distinct `Name`). This replaces the
     // lowering-time base-name registry.
     let txn_mut_vars = transact_phase::collect_txn_mut_vars(&expr);
+    // Before the user-facing checks: after exception elimination, a write following a
+    // statement that may raise sits under the arm where it did not, which
+    // `check_no_guarded_induction_write_in_block` would report as a branch the user wrote.
+    transact_phase::refuse_uncompiled_aborting_blocks(&expr, &txn_mut_vars)
+        .and_then(|()| transact_phase::refuse_conditional_writing_blocks(&expr, &txn_mut_vars))
+        .map_err(|message| {
+            vec![CompileError::Internal {
+                stage: "transact",
+                message,
+            }]
+        })?;
     // A transactional writer reaching a `with begin():` block via a function call
     // is a nested transaction — the callee's inlined `For` would otherwise be
     // silently absorbed into the outer block's read-your-writes env, dropping its

@@ -743,9 +743,15 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         TypedExprNode::Defer => (Precedence::Atom, "defer".to_string()),
         TypedExprNode::Abstract => (Precedence::Atom, "abstract".to_string()),
 
-        TypedExprNode::Begin { body, .. } => {
+        TypedExprNode::Begin {
+            body, commits_on, ..
+        } => {
             let body_str = fmt(body, Precedence::Lowest, opts);
-            (Precedence::Atom, format!("begin {{ {body_str} }}"))
+            let on = match commits_on {
+                Some(tag) => format!(" on `{tag}"),
+                None => String::new(),
+            };
+            (Precedence::Atom, format!("begin{on} {{ {body_str} }}"))
         }
 
         TypedExprNode::Error => (Precedence::Atom, "<error>".to_string()),
@@ -1249,6 +1255,7 @@ in x"
                 source: Expr::var("xs"),
                 body: Expr::var("i"),
                 item_taps: Vec::new(),
+                fed_back: Vec::new(),
             }],
             domain: Type::Base(BaseType::Int),
             parameter: None,
@@ -1272,6 +1279,7 @@ in x"
                 source: Expr::var("xs"),
                 body: Expr::tuple(vec![Expr::var("x"), Expr::var("y")]),
                 item_taps: Vec::new(),
+                fed_back: Vec::new(),
             }],
             domain: Type::Base(BaseType::Int),
             parameter: None,
@@ -1291,6 +1299,7 @@ in x"
                 source: Expr::var("xs"),
                 body: Expr::var("i"),
                 item_taps: Vec::new(),
+                fed_back: Vec::new(),
             }],
             domain: Type::Base(BaseType::Int),
             parameter: Some(Type::Tuple(vec![

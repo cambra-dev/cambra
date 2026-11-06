@@ -13,6 +13,9 @@
 //! - `Var(𝑥)` where an enclosing `Let` binds 𝑥 to a literal.
 //! - `(𝑎, 𝑏) ▷ binop` where 𝑎 and 𝑏 are literals.
 //! - `𝑎 ▷ neg` and `𝑎 ▷ not_fn` where 𝑎 is a literal.
+//! - A function's result binding `let __output = 𝑎 in 𝑏` where 𝑎 and 𝑏 are literals, which is
+//!   𝑏: nothing reads `__output` any more. `let __output = 1 in __output` is left this way once
+//!   the transaction the function's body ran is stripped onto the store.
 //!
 //! A gate that folded to a literal then decides the filter it gates, and the fold applies these
 //! rewrites to the terms lambda elimination builds for a value-`Case`:
@@ -356,6 +359,19 @@ fn gate_operand_at(
 fn reduce(expr: &Expr, consts: &Consts) -> Option<Reduction> {
     let lit = match &expr.node {
         TypedExprNode::Var(name) => consts.get(name).cloned(),
+        // A definition the body's type discharges stays, as it does not fold ([`fold`]).
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } if binding.name.is_output() => match (&bound_expr.node, &body.node) {
+            (TypedExprNode::Lit(_), TypedExprNode::Lit(lit))
+                if !crate::ccl::subst::type_free_vars(&body.ty).contains(&binding.name) =>
+            {
+                Some(lit.clone())
+            }
+            _ => None,
+        },
         TypedExprNode::DisjointJoin(arms) => {
             // A join whose arms are all empty is left as it is, so it never has no operand.
             let empty = arms.iter().filter(|arm| is_empty_arm(arm)).count();
@@ -574,6 +590,28 @@ mod tests {
 
     /// `true and 𝑝` is 𝑝 wherever the gate sits in its composition, and the elements around
     /// it stay.
+    /// `let __output = 1 in __output`, what a function's result binding holds once its body's
+    /// transaction is stripped onto the store, is `1`.
+    #[test]
+    fn a_result_binding_of_a_literal_folds_to_the_literal() {
+        let one = || Expr::new(TypedExprNode::Lit(Lit::Int(1))).with_ty(int());
+        let output = Name::output();
+        let read = Expr::new(TypedExprNode::Var(output.clone())).with_ty(int());
+        let mut expr = Expr::let_bind(output, one(), read).with_ty(int());
+        fold_constants(&mut expr);
+        assert!(matches!(expr.node, TypedExprNode::Lit(Lit::Int(1))));
+    }
+
+    /// A program's own binding of a literal stays, with its body folded: `let g = 10 in g + 3`
+    /// is `let g = 10 in 13`.
+    #[test]
+    fn a_program_binding_of_a_literal_stays() {
+        let lit = |n| Expr::new(TypedExprNode::Lit(Lit::Int(n))).with_ty(int());
+        let mut expr = Expr::let_bind("g", lit(10), lit(13)).with_ty(int());
+        fold_constants(&mut expr);
+        assert!(matches!(expr.node, TypedExprNode::Let { .. }));
+    }
+
     #[test]
     fn a_gate_in_the_middle_of_a_composition_folds_to_its_operand() {
         let before = var("f", Type::fun(int(), int()));

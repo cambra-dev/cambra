@@ -1636,6 +1636,7 @@ mod tests {
                 source: list_123().with_ty(list_ty.clone()),
                 body,
                 item_taps: Vec::new(),
+                fed_back: Vec::new(),
             }],
             domain: Type::UIntRange(3),
             parameter: None,

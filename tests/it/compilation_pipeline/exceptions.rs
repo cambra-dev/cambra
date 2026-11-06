@@ -497,22 +497,6 @@ fn raise_clauses(#[case] code: &str, #[case] expected: i64) {
     "},
     "does not list"
 )]
-// An exception escaping a block aborts its transaction and leaves the block's outcome to the
-// code after it, which exception elimination does not give the block yet.
-#[case::an_exception_escaping_a_block(
-    indoc! {"
-        pool: Mut(Int, Txn) := 100
-        y = try:
-                with begin():
-                    pool := pool - 5
-                    raise 7
-                0
-            except Int as e:
-                e
-        y
-    "},
-    "escaping a `with begin():` block is not compiled yet"
-)]
 // A function value in a collection stays in the tree as a lambda that may raise, which
 // elimination does not rewrite yet.
 #[case::a_function_value_in_a_collection(
@@ -792,6 +776,174 @@ fn caught_inside_a_block(#[case] code: &str, #[case] expected: i64) {
     check_scalar(
         &format!("{defs}{code}\nawait_final(pool)"),
         Value::Int(expected),
+    );
+}
+
+/// An exception escaping a `with begin():` block aborts its transaction: none of its writes
+/// commits, including the writes before the raise, and the `try` around the block catches it.
+#[rstest]
+#[case::a_standalone_block(indoc! {"
+    y = try:
+            with begin():
+                pool := pool - 5
+                raise 7
+            0
+        except Int as e:
+            e
+    await_final(pool) + y
+"}, 107)]
+#[case::a_block_in_a_loop(indoc! {"
+    for r in [10, 20, 5]:
+        try:
+            with begin():
+                pool := pool - r
+                check(pool - 70)
+        except Int:
+            pass
+    await_final(pool)
+"}, 75)]
+#[case::a_raise_after_a_read_of_a_write(indoc! {"
+    for r in [10, 20, 30]:
+        try:
+            with begin():
+                pool := pool - r
+                if pool < 75:
+                    raise pool
+                pool := pool - 1
+        except Int:
+            pass
+    await_final(pool)
+"}, 89)]
+#[case::a_block_after_a_block_that_aborts(indoc! {"
+    for r in [10, 20, 5]:
+        try:
+            with begin():
+                pool := pool - r
+                check(r)
+            with begin():
+                pool := pool + 1
+        except Int:
+            pass
+    await_final(pool)
+"}, 87)]
+#[case::a_raise_before_a_block(indoc! {"
+    for r in [10, 20, 5]:
+        try:
+            check(r)
+            with begin():
+                pool := pool - r
+        except Int:
+            pass
+    await_final(pool)
+"}, 85)]
+#[case::a_block_in_value_position(indoc! {"
+    for r in [10, 20, 5]:
+        try:
+            d = with begin():
+                pool := pool - r
+                check(r)
+            pass
+        except Int:
+            pass
+    await_final(pool)
+"}, 85)]
+fn escaping_a_block(#[case] code: &str, #[case] expected: i64) {
+    let defs = indoc! {"
+        def check(v):
+            if v > 15:
+                raise v
+            v
+        pool: Mut(Int, Txn) := 100
+    "};
+    check_scalar(&format!("{defs}{code}"), Value::Int(expected));
+}
+
+/// A block an exception escapes whose abort is not compiled, and one in a loop an exception
+/// escapes, which runs only where no earlier block raised, are refused rather than committed on
+/// every path.
+#[rstest]
+#[case::an_exception_escaping_a_loop_of_blocks(indoc! {"
+    y = try:
+            for r in [10, 20, 5]:
+                with begin():
+                    pool := pool - r
+                    check(r)
+            0
+        except Int as e:
+            e
+    await_final(pool) + y
+"}, "in value position or with an exception escaping it, under an `if`")]
+#[case::an_induction_write_in_the_block(indoc! {"
+    n := 0
+    for r in [10, 20, 5]:
+        try:
+            with begin():
+                pool := pool - r
+                n := n + 1
+                check(r)
+        except Int:
+            pass
+    await_final(pool) + n
+"}, "undoing such a write when the exception aborts the block is not compiled yet")]
+#[case::a_read_only_block_that_feeds(indoc! {"
+    out: Feed(_)
+    for r in [10, 20, 5]:
+        try:
+            with begin():
+                out << pool + r
+                check(r)
+        except Int as e:
+            out << 0 - e
+    out
+"}, "sends output and writes no transactional variable is not compiled yet")]
+#[case::a_clause_that_feeds_in_a_loop(indoc! {"
+    out: Feed(_)
+    for r in [10, 20, 5]:
+        try:
+            with begin():
+                pool := pool - r
+                check(r)
+        except Int as e:
+            out << e
+    out
+"}, "a feed under a condition that reads the value of a `with begin():` block")]
+fn escaping_a_block_refused(#[case] code: &str, #[case] needle: &str) {
+    let defs = indoc! {"
+        def check(v):
+            if v > 15:
+                raise v
+            v
+        pool: Mut(Int, Txn) := 100
+    "};
+    check_compile_error(&format!("{defs}{code}"), needle);
+}
+
+/// An exception escaping a block sends none of the outputs inside it, and the code after the
+/// block reads the outcome: the clause that catches it runs, or the value where none escaped.
+/// The aborted block still takes a commit time, `t2`, at which it sends nothing.
+#[test]
+fn escaping_a_block_sends_no_output() {
+    check_sink(
+        indoc! {"
+            def check(v):
+                if v > 15:
+                    raise v
+                v
+            pool: Mut(Int, Txn) := 100
+            out = test_sink()
+            for r in [10, 20, 5]:
+                got = try:
+                        d = with begin():
+                            pool := pool - r
+                            out << pool
+                            check(r)
+                        d
+                    except Int as e:
+                        0 - e
+                out << got
+        "},
+        "[`got.d.out<<(t1) -> 90, `got.d.out<<(t3) -> 85, `out<<(0) -> 10, `out<<(1) -> -20, \
+         `out<<(2) -> 5]",
     );
 }
 

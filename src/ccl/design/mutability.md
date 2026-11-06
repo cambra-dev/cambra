@@ -330,14 +330,17 @@ eliminator, stated by content rather than by a "mirrors CHL" adjective.)
   at a write either.  `mut_elim::desugar_keyed_writes` then rewrites it to the whole-value write it
   denotes, `m := insert(m, k, v)`, so every phase below sees one kind of `MutWrite` and none of them
   needs a key.
-- `Begin { body }` — one `with begin():` transaction block, made a *single* statement
+- `Begin { body, commits_on }` — one `with begin():` transaction block, made a *single* statement
   (`ExprStmt(Begin{block}, rest)`), or bound by a `let` in value position
   ([A block in value position](#a-block-in-value-position)), so a loop body may freely mix a
   per-iteration transaction, sibling induction writes, and feeds. `body` is the per-transaction
   statement chain. The transaction phase strips it: a block writing a `Mut(_, Txn)` mutable variable
   becomes a commit site (partitioned by mutable variable domain — induction writes lifted onto the
   enclosing loop); a read-only block is unwrapped onto the loop spine. A standalone block lowers to
-  a singleton `For` wrapping a `Begin`.
+  a `Begin` on its statement chain, and the phase runs it over the singleton `[unit]`: a writing
+  block as a site over it, and a read-only block as the body of a loop over it, which positions the
+  as-of reads it feeds out. `commits_on` is `` `__ok `` on a block an exception escapes
+  ([A block an exception escapes](#a-block-an-exception-escapes)) and `None` on every other.
 - `Feed { name, value }` / `Defer` — a `<<` feed and its channel. These survive into inference (so
   a defer binding is typed, at `Feed(𝑉)`) and are eliminated by mut_elim (feeds via channelize).
 
@@ -1355,6 +1358,91 @@ condition, and here the restriction reads the store. The channel's type leaves t
 the declaration of the channel it feeds, and a type outside a `letrec` cannot state a value read
 from it.
 
+### A block in a branch
+
+A writing block in a branch of an `if` or a `match` runs at the positions of its loop where the
+branch's condition holds, or outside a loop at the singleton when it holds there. Exception
+elimination puts a block after a statement that may raise in the branch where nothing raised, so
+that block is one too. `transact_phase::strip` tracks the path to each block: the condition of each
+branch around it, first-match (`synthesize_arm_predicate`), and the bindings ahead of it in its
+loop's body and its branches. `restrict_to_path` builds the site from the path:
+
+- The site's source is refined by `λ 𝑟 → 𝑐`, where `𝑐` is the conjunction of the branch conditions
+  and `𝑟` the loop's item binder, the refinement `channelize` puts on a conditional feed's source
+  (`refine_source_domain`). Positions where `𝑐` fails make no proposal and take no commit time.
+- The block and the condition each take fresh copies of the bindings they read, through one another,
+  with a `match` arm's payload bound to its projection of the scrutinee. A store is placed on the
+  top-level spine, outside every loop body and branch, so a block that reads a binding of its
+  loop's body takes a copy whether it is in a branch or not.
+
+A condition cannot read a transactional variable: a `Txn` variable is read only inside a `with
+begin():` block (the CHL spec, [reads](../../../docs/chl-spec.md#83-reads)). A check against a
+variable is written inside the block, where the snapshot it reads is the one the block commits on.
+
+`refuse_conditional_writing_blocks` refuses, before the phase, with internal errors:
+
+- A block under a condition that reads an induction accumulator or the value of a block that writes
+  nothing. No source the site could carry holds either; a writing block's value is carried, as
+  [A block reading another block's value](#a-block-reading-another-blocks-value) describes.
+- A block in value position, or one an exception escapes, in a branch. `iterate_block_values` zips
+  the loop's source with the block's values, and a restricted site has values at only some of its
+  positions. Exception elimination puts a block in a loop an exception escapes under the condition
+  that no earlier block raised, which is this shape.
+- A loop holding a writing block, in a branch. The loop's body runs at every position of its own
+  source.
+- A block or condition reading a binding whose value writes, feeds, declares a channel or holds a
+  loop or a block, which a copy would repeat.
+
+### A block reading another block's value
+
+A writing block whose block or condition reads the value of an earlier writing block in its loop's
+body runs at a position once that block has committed its value there. The value at an item is
+final at that commit, so the later site's source carries it: `restrict_to_path` makes the source
+`λ ξ → (source(ξ), __values(ξ), …)` and the item binder a tuple, from which the block and its
+condition bind the loop's item and each value they read. Outside a loop a block's value is bound
+once on the top-level spine and read where it stands.
+
+A block in another store reads the earlier block's `__values` from the store placed outside its
+own. A block in the same store reads them inside the store's `letrec`, where `plan_store` binds the
+earlier site's tap: the later site's source reads ``tap ≫ variant_project(`fired)``. Recognition
+records the tap on the reading writer (`WriterSite::fed_back`), which binds its name in the
+writer's source, and op-conversion reads the tap back from the store through the commit operator's
+recurrence slot, keyed by item (`RekeySorted`). A writer reads only an earlier writer's tap: its
+own would be a cycle `check_letrec_causal` refuses.
+
+An exception escaping a block is this shape too: the code after the block reads its outcome, so a
+block after it in the same `try` runs where the first one committed `` `__ok ``.
+
+### A block an exception escapes
+
+Exception elimination makes a `Begin` whose body may raise the outcome of its body,
+``{`__ok{𝑇} | `__raise𝑖{𝐸𝑖} …}``, with `commits_on` set to `` `__ok ``, and the code after the
+block matches that outcome: `let __outcome = Begin{block} in match __outcome {…}`. A block in
+statement position is then in value position too, and compiles as [A block in value
+position](#a-block-in-value-position) describes, with the decision gated on the outcome
+(`WriterWalk::commit_only_on`):
+
+- `committed = __v ▷ variant_is(`__ok)`, over the value the block feeds to its `__block_value`
+  defer.
+- Each variable the block writes holds `{committed → 𝑤; true → 𝑠}`, its written value `𝑤` where
+  the block commits and its snapshot `𝑠` elsewhere. The block reads every variable it writes, so
+  each snapshot is a slot of the writer parameter.
+- Each tap other than the value's fires on `committed` and its own path, so an aborted block sends
+  no output. The value's tap fires on every path, so the code after the block reads every outcome.
+
+An aborted block commits its snapshots, which leaves every variable as it was, and takes a commit
+time like any other proposal.
+
+In a loop, the block's outcome is a value the loop iterates, so a clause that feeds is a feed under
+a condition reading a block's value, refused as [A block in value position](#a-block-in-value-position)
+describes.
+
+Two shapes are refused before the phase with internal errors. An induction write in such a block
+is lifted onto the enclosing loop, and a block that writes no transactional variable is unwrapped
+onto it, so their writes and outputs would stand whatever the block decides
+(`refuse_uncompiled_aborting_blocks`). Such a block in a branch is refused as [A block in a
+branch](#a-block-in-a-branch) describes.
+
 ### A reply's `Txn` domain overstates its keys [Interim]
 
 A commit-gated reply is typed `Txn ⤇ 𝑉`, but it holds a value only at the commits where its own
@@ -1693,47 +1781,3 @@ path its guard excludes.
 
 Designed — it binds `t` to the transaction's commit time (see the CHL spec,
 [transactions](../../../docs/chl-spec.md#82-transactions-with-begin)) — but rejected at lowering today.
-
-### Conditional transactions (a `with begin():` inside a conditional)
-
-Rejected at lowering today (`lower/loops.rs` — a `with begin():` under an `if` hits the "only
-assignments and function definitions" gate). This is the **dual** of the general in-transaction
-conditionals above: there, one transaction takes one snapshot and a path-based walk merges per key;
-here the *transaction itself* is conditional — `if 𝑝: with begin(): x := 𝑒` fires a transaction on
-some iterations and not others.
-
-**Mechanism — source-restriction fan-out (the value-`Case` machinery, reused).** A conditional
-transaction is a transaction over a *restricted source*: the site's iteration source (and its
-`begin_<site>` oracle domain) is refined to the sub-domain where the guard holds — `(reqs ↾ π̂) ≫
-⟨body⟩`, which is exactly `refine_source_domain` + `synthesize_arm_predicate` (the first-match
-`π̂ᵢ = 𝑔ᵢ ∧ ¬⋁ⱼ˂ᵢ 𝑔ⱼ` encoding) applied to a transaction site rather than a feed. The work is
-mostly *lowering*: stop rejecting the nested `with begin():`, let the branch structure reach the
-transaction phase, and have the phase refine a transaction site sitting under a path condition.
-Everything else in the branch (feeds, induction writes) rides the same `π̂` refinement, so it
-composes. `elif`/`else` land as disjoint sites over `reqs ↾ π̂` and `reqs ↾ ¬π̂`, merged into the
-shared store by the existing multi-writer commit-stream machinery. A standalone (non-loop)
-`if 𝑝: with begin(): …` refines the `Units(1)` one-shot driver, so the transaction fires
-zero-or-one times.
-
-**Why this is sound where per-path writer sites *inside* one block are not** (contrast the "one
-decision record per transaction" verdict above): the guard `𝑝` is a **source-domain** predicate —
-evaluated on the request element ahead of the transaction, not on its snapshot — so it may
-legitimately restrict the source; each branch's block is a **distinct transaction** with its own
-`begin_<site>`, so distinct serialization points are correct rather than a violation; and atomicity
-is intact — still one snapshot, one commit, one write-set per transaction. The whole difference is
-"two transactions" vs. "one transaction, two paths".
-
-**A guard reading the variable is rejected, so the non-atomic check is unwritable.** Of these two,
-only (B) is a program:
-
-```text
-if balance > 0: with begin(): balance -= req      # (A) rejected: `balance` is read outside a block
-with begin(): if balance > 0: balance -= req       # (B) atomic — checked in the snapshot
-```
-
-(A) would be a TOCTOU pre-check, stale between the read and the commit. It does not compile, and not
-because conditional transactions are unbuilt: a `Txn` variable is read only inside a `with begin():`
-block, permanently (the CHL spec, [reads](../../../docs/chl-spec.md#83-reads)), so the guard is
-rejected at lowering whatever becomes of the conditional around it. That leaves (B) as the only way
-to write the check, which is the atomic one, so there is no footgun here to lint.
-
