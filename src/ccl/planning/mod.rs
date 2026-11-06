@@ -385,9 +385,11 @@ fn refuse_a_union_applied_at_the_input(term: &Expr) -> Result<(), String> {
     }
 }
 
-/// Is `e` a bare `Var` other than the element binder (the free key binder)?
+/// Is `e` a bare `Var` other than an element reference (the free key binder)? An enclosing
+/// refinement's element, `__elem^𝑛` for `𝑛 > 0`, is not a key binder: a group's refinement
+/// `__elem ▷ xs ▷ 𝑓 == __elem^1` reads the key the enclosing refinement ranges over.
 pub(super) fn is_free_var(e: &Expr) -> bool {
-    matches!(&e.node, TypedExprNode::Var(n) if !n.is_elem())
+    matches!(&e.node, TypedExprNode::Var(n) if n.elem_index().is_none())
 }
 
 // Returns whether the given expression is a constant, or a function of a constant.

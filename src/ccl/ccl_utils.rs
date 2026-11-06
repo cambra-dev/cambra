@@ -2550,11 +2550,10 @@ pub fn refine_with_bare(base: Type, bare_predicate: &Expr) -> Type {
 /// *uses* of the handle / mutable variable), while a
 /// [`TypedExprNode::Transact`] mutable variable key does not (it is a field label).
 ///
-/// A [`Type::Refinement`] is a binding form too — it binds
-/// [`crate::ccl::REFINEMENT_BINDER`] (`__elem`) in its predicate — so occurrences
-/// of that one name inside a type are **bound, never free** (see
-/// [`is_free_in_type`]). Every other name in a predicate is a free reference to
-/// the enclosing lexical scope and is counted.
+/// A [`Type::Refinement`] is a binding form too: it binds its element in its
+/// predicate, so an element reference `__elem^𝑛` inside it reads an enclosing element
+/// at `𝑛 - 1` and is counted there. Every other name in a predicate is a free
+/// reference to the enclosing lexical scope and is counted.
 ///
 /// Used by:
 /// - [`is_free`] — the bool wrapper for "does `name` appear at all?"
@@ -2855,8 +2854,9 @@ pub fn free_names_in_value(expr: &Expr) -> HashSet<Name> {
 /// enclosing that slot within `expr` binds it.
 ///
 /// Self-referential predicates terminate on the same `visited` discipline as
-/// [`count_free`], and the refinement element binder is excluded in type
-/// position for the reason given on [`count_free_in_type_with_visited`].
+/// [`count_free`]. A predicate's element references are read as from outside its
+/// refinement, as [`count_free`] counts them: its own element is bound, and
+/// `__elem^𝑛` for `𝑛 > 0` is `__elem^(𝑛-1)` there.
 pub fn free_names(expr: &Expr) -> HashSet<Name> {
     free_names_counting(expr, true)
 }
@@ -2879,10 +2879,24 @@ fn free_names_counting(expr: &Expr, writes: bool) -> HashSet<Name> {
         e.walk_type_slots(|ty| {
             walk_refined_predicates(ty, visited, &mut |pred, vis| {
                 // A binder's declared type sits in the enclosing scope, so the
-                // predicate is walked under the binders in force *here*.
+                // predicate is walked under the binders in force *here*. Outside the
+                // refinement its own element is bound and an enclosing one's index is one
+                // lower. A predicate reading an enclosing element reads a different one at
+                // each depth it is shared at, so it is walked at each.
                 let mut inner = HashSet::new();
                 go(pred, writes, bound, vis, &mut inner);
-                out.extend(inner.into_iter().filter(|n| !n.is_elem()));
+                let mut outer_elem = false;
+                out.extend(inner.into_iter().filter_map(|n| match n.elem_index() {
+                    Some(0) => None,
+                    Some(up) => {
+                        outer_elem = true;
+                        Some(Name::elem_at(up - 1))
+                    }
+                    None => Some(n),
+                }));
+                if outer_elem {
+                    vis.remove(&std::ptr::from_ref(pred));
+                }
             });
         });
         // A `VarRef` is a `Var`'s name or a write's target.
@@ -2938,10 +2952,9 @@ pub(crate) fn count_free_in_value(name: &Name, expr: &Expr) -> usize {
 /// type-carried predicate (e.g. a `cast`-introduced domain refinement that
 /// closes over the substituted variable).
 ///
-/// **Always `false` for [`crate::ccl::REFINEMENT_BINDER`]** — a type's only
-/// binding form is the refinement, and every `__elem` occurrence sits under the
-/// refinement that binds it, so the element binder is never a free reference to
-/// anything a substitution could supply.
+/// An element reference is read as from where `ty` stands: inside a refinement in
+/// `ty`, `name = __elem^𝑛` is `__elem^(𝑛+1)`, so a predicate's own `__elem` is never
+/// free in `ty` and a nested `__elem^1` reads `__elem` free.
 pub fn is_free_in_type(name: &Name, ty: &Type) -> bool {
     count_free_in_type_with_visited(name, ty, &mut HashSet::new()) > 0
 }
@@ -2955,22 +2968,8 @@ fn count_free_in_type_with_visited(
     ty: &Type,
     visited: &mut HashSet<PredicateId>,
 ) -> usize {
-    // The refinement element binder ([`crate::ccl::REFINEMENT_BINDER`]) occurs *only*
-    // inside refinement predicates, and each such occurrence is bound by its enclosing
-    // refinement — including under nesting, where each layer binds its own. So it is
-    // never free in a type: counting its (bound) occurrences reports a binder capture
-    // that cannot happen, and the caller that asks (lambda-elim's "value-dependent
-    // dependent function" guard) then rejects a perfectly ordinary term because some
-    // type inside it carried an `__elem` predicate.
-    //
-    // The carve-out is type-level only: the *term* walk
-    // ([`count_free_with_visited`]) deliberately keeps counting `__elem`, because a
-    // bare predicate manipulated as a term — eta-expanded by
-    // `planning::fn_of_bare_predicate`, say — genuinely has it free until that
-    // expansion binds it.
-    if name.is_elem() {
-        return 0;
-    }
+    // An element reference is bound by the refinements it sits in: inside one more, the same
+    // element is one index further out (`count_free_in_type_go`).
     count_free_in_type_go(name, ty, visited)
 }
 
@@ -3013,8 +3012,23 @@ fn count_free_in_type_go(name: &Name, ty: &Type, visited: &mut HashSet<Predicate
             let mut count = 0;
             if let Type::Refinement(_, refinements) = ty {
                 for refinement in refinements {
-                    if visited.insert(refinement.predicate_id()) {
-                        count += count_free_with_visited(name, &refinement.predicate, visited);
+                    match name.elem_index() {
+                        // The refinement binds its own element, so the one `name` reads is an
+                        // index further out inside it. A predicate shared at two depths reads
+                        // two different elements there, so `visited` does not skip it: each
+                        // occurrence is walked with a set of its own, and a predicate shared
+                        // at one depth counts once per occurrence.
+                        Some(up) => {
+                            count += count_free_with_visited(
+                                &Name::elem_at(up + 1),
+                                &refinement.predicate,
+                                &mut HashSet::new(),
+                            )
+                        }
+                        None if visited.insert(refinement.predicate_id()) => {
+                            count += count_free_with_visited(name, &refinement.predicate, visited);
+                        }
+                        None => {}
                     }
                 }
             }
@@ -3677,5 +3691,22 @@ mod tests {
                 &Expr::unary(op, Expr::var("x"))
             ));
         }
+    }
+
+    /// `free_names` is the set counterpart of `is_free`: a name one reports free, the other
+    /// contains. A type reading the enclosing element as `__elem^1` reads `__elem` free.
+    #[test]
+    fn free_names_agrees_with_is_free_on_an_element_read_through_a_type() {
+        let int = || Type::Base(BaseType::Int);
+        let pred = Expr::binop(
+            Expr::var(Name::elem()).with_ty(int()),
+            BinOpKind::Compare(CompareKind::Equals),
+            Expr::var(Name::elem_at(1)).with_ty(int()),
+        )
+        .with_ty(Type::Base(BaseType::Bool));
+        let g = Expr::var(Name::from("g"))
+            .with_ty(Type::refined_one(int(), Refinement::born(Rc::new(pred))));
+        assert!(is_free(&Name::elem(), &g));
+        assert!(free_names(&g).contains(&Name::elem()));
     }
 }

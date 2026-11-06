@@ -147,7 +147,7 @@ fn collect(e: &TypedExpr, out: &mut HashMap<NodeId, ContentHash>) {
 /// name, say) has nothing to resolve to, so it falls back to its spelling.
 fn hash_free_var(name: &Name, free: FreeVars<'_>, state: &mut DefaultHasher) {
     match free {
-        FreeVars::BySpelling => name.base().hash(state),
+        FreeVars::BySpelling => hash_spelling(name, state),
         FreeVars::ByBinder(scope) => match scope.iter().rev().find(|(n, _)| *n == name) {
             Some((_, correspondent)) => {
                 0u8.hash(state);
@@ -155,9 +155,18 @@ fn hash_free_var(name: &Name, free: FreeVars<'_>, state: &mut DefaultHasher) {
             }
             None => {
                 1u8.hash(state);
-                name.base().hash(state);
+                hash_spelling(name, state);
             }
         },
+    }
+}
+
+/// Hash `name`'s stable spelling: [`Name::base`], and the index of an element reference
+/// `__elem^𝑛`, which `base` spells `__elem` at every `𝑛`. `__elem` hashes its base alone.
+fn hash_spelling(name: &Name, state: &mut DefaultHasher) {
+    name.base().hash(state);
+    if let Some(up) = name.elem_index().filter(|&up| up > 0) {
+        up.hash(state);
     }
 }
 
@@ -763,6 +772,14 @@ mod tests {
             h(&light(&["red", "green"])),
             h(&light(&["red", "green", "blue"]))
         );
+    }
+
+    /// Element references at different indices read different elements, so they hash apart.
+    #[test]
+    fn element_references_hash_their_index() {
+        let elem = |up| TypedExpr::var(Name::elem_at(up));
+        assert_ne!(h(&elem(0)), h(&elem(1)));
+        assert_ne!(h(&elem(1)), h(&elem(2)));
     }
 
     #[test]
