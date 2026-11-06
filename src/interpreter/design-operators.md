@@ -846,41 +846,52 @@ later.
 
 ## Pipeline breakers
 
-A pipeline breaker is the end of a pipeline: it consumes the input it owns into state of its own.
-`Breaker` (`src/interpreter/tile_operators/mod.rs`) holds `consume_impl`, which a driver calls. A
-breaker that also answers pulls from that state is a producer: `BreakingProducer`, a subtrait of
-`TileProducer` and `Breaker`, adds `input` (the producer `consume_impl` pulls), `held`, `finalize`,
-`pushes_while_consuming` and `offer_impl`.
+A pipeline breaker is the end of a pipeline: it consumes the pipeline's work packages into state
+of its own. `Breaker` (`src/interpreter/tile_operators/mod.rs`) is what the dispatcher drives:
+`consume_impl`, `input_tiling`, `input_released`, `as_producer` and `finish`. A breaker that other
+pipelines read is also a producer, which answers pulls from that state: `BreakingProducer`, a
+subtrait of `TileProducer` and `Breaker`, adds `held`, `final_guard`, `morsels`,
+`pushes_while_consuming` and `offer_impl`. Its `as_producer` answers itself, and `Breaker`'s
+default `finish` pushes through that producer.
 
 | Call | What it does |
 |---|---|
 | `consume_impl(input, guard)` | Pulls input `input` at `guard`, a guard of the tiling that input answers, merges the answer into the breaker's state, and releases the input at the guard the answer states once it has taken delivery of the answer. The caller handles no tile. |
 | `enter_consuming_mode()` | Puts the breaker in consuming mode for a dispatched run, before its first `consume_impl`; nothing else changes the mode. |
-| `finalize()` | Returns what the breaker holds as a guard of its tiling: `held()` less the guard its readers have released. It asserts that the input has stated everything complete, and wakes no one. |
-| `pushes_while_consuming()` | Whether what `held()` names after a consume is final, so a driver may push it before the breaker's pipeline finishes. The default answers `true`. |
+| `as_producer()` | The breaker as a `BreakingProducer`, or `None` for a breaker that is no producer. |
+| `finish(pushes)` | Finishes once the pipeline has consumed every package and nothing more can be queued for it. The default pushes, through `as_producer`, what the breaker holds and no push named before, one morsel of its outermost keys per work package, through its consumer to the pipelines that read it; a breaker that is no producer pushes nothing. This is the last call to the breaker. An empty guard pushes nothing. It wakes no one. |
+| `morsels(guard, rows)` | Cuts a guard the breaker pushes into morsels of at most `rows` held rows, which partition it. The default answers the guard whole. |
+| `pushes_while_consuming()` | Whether the driver also pushes after each `consume_impl`. The default answers `true`. |
 | `offer_impl(guard)` | Answers from the state `consume_impl` built and pulls nothing. The breaker's own `get_impl` calls it once the breaker is consuming. |
 
 An operator that consumes its input into state of its own is a breaker. A breaker starts in the pull
 mode described in [The producer protocol](#the-producer-protocol) and is a consuming producer from
-its first `consume_impl`, which it stays. `finalize` is provided over two accessors, `input()` and
-`held()`: it asserts that the input has been released whole and returns `held()` less the guard
-released to the breaker. A release removes rows from the state and leaves the statement of the tile
-as it was, so the difference is taken in the guard algebra. `guard_minus` (`tile_operators/mod.rs`)
-spells it for guards of a collection's outermost keys, of a scalar and of an aggregation, none of
-them qualified by an enclosing path, and for a record of such guards field by field. Two guards of a
-collection's keys at any levels differ as their projections do. A state of another shape has no
-spelling, and `finalize` panics naming the gap instead of answering a smaller or larger region.
+its first `consume_impl`, which it stays. `final_guard` is provided over `held()`: it is `held()`
+less the guard released to the breaker, and the driver pushes the part of it no earlier push named,
+after each consume and at `finish`. When a pipeline may finish is the
+dispatcher's to check ([The dispatcher](design-dispatcher.md#the-dispatcher)). A release removes rows from the state and
+leaves the statement of the tile as it was, so the difference is taken in the guard algebra.
+`guard_minus` (`tile_operators/mod.rs`) spells it for guards of a collection's outermost keys, of a
+scalar and of an aggregation, none of them qualified by an enclosing path, and for a record of such
+guards field by field. Two guards of a collection's keys at any levels differ as their projections
+do: a release up to the path `(𝑘, 𝑗)` leaves of a held row 𝑘 its paths past 𝑗, which
+`TileGuard::closed_over` drops where the row's level is a finite range of positions with none past
+𝑗; `final_guard` closes the difference over the producer's tiling. A state of another shape has no
+spelling, and a push after the first panics naming the gap instead of answering a smaller or larger
+region. `MapAggregate` holds a state released beneath the keys of a group, and what a release
+beneath them leaves is a region beneath the outermost keys. A reader's chain may restate only the
+outermost keys (`TileProducer::restates`), so it answers `pushes_while_consuming` with `false` and
+pushes at `finish`. A push beneath the outermost keys lands in each reader as a
+projection at its level ([The dispatcher](design-dispatcher.md#the-dispatcher)).
 
 ### Memo
 
 A consuming memo answers from its cache, and the cache's statement says which region that answer
 covers. A consume over a memo whose input has drained pulls nothing. The memo's consumer is woken by
 the input's notifications, which reach it as they do for a memo in pull mode, and by the rule that
-wakes it when a pull finds rows no notification announced. A consume that changes the cache wakes it
-as well: the notification that made a region dirty may have been answered by a pull of the cache
-before the consume, and no later notification follows. `finalize` queues no wake. A breaker with no
-handle on its consumer announces nothing, so the caller of its `consume_impl` announces a change to
-its consumer.
+wakes it when a pull finds rows no notification announced. A consuming memo's only reader is the
+pipeline the dispatcher pushes to, so a consume wakes no consumer and a push queues no wake: what
+the memo holds reaches its reader through the packages the driver pushes after each consume.
 
 ### Aggregate
 
@@ -889,7 +900,8 @@ final when the input has been released whole and holds the one value until the c
 output. A consume at part of the input folds that part once: the input releases what it answered and
 does not answer it again. Its guards are `Aggregation` guards, which are all or nothing. `held`
 names the accumulator only once it is final, when the input has been released whole, so no guard
-names a partial aggregation.
+names a partial aggregation. `finish` panics where the output is unreleased and the
+input has not been released whole, because no later consume completes the accumulator.
 
 ### ExtractAggregate
 
@@ -906,15 +918,13 @@ accumulator and keeps what the answers state about completeness, united across c
 final per key once the input states it complete, at a level on its path or at the folded level
 under its key. An answer of a pull beneath the groups' keys states only the elements it reads, so
 the folded level's statements are united too, and a group is final once they cover every element
-under its key (`Stated::settled`). `finalize` asserts that the input has drained, so every group it
-holds is final. The guard it returns is the guard of the output built from the accumulators, less
-every group whose accumulator is not terminal, less the guard released. The input releases a
-complete group whole and an open one only beneath its key, so a group that arrives later in a region
-already consumed is still the input's to answer. A release of the output drops the accumulators it
-covers and forwards to the input, as in pull mode. It holds groups beneath their keys, and what a
-release beneath them leaves is a region beneath the outermost keys. A reader's chain may restate
-only the outermost keys (`TileProducer::restates`), so it answers `pushes_while_consuming` with
-`false`.
+under its key (`Stated::settled`). The input releases a complete group whole and an open one only
+beneath its key, so a group that arrives later in a region already consumed is still the input's to
+answer. The dispatcher finishes the pipeline once its input has released every guard the
+pipeline consumed in it, so every group it holds is then final, and `MapAggregate` pushes then
+rather than after each consume. The guard it pushes is the guard of the output built from the
+accumulators, less every group whose accumulator is not terminal, less the guard released. A
+release of the output drops the accumulators it covers and forwards to the input, as in pull mode.
 
 ### Converse
 
@@ -950,9 +960,11 @@ which a consuming `ExtractFinal` does not. Keys of one collection are totally or
 collection whose keys do not compare panics. The value is extracted once the source has been
 released whole. A source that held nothing falls back to the default, which `consume_impl` reads
 when the source drains and reads again at each later `consume_impl` until it has converged; until
-then nothing is held and `finalize` returns the empty guard. A source declared total that held
-nothing panics as it does in pull mode. The value is final from then, and stays until the consumer
-releases the output, which is all or nothing.
+then nothing is held. The dispatcher issues no `consume_impl` after the finish, so `finish` panics when the output is unreleased and no value has been extracted rather than push
+nothing. A source declared total that held nothing panics as it does in pull mode. The value is
+final from then, and stays until the consumer releases the output, which is all or nothing.
+
+The dispatcher is described in [Pipeline dispatch](design-dispatcher.md).
 
 ## Tile Operators
 
