@@ -363,6 +363,15 @@ impl TileProducer for IterateExtentProducer {
         }
     }
 
+    fn data_sources(&self) -> Vec<Rc<RefCell<dyn DataSourceDomainExtentImpl>>> {
+        let mut sources = Vec::new();
+        self.tiling()
+            .domain_extent()
+            .expect("an iterator has a domain")
+            .for_each_source(&mut |source| sources.push(source.clone()));
+        sources
+    }
+
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         if matches!(&self.iteration, Iteration::Cartesian(_)) {
             let tiling = self.tiling().clone();
