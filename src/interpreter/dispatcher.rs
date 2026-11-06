@@ -345,6 +345,10 @@ struct PipelineInfo {
     /// before it queues more ([`limit`](Dispatcher::limit)); `usize::MAX` for none.
     limit: usize,
     ingress: Option<std::ops::Range<usize>>,
+    /// The pipeline whose record of what it pushed this one's pushes read and grow: itself, or the
+    /// first of the pipelines whose breaker this one shares
+    /// ([`share_pushes`](Dispatcher::share_pushes)).
+    pushes_with: usize,
 }
 
 /// A region a pipeline parked ([`Dispatcher::park`]), and whether a release may hand out the part
@@ -519,7 +523,8 @@ impl Dispatcher {
         let infos: Vec<_> = reads
             .into_iter()
             .zip(readers)
-            .map(|(reads, readers)| PipelineInfo {
+            .enumerate()
+            .map(|(pipeline, (reads, readers))| PipelineInfo {
                 reads,
                 readers,
                 ordered: false,
@@ -529,6 +534,7 @@ impl Dispatcher {
                 reach: Vec::new(),
                 limit: usize::MAX,
                 ingress: None,
+                pushes_with: pipeline,
             })
             .collect();
         let states = infos
@@ -577,6 +583,7 @@ impl Dispatcher {
             {
                 *pipeline += offset;
             }
+            info.pushes_with += offset;
             if let Some(ingress) = &mut info.ingress {
                 ingress.start += offset;
                 ingress.end += offset;
@@ -607,6 +614,7 @@ impl Dispatcher {
             whole: None,
             follows: Vec::new(),
             limit: usize::MAX,
+            pushes_with: pipeline,
             parks: false,
             reach: Vec::new(),
             ingress: None,
@@ -778,6 +786,29 @@ impl Dispatcher {
     /// ascending.
     pub fn order(&mut self, pipeline: PipelineId) {
         self.infos[pipeline.0].ordered = true;
+    }
+
+    /// Mark `pipelines` as the pipelines of one breaker, each consuming an input of its own: their
+    /// pushes read and grow one record of what the breaker pushed, the first pipeline's, so a
+    /// region one of them pushed is pushed by none of the others.
+    ///
+    /// # Panics
+    ///
+    /// When `pipelines` is empty, or one of them shares another breaker's pushes already.
+    pub fn share_pushes(&mut self, pipelines: &[PipelineId]) {
+        let first = pipelines
+            .first()
+            .expect("a breaker's pushes are shared by its pipelines, of which it has one at least")
+            .0;
+        for pipeline in pipelines {
+            let info = &mut self.infos[pipeline.0];
+            assert_eq!(
+                info.pushes_with, pipeline.0,
+                "pipeline {} already shares the pushes of another breaker's pipelines",
+                pipeline.0
+            );
+            info.pushes_with = first;
+        }
     }
 
     /// Let a notify of the source `pipeline` queue more only while fewer than `packages` of its
@@ -976,16 +1007,16 @@ impl Dispatcher {
 
     /// Grow what `source`, a pipeline `reader` reads, has decided of `reader`'s input by `guard`,
     /// or record it whole where `guard` is `None`, and release what `reader` parked that is now
-    /// decided.
+    /// decided. Every pipeline `reader` reads that shares `source`'s breaker shares the record,
+    /// since a store's pipelines push one store's decided region
+    /// ([`share_pushes`](Self::share_pushes)).
     fn record_decided(&self, reader: usize, source: usize, guard: Option<&TileGuard>) {
         let reads = &self.infos[reader].reads;
-        let at = reads.iter().position(|&r| r == source);
-        self.ensure(at.is_some(), || {
+        self.ensure(reads.contains(&source), || {
             format!(
                 "pipeline {source} pushes a decided region to pipeline {reader}, which reads it"
             )
         });
-        let at = at.expect("refused above");
         {
             let mut decided = self.states[reader]
                 .decided
@@ -994,11 +1025,14 @@ impl Dispatcher {
             if decided.len() < reads.len() {
                 decided.resize(reads.len(), Decided::Nothing);
             }
-            let before = std::mem::take(&mut decided[at]);
-            decided[at] = match guard {
-                Some(guard) => before.grown(guard),
-                None => Decided::Whole,
-            };
+            let shares = self.infos[source].pushes_with;
+            for at in (0..reads.len()).filter(|&at| self.infos[reads[at]].pushes_with == shares) {
+                let before = std::mem::take(&mut decided[at]);
+                decided[at] = match guard {
+                    Some(guard) => before.grown(guard),
+                    None => Decided::Whole,
+                };
+            }
         }
         if self.infos[reader].parks {
             self.release_parked(reader);
@@ -1792,7 +1826,7 @@ impl Pushes<'_> {
     /// Add the region `next` computes from the region pushed so far to that region, under its
     /// lock, and answer it.
     fn record(&self, next: impl FnOnce(&Option<TileGuard>) -> TileGuard) -> TileGuard {
-        let mut pushed = self.dispatcher.states[self.pipeline]
+        let mut pushed = self.dispatcher.states[self.dispatcher.infos[self.pipeline].pushes_with]
             .pushed
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
@@ -2310,8 +2344,9 @@ pub fn run(dispatcher: &Dispatcher, breakers: &[BreakerHandle]) {
 /// walking a compiled program's producer chains (`run_program`).
 type Reach<'r> = dyn FnMut(PipelineId, &mut Call<'_>) + 'r;
 
-/// One call on a pipeline's breaker, which a [`Reach`] makes.
-type Call<'c> = dyn FnMut(&mut dyn Breaker) + 'c;
+/// One call on a pipeline's breaker, which a [`Reach`] makes, with the input of the breaker the
+/// pipeline consumes.
+type Call<'c> = dyn FnMut(&mut dyn Breaker, InputId) + 'c;
 
 /// The breakers `breakers` holds, by pipeline, each borrowed for one call.
 fn handles(breakers: &[BreakerHandle]) -> impl FnMut(PipelineId, &mut Call<'_>) {
@@ -2322,7 +2357,7 @@ fn handles(breakers: &[BreakerHandle]) -> impl FnMut(PipelineId, &mut Call<'_>) 
             "{} answers itself as a producer, so its pushes reach its readers",
             breaker.name()
         );
-        call(&mut *breaker)
+        call(&mut *breaker, InputId::ONLY)
     }
 }
 
@@ -2350,8 +2385,8 @@ fn start_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>) {
     for (pipeline, info) in dispatcher.infos.iter().enumerate() {
         if info.reads.is_empty() {
             let mut input = None;
-            reach(PipelineId(pipeline), &mut |breaker| {
-                input = Some(breaker.input_tiling(InputId::ONLY));
+            reach(PipelineId(pipeline), &mut |breaker, at| {
+                input = Some(breaker.input_tiling(at));
             });
             let input = input.expect("a reach calls the breaker it reaches");
             dispatcher.start_source(PipelineId(pipeline), &input);
@@ -2379,18 +2414,16 @@ fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPac
     // The pushes land once the reach has returned: a breaker reached through a fan-out slot is
     // called while the walk holds the fan-out, which the push climbs.
     let mut landed = None;
-    reach(package.pipeline, &mut |breaker| {
+    reach(package.pipeline, &mut |breaker, input| {
         // A package carries a guard of the tiling of the pipeline that pushed it, or of this
         // breaker's own input for a source or a pipeline that reads it whole, so it fits only a
         // breaker whose input answers that tiling.
         debug_assert!(
-            package
-                .guard
-                .check_from(&breaker.input_tiling(InputId::ONLY)),
+            package.guard.check_from(&breaker.input_tiling(input)),
             "pipeline {p} consumes a guard of the tiling its breaker's input answers: {:?}",
             package.guard
         );
-        breaker.consume_impl(InputId::ONLY, package.guard.clone());
+        breaker.consume_impl(input, package.guard.clone());
         if let Some(producer) = breaker.as_producer()
             && producer.pushes_while_consuming()
         {
@@ -2417,7 +2450,7 @@ fn push_held(
 ) {
     for pipeline in pipelines {
         let mut landed = None;
-        reach(pipeline, &mut |breaker| {
+        reach(pipeline, &mut |breaker, _| {
             breaker.pushing(&mut |producer| {
                 let mut pushes = dispatcher.pushes(pipeline);
                 pushes.push_final(producer);
@@ -2453,11 +2486,11 @@ fn finish_with(
     let mut consumed = Some(consumed);
     // As in `consume_with`, the pushes land once the reach has returned.
     let mut finished = None;
-    reach(pipeline, &mut |breaker| {
+    reach(pipeline, &mut |breaker, input| {
         let consumed = consumed
             .take()
             .expect("a reach calls the breaker it reaches once");
-        let released = breaker.input_released(InputId::ONLY);
+        let released = breaker.input_released(input);
         dispatcher.ensure(
             consumed.is_none_or(|consumed| {
                 // Closed over the input's tiling: where a row's level is a finite range of
@@ -2465,7 +2498,7 @@ fn finish_with(
                 // paths past it.
                 released.is_universal()
                     || guard_minus(&consumed, &released)
-                        .closed_over(&breaker.input_tiling(InputId::ONLY))
+                        .closed_over(&breaker.input_tiling(input))
                         .is_empty()
             }),
             || {
