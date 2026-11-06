@@ -228,8 +228,13 @@ impl Typing for CheckCtx {
         &mut self,
         error: LocatedInferError,
         _reads_before: usize,
+        _statement: NodeId,
     ) -> Result<(), LocatedInferError> {
         Err(error)
+    }
+
+    fn stand_in(&mut self) {
+        crate::unexpected_error_node!()
     }
 
     fn poisoned_reads(&self) -> usize {

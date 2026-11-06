@@ -3438,9 +3438,11 @@ pub struct OperandRequirement {
 /// subtree is deliberately never coalesced in place, so walking the tree would see
 /// only use-site clones, and a clone that goes unsatisfiable already fails by delivery.
 ///
-/// Returns the offending variable alongside its requirements; the caller supplies
-/// blame, because node identity belongs to the tree and not to the solver.
-pub fn resolve_operand_requirements(cache: &mut ConstrainCache) -> Result<(), OperandFailure> {
+/// Returns each offending place's variables alongside its requirements, once per place
+/// and in the order the sweep reached them; the caller supplies blame, because node
+/// identity belongs to the tree and not to the solver. A place that fails deposits
+/// nothing, and the sweep goes on to the others.
+pub fn resolve_operand_requirements(cache: &mut ConstrainCache) -> Vec<OperandFailure> {
     // A deposit is an ordinary `constrain_subtype`, so it can deliver a base to another
     // variable's watches and shrink *their* candidate sets — which can determine a
     // value that was open when this pass looked at it. So the sweep runs to a fixpoint
@@ -3449,6 +3451,10 @@ pub fn resolve_operand_requirements(cache: &mut ConstrainCache) -> Result<(), Op
     // decide, since re-depositing a bound the graph already carries is not progress.
     let mut deposited: std::collections::HashSet<(InferVarId, BaseType)> =
         std::collections::HashSet::new();
+    // Each failing place's variables, so a place reached again, from another root or on a
+    // later pass, reports once.
+    let mut failed: std::collections::HashSet<Vec<InferVarId>> = std::collections::HashSet::new();
+    let mut failures = Vec::new();
     loop {
         let before = deposited.len();
         // Re-read the arena every pass rather than snapshotting once. Every variable
@@ -3458,9 +3464,15 @@ pub fn resolve_operand_requirements(cache: &mut ConstrainCache) -> Result<(), Op
         // which `copy_watches` gives the original's requirements). Measured, the arena
         // does not currently grow here; re-reading makes that irrelevant instead of
         // load-bearing.
-        resolve_pass(&crate::ccl::infer_var::arena_vars(), cache, &mut deposited)?;
+        resolve_pass(
+            &crate::ccl::infer_var::arena_vars(),
+            cache,
+            &mut deposited,
+            &mut failed,
+            &mut failures,
+        );
         if deposited.len() == before {
-            return Ok(());
+            return failures;
         }
     }
 }
@@ -3712,12 +3724,33 @@ fn resolve_pass(
     vars: &[Rc<InferVar>],
     cache: &mut ConstrainCache,
     deposited: &mut std::collections::HashSet<(InferVarId, BaseType)>,
-) -> Result<(), OperandFailure> {
+    failed: &mut std::collections::HashSet<Vec<InferVarId>>,
+    failures: &mut Vec<OperandFailure>,
+) {
     for root in vars {
         for place in places_under(root).into_values() {
             if place.reqs.is_empty() {
                 continue;
             }
+            let mut key: Vec<InferVarId> = place.vars.iter().map(|v| v.uid).collect();
+            key.sort();
+            if failed.contains(&key) {
+                continue;
+            }
+            // Blame candidates, narrowest first: the variables standing at the place,
+            // then the variable the walk reached them from. An *interior* place is
+            // reached only through a bound, and blame deliberately does not follow
+            // bounds, so no node's type can ever name a variable standing there —
+            // without the root as a candidate the walk finds nothing and lands on the
+            // tree root, which is a different statement entirely rather than a wider one.
+            let blame = || -> Vec<InferVarId> {
+                place
+                    .vars
+                    .iter()
+                    .map(|v| v.uid)
+                    .chain(std::iter::once(root.uid))
+                    .collect()
+            };
             let mut requirements: Vec<OperandRequirement> = place
                 .reqs
                 .iter()
@@ -3764,20 +3797,9 @@ fn resolve_pass(
             match common.as_slice() {
                 // Nothing satisfies every requirement, so no argument ever could.
                 [] => {
-                    // Narrowest first, then the variable the walk reached them from.
-                    // An *interior* place is reached only through a bound, and blame
-                    // deliberately does not follow bounds, so no node's type can ever
-                    // name a variable standing there — without the root as a candidate
-                    // the walk finds nothing and lands on the tree root, which is a
-                    // different statement entirely rather than a wider one.
-                    let blame = place
-                        .vars
-                        .iter()
-                        .map(|v| v.uid)
-                        .chain(std::iter::once(root.uid))
-                        .collect();
-                    return Err(OperandFailure::Unsatisfiable {
-                        vars: blame,
+                    failed.insert(key);
+                    failures.push(OperandFailure::Unsatisfiable {
+                        vars: blame(),
                         requirements,
                     });
                 }
@@ -3798,33 +3820,41 @@ fn resolve_pass(
                 // ([`TraitObligation::try_select`]).
                 [InstanceHead::Nominal(_)] => {}
                 [InstanceHead::Base(only)] => {
+                    // Read the lattice before writing to it, for every variable at the
+                    // place. `constrain_subtype` *records* a bound rather than checking it
+                    // against the ones already there, so a requirement contradicting an
+                    // annotation or a monomorphic operator's operand would otherwise
+                    // surface at coalesce as a bare `IncompatibleBounds` — twice, once per
+                    // direction, and with no mention of the trait that demanded it. The
+                    // facts are all here, so the diagnostic is made here.
+                    if let Some(found) = place
+                        .vars
+                        .iter()
+                        .find_map(|var| conflicting_base(var, only))
+                    {
+                        failed.insert(key);
+                        failures.push(OperandFailure::ContradictsBound {
+                            vars: blame(),
+                            requirements,
+                            required: (*only).clone(),
+                            found,
+                        });
+                        continue;
+                    }
                     for var in &place.vars {
-                        // Read the lattice before writing to it. `constrain_subtype`
-                        // *records* a bound rather than checking it against the ones
-                        // already there, so a requirement contradicting an annotation or
-                        // a monomorphic operator's operand would otherwise surface at
-                        // coalesce as a bare `IncompatibleBounds` — twice, once per
-                        // direction, and with no mention of the trait that demanded it.
-                        // The facts are all here, so the diagnostic is made here.
-                        if let Some(found) = conflicting_base(var, only) {
-                            return Err(OperandFailure::ContradictsBound {
-                                vars: place
-                                    .vars
-                                    .iter()
-                                    .map(|v| v.uid)
-                                    .chain(std::iter::once(root.uid))
-                                    .collect(),
-                                requirements,
-                                required: (*only).clone(),
-                                found,
-                            });
-                        }
                         if !deposited.insert((var.uid, (*only).clone())) {
                             continue;
                         }
                         let deposit = Type::Base((*only).clone());
-                        constrain_subtype(&Type::Infer(Rc::clone(var)), &deposit, cache)
-                            .map_err(|error| OperandFailure::Conflict { error })?;
+                        if let Err(error) =
+                            constrain_subtype(&Type::Infer(Rc::clone(var)), &deposit, cache)
+                        {
+                            failures.push(OperandFailure::Conflict { error });
+                            failed.insert(key.clone());
+                        }
+                    }
+                    if failed.contains(&key) {
+                        continue;
                     }
                     // The bound alone does not reach the obligations at this place: it
                     // is an *upper* bound and narrowing consumes lower ones. So tell
@@ -3834,14 +3864,14 @@ fn resolve_pass(
                     // with one row, which determines `𝑏` next round.
                     for (obligation, pos) in &place.reqs {
                         let head = InstanceHead::Base(only.clone());
-                        obligation.narrow(*pos, &head, cache).map_err(|error| {
+                        if let Err(error) = obligation.narrow(*pos, &head, cache) {
                             debug_assert!(
                                 false,
                                 "narrowing by a base the intersection just proved \
                                  acceptable emptied {obligation:?} at operand {pos}",
                             );
-                            OperandFailure::Conflict { error }
-                        })?;
+                            failures.push(OperandFailure::Conflict { error });
+                        }
                     }
                 }
                 // Several bases still satisfy everything: the requirements genuinely do
@@ -3850,16 +3880,11 @@ fn resolve_pass(
             }
         }
     }
-    Ok(())
 }
 
 /// Why [`resolve_operand_requirements`] rejected a value.
 pub enum OperandFailure {
     /// No type satisfies every requirement on it — ill-typed for every argument.
-    ///
-    /// Raised for the first such place found. *Whether* a program is rejected does not
-    /// depend on order — the intersection is commutative — but *which* place is named,
-    /// when a program has several, follows the order variables were minted in.
     Unsatisfiable {
         /// Blame candidates, narrowest first: the variables standing at the offending
         /// place, then the variable the walk reached them from. The caller takes the

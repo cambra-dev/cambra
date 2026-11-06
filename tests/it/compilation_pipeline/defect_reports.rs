@@ -204,6 +204,108 @@ fn underlined(code: &str) -> Vec<String> {
     "},
     &[r"\z -> x"],
 )]
+// A use failing at a value the join holds is the join's defect met downstream.
+#[case::a_join_and_a_use_failing_at_one_of_its_values(
+    indoc! {r#"
+        xs = [1, "a"]
+        ys = [x + 1 for x in xs]
+        ys
+    "#},
+    &[r#"[1, "a"]"#],
+)]
+#[case::a_join_and_two_uses_failing_at_its_values(
+    indoc! {r#"
+        xs = [1, "a"]
+        ys = [x ++ "b" for x in xs]
+        zs = [x + 1 for x in xs]
+        (ys, zs)
+    "#},
+    &[r#"[1, "a"]"#],
+)]
 fn a_defect_is_reported_once_per_site(#[case] code: &str, #[case] expected: &[&str]) {
+    assert_eq!(underlined(code), expected);
+}
+
+/// A failed statement hides no defect elsewhere: inference starts over without it, and what
+/// that run finds is reported too, but for a type nothing determines
+/// (`src/ccl/design/type-inference.md`, "An error stops its statement, not the pass").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_join_past_an_unbound_name(
+    indoc! {r#"
+        x = undefined_name + 1
+        y = [1, "a"]
+        y
+    "#},
+    &["undefined_name", r#"[1, "a"]"#],
+)]
+// The list's element type is what the failed statement would have fixed.
+#[case::a_value_only_the_failed_statement_determines(
+    indoc! {"
+        xs = []
+        z = xs ++ nope
+        xs
+    "},
+    &["nope"],
+)]
+#[case::each_definition_no_type_satisfies(
+    indoc! {r#"
+        def f(a):
+            (a + 1, a + "s")
+        def g(b):
+            (b + 1, b + "s")
+        1
+    "#},
+    &[
+        "def f(a):\n    (a + 1, a + \"s\")\n",
+        "def g(b):\n    (b + 1, b + \"s\")\n",
+    ],
+)]
+// A barrier check's failure leaves its statement out as an emission error does.
+#[case::a_join_past_an_annotation_an_opaque_result_fails(
+    indoc! {r#"
+        def f(x: Int):
+            r ^= x;
+            r ^+ 0
+        a = f(1)
+        b: {Int where _ == a} = f(2)
+        y = [1, "a"]
+        (a == b, y)
+    "#},
+    &["b: {Int where _ == a} = f(2)", r#"[1, "a"]"#],
+)]
+// The binding keeps its declared type over a definition that failed.
+#[case::a_use_against_a_declared_type(
+    indoc! {r#"
+        w: Int = "s"
+        v = w + "t"
+        v
+    "#},
+    &[r#"w: Int = "s""#, r#"w + "t""#],
+)]
+// The annotation fails without the definition too, so the second run leaves it out.
+#[case::a_join_past_a_result_annotation_that_fails(
+    indoc! {r#"
+        def f(x: Int) => {Int where _ == r}:
+            x
+        y = [1, "a"]
+        y
+    "#},
+    &["r", r#"[1, "a"]"#],
+)]
+// The function's result is the binding left out, which nothing determines.
+#[case::a_failed_binding_under_an_opaque_one(
+    indoc! {"
+        def f(x: Int):
+            r ^= x
+            def k(y: {Int where _ > 0 and r == r}):
+                nope
+            k
+        f1 = f(1)
+        f1(-5)
+    "},
+    &["nope"],
+)]
+fn each_defect_is_reported_past_a_failed_statement(#[case] code: &str, #[case] expected: &[&str]) {
     assert_eq!(underlined(code), expected);
 }

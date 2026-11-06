@@ -329,11 +329,40 @@ at a poison and does not type its definition, which would lack the bounds and th
 annotation states. A `:=` whose initializer failed binds the variable at its declared history,
 which its writes still constrain.
 
-After any emission error, inference stops before the operand-requirement sweep and Pass 2. The graph
-lacks the constraints the failed statements would have contributed, so what those passes would
-report is the gap rather than the program. Check mode shares the rules and does not recover at
-statements: its rules record a failed constraint and continue, and an error a rule returns ends the
-walk.
+After any emission error, the run stops before the operand-requirement sweep and Pass 2. The graph
+holds the constraints a failed statement recorded before its rule failed, and lacks the rest, so
+neither pass can read it: an obligation a failed constraint emptied is no requirement the program
+states, and a variable only the failed statement would have bound is no gap in it. Inference
+instead starts over (`run_with_params`), in a restarted arena, on a copy of the tree as it was
+before emission (`clone_preserving_ids`), in which the expression of each statement recovered from
+is the `Error` stand-in: a `let`'s right-hand side, an expression statement's expression, a `:=`'s
+initializer, a `def` group member's definition. A statement rule types a stand-in as it types a
+failed expression, without reporting it (`Typing::stand_in`): the `let` binds at its exact
+annotation or at a poison, and the `:=` at its declared history. Coalesce does not descend into a
+stand-in. The graph of the second run holds exactly the constraints of the statements that typed.
+
+The two checks that read the whole graph before coalesce stop a run too, each after reporting every
+failure it finds: the barrier check and the [operand-requirement
+sweep](#requirements-are-read-together-once). Inference starts over the same way, leaving out the
+innermost statement enclosing each failure's node (`failed_in_statements`). A failure no statement
+encloses leaves nothing out.
+
+A statement recovered from again as a stand-in stands in **bare** in the next run: its declared
+type is left out too, so the `let` binds at a poison and the `:=` at a history whose value type is
+undeclared. That is a statement whose annotation fails on its own, `def f(x) => {Int where _ == r}`
+with no `r` in scope. Each statement goes the two steps at most, and a run that recovers from no
+statement an earlier run did not, or recovers only from bare ones, is the last.
+
+Each later run's errors are added to the earlier runs', but for those saying the program does not
+determine a type (`InferError::is_undetermined`): an unresolved variable or tuple width, or a
+method call with no receiver type. The constraints a stand-in removed may be what determines such a
+value, and they can raise nothing else, since removing constraints removes conflicts and adds none.
+An error saying what an earlier run's error said is that error, met again, so it is not added:
+every run reports every failure of each check it reaches, and a failure blamed outside the
+statement that causes it is met again at another node of the run that leaves that statement out.
+
+Check mode shares the rules and does not recover at statements: its rules record a failed
+constraint and continue, and an error a rule returns ends the walk.
 
 #### A lambda applied where it stands binds its parameter first
 
@@ -2649,6 +2678,12 @@ coalescing reports as `CoalesceError::RecursiveType`; the phase above skips the 
 resolution, as it skips any resolution that does not materialize. `spec_key` cuts the same edge
 (`a_barrier_reaching_itself_through_its_lower_is_a_recursive_type` in `solver/compact.rs`).
 
+The phase skips a resolution nothing determines too, a lower bound that is a variable with no
+bounds of its own, such as a poison a run that starts over binds a left-out definition at. Such a
+resolution materializes as a variable minted for it alone, afresh at each check, so checking it
+records bounds on that variable and nothing else, and the check's memo, which compares
+resolutions, would never match.
+
 `opaque_output::run` leaves a lambda unwrapped in two cases. Its body binds no opaque variable, or
 its body is `let 𝑦 : 𝑇 = body in 𝑦` with a concrete user annotation `𝑇`, the lowering of a `=> 𝑇`
 output annotation. A concrete annotation holds no `_`, inference variable, or barrier variable at
@@ -4071,6 +4106,9 @@ A pass between emission and coalesce closes this. For each value it intersects w
 * **Empty** — nothing satisfies them all, so no argument could. `UnsatisfiableOperand`, listing each requirement together with what the trait's other operand accepts, that being what narrowed it.
 * **One base** — the requirements determine the value. It is deposited as an upper bound, and the obligations there are narrowed by it directly, since an upper bound does not reach them on its own.
 * **Several** — the value stays open.
+
+A value that fails deposits nothing and the pass goes on, so each failing value is reported once,
+whichever variable the pass reaches it from and however many rounds it takes.
 
 Before depositing, the pass reads the bounds the value already carries. A base that disagrees is `RequirementContradictsBound`, naming both it and the required type. Left to the write, the same contradiction reaches coalesce as two `IncompatibleBounds` naming no trait: a *bounded* annotation and a monomorphic operator's operand are ordinary bounds, so no intersection of requirements sees them. An *exact* annotation does not reach here at all — it delivers a base, so the obligation narrows and fails on its own ([Annotation kinds: exact and bounded](#annotation-kinds-exact-and-bounded)).
 

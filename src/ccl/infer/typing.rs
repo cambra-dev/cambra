@@ -98,11 +98,20 @@ pub(super) trait Typing {
     /// Emit drops the error of a statement that has read a
     /// [poisoned](LetScheme::Poisoned) binding since: such a statement fails
     /// because the binding's definition did, which has already been reported.
+    /// `statement` is the statement's expression, which emit records either way, for a run
+    /// that starts over without it ([`super::run_with_params`]).
     fn recover(
         &mut self,
         error: LocatedInferError,
         reads_before: usize,
+        statement: NodeId,
     ) -> Result<(), LocatedInferError>;
+
+    /// Pass over a statement whose expression is the [`Error`](crate::ccl::TypedExprNode::Error)
+    /// stand-in for one that failed in an earlier run ([`super::run_with_params`]): it is
+    /// typed as a failed statement is, reporting nothing, and counts toward
+    /// [`Self::recoveries`]. Check runs only on a tree that typed, which holds no stand-in.
+    fn stand_in(&mut self);
 
     /// How many uses of a [poisoned](LetScheme::Poisoned) binding emission has
     /// resolved so far. Check resolves no names, so it answers `0`.

@@ -2520,7 +2520,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             }
         }
 
-        TypedExprNode::Error => crate::unexpected_error_node!(),
+        // The stand-in for a statement's expression that failed in an earlier run
+        // (`run_with_params`): emission typed nothing under it, and nothing reads it.
+        TypedExprNode::Error => return,
     }
 
     // Resolve this node's type in place. `emit_node` wrote the emitted
@@ -2615,7 +2617,10 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // expression when the discharge would be vacuous. An opaque binder
             // has no definiens to discharge at all, so its body type lifts with
             // the binder's name still in it (`Typing::close_let_type`).
+            // A stand-in definition (`run_with_params`) has no value to discharge, as
+            // emission kept the name over it (`ScopeExit::Keep`).
             if binding.transparency == BindingTransparency::Transparent
+                && !matches!(bound_expr.node, TypedExprNode::Error)
                 && crate::ccl::subst::type_free_vars(&body.ty).contains(&binding.name)
             {
                 let sigma = crate::ccl::subst::Subst::discharge(
