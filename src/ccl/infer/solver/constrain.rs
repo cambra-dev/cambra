@@ -683,36 +683,16 @@ fn witness_instantiation(
         }
         // One frame per constructor pair, so only positions the two share are visited.
         match (pattern, instance) {
-            (
-                Type::Fun {
-                    domain: pd,
-                    codomain: pc,
-                    ..
-                },
-                Type::Fun {
-                    domain: id,
-                    codomain: ic,
-                    ..
-                },
-            ) => {
-                go(pd, id, binders, out);
-                go(pc, ic, binders, out);
-            }
-            (Type::Tuple(ps), Type::Tuple(is)) => {
-                for (p, i) in ps.iter().zip(is) {
-                    go(p, i, binders, out);
-                }
-            }
-            (Type::Record(ps), Type::Record(is)) => {
-                for (name, p) in ps {
-                    if let Some((_, i)) = is.iter().find(|(n, _)| n == name) {
-                        go(p, i, binders, out);
-                    }
-                }
-            }
             (Type::Refinement(pb, _), _) => go(pb, instance, binders, out),
             (_, Type::Refinement(ib, _)) => go(pattern, ib, binders, out),
-            _ => {}
+            _ => {
+                for part in crate::ccl::pairing::paired_parts(pattern, instance)
+                    .map(|p| p.parts)
+                    .unwrap_or_default()
+                {
+                    go(part.left, part.right, binders, out);
+                }
+            }
         }
     }
     let ids: Vec<crate::ccl::ty::WitnessId> = binders.iter().map(|w| *w.id()).collect();

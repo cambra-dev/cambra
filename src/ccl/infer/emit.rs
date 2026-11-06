@@ -952,35 +952,18 @@ fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
             );
             Type::fun_like(ann, complete_annotation(ad, id), cod)
         }
-        (Type::Tuple(ats), Type::Tuple(its)) if ats.len() == its.len() => Type::Tuple(
-            ats.iter()
-                .zip(its)
-                .map(|(a, i)| complete_annotation(a, i))
-                .collect(),
-        ),
-        // Records match by *name*, not position, and width-subtyping means the
-        // inferred record may carry fields the annotation does not mention. Those
-        // are exactly what an exact annotation discards, so only the annotated
-        // fields are completed.
-        (Type::Record(afs), Type::Record(ifs)) => Type::Record(
-            afs.iter()
-                .map(|(n, a)| {
-                    let i = ifs.iter().find(|(m, _)| m == n).map(|(_, t)| t);
-                    (
-                        n.clone(),
-                        i.map_or_else(|| a.clone(), |i| complete_annotation(a, i)),
-                    )
-                })
-                .collect(),
-        ),
-        (
-            Type::History {
-                function: av,
-                history_kind,
-            },
-            Type::History { function: iv, .. },
-        ) => Type::history_over(complete_annotation(av, iv), *history_kind),
-        _ => ann.clone(),
+        // A nominal type's arguments are left to normalization, which makes each hole a
+        // variable the initializer bounds. Filled from the initializer here, a family argument
+        // would carry the binders its inferred form opens into the annotation, outside the
+        // family that binds them (`two_applications_relate_their_families`).
+        (Type::Nominal(..), _) => ann.clone(),
+        // Every other shape is filled position by position. Records pair by *name*, and
+        // width-subtyping means the inferred record may carry fields the annotation does not
+        // mention; those are exactly what an exact annotation discards, so only the annotated
+        // positions are completed.
+        (ann, inferred) => crate::ccl::pairing::rebuilt(ann, inferred, &mut |part| {
+            complete_annotation(part.left, part.right)
+        }),
     }
 }
 

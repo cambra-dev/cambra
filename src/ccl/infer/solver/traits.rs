@@ -1706,15 +1706,15 @@ fn matches_pattern(pattern: &Type, ty: &Type, at: &mut HashMap<TypeParamId, Type
                 true
             }
         },
-        (Type::Nominal(d, ps), Type::Nominal(e, ts)) => {
-            d == e
-                && ps.len() == ts.len()
-                && ps.iter().zip(ts).all(|(p, t)| matches_pattern(p, t, at))
-        }
-        (Type::Tuple(ps), Type::Tuple(ts)) => {
-            ps.len() == ts.len() && ps.iter().zip(ts).all(|(p, t)| matches_pattern(p, t, at))
-        }
-        _ => pattern == ty,
+        // A structure matches one of its shape whose parts match.
+        _ => match crate::ccl::pairing::paired_parts(pattern, ty) {
+            Some(pairing) if pairing.exact => pairing
+                .parts
+                .iter()
+                .all(|part| matches_pattern(part.left, part.right, at)),
+            Some(_) => false,
+            None => pattern == ty,
+        },
     }
 }
 
