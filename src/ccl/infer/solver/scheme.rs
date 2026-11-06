@@ -103,12 +103,18 @@ impl PolyScheme {
     /// gets independent constraints (e.g. two uses of `Compare` can
     /// compare `Int`s and `String`s respectively without conflict).
     pub fn instantiate(&self, current_level: Level) -> Type {
-        freshen_above(
+        #[cfg(debug_assertions)]
+        let before = Minted::now();
+        let mut cache = FreshenCache::new();
+        let ty = freshen_above(
             self.level,
             &self.body,
             FreshenLevel::At(current_level),
-            &mut FreshenCache::new(),
-        )
+            &mut cache,
+        );
+        #[cfg(debug_assertions)]
+        assert_copied_apart(self.level, std::slice::from_ref(&ty), &cache, before);
+        ty
     }
 
     /// [`instantiate`](Self::instantiate) for a scheme that may quantify **type
@@ -129,13 +135,15 @@ impl PolyScheme {
         telescope: &Telescope,
         use_at: crate::ccl::provenance::NodeId,
     ) -> Instance {
+        #[cfg(debug_assertions)]
+        let before = Minted::now();
         let mut cache = FreshenCache::new();
         cache.use_at = Some(use_at);
         cache.param_telescope = Some(telescope.clone());
         cache.use_telescope = Some(telescope.clone());
         let at = FreshenLevel::At(current_level);
         let ty = freshen_above(self.level, &self.body, at, &mut cache);
-        let requires = self
+        let requires: Vec<TraitRequirement> = self
             .requires
             .iter()
             .map(|r| r.map_types(|t| freshen_above(self.level, t, at, &mut cache)))
@@ -178,6 +186,20 @@ impl PolyScheme {
                 bounds.push((var, bound, param.bound_at));
             }
         }
+        // The instance is the body, each bound with its instantiation, and each requirement.
+        #[cfg(debug_assertions)]
+        assert_copied_apart_from(self.level, &cache, before, &mut |visit| {
+            visit(&ty);
+            for (instantiation, bound, _) in &bounds {
+                visit(instantiation);
+                visit(bound);
+            }
+            for r in &requires {
+                r.args.iter().for_each(&mut *visit);
+                r.assoc.iter().for_each(|(_, t)| visit(t));
+                r.binders.iter().for_each(|(_, t)| visit(t));
+            }
+        });
         Instance {
             ty,
             bounds,
@@ -198,14 +220,170 @@ impl PolyScheme {
     /// binders the definition's own stood under, entered after the use site's
     /// ([`FreshenCache::use_telescope`]).
     pub fn instantiate_in(&self, current_level: Level, telescope: &Telescope) -> Type {
+        #[cfg(debug_assertions)]
+        let before = Minted::now();
         let mut cache = FreshenCache::new();
         cache.site_telescope = Some(telescope.clone());
-        freshen_above(
+        let ty = freshen_above(
             self.level,
             &self.body,
             FreshenLevel::At(current_level),
             &mut cache,
-        )
+        );
+        #[cfg(debug_assertions)]
+        assert_copied_apart(self.level, std::slice::from_ref(&ty), &cache, before);
+        ty
+    }
+}
+
+/// The first variable and funkind variable ids an instantiation could mint: whatever has a smaller
+/// id stood before it, and whatever has a larger one the instantiation made.
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy)]
+pub(crate) struct Minted {
+    var: InferVarId,
+    funkind: FunKindVarId,
+    capability: CapabilityVarId,
+}
+
+#[cfg(debug_assertions)]
+impl Minted {
+    pub(crate) fn now() -> Self {
+        Minted {
+            var: crate::ccl::infer_var::next_infer_var_id(),
+            funkind: crate::ccl::ty::next_fun_kind_var_id(),
+            capability: crate::ccl::capabilities::next_capability_var_id(),
+        }
+    }
+}
+
+/// Panic where an instantiation shares with its scheme something above the cutoff `lim`: a
+/// variable, a funkind variable or a capability variable that stood before the instantiation (`before`), stands above
+/// `lim`, and is reached from the instance, through its structure or a copy's bounds and funkind
+/// edges. What stands at or below `lim` is an enclosing scope's and is shared by design; above it,
+/// each use owns its own copy, and one shared with the scheme carries whatever a later use
+/// records into every other (`src/ccl/design/type-inference.md`, "Funkind variables are copied by
+/// level").
+#[cfg(debug_assertions)]
+fn assert_copied_apart(lim: Level, roots: &[Type], cache: &FreshenCache, before: Minted) {
+    assert_copied_apart_from(lim, cache, before, &mut |visit| {
+        roots.iter().for_each(visit)
+    });
+}
+
+/// A walk handing each root type of a copy to the visitor it is given.
+#[cfg(debug_assertions)]
+pub(crate) type Roots<'a> = dyn FnMut(&mut dyn FnMut(&Type)) + 'a;
+
+/// [`assert_copied_apart`] over the roots `roots` hands its visitor: a specialization's are its
+/// clone's type slots, walked in place.
+#[cfg(debug_assertions)]
+pub(crate) fn assert_copied_apart_from(
+    lim: Level,
+    cache: &FreshenCache,
+    before: Minted,
+    roots: &mut Roots<'_>,
+) {
+    struct Audit {
+        lim: Level,
+        before: Minted,
+        vars: std::collections::HashSet<InferVarId>,
+        kinds: std::collections::HashSet<FunKindVarId>,
+        terms: std::collections::HashSet<crate::ccl::PredicateId>,
+        /// The copies the cache holds, which a specialization may have taken from its use's
+        /// instantiation before `before` (`UseCapabilities::copies`).
+        capability_copies: std::collections::HashSet<CapabilityVarId>,
+    }
+    impl Audit {
+        fn kind(&mut self, kind: &FunKind) {
+            if let FunKind::Var(k) = kind {
+                assert!(
+                    k.uid >= self.before.funkind || k.level().is_some_and(|l| l <= self.lim),
+                    "an instantiation shares a funkind variable above the cutoff {} with its scheme: {k:?}",
+                    self.lim
+                );
+                if k.level().is_some_and(|l| l <= self.lim) || !self.kinds.insert(k.uid) {
+                    return;
+                }
+                for (edge, _) in k.lower_edges().into_iter().chain(k.upper_edges()) {
+                    self.kind(&edge);
+                }
+            }
+            for witness in kind.witnesses() {
+                for ty in witness.types() {
+                    self.ty(ty);
+                }
+            }
+        }
+        fn term(&mut self, term: &Rc<TypedExpr>) {
+            if !self.terms.insert(Rc::as_ptr(term)) {
+                return;
+            }
+            self.expr(term);
+        }
+        fn expr(&mut self, expr: &TypedExpr) {
+            expr.walk_type_slots(|ty| self.ty(ty));
+            expr.walk_children(|child| self.expr(child));
+        }
+        fn ty(&mut self, ty: &Type) {
+            if let Type::Infer(v) = ty {
+                assert!(
+                    v.uid >= self.before.var || v.level() <= self.lim,
+                    "an instantiation shares a variable above the cutoff {} with its scheme: {v:?}",
+                    self.lim
+                );
+                if v.level() <= self.lim || !self.vars.insert(v.uid) {
+                    return;
+                }
+                self.kind(&FunKind::Var(Rc::clone(&v.fun_kind)));
+                for bound in v
+                    .bounds
+                    .borrow()
+                    .lower()
+                    .iter()
+                    .chain(v.bounds.borrow().upper().iter())
+                {
+                    self.ty(&bound.ty);
+                }
+            }
+            if let Type::Fun {
+                fun_kind,
+                capabilities,
+                ..
+            } = ty
+            {
+                self.kind(fun_kind);
+                if let Repr::Var(c) = capabilities.repr() {
+                    assert!(
+                        c.uid >= self.before.capability
+                            || c.level() <= self.lim
+                            || self.capability_copies.contains(&c.uid),
+                        "an instantiation shares a capability variable above the cutoff {} with its scheme: {c:?}",
+                        self.lim
+                    );
+                }
+            }
+            for r in ty.refinements() {
+                self.term(&r.predicate);
+            }
+            ty.quoted_terms().for_each(|term| self.term(term));
+            ty.walk_children(|child| self.ty(child));
+        }
+    }
+    let mut audit = Audit {
+        lim,
+        before,
+        vars: Default::default(),
+        kinds: Default::default(),
+        terms: Default::default(),
+        capability_copies: cache.capability_vars.values().map(|c| c.uid).collect(),
+    };
+    roots(&mut |root| audit.ty(root));
+    for copy in cache.vars.values() {
+        audit.ty(&Type::Infer(Rc::clone(copy)));
+    }
+    for copy in cache.fun_kind_vars.values() {
+        audit.kind(&FunKind::Var(Rc::clone(copy)));
     }
 }
 
@@ -215,6 +393,9 @@ impl PolyScheme {
 /// single fresh (or pre-seeded — see [`seed_chan_dom_pairings`]) rename.
 #[derive(Default)]
 pub struct FreshenCache {
+    /// The first variable this freshening can mint. Earlier variables keep their existing
+    /// witness scopes when a function carrying them is copied.
+    pub first_var: Option<InferVarId>,
     /// When set, every variable this freshening mints stands at *this* telescope instead
     /// of its original's — the operator-scheme instantiation mode
     /// ([`PolyScheme::instantiate_in`]). A template's own variables stand nowhere but under
@@ -370,7 +551,13 @@ fn freshen_fun_kind(
     cache: &mut FreshenCache,
 ) -> FunKind {
     match fun_kind {
-        FunKind::Compute | FunKind::Data(..) => fun_kind.clone(),
+        FunKind::Compute | FunKind::Data(None) => fun_kind.clone(),
+        FunKind::Data(Some(witnesses)) => FunKind::Data(Some(Rc::new(
+            witnesses
+                .iter()
+                .map(|w| w.map_types(|t| freshen_above(lim, t, target, cache)))
+                .collect(),
+        ))),
         FunKind::Var(kv) => FunKind::Var(freshen_kind_var(kv, lim, target, cache)),
     }
 }
@@ -548,6 +735,24 @@ fn freshen_kind_var(
     if kv.level().is_some_and(|l| l <= lim) {
         return Rc::clone(kv);
     }
+    // Each field of the original, and what the copy makes of it.
+    let crate::ccl::ty::FunKindVarFields {
+        // The copy's own.
+        uid: (),
+        // An annotation's funkind hole is normalized away before inference, so no funkind
+        // variable a freshening copies is one.
+        hole: (),
+        // The target's level for the original's, below.
+        level: (),
+        // The stamp, the binders and every edge, below.
+        bounds: (),
+        // Memos of what the funkind variable resolved to, recomputed for the copy when it is
+        // read.
+        resolved_at: (),
+        component_at: (),
+        // A copy's witness positions belong to its own graph, so start without the cache.
+        binder_positions_at: (),
+    } = kv.fields();
     let f = FunKindVar::fresh();
     if let Some(l) = kv.level() {
         f.place_at(target.level_of(l));
@@ -669,10 +874,21 @@ fn freshen_level(ty: &Type) -> Level {
             .map(|a| predicate_level(&a.term))
             .fold(app.param.opened_at.unwrap_or(0), Level::max),
         Type::ChanDom(_, l) => l.0,
-        // A capability variable is copied like any variable above the cutoff, so a type whose
-        // only quantified content is a function's capabilities is not returned verbatim: each use
-        // would add its arguments' capabilities to the definition's own variable.
-        Type::Fun { capabilities, .. } => capabilities.level(),
+        // A funkind variable and a capability variable are copied like any variable above the
+        // cutoff, so a type whose only quantified content is a function's funkind or capabilities
+        // is not returned verbatim: each use would record its own funkind, or add its arguments'
+        // capabilities, on the definition's variable.
+        Type::Fun {
+            fun_kind,
+            capabilities,
+            ..
+        } => {
+            let kind = match fun_kind {
+                FunKind::Var(kind) => kind.level().unwrap_or(Level::MAX),
+                _ => 0,
+            };
+            kind.max(capabilities.level())
+        }
         _ => 0,
     };
     for r in ty.refinements() {
@@ -769,6 +985,9 @@ pub fn freshen_above(
     target: FreshenLevel,
     cache: &mut FreshenCache,
 ) -> Type {
+    let first_var = *cache
+        .first_var
+        .get_or_insert_with(crate::ccl::infer_var::next_infer_var_id);
     // The short-circuit asks [`freshen_level`], not `type_level`: a refinement's
     // predicate holds type slots whose quantified variables a low base hides, and
     // freshening has to copy them (see [`freshen_level`] for why the two levels
@@ -889,18 +1108,7 @@ pub fn freshen_above(
                 (Some(n), Some(_)) => Some(cache.binder_name(n)),
                 _ => name.clone(),
             };
-            let fun_kind = match fun_kind {
-                // A sum's binder kinds carry type children — the scheme's quantified
-                // variables sit among the candidates — so they freshen like any
-                // other position. The binders themselves are re-minted just below, by
-                // [`Type::alpha_convert_sum`].
-                FunKind::Data(Some(ws)) => FunKind::Data(Some(Rc::new(
-                    ws.iter()
-                        .map(|w| w.map_types(|t| freshen_above(lim, t, target, cache)))
-                        .collect(),
-                ))),
-                other => freshen_fun_kind(other, lim, target, cache),
-            };
+            let fun_kind = freshen_fun_kind(fun_kind, lim, target, cache);
             let domain = freshen_above(lim, d, target, cache);
             let codomain = match &name {
                 // An application of a family parameter discharges that parameter's
@@ -941,8 +1149,9 @@ pub fn freshen_above(
                 ..
             } = &out
             {
-                InferVar::place_parts_under(domain, fun_kind);
-                InferVar::place_parts_under(codomain, fun_kind);
+                let owned = |v: &InferVar| v.uid >= first_var;
+                InferVar::place_parts_under_where(domain, fun_kind, &owned);
+                InferVar::place_parts_under_where(codomain, fun_kind, &owned);
             }
             // A scheme binds its witnesses, so each instantiation owes itself its own —
             // `box`'s scheme is one sum, and sharing its binders would make every `box`
@@ -1147,6 +1356,31 @@ pub fn freshen_above(
                         .rescoped(|_| false, cache.entered_binders.iter().cloned()),
                 },
             };
+            // Each field of the original, and what the copy makes of it.
+            let crate::ccl::infer_var::InferVarFields {
+                // The copy's own.
+                uid: (),
+                // The target's level for the original's (`new_level`).
+                level: (),
+                // Rescoped to the use (`telescope`, above).
+                telescope: (),
+                // Freshened below, lower, upper and type kinds.
+                bounds: (),
+                // The original's funkind variable freshened (above), related by
+                // `relate_kind_copy`.
+                fun_kind: (),
+                // Freshened, each obligation's frames copied (`freshen_watches`).
+                watches: (),
+                // A memo of the variables reading this one under substitutions, minted afresh as
+                // the copy is read; the memberships recorded on them come across below.
+                suspensions: (),
+                // `mark_named_domain`, below.
+                named_domain: (),
+                // `inherit_stands_for`, below.
+                stands_for: (),
+                // `inherit_witness_placement_renamed`, below.
+                witness_scopes: (),
+            } = tv.fields();
             let v = InferVar::fresh_over(new_level, &telescope, fun_kind);
             // The kinds the original sits under are this copy's kinds, whichever this walk
             // reaches first: a variable copied before the function it is a part of would
@@ -1282,7 +1516,7 @@ pub fn freshen_above(
             for held in readings {
                 freshen_above(lim, &Type::Infer(held), target, cache);
             }
-            cache.relate_kind_copy(&tv.fun_kind, &v.fun_kind);
+            cache.relate_kind_copy(&tv.fun_kind, &v.fun_kind, lim, target);
             let watches = tv.watches.borrow().clone();
             freshen_watches(
                 lim,
@@ -1359,16 +1593,22 @@ impl FreshenCache {
     ///
     /// **Only edges whose far end this instantiation copied.** A kind not in the cache is
     /// one no type in this copy names, so an edge to it would relate the copy to a position
-    /// outside itself; a *concrete* kind is shared rather than copied
-    /// ([`freshen_fun_kind`]), so it crosses as itself. Carrying every edge instead pulls
+    /// outside itself. Concrete sum kinds carry freshened candidate types.
+    /// Carrying every edge instead pulls
     /// the whole component across, since an edge is recorded on both ends.
-    pub fn relate_kind_copy(&self, original: &Rc<FunKindVar>, copy: &Rc<FunKindVar>) {
-        let copied = |k: &FunKind| match k {
+    pub fn relate_kind_copy(
+        &mut self,
+        original: &Rc<FunKindVar>,
+        copy: &Rc<FunKindVar>,
+        lim: Level,
+        target: FreshenLevel,
+    ) {
+        let mut copied = |k: &FunKind| match k {
             FunKind::Var(v) => self
                 .fun_kind_vars
                 .get(&v.uid)
                 .map(|c| FunKind::Var(Rc::clone(c))),
-            concrete => Some(concrete.clone()),
+            concrete => Some(freshen_fun_kind(concrete, lim, target, self)),
         };
         {
             // **A kind that cannot bind a position has no correspondence to carry.** The
@@ -1795,6 +2035,41 @@ mod tests {
         );
     }
 
+    /// A function whose funkind variable stands at the cutoff and whose only quantified content is
+    /// a capability variable is still copied: each use collects its own capabilities.
+    #[test]
+    fn a_capability_variable_beside_a_shared_funkind_variable_is_copied() {
+        let kind = FunKindVar::fresh();
+        kind.place_at(0);
+        let quantified = CapabilityVar::fresh(1);
+        let ty = Type::Fun {
+            name: None,
+            fun_kind: FunKind::Var(Rc::clone(&kind)),
+            domain: Box::new(Type::Base(BaseType::Int)),
+            codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: Capabilities::var(Rc::clone(&quantified)),
+        };
+        let Type::Fun {
+            fun_kind: FunKind::Var(copied_kind),
+            capabilities,
+            ..
+        } = PolyScheme::poly(0, ty).instantiate(0)
+        else {
+            panic!("expected a function with a funkind variable");
+        };
+        assert_eq!(
+            copied_kind.uid, kind.uid,
+            "a funkind variable at the cutoff is shared"
+        );
+        let Repr::Var(copy) = capabilities.repr() else {
+            panic!("expected a capability variable");
+        };
+        assert_ne!(
+            copy.uid, quantified.uid,
+            "the capability variable above the cutoff is copied"
+        );
+    }
+
     /// A quantified variable reachable *only* through a refinement predicate must
     /// still be freshened.
     ///
@@ -1852,5 +2127,143 @@ mod tests {
              freshened — sharing it with the definition mints a duplicate \
              specialization"
         );
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod copy_audit_tests {
+    use super::*;
+    use crate::ccl::{BaseType, Expr, InferVar, Name};
+
+    #[test]
+    fn the_copy_audit_enters_every_quoted_type() {
+        let variable = super::super::fresh_var(1);
+        let quoted = Rc::new(Expr::var("condition").with_ty(variable));
+        let roots = [
+            Type::refined_one(
+                Type::Base(BaseType::Int),
+                Refinement::born(Rc::clone(&quoted)),
+            ),
+            Type::FamilyApp(crate::ccl::ty::FamilyApp::new(
+                crate::ccl::TypeParam::declared_family("V", 1),
+                vec![Rc::clone(&quoted)],
+            )),
+            Type::WitnessProjection(crate::ccl::ty::WitnessProjection::new(quoted, 0)),
+        ];
+        let before = Minted::now();
+        for root in roots {
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    assert_copied_apart(0, &[root], &FreshenCache::new(), before);
+                }))
+                .is_err(),
+                "a quoted variable shared above the cutoff must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn settled_sum_kinds_on_copied_edges_freshen_their_candidates() {
+        let candidate = super::super::fresh_var(1);
+        let sum = Type::sum_over(
+            crate::ccl::TypeKind::Enumerated(vec![candidate.clone()]),
+            None,
+            Type::Base(BaseType::Int),
+        );
+        let kind = FunKind::fresh_var();
+        let FunKind::Var(k) = &kind else {
+            unreachable!()
+        };
+        k.record_under(sum.fun_kind().unwrap().clone(), true, Subst::id());
+        let ty = Type::fun_over(
+            Name::fresh("x"),
+            Type::Base(BaseType::Int),
+            Type::Base(BaseType::Int),
+            kind,
+        );
+        let variable = InferVar::fresh(1);
+        variable
+            .fun_kind
+            .record_under(sum.fun_kind().unwrap().clone(), true, Subst::id());
+        for source in [ty, Type::Infer(variable)] {
+            let instance = PolyScheme::poly(0, source).instantiate(0);
+            let copied = match &instance {
+                Type::Infer(v) => Rc::clone(&v.fun_kind),
+                ty => match ty.fun_kind().unwrap() {
+                    FunKind::Var(k) => Rc::clone(k),
+                    _ => unreachable!(),
+                },
+            };
+            let edge = copied
+                .lower_edges()
+                .into_iter()
+                .find_map(|(kind, _)| match kind {
+                    FunKind::Data(Some(witnesses)) => Some(witnesses),
+                    _ => None,
+                })
+                .unwrap();
+            let crate::ccl::TypeKind::Enumerated(types) = edge[0].type_kind() else {
+                unreachable!()
+            };
+            assert_ne!(types[0], candidate);
+        }
+    }
+
+    #[test]
+    fn copying_a_function_places_only_its_fresh_variables_under_the_copy() {
+        let captured = InferVar::fresh(0);
+        let quantified = InferVar::fresh(1);
+        let ty = Type::Fun {
+            name: None,
+            fun_kind: FunKind::fresh_var(),
+            domain: Box::new(Type::Tuple(vec![
+                Type::Infer(Rc::clone(&captured)),
+                Type::Infer(quantified),
+            ])),
+            codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: Capabilities::none(),
+        };
+        let instance = PolyScheme::poly(0, ty).instantiate(0);
+        let Type::Fun {
+            fun_kind: FunKind::Var(kind),
+            domain,
+            ..
+        } = instance
+        else {
+            unreachable!()
+        };
+        let Type::Tuple(parts) = *domain else {
+            unreachable!()
+        };
+        let Type::Infer(fresh) = &parts[1] else {
+            unreachable!()
+        };
+        assert!(captured.witness_scope_kinds().is_empty());
+        assert_eq!(parts[0], Type::Infer(captured));
+        assert!(
+            fresh
+                .witness_scope_kinds()
+                .iter()
+                .any(|k| k.uid == kind.uid)
+        );
+    }
+
+    #[test]
+    fn a_funkind_is_copied_even_when_its_function_has_no_type_variables() {
+        let kind = FunKind::fresh_var();
+        let int = Type::Base(BaseType::Int);
+        let ty = Type::fun_over(Name::fresh("x"), int.clone(), int, kind.clone());
+        let scheme = PolyScheme::poly(0, ty);
+        let a = scheme.instantiate(0);
+        let b = scheme.instantiate(0);
+        let kind_id = |t: &Type| match t.fun_kind().unwrap() {
+            FunKind::Var(k) => k.uid,
+            _ => panic!("an unpinned funkind remains a variable"),
+        };
+        let FunKind::Var(original) = kind else {
+            unreachable!()
+        };
+        assert_ne!(kind_id(&a), original.uid);
+        assert_ne!(kind_id(&a), kind_id(&b));
     }
 }
