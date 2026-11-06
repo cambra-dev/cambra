@@ -228,13 +228,13 @@ fn lower_tx_block_scoped(
                 ctx.tag_machinery(Expr::expr_stmt(write, chain), stmt.span, "lower.stmt_seq")
             }
             ChlStmt::MutAssign { target, value, .. } => {
-                let name = extract_name_target(target, "mutable assignment")?;
+                let name = mut_target_name(target, "mutable assignment", ctx)?;
                 let val = lower_assigned_value(value, &[], outer_bindings, ctx)?;
                 write_or_let(name, val, chain, stmt.span, ctx)?
             }
             // `balance += value` — the compound-write shorthand, likewise a write.
             ChlStmt::AugAssign { target, op, value } => {
-                let name = extract_name_target(target, "augmented assignment")?;
+                let name = mut_target_name(target, "augmented assignment", ctx)?;
                 let rhs = lower_assigned_value(value, &[], outer_bindings, ctx)?;
                 let val = lower_aug_binop(&name, *op, rhs, stmt.span, ctx)?;
                 write_or_let(name, val, chain, stmt.span, ctx)?

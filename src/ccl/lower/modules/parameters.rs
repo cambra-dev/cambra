@@ -649,19 +649,80 @@ pub(super) fn rebind_entry(
     *at = ctx.tag_image(bound, span);
 }
 
+/// Rebind, in `chain`, a copy of a module's chain, the transactional variable the Module-typed
+/// parameter's entry `binder`, `p::stock`, declares: a run reaches the argument's own variable
+/// under the entry's spelling ([`mut_entries`]), so the declaration goes, and in its place a
+/// function nothing calls reads and writes the variable at the entry's value type `value`,
+/// which checks the argument's variable is of it both ways, as `Mut` is invariant. It is
+/// imaged at the argument at `span`, so a variable of another type is the argument's error.
+pub(super) fn rebind_mut_entry(
+    chain: &mut Expr,
+    binder: &QualifiedName,
+    value: Type,
+    span: Span,
+    ctx: &mut LoweringContext,
+) {
+    let at = parameter_let(chain, &binder.to_string());
+    let TypedExprNode::MutDecl { body, .. } = std::mem::take(at).node else {
+        unreachable!("a transactional variable's entry declares one");
+    };
+    const LABEL: &str = "link.mut_entry_fits";
+    let fits = QualifiedName::new("__fits").then(binder);
+    let given = Name::raw("__fits_value");
+    let read = fits.child("read").raw();
+    let mut node = |expr: Expr| ctx.tag_machinery(expr, span, LABEL);
+    let written = node(Expr::var(given.clone()));
+    let write = node(Expr::mut_write(binder.raw(), written));
+    let variable = node(Expr::var(binder.raw()));
+    let result = node(Expr::var(read.clone()));
+    let reread = node(Expr::let_bind_annotated(
+        read,
+        variable,
+        result,
+        value.clone(),
+    ));
+    let checks = node(Expr::expr_stmt(write, reread));
+    let check = node(Expr::lambda(given, value, checks));
+    *at = ctx.tag_image(Expr::let_bind(fits.raw(), check, *body), span);
+}
+
+/// The argument's variable each transactional entry of the Module-typed parameter `parameter`
+/// of type `ty` reaches, among `names`, what the module passed reaches, spelled as the entry:
+/// `p::stock` to the argument's `stock`, which a run's scope resolves the module's references
+/// through ([`rebind_mut_entry`]).
+pub(super) fn mut_entries(
+    parameter: &str,
+    ty: &ModuleType,
+    names: &HashMap<QualifiedName, Name>,
+) -> Vec<(QualifiedName, Name)> {
+    let parameter = QualifiedName::new(parameter);
+    let mut lets = Vec::new();
+    ModuleView::of(&parameter, ty, &mut lets);
+    lets.into_iter()
+        .filter(|(_, ty)| crate::ccl::lower::stmts::is_mut_entry(ty))
+        .filter_map(|(binder, _)| {
+            let entry = binder.strip_prefix(&parameter)?;
+            Some((binder, names.get(&entry)?.clone()))
+        })
+        .collect()
+}
+
 /// The `let` of the parameter `parameter` in `chain`, a copy of a module's
 /// chain, which its parameters' `let`s head.
 pub(super) fn parameter_let<'a>(chain: &'a mut Expr, parameter: &str) -> &'a mut Expr {
     let mut at = chain;
     loop {
-        let TypedExprNode::Let { binding, .. } = &at.node else {
+        let (TypedExprNode::Let { binding, .. } | TypedExprNode::MutDecl { binding, .. }) =
+            &at.node
+        else {
             unreachable!("a module's parameters head its chain, and `{parameter}` is one");
         };
         if matches!(&binding.name, Name::Raw(spelling) if spelling == parameter) {
             return at;
         }
-        let TypedExprNode::Let { body, .. } = &mut at.node else {
-            unreachable!("matched a `let` above");
+        let (TypedExprNode::Let { body, .. } | TypedExprNode::MutDecl { body, .. }) = &mut at.node
+        else {
+            unreachable!("matched a binding above");
         };
         at = body;
     }

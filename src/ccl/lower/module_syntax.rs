@@ -48,6 +48,17 @@ pub(super) fn refuse_module_syntax(module: &ChlModule) -> ModuleSyntax {
 }
 
 /// Spell a qualified name as written: `shop::eu::stock`.
+/// Whether `annotation` is `Mut(V, Txn)`, a transactional mutable variable's.
+fn is_txn_annotation(annotation: &TypeAnnotation) -> bool {
+    matches!(
+        &annotation.ty.node,
+        ChlExpr::Call { func, args }
+            if matches!(&func.node, ChlExpr::Name(head) if head == "Mut")
+                && matches!(args.as_slice(), [_, domain]
+                    if matches!(&domain.node, ChlExpr::Name(d) if d == "Txn"))
+    )
+}
+
 fn spell(qualifier: &[Spanned<SmolStr>], name: &str) -> String {
     let mut out = String::new();
     for segment in qualifier {
@@ -167,9 +178,20 @@ impl Refusals {
                     ChlStmt::Assign { .. }
                     | ChlStmt::AnnAssign { .. }
                     | ChlStmt::FunctionDef { .. } => {}
-                    ChlStmt::MutAssign { .. } | ChlStmt::LoadFrom { .. } => {
-                        self.refuse(*keyword, "a public mutable variable is not supported yet")
-                    }
+                    // A public mutable variable is a transactional one: an induction
+                    // variable stays in its module (`docs/chl-spec.md`, "9.10 Induction
+                    // variables stay in their module").
+                    ChlStmt::MutAssign { annotation, .. }
+                        if annotation.as_ref().is_some_and(is_txn_annotation) => {}
+                    ChlStmt::MutAssign { .. } => self.refuse(
+                        *keyword,
+                        "a public mutable variable is transactional, `pub x: Mut(V, Txn) := …`: \
+                         an induction variable stays in its module",
+                    ),
+                    ChlStmt::LoadFrom { .. } => self.refuse(
+                        *keyword,
+                        "a public `@LoadFrom` declaration is not supported yet",
+                    ),
                     // `pub` on a `type` exports it, and on any other statement it is a
                     // parse error.
                     _ => {}
@@ -183,7 +205,7 @@ impl Refusals {
                 self.expr(value);
             }
             ChlStmt::AugAssign { target, value, .. } => {
-                self.target(target);
+                self.write_target(target);
                 self.expr(value);
             }
             ChlStmt::AnnAssign {
@@ -200,7 +222,7 @@ impl Refusals {
                 annotation,
                 value,
             } => {
-                self.target(target);
+                self.write_target(target);
                 self.annotation(annotation.as_ref());
                 self.expr(value);
             }
@@ -385,6 +407,16 @@ impl Refusals {
         }
     }
 
+    /// The target of a `:=` or a compound assignment, which may write another module's public
+    /// mutable variable through its qualifier, `inv::stock := …` (`docs/chl-spec.md`, "9.9
+    /// Running"); lowering resolves the qualifier as it resolves a read.
+    fn write_target(&mut self, target: &Spanned<AssignTarget>) {
+        match &target.node {
+            AssignTarget::Qualified(q) if !names_a_method(&q.qualifier) => {}
+            _ => self.target(target),
+        }
+    }
+
     fn target(&mut self, target: &Spanned<AssignTarget>) {
         match &target.node {
             AssignTarget::Name(name) => self.binders.push((name.clone(), target.span)),
@@ -405,7 +437,8 @@ impl Refusals {
                 self.refuse(
                     target.span,
                     format!(
-                        "writing `{spelled}`, a member of another module, is not supported yet"
+                        "`{spelled}` is a member of another module, which `=` cannot rebind: \
+                         `:=` writes another module's public mutable variable"
                     ),
                 );
             }
@@ -620,10 +653,10 @@ mod tests {
         assert_eq!(spans, ["old", "@Discard\nstock"]);
     }
 
-    /// `pub` on a mutable variable is refused at the keyword, and the
+    /// `pub` on an induction variable is refused at the keyword, and the
     /// statement it marks is checked as any other.
     #[test]
-    fn pub_on_a_mutable_variable_is_refused_at_its_keyword() {
+    fn pub_on_an_induction_variable_is_refused_at_its_keyword() {
         let refused = refusals(indoc! {"
             pub stock := x.mod::Price::zero
             stock
@@ -632,7 +665,8 @@ mod tests {
         assert_eq!(refused[0].0, "pub");
         assert_eq!(
             refused[0].1,
-            "a public mutable variable is not supported yet"
+            "a public mutable variable is transactional, `pub x: Mut(V, Txn) := …`: an \
+             induction variable stays in its module"
         );
         assert_eq!(refused[1].0, "mod::Price::zero");
     }
@@ -695,18 +729,19 @@ mod tests {
         );
     }
 
-    /// A variable of another module is a write target, of `+=` and of `:=`
-    /// inside a transaction (`docs/chl-spec.md`, "9.6 Qualified references").
+    /// Another module's variable is a target of `+=` and `:=`, which write it, and not of `=`,
+    /// which would rebind it (`docs/chl-spec.md`, "9.9 Running").
     #[test]
-    fn a_qualified_write_target_is_refused() {
+    fn a_qualified_target_is_refused_only_for_a_rebinding() {
         assert_eq!(
             refused_spans(indoc! {"
                 c::count += 1
                 with begin():
                     inv::stock := inv::stock
+                inv::stock = 1
                 1
             "}),
-            ["c::count", "inv::stock"]
+            ["inv::stock"]
         );
     }
 
