@@ -51,6 +51,15 @@ pub enum ConstrainError {
         /// The escaping parameter.
         param: Rc<crate::ccl::ty::TypeParam>,
     },
+    /// A value whose type reads a binder reached a type chosen outside the binder, a declared
+    /// type parameter or a constant family's hole: it is one type for every value of the
+    /// binder, and the value's type differs with it.
+    ParamReadsBinder {
+        /// What the variable the value reached stands for.
+        chosen: crate::ccl::infer_var::StandsFor,
+        /// The binder the value's type reads.
+        binder: Name,
+    },
     /// An operator was applied to a value of a type parameter's type, and no
     /// requirement states the trait the operator needs of it.
     MissingRequirement {
@@ -268,6 +277,12 @@ pub struct ConstrainCache {
     /// a stored bound walks on with that bound's origin on its side. Swapped wherever
     /// the descent swaps the sides, as the contexts are.
     origins: (Option<Origin>, Option<Origin>),
+    /// Whether the descent has swapped the sides an odd number of times, so that the value is
+    /// on the right of the edge being walked and the demand on the left
+    /// ([`origins`](Self::origins)). Every walk starts with the value on the left, and every
+    /// edge that relates the two sides the other way round runs under
+    /// [`swapped`](Self::swapped), so the flag holds on every edge.
+    value_on_right: bool,
     /// The origins of the innermost edge that failed, set by the first error to unwind
     /// and read by the caller with [`take_failure`](Self::take_failure).
     failure: Option<(Option<Origin>, Option<Origin>)>,
@@ -327,6 +342,7 @@ impl ConstrainCache {
             lctx: crate::ccl::ty::WitnessContext::default(),
             rctx: crate::ccl::ty::WitnessContext::default(),
             origins: (None, None),
+            value_on_right: false,
             failure: None,
             unreported: Vec::new(),
             extruded: HashMap::new(),
@@ -430,14 +446,17 @@ impl ConstrainCache {
     }
 
     /// Run `f` with the two sides traded, for a descent that relates them the other way
-    /// round — the contravariant domain edge, which already swaps the substitutions.
+    /// round: a contravariant domain or argument edge, which already swaps the substitutions,
+    /// and the reversed direction of an invariant pair.
     fn swapped<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         std::mem::swap(&mut self.lctx, &mut self.rctx);
         let (l, r) = self.origins;
         self.origins = (r, l);
+        self.value_on_right = !self.value_on_right;
         let out = f(self);
         std::mem::swap(&mut self.lctx, &mut self.rctx);
         self.origins = (l, r);
+        self.value_on_right = !self.value_on_right;
         out
     }
 }
@@ -952,11 +971,17 @@ fn codomain_binder_gap(
     let binder = crate::ccl::infer_var::bound_scope_gaps(&holder.telescope, bound)
         .into_iter()
         .find(|n| cache.codomain_binders.contains(n))?;
-    Some(ConstrainError::NotCompiledYet(format!(
-        "a value that is one type for every `{}`, related to a type that reads `{}`,",
-        binder.source_spelling().unwrap_or("k"),
-        binder.source_spelling().unwrap_or("k"),
-    )))
+    Some(ConstrainError::NotCompiledYet(
+        match binder.source_spelling() {
+            Some(binder) => format!(
+                "a value that is one type for every `{binder}`, related to a type that reads \
+                 `{binder}`,"
+            ),
+            None => "a value that is one type for every key of the collection it is part of, \
+                     related to a type that reads the key,"
+                .to_string(),
+        },
+    ))
 }
 
 /// The two domains a failed domain edge found unequal: the comparison at the bottom of `err`'s
@@ -1246,6 +1271,31 @@ fn acting_side<'s>(t: &Type, s: &'s Subst) -> std::borrow::Cow<'s, Subst> {
     }
 }
 
+/// A bound from the value's side of the edge that would put a binder outside its scope on a
+/// variable standing for a type chosen outside it ([`crate::ccl::infer_var::StandsFor`]): a
+/// user error rather than a missing discharge, since nothing can discharge a value's dependence
+/// on the binder (`docs/chl-spec.md`, "Family parameters"). `bound_is_value` says whether the
+/// bound is on the value's side ([`ConstrainCache::value_on_right`]).
+///
+/// A bound from the demand's side reads a binder the value does not: the variable is bounded
+/// by the demand at every value of the binder, which [`codomain_binder_gap`] reports where the
+/// binder is a codomain edge's. Every other gap stays
+/// [`enforce_bound_scope`](crate::ccl::infer_var::enforce_bound_scope)'s internal error.
+fn param_reads_binder(
+    holder: &InferVar,
+    bound: &Bound,
+    bound_is_value: bool,
+) -> Option<ConstrainError> {
+    if !bound_is_value {
+        return None;
+    }
+    let chosen = holder.stands_for()?;
+    let binder = crate::ccl::infer_var::bound_scope_gaps(&holder.telescope, bound)
+        .into_iter()
+        .next()?;
+    Some(ConstrainError::ParamReadsBinder { chosen, binder })
+}
+
 fn constrain_go(
     lhs: &Type,
     rhs: &Type,
@@ -1455,7 +1505,9 @@ fn constrain_go_impl(
         // function's domain does, swapping the two sides' morphisms. An invariant one
         // equates in both directions under no morphism, as a history's children do: both
         // directions carrying the sides' morphisms would meet two non-invertible
-        // morphisms at one variable. A nominal type relates to no other type, so every
+        // morphisms at one variable. The second direction relates the sides the other way
+        // round, so it swaps them as a contravariant argument does, and its left side is the
+        // demand's. A nominal type relates to no other type, so every
         // other pairing falls to the catch-all `Mismatch` below (`docs/chl-spec.md`, "A
         // nominal type is opaque").
         (Type::Nominal(d0, a0), Type::Nominal(d1, a1)) if d0 == d1 => {
@@ -1467,7 +1519,9 @@ fn constrain_go_impl(
                     }
                     Variance::Invariant => {
                         constrain_go(x, y, &Subst::id(), &Subst::id(), cache, scope)?;
-                        constrain_go(y, x, &Subst::id(), &Subst::id(), cache, scope)?;
+                        cache.swapped(|cache| {
+                            constrain_go(y, x, &Subst::id(), &Subst::id(), cache, scope)
+                        })?;
                     }
                     // The output sides relate as a covariant argument does and the input
                     // sides as a contravariant one. An argument that is not split is both
@@ -1705,6 +1759,8 @@ fn constrain_go_impl(
                     // sub-comparison rides along as the inequality's `cause`. A `NotOfKind`
                     // is not an inequality either: it says a domain is not of the kind a
                     // collection annotation demands, which holds whatever it is compared to.
+                    // Nor is a `ParamReadsBinder`: it says a type parameter cannot hold a domain
+                    // that reads a binder outside it, whatever the other side is.
                     //
                     // **Between two inferred domains it is a join.** A demand is a domain a
                     // declaration or parameter states; where neither side is one, the two
@@ -1712,9 +1768,9 @@ fn constrain_go_impl(
                     // carried there by invariance, and that is the conflict a join reports.
                     if let Err(err) = decided {
                         return match err {
-                            ConstrainError::SmtError { .. } | ConstrainError::NotOfKind { .. } => {
-                                Err(err)
-                            }
+                            ConstrainError::SmtError { .. }
+                            | ConstrainError::NotOfKind { .. }
+                            | ConstrainError::ParamReadsBinder { .. } => Err(err),
                             _ if matches!(&**d0, Type::Infer(_))
                                 && matches!(&**d1, Type::Infer(_))
                                 && let Some(domains) = colliding_domains(&err) =>
@@ -2057,7 +2113,8 @@ fn constrain_go_impl(
         // channel, not a `:=` mutable variable.
         //
         // The functions relate in both directions, which is invariance in both the domain and
-        // the value, and the function rule aligns their binders.
+        // the value, and the function rule aligns their binders. The second direction swaps
+        // the sides, as an invariant nominal argument's does.
         (
             Type::History {
                 function: w0,
@@ -2069,7 +2126,7 @@ fn constrain_go_impl(
             },
         ) if k0 == k1 => {
             constrain_go(w0, w1, &Subst::id(), &Subst::id(), cache, scope)?;
-            constrain_go(w1, w0, &Subst::id(), &Subst::id(), cache, scope)
+            cache.swapped(|cache| constrain_go(w1, w0, &Subst::id(), &Subst::id(), cache, scope))
         }
         // Record the upper edge in native form (`H‹sl› <: rhs‹sr›`), as the
         // `(Type::Infer(_), _)` arm below does. It is not closed against the lowers:
@@ -2115,6 +2172,9 @@ fn constrain_go_impl(
             let lows = {
                 let bound =
                     Bound::edge(sl.clone(), rhs.clone(), sr.clone()).with_origin(cache.origins.1);
+                if let Some(e) = param_reads_binder(lv, &bound, cache.value_on_right) {
+                    return Err(e);
+                }
                 if let Some(e) = codomain_binder_gap(lv, &bound, cache) {
                     return Err(e);
                 }
@@ -2213,6 +2273,9 @@ fn constrain_go_impl(
             let ups = {
                 let bound =
                     Bound::edge(sr.clone(), lhs.clone(), sl.clone()).with_origin(cache.origins.0);
+                if let Some(e) = param_reads_binder(rv, &bound, !cache.value_on_right) {
+                    return Err(e);
+                }
                 if let Some(e) = codomain_binder_gap(rv, &bound, cache) {
                     return Err(e);
                 }
@@ -2866,6 +2929,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             // the bounds copied below close against the same scope.
             let nvs = InferVar::fresh_in(target_level, &tv.telescope);
             nvs.inherit_witness_placement(tv);
+            nvs.inherit_stands_for(tv);
             cache.vars.insert((tv.uid, pol), Rc::clone(&nvs));
             copy_watches(tv, &nvs);
             // Kinding constraints ride along at **both** polarities, unlike the bounds
@@ -3038,6 +3102,7 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
                 .or_else(|| cached_neg.clone())
                 .unwrap_or_else(|| InferVar::fresh_in(target_level, &tv.telescope));
             nvs.inherit_witness_placement(tv);
+            nvs.inherit_stands_for(tv);
             // Which bound links does the reused proxy already carry? A polar
             // proxy under the `true` key has the positive link (`tv <: proxy`);
             // under the `false` key, the negative link (`proxy <: tv`). A fresh
@@ -4447,6 +4512,39 @@ mod tests {
             constrain_subtype(&prim(BaseType::Int), &m, &mut cache),
             Err(ConstrainError::Mismatch { .. })
         ));
+    }
+
+    /// A value that is one type for every value of a binder, below a type that reads the binder,
+    /// is not compiled yet. The message names a binder the program wrote and calls a binder the
+    /// compiler minted the key.
+    #[test]
+    fn a_meet_over_a_codomain_binder_names_only_a_written_binder() {
+        let arena = crate::ccl::infer::InferArena::new();
+        for (binder, what) in [
+            (
+                Name::fresh("i"),
+                "a value that is one type for every `i`, related to a type that reads `i`,",
+            ),
+            (
+                Name::fresh("__k"),
+                "a value that is one type for every key of the collection it is part of, \
+                 related to a type that reads the key,",
+            ),
+        ] {
+            let value = Type::fun(prim(BaseType::Int), fresh_var(0));
+            let demand = Type::pi(
+                binder.clone(),
+                prim(BaseType::Int),
+                Type::refined_one(prim(BaseType::Int), gt_refinement(TypedExpr::var(binder))),
+            );
+            let err = constrain_subtype(&value, &demand, &mut ConstrainCache::new())
+                .expect_err("a meet over the binder");
+            let ConstrainError::NotCompiledYet(got) = err else {
+                panic!("expected not compiled yet, got {err:?}")
+            };
+            assert_eq!(got, what);
+        }
+        drop(arena);
     }
 
     /// Build a refinement whose predicate is the **bare** `__elem > <rhs>` —

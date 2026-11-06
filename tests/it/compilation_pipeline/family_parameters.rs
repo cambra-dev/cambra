@@ -194,33 +194,47 @@ fn a_function_type_names_its_domain_s_value_in_an_annotation() {
 
 /// Not compiled yet: a collection whose values are one type for every key, below a type whose
 /// values' type reads its key. The edge would bound the element's variable at every key, their
-/// meet over the key, which the solver does not compute.
-#[test]
-fn a_codomain_refinement_reading_the_key_over_one_value_type_is_not_compiled_yet() {
+/// meet over the key, which the solver does not compute. Through a declared type parameter the
+/// value still reads no key, so the parameter is not what refuses it.
+#[rstest]
+#[case::literal("xs: (i: _) |=> {Int where _ > i} = [1, 2]")]
+#[case::through_a_type_parameter(indoc! {r#"
+    def f(K, V, g: K |=> V) => K |=> V:
+        g
+    xs: (i: _) |=> {Int where _ > i} = f([1, 2])
+"#})]
+#[case::through_a_constructor(indoc! {r#"
+    type M(K, V) = K |=> V
+    xs: (i: _) |=> {Int where _ > i} = M::new([1, 2]).extract()
+"#})]
+fn a_codomain_refinement_reading_the_key_over_one_value_type_is_not_compiled_yet(
+    #[case] program: &str,
+) {
     check_compile_error(
-        indoc! {r#"
-            xs: (i: _) |=> {Int where _ > i} = [1, 2]
-            sum(xs)
-        "#},
+        &format!("{program}\nsum(xs)"),
         "a value that is one type for every `i`, related to a type that reads `i`, is not compiled yet",
     );
 }
 
 /// A constant family is one type for every value, so its holes read no binder, and a group-by,
-/// whose groups' domain reads the key, is refused. The refusal is a scope-invariant panic here:
-/// the hole's variable is minted outside the binder.
-#[test]
-#[should_panic = "open bound recorded"]
-fn a_constant_family_s_holes_read_no_binder() {
+/// whose groups' domain reads the key, is refused with a lambda that names the key. The binder
+/// the groups' domain reads is one the compiler names, so the message names no binder, whatever
+/// the declaration calls its own.
+#[rstest]
+#[case::k(GROUPS)]
+#[case::key("type Groups(K, V: K => Type) = (key: K) |=> V(key)\n")]
+fn a_constant_family_s_holes_read_no_binder(#[case] groups: &str) {
     check_compile_error(
         &format!(
-            "{GROUPS}{}",
+            "{groups}{}",
             indoc! {r#"
                 gs: Groups(_, _ |=> Int) = Groups::new(groupby([1, 2, 3], \x -> x > 1))
                 1
             "#}
         ),
-        "write the family as a lambda",
+        "the type given for `V` is a constant family, one type for every key of the collection \
+         it is part of, and the value differs per key: write the family as a lambda that names \
+         the key",
     );
 }
 
@@ -454,6 +468,47 @@ fn a_method_a_family_type_does_not_declare_names_the_type() {
         ),
         "has no method `cents`",
     );
+}
+
+/// A parameter that is not a family is one type at every value, so a value whose type differs
+/// with a binder outside it is refused, naming the parameter, and the binder when the program
+/// wrote it.
+#[test]
+fn a_value_differing_with_a_binder_does_not_fit_a_plain_parameter() {
+    for (program, message) in [
+        (
+            indoc! {r#"
+                type M(K, V) = (k: K) |=> V
+                M::new(groupby([1, 2, 3], \x -> x > 1))
+            "#},
+            "`V` is one type for every `k`, and the value given for it differs with `k`",
+        ),
+        (
+            indoc! {r#"
+                type M(K, V) = K |=> V
+                M::new(groupby([1, 2, 3], \x -> x > 1))
+            "#},
+            "`V` is one type for every key of the collection it is part of",
+        ),
+        (
+            indoc! {r#"
+                def f(K, V, g: FullMap(K, V)) => Int:
+                    0
+                f(groupby([1, 2, 3], \x -> x > 1))
+            "#},
+            "`V` is one type for every key of the collection it is part of",
+        ),
+        (
+            indoc! {r#"
+                type Pairs(A, B, V: {A, B} => Type) = (a: A) |=> (b: B) |=> V(a, b)
+                nested = [groupby(grp, \x -> x > 3) for grp in groupby([1, 2, 3, 4], \x -> x > 2)]
+                Pairs::new(nested)
+            "#},
+            "`B` is one type for every `a`, and the value given for it differs with `a`",
+        ),
+    ] {
+        check_compile_error(program, message);
+    }
 }
 
 /// A function's family parameter, which its parameters' types pass on: two arguments of one

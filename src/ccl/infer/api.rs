@@ -565,6 +565,23 @@ pub enum InferError {
         /// The two types the receiver is stated to be.
         types: (String, String),
     },
+    /// A value whose type differs with a binder reached a type parameter declared outside
+    /// that binder, which is one type for every value of it.
+    ParamReadsBinder {
+        /// The parameter's spelling.
+        param: String,
+        /// The binder the value's type reads, when the program wrote it: a collection's key
+        /// binder is often one only the compiler names.
+        binder: Option<String>,
+    },
+    /// A value whose type differs with a binder was given for a family parameter as a constant
+    /// family, one type for every value of the binder.
+    ConstantFamilyReadsBinder {
+        /// The family parameter's spelling.
+        param: String,
+        /// The binder the value's type reads, when the program wrote it.
+        binder: Option<String>,
+    },
     /// A type parameter would reach something declared outside the definition
     /// that declares it, whose type is fixed before the parameter is chosen.
     TypeParamEscapes {
@@ -890,6 +907,8 @@ impl InferError {
             | InferError::MutNotBareVariable { .. }
             | InferError::MutArgNotMutable { .. }
             | InferError::TypeParamEscapes { .. }
+            | InferError::ParamReadsBinder { .. }
+            | InferError::ConstantFamilyReadsBinder { .. }
             | InferError::AmbiguousReceiver { .. }
             | InferError::MethodArity { .. }
             | InferError::DefinitionCycle { .. }
@@ -1448,7 +1467,11 @@ impl std::fmt::Debug for InferError {
             InferError::UnresolvedMethod {
                 method,
                 receiver: Some(ty @ Type::Nominal(..)),
-            } => write!(f, "`{ty}` has no method `{method}`"),
+            } => write!(
+                f,
+                "`{}` has no method `{method}`",
+                crate::ccl::chl_print::chl_type(ty)
+            ),
             InferError::UnresolvedMethod {
                 method,
                 receiver: Some(ty),
@@ -1457,6 +1480,34 @@ impl std::fmt::Debug for InferError {
                 "`.{method}(…)` calls a method, and `{ty}` is not a nominal type, so it has no \
                  methods; the function a field holds is called as `(r.{method})(…)`"
             ),
+            InferError::ParamReadsBinder { param, binder } => match binder {
+                Some(binder) => write!(
+                    f,
+                    "`{param}` is one type for every `{binder}`, and the value given for it \
+                     differs with `{binder}`: declare `{param}` as a family over `{binder}`'s \
+                     type, or box the values"
+                ),
+                None => write!(
+                    f,
+                    "`{param}` is one type for every key of the collection it is part of, and the \
+                     value given for it differs per key: declare `{param}` as a family \
+                     over the key type, or box the values"
+                ),
+            },
+            InferError::ConstantFamilyReadsBinder { param, binder } => match binder {
+                Some(binder) => write!(
+                    f,
+                    "the type given for `{param}` is a constant family, one type for every \
+                     `{binder}`, and the value differs with `{binder}`: write the family as a \
+                     lambda that names its binder, `\\{binder} -> …`"
+                ),
+                None => write!(
+                    f,
+                    "the type given for `{param}` is a constant family, one type for every key \
+                     of the collection it is part of, and the value differs per key: write the \
+                     family as a lambda that names the key"
+                ),
+            },
             InferError::TypeParamEscapes { param, target, at } => match target {
                 Some(EscapeTarget::Argument { function }) => write!(
                     f,
@@ -1533,7 +1584,11 @@ impl std::fmt::Debug for InferError {
                 _ => write!(f, "No field .{key} for {at}: {found}"),
             },
             InferError::ExpectedFunction { found, at } => {
-                write!(f, "Expected function type at {at}, found {found}")?;
+                write!(
+                    f,
+                    "Expected function type at {at}, found {}",
+                    crate::ccl::chl_print::chl_type(found)
+                )?;
                 if matches!(found, Type::Tuple(_) | Type::Record(_)) {
                     write!(
                         f,

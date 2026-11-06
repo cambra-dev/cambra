@@ -74,6 +74,9 @@ struct Printer {
     /// Every binder the printed text introduces and is inside of, innermost last, with
     /// the spelling it is written with. A reference by name reads its spelling here.
     spelled: Vec<(Name, String)>,
+    /// Every binder the compiler minted that a family is applied at outside of it, with the
+    /// spelling it is written with ([`Printer::family_arg`]).
+    free_spelled: Vec<(Name, String)>,
     /// Every spelling a name in the printed type has, so a binder the compiler minted is
     /// given one that no other name in the text reads as.
     taken: HashSet<String>,
@@ -127,6 +130,7 @@ impl Printer {
         let free = |candidate: &String| {
             !self.taken.contains(candidate)
                 && !self.spelled.iter().any(|(_, s)| s == candidate)
+                && !self.free_spelled.iter().any(|(_, s)| s == candidate)
                 && !self.binders.iter().flatten().any(|s| s == candidate)
         };
         std::iter::once(preferred.to_string())
@@ -227,11 +231,7 @@ impl Printer {
             // A compiler-made family has no CHL spelling.
             Type::FamilyApp(app) if app.param.generalized => self.fallback(ty),
             Type::FamilyApp(app) => {
-                let args: Vec<String> = app
-                    .args
-                    .iter()
-                    .map(|a| self.expr(&a.term, Prec::Lowest, &Vec::new()))
-                    .collect();
+                let args: Vec<String> = app.args.iter().map(|a| self.family_arg(&a.term)).collect();
                 format!("{}({})", app.param.spelling, args.join(", "))
             }
             Type::Family { binders, body } => self.family(binders, body),
@@ -342,6 +342,26 @@ impl Printer {
             | Type::BoundedHole(_)
             | Type::DepTuple(_) => self.fallback(ty),
         }
+    }
+
+    /// An argument of a family application. A binder the compiler minted that the printed
+    /// text does not introduce is written at a spelling an unnamed binder would take, the
+    /// same one at each of its occurrences.
+    fn family_arg(&mut self, term: &Expr) -> String {
+        if let TypedExprNode::Var(n) = &term.node
+            && !n.is_elem()
+            && n.pi_bound_index().is_none()
+            && spelling(n).is_none()
+            && !self.spelled.iter().any(|(m, _)| m == n)
+        {
+            if let Some((_, s)) = self.free_spelled.iter().find(|(m, _)| m == n) {
+                return s.clone();
+            }
+            let s = self.binder(n, "k");
+            self.free_spelled.push((n.clone(), s.clone()));
+            return s;
+        }
+        self.expr(term, Prec::Lowest, &Vec::new())
     }
 
     /// A family, `\k: K -> T`, or its body alone where the body reads no binder: a type

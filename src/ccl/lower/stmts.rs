@@ -4179,7 +4179,7 @@ fn family_argument(
         return Ok(Type::family(
             domains
                 .iter()
-                .map(|d| (Name::fresh("k"), d.clone()))
+                .map(|d| (Name::fresh("__family_k"), d.clone()))
                 .collect(),
             body,
         ));
@@ -4305,7 +4305,7 @@ fn passed_on_family(
     }
     let binders: Vec<(Name, Type)> = domains
         .iter()
-        .map(|d| (Name::fresh("k"), d.clone()))
+        .map(|d| (Name::fresh("__family_k"), d.clone()))
         .collect();
     let terms = binders
         .iter()

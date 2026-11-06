@@ -3146,6 +3146,9 @@ gs = Groups::new(groupby([1, 2, 3], \x -> x > 1))
   indexed by a type. A curried kind, `K₁ => K₂ => Type`, is an error.
 - **A kind may name its domain's value, `V: (k: K) => Type`.** Nothing reads the name, so the
   kind is `K => Type`.
+- **A parameter that is not a family is one type at every value.** A value whose type differs
+  with a binder outside the parameter does not fit it: `type M(K, V) = K |=> V` admits no
+  group-by, whose groups' domains differ by key, and `V: K => Type` admits one.
 - **A function type names its domain's value as `(k: K) |=> T`**, which `T` reads in refinements
   and family applications, in any annotation: `def f(g: (k: _) |=> (_ |=> Int))`.
 - **A family parameter is applied to distinct binders in scope.** `V(k)` names a binder of a type

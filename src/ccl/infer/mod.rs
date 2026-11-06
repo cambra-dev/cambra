@@ -416,6 +416,21 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             found: Box::new(coalesce_for_error(&lhs)),
             expected: Some(Box::new(coalesce_for_error(&rhs))),
         },
+        ConstrainError::ParamReadsBinder { chosen, binder } => {
+            let binder = binder.source_spelling().map(str::to_string);
+            match chosen {
+                crate::ccl::infer_var::StandsFor::Param(param) => InferError::ParamReadsBinder {
+                    param: param.to_string(),
+                    binder,
+                },
+                crate::ccl::infer_var::StandsFor::ConstantFamily(param) => {
+                    InferError::ConstantFamilyReadsBinder {
+                        param: param.to_string(),
+                        binder,
+                    }
+                }
+            }
+        }
         ConstrainError::TypeParamEscapes { param } => InferError::TypeParamEscapes {
             param: param.spelling.to_string(),
             target: None,

@@ -833,12 +833,16 @@ pub fn freshen_above(
                 .param_telescope
                 .clone()
                 .unwrap_or_else(Telescope::empty);
+            let for_param = |level| {
+                let v = InferVar::fresh_in(level, &telescope);
+                v.mark_stands_for(crate::ccl::infer_var::StandsFor::Param(
+                    param.spelling.clone(),
+                ));
+                Type::Infer(v)
+            };
             let out = match target {
-                FreshenLevel::At(at) => Type::Infer(InferVar::fresh_in(at, &telescope)),
-                _ if param.level() == lim + 1 => Type::Infer(InferVar::fresh_in(
-                    target.level_of(param.level()),
-                    &telescope,
-                )),
+                FreshenLevel::At(at) => for_param(at),
+                _ if param.level() == lim + 1 => for_param(target.level_of(param.level())),
                 _ => {
                     let bound = param
                         .bound
@@ -952,6 +956,7 @@ pub fn freshen_above(
             if tv.names_domain() {
                 v.mark_named_domain();
             }
+            v.inherit_stands_for(tv);
             cache.vars.insert(tv.uid, Rc::clone(&v));
 
             // Snapshot bounds before recursing — the recursion may touch
