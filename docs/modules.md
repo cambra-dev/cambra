@@ -894,7 +894,7 @@ run storefront(port="8081", region="us", audit=audit) as us
 
 What each rule contributes:
 
-- `catalog` performs no IO, so `storefront` imports it, and both storefront runs reach its one
+- `catalog` is shareable, so `storefront` imports it, and both storefront runs reach its one
   shared import.
 - `storefront` checks alone: its parameters are typed by their annotations. Each `run` checks its
   arguments: the run `audit` has an `events` member of type `Feed(audit_api::Event)`, so its Module
@@ -950,8 +950,8 @@ the [Implementation stack](#implementation-stack).
   function that owns a transaction and serves a request loop.
 - **Mutable writes inside a comprehension.** A function writing a mutable variable, called in a
   comprehension's element, has its writes dropped rather than applied or refused.
-- **`requires Transaction`** ([chl-spec.md, "8.7 Direction [Decided]: transactions as contextual
-  parameters"](chl-spec.md#87-direction-decided-transactions-as-contextual-parameters)). A function
+- **`requires Transaction`** ([chl-spec.md, "8.7 Transactions as contextual
+  parameters"](chl-spec.md#87-transactions-as-contextual-parameters)). A function
   that reads or writes `Txn` state inside its caller's transaction, and so two module functions
   composed in one transaction. The lexical read gate refuses a `Txn` read in a `def` outside a `with
   begin():` of its own until then.
@@ -961,7 +961,7 @@ the [Implementation stack](#implementation-stack).
   `{String where _ in stock.keys()}` over `stock: Mut(Map(String, Int), Txn)`, names a key set that
   changes with each commit. The compiler cannot name a mutable map's key set in a type today, in one
   file or several. Needed for a per-run type such as `InStock` ([chl-spec.md, "9.7 Importing
-  asserts no IO and no state"](chl-spec.md#97-importing-asserts-no-io-and-no-state)).
+  asserts a shareable module"](chl-spec.md#97-importing-asserts-a-shareable-module)).
 - **Constants where an import resolves.** A link-time constant is a `const` parameter or a binding
   whose definition is a constant ([chl-spec.md, "9.19 Constants"](chl-spec.md#919-constants)), and
   linking gives each run's `const` parameters their values ([Runs](#runs)). An import's arguments
