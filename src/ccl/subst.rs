@@ -4385,6 +4385,12 @@ impl RefinementScope {
         out
     }
 
+    /// `ty`, a type the walk puts at its position whole, closed against the functions entered so
+    /// far.
+    pub(crate) fn closed_type(&self, ty: &Type) -> Type {
+        close_pi_binders(&self.enclosing, ty)
+    }
+
     /// [`close`](Self::close), in place, for a term a type quotes outside a refinement
     /// ([`Type::quoted_terms`]).
     pub(crate) fn close_quoted(&mut self, q: &mut (impl crate::ccl::QuotedTerm + ?Sized)) {
