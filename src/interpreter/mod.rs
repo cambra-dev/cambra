@@ -5,6 +5,7 @@
 
 mod binop;
 pub mod commit_operator;
+pub mod dispatcher;
 pub mod http_server;
 pub mod operator_conversion;
 pub mod operator_graph;
@@ -55,6 +56,18 @@ pub trait Consumer {
     /// Notify the consumer that the keys `arrived` changed, and that it should pull again if it
     /// reads this producer.
     fn notify(&mut self, arrived: &Projection);
+
+    /// Hand on `region` of the producer's keys at any level, which a pipeline breaker pushed
+    /// ([`dispatcher::Pushes`]): a consumer between two breakers restates it as it restates a
+    /// notification and passes it on, and the next breaker's [`dispatcher::Entry`] queues it in
+    /// `landing` as a work package of the breaker's pipeline. No gate holds a push back, since
+    /// every region becomes a package, and a consumer that pulls ignores it, which is the default:
+    /// a push wakes no one.
+    ///
+    /// TODO: this is a second path beside `notify` while runs still pull. Once every run goes
+    /// through the dispatcher, `notify`, its gates (`GatedConsumer`) and `WakeupQueue` go, and
+    /// this method takes `notify`'s place.
+    fn push(&mut self, _region: &Projection, _landing: &mut dispatcher::Landing<'_>) {}
 }
 
 /// Blanket implementation: Rc<RefCell<C>> implements Consumer when C does.
@@ -63,6 +76,10 @@ pub trait Consumer {
 impl<C: Consumer> Consumer for Rc<RefCell<C>> {
     fn notify(&mut self, arrived: &Projection) {
         self.borrow_mut().notify(arrived)
+    }
+
+    fn push(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
+        self.borrow_mut().push(region, landing)
     }
 }
 
