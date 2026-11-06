@@ -971,6 +971,24 @@ fn a_region_consumed_twice_is_refused() {
     });
 }
 
+/// The pipelines of one breaker push into one record of what it pushed: a region one of them
+/// pushed, the other pushing again would consume twice, which a debug build refuses.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "the reader of pipeline 1 consumes each region once")]
+fn the_pipelines_of_one_breaker_share_what_it_pushed() {
+    let all = ints().universal_guard();
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![0, 1]], UNBOUNDED);
+    dispatcher.share_pushes(&[PipelineId(0), PipelineId(1)]);
+    // Both sources closed, so each may finish.
+    dispatcher.close(PipelineId(1));
+    for pipeline in [PipelineId(0), PipelineId(1)] {
+        dispatcher.finish_by_hand(pipeline, |pushes| {
+            pushes.push(&all, |guard, _| vec![guard.clone()]);
+        });
+    }
+}
+
 /// A breaker's final guard pushed twice pushes it once: the second push is of what the breaker
 /// decided since, which is nothing.
 #[test]
@@ -1821,4 +1839,35 @@ fn an_added_step_pipeline_waits_for_its_body_and_its_claim_hold() {
     assert_eq!(pipeline, PipelineId(0));
     dispatcher.finish(dispatcher.pushes(pipeline));
     assert!(matches!(dispatcher.try_claim(None), Next::Done));
+}
+
+#[test]
+fn appended_shared_pushes_are_deduplicated_without_reusing_the_original_graphs_record() {
+    let reads = vec![vec![], vec![0], vec![], vec![], vec![2, 3]];
+    let breakers: Vec<BreakerHandle> = (0..reads.len())
+        .map(|_| Scripted::holding(ints().universal_guard()) as BreakerHandle)
+        .collect();
+    wire(&reads, &breakers);
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    let mut body = Dispatcher::new(vec![vec![], vec![], vec![0, 1]], UNBOUNDED);
+    body.share_pushes(&[PipelineId(0), PipelineId(1)]);
+    assert_eq!(dispatcher.append_graph(body), 2);
+
+    for pipeline in [0, 2, 3] {
+        let mut pushes = dispatcher.pushes(PipelineId(pipeline));
+        {
+            let breaker = breakers[pipeline].borrow();
+            pushes.push_final(breaker.as_producer().expect("a scripted breaker pushes"));
+        }
+        dispatcher.land(pushes);
+    }
+    for expected in [1, 4] {
+        let Next::Package(package) = dispatcher.try_claim(None) else {
+            panic!("each graph's reader receives one retained-output package")
+        };
+        assert_eq!(package.pipeline, PipelineId(expected));
+        assert_eq!(package.guard, ints().universal_guard());
+        dispatcher.acknowledge(package);
+    }
+    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
 }

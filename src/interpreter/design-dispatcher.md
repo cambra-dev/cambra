@@ -6,7 +6,7 @@
 one reads and so which one reads it, a queue of work packages per pipeline, and the morsel size
 `morsel_rows`. A work package is a pipeline, a guard for its
 breaker to consume, one morsel of at most `morsel_rows` held rows, and the package's index in the pipeline's queue. The dispatcher holds no breaker: the driver,
-`run`, reaches each breaker through a handle its caller passes, indexed by pipeline, and borrows it
+`run`, reaches each breaker, with the input it consumes, through a handle its caller passes, indexed by pipeline, and borrows it
 for one call at a time.
 
 `Dispatcher::new` refuses a zero morsel size, a graph with a cycle, and a pipeline that reads one
@@ -37,15 +37,16 @@ and stops once every pipeline has finished.
 `Pushes::push_final` pushes what a breaker has decided and its pipeline has not pushed before, its
 final guard less the region pushed, one package per morsel the breaker cuts it into
 (`BreakingProducer::morsels`); a breaker no pipeline reads cuts nothing. The dispatcher keeps each
-pipeline's pushed region. A push computes the difference and grows the region in one
-step under that region's lock, so two threads pushing for one pipeline push disjoint regions, and a
-push, after a consume or at its finish, pushes only what no earlier push did. The driver
-lands a push made after a consume at once (`Dispatcher::land`), before it acknowledges the package,
-so a reader may claim it while the pipeline runs; the finish lands its own push and closes the queue
-of each pipeline that reads it, where every other pipeline that one reads has finished. A breaker
-whose output is one value, `Aggregate`, `ExtractAggregate` and `ExtractFinal`, pushes one morsel.
-`Memo` and `MapAggregate` cut at the outermost keys they hold, in key order (`cut_at_keys`): a cut
-falls before every `morsel_rows`-th held key the guard names, the first morsel reaches down from the
+breaker's pushed region, which the pipelines of one breaker share
+(`Dispatcher::share_pushes`). A push computes the difference and grows the region in one step under
+that region's lock, so two threads pushing for one pipeline push disjoint regions, and a push, after
+a consume or at its finish, pushes only what no earlier push did. The driver lands a push
+made after a consume at once (`Dispatcher::land`), before it acknowledges the package, so a reader
+may claim it while the pipeline runs; the finish lands its own push and closes the queue of each
+pipeline that reads it, where every other pipeline that one reads has finished. A breaker whose
+output is one value, `Aggregate`, `ExtractAggregate` and `ExtractFinal`, pushes one morsel. `Memo`
+and `MapAggregate` cut at the outermost keys they hold, in key order (`cut_at_keys`): a cut falls
+before every `morsel_rows`-th held key the guard names, the first morsel reaches down from the
 guard's lower end and the last is open above. The morsels partition the guard exactly. A key the
 breaker states absent rides in the morsel that covers it, so the releases of a reader's input at its
 morsels add up to the whole guard, and a reader that is final once its input is released whole, such
@@ -101,14 +102,15 @@ consumer with other inputs, a store's with its seeds and the drive's with the st
 (`IterateExtent`) keeps its consumer too. A producer is identified by its address, since
 `producer_id` counts per producer type. A breaker a second reader reaches keeps its pipeline, and a
 reader that reaches one along two paths, as a filter reads its input for the values and the
-predicate, reads it once. A pipeline that reads directly a pipeline another pipeline reads is
-refused, since only a fan-out slot keeps one reader's release from removing what another still
-reads. A store, or a loop's scope, is the breaker of a pipeline of its own
-([A store as a breaker](design-operators.md#a-store-as-a-breaker), [A loop in rounds](#a-loop-in-rounds)), which the
-walk plans where it reaches a reader slot of the store's fan-out (`TileProducer::store_read`).
-Each package reaches its breaker by walking the chains again, and the pushes a call makes land
-once the walk has returned, since a breaker reached through a fan-out slot is called while the walk
-holds the fan-out its push climbs.
+predicate, reads it once. A pipeline that reads directly a pipeline another breaker's pipeline reads
+is refused, since only a fan-out slot keeps one reader's release from removing what another still
+reads. The pipelines of one store's inputs count as one reader: the store pulls and releases a seed
+once, when it opens. A store is the breaker of a pipeline per input, and a loop's scope of a
+pipeline of its own ([A store as a breaker](design-operators.md#a-store-as-a-breaker),
+[A loop in rounds](#a-loop-in-rounds)), which the walk plans where it reaches a reader slot of the
+store's fan-out (`TileProducer::store_read`). Each package reaches its breaker by walking the chains
+again, and the pushes a call makes land once the walk has returned, since a breaker reached through
+a fan-out slot is called while the walk holds the fan-out its push climbs.
 
 Before the run, each edge from a pipeline to the pipeline that reads it is probed: the read
 pipeline's breaker pushes `Everything` through its consumer into a landing that records what reaches
@@ -165,8 +167,6 @@ a `Refused` error that names the shape, and pull mode runs every refused program
 - a live source whose arrivals reach no pipeline's entry, reach one as a region that is no
   projection of its keys, or reach a pipeline that also reads pushes (below);
 - a pipeline read directly by a pipeline another pipeline reads;
-- a breaker with no consuming mode (`Breaker::no_consuming_mode`): a transaction store of several
-  writers;
 - the stores [A store as a breaker](design-operators.md#a-store-as-a-breaker) lists.
 
 A range over a live source's domain (`TileProducer::data_sources`, an `IterateExtent` over a
@@ -187,8 +187,9 @@ in one of four ways (`LivePipeline::poll`):
   delivery's keys as positions of its rounds. Where it reaches no drive of the scope, the source is
   read inside a loop nested in it, whose rows end only once the source yields everything, so the
   scope reads its input whole then, as pull mode waits for each row.
-- The range is read under a transaction store, whose input is its writer's source, read behind an
-  entry no planner places: the store's pipeline is notified of each delivery's keys as its items.
+- The range is read under a writer of a transaction store, whose source is the input of the
+  writer's pipeline, read behind an entry no planner places: that pipeline is notified of each
+  delivery's keys as its items.
 
 A drive and a transaction store decide positions in order, and a debug build checks that a delivery
 adds positions after every one before it. A dispatched run delivers no notification: a loop's scope

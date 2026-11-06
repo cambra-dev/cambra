@@ -43,8 +43,8 @@ use crate::{
         scalar_expr,
         tile_operators::{
             Aggregate, CheckedLookup, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut,
-            Filter, FlattenTupleDomain, IterateExtent, Lookup, MakeRecord, MapAggregate, MapDomain,
-            MapExtractAggregate, MapResult, MapResultToConst, MapResultToConstMode,
+            Filter, FlattenTupleDomain, IterateExtent, KeyOrder, Lookup, MakeRecord, MapAggregate,
+            MapDomain, MapExtractAggregate, MapResult, MapResultToConst, MapResultToConstMode,
             MapResultWithSource, Memo, PermuteRecordDomain, Product, ReadingSource, Readings,
             RekeySorted, Restrict, SelectField, TileOperator, Tiling, Uncurry, UnionOperator,
             VariantIs, VariantProject, VariantWrap, zip_arms_at, zip_arms_named_at,
@@ -1403,7 +1403,8 @@ records one and the only site a `Transact` reaches"
             // it is not recomputable the kept iteration is the whole of what is
             // available, so it is taken and the loop is reported as beginning
             // above its input ([`unreadable_inputs`](Self::unreadable_inputs)).
-            if continues || released.is_none() || !self.recomputable(term) {
+            // A kept iteration nothing has released still offers its beginning.
+            if continues || !kept.fan().released_any() || !self.recomputable(term) {
                 self.reuse.kept += 1;
                 self.keep_region(term, kept.fan());
                 let fan = kept.fan().clone();
@@ -4169,7 +4170,12 @@ fn build_commit_store(
         .collect();
     let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
 
-    for ((set_writer, w), taps) in setters.into_iter().zip(writers.iter()).zip(per_writer_taps) {
+    for (writer_index, ((set_writer, w), taps)) in setters
+        .into_iter()
+        .zip(writers.iter())
+        .zip(per_writer_taps)
+        .enumerate()
+    {
         // Attribute this writer's operators to the writer, not to the binding
         // the whole store hangs off. Without this every operator of a
         // transaction resolves to one span, since each is minted after its
@@ -4182,12 +4188,8 @@ fn build_commit_store(
             ))
         })?;
         let item_extent = ctx.extent_of(&item_ty)?;
-        // A drive counts commits against the positions its source offers, so
-        // where it starts is whatever the source it is handed still has. A source
-        // this version keeps has already passed some of them. A freshly-built one
-        // starts at `0` whatever the source has done: this drive finds its next
-        // item by scanning up from its cursor, so an advanced source costs it a
-        // comparison, where the induction drive's window would stall.
+        // A transaction drive attempts the source items still offered, acknowledges each key
+        // separately, and resumes with its predecessor's released prefix where one is supplied.
         // A source reading an earlier writer's item tap reads it back from this store through
         // the recurrence slot, as the writers read their snapshots: the source is in the
         // store's own input chain. Its value at an item is final at that writer's commit for
@@ -4214,6 +4216,7 @@ fn build_commit_store(
             let fan = Rc::new(FanOut::new(Box::new(RekeySorted::new(
                 stream,
                 items_of_tap(items, &info.runtime_key),
+                items.order(&info.runtime_key),
             ))));
             scope.rebuilt.insert(fed.name.clone());
             let binding = LetBinding {
@@ -4246,6 +4249,18 @@ fn build_commit_store(
                     })
             })
             .collect::<Result<_, _>>()?;
+        // The source's positions, which the drive's rows and the writer's proposals carry each
+        // item's in.
+        let Tiling::DataFunction {
+            domain: item_positions,
+            ..
+        } = source_op.tiling().clone()
+        else {
+            return Err(ConversionError::TypeError(format!(
+                "a transaction source is a collection, got {}",
+                source_op.tiling()
+            )));
+        };
         let driver = TransactDriver::new(
             // The driver is placed inside this store by `set_writer` below, so
             // its read of the store is a recurrence rather than a reader.
@@ -4255,13 +4270,11 @@ fn build_commit_store(
             read_extents,
             item_extent,
             drive_resume,
-            // A tap commits with its item's position, which the driver's rows carry for the
-            // writer.
-            !taps.is_empty(),
+            writer_index,
         );
         // Two slots of the driver: the body consumes rows, and the writer acks
-        // finished attempts. The driver advances its item cursor on the release
-        // *intersection*, so a body's consume-release cannot advance it past an
+        // finished attempts. The driver removes its source item on the release
+        // *intersection*, so a body's consume-release cannot acknowledge an
         // attempt still in flight — and so this is the one fan whose input is **not**
         // memoized. A `Memo` releases its input as soon as it caches, which reaches the
         // driver as an ack for an attempt no slot has finished.
@@ -4274,7 +4287,12 @@ fn build_commit_store(
         // domain, whatever the `Transact` sits in.
         let body_op = convert_at(
             &w.body,
-            Some(Box::new(Memo::new(driver_fan.slot()))),
+            // The drive's stream is its rows and what it has decided of its source; the body
+            // reads the rows.
+            Some(Box::new(Memo::new(Box::new(SelectField::new(
+                driver_fan.slot(),
+                crate::interpreter::commit_operator::TRANSACT_ROWS,
+            ))))),
             CurryLevel::new(1),
             ctx,
         )?;
@@ -4291,7 +4309,9 @@ fn build_commit_store(
             let Extent::Record(pair) = &tap_value_extent else {
                 unreachable!("a tap keyed by item stores `(item position, value)` pairs")
             };
-            committed_items.track(store_key(&field), pair[&tuple_field(0)].clone());
+            let positions = pair[&tuple_field(0)].clone();
+            let order = KeyOrder::of_items(&positions);
+            committed_items.track(store_key(&field), positions, order);
             let prior = keys_map.insert(
                 field.clone(),
                 KeyReadInfo {
@@ -4328,6 +4348,7 @@ fn build_commit_store(
             tap_fields.iter().map(Label::runtime_key).collect(),
             key_extent.clone(),
             value_extent.clone(),
+            item_positions,
         );
         set_writer(Box::new(writer));
     }
@@ -5691,7 +5712,12 @@ fn convert_store_read(
             // commits its items in its source's order.
             Ok(match by_item {
                 Some(items) => {
-                    Box::new(RekeySorted::new(stream, items_of_tap(&items, &runtime_key)))
+                    let order = items.order(&runtime_key);
+                    Box::new(RekeySorted::new(
+                        stream,
+                        items_of_tap(&items, &runtime_key),
+                        order,
+                    ))
                 }
                 None => stream,
             })

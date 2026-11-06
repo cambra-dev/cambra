@@ -1,22 +1,24 @@
 use super::*;
 use crate::interpreter::operator_graph::value;
 use crate::interpreter::scheduler::restating;
-use crate::interpreter::{ColumnValue, Consumer, Extent, Scheduler, Value, tuple_field};
+use crate::interpreter::{BaseType, ColumnValue, Consumer, Extent, Scheduler, Value, tuple_field};
 
 /// Re-keys a collection of pairs by each pair's first component, `𝐾 ⤇ (𝐽, 𝑉)` to `𝐽 ⤇ 𝑉`, where
-/// those keys are distinct and rise with the input's own key order: the `map` constructor's
-/// re-keying (group by the new key, then take the group's one element) for input that states
-/// its new keys in sorted order.
+/// those keys are distinct: the `map` constructor's re-keying (group by the new key, then take the
+/// group's one element) for input whose every new key appears once.
 ///
 /// Its one use is a commit store's reply tap (`src/ccl/design/mutability.md`, "Replies ride
 /// their transaction"): the tap's `StoreValueStream`, `Txn ⤇ (𝐼, 𝑉)`, holds the item position the
-/// writer committed each value with, and a site commits its items once each and in its source's
-/// order. No CCL term names it: op-conversion builds it for the read.
+/// writer committed each value with, and a site commits its items once each. No CCL term names
+/// it: op-conversion builds it for the read.
 ///
-/// The rising keys are what the operator is for. Once the input is complete through a
-/// position, no later position carries a key at or below the one there, so the output is
-/// complete through that key: an entry is final as soon as the input is complete through it,
-/// where a group-by of the pairs could close no group before the whole input completes.
+/// Where the keys rise with the input's own key order ([`KeyOrder::Rising`]), as a site's do
+/// when it commits its items in its source's order, the rising keys are what the operator is
+/// for. Once the input is complete through a position, no later position carries a key at or
+/// below the one there, so the output is complete through that key: an entry is final as soon
+/// as the input is complete through it, where a group-by of the pairs could close no group before
+/// the whole input completes. Where they need not ([`KeyOrder::Any`]), the output states complete
+/// the keys of the rows the input states complete, and the rest once the input completes.
 ///
 /// A release names output keys, and the input is released by its own positions. Under rising
 /// keys a prefix of keys is a prefix of positions, so the operator forwards the longest prefix
@@ -41,12 +43,38 @@ pub struct RekeySorted {
     key: Extent,
     /// A region of input positions restated as the output keys at those positions.
     restate: Rc<dyn Fn(&Projection) -> Projection>,
+    /// Whether the keys rise with the input's positions.
+    order: KeyOrder,
+}
+
+/// How the new keys of [`RekeySorted`]'s input are ordered against its positions.
+#[derive(Clone, Copy)]
+pub enum KeyOrder {
+    /// Each position carries a key above every key at the positions before it.
+    Rising,
+    /// The keys come in any order.
+    Any,
+}
+
+impl KeyOrder {
+    /// The order a site commits its items in, from its source's positions. A stream's positions,
+    /// `UInt`s or a range of them, are delivered in their own order, so its items commit rising.
+    /// Any other source's need not be: a product's, a record of its dimensions' positions, and a
+    /// concatenation's, a union of its parts', deliver their parts independently, and a keyed
+    /// collection's keys, a group-by's say, arrive as their groups complete.
+    pub fn of_items(positions: &Extent) -> KeyOrder {
+        match positions {
+            Extent::Base(BaseType::UInt) | Extent::UIntRange(_) => KeyOrder::Rising,
+            _ => KeyOrder::Any,
+        }
+    }
 }
 
 impl RekeySorted {
     pub fn new(
         input: Box<dyn TileOperator>,
         restate: Rc<dyn Fn(&Projection) -> Projection>,
+        order: KeyOrder,
     ) -> Self {
         let (tiling, key) = rekeyed_tiling(input.tiling());
         Self {
@@ -54,6 +82,7 @@ impl RekeySorted {
             input,
             key,
             restate,
+            order,
         }
     }
 }
@@ -114,7 +143,7 @@ impl TileOperator for RekeySorted {
                 scheduler,
             ),
             held: Vec::new(),
-            complete_through: None,
+            complete: Complete::new(self.order),
             key: self.key.clone(),
         })
     }
@@ -125,11 +154,11 @@ struct RekeySortedProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
     /// The rows the input returned on the last pull, as `(key, position)` in the input's
-    /// order, which is also key order.
+    /// order, which is also key order under [`KeyOrder::Rising`].
     held: Vec<(Value, Value)>,
-    /// The highest key the output has called complete. It only rises, and a release of the
-    /// rows below it does not lower it.
-    complete_through: Option<Value>,
+    /// The keys the output has called complete. They only grow, and a release of their rows
+    /// does not shrink them.
+    complete: Complete,
     /// The output's domain ([`RekeySorted::key`]).
     key: Extent,
 }
@@ -194,7 +223,7 @@ impl TileProducer for RekeySortedProducer {
         // The precondition the completeness below rests on, so a violation stops here rather
         // than declaring a key complete that a later row carries.
         assert!(
-            rows.windows(2).all(|w| w[0].0 < w[1].0),
+            matches!(self.complete, Complete::Any(_)) || rows.windows(2).all(|w| w[0].0 < w[1].0),
             "RekeySorted's keys rise with its input's order"
         );
         // A released key is complete, so its row had arrived when it was released: a row
@@ -207,21 +236,34 @@ impl TileProducer for RekeySortedProducer {
             self.name()
         );
         for (key, at) in &rows {
-            if domain_predicate.contains(at)
-                && self.complete_through.as_ref().is_none_or(|c| key > c)
-            {
-                self.complete_through = Some(key.clone());
+            if domain_predicate.contains(at) {
+                self.complete.add(key);
             }
         }
-        self.held = rows;
-        let complete = if domain_predicate.is_true() {
-            Predicate::True
-        } else {
-            match &self.complete_through {
-                Some(key) => Predicate::at_or_below_in(key.clone(), &self.key),
-                None => Predicate::False,
-            }
+        let complete = match domain_predicate.is_true() {
+            true => Predicate::True,
+            false => self.complete.predicate(&self.key),
         };
+        // A collection's keys ascend, which keys in any order are put in.
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        order.sort_by(|&a, &b| {
+            rows[a]
+                .0
+                .partial_cmp(&rows[b].0)
+                .expect("the keys of one domain compare")
+        });
+        assert!(
+            order.windows(2).all(|w| rows[w[0]].0 != rows[w[1]].0),
+            "RekeySorted's keys are distinct"
+        );
+        let (keys, values) = match order.iter().enumerate().all(|(at, &row)| at == row) {
+            true => (keys, values),
+            false => (
+                keys.select_indices(order.iter().copied(), order.len()),
+                values.select_rows(&order),
+            ),
+        };
+        self.held = rows;
         let mut out = Tile::data_function(keys, Box::new(values), complete, deleted);
         // The rows above a gap in the released keys, which the input still holds.
         let released = self.obsolete_guard().clone();
@@ -258,6 +300,48 @@ impl TileProducer for RekeySortedProducer {
     }
 }
 
+/// The keys a [`RekeySortedProducer`] has called complete.
+enum Complete {
+    /// Under [`KeyOrder::Rising`], every key through the highest complete one, `None` before
+    /// any.
+    Through(Option<Value>),
+    /// Under [`KeyOrder::Any`], the complete keys themselves.
+    Any(Predicate),
+}
+
+impl Complete {
+    fn new(order: KeyOrder) -> Complete {
+        match order {
+            KeyOrder::Rising => Complete::Through(None),
+            KeyOrder::Any => Complete::Any(Predicate::False),
+        }
+    }
+
+    /// Call `key`'s row complete.
+    fn add(&mut self, key: &Value) {
+        match self {
+            Complete::Through(through) => {
+                if through.as_ref().is_none_or(|through| key > through) {
+                    *through = Some(key.clone());
+                }
+            }
+            Complete::Any(keys) if !keys.contains(key) => {
+                *keys = keys.union(&Predicate::point(key.clone()));
+            }
+            Complete::Any(_) => {}
+        }
+    }
+
+    /// The complete keys over the output's domain `key`.
+    fn predicate(&self, key: &Extent) -> Predicate {
+        match self {
+            Complete::Through(None) => Predicate::False,
+            Complete::Through(Some(through)) => Predicate::at_or_below_in(through.clone(), key),
+            Complete::Any(keys) => keys.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,13 +375,21 @@ mod tests {
 
     /// A producer over `input`, pulled once, with the guards it forwards upstream.
     fn pulled(input: Tile) -> (RekeySortedProducer, Tile, Rc<RefCell<Vec<TileGuard>>>) {
+        pulled_in(input, KeyOrder::Rising)
+    }
+
+    /// [`pulled`] for keys ordered as `order` says.
+    fn pulled_in(
+        input: Tile,
+        order: KeyOrder,
+    ) -> (RekeySortedProducer, Tile, Rc<RefCell<Vec<TileGuard>>>) {
         let (spy, released) = ReleaseSpy::new(input, pair_tiling());
         let (tiling, key) = rekeyed_tiling(&pair_tiling());
         let mut producer = RekeySortedProducer {
             base: ProducerBase::unowned(RekeySortedProducer::alloc_id(), &tiling),
             input: Box::new(spy),
             held: Vec::new(),
-            complete_through: None,
+            complete: Complete::new(order),
             key,
         };
         let out = producer.get(tiling.universal_guard());
@@ -395,6 +487,57 @@ mod tests {
         };
         assert_eq!(domain, ColumnValue::from_uints(vec![1]));
         assert_eq!(*codomain, Tile::Scalar(ColumnValue::Ints(vec![20])));
+    }
+
+    /// Keys in any order are answered in key order, and each is complete where its row is.
+    #[test]
+    fn keys_in_any_order_are_complete_where_their_rows_are() {
+        let (_, out, _) = pulled_in(
+            pairs(
+                &[3, 7, 9],
+                &[0, 2, 1],
+                &[10, 20, 30],
+                Predicate::at_or_below(uint(7)),
+            ),
+            KeyOrder::Any,
+        );
+        let Tile::DataFunction {
+            domain,
+            codomain,
+            domain_predicate,
+            ..
+        } = out
+        else {
+            panic!("expected a collection")
+        };
+        assert_eq!(domain, ColumnValue::from_uints(vec![0, 1, 2]));
+        assert_eq!(*codomain, Tile::Scalar(ColumnValue::Ints(vec![10, 30, 20])));
+        assert_eq!(
+            domain_predicate,
+            Predicate::point(uint(0)).union(&Predicate::point(uint(2)))
+        );
+    }
+
+    /// Under keys in any order, the input is released through the last position whose key, and
+    /// every key at a position before it, is released.
+    #[test]
+    fn keys_in_any_order_release_a_position_prefix() {
+        let (mut producer, _, released) = pulled_in(
+            pairs(&[3, 7, 9], &[0, 2, 1], &[10, 20, 30], Predicate::True),
+            KeyOrder::Any,
+        );
+        producer.release(keys(Predicate::point(uint(1))));
+        assert!(released.borrow().is_empty(), "{:?}", released.borrow());
+        producer.release(keys(Predicate::point(uint(0))));
+        assert_eq!(
+            *released.borrow(),
+            vec![keys(Predicate::at_or_below(uint(3)))]
+        );
+        producer.release(keys(Predicate::point(uint(2))));
+        assert_eq!(
+            released.borrow().last(),
+            Some(&keys(Predicate::at_or_below(uint(9))))
+        );
     }
 
     #[test]
