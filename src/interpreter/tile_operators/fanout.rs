@@ -751,6 +751,19 @@ impl TileProducer for FanOutProducer {
         }
     }
 
+    /// A reader slot visits its fan-out's input. A recurrence slot visits nothing: it sits in a
+    /// store's cycle, beneath the store's reader slot, and the walk refuses a store
+    /// (`dispatcher::store_of`).
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        let FanHold::Reader { shared, .. } = &self.hold else {
+            return;
+        };
+        if let Some(input) = &mut shared.borrow_mut().producer {
+            visit("input", &mut **input);
+        }
+    }
+
     /// No children: a fan-out's input is one producer however many slots read it, so a
     /// slot does not list it.
     fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
@@ -977,6 +990,13 @@ impl TileOperator for Memo {
     ) -> Box<dyn TileProducer> {
         let arrivals = Arrivals::new();
         let (consumer, gate) = shared_consumer(consumer);
+        let (entry, placement) = crate::interpreter::dispatcher::Entry::unplaced(
+            self.input.tiling().clone(),
+            arrivals.consumer(forwarding_consumer_keeping_keys(
+                &consumer,
+                &scheduler.wakeup_queue(),
+            )),
+        );
         Box::new(MemoProducer::new(
             ProducerBase::new(
                 MemoProducer::alloc_id(),
@@ -984,15 +1004,10 @@ impl TileOperator for Memo {
                 &self.base,
                 scheduler,
             )
-            .sharing(gate),
-            self.input.subscribe(
-                intent_guard,
-                arrivals.consumer(forwarding_consumer_keeping_keys(
-                    &consumer,
-                    &scheduler.wakeup_queue(),
-                )),
-                scheduler,
-            ),
+            .sharing(gate)
+            .breaking(consumer.shared().clone(), placement),
+            self.input
+                .subscribe(intent_guard, Box::new(entry), scheduler),
             arrivals,
             consumer,
             scheduler.wakeup_queue(),
@@ -1252,6 +1267,16 @@ impl TileProducer for MemoProducer {
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("input", &*self.input);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
+    }
+
+    #[cfg(test)]
+    fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
+        Some(self)
     }
 
     fn restates(&self) -> Restates {
