@@ -48,6 +48,15 @@ function pressReload(view: SourceView): boolean {
   );
 }
 
+/** Press `Mod-Shift-Enter` in `view`. */
+function pressRestart(view: SourceView): boolean {
+  return runScopeHandlers(
+    view.view,
+    new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, shiftKey: true }),
+    "editor",
+  );
+}
+
 /** Type `text` at the end of `view`'s document. */
 function typeAtEnd(view: SourceView, text: string): void {
   const end = view.view.state.doc.length;
@@ -71,7 +80,7 @@ describe("the source pane under an edit session", () => {
     typeAtEnd(view, "# edit\n");
 
     expect(pressReload(view)).toBe(true);
-    expect(send).toHaveBeenCalledWith(`${listMin.source.text}# edit\n`);
+    expect(send).toHaveBeenCalledWith("reload", `${listMin.source.text}# edit\n`);
     await settle();
     // Still edited: the redraw that installs the version has not happened.
     expect(body.querySelector(".edit-status")?.textContent).toMatch(/^edited/);
@@ -130,23 +139,25 @@ describe("the source pane under an edit session", () => {
 describe("the source pane once the run has finished", () => {
   beforeAll(stubLayout);
 
-  it("stops taking typing, and says why", () => {
-    const { session, send } = sessionAnswering({ kind: "reloaded", kept: 0, bound: 0 });
+  // A finished program takes no reload, and a restart runs it again, so the
+  // pane keeps taking typing and the strip says which chord is left.
+  it("sends no reload, restarts on Mod-Shift-Enter, and says so", async () => {
+    const { session, send } = sessionAnswering({ kind: "restarted" });
     const { view, body } = mount(listMin, session);
     session.finish();
 
-    expect(view.view.state.facet(EditorState.readOnly)).toBe(true);
-    expect(pressReload(view)).toBe(false);
-    expect(send).not.toHaveBeenCalled();
+    expect(view.view.state.facet(EditorState.readOnly)).toBe(false);
     expect(body.querySelector(".edit-status")?.textContent).toBe(
-      "the program has finished · a finished program takes no reload",
+      "the program has finished · Ctrl+Shift+Enter restarts it with this text",
     );
-  });
+    pressReload(view);
+    expect(send).not.toHaveBeenCalled();
 
-  it("is drawn read-only when it was finished before the redraw", () => {
-    const { session } = sessionAnswering({ kind: "reloaded", kept: 0, bound: 0 });
-    session.finish();
-    expect(mount(listMin, session).view.view.state.facet(EditorState.readOnly)).toBe(true);
+    typeAtEnd(view, "# again\n");
+    expect(pressRestart(view)).toBe(true);
+    expect(send).toHaveBeenCalledWith("restart", `${listMin.source.text}# again\n`);
+    await settle();
+    expect(statusLine(session.get(), false).text).toBe("restarted from a fresh compile");
   });
 });
 
