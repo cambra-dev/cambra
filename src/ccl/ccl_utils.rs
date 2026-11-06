@@ -3098,6 +3098,11 @@ impl RecordingDerivations {
         DERIVATIONS.with(|d| *d.borrow_mut() = Some(HashMap::new()));
         RecordingDerivations(())
     }
+
+    /// Forget every derivation recorded so far, for a run that starts over.
+    pub(crate) fn restart(&mut self) {
+        DERIVATIONS.with(|d| *d.borrow_mut() = Some(HashMap::new()));
+    }
 }
 
 impl Drop for RecordingDerivations {

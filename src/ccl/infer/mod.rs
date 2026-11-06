@@ -82,6 +82,7 @@ use solver::smt::SmtError;
 // `Name` is no longer debug-only: `lit_singleton` builds its predicate over the
 // refinement binder in every build.
 use crate::ccl::Name;
+use crate::ccl::provenance::NodeId;
 use solve::check_scope_valid;
 
 /// Build a structural product [`Type`] from a `FieldKey`-keyed field map:
@@ -139,10 +140,7 @@ pub(super) fn variant_type(tags: BTreeMap<FieldKey, Type>) -> Type {
 /// Falls back to the root, so a span can be coarse but never wrong — an interior place
 /// is exactly the case where that can happen. Only reached on a failure path, so the
 /// walk costs nothing in the passing case.
-fn blame_node_for_place(
-    expr: &Expr,
-    uids: &[crate::ccl::InferVarId],
-) -> crate::ccl::provenance::NodeId {
+fn blame_node_for_place(expr: &Expr, uids: &[crate::ccl::InferVarId]) -> NodeId {
     /// Structural only — deliberately does **not** follow a variable's bounds. The
     /// question is which node's type *is written in terms of* this variable, and
     /// chasing bounds would answer a different one (nearly every node, transitively).
@@ -203,7 +201,7 @@ fn blame_node_for_place(
         );
         own || annotated || cast
     }
-    fn go(e: &Expr, uid: crate::ccl::InferVarId) -> Option<crate::ccl::provenance::NodeId> {
+    fn go(e: &Expr, uid: crate::ccl::InferVarId) -> Option<NodeId> {
         if owns(e, uid) {
             return Some(e.node_id());
         }
@@ -725,11 +723,12 @@ pub(crate) fn case_result_ty<'a>(
 /// the public [`crate::ccl::infer::TypeInferenceContext`] and are
 /// normalized (holes → fresh vars) up front.
 pub(crate) fn run(
+    arena: &mut InferArena,
     expr: &mut Expr,
     sources: &HashMap<String, Type>,
     instances: &Rc<solver::traits::InstanceTable>,
 ) -> Result<Type, Vec<LocatedInferError>> {
-    run_with_params(expr, sources, instances, &[], &HashSet::new()).map(|(ty, _, _)| ty)
+    run_with_params(arena, expr, sources, instances, &[], &HashSet::new()).map(|(ty, _, _)| ty)
 }
 
 /// The scheme each generalized binding a module check reports was bound at.
@@ -743,13 +742,243 @@ pub(crate) type OpenedVars = HashMap<crate::ccl::InferVarId, Rc<crate::ccl::ty::
 /// also returning the scheme each generalized binding in `reported` is bound at
 /// ([`typing::Typing::note_scheme`]), and the variable each parameter with no kind
 /// written is opened as.
+///
+/// A run whose emission recovered from a statement stops after emission, and inference
+/// starts over in `arena`, restarted, on a copy of `expr` as it was, with the expression of
+/// each statement recovered from replaced by the [`Error`](crate::ccl::TypedExprNode::Error)
+/// stand-in. A run the barrier check or the requirement sweep stops starts over the same
+/// way, without the statements enclosing their failures ([`failed_in_statements`]). The
+/// statements left in are then solved over a graph holding exactly their constraints, and
+/// what that run reports is added, but for a value it leaves undetermined
+/// ([`InferError::is_undetermined`]): the missing statements' constraints may be what
+/// determines it. Each run that stops so again starts over the same way. See
+/// `src/ccl/design/type-inference.md`, "An error stops its statement, not the pass".
 pub(crate) fn run_with_params(
+    arena: &mut InferArena,
     expr: &mut Expr,
     sources: &HashMap<String, Type>,
     instances: &Rc<solver::traits::InstanceTable>,
     params: &[ModuleCheckParam],
     reported: &HashSet<Name>,
 ) -> Result<(Type, NotedSchemes, OpenedVars), Vec<LocatedInferError>> {
+    // Emission rewrites the tree it types, so a run that starts over needs it as it was: a
+    // snapshot, at the same identities, since the statements recovered from are named by
+    // node. Neither copy joins the tree `expr` is.
+    let pristine = expr.clone_preserving_ids();
+    let RunFailure {
+        mut errors,
+        mut recovered,
+    } = match run_once(expr, sources, instances, params, reported) {
+        Ok(typed) => return Ok(typed),
+        Err(failure) => failure,
+    };
+    let mut stood_in: HashMap<NodeId, StandIn> = HashMap::new();
+    loop {
+        // A statement recovered from stands in; one that is recovered from as a stand-in
+        // stands in bare. Each statement goes the two steps at most, so this ends.
+        let mut changed = false;
+        for node in recovered {
+            let next = match stood_in.get(&node) {
+                None => StandIn::Expression,
+                Some(StandIn::Expression) => StandIn::Bare,
+                Some(StandIn::Bare) => continue,
+            };
+            stood_in.insert(node, next);
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+        arena.restart();
+        let mut rest = pristine.clone_preserving_ids();
+        stand_in_for_recovered(&mut rest, &stood_in);
+        let Err(failure) = run_once(&mut rest, sources, instances, params, reported) else {
+            break;
+        };
+        // A run reports every failure of each check it reaches, so a later run's failure
+        // saying what an earlier one said is that failure, met again: at the same node,
+        // or at another one when the statement left out is not the one the failure was
+        // blamed in.
+        let said: HashSet<String> = errors.iter().map(|e| format!("{:?}", e.error)).collect();
+        errors.extend(
+            failure.errors.into_iter().filter(|e| {
+                !e.error.is_undetermined() && !said.contains(&format!("{:?}", e.error))
+            }),
+        );
+        recovered = failure.recovered;
+    }
+    drop_met_downstream(&pristine, &mut errors);
+    Err(errors)
+}
+
+/// Drop each error whose value came from inside a join already reported as having no common
+/// type (`src/ccl/design/diagnostics.md`, "One report per defect"): `x + 1` over the
+/// elements of `[1, "a"]` fails at `"a"` because the list joins `Int` and `String`, and fixing
+/// the list fixes both. The join is the defect, and the error is it met downstream.
+fn drop_met_downstream(tree: &Expr, errors: &mut Vec<LocatedInferError>) {
+    fn find(e: &Expr, node: NodeId) -> Option<&Expr> {
+        if e.node_id() == node {
+            return Some(e);
+        }
+        let mut found = None;
+        e.walk_children(|c| {
+            if found.is_none() {
+                found = find(c, node);
+            }
+        });
+        found
+    }
+    fn collect(e: &Expr, out: &mut HashSet<NodeId>) {
+        out.insert(e.node_id());
+        e.walk_children(|c| collect(c, out));
+    }
+    let mut joined: HashSet<NodeId> = HashSet::new();
+    for error in errors.iter() {
+        if let InferError::IncompatibleBounds { polarity: true, .. } = error.error
+            && let Some(join) = find(tree, error.node_id)
+        {
+            collect(join, &mut joined);
+        }
+    }
+    if joined.is_empty() {
+        return;
+    }
+    errors.retain(|error| {
+        matches!(
+            error.error,
+            InferError::IncompatibleBounds { polarity: true, .. }
+        ) || !error.related.iter().any(|related| {
+            related.role == RelatedRole::Value
+                && matches!(related.origin, crate::ccl::infer_var::Origin::Node(node)
+                        if joined.contains(&node))
+        })
+    });
+}
+
+/// Why one run of inference ([`run_once`]) failed.
+struct RunFailure {
+    /// What it reports.
+    errors: Vec<LocatedInferError>,
+    /// The expression of each statement a run that starts over leaves out: one emission
+    /// recovered from ([`typing::Typing::recover`]), when emission reached the end of the
+    /// tree, or one enclosing a failure of a check of the whole graph
+    /// ([`failed_in_statements`]). Empty when coalesce or a later pass failed, since those
+    /// report every failing node already.
+    recovered: Vec<NodeId>,
+}
+
+/// How much of a statement recovered from a run that starts over leaves out
+/// ([`run_with_params`]).
+#[derive(Clone, Copy)]
+enum StandIn {
+    /// Its expression: a `let` still binds at an exact annotation, and a `:=` at its
+    /// declared history.
+    Expression,
+    /// Its expression and its declared type, for a statement whose annotation fails on its
+    /// own: a `let` binds at a poison, and a `:=` at a history of undeclared value type.
+    Bare,
+}
+
+/// Replace each statement expression in `stood_in` with the
+/// [`Error`](crate::ccl::TypedExprNode::Error) stand-in: a `let`'s right-hand side, an
+/// expression statement's expression, a `:=`'s initializer, or a
+/// [`DefGroup`](crate::ccl::TypedExprNode::DefGroup) member's definition. A
+/// [bare](StandIn::Bare) one's statement loses its declared type too.
+fn stand_in_for_recovered(expr: &mut Expr, stood_in: &HashMap<NodeId, StandIn>) {
+    use crate::ccl::TypedExprNode;
+    /// Stand in for `part` if it is listed, returning whether to drop its declared type.
+    fn stand_in(part: &mut Expr, stood_in: &HashMap<NodeId, StandIn>) -> bool {
+        let Some(how) = stood_in.get(&part.node_id()) else {
+            return false;
+        };
+        part.node = TypedExprNode::Error;
+        part.ty = Type::Hole;
+        matches!(how, StandIn::Bare)
+    }
+    match &mut expr.node {
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            ..
+        } => {
+            if stand_in(bound_expr, stood_in) {
+                binding.user_annotation = None;
+            }
+        }
+        TypedExprNode::ExprStmt { expr: e, .. } => {
+            stand_in(e, stood_in);
+        }
+        TypedExprNode::MutDecl { binding, init, .. } => {
+            if stand_in(init, stood_in)
+                && let Some((domain, _, _)) = binding.ty.history_parts()
+            {
+                binding.ty = Type::mutable(domain.clone(), Type::Hole);
+            }
+        }
+        TypedExprNode::DefGroup { bindings, .. } => {
+            for (binding, def) in bindings {
+                if stand_in(def, stood_in) {
+                    binding.user_annotation = None;
+                }
+            }
+        }
+        _ => {}
+    }
+    expr.walk_children_mut(|child| stand_in_for_recovered(child, stood_in));
+}
+
+/// A run's failure in a check of the whole graph, the barrier check or the requirement
+/// sweep, which stops it before coalesce: `errors`, and the expression of the innermost
+/// statement enclosing each error's node, which a run that starts over leaves out as it
+/// leaves out a statement emission recovered from. An error no statement encloses names
+/// none.
+fn failed_in_statements(expr: &Expr, errors: Vec<LocatedInferError>) -> RunFailure {
+    use crate::ccl::TypedExprNode;
+    fn go(e: &Expr, within: Option<NodeId>, nodes: &HashSet<NodeId>, out: &mut Vec<NodeId>) {
+        let expression = match &e.node {
+            TypedExprNode::Let { bound_expr, .. } => Some(&**bound_expr),
+            TypedExprNode::ExprStmt { expr, .. } => Some(&**expr),
+            TypedExprNode::MutDecl { init, .. } => Some(&**init),
+            _ => None,
+        };
+        // A statement's own node is blamed for what its rule raises, an annotation
+        // mismatch, and stands for its expression.
+        if nodes.contains(&e.node_id())
+            && let Some(at) = expression.map(Expr::node_id).or(within)
+        {
+            out.push(at);
+        }
+        let members: Vec<&Expr> = match &e.node {
+            TypedExprNode::DefGroup { bindings, .. } => bindings.iter().map(|(_, d)| d).collect(),
+            _ => expression.into_iter().collect(),
+        };
+        e.walk_children(|child| {
+            let within = if members.iter().any(|m| std::ptr::eq(*m, child)) {
+                Some(child.node_id())
+            } else {
+                within
+            };
+            go(child, within, nodes, out);
+        });
+    }
+    let nodes = errors.iter().map(|e| e.node_id).collect();
+    let mut recovered = Vec::new();
+    go(expr, None, &nodes, &mut recovered);
+    RunFailure { errors, recovered }
+}
+
+/// One run of inference over `expr`, as [`run_with_params`] describes.
+fn run_once(
+    expr: &mut Expr,
+    sources: &HashMap<String, Type>,
+    instances: &Rc<solver::traits::InstanceTable>,
+    params: &[ModuleCheckParam],
+    reported: &HashSet<Name>,
+) -> Result<(Type, NotedSchemes, OpenedVars), RunFailure> {
+    let failed = |errors| RunFailure {
+        errors,
+        recovered: Vec::new(),
+    };
     // Convert source registry once; reuse across all node emissions.
     let mut sub_ctx = {
         let pre = InferCtx::new(HashMap::new(), expr.node_id());
@@ -763,7 +992,9 @@ pub(crate) fn run_with_params(
         ctx.instances = Rc::clone(instances);
         ctx
     };
-    let opened = sub_ctx.open_module_params(params).map_err(|e| vec![e])?;
+    let opened = sub_ctx
+        .open_module_params(params)
+        .map_err(|e| failed(vec![e]))?;
     sub_ctx.reported = reported.clone();
 
     // Pass 1: emit constraints. The high-value variants
@@ -772,10 +1003,9 @@ pub(crate) fn run_with_params(
     // one error per failing statement, each carrying the node whose rule raised
     // it (`Typing::raise`). An error no statement encloses ends the walk.
     //
-    // After any error the passes below do not run: the graph lacks the
-    // constraints the failed statements would have contributed, so the
-    // requirement sweep and coalesce would report those gaps rather than
-    // anything in the program.
+    // After any error the passes below do not run: the graph holds whatever
+    // constraints the failed statements wrote before they failed, and lacks the
+    // rest. `run_with_params` starts over without those statements instead.
     let emitted = emit_node(expr, &mut sub_ctx);
     let mut errors = std::mem::take(&mut sub_ctx.errors);
     // A method call the program's own statements deferred, and nothing after it resolved
@@ -792,11 +1022,16 @@ pub(crate) fn run_with_params(
                 .map(|call| call.unresolved()),
         );
     }
+    let recovered = if emitted.is_ok() {
+        std::mem::take(&mut sub_ctx.recovered)
+    } else {
+        Vec::new()
+    };
     if let Err(e) = emitted {
         errors.push(e);
     }
     if !errors.is_empty() {
-        return Err(errors);
+        return Err(RunFailure { errors, recovered });
     }
 
     // Check each barrier variable's upper bounds against its resolution. The checks add
@@ -804,7 +1039,7 @@ pub(crate) fn run_with_params(
     // variable's lower bounds and nothing else (`solver::barrier`).
     push_barrier_failures(&mut errors, expr.node_id(), "this value");
     if !errors.is_empty() {
-        return Err(errors);
+        return Err(failed_in_statements(expr, errors));
     }
 
     // The graph is complete here and nothing has been materialized yet — the one
@@ -841,7 +1076,8 @@ pub(crate) fn run_with_params(
             }
         }
         let mut cache = solver::ConstrainCache::new();
-        if let Err(failure) = solver::traits::resolve_operand_requirements(&mut cache) {
+        let failures = solver::traits::resolve_operand_requirements(&mut cache);
+        let located = failures.into_iter().map(|failure| {
             let (blame_vars, error) = match failure {
                 OperandFailure::Unsatisfiable { vars, requirements } => (
                     vars,
@@ -869,13 +1105,16 @@ pub(crate) fn run_with_params(
                     map_constrain_err(error, "a value an operator constrains"),
                 ),
             };
-            let node_id = blame_node_for_place(expr, &blame_vars);
-            return Err(vec![LocatedInferError {
+            LocatedInferError {
                 error,
-                node_id,
+                node_id: blame_node_for_place(expr, &blame_vars),
                 also: Box::default(),
                 related: RelatedPositions::default(),
-            }]);
+            }
+        });
+        let errors: Vec<_> = located.collect();
+        if !errors.is_empty() {
+            return Err(failed_in_statements(expr, errors));
         }
     }
     // Sealed *after* the requirement sweep, not before: the sweep itself narrows, and
@@ -905,7 +1144,7 @@ pub(crate) fn run_with_params(
     sub_ctx.name_varying_binders(&mut errors);
     sub_ctx.name_other_feed_places(&mut errors);
     if !errors.is_empty() {
-        return Err(errors);
+        return Err(failed(errors));
     }
 
     // Coalesce can retain a witness before its enclosing binder is known. Validate
@@ -913,7 +1152,7 @@ pub(crate) fn run_with_params(
     let mut scope_errors = Vec::new();
     check_scope_valid(expr, &Default::default(), &mut scope_errors);
     if !scope_errors.is_empty() {
-        return Err(scope_errors);
+        return Err(failed(scope_errors));
     }
     // Also inspect predicate, binder and target type slots, which the node-type scope
     // validator does not traverse for witness references. This additional walk is debug-only.

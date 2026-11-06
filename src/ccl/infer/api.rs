@@ -60,6 +60,23 @@ impl InferArena {
     /// while another is live trips a `debug_assert!` (see
     /// [`crate::ccl::arena_enter`]).
     pub fn new() -> Self {
+        Self::enter();
+        InferArena {
+            _derivations: crate::ccl::ccl_utils::RecordingDerivations::start(),
+            _not_send_sync: std::marker::PhantomData,
+        }
+    }
+
+    /// Tear down every variable minted so far and begin capturing again, for a run
+    /// that starts over: inference after a statement failed
+    /// ([`super::run_with_params`]).
+    pub(crate) fn restart(&mut self) {
+        Self::exit();
+        Self::enter();
+        self._derivations.restart();
+    }
+
+    fn enter() {
         crate::ccl::arena_enter();
         // The witness range index is per-run for the same reason the variable capture is:
         // it maps a binder minted by this run to the domains that run found it ranging
@@ -79,21 +96,9 @@ impl InferArena {
         crate::ccl::infer::solver::traits::unseal_emission();
         #[cfg(debug_assertions)]
         crate::ccl::subst::clear_dropped_entries();
-        InferArena {
-            _derivations: crate::ccl::ccl_utils::RecordingDerivations::start(),
-            _not_send_sync: std::marker::PhantomData,
-        }
     }
-}
 
-impl Default for InferArena {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Drop for InferArena {
-    fn drop(&mut self) {
+    fn exit() {
         let vars = crate::ccl::arena_exit();
         // Solving has ended, so every scope `Subst::acting_on` read has reached its final
         // size. A panicking run may have stopped mid-solve, with scopes still to grow.
@@ -119,6 +124,18 @@ impl Drop for InferArena {
             barrier.watches.borrow_mut().clear();
             barrier.checked.borrow_mut().take();
         }
+    }
+}
+
+impl Default for InferArena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for InferArena {
+    fn drop(&mut self) {
+        Self::exit();
     }
 }
 
@@ -770,6 +787,19 @@ pub enum InferError {
 }
 
 impl InferError {
+    /// Whether `self` says the program does not determine a type, rather than that what
+    /// it determines conflicts. Constraints a program lacks can raise such an error, and
+    /// none can raise any other: inference after a failed statement reports only the
+    /// others ([`super::run_with_params`]).
+    pub(crate) fn is_undetermined(&self) -> bool {
+        matches!(
+            self,
+            InferError::UnresolvedInfer { .. }
+                | InferError::UnresolvedTupleWidth { .. }
+                | InferError::UnresolvedMethod { receiver: None, .. }
+        )
+    }
+
     /// Whether the errors describe the same failure. Source labels and bound-binder
     /// spellings are presentation; the variant, semantic payload, and free identities
     /// distinguish failures. Callers compare source nodes or failing graph positions
@@ -2014,8 +2044,8 @@ pub fn infer(
     // — on the `Ok` and the `?`/error paths alike — its `Drop` clears every
     // variable's bounds, breaking the `Rc` cycles that would otherwise leak
     // the whole variable graph. See [`InferArena`].
-    let _arena = InferArena::new();
-    let ty = super::run(expr, &ctx.source_types, &ctx.instances);
+    let mut arena = InferArena::new();
+    let ty = super::run(&mut arena, expr, &ctx.source_types, &ctx.instances);
     #[cfg(debug_assertions)]
     if std::env::var_os("DUMP_KINDS").is_some() {
         eprintln!("=== kind vars ===\n{}", crate::ccl::ty::dump_kind_vars());
@@ -2046,9 +2076,15 @@ pub fn check_module(
     reported: &HashSet<Name>,
 ) -> Result<HashMap<Name, Contract>, Vec<LocatedInferError>> {
     // The arena tears down every variable the check mints, as for `infer`.
-    let _arena = InferArena::new();
-    let (_, schemes, opened) =
-        super::run_with_params(expr, &ctx.source_types, &ctx.instances, params, reported)?;
+    let mut arena = InferArena::new();
+    let (_, schemes, opened) = super::run_with_params(
+        &mut arena,
+        expr,
+        &ctx.source_types,
+        &ctx.instances,
+        params,
+        reported,
+    )?;
     let mut contracts: HashMap<Name, Contract> = schemes
         .into_iter()
         .map(|(name, mut scheme)| {

@@ -1037,6 +1037,11 @@ pub enum TypedExprNode {
     /// must inspect `errors` before consuming the lowered tree and abort the
     /// pipeline (no inference, no operator conversion) if non-empty.
     /// Downstream passes treat this variant as unreachable.
+    ///
+    /// The one exception is inference starting over after a statement failed
+    /// (`infer::run_with_params`): on a copy of its tree, the failed
+    /// statement's expression is this stand-in, which the statement's rule types
+    /// as a failed expression. The copy is dropped once inference returns.
     Error,
 }
 
