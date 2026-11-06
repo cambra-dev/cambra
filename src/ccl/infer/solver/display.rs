@@ -332,6 +332,7 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
                 .map(|(name, _)| name.clone())
                 .zip(assoc_tys.iter().cloned())
                 .collect(),
+            binders: Vec::new(),
             at: None,
         };
         // A requirement about no parameter is one the definition already answered

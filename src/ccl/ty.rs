@@ -721,9 +721,23 @@ pub struct FunKindVar {
     /// [`resolved`](Self::resolved)'s answer, with the [`KIND_FACTS`] count it was
     /// computed at: still the answer while no kind variable has been written since.
     resolved_at: RefCell<Option<(u64, KindPin)>>,
-    /// [`component_ids`](Self::component_ids)' answer, with the [`KIND_FACTS`] count it was
-    /// computed at. Identities, not the kinds, so a kind does not keep its relations alive.
-    component_at: RefCell<Option<(u64, Rc<Vec<FunKindVarId>>)>>,
+    /// [`component`](Self::component)'s answer, with the [`KIND_FACTS`] count it was computed
+    /// at. Weak references avoid retaining the component through the cache.
+    component_at: RefCell<Option<(u64, Rc<KindComponent>)>>,
+    /// Witness positions in this kind's graph, invalidated by new facts or binder names.
+    binder_positions_at: RefCell<Option<BinderPositions>>,
+}
+
+struct BinderPositions {
+    facts: u64,
+    names: u64,
+    positions: std::collections::HashMap<WitnessId, usize>,
+}
+
+struct KindComponent {
+    ids: std::collections::HashSet<FunKindVarId>,
+    kinds: Vec<std::rc::Weak<FunKindVar>>,
+    binders_at: RefCell<Option<(u64, Vec<WitnessId>)>>,
 }
 
 thread_local! {
@@ -731,6 +745,8 @@ thread_local! {
     /// stamps and sources [`FunKindVar::resolved`] reads. Every write bumps it, so a
     /// cached answer computed at the current count is still the answer.
     static KIND_FACTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Binder names can be minted without changing the graph's facts.
+    static KIND_NAMES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn kind_fact_written() {
@@ -750,6 +766,7 @@ impl FunKindVar {
             bounds: RefCell::new(FunKindBounds::default()),
             resolved_at: RefCell::new(None),
             component_at: RefCell::new(None),
+            binder_positions_at: RefCell::new(None),
         });
         #[cfg(debug_assertions)]
         KIND_VARS.with(|ks| ks.borrow_mut().push(Rc::clone(&v)));
@@ -892,6 +909,7 @@ impl FunKindVar {
             if b.settled.len() < arity {
                 b.settled
                     .resize_with(arity, crate::ccl::infer_var::fresh_witness_binder_id);
+                KIND_NAMES.with(|n| n.set(n.get() + 1));
             }
             b.settled[..arity].to_vec()
         };
@@ -910,6 +928,7 @@ impl FunKindVar {
         if b.settled.len() <= position {
             b.settled
                 .resize_with(position + 1, crate::ccl::infer_var::fresh_witness_binder_id);
+            KIND_NAMES.with(|n| n.set(n.get() + 1));
         }
         WitnessId(b.settled[position])
     }
@@ -1017,7 +1036,12 @@ impl FunKindVar {
     /// Record that this kind is a copy of `original` — see
     /// [`instantiated_from`](FunKindBounds::instantiated_from).
     pub fn copied_from(&self, original: &Rc<FunKindVar>) {
-        self.bounds.borrow_mut().instantiated_from = Some(Rc::clone(original));
+        let mut bounds = self.bounds.borrow_mut();
+        if bounds.instantiated_from.as_ref().map(|k| k.uid) != Some(original.uid) {
+            bounds.instantiated_from = Some(Rc::clone(original));
+            drop(bounds);
+            kind_fact_written();
+        }
     }
 
     /// What this kind is a copy of, where it is one.
@@ -1036,41 +1060,63 @@ impl FunKindVar {
     /// it ([`Self::may_bind`]): its position in the sum binding it, since binders correspond
     /// by position across a kind edge.
     pub fn binder_position(&self, w: &WitnessId) -> Option<usize> {
-        fn go(k: &FunKindVar, w: &WitnessId, seen: &mut Vec<FunKindVarId>) -> Option<usize> {
-            if seen.contains(&k.uid) {
-                return None;
-            }
-            seen.push(k.uid);
-            if let Some(i) = k.named_binder_ids().iter().position(|x| x == w) {
-                return Some(i);
-            }
-            let edges = {
-                let b = k.bounds.borrow();
-                b.lower
-                    .iter()
-                    .chain(b.upper.iter())
-                    .map(|(k, _)| k.clone())
-                    .collect::<Vec<_>>()
-            };
-            edges
-                .iter()
-                .find_map(|kind| match kind {
-                    FunKind::Data(Some(ws)) => ws.iter().position(|x| x.id() == w),
-                    FunKind::Var(other) => go(other, w, seen),
-                    _ => None,
-                })
-                .or_else(|| {
-                    k.instantiated_from()
-                        .and_then(|original| go(&original, w, seen))
-                })
+        let facts = KIND_FACTS.with(|n| n.get());
+        let names = KIND_NAMES.with(|n| n.get());
+        if let Some(done) = &*self.binder_positions_at.borrow()
+            && done.facts == facts
+            && done.names == names
+        {
+            return done.positions.get(w).copied();
         }
-        go(self, w, &mut Vec::new())
+        fn collect(
+            k: &FunKindVar,
+            seen: &mut std::collections::HashSet<FunKindVarId>,
+            positions: &mut std::collections::HashMap<WitnessId, usize>,
+        ) {
+            if !seen.insert(k.uid) {
+                return;
+            }
+            for (index, w) in k.named_binder_ids().into_iter().enumerate() {
+                positions.entry(w).or_insert(index);
+            }
+            let b = k.bounds.borrow();
+            for (kind, _) in b.lower.iter().chain(&b.upper) {
+                match kind {
+                    FunKind::Data(Some(ws)) => {
+                        for (index, w) in ws.iter().enumerate() {
+                            positions.entry(*w.id()).or_insert(index);
+                        }
+                    }
+                    FunKind::Var(other) => collect(other, seen, positions),
+                    _ => {}
+                }
+            }
+            if let Some(original) = &b.instantiated_from {
+                collect(original, seen, positions);
+            }
+        }
+        let mut positions = std::collections::HashMap::new();
+        collect(self, &mut std::collections::HashSet::new(), &mut positions);
+        let result = positions.get(w).copied();
+        *self.binder_positions_at.borrow_mut() = Some(BinderPositions {
+            facts,
+            names,
+            positions,
+        });
+        result
     }
 
     /// **The kinds whose binders [`Self::binder_position`] can place**, this one included: every
     /// kind reached through kind edges in either direction or through being copied.
-    fn component(self: &Rc<Self>) -> Vec<Rc<FunKindVar>> {
+    fn component(self: &Rc<Self>) -> Rc<KindComponent> {
+        let now = KIND_FACTS.with(|n| n.get());
+        if let Some((at, component)) = &*self.component_at.borrow()
+            && *at == now
+        {
+            return Rc::clone(component);
+        }
         let mut reached: Vec<Rc<FunKindVar>> = vec![Rc::clone(self)];
+        let mut seen = std::collections::HashSet::from([self.uid]);
         let mut next = 0;
         while let Some(k) = reached.get(next).cloned() {
             next += 1;
@@ -1087,39 +1133,42 @@ impl FunKindVar {
             };
             related.extend(k.instantiated_from());
             for r in related {
-                if !reached.iter().any(|k| k.uid == r.uid) {
+                if seen.insert(r.uid) {
                     reached.push(r);
                 }
             }
         }
-        reached
-    }
-
-    /// The identities of this kind's [`component`](Self::component), answered from the walk at
-    /// the current [`KIND_FACTS`] count, as [`Self::resolved`] is.
-    fn component_ids(self: &Rc<Self>) -> Rc<Vec<FunKindVarId>> {
-        let now = KIND_FACTS.with(|n| n.get());
-        if let Some((at, ids)) = &*self.component_at.borrow()
-            && *at == now
-        {
-            return Rc::clone(ids);
-        }
-        let ids = Rc::new(self.component().iter().map(|k| k.uid).collect::<Vec<_>>());
-        *self.component_at.borrow_mut() = Some((now, Rc::clone(&ids)));
-        ids
+        let component = Rc::new(KindComponent {
+            ids: seen,
+            kinds: reached.iter().map(Rc::downgrade).collect(),
+            binders_at: RefCell::new(None),
+        });
+        *self.component_at.borrow_mut() = Some((now, Rc::clone(&component)));
+        component
     }
 
     /// Whether `other` is in this kind's [`component`](Self::component).
     pub fn same_component(self: &Rc<Self>, other: &Rc<FunKindVar>) -> bool {
-        self.uid == other.uid || self.component_ids().contains(&other.uid)
+        self.uid == other.uid || self.component().ids.contains(&other.uid)
     }
 
     /// Every binder name minted so far by a kind in this one's [`component`](Self::component).
     pub fn component_binder_ids(self: &Rc<Self>) -> Vec<WitnessId> {
-        self.component()
+        let component = self.component();
+        let now = KIND_NAMES.with(|n| n.get());
+        if let Some((at, ids)) = &*component.binders_at.borrow()
+            && *at == now
+        {
+            return ids.clone();
+        }
+        let ids: Vec<_> = component
+            .kinds
             .iter()
+            .filter_map(std::rc::Weak::upgrade)
             .flat_map(|k| k.named_binder_ids())
-            .collect()
+            .collect();
+        *component.binders_at.borrow_mut() = Some((now, ids.clone()));
+        ids
     }
 
     /// What this kind was stamped at construction — the one fact no edge spells
@@ -1876,6 +1925,11 @@ pub struct TraitRequirement {
     /// The associated types the clause names. One it leaves unnamed is absent, and
     /// leaves that position open.
     pub assoc: Vec<(crate::ccl::infer::solver::traits::Assoc, Type)>,
+    /// The values a `forall` around the requirement binds, each with the type it ranges over:
+    /// `k: K` in `forall (k: K) Iterable(V(k))`. The operands and associated types read them,
+    /// and the requirement holds at every value of them (`docs/chl-spec.md`, "Family
+    /// parameters"). Empty for a requirement no `forall` quantifies.
+    pub binders: Vec<(crate::ccl::Name, Type)>,
     /// Where the requirement was written, for the secondary label of a use that fails
     /// it; `None` for one no `requires` clause states.
     pub at: Option<chl_parser::ast::Span>,
@@ -1887,6 +1941,7 @@ impl PartialEq for TraitRequirement {
             && self.args == other.args
             && self.terms == other.terms
             && self.assoc == other.assoc
+            && self.binders == other.binders
     }
 }
 impl Eq for TraitRequirement {}
@@ -1896,11 +1951,12 @@ impl std::hash::Hash for TraitRequirement {
         self.args.hash(state);
         self.terms.hash(state);
         self.assoc.hash(state);
+        self.binders.hash(state);
     }
 }
 
 impl TraitRequirement {
-    /// This requirement with `f` applied to each operand and associated type.
+    /// This requirement with `f` applied to each operand, associated type and binder's type.
     pub fn map_types(&self, mut f: impl FnMut(&Type) -> Type) -> TraitRequirement {
         TraitRequirement {
             trait_: self.trait_.clone(),
@@ -1908,8 +1964,111 @@ impl TraitRequirement {
             terms: self.terms.clone(),
             effect_assoc: self.effect_assoc.clone(),
             assoc: self.assoc.iter().map(|(n, t)| (n.clone(), f(t))).collect(),
+            binders: self
+                .binders
+                .iter()
+                .map(|(n, t)| (n.clone(), f(t)))
+                .collect(),
             at: self.at,
         }
+    }
+
+    /// This requirement with its binders renamed to `names`, one each: a use proves a
+    /// quantified requirement at binders of its own, which nothing else reads.
+    pub fn with_binders_named(&self, names: &[crate::ccl::Name]) -> TraitRequirement {
+        debug_assert_eq!(names.len(), self.binders.len(), "one name per binder");
+        let terms: Vec<Rc<TypedExpr>> = names
+            .iter()
+            .zip(&self.binders)
+            .map(|(n, (_, t))| Rc::new(crate::ccl::Expr::var(n.clone()).with_ty(t.clone())))
+            .collect();
+        let binders = names
+            .iter()
+            .zip(&self.binders)
+            .map(|(n, (_, t))| (n.clone(), t.clone()))
+            .collect();
+        TraitRequirement {
+            binders,
+            ..self.discharged(&terms)
+        }
+    }
+
+    /// This requirement at the terms `terms`, one per binder, which it no longer binds: an
+    /// application `V(t)` reaching an obligation reads the assumption
+    /// `forall (k: K) Iterable(V(k))` at `t` ([`crate::ccl::subst::discharge_binders`]).
+    pub fn discharged(&self, terms: &[Rc<TypedExpr>]) -> TraitRequirement {
+        let names: Vec<crate::ccl::Name> = self.binders.iter().map(|(n, _)| n.clone()).collect();
+        let at = |t: &Type| crate::ccl::subst::discharge_binders(&names, t, terms);
+        TraitRequirement {
+            trait_: self.trait_.clone(),
+            args: self.args.iter().map(at).collect(),
+            terms: self.terms.clone(),
+            effect_assoc: self.effect_assoc.clone(),
+            assoc: self.assoc.iter().map(|(n, t)| (n.clone(), at(t))).collect(),
+            binders: Vec::new(),
+            at: self.at,
+        }
+    }
+
+    /// Read the binders determined by the family application at operand `pos`, retaining
+    /// those another operand must determine. Repeated arguments must agree, including terms
+    /// fixed by an earlier operand. Associated types are deposited only after no binder remains.
+    pub fn at_application(
+        &self,
+        path: &[u8],
+        contribution: &FamilyApp,
+    ) -> Option<TraitRequirement> {
+        let (pos, args) = path.split_first()?;
+        let mut operand = self.args.get(*pos as usize)?;
+        for index in args {
+            let Type::Nominal(_, components) = operand.peel_refinements() else {
+                return None;
+            };
+            operand = components.get(*index as usize)?;
+        }
+        let Type::FamilyApp(stated) = operand.peel_refinements() else {
+            return None;
+        };
+        if stated.param != contribution.param || stated.args.len() != contribution.args.len() {
+            return None;
+        }
+        let mut terms: Vec<Option<Rc<TypedExpr>>> = vec![None; self.binders.len()];
+        for (arg, given) in stated.args.iter().zip(&contribution.args) {
+            if let TypedExprNode::Var(n) = &arg.term.node
+                && let Some(i) = self.binders.iter().position(|(b, _)| b == n)
+            {
+                if let Some(first) = &terms[i]
+                    && !eq_term_modulo_ty_slots(first, &given.term)
+                {
+                    return None;
+                }
+                terms[i] = Some(Rc::clone(&given.term));
+            } else if !eq_term_modulo_ty_slots(&arg.term, &given.term) {
+                return None;
+            }
+        }
+        let (names, args): (Vec<_>, Vec<_>) = self
+            .binders
+            .iter()
+            .zip(&terms)
+            .filter_map(|((n, _), t)| t.as_ref().map(|t| (n.clone(), Rc::clone(t))))
+            .unzip();
+        let at = |t: &Type| crate::ccl::subst::discharge_binders(&names, t, &args);
+        Some(TraitRequirement {
+            binders: self
+                .binders
+                .iter()
+                .zip(&terms)
+                .filter(|(_, t)| t.is_none())
+                .map(|((n, t), _)| (n.clone(), at(t)))
+                .collect(),
+            args: self.args.iter().map(at).collect(),
+            terms: self.terms.clone(),
+            effect_assoc: self.effect_assoc.clone(),
+            assoc: self.assoc.iter().map(|(n, t)| (n.clone(), at(t))).collect(),
+            trait_: self.trait_.clone(),
+            at: self.at,
+        })
     }
 
     /// The type this requirement associates with `name`, if it names one.
@@ -1934,12 +2093,23 @@ impl TraitRequirement {
     }
 }
 
+/// The member parameter a requirement's associated type `ty` stands for: a type parameter, or a
+/// member family applied to a quantified requirement's binders.
+fn member_param(ty: &Type) -> Option<&Rc<TypeParam>> {
+    match ty {
+        Type::Param(p) => Some(p),
+        Type::FamilyApp(app) => Some(&app.param),
+        _ => None,
+    }
+}
+
 /// The type parameters `ty` is, or a nominal type in it is applied to, through any depth of
-/// nominal types.
+/// nominal types. A family parameter's application is an occurrence of it.
 fn params_at_or_below(ty: &Type) -> impl Iterator<Item = TypeParamId> {
     fn go(ty: &Type, out: &mut Vec<TypeParamId>) {
         match ty {
             Type::Param(p) => out.push(p.id),
+            Type::FamilyApp(app) => out.push(app.param.id),
             Type::Nominal(_, args) => args.iter().for_each(|a| go(a, out)),
             _ => {}
         }
@@ -1973,7 +2143,7 @@ impl PolyType {
             && self.requires.iter().any(|r| {
                 r.assoc
                     .iter()
-                    .any(|(_, t)| matches!(t, Type::Param(p) if p.id == param.id))
+                    .any(|(_, t)| member_param(t).is_some_and(|p| p.id == param.id))
                     || r.effect_assoc.iter().any(|(_, c)| c.param.id == param.id)
             })
     }
@@ -2001,10 +2171,7 @@ impl PolyType {
             let unnamed: Vec<&Rc<TypeParam>> = r
                 .assoc
                 .iter()
-                .filter_map(|(_, t)| match t {
-                    Type::Param(p) => Some(p),
-                    _ => None,
-                })
+                .filter_map(|(_, t)| member_param(t))
                 .chain(r.effect_assoc.iter().map(|(_, c)| &c.param))
                 .filter(|p| self.is_member(p) && p.spelling.starts_with("_::"))
                 .collect();
@@ -2024,9 +2191,14 @@ impl PolyType {
             };
             for p in unnamed {
                 let member = &p.spelling["_::".len()..];
+                let spelling = format!("{binder}::{member}");
                 renamed.insert(
                     p.id,
-                    TypeParam::declared(format!("{binder}::{member}").as_str()),
+                    if p.arity > 0 {
+                        TypeParam::declared_family(spelling.as_str(), p.arity)
+                    } else {
+                        TypeParam::declared(spelling.as_str())
+                    },
                 );
             }
         }
@@ -2047,6 +2219,11 @@ impl PolyType {
             if let Type::Fun { capabilities, .. } = &mut out {
                 *capabilities =
                     capabilities.with_params_respelled(&|p| renamed.get(&p.id).cloned());
+            }
+            if let Type::FamilyApp(app) = &mut out
+                && let Some(to) = renamed.get(&app.param.id)
+            {
+                app.param = Rc::clone(to);
             }
             out.walk_children_mut(|c| *c = respell(c, renamed));
             out
@@ -2085,10 +2262,7 @@ impl PolyType {
             let members = r
                 .assoc
                 .iter()
-                .filter_map(|(_, t)| match t {
-                    Type::Param(p) if self.is_member(p) => Some(p),
-                    _ => None,
-                })
+                .filter_map(|(_, t)| member_param(t).filter(|p| self.is_member(p)))
                 .chain(r.effect_assoc.iter().map(|(_, c)| &c.param));
             // An unnamed requirement's member is spelled `_::Name`, and printing names it.
             members
@@ -2115,26 +2289,61 @@ impl PolyType {
         };
         let mut items = Vec::new();
         for r in &self.requires {
+            // A quantified requirement is written under its `forall`, its binders spelled `k`,
+            // `k1`, …, and the bounds on its associated types in the same group.
+            let names: Vec<crate::ccl::Name> = (0..r.binders.len())
+                .map(|i| match i {
+                    0 => crate::ccl::Name::raw("k"),
+                    i => crate::ccl::Name::raw(format!("k{i}").as_str()),
+                })
+                .collect();
+            let r = &if r.binders.is_empty() {
+                (**r).clone()
+            } else {
+                r.with_binders_named(&names)
+            };
+            let mut group = Vec::new();
             let args: Vec<String> = r.args.iter().map(&mut write).collect();
             let binder = member_binder(r)
                 .or_else(|| (!r.assoc.is_empty() || !r.effect_assoc.is_empty()).then(&mut fresh));
-            items.push(match &binder {
+            group.push(match &binder {
                 Some(b) => format!("{b}: {}({})", r.trait_, args.join(", ")),
                 None => format!("{}({})", r.trait_, args.join(", ")),
             });
-            let Some(binder) = binder else { continue };
-            for (n, t) in &r.assoc {
-                let bound = match t {
-                    Type::Param(p) if self.is_member(p) => self
-                        .params
-                        .iter()
-                        .find(|d| d.param.id == p.id)
-                        .and_then(|d| d.bound().cloned()),
-                    other => Some(other.clone()),
-                };
-                if let Some(bound) = bound {
-                    items.push(format!("{binder}::{n} <: {}", write(&bound)));
+            if let Some(binder) = binder {
+                for (n, t) in &r.assoc {
+                    let bound = match (t, member_param(t)) {
+                        (Type::Param(_), Some(p)) if self.is_member(p) => self
+                            .params
+                            .iter()
+                            .find(|d| d.param.id == p.id)
+                            .and_then(|d| d.bound().cloned()),
+                        (Type::FamilyApp(_), Some(p)) if self.is_member(p) => self
+                            .params
+                            .iter()
+                            .find(|d| d.param.id == p.id)
+                            .and_then(|d| d.kind.family_bound())
+                            .map(|family| crate::ccl::subst::family_at_names(family, &names)),
+                        (other, _) => Some(other.clone()),
+                    };
+                    if let Some(bound) = bound {
+                        group.push(format!("{binder}::{n} <: {}", write(&bound)));
+                    }
                 }
+            }
+            if r.binders.is_empty() {
+                items.extend(group);
+            } else {
+                let binders: Vec<String> = names
+                    .iter()
+                    .zip(&r.binders)
+                    .map(|(n, (_, t))| format!("{n}: {}", write(t)))
+                    .collect();
+                let body = match group.as_slice() {
+                    [one] => one.clone(),
+                    many => format!("({})", many.join(", ")),
+                };
+                items.push(format!("forall ({}) {body}", binders.join(", ")));
             }
         }
         items
@@ -6547,6 +6756,56 @@ impl From<Refinement> for RefinementSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_witness_positions_read_new_names_edges_and_copies() {
+        let a = FunKindVar::fresh();
+        let b = FunKindVar::fresh();
+        a.record(FunKind::Var(Rc::clone(&b)), true);
+        let absent = *Witness::mint(TypeKind::UIntRanges).id();
+        assert_eq!(a.binder_position(&absent), None);
+        let first = b.binder_id_at(0);
+        assert_eq!(a.binder_position(&first), Some(0));
+
+        let c = FunKindVar::fresh();
+        let second = c.binder_id_at(1);
+        assert_eq!(a.binder_position(&second), None);
+        b.record(FunKind::Var(Rc::clone(&c)), false);
+        assert_eq!(a.binder_position(&second), Some(1));
+
+        let original = FunKindVar::fresh();
+        let third = original.binder_id_at(2);
+        assert_eq!(a.binder_position(&third), None);
+        c.copied_from(&original);
+        assert_eq!(a.binder_position(&third), Some(2));
+
+        let bound = Witness::mint(TypeKind::UIntRanges);
+        assert_eq!(a.binder_position(bound.id()), None);
+        c.record(FunKind::Data(Some(vec![bound.clone()].into())), true);
+        assert_eq!(a.binder_position(bound.id()), Some(0));
+    }
+
+    #[test]
+    fn a_cached_kind_component_reads_new_binders_and_edges() {
+        let a = FunKindVar::fresh();
+        let b = FunKindVar::fresh();
+        a.record(FunKind::Var(Rc::clone(&b)), true);
+        assert!(a.component_binder_ids().is_empty());
+
+        let first = b.binder_id_at(0);
+        assert_eq!(a.component_binder_ids(), vec![first]);
+
+        let c = FunKindVar::fresh();
+        let second = c.binder_id_at(0);
+        b.record(FunKind::Var(Rc::clone(&c)), true);
+        assert!(a.same_component(&c));
+        assert_eq!(a.component_binder_ids(), vec![first, second]);
+
+        let original = FunKindVar::fresh();
+        let third = original.binder_id_at(0);
+        c.copied_from(&original);
+        assert_eq!(a.component_binder_ids(), vec![first, second, third]);
+    }
     use crate::ccl::Annotation;
     use crate::ccl::Occurrence;
 

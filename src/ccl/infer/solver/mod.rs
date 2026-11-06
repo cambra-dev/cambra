@@ -177,6 +177,47 @@ pub(crate) mod test_helpers {
 
     use crate::ccl::{FieldKey, Refinement, Type};
 
+    /// `depth` diamonds sharing one scalar leaf, with `edge` on each side's path to the next.
+    pub(crate) fn diamond_bound_graph(
+        depth: usize,
+        leaf: Type,
+        edge: &crate::ccl::subst::Subst,
+    ) -> (Type, usize) {
+        use crate::ccl::Bound;
+        let mut root = super::fresh_var(0);
+        let Type::Infer(bottom) = &root else {
+            unreachable!()
+        };
+        bottom
+            .bounds
+            .borrow_mut()
+            .lower_mut()
+            .push(Bound::conc(leaf));
+        for _ in 0..depth {
+            let top = super::fresh_var(0);
+            let Type::Infer(parent) = &top else {
+                unreachable!()
+            };
+            for _ in 0..2 {
+                let side = super::fresh_var(0);
+                let (Type::Infer(v), Type::Infer(below)) = (&side, &root) else {
+                    unreachable!()
+                };
+                v.bounds
+                    .borrow_mut()
+                    .lower_mut()
+                    .push(Bound::suspended_on(below, edge.clone()));
+                parent
+                    .bounds
+                    .borrow_mut()
+                    .lower_mut()
+                    .push(Bound::conc(side));
+            }
+            root = top;
+        }
+        (root, 3 * depth + 1)
+    }
+
     /// The dependent refinement `__elem == <name>` — a predicate referencing an
     /// enclosing Pi binder by (raw) name, the mid-solve form.
     pub(crate) fn dep_pred(name: &str) -> Rc<crate::ccl::TypedExpr> {

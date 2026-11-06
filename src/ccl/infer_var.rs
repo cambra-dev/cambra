@@ -427,6 +427,12 @@ pub struct InferBounds {
     pub type_kinds: Vec<crate::ccl::ty::TypeKind>,
 }
 
+#[derive(Default)]
+struct InferVarArena {
+    vars: Vec<Rc<InferVar>>,
+    positions: HashMap<InferVarId, usize>,
+}
+
 thread_local! {
     /// One shared empty bound list, so a fresh variable costs no allocation.
     ///
@@ -853,7 +859,7 @@ impl WitnessScope {
 thread_local! {
     /// Storage for every inference variable minted during the active inference
     /// run on this thread — owned directly by this slot, not shared. Installed
-    /// (as an empty `Vec`) by [`arena_enter`] on scope entry and removed by
+    /// empty by [`arena_enter`] on scope entry and removed by
     /// [`arena_exit`] at teardown, which hands the variables back so their
     /// bounds can be cleared. Inference runs one-at-a-time per thread: this is
     /// a single slot, not a stack, because nesting an inference run inside
@@ -861,7 +867,7 @@ thread_local! {
     /// [`arena_enter`]), not a supported mode. `None` outside any inference
     /// run, in which case [`InferVar::fresh`] records nowhere (a harmless
     /// no-op — used by unit tests that mint vars directly).
-    static ACTIVE_ARENA: RefCell<Option<Vec<Rc<InferVar>>>> =
+    static ACTIVE_ARENA: RefCell<Option<InferVarArena>> =
         const { RefCell::new(None) };
 }
 
@@ -959,7 +965,7 @@ pub(crate) fn arena_enter() {
             slot.is_none(),
             "inference is non-reentrant: an InferArena is already active on this thread",
         );
-        *slot = Some(Vec::new());
+        *slot = Some(InferVarArena::default());
     });
     BARRIER_ARENA.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
     SUSPENDED_MEMBERSHIPS.with(|ms| *ms.borrow_mut() = SuspendedMemberships::default());
@@ -976,7 +982,7 @@ pub(crate) fn arena_is_active() -> bool {
 /// active (which the [`InferArena`](crate::ccl::infer::InferArena) RAII guard
 /// makes unreachable in practice).
 pub(crate) fn arena_exit() -> Vec<Rc<InferVar>> {
-    ACTIVE_ARENA.with(|slot| slot.borrow_mut().take().unwrap_or_default())
+    ACTIVE_ARENA.with(|slot| slot.borrow_mut().take().unwrap_or_default().vars)
 }
 
 /// Stop capturing barrier variables and return every one minted since
@@ -999,7 +1005,12 @@ pub(crate) fn arena_barrier_vars() -> Vec<Rc<BarrierVar>> {
 /// generalized definition's, which coalesce deliberately never visits in place. Hands
 /// back a snapshot rather than a borrow so a caller is free to touch the arena.
 pub(crate) fn arena_vars() -> Vec<Rc<InferVar>> {
-    ACTIVE_ARENA.with(|slot| slot.borrow().clone().unwrap_or_default())
+    ACTIVE_ARENA.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|a| a.vars.clone())
+            .unwrap_or_default()
+    })
 }
 
 /// The variable this run minted under `uid`, if the arena still holds it.
@@ -1009,11 +1020,9 @@ pub(crate) fn arena_vars() -> Vec<Rc<InferVar>> {
 /// level and telescope that decide whether generalization quantifies it.
 pub(crate) fn lookup(uid: &InferVarId) -> Option<Rc<InferVar>> {
     ACTIVE_ARENA.with(|slot| {
-        slot.borrow()
-            .as_ref()?
-            .iter()
-            .find(|v| v.uid == *uid)
-            .map(Rc::clone)
+        let slot = slot.borrow();
+        let arena = slot.as_ref()?;
+        arena.positions.get(uid).map(|i| Rc::clone(&arena.vars[*i]))
     })
 }
 
@@ -1031,7 +1040,7 @@ pub(crate) type HeldElsewhere = HashMap<InferVarId, (Vec<Rc<InferVar>>, Vec<Rc<I
 pub(crate) fn var_edges_held_elsewhere() -> HeldElsewhere {
     let mut index = HeldElsewhere::new();
     ACTIVE_ARENA.with(|slot| {
-        for u in slot.borrow().iter().flatten() {
+        for u in slot.borrow().iter().flat_map(|a| &a.vars) {
             let s = u.bounds.borrow();
             for (holds_upper, list) in [(true, s.upper()), (false, s.lower())] {
                 for b in list.iter() {
@@ -1096,8 +1105,9 @@ impl InferVar {
             witness_scopes: RefCell::new(Vec::new()),
         });
         ACTIVE_ARENA.with(|slot| {
-            if let Some(vars) = slot.borrow_mut().as_mut() {
-                vars.push(Rc::clone(&var));
+            if let Some(arena) = slot.borrow_mut().as_mut() {
+                arena.positions.insert(var.uid, arena.vars.len());
+                arena.vars.push(Rc::clone(&var));
             }
         });
         var

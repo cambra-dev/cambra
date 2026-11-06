@@ -577,25 +577,7 @@ fn lower_constructors(
     head: &Rc<NominalDecl>,
     ctx: &mut LoweringContext,
 ) -> Result<Vec<NominalCtor>, LoweringError> {
-    let aliases = ctx.snapshot_type_aliases();
-    let scoped = ctx.type_param_scope();
-    for (i, param) in head.params.iter().enumerate() {
-        if param.arity == 0 {
-            ctx.declare_type_throughout(
-                param.spelling.as_str(),
-                written_param_span(decl, &param.spelling),
-                crate::ccl::module_type::AliasType::Type(Type::Param(Rc::clone(param))),
-            );
-        } else {
-            ctx.family_params.push((
-                param.spelling.clone(),
-                Rc::clone(param),
-                head.family_domains(i).to_vec(),
-            ));
-        }
-        ctx.type_params_in_scope.push(param.spelling.to_string());
-    }
-    let result = (|| {
+    with_decl_params(decl, head, ctx, |ctx| {
         let mut ctors: Vec<NominalCtor> = Vec::new();
         match &decl.body {
             TypeDeclBody::Single(ty) => {
@@ -645,10 +627,108 @@ fn lower_constructors(
             }
         }
         Ok(ctors)
-    })();
+    })
+}
+
+fn with_decl_params<T>(
+    decl: &TypeDecl,
+    head: &Rc<NominalDecl>,
+    ctx: &mut LoweringContext,
+    lower: impl FnOnce(&mut LoweringContext) -> Result<T, LoweringError>,
+) -> Result<T, LoweringError> {
+    let aliases = ctx.snapshot_type_aliases();
+    let scoped = ctx.type_param_scope();
+    for (i, param) in head.params.iter().enumerate() {
+        if param.arity == 0 {
+            ctx.declare_type_throughout(
+                param.spelling.as_str(),
+                written_param_span(decl, &param.spelling),
+                crate::ccl::module_type::AliasType::Type(Type::Param(Rc::clone(param))),
+            );
+        } else {
+            ctx.family_params.push((
+                param.spelling.clone(),
+                Rc::clone(param),
+                head.family_domains(i).to_vec(),
+            ));
+        }
+        ctx.type_params_in_scope.push(param.spelling.to_string());
+    }
+    let result = lower(ctx);
     ctx.end_type_params(scoped);
     ctx.restore_type_aliases(aliases);
     result
+}
+
+/// Record nominal declarations' requirements after the module's traits are available.
+/// Constructor payloads are defined first because trait signatures may name those types.
+pub(super) fn declare_nominal_requirements(
+    stmts: &[Spanned<ChlStmt>],
+    ctx: &mut LoweringContext,
+) -> Vec<LoweringError> {
+    let mut errors = Vec::new();
+    for (decl, _) in type_decls(stmts) {
+        let head = ctx
+            .nominal_type(&decl.name.node)
+            .expect("a declared nominal head");
+        let requirements = with_decl_params(decl, &head, ctx, |ctx| {
+            lower_decl_requirements(decl, &head, ctx)
+        });
+        match requirements {
+            Ok(requirements) => head.set_requirements(requirements),
+            Err(error) => errors.push(error),
+        }
+    }
+    errors
+}
+
+/// `decl`'s `requires` clause, lowered over its type parameters, which are in scope
+/// (`docs/chl-spec.md`, "Declaring a nominal type"): what every application of the type requires
+/// of its arguments, as a `def`'s clause states what every call requires.
+fn lower_decl_requirements(
+    decl: &TypeDecl,
+    head: &Rc<NominalDecl>,
+    ctx: &mut LoweringContext,
+) -> Result<crate::ccl::nominal::DeclRequirements, LoweringError> {
+    let mut params: Vec<PolyParam> = head
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| PolyParam {
+            param: Rc::clone(p),
+            kind: if p.arity == 0 {
+                TypeKind::Type
+            } else {
+                TypeKind::family(head.family_domains(i).to_vec(), None)
+            },
+            bound_at: None,
+        })
+        .collect();
+    if decl.requires.is_empty() {
+        return Ok(crate::ccl::nominal::DeclRequirements::default());
+    }
+    fn refuse_context(
+        requires: &[Spanned<Requirement>],
+        ctx: &LoweringContext,
+    ) -> Result<(), LoweringError> {
+        for req in requires {
+            if super::clauses::is_context_item(req, ctx) {
+                return Err(LoweringError::unsupported(
+                    req.span,
+                    "a nominal type declaration's `requires` clause accepts no context requirements; \
+                     context belongs on a function type",
+                ));
+            }
+            if let Requirement::Forall { requirements, .. } = &req.node {
+                refuse_context(requirements, ctx)?;
+            }
+        }
+        Ok(())
+    }
+    refuse_context(&decl.requires, ctx)?;
+    let (requires, _) =
+        super::stmts::lower_named_requirements(&decl.requires, Some(&mut params), ctx)?;
+    Ok(crate::ccl::nominal::DeclRequirements { params, requires })
 }
 
 /// The order of the parameter type `ty` the declaration writes as `written`: each record it
@@ -1715,17 +1795,25 @@ fn bind_function(
     let binding = if decl.params.is_empty() {
         Expr::let_bind(name, binder, function, acc)
     } else {
+        // A constructor states the declaration's `requires` clause, so a call is checked
+        // against it at its own types, and `extract` assumes it.
+        let (params, requires) = match decl.requirements() {
+            Some(r) => (r.params.clone(), r.requires.clone()),
+            None => (
+                decl.params
+                    .iter()
+                    .map(|p| PolyParam {
+                        param: Rc::clone(p),
+                        kind: TypeKind::Type,
+                        bound_at: None,
+                    })
+                    .collect(),
+                Vec::new(),
+            ),
+        };
         let poly = Type::Poly(Rc::new(PolyType {
-            params: decl
-                .params
-                .iter()
-                .map(|p| PolyParam {
-                    param: Rc::clone(p),
-                    kind: TypeKind::Type,
-                    bound_at: None,
-                })
-                .collect(),
-            requires: Vec::new(),
+            params,
+            requires,
             body: Type::Hole,
         }));
         Expr::let_bind_annotated(

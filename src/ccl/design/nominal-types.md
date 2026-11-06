@@ -114,6 +114,9 @@ parameter.
   so the terms name their binders, and closes the result.
 - **Variance counts each application as an occurrence of its parameter.** A family's domains are
   equality positions, and its body stands where the family does.
+- **A `requires` clause on the declaration states what every application requires of its
+  arguments**, a family's values included
+  ([type-parameters.md, "Requirements of a type declaration"](type-parameters.md#requirements-of-a-type-declaration)).
 
 ---
 
@@ -130,6 +133,12 @@ alias may name a nominal type and a constructor's parameter type may name an ali
 
 An error in either step leaves the module unlowered, as a module-syntax refusal does. Every use
 of a declaration that failed would otherwise report a second error.
+
+After the module's traits are declared, `declare_nominal_requirements` lowers each nominal type's
+`requires` clause over its parameters. The clause can name the module's traits. Associated functions
+and constructor bindings are lowered after the requirements are recorded.
+Nominal applications in earlier constructor payloads, aliases and trait signatures are retained
+in `pending_nominal_applications` and checked after the module's instances are declared.
 
 A declaration stands only at a module's top level, so the table of declarations
 (`LoweringContext::nominal_types`) is never snapshotted. A `type` statement in any other block is
@@ -326,9 +335,13 @@ statement collects the calls it defers (`Typing::open_method_calls`). At a `let`
 scheme carries (`display::scheme_obligations`), asking for an annotation on the receiver. A
 variable the scheme quantifies watches such a call's obligation, so each use would copy it and
 select its own method, making the definition polymorphic over every type declaring the method,
-which a trait states instead. A call the scheme does not carry waits with the enclosing
-definition's calls, at that definition's level and telescope, and its function's variable gets a
-variable of that level below it (`TraitObligation::pass_method_call`). The selected method's type
+which a trait states instead. So does a call whose receiver reaches, through variable bounds, no
+variable of the enclosing scope (`DeferredMethod::receiver_reaches_below`): only the definition's
+uses settle it, though no type of the scheme names it, as an element of `i::Elements` under
+`forall (k: K) (i: Iterable(V(k)))`, whose holes stand in the member family's bound. Any other call
+the scheme does not carry waits with the enclosing definition's calls, at that definition's level
+and telescope, and its function's variable gets a variable of that level below it
+(`TraitObligation::pass_method_call`). The selected method's type
 flows into that variable, which no use of the definition copies, so it reaches every use's copy. A
 monomorphic definition's waiting calls wait with the enclosing one's, a failed statement's report
 nothing, and the program's own are refused once emission ends.
@@ -435,8 +448,10 @@ type twice and that every constructor's argument compares by value under its `re
 a written order. The instance goes in the program's `InstanceTable` with the others, which every
 check after inference reads.
 
-Lowering declares a module's traits after its types and before their associated functions, and its
-instances after those (`lower::traits`). An instance's `def`s lower where its `instance` statement
+Lowering defines a module's nominal types before declaring its traits, whose signatures may name
+those types. `declare_nominal_requirements` then lowers the nominal declarations' requirements,
+which may name those traits. Associated functions follow, and instances are declared after them
+(`lower::traits`). An instance's `def`s lower where its `instance` statement
 stands, each completed from the trait's signature at the instance's types: a missing annotation
 becomes the trait's type there, and one the `def` writes is compared with it. Each body reads the
 requirements the trait's clause names, at the instance's types, and those the block's clause names

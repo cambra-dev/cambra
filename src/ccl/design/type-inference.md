@@ -530,12 +530,16 @@ visible in the final rendered type. Refinements belong to positions, not variabl
 
 #### Materialization outcomes
 
-`coalesce_compact` converts structural contributions into `ccl::Type`. It does not expose the
-original bound-graph variable identities as output type variables.
+`coalesce_compact` converts structural contributions into `ccl::Type`. A concrete shape replaces
+the variable contributions at that position. With no concrete shape, the least retained variable
+id is looked up in the active inference arena. A successful lookup returns that variable, with
+its bounds and scope; otherwise materialization supplies a fresh unresolved variable. Retained
+variables still reach their original bound graphs, so materialization does not detach a
+polymorphic scheme.
 
 | Contributions at a position | Result |
 | --- | --- |
-| No concrete shape | A fresh `Type::Infer` placeholder |
+| No concrete shape | The retained arena variable, if available; otherwise a fresh `Type::Infer` placeholder |
 | One compatible shape | The corresponding concrete type, with materialized children |
 | `UInt` and ranges `0..𝑛` | The greatest at a positive position and the least at a negative one, since `0..𝑚 <: 0..𝑛 <: UInt` for `𝑚 ≤ 𝑛` |
 | Distinct incompatible shapes, such as `Int` and `String` | `IncompatibleBounds` |
@@ -723,18 +727,26 @@ ordinary ([Data domains are invariant](#data-domains-are-invariant)).
 A result depends on more than the variable, and the memo's key holds the rest: the polarity, the
 binders the refinement-closing runs against (`st.scope`), whether the walk is at the position
 (`fallback_allowed`), and whether the position is invariant. It also depends on the path's
-substitution, `subst_acc`, which the key leaves out. A result is stored and reused only where
-that substitution acts on none of the names the walk below the variable can reach
-(`consulted_below`), where it leaves the walk as the identity does. Those names are the free
-names of every refinement below the variable, and the telescope of every variable a refinement's
-predicate holds, through whose binders alone a substitution reaches what that variable resolves
-to (`Subst::suspended`). Each is spelled through the substitutions of the bounds between, along
-the bounds `compact_go` follows: the polarity-correct side, the opposite side where it may be
-read, and a barrier variable's lowers. A cycle back through a renaming edge closes them under its
-images (`close_under_cycles`). A variable's names are kept with the cycles its read cut back to
-variables entered before it (`Consulted::cuts`), and reused where each of those is again being
-read, which records those cycles again. A substitution with a witness half, or a variable whose
-names are not known, bypasses the memo.
+substitution, `subst_acc`, which the key leaves out. The walk reuses the identity's result
+where the substitution cannot change any read below the variable. Otherwise it can reuse a
+result under the same substitution restricted to the term names read below it.
+
+`consulted_below` summarizes those reads through the bounds `compact_go` follows: the
+polarity-correct side, the opposite side where it may be read, and a barrier variable's lowers.
+The summary includes free term names in refinements and the scopes of their unresolved type
+slots. It also records whether witness operations can affect the reached types. Functions,
+refinements, witness references, projections and family applications conservatively retain
+that dependence. A scalar or structural graph with none of them ignores a substitution's
+witness half, so witness eliminations along different paths do not disable sharing of that
+graph.
+
+The dependency analysis collects each reached variable and position once, then propagates
+names through each bound's substitution until no summary grows. Witness dependence propagates
+with the names. This includes the names brought back by cycles: a rename cycle carrying `x`
+back as `y` makes both names consulted. The completed summaries are reusable from every entry
+into the graph; they carry no assumptions about which ancestors a query is already reading.
+Unknown reads propagate as unknown, and a propagation that does not settle within 64 rounds
+also returns unknown. Either case disables reuse conservatively.
 
 A result can also depend on the path through the cycles its walk cut back to variables entered
 before it. It is stored only where each such cut was spurious, and it records them
@@ -1047,6 +1059,18 @@ Debug builds log `ReadRecord` snapshots that retain the live variables and their
 results. At the end of a successful coalesce pass, `assert_reads_stable` resolves them against
 the final graph.
 
+The verification batch shares complete `compact_type` results by root type and the identities of its
+immutable carriers: quoted terms, settled witness lists, declarations and capabilities. `Type`
+equality omits typed information in those carriers. The cache keeps them alive and distinguishes
+their identities so equal-looking roots cannot substitute a different typed view.
+
+The graph and its scopes stay fixed throughout the batch. Every recorded read still simplifies and
+coalesces its compacted graph and compares the result with its own earlier result. Cached graphs are
+cloned before callers use them, and the cache is discarded when the batch returns or unwinds.
+Specialization uses fresh compactions, because pins can change a root's reachable bounds without
+changing the root type. A nested witness-projection query also uses a fresh walk because its
+recursion guard affects the answer.
+
 The comparison is bounded:
 
 - It checks structural shape, bases, ranges, and other materialized structure.
@@ -1309,10 +1333,11 @@ The rule over-splits: two under-determined uses whose joins supply one type get 
 polarity, and enclosing binders, and keeps each result with the accumulated substitution it was
 reached under, restricted to the names that substitution could act on below the variable
 (`ConsultedNames`, compaction's `consulted_below`). A later reach reuses a result whose
-restricted substitution is the same, as the identity's is wherever the substitution acts on none
-of those names. A substitution with a witness half, and a variable whose names are not known,
-skip the memo. A result whose walk cut a cycle is not cached. This memo belongs to one `spec_key` calculation;
-it is distinct from the specialization list stored on a frame and from compaction's cycle guard.
+restricted substitution is the same, as the identity's is wherever the substitution acts on
+none of those names. A witness half skips the memo only where the dependency summary retains
+witness dependence; unknown summaries also skip it. A result whose walk cut a cycle is not
+cached. This memo belongs to one `spec_key` calculation; it is distinct from the specialization
+list stored on a frame and from compaction's cycle guard.
 
 ##### Key timing and precision limits
 
@@ -1582,8 +1607,9 @@ expression tree does not break the references between their bound cells.
 
 `InferArena` in `infer/api.rs` owns the teardown of each inference run. Its thread-local
 capture records a strong handle to every variable minted while the arena is active.
-The type itself carries the variable handle, so the arena enumerates these handles for cleanup
-rather than serving as a lookup table.
+The type itself carries the variable handle. The arena keeps these handles in allocation order
+for cleanup and indexes their positions by variable id. Compaction can then recover the variable
+behind a recorded id without scanning the whole run's allocation list at each compact position.
 
 On drop, the arena takes the captured variables and clears both their bound lists and trait-watch
 lists. Watches can form another cycle: a variable watches an obligation whose output type refers
@@ -2320,6 +2346,11 @@ substitution; it applies nothing, so it mints no suspension. An elimination
 ([An elimination reads a sum through a term](#an-elimination-reads-a-sum-through-a-term)) acts on
 `𝑉` unless `𝑉`'s funkind settled plain. A fact about `𝑉[σ]` stays out of `𝑉`'s answer and reaches
 the variable that stands for the instance.
+
+Bound eligibility depends on the holder's own content and the bound's holder substitution.
+The graph is fixed during a compaction walk, so `CompactState::own_bounds` caches this decision
+by holder and bound side. Different incoming substitutions reuse the flags, then render each
+eligible bound under their own accumulated substitution. A later walk checks eligibility again.
 
 `compact_go` accumulates these rendering substitutions while following bounds and forces the
 composite at refinement leaves. `RefinementScope` then closes references against the functions
@@ -3632,6 +3663,25 @@ The node also keeps the `Case` it replaces as the term it stages. A consumer's t
 `Case`, and normal form reads the node as it, so the type rebuilt over the realized tree equals
 the recorded one
 ([The check after planning reads planning's rewrites back](#the-check-after-planning-reads-plannings-rewrites-back)).
+
+Freshening preserves an obligation's operand separately from the watches propagated below it.
+`TraitObligation::copy_watch` copies each watch and its frame, and registers the copy as an operand
+only if the original variable was that operand. Redelivery reads the copied operand's bounds in
+its own frame.
+
+A kind-component walk tracks visited kind identities in a hash set while retaining discovery
+order in its result. Each related kind is tested once per edge rather than against every kind
+already reached.
+The component is cached at the current kind-fact count through weak references. Its binder names
+are cached separately at the name-allocation count, so a new binder is visible without changing
+a kind edge. A content query that already finds a mapped term name, or whose content reads no
+witness, need not enumerate those binder names.
+
+Witness-position lookups cache the position of each reachable binder, including binders on
+concrete sum bounds and on originals a kind was copied from. Collection preserves the lookup's
+existing depth-first precedence and visits each kind identity once. Both the kind-fact and
+name-allocation counts invalidate the cache, including negative lookups. A freshened kind
+starts without its original's cache.
 
 ### Implementation limits
 
