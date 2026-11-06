@@ -216,6 +216,31 @@ impl Consumer for FanOutInput {
             c.borrow_mut().notify(arrived);
         }
     }
+
+    /// A push reaches every live slot's consumer, past the gate that holds back a second
+    /// notification, since every pushed region is a work package of a pipeline that reads a slot.
+    fn push(
+        &mut self,
+        region: &Projection,
+        landing: &mut crate::interpreter::dispatcher::Landing<'_>,
+    ) {
+        let Some(shared_rc) = self.shared.upgrade() else {
+            return;
+        };
+        let consumers = {
+            let shared = shared_rc.borrow();
+            shared
+                .live_indices()
+                .map(|i| shared.consumers[i].clone())
+                .collect::<Vec<_>>()
+        };
+        for c in &consumers {
+            match c.try_borrow_mut() {
+                Ok(mut consumer) => consumer.push(region, landing),
+                Err(_) => landing.reentered(),
+            }
+        }
+    }
 }
 
 /// RAII guard for the cyclic `FanOut` `subscribing_inner` flag.  Created
@@ -1075,13 +1100,14 @@ impl MemoProducer {
 
 impl MemoProducer {
     /// Pull the input at `projection_guard`, merge the answer into the cache, and release the
-    /// input at what the answer states. `must_read` is whether the region was dirty: a read of a
-    /// clean region that finds data the cache lacked wakes the memo's consumer.
+    /// input at what the answer states. With `wake_on_new_data`, data the cache lacked wakes the
+    /// memo's consumer: a pull passes it for a clean region, where no notification announced the
+    /// data, and a consume never does.
     fn read_input(
         &mut self,
         projection_guard: TileGuard,
         projection: &Projection,
-        must_read: bool,
+        wake_on_new_data: bool,
     ) {
         self.gate_probed = false;
         self.dirty = self.dirty.minus(projection);
@@ -1117,14 +1143,14 @@ impl MemoProducer {
             self.name(),
             self.cached_tile
         );
-        if must_read {
-            self.cached_tile.merge(input);
-        } else {
+        if wake_on_new_data {
             let before = self.cached_tile.clone();
             self.cached_tile.merge(input);
             if self.cached_tile != before {
                 self.wakeups.request(self.consumer.shared().clone());
             }
+        } else {
+            self.cached_tile.merge(input);
         }
     }
 }
@@ -1134,10 +1160,10 @@ impl Breaker for MemoProducer {
         self.consuming = true;
     }
 
-    /// Reads the input at `guard` whether or not the cache holds the region, since the caller
-    /// asks for the pipeline to run. The consumer is woken when
-    /// the read changes the cache: the notification that made the region dirty may have been
-    /// answered by a pull of the cache before this consume.
+    /// Reads the input at `guard` whether or not the cache holds the region, since the caller asks
+    /// for the pipeline to run. It wakes no consumer: a consuming memo's only reader is the
+    /// pipeline the dispatcher pushes to, and what the consume merged reaches it through the
+    /// packages pushed after the consume.
     fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
         debug_assert!(
             guard.check_from(self.input.tiling()),
@@ -1167,17 +1193,47 @@ impl Breaker for MemoProducer {
             }
         }
     }
+
+    fn input_tiling(&self, _: InputId) -> Tiling {
+        self.input.tiling().clone()
+    }
+
+    fn input_released(&self, _: InputId) -> TileGuard {
+        self.input.obsolete_guard().clone()
+    }
+
+    fn as_producer(&self) -> Option<&dyn BreakingProducer> {
+        Some(self)
+    }
 }
 
 impl BreakingProducer for MemoProducer {
-    fn input(&self) -> &dyn TileProducer {
-        &*self.input
+    /// The region the cached tile states, and what its readers released whole, which they release
+    /// only once it is decided. A release of a collection's rows leaves its statement as it was,
+    /// but a release of a scalar empties it, so the cache alone no longer states it. A release of
+    /// some fields' cells beneath a row leaves the row in the cache, which states it, so only the
+    /// keys released whole are added (`keys_released_whole`). `final_guard` takes the released
+    /// region out again.
+    fn held(&self) -> TileGuard {
+        let stated = self.cached_tile.to_guard();
+        let released = self.obsolete_guard();
+        if released.is_empty() {
+            return stated;
+        }
+        let released = match names_collection_keys(released) {
+            true => match keys_released_whole(released) {
+                Some(keys) => keys,
+                None => return stated,
+            },
+            false => released.clone(),
+        };
+        stated.union(&released)
     }
 
-    /// The region the cached tile states. A release removes rows and leaves the statement as it
-    /// was, which `finalize` takes into account.
-    fn held(&self) -> TileGuard {
-        self.cached_tile.to_guard()
+    /// Cut at the cached keys.
+    fn morsels(&self, guard: &TileGuard, rows: usize) -> Vec<TileGuard> {
+        let keys = self.cached_tile.live_keys().into_iter().flatten();
+        cut_at_keys(guard, keys.map(|(_, key)| key), rows, self.tiling())
     }
 
     fn offer_impl(&mut self, guard: TileGuard) -> Tile {
@@ -1263,7 +1319,7 @@ impl TileProducer for MemoProducer {
             }
             return self.answer(&projection);
         }
-        self.read_input(projection_guard, &projection, must_read);
+        self.read_input(projection_guard, &projection, !must_read);
         self.answer(&projection)
     }
 
@@ -1962,7 +2018,9 @@ mod tests {
 #[cfg(test)]
 mod projection_tests {
     use super::*;
+    use crate::interpreter::dispatcher::{Dispatcher, PipelineId};
     use crate::interpreter::tile_operators::Scheduler;
+    use crate::interpreter::tile_operators::test_helpers::push_to;
     use crate::interpreter::tile_operators::test_helpers::{
         GuardLog, InputConsumer, NotifyingOp, ProjectionSpy, ProjectionSpyOp, int_entries,
         ints_by_position, keys_between, notify_input,
@@ -2102,7 +2160,7 @@ mod projection_tests {
         let (mut consuming, _, _) = memo_over_stream();
         consuming.enter_consuming_mode();
         consuming.consume_impl(InputId::ONLY, ints().universal_guard());
-        assert_eq!(consuming.finalize(), ints().universal_guard());
+        assert_eq!(consuming.final_guard(), ints().universal_guard());
 
         for guard in [
             ints().universal_guard(),
@@ -2175,46 +2233,36 @@ mod projection_tests {
         memo.consume_impl(InputId::ONLY, ints().universal_guard());
         let pulls = pulled.borrow().len();
         memo.consume_impl(InputId::ONLY, ints().universal_guard());
-        assert_eq!(memo.finalize(), ints().universal_guard());
+        assert_eq!(memo.final_guard(), ints().universal_guard());
         assert_eq!(pulled.borrow().len(), pulls);
     }
 
-    /// A pipeline finalizes after its input has stated everything complete, and a memo consumed
-    /// in part has not had that. The check is an `assert!`, since it guards the protocol between
-    /// the driver and the breaker and a release build runs the same driver.
-    #[test]
-    #[should_panic(expected = "finalizes after its input has stated everything complete")]
-    fn finalize_before_the_input_has_drained_panics() {
-        let (mut memo, _, _) = memo_over_stream();
-        memo.enter_consuming_mode();
-        memo.consume_impl(InputId::ONLY, keys_between(0, 3));
-        memo.finalize();
-    }
-
-    /// `finalize` queues no wake. A consume that finds nothing new, on a memo whose input has
+    /// `finish` queues no wake. A consume that finds nothing new, on a memo whose input has
     /// drained, queues none either, so the queue is empty throughout.
     #[test]
-    fn finalize_queues_no_wake() {
+    fn finish_queues_no_wake() {
         let (mut memo, _, _) = memo_over_stream();
         memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, ints().universal_guard());
-        // The first consume changed the cache and woke the consumer; watch a queue of our own.
-        memo.wakeups = WakeupQueue::default();
+        assert!(memo.wakeups.is_empty(), "a consume queues no wake");
         memo.consume_impl(InputId::ONLY, ints().universal_guard());
-        memo.finalize();
+        push_to(&mut memo, &[1]);
+        let dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
+        dispatcher.finish_by_hand(PipelineId(0), |pushes| memo.finish(pushes));
+        assert!(dispatcher.pop().is_some(), "finish pushed a package");
         assert!(memo.wakeups.is_empty());
     }
 
-    /// The guard one memo finalizes is the guard the memo that reads it consumes: the whole
+    /// The final guard of one memo is the guard the memo that reads it consumes: the whole
     /// tiling less what the first released, which the second pulls and releases at.
     #[test]
-    fn a_memo_consumes_the_guard_the_memo_before_it_finalized() {
+    fn a_memo_consumes_the_final_guard_of_the_memo_before_it() {
         let (mut first, _, _) = memo_over_stream();
         let (mut second, pulled, released) = memo_over_stream();
         first.enter_consuming_mode();
         first.consume_impl(InputId::ONLY, ints().universal_guard());
         first.release(keys_between(0, 3));
-        let handed = first.finalize();
+        let handed = first.final_guard();
         assert_ne!(
             handed,
             ints().universal_guard(),
@@ -2507,18 +2555,21 @@ mod projection_tests {
 }
 
 /// A consuming memo over an input that grows, is released and is notified: what it holds, what it
-/// finalizes and what reaches the input, each against a model of the rows written and released.
+/// names as its final guard and what reaches the input, each against a model of the rows written
+/// and released.
 #[cfg(test)]
 mod consuming_tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    use crate::interpreter::dispatcher::{Dispatcher, PipelineId};
     use crate::interpreter::tile_operators::Scheduler;
     use crate::interpreter::tile_operators::growing::{
         Input, InputModel, KEYS, Region, Released, Rng, Shared, Step, entries, growing_source,
         ints, keys_of, keys_predicate, predicate, rows_of, same_region, source, value,
     };
     use crate::interpreter::tile_operators::test_helpers::keys_between;
+    use crate::interpreter::tile_operators::test_helpers::push_to;
     use crate::interpreter::{Predicate, Value};
 
     /// A memo over `source`, and the consumer its input notifies through.
@@ -2620,9 +2671,9 @@ mod consuming_tests {
     }
 
     /// `Everything` notified and consumed drains the input: the cache states the universe, and
-    /// `finalize` names all of it.
+    /// `final_guard` names all of it.
     #[test]
-    fn everything_notified_and_consumed_finalizes_the_universe() {
+    fn everything_notified_and_consumed_has_the_universe_as_final_guard() {
         let source = source(0..10);
         let (mut memo, mut notifier) = memo_over(&source);
         notifier.notify(&Projection::Everything);
@@ -2630,7 +2681,7 @@ mod consuming_tests {
         memo.consume_impl(InputId::ONLY, All.guard());
         assert_eq!(entries(&memo.cached_tile), rows_of(0..10));
         assert!(same_region(&statement(&memo), &Predicate::True));
-        assert_eq!(memo.finalize(), ints().universal_guard());
+        assert_eq!(memo.final_guard(), ints().universal_guard());
     }
 
     /// `Nothing` notified is not recorded, and consuming nothing reads nothing.
@@ -2700,57 +2751,57 @@ mod consuming_tests {
     /// A release of the whole output leaves nothing held, and a release of every key of the
     /// universe leaves exactly the keys beyond it.
     #[test]
-    fn finalize_after_releasing_everything_or_every_key_is_exact() {
+    fn final_guard_after_releasing_everything_or_every_key_is_exact() {
         let (mut memo, _) = memo_over(&source(0..10));
         memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, All.guard());
         memo.release(All.guard());
-        assert_eq!(memo.finalize(), ints().empty_guard());
+        assert_eq!(memo.final_guard(), ints().empty_guard());
 
         let (mut memo, _) = memo_over(&source(0..10));
         memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, All.guard());
         memo.release(Keys(0, KEYS - 1).guard());
         assert!(same_region(
-            &predicate(&memo.finalize()),
+            &predicate(&memo.final_guard()),
             &Predicate::True.minus(&keys_predicate(0, KEYS - 1))
         ));
     }
 
-    /// A release of nothing changes neither the cache nor what `finalize` returns.
+    /// A release of nothing changes neither the cache nor what `final_guard` returns.
     #[test]
     fn a_release_of_nothing_changes_nothing() {
         let (mut memo, _) = memo_over(&source(0..10));
         memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, All.guard());
-        let before = (entries(&memo.cached_tile), memo.finalize());
+        let before = (entries(&memo.cached_tile), memo.final_guard());
         memo.release(ints().empty_guard());
-        assert_eq!((entries(&memo.cached_tile), memo.finalize()), before);
+        assert_eq!((entries(&memo.cached_tile), memo.final_guard()), before);
     }
 
     // ------------------------------------------------------------------------------------
-    // What finalize returns
+    // What final_guard returns
     // ------------------------------------------------------------------------------------
 
-    /// A drained memo finalizes the whole of what it consumed.
+    /// The final guard of a drained memo is the whole of what it consumed.
     #[test]
-    fn finalize_names_everything_consumed() {
+    fn final_guard_names_everything_consumed() {
         let source = source(0..10);
         let (mut memo, _) = memo_over(&source);
         memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, All.guard());
-        assert_eq!(memo.finalize(), ints().universal_guard());
+        assert_eq!(memo.final_guard(), ints().universal_guard());
     }
 
     /// A release of a sub-region leaves the rest: the guard excludes exactly the keys released.
     #[test]
-    fn finalize_excludes_what_was_released() {
+    fn final_guard_excludes_what_was_released() {
         let source = source(0..10);
         let (mut memo, _) = memo_over(&source);
         memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, All.guard());
         memo.release(keys_between(2, 3));
-        let guard = memo.finalize();
+        let guard = memo.final_guard();
         assert!(same_region(
             &predicate(&guard),
             &Predicate::True.minus(&keys_predicate(2, 3))
@@ -2764,7 +2815,7 @@ mod consuming_tests {
     /// Rows added after a first consume, and consumed, are in the guard; the released keys are
     /// still out of it.
     #[test]
-    fn finalize_includes_rows_added_and_consumed_later_and_still_excludes_released_ones() {
+    fn final_guard_includes_rows_added_and_consumed_later_and_still_excludes_released_ones() {
         let source = source(0..6);
         let (mut memo, mut notifier) = memo_over(&source);
         memo.enter_consuming_mode();
@@ -2775,7 +2826,7 @@ mod consuming_tests {
         notifier.notify(&Keys(6, 11).projection());
         memo.consume_impl(InputId::ONLY, All.guard());
 
-        let guard = keys_of(&memo.finalize());
+        let guard = keys_of(&memo.final_guard());
         assert_eq!(guard, (0..KEYS).filter(|k| ![2, 3].contains(k)).collect());
         assert!(guard.contains(&9), "the row added later");
         assert_eq!(entries(&memo.cached_tile), rows_of([0, 1, 4, 5, 9]));
@@ -2784,26 +2835,17 @@ mod consuming_tests {
     /// An input that has stated everything complete and holds no row leaves a cache that states
     /// the universe and holds nothing: its guard is the universe.
     #[test]
-    fn finalize_of_a_memo_over_an_empty_input_is_the_universe() {
+    fn final_guard_of_a_memo_over_an_empty_input_is_the_universe() {
         let source = source([]);
         let (mut memo, _) = memo_over(&source);
         memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, All.guard());
         assert!(entries(&memo.cached_tile).is_empty());
-        assert_eq!(memo.finalize(), ints().universal_guard());
-    }
-
-    /// A memo that was not consumed has a cache that states nothing, and a pipeline does not
-    /// finalize before its input has drained.
-    #[test]
-    #[should_panic(expected = "finalizes after its input has stated everything complete")]
-    fn finalize_before_the_first_consume_panics() {
-        let (mut memo, _) = memo_over(&source(0..3));
-        memo.finalize();
+        assert_eq!(memo.final_guard(), ints().universal_guard());
     }
 
     /// A cache of outermost keys has no exact difference with a release of a scalar, so
-    /// `finalize` names the gap rather than answering another region.
+    /// `final_guard` names the gap rather than answering another region.
     #[test]
     #[should_panic(expected = "the guard algebra has no difference")]
     fn guard_minus_of_a_shape_without_a_spelling_panics() {
@@ -2826,7 +2868,7 @@ mod consuming_tests {
         let released = TileGuard::Function(FunctionGuard::Codomain(Box::new(Keys(0, 1).guard())));
         memo.release(released.clone());
         let before = Projection::of(&memo.held()).expect("a region of keys");
-        let held = Projection::of(&memo.finalize()).expect("a region of paths");
+        let held = Projection::of(&memo.final_guard()).expect("a region of paths");
         let released = Projection::of(&released).expect("a region of paths");
         assert_eq!(held.level(), Some(CurryLevel::new(1)));
         assert_eq!(held.intersect(&released), Projection::Nothing);
@@ -2838,13 +2880,144 @@ mod consuming_tests {
         );
     }
 
+    /// A memo released beneath its keys, over an open range of positions, holds paths beneath its
+    /// outermost keys, and its push of them lands in its reader as a region at their level.
+    #[test]
+    fn a_push_beneath_the_outermost_keys_lands_at_their_level() {
+        use crate::interpreter::tile_operators::growing::{NestedInput, nested_tiling};
+        let mut memo =
+            MemoProducer::over(Box::new(NestedInput::over(&source(0..4))), &nested_tiling());
+        push_to(&mut memo, &[1]);
+        memo.enter_consuming_mode();
+        memo.consume_impl(InputId::ONLY, nested_tiling().universal_guard());
+        memo.release(TileGuard::Function(FunctionGuard::Codomain(Box::new(
+            Keys(0, 1).guard(),
+        ))));
+        let dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
+        dispatcher.finish_by_hand(PipelineId(0), |pushes| pushes.push_final(&memo));
+        let crate::interpreter::dispatcher::Next::Package(package) =
+            dispatcher.try_claim(Some(PipelineId(1)))
+        else {
+            panic!("the reader is queued the push")
+        };
+        let level = Projection::of(&package.guard)
+            .expect("a push names a projection")
+            .level();
+        assert_eq!(level, Some(CurryLevel::new(1)), "{:?}", package.guard);
+    }
+
+    /// A memo released position by position through the last position of a row, over a finite
+    /// range of positions, holds the row no more (`BreakingProducer::final_guard` closes it).
+    #[test]
+    fn a_row_released_through_its_last_position_is_held_no_more() {
+        use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
+        use crate::interpreter::{BaseType, ColumnValue, Extent};
+        use bit_set::BitSet;
+        let tiling = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::data_function(
+                Extent::uint_range(2),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        // 0 ↦ {0 ↦ 1, 1 ↦ 2}, 1 ↦ {0 ↦ 3, 1 ↦ 4}, every level stated complete.
+        let tile = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                vec![0, 2],
+                ColumnValue::UInts(vec![0, 1, 0, 1]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 4]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let mut memo = MemoProducer::over(
+            Box::new(TestTileProducer::new(tile, tiling.clone())),
+            &tiling,
+        );
+        memo.enter_consuming_mode();
+        memo.consume_impl(InputId::ONLY, tiling.universal_guard());
+        for last in 0..2 {
+            memo.release(TileGuard::Function(FunctionGuard::Codomain(Box::new(
+                TileGuard::Function(FunctionGuard::Domain(Predicate::qualified(
+                    Predicate::point(Value::UInt(0)),
+                    Predicate::at_or_below(Value::UInt(last)),
+                ))),
+            ))));
+        }
+        let held = Projection::of(&memo.final_guard()).expect("a region of keys");
+        assert_eq!(held.level(), Some(CurryLevel::OUTERMOST), "{held:?}");
+        assert_eq!(
+            held.intersect(&Projection::admitting(Predicate::point(Value::UInt(0)))),
+            Projection::Nothing,
+            "row 0 is released through its last position"
+        );
+    }
+
+    /// A memo of records released at a key whole and at one field's cells under every key holds
+    /// the other keys: the field it still holds there names them (`BreakingProducer::final_guard`).
+    #[test]
+    fn a_release_of_a_fields_cells_leaves_the_keys_held() {
+        use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
+        use crate::interpreter::{BaseType, ColumnValue, Extent};
+        use bit_set::BitSet;
+        let int = || Tiling::Scalar(Extent::Base(BaseType::Int));
+        let tiling = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::Record(HashMap::from([("_0".into(), int()), ("_1".into(), int())])),
+        );
+        // 0 ↦ (_0: 1, _1: 3), 1 ↦ (_0: 2, _1: 4).
+        let tile = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::Record {
+                fields: HashMap::from([
+                    ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2]))),
+                    ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![3, 4]))),
+                ]),
+                absent: Default::default(),
+            }),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let mut memo = MemoProducer::over(
+            Box::new(TestTileProducer::new(tile, tiling.clone())),
+            &tiling,
+        );
+        memo.enter_consuming_mode();
+        memo.consume_impl(InputId::ONLY, tiling.universal_guard());
+        let first_field = TileGuard::Function(FunctionGuard::Codomain(Box::new(
+            TileGuard::Record(HashMap::from([
+                ("_0".into(), TileGuard::Scalar(Predicate::True)),
+                ("_1".into(), TileGuard::Scalar(Predicate::False)),
+            ])),
+        )));
+        memo.release(TileGuard::Or(vec![
+            TileGuard::Function(FunctionGuard::Domain(Predicate::point(Value::UInt(0)))),
+            first_field,
+        ]));
+        let held = Projection::of(&memo.final_guard()).expect("a region of keys");
+        let key = |k| Projection::admitting(Predicate::point(Value::UInt(k)));
+        assert_eq!(
+            held.intersect(&key(0)),
+            Projection::Nothing,
+            "key 0 is released whole"
+        );
+        assert_ne!(
+            held.intersect(&key(1)),
+            Projection::Nothing,
+            "key 1 holds field `_1`"
+        );
+    }
+
     // ------------------------------------------------------------------------------------
     // Wakes
     // ------------------------------------------------------------------------------------
 
-    /// A consumer of a consuming memo is woken by the input's notification, as a memo's in pull
-    /// mode is; `consume_impl` and `finalize` queue no wake of their own for a read the
-    /// notification announced.
+    /// A consumer of a consuming memo is woken by the input's notification, as a memo's in pull mode
+    /// is; `consume_impl` and `finish` queue no wake of their own for a read the notification
+    /// announced.
     #[test]
     fn the_consumer_of_a_consuming_memo_is_woken_by_the_input_notification() {
         use crate::interpreter::scheduler::forwarding_consumer_keeping_keys;
@@ -2880,15 +3053,18 @@ mod consuming_tests {
             "the gate is closed until the consumer pulls"
         );
         memo.get(All.guard());
-        memo.finalize();
-        assert!(memo.wakeups.is_empty(), "finalize queues no wake");
+        push_to(&mut memo, &[1]);
+        let dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
+        dispatcher.finish_by_hand(PipelineId(0), |pushes| memo.finish(pushes));
+        assert!(dispatcher.pop().is_some(), "finish pushed a package");
+        assert!(memo.wakeups.is_empty(), "finish queues no wake");
     }
 
     /// A consumer woken by the input's notification pulls a consuming memo before the driver
     /// consumes the keys notified: it is answered from the rows consumed so far, and the consume
-    /// that merges the new rows wakes it again, since no later notification will.
+    /// that merges the new rows wakes it no more. The package `finish` pushes announces them.
     #[test]
-    fn a_consumer_that_pulled_between_the_notification_and_the_consume_is_woken_by_the_consume() {
+    fn a_consume_wakes_no_consumer_that_pulled_since_the_notification() {
         use crate::interpreter::scheduler::forwarding_consumer_keeping_keys;
 
         let woken = Rc::new(Cell::new(0));
@@ -2909,11 +3085,7 @@ mod consuming_tests {
         memo.consume_impl(InputId::ONLY, Keys(0, 1).guard());
         notifier.notify(&Keys(2, 3).projection());
         sched.check_for_notifications();
-        assert_eq!(
-            woken.get(),
-            2,
-            "the consume's wake, and the notification of keys it did not name"
-        );
+        assert_eq!(woken.get(), 1, "the notification wakes the consumer");
 
         let pulled = memo.get(All.guard());
         assert_eq!(
@@ -2924,7 +3096,12 @@ mod consuming_tests {
 
         memo.consume_impl(InputId::ONLY, Keys(2, 3).guard());
         sched.check_for_notifications();
-        assert_eq!(woken.get(), 3, "the rows the consume merged are announced");
+        assert_eq!(woken.get(), 1, "a consuming memo wakes no consumer");
+        assert_eq!(
+            entries(&memo.get(All.guard())),
+            rows_of(0..4),
+            "the rows are merged"
+        );
     }
 
     // ------------------------------------------------------------------------------------
@@ -3041,12 +3218,12 @@ mod consuming_tests {
             );
             self.input.check(&self.consuming_source, trace);
             if self.input.drained() {
-                let guard = predicate(&self.consuming.finalize());
+                let guard = predicate(&self.consuming.final_guard());
                 let expected = self.stated.minus(&self.memo_released_predicate);
                 assert!(
                     same_region(&guard, &expected),
-                    "{trace}: finalize is {guard:?}, not what was stated less what was released \
-                     {expected:?}"
+                    "{trace}: the final guard is {guard:?}, not what was stated less what was \
+                     released {expected:?}"
                 );
             }
         }
