@@ -835,6 +835,25 @@ fn several_generators_key_by_the_tuple_of_positions(#[case] source: &str, #[case
     check_sink(source, expected);
 }
 
+/// A tuple annotation over a comprehension keyed by a dependent tuple panics in inference: the
+/// lower bound recorded for the inner generator's keys reads the outer key's binder
+/// (`__uncurry_k0`) outside the scope binding it. Without the annotation both run
+/// (`an_inner_generator_over_the_outer_element_keys_by_a_dependent_tuple`). Pinned until
+/// inference keeps the binder in scope; the sums are then `expected`.
+#[rstest]
+#[case::over_boxed_rows("[x for xs in [box([1, 2]), box([3])] for x in xs]", 6)]
+#[case::over_groups(r"[x for g in groupby([1, 2, 3, 4], \e -> e // 2) for x in g]", 10)]
+#[should_panic(expected = "the bound left its binder's scope without a mediating discharge")]
+fn a_tuple_annotation_over_a_dependent_tuple_keyed_comprehension(
+    #[case] comprehension: &str,
+    #[case] expected: i64,
+) {
+    check_sink(
+        &format!("ys: {{_, _}} |=> Int = {comprehension}\nout = test_sink()\nout << sum(ys)\n"),
+        &format!("[() -> {expected}]"),
+    );
+}
+
 /// A comprehension whose inner generator ranges over the outer element is keyed by a dependent
 /// tuple: each outer key has its own inner keys, the positions of the row it selects.
 #[rstest]

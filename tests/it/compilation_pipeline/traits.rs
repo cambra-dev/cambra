@@ -257,6 +257,46 @@ fn an_associated_type_is_the_instances(#[case] code: &str, #[case] expected: Val
     check_scalar(&format!("{PAIRS}\n{code}"), expected);
 }
 
+/// Instance heads a requirement's associated type is read through at a definition's use: a
+/// head naming one variable twice, which binds it once, and a head nested in another.
+const HEADS: &str = indoc! {"
+    type Two(T) = {T, T}
+    type Duo(A, B) = {A, B}
+    trait Pair(C):
+        Elem
+        def left(c: C) => Elem
+    instance forall (T) Pair(Duo(T, T)):
+        Elem = T
+        def left(c):
+            c.extract().0
+    instance forall (T) Pair(Two(Two(T))):
+        Elem = Two(T)
+        def left(c):
+            c.extract().0
+    instance Pair(Two(Int)):
+        Elem = Int
+        def left(c):
+            c.extract().0
+    def first_of(C, c: C) => r::Elem requires r: Pair(C):
+        summon(Pair(_))::left(c)
+"};
+
+/// The associated type a use's operands select is the one the definition's result reads.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_variable_named_twice("first_of(Duo::new((6, 0))) + 1", 7)]
+#[case::a_nested_head(
+    "first_of(Two::new((Two::new((1, 2)), Two::new((3, 4))))).extract().1 + 10",
+    12
+)]
+#[case::a_closed_head_beside_a_nested_one("first_of(Two::new((5, 6))) + 1", 6)]
+fn an_associated_type_is_read_through_the_head_its_operands_match(
+    #[case] call: &str,
+    #[case] expected: i64,
+) {
+    check_scalar(&format!("{HEADS}\n{call}"), Value::Int(expected));
+}
+
 /// A conditional instance answers only where what it requires holds, and its functions may
 /// use that.
 #[rstest]

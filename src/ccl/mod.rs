@@ -35,6 +35,7 @@ pub mod names;
 pub mod nominal;
 pub mod observe_world;
 pub mod opaque_output;
+pub(crate) mod pairing;
 pub mod panes;
 pub mod planning;
 pub mod provenance;
