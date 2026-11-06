@@ -88,9 +88,11 @@ impl TileOperator for ExtractFinal {
     ) -> Box<dyn TileProducer> {
         // Only source notifications reach the consumer. The default is subscribed eagerly
         // but pulled only after a terminal source has no live positions.
-        let source_producer =
-            self.source
-                .subscribe(self.source.tiling().universal_guard(), consumer, scheduler);
+        let source_producer = self.source.subscribe(
+            self.source.tiling().universal_guard(),
+            widening(consumer),
+            scheduler,
+        );
         let default_producer = self
             .default
             .as_mut()
@@ -476,7 +478,11 @@ mod tests {
         assert!(!producer.get(guard.clone()).is_terminal());
 
         ready.set(true);
-        consumer.borrow_mut().as_mut().unwrap().notify();
+        consumer
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .notify(&Projection::Everything);
         assert_eq!(notifications.get(), 0, "bug pin: the fallback wake is lost");
         let Tile::Scalar(result) = producer.get(guard) else {
             panic!("expected a scalar fallback");
