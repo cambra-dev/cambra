@@ -166,7 +166,17 @@ pub struct Bound {
     pub ty: Type,
     /// Morphism on the bound type's side of the edge.
     pub ty_subst: subst::Subst,
+    /// [`render_subst`](Self::render_subst), computed once: compaction reads it at each bound
+    /// it follows, once per walk, and composing it applies the holder side to every term the
+    /// content side's range holds.
+    pub rendered: RenderedSubst,
 }
+
+/// The memo of a [`Bound`]'s [`render_subst`](Bound::render_subst). A bound's two
+/// substitutions are fixed once it is built, so the composite is too. Empty in a newly built
+/// bound, and filled only where a copy mints its own ids (`provenance::ids_preserved`).
+#[derive(Debug, Clone, Default)]
+pub struct RenderedSubst(std::cell::OnceCell<subst::Subst>);
 
 impl Bound {
     /// `ty` with the **witness** half of `s` already applied, and `s` with that half
@@ -190,6 +200,7 @@ impl Bound {
             self_subst: subst::Subst::id(),
             ty,
             ty_subst: subst::Subst::id(),
+            rendered: RenderedSubst::default(),
         }
     }
 
@@ -203,6 +214,7 @@ impl Bound {
             self_subst: subst::Subst::id(),
             ty,
             ty_subst,
+            rendered: RenderedSubst::default(),
         }
     }
 
@@ -215,6 +227,7 @@ impl Bound {
             self_subst: subst::Subst::id(),
             ty: Type::Infer(Rc::clone(v)),
             ty_subst: s,
+            rendered: RenderedSubst::default(),
         }
     }
 
@@ -226,6 +239,7 @@ impl Bound {
             self_subst,
             ty,
             ty_subst,
+            rendered: RenderedSubst::default(),
         }
     }
 
@@ -254,7 +268,15 @@ impl Bound {
         if self.self_subst.is_id() {
             return self.ty_subst.clone();
         }
-        subst::Subst::then(&self.ty_subst, &self.holder_inverse())
+        // A composite built while ids are preserved holds nodes that keep their originals' ids,
+        // or throwaways in a debug check, which may not outlive that scope, so it is not kept.
+        if crate::ccl::provenance::ids_preserved() {
+            return subst::Subst::then(&self.ty_subst, &self.holder_inverse());
+        }
+        self.rendered
+            .0
+            .get_or_init(|| subst::Subst::then(&self.ty_subst, &self.holder_inverse()))
+            .clone()
     }
 
     /// The holder side of [`render_subst`](Self::render_subst): `self_subst` inverted where

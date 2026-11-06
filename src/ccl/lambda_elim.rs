@@ -35,7 +35,7 @@
 //! | `map` | `Builtin(Map)` | post-composition |
 //! | `sum`, `max` | `Builtin(Sum)`, `Builtin(Max)` | fold/reduce |
 //! | `converse` | `Builtin(Converse)` | grouping by key |
-//! | `uncurry` | `Builtin(Uncurry)` | uncurry |
+//! | `uncurry(n)` | `Builtin(Uncurry(n))` | uncurry |
 //! | `compose` | `Builtin(Compose)` | composition as first-class morphism |
 //! | `add`/`sub`/… (and compares / logic) | `Builtin(BinOp(op))` for `op: BinOpKind` | binary scalar ops |
 //! | `neg`, `not_fn` | `Builtin(Neg)`, `Builtin(NotFn)` | unary scalar ops |

@@ -45,6 +45,9 @@ pub struct InferArena {
     /// (dropping elsewhere would tear down the wrong thread's slot). Also
     /// unconstructible outside this module's `new`.
     _not_send_sync: std::marker::PhantomData<*const ()>,
+    /// The run's predicate derivations, which coalesce reads to share equal copies of one
+    /// predicate.
+    _derivations: crate::ccl::ccl_utils::RecordingDerivations,
 }
 
 impl InferArena {
@@ -75,6 +78,7 @@ impl InferArena {
         #[cfg(debug_assertions)]
         crate::ccl::subst::clear_dropped_entries();
         InferArena {
+            _derivations: crate::ccl::ccl_utils::RecordingDerivations::start(),
             _not_send_sync: std::marker::PhantomData,
         }
     }
@@ -1187,6 +1191,15 @@ fn option_variant_hint(type_a: &Type, type_b: &Type) -> Option<&'static str> {
 const TUPLE_WIDTH_HINT: &str =
     "hint: a tuple's width is part of its type, so tuples of different widths are different types";
 
+/// How many components the plain or dependent tuple `ty` has.
+fn tuple_width(ty: &Type) -> Option<usize> {
+    match ty {
+        Type::Tuple(ts) => Some(ts.len()),
+        Type::DepTuple(cs) => Some(cs.len()),
+        _ => None,
+    }
+}
+
 /// The hint for a product `found` where the product `expected` is required. A type
 /// parameter found is read as its bound, which is what the definition knows of it.
 fn product_keying_hint(expected: &Type, found: &Type) -> Option<&'static str> {
@@ -1201,7 +1214,13 @@ fn product_keying_hint(expected: &Type, found: &Type) -> Option<&'static str> {
              has no `.0` and a tuple has no named fields, so project a record with \
              `.name` and a tuple with `.0`",
         ),
-        (Type::Tuple(a), Type::Tuple(b)) if a.len() != b.len() => Some(TUPLE_WIDTH_HINT),
+        // A dependent tuple has a width as a plain one does: the keys of a comprehension over
+        // several generators, one per generator.
+        (Type::Tuple(_) | Type::DepTuple(_), Type::Tuple(_) | Type::DepTuple(_))
+            if tuple_width(expected) != tuple_width(found) =>
+        {
+            Some(TUPLE_WIDTH_HINT)
+        }
         // An open tuple found is a type parameter's bound.
         (Type::Tuple(_), Type::OpenTuple(_)) => Some(
             "hint: an open tuple `{A, ..}` fixes no width, so a value bounded by one \

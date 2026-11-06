@@ -944,73 +944,172 @@ fn base_keys(
                      {base} compiled from {uncompiled} [{site}]"
                 ));
             };
-            let mut levels = components.iter().zip(uncompiled);
-            let Some((first, uncompiled_first)) = levels.next() else {
+            // Each component's keys, nested under the ones before it as a constant family,
+            // `𝐾₀ ≫ const(𝐾₁ ≫ const(…))`, flattened to one level over the tuple by `uncurry(𝑛)`
+            // and taken as their own values.
+            let mut keys = components
+                .iter()
+                .zip(uncompiled)
+                .map(|(c, uc)| domain_keys(c, uc, ctx, site))
+                .collect::<Result<Vec<_>, _>>()?;
+            let Some(mut nested) = keys.pop() else {
                 return Ok(make_iterate(trivially_true_predicate(base.clone())));
             };
-            // The keys of the prefix, as a key set over the prefix: one component, then each
-            // next one's keys as a family over it, uncurried and flattened back to one level.
-            let mut keys = domain_keys(first, uncompiled_first, ctx, site)?;
-            let mut prefix = first.clone();
-            for (k, (next, uncompiled_next)) in levels.enumerate() {
-                let inner = domain_keys(next, uncompiled_next, ctx, site)?;
-                let inner_ty = inner.ty.clone();
-                let family = apply_primitive(
-                    inner,
-                    Builtin::Const,
-                    Type::fun(prefix.clone(), inner_ty.clone()),
-                );
-                let nested = typed_compose(vec![keys, family])
-                    .with_ty(Type::data_fun(prefix.clone(), inner_ty));
-                let paired = Type::Tuple(vec![prefix.clone(), next.clone()]);
-                let mut flat = apply_primitive(
-                    nested,
-                    Builtin::Uncurry,
-                    Type::data_fun(paired.clone(), next.clone()),
-                );
-                let widened = Type::Tuple(components[..k + 2].to_vec());
-                // From the third component on, the prefix is itself a tuple, which the pair
-                // nests; flattening its field re-addresses the rows over one tuple.
-                if k > 0 {
-                    let indices = Expr::list(vec![
-                        Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int)),
-                    ])
-                    .with_ty(Type::data_fun(
-                        Type::index_range(1),
-                        Type::Base(BaseType::Int),
-                    ));
-                    let flatten = apply_primitive(
-                        indices,
-                        Builtin::FlattenDomain,
-                        Type::fun(
-                            Type::data_fun(paired.clone(), next.clone()),
-                            Type::data_fun(widened.clone(), next.clone()),
-                        ),
-                    );
-                    flat = apply_function(
-                        flat,
-                        flatten,
-                        Type::data_fun(widened.clone(), next.clone()),
-                    );
-                }
-                keys = apply_primitive(
-                    flat,
-                    Builtin::MapDomain,
-                    Type::data_fun(widened.clone(), widened.clone()),
-                );
-                prefix = widened;
+            if keys.is_empty() {
+                return Ok(nested);
             }
-            Ok(keys)
+            for (outer, component) in keys.into_iter().zip(components).rev() {
+                let inner_ty = nested.ty.clone();
+                let family = apply_primitive(
+                    nested,
+                    Builtin::Const,
+                    Type::fun(component.clone(), inner_ty.clone()),
+                );
+                nested = typed_compose(vec![outer, family])
+                    .with_ty(Type::data_fun(component.clone(), inner_ty));
+            }
+            let last = components
+                .last()
+                .expect("the tuple has a last component")
+                .clone();
+            let flat = apply_primitive(
+                nested,
+                Builtin::Uncurry(components.len()),
+                Type::data_fun(base.clone(), last),
+            );
+            Ok(apply_primitive(
+                flat,
+                Builtin::MapDomain,
+                Type::data_fun(base.clone(), base.clone()),
+            ))
+        }
+        // **A dependent tuple's keys are a family**: the first component's keys, and at each
+        // of them the keys of the component its value picks ([`super::correlated::keys_family`]),
+        // flattened to one level over the tuple (`src/ccl/design/type-inference.md`,
+        // "Iterating a dependent tuple").
+        // More than two components are the prefix's keys and the last component's as a family
+        // over the prefix: the last component read at the prefix's projections, the pairs
+        // flattened back to one tuple as a product's are.
+        Type::DepTuple(components) if components.len() > 2 => {
+            let Type::DepTuple(uncompiled_components) = uncompiled else {
+                return Err(format!(
+                    "compiling a domain's predicates keeps its structure, but the dependent \
+                     tuple {base} compiled from {uncompiled} [{site}]"
+                ));
+            };
+            let p = Name::fresh("__prefix");
+            // The prefix and the last component read at it, of the compiled tuple and of the
+            // tuple before its predicates were compiled alike.
+            let pair_of = |tuple: &Type, components: &[(Option<Name>, Type)]| {
+                let (last, prefix) = components.split_last().expect("more than two components");
+                let prefix_ty = Type::dep_tuple(prefix.to_vec());
+                let of_p = Expr::var(&p).with_ty(prefix_ty.clone());
+                let last_at_prefix = tuple
+                    .component_type(prefix.len(), |j, ty| component_of(&prefix_ty, &of_p, j, ty))
+                    .expect("the last component of a dependent tuple has a type");
+                Type::dep_tuple(vec![
+                    (Some(p.clone()), prefix_ty),
+                    (last.0.clone(), last_at_prefix),
+                ])
+            };
+            let pair = pair_of(base, components);
+            let uncompiled_pair = pair_of(uncompiled, uncompiled_components);
+            let paired = domain_keys(&pair, &uncompiled_pair, ctx, site)?;
+            let indices = Expr::list(vec![
+                Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int)),
+            ])
+            .with_ty(Type::data_fun(
+                Type::index_range(1),
+                Type::Base(BaseType::Int),
+            ));
+            // The splice re-addresses the keys and leaves the values the pairs they were, so
+            // the keys are taken as the values again after it.
+            let pair_values = paired.ty.codomain().unwrap_or(Type::Hole);
+            let spliced = Type::data_fun(base.clone(), pair_values);
+            let flatten = apply_primitive(
+                indices,
+                Builtin::FlattenDomain,
+                Type::fun(paired.ty.clone(), spliced.clone()),
+            );
+            let flat = apply_function(paired, flatten, spliced);
+            Ok(apply_primitive(
+                flat,
+                Builtin::MapDomain,
+                Type::data_fun(base.clone(), base.clone()),
+            ))
+        }
+        Type::DepTuple(components) => {
+            let [(_, first), _] = components.as_slice() else {
+                unreachable!("a dependent tuple has more than one component")
+            };
+            let Type::DepTuple(uncompiled_components) = uncompiled else {
+                return Err(format!(
+                    "compiling a domain's predicates keeps its structure, but the dependent \
+                     tuple {base} compiled from {uncompiled} [{site}]"
+                ));
+            };
+            let [(_, uncompiled_first), _] = uncompiled_components.as_slice() else {
+                unreachable!("a dependent tuple keeps its components when compiled")
+            };
+            let outer = domain_keys(first, uncompiled_first, ctx, site)?;
+            let family = correlated::keys_family(components, ctx)?;
+            let Type::Fun { name, codomain, .. } = family.ty.peel_refinements().clone() else {
+                return Err(format!("a key family is a function, got {}", family.ty));
+            };
+            let nested_ty = Type::Fun {
+                name,
+                fun_kind: crate::ccl::FunKind::Data(None),
+                domain: Box::new(first.clone()),
+                codomain,
+            };
+            let nested = typed_compose(vec![outer, family]).with_ty(nested_ty);
+            let p = Name::fresh("__keys");
+            let of_p = Expr::var(&p).with_ty(base.clone());
+            let second = base
+                .component_type(1, |j, ty| component_of(base, &of_p, j, ty))
+                .expect("a dependent tuple of two components has a second");
+            let flat = apply_primitive(
+                nested,
+                Builtin::Uncurry(2),
+                Type::pi_kinded(p, base.clone(), second, crate::ccl::FunKind::Data(None)),
+            );
+            Ok(apply_primitive(
+                flat,
+                Builtin::MapDomain,
+                Type::data_fun(base.clone(), base.clone()),
+            ))
         }
         _ => Ok(make_iterate(trivially_true_predicate(base.clone()))),
     }
 }
 
-/// Whether `ty`'s extent holds keys `ty` does not: a refinement narrows the keys, and a
-/// projection's keys are the ones its collection holds.
+/// `of.𝑗`, typed `opened`, the component already read at `of`'s earlier components. The
+/// projection's own type is a Pi where component `𝑗` reads an earlier one, opened at its own
+/// binder, as `lambda_elim` types `.1` out of a dependent pair.
+fn component_of(tuple: &Type, of: &Expr, j: usize, opened: &Type) -> Expr {
+    let own = Name::fresh("__tuple");
+    let of_own = Expr::var(&own).with_ty(tuple.clone());
+    let at_own = tuple
+        .component_type(j, |i, ty| component_of(tuple, &of_own, i, ty))
+        .expect("a projected component exists");
+    let projection_ty = if crate::ccl::subst::type_free_vars(&at_own).contains(&own) {
+        Type::pi(own, tuple.clone(), at_own)
+    } else {
+        Type::fun(tuple.clone(), at_own)
+    };
+    Expr::apply(
+        of.clone_preserving_ids(),
+        Expr::proj_index(j).with_ty(projection_ty),
+    )
+    .with_ty(opened.clone())
+}
+
+/// Whether `ty`'s extent holds keys `ty` does not: a refinement narrows the keys, a
+/// projection's keys are the ones its collection holds, and a dependent tuple's later
+/// components' keys are a family over the earlier ones.
 pub(super) fn extent_overstates_keys(ty: &Type) -> bool {
     match ty {
-        Type::Refinement(..) | Type::WitnessProjection(_) => true,
+        Type::Refinement(..) | Type::WitnessProjection(_) | Type::DepTuple(_) => true,
         Type::Tuple(cs) => cs.iter().any(extent_overstates_keys),
         _ => false,
     }

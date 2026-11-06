@@ -2208,6 +2208,16 @@ fn a_nominal_elements_is_refused_at_the_instance() {
     "},
     33
 )]
+#[case::a_boxed_product_of_boxes_passed_on(
+    indoc! {"
+        def total(C, c: C) => Int requires r: Iterable(C), r::Elements <: _ |=> Int:
+            sum([x for x in c])
+        def passed(C, c: C) => Int requires r: Iterable(C), r::Elements <: _ |=> Int:
+            total(c)
+        passed(box([x + y for x in box([1, 2]) for y in box([3, 4, 5])]))
+    "},
+    33
+)]
 #[case::read_twice(
     indoc! {"
         def pairs(C, c: C) => Int requires r: Iterable(C), r::Elements <: _ |=> Int:

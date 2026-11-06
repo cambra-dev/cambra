@@ -1415,6 +1415,12 @@ pub(crate) fn run_debug_check<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Whether a [`preserve_ids`] scope is open on this thread, so a clone keeps its origin's id
+/// and a term built here may not outlive the scope in a live tree.
+pub(crate) fn ids_preserved() -> bool {
+    PRESERVING_IDS.is_open()
+}
+
 /// Select a clone's identity and report a fresh copy to [`on_copy`].
 ///
 /// An open [`preserve_ids`] scope returns `origin` unchanged and records nothing.

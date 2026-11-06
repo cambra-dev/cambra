@@ -293,7 +293,10 @@ fn through_strength(expr: &Expr, ctx: &mut PlanningCtx) -> Result<Option<Expr>, 
 /// The component is read under a name for `𝑥`. A membership refinement `{𝐾 | 𝑘 ∈ 𝑀(𝑥)}`
 /// states the keys as the image of the collection `𝑀(𝑥)`, so the keys are
 /// `map_domain(converse(𝑀(𝑥)))`, and `𝐹` is `(λ 𝑥 → 𝑀(𝑥)) ≫ converse ≫ map_domain`.
-fn keys_family(components: &[(Option<Name>, Type)], ctx: &mut PlanningCtx) -> Result<Expr, String> {
+pub(super) fn keys_family(
+    components: &[(Option<Name>, Type)],
+    ctx: &mut PlanningCtx,
+) -> Result<Expr, String> {
     let [(name, enclosing), (_, component)] = components else {
         return Err(format!(
             "a dependent tuple of {} components under one `curry` is not supported yet",

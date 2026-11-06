@@ -270,7 +270,9 @@ the pair's first component, which `Type` has no dependent pair to state. After t
 inner lambda is the element function `𝑓`, over the source's values, which carry no witness.
 
 Where `𝑓` reads nothing from the enclosing scope, elimination leaves `⟨𝑆, 𝑓 ▷ const⟩ ≫ compose`.
-`simplify` rewrites this to `𝑆 ≫ map(𝑓)`, or to `𝑆` for `id`. Where `𝑓` reads the enclosing scope,
+`simplify` rewrites this to `𝑆 ≫ map(𝑓)`, or to `𝑆` for `id`. Where `𝑓`'s result reads its input, as
+`unbox`'s keys read the sum it unboxes, `map(𝑓)` is typed by the element:
+`(𝑐 : 𝐶) ⇒ ((𝑎 : 𝐷) ⤇ 𝐵(𝑎 ▷ 𝑐))` for `𝑓 : (𝑥 : 𝑋) ⇒ 𝐵(𝑥)`. Where `𝑓` reads the enclosing scope,
 elimination leaves `⟨𝑆, curry(𝑔)⟩ ≫ compose` with `𝑔` over `(𝑋, 𝑉)`, which `simplify` rewrites to
 `𝑆 ▷ strength_over ≫ map(𝑔)`. `strength_over : (𝐴 ⇒ Σ (𝐷 : 𝐾). 𝐷 ⤇ 𝑉) ⇒ (𝐴 ⇒ Σ (𝐷 : 𝐾). 𝐷 ⤇ (𝐴, 𝑉))`
 pairs each input with each value of its own collection under that value's key, so the witness binds
@@ -293,6 +295,35 @@ spelling for a domain narrowed by its input (`src/ccl/ops.rs`, `Builtin::CurryOv
 `lambda_elim::run` refuses a `curry` whose argument's type still names a witness free once
 simplification has run: the nested-lambda rule reached a Σ-typed inner lambda that
 `compose_sum_generators` did not rewrite.
+
+### `uncurry` of an eliminated nest
+
+Elimination turns each level of a two-generator comprehension
+([ir.md, "Several generators"](ir.md#several-generators)) into the forms above, and `simplify`
+rewrites `uncurry` of the result into a morphism of the pair `(𝑎, 𝑏)` (`try_uncurry_curried`):
+
+- `curry(𝑔) ▷ uncurry ⟹ 𝑔`;
+- `(𝑠 ≫ curry(𝑔)) ▷ uncurry ⟹ ⟨.0 ≫ 𝑠, .1⟩ ≫ 𝑔`;
+- `(𝑠 ≫ ⟨𝑡 ▷ const, curry(𝑔)⟩ ≫ compose) ▷ uncurry ⟹ ⟨.0 ≫ 𝑠, .1 ≫ 𝑡⟩ ≫ 𝑔`, an inner level
+  over a sum composed with its source;
+- `(𝑠 ≫ 𝑐 ▷ const) ▷ uncurry ⟹ .1 ≫ 𝑐`, an inner collection that reads nothing of the outer
+  element.
+
+The last law drops `𝑠`, so the pairs are enumerated from the domain the type states. It does not
+fire where a component's keys are a witness projection (`keys_only_in_the_data`), which no extent
+enumerates: planning enumerates those pairs through the unrewritten term.
+
+At `𝑛 > 2` levels each law pairs the first two keys as above and leaves `uncurry(𝑛 − 1)` of the
+rest over that pair beside the remaining keys:
+`(𝑠 ≫ curry(𝑔)) ▷ uncurry(𝑛) ⟹ ⟨⟨.0 ≫ 𝑠, .1⟩, .2, …, .(𝑛−1)⟩ ≫ (𝑔 ▷ uncurry(𝑛 − 1))`, and the
+constant inner collection `⟨.1, …, .(𝑛−1)⟩ ≫ (𝑐 ▷ uncurry(𝑛 − 1))`. Product beta and zip
+distribution act on zips of any arity, which reduces the reshaping zip into the element.
+
+Operator conversion compiles `uncurry(𝑛)` to `𝑛 − 1` binary `Uncurry` operators, each past the
+first followed by `FlattenTupleDomain` at position 0, which splices the tuple already built open
+beside the next level's key. Composed beneath the levels of an enclosing comprehension, the same
+operators act at the innermost of them, each row's nest on its own (`Uncurry::new_at`,
+`FlattenTupleDomain::new_at`).
 
 ---
 

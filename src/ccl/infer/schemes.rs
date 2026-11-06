@@ -4,6 +4,7 @@
 
 use crate::ccl::F_TIME;
 use crate::ccl::F_WRITE;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use crate::ccl::FieldKey;
@@ -177,14 +178,16 @@ pub struct OperatorSchemes {
     collection_contains: PolyScheme,
 }
 
+/// The level every operator scheme is quantified at.
+const SCHEME_LEVEL: Level = 0;
+/// The level a scheme's own variables are minted at, so `instantiate(0)` mints fresh copies.
+const BODY_LEVEL: Level = 1;
+
 impl OperatorSchemes {
     /// Build the registry. Schemes are quantified at level 0; their
     /// internal fresh vars live at level 1 so `instantiate(0)` mints
     /// fresh copies at the active inference level.
     pub fn new() -> Self {
-        const SCHEME_LEVEL: Level = 0;
-        const BODY_LEVEL: Level = 1;
-
         // Box: ∀δ ε. ((k: δ) ⤇ ε) ⇒ Σ (σ : [δ]). (k: σ) ⤇ ε — the sum over the one
         // candidate δ, the argument's *domain*. `δ` occurs among the candidates, which is
         // an *invariant* position, so the domain is pinned exactly rather than widened on
@@ -454,17 +457,133 @@ impl OperatorSchemes {
     /// be expressed via the generic `Hole → fresh_var` conversion); `None`
     /// for builtins whose pre-stamped `expr.ty` is already monomorphic
     /// (or polymorphic only in independent vars).
-    pub(super) fn builtin(&self, b: Builtin) -> Option<&PolyScheme> {
-        match b {
-            Builtin::Box => Some(&self.box_intro),
-            Builtin::CollectionContains => Some(&self.collection_contains),
-            Builtin::FinalOrDefault => Some(&self.final_or_default),
-            Builtin::GetPrevSeq => Some(&self.get_prev_seq),
-            Builtin::GetPrevTxn => Some(&self.get_prev_txn),
-            Builtin::AwaitFinal => Some(&self.await_final),
-            _ => None,
+    pub(super) fn builtin(&self, b: Builtin) -> Option<Cow<'_, PolyScheme>> {
+        let stored = match b {
+            Builtin::Box => &self.box_intro,
+            Builtin::CollectionContains => &self.collection_contains,
+            Builtin::Uncurry(n) => return Some(Cow::Owned(uncurry_scheme(n))),
+            Builtin::FinalOrDefault => &self.final_or_default,
+            Builtin::GetPrevSeq => &self.get_prev_seq,
+            Builtin::GetPrevTxn => &self.get_prev_txn,
+            Builtin::AwaitFinal => &self.await_final,
+            _ => return None,
+        };
+        Some(Cow::Borrowed(stored))
+    }
+}
+
+/// An instantiated `uncurry(𝑛)` with its result's value read through the flattened tuple:
+/// `((𝑘₁ : 𝛼₁) ⤇ (… ⤇ 𝜈)) ⇒ ((𝑝 : (𝑘₁ : 𝛼₁) × …) ⤇ 𝜈[𝑘ᵢ ↦ 𝑝.𝑖])`, each `𝑝.𝑖` typed as its
+/// component opened at the projections before it. The substitution suspends on `𝜈`, so a value
+/// that reads no key is `𝜈` once it resolves.
+pub(super) fn uncurried_value_at_its_tuple(
+    instantiated: Type,
+    at: crate::ccl::provenance::NodeId,
+) -> Type {
+    // The projections are machinery of the `uncurry` node the type is read for.
+    let _g = crate::ccl::provenance::enter(
+        at,
+        "infer.uncurry_tuple_read",
+        crate::ccl::provenance::Nature::Machinery,
+    );
+    let Type::Fun {
+        name,
+        fun_kind,
+        domain: argument,
+        codomain,
+    } = instantiated
+    else {
+        unreachable!("uncurry's scheme is a function")
+    };
+    let Type::Fun {
+        fun_kind: result_kind,
+        domain: tuple,
+        codomain: value,
+        ..
+    } = *codomain
+    else {
+        unreachable!("uncurry's scheme returns a collection")
+    };
+    let Type::DepTuple(components) = tuple.as_ref() else {
+        unreachable!("uncurry's scheme is keyed by a dependent tuple")
+    };
+    let p = crate::ccl::Name::fresh("__uncurry_p");
+    let project = |j: usize, ty: &Type| {
+        crate::ccl::TypedExpr::apply(
+            crate::ccl::TypedExpr::var(&p).with_ty((*tuple).clone()),
+            crate::ccl::TypedExpr::proj_index(j).with_ty(Type::fun((*tuple).clone(), ty.clone())),
+        )
+        .with_ty(ty.clone())
+    };
+    // During inference a component reads the ones before it by name, so each is read at the
+    // projections before it by discharging those names, outermost first.
+    let mut env: std::collections::HashMap<crate::ccl::Name, crate::ccl::TypedExpr> =
+        std::collections::HashMap::new();
+    for (i, (k, component)) in components.iter().enumerate() {
+        let at_earlier = crate::ccl::subst::Subst::discharging(&env).apply_type(component);
+        if let Some(k) = k {
+            env.insert(k.clone(), project(i, &at_earlier));
         }
     }
+    let read = crate::ccl::subst::Subst::discharging(&env).apply_type(&value);
+    Type::Fun {
+        name,
+        fun_kind,
+        domain: argument,
+        codomain: Box::new(Type::Fun {
+            name: Some(p),
+            fun_kind: result_kind,
+            domain: tuple,
+            codomain: Box::new(read),
+        }),
+    }
+}
+
+/// `∀𝛼₁ … 𝛼ₙ 𝜈. ((𝑘₁ : 𝛼₁) ⤇ (… ⤇ ((𝑘ₙ : 𝛼ₙ) ⤇ 𝜈))) ⇒ (((𝑘₁ : 𝛼₁) × … × 𝛼ₙ) ⤇ 𝜈)` —
+/// [`Builtin::Uncurry`] at arity `n`, one scheme per arity, built where it is used.
+///
+/// **A level's keys may read the keys outside it**, so `𝛼ᵢ` stands under `𝑘₁ … 𝑘ᵢ₋₁`, and the
+/// flattened domain is the dependent tuple whose component `𝑖` stands under the same binders:
+/// a nest whose inner domains differ per outer key is read as one collection
+/// (`src/ccl/design/type-inference.md`, "4.8 Dependent tuples"). The tuple is built as a
+/// `DepTuple` whether or not a component reads an earlier one, since a variable reads nothing
+/// yet; compaction collapses it to a plain tuple where none does. `𝜈` stands under every
+/// binder, since a value may read the keys it stands at (a flattened nest whose values are
+/// collections over the inner keys). A function over a dependent tuple binds the tuple and not
+/// its components' names, so the result reads `𝜈` through the tuple's projections, which emission
+/// puts in at each use ([`uncurried_value_at_its_tuple`]).
+fn uncurry_scheme(n: usize) -> PolyScheme {
+    assert!(
+        n >= 2,
+        "uncurry flattens at least two collection levels, got {n}"
+    );
+    let names: Vec<crate::ccl::Name> = (0..n)
+        .map(|i| crate::ccl::Name::from(format!("__uncurry_k{i}").as_str()))
+        .collect();
+    let mut telescope = crate::ccl::infer_var::Telescope::empty();
+    let mut keys = Vec::with_capacity(n);
+    for name in &names {
+        keys.push(Type::Infer(crate::ccl::InferVar::fresh_in(
+            BODY_LEVEL, &telescope,
+        )));
+        telescope = telescope.extended(name.clone());
+    }
+    let value = Type::Infer(crate::ccl::InferVar::fresh_in(BODY_LEVEL, &telescope));
+    let nested = names
+        .iter()
+        .zip(&keys)
+        .rev()
+        .fold(value.clone(), |inner, (name, key)| Type::Fun {
+            name: Some(name.clone()),
+            fun_kind: crate::ccl::FunKind::Data(None),
+            domain: Box::new(key.clone()),
+            codomain: Box::new(inner),
+        });
+    let components = names.into_iter().map(Some).zip(keys).collect();
+    PolyScheme::poly(
+        SCHEME_LEVEL,
+        fun(nested, Type::data_fun(Type::DepTuple(components), value)),
+    )
 }
 
 impl Default for OperatorSchemes {
