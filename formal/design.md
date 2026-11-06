@@ -53,7 +53,7 @@ bound only, so the term calculus never types a value with one.
 
 The grammar is a subset of concrete Rust types, not every type a fully inferred program can
 contain. It has no Σ or witness-reference constructor and no open variant form. It also excludes
-inference unknowns (`Hole`, `SharedHole`, `BoundedHole` and `Infer`), kind variables, and the
+inference unknowns (`Hole`, `SharedHole`, `BoundedHole` and `Infer`), funkind variables, and the
 `History` and `ChanDom` forms. The `ty_json` encoder in
 [the differential harness](../tests/differential_oracle.rs) defines the supported wire boundary:
 it rejects sum-bearing function kinds and function binders other than a raw name or no name.
@@ -444,8 +444,8 @@ A formal extension must preserve their distinction between a term introducing a 
 subtyping an existing sum. A domain disagreement must not silently acquire a sum merely because
 a merge needs a representable result.
 
-Unresolved kind variables also require a model of pinning and final defaulting. Adding sums or
-kind variables does not by itself discharge `DataAgree` or supply a proof of semantic joins.
+Unresolved funkind variables also require a model of pinning and final defaulting. Adding sums or
+funkind variables does not by itself discharge `DataAgree` or supply a proof of semantic joins.
 
 ### Histories: the mutability semantic model
 
