@@ -901,6 +901,12 @@ pub(crate) fn arena_enter() {
     SUSPENDED_MEMBERSHIPS.with(|ms| *ms.borrow_mut() = SuspendedMemberships::default());
 }
 
+/// Whether an inference run is active on this thread ([`arena_enter`]).
+#[cfg(debug_assertions)]
+pub(crate) fn arena_is_active() -> bool {
+    ACTIVE_ARENA.with(|slot| slot.borrow().is_some())
+}
+
 /// Stop capturing and return every variable minted since [`arena_enter`], so
 /// the caller can clear their bounds. Yields an empty `Vec` if no run was
 /// active (which the [`InferArena`](crate::ccl::infer::InferArena) RAII guard

@@ -72,6 +72,8 @@ impl InferArena {
         // make the check pass without checking.
         #[cfg(debug_assertions)]
         crate::ccl::infer::solver::traits::unseal_emission();
+        #[cfg(debug_assertions)]
+        crate::ccl::subst::clear_dropped_entries();
         InferArena {
             _not_send_sync: std::marker::PhantomData,
         }
@@ -86,9 +88,16 @@ impl Default for InferArena {
 
 impl Drop for InferArena {
     fn drop(&mut self) {
+        let vars = crate::ccl::arena_exit();
+        // Solving has ended, so every scope `Subst::acting_on` read has reached its final
+        // size. A panicking run may have stopped mid-solve, with scopes still to grow.
+        #[cfg(debug_assertions)]
+        if !std::thread::panicking() {
+            crate::ccl::subst::check_dropped_entries(&vars);
+        }
         // Take back every variable minted during the run and sever its bound
         // edges, so the (otherwise cyclic) refcounts can all reach zero.
-        for var in crate::ccl::arena_exit() {
+        for var in vars {
             var.bounds.borrow_mut().clear();
             // A trait obligation holds its output `Type`, which holds a variable,
             // which watches the obligation — a cycle of exactly the kind the bound

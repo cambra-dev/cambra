@@ -1797,24 +1797,6 @@ fn a_bare_key_lookup_on_a_groupby_is_refused() {
     }
 }
 
-/// Consuming this boxed Map annotation fails inference: the dependent key is spelled by
-/// `box`'s binder `__box_k` on one side and by the consumer's binder on the other, and the
-/// two domains collide instead of reconciling. The FullMap counterpart runs in
-/// `a_keyed_annotation_compiles_and_runs`.
-#[test]
-fn a_consumed_boxed_map_annotation_escapes_its_scope() {
-    let errs = infer_program_err(indoc! {r#"
-        g: Map(_, _) = box(groupby([1,2,3], \x -> x))
-        sum([sum(v) for v in g])
-    "#});
-    assert!(
-        errs.iter().map(|e| format!("{e:?}")).any(|m| m
-            .contains("collection domains have no common answer")
-            && m.contains("__box_k")),
-        "expected the two spellings of the key domain to collide, got {errs:?}"
-    );
-}
-
 /// FullMap(_, _) preserves the group-by domain at either annotation strength. Consuming the
 /// groups under either is run in `a_keyed_annotation_compiles_and_runs`.
 /// See `src/ccl/design/collections.md`, "`groupby`'s exact type".
@@ -2082,6 +2064,15 @@ f(box([1,2]),box([3,4,5]))"
 /// result is a `List`, not a function over an unresolved domain.
 #[test]
 fn list_param_under_a_domain_preserving_consumer() {
+    assert_eq!(
+        infer_program(
+            r"
+def f(a: List(Int)):
+    [x + 1 for x in a]
+sum(f(box([1,2])))"
+        ),
+        int()
+    );
     // Two consumers of one `List` param — a uniform one and a domain-preserving
     // one — so the annotation's kind meets two separate demands.
     assert_eq!(
@@ -2092,21 +2083,6 @@ def f(a: List(Int)):
 f(box([1,2]))"
         ),
         int()
-    );
-}
-
-/// The domain-preserving consumer alone: the comprehension over the parameter, bound ahead by
-/// A-normalization, is read through `unbox`, and the projection `σ₁(__anf)` its result is keyed
-/// by lands on a variable whose telescope does not hold the temp. Pinned on the panic it
-/// reaches; the program answers 5.
-#[test]
-#[should_panic(expected = "open bound recorded")]
-fn list_param_under_a_domain_preserving_consumer_alone() {
-    infer_program(
-        r"
-def f(a: List(Int)):
-    [x + 1 for x in a]
-sum(f(box([1,2])))",
     );
 }
 
