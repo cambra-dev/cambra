@@ -1215,11 +1215,42 @@ pub fn freshen_above(
                 .iter()
                 .map(|k| k.map_children(|t| freshen_above(lim, t, target, cache)))
                 .collect();
+            // And of the guarded bounds, for the same reason: each instantiation's lower bounds
+            // are checked under its own copy. The guard is freshened as the refinement it is, on
+            // the copy of the variable it guards.
+            let guarded = tv.bounds.borrow().guarded_upper.clone();
+            let new_guarded: Vec<_> = guarded
+                .iter()
+                .map(|g| {
+                    let guarded_ty = freshen_above(
+                        lim,
+                        &Type::refined(Type::Infer(Rc::clone(tv)), g.guard.clone()),
+                        target,
+                        cache,
+                    );
+                    crate::ccl::infer_var::GuardedBound {
+                        guard: guarded_ty.refinements().iter().cloned().collect(),
+                        bound: Bound {
+                            origin: g.bound.origin,
+                            self_subst: freshen_subst_payloads(
+                                lim,
+                                &g.bound.self_subst,
+                                target,
+                                cache,
+                            ),
+                            ty: freshen_above(lim, &g.bound.ty, target, cache),
+                            ty_subst: freshen_subst_payloads(lim, &g.bound.ty_subst, target, cache),
+                            rendered: Default::default(),
+                        },
+                    }
+                })
+                .collect();
             {
                 let mut s = v.bounds.borrow_mut();
                 s.set_lower(new_lows);
                 s.set_upper(new_ups);
                 s.type_kinds = new_kinds;
+                s.guarded_upper = new_guarded;
             }
             // A suspension's kinds are decided on it, and so on its copy
             // ([`crate::ccl::infer_var::SuspendedMembership`]).

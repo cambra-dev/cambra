@@ -1779,8 +1779,9 @@ It computes the consumer predicates missing from the producer, then takes one of
 
 1. With no deficit, constrain the peeled base types. A `UInt` producer base against a `0..𝑛`
    consumer base skips this path: the range's bound is a demand no refinement layer records.
-2. If the producer base is an inference variable, constrain it against the consumer base with the
-   missing predicates attached. That variable can still acquire the required information.
+2. If the producer base is an inference variable, constrain it against the consumer base, and
+   record the edge as written, a guarded bound checked against each of the variable's lower
+   bounds; see [A variable base takes a guarded bound](#a-variable-base-takes-a-guarded-bound).
 3. For a concrete producer with a deficit, use the caller's SMT policy. A structural-only caller
    rejects; an SMT-enabled caller can establish entailment as described below.
 
@@ -1823,7 +1824,11 @@ are leaves, and `0..𝑚 <: 0..𝑛` for `𝑚 ≤ 𝑛` and `0..𝑛 <: UInt` a
 `constrain_go`.
 
 An unsupported predicate produces `SmtError::Encoding`. The subtype deficit rule treats that
-outcome as a mismatch: failure to encode is not evidence of entailment. Other SMT errors reach
+outcome as a mismatch: failure to encode is not evidence of entailment. A guarded bound's guard is
+the exception (`smt_sub_guarded`): an unsupported guard predicate is left out of the antecedent, as
+an unsupported scope assumption is, since leaving it out only weakens the antecedent. Under the
+guard `__elem in kvs`, `{Int | __elem == 1} <: {Int | __elem > 0}` holds by its own predicate, and
+the membership has no encoding. Other SMT errors reach
 `map_constrain_err`, which currently panics. `TODO(smt-undecided)` records a proposed change to
 some of that policy; it is not implemented error recovery.
 
@@ -3093,8 +3098,11 @@ invariant-domain path:
    a stated demand, so the two reached one variable as contributions. Wrap any other domain
    failure in `DataDomainMismatch`, retaining its cause.
 
-Two collections over different domains reaching one variable therefore meet as an equation, and
-the edge that closes them reports it. A `DisjointJoin`'s operands are partial maps over one
+Two collections over different domains reaching one variable therefore meet as an equation. Where
+both bases are concrete, the edge that closes them reports it; where a base is a variable, the
+comparison waits until the bases resolve
+([A variable base takes a guarded bound](#a-variable-base-takes-a-guarded-bound)). A `DisjointJoin`'s
+operands are partial maps over one
 domain, not collections standing for it: each operand's domain is a lower bound of the join's
 (`emit_disjoint_join`).
 
@@ -3106,6 +3114,49 @@ and unrefined directions, reflexivity, and the compute-function contrast.
 
 Post-inference checks use the same constraint relation. Invariance is not confined to emission,
 and the known variable-accumulation cases do not establish general constraint-order independence.
+
+#### A variable base takes a guarded bound
+
+A refined side whose base is an inference variable, meeting a refinement it lacks, constrains only
+part of that variable. `{𝑏 | 𝑞} <: {𝑇 | 𝑝}` says that the values of `𝑏` satisfying `𝑞` satisfy
+`𝑝`. It says nothing of the values of `𝑏` outside `𝑞`. `map(kvs)` produces such a side: its keys
+are the variable for the pairs' key type, refined by membership in the pairs, so an annotation
+`Map({String where _ != ""}, Int)` relates `{𝑘 | _ in kvs} <: {String | _ != ""}`.
+
+No bound on the whole of `𝑏` states this edge. `𝑏 <: {𝑇 | 𝑝}` also narrows the values outside
+`𝑞`. Two collections reaching one variable, as the arms of a conditional do at a consumer's
+domain, would then each take the other's filter, agree, and join with nothing reported for
+collections whose rows differ. `𝑏 <: 𝑇` alone states nothing about `𝑝`, and accepts a map with
+the key `""` above. The exact whole-variable form, `𝑏 <: {𝑇 | ¬𝑞 ∨ 𝑝}`, is a predicate that no
+refinement comparison reads.
+
+So the edge relates the bases, `𝑏 <: 𝑇`, and is kept as written: a **guarded bound**
+`{𝑏 | 𝑞} <: {𝑇 | 𝑝}` in `𝑏`'s `guarded_upper` list, next to its bounds. It is a [`Bound`] with
+the guard `𝑞` beside it, which reads in the holder's frame, under the holder-side morphism. Each
+lower bound `𝐿` of `𝑏`, already recorded or arriving later, is checked as `{𝐿 | 𝑞} <: {𝑇 | 𝑝}`,
+the two views of `𝑏` bridged as an ordinary bound's are (`close_guarded`). A concrete `𝐿` meets
+the deficit rule for a concrete base: structural matching, then the caller's SMT policy. A
+variable `𝐿` takes the same guarded bound. A guarded bound already recorded on a variable is not
+recorded again, which ends the walk on a cyclic bound graph.
+
+Instantiation copies a variable's guarded bounds with its bounds, so each instance's lower bounds
+are checked under its own copy. Extrusion gives a proxy flowing into the variable its guarded
+bounds, as it gives it the upper bounds. Compaction does not read them: they restrict which values
+reach the variable, and say nothing of the type it stands for.
+
+Within two data domains the edge is one direction of an equation, and the variable base takes no
+guarded bound there. Whether two such domains are one is decided where they materialize, once
+their bases have resolved, by the comparison every join of collections reaches
+(`data_domains_disagree`). Between two refined variable bases the edge relates nothing at all.
+Each base is settled by its own collection, and a base can hold filters in its own bounds: the
+domain of `[y for y in [x for x in xs if x > 1] if t]` is a variable bounded by the inner
+comprehension's filtered domain, refined by `t`. Tying it to the base of a sibling arm
+`[x for x in xs if t]`, whose layers match, would give the sibling the inner filter, and the two
+arms would agree. Arms whose filters differ report `DomainJoinConflict`, naming each
+domain as the program wrote it: a domain variable both arms reach unions their filters, and keeps
+the two sets it met (`met_refinements`) for the report. Arms with the same filter join, whether
+written inline, bound by `let` or passed as parameters: A-normalization names a variable's
+collection read once in scope (`share_collection_reads`), so the two filters quote one temp.
 
 ## 4.7 Dependent sums
 

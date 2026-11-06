@@ -45,6 +45,27 @@ pub fn is_mut_param(param: &TypedBinding) -> bool {
         .is_some()
 }
 
+/// Every mutable variable `e` binds: each [`TypedExprNode::MutDecl`] binder, and each `Lambda`
+/// parameter annotated `Mut(…)` ([`is_mut_param`]). Post-uniquify a name is bound once, so the
+/// set answers "is this `Var` a mutable variable?" anywhere in `e`, without walking scopes.
+pub fn bound_in(e: &Expr) -> Muts {
+    fn go(e: &Expr, out: &mut Muts) {
+        match &e.node {
+            TypedExprNode::MutDecl { binding, .. } => {
+                out.insert(binding.name.clone());
+            }
+            TypedExprNode::Lambda { param, .. } if is_mut_param(param) => {
+                out.insert(param.name.clone());
+            }
+            _ => {}
+        }
+        e.walk_children(|c| go(c, out));
+    }
+    let mut out = Muts::new();
+    go(e, &mut out);
+    out
+}
+
 /// `muts` with `name` added — the scope a [`TypedExprNode::MutDecl`]'s body is
 /// walked under.
 pub fn with(muts: &Muts, name: &Name) -> Muts {

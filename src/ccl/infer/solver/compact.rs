@@ -687,6 +687,26 @@ pub struct CompactFun {
     pub codomain: Box<CompactType>,
 }
 
+/// The two different refinement sets a negative merge unioned at one position
+/// ([`CompactType::met_refinements`]) — an **unordered** pair, for the reason
+/// [`CombinedDomains`] is one.
+#[derive(Debug, Clone)]
+pub struct MetRefinements(Box<(RefinementSet, RefinementSet)>);
+
+impl MetRefinements {
+    /// The two sets, in the order they were met — a rendering order, never an identity.
+    pub(super) fn pair(&self) -> (&RefinementSet, &RefinementSet) {
+        (&self.0.0, &self.0.1)
+    }
+}
+
+impl PartialEq for MetRefinements {
+    fn eq(&self, other: &Self) -> bool {
+        let ((a, b), (c, d)) = (self.pair(), other.pair());
+        (a == c && b == d) || (a == d && b == c)
+    }
+}
+
 /// The two domains a merge had to combine — an **unordered** pair.
 ///
 /// Unordered because `CompactFun` derives `PartialEq` and a merged slot's identity must not
@@ -758,6 +778,7 @@ impl CompactType {
             family,
             nominal,
             nominal_conflict: _,
+            met_refinements: _,
             origins: _,
         } = self;
         Occupied {
@@ -1215,6 +1236,11 @@ pub struct CompactType {
     /// value-shaped contribution is built from [`CompactType::value`] and only
     /// the two non-values keep the `None`.
     pub refinements: Option<RefinementSet>,
+    /// The first two different refinement sets a negative merge unioned here, as their
+    /// contributions wrote them. The union is neither set, so a domain conflict reported at
+    /// this position names these rather than the union
+    /// ([`super::coalesce::CoalesceError::DomainJoinConflict`]).
+    pub met_refinements: Option<MetRefinements>,
     /// History-handle `(value, domain, kind)`, if a [`Type::History`]
     /// contributed here — a mutable variable (`kind: Overwrite`) or a feed channel
     /// (`kind: Feed`).
@@ -1648,6 +1674,7 @@ impl CompactType {
             family,
             nominal,
             nominal_conflict: _,
+            met_refinements: _,
             origins: _,
         } = self;
         let is_witness = |a: &&AtomKey| matches!(a, AtomKey::Witness(_));
@@ -1790,6 +1817,7 @@ impl CompactType {
             family,
             nominal,
             nominal_conflict: _,
+            met_refinements: _,
             origins: _,
         } = self;
         // `atoms` and `refinements` hold no position, so structural equality on those is
@@ -1987,6 +2015,16 @@ impl CompactType {
                 })
             }
         };
+        // The union a negative merge forms is neither set it unions, so the first two
+        // different sets are kept beside it for a conflict to name.
+        let met_refinements = lhs.met_refinements.or(rhs.met_refinements).or_else(|| {
+            match (&lhs.refinements, &rhs.refinements) {
+                (Some(a), Some(b)) if !pol && a != b => {
+                    Some(MetRefinements(Box::new((a.clone(), b.clone()))))
+                }
+                _ => None,
+            }
+        });
         let refinements = match (lhs.refinements, rhs.refinements) {
             // `None` is the identity, exactly as for the shape slots above.
             (None, r) | (r, None) => r,
@@ -2064,6 +2102,7 @@ impl CompactType {
             family,
             nominal,
             nominal_conflict,
+            met_refinements,
             origins: lhs_origins.union(rhs_origins),
         }
     }
@@ -2094,6 +2133,7 @@ impl CompactType {
             kinds,
             nominal,
             nominal_conflict: _,
+            met_refinements: _,
             origins: _,
         } = self;
         atoms.is_empty()
@@ -4357,6 +4397,7 @@ fn compact_go_inner(
                     refinements: _,
                     kinds: _,
                     nominal_conflict: _,
+                    met_refinements: _,
                     origins: _,
                 } = &bound;
                 // A variant shape counts as concrete only at a **positive**

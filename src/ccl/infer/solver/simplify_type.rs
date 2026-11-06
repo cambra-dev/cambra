@@ -523,6 +523,7 @@ fn simplify_reconstruct(
         var: new_var,
         fun: new_fun,
         refinements: ct.refinements,
+        met_refinements: ct.met_refinements,
         history_slot: new_history_slot,
         dep_tuple: new_dep_tuple,
         family: new_family,

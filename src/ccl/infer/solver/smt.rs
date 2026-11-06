@@ -471,10 +471,25 @@ pub fn smt_sub(
     rhs: &[Refinement],
     scope: &dyn ScopeEnv,
 ) -> Result<bool, SmtError> {
+    smt_sub_guarded(base, lhs, &[], rhs, scope)
+}
+
+/// [`smt_sub`] for a guarded bound's check (`src/ccl/design/type-inference.md`, "A variable
+/// base takes a guarded bound"): the subject also satisfies `guard`. A guard predicate outside
+/// the encoded fragment is left out of the antecedent rather than failing the query, as a
+/// scope assumption is: `{Int | __elem == 1}` under the guard `__elem in kvs` is below
+/// `{Int | __elem > 0}` by its own predicate, and the membership has no encoding.
+pub fn smt_sub_guarded(
+    base: &Type,
+    lhs: &[Refinement],
+    guard: &[Refinement],
+    rhs: &[Refinement],
+    scope: &dyn ScopeEnv,
+) -> Result<bool, SmtError> {
     if rhs.is_empty() {
         return Ok(true);
     }
-    with_solver(|ctx| check(ctx, base, None, lhs, rhs, scope))
+    with_solver(|ctx| check(ctx, base, None, lhs, guard, rhs, scope))
 }
 
 /// Whether every value of `base` satisfying all of `lhs` is a value of `target` satisfying
@@ -492,7 +507,7 @@ pub fn smt_sub_at(
     rhs: &[Refinement],
     scope: &dyn ScopeEnv,
 ) -> Result<bool, SmtError> {
-    with_solver(|ctx| check(ctx, base, Some(target), lhs, rhs, scope))
+    with_solver(|ctx| check(ctx, base, Some(target), lhs, &[], rhs, scope))
 }
 
 /// One query: build it, then run it inside a `push`/`pop` scope so the constants
@@ -502,13 +517,14 @@ fn check(
     base: &Type,
     target: Option<&Type>,
     lhs: &[Refinement],
+    assumed: &[Refinement],
     rhs: &[Refinement],
     scope: &dyn ScopeEnv,
 ) -> Result<bool, SmtError> {
     // Encoding is pure and can bail; bailing before the `push` leaves no scope to
     // unwind.
     let mut enc = Encode::new(ctx, scope, base);
-    let formula = enc.query(target, lhs, rhs)?;
+    let formula = enc.query(target, lhs, assumed, rhs)?;
     let decls = enc.decls;
 
     ctx.push().map_err(exchange_failure)?;
@@ -610,10 +626,12 @@ impl<'a> Encode<'a> {
         &mut self,
         target: Option<&Type>,
         lhs: &[Refinement],
+        assumed: &[Refinement],
         rhs: &[Refinement],
     ) -> Result<SExpr, SmtError> {
         self.declare_subject(lhs, rhs)?;
         let mut conjuncts = self.conjuncts(lhs)?;
+        conjuncts.extend(self.antecedent(assumed));
         let mut goals = self.conjuncts(rhs)?;
         if let Some(target) = target {
             goals.extend(self.target_membership(target, lhs, rhs)?);
@@ -741,6 +759,30 @@ impl<'a> Encode<'a> {
 
     /// One s-expression per refinement. [`Encode::expr`] reports the part it
     /// could not translate; this is where the body carrying it is known.
+    /// A guarded bound's guard, as the query assumes it ([`smt_sub_guarded`]). A body outside
+    /// the fragment is dropped, as [`assume_refinements`](Self::assume_refinements) drops one:
+    /// an antecedent left out only weakens it, so a goal the rest proves is still proven.
+    ///
+    /// A body that fails can do so after it declared a leaf or gathered an assumption, so the
+    /// encoder's state is put back as it was before that body: nothing a dropped body met
+    /// reaches the query.
+    fn antecedent(&mut self, refs: &[Refinement]) -> Vec<SExpr> {
+        refs.iter()
+            .filter_map(|r| {
+                let (vars, assumed) = (self.vars.clone(), self.assumed.clone());
+                let (decls, assumptions) = (self.decls.len(), self.assumptions.len());
+                let encoded = self.expr(&r.predicate);
+                if encoded.is_err() {
+                    self.vars = vars;
+                    self.assumed = assumed;
+                    self.decls.truncate(decls);
+                    self.assumptions.truncate(assumptions);
+                }
+                encoded.ok()
+            })
+            .collect()
+    }
+
     fn conjuncts(&mut self, refs: &[Refinement]) -> Result<Vec<SExpr>, SmtError> {
         refs.iter()
             .map(|r| {
