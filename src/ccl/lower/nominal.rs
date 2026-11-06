@@ -31,7 +31,7 @@ use crate::ccl::{
     Expr, FieldKey, Lit, MethodCandidate, Name, Pattern, PatternHead, Type, TypedBinding,
     TypedExprNode,
 };
-use crate::ccl::{V_NONE, V_SOME};
+use crate::ccl::{Label, V_NONE, V_SOME};
 use crate::chl_parser::ast::{
     AnnotationMode, ArmPattern, Clause, ConstructorPattern, Expr as ChlExpr, ImplBlock,
     KindAnnotation, MatchArm, Param, QualifiedName, Requirement, Span, Spanned, Stmt as ChlStmt,
@@ -1756,10 +1756,20 @@ fn asserting(
     label: crate::ccl::provenance::RewriteLabel,
     ctx: &mut LoweringContext,
 ) -> Expr {
-    let id = Expr::builtin(crate::ccl::Builtin::Id).with_ty(Type::fun(
-        refined.peel_refinements().clone(),
-        refined.clone(),
-    ));
+    let from = refined.peel_refinements().clone();
+    stamped_id(value, from, refined.clone(), span, label, ctx)
+}
+
+/// `value ▷ id`, with `id` stamped `from ⇒ to`, which inference takes as given ([`asserting`]).
+fn stamped_id(
+    value: Expr,
+    from: Type,
+    to: Type,
+    span: Span,
+    label: crate::ccl::provenance::RewriteLabel,
+    ctx: &mut LoweringContext,
+) -> Expr {
+    let id = Expr::builtin(crate::ccl::Builtin::Id).with_ty(Type::fun(from, to));
     let id = ctx.tag_machinery(id, span, label);
     ctx.tag_machinery(Expr::apply(value, id), span, label)
 }
@@ -1779,10 +1789,10 @@ fn refined_by(
     )
 }
 
-/// `match scrutinee { Option::some(𝑣) → 𝑣; Option::none → none }`, or with no `none` arm
-/// when `none` is `None`.
+/// `match scrutinee { some(𝑣) → 𝑣; none → none }`, each arm's head `head(tag)`, or with no
+/// `none` arm when `none` is `None`.
 fn match_option(
-    decl: &Rc<NominalDecl>,
+    head: &dyn Fn(Label) -> PatternHead,
     scrutinee: Expr,
     none: Option<Expr>,
     span: Span,
@@ -1810,10 +1820,7 @@ fn match_option(
         .into_iter()
         .map(|(tag, binding, empty_payload, body)| crate::ccl::Branch {
             pattern: Some(Pattern {
-                head: PatternHead::Constructor {
-                    decl: Rc::clone(decl),
-                    ctor: tag.name().into(),
-                },
+                head: head(tag),
                 head_occurrence: Occurrence::mint(),
                 binding,
                 empty_payload,
@@ -1826,10 +1833,14 @@ fn match_option(
 }
 
 /// `Option::unwrap`, the function `x!` applies:
-/// `λ 𝑜 : {Option(𝑇) | not (__elem ▷ option_is_none)} → match 𝑜 { Option::some(𝑣) → 𝑣 }`, its
+/// `λ 𝑜 : {Option(𝑇) | not (__elem ▷ option_is_none)} → match (𝑜 ▷ id) { `some(𝑣) → 𝑣 }`, its
 /// result asserted `{𝑇 | __elem == (𝑜 ▷ option_value)}` ([`asserting`]).
 ///
-/// The parameter's refinement excludes `none`, so the `match` has no arm for it.
+/// The parameter's refinement excludes `none`, so the `match` has no arm for it. The `id` is
+/// stamped ``{Option(𝑇) | not (__elem ▷ option_is_none)} ⇒ {`some{𝑇}}``, the variant the
+/// refinement leaves, so the scrutinee's type carries no `none` tag for the one arm to miss:
+/// `lambda_elim` checks a `match`'s arms against its scrutinee's tags with the refinements
+/// stripped (the scrutinee-Case rule).
 fn bind_unwrap(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) -> Expr {
     use crate::ccl::nominal::{option_is_none, option_value};
     use crate::ccl::{BinOpKind, CompareKind, UnaryOpKind};
@@ -1847,6 +1858,7 @@ fn bind_unwrap(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) -> 
     let param_ty = refined_by(&option_ty, excludes_none, span, label, ctx);
 
     let read = Expr::var(arg).with_ty(option_ty);
+    let some_ty = Type::variant(vec![(FieldKey::Name(V_SOME), t.clone())]);
     let predicate = Expr::binop(
         Expr::var(Name::elem()).with_ty(t.clone()),
         BinOpKind::Compare(CompareKind::Equals),
@@ -1856,7 +1868,8 @@ fn bind_unwrap(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) -> 
     let result_ty = refined_by(&t, predicate, span, label, ctx);
 
     let scrutinee = ctx.tag_machinery(Expr::var(arg), span, label);
-    let case = match_option(decl, scrutinee, None, span, label, ctx);
+    let scrutinee = stamped_id(scrutinee, param_ty.clone(), some_ty, span, label, ctx);
+    let case = match_option(&PatternHead::Tag, scrutinee, None, span, label, ctx);
     let value = asserting(case, &result_ty, span, label, ctx);
     let name = member_binding(decl, UNWRAP);
     let binder = Occurrence::mint();
@@ -1915,7 +1928,11 @@ fn bind_unwrap_or(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) 
     };
     let scrutinee = component(0, ctx);
     let default = component(1, ctx);
-    let case = match_option(decl, scrutinee, Some(default), span, label, ctx);
+    let constructor = |tag: Label| PatternHead::Constructor {
+        decl: Rc::clone(decl),
+        ctor: tag.name().into(),
+    };
+    let case = match_option(&constructor, scrutinee, Some(default), span, label, ctx);
     let value = asserting(case, &result_ty, span, label, ctx);
     let name = member_binding(decl, UNWRAP_OR);
     let binder = Occurrence::mint();

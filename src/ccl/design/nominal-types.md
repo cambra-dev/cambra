@@ -388,7 +388,10 @@ uninterpreted sort with an uninterpreted `is_some` and `value` (`Sort::Option` i
 - `bind_unwrap` and `bind_unwrap_or` state their results through `asserting`, which applies an
   `id` stamped `𝑇 ⇒ {𝑇 | predicate}`. Inference takes the stamp as given, since no typing rule
   derives the predicate from the `match` that computes the result. `unwrap`'s parameter is
-  `{Option(𝑇) | not (__elem ▷ option_is_none)}`, so its `match` has no `none` arm.
+  `{Option(𝑇) | not (__elem ▷ option_is_none)}`, so its `match` has no `none` arm. Its scrutinee
+  is the parameter through an `id` stamped ``{Option(𝑇) | …} ⇒ {`some{𝑇}}``, and the arm names the
+  tag `` `some ``: `lambda_elim` checks a `match` against its scrutinee's tags with refinements
+  stripped, and `Option(𝑇)` stripped still carries `none`.
 - In a refinement predicate, `.is_none()` and `.value()` lower to `option_is_none` and
   `option_value` (`predicate_observer`) where `Option` is the only type declaring the method.
   A call of the method's binding has no encoding, and specialization renames the binding. The

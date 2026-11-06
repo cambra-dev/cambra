@@ -2488,10 +2488,13 @@ fn refined_add_of_a_computed_value_in_a_comprehension() {
     );
 }
 
-/// `!` in a comprehension's element: lambda elimination reads `unwrap`'s `match` at a scrutinee
-/// type that no longer excludes `none`, so the match's one arm is non-exhaustive.
+/// `!` in a comprehension's element. `Option::some(x)` is refined `__elem ▷ option_value == x`,
+/// and lambda elimination leaves that refinement on `variant_wrap(`some)` after removing the
+/// `λ x` that binds `x`. Discharging the `Let` that holds the eliminated term then substitutes a
+/// range mentioning `x` under the Pi binder `x`. `Option::some(x).unwrap_or(0)` fails the same
+/// way; [`some_of_a_computed_value`] is the same family.
 #[test]
-#[should_panic(expected = "scrutinee-Case is non-exhaustive")]
+#[should_panic(expected = "Barendregt violation")]
 fn unwrap_in_a_comprehension() {
     check_scalar(
         indoc! {"
