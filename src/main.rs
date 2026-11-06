@@ -160,29 +160,39 @@ fn print_main(branch: &str) -> std::sync::Arc<dyn DataSink> {
     }
 }
 
-/// The observer of a dispatched run under `--control` or `--inspect`: it samples the source
-/// windows where a pass has polled, publishes a frame where the pass has drained, and ends the run
-/// at the first drained boundary after a control request arrives, which the driver services
-/// between two runs.
+/// The observer of a dispatched run under `--control` or `--inspect`: it records the source
+/// windows where a pass has polled, for the publisher ([`Publisher`]) to send with its next frame,
+/// and ends the run at the first drained boundary after a control request arrives, which the
+/// driver services between two runs.
 struct Driver<'a> {
     control: Option<&'a ControlPort>,
     pending: &'a mut Option<ControlMessage>,
-    inspection: Option<&'a mut Inspection>,
+    inspection: Option<&'a Inspection>,
+    publisher: Option<&'a Publisher>,
     scheduler: &'a Scheduler,
-    sources: Vec<SourceWindow>,
 }
 
 impl RunObserver for Driver<'_> {
+    /// Probing switches on here where a client watches, as well as on the publisher's timer, and
+    /// only the publisher switches it off. `LiveServer::accept` counts a client as watching before
+    /// it answers the handshake, so input the client sends after it is taken by a poll that sees
+    /// the count, and its readings are recorded.
+    ///
+    /// The source windows are sampled here, between the poll and the pass's consumes, so a window
+    /// holds the arrivals the poll took. The handles are `Rc`, so the run's thread samples them.
     fn polled(&mut self) {
-        if let Some(inspection) = self.inspection.as_mut() {
-            self.sources = inspection.before_pull(self.scheduler);
+        let (Some(inspection), Some(publisher)) = (self.inspection, self.publisher) else {
+            return;
+        };
+        if inspection.channel.is_watched() && !inspection.probes.is_enabled() {
+            inspection.probes.enable();
+        }
+        if inspection.probes.is_enabled() {
+            publisher.record_windows(inspection.sample_sources(self.scheduler));
         }
     }
 
     fn drained(&mut self, changed: bool) -> ControlFlow<()> {
-        if let Some(inspection) = self.inspection.as_mut() {
-            inspection.publish(&self.sources);
-        }
         if let Some(message) = self.control.and_then(ControlPort::poll) {
             *self.pending = Some(message);
             return ControlFlow::Break(());
@@ -191,6 +201,128 @@ impl RunObserver for Driver<'_> {
             thread::sleep(Duration::from_millis(1));
         }
         ControlFlow::Continue(())
+    }
+}
+
+/// How often the [`Publisher`] reads the probe table.
+const PUBLISH_INTERVAL: Duration = Duration::from_millis(100);
+
+/// A thread that publishes probe frames on a timer, independent of a dispatched run's boundaries
+/// (`src/inspector_model/design.md`, "Probing follows the live route").
+///
+/// It switches probing to match whether a client is connected, and sends a frame where a probe took
+/// a reading that carried rows since the last frame, or where `main`'s version changed since it. It
+/// renders each frame from a copy of the table ([`ProbeSlot::snapshot`]), so no `get` waits on a
+/// render.
+struct Publisher {
+    shared: std::sync::Arc<Published>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+/// What the run's thread shares with the publisher's.
+struct Published {
+    probes: ProbeSlot,
+    channel: LiveChannel,
+    /// The source windows the run sampled at its last poll with probing on.
+    windows: std::sync::Mutex<Vec<SourceWindow>>,
+    /// Set where [`Inspection::follow`] took up a new version: the next frame is sent whatever the
+    /// table holds.
+    followed: std::sync::atomic::AtomicBool,
+    stop: std::sync::atomic::AtomicBool,
+}
+
+impl Publisher {
+    fn start(probes: ProbeSlot, channel: LiveChannel) -> Self {
+        let shared = std::sync::Arc::new(Published {
+            probes,
+            channel,
+            windows: std::sync::Mutex::new(Vec::new()),
+            followed: std::sync::atomic::AtomicBool::new(false),
+            stop: std::sync::atomic::AtomicBool::new(false),
+        });
+        let publishing = shared.clone();
+        let thread = thread::spawn(move || publishing.run());
+        Self {
+            shared,
+            thread: Some(thread),
+        }
+    }
+
+    fn record_windows(&self, windows: Vec<SourceWindow>) {
+        *self
+            .shared
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = windows;
+    }
+
+    fn followed(&self) {
+        self.shared
+            .followed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Stop the thread and wait for it, so a frame published after this is the driver's. A
+    /// publisher dropped without this, as on an error return, stops the same way.
+    fn stop(self) {}
+}
+
+impl Drop for Publisher {
+    fn drop(&mut self) {
+        self.shared
+            .stop
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("the publisher thread does not panic");
+        }
+    }
+}
+
+impl Published {
+    fn run(&self) {
+        use std::sync::atomic::Ordering;
+        // `ProbeTable::flows` at the last frame, as `Inspection::published_through` keeps it for
+        // pull mode: `None` from a follow until the next frame, `Some(0)` again at each switch.
+        let mut published_through = Some(0);
+        // Whether probing was on at the last tick. The run's poll can switch it on between two
+        // ticks (`Driver::polled`), which starts a fresh table as a switch here does.
+        let mut was_enabled = self.probes.is_enabled();
+        while !self.stop.load(Ordering::Acquire) {
+            if self.followed.swap(false, Ordering::AcqRel) {
+                published_through = None;
+            }
+            let watched = self.channel.is_watched();
+            if watched != self.probes.is_enabled() {
+                if watched {
+                    self.probes.enable();
+                } else {
+                    self.probes.disable();
+                    self.channel.forget_frame();
+                    self.windows
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clear();
+                }
+            }
+            let enabled = self.probes.is_enabled();
+            if enabled != was_enabled && published_through.is_some() {
+                published_through = Some(0);
+            }
+            was_enabled = enabled;
+            if watched
+                && let Some(table) = self.probes.snapshot()
+                && Some(table.flows()) != published_through
+            {
+                published_through = Some(table.flows());
+                let windows = self
+                    .windows
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                self.channel.publish_probes(&table, &windows);
+            }
+            thread::sleep(PUBLISH_INTERVAL);
+        }
     }
 }
 
@@ -317,20 +449,26 @@ fn run_program(
         // back to pull mode; a later run starts over breakers that consumed, which pull mode cannot
         // drive.
         let mut ran = false;
+        let publisher = inspection.as_ref().map(|inspection| {
+            Publisher::start(inspection.probes.clone(), inspection.channel.clone())
+        });
         loop {
             if let Some(message) = pending.take() {
                 let reply = service(message.request(), &mut ctx, &mut live, &main_consumer);
                 message.answer(reply);
             }
-            if let Some(inspection) = inspection.as_mut() {
-                inspection.follow(&live);
+            if let Some(inspection) = inspection.as_mut()
+                && inspection.follow(&live)
+                && let Some(publisher) = publisher.as_ref()
+            {
+                publisher.followed();
             }
             let mut driver = Driver {
                 control: control.as_ref(),
                 pending: &mut pending,
-                inspection: inspection.as_mut(),
+                inspection: inspection.as_ref(),
+                publisher: publisher.as_ref(),
                 scheduler: ctx.scheduler(),
-                sources: Vec::new(),
             };
             let ended = live.run(rows, &print_main, &mut driver);
             match ended {
@@ -347,6 +485,11 @@ fn run_program(
                 }
                 Err(refused) if !ran => {
                     eprintln!("note: {DISPATCH_VAR}: {refused}; running in pull mode");
+                    // Pull mode switches probing itself before each pull, from a slot the
+                    // publisher may have filled.
+                    if let Some(inspection) = inspection.as_ref() {
+                        inspection.probes.disable();
+                    }
                     ctx.resume_sink_pulls();
                     live.pull_sinks();
                     break;
@@ -357,6 +500,9 @@ fn run_program(
                 }
             }
             ran = true;
+        }
+        if let Some(publisher) = publisher {
+            publisher.stop();
         }
         if ran {
             if let Some(inspection) = inspection.as_ref() {
@@ -506,18 +652,21 @@ impl Inspection {
     /// it. Another branch's reload changes nothing here, and neither does
     /// deleting `main`: the panes keep describing the last version it ran
     /// (`src/inspector_model/design.md`, "A reload of main is followed").
-    fn follow(&mut self, live: &LiveProgram) {
+    ///
+    /// Answers whether it took up a new version, which a [`Publisher`] sends a frame for.
+    fn follow(&mut self, live: &LiveProgram) -> bool {
         let Some((version, program)) = live.program(MAIN_BRANCH) else {
-            return;
+            return false;
         };
         if version == self.following {
-            return;
+            return false;
         }
         self.snapshot.replace(program, &self.name, version);
         self.source_node_ids = source_nodes(&program.operator_graph);
         self.channel.follow(version);
         self.following = version;
         self.published_through = None;
+        true
     }
 
     /// Switch probing to match whether a client is connected, and sample the
