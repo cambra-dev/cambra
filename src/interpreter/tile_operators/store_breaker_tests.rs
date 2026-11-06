@@ -100,6 +100,11 @@ impl Compiled {
         f(store)
     }
 
+    /// Open the store: consume all of its seed input, input 0, ahead of every writer's.
+    fn open(&self) {
+        self.consume_whole(0);
+    }
+
     /// Consume all of the store's input `input`.
     fn consume_whole(&self, input: usize) {
         self.breaker(|store| {
@@ -115,6 +120,33 @@ impl Compiled {
             store.offer_impl(guard)
         })
     }
+}
+
+/// The input of a transaction store's writer `k`: the store reads its seeds as input 0, ahead of
+/// every writer's source.
+fn writer(k: usize) -> usize {
+    k + 1
+}
+
+/// An induction store short of terminal holds nothing, since a reader pulls its tile whole, but
+/// states decided the positions it has stepped: its decided region grows a position a step.
+#[test]
+fn an_induction_store_decides_each_position_it_steps() {
+    let compiled = Compiled::of(SUM);
+    let decided = || compiled.breaker(|store| (store.held(), store.decided()));
+    compiled.breaker(|store| store.consume_impl(InputId::ONLY, keys_between(0, 0)));
+    let (held, after_one) = decided();
+    assert!(held.is_empty(), "{held:?}");
+    compiled.breaker(|store| store.consume_impl(InputId::ONLY, keys_between(1, 1)));
+    let (_, after_two) = decided();
+    assert!(
+        !after_one.is_empty() && guard_minus(&after_one, &after_two).is_empty(),
+        "each step grows what is decided: {after_one:?}, then {after_two:?}"
+    );
+    assert!(
+        !guard_minus(&after_two, &after_one).is_empty(),
+        "the second step decides a position the first did not: {after_one:?}, then {after_two:?}"
+    );
 }
 
 /// A consuming store answers a pull from its last step and pulls its body no more.
@@ -200,17 +232,52 @@ fn committed(store: &Tile) -> Vec<Value> {
         .collect()
 }
 
+/// How many times the store's inputs, its body or writers and its seeds, have been pulled.
+fn input_pulls(compiled: &Compiled) -> u64 {
+    let mut pulls = 0;
+    compiled
+        .store
+        .borrow()
+        .visit_input_producers(&mut |_, input| pulls += input.base().pulls);
+    pulls
+}
+
+/// A consuming store answers a pull before its first consume with the unopened store: nothing
+/// terminal, and no input pulled. Its consumes then run as they would have.
+#[rstest_log::rstest]
+#[case::an_induction_store(SUM)]
+#[case::a_transaction_store(TWO_WRITERS)]
+fn a_consuming_store_pulled_before_its_first_consume_answers_nothing_final(#[case] source: &str) {
+    let compiled = Compiled::of(source);
+    compiled.breaker(|_| {});
+    let before = input_pulls(&compiled);
+    let whole = compiled.store.borrow().tiling().universal_guard();
+    let pulled = compiled.store.borrow_mut().get(whole);
+    assert!(!pulled.is_terminal(), "{pulled:?}");
+    assert_eq!(input_pulls(&compiled), before, "the pull steps nothing");
+    if source == TWO_WRITERS {
+        compiled.open();
+        compiled.consume_whole(writer(0));
+        compiled.consume_whole(writer(1));
+        assert_eq!(
+            committed(&compiled.snapshot()),
+            [90, 85, 65].map(Value::Int).to_vec()
+        );
+    }
+}
+
 /// A consume of one writer's source takes its proposals and commits none of them while the other
 /// writer has not passed their positions, and the positions taken count as released for that
 /// writer's input.
 #[test]
 fn a_proposal_waits_for_the_other_writer_to_pass_its_position() {
     let compiled = Compiled::of(TWO_WRITERS);
-    compiled.consume_whole(0);
+    compiled.open();
+    compiled.consume_whole(writer(0));
     assert_eq!(committed(&compiled.snapshot()), Vec::<Value>::new());
     compiled.breaker(|store| {
-        let whole = store.input_tiling(InputId(0)).universal_guard();
-        let released = store.input_released(InputId(0));
+        let whole = store.input_tiling(InputId(writer(0))).universal_guard();
+        let released = store.input_released(InputId(writer(0)));
         assert!(
             guard_minus(&whole, &released).is_empty(),
             "the positions taken are released for writer 0's input: {released:?}"
@@ -224,29 +291,35 @@ fn a_proposal_waits_for_the_other_writer_to_pass_its_position() {
 #[test]
 fn a_stale_proposal_is_proposed_again_before_a_larger_key_commits() {
     let compiled = Compiled::of(TWO_WRITERS);
-    compiled.consume_whole(0);
-    compiled.consume_whole(1);
+    compiled.open();
+    compiled.consume_whole(writer(0));
+    compiled.consume_whole(writer(1));
     assert_eq!(
         committed(&compiled.snapshot()),
         [90, 85, 65].map(Value::Int).to_vec()
     );
 }
 
-/// The last finish, across both inputs, commits what the store still
-/// holds and leaves the store terminal; the first input's last finish leaves it as it was.
+/// The last finish, across every input, commits what the store still
+/// holds and leaves the store terminal; the earlier inputs' last finishes leave it as it was.
 #[test]
 fn the_last_finish_of_the_last_input_commits_the_rest() {
     let compiled = Compiled::of(TWO_WRITERS);
-    compiled.consume_whole(0);
-    let dispatcher = Dispatcher::new(vec![vec![], vec![]], usize::MAX);
-    // Both sources closed, so each may finish.
-    dispatcher.close(PipelineId(1));
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        compiled.breaker(|store| store.finish(pushes))
-    });
+    compiled.open();
+    compiled.consume_whole(writer(0));
+    let dispatcher = Dispatcher::new(vec![vec![]; 3], usize::MAX);
+    // Every source closed, so each may finish.
+    for input in 1..3 {
+        dispatcher.close(PipelineId(input));
+    }
+    for input in 0..2 {
+        dispatcher.finish_by_hand(PipelineId(input), |pushes| {
+            compiled.breaker(|store| store.finish(pushes))
+        });
+    }
     assert_eq!(committed(&compiled.snapshot()), Vec::<Value>::new());
     assert!(!compiled.snapshot().is_terminal());
-    dispatcher.finish_by_hand(PipelineId(1), |pushes| {
+    dispatcher.finish_by_hand(PipelineId(2), |pushes| {
         compiled.breaker(|store| store.finish(pushes))
     });
     let settled = compiled.snapshot();
@@ -283,9 +356,11 @@ const THREE_WRITERS: &str = indoc! {"
 #[test]
 fn a_release_reclaims_no_version_a_held_proposal_read() {
     let compiled = Compiled::of(THREE_WRITERS);
-    let consume = |input: usize, position: u64| {
-        compiled
-            .breaker(|store| store.consume_impl(InputId(input), keys_between(position, position)));
+    compiled.open();
+    let consume = |writer_k: usize, position: u64| {
+        compiled.breaker(|store| {
+            store.consume_impl(InputId(writer(writer_k)), keys_between(position, position))
+        });
     };
     consume(0, 0);
     consume(0, 1);
@@ -296,11 +371,11 @@ fn a_release_reclaims_no_version_a_held_proposal_read() {
     consume(2, 1);
     consume(0, 3);
     compiled.pull_sinks();
-    let dispatcher = Dispatcher::new(vec![vec![]; 3], usize::MAX);
-    for input in [1, 2] {
+    let dispatcher = Dispatcher::new(vec![vec![]; 4], usize::MAX);
+    for input in 1..4 {
         dispatcher.close(PipelineId(input));
     }
-    for input in 0..3 {
+    for input in 0..4 {
         dispatcher.finish_by_hand(PipelineId(input), |pushes| {
             compiled.breaker(|store| store.finish(pushes))
         });
@@ -341,11 +416,12 @@ fn a_writer_stating_a_position_read_past_lets_a_larger_key_commit() {
         feed.add_data(&[(Value::UInt(0), Value::Int(5))]);
         feed.set_yield_predicate(Predicate::at_or_below(Value::UInt(1)));
     }
-    compiled.consume_whole(0);
+    compiled.open();
+    compiled.consume_whole(writer(0));
     let source: Rc<RefCell<dyn DataSourceDomainExtentImpl>> = feed.clone();
     compiled.breaker(|store| {
         store.read_source_again(&source);
-        store.consume_impl(InputId(1), keys_between(0, 1));
+        store.consume_impl(InputId(writer(1)), keys_between(0, 1));
     });
     assert_eq!(
         committed(&compiled.snapshot()),
