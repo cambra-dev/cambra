@@ -46,6 +46,7 @@ impl Requirement {
             trait_,
             args: Vec::new(),
             terms,
+            effect_assoc: Vec::new(),
             assoc: Vec::new(),
             at: None,
         })
@@ -773,6 +774,10 @@ pub struct Written {
     /// A `def`'s clauses, which the stamp on its body's lambda carries to the body's effect
     /// variable (`Typing::function_body`). As an annotation the stamp states nothing.
     pub of_def: bool,
+    /// An instance's function's clauses, its signature's: the parameters they name are the
+    /// instance's associated effect types, which the body defines rather than is bounded by
+    /// (`docs/chl-spec.md`, "Effects in traits").
+    pub of_instance: bool,
 }
 
 /// One requirement or effect, as an [`EffectVar`] records it.
@@ -1016,6 +1021,8 @@ impl Upper {
 pub enum Blame {
     /// A `def`'s `only` clause.
     Clause(chl_parser::ast::Span),
+    /// The trait's signature bounding an instance's function.
+    Signature(chl_parser::ast::Span),
     /// A written function type, whose clauses are exact.
     Written(chl_parser::ast::Span),
     /// A clause variable's bound, `E <: Effect except RunTransaction`, which each use's
@@ -1966,7 +1973,10 @@ mod tests {
         let variable = |bound: BTreeSet<Item>, own: BTreeSet<Item>| {
             Item::Param(ClauseParam {
                 except: own,
-                ..ClauseParam::whole(crate::ccl::ty::TypeParam::declared_except("E", bound), true)
+                ..ClauseParam::whole(
+                    crate::ccl::ty::TypeParam::declared_except("E", bound, None),
+                    true,
+                )
             })
         };
         let commits = Item::Causes(Effect::RunTransaction);

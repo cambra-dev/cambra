@@ -289,7 +289,8 @@ impl Refusals {
                         if let Some(output) = &sig.node.output {
                             self.expr(output);
                         }
-                        self.requires(&sig.node.requires);
+                        self.requires(&sig.node.requires.items);
+                        self.trait_types(&sig.node.causes.items);
                     }
                 }
             }

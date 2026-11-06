@@ -3378,9 +3378,8 @@ is a trait's function, read from an instance, `summon(Area(_))::area(s)`
 
 **[Decided]** — the rule that nothing leaving a scope names a variable whose history the scope ends;
 a written `Transaction`, a function's `Transaction` supplied by the block that calls it, and block
-footprints; effects in traits ([Effects in traits](#effects-in-traits)); outputs outside the program
-([Output outside the program](#output-outside-the-program)); readings
-([Inputs from outside the program](#inputs-from-outside-the-program)); and exceptions
+footprints; outputs outside the program ([Output outside the program](#output-outside-the-program));
+readings ([Inputs from outside the program](#inputs-from-outside-the-program)); and exceptions
 ([Exceptions](#exceptions)). The rest of this section is implemented.
 
 A function's type states what a call reads from its context, in its **`requires` clause**, and what
@@ -4154,12 +4153,11 @@ trait Scales(V, F):
 ```
 
 - **A signature states every type.** Each parameter is annotated and the result is written. The
-  operands and associated types are types in every signature. A function may declare type
-  parameters of its own, as `tag` declares `R`, and a `requires` clause; each call opens the
-  parameters at its own types and satisfies the clause there. **[Decided]** A signature is a
-  written type, so one without a `causes` clause causes nothing, and an associated type
-  `Name <: Effect` lets instances cause different effects
-  ([Effects in traits](#effects-in-traits)).
+  operands and associated types are types in every signature. A function may declare type parameters
+  of its own, as `tag` declares `R`, and a `requires` clause; each call opens the parameters at its
+  own types and satisfies the clause there. A signature is a written type, so one without a `causes`
+  clause causes nothing, and an associated type `Name <: Effect` lets instances cause different
+  effects ([Effects in traits](#effects-in-traits)).
 - **A parameter may be pass-by-reference.** `Mut(V)`, `Mut(V, Txn)` and `Feed(V)` state a
   parameter as they do on a `def`
   ([6.2 Non-purity as type wrappers](#62-non-purity-as-type-wrappers)): the caller's variable or
@@ -4281,8 +4279,8 @@ instance forall (T) Area(Two(T)) requires a: Area(T):
 - **The block defines each of the trait's functions, and nothing else.** A `def` in it is the
   trait's function at the instance's types. A parameter it leaves unannotated, its result, its own
   type parameters and its `requires` clause are the trait's there, and one it writes must be the
-  trait's. **[Decided]** It writes no `causes` clause and no context requirement: it requires and
-  causes what the trait's signature states, and its body causes nothing beyond that
+  trait's. It writes no `causes` clause and no context requirement: it requires and causes what the
+  trait's signature states, and its body causes nothing beyond that
   ([Effects in traits](#effects-in-traits)). A `def` names no type of its own, and `pub` does not
   mark one.
 - **No two instances of a trait accept one type.** Two instances overlap when some types match both

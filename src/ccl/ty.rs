@@ -1610,10 +1610,11 @@ pub struct TypeParam {
 impl TypeParam {
     /// A declared parameter: what lowering writes for `T` in `forall (T) V`.
     pub fn declared(spelling: impl Into<SmolStr>) -> Rc<TypeParam> {
-        TypeParam::declared_except(spelling, Default::default())
+        TypeParam::declared_except(spelling, Default::default(), None)
     }
 
-    /// A declared parameter standing for a clause, whose bound takes `except` away.
+    /// A declared parameter standing for a clause, whose bound, written at `bound_at`, takes
+    /// `except` away.
     #[expect(
         clippy::mutable_key_type,
         reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
@@ -1622,13 +1623,14 @@ impl TypeParam {
     pub fn declared_except(
         spelling: impl Into<SmolStr>,
         except: std::collections::BTreeSet<crate::ccl::effects::Item>,
+        bound_at: Option<chl_parser::ast::Span>,
     ) -> Rc<TypeParam> {
         Rc::new(TypeParam {
             id: TypeParamId(TYPE_PARAM_COUNTER.fetch_add(1, Ordering::Relaxed)),
             spelling: spelling.into(),
             opened_at: None,
             bound: None,
-            bound_at: None,
+            bound_at,
             clause_except: except,
         })
     }
@@ -1748,6 +1750,11 @@ pub struct TraitRequirement {
     pub args: Vec<Type>,
     /// One per term parameter of the trait: the variable `x` in `Read(x)`.
     pub terms: Vec<crate::ccl::Name>,
+    /// Each of the trait's associated effect types, by the trait's parameter for it, with the
+    /// parameter standing for it at this requirement, `s::Writes` under `requires s:
+    /// Sink(T)` (`docs/chl-spec.md`, "Effects in traits"). Equality and hashing leave it
+    /// out: it follows from where the requirement is written.
+    pub effect_assoc: Vec<(TypeParamId, crate::ccl::effects::ClauseParam)>,
     /// The associated types the clause names. One it leaves unnamed is absent, and
     /// leaves that position open.
     pub assoc: Vec<(crate::ccl::infer::solver::traits::Assoc, Type)>,
@@ -1781,6 +1788,7 @@ impl TraitRequirement {
             trait_: self.trait_.clone(),
             args: self.args.iter().map(&mut f).collect(),
             terms: self.terms.clone(),
+            effect_assoc: self.effect_assoc.clone(),
             assoc: self.assoc.iter().map(|(n, t)| (n.clone(), f(t))).collect(),
             at: self.at,
         }
@@ -1825,7 +1833,8 @@ fn params_at_or_below(ty: &Type) -> impl Iterator<Item = TypeParamId> {
 
 impl PolyType {
     /// Whether `param` stands for an associated type of a requirement the clause names,
-    /// `a::Output` under `requires a: Addable(T, T)`: a parameter of this `Poly` that some
+    /// `a::Output` under `requires a: Addable(T, T)`, or for an associated effect type,
+    /// `s::Writes` under `requires s: Sink(T)`: a parameter of this `Poly` that some
     /// requirement associates, spelled through the requirement's name. A `requires` clause
     /// writes its bound, and the parameter list leaves it out.
     pub fn is_member(&self, param: &TypeParam) -> bool {
@@ -1834,6 +1843,9 @@ impl PolyType {
                 r.assoc
                     .iter()
                     .any(|(_, t)| matches!(t, Type::Param(p) if p.id == param.id))
+                    // The scheme holds its own copy of an associated effect type's parameter,
+                    // which keeps the spelling, `s::Writes`, and the requirement's name in it.
+                    || r.effect_assoc.iter().any(|(_, c)| c.param.spelling == param.spelling)
             })
     }
 
@@ -1920,15 +1932,19 @@ impl PolyType {
     /// inferred one, is named `r`, numbered apart from the clause's other names.
     pub fn requires_text(&self, mut write: impl FnMut(&Type) -> String) -> Vec<String> {
         let member_binder = |r: &TraitRequirement| {
-            r.assoc.iter().find_map(|(_, t)| match t {
-                // An unnamed requirement's member is spelled `_::Name`, and printing names it.
-                Type::Param(p) if self.is_member(p) => p
-                    .spelling
-                    .split_once("::")
-                    .map(|(binder, _)| binder.to_string())
-                    .filter(|binder| binder != "_"),
-                _ => None,
-            })
+            let members = r
+                .assoc
+                .iter()
+                .filter_map(|(_, t)| match t {
+                    Type::Param(p) if self.is_member(p) => Some(p),
+                    _ => None,
+                })
+                .chain(r.effect_assoc.iter().map(|(_, c)| &c.param));
+            // An unnamed requirement's member is spelled `_::Name`, and printing names it.
+            members
+                .filter_map(|p| p.spelling.split_once("::"))
+                .map(|(binder, _)| binder.to_string())
+                .find(|binder| binder != "_")
         };
         let taken: Vec<String> = self
             .requires
@@ -1950,7 +1966,8 @@ impl PolyType {
         let mut items = Vec::new();
         for r in &self.requires {
             let args: Vec<String> = r.args.iter().map(&mut write).collect();
-            let binder = member_binder(r).or_else(|| (!r.assoc.is_empty()).then(&mut fresh));
+            let binder = member_binder(r)
+                .or_else(|| (!r.assoc.is_empty() || !r.effect_assoc.is_empty()).then(&mut fresh));
             items.push(match &binder {
                 Some(b) => format!("{b}: {}({})", r.trait_, args.join(", ")),
                 None => format!("{}({})", r.trait_, args.join(", ")),
