@@ -9,7 +9,7 @@ use crate::scalar_ops::{
     zip_arithmetic, zip_bool_compare, zip_bool_logic, zip_compare, zip_concat,
 };
 
-use super::{BaseType, ColumnValue, ColumnView, Extent, Value};
+use super::{BaseType, ColumnValue, ColumnView, Extent};
 
 /// Output [`Extent`] for a [`BinOpKind`].
 pub fn binop_output_extent(op: &BinOpKind) -> Extent {
@@ -128,8 +128,8 @@ fn apply_binop_into(op: BinOpKind, left: &ColumnValue, right: &ColumnValue, out:
             ColumnValue::Bools(o),
         ) => o.extend(compare_records(op, l, r)),
         // A tuple orders lexicographically by position (`docs/chl-spec.md`, "3.4
-        // Comparisons"). A nominal value's order is compiled into one, its fields in the
-        // order its declaration writes them (`operator_conversion`'s `OrderKey`).
+        // Comparisons"), and a nominal value by its fields in the order its declaration writes
+        // them, which its tag names: both are the values' own comparison.
         (
             BinOpKind::Compare(
                 op @ (CompareKind::Less
@@ -137,8 +137,8 @@ fn apply_binop_into(op: BinOpKind, left: &ColumnValue, right: &ColumnValue, out:
                 | CompareKind::Greater
                 | CompareKind::GreaterOrEq),
             ),
-            l @ ColumnValue::Records(_),
-            r @ ColumnValue::Records(_),
+            l @ (ColumnValue::Records(_) | ColumnValue::Union(_)),
+            r @ (ColumnValue::Records(_) | ColumnValue::Union(_)),
             ColumnValue::Bools(o),
         ) => o.extend(order_rows(op, l, r)),
         // A nominal value compares by value: constructor, then argument.
@@ -164,55 +164,31 @@ fn equal_rows(op: CompareKind, left: &ColumnValue, right: &ColumnValue) -> Vec<b
         .collect()
 }
 
-/// Order two tuple columns row by row, lexicographically by position ([`compare_values`]),
+/// Order two columns of tuples or nominal values row by row, by the values' own comparison,
 /// under an ordering comparator.
 fn order_rows(op: CompareKind, left: &ColumnValue, right: &ColumnValue) -> Vec<bool> {
     let rows = left.len().min(right.len());
     (0..rows)
         .map(|i| {
             let (l, r) = (left.index_at(i), right.index_at(i));
-            let ord = compare_values(&l, &r).unwrap_or_else(|| {
+            let ord = l.partial_cmp(&r).unwrap_or_else(|| {
                 panic!("{l:?} and {r:?} have no order; typing admits an ordered pair")
             });
-            match op {
-                CompareKind::Less => ord.is_lt(),
-                CompareKind::LessOrEq => ord.is_le(),
-                CompareKind::Greater => ord.is_gt(),
-                CompareKind::GreaterOrEq => ord.is_ge(),
-                CompareKind::Equals | CompareKind::NotEquals => {
-                    unreachable!("equality on records is compared componentwise above")
-                }
-            }
+            order_holds(op, ord)
         })
         .collect()
 }
 
-/// The order of two values: a base's own, and a tuple's lexicographically by position, its
-/// fields being `_0`, `_1`, …. `None` for values with no order, which typing never compares.
-pub fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
-    let positions = |fields: &HashMap<SmolStr, Value>| -> Option<Vec<(usize, Value)>> {
-        let mut out: Vec<(usize, Value)> = fields
-            .iter()
-            .map(|(k, v)| Some((k.strip_prefix('_')?.parse().ok()?, v.clone())))
-            .collect::<Option<_>>()?;
-        out.sort_by_key(|(i, _)| *i);
-        Some(out)
-    };
-    match (a, b) {
-        (Value::Record(x), Value::Record(y)) => {
-            let (x, y) = (positions(x)?, positions(y)?);
-            if x.len() != y.len() {
-                return None;
-            }
-            for ((_, l), (_, r)) in x.iter().zip(&y) {
-                match compare_values(l, r)? {
-                    std::cmp::Ordering::Equal => continue,
-                    other => return Some(other),
-                }
-            }
-            Some(std::cmp::Ordering::Equal)
+/// Whether the ordering comparison `op` holds of two values that compare as `ord`.
+pub fn order_holds(op: CompareKind, ord: std::cmp::Ordering) -> bool {
+    match op {
+        CompareKind::Less => ord.is_lt(),
+        CompareKind::LessOrEq => ord.is_le(),
+        CompareKind::Greater => ord.is_gt(),
+        CompareKind::GreaterOrEq => ord.is_ge(),
+        CompareKind::Equals | CompareKind::NotEquals => {
+            unreachable!("equality is compared by value, not by an order")
         }
-        _ => a.partial_cmp(b),
     }
 }
 

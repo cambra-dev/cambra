@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ccl::ccl_utils::TermMemo;
 use crate::ccl::effects::{
     Blame, Bound as CapabilityBound, Capability, Effect, EffectSet, EffectVar, EffectVarId,
-    Effects, Every, Filter, Item, Repr, Requirement, Upper,
+    Effects, Every, Family, Filter, Item, Repr, Requirement, Upper,
 };
 use crate::ccl::infer::solver::barrier::EdgeReport;
 use crate::ccl::infer::solver::display::{poly_for_display, scheme_obligations};
@@ -151,6 +151,12 @@ pub(super) struct InferCtx {
     /// Each statement emitted, with the variable collecting what it causes and the one of
     /// the body it stands in.
     effect_statements: Vec<(NodeId, Rc<EffectVar>, EffectVarId)>,
+    /// Each `for` loop emitted, for [`InferCtx::check_loop_orders`]: its node, the variable
+    /// collecting what its body causes, the mutable variables the body declares, and whether
+    /// its iterations interacted when its body was emitted.
+    effect_loops: Vec<EffectLoop>,
+    /// Each ordered loop's source, for [`InferCtx::order_keyed_loops`].
+    ordered_loops: Vec<OrderedLoop>,
     /// Each `with begin():` block emitted, with the variable collecting what its body causes.
     effect_transactions: Vec<(NodeId, Rc<EffectVar>)>,
     /// What lowering marks each marked node as: an expression statement, which an inert one
@@ -420,6 +426,63 @@ impl EffectFrame {
     }
 }
 
+/// A `for` loop emitted ([`InferCtx::effect_loops`]).
+struct EffectLoop {
+    node: NodeId,
+    var: Rc<EffectVar>,
+    declared: HashSet<Name>,
+    ordered: bool,
+}
+
+/// An ordered loop's source: the loop, the source's node, its type and its positions' type.
+struct OrderedLoop {
+    node: NodeId,
+    source: NodeId,
+    iter: Type,
+    positions: Type,
+}
+
+/// Whether what `var` collects, a loop body's effects, makes its iterations interact: a write
+/// to an induction variable not among `declared`, the ones the body declares, outlives the
+/// iteration (`docs/chl-spec.md`, "Ordered loops"). `WriteTxn(x)` orders nothing: the
+/// run's transactions commit in commit order, whatever position the iteration has.
+fn iterations_interact(var: &Rc<EffectVar>, declared: &HashSet<Name>) -> bool {
+    interacting(var, declared).is_some()
+}
+
+/// What an unordered loop's refusal says of a source whose positions are keys of type `key`.
+fn keys_detail(key: &Type) -> String {
+    format!(
+        "keys of type `{}`, which have no order",
+        crate::ccl::chl_print::chl_type(key)
+    )
+}
+
+/// What an unordered loop's refusal says of a source whose positions have type `positions`,
+/// as emission required `Orderable` of them: a concatenation's are a variant of its parts'.
+pub(super) fn positions_detail(positions: &Type) -> String {
+    match positions.peel_refinements() {
+        Type::Variant(..) => {
+            "the positions of a concatenation, which puts neither part first".to_string()
+        }
+        other => format!(
+            "positions of type `{}`, which have no order",
+            crate::ccl::chl_print::chl_type(other)
+        ),
+    }
+}
+
+/// The capability that makes a loop's iterations interact, as [`iterations_interact`] reads it.
+fn interacting(var: &Rc<EffectVar>, declared: &HashSet<Name>) -> Option<Capability> {
+    var.resolved().into_iter().find(|l| match &l.item {
+        Item::Causes(Effect::Write(x)) => !declared.contains(x),
+        // `Effect` and `Write(_)` hold a write to every variable, the accumulators outside the
+        // loop's too.
+        Item::Every(every) => every.overlaps(&Item::Every(Family::Write.top())),
+        _ => false,
+    })
+}
+
 /// A variable standing for an associated effect type, `Writes`, at a call of a trait's
 /// function or a use of a definition requiring the trait: it holds what the instance the
 /// obligation selects does, or the requirement in scope that answers it.
@@ -663,6 +726,8 @@ impl InferCtx {
             }],
             effect_binders: HashMap::new(),
             effect_statements: Vec::new(),
+            effect_loops: Vec::new(),
+            ordered_loops: Vec::new(),
             effect_transactions: Vec::new(),
             marks: HashMap::new(),
             effect_calls: HashSet::new(),
@@ -917,6 +982,86 @@ impl InferCtx {
     /// definition determines: a parameter's. That call's variable has nothing flowing into it
     /// at the definition, where each use fills a copy of its own, so a statement or a block
     /// reaching one may do something and is not reported.
+    /// Hold each loop's order to what its body was found to cause once emission is done. A loop
+    /// is ordered, and requires `Orderable` of its positions, from what its body causes when it
+    /// is emitted, which is when a requirement can enter the scheme of the function holding
+    /// it. A body that interacts only through a function passed to it learns so later.
+    /// Require `Orderable` of the keys of each ordered loop whose source's positions are a
+    /// keyed collection's, `σ` of `Σ (σ : SubtypesOf(K))`, whose order is `K`'s
+    /// (`docs/chl-spec.md`, "Ordered loops"). Emission requires it of `σ` itself, which no
+    /// instance answers or refuses; the source's type is resolved only now.
+    pub(super) fn order_keyed_loops(&mut self) -> Vec<LocatedInferError> {
+        use crate::ccl::ty::TypeKind;
+        let mut errors = Vec::new();
+        for l in std::mem::take(&mut self.ordered_loops) {
+            let positions =
+                crate::ccl::infer::solve::resolve_var_type(&l.positions).unwrap_or(l.positions);
+            let Type::WitnessRef(id) = positions.peel_refinements() else {
+                continue;
+            };
+            let iter = crate::ccl::infer::solve::resolve_var_type(&l.iter).unwrap_or(l.iter);
+            // Resolving the source renames its binders, so a sum of one binder names the
+            // positions by being one.
+            let kind = match iter.peel_refinements().sum() {
+                Some([only]) => Some(only.type_kind()),
+                Some(ws) => ws.iter().find(|w| w.id() == id).map(|w| w.type_kind()),
+                None => None,
+            };
+            let detail = match kind {
+                Some(TypeKind::SubtypesOf(key)) => {
+                    if self
+                        .require_trait(Trait::orderable(), l.node, &[&key, &key], None, &|| {
+                            "the keys of an ordered loop's source".to_string()
+                        })
+                        .is_ok()
+                    {
+                        continue;
+                    }
+                    keys_detail(&key)
+                }
+                Some(TypeKind::Type) => {
+                    "the positions of a collection, which have no order".to_string()
+                }
+                _ => continue,
+            };
+            errors.extend(self.unordered_loop_error(l.node, l.source, detail));
+        }
+        errors
+    }
+
+    /// The error refusing the ordered loop `node` over the source at `source`, whose positions
+    /// `detail` describes, naming what orders the loop.
+    pub(super) fn unordered_loop_error(
+        &self,
+        node: NodeId,
+        source: NodeId,
+        detail: String,
+    ) -> Option<LocatedInferError> {
+        let l = self.effect_loops.iter().find(|l| l.node == node)?;
+        let why = match interacting(&l.var, &l.declared)?.item {
+            Item::Causes(Effect::Write(x)) => {
+                format!("its body writes `{x}`, a variable bound outside it")
+            }
+            item => format!("its body causes `{item}`"),
+        };
+        Some(LocatedInferError::new(
+            InferError::UnorderedLoop { why, detail },
+            source,
+        ))
+    }
+
+    pub(super) fn check_loop_orders(&self) {
+        for l in &self.effect_loops {
+            assert!(
+                l.ordered || !iterations_interact(&l.var, &l.declared),
+                "the loop at {:?} is ordered only by what a function passed to it causes, which \
+                 is known after its body is emitted, too late to require `Orderable` of its \
+                 positions; that is not supported yet",
+                l.node
+            );
+        }
+    }
+
     pub(super) fn does_nothing(&self) -> Vec<(NodeId, InferError)> {
         let undetermined = |v: &EffectVar| {
             self.effect_calls.contains(&v.uid) && v.incoming().is_empty() && v.own().is_empty()
@@ -1621,7 +1766,21 @@ impl InferCtx {
             "{trait_} is over {} type(s); an operator wired to it must supply that many",
             trait_.arity(),
         );
-        let positions: Vec<Type> = operand_types.iter().map(|_| self.fresh()).collect();
+        // Each operand's variable stands where the operand does: one placed under a
+        // function's witness binders, a loop's positions over a sum among them, may name
+        // those witnesses, and so may the variable the obligation watches for it.
+        let positions: Vec<Type> = operand_types
+            .iter()
+            .map(|operand| {
+                let position = self.fresh();
+                if let (Type::Infer(copy), Type::Infer(original)) =
+                    (&position, operand.peel_refinements())
+                {
+                    copy.inherit_witness_placement(original);
+                }
+                position
+            })
+            .collect();
         // Only a requested association gets a variable for the obligation to settle;
         // a pure requirement determines nothing and mints none.
         let wanted: Vec<(Assoc, Type)> = assoc
@@ -2819,6 +2978,21 @@ impl Typing for InferCtx {
             Ok(()) => Ok(()),
             Err(e) => {
                 let failure = self.cache.take_failure();
+                // An ordered loop refusing the positions that arrived here, at a use of the
+                // definition holding it, is refused as the loop.
+                if let crate::ccl::infer::solver::ConstrainError::NoTraitInstance {
+                    operator,
+                    found,
+                    ..
+                } = &e
+                    && let Some(refusal) = self.unordered_loop_error(
+                        *operator,
+                        self.current_node_id,
+                        positions_detail(&coalesce_for_error(found)),
+                    )
+                {
+                    return Err(refusal.with_failure(failure));
+                }
                 Err(self
                     .raise(map_constrain_err(e, &at()))
                     .with_failure(failure))
@@ -3115,6 +3289,63 @@ impl Typing for InferCtx {
         let body = outer.var.uid;
         self.effect_statements.push((node, var, body));
         r
+    }
+
+    fn loop_body<R>(
+        &mut self,
+        node: NodeId,
+        declared: &HashSet<Name>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> (R, bool) {
+        // A frame of its own, as a statement's, keeping what names the enclosing function's own
+        // variables: an accumulator may be one.
+        let outer = self.effect_frame();
+        let frame = EffectFrame {
+            var: EffectVar::fresh(self.level),
+            depth: outer.depth,
+            keeps_own: true,
+            transactions: outer.transactions,
+        };
+        let var = Rc::clone(&frame.var);
+        self.effect_frames.push(frame);
+        let r = f(self);
+        self.effect_frames.pop();
+        let outer = self.effect_frame();
+        outer.var.flows_from(
+            &var,
+            Filter {
+                at: Some(node),
+                ..outer.filter()
+            },
+        );
+        let ordered = iterations_interact(&var, declared);
+        self.effect_loops.push(EffectLoop {
+            node,
+            var,
+            declared: declared.clone(),
+            ordered,
+        });
+        (r, ordered)
+    }
+
+    fn note_ordered_loop(&mut self, node: NodeId, source: NodeId, iter: &Type, positions: &Type) {
+        self.ordered_loops.push(OrderedLoop {
+            node,
+            source,
+            iter: iter.clone(),
+            positions: positions.clone(),
+        });
+    }
+
+    fn unordered_loop(
+        &self,
+        node: NodeId,
+        source: NodeId,
+        positions: &Type,
+    ) -> Option<LocatedInferError> {
+        let positions = crate::ccl::infer::solve::resolve_var_type(positions)
+            .unwrap_or_else(|_| positions.clone());
+        self.unordered_loop_error(node, source, positions_detail(&positions))
     }
 
     fn note_binding(&mut self, name: &Name, ty: &Type, node: NodeId) {

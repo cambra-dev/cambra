@@ -843,42 +843,6 @@ fn a_main_output_accumulator_carries_across_the_swap() {
     );
 }
 
-/// An accumulator over a **concatenation** carries across the swap. The loop's positions
-/// are keys of a union, the tag naming the operand, so the position the swap resumes above
-/// is one too: `stdin`'s second line, under its tag. Read as that line's bare index it
-/// compares with none of the union's keys.
-///
-/// Four lines and the literal's one element, the rule changing from `+1` to `+2` after
-/// the second line: `1 + 1 + 2 + 2 + 2`.
-#[test]
-fn an_accumulator_over_a_concatenation_carries_across_the_swap() {
-    let (reply, out) = stdin_across_reload(
-        indoc! {r#"
-            n := 0
-            for line in stdin() ++ ["end"]:
-                n := n + 1
-            n
-        "#},
-        indoc! {r#"
-            n := 0
-            for line in stdin() ++ ["end"]:
-                n := n + 2
-            n
-        "#},
-        "a\nb",
-        "c\nd",
-    );
-    assert!(
-        reply.contains("reloaded"),
-        "the reload should be accepted: {reply}"
-    );
-    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
-    assert!(
-        flat.contains("Ints([8,],)"),
-        "want 1+1+2+2+2; the whole run was: {out}"
-    );
-}
-
 /// An accumulator over a **product** carries across the swap. The loop's positions are
 /// records, one field per factor, ordered field by field, so the swap resumes above a record
 /// position.

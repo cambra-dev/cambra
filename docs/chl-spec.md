@@ -720,7 +720,8 @@ a finite function from `0..n` to values, so `xs[i]` is well-defined
 
 ### Ordered loops
 
-**[Decided]** — the rules of this section.
+**[Decided]** — a loop or a comprehension ordered by an exception that escapes an
+iteration ([Exceptions](#exceptions)).
 
 A loop is **ordered** when its iterations interact: its body causes `Write(x)` for an induction
 variable `x` bound outside the loop, an accumulator update made directly or by a call (§4.6), or a

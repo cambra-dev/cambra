@@ -2424,6 +2424,7 @@ impl TraitObligation {
                 position: operand,
                 found: around,
                 accepted,
+                operator: self.operator_node_id,
             });
         }
         if let Type::Nominal(decl, args) = contribution.peel_refinements() {
@@ -2665,6 +2666,7 @@ impl TraitObligation {
             position: pos,
             found: found.clone(),
             accepted,
+            operator: self.operator_node_id,
         })
     }
 
@@ -2763,6 +2765,7 @@ impl TraitObligation {
                     position: pos,
                     found: head.as_type(),
                     accepted: accepted_types,
+                    operator: self.operator_node_id,
                 });
             }
         }
@@ -3405,14 +3408,14 @@ pub fn clear_watch_log() {
 /// invariant the whole mechanism rests on: **every concrete type reaching an operand
 /// variable reaches its obligation**.
 ///
-/// A variable's lower bounds are written in exactly four places, and delivery is
-/// wired into every one: `constrain_go`'s two variable arms (`notify_lower` for a
-/// concrete contribution, `link_watches` for a var-var edge, `link_barrier_watches`
-/// for a barrier variable), `extrude`'s proxy seeding (`copy_watches`), and
-/// `freshen_above`'s clone (`freshen_watches`). A barrier variable flowing into a
-/// watched variable carries the watches itself, so its lower bounds are delivery sites
-/// too: `constrain_go`'s barrier lower-bound arm (`notify_barrier_lower`) and the
-/// copies `extrude` and `freshen_above` make of it, which copy its watches.
+/// A variable's lower bounds are written in exactly four places, and delivery is wired into
+/// every one: `constrain_go`'s two variable arms (`notify_lower` for a concrete
+/// contribution, `link_watches` for a var-var edge or a refined variable's,
+/// `link_barrier_watches` for a barrier variable), `extrude`'s proxy seeding
+/// (`copy_watches`), and `freshen_above`'s clone (`freshen_watches`). A barrier variable
+/// flowing into a watched variable carries the watches itself, so its lower bounds are
+/// delivery sites too: `constrain_go`'s barrier lower-bound arm (`notify_barrier_lower`)
+/// and the copies `extrude` and `freshen_above` make of it, which copy its watches.
 /// `a_concrete_operand_reaches_its_obligation` has a case per mechanism, confirmed by
 /// deleting the mechanism and watching only its case fail; no case reaches a barrier
 /// variable's copies with a watch on it.
@@ -3621,6 +3624,43 @@ pub fn resolve_operand_requirements(cache: &mut ConstrainCache) -> Result<(), Op
             return Ok(());
         }
     }
+}
+
+/// Offer each watched variable that no contribution reached the type it resolves to, and
+/// answer the first obligation that refuses it with the node that placed it.
+///
+/// **The check delivery cannot make.** Narrowing acts on what flows into an operand, so an
+/// operand bounded only from above is never offered anything and its obligations stay
+/// undecided, while coalesce resolves the variable to its upper bound. A loop's positions are
+/// such an operand: inference sees them only as the domain of the collection the loop
+/// iterates, so the key type reaches the position variable as an upper bound
+/// (`docs/chl-spec.md`, "Ordered loops"). A variable that resolves to a determined type is
+/// offered it here as a contribution, and the obligation judges it as it would one that
+/// arrived; one that stays a variable is offered nothing.
+///
+/// Runs after [`resolve_operand_requirements`], whose deposits are upper bounds too, and before
+/// the emission seal, since it narrows a definition's obligations.
+pub fn deliver_resolutions(
+    cache: &mut ConstrainCache,
+    resolve: impl Fn(&Type) -> Option<Type>,
+) -> Result<(), (ConstrainError, provenance::NodeId)> {
+    for var in crate::ccl::infer_var::arena_vars() {
+        let watches = var.watches.borrow().clone();
+        if watches.is_empty() || !var.bounds.borrow().lower().is_empty() {
+            continue;
+        }
+        let Some(resolved) = resolve(&Type::Infer(Rc::clone(&var))) else {
+            continue;
+        };
+        if matches!(offered(&resolved), Offered::Unknown) {
+            continue;
+        }
+        for (obligation, pos) in watches {
+            deliver(&obligation, pos, &resolved, None, cache)
+                .map_err(|e| (e, obligation.operator_node_id))?;
+        }
+    }
+    Ok(())
 }
 
 /// One step into a value: how a sub-place is reached from the place above it.
@@ -4288,7 +4328,7 @@ pub(super) fn link_watches(
     // offered — it arrived before the edge existed. A type parameter is replayed
     // with the bases: missing one would leave an operator on an unbounded parameter
     // unchecked.
-    let (known, params, collections, nominal_above, below, barriers_below) = {
+    let (known, params, products, collections, nominal_above, below, barriers_below) = {
         let bounds = lower.bounds.borrow();
         let known: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = bounds
             .lower()
@@ -4300,6 +4340,14 @@ pub(super) fn link_watches(
             .lower()
             .iter()
             .filter(|b| matches!(offered(&b.ty), Offered::Param(_)))
+            .map(|b| (b.ty.clone(), b.origin))
+            .collect();
+        // A product no product rule reads is refused as it is when it arrives after the edge: a
+        // record reaching `Orderable`, the keys of a map an ordered loop runs over.
+        let products: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = bounds
+            .lower()
+            .iter()
+            .filter(|b| matches!(offered(&b.ty), Offered::Product(_)))
             .map(|b| (b.ty.clone(), b.origin))
             .collect();
         // A collection offers no head, and the collection rule reads it all the same, from
@@ -4337,6 +4385,7 @@ pub(super) fn link_watches(
         (
             known,
             params,
+            products,
             collections,
             nominal_above,
             below,
@@ -4349,6 +4398,11 @@ pub(super) fn link_watches(
         }
         for (param, origin) in &params {
             deliver(obligation, *pos, param, *origin, cache)?;
+        }
+        for (product, origin) in &products {
+            if !obligation.trait_.admits_product(product) {
+                deliver(obligation, *pos, product, *origin, cache)?;
+            }
         }
         if obligation.trait_.reads_collections() {
             for (collection, origin) in &collections {
@@ -4857,6 +4911,7 @@ mod tests {
             position,
             found,
             accepted,
+            ..
         } = err
         else {
             panic!("expected NoTraitInstance, got {err:?}");

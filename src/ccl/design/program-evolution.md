@@ -901,6 +901,11 @@ nominal value has to meet are
 parameter types alone would admit two values the source tells apart: a renamed type, and a value
 that fails the new version's refinement while holding the same scalar.
 
+A carried value's tags name its declaration as the predecessor defined it (`nominal-types.md`), and
+a changed definition has a new id. So where the comparison accepts a changed definition, the swap
+re-tags each carried value of the type with the new id, in the same pass as the constructor renames
+below: a value keeps the id it was built under, and comparisons read that declaration's order.
+
 The check needs the predecessor's declarations as well as its types, because a constructor is paired
 by name, or by `@RenamedFrom`, and its parameter types compared under the arguments of the run that
 holds the value. A stored value names its constructor, so the pairing is by that name, and
