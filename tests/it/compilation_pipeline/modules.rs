@@ -1119,6 +1119,33 @@ fn a_reference_into_a_module_lowering_failed_in_hides_no_root_inference_error() 
     assert_eq!(report_count(&errors), 2, "{errors}");
 }
 
+/// A module whose own check fails hides no error of the root's: the program is inferred all
+/// the same, and an error naming the module's code is left to its check
+/// (`docs/modules.md`, "Checking a module on its own").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_module_whose_check_fails_hides_no_error_of_the_root() {
+    let library = indoc! {r#"
+        pub def f(x):
+            (x + 1, x + "s")
+    "#};
+    let root = indoc! {r#"
+        import lib
+        z = [2, "b"]
+        (lib::f(1), z)
+    "#};
+    let errors = compile_errors(&program(root, &[("lib", library)]));
+    assert!(
+        errors.contains("No type satisfies every requirement"),
+        "{errors}"
+    );
+    assert!(
+        errors.contains("The values that meet here have no common type"),
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
 /// A module two others import is evaluated once: its bindings stand once in the
 /// linked tree, ahead of both importers' (`docs/chl-spec.md`, "9.7 Importing
 /// asserts no IO and no state").

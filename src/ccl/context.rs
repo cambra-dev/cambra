@@ -2605,12 +2605,17 @@ fn run_passes(
 
     debug!("Lowered:\n{}", symbolic(&expr));
 
-    // Each module is checked on its own before the linked program is inferred,
-    // and a module whose check fails stops the compile with its errors.
+    // Each module is checked on its own before the linked program is inferred. A module
+    // whose check fails reports through it: the program is inferred all the same and the
+    // compile stops after inference, and an error inference raises in code a check's error
+    // stands in is that check's to report (`docs/modules.md`, "Checking a module on its
+    // own").
     let check_errors = check_modules(ctx, checks, &blame, None, &mut HashMap::new());
-    if !check_errors.is_empty() {
-        return Err(check_errors);
-    }
+    let checked_out: HashSet<FileId> = check_errors
+        .iter()
+        .filter_map(CompileError::span)
+        .map(|span| span.file)
+        .collect();
 
     // Inference runs on the user-shaped tree — before channelize — so type
     // errors are reported against the program the user wrote, not the
@@ -2651,7 +2656,25 @@ fn run_passes(
                 located
             })
             .collect();
-        return Err(blame.infer(errors, &expr));
+        // An error that names code a check's error stands in, at its primary span or a
+        // label, may be that error met through a use of the module: the check reports it.
+        let names_checked_out = |e: &CompileError| {
+            e.span()
+                .into_iter()
+                .chain(e.related().into_iter().flatten().map(|(span, _)| *span))
+                .any(|span| checked_out.contains(&span.file))
+        };
+        let mut all = check_errors;
+        all.extend(
+            blame
+                .infer(errors, &expr)
+                .into_iter()
+                .filter(|e| !names_checked_out(e)),
+        );
+        return Err(all);
+    }
+    if !check_errors.is_empty() {
+        return Err(check_errors);
     }
     // The checks below read a tree that typed, which a statement the parser or lowering
     // failed in is not.

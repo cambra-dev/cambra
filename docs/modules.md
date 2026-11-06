@@ -687,8 +687,12 @@ raised it, and it carries a secondary label at the module's `import` or `run` st
 that code in (`ModuleCheck::reached_by`). A module whose own check passed is sound at the types
 its parameters declare, so an error a run raises in its code comes from an argument that does not
 fit them; where the statement bringing the code in has an error of its own, the module's error is
-dropped. A module whose check fails stops the compile before
-linking's inference. A module is checked against its dependencies' bodies, so each check infers them
+dropped. A module whose check fails does not stop linking's inference: the program is inferred all
+the same and the compile stops after it. An error linking's inference raises that names, at its span
+or a label, a file a check's error stands in is dropped: it is that error met again, through the
+module's code or through a use of the module, which the check reports. A module with lowering errors
+of its own has no check, and its code is not linked, so its type errors are not reported until its
+lowering errors are fixed. A module is checked against its dependencies' bodies, so each check infers them
 again; keeping each module's inferred schemes for its users would remove that cost.
 
 `cambra check lib.cambra` checks a file on its own (`check_program`). It lowers the file as a module
