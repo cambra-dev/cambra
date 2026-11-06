@@ -73,6 +73,9 @@ impl TileOperator for Converse {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // Beneath standing levels the input's outermost keys are the result's; inverting the
+        // outermost collection re-keys.
+        let keeps_keys = self.level != CurryLevel::OUTERMOST;
         Box::new(ConverseProducer {
             base: ProducerBase::new(
                 ConverseProducer::alloc_id(),
@@ -82,7 +85,7 @@ impl TileOperator for Converse {
             ),
             input: self.input.subscribe(
                 self.tiling().universal_guard(),
-                widening(consumer),
+                consumer_keeping_keys_if(keeps_keys, consumer),
                 scheduler,
             ),
             held: Vec::new(),
@@ -465,6 +468,7 @@ impl TileOperator for MapDomain {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // Every level's keys stand.
         Box::new(MapDomainProducer {
             base: ProducerBase::new(
                 MapDomainProducer::alloc_id(),
@@ -472,11 +476,9 @@ impl TileOperator for MapDomain {
                 &self.base,
                 scheduler,
             ),
-            input: self.input.subscribe(
-                self.tiling().universal_guard(),
-                widening(consumer),
-                scheduler,
-            ),
+            input: self
+                .input
+                .subscribe(self.tiling().universal_guard(), consumer, scheduler),
             level: self.level,
         })
     }
@@ -610,6 +612,10 @@ impl TileOperator for Uncurry {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // Beneath standing levels the input's outermost keys are the result's, and a region at or
+        // beneath the paired level names the pairs it heads; pairing the whole tile re-keys.
+        let keeps_keys = self.level != CurryLevel::OUTERMOST;
+        let level = self.level;
         Box::new(UncurryProducer {
             base: ProducerBase::new(
                 UncurryProducer::alloc_id(),
@@ -619,7 +625,13 @@ impl TileOperator for Uncurry {
             ),
             input: self.input.subscribe(
                 self.tiling().universal_guard(),
-                widening(consumer),
+                match keeps_keys {
+                    true => crate::interpreter::scheduler::restating(
+                        Box::new(move |region| paired(region, level)),
+                        consumer,
+                    ),
+                    false => widening(consumer),
+                },
                 scheduler,
             ),
             level: self.level,
@@ -751,6 +763,69 @@ fn unpaired(keys: &Predicate, level: CurryLevel, pairs: CurryLevel) -> Predicate
         }
     }
     split(keys, level.index(), pairs.index())
+}
+
+/// The region of an `Uncurry`'s output that `region`, a region of its input, names, where the
+/// `Uncurry` pairs the keys at `pairs` with the keys beneath them: keys above `pairs` stand as they
+/// are, an outer key at `pairs` heads every pair whose first field it is, an inner key beneath it
+/// is the pair of the two, and each key deeper stands one level higher, under its pair.
+fn paired(region: &Projection, pairs: CurryLevel) -> Projection {
+    fn record(outer: Predicate, inner: Predicate) -> Predicate {
+        Predicate::Record(HashMap::from([
+            (tuple_field(0), outer),
+            (tuple_field(1), inner),
+        ]))
+    }
+    // The pair at `pairs` heading the path `admitted` admits, whose last key stands at `depth`.
+    fn join(admitted: &Predicate, depth: usize, pairs: usize) -> Predicate {
+        match admitted {
+            Predicate::Or(arms) => {
+                Predicate::union_all(arms.iter().map(|arm| join(arm, depth, pairs)).collect())
+            }
+            Predicate::Qualified { enclosing, here } if depth > pairs + 1 => {
+                Predicate::qualified(join(enclosing, depth - 1, pairs), (**here).clone())
+            }
+            unqualified if depth > pairs + 1 => unqualified.clone(),
+            Predicate::Qualified { enclosing, here } if depth == pairs + 1 => match &**enclosing {
+                Predicate::Or(outers) => Predicate::union_all(
+                    outers
+                        .iter()
+                        .map(|outer| {
+                            join(
+                                &Predicate::qualified(outer.clone(), (**here).clone()),
+                                depth,
+                                pairs,
+                            )
+                        })
+                        .collect(),
+                ),
+                Predicate::Qualified {
+                    enclosing: above,
+                    here: outer,
+                } => Predicate::qualified(
+                    (**above).clone(),
+                    record((**outer).clone(), (**here).clone()),
+                ),
+                outer => record(outer.clone(), (**here).clone()),
+            },
+            inner if depth == pairs + 1 => record(Predicate::True, inner.clone()),
+            Predicate::Qualified { enclosing, here } => Predicate::qualified(
+                (**enclosing).clone(),
+                record((**here).clone(), Predicate::True),
+            ),
+            outer => record(outer.clone(), Predicate::True),
+        }
+    }
+    match region {
+        Projection::Keys { level, keys } if level.index() >= pairs.index() => {
+            let at = level.index().saturating_sub(1).max(pairs.index());
+            Projection::Keys {
+                level: CurryLevel::new(at),
+                keys: join(keys, level.index(), pairs.index()),
+            }
+        }
+        standing_or_whole => standing_or_whole.clone(),
+    }
 }
 
 /// Pair a curried collection's two levels into one keyed by `(outer, inner)` pairs.
@@ -977,8 +1052,20 @@ impl TileOperator for Filter {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         let (shared, gate) = shared_consumer(consumer);
-        let predicate_producer = subscribe_forwarding(&mut *self.predicate, &shared, scheduler);
-        let input_producer = subscribe_forwarding(&mut *self.input, &shared, scheduler);
+        // A side that is a collection is pulled at the projection and shares the mask's keys; a
+        // side that is not is read whole.
+        let predicate_producer = subscribe_forwarding_keeping_keys_if(
+            self.predicate.tiling().is_data_function(),
+            &mut *self.predicate,
+            &shared,
+            scheduler,
+        );
+        let input_producer = subscribe_forwarding_keeping_keys_if(
+            self.input.tiling().is_data_function(),
+            &mut *self.input,
+            &shared,
+            scheduler,
+        );
         Box::new(FilterProducer {
             base: ProducerBase::new(
                 FilterProducer::alloc_id(),
@@ -1282,9 +1369,10 @@ impl TileOperator for Restrict {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // The restricted domain is the predicate's keys that pass, so a region of them is a region of the result's.
         let predicate_producer = self.predicate.subscribe(
             self.predicate.tiling().universal_guard(),
-            widening(consumer),
+            consumer,
             scheduler,
         );
         Box::new(RestrictProducer {
@@ -1669,8 +1757,9 @@ impl TileOperator for Product {
                 scheduler,
             )
             .sharing(gate),
-            outer: subscribe_forwarding(&mut *self.outer, &shared, scheduler),
-            inner: subscribe_forwarding(&mut *self.inner, &shared, scheduler),
+            // Both sides are pulled at the projection, aligned row for row.
+            outer: subscribe_forwarding_keeping_keys(&mut *self.outer, &shared, scheduler),
+            inner: subscribe_forwarding_keeping_keys(&mut *self.inner, &shared, scheduler),
             level,
             empty_level,
             pair: self.tiling().deepest_values().clone(),
@@ -3431,7 +3520,6 @@ mod tests {
 #[cfg(test)]
 mod filter_projection_tests {
     use super::*;
-
     use crate::interpreter::BaseType;
     use crate::interpreter::tile_operators::test_helpers::{
         GuardLog, ProjectionSpy, assert_conforms, int_entries, ints_by_position, keys_between,
@@ -4121,6 +4209,42 @@ mod uncurry_projection_tests {
             ))))]
         );
         assert_conforms(|| Box::new(paired_groups_of_collections().0), guard);
+    }
+
+    /// Beneath a standing level, a region of the input's inner keys climbs as the pairs they
+    /// make with their outer key, and one of the outer keys as every pair they head: inner key 0
+    /// under row 1's outer key 2 is the pair `(2, 0)` under row 1.
+    #[test]
+    fn a_region_beneath_a_standing_level_climbs_as_the_pairs_it_names() {
+        let point = |k: u64| Predicate::point(Value::UInt(k));
+        let record = |outer: Predicate, inner: Predicate| {
+            Predicate::Record(HashMap::from([
+                (tuple_field(0), outer),
+                (tuple_field(1), inner),
+            ]))
+        };
+        let standing = CurryLevel::new(1);
+        let inner = Projection::keys_at(
+            CurryLevel::new(2),
+            Predicate::qualified(Predicate::qualified(point(1), point(2)), point(0)),
+        );
+        assert_eq!(
+            paired(&inner, standing),
+            Projection::keys_at(
+                standing,
+                Predicate::qualified(point(1), record(point(2), point(0)))
+            )
+        );
+        let outer = Projection::keys_at(standing, Predicate::qualified(point(1), point(2)));
+        assert_eq!(
+            paired(&outer, standing),
+            Projection::keys_at(
+                standing,
+                Predicate::qualified(point(1), record(point(2), Predicate::True))
+            )
+        );
+        let rows = Projection::keys_at(CurryLevel::OUTERMOST, point(1));
+        assert_eq!(paired(&rows, standing), rows);
     }
 
     /// A morsel of pairs headed by groups 1 and 3 reads those groups of the grouping alone, and
