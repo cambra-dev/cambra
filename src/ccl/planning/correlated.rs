@@ -208,7 +208,7 @@ fn through_strength(expr: &Expr, ctx: &mut PlanningCtx) -> Result<Option<Expr>, 
     let Some(curried) = expr.ty.codomain() else {
         unreachable!("`curry(𝑔)` is a function, got {}", expr.ty)
     };
-    let Type::Fun { fun_kind, .. } = &expr.ty else {
+    let Some(fun_kind) = expr.ty.fun_kind() else {
         unreachable!("`curry(𝑔)` is a function, got {}", expr.ty)
     };
     let collection = keys.ty.clone();
@@ -335,7 +335,7 @@ fn keys_family(components: &[(Option<Name>, Type)], ctx: &mut PlanningCtx) -> Re
         domain,
         codomain,
         ..
-    } = &per_row.ty
+    } = crate::ccl::generalize::opened(&per_row.ty)
     {
         per_row.ty = Type::pi_kinded(
             x.clone(),
@@ -404,7 +404,7 @@ fn row_keys_family(
         domain,
         codomain,
         ..
-    } = &per_row.ty
+    } = crate::ccl::generalize::opened(&per_row.ty)
     {
         per_row.ty = Type::pi_kinded(
             x.clone(),
@@ -529,7 +529,7 @@ fn emit_pair_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, String>
         fun_kind,
         domain,
         codomain,
-    } = &g.ty
+    } = crate::ccl::generalize::opened(&g.ty)
     else {
         return Ok(false);
     };
@@ -643,7 +643,7 @@ fn emit_component_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, St
         name: binder,
         codomain,
         ..
-    } = chain.ty.peel_refinements().clone()
+    } = crate::ccl::generalize::opened(&chain.ty).clone()
     else {
         unreachable!("matched a function")
     };

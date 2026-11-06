@@ -432,6 +432,42 @@ fn an_augmented_write_in_a_loop() {
     "#});
 }
 
+/// A collection a loop's value filters, fed inside a tuple: it crosses the loop's exit boxed
+/// where it sits, a named tuple spelled out by its projections first.
+#[rstest]
+#[case::a_literal("", "([z for z in [1, 2, 3, 4] if z > acc], 1)")]
+#[case::a_named_tuple("t = ([z for z in [1, 2, 3, 4] if z > acc], 1)", "t")]
+fn a_tuple_holding_a_loop_computed_filter_crosses_the_loop(
+    #[case] binding: &str,
+    #[case] fed: &str,
+) {
+    agree(&format!(
+        indoc! {r#"
+            out = test_sink()
+            acc := 0
+            for r in [1, 2]:
+                acc += r
+            {}
+            out << {}
+        "#},
+        binding, fed
+    ));
+}
+
+/// The same collection inside a list crosses the loop's exit boxed where it sits, and operator
+/// conversion does not convert a list element that is a computed collection.
+#[test]
+#[should_panic(expected = "a collection-valued list element must be written out as a list literal")]
+fn a_list_holding_a_loop_computed_filter_not_compiled_yet() {
+    agree(indoc! {r#"
+        out = test_sink()
+        acc := 0
+        for r in [1, 2]:
+            acc += r
+        out << [[z for z in [1, 2, 3, 4] if z > acc]]
+    "#});
+}
+
 /// A filter reading both binders of a nested loop, inside the loop's write. The filter's
 /// predicate and its rows reach each enclosing position separately, so a pull can hold rows
 /// whose answers have not arrived.
@@ -662,12 +698,11 @@ fn a_mutable_variable_introduced_in_a_nested_loops_body() {
 }
 
 /// Group keys compared through the loop key, rather than folded away by an aggregate.
-/// Inference panics: the group key binder `__gb_k` escapes into a bound outside its scope.
-/// Pinned at the interpreter's answer and the compiler's panic.
+/// A loop over a group-by feeds one row per group, keyed by the group's key: each group's
+/// domain reads its key, which the loop's position binds.
 #[test]
-#[should_panic(expected = "open bound recorded")]
-fn a_loop_over_groups_panics_in_inference() {
-    let source = indoc! {r#"
+fn a_loop_over_groups_feeds_a_row_per_group() {
+    agree(indoc! {r#"
         sales = [
             (region="east", amount=1),
             (region="west", amount=2),
@@ -676,12 +711,7 @@ fn a_loop_over_groups_panics_in_inference() {
         out = test_sink()
         for g in groupby(sales, \r -> r.region):
             out << sum([s.amount for s in g])
-    "#};
-    assert_eq!(
-        interpreted(source).to_string(),
-        r#"["east" -> 4, "west" -> 2]"#
-    );
-    compiled(source);
+    "#});
 }
 
 /// A site that never fires still makes the channel a union, because the tagging is fixed

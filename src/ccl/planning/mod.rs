@@ -451,6 +451,9 @@ pub(super) fn set_domain_ty(fun_ty: &mut Type, ty: &Type) {
         Type::Fun { domain, .. } => {
             **domain = ty.clone();
         }
+        // A generalized type's structure is its body's (`src/ccl/design/type-parameters.md`,
+        // "Generalized types").
+        Type::Poly(p) if p.is_generalized() => set_domain_ty(&mut Rc::make_mut(p).body, ty),
         _ => panic!("Not function type: {}", fun_ty),
     }
 }

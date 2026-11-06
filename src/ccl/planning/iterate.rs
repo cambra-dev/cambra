@@ -464,7 +464,10 @@ pub(super) fn wrap_with_iterate(
         // hit an `input=None` arm and error.  This wrap is the workaround
         // for that eager compilation — #232 tracks making iteration
         // use-driven so a dead binding is dropped rather than wrapped.
-        if matches!(&bound_expr.ty, Type::Fun { .. }) {
+        if matches!(
+            crate::ccl::generalize::opened(&bound_expr.ty),
+            Type::Fun { .. }
+        ) {
             wrap_with_iterate(bound_expr, ctx, memo, site)?;
         }
         return wrap_with_iterate(body, ctx, memo, site);

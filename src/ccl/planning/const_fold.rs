@@ -326,7 +326,7 @@ fn gate_operand_at(
         let keep = if *b == absorbing { literal } else { other };
         let Type::Fun {
             fun_kind, domain, ..
-        } = &zipped.ty
+        } = crate::ccl::generalize::opened(&zipped.ty)
         else {
             return None;
         };

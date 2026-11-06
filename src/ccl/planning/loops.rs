@@ -936,22 +936,23 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         let TypedExprNode::Apply { argument, .. } = def.node else {
             unreachable!("curried above")
         };
+        let family = crate::ccl::generalize::opened(&h.ty);
         let Type::Fun {
             domain, codomain, ..
-        } = &h.ty
+        } = family
         else {
             panic!("letrec recognition: a curried history is a function");
         };
         // A family whose histories depend on the enclosing argument names it, and each
         // history reads that name once opened.
-        let history = crate::ccl::subst::open_codomain(&h.ty, codomain);
+        let history = crate::ccl::subst::open_codomain(family, codomain);
         (history, *argument, Some((**domain).clone()))
     } else {
-        (h.ty.clone(), def, None)
+        (crate::ccl::generalize::opened(&h.ty).clone(), def, None)
     };
     // The name the family gives its enclosing argument, which the history's fields read where
     // they depend on it.
-    let enclosing_binder = match (&enclosing, h.ty.peel_refinements()) {
+    let enclosing_binder = match (&enclosing, crate::ccl::generalize::opened(&h.ty)) {
         (Some(_), Type::Fun { name: Some(e), .. }) => Some(e.clone()),
         _ => None,
     };
@@ -959,7 +960,7 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     // A history keyed by its position names it, and a decision that depends on the position
     // reads that name once opened: a fed row whose keys depend on the loop variable
     // (`src/ccl/design/type-inference.md`, "A history's value may depend on its position").
-    let position = match h_ty.peel_refinements() {
+    let position = match crate::ccl::generalize::opened(&h_ty) {
         Type::Fun { name: Some(r), .. } => Some(r.clone()),
         _ => None,
     };
@@ -1035,7 +1036,11 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
                 .expect("letrec recognition: a writer source is a function");
             crate::ccl::lambda_elim::curry_at(
                 source,
-                Type::fun(ctx_ty.clone(), Type::data_fun(domain_ty.clone(), item)),
+                over_enclosing(
+                    enclosing_binder.as_ref(),
+                    ctx_ty,
+                    Type::data_fun(domain_ty.clone(), item),
+                ),
             )
         }
     };
@@ -1147,21 +1152,21 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         source,
         body: writer_body,
     };
+    // A nested `Transact` runs over its `(enclosing, position)` pairs, the domain its parameter
+    // states; the position's own domain reads the enclosing value and is stated only there.
+    let domain = parameter.clone().unwrap_or_else(|| domain_ty.clone());
     let mut transact = Expr::new(TypedExprNode::Transact {
         keys,
         writers: vec![writer],
-        domain: domain_ty.clone(),
+        domain,
         parameter,
     });
     // A nested `Transact` is one history record per enclosing position, so it is a function of
     // the enclosing parameter, and its reads are morphisms of that parameter
     // (`src/ccl/design/ir.md`, "`Transact` — the domain-parameterized recurrence carrier").
-    let transact_ty = match (&enclosing, &enclosing_binder) {
-        (Some(ctx_ty), Some(e)) if crate::ccl::subst::type_free_vars(&hist_ty).contains(e) => {
-            Type::pi(e.clone(), ctx_ty.clone(), hist_ty.clone())
-        }
-        (Some(ctx_ty), _) => Type::fun(ctx_ty.clone(), hist_ty.clone()),
-        (None, _) => hist_ty.clone(),
+    let transact_ty = match &enclosing {
+        Some(ctx_ty) => over_enclosing(enclosing_binder.as_ref(), ctx_ty, hist_ty.clone()),
+        None => hist_ty.clone(),
     };
     transact.ty = transact_ty.clone();
 
@@ -1174,6 +1179,7 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
             hist: &hist,
             hist_ty: &hist_ty,
             enclosing: enclosing.as_ref(),
+            enclosing_binder: enclosing_binder.as_ref(),
         },
     );
     assert_eq!(
@@ -1192,6 +1198,20 @@ struct HistReads<'a> {
     hist: &'a Name,
     hist_ty: &'a Type,
     enclosing: Option<&'a Type>,
+    /// The name the history family gives its enclosing argument, which the history reads
+    /// where it depends on it.
+    enclosing_binder: Option<&'a Name>,
+}
+
+/// A morphism of a nested `Transact`'s enclosing parameter, `ctx ⇒ codomain`, dependent on it
+/// where `codomain` reads its `binder`.
+fn over_enclosing(binder: Option<&Name>, ctx: &Type, codomain: Type) -> Type {
+    match binder {
+        Some(e) if crate::ccl::subst::type_free_vars(&codomain).contains(e) => {
+            Type::pi(e.clone(), ctx.clone(), codomain)
+        }
+        _ => Type::fun(ctx.clone(), codomain),
+    }
 }
 
 /// Key `field`'s history `Fun(D, V)` read off the `Transact`: the projection `__hist.field` of a
@@ -1203,10 +1223,13 @@ fn hist_field_read_of(reads: &HistReads<'_>, field: Label, field_ty: Type) -> Ex
         Some(ctx_ty) => {
             let mut proj = Expr::proj_field(field);
             proj.ty = Type::fun(reads.hist_ty.clone(), field_ty.clone());
-            let hist = tvar(reads.hist, Type::fun(ctx_ty.clone(), reads.hist_ty.clone()));
+            let hist = tvar(
+                reads.hist,
+                over_enclosing(reads.enclosing_binder, ctx_ty, reads.hist_ty.clone()),
+            );
             crate::ccl::ccl_utils::chain_typed(
                 vec![hist, proj],
-                Type::fun(ctx_ty.clone(), field_ty),
+                over_enclosing(reads.enclosing_binder, ctx_ty, field_ty),
             )
         }
     }
@@ -1351,19 +1374,34 @@ fn per_row_view(read: Expr, steps: Vec<Expr>) -> Expr {
     if steps.is_empty() {
         return read;
     }
-    let (Some(enclosing), Some(history_ty), Some(step_dom), Some(step_cod)) = (
-        read.ty.domain(),
-        read.ty.codomain(),
-        steps[0].ty.domain(),
-        steps[steps.len() - 1].ty.codomain(),
-    ) else {
-        panic!("letrec recognition: a nested history read and its steps are functions")
+    let (Some(enclosing), Some(history_ty)) = (read.ty.domain(), read.ty.codomain()) else {
+        panic!("letrec recognition: a nested history read is a function")
     };
+    // The history read by the enclosing argument's name where it depends on it.
+    let binder = match crate::ccl::generalize::opened(&read.ty) {
+        Type::Fun { name, .. } => name.clone(),
+        _ => None,
+    };
+    let history_ty =
+        crate::ccl::subst::open_codomain(crate::ccl::generalize::opened(&read.ty), &history_ty);
     let fun_kind = read
         .ty
         .fun_kind()
         .cloned()
         .unwrap_or(crate::ccl::FunKind::Compute);
+    // The steps are typed at what they receive, a position's history value with the
+    // position read by name: a generic step is instantiated there, and the types built
+    // here, which then read the position outside its binder, are generalized after
+    // recognition (`src/ccl/design/type-parameters.md`, "Generalized types").
+    let step_dom = history_ty
+        .codomain()
+        .map(|c| crate::ccl::subst::open_codomain(&history_ty, &c))
+        .unwrap_or_else(|| panic!("letrec recognition: a history is a function"));
+    let step_cod = steps.iter().fold(step_dom.clone(), |reaching, s| {
+        crate::ccl::generalize::instantiate(&s.ty, &reaching)
+            .codomain()
+            .unwrap_or_else(|| panic!("letrec recognition: a history read's step is a function"))
+    });
     let step_ty = Type::fun(step_dom, step_cod.clone());
     let chained = match steps.len() {
         1 => steps
@@ -1372,12 +1410,12 @@ fn per_row_view(read: Expr, steps: Vec<Expr>) -> Expr {
             .unwrap_or_else(|| unreachable!("one step")),
         _ => crate::ccl::ccl_utils::chain_typed(steps, step_ty.clone()),
     };
-    let lifted_ty = Type::fun(enclosing.clone(), step_ty.clone());
+    let lifted_ty = over_enclosing(binder.as_ref(), &enclosing, step_ty.clone());
     let lifted = Expr::apply(
         chained,
-        Expr::builtin(Builtin::Const).with_ty(Type::fun(step_ty.clone(), lifted_ty)),
+        Expr::builtin(Builtin::Const).with_ty(Type::fun(step_ty.clone(), lifted_ty.clone())),
     )
-    .with_ty(Type::fun(enclosing.clone(), step_ty.clone()));
+    .with_ty(lifted_ty);
     let paired = crate::ccl::lambda_elim::zip_pair(read, lifted, &fun_kind);
     let history_domain = history_ty
         .domain()
@@ -1388,11 +1426,11 @@ fn per_row_view(read: Expr, steps: Vec<Expr>) -> Expr {
         paired,
         Expr::builtin(Builtin::Compose).with_ty(compose_ty),
     ])
-    .with_ty(Type::fun(enclosing, chain))
+    .with_ty(over_enclosing(binder.as_ref(), &enclosing, chain))
 }
 
-/// A view compose split into the `⟨…⟩ ≫ compose` head [`peel_view_steps`] reads and
-/// the elements after it, which take the view whole.
+/// A view compose split into the head [`peel_view_steps`] reads, `⟨…⟩ ≫ compose` or
+/// `h ≫ (…) ▷ map`, and the elements after it, which take the view whole.
 ///
 /// `None` where `e` is not that shape, which the caller reads as `e` itself with no tail,
 /// so it peels the same way whether or not anything follows.
@@ -1403,7 +1441,14 @@ fn split_view_tail(e: &Expr) -> Option<(Expr, Vec<Expr>)> {
     let [head, marker, after @ ..] = elts.as_slice() else {
         return None;
     };
-    if after.is_empty() || !matches!(&marker.node, TypedExprNode::Builtin(Builtin::Compose)) {
+    let ends_a_view = match &marker.node {
+        TypedExprNode::Builtin(Builtin::Compose) => true,
+        TypedExprNode::Apply { function, .. } => {
+            matches!(&function.node, TypedExprNode::Builtin(Builtin::Map))
+        }
+        _ => false,
+    };
+    if after.is_empty() || !ends_a_view {
         return None;
     }
     // The head is a morphism of the writer's parameter and `compose` takes its pair to
@@ -1423,11 +1468,12 @@ fn split_view_tail(e: &Expr) -> Option<(Expr, Vec<Expr>)> {
 /// steps applied to the history.
 ///
 /// `λ 𝑥 → h(𝑥) ≫ step₁ ≫ … ≫ stepₙ` eliminates to a left-nested
-/// `⟨view, stepᵢ ▷ const⟩ ≫ compose`, innermost first, so the steps come back
-/// in application order with the bare history as the base. `None` where the tree is
-/// not that shape or its base is not `h` — a history that does not depend on the
-/// writer's parameter keeps the flat `h ≫ step₁ ≫ …` compose instead, which the
-/// caller matches directly.
+/// `⟨view, stepᵢ ▷ const⟩ ≫ compose`, innermost first, and the pointwise view
+/// `λ 𝑥 → λ 𝑟 → 𝑟 ▷ h(𝑥) ▷ step₁ ▷ … ▷ stepₙ` ([`crate::ccl::ccl_utils::pointwise_view`]) to
+/// `h ≫ (step₁ ≫ … ≫ stepₙ) ▷ map`; either way the steps come back in application order
+/// with the bare history as the base. `None` where the tree is not that shape or its base is
+/// not `h` — a history that does not depend on the writer's parameter keeps the flat
+/// `h ≫ step₁ ≫ …` compose instead, which the caller matches directly.
 fn peel_view_steps(e: &Expr, h: &Name) -> Option<Vec<Expr>> {
     if matches!(&e.node, TypedExprNode::Var(n) if n == h) {
         return Some(Vec::new());
@@ -1435,6 +1481,20 @@ fn peel_view_steps(e: &Expr, h: &Name) -> Option<Vec<Expr>> {
     let TypedExprNode::Compose(elts) = &e.node else {
         return None;
     };
+    if let [base @ .., last] = elts.as_slice()
+        && let TypedExprNode::Apply { argument, function } = &last.node
+        && matches!(&function.node, TypedExprNode::Builtin(Builtin::Map))
+    {
+        let mut steps = match base {
+            [one] => peel_view_steps(one, h)?,
+            _ => return None,
+        };
+        match &argument.node {
+            TypedExprNode::Compose(mapped) => steps.extend(mapped.iter().cloned()),
+            _ => steps.push((**argument).clone()),
+        }
+        return Some(steps);
+    }
     let [head, tail] = elts.as_slice() else {
         return None;
     };

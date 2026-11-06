@@ -208,8 +208,9 @@ The streamed collection-valued answer is rejected later at operator conversion; 
 ### The key domain is the key morphism's image
 
 `present_key_domain` in `lower/exprs.rs` constructs
-`{K | __elem ▷ ((c ≫ key) ▷ collection_contains)}`. The predicate retains the producer
-morphism rather than an opaque key-set identifier. Its structural identity therefore depends
+`{K | __elem ▷ ((c ≫ key) ▷ collection_contains)}`. `comprehension::run` rewrites `c ≫ key` as it
+rewrites a loop, to `λ __iter_record → __iter_record ▷ c ▷ key`, the key at each of `c`'s
+positions. The predicate retains the producer morphism rather than an opaque key-set identifier. Its structural identity therefore depends
 on the named term and its free references, not merely on the keys that term happens to produce.
 
 The helper shares one `SharedHole` between the refinement base and the morphism's codomain.
