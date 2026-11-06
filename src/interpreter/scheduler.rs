@@ -7,8 +7,8 @@ use std::{
 use crate::ccl::FieldKey;
 use crate::interpreter::CurryLevel;
 use crate::interpreter::{
-    Consumer, DataSourceDomainExtentImpl, Projection, tile_operators::Notified,
-    value_probe::ProbeSlot,
+    Consumer, DataSourceDomainExtentImpl, Projection, dispatcher::Landing,
+    tile_operators::Notified, value_probe::ProbeSlot,
 };
 
 /// A consumer handle shared by notification forwarders and deferred wakeups.
@@ -112,6 +112,12 @@ impl Consumer for Gated {
             self.consumer.notify(arrived);
         }
     }
+
+    /// A push passes the gate whatever it says, and leaves it as it is: every pushed region is a
+    /// work package, which no pull replaces.
+    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        self.consumer.push(region, landing);
+    }
 }
 
 impl GatedConsumer {
@@ -200,6 +206,46 @@ impl Consumer for Widening {
     fn notify(&mut self, _arrived: &Projection) {
         self.0.notify(&Projection::Everything);
     }
+
+    /// A change widens to every key. A decided region passes as every key where its source is
+    /// wholly decided, and not at all otherwise: each output key depends on every input key.
+    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        match region {
+            Projection::Everything => self.0.push(region, landing),
+            _ if landing.is_wholly_decided() => self.0.push(&Projection::Everything, landing),
+            _ if landing.is_decided() => {}
+            _ => landing.widened(|landing| self.0.push(&Projection::Everything, landing)),
+        }
+    }
+}
+
+/// `consumer` behind a consumer that widens like [`widening`] except for a decided region, which it
+/// passes as `restate` names it: the region of the operator's keys each of whose values the input
+/// region decides. An operator that re-keys its input knows which of its keys an input key
+/// contributes to, as `Uncurry` pairs an outer key with each inner key beneath it, so a decided
+/// region of its input decides that region of its own keys, which [`widening`] would hold back
+/// until the input is wholly decided.
+pub fn widening_restating_decided(
+    restate: fn(&Projection) -> Projection,
+    consumer: Box<dyn Consumer>,
+) -> Box<dyn Consumer> {
+    Box::new(WideningRestatingDecided(restate, consumer))
+}
+
+struct WideningRestatingDecided(fn(&Projection) -> Projection, Box<dyn Consumer>);
+
+impl Consumer for WideningRestatingDecided {
+    fn notify(&mut self, _arrived: &Projection) {
+        self.1.notify(&Projection::Everything);
+    }
+
+    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        match region {
+            Projection::Everything => self.1.push(region, landing),
+            _ if landing.is_decided() => self.1.push(&(self.0)(region), landing),
+            _ => landing.widened(|landing| self.1.push(&Projection::Everything, landing)),
+        }
+    }
 }
 
 /// `consumer` behind a consumer that passes each region on as `restate` names it: an operator that
@@ -218,6 +264,10 @@ impl Consumer for Restating {
     fn notify(&mut self, arrived: &Projection) {
         self.1.notify(&(self.0)(arrived));
     }
+
+    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        self.1.push(&(self.0)(region), landing);
+    }
 }
 
 /// `consumer` behind a consumer that forwards each notification as the same keys under `tag`
@@ -233,6 +283,10 @@ impl Consumer for Tagging {
     fn notify(&mut self, arrived: &Projection) {
         self.1.notify(&arrived.tagged(&self.0));
     }
+
+    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        self.1.push(&region.tagged(&self.0), landing);
+    }
 }
 
 /// What [`forwarding_consumer_keeping_keys`] returns: it passes each region on as it arrives,
@@ -244,6 +298,15 @@ struct Forwarding {
 }
 
 impl Consumer for Forwarding {
+    /// A push is passed on at once, past the gate. A push climbs from one breaker to the next, so
+    /// one that re-enters a consumer it is passing through has met a cycle, which fails the run.
+    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        match self.gated.shared.try_borrow_mut() {
+            Ok(mut consumer) => consumer.push(region, landing),
+            Err(_) => landing.reentered(),
+        }
+    }
+
     fn notify(&mut self, arrived: &Projection) {
         let GatedConsumer { shared, admission } = &self.gated;
         // A notification that re-enters a consumer already being notified is deferred to
@@ -303,6 +366,28 @@ impl Consumer for OneLevelIn {
     fn notify(&mut self, arrived: &Projection) {
         let restated = self.restated(arrived).unwrap_or(Projection::Everything);
         self.consumer.notify(&restated);
+    }
+
+    /// A decided region of the standing levels passes as it is. One that names keys at or beneath
+    /// level `at` passes as every key where its source is wholly decided, and not at all
+    /// otherwise: which output keys an input row stands beneath depends on its values, which no
+    /// region carries.
+    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        if landing.is_decided() {
+            match region {
+                Projection::Keys { level, .. } if *level >= self.at => {
+                    if landing.is_wholly_decided() {
+                        self.consumer.push(&Projection::Everything, landing);
+                    }
+                }
+                standing => self.consumer.push(standing, landing),
+            }
+            return;
+        }
+        match self.restated(region) {
+            Some(restated) => self.consumer.push(&restated, landing),
+            None => landing.widened(|landing| self.consumer.push(&Projection::Everything, landing)),
+        }
     }
 }
 
