@@ -3106,11 +3106,11 @@ fn a_mut_loop_inside_a_groupby_loop() {
     );
 }
 
-/// A `groupby` `:=` loop **inside** a `:=` loop does not run yet: it compiles, and at run time a
-/// map operator meets a function whose codomain is not a scalar. It answers 30.
+/// A `groupby` `:=` loop **inside** a `:=` loop: each group is looked up beneath the outer
+/// loop's key.
 #[test]
-fn a_groupby_loop_inside_a_mut_loop_is_not_compiled_yet() {
-    check_compile_error(
+fn a_groupby_loop_inside_a_mut_loop() {
+    check_scalar(
         indoc! {r#"
             n := 0
             for i in [1, 2]:
@@ -3118,7 +3118,7 @@ fn a_groupby_loop_inside_a_mut_loop_is_not_compiled_yet() {
                     n += sum(g)
             n
         "#},
-        "MapResult with Function only supports Scalar codomains",
+        cambra::interpreter::Value::Int(30),
     );
 }
 
