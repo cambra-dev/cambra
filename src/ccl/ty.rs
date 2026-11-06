@@ -1602,17 +1602,34 @@ pub struct TypeParam {
     /// For an opened parameter, where its bound was written: the secondary label of a
     /// use that fails it.
     pub bound_at: Option<chl_parser::ast::Span>,
+    /// For a parameter standing for a clause, what its bound's `except` takes away:
+    /// `E <: Effect except RunTransaction` (`docs/chl-spec.md`, "Kinds and bounds").
+    pub clause_except: std::collections::BTreeSet<crate::ccl::effects::Item>,
 }
 
 impl TypeParam {
     /// A declared parameter: what lowering writes for `T` in `forall (T) V`.
     pub fn declared(spelling: impl Into<SmolStr>) -> Rc<TypeParam> {
+        TypeParam::declared_except(spelling, Default::default())
+    }
+
+    /// A declared parameter standing for a clause, whose bound takes `except` away.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
+                  and a trait hashes and orders by its module path and name"
+    )]
+    pub fn declared_except(
+        spelling: impl Into<SmolStr>,
+        except: std::collections::BTreeSet<crate::ccl::effects::Item>,
+    ) -> Rc<TypeParam> {
         Rc::new(TypeParam {
             id: TypeParamId(TYPE_PARAM_COUNTER.fetch_add(1, Ordering::Relaxed)),
             spelling: spelling.into(),
             opened_at: None,
             bound: None,
             bound_at: None,
+            clause_except: except,
         })
     }
 
@@ -1629,6 +1646,27 @@ impl TypeParam {
             opened_at: Some(level),
             bound,
             bound_at,
+            clause_except: Default::default(),
+        })
+    }
+
+    /// This parameter with `except` as what its clause bound takes away.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
+                  and a trait hashes and orders by its module path and name"
+    )]
+    pub fn with_clause_except(
+        self: &Rc<TypeParam>,
+        except: std::collections::BTreeSet<crate::ccl::effects::Item>,
+    ) -> Rc<TypeParam> {
+        Rc::new(TypeParam {
+            id: self.id,
+            spelling: self.spelling.clone(),
+            opened_at: self.opened_at,
+            bound: self.bound.clone(),
+            bound_at: self.bound_at,
+            clause_except: except,
         })
     }
 
@@ -2838,7 +2876,12 @@ fn fmt_type(
                 .map(|p| match &p.kind {
                     TypeKind::Type => p.param.spelling.to_string(),
                     TypeKind::SubtypesOf(bound) => {
-                        format!("{} <: {}", p.param.spelling, at(bound, binders))
+                        format!(
+                            "{} <: {}{}",
+                            p.param.spelling,
+                            at(bound, binders),
+                            crate::ccl::effects::except_text(&p.param.clause_except)
+                        )
                     }
                     other => format!("{}: {other}", p.param.spelling),
                 })

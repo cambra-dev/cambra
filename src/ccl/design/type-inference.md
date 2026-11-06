@@ -4147,12 +4147,27 @@ A requirement in an effect set is a `TraitRequirement` of one of the compiler's 
 variable whose history the read stands in (`TraitDecl::term_params`, `TraitRequirement::terms`). A
 context trait is over no types.
 
+A top over one run's state, `WriteTxn(inv::_)`, is an `Every` whose `owner` is that run. Lowering
+writes the owner as the qualifier it is spelled through, or `Owner::Module` for `Module::_` in a
+Module type's entry, which instantiating the type for a parameter turns into the parameter's
+qualifier. Creating a run of the module (`resolve_owners` in `lower/modules/link.rs`) replaces each
+qualifier by the home of the run it reaches, a run the module declares or the argument a
+Module-typed parameter takes; one with no argument, a parameter of the module being checked on its
+own, stays a qualifier and holds only itself. A run's top holds `ReadTxn(𝑥)` and `WriteTxn(𝑥)` for
+each 𝑥 whose home is the run or a run below it (`RunPath::is_within`). A module's interface writes
+its own state, a private variable or one of a run it declares, as `Module::_`
+(`own_state_as_module`).
+
 ### Effect variables
 
-An `EffectVar` holds **capabilities** and **edges**. A capability is one requirement or effect, with
-the depth of the function body that binds the variable it names: the number of function bodies
-around the binder, 0 at the top level, and none for a capability naming no variable. An edge from 𝑢 into 𝑣 says that what 𝑢 holds, through the edge's
-filter, 𝑣 holds too. `EffectVar::resolved` is the fixpoint over the edges reaching a variable.
+An `EffectVar` holds **capabilities**, **edges** and **upper bounds**. A capability is one
+requirement or effect, with the depth of the function body that binds the variable it names: the
+number of function bodies around the binder, 0 at the top level, and none for a capability naming no
+variable. A capability also records the node where it entered its variable (`Capability::at`), which
+equality and ordering leave out. An edge from 𝑢 into 𝑣 says that what 𝑢 holds, through the edge's
+filter, 𝑣 holds too. An edge standing for a node, a call, a statement or an argument, stamps that
+node on each capability crossing it (`Filter::at`). `EffectVar::resolved` is the fixpoint over the
+edges reaching a variable.
 
 Emission keeps a stack of frames, one for the module's top level and one for each function body
 under emission (`InferCtx::effect_frames`). A frame's variable is the effects of the function
@@ -4176,7 +4191,8 @@ filter admits: only a statement's frame, below, keeps one. A `MutDecl` binder is
 parameter (`Typing::declare_mutable`). `InferCtx::record_effect` records a read or a write of a
 transactional variable, a declared one or a `Mut` parameter, as `ReadTxn(𝑥)` or `WriteTxn(𝑥)`
 (`InferCtx::of_family`). These belong to the run, so no scope discharges them. Declaring a
-transactional variable in a function body is refused (`InferError::TransactionalOutsideTopLevel`).
+transactional variable in a function body is refused (`InferError::TransactionalOutsideTopLevel`),
+and so is a written `Read(𝑥)` or `Write(𝑥)` naming one (`InferError::ClauseNamesNoVariable`).
 
 **A frame's filter keeps what is the function's own out of its type.** An edge or capability
 entering a frame passes when the variable it names is bound outside the frame's body: its depth is
@@ -4187,8 +4203,9 @@ call has a position in its history.
 **A call relates the callee's effects to the caller's.** `InferCtx::apply` puts a fresh call
 variable on the expected function type and an edge from it into the innermost frame. The
 `Fun`/`Fun` arm of `constrain_go` relates effects covariantly: an edge from the left side's
-variable into the right side's, or the left side's known capabilities recorded on the right side's
-variable. A known set on the right records nothing.
+variable into the right side's, stamped with the value's node, or the left side's known capabilities
+recorded on the right side's variable. A known set is a type the compiler built or materialized,
+and on the right it bounds nothing.
 
 **A collection runs where it is built.** A lambda, a `Compose` chain or a `Cast` whose kind is data
 denotes a collection, and its body runs where the collection is built, so its capabilities flow into
@@ -4197,6 +4214,66 @@ gets the edge with a condition, `Filter::when_data`, which holds once the kind r
 compute function's capabilities stay in its type. A chain's and a cast's effects are the union of
 their parts' (`Typing::composed_effects`). The kind is the lowering stamp where the node carries
 one, as `emit_node` applies it.
+
+### Written clauses
+
+Lowering writes a function type's clauses as `Repr::Written`: the items, which clause ends in `_`,
+and where the clauses are written (`lower/clauses.rs`). A function type with no clause is written
+too, with no item and neither clause open, since a written type's clauses are exact.
+`normalize_annotation` turns written clauses into a fresh variable holding the items, with an upper
+bound of the items over each clause not ending in `_` (`InferCtx::normalize_effects`). `uniquify`
+resolves the variables a clause names in the scope the clause is written in, and
+`Typing::check_written` refuses one that names no variable of the kind its item takes
+(`InferError::ClauseNamesNoVariable`). The Check mode reads no effects, and normalizes a written
+clause to none.
+
+A `def`'s clauses ride a stamp on the lambda whose body is the `def`'s body, the innermost of its
+parameters' chain (`lower/functions.rs`, `stamp_clauses`). `Typing::function_body` records the
+items on the body's variable, and a clause under `only` or `nothing` bounds it. The stamp states
+nothing as an annotation (`Written::of_def`), so the bound is checked once.
+
+**Declared parameters.** A type parameter bounded by `Effect` or `Context`, `E <: Effect`, stands
+for a clause (`LoweringContext::clause_params`), and a clause naming it carries it
+(`EffectSet::params`). Opening the definition's `Poly` gives it an effect variable holding a
+capability that names it rigidly (`Item::Param`), as an opened type parameter stands for itself
+(`InferCtx::open_poly`). A written type naming it relates its own variable to the parameter's in
+both directions, and a `def`'s clause naming it has the parameter's variable flow into the body's.
+The edge into the parameter's variable leaves out the items the written type lists beside it
+(`Filter::stated`): in `h: Int => Int causes E, RunTransaction`, `E` stands for what `h` causes
+besides `RunTransaction`, so a construct that discharges a listed item from a call of `h` leaves
+none of it in `E`. So `causes only E` is checked once, at the definition, against what any use may
+pass. Instantiation drops the rigid capability, and a copied bound no longer bounds the part the
+parameter stands in (`freshen_effect_var`), so a use's copy holds what its arguments bring.
+
+**Tops.** A written clause's `Effect` or `Context`, and a family's top such as `Write(_)`, is an
+`Item::Every`: its direction, its `Family` or none, and what its `except` takes away. An `EffectSet`
+holds them in `tops`. `EffectSet::normalized` drops a top another holds, and stops taking away from
+a top what the set holds otherwise, so a union of `Effect except Write(_)` and `Write(_)` is
+`Effect`; `Every::meet` and `Every::join` keep intersections and unions exact. A top is recorded
+like any other capability. An edge discharging a requirement passes a top less it (`Filter::pass`),
+a clause's `except` takes its capabilities out of the edges from its clause variables
+(`Filter::except`), and an upper bound holding a top admits what the top holds (`Every::holds`,
+`effects::taken_away`). A clause variable carries what its clause, or its own `except` in
+parentheses, takes from it (`ClauseParam::except`), and an edge's `except` adds to it as it crosses,
+so a contract prints `E except X`. A top holds a clause variable only where the variable's bound and
+its `except` take away all the top does; a written clause bounds a use's copy of a variable by the
+top less its `except` (`bound_written`, `freshen_effect_var`). A variable or a top taking away other
+than what the rest of its clause shares prints in parentheses (`effects::clauses`). A top holding
+writes or reads names every mutable variable, and one holding appends every feed
+(`Every::names_mutable_variables`, `Every::names_feeds`), so a function whose type holds one is no
+public member of a module whose top level binds what it names. A clause variable's bound may take
+capabilities away (`TypeParam::clause_except`): opening the parameter bounds its variable by
+`Effect` or `Context` less them, which each use's copy keeps (`Blame::Bound`).
+
+**Upper bounds are checked once emission is complete.** A variable's capabilities are known only
+then, so `effects::exceeded_uppers` reads each bounded variable's resolution after the barrier
+variables' checks. The first capability beyond a bound is reported at the node where it entered: the
+statement recording it, or the call or argument an edge carried it through. The clause or the
+written type is the secondary label (`InferError::EffectBeyondClause`,
+`InferError::EffectNotStated`). Instantiation copies a variable's bounds with its capabilities, so
+each use checks what its own arguments add. A `def` whose `requires` clause is bounded is also
+checked against the trait requirements its scheme reaches beyond those it writes
+(`InferCtx::requirements_beyond_clauses`).
 
 ### Checks that read a body's effects
 
@@ -4218,16 +4295,38 @@ the function (`InferCtx::exported_effects`).
 
 ### Polymorphism and materialization
 
-**Levels.** An effect variable is minted at the emission level. `type_level` leaves effects out,
-since an effect variable decides nothing about whether a definition is polymorphic. A type
-becoming a bound of a variable at a shallower level lowers its effect variables to that level
-(`lower_effect_levels`, at bound recording and at extrusion). Instantiation copies an effect
-variable above the scheme's cutoff with its capabilities and the edges into it
-(`freshen_effect_var`), so two uses of one polymorphic function collect their effects apart.
+**Levels.** An effect variable is minted at the emission level. `type_level` leaves effects out:
+counting the variable of every function body would generalize every function. An effect variable
+at an input, a parameter's function type, decides that a definition is polymorphic as a type
+variable does (`effects::input_effect_level` in `should_generalize`): a body that calls the
+parameter leaves it open. A type becoming a bound of a variable at a shallower level lowers its
+effect variables to that level (`lower_effect_levels`, at bound recording and at extrusion).
+Instantiation copies an effect variable above the scheme's cutoff with its capabilities, its upper
+bounds and the edges into it (`freshen_effect_var`), so two uses of one polymorphic function
+collect their effects apart. `freshen_level` counts a function type's effect variable, so a type
+whose only quantified part is its effects is copied rather than shared.
+
+**Effects choose no clone.** Uses that differ only in what they require and cause run one body, so
+`SpecKey` leaves effects out and a specialization pin relates none
+(`ConstrainCache::without_effects`). A pin still adds the clone's function type as a bound of the
+use's variables, whose effects then meet the use's at an input, so the walk's read-stability check
+compares types without their effects. Nothing after specialization reads an effect off a
+materialized type.
 
 **Materialization.** Compaction resolves each function position's effects (`CompactFun::effects`).
-A merge takes the union at a positive position and the intersection at a negative one. Coalesce
-writes the set into a compute function's type as `Known`.
+A merge takes the union at a positive position and the intersection at a negative one, except for
+the effect variables at a negative one, which it keeps all of: each is one call's expectation of
+the function value there. Coalesce writes the set into a compute function's type as `Known`.
+
+**Printing an effect variable.** A rendering of a polymorphic type (`poly_for_display`) compacts
+with `compact_type_for_display`, which also records the effect variables at each function
+position (`EffectSet::vars`): at an input the position's own variable, at an output every variable
+flowing into it. A variable above the cutoff that stands at both an input and an output relates
+them, and is printed: its requirements as a parameter `R <: Context` and its effects as
+`E <: Effect`, each where no exact clause closes that part (`EffectVar::closed`). A variable at
+inputs alone is dropped, as a type variable at one polarity is. The variables standing together
+at one input are printed as one: `def twice(f, x): f(f(x))` calls `f` twice, and each call's
+variable stands for what `f` does.
 
 ### Erasure
 

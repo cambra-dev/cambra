@@ -273,7 +273,7 @@ pub enum Stmt {
         body: Vec<Spanned<Stmt>>,
     },
 
-    /// `def name(type_params, params) => output requires …: body`.
+    /// `def name(type_params, params) => output requires … causes …: body`.
     ///
     /// The type parameters are the capitalized leading parameters, kept apart from
     /// `params` because they are not arguments: `params` alone is the arity.
@@ -287,7 +287,8 @@ pub enum Stmt {
         type_params: Vec<TypeParam>,
         params: Vec<Param>,
         output: Option<Spanned<Expr>>,
-        requires: Vec<Spanned<Requirement>>,
+        requires: Box<Clause<Requirement>>,
+        causes: Box<Clause<TraitType>>,
         body: Vec<Spanned<Stmt>>,
     },
 
@@ -667,6 +668,9 @@ pub struct Param {
     pub name: SmolStr,
     pub name_span: Span,
     pub annotation: Option<TypeAnnotation>,
+    /// What `except` takes out of a bound, `E <: Effect except RunTransaction`, which only a
+    /// type parameter's takes. Empty without `except`.
+    pub except: Vec<Spanned<TraitType>>,
 }
 
 /// A type parameter: a capitalized name, optionally with its kind, `T: K`, or its upper
@@ -678,6 +682,9 @@ pub struct TypeParam {
     pub name: SmolStr,
     pub name_span: Span,
     pub annotation: Option<KindAnnotation>,
+    /// What `except` takes out of the bound: `E <: Effect except RunTransaction`
+    /// (`docs/chl-spec.md`, "Kinds and bounds").
+    pub except: Vec<Spanned<TraitType>>,
 }
 
 /// What a type parameter's annotation states (`docs/chl-spec.md`, "Kinds and bounds").
@@ -687,6 +694,39 @@ pub enum KindAnnotation {
     Kind(Spanned<Expr>),
     /// `T <: U` — the upper bound `U`, which is the kind `SubtypesOf(U)`.
     Bound(Spanned<Expr>),
+}
+
+/// A `requires` or `causes` clause after a `def` signature or a function type's codomain, over
+/// `T`, its item: [`Requirement`] or [`TraitType`]. An effect is written as a trait is, and `_`
+/// is a trait type named `_`, as a type hole is a name.
+///
+/// Spec: `docs/chl-spec.md`, "Writing requirements and effects".
+#[derive(Debug, Clone, PartialEq)]
+pub struct Clause<T> {
+    /// The keyword's span through the last item's, `None` when no clause is written.
+    pub span: Option<Span>,
+    /// The span of `only` or `nothing`, which makes the clause an upper bound.
+    pub only: Option<Span>,
+    /// Empty when no clause is written and under `nothing`.
+    pub items: Vec<Spanned<T>>,
+    /// What `except` takes out of the clause's variables and its tops: one item, or a
+    /// parenthesized list of them. Empty without `except`.
+    pub except: Vec<Spanned<T>>,
+    /// Each top written in parentheses with an `except` of its own, `(Write(_) except
+    /// Write(x))`, which takes from that top alone; in written order, after `items`.
+    pub scoped: Vec<(Spanned<T>, Vec<Spanned<T>>)>,
+}
+
+impl<T> Default for Clause<T> {
+    fn default() -> Self {
+        Clause {
+            span: None,
+            only: None,
+            items: Vec::new(),
+            except: Vec::new(),
+            scoped: Vec::new(),
+        }
+    }
 }
 
 /// One item of a `requires` clause.
@@ -1026,6 +1066,11 @@ pub enum Expr {
         domain: Box<Spanned<Expr>>,
         arrow: Arrow,
         codomain: Box<Spanned<Expr>>,
+        /// The clauses after the codomain, which a written type states exactly
+        /// (`docs/chl-spec.md`, "Writing requirements and effects"). Boxed, as the clauses
+        /// of a `def` are, so that every expression does not carry their size.
+        requires: Box<Clause<Requirement>>,
+        causes: Box<Clause<TraitType>>,
     },
 
     /// Subscript: the **checked** form `target[index]`, or the proven form

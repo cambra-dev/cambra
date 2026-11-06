@@ -479,8 +479,33 @@ pub(super) fn mentioned_names(expr: &ChlExpr, names: &mut HashSet<SmolStr>) {
             each(&mut [&**base, &**predicate].into_iter())
         }
         ChlExpr::FunctionType {
-            domain, codomain, ..
-        } => each(&mut [&**domain, &**codomain].into_iter()),
+            domain,
+            codomain,
+            requires,
+            causes,
+            ..
+        } => {
+            each(&mut [&**domain, &**codomain].into_iter());
+            let written = requires
+                .items
+                .iter()
+                .filter_map(|r| match &r.node {
+                    chl_parser::ast::Requirement::Trait { ty, .. } => Some(ty),
+                    chl_parser::ast::Requirement::Bound { .. } => None,
+                })
+                .chain(causes.items.iter().map(|t| &t.node));
+            for ty in written {
+                names.insert(ty.name.clone());
+                for arg in &ty.args {
+                    mentioned_names(&arg.node, names);
+                }
+            }
+            for r in &requires.items {
+                if let chl_parser::ast::Requirement::Bound { bound, .. } = &r.node {
+                    mentioned_names(&bound.node, names);
+                }
+            }
+        }
         ChlExpr::Subscript { target, index, .. } => each(&mut [&**target, &**index].into_iter()),
         ChlExpr::BinOp { left, right, .. } => each(&mut [&**left, &**right].into_iter()),
         ChlExpr::UnaryOp { operand, .. } => each(&mut std::iter::once(&**operand)),

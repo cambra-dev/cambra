@@ -90,10 +90,23 @@ pub enum Token {
     Match,
     #[token("case", priority = 3)]
     Case,
+    // `except` takes capabilities out of a clause (`docs/chl-spec.md`, "Writing requirements
+    // and effects").
+    #[token("except", priority = 3)]
+    Except,
     #[token("forall", priority = 3)]
     Forall,
     #[token("requires", priority = 3)]
     Requires,
+    /// Begins a `causes` clause (`docs/chl-spec.md`, "Writing requirements and effects").
+    #[token("causes", priority = 3)]
+    Causes,
+    /// Makes a `requires` or `causes` clause an upper bound.
+    #[token("only", priority = 3)]
+    Only,
+    /// The empty clause, an upper bound with no item.
+    #[token("nothing", priority = 3)]
+    Nothing,
     /// Opens a nominal type declaration (`docs/chl-spec.md`, "Declaring a nominal type").
     #[token("type", priority = 3)]
     Type,
@@ -330,8 +343,12 @@ pub const KEYWORDS: &[(&str, Token)] = &[
     ("with", Token::With),
     ("match", Token::Match),
     ("case", Token::Case),
+    ("except", Token::Except),
     ("forall", Token::Forall),
     ("requires", Token::Requires),
+    ("causes", Token::Causes),
+    ("only", Token::Only),
+    ("nothing", Token::Nothing),
     ("type", Token::Type),
     ("impl", Token::Impl),
     ("instance", Token::Instance),
@@ -470,7 +487,8 @@ pub fn highlight_class(token: &Token) -> Option<HighlightClass> {
         | Token::Pass
         | Token::With
         | Token::Match
-        | Token::Case => C::KeywordControl,
+        | Token::Case
+        | Token::Except => C::KeywordControl,
         Token::Def
         | Token::Where
         | Token::And
@@ -478,6 +496,9 @@ pub fn highlight_class(token: &Token) -> Option<HighlightClass> {
         | Token::Not
         | Token::Forall
         | Token::Requires
+        | Token::Causes
+        | Token::Only
+        | Token::Nothing
         | Token::Type
         | Token::Impl
         | Token::Instance
@@ -735,6 +756,9 @@ impl fmt::Display for Token {
             Token::Where => "where",
             Token::Forall => "forall",
             Token::Requires => "requires",
+            Token::Causes => "causes",
+            Token::Only => "only",
+            Token::Nothing => "nothing",
             Token::Type => "type",
             Token::Impl => "impl",
             Token::Instance => "instance",
@@ -754,6 +778,7 @@ impl fmt::Display for Token {
             Token::With => "with",
             Token::Match => "match",
             Token::Case => "case",
+            Token::Except => "except",
             Token::Import => "import",
             Token::Use => "use",
             Token::As => "as",
@@ -1846,7 +1871,9 @@ mod tests {
 
     #[test]
     fn keywords_beat_idents() {
-        let toks = tokens("if elif else for in def not and or True False where forall requires");
+        let toks = tokens(
+            "if elif else for in def not and or True False where forall requires causes only nothing",
+        );
         assert_eq!(
             toks,
             vec![
@@ -1864,6 +1891,9 @@ mod tests {
                 Token::Where,
                 Token::Forall,
                 Token::Requires,
+                Token::Causes,
+                Token::Only,
+                Token::Nothing,
                 Token::Newline,
             ]
         );

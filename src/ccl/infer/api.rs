@@ -56,6 +56,7 @@ impl InferArena {
     /// [`crate::ccl::arena_enter`]).
     pub fn new() -> Self {
         crate::ccl::arena_enter();
+        crate::ccl::effects::upper_arena_enter();
         // The witness range index is per-run for the same reason the variable capture is:
         // it maps a binder minted by this run to the domains that run found it ranging
         // over. Binder ids are globally unique, so a stale entry is unreachable rather
@@ -104,6 +105,7 @@ impl Drop for InferArena {
             barrier.watches.borrow_mut().clear();
             barrier.checked.borrow_mut().take();
         }
+        crate::ccl::effects::upper_arena_exit();
     }
 }
 
@@ -322,6 +324,16 @@ pub enum InferError {
     /// which no other module may read or write (`docs/chl-spec.md`, "9.10 Induction variables
     /// stay in their module").
     VariablePastItsScope { member: String, item: String },
+    /// A function requiring or causing `item` flowed into a function type whose clauses do
+    /// not state it (`docs/chl-spec.md`, "Writing requirements and effects").
+    EffectNotStated { item: String },
+    /// A capability reaching a clause variable, or an instance's associated effect type, whose
+    /// bound takes it away: a use passing it, or an instance's function causing it.
+    EffectBeyondBound { item: String },
+    /// A body requiring or causing `item` beyond its definition's `only` clause.
+    EffectBeyondClause { item: String },
+    /// A written clause's `item` names no variable of the kind it takes in scope.
+    ClauseNamesNoVariable { item: String },
     /// A type mismatch was detected between two solved types.
     ///
     /// Named for the roles rather than positionally: `constrain_subtype(lhs, rhs)`
@@ -886,6 +898,10 @@ impl InferError {
             | InferError::NoJoinOverBinder { .. }
             | InferError::InertStatement
             | InferError::VariablePastItsScope { .. }
+            | InferError::EffectNotStated { .. }
+            | InferError::EffectBeyondBound { .. }
+            | InferError::EffectBeyondClause { .. }
+            | InferError::ClauseNamesNoVariable { .. }
             | InferError::Unsupported(_)
             | InferError::EmptyCase { .. }
             | InferError::UnresolvedHole { .. }
@@ -1291,6 +1307,25 @@ impl std::fmt::Debug for InferError {
             InferError::InertStatement => write!(
                 f,
                 "this statement causes nothing and its value is discarded, so it does nothing"
+            ),
+            InferError::EffectNotStated { item } => write!(
+                f,
+                "this has `{item}`, which the function type it must have does not state"
+            ),
+            InferError::EffectBeyondBound { item } => write!(
+                f,
+                "this has `{item}`, which the bound of the clause variable it reaches takes away"
+            ),
+            InferError::ClauseNamesNoVariable { item } => write!(
+                f,
+                "`{item}` names no variable in scope of the kind it takes: `Write` and `Read` \
+                 take an induction variable, `WriteTxn` and `ReadTxn` a transactional one, and \
+                 `Append` a feed"
+            ),
+            InferError::EffectBeyondClause { item } => write!(
+                f,
+                "this has `{item}`, which the definition's clause, bounded by `only` or \
+                 `nothing`, does not list"
             ),
             InferError::VariablePastItsScope { member, item } => write!(
                 f,
@@ -1915,6 +1950,22 @@ impl Contract {
                 crate::ccl::chl_print::chl_inferred_poly_in(scheme, Some(home))
             }
             Contract::Type(ty) => crate::ccl::chl_print::chl_type_in(ty, home),
+        }
+    }
+
+    /// This contract with `f` applied to its type.
+    pub fn map_type(&self, f: impl Fn(&mut Type)) -> Contract {
+        match self {
+            Contract::Scheme(scheme) => {
+                let mut scheme = scheme.clone();
+                f(&mut scheme.poly.body);
+                Contract::Scheme(scheme)
+            }
+            Contract::Type(ty) => {
+                let mut ty = ty.clone();
+                f(&mut ty);
+                Contract::Type(ty)
+            }
         }
     }
 

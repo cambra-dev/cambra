@@ -171,7 +171,7 @@ fn a_pair_arrow_in_a_def_return_annotation_is_a_parse_error() {
 
             f(4)
         "#},
-        "found '->', expected 'requires', '=>', or ':'",
+        "found '->', expected 'requires', 'causes', '=>', or ':'",
     )
 }
 

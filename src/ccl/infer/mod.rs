@@ -643,6 +643,31 @@ pub(crate) fn run(
     .map(|inferred| (inferred.ty, inferred.inert))
 }
 
+/// An error for each effect variable's upper bound that its capabilities exceed, at the node where
+/// the first capability beyond it entered, with the clause or the written type as the secondary
+/// label.
+fn push_effect_failures(errors: &mut Vec<LocatedInferError>, expr: &Expr) {
+    use crate::ccl::effects::Blame;
+    use crate::ccl::infer_var::Origin;
+    for failure in crate::ccl::effects::exceeded_uppers() {
+        let item = failure.capability.item.to_string();
+        let (error, written) = match failure.blame {
+            Blame::Clause(at) => (InferError::EffectBeyondClause { item }, at),
+            Blame::Written(at) => (InferError::EffectNotStated { item }, at),
+            Blame::Bound(at) => (InferError::EffectBeyondBound { item }, at),
+        };
+        errors.push(
+            LocatedInferError {
+                error,
+                node_id: failure.capability.at.unwrap_or_else(|| expr.node_id()),
+                also: Box::default(),
+                related: RelatedPositions::default(),
+            }
+            .with_failure((None, Some(Origin::Written(written)))),
+        );
+    }
+}
+
 /// The scheme each generalized binding a module check reports was bound at.
 pub(crate) type NotedSchemes = Vec<(Name, solver::display::InferredPoly)>;
 
@@ -723,6 +748,14 @@ pub(crate) fn run_with_params(
             crate::ccl::symbolic::symbolic_head,
         )
     });
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    // Each effect variable's capabilities are complete once emission is, so its upper bounds are
+    // checked here (`src/ccl/design/type-inference.md`, "Effect variables").
+    push_effect_failures(&mut errors, expr);
+    errors.extend(sub_ctx.requirements_beyond_clauses());
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -858,10 +891,7 @@ pub(crate) fn run_with_params(
         .escaping
         .into_iter()
         .map(|(node, name, capability)| {
-            let item = match &capability.item {
-                crate::ccl::effects::Item::Requires(r) => r.to_string(),
-                crate::ccl::effects::Item::Causes(e) => e.to_string(),
-            };
+            let item = capability.item.to_string();
             LocatedInferError::new(
                 InferError::VariablePastItsScope {
                     member: name.base().to_string(),

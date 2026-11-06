@@ -158,7 +158,12 @@ impl Printer {
             .iter()
             .filter(|p| !poly.is_member(&p.param))
             .map(|p| match p.bound() {
-                Some(bound) => format!("{} <: {}", p.param.spelling, self.ty(bound)),
+                Some(bound) => format!(
+                    "{} <: {}{}",
+                    p.param.spelling,
+                    self.component(bound),
+                    crate::ccl::effects::except_text(&p.param.clause_except)
+                ),
                 None => p.param.spelling.to_string(),
             })
             .collect();
@@ -173,12 +178,23 @@ impl Printer {
             body => (body.clone(), crate::ccl::effects::Effects::none()),
         };
         let body = self.ty(&body);
-        let requires = poly.requires_text(|t| self.ty(t));
+        let requires = poly.requires_text(|t| self.component(t));
         format!(
             "forall ({}) {body}{}",
             params.join(", "),
             crate::ccl::effects::clauses(requires, &effects)
         )
+    }
+
+    /// `ty` as one of a list of types: a function type with clauses in parentheses, since a
+    /// clause runs on through each next item that begins with a capitalized name
+    /// (`docs/chl-spec.md`, "Writing requirements and effects").
+    fn component(&mut self, ty: &Type) -> String {
+        let text = self.ty(ty);
+        match ty {
+            Type::Fun { effects, .. } if !effects.to_string().is_empty() => format!("({text})"),
+            _ => text,
+        }
     }
 
     fn ty(&mut self, ty: &Type) -> String {
@@ -197,14 +213,14 @@ impl Printer {
             },
             Type::Tuple(ts) => match ts.as_slice() {
                 [] => "{}".to_string(),
-                [only] => format!("{{{},}}", self.ty(only)),
+                [only] => format!("{{{},}}", self.component(only)),
                 _ => {
-                    let parts: Vec<String> = ts.iter().map(|t| self.ty(t)).collect();
+                    let parts: Vec<String> = ts.iter().map(|t| self.component(t)).collect();
                     format!("{{{}}}", parts.join(", "))
                 }
             },
             Type::OpenTuple(ts) => {
-                let parts: Vec<String> = ts.iter().map(|t| self.ty(t)).collect();
+                let parts: Vec<String> = ts.iter().map(|t| self.component(t)).collect();
                 format!("{{{}, ..}}", parts.join(", "))
             }
             Type::Record(fields) => {
@@ -293,7 +309,7 @@ impl Printer {
                 if args.is_empty() {
                     return name;
                 }
-                let args: Vec<String> = args.iter().map(|t| self.ty(t)).collect();
+                let args: Vec<String> = args.iter().map(|t| self.component(t)).collect();
                 format!("{name}({})", args.join(", "))
             }
             // No program writes one; this names both sides.

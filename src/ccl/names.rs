@@ -391,6 +391,11 @@ impl RunPath {
     pub fn last(&self) -> Option<&SmolStr> {
         self.0.last()
     }
+
+    /// Whether this is `outer` or a run `outer` declares, directly or through other runs.
+    pub fn is_within(&self, outer: &RunPath) -> bool {
+        self.0.starts_with(&outer.0)
+    }
 }
 
 impl fmt::Display for RunPath {
