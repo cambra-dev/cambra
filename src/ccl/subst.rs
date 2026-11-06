@@ -232,9 +232,7 @@ impl Mapping {
     fn image(&self) -> BTreeSet<Name> {
         match self {
             Mapping::Rename(to) => BTreeSet::from([to.clone()]),
-            Mapping::Discharge(t) | Mapping::Join(Some(t)) => {
-                crate::ccl::ccl_utils::free_names(t).into_iter().collect()
-            }
+            Mapping::Discharge(t) | Mapping::Join(Some(t)) => crate::ccl::ccl_utils::free_names(t),
             Mapping::Join(None) => BTreeSet::new(),
         }
     }
@@ -968,12 +966,12 @@ impl Subst {
                 Some(Mapping::Rename(to)) => {
                     out.insert(to.clone());
                 }
-                Some(Mapping::Discharge(t)) => out.extend(expr_free_vars(t)),
+                Some(Mapping::Discharge(t)) => out.extend(crate::ccl::ccl_utils::free_names(t)),
                 // A joined binder's occurrence stays, and in a collection's domain a keyed
                 // join reads its term at the key instead ([`Self::in_data_domain`]).
                 Some(Mapping::Join(Some(t))) => {
                     out.insert(n.clone());
-                    out.extend(expr_free_vars(t));
+                    out.extend(crate::ccl::ccl_utils::free_names(t));
                 }
                 Some(Mapping::Join(None)) | None => {
                     out.insert(n.clone());
@@ -3116,7 +3114,7 @@ pub fn type_free_vars(ty: &Type) -> BTreeSet<Binder> {
 /// The indices of the element references `t` reads free: `0` for the element of the
 /// refinement whose predicate holds `t`, one more per refinement further out.
 pub fn free_elem_indices(t: &TypedExpr) -> BTreeSet<u32> {
-    crate::ccl::free_names::names(t, crate::ccl::free_names::EVERY_READ)
+    crate::ccl::ccl_utils::free_names(t)
         .iter()
         .filter_map(Name::elem_index)
         .collect()
@@ -3170,11 +3168,6 @@ pub(crate) fn infer_var_scopes(e: &TypedExpr) -> BTreeSet<Name> {
 /// free, inside the predicate.
 pub fn refinement_free_vars(r: &crate::ccl::Refinement) -> BTreeSet<Binder> {
     crate::ccl::free_names::names_in_refinement(r)
-}
-
-/// The free term-variable names of `e`, those in its sub-expressions' type slots included.
-pub fn expr_free_vars(e: &TypedExpr) -> BTreeSet<Binder> {
-    crate::ccl::free_names::names(e, crate::ccl::free_names::EVERY_READ)
 }
 
 /// Whether `ty`'s structural skeleton contains an unresolved [`Type::Infer`]
