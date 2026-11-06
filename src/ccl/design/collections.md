@@ -105,14 +105,27 @@ Emptiness is what makes the choice unobservable. A nonempty comprehension such a
 program that has no type. The pinning pass walks expression children, not copies stored in
 refinement predicate type slots.
 
-### The empty collection has no key morphism [Interim]
+### The empty collection's key type comes from its uses
 
-`map([])` and `set([])` fail inference with an unresolved-variable error. Their key type is
-derived from [the key morphism's image](#the-key-domain-is-the-key-morphisms-image), and the empty
-source supplies no key value. The re-keying stores a copy of that source in a refinement
-predicate; the term-only pinning pass does not choose the copied literal's element type.
-`a_re_keying_constructor_rejects_an_empty_literal` also covers `box(map([]))` under an explicit
-`Map(String, Int)` annotation.
+`map([])` and `set([])` derive their key type from
+[the key morphism's image](#the-key-domain-is-the-key-morphisms-image), and an empty source
+supplies no key value, so the literal's element type is pinned as any empty literal's is. Two
+things carry its uses to the pin:
+
+- **One literal.** The group-by's expansion copies its collection into the key domain's predicate
+  and the groups' refinement, and a copy in a predicate keeps its own variables, which the pin,
+  walking terms only, never reaches. So A-normalization names a literal collection once
+  (`anf`, the `GroupBy` arm), and every copy reads the one binding the pin decides.
+- **The annotation's key type.** A `Set(𝐾)` or `Map(𝐾, 𝑉)` annotation meets the boxed key domain as
+  a membership in `SubtypesOf(𝐾)`, recorded on the key variable without a bound. The type of a
+  position reads that membership as a demand
+  ([The type of a position](type-inference.md#the-type-of-a-position)), so the element takes `𝐾`.
+
+`map`'s entry is declared a pair, so its element is the pair `(𝐾, 𝑉)`, and the pin decides each
+component that no value reaches the same way. With no use, the element is unit, and a map's is
+`(unit, unit)`.
+
+### `empty_map()` [Interim]
 
 `empty_map()` constructs a keyed sum without deriving a type from entries:
 `Σ (σ : SubtypesOf(𝐾)). σ ⤇ 𝑉`. A `Map(𝐾, 𝑉)` annotation fixes its parameters. A `Set(𝐾)`
