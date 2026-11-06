@@ -32,6 +32,21 @@ Source-domain availability and release are delegated to the source implementatio
 Runtime filtering uses `Filter` operators, not a populated `Restriction` handle;
 `iterate_extent` panics on `Extent::Restricted`.
 
+### Cartesian iteration
+
+`IterateExtentProducer` retains each dimension of a live record extent. Its output is the identity
+function over record keys. The extent's decided region is the conjunction of record fields or the
+tagged regions of a union, including keys that hold no value.
+
+A pull enumerates each dimension, excludes keys already held or released, and merges its new keys
+and decided predicate into a retained tile. Each output projection is cut from the Cartesian
+product of those keys, excluding released pairs.
+
+Releasing one pair retains either input key that a future partner can still need. A dimension's
+keys are reclaimed where the released region covers every other dimension without restriction.
+Each dimension registers separately with every source it reads. Source values under a compound
+dimension remain retained until that dimension is released whole.
+
 ### Tiling
 
 [`Tiling`](tiling/tiling_kind.rs) specifies the tiles a `TileOperator` produces.
@@ -543,7 +558,7 @@ Each operator answers a projection as its row of this table states.
 
 | Operator | Projection |
 | --- | --- |
-| `IterateExtent` | A finite range is cut to the admitted interval before it is rendered. Every other extent renders whole and is cut after. |
+| `IterateExtent` | A finite range is cut to the admitted interval before it is rendered. Live record extents form the requested product from retained dimension keys. Other extents render whole and are cut after. |
 | `Constant` | A collection constant answers the admitted keys. A scalar constant answers the whole value or nothing. |
 | `MapResult` | A keyed input is pulled at the projection; a scalar input is a key looked up in the function, has no keys to project, and is read whole. A function operand that is a collection is pulled at the projection too where the input's values are its keys, the arguments stand at the first level, and the operand is a data function; its keys are released with the data's. Any other function operand is read whole. Beneath the outermost keys the input is pulled at a projection above the level the function applies at (`Restates::Above`), and the function operand is read whole. |
 | `MapResultToConst` | A collection input is pulled at the projection where the constant applies one level in or deeper. At the outermost level the constant replaces the whole input, so the input is read whole. The constant is read whole, since every row reads all of it. A projection beneath the outermost keys is answered above the constant's level (`Restates::Above`), and one at or beneath it panics. |
