@@ -2789,24 +2789,20 @@ pub fn free_names_in_value(expr: &Expr) -> BTreeSet<Name> {
 /// [`count_free`] counts them: its own element is bound, and `__elem^𝑛` for `𝑛 > 0` is
 /// `__elem^(𝑛-1)` there.
 pub fn free_names(expr: &Expr) -> BTreeSet<Name> {
-    free_names_reading(expr, crate::ccl::free_names::EVERY_READ)
+    crate::ccl::free_names::names(expr, crate::ccl::free_names::EVERY_READ)
 }
 
 /// [`free_names`] without the names a `Feed`, `Define` or `MutWrite` writes: the variables
 /// `expr` reads. A write's target is a handle bound elsewhere, which a caller copying the
 /// bindings a term reads must not copy.
 pub fn free_reads(expr: &Expr) -> BTreeSet<Name> {
-    free_names_reading(
+    crate::ccl::free_names::names(
         expr,
         crate::ccl::free_names::Reads {
             writes: false,
             ..crate::ccl::free_names::EVERY_READ
         },
     )
-}
-
-fn free_names_reading(expr: &Expr, reads: crate::ccl::free_names::Reads) -> BTreeSet<Name> {
-    crate::ccl::free_names::names(expr, reads)
 }
 
 /// Value-only worker for [`is_free_in_value`]: the same fold over
