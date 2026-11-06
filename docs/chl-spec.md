@@ -666,8 +666,9 @@ The effecting forms:
   A function's effects are always visible in its type: its `causes` clause states them, written or
   inferred. There are **no implicit-effect functions**, so an inert expression statement (§4.9)
   stays detectable and rejected.
-- **[Decided]** — **`raise`**, a call that may raise, and an output outside
-  the program, such as binding a sink
+- **An output outside the program,** such as binding a sink
+  ([6.9 Capabilities](#69-capabilities)).
+- **[Decided]** — **`raise`** and a call that may raise
   ([6.9 Capabilities](#69-capabilities)).
 
 `yield` (§3.13) is not an effect in this sense: it adds its operand to the
@@ -3377,7 +3378,7 @@ is a trait's function, read from an instance, `summon(Area(_))::area(s)`
 ### 6.9 Capabilities
 
 **[Decided]** — a written `Transaction`, a function's `Transaction` supplied by the block that calls
-it, and block footprints; outputs outside the program
+it, and block footprints; sink functions and calls made outside the program
 ([Output outside the program](#output-outside-the-program)); readings
 ([Inputs from outside the program](#inputs-from-outside-the-program)); and exceptions
 ([Exceptions](#exceptions)). The rest of this section is implemented.
@@ -4573,10 +4574,10 @@ Additional sources may be pre-registered by the host embedding (testing,
 demos, etc.). `std::time` adds a clock read and an alarm source and sink
 ([7.5 Time [Decided]](#75-time-decided)).
 
-Opening a source requires `ObserveWorld`
-([Inputs from outside the program](#inputs-from-outside-the-program)). **[Decided]** — binding a
-sink causes `AffectWorld` ([Output outside the program](#output-outside-the-program)), and a
-reading, such as the clock, is a call of a `@Builtin` function a std module declares
+Opening a source requires `ObserveWorld`, and binding a sink causes `AffectWorld`
+([Inputs from outside the program](#inputs-from-outside-the-program),
+[Output outside the program](#output-outside-the-program)). **[Decided]** — a reading, such as the
+clock, is a call of a `@Builtin` function a std module declares
 ([9.16 The std root](#916-the-std-root)).
 
 `http_serve` opens its route when the program starts, so a call is the
@@ -5659,10 +5660,6 @@ access](#39-subscript-and-attribute-access)). With `import shop::cart`, `run sho
 
 ### 9.7 Importing asserts a shareable module
 
-**[Decided]** — importing a shareable module that declares or loads mutable state, declares a feed,
-binds a sink, or has a top-level `for`, `if`, `match` or `with`: lowering does not import one yet,
-so such a module is run.
-
 Importing a module asserts that it is **shareable**: its top level reads nothing from outside
 the program, and leaves behind no output and no state another module could reach
 ([Shareable modules](#shareable-modules)).
@@ -6302,10 +6299,10 @@ is discarded.
 
 Sinks may observe the indices of collections passed to them if needed.
 
-**[Decided]** A sink is any operation that hands data out of the program: binding a feed to a sink,
-or calling a sink function that takes a collection and writes it out. Feeds are one way to build the
-collection, not the only one. Each causes `AffectWorld`
-([Output outside the program](#output-outside-the-program)).
+A sink is any operation that hands data out of the program, and each causes `AffectWorld`
+([Output outside the program](#output-outside-the-program)). Binding a feed to a sink is one.
+**[Decided]** — so is calling a sink function that takes a collection and writes it out: feeds are
+one way to build the collection, not the only one.
 
 ## 11. Errors and recovery
 
