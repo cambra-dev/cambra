@@ -1489,6 +1489,24 @@ impl Tile {
         path
     }
 
+    /// This tile with its outermost statement closed over `tiling`, as [`TileGuard::closed_over`]
+    /// closes a guard: a statement under every tag of a tagged union's domain, each saying
+    /// everything or each saying nothing, is that. An answer assembled arm by arm states each
+    /// arm on its own, and only the closed statement reads as terminal.
+    pub(crate) fn closed_over(mut self, tiling: &Tiling) -> Tile {
+        if let Tile::DataFunction {
+            domain_predicate, ..
+        } = &mut self
+            && matches!(domain_predicate, Predicate::Union { .. })
+            && let TileGuard::Function(FunctionGuard::Domain(closed)) =
+                TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone()))
+                    .closed_over(tiling)
+        {
+            *domain_predicate = closed;
+        }
+        self
+    }
+
     /// Which paths through `level` are complete, over whole paths: those `level` calls
     /// complete, and every path beneath a key some level above it calls complete.
     ///

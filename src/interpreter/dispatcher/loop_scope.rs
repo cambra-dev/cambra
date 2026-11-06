@@ -1,15 +1,15 @@
 //! Loop request control and body graph planning for the run's shared dispatcher.
 //! See `src/interpreter/design-dispatcher.md`, "A loop in rounds".
 
+use super::plan::{ChainPaths, Planned};
 use super::*;
-use super::{Planned, reach_in_chain};
 use crate::interpreter::commit_operator::InductionStoreProducer;
 use crate::interpreter::tile_operators::{StoreCell, TileProducer};
 
 /// Where a loop scope finds the breaker of one of its inner pipelines.
 #[derive(Clone)]
 pub(super) enum Member {
-    /// In the store's chain, by its address (`super::address`).
+    /// In the store's chain, by its address (`plan::address`).
     Chain(usize),
     /// The scope of a loop nested in this one, which runs the rounds of one row of its store per
     /// round, the row of the round's position.
@@ -23,6 +23,8 @@ pub(crate) struct InductionRun {
     pub(super) body_graph: Option<Dispatcher>,
     pub(super) shared: Option<SharedLoop>,
     pub(super) members: Vec<Member>,
+    /// Where each of `members`' breakers in the store's chain was last reached.
+    chain_paths: ChainPaths,
     /// Entries placed at global body IDs after activation. Explicitly queued source entries
     /// stay unplaced so external source pushes reach their completeness targets.
     placements: Vec<Vec<Placement>>,
@@ -66,6 +68,7 @@ impl InductionRun {
             body_graph: Some(body_graph),
             shared: None,
             members,
+            chain_paths: ChainPaths::default(),
             placements,
             starts,
             planned,
@@ -517,10 +520,17 @@ pub(super) fn reach_member(
         Member::Scope(store) => call(&mut *induction(store)),
         Member::Chain(id) => {
             let mut call = Some(call);
-            let mut found = false;
-            store.visit_input_producers_mut(&mut |_, input| {
-                found = found || reach_in_chain(input, *id, &mut call);
-            });
+            // The paths live on the store's run, and the walk borrows the store whole. A planner
+            // reaches a member before the run is installed, with no paths to keep.
+            let mut paths = store
+                .run
+                .as_mut()
+                .map(|run| std::mem::take(&mut run.chain_paths))
+                .unwrap_or_default();
+            let found = paths.reach_or_walk_again(store, *id, &mut call);
+            if let Some(run) = store.run.as_mut() {
+                run.chain_paths = paths;
+            }
             assert!(
                 found,
                 "inner pipeline {} has its breaker in the store's chain",
@@ -588,7 +598,7 @@ impl Drop for Placed<'_> {
 mod tests {
     use indoc::indoc;
 
-    use super::super::{Execution, InductionRuns, Planner};
+    use super::super::plan::{Execution, InductionRuns, Planner};
     use super::*;
     use crate::ccl::context::{GlobalContext, compile_program};
     use crate::ccl::load::LoadedProgram;
