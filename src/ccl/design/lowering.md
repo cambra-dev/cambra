@@ -223,6 +223,11 @@ does so as well. No separate block-expression node remains. The result is normal
 default-only `match` uses the sequence described below. A value-returning `if` requires an `else`
 branch.
 
+A `with begin():` block used as an assigned value lowers to a `Begin` whose body ends in the
+value of the block's last statement rather than in `unit` (`lower_valued_with_block`), and the
+assignment binds it, `let x = Begin{…} in rest`. The last statement is an expression, or an `if`,
+`match` or `try` whose blocks each end in one (`lower_tx_tail`).
+
 ## `raise` and `try`
 
 `raise 𝑒` lowers to `Raise { value }`, a `Unit`-valued statement on the chain it stands in. `try`

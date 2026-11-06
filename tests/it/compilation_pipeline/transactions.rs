@@ -4578,3 +4578,376 @@ fn a_transaction_loop_holds_a_bounded_store_state_at_any_length(#[case] n: usize
         );
     }
 }
+
+/// A `with begin():` block on an assignment's right-hand side is the value of its last
+/// statement, read in the block's snapshot after its own writes (`docs/chl-spec.md`, "A block
+/// is also the value it computes"). Outside a loop the block commits once, and the
+/// code after it reads that commit's value.
+#[rstest]
+#[case::after_its_write(indoc! {"
+    pool: Mut(Int, Txn) := 100
+    x = with begin():
+        pool := pool - 10
+        pool * 2
+    x
+"}, 180)]
+// Each branch ends in its value. The block reads what the loop above it committed, because the
+// code after a block reads the value it committed, and `await_final` the last commit.
+#[case::a_branch_value_after_a_loop(indoc! {"
+    pool: Mut(Int, Txn) := 100
+    for r in [1, 2]:
+        with begin():
+            pool := pool + r
+    x = with begin():
+        if pool > 200:
+            pool := 0
+            1
+        else:
+            pool := pool * 2
+            2
+    x * 1000 + await_final(pool)
+"}, 2206)]
+fn a_block_value_outside_a_loop(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
+/// A list may read a binding whose value commits a transaction: the elements read the value,
+/// and the transaction commits once.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_list_reads_a_binding_that_commits() {
+    check_scalar(
+        indoc! {"
+            stock: Mut(Int, Txn) := 10
+            def take(n: Int):
+                with begin():
+                    stock := stock - n
+                n
+            x = take(1)
+            sum([x, x + 1]) * 100 + await_final(stock)
+        "},
+        Value::Int(309),
+    );
+}
+
+/// A list literal's elements are constants once the program is compiled, and a block's value is
+/// known only when the block commits, so a list of one is refused.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_block_value_in_a_list_is_refused() {
+    check_compile_error(
+        indoc! {"
+            stock: Mut(Int, Txn) := 10
+            x = with begin():
+                stock := stock - 1
+                stock
+            [x, x]
+        "},
+        "a list element has to be a value here",
+    );
+}
+
+/// Inside a loop each iteration binds its own block's value, and a reply after the block is
+/// indexed by the iteration. Every path commits, so a path that writes nothing still has a value:
+/// where the bare `if` fails there is no deny.
+#[rstest]
+#[case::the_written_value(indoc! {"
+    pool: Mut(Int, Txn) := 100
+    out = test_sink()
+    for r in [10, 20, 30]:
+        left = with begin():
+            pool := pool - r
+            pool
+        out << left
+"}, "[90, 70, 40]")]
+#[case::each_branch_ends_in_its_value(indoc! {r#"
+    pool: Mut(Int, Txn) := 100
+    out = test_sink()
+    for r in [30, 50, 40, 20]:
+        msg = with begin():
+            if pool >= r:
+                pool := pool - r
+                "ok"
+            else:
+                "insufficient"
+        out << msg
+"#}, r#"["ok", "ok", "insufficient", "ok"]"#)]
+#[case::a_path_that_writes_nothing(indoc! {"
+    pool: Mut(Int, Txn) := 100
+    seen: Mut(Int, Txn) := 0
+    out = test_sink()
+    for r in [30, 50, 40, 20]:
+        left = with begin():
+            seen := seen + 1
+            if pool >= r:
+                pool := pool - r
+            pool * 10 + seen
+        out << left
+"}, "[701, 202, 203, 4]")]
+#[case::each_arm_ends_in_its_value(indoc! {"
+    pool: Mut(Int, Txn) := 100
+    out = test_sink()
+    for r in [`take(30), `give(5), `take(200)]:
+        msg = with begin():
+            match r:
+                case `take(n):
+                    if pool >= n:
+                        pool := pool - n
+                        pool
+                    else:
+                        -1
+                case `give(n):
+                    pool := pool + n
+                    pool
+        out << msg
+"}, "[70, 75, -1]")]
+// Over a concatenation, whose positions have no order: the blocks' transactions order no
+// loop, and each position keeps its own value.
+#[case::over_a_concatenation(indoc! {"
+    seen: Mut(Int, Txn) := 0
+    out = test_sink()
+    for x in [1, 2] ++ [3]:
+        doubled = with begin():
+            seen := seen + 1
+            x * 2
+        out << doubled
+"}, "[`0(0) -> 2, `0(1) -> 4, `1(0) -> 6]")]
+// A block that writes nothing commits nothing: its value is one snapshot of the variables it
+// reads.
+#[case::a_snapshot(indoc! {"
+    a: Mut(Int, Txn) := 1
+    b: Mut(Int, Txn) := 2
+    out = test_sink()
+    x = with begin():
+        (a, b)
+    out << x.0 * 10 + x.1
+"}, "[() -> 12]")]
+fn a_block_value_in_a_loop(#[case] code: &str, #[case] expected: &str) {
+    check_sink(code, expected);
+}
+
+/// A feed whose positions depend on a block's value has no channel type the compiler can state
+/// outside the block's store, so it is refused: under a condition reading the value, or in a
+/// loop iterating a writing block's values under any condition.
+#[rstest]
+#[case::a_condition_on_the_value_in_a_loop(indoc! {"
+    for r in [1, 2, 3]:
+        x = with begin():
+            pool := pool - r
+            pool
+        if x > 95:
+            out << x
+"})]
+#[case::any_condition_in_a_loop_reading_a_value(indoc! {"
+    for r in [1, 2, 3]:
+        x = with begin():
+            pool := pool - r
+            pool
+        if r > 1:
+            out << r
+"})]
+#[case::a_match_on_the_value(indoc! {"
+    for r in [1, 2, 3]:
+        x = with begin():
+            pool := pool - r
+            `a(r) if r > 1 else `b(r)
+        match x:
+            case `a(v):
+                out << v
+            case `b(w):
+                pass
+"})]
+#[case::a_read_only_value_in_a_loop(indoc! {"
+    for r in [1, 2, 3]:
+        x = with begin():
+            pool
+        if x > r * 40:
+            out << r
+"})]
+#[case::a_condition_on_the_value_outside_a_loop(indoc! {"
+    x = with begin():
+        pool := pool - 1
+        pool
+    if x > 50:
+        out << x
+    out << 0
+"})]
+fn a_feed_depending_on_a_block_value_is_refused(#[case] code: &str) {
+    check_compile_error(
+        &format!("pool: Mut(Int, Txn) := 100\nout: Feed(_)\n{code}\nout\n"),
+        "a feed under a condition that reads the value of a `with begin():` block",
+    );
+}
+
+/// A feed of a block's value under no condition, and a condition on a read-only block's value
+/// outside a loop, which is read once before it, compile.
+#[rstest]
+#[case::a_feed_of_the_value_in_a_loop(indoc! {"
+    for r in [1, 2, 3]:
+        x = with begin():
+            pool := pool - r
+            pool
+        out << x
+"}, "[99, 97, 94]")]
+#[case::a_condition_on_a_read_only_value_outside_a_loop(indoc! {"
+    x = with begin():
+        pool
+    if x > 50:
+        out << x
+    out << 0
+"}, "[`out<<(()) -> 100, `out<<#1(()) -> 0]")]
+fn a_feed_beside_a_block_value(#[case] code: &str, #[case] expected: &str) {
+    check_sink(
+        &format!("pool: Mut(Int, Txn) := 100\nout = test_sink()\n{code}"),
+        expected,
+    );
+}
+
+/// A block in value position ends in a value on every path.
+#[rstest]
+#[case::a_write(indoc! {"
+    pool: Mut(Int, Txn) := 100
+    x = with begin():
+        pool := pool - 1
+    x
+"}, "ends in an expression, or in an `if`, `match` or `try` whose blocks each end in one")]
+#[case::an_if_with_no_else(indoc! {"
+    pool: Mut(Int, Txn) := 100
+    x = with begin():
+        if pool > 1:
+            pool := pool - 1
+            pool
+    x
+"}, "ends in an `if` with an `else`")]
+fn a_block_value_without_a_value_is_refused(#[case] code: &str, #[case] needle: &str) {
+    check_compile_error(code, needle);
+}
+
+/// A block's value is final at its item's commit: each request is answered while the source is
+/// still open, and a reply is complete as far as its request is.
+#[test]
+fn a_block_value_replies_while_its_source_is_open() {
+    use cambra::ccl::{BaseType, Type};
+    use cambra::interpreter::{Extent, TestDataSource, Value, sort_function_by_domain};
+
+    let code = indoc! {r#"
+        resps: Feed(_)
+        pool: Mut(Int, Txn) := 100
+        for req in source1():
+            left = with begin():
+                if pool >= req:
+                    pool := pool - req
+                pool
+            resps << left
+        resps
+    "#};
+    let mut ctx = GlobalContext::default();
+    let src = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(src.clone());
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let loaded = LoadedProgram::test(code);
+    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+
+    src.borrow_mut().add_data(&[
+        (Value::UInt(0), Value::Int(30)),
+        (Value::UInt(1), Value::Int(50)),
+    ]);
+    src.borrow_mut()
+        .set_yield_predicate(Predicate::at_or_below(Value::UInt(1)));
+    ctx.scheduler().check_for_notifications();
+    let replied = |t: &Tile| t.live_keys().is_some_and(|k| k.count() == 2);
+    let mut open = pull_laps(ctx.scheduler(), &mut *producer, 65, replied);
+    open.compact();
+    let Tile::DataFunction {
+        domain_predicate, ..
+    } = &open
+    else {
+        panic!("the replies are a collection, got {open:?}")
+    };
+    assert!(
+        domain_predicate.subsumes(&Predicate::at_or_below(Value::UInt(1))),
+        "the replies are complete as far as the requests are, got {domain_predicate:?}"
+    );
+    let Tile::DataFunction {
+        domain, codomain, ..
+    } = sort_function_by_domain(open)
+    else {
+        unreachable!("checked above")
+    };
+    assert_eq!(
+        (domain, *codomain),
+        (
+            ColumnValue::UInts(vec![0, 1]),
+            Tile::Scalar(ColumnValue::Ints(vec![70, 20]))
+        ),
+        "each request is answered while the source is open"
+    );
+
+    src.borrow_mut()
+        .add_data(&[(Value::UInt(2), Value::Int(40))]);
+    src.borrow_mut().set_yield_predicate(Predicate::True);
+    ctx.scheduler().check_for_notifications();
+    let mut result = pull_laps(ctx.scheduler(), &mut *producer, 65, Tile::is_terminal);
+    result.compact();
+    assert_eq!(
+        sort_function_by_domain(result),
+        sort_function_by_domain(make_int_list(&[70, 20, 20])),
+    );
+}
+
+/// A block in value position inside a loop that lowers to a function over its items runs once per
+/// application of that function, which `transact_phase` cannot key, so it is refused before the
+/// phase.
+#[rstest]
+#[case::through_a_call_in_a_feed(indoc! {"
+    pool: Mut(Int, Txn) := 100
+    def take(n):
+        left = with begin():
+            pool := pool - n
+            pool
+        left * 2
+    out: Feed(_)
+    for r in [10, 20]:
+        out << take(r)
+    out
+"})]
+#[case::inside_a_nested_loop(indoc! {"
+    pool: Mut(Int, Txn) := 100
+    out: Feed(_)
+    for i in [1, 2]:
+        for r in [10, 20]:
+            left = with begin():
+                pool := pool - r
+                pool
+            out << left
+    out
+"})]
+fn a_block_value_under_a_lambda_is_refused(#[case] code: &str) {
+    check_compile_error(
+        code,
+        "a `with begin():` block in value position is not compiled yet",
+    );
+}
+
+/// A loop's induction accumulator reads its block's value after the block, once per iteration.
+#[test]
+fn a_block_value_feeds_an_accumulator() {
+    check_scalar(
+        indoc! {"
+            pool: Mut(Int, Txn) := 100
+            total := 0
+            for r in [10, 20]:
+                left = with begin():
+                    pool := pool - r
+                    pool
+                total := total + left
+            total
+        "},
+        Value::Int(160),
+    );
+}

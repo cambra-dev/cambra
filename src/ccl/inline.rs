@@ -643,9 +643,27 @@ fn reads_a_variable_written_in(definiens: &Expr, body: &Expr) -> bool {
         .any(|name| is_mut_written(name, body))
 }
 
+/// Whether `e` does something besides computing its value: commits a transaction,
+/// writes a mutable variable, feeds or declares a channel, or raises. A copy of
+/// `e` does it once more, so `x = with begin(): …` read at two elements of
+/// `[x, x]` would commit twice.
+fn does_something(e: &Expr) -> bool {
+    matches!(
+        e.node,
+        TypedExprNode::Begin { .. }
+            | TypedExprNode::MutWrite { .. }
+            | TypedExprNode::Feed { .. }
+            | TypedExprNode::Define { .. }
+            | TypedExprNode::Defer
+            | TypedExprNode::Raise { .. }
+    ) || e.any_child(does_something)
+}
+
 /// Move every `Let`-bound definiens read in a list element into that element,
 /// everywhere in `expr` — its term tree and the refinement predicates riding its
-/// type slots alike. Reports whether anything moved.
+/// type slots alike. Reports whether anything moved. A definiens that does
+/// something besides computing its value stays ([`does_something`]): each copy
+/// would do it again.
 ///
 /// A list literal's elements are a value position. Op-conversion compiles the
 /// whole literal to one table read at graph-build time, so an element is
@@ -724,7 +742,10 @@ fn inline_list_element_reads(mut expr: Expr, memo: &PredMemo) -> (Expr, bool) {
         && (crate::ccl::subst::type_free_vars(&ty).contains(&binding.name)
             || spelled_in_a_type(&body, &binding.name));
 
-    let (body, here) = if spelled || reads_a_variable_written_in(&bound_expr, &body) {
+    let (body, here) = if spelled
+        || reads_a_variable_written_in(&bound_expr, &body)
+        || does_something(&bound_expr)
+    {
         (*body, false)
     } else {
         let _g = provenance::enter(

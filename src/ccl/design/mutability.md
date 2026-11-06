@@ -330,12 +330,14 @@ eliminator, stated by content rather than by a "mirrors CHL" adjective.)
   at a write either.  `mut_elim::desugar_keyed_writes` then rewrites it to the whole-value write it
   denotes, `m := insert(m, k, v)`, so every phase below sees one kind of `MutWrite` and none of them
   needs a key.
-- `Begin { body }` — one `with begin():` transaction block, made a *single* `Unit`-valued statement
-  (`ExprStmt(Begin{block}, rest)`) so a loop body may freely mix a per-iteration transaction, sibling
-  induction writes, and feeds. `body` is the per-transaction statement chain. The transaction phase
-  strips it: a block writing a `Mut(_, Txn)` mutable variable becomes a commit site (partitioned by mutable variable
-  domain — induction writes lifted onto the enclosing loop); a read-only block is unwrapped onto the
-  loop spine. A standalone block lowers to a singleton `For` wrapping a `Begin`.
+- `Begin { body }` — one `with begin():` transaction block, made a *single* statement
+  (`ExprStmt(Begin{block}, rest)`), or bound by a `let` in value position
+  ([A block in value position](#a-block-in-value-position)), so a loop body may freely mix a
+  per-iteration transaction, sibling induction writes, and feeds. `body` is the per-transaction
+  statement chain. The transaction phase strips it: a block writing a `Mut(_, Txn)` mutable variable
+  becomes a commit site (partitioned by mutable variable domain — induction writes lifted onto the
+  enclosing loop); a read-only block is unwrapped onto the loop spine. A standalone block lowers to
+  a singleton `For` wrapping a `Begin`.
 - `Feed { name, value }` / `Defer` — a `<<` feed and its channel. These survive into inference (so
   a defer binding is typed, at `Feed(𝑉)`) and are eliminated by mut_elim (feeds via channelize).
 
@@ -584,7 +586,7 @@ Symbolic rendering: `letrec 𝑏₁ = 𝑒₁; …; 𝑏ₙ = 𝑒ₙ in body`.
 | `get_prev_seq` | `(𝐼 ⤇ 𝑉, 𝐼, 𝑉) ⇒ 𝑉` | history value at the predecessor of the given position; default at the first |
 | `get_prev_txn` | `(𝐼 ⤇ {time: Txn, write: 𝑉}, Txn, 𝑉) ⇒ 𝑉` | write of the latest commit strictly before the given time; default if none |
 | `begin_<site>` | `𝐼 ⇒ Txn` | the commit-time oracle for one `with begin():` site — where site `𝑠`'s iteration `𝑟` lands in the global commit order |
-| `by_commit_time` | `(𝐼 ⤇ {time: Txn, …}) ⇒ (Txn ⤇ {time: Txn, …})` | one site's commit records keyed by the commit time each carries. A denied iteration's record carries a time too in the model, where `begin_<site>` is injective over iterations; the engine allocates no tick for it. The tap's ``variant_project(`commit)`` drops it. Heads each in-block reply tap, so a reply's keys have type `Txn` |
+| `by_commit_time` | `(𝐼 ⤇ {time: Txn, …}) ⇒ (Txn ⤇ {time: Txn, …})` | one site's commit records keyed by the commit time each carries. A denied iteration's record carries a time too in the model, where `begin_<site>` is injective over iterations; the engine allocates no tick for it. The tap's ``variant_project(`commit)`` drops it. Heads each in-block reply tap, so a reply's keys have type `Txn`; a [block's value](#a-block-in-value-position) is read keyed by item and does not pass through it |
 | `final_or_default` | `(𝐷 ⤇ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed stream; the default if the domain is empty. Compiles to `ExtractFinal`. A mutable variable's final value is `final_read`, a different term |
 | `final_read` | `(𝐷 ⤇ 𝑉) ⇒ 𝑉` | a mutable variable's value where its writers finish, sampled from the settled store, and its seed where they wrote nothing. `mut_elim` mints it for a loop's trailing read and `transact_phase` for `await_final`; it compiles to `StoreFinalRead`, one per enclosing position for an inner loop's |
 | `as_of_read` | `(Txn ⤇ 𝑉) ⇒ 𝑉` | a commit history read at an unspecified position — every fed-out mutable variable read. `rewrite_as_of_reads` pairs it with the reading loop that indexes it and builds the `AsOf` join; an unpaired one is a compile error, since nothing downstream supplies a position |
@@ -1304,6 +1306,54 @@ nothing. The tap may read an induction accumulator (`resp << cnt`), which compos
 commit-decision co-iteration above. Contrast a sibling reply *outside* the block (`resp << cnt`),
 which rides the induction domain and fires every iteration regardless of commit — value-correct,
 request-indexed, but not commit-ordered. To gate or commit-order a reply, put it in the block.
+
+### A block in value position
+
+`x = with begin(): …` lowers to `let x = Begin{block} in rest`, whose block ends in its value
+rather than in `unit` (CHL spec, [A block is also the value it
+computes](../../../docs/chl-spec.md#a-block-is-also-the-value-it-computes)).
+`transact_phase::strip_valued_block` makes the block a commit site whose spine ends in a feed of
+that value to a defer no channel declares, `let __v = tail in __block_value << 𝑝`. The writer walk
+merges a tail `Case` that writes as it merges a bound one, so the feed sits on the spine. Every
+path feeds it, so every path commits: a path that writes nothing proposes an empty write set and
+its read set, which the commit engine validates like any other proposal.
+
+`plan_store` binds the feed's tap keyed by the item it was committed for, as the commit records
+are, rather than by commit time, and does not hoist it into a channel:
+``tap = commits_j ≫ .decision ≫ variant_project(`commit) ≫ .field : 𝐼 ⤇ {`fired{𝑉} | `idle}``,
+with no `by_commit_time`. The block's values are `__values = tap ≫ variant_project(`fired) : 𝐼 ⤇
+𝑉`:
+
+- **Outside a loop** the site runs over the singleton `[unit]`, as a standalone statement block
+  does, and the continuation binds `x = sole(__values)`, the one value the site commits.
+- **Inside a loop** the loop iterates the values beside its source:
+  `For{𝑝, λ ξ → (source(ξ), __values(ξ)), let r = 𝑝.0 in let x = 𝑝.1 in body}`
+  (`iterate_block_values`).
+
+Recognition records a tap read keyed by item on its writer (`WriterSite::item_taps`), and inference
+types its history over the writer source's domain. The commit store keys the tap by commit time,
+as every tap: the writer commits it as the pair of the item's source position, which the driver's
+rows carry, and the value, and op-conversion reads it through `RekeySorted`, which re-keys the
+pairs by position. An item's value is final at its commit
+([design-operators.md](../../interpreter/design-operators.md#the-commit-operator-interpretercommit_operatorrs),
+`RekeySorted`).
+
+A block that writes no transactional variable has nothing to commit: it is unwrapped to
+`let x = block in rest`, and its reads are as-of reads, as any read-only block's are.
+
+`strip` keys a block by the `For` around it, and a lambda's body runs once per application rather
+than once per position of that loop. A block in value position under a lambda is refused before the
+phase (`refuse_valued_blocks_under_lambdas`): one in a loop lowering compiles as a function over its
+items, which a loop that only feeds and the outer loop of a nest are, or one a call inlined into a
+feed's value or a comprehension.
+
+A feed whose positions depend on a block's value is refused before the phase
+(`refuse_feeds_under_block_values`): a feed under a condition reading a writing block's value, or
+in a loop a read-only block's, and in a loop that iterates a writing block's values a feed under
+any condition. `channelize` types a conditional feed's channel by restricting a source by the
+condition, and here the restriction reads the store. The channel's type leaves the store's scope at
+the declaration of the channel it feeds, and a type outside a `letrec` cannot state a value read
+from it.
 
 ### A reply's `Txn` domain overstates its keys [Interim]
 
