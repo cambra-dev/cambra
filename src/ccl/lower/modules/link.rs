@@ -648,10 +648,11 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
                 .push((*statement, label));
         }
     }
-    // Each module is checked on its own, once linking has found nothing wrong.
-    // The root's check is the linked program's inference, unless its parameters
-    // or the arguments its own runs and imports pass need one of their own.
-    if errors.is_empty() && value.is_some() {
+    // Each module is checked on its own, once linking has found nothing wrong but statements
+    // the placeholder stands in for, which a module's check reads as inference reads them.
+    // The root's check is the linked program's inference, unless its parameters or the
+    // arguments its own runs and imports pass need one of their own.
+    if errors.len() == ctx.stood_in && value.is_some() {
         if let Some(root_lowered) = root_lowered
             && (!root_lowered.interface.parameters.is_empty()
                 || !lowering
@@ -685,6 +686,11 @@ pub(super) struct ProgramLowering<'a> {
     /// Each module other than the root, lowered, by file, or `None` when it has
     /// no syntax tree or has errors of its own.
     pub(super) lowered: HashMap<FileId, Option<Rc<LoweredModule>>>,
+    /// Each module with errors of its own whose lowering errors are all a statement's it
+    /// stood the placeholder in for (`stmts::stand_in_for_failed`), lowered. Its check
+    /// reads it, and nothing else does: a reference into the module reaches nothing, as
+    /// one into any module with errors of its own does.
+    pub(super) with_errors: HashMap<FileId, Rc<LoweredModule>>,
     /// What each `import` statement reaches, by the statement. An import whose
     /// arguments are in error reaches nothing.
     pub(super) imports: HashMap<Span, Imported>,
@@ -884,6 +890,7 @@ impl<'a> ProgramLowering<'a> {
         ProgramLowering {
             program,
             lowered: HashMap::new(),
+            with_errors: HashMap::new(),
             imports: HashMap::new(),
             type_keys: TypeKeys::default(),
             shared: HashMap::new(),
@@ -1006,6 +1013,7 @@ impl<'a> ProgramLowering<'a> {
         });
         let scope = self.scope(ast, Some(module.clone()), ctx);
         ctx.begin_module(scope.clone());
+        let stood_in = ctx.stood_in;
         let lowered = lower_module_body(ast, ctx);
         let sinks = std::mem::take(&mut ctx.declared_sinks);
         let run_checks = std::mem::take(&mut ctx.run_type_checks);
@@ -1014,8 +1022,11 @@ impl<'a> ProgramLowering<'a> {
             .or_else(|| state_site(ast).map(Unimportable::State))
             .or(ctx.io_site.map(Unimportable::Io));
         let clean = lowered.errors.is_empty() && self.program.parsed_cleanly(file);
+        // Every lowering error a statement's the placeholder stands in for, so the chain is
+        // one inference reads (`compile_program`).
+        let stood_in_for_all = lowered.errors.len() == ctx.stood_in - stood_in;
         self.errors.extend(lowered.errors);
-        let chain = lowered.value.filter(|_| clean)?;
+        let chain = lowered.value.filter(|_| clean || stood_in_for_all)?;
         let interface = Interface::of_lowered(
             module,
             ast,
@@ -1025,14 +1036,19 @@ impl<'a> ProgramLowering<'a> {
             unimportable,
         );
         ctx.reached_methods.extend(interface.public_methods());
-        Some(LoweredModule {
+        let lowered = LoweredModule {
             chain,
             interface: Rc::new(interface),
             scope,
             sinks,
             run_checks,
             as_root: false,
-        })
+        };
+        if !clean {
+            self.with_errors.insert(file, Rc::new(lowered));
+            return None;
+        }
+        Some(lowered)
     }
 
     /// Whether the module in `file` can be imported for its statements: an

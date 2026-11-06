@@ -1152,6 +1152,38 @@ fn a_module_that_does_not_load_hides_no_error_of_the_root() {
     assert_eq!(report_count(&errors), 3, "{errors}");
 }
 
+/// A module with lowering errors of its own reports its type errors too: its check reads the
+/// statements the placeholder stands in for, while a reference into it still reaches nothing.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_module_with_lowering_errors_reports_its_type_errors() {
+    let library = indoc! {r#"
+        pub x: Mut(Int) = 3
+        pub def g(a: Int) => String:
+            a
+        pub w = [1, "c"]
+    "#};
+    let root = indoc! {r#"
+        import lib
+        z = [2, "b"]
+        (lib::g(1), z)
+    "#};
+    let errors = compile_errors(&program(root, &[("lib", library)]));
+    assert!(errors.contains("introduces a mutable"), "{errors}");
+    assert!(
+        errors.contains("annotated as String, but inferred as Int"),
+        "{errors}"
+    );
+    assert_eq!(
+        errors
+            .matches("The values that meet here have no common type")
+            .count(),
+        2,
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 4, "{errors}");
+}
+
 /// A module two others import is evaluated once: its bindings stand once in the
 /// linked tree, ahead of both importers' (`docs/chl-spec.md`, "9.7 Importing
 /// asserts no IO and no state").
