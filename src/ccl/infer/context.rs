@@ -7,8 +7,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ccl::ccl_utils::TermMemo;
 use crate::ccl::effects::{
-    Blame, Bound as CapabilityBound, Capability, Effect, EffectSet, EffectVar, Effects, Every,
-    Filter, Item, Repr, Requirement, Upper,
+    Blame, Bound as CapabilityBound, Capability, Effect, EffectSet, EffectVar, EffectVarId,
+    Effects, Every, Filter, Item, Repr, Requirement, Upper,
 };
 use crate::ccl::infer::solver::barrier::EdgeReport;
 use crate::ccl::infer::solver::display::{poly_for_display, scheme_obligations};
@@ -143,10 +143,16 @@ pub(super) struct InferCtx {
     /// The function bodies under emission, innermost last, above the module's top level
     /// (`src/ccl/design/type-inference.md`, "Effect variables").
     effect_frames: Vec<EffectFrame>,
+    /// Every `with begin():` block's variable and each use's copies of them, from which coalesce
+    /// gives each block its footprint.
+    pub(super) footprints: crate::ccl::effects::Footprints,
     /// Where each mutable variable and feed in scope is bound, for the capability that names it.
     effect_binders: HashMap<Name, EffectBinder>,
-    /// Each statement emitted, with the variable collecting what it causes.
-    effect_statements: Vec<(NodeId, Rc<EffectVar>)>,
+    /// Each statement emitted, with the variable collecting what it causes and the one of
+    /// the body it stands in.
+    effect_statements: Vec<(NodeId, Rc<EffectVar>, EffectVarId)>,
+    /// Each `with begin():` block emitted, with the variable collecting what its body causes.
+    effect_transactions: Vec<(NodeId, Rc<EffectVar>)>,
     /// What lowering marks each marked node as: an expression statement, which an inert one
     /// is refused among, or a sink binding, which causes `AffectWorld`.
     pub(super) marks: HashMap<NodeId, crate::ccl::lower::Mark>,
@@ -157,7 +163,7 @@ pub(super) struct InferCtx {
     /// and its node ([`InferCtx::requirements_beyond_clauses`]).
     bounded_requires: Vec<BoundedRequires>,
     /// The variable of every call site ([`InferCtx::call_effects`]).
-    effect_calls: HashSet<crate::ccl::effects::EffectVarId>,
+    effect_calls: HashSet<EffectVarId>,
     /// Lexical scope: name → [`Binding`] for in-scope variables and let-bound
     /// names. Lambda params and `Case`/`Loop` binders bind monomorphically; a
     /// polymorphic `let` additionally stashes its typed definition subtree so
@@ -458,8 +464,8 @@ struct EffectBinder {
     /// and the callee records nothing (`docs/chl-spec.md`, "Discharging requirements and
     /// effects").
     parameter: bool,
-    /// A transactional mutable variable: reading or writing it requires `Transaction`, and its
-    /// capabilities are `ReadTxn` and `WriteTxn`.
+    /// A transactional mutable variable, or a parameter passed one: reading or writing it
+    /// requires `Transaction`, and its capabilities are `ReadTxn` and `WriteTxn`.
     transactional: bool,
     /// A feed, which a clause names in `Append(f)`; every other binder here is a mutable
     /// variable.
@@ -648,6 +654,7 @@ impl InferCtx {
             recoveries: 0,
             method_calls: vec![Vec::new()],
             selected_methods: Rc::default(),
+            footprints: Default::default(),
             effect_frames: vec![EffectFrame {
                 var: EffectVar::fresh(0),
                 depth: 0,
@@ -656,6 +663,7 @@ impl InferCtx {
             }],
             effect_binders: HashMap::new(),
             effect_statements: Vec::new(),
+            effect_transactions: Vec::new(),
             marks: HashMap::new(),
             effect_calls: HashSet::new(),
             effect_public: Vec::new(),
@@ -680,8 +688,7 @@ impl InferCtx {
     /// is its argument's.
     fn bind_effect_name(&mut self, name: &Name, ty: &Type, declares: bool) {
         if let Some((domain, _, history_kind)) = ty.history_parts() {
-            let transactional = declares
-                && matches!(history_kind, crate::ccl::ty::HistoryKind::Overwrite)
+            let transactional = matches!(history_kind, crate::ccl::ty::HistoryKind::Overwrite)
                 && matches!(domain, Type::Txn);
             let depth = self.effect_frame().depth;
             if declares && let Some(declared) = self.body_binds.last_mut() {
@@ -693,7 +700,7 @@ impl InferCtx {
             }
             // Transactional state belongs to the run, so a transactional variable is declared
             // at a module's top level.
-            if transactional && depth > 0 {
+            if declares && transactional && depth > 0 {
                 self.errors.push(LocatedInferError::new(
                     InferError::TransactionalOutsideTopLevel {
                         name: name.base().to_string(),
@@ -717,8 +724,8 @@ impl InferCtx {
             );
             // Declaring a transactional variable writes it, and other modules append to a
             // public feed, so declaring one is an output of the top level's too. Neither
-            // capability is discharged where the variable's scope ends.
-            if transactional {
+            // capability is discharged where the top level's scope ends.
+            if declares && transactional {
                 self.record_effect(Item::Causes(Effect::Write(name.clone())));
             }
             if public_feed {
@@ -901,26 +908,43 @@ impl InferCtx {
         out
     }
 
-    /// The statements emitted that cause nothing and so do nothing
+    /// What was emitted that causes nothing and so does nothing: each `with begin():` block
+    /// whose body writes and feeds nothing (`docs/chl-spec.md`, "8.2 Transactions: `with
+    /// begin():`"), then each expression statement outside those blocks
     /// (`docs/chl-spec.md`, "4.9 Expression statement").
     ///
     /// A statement in a polymorphic definition can call a function that only each use of the
     /// definition determines: a parameter's. That call's variable has nothing flowing into it
-    /// at the definition, where each use fills a copy of its own, so a statement reaching one
-    /// may do something and is not reported.
-    pub(super) fn inert_statements(&self) -> Vec<NodeId> {
+    /// at the definition, where each use fills a copy of its own, so a statement or a block
+    /// reaching one may do something and is not reported.
+    pub(super) fn does_nothing(&self) -> Vec<(NodeId, InferError)> {
         let undetermined = |v: &EffectVar| {
             self.effect_calls.contains(&v.uid) && v.incoming().is_empty() && v.own().is_empty()
         };
-        self.effect_statements
+        // A top or a clause variable of the `causes` clause, `WriteTxn(_)` or `E`, stands for
+        // effects as a listed one does.
+        let idle = |var: &EffectVar| {
+            let set = crate::ccl::effects::set_of(&var.resolved());
+            set.causes.is_empty()
+                && set.tops_of(true).next().is_none()
+                && !set.params.iter().any(|p| p.of_causes)
+                && !var.reaches(&undetermined)
+        };
+        let empty: Vec<&(NodeId, Rc<EffectVar>)> = self
+            .effect_transactions
             .iter()
-            .filter(|(_, var)| {
-                crate::ccl::effects::set_of(&var.resolved())
-                    .causes
-                    .is_empty()
-                    && !var.reaches(&undetermined)
-            })
-            .map(|(node, _)| *node)
+            .filter(|(_, var)| idle(var))
+            .collect();
+        let in_empty = |body: EffectVarId| empty.iter().any(|(_, var)| var.uid == body);
+        empty
+            .iter()
+            .map(|(node, _)| (*node, InferError::EmptyTransaction))
+            .chain(
+                self.effect_statements
+                    .iter()
+                    .filter(|(_, var, body)| idle(var) && !in_empty(*body))
+                    .map(|(node, _, _)| (*node, InferError::InertStatement)),
+            )
             .collect()
     }
 
@@ -1068,7 +1092,7 @@ impl InferCtx {
         &mut self,
         requirement: &TraitRequirement,
         obligation: &Rc<TraitObligation>,
-        copies: &HashMap<crate::ccl::effects::EffectVarId, Rc<EffectVar>>,
+        copies: &HashMap<EffectVarId, Rc<EffectVar>>,
     ) {
         for (assoc, member) in &requirement.effect_assoc {
             let Some(var) = self.opened_clause_params.get(&member.param.id) else {
@@ -3053,13 +3077,16 @@ impl Typing for InferCtx {
         }
     }
 
-    fn record_read(&mut self, name: &Name) {
+    fn record_read(&mut self, name: &Name, at: NodeId) {
+        // The read is the variable's mention, wherever the rule reading through it runs.
+        let prev = self.enter_node(at);
         if let Some(transactional) = self.effect_binders.get(name).map(|b| b.transactional) {
             if transactional {
                 self.record_effect(Item::Requires(Requirement::transaction()));
             }
             self.record_effect(Item::Requires(Requirement::read(name.clone())));
         }
+        self.leave_node(prev);
     }
 
     fn statement<R>(&mut self, node: NodeId, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -3085,7 +3112,8 @@ impl Typing for InferCtx {
                 ..outer.filter()
             },
         );
-        self.effect_statements.push((node, var));
+        let body = outer.var.uid;
+        self.effect_statements.push((node, var, body));
         r
     }
 
@@ -3127,6 +3155,8 @@ impl Typing for InferCtx {
         self.effect_frames.push(frame);
         let r = f(self);
         self.effect_frames.pop();
+        self.footprints.record_block(node, &var);
+        self.effect_transactions.push((node, Rc::clone(&var)));
         let outer = self.effect_frame();
         outer.var.flows_from(
             &var,

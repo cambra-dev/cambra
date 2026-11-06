@@ -352,11 +352,11 @@ diagnostics:
   38:23-38:25 found 'in', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '|=>', '**', '}', or '::'
     38:1-38:41 while parsing statement
     38:21-38:22 while parsing expression
-  75:12-75:18 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
-    75:5-75:11 while parsing statement
-    75:5-75:11 while parsing expression
-  89:14-89:18 found 'with', expected 'if', or 'match'
-    89:5-89:13 while parsing statement
+  76:12-76:18 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
+    76:5-76:11 while parsing statement
+    76:5-76:11 while parsing expression
+  90:14-90:18 found 'with', expected 'if', or 'match'
+    90:5-90:13 while parsing statement
 symbols:
   variable Dollars 27:1-27:14 (name 27:1-27:8)
   variable Qty 28:1-28:25 (name 28:1-28:4)
@@ -365,42 +365,43 @@ symbols:
   variable SKU 38:1-38:41 (name 38:1-38:4)
   variable inventory 44:1-48:2 (name 44:1-44:10)
   module std::http 50:1-50:17 (name 50:8-50:17)
-  variable order_reqs 52:1-52:67 (name 52:1-52:11)
-  variable order_resps 52:1-52:67 (name 52:15-52:26)
-  variable restock_reqs 53:1-53:69 (name 53:1-53:13)
-  variable restock_resps 53:1-53:69 (name 53:15-53:28)
-  variable stats_reqs 54:1-54:66 (name 54:1-54:11)
-  variable stats_resps 54:1-54:66 (name 54:15-54:26)
-  function is_promo_spent 60:1-64:52 (name 60:5-60:19)
-  function quote 66:1-76:6 (name 66:5-66:10)
-  function reserve 78:1-84:14 (name 78:5-78:12)
-  variable orders 99:1-99:82 (name 99:1-99:7)
+  module std::txn 51:1-51:16 (name 51:8-51:16)
+  variable order_reqs 53:1-53:67 (name 53:1-53:11)
+  variable order_resps 53:1-53:67 (name 53:15-53:26)
+  variable restock_reqs 54:1-54:69 (name 54:1-54:13)
+  variable restock_resps 54:1-54:69 (name 54:15-54:28)
+  variable stats_reqs 55:1-55:66 (name 55:1-55:11)
+  variable stats_resps 55:1-55:66 (name 55:15-55:26)
+  function is_promo_spent 61:1-65:52 (name 61:5-61:19)
+  function quote 67:1-77:6 (name 67:5-67:10)
+  function reserve 79:1-85:14 (name 79:5-79:12)
+  variable orders 100:1-100:82 (name 100:1-100:7)
 folds:
   1-24 comment
   31-34
   40-43 comment
   44-47
-  56-59 comment
-  60-64
-  66-76
-  70-71
-  72-73
-  78-84
-  80-82
-  83-84
-  88-96
-  101-124
-  102-103 comment
-  104-122
-  105-106
-  107-122
-  108-122
-  110-120
-  113-118
-  121-122
-  127-133
-  128-131
-  130-131
+  57-60 comment
+  61-65
+  67-77
+  71-72
+  73-74
+  79-85
+  81-83
+  84-85
+  89-97
+  102-125
+  103-104 comment
+  105-123
+  106-107
+  108-123
+  109-123
+  111-121
+  114-119
+  122-123
+  128-134
+  129-132
+  131-132
 == tests/programs/streaming_echo/program.cambra
 diagnostics:
 symbols:

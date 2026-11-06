@@ -917,7 +917,15 @@ pub enum TypedExprNode {
     /// Making the block a statement (rather than *being* the whole `For` body)
     /// is what lets one loop body mix a transaction with sibling induction
     /// writes and feeds.
-    Begin { body: Box<TypedExpr> },
+    ///
+    /// `footprint` is what the body's type states it reads and writes of the run's
+    /// transactional state, which decides the block's commit store and read set: `None`
+    /// until coalesce resolves it, after which it survives effect erasure
+    /// (`src/ccl/design/type-inference.md`, "Block footprints").
+    Begin {
+        body: Box<TypedExpr>,
+        footprint: Option<crate::ccl::effects::Effects>,
+    },
 
     /// Recovery placeholder inserted by lowering when a sub-expression or
     /// statement could not be lowered (either because it came from a parser
@@ -1351,6 +1359,7 @@ impl TypedExpr {
     pub fn begin(body: Self) -> Self {
         Self::new(TypedExprNode::Begin {
             body: Box::new(body),
+            footprint: None,
         })
     }
 
@@ -1833,7 +1842,7 @@ impl TypedExpr {
                 }
                 f(value.as_ref());
             }
-            TypedExprNode::Begin { body } => f(body.as_ref()),
+            TypedExprNode::Begin { body, .. } => f(body.as_ref()),
         }
     }
 
@@ -2040,7 +2049,7 @@ impl TypedExpr {
                 }
                 f(value.as_mut());
             }
-            TypedExprNode::Begin { body } => f(body.as_mut()),
+            TypedExprNode::Begin { body, .. } => f(body.as_mut()),
         }
     }
 

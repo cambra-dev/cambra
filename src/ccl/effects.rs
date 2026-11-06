@@ -8,7 +8,7 @@
 use smol_str::SmolStr;
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     hash::{Hash, Hasher},
     rc::Rc,
@@ -1270,7 +1270,7 @@ impl EffectVar {
 
     /// Whether `pred` holds of this variable or of any variable flowing into it.
     pub fn reaches(&self, pred: &dyn Fn(&EffectVar) -> bool) -> bool {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         let mut stack: Vec<Rc<EffectVar>> = self.incoming().into_iter().map(|(v, _)| v).collect();
         if pred(self) {
             return true;
@@ -1321,6 +1321,122 @@ impl Eq for EffectVar {}
 impl Hash for EffectVar {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.uid.hash(state);
+    }
+}
+
+/// What a `with begin():` block reads and writes of the run's transactional state, as its
+/// body's type states it: each `ReadTxn` and `WriteTxn` capability, and each top or clause
+/// variable that may hold one (`docs/chl-spec.md`, "Discharging requirements and effects").
+pub fn footprint_of(set: &EffectSet) -> EffectSet {
+    let txn = |item: &Item| match item {
+        Item::Requires(r) => r.requirement().trait_ == Trait::read_txn(),
+        Item::Causes(e) => matches!(e, Effect::WriteTxn(_)),
+        Item::Param(_) => true,
+        Item::Every(top) => [Family::ReadTxn, Family::WriteTxn]
+            .into_iter()
+            .any(|f| top.overlaps(&Item::Every(f.top()))),
+    };
+    let mut out = EffectSet::default();
+    for item in set.items().filter(txn) {
+        match item {
+            Item::Requires(r) => {
+                out.requires.insert(r);
+            }
+            Item::Causes(e) => {
+                out.causes.insert(e);
+            }
+            Item::Param(p) => {
+                out.params.insert(p);
+            }
+            Item::Every(top) => out.add_every(top),
+        }
+    }
+    out
+}
+
+/// The variable each `with begin():` body collects on, and each use's copies of them, from
+/// which each block in the program after specialization takes its footprint
+/// (`src/ccl/design/type-inference.md`, "Block footprints").
+///
+/// A block emitted in place keeps its own variable. A block in a polymorphic definition stands
+/// in each specialization of it, and there takes the copy the use that minted the
+/// specialization made of its variable, which holds what that use's arguments bring.
+#[derive(Debug, Default)]
+pub struct Footprints {
+    /// The variable whose capabilities are the footprint of the block at each node.
+    blocks: HashMap<NodeId, Rc<EffectVar>>,
+    /// Each use of a polymorphic definition, by its node: the copy its instantiation made of
+    /// each block variable the definition reaches, by the original's id.
+    uses: HashMap<NodeId, HashMap<EffectVarId, Rc<EffectVar>>>,
+    /// Every block variable and every copy of one.
+    block_vars: HashSet<EffectVarId>,
+}
+
+impl Footprints {
+    /// The block at `node` collects on `var`.
+    pub fn record_block(&mut self, node: NodeId, var: &Rc<EffectVar>) {
+        self.block_vars.insert(var.uid);
+        self.blocks.insert(node, Rc::clone(var));
+    }
+
+    /// The use at `node` instantiated its definition with `copies`, from each variable of the
+    /// definition to its copy. Only the copies of block variables are kept, each a block
+    /// variable of its own, which a use of a definition whose body holds this use copies in
+    /// turn.
+    pub fn record_use(&mut self, node: NodeId, copies: &HashMap<EffectVarId, Rc<EffectVar>>) {
+        let kept: HashMap<EffectVarId, Rc<EffectVar>> = copies
+            .iter()
+            .filter(|(id, _)| self.block_vars.contains(id))
+            .map(|(id, copy)| (*id, Rc::clone(copy)))
+            .collect();
+        if kept.is_empty() {
+            return;
+        }
+        self.block_vars.extend(kept.values().map(|copy| copy.uid));
+        self.uses.insert(node, kept);
+    }
+
+    /// What decides, beside the types, whether the use at `node` may share a specialization:
+    /// the footprint each block reached through its definition takes at this use, in a
+    /// canonical order.
+    pub fn key(&self, node: NodeId) -> Vec<EffectSet> {
+        let mut key: Vec<EffectSet> = self
+            .uses
+            .get(&node)
+            .into_iter()
+            .flat_map(|copies| copies.values())
+            .map(|copy| footprint_of(&set_of(&copy.resolved())))
+            .collect();
+        key.sort_by_cached_key(|set| clauses(Vec::new(), &Effects::known(set.clone())));
+        key
+    }
+
+    /// The use at `node` minted a specialization, whose nodes are copies of its definition's,
+    /// each by its original in `origins`: each block in it takes the use's copy of the
+    /// original's variable, and each use in it records its original's copies as the use's
+    /// copies of them, so a specialization it mints in turn takes these.
+    pub fn specialize(&mut self, node: NodeId, origins: &HashMap<NodeId, NodeId>) {
+        let empty = HashMap::new();
+        let copies = self.uses.get(&node).unwrap_or(&empty).clone();
+        let at_use = |var: &Rc<EffectVar>| Rc::clone(copies.get(&var.uid).unwrap_or(var));
+        for (clone, original) in origins {
+            if let Some(var) = self.blocks.get(original) {
+                let var = at_use(var);
+                self.blocks.insert(*clone, var);
+            }
+            if let Some(inner) = self.uses.get(original) {
+                let inner: HashMap<EffectVarId, Rc<EffectVar>> =
+                    inner.iter().map(|(id, var)| (*id, at_use(var))).collect();
+                self.uses.insert(*clone, inner);
+            }
+        }
+    }
+
+    /// The footprint of the block at `node`, resolved, or `None` for a node no block was
+    /// recorded at.
+    pub fn footprint(&self, node: NodeId) -> Option<Effects> {
+        let var = self.blocks.get(&node)?;
+        Some(Effects::known(footprint_of(&set_of(&var.resolved()))))
     }
 }
 
@@ -1452,6 +1568,61 @@ impl Item {
             | Item::Param(_)
             | Item::Every(_) => None,
         }
+    }
+}
+
+impl EffectSet {
+    /// Each variable this set's capabilities name, those its tops and clause variables take
+    /// away included.
+    pub fn names(&self) -> Vec<&Name> {
+        let mut out: Vec<&Name> = self.items_named().collect();
+        for except in self
+            .tops
+            .iter()
+            .map(|t| &t.except)
+            .chain(self.params.iter().map(|p| &p.except))
+        {
+            out.extend(except.iter().filter_map(Item::variable));
+        }
+        out
+    }
+
+    fn items_named(&self) -> impl Iterator<Item = &Name> + '_ {
+        self.requires
+            .iter()
+            .filter_map(|r| r.requirement().terms.first())
+            .chain(self.causes.iter().filter_map(|e| match e {
+                Effect::Write(x) | Effect::WriteTxn(x) | Effect::Append(x) => Some(x),
+                Effect::RunTransaction | Effect::AffectWorld => None,
+            }))
+    }
+}
+
+impl Effects {
+    /// The set a known `Effects` states, or `None` for a variable or written clauses.
+    pub fn known_set(&self) -> Option<&EffectSet> {
+        match self.repr() {
+            Repr::Known(set) => Some(set),
+            Repr::Var(_) | Repr::Written(_) => None,
+        }
+    }
+
+    /// A known set with `f` applied to each variable it names, as [`Written::map_names`] does
+    /// to written clauses.
+    pub fn map_known_names(&self, f: impl FnMut(&Name) -> Name) -> Effects {
+        let set = self
+            .known_set()
+            .expect("only a known set's names are mapped")
+            .clone();
+        let written = Written {
+            set,
+            open_requires: false,
+            open_causes: false,
+            at: chl_parser::ast::Span::new(chl_parser::FileId::ROOT, 0, 0),
+            of_def: false,
+            of_instance: false,
+        };
+        Effects::known(written.map_names(f).set)
     }
 }
 

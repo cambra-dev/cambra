@@ -70,7 +70,7 @@
 //! - Transactions, `Mut(..., Txn)`, `match`/`Option`, structured requests,
 //!   `restrict`/`count` — `txn_kv` (the storefront spells restriction
 //!   `filter`); v1's `is_promo_spent` additionally uses
-//!   `summon(Transaction)` and a time-pinned aggregate inside a
+//!   the transaction's time (`txn::time()`) and a time-pinned aggregate inside a
 //!   `requires Transaction` UDF, which no smaller program pins.  Its
 //!   incremental materialization is the efficiency milestone: the naive
 //!   plan rescans order history per quote.

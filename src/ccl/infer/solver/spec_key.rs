@@ -32,6 +32,17 @@ pub struct SpecKey {
     /// The clone's view — a domain resolved from the argument that flowed in.
     /// This is the half that sees a use's refinements.
     negative: KeyView,
+    /// The footprint each `with begin():` block the definition reaches takes at this use,
+    /// which the clone's blocks keep, so uses giving a block two footprints share no clone
+    /// (`effects::Footprints::key`). Otherwise effects choose no clone.
+    blocks: Vec<crate::ccl::effects::EffectSet>,
+}
+
+impl SpecKey {
+    /// This key, for a use whose blocks take the footprints `blocks`.
+    pub(crate) fn with_blocks(self, blocks: Vec<crate::ccl::effects::EffectSet>) -> SpecKey {
+        SpecKey { blocks, ..self }
+    }
 }
 
 /// A canonical fingerprint of one position, under one directed read.
@@ -435,6 +446,7 @@ pub fn spec_key(ty: &Type) -> SpecKey {
     SpecKey {
         positive: key_go(ty, true, &Subst::id(), &mut ctx),
         negative: key_go(ty, false, &Subst::id(), &mut ctx),
+        blocks: Vec::new(),
     }
 }
 

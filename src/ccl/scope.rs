@@ -328,7 +328,19 @@ where
             open(f, expr);
             open(f, body);
         }
-        N::Begin { body } => open(f, body),
+        // A block's footprint names the variables it reads and writes.
+        N::Begin {
+            body, footprint, ..
+        } => {
+            for n in footprint
+                .iter()
+                .filter_map(|fp| fp.known_set())
+                .flat_map(|set| set.names())
+            {
+                f(ScopedItem::VarRef(n));
+            }
+            open(f, body);
+        }
         // A type alias binds no value; its type is a type slot, reached by the
         // caller's type walk.
         N::LetType { body, .. } | N::Run { body, .. } => open(f, body),
@@ -549,6 +561,16 @@ where
         N::Feed { name, .. } | N::Define { name, .. } | N::MutWrite { name, .. } => {
             f(ScopedItemMut::VarRef(name));
         }
+        N::Begin {
+            footprint: Some(footprint),
+            ..
+        } => {
+            *footprint = footprint.map_known_names(|n| {
+                let mut n = n.clone();
+                f(ScopedItemMut::VarRef(&mut n));
+                n
+            });
+        }
         N::Transact { keys, writers, .. } => {
             for k in keys {
                 f(ScopedItemMut::KeyRef(&mut k.name));
@@ -586,7 +608,9 @@ where
         | N::Copair(_)
         | N::DisjointJoin(_)
         | N::ExprStmt { .. }
-        | N::Begin { .. }
+        | N::Begin {
+            footprint: None, ..
+        }
         | N::Lambda { .. }
         | N::Let { .. }
         | N::LetType { .. }
@@ -727,6 +751,7 @@ mod tests {
             TypedExpr::expr_stmt(var("stmt"), var("rest")),
             node(N::Begin {
                 body: Box::new(var("bg")),
+                footprint: None,
             }),
             TypedExpr::feed("d", var("fv")),
             node(N::Define {

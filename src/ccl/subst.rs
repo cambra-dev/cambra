@@ -1978,6 +1978,15 @@ impl Subst {
             _ => {
                 let mut child = e.clone();
                 child.map_children(|c| self.apply_expr(&c));
+                // A block's footprint names the variables it reads and writes, a `Mut`
+                // parameter's among them, which retarget as a write's target does.
+                if let Begin {
+                    footprint: Some(footprint),
+                    ..
+                } = &mut child.node
+                {
+                    *footprint = footprint.map_known_names(|n| self.handle_target(n));
+                }
                 child.ty = self.apply_type(&e.ty);
                 child.user_annotation = e.user_annotation.as_ref().map(|t| self.apply_type(t));
                 self.apply_binder_types(&mut child);

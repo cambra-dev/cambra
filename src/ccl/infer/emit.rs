@@ -141,6 +141,9 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                     let instance = binding
                         .scheme
                         .instantiate_with_params(ctx.level, &ctx.telescope);
+                    // The blocks its definition reaches take this use's copies in the
+                    // specialization the use mints (`effects::Footprints`).
+                    ctx.footprints.record_use(node_id, &instance.effect_copies);
                     for (instantiation, bound, bound_at) in instance.bounds {
                         let check = |ctx: &mut InferCtx| {
                             ctx.require_sub(&instantiation, &bound, &|| {
@@ -351,7 +354,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // A value known only by its type, which the `let` binding it states.
         TypedExprNode::Abstract => ctx.fresh(),
 
-        TypedExprNode::Begin { body } => emit_begin(body, ctx)?,
+        TypedExprNode::Begin { body, .. } => emit_begin(body, ctx)?,
 
         // The feed/define target lookup is Emit-specific (Check maintains no
         // scope): resolve the feed handle's type from the environment exactly
@@ -1166,9 +1169,10 @@ pub(super) fn emit_apply<C: Typing>(
         // A handle reaching its pass-by-reference parameter: invariance relates the two
         // value types directly, in both directions.
         (Some(param), Some(_)) if param.mut_value_type().is_some() => {
-            // The callee may write the argument, so the call does, whether or not the callee
-            // does (`docs/chl-spec.md`, "Discharging requirements and effects").
+            // The callee may read and write the argument, so the call does, whether or not the
+            // callee does (`docs/chl-spec.md`, "Discharging requirements and effects").
             if let TypedExprNode::Var(a) = &argument.node {
+                ctx.record_effect(Item::Requires(Requirement::read(a.clone())));
                 ctx.record_effect(Item::Causes(Effect::Write(a.clone())));
             }
             raw_arg_ty
@@ -1729,7 +1733,7 @@ fn record_value_read<C: Typing>(e: &Expr, ty: &Type, ctx: &mut C) {
     if ty.mut_value_type().is_some()
         && let TypedExprNode::Var(name) = &denoted_expr(e).node
     {
-        ctx.record_read(name);
+        ctx.record_read(name, e.node_id());
     }
 }
 
@@ -2819,7 +2823,7 @@ pub(super) fn emit_for<C: Typing>(
     Ok(Type::Base(BaseType::Unit))
 }
 
-/// Type a `Begin { body }` transaction-block marker: emit the per-transaction
+/// Type a `Begin { body, .. }` transaction-block marker: emit the per-transaction
 /// body chain and give the block itself type `Unit`. The block introduces no
 /// binder or scope — in-block mutable variable reads/writes/feeds are typed by their own
 /// `Var`/`MutWrite`/`Feed` rules. Shared by Emit and Check via [`Typing`], like

@@ -4189,7 +4189,7 @@ whose body it is. Capabilities are recorded on the innermost frame:
 | a sink binding's `Defer` (`lower::SINK_BINDING`) | `AffectWorld` |
 | a value read of a transactional variable 𝑥 | `ReadTxn(𝑥)` and `Transaction` |
 | a value read of an induction variable 𝑥 | `Read(𝑥)` |
-| an `Apply` passing 𝑎 to a `Mut` parameter | `Write(𝑎)`, or `WriteTxn(𝑎)` when 𝑎 is transactional |
+| an `Apply` passing 𝑎 to a `Mut` parameter | `Read(𝑎)` and `Write(𝑎)`, or `ReadTxn(𝑎)` and `WriteTxn(𝑎)` when 𝑎 is transactional |
 | an `Apply` passing a feed 𝑎 to a `Feed` parameter | `Append(𝑎)` |
 
 A value read is a mention whose handle becomes its value (`read_value` in `emit.rs`). A mention
@@ -4320,7 +4320,12 @@ is one a write or an append hands a variable bound outside that capability's sco
 (`Typing::note_handed_out`, `InferError::HandsOutItsVariable`): the target's type, read through the
 lower bounds of the inference variables in it, may hold no function with a capability bound below
 the target's scope, which for the run's state is every scope and for a `Mut` or `Feed` parameter the
-function's own.
+function's own. A `Transaction` the top level requires is supplied by nothing, since only a block's
+body supplies one, so each read or write of a transactional variable that no block encloses,
+directly or through a call, is refused at the node it entered the top level at
+(`InferError::TransactionOutsideBlock`). A block whose body causes nothing does nothing, and is
+refused as an inert statement is (`InferCtx::does_nothing`, `InferError::EmptyTransaction`); a
+statement inside such a block is not reported again.
 
 **Statements.** An expression statement a program writes before its block's last statement gets a
 frame of its own, which keeps every capability, the enclosing function's own variables' included,
@@ -4351,9 +4356,10 @@ bounds and the edges into it (`freshen_effect_var`), so two uses of one polymorp
 collect their effects apart. `freshen_level` counts a function type's effect variable, so a type
 whose only quantified part is its effects is copied rather than shared.
 
-**Effects choose no clone.** Uses that differ only in what they require and cause run one body, so
-`SpecKey` leaves effects out and a specialization pin relates none
-(`ConstrainCache::without_effects`). A pin still adds the clone's function type as a bound of the
+**Effects choose no clone, except a block's footprint.** Uses that differ only in what they require
+and cause run one body, so `SpecKey` leaves a type's effects out and a specialization pin relates
+none (`ConstrainCache::without_effects`). A use whose blocks take another footprint gets another
+clone ([Block footprints](#block-footprints)). A pin still adds the clone's function type as a bound of the
 use's variables, whose effects then meet the use's at an input, so the walk's read-stability check
 compares types without their effects. Nothing after specialization reads an effect off a
 materialized type.
@@ -4376,7 +4382,28 @@ variable stands for what `f` does.
 ### Erasure
 
 The checks after inference read the materialized effects. Once they have run, `effects::erase` sets
-every function type's effects to none, and every later pass builds function types that state none.
+every function type's effects to none, and every later pass builds function types that state none. A
+`Begin` node's footprint is no function type's and survives.
+
+### Block footprints
+
+A `with begin():` block's footprint is what its body's type states it reads and writes of the
+run's transactional state: its `ReadTxn` and `WriteTxn` capabilities, and the tops holding some
+(`effects::footprint_of`). `transact_phase` takes each block's keys, store and read set from it
+(`transact_phase::block_keys`), so the stores follow the capabilities `docs/chl-spec.md`,
+"Discharging requirements and effects", states, a write a clause declares and a top included.
+
+A block in a polymorphic definition has one variable at the definition, whose footprint holds the
+definition's clause variables. Each use's instantiation copies it (`freshen_effect_var`), and the
+copy holds what that use's arguments bring. `effects::Footprints` records every block's variable
+by its node (`Typing::transaction_body`) and each use's copies of them by the use's node
+(`emit_node`'s `Var` arm). A use's specialization key adds the footprint each copy resolves to
+(`SpecKey::with_blocks`), so uses whose blocks would differ get separate clones. Minting a clone
+gives each block in it the use's copy of its original's variable, and each use in it its
+original's copies through the use's (`Footprints::specialize`), so a clone a use in it mints takes
+footprints at the outer use's instance. Once coalesce is done, each `Begin` takes its footprint as
+a known set (`write_footprints`), which holds no clause variable. Inlining renames a `Mut`
+parameter in it to the argument, as it renames a write's target (`Subst::apply_expr`).
 
 ## 5. CCL-specific inference rules
 
