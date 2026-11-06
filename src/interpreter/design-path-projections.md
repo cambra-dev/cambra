@@ -120,15 +120,16 @@ regions.
 
 ## Operator rows
 
-A projection at level 𝑛 > 0 meets an operator in one of five ways
+A projection at level 𝑛 > 0 meets an operator in one of six ways
 ([Projection guards](design-operators.md#projection-guards) lists each operator's row):
 
 | Kind | Operators | A projection at level 𝑛 |
 | --- | --- | --- |
-| Keeps every level's keys | `MapResultWithSource`, `Filter` (with a collection predicate, the levels down to the masked one), `Restrict`, `MapDomain`, `VariantProject`, `VariantIs`, `Memo`, `FanOutSlot`, `IterateExtent`, `MapAggregate`, `MapExtractAggregate` (the levels of its input, not those of a `Sole` collection beneath them) | pulls each keyed input at the same projection and cuts its answer to it |
+| Keeps every level's keys | `MapResultWithSource`, `Filter` (with a collection predicate, the levels down to the masked one), `Memo`, `FanOutSlot`, `MapAggregate`, `MapExtractAggregate` (the levels of its input, not those of a `Sole` collection beneath them), `UnionOperator` (a tagged one each arm's under the arm's tag) | pulls each keyed input at the same projection and cuts its answer to it |
 | Keeps the keys above its level | `MapResult` (keyed input), `MapResultToConst`, `RecordWrap`, `Zip`, `VariantWrap`, `SelectField` over a stream of records, `Product` | pulls each keyed input at a projection above its level and refuses one at or beneath it, or, for `Product`, pulls both sides at the rows above its paired level and cuts the pairs |
-| Shifts levels | `Uncurry`, `Converse` (pulled at the input's keys one level in, or at the standing keys, its groups cut), a nested store's read | restates the projection by the levels it adds or removes |
-| Reads whole and cuts | `PermuteRecordDomain`, `FlattenTupleDomain`, `SelectField` over a product, `CheckedLookup`'s collection, `UnionOperator`, `Converse` at the outermost level pulled at its values | reads its input whole and cuts the answer at level 𝑛 |
+| Shifts levels | `Converse` (pulled at the input's keys one level in, or at the standing keys, its groups cut), a nested store's read, `Uncurry` (a key at or beneath its pairs stands under the path of the pair's outer and inner key) | restates the projection by the levels it adds or removes |
+| Reads whole and cuts | `SelectField` over a product, `Converse` at the outermost level pulled at its values | reads its input whole and cuts the answer at level 𝑛 |
+| Keeps the outermost keys only | `Restrict`, `MapDomain`, `VariantProject`, `VariantIs`, `IterateExtent`, `PermuteRecordDomain`, `FlattenTupleDomain`, `CheckedLookup` | restate the outermost keys only (`Restates::Outermost`, the default of `TileProducer::restates`), so the planner panics on a nested loop whose rounds pull one of them beneath its outermost keys ([The planner](#the-planner)) |
 | No keys beneath | `Aggregate`, `ExtractAggregate`, `ExtractFinal`, `MakeRecord`, `Constant` scalar | refuses it, as it refuses keys at level 0 |
 
 An operator that keeps its input's keys above its own level and computes the values beneath them
