@@ -970,10 +970,10 @@ stays until the consumer releases the output, which is all or nothing.
 A transaction store (`CommitProducer`, `commit_operator.rs`) is the breaker of one pipeline per
 writer (`Breaker::inputs`): a writer's cycle, the store, the writer and its drive, is the pipeline
 of the writer's input, and the operators inside it stay in pull mode. An induction store
-(`InductionStoreProducer`) implements `Breaker`, but in a run its loop's scope (`LoopScope`) is the
-breaker: the loop runs in rounds ([A loop in rounds](#a-loop-in-rounds)), and its store steps once
-per round; a loop nested in it runs as a scope inside that loop's scope, a row of its store per
-round. A cyclic `FanOut` holds its store in a cell of its own (`Inner::Store`,
+(`InductionStoreProducer`) owns both accumulator state and optional per-run control. Its request and
+ordered step pipelines target that same producer. The loop runs in rounds
+([A loop in rounds](#a-loop-in-rounds)), and its store steps once per round. A nested request covers
+one row of its store per enclosing round. A cyclic `FanOut` holds its store in a cell of its own (`Inner::Store`,
 `tile_operators/fanout.rs`) and hands the store a `Cycle` when it subscribes it
 (`TileProducer::enter_cycle`). The call that steps the store holds the store's cell, so the
 recurrence's pull of the store finds the cell borrowed and is answered from the snapshot the store
@@ -1471,7 +1471,7 @@ notify cut counts as one of that source's packages, so it is released whole.
 A loop's drive reads its source by pull, behind an entry no planner places in the run's
 dispatcher, so a push of the source stops there. The positions the drive emits are its source's
 keys, so the entry records a decided push of the source at the loop's scope, as the same keys of
-the store's input (`DecidedTarget`, set by `LoopScope::decide_through_drive`). A loop over a
+the store's input (`DecidedTarget`, set by `InductionStoreProducer::decide_through_drive`). A loop over a
 let-bound list of a live source then steps at each position the list has decided, before the
 source yields everything.
 
@@ -1594,7 +1594,7 @@ brings none. A widened push brings such a pipeline no row: its arrivals name its
 A reader inside a loop's scope parks as one in the run's dispatcher does. Its inner pipelines' keys
 carry the loop's position, so a decided region names the rows of one position. A round queues its
 row to each inner reader as a push of the row from the drive lands at the reader's entry, restated
-by every operator on the way (`LoopScope::row_for`), and queues none to a reader whose input has
+by every operator on the way (`InductionStoreProducer::row_for`), and queues none to a reader whose input has
 released the row whole. A row a round queues waits whole until the pipelines the reader reads have
 decided all of it, the row's end included, which a closing round's reads state
 (`Dispatcher::queue_round`). Every round queues its row whole, whatever it queued before, since a
@@ -1612,16 +1612,23 @@ stay parked until the source yields everything, where the sum is decided.
 
 #### A loop in rounds
 
-An induction loop runs one round per source position. Its request pipeline, body pipelines and ordered
-store-step pipeline share the run's dispatcher. `LoopScope` retains per-run control state: the pending
-request package, current round and global pipeline IDs. The store retains the accumulator and its
-published snapshot. `Dispatcher` queues guards and tracks claims, acknowledgements and finishes; it
-holds no loop or operator state.
+An induction loop runs one round per source position. Its request, body and ordered store-step
+pipelines share the run's dispatcher. The request and store-step pipelines target the same
+`InductionStoreProducer`. Its optional `InductionRun` retains the pending request package, current
+round and global pipeline IDs. The producer also retains the accumulator and its published snapshot;
+scheduling metadata contains no handle back to its own store cell. `Dispatcher` queues guards and
+tracks claims, acknowledgements and finishes; it holds no loop or operator state.
 
 The planner configures each body graph locally, removes whole-input breakers that must remain in pull
 mode, and appends the configured graphs to the run. Composition remaps dependency, follower and shared
 push-record indices. The `Planned.rounds` report remains a tree with indices local to each sibling
 list; those indices describe planning and are not runtime pipeline IDs.
+
+Each plan installs fresh run metadata through a plan-scoped `InductionRuns` owner. The owner covers
+graph construction and execution, and clears run metadata on pause, completion, planning refusal or
+panic. Cleanup clears body and seed entry placements and the drive's completeness target. It keeps
+engines, snapshots and input releases unchanged. A retained producer therefore starts the next plan
+with its accumulated value and a fresh dispatcher mapping.
 
 A scope's request pipeline is ordered. Claiming a request opens its store if necessary and queues one
 round. The execution handler retains the request's acknowledgement until every position and closing

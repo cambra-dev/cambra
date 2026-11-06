@@ -550,7 +550,7 @@ fn a_loop_over_a_literal() {
             out << total
         "},
         "6",
-        &["LoopScope", "SinkBreaker"],
+        &["InductionRequest", "SinkBreaker"],
     );
 }
 
@@ -558,7 +558,7 @@ fn a_loop_over_a_literal() {
 fn rounds(planned: &[Planned]) -> &[Planned] {
     let scopes: Vec<_> = planned
         .iter()
-        .filter(|plan| plan.name.starts_with("LoopScope"))
+        .filter(|plan| plan.name.starts_with("InductionRequest"))
         .collect();
     assert_eq!(scopes.len(), 1, "one loop scope: {planned:?}");
     &scopes[0].rounds
@@ -576,7 +576,7 @@ fn a_guarded_loop() {
                 total += x
         out << total
     "};
-    answers(source, "5", &["LoopScope", "SinkBreaker"]);
+    answers(source, "5", &["InductionRequest", "SinkBreaker"]);
     let (_, planned) = dispatched(source, 1);
     let kinds = |planned: &[Planned], kind: &str| {
         rounds(planned)
@@ -647,7 +647,7 @@ fn a_guarded_loop() {
     out << total
 "}, "0")]
 fn a_loop_over_a_filtered_list(#[case] source: &str, #[case] expected: &str) {
-    answers(source, expected, &["LoopScope", "SinkBreaker"]);
+    answers(source, expected, &["InductionRequest", "SinkBreaker"]);
 }
 
 /// A loop over a let-bound list reads the list's memo, a pipeline beneath the store's cycle,
@@ -662,12 +662,12 @@ fn a_loop_over_a_let_bound_list() {
             total += x
         out << total
     "};
-    answers(source, "6", &["Memo", "LoopScope", "SinkBreaker"]);
+    answers(source, "6", &["Memo", "InductionRequest", "SinkBreaker"]);
     let (_, planned) = dispatched(source, 1);
     assert!(
         planned
             .iter()
-            .any(|plan| plan.name.starts_with("LoopScope") && plan.whole),
+            .any(|plan| plan.name.starts_with("InductionRequest") && plan.whole),
         "the loop's scope reads the list's memo whole: {planned:?}"
     );
 }
@@ -685,7 +685,7 @@ fn a_loop_beside_a_sum() {
             out << total + sum(ys)
         "},
         "15",
-        &["LoopScope", "Aggregate", "SinkBreaker"],
+        &["InductionRequest", "Aggregate", "SinkBreaker"],
     );
 }
 
@@ -702,7 +702,7 @@ fn a_reader_inside_a_loops_scope_parks() {
                 total += x * y
         out << total
     "};
-    answers(source, "18", &["LoopScope", "SinkBreaker"]);
+    answers(source, "18", &["InductionRequest", "SinkBreaker"]);
     let (_, planned) = dispatched(source, 1);
     let inner = rounds(&planned);
     assert!(
@@ -723,12 +723,13 @@ fn a_nested_loop() {
                 total += x * y
         out << total
     "};
-    answers(source, "18", &["LoopScope", "SinkBreaker"]);
+    answers(source, "18", &["InductionRequest", "SinkBreaker"]);
     let (_, planned) = dispatched(source, 1);
     assert!(
-        rounds(&planned).iter().any(
-            |plan| plan.name.starts_with("LoopScope(InductionStore") && !plan.rounds.is_empty()
-        ),
+        rounds(&planned).iter().any(|plan| plan
+            .name
+            .starts_with("InductionRequest(InductionStore")
+            && !plan.rounds.is_empty()),
         "the inner loop is a scope inside the outer loop's scope: {planned:?}"
     );
 }
@@ -748,7 +749,7 @@ fn two_loops_in_sequence() {
             out << b
         "},
         "9",
-        &["LoopScope", "SinkBreaker"],
+        &["InductionRequest", "SinkBreaker"],
     );
 }
 
@@ -768,7 +769,7 @@ fn a_nested_loop_seeded_from_the_outer_position() {
             out << total
         "},
         "15",
-        &["LoopScope", "SinkBreaker"],
+        &["InductionRequest", "SinkBreaker"],
     );
 }
 
@@ -831,7 +832,7 @@ fn a_nested_loop_seeded_from_the_outer_position() {
     out << total
 "}, "54")]
 fn a_nested_loop_answers(#[case] source: &str, #[case] expected: &str) {
-    answers(source, expected, &["LoopScope", "SinkBreaker"]);
+    answers(source, expected, &["InductionRequest", "SinkBreaker"]);
 }
 
 /// A loop nested twice over nested collections: each inner loop iterates the element of the loop
@@ -850,7 +851,7 @@ fn a_loop_nested_twice_over_nested_collections() {
             out << acc
         "},
         "36",
-        &["LoopScope", "SinkBreaker"],
+        &["InductionRequest", "SinkBreaker"],
     );
 }
 
@@ -869,7 +870,7 @@ fn a_loop_nested_twice() {
             out << total
         "},
         "27",
-        &["LoopScope", "SinkBreaker"],
+        &["InductionRequest", "SinkBreaker"],
     );
 }
 
@@ -894,7 +895,7 @@ fn a_loop_nested_twice() {
     out << total
 "}, "24")]
 fn a_nested_loop_aggregating_a_map_of_its_position(#[case] source: &str, #[case] expected: &str) {
-    answers(source, expected, &["LoopScope", "SinkBreaker"]);
+    answers(source, expected, &["InductionRequest", "SinkBreaker"]);
 }
 
 /// A nested loop with a condition in its body, on the inner and on the outer position, plans a
@@ -919,7 +920,7 @@ fn a_nested_loop_aggregating_a_map_of_its_position(#[case] source: &str, #[case]
     out << total
 "}, "3")]
 fn a_nested_loop_with_a_condition(#[case] source: &str, #[case] expected: &str) {
-    answers(source, expected, &["LoopScope", "SinkBreaker"]);
+    answers(source, expected, &["InductionRequest", "SinkBreaker"]);
 }
 
 /// Nested-loop bodies of the shapes the cases name: each plans a loop scope.
@@ -1007,7 +1008,7 @@ fn a_nested_loop_with_a_condition(#[case] source: &str, #[case] expected: &str) 
     out << total
 "}, "54")]
 fn a_nested_loop_body_reading(#[case] source: &str, #[case] expected: &str) {
-    answers(source, expected, &["LoopScope", "SinkBreaker"]);
+    answers(source, expected, &["InductionRequest", "SinkBreaker"]);
 }
 
 /// A loop nested over the rows of a list, the inner source being the outer element, so each
@@ -1030,7 +1031,7 @@ fn a_nested_loop_body_reading(#[case] source: &str, #[case] expected: &str) {
     out << acc
 "}, "28")]
 fn a_loop_nested_over_rows(#[case] source: &str, #[case] expected: &str) {
-    answers(source, expected, &["LoopScope", "SinkBreaker"]);
+    answers(source, expected, &["InductionRequest", "SinkBreaker"]);
 }
 
 /// A condition on the inner position of a loop nested over rows. Its body selects a field of the
@@ -1056,7 +1057,7 @@ fn a_loop_nested_over_rows(#[case] source: &str, #[case] expected: &str) {
     out << acc
 "}, "30")]
 fn a_condition_in_a_loop_nested_over_rows(#[case] source: &str, #[case] expected: &str) {
-    answers(source, expected, &["LoopScope", "SinkBreaker"]);
+    answers(source, expected, &["InductionRequest", "SinkBreaker"]);
 }
 
 /// A store per row of a comprehension, from a function whose loop runs once per row, runs as a
@@ -1105,7 +1106,7 @@ fn a_store_per_row_of_a_comprehension(
     assert!(
         run.planned
             .iter()
-            .any(|plan| plan.name.starts_with("LoopScope")),
+            .any(|plan| plan.name.starts_with("InductionRequest")),
         "the store runs as a loop's scope: {:?}",
         run.planned
     );
@@ -1168,7 +1169,7 @@ fn a_program_compiled_with_its_sinks_pulled_is_refused() {
     out << acc
 "}, "27")]
 fn a_map_in_the_first_of_two_inner_loops(#[case] source: &str, #[case] expected: &str) {
-    answers(source, expected, &["LoopScope", "SinkBreaker"]);
+    answers(source, expected, &["InductionRequest", "SinkBreaker"]);
 }
 
 /// A transaction store of one writer is the breaker of a pipeline of its own; its input is the
@@ -1506,7 +1507,7 @@ fn a_loop_over_a_live_source(
         assert!(
             planned
                 .iter()
-                .any(|plan| plan.live && plan.name.starts_with("LoopScope")),
+                .any(|plan| plan.live && plan.name.starts_with("InductionRequest")),
             "the loop's scope is the live source pipeline over {delivery}: {planned:?}"
         );
     }
@@ -1625,10 +1626,12 @@ fn a_loop_over_a_let_bound_map_of_a_live_source(
         "the map's `Memo` is a live pipeline: {planned:?}"
     );
     assert!(
-        planned.iter().any(|plan| plan.name.starts_with("LoopScope")
-            && plan.live
-            && !plan.whole
-            && plan.held),
+        planned
+            .iter()
+            .any(|plan| plan.name.starts_with("InductionRequest")
+                && plan.live
+                && !plan.whole
+                && plan.held),
         "the loop's scope takes the deliveries as rounds, parked on the `Memo`: {planned:?}"
     );
 }
@@ -1927,7 +1930,7 @@ fn a_guarded_loop_over_a_let_bound_list() {
             out << total
         "},
         "5",
-        &["Memo", "LoopScope", "SinkBreaker"],
+        &["Memo", "InductionRequest", "SinkBreaker"],
     );
 }
 
@@ -3284,7 +3287,8 @@ fn a_store_over_a_live_source_reading_a_pipeline(
     let following: Vec<_> = planned
         .iter()
         .filter(|plan| {
-            plan.live && (plan.name.starts_with("Commit") || plan.name.starts_with("LoopScope"))
+            plan.live
+                && (plan.name.starts_with("Commit") || plan.name.starts_with("InductionRequest"))
         })
         .collect();
     assert_eq!(
@@ -3448,7 +3452,7 @@ fn a_store_over_a_live_source_reading_a_sum_of_another(
             total += x
         total
     "},
-    "LoopScope"
+    "InductionRequest"
 )]
 fn a_sum_over_a_live_source_at_main(
     #[case] source: &str,

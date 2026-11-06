@@ -29,7 +29,7 @@ use crate::interpreter::{
     Consumer, Extent, Predicate, Projection, SharedConsumer, TileGuard, Value,
 };
 
-mod loop_scope;
+pub(crate) mod loop_scope;
 mod plan;
 
 pub use plan::{
@@ -723,7 +723,7 @@ impl Dispatcher {
 
     /// [`queue_for`](Self::queue_for) for a loop's round: the row of a nested loop's store, which
     /// follows the pipelines inside the cycle around it ([`follow`](Self::follow)), or a row the
-    /// closing round has every inner pipeline read again (`loop_scope::LoopScope`). A reader that
+    /// closing round has every inner pipeline read again. A reader that
     /// parks takes the row again whatever it took before, and only once the pipelines it reads
     /// have decided all of it, the row's end with its rows ([`Parked`]).
     pub(crate) fn queue_round(&self, reader: PipelineId, guard: &TileGuard) {
@@ -2934,9 +2934,8 @@ fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPac
 /// Have the selected pipelines push what their breakers hold and no push named before. A run after a pause
 /// or a reload starts over breakers an earlier run consumed into, and has no finish before its
 /// sources close, so its start is where its readers learn what the breakers already hold; each
-/// round of a loop, which no finish ends either, does the same ([`LoopScope`]).
-///
-/// [`LoopScope`]: loop_scope::LoopScope
+/// round of an induction run, which no finish ends either, does the same. See
+/// `src/interpreter/design-operators.md`, "A loop in rounds".
 fn push_held(
     dispatcher: &Dispatcher,
     reach: &mut Reach<'_>,

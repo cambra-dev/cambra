@@ -988,15 +988,14 @@ impl SteppedStore for InductionStoreProducer {
     }
 }
 
-/// An induction store driven as a pipeline breaker: its input is the body, its decision stream.
-/// A loop's scope runs one round of the pipelines inside its cycle per position and then consumes
-/// the position, which one step releases. A loop nested in another runs as a scope inside the
-/// scope of the loop around it, which queues it one row of its store per round: its rounds
-/// consume the row's positions, and a round at the row closes it
-/// (`src/interpreter/design-operators.md`, "A loop in rounds").
+/// An induction store consumes its body's decision stream. Planned requests retain their guards
+/// in per-run control; ordered step packages consume one settled round at a time. Nested requests
+/// cover one row and include a closing round before releasing that row. See
+/// `src/interpreter/design-operators.md`, "A loop in rounds".
 impl Breaker for InductionStoreProducer {
     fn enter_consuming_mode(&mut self) {
         self.breaker.consuming = true;
+        self.enter_loop_consuming();
     }
 
     /// Steps the store until the body has released `guard` ([`consume_store`]).
@@ -1020,9 +1019,19 @@ impl Breaker for InductionStoreProducer {
         Some(self)
     }
 
-    /// As [`finish_store`].
+    /// A planned run finishes after its body and step pipelines, so it only checks terminality
+    /// and pushes. An unplanned breaker finishes through [`finish_store`].
     fn finish(&mut self, pushes: &mut crate::interpreter::dispatcher::Pushes<'_>) {
-        finish_store(self, pushes);
+        if self.run.is_some() {
+            assert!(
+                self.held().is_universal(),
+                "{} finishes the run terminal",
+                self.name()
+            );
+            pushes.push_final(self);
+        } else {
+            finish_store(self, pushes);
+        }
     }
 }
 
@@ -3608,6 +3617,7 @@ impl TileOperator for InductionStore {
             })
             .collect();
         Box::new(InductionStoreProducer {
+            run: None,
             base: ProducerBase::new(
                 InductionStoreProducer::alloc_id(),
                 self.tiling(),
@@ -3671,7 +3681,9 @@ impl ChangeNotifier {
     }
 }
 
-struct InductionStoreProducer {
+/// An induction store with accumulator state and optional dispatcher-run control.
+pub struct InductionStoreProducer {
+    pub(crate) run: Option<crate::interpreter::dispatcher::loop_scope::InductionRun>,
     /// Wakes this store's readers when a pull changes what it answers.
     notifier: ChangeNotifier,
     base: ProducerBase,
@@ -4196,8 +4208,8 @@ impl TileProducer for InductionStoreProducer {
         Some(self)
     }
 
-    fn runs_in_rounds(&self) -> bool {
-        true
+    fn as_induction_store_mut(&mut self) -> Option<&mut InductionStoreProducer> {
+        Some(self)
     }
 
     fn read_cycle_again(&mut self) {
@@ -8942,6 +8954,238 @@ mod tests {
     use crate::interpreter::validate_tile;
     use rstest::rstest;
     use std::{cell::RefCell, rc::Rc};
+
+    mod induction_run_lifecycle {
+        use super::*;
+        use crate::ccl::context::{CompiledProgram, GlobalContext, compile_program};
+        use crate::ccl::load::LoadedProgram;
+        use crate::interpreter::dispatcher::{Ended, RunObserver, Targets};
+        use crate::interpreter::operator_conversion::OperatorMap;
+        use crate::interpreter::tile_operators::StoreCell;
+        use crate::interpreter::{TestDataSource, TestSink};
+        use indoc::indoc;
+        use std::ops::ControlFlow;
+        use std::sync::Arc;
+
+        struct Fixture {
+            _ctx: GlobalContext,
+            _operators: OperatorMap,
+            program: CompiledProgram,
+            feed: Rc<RefCell<TestDataSource>>,
+            sink: Arc<TestSink>,
+            store: StoreCell,
+        }
+
+        impl Fixture {
+            fn new() -> Self {
+                let mut ctx = GlobalContext::default();
+                ctx.defer_sink_pulls();
+                let feed = Rc::new(RefCell::new(TestDataSource::new(
+                    "source1",
+                    crate::ccl::Type::Base(BaseType::Int),
+                    Extent::Base(BaseType::Int),
+                )));
+                ctx.register_source(feed.clone());
+                let sink = ctx.register_test_sink("out");
+                let source = indoc! {"
+                    out = test_sink()
+                    total := 0
+                    for x in source1():
+                        total += x
+                    out << total
+                "};
+                let program =
+                    compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {}))
+                        .expect("the induction loop compiles");
+                let operators = ctx.take_operator_map();
+                let mut stores: Vec<_> = operators
+                    .operators()
+                    .into_iter()
+                    .filter_map(|fan| fan.store())
+                    .collect();
+                assert_eq!(stores.len(), 1);
+                Self {
+                    _ctx: ctx,
+                    _operators: operators,
+                    program,
+                    feed,
+                    sink,
+                    store: stores.remove(0),
+                }
+            }
+
+            fn first_delivery(&self) {
+                let mut feed = self.feed.borrow_mut();
+                feed.add_data(&[
+                    (Value::UInt(0), Value::Int(1)),
+                    (Value::UInt(1), Value::Int(2)),
+                ]);
+                feed.set_yield_predicate(Predicate::at_or_below(Value::UInt(1)));
+            }
+
+            fn targets(&self) -> Targets {
+                let mut targets = Targets::new();
+                targets.add_sinks(&self.program);
+                targets
+            }
+
+            fn assert_run_cleared(&self) {
+                let mut store = self.store.borrow_mut();
+                let store = store.as_induction_store_mut().expect("an induction store");
+                assert!(
+                    store.run.is_none(),
+                    "the completed execution plan leaves no scheduling state on its producer"
+                );
+                assert_eq!(
+                    store.breaker.last_finishes, 0,
+                    "planned induction runs retain no finish count between execution plans"
+                );
+                assert!(
+                    store
+                        .seed_placements
+                        .iter()
+                        .all(|placement| placement.get().is_none()),
+                    "a finished run leaves no seed entry assigned to an old pipeline"
+                );
+                fn check_targets(producer: &dyn TileProducer) {
+                    if producer.recurrence_of().is_some() {
+                        return;
+                    }
+                    if let Some(target) = producer.decides_through() {
+                        assert!(
+                            target.borrow().is_none(),
+                            "source completeness retains no target in the discarded dispatcher"
+                        );
+                    }
+                    producer.visit_input_producers(&mut |_, input| check_targets(input));
+                }
+                store.visit_input_producers(&mut |_, input| check_targets(input));
+            }
+        }
+
+        fn progress(store: &StoreCell) -> (Tile, TileGuard) {
+            let mut store = store.borrow_mut();
+            let store = store.as_induction_store_mut().expect("an induction store");
+            (
+                store
+                    .breaker
+                    .snapshot
+                    .clone()
+                    .expect("the loop has stepped"),
+                store.input_released(InputId::ONLY),
+            )
+        }
+
+        struct AtBoundary {
+            store: StoreCell,
+            observed: Option<(Tile, TileGuard)>,
+            panic: bool,
+        }
+
+        impl RunObserver for AtBoundary {
+            fn drained(&mut self, _: bool) -> ControlFlow<()> {
+                assert!(
+                    self.store
+                        .borrow_mut()
+                        .as_induction_store_mut()
+                        .expect("an induction store")
+                        .run
+                        .is_some(),
+                    "round control belongs to the active execution plan"
+                );
+                self.observed = Some(progress(&self.store));
+                assert!(!self.panic, "intentional induction boundary failure");
+                ControlFlow::Break(())
+            }
+        }
+
+        #[rstest]
+        fn scheduling_state_ends_with_the_run_and_progress_survives_replanning(
+            #[values(1, usize::MAX)] rows: usize,
+        ) {
+            let fixture = Fixture::new();
+            fixture.first_delivery();
+            let mut observer = AtBoundary {
+                store: fixture.store.clone(),
+                observed: None,
+                panic: false,
+            };
+            assert!(matches!(
+                fixture.targets().run(rows, &mut observer).unwrap(),
+                Ended::Paused(_)
+            ));
+            fixture.assert_run_cleared();
+            assert_eq!(progress(&fixture.store), observer.observed.unwrap());
+            assert_eq!(store_frontier(&progress(&fixture.store).0), Some(pos(1)));
+
+            let mut extra_ctx = GlobalContext::default();
+            extra_ctx.defer_sink_pulls();
+            let extra_sink = extra_ctx.register_test_sink("extra");
+            let extra = compile_program(
+                &mut extra_ctx,
+                &LoadedProgram::test(indoc! {"
+                extra = test_sink()
+                extra << 7
+            "}),
+                Box::new(|| {}),
+            )
+            .expect("the preceding root compiles");
+            let _extra_operators = extra_ctx.take_operator_map();
+            let mut targets = Targets::new();
+            targets.add_sinks(&extra);
+            targets.add_sinks(&fixture.program);
+            {
+                let mut feed = fixture.feed.borrow_mut();
+                feed.add_data(&[(Value::UInt(2), Value::Int(3))]);
+                feed.set_yield_predicate(Predicate::True);
+            }
+            let mut observer = AtBoundary {
+                store: fixture.store.clone(),
+                observed: None,
+                panic: false,
+            };
+            assert!(matches!(
+                targets.run(rows, &mut observer).unwrap(),
+                Ended::Done(_)
+            ));
+            fixture.assert_run_cleared();
+            assert!(progress(&fixture.store).0.is_terminal());
+            let written = fixture.sink.value().unwrap();
+            assert_eq!(written.as_function().len(), 1);
+            assert_eq!(written.as_function()[0].output, Value::Int(6));
+            assert_eq!(
+                extra_sink.value().unwrap().as_function()[0].output,
+                Value::Int(7)
+            );
+        }
+
+        #[test]
+        fn scheduling_state_is_cleared_when_execution_unwinds() {
+            let fixture = Fixture::new();
+            fixture.first_delivery();
+            let mut observer = AtBoundary {
+                store: fixture.store.clone(),
+                observed: None,
+                panic: true,
+            };
+            let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fixture.targets().run(1, &mut observer)
+            }));
+            let failure = match failed {
+                Err(failure) => failure,
+                Ok(_) => panic!("the boundary observer panics"),
+            };
+            assert_eq!(
+                failure
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| failure.downcast_ref::<&str>().copied()),
+                Some("intentional induction boundary failure")
+            );
+            fixture.assert_run_cleared();
+            assert_eq!(progress(&fixture.store), observer.observed.unwrap());
+        }
+    }
 
     /// A fixture producer's answer with the released region subtracted — the
     /// post-condition [`TileProducer::get`] asserts. A fixture stands in for a real

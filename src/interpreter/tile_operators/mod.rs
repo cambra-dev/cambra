@@ -1538,7 +1538,8 @@ pub trait BreakingProducer: TileProducer + Breaker {
     /// `false`: a release beneath those keys leaves a region beneath the outermost keys, and a
     /// reader's chain may restate only the outermost keys (`TileProducer::restates`). It pushes at
     /// its finish, and inside a loop's rounds where each round has every inner pipeline push what
-    /// it holds (`LoopScope::run_round`).
+    /// it holds through the run's scope-local publication pass. See
+    /// `src/interpreter/design-operators.md`, "A loop in rounds".
     fn pushes_while_consuming(&self) -> bool {
         true
     }
@@ -1872,11 +1873,11 @@ pub trait TileProducer {
         None
     }
 
-    /// Whether this producer, a store, runs in rounds as a pipeline breaker: one round of the
-    /// pipelines inside its cycle per position, in the nested dispatcher of a loop's scope. A
-    /// store that answers `false` steps itself until its input has released a morsel.
-    fn runs_in_rounds(&self) -> bool {
-        false
+    /// The concrete induction store behind a cyclic store cell, where this is one.
+    fn as_induction_store_mut(
+        &mut self,
+    ) -> Option<&mut crate::interpreter::commit_operator::InductionStoreProducer> {
+        None
     }
 
     /// Have every operator inside this producer's cycle read again at its next pull
