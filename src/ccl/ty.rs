@@ -476,6 +476,15 @@ impl FunKind {
         FunKind::Var(v)
     }
 
+    /// [`fresh_data`](Self::fresh_data) for a function an annotation's normalization mints at
+    /// `level`.
+    pub fn fresh_data_at(level: crate::ccl::infer_var::Level) -> FunKind {
+        let v = FunKindVar::fresh();
+        v.stamp_data();
+        v.place_at(level);
+        FunKind::Var(v)
+    }
+
     /// An annotation's **funkind hole**: a data function whose funkind the program left to
     /// inference, written `_ |=> 𝑇` (`docs/chl-spec.md`, "6.3 Direction: collection types
     /// \[Decided\]"). It admits a plain collection and a sum alike, as
@@ -717,6 +726,13 @@ pub struct FunKindVar {
     /// program left to inference, which normalization replaces with a fresh data funkind at
     /// each occurrence, as it replaces a `Hole`. Immutable, like `uid`.
     hole: bool,
+    /// The scope level of what owns this funkind variable, the variable it is the funkind of or
+    /// the annotation's function it was minted for, where that is known: a freshening copies it
+    /// only above its cutoff, as it copies a variable, so an instantiation leaves an outer
+    /// definition's funkind variable its own (`src/ccl/design/type-inference.md`, "Funkind
+    /// variables are copied by level"). `None` where nothing records an owner's level, and such
+    /// a funkind variable is copied by every freshening that reaches it.
+    level: std::cell::Cell<Option<crate::ccl::infer_var::Level>>,
     bounds: RefCell<FunKindBounds>,
     /// [`resolved`](Self::resolved)'s answer, with the [`KIND_FACTS`] count it was
     /// computed at: still the answer while no kind variable has been written since.
@@ -743,10 +759,25 @@ impl FunKindVar {
         Self::minted(false)
     }
 
+    /// The scope level of what owns this funkind variable
+    /// ([`FunKindVar::level`](Self#structfield.level)).
+    pub fn level(&self) -> Option<crate::ccl::infer_var::Level> {
+        self.level.get()
+    }
+
+    /// Record that what owns this funkind variable stands at `level`, or lower it there: it
+    /// stands as low as its lowest owner.
+    pub fn place_at(&self, level: crate::ccl::infer_var::Level) {
+        if self.level.get().is_none_or(|l| l > level) {
+            self.level.set(Some(level));
+        }
+    }
+
     fn minted(hole: bool) -> Rc<FunKindVar> {
         let v = Rc::new(FunKindVar {
             uid: FunKindVarId(FUN_KIND_VAR_COUNTER.fetch_add(1, Ordering::Relaxed)),
             hole,
+            level: std::cell::Cell::new(None),
             bounds: RefCell::new(FunKindBounds::default()),
             resolved_at: RefCell::new(None),
             component_at: RefCell::new(None),

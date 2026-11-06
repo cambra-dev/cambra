@@ -375,7 +375,16 @@ fn freshen_kind_var(
     if let Some(f) = cache.fun_kind_vars.get(&kv.uid) {
         return f.clone();
     }
+    // A funkind variable at or below the cutoff is an enclosing scope's, as a variable there
+    // is, and freshens to itself: a copy of a function this freshening copies relates to it as
+    // the original did.
+    if kv.level().is_some_and(|l| l <= lim) {
+        return Rc::clone(kv);
+    }
     let f = FunKindVar::fresh();
+    if let Some(l) = kv.level() {
+        f.place_at(target.level_of(l));
+    }
     // Registered **before** the bounds are carried across: a collection reaches itself
     // through a recurrence, and the cache is what terminates the walk.
     cache.fun_kind_vars.insert(kv.uid, Rc::clone(&f));
@@ -401,13 +410,30 @@ fn freshen_kind_var(
         cache.witnesses.insert(from, f.binder_id_at(i));
     }
     // Each edge's substitution comes across freshened, as a copied bound's does.
-    for (k, edge) in kv.lower_edges() {
-        let edge = freshen_subst_payloads(lim, &edge, target, cache);
-        f.record_under(freshen_fun_kind(&k, lim, target, cache), true, edge);
-    }
-    for (k, edge) in kv.upper_edges() {
-        let edge = freshen_subst_payloads(lim, &edge, target, cache);
-        f.record_under(freshen_fun_kind(&k, lim, target, cache), false, edge);
+    for (lower, edges) in [(true, kv.lower_edges()), (false, kv.upper_edges())] {
+        for (k, edge) in edges {
+            let edge = freshen_subst_payloads(lim, &edge, target, cache);
+            let neighbor = freshen_fun_kind(&k, lim, target, cache);
+            // A neighbor this freshening leaves in place, an enclosing scope's funkind variable,
+            // is not copied, so its side of the edge is recorded here: the edge is recorded on
+            // both ends, and `kv`'s neighbor reads it as it reads its edge to `kv`.
+            if let (FunKind::Var(original), FunKind::Var(kept)) = (&k, &neighbor)
+                && Rc::ptr_eq(original, kept)
+            {
+                let reverse = if lower {
+                    kept.upper_edges()
+                } else {
+                    kept.lower_edges()
+                };
+                for (back, back_edge) in reverse {
+                    if matches!(&back, FunKind::Var(b) if b.uid == kv.uid) {
+                        let back_edge = freshen_subst_payloads(lim, &back_edge, target, cache);
+                        kept.record_under(FunKind::Var(Rc::clone(&f)), !lower, back_edge);
+                    }
+                }
+            }
+            f.record_under(neighbor, lower, edge);
+        }
     }
     for src in kv.built_over().into_iter().rev() {
         f.contributes_first(freshen_fun_kind(&src, lim, target, cache));
@@ -911,6 +937,7 @@ pub fn freshen_above(
                 Some(existing) => Rc::clone(existing),
                 None => {
                     let f = FunKindVar::fresh();
+                    f.place_at(new_level);
                     cache.fun_kind_vars.insert(tv.fun_kind.uid, Rc::clone(&f));
                     f
                 }
