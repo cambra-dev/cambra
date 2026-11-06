@@ -1318,7 +1318,12 @@ fn elim_lambda_impl(
     let result_ty = if param_ty.is_unresolved() || body_ty.is_unresolved() {
         Type::Hole
     } else {
-        Type::pi_if_dependent(param, param_ty.clone(), body_ty.clone(), fun_kind.clone())
+        Type::fun_over(
+            param.clone(),
+            param_ty.clone(),
+            body_ty.clone(),
+            fun_kind.clone(),
+        )
     };
     assert_ne!(Type::Hole, result_ty);
 
@@ -1663,6 +1668,22 @@ fn elim_lambda_impl(
         // For an n-ary Compose([f₀, f₁, …]), eliminate the lambda through each
         // element and re-build a pairwise chain: ⟨λx→f₀, λx→f₁⟩ ≫ compose ≫ …
         TypedExprNode::Compose(elts) => {
+            // Whether every morphism before each one maps a position to itself, so that one's
+            // input is the chain's ([`crate::ccl::ccl_utils::maps_each_position_to_itself`]).
+            let through: Vec<bool> = elts
+                .iter()
+                .scan(true, |all, e| {
+                    let before = *all;
+                    *all &= crate::ccl::ccl_utils::maps_each_position_to_itself(e);
+                    Some(before)
+                })
+                .collect();
+            // A chain whose later morphism reads its input is restated over the morphisms
+            // before it, which takes their terms: kept only where some morphism is dependent.
+            let originals: Option<Vec<Expr>> = elts
+                .iter()
+                .any(|e| crate::ccl::subst::is_dependent(crate::ccl::generalize::opened(&e.ty)))
+                .then(|| elts.iter().map(Expr::clone_preserving_ids).collect());
             let mut elim_elts = elts
                 .into_iter()
                 .map(|e| elim_lambda_kinded(ctx, param, param_ty, e, fun_kind.clone()))
@@ -1670,7 +1691,11 @@ fn elim_lambda_impl(
             // Fold pairwise from the left: ⟨e0, e1⟩ ≫ compose, then compose
             // the result with e2, etc.
             let mut acc = elim_elts.remove(0);
-            for next in elim_elts {
+            for (at, (next, through)) in elim_elts
+                .into_iter()
+                .zip(through.into_iter().skip(1))
+                .enumerate()
+            {
                 let pair = zip_pair(acc, next, &fun_kind);
                 // compose: Tuple([A→B, B→C]) → (A→C); domain = codomain of pair
                 // The chain this step produces, `A → C`, types both the `compose`
@@ -1685,71 +1710,104 @@ fn elim_lambda_impl(
                         domain: pair_domain,
                         codomain: cod,
                         ..
-                    } => match cod.as_ref() {
-                        Type::Tuple(elts) if elts.len() == 2 => match (&elts[0], &elts[1]) {
-                            (
-                                first @ Type::Fun { domain: a, .. },
-                                Type::Fun {
-                                    domain: _,
-                                    codomain: c,
-                                    ..
-                                },
-                            ) => {
-                                // `compose`'s codomain is the *chain it produces*,
-                                // `A → C`, and a chain's kind is its head's — the
-                                // rule `typed_compose` builds by. A bare function type
-                                // makes composing onto a collection yield a
-                                // compute function.
-                                let chain = Type::fun_like(first, *a.clone(), *c.clone());
-                                // The step names the pair's binder exactly when the chain
-                                // references it — the rule every function type here is
-                                // built by ([`zip_pair_ty`]). The chain keeps the first
-                                // operand's domain and the second's codomain and drops
-                                // what joins them, so the pair naming a binder does not
-                                // settle it. Leaving the step unnamed where the chain does
-                                // reference one strands the reference: the next
-                                // `zip_pair_ty` has no binder to ride, and
-                                // `open_codomain` none to open at. A correlated filter
-                                // beside a correlated body is the shape that gets there.
-                                // The `compose` built-in sits **under** the pair's
-                                // binder, so its own type speaks the opened form — the
-                                // same rule the `Apply` arm above builds its transformer
-                                // by. Leaving it closed hands the chain a function whose
-                                // type carries an index no binder of its own accounts for.
-                                let under_binder =
-                                    |t: &Type| crate::ccl::subst::open_codomain(&pair.ty, t);
-                                let compose_ty = Type::compute_fun_or_hole(
-                                    &under_binder(cod),
-                                    &under_binder(&chain),
-                                );
-                                let step = match pair_name {
-                                    Some(n)
-                                        if crate::ccl::subst::references_enclosing_function(
-                                            &chain,
-                                        ) =>
+                    } => {
+                        match cod.as_ref() {
+                            Type::Tuple(elts) if elts.len() == 2 => {
+                                match (&elts[0], &elts[1]) {
+                                    (
+                                        first @ Type::Fun { domain: a, .. },
+                                        Type::Fun {
+                                            name: second_name,
+                                            domain: _,
+                                            codomain: c,
+                                            ..
+                                        },
+                                    ) => {
+                                        // `compose`'s codomain is the *chain it produces*,
+                                        // `A → C`, and a chain's kind is its head's — the
+                                        // rule `typed_compose` builds by. A bare function type
+                                        // makes composing onto a collection yield a
+                                        // compute function.
+                                        let chain = Type::fun_like(first, *a.clone(), *c.clone());
+                                        // A `C` that reads the second morphism's input reads the
+                                        // chain's where everything before it maps a position to
+                                        // itself, so the chain binds it there, as `chain_type_of`
+                                        // does.
+                                        // Otherwise it reads `𝑥 ▷ first`, restated over the morphisms
+                                        // before it as a chain is (`chain_type_of`), their terms reading
+                                        // the parameter, which the step binds.
+                                        let chain = match (&chain, second_name, &originals) {
+                                    (Type::Fun { name: None, fun_kind, .. }, Some(y), _)
+                                        if through
+                                            && crate::ccl::subst::references_enclosing_function(c) =>
                                     {
-                                        Type::pi_kinded(
-                                            n.clone(),
-                                            *pair_domain.clone(),
-                                            chain.clone(),
+                                        Type::fun_over(
+                                            y.clone(),
+                                            *a.clone(),
+                                            *c.clone(),
                                             fun_kind.clone(),
                                         )
                                     }
-                                    _ => Type::Fun {
-                                        name: None,
-                                        fun_kind: fun_kind.clone(),
-                                        domain: pair_domain.clone(),
-                                        codomain: Box::new(chain.clone()),
-                                        capabilities: crate::ccl::capabilities::Capabilities::none(
-                                        ),
-                                    },
+                                    (Type::Fun { name: None, .. }, Some(_), Some(originals))
+                                        if crate::ccl::subst::references_enclosing_function(c) =>
+                                    {
+                                        let restated = crate::ccl::ccl_utils::chain_type_of(
+                                            &originals[..=at + 1],
+                                            chain.clone(),
+                                        );
+                                        match pair_name {
+                                            Some(p) if p != param => {
+                                                crate::ccl::subst::Subst::rename(
+                                                    param.clone(),
+                                                    p.clone(),
+                                                )
+                                                .apply_type(&restated)
+                                            }
+                                            _ => restated,
+                                        }
+                                    }
+                                    _ => chain,
                                 };
-                                (compose_ty, step)
+                                        // The step names the pair's binder exactly when the chain
+                                        // references it — the rule every function type here is
+                                        // built by ([`zip_pair_ty`]). The chain keeps the first
+                                        // operand's domain and the second's codomain and drops
+                                        // what joins them, so the pair naming a binder does not
+                                        // settle it. Leaving the step unnamed where the chain does
+                                        // reference one strands the reference: the next
+                                        // `zip_pair_ty` has no binder to ride, and
+                                        // `open_codomain` none to open at. A correlated filter
+                                        // beside a correlated body is the shape that gets there.
+                                        // The `compose` built-in sits **under** the pair's
+                                        // binder, so its own type speaks the opened form — the
+                                        // same rule the `Apply` arm above builds its transformer
+                                        // by. Leaving it closed hands the chain a function whose
+                                        // type carries an index no binder of its own accounts for.
+                                        let under_binder = |t: &Type| {
+                                            crate::ccl::subst::open_codomain(&pair.ty, t)
+                                        };
+                                        let compose_ty = Type::compute_fun_or_hole(
+                                            &under_binder(cod),
+                                            &under_binder(&chain),
+                                        );
+                                        // An unnamed pair the chain reads by index takes a name, so
+                                        // the reference has its binder.
+                                        let step = Type::fun_over(
+                                            pair_name
+                                                .clone()
+                                                .unwrap_or_else(|| Name::fresh("__pair")),
+                                            *pair_domain.clone(),
+                                            chain.clone(),
+                                            fun_kind.clone(),
+                                        );
+                                        (compose_ty, step)
+                                    }
+                                    _ => (Type::Hole, Type::Hole),
+                                }
                             }
                             _ => (Type::Hole, Type::Hole),
-                        },
-                        _ => (Type::Hole, Type::Hole),
-                    },
+                        }
+                    }
                     _ => (Type::Hole, Type::Hole),
                 };
                 let compose_var = Expr::builtin(Builtin::Compose).with_ty(compose_ty);

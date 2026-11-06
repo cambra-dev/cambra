@@ -157,6 +157,13 @@ value each read took and makes every opaque `let` transparent
 
 `well_scoped::assert_well_scoped` checks the rule in debug builds at every boundary `settle`
 checks, type parameters included, and `infer::debug_assert_no_free_witness` checks witnesses.
+A function's binder, read by index, is checked too: no unnamed function's codomain reads the
+function, since such a reference counts the function as its binder and has no name to read. In
+debug builds `Expr::with_ty` checks the top of each type it stores
+(`Type::assert_indices_bound`), which reports a type where it is built, and `assert_well_scoped`
+checks every type slot at every depth at each boundary, however the slot was written. A rebuild whose codomain may read its binder states the function with
+`Type::fun_over`, which binds it exactly when the codomain reads it, and a chain hands each
+morphism the codomain before it read by name (`ccl_utils::chain_type`).
 
 ### Source locations on substituted parameter projections
 

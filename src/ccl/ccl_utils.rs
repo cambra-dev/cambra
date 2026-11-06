@@ -330,7 +330,7 @@ pub(crate) fn gate_values(
         binder.name
     );
     let body = around(tap_gated(condition, value, value_ty.clone()));
-    let ty = Type::pi_if_dependent(
+    let ty = Type::fun_over(
         binder.name.clone(),
         binder.ty.clone(),
         body.ty.clone(),
@@ -1420,16 +1420,23 @@ pub(crate) fn chain_type(elts: &[Expr], fun_kind: crate::ccl::ty::FunKind) -> Ty
     // Each morphism is read at what the one before it hands it: a generalized type is instantiated
     // there (`src/ccl/design/type-parameters.md`, "Generalized types").
     let mut reaching = head_domain.clone();
-    let mut last = elts[0].ty.clone();
+    let mut instances = Vec::with_capacity(elts.len());
     for e in elts {
-        last = crate::ccl::generalize::instantiate(&e.ty, &reaching);
-        reaching = last.codomain().expect("a chain's element is a function");
+        let instance = crate::ccl::generalize::instantiate(&e.ty, &reaching);
+        // Handed on by name: a dependent morphism's codomain reads its binder by index, which
+        // under the next morphism would read that one instead. The name is the position
+        // [`chain_type_at`] reads at the chain's input.
+        let morphism = crate::ccl::generalize::opened(&instance);
+        let codomain = morphism
+            .codomain()
+            .expect("a chain's element is a function");
+        reaching = crate::ccl::subst::open_codomain(morphism, &codomain);
+        instances.push(instance);
     }
-    let last_codomain = last
-        .codomain()
-        .expect("a chain's last element is a function");
-    chain_type_of(
+    let last_codomain = reaching;
+    chain_type_at(
         elts,
+        &instances,
         Type::Fun {
             name: None,
             fun_kind,
@@ -1618,7 +1625,7 @@ pub(crate) fn indexed_loop(position: Option<Name>, source: Expr, step: Expr) -> 
         Type::Fun { codomain, .. } => (**codomain).clone(),
         other => panic!("a loop's step is a function, got {other}"),
     };
-    let ty = Type::pi_if_dependent(position.name.clone(), *domain, value.clone(), fun_kind);
+    let ty = Type::fun_over(position.name.clone(), *domain, value.clone(), fun_kind);
     let body = Expr::apply(read, step).with_ty(value);
     let TypedExprNode::Lambda { param, body } =
         Expr::lambda(position.name, position.occurrence, Type::Hole, body).node
@@ -1674,9 +1681,20 @@ pub(crate) fn chain_typed(elts: Vec<Expr>, ty: Type) -> Expr {
 /// the prefix does, the chain keeps `𝑓`'s binder and codomain. Every other chain is typed by
 /// its ends, so `stated` stands.
 pub(crate) fn chain_type_of(elts: &[Expr], stated: Type) -> Type {
-    let Some(last) = elts.last() else {
+    let types: Vec<Type> = elts
+        .iter()
+        .map(|e| crate::ccl::generalize::opened(&e.ty).clone())
+        .collect();
+    chain_type_at(elts, &types, stated)
+}
+
+/// [`chain_type_of`] with each morphism read at `types`, one per element: what it is where the
+/// chain applies it, a generalized type instantiated at what the morphism before it hands it.
+fn chain_type_at(elts: &[Expr], types: &[Type], stated: Type) -> Type {
+    let (Some(last), Some(last_ty)) = (elts.last(), types.last()) else {
         return stated;
     };
+    let last_ty = crate::ccl::generalize::opened(last_ty);
     let (
         Type::Fun {
             name: stated_name,
@@ -1685,16 +1703,13 @@ pub(crate) fn chain_type_of(elts: &[Expr], stated: Type) -> Type {
             ..
         },
         Some(last_cod),
-    ) = (
-        stated.peel_refinements(),
-        last.ty.peel_refinements().codomain(),
-    )
+    ) = (stated.peel_refinements(), last_ty.codomain())
     else {
         return stated;
     };
-    let named: Vec<Option<(Name, Type)>> = elts
+    let named: Vec<Option<(Name, Type)>> = types
         .iter()
-        .map(|e| match e.ty.peel_refinements() {
+        .map(|t| match crate::ccl::generalize::opened(t) {
             Type::Fun {
                 name: Some(b),
                 domain,
@@ -1703,13 +1718,13 @@ pub(crate) fn chain_type_of(elts: &[Expr], stated: Type) -> Type {
             _ => None,
         })
         .collect();
-    let opened = crate::ccl::subst::open_codomain(&last.ty, &last_cod);
+    let opened = crate::ccl::subst::open_codomain(last_ty, &last_cod);
     let reads_a_position = named
         .iter()
         .flatten()
         .any(|(b, _)| crate::ccl::subst::type_free_vars(&opened).contains(b));
     if !reads_a_position {
-        return without_unread_binder(stated, elts);
+        return without_unread_binder(stated, elts, types);
     }
     let position = chain_input_binder(elts, stated_name.as_ref(), &named);
     // The reads are minted for the last morphism, whose codomain they restate.
@@ -1722,6 +1737,7 @@ pub(crate) fn chain_type_of(elts: &[Expr], stated: Type) -> Type {
     without_unread_binder(
         Type::pi_kinded(position, (**domain).clone(), cod, fun_kind.clone()),
         elts,
+        types,
     )
 }
 
@@ -1753,7 +1769,7 @@ pub(crate) fn chain_input_binder(
 /// `stated` without its binder where nothing reads it: not its codomain, which reads it by
 /// index, and not the chain's morphisms, typed under it by name where the head does not bind
 /// that name itself. A binder no type reads is no part of the chain's type.
-fn without_unread_binder(stated: Type, elts: &[Expr]) -> Type {
+fn without_unread_binder(stated: Type, elts: &[Expr], types: &[Type]) -> Type {
     let Type::Fun {
         name: Some(k),
         fun_kind,
@@ -1764,8 +1780,8 @@ fn without_unread_binder(stated: Type, elts: &[Expr]) -> Type {
     else {
         return stated;
     };
-    let head_binds = elts.first().is_some_and(
-        |head| matches!(head.ty.peel_refinements(), Type::Fun { name: Some(h), .. } if h == k),
+    let head_binds = types.first().is_some_and(
+        |head| matches!(crate::ccl::generalize::opened(head), Type::Fun { name: Some(h), .. } if h == k),
     );
     if crate::ccl::subst::references_enclosing_function(codomain)
         || (!head_binds && elts.iter().any(|e| is_free(k, e)))

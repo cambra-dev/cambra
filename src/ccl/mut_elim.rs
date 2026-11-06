@@ -2661,16 +2661,12 @@ pub(crate) fn fold_induction_loop(
     // The recurrence binds the loop's history, so it is a collection — and a `Type::fun`
     // here rode down into everything lambda elimination mints out of the position binder,
     // the loop's own iteration source among them.
-    let hist_ty = if crate::ccl::subst::type_free_vars(&decision_ty).contains(&r) {
-        Type::pi_kinded(
-            r.clone(),
-            domain_ty.clone(),
-            decision_ty.clone(),
-            crate::ccl::ty::FunKind::Data(None),
-        )
-    } else {
-        crate::ccl::ccl_utils::history_ty(&domain_ty, &decision_ty)
-    };
+    let hist_ty = Type::fun_over(
+        r.clone(),
+        domain_ty.clone(),
+        decision_ty.clone(),
+        crate::ccl::ty::FunKind::Data(None),
+    );
 
     // The recurrence guard reads each accumulator's own writes:
     // `(acc₀: get_prev_seq((__hist ≫ .writes ≫ .acc₀ ≫ fired, r, init₀)), …)` — a view of
@@ -4306,6 +4302,7 @@ impl<'a> WriterWalk<'a> {
         }
         let decision = sink_prefix(decision);
         // A fed row whose keys depend on the loop variable reads the parameter in its type.
+
         (
             Expr::lambda(param.name, Occurrence::mint(), param.ty, decision),
             self.feeds,
