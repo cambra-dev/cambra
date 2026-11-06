@@ -735,7 +735,7 @@ pub(super) fn lower_subscript(
 /// callee's inferred parameter type; lowering cannot know the signature (it runs
 /// before inference). A non-bare argument is a computed value expression and
 /// lowers through [`super::lower_expr`], where the gate still applies.
-fn lower_call_arg(
+pub(super) fn lower_call_arg(
     arg: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
