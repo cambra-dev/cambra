@@ -2410,6 +2410,8 @@ pub fn check_program(
     }
     let lowering_session = LoweringSession::install();
     let lowered = lower_for_check(program, ctx.lowering_ctx());
+    let stood_in = std::mem::take(&mut ctx.lowering_ctx().stood_in);
+    let contained = lowered.len() == stood_in;
     // A part the parser could not read is reported by its parse error.
     errors.extend(
         lowered
@@ -2418,7 +2420,17 @@ pub fn check_program(
             .map(CompileError::Lower),
     );
     let checks = std::mem::take(&mut ctx.lowering_ctx().module_checks);
-    if !errors.is_empty() {
+    // As in `run_frontend`: each module is checked past parse, load and lowering errors when
+    // every lowering error is a statement's the placeholder stands in for, and what the checks
+    // report is added to theirs.
+    if !contained
+        || errors.iter().any(|e| {
+            !matches!(
+                e,
+                CompileError::Lower(_) | CompileError::Parse(_) | CompileError::Load(_)
+            )
+        })
+    {
         return Err(errors);
     }
     let mut output_ids = HashSet::new();
@@ -2446,9 +2458,15 @@ pub fn check_program(
         .map(|check| Rc::clone(&check.interface));
     let blame = Blame::new(&projection, program.sources());
     let mut contracts = HashMap::new();
-    let errors = check_modules(ctx, checks, &blame, Some(root), &mut contracts);
+    errors.extend(check_modules(
+        ctx,
+        checks,
+        &blame,
+        Some(root),
+        &mut contracts,
+    ));
     if !errors.is_empty() {
-        return Err(errors);
+        return Err(merged_copies(errors));
     }
     let interface = interface.expect("a program that checks has its root's file checked");
     Ok(interface.written(&contracts))
