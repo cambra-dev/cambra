@@ -1724,8 +1724,9 @@ In a loop's scope a reader takes a package only once every pipeline it follows
 pipeline it reads (`Dispatcher::quiescent`). It takes no push of theirs
 ([A loop in rounds](#a-loop-in-rounds)). A claim of such a reader reads the package's index first,
 then checks the pipelines it follows, then takes that index alone, so the check sees the work that
-the package was queued after. A round holds its followers while its pushes settle
-(`Dispatcher::hold_followers`). An ordered pipeline has at most one package in flight and
+the package was queued after. A round holds its own follower pipelines while its pushes settle
+(`Dispatcher::hold_followers`); holding or releasing them does not affect another loop's followers
+in the same dispatcher. An ordered pipeline has at most one package in flight and
 takes its packages in queue order.
 
 #### Claiming from several threads

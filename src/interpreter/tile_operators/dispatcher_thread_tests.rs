@@ -1867,3 +1867,115 @@ fn stepped_in_rounds(seed: u64, threads: usize) {
         "the store stepped every position once, in order"
     );
 }
+
+/// A row request stays in flight while its rounds run in the same dispatcher. Its final step
+/// acknowledges the request, so an ordered scope accepts the next row only after finishing it.
+#[test]
+fn a_rows_rounds_keep_the_request_in_flight() {
+    for seed in 1..=60 {
+        for threads in [1, 2, 8, 16] {
+            within(
+                format!("row rounds: seed {seed}, {threads} workers"),
+                move || row_rounds(seed, threads),
+            );
+        }
+    }
+}
+
+fn row_rounds(seed: u64, threads: usize) {
+    const ROWS: u64 = 3;
+    const POSITIONS: u64 = 8;
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![1], vec![2]], 1);
+    dispatcher.order(PipelineId(0));
+    dispatcher.order(PipelineId(3));
+    dispatcher.follow(PipelineId(3), PipelineId(2));
+    dispatcher.notify(PipelineId(0), &keys_between(0, ROWS - 1));
+    dispatcher.close(PipelineId(0));
+    let request = Mutex::new(None);
+    let consumed = AtomicU64::new(0);
+    let completed = AtomicU64::new(0);
+    let steps = Mutex::new(Vec::new());
+    thread::scope(|scope| {
+        for at in 0..threads {
+            let (dispatcher, request, consumed, completed, steps) =
+                (&dispatcher, &request, &consumed, &completed, &steps);
+            scope.spawn(move || {
+                let _worker = dispatcher.worker();
+                let mut rng = Rng(seed ^ (at as u64 + 1) << 32);
+                loop {
+                    match dispatcher.claim(None) {
+                        Next::Package(package) => {
+                            jitter(&mut rng);
+                            let mask = mask_of(&package.guard);
+                            assert_eq!(mask.count_ones(), 1);
+                            let position = u64::from(mask.trailing_zeros());
+                            match package.pipeline.0 {
+                                0 => {
+                                    assert_eq!(completed.load(SeqCst), (1 << position) - 1);
+                                    let mut pending = request.lock().expect("no worker panics");
+                                    assert!(pending.is_none(), "one row request is in flight");
+                                    *pending = Some(package);
+                                    drop(pending);
+                                    let guard =
+                                        keys_between(position * POSITIONS, position * POSITIONS);
+                                    dispatcher.notify(PipelineId(1), &guard);
+                                    dispatcher.queue_for(PipelineId(3), &guard);
+                                }
+                                1 => {
+                                    let mut pushes = dispatcher.pushes(package.pipeline);
+                                    pushes.push(&package.guard, cut);
+                                    dispatcher.land(pushes);
+                                    dispatcher.acknowledge(package);
+                                }
+                                2 => {
+                                    assert_eq!(consumed.fetch_or(mask, SeqCst) & mask, 0);
+                                    dispatcher.acknowledge(package);
+                                }
+                                _ => {
+                                    assert_ne!(consumed.load(SeqCst) & mask, 0);
+                                    steps.lock().expect("no worker panics").push(position);
+                                    if (position + 1).is_multiple_of(POSITIONS) {
+                                        let row = position / POSITIONS;
+                                        assert_eq!(
+                                            completed.fetch_or(1 << row, SeqCst),
+                                            (1 << row) - 1
+                                        );
+                                        if row + 1 == ROWS {
+                                            dispatcher.close(PipelineId(1));
+                                        }
+                                        let parent = request
+                                            .lock()
+                                            .expect("no worker panics")
+                                            .take()
+                                            .expect("the row's request is still in flight");
+                                        dispatcher.acknowledge(parent);
+                                    } else {
+                                        let guard = keys_between(position + 1, position + 1);
+                                        dispatcher.notify(PipelineId(1), &guard);
+                                        dispatcher.queue_for(PipelineId(3), &guard);
+                                    }
+                                    dispatcher.acknowledge(package);
+                                }
+                            }
+                        }
+                        Next::Finish { pipeline, .. } => {
+                            if pipeline == PipelineId(0) {
+                                assert_eq!(completed.load(SeqCst), (1 << ROWS) - 1);
+                            }
+                            dispatcher.finish(dispatcher.pushes(pipeline));
+                        }
+                        Next::Done => return,
+                        Next::Failed => panic!("the run failed"),
+                        Next::Wait(_) => unreachable!("a blocking claim waits itself"),
+                    }
+                }
+            });
+        }
+    });
+    assert_eq!(consumed.load(SeqCst), (1 << (ROWS * POSITIONS)) - 1);
+    assert_eq!(
+        steps.into_inner().expect("no worker panics"),
+        (0..ROWS * POSITIONS).collect::<Vec<_>>()
+    );
+    assert!(request.into_inner().expect("no worker panics").is_none());
+}

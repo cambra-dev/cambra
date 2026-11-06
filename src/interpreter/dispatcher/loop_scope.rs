@@ -319,7 +319,8 @@ impl LoopScope {
             reach_member(&self.store, &self.members[pipeline.0], pipeline, call)
         };
         loop {
-            self.inner.hold_followers(true);
+            self.inner
+                .hold_followers((0..self.members.len()).map(PipelineId), true);
             loop {
                 let before = self.inner.changes();
                 push_held(&self.inner, &mut reach);
@@ -328,7 +329,8 @@ impl LoopScope {
                     break;
                 }
             }
-            self.inner.hold_followers(false);
+            self.inner
+                .hold_followers((0..self.members.len()).map(PipelineId), false);
             match self.inner.try_claim(None) {
                 Next::Package(package) => consume_with(&self.inner, &mut reach, package),
                 Next::Finish { pipeline, consumed } => {
@@ -420,6 +422,13 @@ impl LoopScope {
     /// starts, or a closing round's region, queued to every inner pipeline but the sources
     /// ([`closing_round`](Self::closing_round)).
     fn round_at(&self, guard: &TileGuard, starts: &[PipelineId]) {
+        self.queue_round(guard, starts);
+        self.run_round();
+        self.step(guard);
+    }
+
+    /// Queue the body's work for one position or closing row, before the store steps it.
+    fn queue_round(&self, guard: &TileGuard, starts: &[PipelineId]) {
         self.with_store(|store| store.read_cycle_again());
         let (sources, readers): (Vec<PipelineId>, Vec<PipelineId>) = starts
             .iter()
@@ -444,7 +453,10 @@ impl LoopScope {
                 self.inner.queue_round(reader, &row);
             }
         }
-        self.run_round();
+    }
+
+    /// Step the store after the round's body and held pushes have settled.
+    fn step(&self, guard: &TileGuard) {
         self.with_store(|store| {
             store.consume_impl(InputId::ONLY, guard.clone());
             // The round's pipelines ran before the step, so the store's input releases the

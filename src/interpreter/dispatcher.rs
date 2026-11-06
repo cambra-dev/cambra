@@ -398,6 +398,8 @@ struct PipelineState {
     acknowledged: AtomicUsize,
     /// For an ordered pipeline, whether a package of it is in flight.
     in_flight: AtomicBool,
+    /// Whether this pipeline waits for its loop's round to settle before following its reads.
+    followers_held: AtomicBool,
     /// For a pipeline that parks its arrivals ([`Dispatcher::park`]), the morsels notified that
     /// the pipelines it reads have not decided yet.
     // shared-state-ok: guards naming regions of the pipeline's input, which its notifies and the
@@ -471,10 +473,6 @@ pub struct Dispatcher {
     done: AtomicBool,
     /// Set by [`Dispatcher::fail`], and by every refusal before it panics ([`Dispatcher::ensure`]).
     failed: AtomicBool,
-    /// Whether a pipeline that follows another takes no package ([`hold_followers`]).
-    ///
-    /// [`hold_followers`]: Dispatcher::hold_followers
-    followers_held: AtomicBool,
     /// Advances at every change that can make a claim succeed or end the run: an append, a close,
     /// an acknowledgement that frees an ordered pipeline's next package, completes a queue or
     /// returns credit to a limited source, a finish, and a failure. It also advances when a claim
@@ -563,6 +561,7 @@ impl Dispatcher {
                 queued: AtomicUsize::new(0),
                 acknowledged: AtomicUsize::new(0),
                 in_flight: AtomicBool::new(false),
+                followers_held: AtomicBool::new(false),
                 parked: Mutex::new(Vec::new()),
                 brought: Mutex::new(None),
             })
@@ -574,7 +573,6 @@ impl Dispatcher {
             states,
             done: AtomicBool::new(false),
             failed: AtomicBool::new(false),
-            followers_held: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             sleepers: AtomicUsize::new(0),
             sleep: Mutex::new(()),
@@ -1071,16 +1069,24 @@ impl Dispatcher {
     fn takes_from(&self, pipeline: usize) -> bool {
         let follows = &self.infos[pipeline].follows;
         follows.is_empty()
-            || (!self.followers_held.load(Ordering::SeqCst)
+            || (!self.states[pipeline].followers_held.load(Ordering::SeqCst)
                 && follows.iter().all(|&read| self.quiescent(read)))
     }
 
-    /// Hold every pipeline that follows another ([`follow`](Self::follow)) from taking a package,
-    /// or release them. A loop's round holds them while the pipelines they follow push what they
-    /// decided: a breaker that pushes only what `push_held` asks it to, as `MapAggregate`, is
-    /// quiescent before its readers have taken what it decided (`LoopScope::run_round`).
-    pub(crate) fn hold_followers(&self, held: bool) {
-        self.followers_held.store(held, Ordering::SeqCst);
+    /// Hold the given pipelines that follow others ([`follow`](Self::follow)) from taking a
+    /// package, or release them. A loop's round holds them while the pipelines they follow push
+    /// what they decided. A breaker that pushes only what `push_held` asks it to, as `MapAggregate`,
+    /// is quiescent before its readers have taken what it decided (`LoopScope::run_round`).
+    pub(crate) fn hold_followers(
+        &self,
+        pipelines: impl IntoIterator<Item = PipelineId>,
+        held: bool,
+    ) {
+        for pipeline in pipelines {
+            self.state(pipeline)
+                .followers_held
+                .store(held, Ordering::SeqCst);
+        }
         self.advance();
     }
 

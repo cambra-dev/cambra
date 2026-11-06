@@ -390,6 +390,53 @@ fn a_reader_takes_nothing_before_the_pipeline_it_follows_is_quiescent() {
     assert_eq!(consumed_by(&events, 2), vec![low]);
 }
 
+/// Two loops in one dispatcher hold and release their step pipelines independently while the
+/// bodies' pushes settle. Releasing one loop does not release the other's step.
+#[test]
+fn loop_steps_are_held_independently_in_one_dispatcher() {
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![0], vec![1]], 1);
+    for (step, body) in [(2, 0), (3, 1)] {
+        dispatcher.order(PipelineId(step));
+        dispatcher.follow(PipelineId(step), PipelineId(body));
+        dispatcher.notify(PipelineId(body), &keys_between(0, 0));
+        dispatcher.queue_for(PipelineId(step), &keys_between(0, 0));
+    }
+    dispatcher.hold_followers([PipelineId(2), PipelineId(3)], true);
+    for body in [0, 1] {
+        let Next::Package(package) = dispatcher.try_claim(Some(PipelineId(body))) else {
+            panic!("each loop's body is claimable while its step is held");
+        };
+        assert_eq!(package.pipeline, PipelineId(body));
+        dispatcher.acknowledge(package);
+    }
+    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
+
+    dispatcher.hold_followers([PipelineId(3)], false);
+    let Next::Package(package) = dispatcher.try_claim(Some(PipelineId(2))) else {
+        panic!("the second loop's step is released");
+    };
+    assert_eq!(package.pipeline, PipelineId(3));
+    dispatcher.acknowledge(package);
+    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
+
+    dispatcher.hold_followers([PipelineId(2)], false);
+    let Next::Package(package) = dispatcher.try_claim(None) else {
+        panic!("the first loop's step is released");
+    };
+    assert_eq!(package.pipeline, PipelineId(2));
+    dispatcher.acknowledge(package);
+    for body in [0, 1] {
+        dispatcher.close(PipelineId(body));
+    }
+    loop {
+        match dispatcher.try_claim(None) {
+            Next::Finish { pipeline, .. } => dispatcher.finish(dispatcher.pushes(pipeline)),
+            Next::Done => break,
+            _ => panic!("both loops have consumed their bodies and steps"),
+        }
+    }
+}
+
 /// The driver consumes the lowest pipeline's package first and finishes only when nothing is
 /// queued, which pins the order across two chains: pipeline 0's push lands as it consumes, and
 /// pipeline 2 consumes it before any pipeline finishes.
