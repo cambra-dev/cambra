@@ -4170,14 +4170,13 @@ whose body it is. Capabilities are recorded on the innermost frame:
 | an `Apply` passing a feed 𝑎 to a `Feed` parameter | `Append(𝑎)` |
 
 A value read is a mention whose handle becomes its value (`read_value` in `emit.rs`). A mention
-passed by reference, or to `await_final`, stays a handle and reads nothing. A parameter's history
-is its argument's, so a capability naming a parameter is not recorded. A
-`MutDecl` binder is declared, not a parameter (`Typing::declare_mutable`). `InferCtx::record_effect`
-records a read or a write of a declared transactional variable as `ReadTxn(𝑥)` or `WriteTxn(𝑥)`,
-which belong to the run, so no scope discharges them; a `Mut` parameter's is its argument's, which
-the call records.
-Declaring a transactional variable in a function body is refused
-(`InferError::TransactionalOutsideTopLevel`).
+passed by reference, or to `await_final`, stays a handle and reads nothing. A parameter's history is
+its argument's, so a capability naming a parameter is `Bound::Parameter`, which no function body's
+filter admits: only a statement's frame, below, keeps one. A `MutDecl` binder is declared, not a
+parameter (`Typing::declare_mutable`). `InferCtx::record_effect` records a read or a write of a
+transactional variable, a declared one or a `Mut` parameter, as `ReadTxn(𝑥)` or `WriteTxn(𝑥)`
+(`InferCtx::of_family`). These belong to the run, so no scope discharges them. Declaring a
+transactional variable in a function body is refused (`InferError::TransactionalOutsideTopLevel`).
 
 **A frame's filter keeps what is the function's own out of its type.** An edge or capability
 entering a frame passes when the variable it names is bound outside the frame's body: its depth is
@@ -4198,6 +4197,24 @@ gets the edge with a condition, `Filter::when_data`, which holds once the kind r
 compute function's capabilities stay in its type. A chain's and a cast's effects are the union of
 their parts' (`Typing::composed_effects`). The kind is the lowering stamp where the node carries
 one, as `emit_node` applies it.
+
+### Checks that read a body's effects
+
+**Statements.** An expression statement a program writes before its block's last statement gets a
+frame of its own, which keeps every capability, the enclosing function's own variables' included,
+and flows into the enclosing frame through that frame's filter (`Typing::statement`; lowering labels
+each one `lower::EXPRESSION_STATEMENT`, which `lower::expression_statements` reads). A parameter's
+capability is `Bound::Parameter`: it reaches the statement's frame and no function body's. A
+statement whose frame causes nothing is inert (`InferError::InertStatement`), unless it reaches a
+call variable with nothing flowing into it, the call of a function a polymorphic definition takes as
+a parameter, which only each use determines (`InferCtx::inert_statements`). Inference returns the
+inert statements, and the compile reports them after the `Mut` discipline checks, which diagnose a
+wrongly passed argument more precisely.
+
+**Public functions.** A public function's effects naming an induction variable of the top level,
+`Bound::At(0)`, are an error at its `let` (`InferError::VariablePastItsScope`). An append to a
+private feed instead joins the top level's effects, since other modules append to the feed through
+the function (`InferCtx::exported_effects`).
 
 ### Polymorphism and materialization
 

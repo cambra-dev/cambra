@@ -2012,6 +2012,9 @@ fn run_frontend(
         gate_leaks(&leaks, "lowering");
         projection
     };
+    // The expression statements the program writes are inference's to read.
+    ctx.inference_ctx().expression_statements =
+        crate::ccl::lower::expression_statements(&lowering_projection);
 
     debug!("Lowered (pre-channelize):\n{}", symbolic(&expr));
 
@@ -2454,6 +2457,8 @@ pub fn check_program(
         gate_leaks(&leaks, "lowering");
         projection
     };
+    ctx.inference_ctx().expression_statements =
+        crate::ccl::lower::expression_statements(&projection);
     for (_name, source) in ctx.lowering_ctx().take_sources() {
         let name = source.borrow().get_id().to_string();
         let output_type = source.borrow().output_type();
@@ -2647,6 +2652,13 @@ fn run_passes(
     // (compiler-bug backstops), these are user errors: aliasing or nesting a
     // mutable reference.
     check_mut_rules(&expr, &blame)?;
+
+    // An expression statement that causes nothing, reported once the checks that diagnose
+    // a statement more precisely have run (`docs/chl-spec.md`, "4.9 Expression statement").
+    let inert = std::mem::take(&mut ctx.inference_ctx().inert);
+    if !inert.is_empty() {
+        return Err(blame.infer(inert, &expr));
+    }
 
     // The last check that reads effects has run, so they are erased: every pass after this
     // one builds function types that state none.
