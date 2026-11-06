@@ -3484,11 +3484,14 @@ fn coalesce_type_predicates_go(
                 true
             });
             // A determined witness is its one candidate, the spelling `ty::unboxed_type` gives.
+            // The candidate is read off the term's own type, written where the binders around
+            // this position are term variables, so it reads them by name and is closed here as
+            // a rebuilt predicate is.
             if let Some(sole) = p
                 .witness()
                 .and_then(crate::ccl::ty::Witness::sole_candidate)
             {
-                *ty = sole;
+                *ty = scope.closed_type(&sole);
                 return;
             }
             scope.close_quoted(p);

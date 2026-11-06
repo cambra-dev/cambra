@@ -2570,6 +2570,9 @@ and close each predicate under the enclosing `RefinementScope`. Deduplication ha
 contributions merge, before a final function is assembled, so waiting until materialization is
 too late. `coalesce_type_predicates` closes rebuilt predicates again: resolving their interior
 type slots can expose named references from the live graph after the enclosing type was closed.
+It closes a determined projection's one candidate too, which replaces the projection. The
+candidate is read off the projected term's type, written where the enclosing binders are term
+variables, so it reads them by name.
 
 **Descent opens.** The function constraint arm opens a closed codomain at its binder's name when the
 reader needs named references. During `LiveSolve`, it does so toward a side whose codomain contains
