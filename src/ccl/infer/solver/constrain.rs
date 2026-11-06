@@ -2857,6 +2857,7 @@ fn escaping_param(ty: &Type, target_level: Level) -> Option<Rc<crate::ccl::ty::T
 /// constrain_subtype solver's level-mismatch branches).
 pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCache) -> Type {
     if type_level(ty) <= target_level {
+        lower_fun_kind_levels(ty, target_level);
         crate::ccl::capabilities::lower_capability_levels(ty, target_level);
         return ty.clone();
     }
@@ -2989,6 +2990,10 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             // "unused" one: a one-way proxy inherits whichever side the polarity picked
             // and silently drops the other, which for a candidate is usually fatal.
             fun_kind: match fun_kind {
+                FunKind::Var(kind) => {
+                    kind.place_at(target_level);
+                    fun_kind.clone()
+                }
                 FunKind::Data(Some(ws)) => FunKind::Data(Some(Rc::new(
                     ws.iter()
                         .map(|w| w.map_types(|t| extrude_invariant(t, target_level, cache)))
@@ -3193,6 +3198,7 @@ fn lower_chan_levels(ty: &mut Type, level: Level) {
 
 fn lower_var_levels(ty: &Type, level: Level) {
     if type_level(ty) <= level {
+        lower_fun_kind_levels(ty, level);
         return;
     }
     if let Type::Infer(v) = ty {
@@ -3217,7 +3223,27 @@ fn lower_var_levels(ty: &Type, level: Level) {
         }
         return;
     }
+    if let Type::Fun {
+        fun_kind: FunKind::Var(kind),
+        ..
+    } = ty
+    {
+        kind.place_at(level);
+    }
     ty.walk_children(|child| lower_var_levels(child, level));
+}
+
+/// Function kinds cross a scope boundary even when their domains and codomains have no type
+/// variable above it. `type_level` omits the kind variable's own level.
+fn lower_fun_kind_levels(ty: &Type, level: Level) {
+    if let Type::Fun {
+        fun_kind: FunKind::Var(kind),
+        ..
+    } = ty
+    {
+        kind.place_at(level);
+    }
+    ty.walk_children(|child| lower_fun_kind_levels(child, level));
 }
 
 /// Extrusion for an *invariant* position — a [`Type::History`] payload.
@@ -3234,6 +3260,7 @@ fn lower_var_levels(ty: &Type, level: Level) {
 /// equality is symmetric in every position.
 fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -> Type {
     if type_level(ty) <= target_level {
+        lower_fun_kind_levels(ty, target_level);
         return ty.clone();
     }
     match ty {
@@ -3339,6 +3366,13 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
         // itself invariant; refinement predicates are not walked (same as
         // the polar extrusion).
         _ => {
+            if let Type::Fun {
+                fun_kind: FunKind::Var(kind),
+                ..
+            } = ty
+            {
+                kind.place_at(target_level);
+            }
             let mut out = ty.clone();
             out.walk_children_mut(|t| *t = extrude_invariant(t, target_level, cache));
             out
@@ -3383,6 +3417,51 @@ mod tests {
     use crate::ccl::{
         BaseType, BinOpKind, CompareKind, Lit, Name, Refinement, Type, TypedExpr, TypedExprNode,
     };
+
+    #[test]
+    fn monomorphic_functions_keep_their_kind_at_the_bindings_level() {
+        let kind = FunKindVar::fresh();
+        kind.place_at(2);
+        let function = Type::Fun {
+            name: None,
+            fun_kind: FunKind::Var(Rc::clone(&kind)),
+            domain: Box::new(prim(BaseType::Int)),
+            codomain: Box::new(prim(BaseType::Int)),
+            capabilities: Capabilities::none(),
+        };
+        let nested = Type::Tuple(vec![function]);
+        assert_eq!(type_level(&nested), 0);
+        lower_levels(&nested, 0);
+        assert_eq!(kind.level(), Some(0));
+    }
+
+    #[test]
+    fn extrusion_moves_a_functions_kind_with_its_type() {
+        for has_variable in [false, true] {
+            for invariant in [false, true] {
+                let kind = FunKindVar::fresh();
+                kind.place_at(2);
+                let function = Type::Fun {
+                    name: None,
+                    fun_kind: FunKind::Var(Rc::clone(&kind)),
+                    domain: Box::new(prim(BaseType::Int)),
+                    codomain: Box::new(if has_variable {
+                        fresh_var(2)
+                    } else {
+                        prim(BaseType::Int)
+                    }),
+                    capabilities: Capabilities::none(),
+                };
+                let extruded = if invariant {
+                    extrude_invariant(&function, 0, &mut ExtrudeCache::new())
+                } else {
+                    extrude(&function, true, 0, &mut ExtrudeCache::new())
+                };
+                assert_eq!(type_level(&extruded), 0);
+                assert_eq!(kind.level(), Some(0));
+            }
+        }
+    }
 
     #[test]
     fn family_mismatches_report_the_substituted_sides() {

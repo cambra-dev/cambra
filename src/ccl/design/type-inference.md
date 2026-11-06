@@ -3664,6 +3664,25 @@ The node also keeps the `Case` it replaces as the term it stages. A consumer's t
 the recorded one
 ([The check after planning reads planning's rewrites back](#the-check-after-planning-reads-plannings-rewrites-back)).
 
+### Funkind variables are copied by level
+
+A funkind variable records the level of what owns it, where that is known
+(`FunKindVar::level`): a variable's own funkind variable stands at the variable's level and is
+lowered with it, and the one an annotation's normalization mints for a funkind hole stands at the
+level the annotation is normalized at. `freshen_kind_var` copies a funkind variable above the
+freshening's cutoff and leaves one at or below it in place, as freshening treats a type variable.
+A funkind variable with no recorded level is copied by every freshening that reaches it.
+`lower_levels` and extrusion also lower a function type's funkind variable to the destination
+level, including when its domain and codomain contain no variable above that level.
+
+A copy carries the data stamp, both bound lists and the source relations, with fresh binder IDs.
+An edge to a neighboring funkind variable left in place is recorded on both ends: the neighbor
+gains the copy beside the original, through the edge it already had to the original
+(`freshen_kind_var`). So a closure's scheme instantiated inside a definition relates its copies
+to the funkind variables the definition owns, the bound `_ |=> 𝑉` on an associated type among
+them, and a specialization of the definition copies both sides with the correspondence between
+them.
+
 Freshening preserves an obligation's operand separately from the watches propagated below it.
 `TraitObligation::copy_watch` copies each watch and its frame, and registers the copy as an operand
 only if the original variable was that operand. Redelivery reads the copied operand's bounds in
@@ -3685,10 +3704,6 @@ starts without its original's cache.
 
 ### Implementation limits
 
-- Funkind variables have no generalization level. `freshen_kind_var` copies them
-  unconditionally, unlike type variables at or below a scheme's cutoff. It copies the
-  data stamp, both bound lists and source-kind relations, with fresh binder IDs. A free
-  funkind variable therefore does not have the same sharing rule as a free type variable.
 - Enumerated membership has no disjunctive constraint representation. Unresolved candidate
   equality is limited to matching expressions; property-kind requirements and subtype
   bounds can still be recorded. This does not impose a groundness precondition on joins.
