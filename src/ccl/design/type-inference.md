@@ -2940,6 +2940,27 @@ and unrefined directions, reflexivity, and the compute-function contrast.
 Post-inference checks use the same constraint relation. Invariance is not confined to emission,
 and the known variable-accumulation cases do not establish general constraint-order independence.
 
+#### Two equations meet without filtering
+
+A comprehension's domain is a variable that takes its value from above: the source it indexes,
+and a refinement deficit flowed onto it. A refined side whose base is a variable meets a
+refinement it lacks by passing the deficit to the base (`𝑏 <: {𝑇 | deficit}`). That is how a
+nested filter's domain acquires the inner filter: the outer domain is equated with its
+comprehension's variable, which indexes the inner collection, and the closure pairs the equation
+with that demand.
+
+An equation paired with another equation is not a demand. Two collections reaching one variable,
+as the arms of a conditional do at a consumer's domain, leave two equations there. Flowing the
+deficit between them would give each arm the other's filter, after which the two agree and the
+join reports nothing for collections whose rows differ.
+
+So each bound records whether it is one half of an equation (`Bound::equation`). The invariant path
+draws its two edges as equation halves, and a closure step pairing two halves is one too. On such
+a step a deficit is not flowed onto a variable base: the edge records nothing, and whether the two
+are one domain is decided where they materialize, once their bases have resolved, by the
+comparison every join of collections reaches (`data_domains_disagree`). Arms filtered by the same
+predicates still join, and arms whose filters differ report `DomainJoinConflict`.
+
 ## 4.7 Dependent sums
 
 A dependent sum `Σ (𝑤 : 𝐾). 𝐵[𝑤]` pairs a type witness `𝑤` in kind `𝐾` with a value of
