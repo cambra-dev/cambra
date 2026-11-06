@@ -32,7 +32,10 @@ use crate::interpreter::{
 mod loop_scope;
 mod plan;
 
-pub use plan::{Planned, Refused, Run, run_program, run_program_into, run_program_polling};
+pub use plan::{
+    Ended, Planned, Refused, Run, RunObserver, Targets, run_program, run_program_into,
+    run_program_polling,
+};
 
 /// A pipeline, by its index in the [`Dispatcher`].
 #[derive(Clone, Copy)]
@@ -2799,8 +2802,10 @@ fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPac
     dispatcher.acknowledge(package);
 }
 
-/// Have every pipeline push what its breaker holds and no push named before: at each drained
-/// live pass and each round of a loop, which no finish ends ([`LoopScope`]).
+/// Have every pipeline push what its breaker holds and no push named before. A run after a pause
+/// or a reload starts over breakers an earlier run consumed into, and has no finish before its
+/// sources close, so its start is where its readers learn what the breakers already hold; each
+/// round of a loop, which no finish ends either, does the same ([`LoopScope`]).
 ///
 /// [`LoopScope`]: loop_scope::LoopScope
 pub(crate) fn push_held(dispatcher: &Dispatcher, reach: &mut Reach<'_>) {

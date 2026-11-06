@@ -1169,6 +1169,13 @@ impl GlobalContext {
         self.sink_pulls_deferred = true;
     }
 
+    /// Undo [`Self::defer_sink_pulls`]: each later compile pulls each sink once it is subscribed,
+    /// as pull mode does. For a driver that falls back to pull mode, which pulls the sinks the
+    /// compiles so far left unpulled itself.
+    pub fn resume_sink_pulls(&mut self) {
+        self.sink_pulls_deferred = false;
+    }
+
     /// Whether a compile pulls each sink once it is subscribed.
     fn pulls_sinks(&self) -> bool {
         !self.sink_pulls_deferred

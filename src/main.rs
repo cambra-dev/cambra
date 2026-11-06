@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path, thread, time::Duration};
+use std::{collections::HashMap, ops::ControlFlow, path::Path, thread, time::Duration};
 
 use cambra::{
     ccl::{
@@ -6,10 +6,11 @@ use cambra::{
         load::LoadedProgram,
         provenance::NodeId,
     },
-    control_port::{ControlPort, service},
+    control_port::{ControlMessage, ControlPort, service},
     inspector_server::{ServedSnapshot, live::LiveChannel, serve_compiled},
     interpreter::{
-        ColumnValue, Consumer, DataSink, Scheduler, dispatcher,
+        ColumnValue, Consumer, DataSink, Scheduler,
+        dispatcher::{self, Ended, RunObserver},
         operator_graph::source_nodes,
         tile_operators::{FunctionGuard, Tile, TileGuard, TileProducer},
         value_probe::{
@@ -88,14 +89,7 @@ fn dispatch_requested() -> bool {
 ///
 /// Where [`MORSEL_ROWS_VAR`] is set to anything but a positive count.
 fn run_dispatched(loaded: &LoadedProgram) -> Result<(), ()> {
-    let rows = match std::env::var(MORSEL_ROWS_VAR) {
-        Ok(rows) => rows
-            .parse::<usize>()
-            .ok()
-            .filter(|rows| *rows > 0)
-            .unwrap_or_else(|| panic!("{MORSEL_ROWS_VAR} is a positive count of rows: {rows}")),
-        Err(_) => DEFAULT_MORSEL_ROWS,
-    };
+    let rows = morsel_rows();
     let mut ctx = GlobalContext::default();
     ctx.defer_sink_pulls();
     let mut program = match compile_program(&mut ctx, loaded, Box::new(|| {})) {
@@ -117,6 +111,23 @@ fn run_dispatched(loaded: &LoadedProgram) -> Result<(), ()> {
     Ok(())
 }
 
+/// The most rows a dispatched run's work package names: [`MORSEL_ROWS_VAR`], or
+/// [`DEFAULT_MORSEL_ROWS`] where it is unset.
+///
+/// # Panics
+///
+/// Where [`MORSEL_ROWS_VAR`] is set to anything but a positive count.
+fn morsel_rows() -> usize {
+    match std::env::var(MORSEL_ROWS_VAR) {
+        Ok(rows) => rows
+            .parse::<usize>()
+            .ok()
+            .filter(|rows| *rows > 0)
+            .unwrap_or_else(|| panic!("{MORSEL_ROWS_VAR} is a positive count of rows: {rows}")),
+        Err(_) => DEFAULT_MORSEL_ROWS,
+    }
+}
+
 /// The `main` output of a dispatched run, which prints each answer it is handed as
 /// [`pull_main`] prints a pull's: one that holds a key or a value, or that is terminal.
 struct PrintedMain;
@@ -126,6 +137,60 @@ impl DataSink for PrintedMain {
         if !tile_is_empty(tile) || tile.is_terminal() {
             println!("Got value: {tile:#?}");
         }
+    }
+}
+
+/// [`PrintedMain`] for a branch other than `main`, printing `Got value from <branch>: …` as
+/// [`pull_main`] does.
+struct PrintedBranch(String);
+
+impl DataSink for PrintedBranch {
+    fn process(&self, tile: &Tile) {
+        if !tile_is_empty(tile) || tile.is_terminal() {
+            println!("Got value from {}: {tile:#?}", self.0);
+        }
+    }
+}
+
+/// The printer of a branch's `main` answers in a dispatched run.
+fn print_main(branch: &str) -> std::sync::Arc<dyn DataSink> {
+    match branch == MAIN_BRANCH {
+        true => std::sync::Arc::new(PrintedMain),
+        false => std::sync::Arc::new(PrintedBranch(branch.to_string())),
+    }
+}
+
+/// The observer of a dispatched run under `--control` or `--inspect`: it samples the source
+/// windows where a pass has polled, publishes a frame where the pass has drained, and ends the run
+/// at the first drained boundary after a control request arrives, which the driver services
+/// between two runs.
+struct Driver<'a> {
+    control: Option<&'a ControlPort>,
+    pending: &'a mut Option<ControlMessage>,
+    inspection: Option<&'a mut Inspection>,
+    scheduler: &'a Scheduler,
+    sources: Vec<SourceWindow>,
+}
+
+impl RunObserver for Driver<'_> {
+    fn polled(&mut self) {
+        if let Some(inspection) = self.inspection.as_mut() {
+            self.sources = inspection.before_pull(self.scheduler);
+        }
+    }
+
+    fn drained(&mut self, changed: bool) -> ControlFlow<()> {
+        if let Some(inspection) = self.inspection.as_mut() {
+            inspection.publish(&self.sources);
+        }
+        if let Some(message) = self.control.and_then(ControlPort::poll) {
+            *self.pending = Some(message);
+            return ControlFlow::Break(());
+        }
+        if !changed {
+            thread::sleep(Duration::from_millis(1));
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -173,10 +238,15 @@ fn run_in_pull_mode(ctx: &mut GlobalContext, program: &mut CompiledProgram) {
 /// Returns `Err(())` if compilation failed; the errors have already been
 /// rendered to stderr by [`eprint_errors`], so the caller's job is just to exit
 /// non-zero.
+///
+/// `dispatch` runs every branch through the dispatcher with work packages of at most that many
+/// rows ([`LiveProgram::run`]), servicing each control request between two runs; `None` runs in
+/// pull mode.
 fn run_program(
     loaded: &LoadedProgram,
     inspect_port: Option<u16>,
     control_port: Option<u16>,
+    dispatch: Option<usize>,
 ) -> Result<(), ()> {
     // Each branch's `main` consumer marks that branch as having something to
     // pull ([`LiveProgram::pull_mains`]); the driver polls those marks, so the
@@ -188,6 +258,9 @@ fn run_program(
     };
 
     let mut ctx = GlobalContext::default();
+    if dispatch.is_some() {
+        ctx.defer_sink_pulls();
+    }
     let mut live = match LiveProgram::start(&mut ctx, loaded, &main_consumer) {
         Ok(p) => p,
         Err(errs) => {
@@ -238,6 +311,65 @@ fn run_program(
     // them this loop runs until the process exits. The control port is serviced
     // once per pass: a swap sits between two pulls, so a source delivering
     // without pause must not be able to starve it of its turn.
+    if let Some(rows) = dispatch {
+        let mut pending: Option<ControlMessage> = None;
+        // Whether a run has started. A refusal of the first run ran nothing, so the process falls
+        // back to pull mode; a later run starts over breakers that consumed, which pull mode cannot
+        // drive.
+        let mut ran = false;
+        loop {
+            if let Some(message) = pending.take() {
+                let reply = service(message.request(), &mut ctx, &mut live, &main_consumer);
+                message.answer(reply);
+            }
+            if let Some(inspection) = inspection.as_mut() {
+                inspection.follow(&live);
+            }
+            let mut driver = Driver {
+                control: control.as_ref(),
+                pending: &mut pending,
+                inspection: inspection.as_mut(),
+                scheduler: ctx.scheduler(),
+                sources: Vec::new(),
+            };
+            let ended = live.run(rows, &print_main, &mut driver);
+            match ended {
+                Ok(Ended::Paused(_)) => {}
+                Ok(Ended::Done(_)) if pending.is_none() && live.poll_finished() => break,
+                // Nothing runs until a request changes the table.
+                Ok(Ended::Done(_)) => {
+                    if pending.is_none() {
+                        pending = control.as_ref().and_then(ControlPort::poll);
+                    }
+                    if pending.is_none() {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                Err(refused) if !ran => {
+                    eprintln!("note: {DISPATCH_VAR}: {refused}; running in pull mode");
+                    ctx.resume_sink_pulls();
+                    live.pull_sinks();
+                    break;
+                }
+                Err(refused) => {
+                    eprintln!("error: {DISPATCH_VAR}: {refused}, after a run has consumed");
+                    return Err(());
+                }
+            }
+            ran = true;
+        }
+        if ran {
+            if let Some(inspection) = inspection.as_ref() {
+                inspection.publish_final(ctx.scheduler());
+            }
+            return Ok(());
+        }
+        if let Some(message) = pending.take() {
+            let reply = service(message.request(), &mut ctx, &mut live, &main_consumer);
+            message.answer(reply);
+        }
+    }
+
     loop {
         poll_control(control.as_ref(), &mut ctx, &mut live, &main_consumer);
         if let Some(inspection) = inspection.as_mut() {
@@ -625,11 +757,13 @@ fn main() {
             inspect_port,
             control_port,
         } => {
-            let dispatched =
-                dispatch_requested() && inspect_port.is_none() && control_port.is_none();
-            let result = match dispatched {
-                true => run_dispatched(&loaded),
-                false => run_program(&loaded, inspect_port, control_port),
+            let served = inspect_port.is_some() || control_port.is_some();
+            let result = match (dispatch_requested(), served) {
+                (true, false) => run_dispatched(&loaded),
+                (true, true) => {
+                    run_program(&loaded, inspect_port, control_port, Some(morsel_rows()))
+                }
+                (false, _) => run_program(&loaded, inspect_port, control_port, None),
             };
             if result.is_err() {
                 std::process::exit(1);
@@ -655,6 +789,6 @@ mod tests {
 
     #[test]
     fn test_run_program() {
-        run_program(&LoadedProgram::test("x = 1; x"), None, None).unwrap();
+        run_program(&LoadedProgram::test("x = 1; x"), None, None, None).unwrap();
     }
 }
