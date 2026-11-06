@@ -589,7 +589,7 @@ impl TileOperator for MapAggregate {
             input: input_producer,
             kind: self.kind,
             accumulators: HashMap::new(),
-            emptied_keys: HashSet::new(),
+            keys_with_nothing_beneath: HashSet::new(),
         })
     }
 }
@@ -603,11 +603,12 @@ struct MapAggregateProducer {
     kind: AggregateKind,
     /// Running accumulators indexed by complete paths, outermost key first.
     accumulators: HashMap<Vec<Value>, Tile>,
-    /// Keys above the accumulators whose every accumulator was released without the key
-    /// itself: a key is there only through what it maps to, and a release naming part of
-    /// what lies beneath leaves it in place, holding nothing unreleased
-    /// (`src/interpreter/design-operators.md`, "The completeness contract").
-    emptied_keys: HashSet<Vec<Value>>,
+    /// Keys above the accumulators that hold none, by path. Such a key arrives with nothing
+    /// beneath it, an empty collection of groups. Or a release takes every accumulator beneath
+    /// it without the key itself, which leaves the key in place holding nothing unreleased
+    /// (`src/interpreter/design-operators.md`, "The completeness contract"). No accumulator's
+    /// path names either kind, so the output keeps them from here.
+    keys_with_nothing_beneath: HashSet<Vec<Value>>,
 }
 
 impl TileProducer for MapAggregateProducer {
@@ -617,7 +618,7 @@ impl TileProducer for MapAggregateProducer {
             .iter()
             .map(|(path, acc)| path.len() + acc.cell_count())
             .sum();
-        ProducerStateInfo::holding(accumulators + self.emptied_keys.len())
+        ProducerStateInfo::holding(accumulators + self.keys_with_nothing_beneath.len())
     }
 
     impl_producer_base!();
@@ -685,6 +686,19 @@ impl TileProducer for MapAggregateProducer {
                 .or_insert_with(|| kind.initial_accumulator(&output_tiling));
             kind.accumulate(acc, &values, start, end);
         }
+        // A key above the groups' level with nothing beneath it stands over no group, so no
+        // accumulator's path reaches it. Its value is the empty collection, which the output
+        // keeps as the key with nothing beneath.
+        for level in 0..depth - 1 {
+            let keys = input_tile.paths_at(CurryLevel::new(level));
+            let beneath = input_tile.values_at(CurryLevel::new(level + 1));
+            for (row, key) in keys.into_iter().enumerate() {
+                let (start, end) = beneath.row_run(row);
+                if start == end {
+                    self.keys_with_nothing_beneath.insert(key);
+                }
+            }
+        }
 
         // Release received values
         self.input.release(upstream_guard);
@@ -727,7 +741,7 @@ impl TileProducer for MapAggregateProducer {
         };
         let mut paths: Vec<&[Value]> = entries.iter().map(|(path, _)| path.as_slice()).collect();
         paths.extend(
-            self.emptied_keys
+            self.keys_with_nothing_beneath
                 .iter()
                 .filter(|key| !entries.iter().any(|(path, _)| path.starts_with(key)))
                 .map(Vec::as_slice),
@@ -754,7 +768,7 @@ impl TileProducer for MapAggregateProducer {
             g if g.is_empty() => {}
             g if g.is_universal() => {
                 self.accumulators.clear();
-                self.emptied_keys.clear();
+                self.keys_with_nothing_beneath.clear();
                 self.input.release(self.input.tiling().universal_guard());
             }
             // Preserve unreleased ancestor keys even when their last accumulator is removed.
@@ -772,11 +786,12 @@ impl TileProducer for MapAggregateProducer {
                     for len in 1..path.len() {
                         let key = &path[..len];
                         if !g.covers_path(key) {
-                            self.emptied_keys.insert(key.to_vec());
+                            self.keys_with_nothing_beneath.insert(key.to_vec());
                         }
                     }
                 }
-                self.emptied_keys.retain(|key| !g.covers_path(key));
+                self.keys_with_nothing_beneath
+                    .retain(|key| !g.covers_path(key));
                 let levels = self.tiling().levels();
                 let input = self.input.tiling();
                 self.input
@@ -910,7 +925,7 @@ mod tests {
             input: Box::new(spy),
             kind: AggregateKind::Sum,
             accumulators: HashMap::new(),
-            emptied_keys: HashSet::new(),
+            keys_with_nothing_beneath: HashSet::new(),
         };
 
         let first = producer.get(out_tiling.universal_guard());
@@ -994,7 +1009,7 @@ mod tests {
             input: Box::new(spy),
             kind: AggregateKind::Sum,
             accumulators: HashMap::new(),
-            emptied_keys: HashSet::new(),
+            keys_with_nothing_beneath: HashSet::new(),
         };
         producer.get(out_tiling.universal_guard());
         assert!(
@@ -1051,7 +1066,7 @@ mod tests {
             input: Box::new(spy),
             kind: AggregateKind::Sum,
             accumulators: HashMap::new(),
-            emptied_keys: HashSet::new(),
+            keys_with_nothing_beneath: HashSet::new(),
         };
         producer.get(out_tiling.universal_guard());
         let second = producer.get(out_tiling.universal_guard());
@@ -1111,7 +1126,7 @@ mod tests {
             input: Box::new(spy),
             kind: AggregateKind::Sum,
             accumulators: HashMap::new(),
-            emptied_keys: HashSet::new(),
+            keys_with_nothing_beneath: HashSet::new(),
         };
         let out = producer.get(out_tiling.universal_guard());
         let Tile::Aggregation { terminal, .. } = out.values_at(CurryLevel::new(2)) else {
@@ -1133,5 +1148,68 @@ mod tests {
             "the input settles (0, 0) at this level, and the output says nothing: \
              {domain_predicate:?}"
         );
+    }
+
+    /// A key above the groups with nothing beneath it maps to the empty collection, so the
+    /// output keeps it, on the pull that delivers it and on later ones. Outer key 0 holds no
+    /// group and outer key 1 holds the group `(1, 0) -> [10, 20]`.
+    #[test]
+    fn map_aggregate_keeps_a_key_with_nothing_beneath() {
+        let uint = || Extent::Base(BaseType::UInt);
+        let int = || Extent::Base(BaseType::Int);
+        let in_tiling = Tiling::data_function(
+            uint(),
+            Tiling::data_function(uint(), Tiling::data_function(uint(), Tiling::Scalar(int()))),
+        );
+        let tile = Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1]),
+            Box::new(Tile::grouped(
+                vec![0, 0],
+                ColumnValue::from_uints(vec![0]),
+                Box::new(Tile::grouped(
+                    vec![0],
+                    ColumnValue::from_uints(vec![0, 1]),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
+                    Predicate::False,
+                    BitSet::new(),
+                )),
+                Predicate::False,
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let (spy, _released) = QuietSpy::new(tile, in_tiling);
+        let out_tiling = Tiling::data_function(
+            uint(),
+            Tiling::data_function(
+                uint(),
+                Tiling::Aggregation {
+                    kind: AggregateKind::Sum,
+                    accumulator: Box::new(Tiling::Scalar(int())),
+                },
+            ),
+        );
+        let mut producer = MapAggregateProducer {
+            base: ProducerBase::unowned(MapAggregateProducer::alloc_id(), &out_tiling),
+            input: Box::new(spy),
+            kind: AggregateKind::Sum,
+            accumulators: HashMap::new(),
+            keys_with_nothing_beneath: HashSet::new(),
+        };
+        for pull in ["first", "second"] {
+            let out = producer.get(out_tiling.universal_guard());
+            let Tile::DataFunction { domain, .. } = &out else {
+                panic!("the output is a collection, got {out:?}")
+            };
+            assert_eq!(
+                domain,
+                &ColumnValue::from_uints(vec![0, 1]),
+                "both outer keys stand on the {pull} pull: {out:?}"
+            );
+            let groups = out.values_at(CurryLevel::new(1));
+            assert_eq!(groups.row_run(0), (0, 0), "key 0 holds nothing: {out:?}");
+            assert_eq!(groups.row_run(1), (0, 1), "key 1 holds its group: {out:?}");
+        }
     }
 }

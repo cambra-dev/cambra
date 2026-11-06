@@ -1783,11 +1783,26 @@ the compilation declined outlives it here"
     /// never produce empty, unsubscribed [`crate::interpreter::Restriction`] objects that would
     /// panic when iterated.
     pub fn extent_of(&self, ty: &Type) -> Result<Extent, ConversionError> {
+        self.extent_in(ty, DependentTuples::Refuse)
+    }
+
+    /// [`Self::extent_of`] for zip fusion's prefix check, which compares the extent a fused
+    /// prefix yields against its last element's codomain, and so reads a bound wherever the
+    /// codomain holds a dependent tuple. A component that reads an earlier one does so in which
+    /// keys it holds, not in its bound: a projected witness's bound is its kind's (the
+    /// `WitnessProjection` arm of [`Self::extent_in`]). So a dependent tuple is bounded as a
+    /// tuple is, component by component.
+    fn bound_of(&self, ty: &Type) -> Result<Extent, ConversionError> {
+        self.extent_in(ty, DependentTuples::Bound)
+    }
+
+    /// [`Self::extent_of`], with a dependent tuple treated as `tuples` says.
+    fn extent_in(&self, ty: &Type, tuples: DependentTuples) -> Result<Extent, ConversionError> {
         match ty {
             // Strip refinements at every level — Filter handles them instead.
-            Type::Refinement(inner, _) => self.extent_of(inner),
+            Type::Refinement(inner, _) => self.extent_in(inner, tuples),
             // A nominal value is held as its representation (`Type::structure`).
-            Type::Nominal(..) => self.extent_of(&ty.structure()),
+            Type::Nominal(..) => self.extent_in(&ty.structure(), tuples),
             // Look up the runtime impl and wrap it in DataSourceDomain.
             Type::DataSource(name) => self
                 .sources
@@ -1799,14 +1814,31 @@ the compilation declined outlives it here"
                 let fields: Result<HashMap<SmolStr, Extent>, _> = ts
                     .iter()
                     .enumerate()
-                    .map(|(i, t)| Ok((tuple_field(i), self.extent_of(t)?)))
+                    .map(|(i, t)| Ok((tuple_field(i), self.extent_in(t, tuples)?)))
                     .collect();
                 Ok(Extent::record(fields?))
             }
+            Type::DepTuple(cs) => match tuples {
+                DependentTuples::Bound => {
+                    let fields: Result<HashMap<SmolStr, Extent>, _> = cs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (_, t))| Ok((tuple_field(i), self.extent_in(t, tuples)?)))
+                        .collect();
+                    Ok(Extent::record(fields?))
+                }
+                // A dependent tuple's entries differ per row, so a site iterating one is planned
+                // as a per-row family (`src/ccl/planning/correlated.rs`, `keys_family`), and its
+                // extent is never read. Reaching here is a site planning did not rewrite.
+                DependentTuples::Refuse => Err(ConversionError::TypeError(format!(
+                    "a dependent tuple has no extent: {ty}; this is a compiler bug — planning \
+                     rewrites a site iterating one into a family of per-row keys"
+                ))),
+            },
             Type::Record(named) => {
                 let fields: Result<HashMap<SmolStr, Extent>, _> = named
                     .iter()
-                    .map(|(name, t)| Ok((name.runtime_key(), self.extent_of(t)?)))
+                    .map(|(name, t)| Ok((name.runtime_key(), self.extent_in(t, tuples)?)))
                     .collect();
                 Ok(Extent::record(fields?))
             }
@@ -1826,7 +1858,7 @@ the compilation declined outlives it here"
                     .collect();
                 Ok(Extent::Function {
                     domain: Box::new(self.sum_domain_extent(domain, &kinds, ty)?),
-                    codomain: Box::new(self.extent_of(codomain)?),
+                    codomain: Box::new(self.extent_in(codomain, tuples)?),
                 })
             }
             Type::Fun {
@@ -1834,8 +1866,8 @@ the compilation declined outlives it here"
                 codomain: b,
                 ..
             } => Ok(Extent::Function {
-                domain: Box::new(self.extent_of(a)?),
-                codomain: Box::new(self.extent_of(b)?),
+                domain: Box::new(self.extent_in(a, tuples)?),
+                codomain: Box::new(self.extent_in(b, tuples)?),
             }),
             // Tagged sum — at runtime `UnionOperator` already
             // discriminates by tag position, so the tags carry no
@@ -1847,12 +1879,12 @@ the compilation declined outlives it here"
             Type::Variant(tags, _) => {
                 let mut arms = Vec::with_capacity(tags.len());
                 for (k, t) in tags {
-                    arms.push((k.clone(), self.extent_of(t)?));
+                    arms.push((k.clone(), self.extent_in(t, tuples)?));
                 }
                 Ok(Extent::Union(TagMap::from_arms(arms)))
             }
             // A generalized type is stored as its body is, each parameter as its bound.
-            Type::Poly(p) if p.is_generalized() => self.extent_of(&p.body),
+            Type::Poly(p) if p.is_generalized() => self.extent_in(&p.body, tuples),
             // A generalized parameter stands for a domain chosen per use, below its bound: the
             // values it ranges over are the bound's (`src/ccl/design/type-parameters.md`,
             // "Generalized types").
@@ -1863,7 +1895,7 @@ the compilation declined outlives it here"
                         p.spelling
                     ))
                 })?;
-                self.extent_of(bound)
+                self.extent_in(bound, tuples)
             }
             // Leaf types — no refinements possible, handle inline.
             Type::Base(b) => Ok(Extent::Base(b.clone())),
@@ -1902,6 +1934,15 @@ the compilation declined outlives it here"
             ))),
         }
     }
+}
+
+/// What [`OpConversionContext::extent_of`]'s conversion does with a [`Type::DepTuple`].
+#[derive(Clone, Copy)]
+enum DependentTuples {
+    /// Refuse it as a compiler bug: a site iterating one is planned as a per-row family.
+    Refuse,
+    /// Bound it component by component, as a tuple, for zip fusion's prefix check.
+    Bound,
 }
 
 /// Core conversion: translate `expr` into an operator that transforms `input`.
@@ -2016,7 +2057,7 @@ fn convert_impl_inner(
                     debug_assert!(
                         last.ty
                             .codomain()
-                            .and_then(|ty| ctx.extent_of(&ty).ok())
+                            .and_then(|ty| ctx.bound_of(&ty).ok())
                             .is_some_and(|want| extent_shapes_agree(&fused.codomain, &want)),
                         "the fused prefix yields {}, where its last element {} has type {}",
                         fused.codomain,

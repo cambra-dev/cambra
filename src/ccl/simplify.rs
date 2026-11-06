@@ -690,10 +690,16 @@ fn try_compose_identity(expr: &mut Expr) -> bool {
 /// Whether `source` is a generator's source as `compose_sum_generators` leaves it: a morphism
 /// to a sum, or one ending in `unbox`, whose collection is over the witness the sum projects
 /// (`σ₁(𝑐)`). The second is read from the term rather than from the projected domain, because a
-/// history over a projected domain has that type too and is not a generator's source.
+/// history over a projected domain has that type too and is not a generator's source. A `map`
+/// after the `unbox`, which a filter on the generator leaves, keeps its keys.
 fn over_a_witness(source: &Expr) -> bool {
+    let is_map = |e: &Expr| matches!(&e.node, TypedExprNode::Apply { function, .. } if is_builtin(function, Builtin::Map));
     let ends_in_unbox = match &source.node {
-        TypedExprNode::Compose(elts) => elts.last().is_some_and(|e| is_builtin(e, Builtin::Unbox)),
+        TypedExprNode::Compose(elts) => elts
+            .iter()
+            .rev()
+            .find(|e| !is_map(e))
+            .is_some_and(|e| is_builtin(e, Builtin::Unbox)),
         _ => is_builtin(source, Builtin::Unbox),
     };
     ends_in_unbox || source.ty.codomain().is_some_and(|c| c.sum().is_some())
@@ -708,13 +714,14 @@ fn over_a_witness(source: &Expr) -> bool {
 /// Both sides keep `𝑆` and `𝑓`, so the rule relocates no iteration source.
 ///
 /// Scoped to a generator's source ([`over_a_witness`]), the shape the generator rewrite
-/// produces. Planning's
-/// letrec recognition reads a history through the unrewritten form, so the rule leaves every
-/// other `𝑆` alone.
+/// produces, and to `id`, where the collection is the chain's input: lambda elimination leaves
+/// `⟨id, 𝑓 ▷ const⟩` for a body that maps a collection bound by a `let`. Planning's letrec
+/// recognition reads a history through the unrewritten form, so the rule leaves every other `𝑆`
+/// alone; with `id`, whatever produces the collection stays its own element of the chain.
 fn try_compose_constant_function(expr: &mut Expr) -> bool {
     fn constant_function(left: &Expr) -> Option<(&Expr, &Expr)> {
         let (source, lifted) = as_zip(left)?;
-        if !over_a_witness(source) {
+        if !over_a_witness(source) && !is_id(source) {
             return None;
         }
         Some((source, as_const(lifted)?))

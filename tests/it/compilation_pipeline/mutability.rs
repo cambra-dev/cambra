@@ -3091,11 +3091,10 @@ fn a_mut_loop_over_a_groupby_carries_its_accumulator() {
     );
 }
 
-/// A `:=` loop **inside** a `groupby` `:=` loop does not compile yet: letrec recognition finds
-/// the inner writer's parameter reading the outer loop's position.
+/// A `:=` loop **inside** a `groupby` `:=` loop: the inner recurrence runs once per group.
 #[test]
-fn a_mut_loop_inside_a_groupby_loop_is_not_compiled_yet() {
-    check_compile_error(
+fn a_mut_loop_inside_a_groupby_loop() {
+    check_scalar(
         indoc! {r#"
             n := 0
             for g in groupby([1, 2, 3, 4, 5], \e -> e // 2):
@@ -3103,12 +3102,12 @@ fn a_mut_loop_inside_a_groupby_loop_is_not_compiled_yet() {
                     n += i
             n
         "#},
-        "a nested writer's parameter is the (enclosing, position) pair",
+        cambra::interpreter::Value::Int(9),
     );
 }
 
-/// A `groupby` `:=` loop **inside** a `:=` loop does not compile yet: letrec recognition
-/// takes the inner loop's domain to be a plain one, and a group's domain reads its key.
+/// A `groupby` `:=` loop **inside** a `:=` loop does not run yet: it compiles, and at run time a
+/// map operator meets a function whose codomain is not a scalar. It answers 30.
 #[test]
 fn a_groupby_loop_inside_a_mut_loop_is_not_compiled_yet() {
     check_compile_error(
@@ -3119,7 +3118,7 @@ fn a_groupby_loop_inside_a_mut_loop_is_not_compiled_yet() {
                     n += sum(g)
             n
         "#},
-        "letrec recognition produced an invalid tree",
+        "MapResult with Function only supports Scalar codomains",
     );
 }
 

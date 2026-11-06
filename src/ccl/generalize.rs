@@ -79,16 +79,29 @@ fn instantiate_with(poly: &crate::ccl::ty::PolyType, bound: &HashMap<TypeParamId
 /// The two sides of a subtyping edge with their generalized types opened for the comparison: a
 /// generic supertype by its body, its parameters standing for any type, and a generic subtype
 /// instantiated at what the supertype receives in its place. Two generic types meet as one
-/// generic type, whatever their parameters are named.
+/// generic type, whatever their parameters are named. A product of generic types, a value
+/// `zip` pairs, is opened component by component.
 pub(crate) fn align(sub: &Type, sup: &Type) -> (Type, Type) {
     if !holds_generalized_type(sub) && !holds_generalized_type(sup) {
         return (sub.clone(), sup.clone());
     }
-    let sup = match sup {
-        Type::Poly(p) if p.is_generalized() => p.body.clone(),
-        _ => sup.clone(),
-    };
+    let sup = generalized_bodies(sup);
     (align_sub(sub, &sup), sup)
+}
+
+/// `ty` with the generalized types it is, or its product's components are, read at their bodies.
+fn generalized_bodies(ty: &Type) -> Type {
+    match ty {
+        Type::Poly(p) if p.is_generalized() => generalized_bodies(&p.body),
+        Type::Tuple(components) => Type::Tuple(components.iter().map(generalized_bodies).collect()),
+        Type::Record(fields) => Type::Record(
+            fields
+                .iter()
+                .map(|(label, t)| (label.clone(), generalized_bodies(t)))
+                .collect(),
+        ),
+        _ => ty.clone(),
+    }
 }
 
 /// `codomain`, the codomain of the function `fun`, with `fun`'s references to its binder read
@@ -107,16 +120,6 @@ fn codomain_opened_as(fun: &Type, codomain: &Type, b: &crate::ccl::Name) -> Type
         codomain: Box::new(codomain.clone()),
     };
     crate::ccl::subst::open_codomain(&renamed, codomain)
-}
-
-/// The names the functions in `ty` bind.
-fn pi_binders(ty: &Type, out: &mut Vec<crate::ccl::Name>) {
-    if let Type::Fun { name: Some(b), .. } = ty
-        && !out.contains(b)
-    {
-        out.push(b.clone());
-    }
-    ty.walk_children(|c| pi_binders(c, out));
 }
 
 /// `ty` with every named function's references to its own binder read by name.
@@ -200,6 +203,12 @@ fn align_sub(sub: &Type, sup: &Type) -> Type {
     if let Type::Poly(p) = sub
         && p.is_generalized()
     {
+        // Types generalized alike share their parameters, so the supertype can read free
+        // the very parameters the subtype quantifies; those are renamed apart first, or
+        // matching binds a parameter to a type that reads it.
+        let avoid: Vec<TypeParamId> = free_params(sup).iter().map(|q| q.id).collect();
+        let renamed = params_renamed_apart(p, &avoid);
+        let (sub, p) = (&Type::Poly(Rc::clone(&renamed)), &renamed);
         let opened = match sup.peel_refinements().domain() {
             Some(input) => instantiate(sub, &input),
             // A generic value meets the type it is expected at whole.
@@ -232,7 +241,9 @@ fn align_sub(sub: &Type, sup: &Type) -> Type {
                 );
                 closed_deep(&adopt_binder_names(substitute(&still.body, &bound), &named))
             }
-            done => done.clone(),
+            // An instance can hold generalized types of its own, a pair of generic morphisms whose
+            // pairing is generic too, which meet the supertype's components in turn.
+            done => align_sub(done, sup),
         };
     }
     match (sub, sup.peel_refinements()) {
@@ -306,6 +317,52 @@ fn align_sub(sub: &Type, sup: &Type) -> Type {
     }
 }
 
+/// The structure a generalized parameter has: its bound's, read the same way, since it ranges over
+/// subtypes of the bound. Any other type is its own.
+pub(crate) fn shape(ty: &Type) -> Type {
+    match ty.peel_refinements() {
+        Type::Param(p) if p.generalized => p.bound.as_ref().map_or_else(|| ty.clone(), shape),
+        _ => ty.clone(),
+    }
+}
+
+/// `part` with the generalized parameters `pattern` reads replaced by what matching `pattern`
+/// against `actual` binds them to: a part of one type read in the parameters of another, which
+/// names the same structure by parameters of its own.
+///
+/// The result stands beside the type it is read from, so the terms it quotes are recorded
+/// copies with identities of their own, where [`substitute`] rewrites a type in place.
+pub(crate) fn renamed_by_match(part: &Type, pattern: &Type, actual: &Type) -> Type {
+    let params: Vec<TypeParamId> = free_params(pattern).iter().map(|q| q.id).collect();
+    let mut bound = HashMap::new();
+    match_params(pattern, actual, &params, &mut bound);
+    bound.retain(|id, to| !matches!(to, Type::Param(q) if q.id == *id));
+    if bound.is_empty() {
+        return part.clone();
+    }
+    let mut out = substitute(part, &bound);
+    let _copy = crate::ccl::provenance::copy_frame("generalize.renamed_by_match");
+    crate::ccl::ccl_utils::walk_quoted_terms_mut(
+        &mut out,
+        &crate::ccl::ccl_utils::PredMemo::default(),
+        &(),
+        &mut |term, _| {
+            *term = term.clone();
+            true
+        },
+    );
+    out
+}
+
+/// `ty` at its body where it is a generalized `Poly`, its refinements kept: a node's slot read
+/// where the node is checked at its body, its parameters standing for any type.
+pub(crate) fn body(ty: &Type) -> &Type {
+    match ty {
+        Type::Poly(p) if p.is_generalized() => body(&p.body),
+        other => other,
+    }
+}
+
 /// `ty`'s structure for a pass that reads a type's parts: a generalized type's body, its
 /// parameters standing for any type, refinements peeled. A pass that builds types from those
 /// parts leaves the parameters outside their `Poly` until [`close_free_params`] closes them.
@@ -336,10 +393,41 @@ fn match_params(
     params: &[TypeParamId],
     out: &mut HashMap<TypeParamId, Type>,
 ) {
+    let mut met = Vec::new();
+    match_direct(pattern, actual, params, out, &mut met);
+    // A parameter's bound reads parameters the input fixes only through it: in `∀ (𝐷 <: 𝑅,
+    // 𝑃 <: ((𝐷 ⤇ 𝑉), 𝐷)). 𝑃 ⇒ (𝐷 ⤇ 𝑉)`, the type 𝑃 is handed is a subtype of its bound, and
+    // a collection's domain is invariant, so that type's structure names 𝐷. Matched after
+    // every direct position, which binds a parameter first. A bound that is a parameter itself
+    // is only an upper bound and fixes nothing.
+    while let Some((p, actual)) = met.pop() {
+        let Some(bound) = &p.bound else { continue };
+        if matches!(bound.peel_refinements(), Type::Param(_)) {
+            continue;
+        }
+        let structure = match actual.peel_refinements() {
+            Type::Param(q) if q.generalized => match &q.bound {
+                Some(b) => b.clone(),
+                None => continue,
+            },
+            other => other.clone(),
+        };
+        match_direct(bound, &structure, params, out, &mut met);
+    }
+}
+
+fn match_direct(
+    pattern: &Type,
+    actual: &Type,
+    params: &[TypeParamId],
+    out: &mut HashMap<TypeParamId, Type>,
+    met: &mut Vec<(Rc<crate::ccl::ty::TypeParam>, Type)>,
+) {
     if let Type::Param(p) = pattern
         && params.contains(&p.id)
     {
         out.entry(p.id).or_insert_with(|| actual.clone());
+        met.push((Rc::clone(p), actual.clone()));
         return;
     }
     // A refined parameter, `{D | 𝑝}`, is what `actual` is without the refinements the pattern
@@ -359,7 +447,8 @@ fn match_params(
             ),
             other => other.clone(),
         };
-        out.entry(p.id).or_insert(rest);
+        out.entry(p.id).or_insert(rest.clone());
+        met.push((Rc::clone(p), rest));
         return;
     }
     match (pattern.peel_refinements(), actual.peel_refinements()) {
@@ -375,30 +464,30 @@ fn match_params(
                 ..
             },
         ) => {
-            match_params(pd, ad, params, out);
-            match_params(pc, ac, params, out);
+            match_direct(pd, ad, params, out, met);
+            match_direct(pc, ac, params, out, met);
         }
         (Type::Tuple(ps), Type::Tuple(acts)) if ps.len() == acts.len() => {
             for (p, a) in ps.iter().zip(acts) {
-                match_params(p, a, params, out);
+                match_direct(p, a, params, out, met);
             }
         }
         (Type::DepTuple(ps), Type::DepTuple(acts)) if ps.len() == acts.len() => {
             for ((_, p), (_, a)) in ps.iter().zip(acts) {
-                match_params(p, a, params, out);
+                match_direct(p, a, params, out, met);
             }
         }
         (Type::Record(ps), Type::Record(acts)) => {
             for (label, p) in ps {
                 if let Some((_, a)) = acts.iter().find(|(l, _)| l == label) {
-                    match_params(p, a, params, out);
+                    match_direct(p, a, params, out, met);
                 }
             }
         }
         (Type::Variant(ps, _), Type::Variant(acts, _)) => {
             for (key, p) in ps {
                 if let Some((_, a)) = acts.iter().find(|(k, _)| k == key) {
-                    match_params(p, a, params, out);
+                    match_direct(p, a, params, out, met);
                 }
             }
         }
@@ -757,7 +846,7 @@ pub(crate) fn generalized(
     let mut renames = Vec::new();
     let apart = renamed_apart(ty, &free, &mut renames);
     let mut own = Vec::new();
-    pi_binders(&apart, &mut own);
+    type_binders(&apart, &mut own);
     let out_of_scope_here = |n: &crate::ccl::Name| out_of_scope(n) && !own.contains(n);
     let generalized = closed_deep(&generalized_go(
         &opened_deep(&apart),
@@ -972,12 +1061,41 @@ fn quantified(
 ) -> Result<Type, Ungeneralizable> {
     let mut params = Vec::new();
     let mut body = ty.clone();
-    let mut groups = groups;
+    let mut groups = contained_first(groups);
+    // The parameters are quantified outside every binder of the type, so a refinement reading
+    // one of those binders stays where the binder is in scope, around its parameter.
+    let mut own = Vec::new();
+    type_binders(ty, &mut own);
+    // A predicate reads a binder of the type by name, or by index where the type stores it
+    // closed: a dependent tuple's later component reads an earlier one so.
+    let reads_own = |r: &crate::ccl::Refinement| {
+        reads_an_index(&r.predicate)
+            || crate::ccl::subst::refinement_free_vars(r)
+                .iter()
+                .any(|n| own.contains(n))
+    };
     for i in 0..groups.len() {
         let group = groups[i].clone();
-        let (kind, bound) = part_range(&group, out_of_scope, at)?;
+        // A part that read out of scope only through a part abstracted before it is that part
+        // refined, and takes no parameter of its own.
+        if !crate::ccl::subst::type_free_vars(&group)
+            .iter()
+            .any(out_of_scope)
+        {
+            continue;
+        }
+        let (kind, bound) = part_range(&group, out_of_scope, &reads_own, at)?;
         let param = crate::ccl::ty::TypeParam::generalized(spelling(i), bound);
         let d = Type::Param(Rc::clone(&param));
+        let staying: crate::ccl::RefinementSet = match &group {
+            Type::Refinement(_, refinements) => refinements
+                .iter()
+                .filter(|r| reads_own(r) && !reads(r, out_of_scope))
+                .cloned()
+                .collect(),
+            _ => crate::ccl::RefinementSet::default(),
+        };
+        let d = Type::refined(d, staying);
         body = abstract_deep(&body, &group, &d, out_of_scope);
         // A later part can hold this one inside the terms it quotes; it is matched as the
         // abstraction leaves it.
@@ -1001,6 +1119,34 @@ fn quantified(
     })))
 }
 
+/// `groups` ordered so that each comes after every other it contains, as a nested type or as
+/// its base with a subset of its refinements ([`abstract_go`]): a part is quantified once,
+/// and a part holding it reads its parameter.
+fn contained_first(mut groups: Vec<Type>) -> Vec<Type> {
+    let contains = |outer: &Type, inner: &Type| {
+        outer != inner && abstract_go(outer, inner, &Type::Hole) != *outer
+    };
+    let mut ordered = Vec::with_capacity(groups.len());
+    while !groups.is_empty() {
+        let next = groups
+            .iter()
+            .position(|g| !groups.iter().any(|h| contains(g, h)))
+            .unwrap_or(0);
+        ordered.push(groups.remove(next));
+    }
+    ordered
+}
+
+/// Whether `term`, a predicate, reads a binder of the type it stands in by index: a term binder
+/// inside it is a name, so a [`crate::ccl::Name::PiBound`] it reads points outside it.
+fn reads_an_index(term: &crate::ccl::Expr) -> bool {
+    matches!(&term.node, crate::ccl::TypedExprNode::Var(n) if n.pi_bound_index().is_some()) || {
+        let mut found = false;
+        term.walk_children(|c| found |= reads_an_index(c));
+        found
+    }
+}
+
 /// What a part a type is generalized over ranges over, and the bound its parameter states: a
 /// refined type's base with the refinements that read nothing out of scope, or, where that base
 /// is a sum's witness read through a term out of scope, the witness's kind, bounded only where
@@ -1013,10 +1159,11 @@ fn quantified(
 fn part_range(
     group: &Type,
     out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool,
+    reads_own: &dyn Fn(&crate::ccl::Refinement) -> bool,
     at: &str,
 ) -> Result<(crate::ccl::ty::TypeKind, Option<Type>), Ungeneralizable> {
     let base = match group {
-        Type::Refinement(..) => refinements_in_scope(group, out_of_scope),
+        Type::Refinement(..) => refinements_in_scope(group, out_of_scope, reads_own),
         other => other.clone(),
     };
     if let Type::WitnessProjection(p) = base.peel_refinements() {
@@ -1052,8 +1199,9 @@ fn spelling(i: usize) -> String {
     }
 }
 
-/// The maximal refined types in `ty` whose own refinements read a binder `out_of_scope`
-/// reports, each once.
+/// The refined types in `ty` whose own refinements read a binder `out_of_scope` reports, each
+/// once, innermost first: a part inside another is quantified first, so the outer one's bound
+/// reads the inner one's parameter, and the inner one's other occurrences are abstracted too.
 fn refined_parts_naming(
     ty: &Type,
     out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool,
@@ -1066,13 +1214,12 @@ fn refined_parts_naming(
             .any(out_of_scope),
         _ => false,
     };
-    if names {
-        if !out.contains(ty) {
-            out.push(ty.clone());
-        }
-        return;
+    if !matches!(ty, Type::WitnessProjection(_)) {
+        ty.walk_children(|c| refined_parts_naming(c, out_of_scope, out));
     }
-    ty.walk_children(|c| refined_parts_naming(c, out_of_scope, out));
+    if names && !out.contains(ty) {
+        out.push(ty.clone());
+    }
 }
 
 fn reads(r: &crate::ccl::Refinement, out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool) -> bool {
@@ -1081,13 +1228,19 @@ fn reads(r: &crate::ccl::Refinement, out_of_scope: &dyn Fn(&crate::ccl::Name) ->
         .any(out_of_scope)
 }
 
-/// `ty`, a refined type, with only the refinements that read no binder `out_of_scope`
-/// reports. A refinement that reads one keeps its top-level `and` conjuncts that read none: a
-/// comprehension joins its guards into one conjunction (`comprehension::run`).
-fn refinements_in_scope(ty: &Type, out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool) -> Type {
+/// `ty`, a refined type, with only the refinements that read no binder `out_of_scope` reports
+/// and none of the type's own (`reads_own`). A refinement that reads one keeps its top-level
+/// `and` conjuncts that read none: a comprehension joins its guards into one conjunction
+/// (`comprehension::run`).
+fn refinements_in_scope(
+    ty: &Type,
+    out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool,
+    reads_own: &dyn Fn(&crate::ccl::Refinement) -> bool,
+) -> Type {
     fn conjuncts_in_scope(
         e: &crate::ccl::Expr,
         out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool,
+        reads_own: &dyn Fn(&crate::ccl::Refinement) -> bool,
         out: &mut Vec<crate::ccl::Refinement>,
     ) {
         use crate::ccl::{BinOpKind, LogicKind, TypedExprNode};
@@ -1097,12 +1250,12 @@ fn refinements_in_scope(ty: &Type, out_of_scope: &dyn Fn(&crate::ccl::Name) -> b
             right,
         } = &e.node
         {
-            conjuncts_in_scope(left, out_of_scope, out);
-            conjuncts_in_scope(right, out_of_scope, out);
+            conjuncts_in_scope(left, out_of_scope, reads_own, out);
+            conjuncts_in_scope(right, out_of_scope, reads_own, out);
             return;
         }
         let conjunct = crate::ccl::Refinement::born(Rc::new(e.clone_preserving_ids()));
-        if !reads(&conjunct, out_of_scope) {
+        if !reads(&conjunct, out_of_scope) && !reads_own(&conjunct) {
             out.push(conjunct);
         }
     }
@@ -1111,8 +1264,8 @@ fn refinements_in_scope(ty: &Type, out_of_scope: &dyn Fn(&crate::ccl::Name) -> b
     };
     let mut kept = Vec::new();
     for r in refinements.iter() {
-        if reads(r, out_of_scope) {
-            conjuncts_in_scope(&r.predicate, out_of_scope, &mut kept);
+        if reads(r, out_of_scope) || reads_own(r) {
+            conjuncts_in_scope(&r.predicate, out_of_scope, reads_own, &mut kept);
         } else {
             kept.push(r.clone());
         }
@@ -1290,39 +1443,82 @@ fn collect_params(e: &crate::ccl::Expr, out: &mut HashMap<TypeParamId, crate::cc
 }
 
 fn close_go(e: &mut crate::ccl::Expr, declared: &HashMap<TypeParamId, crate::ccl::ty::PolyParam>) {
-    let free = free_params(&e.ty);
-    if !free.is_empty() {
-        // A parameter whose `Poly` a pass replaced is declared again from its own bound.
-        let params: Vec<_> = free
-            .iter()
-            .map(|p| {
-                declared
-                    .get(&p.id)
-                    .cloned()
-                    .unwrap_or_else(|| crate::ccl::ty::PolyParam {
-                        param: Rc::clone(p),
-                        kind: match &p.bound {
-                            Some(b) => crate::ccl::ty::TypeKind::SubtypesOf(Box::new(b.clone())),
-                            None => crate::ccl::ty::TypeKind::Type,
-                        },
-                        bound_at: None,
-                    })
-            })
-            .collect();
-        e.ty = match &e.ty {
-            Type::Poly(p) if p.is_generalized() => {
-                let mut inner = (**p).clone();
-                inner.params.extend(params);
-                Type::Poly(Rc::new(inner))
-            }
-            ty => Type::Poly(Rc::new(crate::ccl::ty::PolyType {
-                params,
-                requires: Vec::new(),
-                body: ty.clone(),
-            })),
-        };
-    }
+    // Every type slot, the node's type and the slots beside it: a `let` binder states its
+    // definition's morphism, and a nested `Transact`'s domain the pair its writers take.
+    e.walk_type_slots_mut(|ty| close_type(ty, declared));
     e.walk_children_mut(|c| close_go(c, declared));
+}
+
+/// `ty` quantified over the generalized parameters it reads that no `Poly` in it binds.
+fn close_type(ty: &mut Type, declared: &HashMap<TypeParamId, crate::ccl::ty::PolyParam>) {
+    let free = free_params(ty);
+    if free.is_empty() {
+        return;
+    }
+    // A parameter whose `Poly` a pass replaced is declared again from its own bound.
+    let params: Vec<_> = free
+        .iter()
+        .map(|p| {
+            declared
+                .get(&p.id)
+                .cloned()
+                .unwrap_or_else(|| crate::ccl::ty::PolyParam {
+                    param: Rc::clone(p),
+                    kind: match &p.bound {
+                        Some(b) => crate::ccl::ty::TypeKind::SubtypesOf(Box::new(b.clone())),
+                        None => crate::ccl::ty::TypeKind::Type,
+                    },
+                    bound_at: None,
+                })
+        })
+        .collect();
+    *ty = match &*ty {
+        Type::Poly(p) if p.is_generalized() => {
+            let mut inner = (**p).clone();
+            inner.params.extend(params);
+            Type::Poly(Rc::new(inner))
+        }
+        other => Type::Poly(Rc::new(crate::ccl::ty::PolyType {
+            params,
+            requires: Vec::new(),
+            body: other.clone(),
+        })),
+    };
+}
+
+/// `p` with each of its parameters in `avoid` replaced by a fresh one of the same spelling and
+/// bound, the parameters after it and the body reading the fresh one.
+fn params_renamed_apart(
+    p: &Rc<crate::ccl::ty::PolyType>,
+    avoid: &[TypeParamId],
+) -> Rc<crate::ccl::ty::PolyType> {
+    if !p.params.iter().any(|q| avoid.contains(&q.param.id)) {
+        return Rc::clone(p);
+    }
+    let mut fresh: HashMap<TypeParamId, Type> = HashMap::new();
+    let params = p
+        .params
+        .iter()
+        .map(|q| {
+            let bound = q.param.bound.as_ref().map(|b| substitute(b, &fresh));
+            let param =
+                crate::ccl::ty::TypeParam::generalized(q.param.spelling.clone(), bound.clone());
+            fresh.insert(q.param.id, Type::Param(Rc::clone(&param)));
+            crate::ccl::ty::PolyParam {
+                param,
+                kind: match bound {
+                    Some(b) => crate::ccl::ty::TypeKind::SubtypesOf(Box::new(b)),
+                    None => q.kind.clone(),
+                },
+                bound_at: q.bound_at,
+            }
+        })
+        .collect();
+    Rc::new(crate::ccl::ty::PolyType {
+        params,
+        requires: p.requires.clone(),
+        body: substitute(&p.body, &fresh),
+    })
 }
 
 /// The generalized parameters `ty` reads that no `Poly` in it binds, in first-occurrence order.
@@ -1378,7 +1574,7 @@ mod tests {
         let part = Type::refined_one(int.clone(), Refinement::born(Rc::new(both)));
         let i = Name::from("i");
         assert_eq!(
-            refinements_in_scope(&part, &|n| *n == i),
+            refinements_in_scope(&part, &|n| *n == i, &|_| false),
             Type::refined_one(int, Refinement::born(Rc::new(below_four))),
         );
     }
