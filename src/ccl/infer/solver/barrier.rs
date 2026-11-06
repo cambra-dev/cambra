@@ -111,9 +111,14 @@ fn check_barrier(barrier: &Rc<BarrierVar>, failures: &mut Vec<BarrierFailure>) -
     }
     // A resolution that does not materialize is not checked: the same join is what the
     // variable's position compacts to, so coalescing that position reports it. A
-    // recursive resolution is one of them (`CoalesceError::RecursiveType`).
+    // recursive resolution is one of them (`CoalesceError::RecursiveType`). Nor is one
+    // nothing determines: it materializes as a variable minted for it alone, and afresh
+    // each time, so a check records bounds on that variable and nothing else, and the memo
+    // would never match it.
     let materialized = if own.rec_vars.is_empty() {
-        coalesce_position(&own.term, true).ok()
+        coalesce_position(&own.term, true)
+            .ok()
+            .filter(|resolved| !matches!(resolved, Type::Infer(_)))
     } else {
         None
     };

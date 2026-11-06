@@ -46,6 +46,10 @@ a generic definition whose instantiation fails it. `defect_reports.rs` checks ea
 - **A module sound at its parameters' types reports nothing a run raises in it.** A run whose
   argument does not fit its parameter reports the argument; an error that run's copy of the module
   raises is dropped (`check_modules`).
+- **A join's defect met downstream reports nothing.** An error whose value came from inside a join
+  reported as having no common type, `x + 1` over the elements of `[1, "a"]` failing at `"a"`, is
+  that join met where its values are used, and fixing the join fixes it. Such an error is dropped
+  (`drop_met_downstream`), read by the node its "the value comes from here" label names.
 - **One span and one message are one diagnostic.** `compile_program` merges inference errors
   that underline one span with one message, keeping the secondary labels of each
   (`Blame::infer`).
