@@ -1416,6 +1416,8 @@ fn check_strength_over(ty: &Type, label: &str, ctx: &mut CheckCtx) {
 /// body with each witness projected through the binder. Recorded into `ctx.errors`, as
 /// `require_sub` records.
 fn check_unbox(ty: &Type, label: &str, ctx: &mut CheckCtx) {
+    // A generalized type is checked at its body, its parameters standing for any type.
+    let ty = crate::ccl::generalize::body(ty);
     let expected = (|| {
         let Type::Fun {
             name,

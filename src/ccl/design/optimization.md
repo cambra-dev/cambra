@@ -252,7 +252,9 @@ sources.
 A value-selecting `Case` inside a lambda becomes a `DisjointJoin` of arms. Each arm first
 applies `filter_values` to the fed input using its first-match condition, then computes the
 arm value. This keeps a partial operation in an arm from running at positions rejected by
-that arm's guard. A scalar `Case` in value position uses a one-element iteration domain:
+that arm's guard. Each arm is typed as the eliminated lambda, binder included: the arm's value
+is typed as the whole `Case`'s, which can read the lambda's parameter through another arm, as
+a boxed arm over a group at the loop's key does. A scalar `Case` in value position uses a one-element iteration domain:
 each arm lifts its value over that domain, restricts it by its first-match condition, and
 the arms are unioned. `final_or_default` extracts the selected value. Its fallback is the
 exhaustive final arm. A collection-valued `Case` remains for conditional-collection planning.

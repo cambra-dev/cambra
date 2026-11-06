@@ -2130,7 +2130,6 @@ fn elim_lambda_impl(
             scrutinee: None,
             branches,
         } if branches.iter().all(|b| b.pattern.is_none()) => {
-            let value_ty = body_ty.clone();
             let mut prior_guards: Vec<Expr> = Vec::new();
             let mut arms: Vec<Expr> = Vec::with_capacity(branches.len());
             for br in branches {
@@ -2155,10 +2154,12 @@ fn elim_lambda_impl(
                     Type::fun(param_ty.clone(), param_ty.clone()),
                 );
                 // `filter_values` maps each position to itself, so an arm whose value reads
-                // `param` keeps `eᵢ`'s binder ([`crate::ccl::ccl_utils::chain_type_of`]).
+                // `param` keeps `eᵢ`'s binder ([`crate::ccl::ccl_utils::chain_type_of`]). The
+                // arm is stated as the eliminated lambda is, binder included: the value's type
+                // is the whole `Case`'s, which can read `param` through another arm.
                 arms.push(crate::ccl::ccl_utils::chain_typed(
                     vec![filter, value_fn],
-                    Type::fun(param_ty.clone(), value_ty.clone()),
+                    result_ty.clone(),
                 ));
             }
             match arms.len() {
