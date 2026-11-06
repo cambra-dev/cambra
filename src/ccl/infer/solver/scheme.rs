@@ -1044,7 +1044,10 @@ pub fn freshen_above(
             freshen_watches(
                 lim,
                 watches,
-                &|copy, pos| copy.watch(&Type::Infer(Rc::clone(&v)), pos),
+                &|original, copy, pos| {
+                    copy.copy_frame(original, pos, tv.uid, v.uid);
+                    copy.watch(&Type::Infer(Rc::clone(&v)), pos)
+                },
                 target,
                 cache,
             );
@@ -1089,7 +1092,7 @@ pub fn freshen_above(
             freshen_watches(
                 lim,
                 watches,
-                &|copy, pos| fresh.watches.borrow_mut().push((Rc::clone(copy), pos)),
+                &|_, copy, pos| fresh.watches.borrow_mut().push((Rc::clone(copy), pos)),
                 target,
                 cache,
             );
@@ -1171,7 +1174,8 @@ impl FreshenCache {
 }
 
 /// Copy the trait obligations in `watches`, a variable's watch list, onto its freshened
-/// counterpart: `attach` records the watch of each copy on it.
+/// counterpart: `attach` records the watch of each copy on it, given the original the copy
+/// is of.
 ///
 /// Runs *after* the bounds write-back, so an obligation reached through a bound has
 /// already had its variables freshened into the cache and the copy's watches line up
@@ -1187,20 +1191,20 @@ impl FreshenCache {
 fn freshen_watches(
     lim: Level,
     watches: Vec<(Rc<TraitObligation>, u8)>,
-    attach: &dyn Fn(&Rc<TraitObligation>, u8),
+    attach: &dyn Fn(&TraitObligation, &Rc<TraitObligation>, u8),
     target: FreshenLevel,
     cache: &mut FreshenCache,
 ) {
     for (obligation, pos) in watches {
         if let Some(existing) = cache.obligations.get(&obligation.uid) {
-            attach(existing, pos);
+            attach(&obligation, existing, pos);
             continue;
         }
         // Phase 1: a copy carrying the original's candidate set, with the output
         // position still pointing at the definition's — enough to be reachable.
         let copy = TraitObligation::new_from(&obligation);
         cache.obligations.insert(obligation.uid, Rc::clone(&copy));
-        attach(&copy, pos);
+        attach(&obligation, &copy, pos);
         // A specialization clone turns the binding's own type parameters, the ones
         // one level above the cutoff, into variables; an assumption about one of
         // them no longer describes the copy. The parameters are told apart by identity:

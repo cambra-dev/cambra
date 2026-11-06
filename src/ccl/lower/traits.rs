@@ -51,6 +51,25 @@ pub(super) fn named_requirement(
     let instance = ctx
         .named_requirement(&q.qualifier[0].node)
         .expect("`reads_named_requirement` holds of `q`");
+    // A requirement under `forall` names an instance for each value of its binders, which a
+    // bound in its own `forall` reads; elsewhere no value picks one of them.
+    if !instance.binders.is_empty()
+        && !instance.binders.iter().all(|(b, _)| {
+            ctx.type_binders
+                .iter()
+                .any(|(n, _)| Name::raw(n.clone()) == *b)
+        })
+    {
+        return Err(LoweringError::unsupported(
+            q.qualifier[0].span,
+            format!(
+                "`{}` names an instance of `{}` for each value its `forall` binds, and reading \
+                 one outside that `forall` is not supported yet; a loop over the value calls \
+                 the instance at its own value",
+                q.qualifier[0].node, instance.trait_
+            ),
+        ));
+    }
     if let [first, second, ..] = q.qualifier.as_slice() {
         return Err(LoweringError::unsupported(
             first.span.join(second.span),
@@ -728,7 +747,7 @@ pub(super) fn declare_instances(
 /// of the form `bound` has. A hole or a type variable on either side could be anything. A
 /// refinement `bound` states is one `ty` must state, so an unrefined `ty` is below a refined
 /// `bound` in no case.
-fn may_be_below(ty: &Type, bound: &Type) -> bool {
+pub(super) fn may_be_below(ty: &Type, bound: &Type) -> bool {
     use crate::ccl::FunKind;
     if matches!(bound, Type::Refinement(..)) && !matches!(ty, Type::Refinement(..)) {
         return false;

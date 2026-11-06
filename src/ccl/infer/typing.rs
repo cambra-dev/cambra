@@ -246,6 +246,15 @@ pub(super) trait Typing {
     /// binding's right-hand side and annotation are checked.
     fn close_poly(&mut self, poly: &crate::ccl::ty::PolyType);
 
+    /// Deposit the answers a quantified requirement gave at one value of a family parameter
+    /// of the innermost open `Poly`, once its binding's right-hand side is emitted: every
+    /// application of the family has arrived by then
+    /// (`src/ccl/design/type-parameters.md`, "Obligations under assumptions").
+    fn settle_held_answers(
+        &mut self,
+        poly: &crate::ccl::ty::PolyType,
+    ) -> Result<(), LocatedInferError>;
+
     /// Run `f` with the demand of every edge it draws stated at `origin`, when there is
     /// one, rather than at the node under emission: a type parameter's bound or a
     /// requirement, written in a `Poly` and checked at a use

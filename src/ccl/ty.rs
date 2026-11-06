@@ -1802,6 +1802,11 @@ pub struct TraitRequirement {
     /// The associated types the clause names. One it leaves unnamed is absent, and
     /// leaves that position open.
     pub assoc: Vec<(crate::ccl::infer::solver::traits::Assoc, Type)>,
+    /// The values a `forall` around the requirement binds, each with the type it ranges over:
+    /// `k: K` in `forall (k: K) Iterable(V(k))`. The operands and associated types read them,
+    /// and the requirement holds at every value of them (`docs/chl-spec.md`, "Family
+    /// parameters"). Empty for a requirement no `forall` quantifies.
+    pub binders: Vec<(crate::ccl::Name, Type)>,
     /// Where the requirement was written, for the secondary label of a use that fails
     /// it; `None` for one no `requires` clause states.
     pub at: Option<chl_parser::ast::Span>,
@@ -1809,7 +1814,10 @@ pub struct TraitRequirement {
 
 impl PartialEq for TraitRequirement {
     fn eq(&self, other: &Self) -> bool {
-        self.trait_ == other.trait_ && self.args == other.args && self.assoc == other.assoc
+        self.trait_ == other.trait_
+            && self.args == other.args
+            && self.assoc == other.assoc
+            && self.binders == other.binders
     }
 }
 impl Eq for TraitRequirement {}
@@ -1818,18 +1826,92 @@ impl std::hash::Hash for TraitRequirement {
         self.trait_.hash(state);
         self.args.hash(state);
         self.assoc.hash(state);
+        self.binders.hash(state);
     }
 }
 
 impl TraitRequirement {
-    /// This requirement with `f` applied to each operand and associated type.
+    /// This requirement with `f` applied to each operand, associated type and binder's type.
     pub fn map_types(&self, mut f: impl FnMut(&Type) -> Type) -> TraitRequirement {
         TraitRequirement {
             trait_: self.trait_.clone(),
             args: self.args.iter().map(&mut f).collect(),
             assoc: self.assoc.iter().map(|(n, t)| (n.clone(), f(t))).collect(),
+            binders: self
+                .binders
+                .iter()
+                .map(|(n, t)| (n.clone(), f(t)))
+                .collect(),
             at: self.at,
         }
+    }
+
+    /// This requirement with its binders renamed to `names`, one each: a use proves a
+    /// quantified requirement at binders of its own, which nothing else reads.
+    pub fn with_binders_named(&self, names: &[crate::ccl::Name]) -> TraitRequirement {
+        debug_assert_eq!(names.len(), self.binders.len(), "one name per binder");
+        let terms: Vec<Rc<TypedExpr>> = names
+            .iter()
+            .zip(&self.binders)
+            .map(|(n, (_, t))| Rc::new(crate::ccl::Expr::var(n.clone()).with_ty(t.clone())))
+            .collect();
+        let binders = names
+            .iter()
+            .zip(&self.binders)
+            .map(|(n, (_, t))| (n.clone(), t.clone()))
+            .collect();
+        TraitRequirement {
+            binders,
+            ..self.discharged(&terms)
+        }
+    }
+
+    /// This requirement at the terms `terms`, one per binder, which it no longer binds: an
+    /// application `V(t)` reaching an obligation reads the assumption
+    /// `forall (k: K) Iterable(V(k))` at `t` ([`crate::ccl::subst::discharge_binders`]).
+    pub fn discharged(&self, terms: &[Rc<TypedExpr>]) -> TraitRequirement {
+        let names: Vec<crate::ccl::Name> = self.binders.iter().map(|(n, _)| n.clone()).collect();
+        let at = |t: &Type| crate::ccl::subst::discharge_binders(&names, t, terms);
+        TraitRequirement {
+            trait_: self.trait_.clone(),
+            args: self.args.iter().map(at).collect(),
+            assoc: self.assoc.iter().map(|(n, t)| (n.clone(), at(t))).collect(),
+            binders: Vec::new(),
+            at: self.at,
+        }
+    }
+
+    /// This quantified requirement read where `contribution` stands at operand `pos`: where the
+    /// operand there is a family applied to distinct binders of the requirement, the terms
+    /// `contribution`, an application of the same family, applies it to, so the requirement
+    /// holds of it ([`discharged`](Self::discharged)). `None` where the operand is not such an
+    /// application or `contribution` applies another family. A requirement no `forall`
+    /// quantifies answers only a contribution equal to its operand.
+    pub fn at_application(&self, pos: usize, contribution: &FamilyApp) -> Option<TraitRequirement> {
+        let Type::FamilyApp(stated) = self.args.get(pos)?.peel_refinements() else {
+            return None;
+        };
+        if stated.param != contribution.param {
+            return None;
+        }
+        if self.binders.is_empty() {
+            return (*stated == *contribution).then(|| self.clone());
+        }
+        let mut terms: Vec<Option<Rc<TypedExpr>>> = vec![None; self.binders.len()];
+        for (arg, given) in stated.args.iter().zip(&contribution.args) {
+            let TypedExprNode::Var(n) = &arg.term.node else {
+                return None;
+            };
+            let i = self.binders.iter().position(|(b, _)| b == n)?;
+            if terms[i].is_some() {
+                return None;
+            }
+            terms[i] = Some(Rc::clone(&given.term));
+        }
+        // A binder this operand does not read is not determined by it, and the requirement
+        // states nothing at one value of the binders it reads alone.
+        let terms: Option<Vec<_>> = terms.into_iter().collect();
+        Some(self.discharged(&terms?))
     }
 
     /// The type this requirement associates with `name`, if it names one.
@@ -1854,12 +1936,23 @@ impl TraitRequirement {
     }
 }
 
+/// The member parameter a requirement's associated type `ty` stands for: a type parameter, or a
+/// member family applied to a quantified requirement's binders.
+fn member_param(ty: &Type) -> Option<&Rc<TypeParam>> {
+    match ty {
+        Type::Param(p) => Some(p),
+        Type::FamilyApp(app) => Some(&app.param),
+        _ => None,
+    }
+}
+
 /// The type parameters `ty` is, or a nominal type in it is applied to, through any depth of
-/// nominal types.
+/// nominal types. A family parameter's application is an occurrence of it.
 fn params_at_or_below(ty: &Type) -> impl Iterator<Item = TypeParamId> {
     fn go(ty: &Type, out: &mut Vec<TypeParamId>) {
         match ty {
             Type::Param(p) => out.push(p.id),
+            Type::FamilyApp(app) => out.push(app.param.id),
             Type::Nominal(_, args) => args.iter().for_each(|a| go(a, out)),
             _ => {}
         }
@@ -1892,7 +1985,7 @@ impl PolyType {
             && self.requires.iter().any(|r| {
                 r.assoc
                     .iter()
-                    .any(|(_, t)| matches!(t, Type::Param(p) if p.id == param.id))
+                    .any(|(_, t)| member_param(t).is_some_and(|p| p.id == param.id))
             })
     }
 
@@ -1919,10 +2012,8 @@ impl PolyType {
             let unnamed: Vec<&Rc<TypeParam>> = r
                 .assoc
                 .iter()
-                .filter_map(|(_, t)| match t {
-                    Type::Param(p) if self.is_member(p) && p.spelling.starts_with("_::") => Some(p),
-                    _ => None,
-                })
+                .filter_map(|(_, t)| member_param(t))
+                .filter(|p| self.is_member(p) && p.spelling.starts_with("_::"))
                 .collect();
             if unnamed.is_empty() {
                 continue;
@@ -1940,9 +2031,14 @@ impl PolyType {
             };
             for p in unnamed {
                 let member = &p.spelling["_::".len()..];
+                let spelling = format!("{binder}::{member}");
                 renamed.insert(
                     p.id,
-                    TypeParam::declared(format!("{binder}::{member}").as_str()),
+                    if p.arity > 0 {
+                        TypeParam::declared_family(spelling.as_str(), p.arity)
+                    } else {
+                        TypeParam::declared(spelling.as_str())
+                    },
                 );
             }
         }
@@ -1959,6 +2055,11 @@ impl PolyType {
                 return Type::Param(Rc::clone(to));
             }
             let mut out = ty.clone();
+            if let Type::FamilyApp(app) = &mut out
+                && let Some(to) = renamed.get(&app.param.id)
+            {
+                app.param = Rc::clone(to);
+            }
             out.walk_children_mut(|c| *c = respell(c, renamed));
             out
         }
@@ -1979,9 +2080,9 @@ impl PolyType {
     /// inferred one, is named `r`, numbered apart from the clause's other names.
     pub fn requires_text(&self, mut write: impl FnMut(&Type) -> String) -> Vec<String> {
         let member_binder = |r: &TraitRequirement| {
-            r.assoc.iter().find_map(|(_, t)| match t {
+            r.assoc.iter().find_map(|(_, t)| match member_param(t) {
                 // An unnamed requirement's member is spelled `_::Name`, and printing names it.
-                Type::Param(p) if self.is_member(p) => p
+                Some(p) if self.is_member(p) => p
                     .spelling
                     .split_once("::")
                     .map(|(binder, _)| binder.to_string())
@@ -2008,25 +2109,60 @@ impl PolyType {
         };
         let mut items = Vec::new();
         for r in &self.requires {
+            // A quantified requirement is written under its `forall`, its binders spelled `k`,
+            // `k1`, …, and the bounds on its associated types in the same group.
+            let names: Vec<crate::ccl::Name> = (0..r.binders.len())
+                .map(|i| match i {
+                    0 => crate::ccl::Name::raw("k"),
+                    i => crate::ccl::Name::raw(format!("k{i}").as_str()),
+                })
+                .collect();
+            let r = &if r.binders.is_empty() {
+                (**r).clone()
+            } else {
+                r.with_binders_named(&names)
+            };
+            let mut group = Vec::new();
             let args: Vec<String> = r.args.iter().map(&mut write).collect();
             let binder = member_binder(r).or_else(|| (!r.assoc.is_empty()).then(&mut fresh));
-            items.push(match &binder {
+            group.push(match &binder {
                 Some(b) => format!("{b}: {}({})", r.trait_, args.join(", ")),
                 None => format!("{}({})", r.trait_, args.join(", ")),
             });
-            let Some(binder) = binder else { continue };
-            for (n, t) in &r.assoc {
-                let bound = match t {
-                    Type::Param(p) if self.is_member(p) => self
-                        .params
-                        .iter()
-                        .find(|d| d.param.id == p.id)
-                        .and_then(|d| d.bound().cloned()),
-                    other => Some(other.clone()),
-                };
-                if let Some(bound) = bound {
-                    items.push(format!("{binder}::{n} <: {}", write(&bound)));
+            if let Some(binder) = binder {
+                for (n, t) in &r.assoc {
+                    let bound = match (t, member_param(t)) {
+                        (Type::Param(_), Some(p)) if self.is_member(p) => self
+                            .params
+                            .iter()
+                            .find(|d| d.param.id == p.id)
+                            .and_then(|d| d.bound().cloned()),
+                        (Type::FamilyApp(_), Some(p)) if self.is_member(p) => self
+                            .params
+                            .iter()
+                            .find(|d| d.param.id == p.id)
+                            .and_then(|d| d.kind.family_bound())
+                            .map(|family| crate::ccl::subst::family_at_names(family, &names)),
+                        (other, _) => Some(other.clone()),
+                    };
+                    if let Some(bound) = bound {
+                        group.push(format!("{binder}::{n} <: {}", write(&bound)));
+                    }
                 }
+            }
+            if r.binders.is_empty() {
+                items.extend(group);
+            } else {
+                let binders: Vec<String> = names
+                    .iter()
+                    .zip(&r.binders)
+                    .map(|(n, (_, t))| format!("{n}: {}", write(t)))
+                    .collect();
+                let body = match group.as_slice() {
+                    [one] => one.clone(),
+                    many => format!("({})", many.join(", ")),
+                };
+                items.push(format!("forall ({}) {body}", binders.join(", ")));
             }
         }
         items

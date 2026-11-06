@@ -563,6 +563,9 @@ pub(super) fn lower_def_declared(
     if declared.is_empty() && requires.is_empty() {
         return Ok((func, None));
     }
+    let mut declared = declared;
+    let mut requires = requires;
+    imply_declaration_requirements(&func, &mut declared, &mut requires);
     let mentioned = determined_params(parameter_annotation_params(&func), &declared, &requires);
     if let Some((Some(span), d)) = spans
         .iter()
@@ -584,6 +587,141 @@ pub(super) fn lower_def_declared(
         body: Type::Hole,
     }));
     Ok((func, Some(poly)))
+}
+
+/// Add to a definition's `requires` clause what the declaration of each nominal type its
+/// parameters' annotations apply requires of the arguments it applies it to, where those are the
+/// definition's type parameters: a definition taking a `Groups(K, V)` assumes what `Groups`'s
+/// clause states of `K` and `V` (`docs/chl-spec.md`, "Declaring a nominal type"). Each member
+/// parameter of the declaration's clause is a member parameter of the definition, and a bound
+/// on a family's values bounds the definition's family passed there, where the definition's
+/// clause leaves it unbounded.
+///
+/// An application implies the clause where each argument is a type parameter of the
+/// definition, a family one passed on as itself, `\k -> V(k)`, so the clause is the
+/// declaration's with its parameters renamed. Inference checks any other application where its
+/// annotation is emitted.
+fn imply_declaration_requirements(
+    func: &Expr,
+    declared: &mut Vec<crate::ccl::ty::PolyParam>,
+    requires: &mut Vec<Rc<crate::ccl::ty::TraitRequirement>>,
+) {
+    type Renames = HashMap<crate::ccl::ty::TypeParamId, Rc<crate::ccl::ty::TypeParam>>;
+    fn applications(ty: &Type, out: &mut Vec<Type>) {
+        if let Type::Nominal(decl, _) = ty
+            && decl.requirements().is_some()
+            && !out.contains(ty)
+        {
+            out.push(ty.clone());
+        }
+        ty.walk_children(|c| applications(c, out));
+    }
+    fn respell(ty: &Type, map: &Renames) -> Type {
+        match ty {
+            Type::Param(p) if map.contains_key(&p.id) => {
+                return Type::Param(Rc::clone(&map[&p.id]));
+            }
+            Type::FamilyApp(app) if map.contains_key(&app.param.id) => {
+                let mut app = app.clone();
+                app.param = Rc::clone(&map[&app.param.id]);
+                return Type::FamilyApp(app);
+            }
+            _ => {}
+        }
+        let mut out = ty.clone();
+        out.walk_children_mut(|c| *c = respell(c, map));
+        out
+    }
+    /// The definition's parameter `arg` passes as the declaration's parameter `param`: itself,
+    /// or a family it passes on applied to the family's binders in order.
+    fn passed_param(
+        param: &crate::ccl::ty::TypeParam,
+        arg: &Type,
+        declared: &[crate::ccl::ty::PolyParam],
+    ) -> Option<Rc<crate::ccl::ty::TypeParam>> {
+        let own = |p: &Rc<crate::ccl::ty::TypeParam>| declared.iter().any(|d| d.param.id == p.id);
+        match arg {
+            Type::Param(p) if param.arity == 0 && own(p) => Some(Rc::clone(p)),
+            Type::Family { binders, body } if param.arity == binders.len() => {
+                let Type::FamilyApp(app) = &**body else {
+                    return None;
+                };
+                let in_order = app.args.iter().enumerate().all(|(j, a)| {
+                    matches!(&a.term.node, TypedExprNode::Var(n)
+                        if n.pi_bound_index() == Some((binders.len() - 1 - j) as u32))
+                });
+                (in_order && own(&app.param)).then(|| Rc::clone(&app.param))
+            }
+            _ => None,
+        }
+    }
+    let mut found = Vec::new();
+    let mut node = func;
+    while let TypedExprNode::Lambda { param, body } = &node.node {
+        if let Some(annotation) = &param.user_annotation {
+            applications(annotation, &mut found);
+        }
+        node = body;
+    }
+    for application in found {
+        let Type::Nominal(decl, args) = &application else {
+            unreachable!("collected as an application of a nominal type")
+        };
+        let passed: Option<Vec<Rc<crate::ccl::ty::TypeParam>>> = decl
+            .params
+            .iter()
+            .zip(args)
+            .map(|(p, a)| passed_param(p, a, declared))
+            .collect();
+        let Some(passed) = passed else {
+            continue;
+        };
+        let stated = decl
+            .requirements()
+            .expect("collected as a declaration with requirements");
+        let mut renames: Renames = decl
+            .params
+            .iter()
+            .zip(&passed)
+            .map(|(p, to)| (p.id, Rc::clone(to)))
+            .collect();
+        for m in stated.params.iter().skip(decl.params.len()) {
+            let fresh = if m.param.arity > 0 {
+                crate::ccl::ty::TypeParam::declared_family(m.param.spelling.clone(), m.param.arity)
+            } else {
+                crate::ccl::ty::TypeParam::declared(m.param.spelling.clone())
+            };
+            renames.insert(m.param.id, fresh);
+        }
+        // A bound on a family's values bounds the definition's family passed there.
+        for (p, to) in stated.params.iter().zip(&passed) {
+            let Some(bound) = p.kind.family_bound() else {
+                continue;
+            };
+            let Some(slot) = declared.iter_mut().find(|d| d.param.id == to.id) else {
+                continue;
+            };
+            if slot.kind.family_bound().is_some() {
+                continue;
+            }
+            let domains = slot.kind.family_domains().unwrap_or_default().to_vec();
+            slot.kind = crate::ccl::ty::TypeKind::family(domains, Some(respell(bound, &renames)));
+            slot.bound_at = p.bound_at;
+        }
+        for m in stated.params.iter().skip(decl.params.len()) {
+            declared.push(crate::ccl::ty::PolyParam {
+                param: Rc::clone(&renames[&m.param.id]),
+                kind: m.kind.map_children(|t| respell(t, &renames)),
+                bound_at: m.bound_at,
+            });
+        }
+        requires.extend(
+            stated
+                .requires
+                .iter()
+                .map(|r| Rc::new(r.map_types(|t| respell(t, &renames)))),
+        );
+    }
 }
 
 /// The type parameters a call's arguments determine (`docs/chl-spec.md`, "Type
