@@ -968,7 +968,7 @@ fn pin_empty_list_element(list_ty: &Type, ctx: &mut CoalesceCtx) {
         return;
     }
     let chosen = payload_pin(codomain, ctx);
-    let pinned = pin_both_ways(&chosen, codomain);
+    let pinned = pin_both_ways(&chosen, codomain).map(|()| pin_open_components(&chosen, ctx));
     // **Reported, not asserted.** `position_type` takes the first answer, and the premise
     // that every other position still accepts it holds for the unreachable arm payload the
     // rule came from — one position, one demand. An empty literal is ordinary reachable
@@ -978,6 +978,27 @@ fn pin_empty_list_element(list_ty: &Type, ctx: &mut CoalesceCtx) {
     if let Err(err) = pinned {
         let label = "this empty collection".to_string();
         ctx.push_error(map_constrain_err(err, &label));
+    }
+}
+
+/// Pin each component of a pinned tuple that no value reaches, as the tuple was: a position
+/// can fix an empty literal's element to a product, `map`'s pair, whose components only
+/// demands reach.
+fn pin_open_components(chosen: &Type, ctx: &mut CoalesceCtx) {
+    let Type::Tuple(components) = chosen.peel_refinements() else {
+        return;
+    };
+    for component in components {
+        if value_reaches(component) {
+            continue;
+        }
+        let pinned = payload_pin(component, ctx);
+        if let Err(err) = pin_both_ways(&pinned, component) {
+            let label = format!("empty collection literal's component pinned to `{pinned}`");
+            ctx.push_error(map_constrain_err(err, &label));
+            continue;
+        }
+        pin_open_components(&pinned, ctx);
     }
 }
 
@@ -1178,17 +1199,34 @@ enum PositionStep {
     Input,
     /// Its output side.
     Output,
+    /// The base of a candidate the sum's witness at this index lists. A variable there is a
+    /// candidate's key type, not a value at a position, and the only answer read there is
+    /// another candidate's base ([`position_answer`]).
+    Candidate(usize),
 }
 
 /// Every [`Type::Infer`] in `ty`, with the position it occupies.
 ///
 /// Kinds and polymorphic types are not entered: a variable there stands for a candidate or
-/// a quantified type, not a value at a position.
+/// a quantified type, not a value at a position. The one exception is the bare base of a
+/// candidate a sum's witness lists, at [`PositionStep::Candidate`].
 fn for_each_positioned_var(
     ty: &Type,
     path: &mut Vec<PositionStep>,
     f: &mut impl FnMut(&Rc<crate::ccl::infer_var::InferVar>, &[PositionStep]),
 ) {
+    for (i, witness) in ty.sum().into_iter().flatten().enumerate() {
+        let crate::ccl::ty::TypeKind::Enumerated(candidates) = witness.type_kind() else {
+            continue;
+        };
+        for candidate in &candidates {
+            if let Type::Infer(base) = candidate.peel_refinements() {
+                path.push(PositionStep::Candidate(i));
+                f(base, path);
+                path.pop();
+            }
+        }
+    }
     let mut step = |child: &Type, s: PositionStep, path: &mut Vec<PositionStep>| {
         path.push(s);
         for_each_positioned_var(child, path, f);
@@ -1514,7 +1552,50 @@ fn position_answer(
             return Some(answer);
         }
     }
+    // A recorded membership in `SubtypesOf(𝑈)` is a demand as an upper bound is: the variable
+    // stands for a type below `𝑈`, and `𝑈` is one. One recorded on a suspension of the variable,
+    // where an edge read it through a substitution, is a demand on it too.
+    let mut kinds = v.bounds.borrow().type_kinds.clone();
+    kinds.extend(crate::ccl::infer_var::suspended_kinds_over(v));
+    for k in kinds.iter() {
+        if let crate::ccl::ty::TypeKind::SubtypesOf(b) = k
+            && let Ok(resolved) = resolve_var_type(b)
+            && let Some(answer) = offer(&resolved, partial)
+        {
+            return Some(answer);
+        }
+    }
     for Occurrence { holder, position } in index.of(v.uid) {
+        // A candidate's base: the other candidates the same witness lists in the holder's lower
+        // bounds are collections joined with this one, and their key type is a use of its key
+        // type, as a joined value is a use of an empty literal's element
+        // (`src/ccl/design/collections.md`, "The empty collection's key type comes from its
+        // uses").
+        if let Some((PositionStep::Candidate(i), at)) = position.split_last() {
+            let lower = Rc::clone(holder.bounds.borrow().lower());
+            for b in lower.iter() {
+                let bound_ty = b.render_subst().apply_type(&b.ty);
+                let Some(witness) = read_at(&bound_ty, at)
+                    .and_then(|sum| sum.peel_refinements().sum())
+                    .and_then(|ws| ws.get(*i))
+                else {
+                    continue;
+                };
+                let crate::ccl::ty::TypeKind::Enumerated(candidates) = witness.type_kind() else {
+                    continue;
+                };
+                // The key type, without what a candidate's own elements refine it to: the
+                // candidate's domain states its membership, and the joined one states its own.
+                for candidate in &candidates {
+                    if let Ok(resolved) = resolve_var_type(candidate.peel_refinements())
+                        && let Some(answer) = offer(resolved.peel_refinements(), partial)
+                    {
+                        return Some(answer);
+                    }
+                }
+            }
+            continue;
+        }
         let holder_ty = Type::Infer(Rc::clone(&holder));
         if let Ok(reading) = coalesce_positive(&holder_ty)
             && let Some(at) = read_at(&reading, &position)
