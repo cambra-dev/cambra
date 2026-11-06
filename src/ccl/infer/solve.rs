@@ -4,13 +4,14 @@
 
 use crate::ccl::Label;
 use crate::ccl::infer::api::RelatedPositions;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{PredMemo, canonical_cast_ty};
 use crate::ccl::infer::InferError;
 use crate::ccl::infer::emit::{read_mut, read_through};
 use crate::ccl::infer::solver::barrier::EdgeReport;
+use crate::ccl::infer::solver::coalesce::FailedPosition;
 use crate::ccl::infer::solver::traits::{
     Assoc, Implementation, InstanceBody, InstanceHead, InstanceTable, OperatorCall, Signature,
     TraitInstance, function_over, replace_params,
@@ -32,23 +33,14 @@ use crate::ccl::{
 use super::context::should_generalize;
 use super::{LocatedInferError, map_coalesce_err, map_constrain_err};
 
-/// Push `new_err` onto `errors`, deduplicating [`InferError::IncompatibleBounds`],
-/// [`InferError::OpaqueEscape`] and [`InferError::NoJoinOverBinder`].
+/// Push `new_err` onto `errors`, blamed on `blame`, dropping a repeat of an
+/// [`InferError::OpaqueEscape`] or an [`InferError::NoJoinOverBinder`].
 ///
-/// If an existing error has the same `(polarity, conflicting)` key, `blame` joins its
-/// [`LocatedInferError::also`] instead of pushing a duplicate. An `OpaqueEscape` naming the same binders as an
-/// existing one is dropped: each specialization of a function copies its barrier
-/// variable, and every copy reports it. A `NoJoinOverBinder` is one fact about one
-/// contribution, which every node whose type reaches the target's variable meets
-/// again, so a second report of the same binders and keys is dropped. All other
-/// error kinds are pushed as-is.
-///
-/// `blame` is the node whose rule raised `new_err`. A merged
-/// `IncompatibleBounds` keeps the *first* contributing node: a bounds conflict
-/// has no single site by nature — the same variable was constrained in several
-/// places — so the blame is the site where the conflict was first detected, and the
-/// later sites' nodes land in [`LocatedInferError::also`], so each copy of a run's code
-/// that raised it is labelled at its run.
+/// An `OpaqueEscape` naming the same binders as an existing one is dropped: each
+/// specialization of a function copies its barrier variable, and every copy reports it. A
+/// `NoJoinOverBinder` equal to an existing one is the same contribution met again. A
+/// failure to resolve a node's type is pushed by [`CoalesceCtx::push_read_error`], which
+/// drops the nodes that only carry a defect already reported.
 fn push_coalesce_err(errors: &mut Vec<LocatedInferError>, new_err: InferError, blame: NodeId) {
     if let InferError::OpaqueEscape { names, .. } = &new_err
         && errors.iter().any(
@@ -57,60 +49,17 @@ fn push_coalesce_err(errors: &mut Vec<LocatedInferError>, new_err: InferError, b
     {
         return;
     }
-    // One conflict between two widths, which every node whose type reaches the variable
-    // meets again.
-    if let InferError::TupleWidthConflict { widths, .. } = &new_err
-        && errors.iter().any(|e| {
-            matches!(&e.error, InferError::TupleWidthConflict { widths: seen, .. } if seen == widths)
-        })
-    {
-        return;
-    }
     if let InferError::NoJoinOverBinder { .. } = &new_err
         && errors.iter().any(|e| e.error == new_err)
     {
         return;
     }
-    if let InferError::IncompatibleBounds {
-        polarity: p,
-        conflicting: ref c,
-        ..
-    } = new_err
-    {
-        let key = (p, c.clone());
-        let existing = errors.iter_mut().find_map(|e| {
-            if let InferError::IncompatibleBounds {
-                polarity,
-                conflicting,
-                ..
-            } = &e.error
-                && *polarity == key.0
-                && conflicting == &key.1
-            {
-                return Some((e.node_id, &mut e.also));
-            }
-            None
-        });
-        if let Some((first, also)) = existing {
-            if blame != first && !also.contains(&blame) {
-                *also = also.iter().copied().chain([blame]).collect();
-            }
-        } else {
-            errors.push(LocatedInferError {
-                error: new_err,
-                node_id: blame,
-                also: Box::default(),
-                related: RelatedPositions::default(),
-            });
-        }
-    } else {
-        errors.push(LocatedInferError {
-            error: new_err,
-            node_id: blame,
-            also: Box::default(),
-            related: RelatedPositions::default(),
-        });
-    }
+    errors.push(LocatedInferError {
+        error: new_err,
+        node_id: blame,
+        also: Box::default(),
+        related: RelatedPositions::default(),
+    });
 }
 
 /// State for coalescing and in-walk specialization.
@@ -172,6 +121,12 @@ pub(super) struct CoalesceCtx {
     /// recorded on one side of an edge, so the two are related when either reaches the
     /// other's variables.
     failed_type_vars: HashMap<NodeId, std::collections::HashSet<InferVarId>>,
+    /// For each node a failure to resolve a type was reported at, each failing position and
+    /// the message reporting it ([`push_read_error`](Self::push_read_error)).
+    reported_at: HashMap<NodeId, Vec<(FailedPosition, String)>>,
+    /// For each error a walk of a discarded definition kept, the node of the source tree
+    /// it was raised at ([`source_node`](Self::source_node)).
+    discarded_sources: HashMap<NodeId, NodeId>,
     /// Whether a **discarded** subtree is being walked — a dead generalized
     /// definition, resolved for its diagnostics and then dropped
     /// ([`typecheck_discarded_definition`]).
@@ -252,6 +207,62 @@ impl CoalesceCtx {
             .entry(self.current_node)
             .or_default()
             .extend(reachable_vars(ty));
+        self.push_read_error(ty, error);
+    }
+
+    /// The node `node` copies in the tree the walk started from: through each
+    /// specialization the walk is inside, innermost first, to the definition's node its
+    /// clone copies. A node a specialization minted copies none and is its own.
+    fn source_node(&self, node: NodeId) -> NodeId {
+        self.specializing
+            .iter()
+            .rev()
+            .fold(node, |at, spec| spec.copies.get(&at).copied().unwrap_or(at))
+    }
+
+    /// [`push_error`](Self::push_error) for a failure to resolve `ty`, unless the node only
+    /// carries a defect already reported.
+    ///
+    /// A defect is one failing position of the graph, and every node whose type reads that
+    /// position meets it again: the literal joining `1` and `"a"`, the binding holding it,
+    /// each use of the binding, and each value built from a use ([`failing_position`]). The
+    /// node that reports it is the first the walk meets, which is the innermost, since the
+    /// walk resolves a node's children before the node. A later failure carries a reported
+    /// one when its message is the reported one's and its position meets the reported one
+    /// ([`meets_reported`]), and its node joins the reported error's
+    /// [`LocatedInferError::also`]. Two positions that fail alike over different values are
+    /// two defects, and each is reported.
+    fn push_read_error(&mut self, ty: &Type, error: InferError) {
+        self.push_position_error(failing_position(ty), error);
+    }
+
+    /// [`push_read_error`](Self::push_read_error) for a failure at a known position.
+    fn push_position_error(&mut self, position: Option<FailedPosition>, error: InferError) {
+        let node = self.current_node;
+        let Some(position) = position else {
+            self.push_error(error);
+            return;
+        };
+        // Compared as a reader sees them: two nodes holding one type can spell its
+        // predicates' binders apart, and a message prints neither binder nor site.
+        let message = format!("{error:?}");
+        let reported_at = &self.reported_at;
+        let carried = self.errors.iter_mut().find(|e| {
+            reported_at.get(&e.node_id).is_some_and(|seen| {
+                seen.iter()
+                    .any(|(seen, said)| *said == message && meets_reported(seen, &position))
+            }) && format!("{:?}", e.error) == message
+        });
+        if let Some(reported) = carried {
+            if reported.node_id != node && !reported.also.contains(&node) {
+                reported.also = reported.also.iter().copied().chain([node]).collect();
+            }
+            return;
+        }
+        self.reported_at
+            .entry(node)
+            .or_default()
+            .push((position, message));
         self.push_error(error);
     }
 
@@ -825,10 +836,7 @@ struct Specialization {
 }
 
 /// The names and the witnesses a predicate reads free ([`share_with_its_origin`]).
-type PredicateReads = (
-    std::collections::BTreeSet<Name>,
-    std::collections::BTreeSet<crate::ccl::ty::WitnessId>,
-);
+type PredicateReads = (BTreeSet<Name>, BTreeSet<crate::ccl::ty::WitnessId>);
 
 /// The coalesced predicates made from one origin ([`CoalesceCtx::coalesced_by_origin`]).
 struct CoalescedFromOrigin {
@@ -1606,6 +1614,8 @@ pub(super) fn coalesce_pass(
         definition_telescopes,
         current_node: expr.node_id(),
         failed_type_vars: HashMap::new(),
+        reported_at: HashMap::new(),
+        discarded_sources: HashMap::new(),
         lambda_params: Vec::new(),
         errors: Vec::new(),
         pred_memo: PredMemo::new(),
@@ -1658,7 +1668,7 @@ pub(super) fn coalesce_pass(
 /// See `src/ccl/design/type-inference.md`, "The witness context".
 pub(super) fn check_scope_valid(
     expr: &Expr,
-    scope: &std::collections::BTreeSet<Name>,
+    scope: &BTreeSet<Name>,
     errors: &mut Vec<LocatedInferError>,
 ) {
     // An opaque binder's name is not discharged when a type leaves its scope
@@ -1675,7 +1685,7 @@ pub(super) fn check_scope_valid(
 
 /// Every [opaque](crate::ccl::BindingTransparency::Opaque) `let` binder in the
 /// tree.
-fn collect_opaque_binders(expr: &Expr, out: &mut std::collections::BTreeSet<Name>) {
+fn collect_opaque_binders(expr: &Expr, out: &mut BTreeSet<Name>) {
     if let TypedExprNode::Let { binding, .. } = &expr.node
         && binding.transparency == BindingTransparency::Opaque
     {
@@ -1684,11 +1694,7 @@ fn collect_opaque_binders(expr: &Expr, out: &mut std::collections::BTreeSet<Name
     expr.walk_children(|c| collect_opaque_binders(c, out));
 }
 
-fn check_scope_valid_go(
-    expr: &Expr,
-    scope: &std::collections::BTreeSet<Name>,
-    errors: &mut Vec<LocatedInferError>,
-) {
+fn check_scope_valid_go(expr: &Expr, scope: &BTreeSet<Name>, errors: &mut Vec<LocatedInferError>) {
     // The construction boundary holds from the outside too: a coalesced type is
     // stored, so every dependent function in it spells its own binder as an index.
     // The opening tripwires (`subst::open_codomain`, this file's `Fun`/`Fun` arm)
@@ -1734,7 +1740,7 @@ fn check_scope_valid_go(
     // The binders are the ones `for_each_scoped_item` states for every node, so a node that
     // introduces one is checked under it without this walk restating which nodes bind. A
     // scope's children are consecutive, so one extended set serves the whole run.
-    let mut opened: Option<(Binders<'_>, std::collections::BTreeSet<Name>)> = None;
+    let mut opened: Option<(Binders<'_>, BTreeSet<Name>)> = None;
     for_each_scoped_item(expr, &mut |item| {
         let ScopedItem::Child {
             expr: child,
@@ -1778,6 +1784,41 @@ pub(crate) fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
         assert_resolves_in_scope(v, &resolved);
     }
     Ok(resolved)
+}
+
+/// The position where `ty` fails to resolve, or `None` where the failure names none.
+///
+/// [`resolve_var_type`] coalesces the simplified graph, and simplification drops variables
+/// from positions. It drops no contribution, so the unsimplified graph fails at the same
+/// position, which still lists them.
+fn failing_position(ty: &Type) -> Option<FailedPosition> {
+    let compacted = compact_type(ty);
+    let error =
+        crate::ccl::infer::solver::coalesce::refuse_param_joined_with_outer_variable(&compacted)
+            .and_then(|()| coalesce_compact(&compacted).map(drop))
+            .err()?;
+    error.position().cloned()
+}
+
+/// Whether a failure at `later` meets the defect reported at `reported`: the variables merged
+/// at one include the other's, or the births of the contributions at one include the other's.
+///
+/// A variable a failing position merges carries the conflict to every position merging it.
+/// Closing an edge copies a variable's concrete bounds to the next one, and a copy keeps the
+/// birth of what it copies, so a position the conflict reached only by copies merges none of
+/// the failing variables and is known by the births. A position holding every contribution
+/// born where the other's were holds the values that conflicted there.
+fn meets_reported(reported: &FailedPosition, later: &FailedPosition) -> bool {
+    fn nested<T: Ord>(a: &BTreeSet<T>, b: &BTreeSet<T>) -> bool {
+        !a.is_empty() && !b.is_empty() && (a.is_subset(b) || b.is_subset(a))
+    }
+    let vars = |p: &FailedPosition| p.vars.iter().copied().collect::<BTreeSet<InferVarId>>();
+    nested(&vars(reported), &vars(later))
+        || reported
+            .origins
+            .known()
+            .zip(later.origins.known())
+            .is_some_and(|(a, b)| nested(a, b))
 }
 
 /// Hold a variable to the invariant every vacuity test relies on: it resolves to a type naming
@@ -1940,7 +1981,11 @@ fn decide_memberships(
                 resolved: Box::new(m.found.clone()),
                 type_kind: m.kind,
             };
-            ctx.push_type_error(&m.found, map_coalesce_err(err, label));
+            ctx.failed_type_vars
+                .entry(ctx.current_node)
+                .or_default()
+                .extend(reachable_vars(&m.found));
+            ctx.push_position_error(Some(m.position), map_coalesce_err(err, label));
         }
     }
 }
@@ -3290,8 +3335,8 @@ fn names_no_variable(ty: &Type) -> bool {
 
 /// The names the arguments reaching a use read: each parameter's domain as the values flowing
 /// into it make it, through a curried function's codomains.
-fn argument_reads(ty: &Type) -> std::collections::BTreeSet<Name> {
-    let mut read = std::collections::BTreeSet::new();
+fn argument_reads(ty: &Type) -> BTreeSet<Name> {
+    let mut read = BTreeSet::new();
     let mut at = ty;
     while let Type::Fun {
         domain, codomain, ..
@@ -3345,7 +3390,7 @@ pub(super) fn specialize_use(
             };
             frame.failed_uses.push((error.clone(), carried));
             frame.failed_use_nodes.insert(node);
-            ctx.push_error(error);
+            ctx.push_read_error(&use_expr.ty, error);
             return;
         }
     };
@@ -4312,19 +4357,21 @@ fn typecheck_discarded_definition(
     // function, fifteen diagnostics for one bug). Walking per clone is right, since
     // the body can depend on the enclosing instantiation and so can fail in one and
     // not another; reporting the *same* diagnostic again is not. Drop a new error
-    // that repeats one already reported.
+    // that an earlier walk raised at a copy of the same node.
     //
-    // Compared only against what preceded this walk, never within it: a walk's own
-    // shape — one report per node whose type carries the defect — is what coalesce
-    // does everywhere, and dead code should read the same as live code.
+    // Compared only against what preceded this walk, never within it: a walk reports
+    // one error per defect already ([`CoalesceCtx::push_read_error`]), and dead code
+    // should read the same as live code.
     let mut i = before;
     while i < ctx.errors.len() {
-        if ctx.errors[..before]
-            .iter()
-            .any(|seen| seen.error == ctx.errors[i].error)
-        {
+        let source = ctx.source_node(ctx.errors[i].node_id);
+        if ctx.errors[..before].iter().any(|seen| {
+            ctx.discarded_sources.get(&seen.node_id) == Some(&source)
+                && seen.error == ctx.errors[i].error
+        }) {
             ctx.errors.remove(i);
         } else {
+            ctx.discarded_sources.insert(ctx.errors[i].node_id, source);
             i += 1;
         }
     }

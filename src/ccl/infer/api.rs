@@ -2240,18 +2240,21 @@ fn check_annotated(expr: &Expr, strictness: Strictness) -> Result<(), Vec<Locate
     let mut errors = Vec::new();
     let mut seen: HashSet<crate::ccl::PredicateId> = HashSet::new();
     collect_expr_errors(expr, strictness, &mut errors, &mut seen);
-    // An unfixed width reaches every node and binder its tuple's type does, so it is
-    // reported once per tuple.
-    let (open, mut errors): (Vec<_>, Vec<_>) = errors
+    // An unfixed width or an undetermined type reaches every node and binder its value's
+    // type does, so it is reported once per value.
+    let (open, errors): (Vec<_>, Vec<_>) = errors
         .into_iter()
         .partition(|e| matches!(e.error, InferError::UnresolvedTupleWidth { .. }));
+    let (undetermined, mut errors): (Vec<_>, Vec<_>) = errors
+        .into_iter()
+        .partition(|e| matches!(e.error, InferError::UnresolvedInfer { .. }));
     // The positions of an open tuple are variables nothing fixes, and every node they flow
     // to holds one too. Those are the width's consequences, so they are not reported beside
     // it: a variable that stays unresolved once the widths are fixed is reported then.
-    if !open.is_empty() {
-        errors.retain(|e| !matches!(e.error, InferError::UnresolvedInfer { .. }));
+    if open.is_empty() {
+        errors.extend(one_per_value(expr, undetermined));
     }
-    errors.extend(one_per_unfixed_width(expr, open));
+    errors.extend(one_per_value(expr, open));
     if errors.is_empty() {
         Ok(())
     } else {
@@ -2259,23 +2262,28 @@ fn check_annotated(expr: &Expr, strictness: Strictness) -> Result<(), Vec<Locate
     }
 }
 
-/// The reports of `open`, each an [`InferError::UnresolvedTupleWidth`] raised at a node or
-/// binder of `expr`, one per tuple whose width nothing fixed.
+/// The reports of `raised`, errors of one kind raised at nodes and binders of `expr` for a
+/// value whose type every node holding the value carries, one per value: an unfixed tuple
+/// width, an undetermined type, a `Mut` inside a composite type.
 ///
-/// An open type reaches every node and binder that holds the tuple, so a report is a
-/// candidate only at the innermost: a node whose subtree raises no other. A projection's open
-/// domain is its argument's tuple, so it is dropped where its argument reports. The candidates
-/// are then grouped by the tuple they hold, which the tree shows as flow: a variable is its
-/// binder's tuple, a `let` binder holds its bound expression's, a lambda applied to an
-/// argument holds the argument's, and an application holds the tuple of a function or argument
-/// that is itself open. The first candidate of each group, in evaluation order, is reported.
-fn one_per_unfixed_width(expr: &Expr, open: Vec<LocatedInferError>) -> Vec<LocatedInferError> {
+/// The defect reaches every node and binder that holds the value, so a report is a
+/// candidate only at the innermost: a node whose subtree raises no other. A projection's
+/// domain is its argument's value, so it is dropped where its argument reports. The candidates
+/// are then grouped by the value they hold, which the tree shows as flow: a variable is its
+/// binder's value, a `let` binder holds its bound expression's, a lambda applied to an
+/// argument holds the argument's, and an application holds the value of a function or
+/// argument that itself reports. The first candidate of each group, in evaluation order, is
+/// reported.
+fn one_per_value(expr: &Expr, raised: Vec<LocatedInferError>) -> Vec<LocatedInferError> {
+    if raised.is_empty() {
+        return raised;
+    }
     struct Walk<'a> {
         raised: HashSet<NodeId>,
         scope: Vec<(&'a Name, NodeId)>,
-        /// Each candidate with the node standing for the tuple it holds.
+        /// Each candidate with the node standing for the value it holds.
         candidates: Vec<(NodeId, NodeId)>,
-        /// Union-find parent of a node standing for a tuple, absent for a root.
+        /// Union-find parent of a node standing for a value, absent for a root.
         parent: HashMap<NodeId, NodeId>,
     }
     impl<'a> Walk<'a> {
@@ -2293,8 +2301,8 @@ fn one_per_unfixed_width(expr: &Expr, open: Vec<LocatedInferError>) -> Vec<Locat
             }
         }
 
-        /// The node standing for the tuple `e` holds: its binder for a variable, else itself.
-        fn tuple_of(&self, e: &Expr) -> NodeId {
+        /// The node standing for the value `e` holds: its binder for a variable, else itself.
+        fn value_of(&self, e: &Expr) -> NodeId {
             match &e.node {
                 TypedExprNode::Var(name) => self
                     .scope
@@ -2306,11 +2314,11 @@ fn one_per_unfixed_width(expr: &Expr, open: Vec<LocatedInferError>) -> Vec<Locat
             }
         }
 
-        /// Hold `e` and `child` to one tuple where both are open, for a node that reads or
+        /// Hold `e` and `child` to one value where both report, for a node that reads or
         /// passes on its child's value: a lambda and its body, a cast, a realization.
         fn join_open_child(&mut self, e: &Expr, child: &Expr) {
             if self.raised.contains(&e.node_id()) && self.raised.contains(&child.node_id()) {
-                let held = self.tuple_of(child);
+                let held = self.value_of(child);
                 self.union(e.node_id(), held);
             }
         }
@@ -2343,7 +2351,7 @@ fn one_per_unfixed_width(expr: &Expr, open: Vec<LocatedInferError>) -> Vec<Locat
                 } => {
                     below |= self.go(bound_expr);
                     if self.raised.contains(&bound_expr.node_id()) {
-                        let held = self.tuple_of(bound_expr);
+                        let held = self.value_of(bound_expr);
                         self.union(e.node_id(), held);
                     }
                     self.scope.push((&binding.name, e.node_id()));
@@ -2364,13 +2372,13 @@ fn one_per_unfixed_width(expr: &Expr, open: Vec<LocatedInferError>) -> Vec<Locat
                     if matches!(function.node, TypedExprNode::Lambda { .. })
                         && self.raised.contains(&argument.node_id())
                     {
-                        let held = self.tuple_of(argument);
+                        let held = self.value_of(argument);
                         self.union(function.node_id(), held);
                     }
                     if self.raised.contains(&e.node_id()) {
                         for child in [&**function, &**argument] {
                             if self.raised.contains(&child.node_id()) {
-                                let held = self.tuple_of(child);
+                                let held = self.value_of(child);
                                 self.union(e.node_id(), held);
                             }
                         }
@@ -2380,13 +2388,13 @@ fn one_per_unfixed_width(expr: &Expr, open: Vec<LocatedInferError>) -> Vec<Locat
             }
             let raised = self.raised.contains(&e.node_id());
             if raised && !below {
-                self.candidates.push((e.node_id(), self.tuple_of(e)));
+                self.candidates.push((e.node_id(), self.value_of(e)));
             }
             below || raised
         }
     }
     let mut walk = Walk {
-        raised: open.iter().map(|e| e.node_id).collect(),
+        raised: raised.iter().map(|e| e.node_id).collect(),
         scope: Vec::new(),
         candidates: Vec::new(),
         parent: HashMap::new(),
@@ -2396,12 +2404,23 @@ fn one_per_unfixed_width(expr: &Expr, open: Vec<LocatedInferError>) -> Vec<Locat
     let kept: HashSet<NodeId> = walk
         .candidates
         .iter()
-        .filter(|(_, tuple)| held.insert(walk.find(*tuple)))
+        .filter(|(_, value)| held.insert(walk.find(*value)))
         .map(|(node, _)| *node)
         .collect();
+    // The walk follows the tree's flow and does not enter a refinement's predicate, so a
+    // report raised in one is kept as raised.
+    fn tree_nodes(e: &Expr, out: &mut HashSet<NodeId>) {
+        out.insert(e.node_id());
+        e.walk_children(|child| tree_nodes(child, out));
+    }
+    let mut in_tree = HashSet::new();
+    tree_nodes(expr, &mut in_tree);
     let mut once = HashSet::new();
-    open.into_iter()
-        .filter(|e| kept.contains(&e.node_id) && once.insert(e.node_id))
+    raised
+        .into_iter()
+        .filter(|e| {
+            (kept.contains(&e.node_id) || !in_tree.contains(&e.node_id)) && once.insert(e.node_id)
+        })
         .collect()
 }
 
@@ -2639,7 +2658,7 @@ fn collect_type_errors(
         }
         // A position is open until its width is fixed, and a value has one width
         // (`docs/chl-spec.md`, "Tuple width"). Reported once, not again for its positions;
-        // `check_annotated` then keeps one report per tuple (`one_per_unfixed_width`). A
+        // `check_annotated` then keeps one report per tuple (`one_per_value`). A
         // position nothing reached is written `_`, as a reader would.
         Type::OpenTuple(_) => {
             let mut open = ty.clone();
@@ -2916,6 +2935,12 @@ pub fn check_mut_discipline(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
     collect_anf_temps(expr, &mut anf);
     let mut errors = Vec::new();
     check_mut_discipline_go(expr, &anf, &mut errors);
+    // A function returning a mutable variable carries it at the lambda, its binding and each
+    // use, so a nested `Mut` is reported once per value.
+    let (nested, mut errors): (Vec<_>, Vec<_>) = errors
+        .into_iter()
+        .partition(|e| matches!(e.error, InferError::MutInCompositeType { .. }));
+    errors.extend(one_per_value(expr, nested));
     if errors.is_empty() {
         Ok(())
     } else {
