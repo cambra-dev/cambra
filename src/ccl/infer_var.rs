@@ -75,6 +75,12 @@ pub(crate) fn fresh_infer_var_id() -> InferVarId {
     InferVarId(INFER_VAR_COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
+/// The id the next variable minted will take: every variable already minted has a smaller one.
+#[cfg(debug_assertions)]
+pub(crate) fn next_infer_var_id() -> InferVarId {
+    InferVarId(INFER_VAR_COUNTER.load(Ordering::Relaxed))
+}
+
 /// Reset the inference variable counter to zero.
 ///
 /// For use in tests that need predictable `InferVarId` values in output.
@@ -1061,6 +1067,52 @@ impl InferVar {
             }
         });
         var
+    }
+}
+
+/// One entry per field of an [`InferVar`], for a copy of a variable to name each field it carries
+/// or leaves, with why ([`InferVar::fields`]). A field added to the variable fails to compile in
+/// `fields`, and then at every copy that destructures this.
+pub(crate) struct InferVarFields {
+    pub(crate) uid: (),
+    pub(crate) level: (),
+    pub(crate) telescope: (),
+    pub(crate) bounds: (),
+    pub(crate) fun_kind: (),
+    pub(crate) watches: (),
+    pub(crate) suspensions: (),
+    pub(crate) named_domain: (),
+    pub(crate) stands_for: (),
+    pub(crate) witness_scopes: (),
+}
+
+impl InferVar {
+    /// [`InferVarFields`], listed by destructuring this variable exhaustively.
+    pub(crate) fn fields(&self) -> InferVarFields {
+        let InferVar {
+            uid: _,
+            level: _,
+            telescope: _,
+            bounds: _,
+            fun_kind: _,
+            watches: _,
+            suspensions: _,
+            named_domain: _,
+            stands_for: _,
+            witness_scopes: _,
+        } = self;
+        InferVarFields {
+            uid: (),
+            level: (),
+            telescope: (),
+            bounds: (),
+            fun_kind: (),
+            watches: (),
+            suspensions: (),
+            named_domain: (),
+            stands_for: (),
+            witness_scopes: (),
+        }
     }
 }
 

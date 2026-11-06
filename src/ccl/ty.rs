@@ -511,6 +511,12 @@ impl fmt::Display for FunKindVarId {
 
 static FUN_KIND_VAR_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// The id the next funkind variable minted will take: every one already minted has a smaller one.
+#[cfg(debug_assertions)]
+pub(crate) fn next_fun_kind_var_id() -> FunKindVarId {
+    FunKindVarId(FUN_KIND_VAR_COUNTER.load(Ordering::Relaxed))
+}
+
 #[cfg(debug_assertions)]
 thread_local! {
     /// Every kind variable minted on this thread, for [`dump_kind_vars`]. Diagnostic only —
@@ -751,6 +757,40 @@ thread_local! {
 
 fn kind_fact_written() {
     KIND_FACTS.with(|n| n.set(n.get() + 1));
+}
+
+/// One entry per field of a [`FunKindVar`], for a copy of a funkind variable to name each field it
+/// carries or leaves, with why ([`FunKindVar::fields`]). A field added to it fails to compile in
+/// `fields`, and then at every copy that destructures this.
+pub(crate) struct FunKindVarFields {
+    pub(crate) uid: (),
+    pub(crate) hole: (),
+    pub(crate) level: (),
+    pub(crate) bounds: (),
+    pub(crate) resolved_at: (),
+    pub(crate) component_at: (),
+}
+
+impl FunKindVar {
+    /// [`FunKindVarFields`], listed by destructuring this funkind variable exhaustively.
+    pub(crate) fn fields(&self) -> FunKindVarFields {
+        let FunKindVar {
+            uid: _,
+            hole: _,
+            level: _,
+            bounds: _,
+            resolved_at: _,
+            component_at: _,
+        } = self;
+        FunKindVarFields {
+            uid: (),
+            hole: (),
+            level: (),
+            bounds: (),
+            resolved_at: (),
+            component_at: (),
+        }
+    }
 }
 
 impl FunKindVar {
