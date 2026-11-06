@@ -1282,8 +1282,6 @@ struct Beneath {
 pub(super) struct LiveLeaf {
     pub(super) consumer: SharedConsumer,
     pub(super) source: LiveSource,
-    /// The range's producer, by the name it releases the source under.
-    pub(super) producer: String,
 }
 
 /// A live source, as a range over its domain reads it.
@@ -1390,14 +1388,7 @@ impl Planner {
             return Beneath::default();
         }
         let (leaf, live) = match (leaf, sources.into_iter().next()) {
-            (Some(consumer), Some(source)) => (
-                None,
-                Some(LiveLeaf {
-                    consumer,
-                    source,
-                    producer: producer.name(),
-                }),
-            ),
+            (Some(consumer), Some(source)) => (None, Some(LiveLeaf { consumer, source })),
             (leaf, _) => (leaf, None),
         };
         below.live.extend(live);
@@ -2119,9 +2110,6 @@ struct LivePipeline {
     /// The regions the pipeline's own ranges bring, which no live source yields and no arrival
     /// names: notified with the first poll, and empty after.
     starts: Vec<TileGuard>,
-    /// Whether the pipeline has been polled. The first poll lands as decided what each range
-    /// starts notified of: an earlier run consumed it, and a source yields a key once for good.
-    polled: bool,
     closed: bool,
 }
 
@@ -2135,21 +2123,13 @@ impl LivePipeline {
     ) -> Self {
         Self {
             pipeline,
-            // A range starts notified of what it has released of its source: a run after a pause
-            // or a reload notifies nothing the range has finished with, and a range a reload
-            // rebuilt starts at the release its predecessor carried
-            // (`DataSourceDomainExtentImpl::released_by`).
             leaves: leaves
                 .into_iter()
-                .map(|leaf| {
-                    let released = leaf.source.borrow().released_by(&leaf.producer);
-                    (leaf, released)
-                })
+                .map(|leaf| (leaf, Predicate::False))
                 .collect(),
             notifies,
             input,
             starts,
-            polled: false,
             closed: false,
         }
     }
@@ -2164,18 +2144,7 @@ impl LivePipeline {
         }
         let mut changed = !self.starts.is_empty();
         for start in std::mem::take(&mut self.starts) {
-            dispatcher.notify(self.pipeline, &start);
-        }
-        if !std::mem::replace(&mut self.polled, true) {
-            for (leaf, notified) in &self.leaves {
-                if !notified.is_false() {
-                    dispatcher.land_range_decided(
-                        self.pipeline,
-                        &decided_region(notified),
-                        &leaf.consumer,
-                    );
-                }
-            }
+            notify_unreleased(dispatcher, reach, self.pipeline, &start);
         }
         let mut complete = true;
         // Several ranges can read one source, so a scope or a store is notified of the positions
@@ -2202,7 +2171,7 @@ impl LivePipeline {
                         &Projection::admitting(fresh),
                         self.pipeline.0,
                     ) {
-                        dispatcher.notify(self.pipeline, &arrival.guard);
+                        notify_unreleased(dispatcher, reach, self.pipeline, &arrival.guard);
                     }
                 }
                 Notifies::Whole => {}
@@ -2239,20 +2208,47 @@ impl LivePipeline {
                     });
                 }
             }
-            dispatcher.notify(
+            notify_unreleased(
+                dispatcher,
+                reach,
                 self.pipeline,
                 &Projection::admitting(positions).guard(&self.input),
             );
         }
         if complete {
             if matches!(self.notifies, Notifies::Whole) {
-                dispatcher.notify(self.pipeline, &self.input.universal_guard());
+                notify_unreleased(
+                    dispatcher,
+                    reach,
+                    self.pipeline,
+                    &self.input.universal_guard(),
+                );
             }
             dispatcher.close(self.pipeline);
             self.closed = true;
             changed = true;
         }
         changed
+    }
+}
+
+/// Queue the announced region that the pipeline's input has not released.
+fn notify_unreleased(
+    dispatcher: &Dispatcher,
+    reach: &mut Reach<'_>,
+    pipeline: PipelineId,
+    announced: &TileGuard,
+) {
+    let mut pending = None;
+    reach(pipeline, &mut |breaker, input| {
+        pending = unreleased(
+            announced,
+            &breaker.input_released(input),
+            &breaker.input_tiling(input),
+        );
+    });
+    if let Some(pending) = pending {
+        dispatcher.notify(pipeline, &pending);
     }
 }
 

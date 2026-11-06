@@ -1411,6 +1411,13 @@ store or a loop's scope whose chain reads a live source and a pipeline takes the
 beside the pushes of the pipelines it reads, and parks them
 ([Reading each row once](#reading-each-row-once)).
 
+A fresh run announces every region each live source has yielded. The range's consumer restates
+that region into the input of its pipeline. The handler queues only the part the breaker's input
+has not released (`notify_unreleased`). The source's per-producer release records remain its
+reclamation and version-handover state; the dispatcher reads progress from each breaker's input.
+The same announcement publishes the source's decided region, including positions consumed by an
+earlier run. Subsequent polls announce the additional yield.
+
 The run starts the other sources whole and then polls: each pass asks every live source for new data
 (`DataSourceDomainExtentImpl::check_for_new_data`), notifies each live pipeline of the keys its
 sources yield beyond what it was notified of (`get_yield_predicate`), and runs what is claimable. A

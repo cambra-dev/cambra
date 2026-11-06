@@ -299,13 +299,6 @@ impl DataSourceDomainExtentImpl for UnopenedRoute {
             self.id
         )
     }
-
-    fn released_by(&self, _producer: &str) -> Predicate {
-        unreachable!(
-            "`{}` was never opened, so nothing registered with it",
-            self.id
-        )
-    }
 }
 
 /// The reply sink of an [`UnopenedRoute`]. Dispatching to it would mean a version
@@ -715,10 +708,6 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
 
     fn retire_producer(&mut self, producer: &str) {
         self.buf.retire_producer(producer);
-    }
-
-    fn released_by(&self, producer: &str) -> Predicate {
-        self.buf.released_by(producer)
     }
 }
 

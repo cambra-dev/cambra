@@ -2616,9 +2616,50 @@ impl crate::interpreter::dispatcher::RunObserver for PauseAtOnce {
 /// over the same graph plans it afresh. The second delivery of `two_batches` comes between two
 /// runs, and the `main` output holds each key once at the end.
 #[rstest_log::rstest]
-fn a_run_paused_at_every_boundary_answers_each_arrival_once(#[values(1, usize::MAX)] rows: usize) {
+#[case::a_map(
+    "[x * 10 for x in source1()]",
+    "[u0 -> 10, u1 -> 20, u2 -> 30, u3 -> 40, u4 -> 50]"
+)]
+#[case::a_filter(
+    "[x for x in source1() if x != 2]",
+    "[u0 -> 1, u2 -> 3, u3 -> 4, u4 -> 5]"
+)]
+#[case::a_group_by("sum([sum(g) for g in groupby(source1(), \\x -> x > 2)])", "15")]
+#[case::a_sum("sum(source1())", "15")]
+#[case::a_static_read(
+    "[x + sum([1, 2]) for x in source1()]",
+    "[u0 -> 4, u1 -> 5, u2 -> 6, u3 -> 7, u4 -> 8]"
+)]
+#[case::a_live_read(
+    "[x + sum(source1()) for x in source1()]",
+    "[u0 -> 16, u1 -> 17, u2 -> 18, u3 -> 19, u4 -> 20]"
+)]
+#[case::a_loop(indoc! {"
+    total := 0
+    for x in source1():
+        total += x
+    total
+"}, "15")]
+#[case::a_loop_over_a_binding(indoc! {"
+    xs = source1()
+    total := 0
+    for x in xs:
+        total += x
+    total
+"}, "15")]
+#[case::a_transaction(indoc! {"
+    pool: Mut(Int, Txn) := 100
+    for x in source1():
+        with begin():
+            pool := pool - x
+    await_final(pool)
+"}, "85")]
+fn a_run_paused_at_every_boundary_answers_each_arrival_once(
+    #[case] source: &str,
+    #[case] expected: &str,
+    #[values(1, usize::MAX)] rows: usize,
+) {
     use crate::interpreter::dispatcher::{Ended, Targets};
-    let source = "[x * 10 for x in source1()]";
     let mut ctx = GlobalContext::default();
     ctx.defer_sink_pulls();
     let feed = std::rc::Rc::new(std::cell::RefCell::new(
@@ -2646,6 +2687,7 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(#[values(1, usize::M
         .and_then(|output| output.main_entry.clone())
         .expect("a `main` output's entry");
     let mut paused = 0;
+    let mut done = false;
     for (entries, complete) in two_batches() {
         let mut feed = feed.borrow_mut();
         feed.add_data(&entries);
@@ -2662,24 +2704,19 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(#[values(1, usize::M
                     "a paused run leaves nothing placed"
                 );
             }
-            Ended::Done(_) => {}
+            Ended::Done(_) => done = true,
         }
     }
-    while let Ended::Paused(_) = targets
-        .run(rows, &mut PauseAtOnce)
-        .unwrap_or_else(|refused| panic!("{refused}"))
-    {
-        paused += 1;
-    }
+    assert!(
+        done,
+        "the run finishes once the last delivery is complete: {source}"
+    );
     assert_eq!(
         paused, 1,
         "the first delivery's run pauses, and the run after the last delivery ends"
     );
     let value = main.kept.value().expect("the `main` output's value");
-    assert_eq!(
-        rendered_in_key_order(&value),
-        "[u0 -> 10, u1 -> 20, u2 -> 30, u3 -> 40, u4 -> 50]"
-    );
+    assert_eq!(rendered_in_key_order(&value), expected, "{source}");
 }
 
 /// `source`, whose `main` output reads the live source `source1`, compiled and run in pull mode,

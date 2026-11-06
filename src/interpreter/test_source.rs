@@ -191,10 +191,6 @@ impl DataSourceDomainExtentImpl for TestDataSource {
     fn retire_producer(&mut self, producer: &str) {
         self.releases.retire(producer);
     }
-
-    fn released_by(&self, producer: &str) -> Predicate {
-        self.releases.released_by(producer)
-    }
 }
 
 fn key_matches_predicate(key: &Value, predicate: &Predicate) -> bool {

@@ -115,11 +115,6 @@ impl ProducerReleases {
         };
     }
 
-    /// What `producer` has released, or where it starts if it has not registered.
-    pub(crate) fn released_by(&self, producer: &str) -> Predicate {
-        self.of(producer).unwrap_or(&self.on_registration).clone()
-    }
-
     /// What a producer registering now is recorded as having already released.
     pub(crate) fn on_registration(&self) -> &Predicate {
         &self.on_registration
