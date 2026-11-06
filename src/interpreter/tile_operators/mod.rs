@@ -1331,9 +1331,13 @@ pub(crate) fn cut_before(region: &Predicate, cuts: &[Value], domain: &Extent) ->
 }
 
 /// Why `morsels` do not partition `guard`, or `None` when they do: each morsel is non-empty, no
-/// two intersect, and their union is `guard`. One morsel partitions `guard` when it is `guard`;
-/// several are guards of a collection's outermost keys.
+/// two intersect, and their union is `guard`. An empty list partitions exactly an empty guard. One
+/// morsel partitions `guard` when it is `guard`; several are guards of a collection's outermost
+/// keys.
 pub(crate) fn partition_gap(guard: &TileGuard, morsels: &[TileGuard]) -> Option<String> {
+    if morsels.is_empty() {
+        return (!guard.is_empty()).then(|| format!("no morsel of {guard:?}"));
+    }
     if let [only] = morsels {
         return (only != guard).then(|| format!("one morsel {only:?} that is not {guard:?}"));
     }

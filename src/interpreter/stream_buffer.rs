@@ -209,6 +209,11 @@ impl UIntStreamBuffer {
         self.releases.retire(producer);
     }
 
+    /// What `producer` has released ([`ProducerReleases::released_by`](crate::interpreter::producer_releases::ProducerReleases::released_by)).
+    pub(crate) fn released_by(&self, producer: &str) -> Predicate {
+        self.releases.released_by(producer)
+    }
+
     /// The first index a producer registering now will be offered.
     ///
     /// The buffer has already dropped everything every producer agreed on, so

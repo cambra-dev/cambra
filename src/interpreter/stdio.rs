@@ -177,6 +177,10 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
     fn retire_producer(&mut self, producer: &str) {
         self.buf.retire_producer(producer);
     }
+
+    fn released_by(&self, producer: &str) -> Predicate {
+        self.buf.released_by(producer)
+    }
 }
 
 #[cfg(test)]
