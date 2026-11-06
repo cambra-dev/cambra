@@ -20,8 +20,8 @@ use crate::{
         Expr, Home, Name, Type, TypedExprNode, anf, channelize, comprehension,
         infer::{
             Contract, InferError, LocatedInferError, TypeInferenceContext, check_module,
-            check_mut_discipline, check_mut_write_targets, check_pre_channelize_located, infer,
-            solver::traits::InstanceTable, typecheck_in, typecheck_planned,
+            check_pre_channelize_located, infer, solver::traits::InstanceTable, typecheck_in,
+            typecheck_planned,
         },
         inline, lambda_elim,
         lower::{
@@ -1849,27 +1849,6 @@ fn invalid_tree(ir: &Expr, boundary: &str, errs: &impl std::fmt::Debug) -> ! {
     panic!("{boundary} produced an invalid tree: {errs:?}")
 }
 
-/// The two user-facing mutability rules, checked on the fully-typed,
-/// still-`Mut`-bearing tree — after [`pre_channelize_wall`], before inlining.
-///
-/// Both need the pre-inline `Apply`/parameter structure and the coalesced `.ty`
-/// slots and `user_annotation`s. Unlike the surrounding [`pre_channelize_wall`]
-/// calls (compiler-bug backstops), these are user errors:
-///
-/// - `check_mut_discipline` — the second-class `Mut` discipline
-///   (`src/ccl/design/mutability.md`, "No aliasing: `Mut` values are second-class
-///   (downward-only)"): no aliasing or nesting a mutable reference.
-/// - `check_mut_write_targets` — every `:=` / `+=` write targets a mutable
-///   variable, never a shadowing rebind of an immutable. Load-bearing rather
-///   than a formality: lowering emits a `MutWrite` for any `x := e` whose name is
-///   already in scope, mutable variable or not (see `src/ccl/design/mutability.md`,
-///   "Mutability is the type (no lowering registry)"), so this is what rejects a
-///   write to an immutable binding — or to one monomorphization has since dropped.
-fn check_mut_rules(expr: &Expr, blame: &Blame<'_>) -> Result<(), Vec<CompileError>> {
-    check_mut_discipline(expr).map_err(|errs| blame.infer(errs, expr))?;
-    check_mut_write_targets(expr).map_err(|errs| blame.infer(errs, expr))
-}
-
 /// The transact phase's five rejections, run on the inlined, typed tree before
 /// [`transact_phase::run`] strips the sites they inspect.
 ///
@@ -2619,16 +2598,6 @@ fn run_passes(
         &instances,
     )?;
 
-    // Enforce the second-class `Mut` discipline (`src/ccl/design/mutability.md`,
-    // "No aliasing: `Mut` values are second-class (downward-only)") on the
-    // fully-typed, still-`Mut`-bearing tree — after the consistency wall,
-    // before inlining. It needs the pre-inline `Apply`/parameter structure
-    // (rule 1's argument check) and the coalesced `.ty` slots and
-    // `user_annotation`s. Unlike the surrounding `check_pre_channelize` walls
-    // (compiler-bug backstops), these are user errors: aliasing or nesting a
-    // mutable reference.
-    check_mut_rules(&expr, &blame)?;
-
     // Give each named read its position back, now that inference has run and no
     // refinement needs a binder to mention (`crate::ccl::mut_read::unbind`).
     // Before the pane below, so one phase sits on one side of it; before
@@ -2637,15 +2606,6 @@ fn run_passes(
     expr = recorded(capture_provenance, Phase::MutRead, || {
         mut_read::unbind(expr)
     });
-
-    // Enforce that every `:=` / `+=` write targets a mutable variable (a write is
-    // never a shadowing rebind of an immutable). Post-inference so binder types
-    // are resolved, post-`uniquify` so write targets carry their binder's
-    // α-unique name — see `check_mut_write_targets`. Load-bearing rather than a
-    // formality: lowering emits a `MutWrite` for any `x := e` whose name is already in
-    // scope, mutable variable or not (see `src/ccl/design/mutability.md`, "Mutability is the
-    // type (no lowering registry)"), so this is what rejects a write to an immutable
-    // binding — or to one monomorphization has since dropped.
 
     // Inline UDFs *before* channelize: a defer-mediating UDF (`λ out → out << e`)
     // or a cross-function writer is beta-reduced to its call site before

@@ -82,6 +82,8 @@ pub(super) struct CheckCtx {
     /// reason [`Typing::raise`] attributes at the raise site.
     errors: Vec<LocatedInferError>,
     pred_memo: TermMemo,
+    /// What each A-normalization temp walked so far names ([`Typing::note_temp`]).
+    temps_written: HashMap<Name, Option<Type>>,
     /// **Γ — what the witnesses in scope range over** at the current position
     /// (`src/ccl/design/type-inference.md`, "The witness context").
     ///
@@ -175,6 +177,7 @@ impl CheckCtx {
             level: 0,
             errors: Vec::new(),
             pred_memo: Default::default(),
+            temps_written: HashMap::new(),
             witness_ctx: Default::default(),
             current_node: root,
             telescope: Telescope::empty(),
@@ -235,6 +238,14 @@ impl Typing for CheckCtx {
 
     fn stand_in(&mut self) {
         crate::unexpected_error_node!()
+    }
+
+    fn note_temp(&mut self, temp: &Name, written: Option<Type>) {
+        self.temps_written.insert(temp.clone(), written);
+    }
+
+    fn temp_written(&self, temp: &Name) -> Option<Option<Type>> {
+        self.temps_written.get(temp).cloned()
     }
 
     fn poisoned_reads(&self) -> usize {

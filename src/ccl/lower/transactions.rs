@@ -351,8 +351,7 @@ fn lower_tx_block_scoped(
 /// write — a transactional mutable variable joins the atomic commit decision; an
 /// induction accumulator is lifted onto the enclosing loop as its own recurrence
 /// (the two run on independent domains). A write to something that is not a
-/// mutable variable surfaces
-/// post-inference (`check_mut_write_targets`), not here.
+/// mutable variable is refused where inference emits the write, not here.
 fn write_or_let(
     name: String,
     val: Expr,

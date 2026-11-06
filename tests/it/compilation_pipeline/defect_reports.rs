@@ -369,3 +369,41 @@ fn inference_runs_past_a_statement_lowering_failed_in(
     let expected: Vec<(&str, String)> = expected.iter().map(|(p, s)| (*p, s.to_string())).collect();
     assert_eq!(underlined_by_phase(code), expected);
 }
+
+/// The mutability rules are inference's, so a type error elsewhere hides none of them
+/// (`src/ccl/design/mutability.md`, "No aliasing: `Mut` values are second-class
+/// (downward-only)").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_write_to_a_value(
+    indoc! {r#"
+        x = 0
+        x += 1
+        y = [1, "a"]
+        (x, y)
+    "#},
+    &["x += 1", r#"[1, "a"]"#],
+)]
+#[case::a_value_passed_by_reference(
+    indoc! {r#"
+        def bump(c: Mut(Int)):
+            c += 1
+        x = 1
+        bump(x)
+        y = [1, "a"]
+        y
+    "#},
+    &["x", r#"[1, "a"]"#],
+)]
+#[case::a_function_returning_a_mutable_variable(
+    indoc! {r#"
+        x := 0
+        f = \z -> x
+        y = [1, "a"]
+        (f, y)
+    "#},
+    &[r#"[1, "a"]"#, r"\z -> x"],
+)]
+fn a_mutability_error_is_reported_with_type_errors(#[case] code: &str, #[case] expected: &[&str]) {
+    assert_eq!(underlined(code), expected);
+}

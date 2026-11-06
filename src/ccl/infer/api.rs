@@ -718,8 +718,9 @@ pub enum InferError {
     /// a bare variable reference — the second-class discipline's rule 1 (see
     /// `src/ccl/design/mutability.md`, "`Mut` is a CCL type"). A mutable value must
     /// be traceable to a single introduction, so a computed/conditional
-    /// expression of `Mut` type (or a non-variable argument to a `Mut`
-    /// parameter) is rejected. Reported by [`check_mut_discipline`].
+    /// expression of `Mut` type is rejected, reported by [`check_mut_discipline`], and
+    /// so is a non-variable argument to a `Mut` parameter, which emission reports at the
+    /// call.
     MutNotBareVariable {
         /// Display label for the message (see the type docs — not the location).
         at: String,
@@ -742,8 +743,7 @@ pub enum InferError {
     /// discipline's rule 1: a `Mut` argument must be a `Mut`-*introduced* variable,
     /// so the callee's writes advance a real mutable variable the caller shares. A plain value would
     /// otherwise satisfy the lenient pass-by-reference coercion (`V <: Mut(V,
-    /// D)`) and be silently mutated in name only. Reported by
-    /// [`check_mut_discipline`].
+    /// D)`) and be silently mutated in name only. Emission reports it at the call.
     MutArgNotMutable {
         /// Display label for the message (see the type docs — not the location).
         at: String,
@@ -752,7 +752,8 @@ pub enum InferError {
     /// [`Type::History`] — a write to something that was never introduced as a
     /// mutable variable. Writes require a mutable (they never mean "shadow an
     /// immutable"); introduce the mutable variable with `:=` (or annotate a pass-by-reference
-    /// parameter `Mut(…)`). Reported by [`check_mut_write_targets`].
+    /// parameter `Mut(…)`). Emission reports it at the write: a `def` named by a write and
+    /// nothing else leaves no binder after monomorphization, and the write names one there.
     MutWriteToNonMutable {
         /// The base name of the write target.
         name: String,
@@ -2875,26 +2876,23 @@ fn has_pre_channelize_artifacts(expr: &Expr) -> bool {
 // Second-class `Mut` discipline
 // ---------------------------------------------------------------------------
 
-/// Enforce the second-class `Mut` discipline (design doc
+/// Enforce the second-class `Mut` discipline's rules on resolved types (design doc
 /// `src/ccl/design/mutability.md`, "No aliasing: `Mut` values are
-/// second-class (downward-only)"): a post-inference structural pass over the
-/// fully-typed, still-`Mut`-bearing tree. Runs *after* [`check_pre_channelize`]
-/// and *before* `inline`, so it sees the pre-inline `Apply`/parameter
-/// structure (rule 1's argument check) and the coalesced `.ty` slots. Every rule
-/// reads the binder's `ty`; none reads an annotation, which inference has already
-/// cleared.
+/// second-class (downward-only)"): a structural pass over the coalesced tree, the last
+/// step of a run of inference ([`super::run_with_params`]), so its errors are reported
+/// with coalesce's. Every rule reads a node's or binder's `ty`.
 ///
 /// The two rules, both of which keep a mutable value statically traceable to
 /// a single introduction (so the writer set of every mutable variable is known):
 ///
 /// 1. A `Mut`-typed *value* must be a bare variable reference — no computed
-///    expression of `Mut` type, and no non-variable argument to a `Mut`
-///    parameter ([`InferError::MutNotBareVariable`]). A *conditional* over two
-///    mutable variables is not caught by the first clause: a mutable read derefs into
-///    the arms' join exactly as it derefs into a tuple element, so the selection
-///    types as a plain value and there is no `Mut` left on the node. What the
-///    rule is protecting — a selected mutable variable reaching a position that writes
-///    through it — is the second clause, which reads the argument's *node*.
+///    expression of `Mut` type ([`InferError::MutNotBareVariable`]). A *conditional*
+///    over two mutable variables is not caught here: a mutable read derefs into the
+///    arms' join exactly as it derefs into a tuple element, so the selection types as a
+///    plain value and there is no `Mut` left on the node. What the rule is protecting —
+///    a selected mutable variable reaching a position that writes through it — is the
+///    argument rule emission checks where it passes an argument by reference
+///    ([`InferError::MutArgNotMutable`]).
 /// 2. `Mut` may not appear inside any composite type — only at a top-level
 ///    binding/parameter/expression position or a function *domain*
 ///    ([`InferError::MutInCompositeType`]).
@@ -2904,15 +2902,13 @@ fn has_pre_channelize_artifacts(expr: &Expr) -> bool {
 /// alias one; now only [`TypedExprNode::MutDecl`] and a pass-by-reference `Lambda`
 /// param can, and an initializer that is a mutable variable *reads* at a `Let` (`emit_let`
 /// derefs it). The alias is unrepresentable rather than rejected, and writing
-/// through the copy is caught by [`check_mut_write_targets`] — which blames the
-/// write rather than the binding. Asserted in debug by
+/// through the copy is the write emission refuses ([`InferError::MutWriteToNonMutable`])
+/// — which blames the write rather than the binding. Asserted in debug by
 /// [`debug_assert_no_mut_var_let`].
 pub fn check_mut_discipline(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
     debug_assert_no_mut_var_let(expr);
-    let mut anf: HashMap<Name, &Expr> = HashMap::new();
-    collect_anf_temps(expr, &mut anf);
     let mut errors = Vec::new();
-    check_mut_discipline_go(expr, &anf, &mut errors);
+    check_mut_discipline_go(expr, &mut errors);
     // A function returning a mutable variable carries it at the lambda, its binding and each
     // use, so a nested `Mut` is reported once per value.
     let (nested, mut errors): (Vec<_>, Vec<_>) = errors
@@ -3021,48 +3017,7 @@ fn check_binder(binding: &TypedBinding, errors: &mut Vec<InferError>) {
     );
 }
 
-/// Every A-normalization temp's binder and the term it names.
-///
-/// Names are α-unique after `uniquify`, so a flat map resolves each reference
-/// without a scope stack — the argument [`check_mut_write_targets`] makes for
-/// its own binder map.
-fn collect_anf_temps<'e>(expr: &'e Expr, out: &mut HashMap<Name, &'e Expr>) {
-    if let TypedExprNode::Let {
-        binding,
-        bound_expr,
-        ..
-    } = &expr.node
-        && binding.name.is_anf_temp()
-    {
-        out.insert(binding.name.clone(), bound_expr);
-    }
-    expr.walk_children(|c| collect_anf_temps(c, out));
-}
-
-/// Read an argument through the A-normalization temps naming it, down to the
-/// term the program wrote.
-///
-/// Rule 1 is a test on the argument *term*: `bump(x if True else y)` is refused
-/// because a selection has no single introduction to trace. A-normalization
-/// names every compound argument, so without this the rule meets a `Var` at
-/// every call site and the selection is refused for the weaker reason that the
-/// temp's own type is not a mutable variable — the same verdict, reported
-/// against a binder the program does not contain.
-fn read_through_anf<'e>(mut arg: &'e Expr, anf: &HashMap<Name, &'e Expr>) -> &'e Expr {
-    while let TypedExprNode::Var(name) = &arg.node {
-        match anf.get(name) {
-            Some(definiens) => arg = definiens,
-            None => break,
-        }
-    }
-    arg
-}
-
-fn check_mut_discipline_go(
-    expr: &Expr,
-    anf: &HashMap<Name, &Expr>,
-    errors: &mut Vec<LocatedInferError>,
-) {
+fn check_mut_discipline_go(expr: &Expr, errors: &mut Vec<LocatedInferError>) {
     // This node's own violations, stamped with its id below.
     let mut here: Vec<InferError> = Vec::new();
 
@@ -3100,41 +3055,6 @@ fn check_mut_discipline_go(
         check_no_nested_mut(&expr.ty, true, &|| symbolic(expr), &mut here);
     }
 
-    // Rule 1(b): an argument passed to a `Mut` parameter must name a real mutable variable
-    // — a bare variable whose own (peeled) type is `Mut`. A non-variable (a
-    // computed/selected `Mut`) has no single introduction to trace; a bare
-    // variable of *non*-`Mut` type is a plain value that the lenient
-    // pass-by-reference coercion (`V <: Mut(V, D)`) would otherwise let a callee
-    // "mutate" in name only, since the caller holds no mutable variable to observe the
-    // write. Both break the design's "a `Mut` argument is a `Mut`-introduced
-    // variable" guarantee.
-    if let TypedExprNode::Apply { function, argument } = &expr.node {
-        let mut fn_ty = &function.ty;
-        while let Type::Refinement(inner, _) = fn_ty {
-            fn_ty = inner;
-        }
-        if let Type::Fun { domain, .. } = fn_ty
-            && domain.mut_value_type().is_some()
-        {
-            let argument = read_through_anf(argument, anf);
-            if !matches!(argument.node, TypedExprNode::Var(_)) {
-                errors.push(LocatedInferError::new(
-                    InferError::MutNotBareVariable {
-                        at: symbolic(argument),
-                    },
-                    argument.node_id(),
-                ));
-            } else if argument.ty.mut_value_type().is_none() {
-                errors.push(LocatedInferError::new(
-                    InferError::MutArgNotMutable {
-                        at: symbolic(argument),
-                    },
-                    argument.node_id(),
-                ));
-            }
-        }
-    }
-
     // Rule 2 on the binder slots `walk_children` does not reach.
     match &expr.node {
         TypedExprNode::Let { binding, .. } | TypedExprNode::MutDecl { binding, .. } => {
@@ -3161,105 +3081,7 @@ fn check_mut_discipline_go(
         here.into_iter()
             .map(|e| LocatedInferError::new(e, expr.node_id())),
     );
-    expr.walk_children(|e| check_mut_discipline_go(e, anf, errors));
-}
-
-/// Enforce that every [`TypedExprNode::MutWrite`] (`:=` / `+=`) targets a
-/// `Mut`-typed binding — a write requires a mutable variable, never a shadowing
-/// rebind of an immutable (`x += 1` on a plain `x` is an error, not `x = x + 1`).
-///
-/// Runs after inference, so binder types are resolved, and after `uniquify`,
-/// which rewrites each `MutWrite` target to its binder's α-unique `Name` (see
-/// `uniquify.rs`). Names are therefore unique, so a flat `Name → Type` map over
-/// the tree's binders resolves each write target unambiguously — no lexical
-/// scope stack, and shadowing is handled for free.
-///
-/// The rule is that a target must **resolve to a mutable binder** — so a target whose
-/// binder says it is not one and a target with no binder at all are both
-/// [`InferError::MutWriteToNonMutable`]. Absence is not the "inference already rejected
-/// this" case it reads as: coalesce rebuilds a generalized `let` as the chain of its
-/// per-use specializations, which is *empty* when nothing reads the binding, so
-/// `def f(…)` followed by a write to `f` and no other mention leaves a write naming a
-/// binder that no longer exists. Treating that as nothing to object to accepted the
-/// write silently.
-pub fn check_mut_write_targets(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
-    let mut muts: HashMap<Name, bool> = HashMap::new();
-    collect_mut_binders(expr, &mut muts);
-    let mut errors = Vec::new();
-    check_mut_write_targets_go(expr, &muts, &mut errors);
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
-}
-
-/// Whether a binder denotes a mutable variable — decided by the binder's own
-/// type, which records what it is *bound at*.
-///
-/// That is the whole rule because the slot is honest about the annotated cases:
-/// a deref-copy (`y: Int = x`) is bound at the value type, so it is not a mutable
-/// variable and `y += 1` gets the "not a mutable variable" error the discipline
-/// promises; a `:=` introduction and a pass-by-reference `Mut(…)` parameter are
-/// bound at the history, so they are. This consulted `user_annotation` first for
-/// as long as the slot recorded the *initializer's* type instead, where a
-/// deref-copy's slot could read `Mut` and the annotation was the only place the
-/// user's declaration survived.
-fn binder_is_mut(b: &TypedBinding) -> bool {
-    b.ty.mut_value_type().is_some()
-}
-
-/// Record every binder's `name → is-a-mut`. Binder-typed slots are unreachable
-/// by `walk_children` (mirroring [`check_binder`]'s call sites), so each binder
-/// node is handled explicitly before recursing into children.
-///
-/// "Every" is load-bearing now that absence is itself an error: a binding node missing
-/// from this match makes its binder look like it does not exist, which would reject
-/// every write to it.
-fn collect_mut_binders(expr: &Expr, out: &mut HashMap<Name, bool>) {
-    match &expr.node {
-        TypedExprNode::Let { binding, .. } | TypedExprNode::MutDecl { binding, .. } => {
-            out.insert(binding.name.clone(), binder_is_mut(binding));
-        }
-        TypedExprNode::Lambda { param, .. } => {
-            out.insert(param.name.clone(), binder_is_mut(param));
-        }
-        TypedExprNode::For { target, .. } => {
-            out.insert(target.name.clone(), binder_is_mut(target));
-        }
-        TypedExprNode::LetRec { bindings, .. } => {
-            for (b, _) in bindings {
-                out.insert(b.name.clone(), binder_is_mut(b));
-            }
-        }
-        TypedExprNode::Case { branches, .. } => {
-            for br in branches {
-                if let Some(p) = &br.pattern {
-                    out.insert(p.binding.name.clone(), binder_is_mut(&p.binding));
-                }
-            }
-        }
-        _ => {}
-    }
-    expr.walk_children(|c| collect_mut_binders(c, out));
-}
-
-fn check_mut_write_targets_go(
-    expr: &Expr,
-    muts: &HashMap<Name, bool>,
-    errors: &mut Vec<LocatedInferError>,
-) {
-    if let TypedExprNode::MutWrite { name, .. } = &expr.node
-        && muts.get(name) != Some(&true)
-    {
-        errors.push(LocatedInferError::new(
-            InferError::MutWriteToNonMutable {
-                name: name.base().to_string(),
-            },
-            expr.node_id(),
-        ));
-    }
-    expr.walk_children(|c| check_mut_write_targets_go(c, muts, errors));
+    expr.walk_children(|e| check_mut_discipline_go(e, errors));
 }
 
 // ---------------------------------------------------------------------------
@@ -3994,50 +3816,39 @@ mod tests {
         );
     }
 
-    /// A `MutWrite` whose target binding is not `Mut`-typed is rejected — the
-    /// invariant that lets lowering emit writes uniformly and stop tracking
-    /// mutability (see src/ccl/design/mutability.md, "Mutability is the type (no lowering registry)").
+    /// A `MutWrite` whose target binding is not `Mut`-typed is rejected where the write
+    /// is emitted — the invariant that lets lowering emit writes uniformly and stop
+    /// tracking mutability (see src/ccl/design/mutability.md, "Mutability is the type (no
+    /// lowering registry)").
     #[test]
     fn mut_write_to_non_mutable_rejected() {
-        // let x : Int = 0 in (x := 5)  =>  MutWriteToNonMutable, at the write
-        let write = Expr::mut_write("x", Expr::lit(Lit::Int(5)));
-        let write_id = write.node_id();
-        let expr = TypedExpr::new(TypedExprNode::Let {
-            binding: TypedBinding {
-                name: "x".into(),
-                ty: Type::Base(BaseType::Int),
-                user_annotation: None,
-                transparency: BindingTransparency::Transparent,
-            },
-            bound_expr: Box::new(Expr::lit(Lit::Int(0))),
-            body: Box::new(write),
-        });
+        let mut ctx = TypeInferenceContext::new();
+        // let x = 0 in (x := 5)  =>  MutWriteToNonMutable
+        let mut expr = Expr::let_bind(
+            "x",
+            Expr::lit(Lit::Int(0)),
+            Expr::mut_write("x", Expr::lit(Lit::Int(5))),
+        );
         assert_eq!(
-            check_mut_write_targets(&expr),
-            Err(vec![LocatedInferError::new(
-                InferError::MutWriteToNonMutable {
-                    name: "x".to_string(),
-                },
-                write_id,
-            )])
+            infer_bare(&mut expr, &mut ctx),
+            Err(vec![InferError::MutWriteToNonMutable {
+                name: "x".to_string(),
+            }])
         );
     }
 
-    /// A `MutWrite` to a `Mut`-typed binding is accepted.
+    /// A `MutWrite` to a mutable variable is accepted.
     #[test]
     fn mut_write_to_mutable_ok() {
-        // let x : Mut(Int, _) = 0 in (x := 5)  =>  Ok
-        let expr = TypedExpr::new(TypedExprNode::Let {
-            binding: TypedBinding {
-                name: "x".into(),
-                ty: Type::mutable(Type::Hole, Type::Base(BaseType::Int)),
-                user_annotation: None,
-                transparency: BindingTransparency::Transparent,
-            },
-            bound_expr: Box::new(Expr::lit(Lit::Int(0))),
-            body: Box::new(Expr::mut_write("x", Expr::lit(Lit::Int(5)))),
-        });
-        assert_eq!(check_mut_write_targets(&expr), Ok(()));
+        let mut ctx = TypeInferenceContext::new();
+        // x := 0; x := 5  =>  Ok
+        let mut expr = Expr::mut_decl(
+            "x",
+            Type::mutable(Type::Hole, Type::Hole),
+            Expr::lit(Lit::Int(0)),
+            Expr::expr_stmt(Expr::mut_write("x", Expr::lit(Lit::Int(5))), Expr::var("x")),
+        );
+        assert!(infer_bare(&mut expr, &mut ctx).is_ok());
     }
 
     #[test]
