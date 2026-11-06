@@ -2226,6 +2226,35 @@ fn a_nominal_elements_is_refused_at_the_instance() {
     "},
     36
 )]
+// A closure in the definition reads the operand, so the closure's scheme is instantiated inside
+// the definition, over the bound on `Elements` the definition owns.
+#[case::read_in_a_lambda(
+    indoc! {r"
+        def total(C, c: C) => Int requires r: Iterable(C), r::Elements <: _ |=> Int:
+            (\y -> sum([x for x in c]) + y)(1)
+        total(Bag::new(box([1, 2]))) + total(Bag::new(box([5])))
+    "},
+    10
+)]
+#[case::read_in_a_let_bound_lambda(
+    indoc! {r"
+        def total(C, c: C) => Int requires r: Iterable(C), r::Elements <: _ |=> Int:
+            h = \y -> sum([x for x in c]) + y
+            h(1)
+        total(Bag::new(box([1, 2])))
+    "},
+    4
+)]
+#[case::read_in_a_nested_definition(
+    indoc! {"
+        def total(C, c: C) => Int requires r: Iterable(C), r::Elements <: _ |=> Int:
+            def plus(y: Int) => Int:
+                sum([x for x in c]) + y
+            plus(1)
+        total(Bag::new(box([1, 2])))
+    "},
+    4
+)]
 fn a_requirement_reads_iterables_elements(#[case] code: &str, #[case] expected: i64) {
     check_scalar(&format!("{BAG}\n{code}"), Value::Int(expected));
 }
