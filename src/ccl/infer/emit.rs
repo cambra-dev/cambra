@@ -315,6 +315,13 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             registered
         }
 
+        // A reading is an input from outside the program, so it requires `ObserveWorld`
+        // (`docs/chl-spec.md`, "Inputs from outside the program").
+        TypedExprNode::Reading(_) => {
+            ctx.record_effect(Item::Requires(Requirement::observe_world()));
+            Type::Base(BaseType::Int)
+        }
+
         // `@LoadFrom(x)` is typed by its declaration. The value it denotes belongs to
         // the retired version of the program, which this compilation cannot see:
         // it is handed a `HashMap<VarPath, Value>` at operator conversion, long

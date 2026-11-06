@@ -241,6 +241,7 @@ impl Refusals {
                 requires,
                 causes,
                 body,
+                builtin: _,
             } => {
                 // An associated function's name is a member of its type, not a binder of
                 // the module.

@@ -1488,8 +1488,8 @@ impl Default for InstanceTable {
     }
 }
 
-/// The type of a function over `inputs`, as a `def` over them lowers: over the one input,
-/// or over the tuple of several.
+/// The type of a function over `inputs`, as a `def` over them lowers: over the one input, or
+/// over the tuple of several, which for none is the unit.
 pub fn function_over(inputs: &[Type], output: Type) -> Type {
     // A function with a pass-by-reference `Mut` or `Feed` parameter among several is curried,
     // as its `def` lowers (`lower::functions`).
@@ -1500,7 +1500,7 @@ pub fn function_over(inputs: &[Type], output: Type) -> Type {
     }
     let domain = match inputs {
         [one] => one.clone(),
-        several => Type::Tuple(several.to_vec()),
+        several => Type::tuple(several.to_vec()),
     };
     crate::ccl::infer::solver::fun(domain, output)
 }

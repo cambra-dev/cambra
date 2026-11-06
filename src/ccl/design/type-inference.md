@@ -4186,6 +4186,7 @@ whose body it is. Capabilities are recorded on the innermost frame:
 | `Feed` or `Define` into 𝑓 | `Append(𝑓)` |
 | `Begin` | `RunTransaction`; its body's frame discharges `Transaction` |
 | `Source` | `ObserveWorld` |
+| `Reading` | `ObserveWorld` |
 | a sink binding's `Defer` (`lower::SINK_BINDING`) | `AffectWorld` |
 | a value read of a transactional variable 𝑥 | `ReadTxn(𝑥)` and `Transaction` |
 | a value read of an induction variable 𝑥 | `Read(𝑥)` |

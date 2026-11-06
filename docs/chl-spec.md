@@ -1163,21 +1163,19 @@ A call that mixes expressions and fields is an error.
 > product with both anonymous and named fields) is **[Open]**.
 > Recorded here only (2026-07-07, no brainstorm writeup yet).
 
-A *zero-argument* call is valid only against a name registered as a
-**data source** — `stdin()` or any source pre-registered by the host
-(§7.3) — against the builtin `empty_map()` (§3.11),
-or as the context of `with begin():` (§8.2). A zero-argument call against
-any other name is a compile-time error.
+A function may declare no parameters, and a call of it passes no arguments: `f()` applies `f` to
+the unit, the product of no components. `def zero() => Int:`, `\ -> 3`, an associated function
+`def Price::zero() => Price:` and a trait's `def one() => S` each take the unit. A call with no
+arguments also opens a registered **data source**, `stdin()` (§7.3), and builds the empty map,
+`empty_map()` (§3.11), and `begin()` is the context of `with begin():` (§8.2).
 
-> **Direction [Decided] — a function may declare no parameters.** A call of one passes no
-> arguments: `f()` applies `f` to the unit, the product of no components. `def zero() => Int:`,
-> `\ -> 3`, an associated function `def Price::zero() => Price:` and a trait's `def one() => S`
-> each take the unit. A pure function of no parameters returns one value at every call. One that
-> requires or causes something returns what its effects give at each call
-> ([6.9 Capabilities](#69-capabilities)): `time::now()`
-> takes a reading at each position and call path
-> ([Inputs from outside the program](#inputs-from-outside-the-program)). `empty_map()` becomes the
-> values `Map::empty` and `Set::empty`
+A pure function of no parameters returns one value at every call. One that requires or causes
+something returns what its effects give at each call
+([6.9 Capabilities](#69-capabilities)): `time::now()` takes
+a reading at each position and call path
+([Inputs from outside the program](#inputs-from-outside-the-program)).
+
+> **Direction [Decided].** `empty_map()` becomes the values `Map::empty` and `Set::empty`
 > ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)).
 
 ### 3.9 Subscript and attribute access
@@ -3269,10 +3267,9 @@ method it means, and the method as an unapplied value has no other spelling.
 - **A type's constructors, its associated functions, and the `new` and `extract` of the
   single-constructor form share one namespace.** Two entries of one type with one name are an error
   naming both sites. Two types in one module may each have a `discounted`.
-- **An associated function declares at least one value parameter.** `def Price::zero():` is an
-  error. **[Decided]** — an associated function may declare no parameters: `def Price::zero() =>
-  Price:` is called `Price::zero()` ([3.8 Function calls](#38-function-calls)). A constructor that
-  declares no parameters is a value instead, written without parentheses.
+- **An associated function may declare no parameters.** `def Price::zero() => Price:` is called
+  `Price::zero()` ([3.8 Function calls](#38-function-calls)). A constructor that declares no
+  parameters is a value instead, written without parentheses.
 - **An associated function reaches nothing a run gives its module.** Every run of a module shares a
   type that reaches none of the module's parameters
   ([Nominal type identity](#nominal-type-identity)), so each run's copy of the type's functions must
@@ -3364,8 +3361,8 @@ is a trait's function, read from an instance, `summon(Area(_))::area(s)`
 ### 6.9 Capabilities
 
 **[Decided]** — sink functions and calls made outside the program
-([Output outside the program](#output-outside-the-program)); readings
-([Inputs from outside the program](#inputs-from-outside-the-program)); and exceptions
+([Output outside the program](#output-outside-the-program)); keeping readings across a reload and a
+restart ([Inputs from outside the program](#inputs-from-outside-the-program)); and exceptions
 ([Exceptions](#exceptions)). The rest of this section is implemented.
 
 A function's type states what a call reads from its context, in its **`requires` clause**, and what
@@ -4164,9 +4161,8 @@ trait Scales(V, F):
 - **A trait's function is no method.** No parameter of one is named `self`, in the trait or in an
   instance, and a call reads it from an instance: `summon(Scales(_, _))::scale_vec(2, v)`, not
   `2.scale_vec(v)` ([Associated functions and methods](#associated-functions-and-methods)).
-- **A function declares at least one parameter.** **[Decided]** — a function may declare no
-  parameters, and a call reads it from an instance like any trait function:
-  `summon(One(Circle))::one()` ([3.8 Function calls](#38-function-calls)).
+- **A function may declare no parameters.** A call reads it from an instance like any trait
+  function: `summon(One(Circle))::one()` ([3.8 Function calls](#38-function-calls)).
 - **Neither the trait's name nor a type's reaches a function.** `Area::area(c)` is an error, and
   `Circle::area(c)` names only a function `Circle` declares
   ([Summoning an instance](#summoning-an-instance)).
@@ -4559,9 +4555,8 @@ demos, etc.). `std::time` adds a clock read and an alarm source and sink
 
 Opening a source requires `ObserveWorld`, and binding a sink causes `AffectWorld`
 ([Inputs from outside the program](#inputs-from-outside-the-program),
-[Output outside the program](#output-outside-the-program)). **[Decided]** — a reading, such as the
-clock, is a call of a `@Builtin` function a std module declares
-([9.16 The std root](#916-the-std-root)).
+[Output outside the program](#output-outside-the-program)). A reading, such as the clock, is a call
+of a `@Builtin` function a std module declares ([9.16 The std root](#916-the-std-root)).
 
 `http_serve` opens its route when the program starts, so a call is the
 whole right-hand side of a `=` in the top-level block, and its three
@@ -6056,7 +6051,7 @@ prints. An annotation is how an author fixes the contract.
 
 ### 9.16 The std root
 
-**[Planned]** — the rules of this section.
+**[Planned]** — the rules of this section, apart from `@Builtin` below, which is implemented.
 
 The compiler's own modules live under a **std root**, and every std module's path begins with `std`:
 `import std::http` binds `http`, then `http::serve(…)` and `http::ok(…)` ([7.3
@@ -6324,7 +6319,6 @@ semantic reasons:
 
 - Use of an unsupported construct (e.g. `yield` outside a generator
   function, `while` loops, `http_serve` not at top level).
-- Use of an unknown name as a zero-argument call.
 - Type mismatches (e.g. comparing values of incompatible types,
   feeding a name that is not a feed).
 - Unsupported operator combination that the current planner can't

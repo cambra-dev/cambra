@@ -1790,7 +1790,7 @@ where
                         .to_string(),
                     _ => format!(
                         "unknown decorator `{name}`; the decorators are `LoadFrom`, \
-                         `RenamedFrom` and `Discard`"
+                         `RenamedFrom`, `Discard` and `Builtin`"
                     ),
                 };
                 Err(Rich::custom(name_span, message))
@@ -1889,7 +1889,8 @@ where
                 .map_with(|s, e| Spanned::new(e.span(), s))
                 .labelled("function name"),
         );
-        let def_stmt = just(Token::Def)
+        // The signature: `def` through the clauses.
+        let def_head = just(Token::Def)
             .ignore_then(def_name)
             .then(
                 param
@@ -1901,7 +1902,9 @@ where
                     .delimited_by(just(Token::LParen), just(Token::RParen)),
             )
             .then(just(Token::DoubleArrow).ignore_then(expr.clone()).or_not())
-            .then(effect_clauses(expr.clone(), requirement(expr.clone())).boxed())
+            .then(effect_clauses(expr.clone(), requirement(expr.clone())).boxed());
+        let def_stmt = def_head
+            .clone()
             .then_ignore(just(Token::Colon))
             .then(block.clone())
             .map_with(
@@ -1918,8 +1921,61 @@ where
                             requires: Box::new(requires),
                             causes: Box::new(causes),
                             body,
+                            builtin: None,
                         },
                     )
+                },
+            );
+        // ---- @Builtin above a `def` with no body ---------------------
+        // (`docs/chl-spec.md`, "9.16 The std root")
+        //
+        // The decorator and its declaration are one statement, as the other decorators' are,
+        // and the signature ends the declaration. `pub` stands on the line below the
+        // decorator. Lowering refuses it outside a std module.
+        let builtin_def = just(Token::At)
+            .ignore_then(
+                select! { Token::Ident(s) if s == "Builtin" => () }.map_with(|(), e| e.span()),
+            )
+            .then_ignore(just(Token::Newline))
+            .then(just(Token::Pub).map_with(|_, e| e.span()).or_not())
+            .then(
+                def_head
+                    .then_ignore(just(Token::Newline))
+                    .map_with(|head, e| (head, e.span())),
+            )
+            .map_with(
+                |(
+                    (builtin, keyword),
+                    (
+                        ((((owner, name), (type_params, params)), output), (requires, causes)),
+                        def_span,
+                    ),
+                ),
+                 e| {
+                    let def = Spanned::new(
+                        def_span,
+                        Stmt::FunctionDef {
+                            owner,
+                            name,
+                            type_params,
+                            params,
+                            output,
+                            requires: Box::new(requires),
+                            causes: Box::new(causes),
+                            body: Vec::new(),
+                            builtin: Some(builtin),
+                        },
+                    );
+                    match keyword {
+                        None => Spanned::new(e.span(), def.node),
+                        Some(keyword) => Spanned::new(
+                            e.span(),
+                            Stmt::Pub {
+                                keyword,
+                                stmt: Box::new(def),
+                            },
+                        ),
+                    }
                 },
             );
 
@@ -2330,6 +2386,7 @@ where
             type_stmt,
             impl_stmt,
             trait_stmt,
+            builtin_def,
             decorated_stmt,
             pub_stmt,
             const_stmt,
@@ -5611,5 +5668,31 @@ mod tests {
             let m = r.value.expect("a module");
             assert_eq!(stmt_kinds(&m.body), *kinds, "{src:?}");
         }
+    }
+
+    /// `@Builtin` marks a `def` whose body the compiler supplies, under `pub` or not, and the
+    /// signature ends the declaration (`docs/chl-spec.md`, "9.16 The std root").
+    #[test]
+    fn builtin_marks_a_def_with_no_body() {
+        let m = parse_m(indoc! {"
+            @Builtin
+            def clock() => Int requires ObserveWorld
+            @Builtin
+            pub def next() => Int
+            def now():
+                clock()
+        "});
+        let def = |stmt: &Spanned<Stmt>| match &stmt.node {
+            Stmt::Pub { stmt, .. } => match &stmt.node {
+                Stmt::FunctionDef { builtin, body, .. } => (builtin.is_some(), body.len()),
+                other => panic!("expected a `def`, got {other:?}"),
+            },
+            Stmt::FunctionDef { builtin, body, .. } => (builtin.is_some(), body.len()),
+            other => panic!("expected a `def`, got {other:?}"),
+        };
+        assert_eq!(def(&m.body[0]), (true, 0));
+        assert_eq!(def(&m.body[1]), (true, 0));
+        assert_eq!(def(&m.body[2]), (false, 1));
+        assert!(matches!(m.body[1].node, Stmt::Pub { .. }));
     }
 }
