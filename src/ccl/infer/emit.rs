@@ -1186,12 +1186,6 @@ pub(super) fn emit_apply<C: Typing>(
     // Undereffed it meets the demand `fn_ty <: (x: d) ⇒ result` as a mismatch, the relation
     // relating a mutable variable only to another.
     let fn_ty = read_through(&ctx.subexpr(function)?);
-    // One of `std`'s collections applied to a key is its representation applied: the value is
-    // taken out of its constructor here, and the application is typed at what it holds.
-    let fn_ty = match std_collection_applied(function, &fn_ty) {
-        Some(rep) => rep,
-        None => fn_ty,
-    };
     // **The one position where a mutable variable's handle survives.** If the parameter is a
     // mutable variable the argument is passed *by reference* and the handle must reach the
     // parameter, so the invariance rule relates the two value types directly — that is
@@ -1278,6 +1272,14 @@ pub(super) fn emit_apply<C: Typing>(
     if applied.is_ok() && matches!(function.node, TypedExprNode::TraitFn { .. }) {
         ctx.bind_instance_function_called(function.node_id())?;
     }
+    // A subscript reads its collection's structure where it stands: a checked lookup the key's
+    // value type, and a proven one the domain that is the key's proof. Where the collection's
+    // type is known, its `Entries` is that type's, which the obligation deposits only below
+    // the call's variable.
+    let applied = match applied {
+        Ok(result) => Ok(entries_known(function, &arg_ty, ctx).unwrap_or(result)),
+        applied => applied,
+    };
     // A call that fails against a generalized definition the definition alone already
     // rejects is the definition's error, reported at the definition rather than at a
     // call that only met it. Any other failure names the function a type parameter
@@ -1294,24 +1296,53 @@ pub(super) fn emit_apply<C: Typing>(
     }
 }
 
-/// Where `function`, of type `fn_ty`, is a value of one of `std`'s collections, replace it with
-/// its representation taken out of its constructor, and give back the representation's type.
-fn std_collection_applied(function: &mut Expr, fn_ty: &Type) -> Option<Type> {
-    let Type::Nominal(decl, _) = fn_ty.peel_refinements() else {
+/// The `Entries` of a known collection, where `function` is `Indexable::entries` applied to a
+/// value of type `collection`: a structural collection is its own, one of `std`'s collections
+/// has its representation, and another nominal type the `Entries` its instance states at the
+/// type's arguments. `None` while the collection's type is unknown, which the obligation the
+/// call placed waits for.
+fn entries_known<C: Typing>(function: &Expr, collection: &Type, ctx: &C) -> Option<Type> {
+    use crate::ccl::infer::solver::traits::{
+        INDEXABLE_ENTRIES, StdTrait, is_structural_collection,
+    };
+    let TypedExprNode::TraitFn {
+        trait_,
+        function: name,
+        ..
+    } = &function.node
+    else {
         return None;
     };
-    crate::ccl::nominal::StdCollection::of(decl)?;
-    let value = std::mem::take(function);
-    let _f = crate::ccl::provenance::enter(
-        value.node_id(),
-        "infer.std_collection_applied",
-        crate::ccl::provenance::Nature::Machinery,
-    );
-    let (unwrapped, rep) =
-        crate::ccl::infer::solver::traits::std_collection_representation(value, fn_ty)
-            .expect("a collection of `std` has a representation");
-    *function = unwrapped;
-    Some(rep)
+    if !trait_.is_std(StdTrait::Indexable) || name.as_str() != INDEXABLE_ENTRIES {
+        return None;
+    }
+    // A binding's type is a variable its definition bounded, which is the collection's type
+    // where the definition stated one.
+    let resolved;
+    let collection = match collection {
+        Type::Infer(_) => {
+            resolved = crate::ccl::infer::resolve_var_type(collection).ok()?;
+            &resolved
+        }
+        _ => collection,
+    };
+    if is_structural_collection(collection) {
+        return Some(collection.clone());
+    }
+    let Type::Nominal(decl, _) = collection.peel_refinements() else {
+        return None;
+    };
+    if crate::ccl::nominal::StdCollection::of(decl).is_none() {
+        return ctx.associated_at(
+            trait_,
+            std::slice::from_ref(collection),
+            &trait_.collection_assoc(),
+        );
+    }
+    let [ctor] = decl.body().ctors.as_slice() else {
+        unreachable!("`std`'s `{}` has one constructor", decl.name)
+    };
+    collection.peel_refinements().nominal_payload(&ctor.name)
 }
 
 /// Check the key against the collection domain's base and return the supplied value type.
@@ -1483,8 +1514,8 @@ fn not_a_keyed_access(collection: &Type, what: &str) -> InferError {
 /// See `src/ccl/design/collections.md`, "The checked lookup `𝑐[𝑘]`".
 fn keyed_access_types(collection: &Type) -> Option<(Type, Option<Name>, Type)> {
     let collection = collection.peel_refinements();
-    // One of `std`'s collections is read at its representation, which coalescing then takes out
-    // of the value (`unwrap_std_collection_lookup` in `solve.rs`).
+    // One of `std`'s collections is written at its representation, as a subscript reads it
+    // through `Indexable::entries`.
     if let Type::Nominal(decl, args) = collection
         && let Some(std_collection) = crate::ccl::nominal::StdCollection::of(decl)
     {
@@ -2667,10 +2698,11 @@ fn feed_places(defer: &Name, body: &Expr) -> Vec<NodeId> {
             {
                 places.push(e.node_id())
             }
-            // A loop reads its source through `Iterable::elements`, which feeds nothing.
+            // A loop reads its source through `Iterable::elements`, and a subscript its
+            // collection through `Indexable::entries`, neither of which feeds anything.
             TypedExprNode::Apply { argument, function }
                 if !matches!(function.node, TypedExprNode::Builtin(_))
-                    && !is_iterable_elements(function)
+                    && !reads_a_collection(function)
                     && crate::ccl::ccl_utils::is_free(defer, argument) =>
             {
                 places.push(e.node_id())
@@ -2684,11 +2716,13 @@ fn feed_places(defer: &Name, body: &Expr) -> Vec<NodeId> {
     places
 }
 
-/// Whether `function` is `Iterable::elements`, the call a loop reads its source through.
-fn is_iterable_elements(function: &Expr) -> bool {
-    use crate::ccl::infer::solver::traits::{ITERABLE_ELEMENTS, StdTrait};
+/// Whether `function` is `Iterable::elements`, the call a loop reads its source through, or
+/// `Indexable::entries`, the call a subscript reads its collection through.
+fn reads_a_collection(function: &Expr) -> bool {
+    use crate::ccl::infer::solver::traits::{INDEXABLE_ENTRIES, ITERABLE_ELEMENTS, StdTrait};
     matches!(&function.node, TypedExprNode::TraitFn { trait_, function, .. }
-        if trait_.is_std(StdTrait::Iterable) && function.as_str() == ITERABLE_ELEMENTS)
+        if (trait_.is_std(StdTrait::Iterable) && function.as_str() == ITERABLE_ELEMENTS)
+            || (trait_.is_std(StdTrait::Indexable) && function.as_str() == INDEXABLE_ENTRIES))
 }
 
 /// Emit/check a `letrec` group (design doc `src/ccl/design/mutability.md`,

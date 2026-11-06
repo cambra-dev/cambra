@@ -375,10 +375,26 @@ runtime-free conversion API. No surface view constructor should be inferred from
 
 ## Lookup: membership discharge
 
-The proven lookup `c[k]!` lowers as function application. It requires the key type to be below
+A subscript reads its collection through `Indexable`, the `std` trait whose function `entries`
+answers the collection as the function from each of its keys to the value there, of type
+`Entries`. Lowering writes `c[k]` as `(c ▷ entries, k) ▷ lookup?` and `c[k]!` as
+`k ▷ (c ▷ entries)`. A structural collection is its own `Entries`, by the collection rule, and
+coalescing removes the call. `Set`, `Map` and `FullMap` have `@Builtin` instances whose `Entries`
+is their representation, and coalescing replaces the call with the `match` that takes the
+representation out of its constructor.
+
+Where `c`'s type is known at the subscript, emission types `c ▷ entries` as that type's
+`Entries` directly, since both lookup rules read the function's structure where they stand.
+Where it is not, as for a parameter of an unannotated lambda, the call's obligation waits for
+the type, and the proven lookup is typed against the call's result variable as an application
+of an unknown function is. ANF leaves `c ▷ entries` in place over an atomic `c`, so the lookup
+reads `c`'s own binding.
+
+The proven lookup `c[k]!` is application of `c ▷ entries`. It requires the key type to be below
 the collection's domain. `c[k]` is checked lookup: it requires a compatible key type but decides
 presence at runtime and returns `Option`. The
 [CHL reference](../../../docs/chl-spec.md#39-subscript-and-attribute-access) owns the spellings.
+A direct call `c(k)` is application of `c` itself, so it reaches a structural collection only.
 
 A `FullMap(K, V)` parameter with a key of type `K` satisfies ordinary application.
 That typing rule does not construct a value at such a domain. A concrete keyed domain requires
@@ -389,8 +405,8 @@ A list's proven lookup accepts a `UInt` key whose refinement entails the range b
 
 ### The checked lookup `𝑐[𝑘]`
 
-Lowering emits `(c, k) ▷ lookup?`. `emit_apply` intercepts that builtin application and uses
-`emit_lookup_checked` rather than the ordinary collection-application rule:
+Lowering emits `(c ▷ entries, k) ▷ lookup?`. `emit_apply` intercepts that builtin application
+and uses `emit_lookup_checked` rather than the ordinary collection-application rule:
 
 1. `keyed_access_types` obtains the domain, optional key binder and codomain. For a sum,
    its first witness must have kind `SubtypesOf(K)`; the sum is instantiated at `K`.
@@ -405,9 +421,9 @@ Lowering emits `(c, k) ▷ lookup?`. `emit_apply` intercepts that builtin applic
 The key constraint is directional. Joining the lookup key and collection keys at a common
 supertype would admit a wrong-base key by widening instead of rejecting it.
 
-An exact `Map(K, V)` parameter exposes a usable type at emission. A bounded parameter can
-still be unresolved there and is rejected; binding the collection locally or giving the
-parameter an exact annotation can avoid that boundary. `checked_lookup_boundaries` also
+An exact `Map(K, V)` parameter exposes a usable type at emission, and a bounded one
+`m <: Map(K, V)` reaches the subscript's `Indexable` requirement from above, which a nominal
+bound settles as a lower one does. `checked_lookup_boundaries` also
 covers tuple targets and range domains. A tuple is a product, not a collection lookup target.
 
 Emission computes the dependent result once. Later type checks recover the payload from the

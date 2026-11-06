@@ -1199,6 +1199,14 @@ is a type error at `!`, not a runtime unwrap failure. `!` has postfix precedence
 
 A direct call `c(k)` remains function application, not an optional membership test.
 
+**[Tentative]** — a subscript reads its collection through `std`'s trait `Indexable(C)`, whose
+`entries(c)` is `c` as the function from each of its keys to the value there, of type `Entries`.
+`c[k]` looks `k` up in `entries(c)`, and `c[k]!` proves `k` against its domain. A structural
+collection is its own `Entries`, and `Set`, `Map` and `FullMap` have the compiler's instances, so a
+subscript whose collection's type is not known where it is written, as `\g -> g[0]!`, waits for
+that type as any trait function's call does. A nominal type is indexed by declaring an instance
+with a structural `Entries`.
+
 #### Method calls [Decided]
 
 `x.m(args)` calls a method of `x`'s type. Calling a function stored in a field takes parentheses
@@ -2696,9 +2704,9 @@ A builtin differs from a declared nominal type in four ways:
   parameters are determined by their use ([Type parameters](#type-parameters)). A declared type
   has no spelling for an associated value
   ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
-- **Trait instances.** All three satisfy `Iterable` through instances the compiler provides
-  ([Trait requirements](#trait-requirements)). A declared type satisfies the traits its module
-  declares instances of ([Declaring an instance](#declaring-an-instance)).
+- **Trait instances.** All three satisfy `Iterable` and `Indexable` through instances the compiler
+  provides ([Trait requirements](#trait-requirements)). A declared type satisfies the traits its
+  module declares instances of ([Declaring an instance](#declaring-an-instance)).
 - **Stated variances.** A declared type's variance is read off its constructors' parameter types,
   and a builtin has none to read, so each is stated. `Set(K)` is covariant in `K`, and `Map(K, V)`
   in both `K` and `V`: a map over keys below `K` is a map over keys below any supertype of `K`.
@@ -3657,6 +3665,7 @@ requirement names one as it names these, which `std` declares and the prelude im
 | `Equatable` | `==`, `!=`, `in`, `not in` | 2 | none | none | `Int`, `UInt`, `String`, `Bool`, and a tuple or record whose fields are `Equatable` |
 | `Orderable` | `<`, `<=`, `>`, `>=`, `max`, `min` | 2 | none | none | `Int`, `UInt`, `String`, `Bool`, and a tuple whose components are `Orderable` |
 | `Iterable` | `for`-in, a comprehension's `for` clause | 1 | `Elements` | `elements` | every collection, as its own `Elements` |
+| `Indexable` | `c[k]`, `c[k]!` | 1 | `Entries` | `entries` | every collection, as its own `Entries`; `Set`, `Map`, `FullMap` |
 
 `max` and `min` place `Orderable(T, T)` on their element type `T`. A binary trait is satisfied by
 two operands of one listed type. A tuple or record satisfies `Equatable` only against the same

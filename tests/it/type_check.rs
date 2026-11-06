@@ -2504,7 +2504,7 @@ fn test_groupby_key_relation_is_per_occurrence(#[case] code: &str) {
 fn a_lookup_at_the_wrong_key_type_is_refused_for_membership() {
     let errs = infer_program_err(indoc! {r#"
         groups = groupby([(a=1, b="w"), (a=2, b="e")], \r -> r.b)
-        groups(1)
+        groups[1]!
     "#});
     let msgs: Vec<String> = errs.iter().map(|e| format!("{e:?}")).collect();
     assert!(
@@ -3352,8 +3352,9 @@ fn dot_projects_and_brackets_look_up() {
     for program in ["t = (1, \"a\")\nt[0]!", "t = (1, 2)\ni = 0\nt[i]!"] {
         let errs = infer_program_err(program);
         assert!(
-            errs.iter()
-                .any(|e| matches!(e, InferError::ExpectedFunction { .. })),
+            errs.iter().any(
+                |e| matches!(e, InferError::NoTraitInstance { trait_, .. } if trait_ == "Indexable")
+            ),
             "a tuple has no domain to look up in: `{program}` gave {errs:?}"
         );
         assert!(
@@ -5622,10 +5623,6 @@ fn checked_lookup_boundaries() {
             "xs = [10, 20, 30]\nxs[0]",
             "a range domain has no membership refinement",
         ),
-        (
-            "def f(m <: Map(Int, Int)):\n    m[1]\nf",
-            "a bounded parameter is unresolved where the relaxation runs",
-        ),
         ("t = (1, \"a\")\nt[0]", "a tuple is not a finite function"),
     ] {
         assert!(
@@ -5633,15 +5630,21 @@ fn checked_lookup_boundaries() {
             "expected a rejection: {why}"
         );
     }
-    // The exact form binds `m` at `Map(Int, Int)` itself, so the relaxation has a domain
-    // to strip the token from and the lookup answers `Option(Int)`.
-    assert_eq!(
-        infer_program("def f(m: Map(Int, Int)):\n    m[1]\nf")
-            .codomain()
-            .expect("f is a function")
-            .to_string(),
-        "Option(Int)"
-    );
+    // The exact form binds `m` at `Map(Int, Int)` itself, and the bounded form reaches the
+    // subscript's `Indexable` requirement from above, so either lookup answers `Option(Int)`.
+    for program in [
+        "def f(m: Map(Int, Int)):\n    m[1]\nf",
+        "def f(m <: Map(Int, Int)):\n    m[1]\nf",
+    ] {
+        assert_eq!(
+            infer_program(program)
+                .codomain()
+                .expect("f is a function")
+                .to_string(),
+            "Option(Int)",
+            "{program}"
+        );
+    }
 }
 /// A `Set(K)` is `Map(K, unit)`, so its checked lookup answers `Option(unit)` —
 /// membership as a value, which is what `k in s` will be built on. The set half of the

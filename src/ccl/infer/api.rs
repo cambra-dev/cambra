@@ -1217,6 +1217,11 @@ fn option_variant_hint(type_a: &Type, type_b: &Type) -> Option<&'static str> {
     )
 }
 
+/// The hint for a tuple or record applied or subscripted as though it were a collection.
+const PRODUCT_NOT_A_FUNCTION_HINT: &str = "hint: a tuple or record is a heterogeneous product, \
+     not a finite function — project it with `.0` (position) or `.name` (field) rather than \
+     applying or subscripting it";
+
 /// The hint for tuples of different widths, whether one is found where the other is required
 /// or the two meet at one position.
 const TUPLE_WIDTH_HINT: &str =
@@ -1379,7 +1384,13 @@ impl std::fmt::Debug for InferError {
                     "No {trait_} instance for {at}: operand {} is {found}, but \
                      the only type accepted there is {accepted}",
                     position + 1,
-                )
+                )?;
+                if trait_ == crate::ccl::infer::solver::traits::StdTrait::Indexable.name()
+                    && matches!(**found, Type::Tuple(_) | Type::Record(_))
+                {
+                    write!(f, "\n  {PRODUCT_NOT_A_FUNCTION_HINT}")?;
+                }
+                Ok(())
             }
             InferError::InstanceAfterUse { function, instance } => write!(
                 f,
@@ -1602,12 +1613,7 @@ impl std::fmt::Debug for InferError {
                     crate::ccl::chl_print::chl_type(found)
                 )?;
                 if matches!(found, Type::Tuple(_) | Type::Record(_)) {
-                    write!(
-                        f,
-                        "\n  hint: a tuple or record is a heterogeneous product, not a \
-                         finite function — project it with `.0` (position) or `.name` \
-                         (field) rather than applying or subscripting it"
-                    )?;
+                    write!(f, "\n  {PRODUCT_NOT_A_FUNCTION_HINT}")?;
                 }
                 Ok(())
             }

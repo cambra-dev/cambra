@@ -1,4 +1,5 @@
 use indoc::indoc;
+use rstest_log::rstest;
 
 use super::helpers::{check_compile_error, check_scalar};
 
@@ -101,5 +102,46 @@ xs = [1,2,3]
 xs[int_to_uint(5)]! == 2
         "#},
         "Type mismatch for Apply: expected 0..3, found {UInt | (__int, __elem) ▷ int_eq_uint}",
+    )
+}
+
+/// A nominal type whose instance of `Indexable` states its `Entries`: a subscript reads the
+/// function the instance's `entries` answers (`docs/chl-spec.md`, "Subscript and unwrap syntax").
+const ROW: &str = indoc! {"
+    type Row(D) = D |=> Int
+    instance forall (D) Indexable(Row(D)):
+        Entries = D |=> Int
+        def entries(r):
+            r.extract()
+"};
+
+/// A checked lookup into a type with a declared instance answers from its `Entries`.
+#[rstest]
+#[case::a_present_key("r[int_to_uint(1)] == Option::some(20)")]
+#[case::an_absent_key("r[int_to_uint(5)] == Option::none")]
+fn a_checked_lookup_reads_a_declared_instance(#[case] lookup: &str) {
+    check_scalar(
+        &format!("{ROW}\nr = Row::new([10, 20, 30])\n{lookup}"),
+        Value::Bool(true),
+    )
+}
+
+/// A proven lookup into a type with a declared instance proves its key against the domain of
+/// the instance's `Entries` at the type's arguments.
+#[test]
+fn a_proven_lookup_proves_its_key_against_a_declared_instance() {
+    check_compile_error(
+        &format!("{ROW}\nr = Row::new([10, 20, 30])\nr[int_to_uint(5)]! == 20"),
+        "Type mismatch for Apply: expected 0..3, found {UInt | (__int, __elem) ▷ int_eq_uint}",
+    )
+}
+
+/// A subscript requires `Indexable` of its collection's type, which a nominal type without an
+/// instance lacks.
+#[test]
+fn a_type_without_an_indexable_instance_is_not_subscripted() {
+    check_compile_error(
+        "type Box = Int\nBox::new(3)[int_to_uint(0)]",
+        "No Indexable instance for Indexable::entries: operand 1 is Box",
     )
 }

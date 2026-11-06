@@ -20,7 +20,7 @@ use smol_str::SmolStr;
 
 use super::*;
 use crate::ccl::infer::solver::traits::{
-    Assoc, DeclaredAt, ITERABLE_ELEMENTS, ITERABLE_ELEMENTS_ASSOC, Implementation, InstanceBody,
+    Assoc, DeclaredAt, INDEXABLE_ENTRIES, ITERABLE_ELEMENTS, Implementation, InstanceBody,
     InstanceHead, InstanceTable, ProductReading, Signature, StdTrait, Trait, TraitDecl,
     TraitFunction, TraitInstance, compares_by_value, entailed, replace_params, unify_all,
 };
@@ -1069,14 +1069,15 @@ fn declare_instance(
                 ),
             ));
         }
-        // A loop walks its source through one `elements` call to a structural collection,
-        // so a nominal `Elements` would need a second instance's `elements` after it
-        // (`docs/chl-spec.md`, "Trait requirements").
-        if trait_.is_std(StdTrait::Iterable) && matches!(ty, Type::Nominal(..)) {
+        // A loop walks its source through one `elements` call to a structural collection, and a
+        // subscript reads one through one `entries` call, so a nominal `Elements` or `Entries`
+        // would need a second instance's function after it (`docs/chl-spec.md`, "Trait
+        // requirements").
+        if trait_.reads_collections() && matches!(ty, Type::Nominal(..)) {
             return Err(LoweringError::unsupported(
                 a.value.span,
                 format!(
-                    "`Elements = {ty}` in `instance {}` is a nominal type, and an `Elements` that \
+                    "`{name} = {ty}` in `instance {}` is a nominal type, and an `{name}` that \
                      is not a structural collection is not supported yet",
                     head_spelling(&trait_, &operands)
                 ),
@@ -1084,12 +1085,12 @@ fn declare_instance(
         }
         assoc.push((name, ty));
     }
-    // `Iterable`'s `@Builtin` instance of one of `std`'s collections iterates its
-    // representation, whose type no CHL spells, so the compiler supplies its `Elements`. The
-    // instance is over the collection's own parameters, at which its declaration states the
-    // representation, so the head writes the collection over its variables in order.
+    // `Iterable`'s and `Indexable`'s `@Builtin` instances of one of `std`'s collections read its
+    // representation, whose type no CHL spells, so the compiler supplies its `Elements` or
+    // `Entries`. The instance is over the collection's own parameters, at which its declaration
+    // states the representation, so the head writes the collection over its variables in order.
     if block.builtin.is_some()
-        && let Some((collection, decl)) = builtin_iterable_head(&trait_, &operands)
+        && let Some((collection, decl)) = builtin_collection_head(&trait_, &operands)
     {
         let in_order = match &operands[..] {
             [Type::Nominal(_, args)] => {
@@ -1134,12 +1135,15 @@ fn declare_instance(
         let [ctor] = decl.body().ctors.as_slice() else {
             unreachable!("`std`'s `{}` has one constructor", collection.name())
         };
-        let elements =
+        // A loop walks the representation's keys or entries, and a subscript reads the
+        // representation itself.
+        let read = if trait_.is_std(StdTrait::Iterable) {
             crate::ccl::infer::solver::traits::std_collection_elements(collection, &ctor.payload())
-                .expect("a collection's representation is a collection");
-        if let Some(name) = trait_.assoc_named(ITERABLE_ELEMENTS_ASSOC) {
-            assoc.push((name, elements));
-        }
+                .expect("a collection's representation is a collection")
+        } else {
+            ctor.payload()
+        };
+        assoc.push((trait_.collection_assoc(), read));
     }
     // An instance's choice is below the associated type's bound, at the instance's operands
     // and its other choices, which the bound may name. A type variable of the instance is
@@ -1372,13 +1376,13 @@ fn declare_instance(
     Ok(())
 }
 
-/// The collection of `std` an instance of `Iterable` is for, if the instance is one:
-/// `Iterable(Set(K))`, `Iterable(Map(K, V))` or `Iterable(FullMap(K, V))`.
-fn builtin_iterable_head(
+/// The collection of `std` an instance of `Iterable` or `Indexable` is for, if the instance is
+/// one: `Iterable(Set(K))`, `Indexable(Map(K, V))`, `Iterable(FullMap(K, V))` and the like.
+fn builtin_collection_head(
     trait_: &Trait,
     operands: &[Type],
 ) -> Option<(crate::ccl::nominal::StdCollection, Rc<NominalDecl>)> {
-    if !trait_.is_std(StdTrait::Iterable) {
+    if !trait_.is_std(StdTrait::Iterable) && !trait_.is_std(StdTrait::Indexable) {
         return None;
     }
     let [Type::Nominal(decl, _)] = operands else {
@@ -1405,11 +1409,18 @@ fn builtin_instance_functions(
         return Err(builtin_outside_std(at));
     }
     let internal = |why: String| LoweringError::internal(block.ty.span, why);
-    if let Some((collection, _)) = builtin_iterable_head(trait_, operands) {
-        return Ok(vec![(
-            SmolStr::new_static(ITERABLE_ELEMENTS),
-            Implementation::Primitive(InstanceBody::Elements(collection)),
-        )]);
+    if let Some((collection, _)) = builtin_collection_head(trait_, operands) {
+        return Ok(vec![if trait_.is_std(StdTrait::Iterable) {
+            (
+                SmolStr::new_static(ITERABLE_ELEMENTS),
+                Implementation::Primitive(InstanceBody::Elements(collection)),
+            )
+        } else {
+            (
+                SmolStr::new_static(INDEXABLE_ENTRIES),
+                Implementation::Primitive(InstanceBody::Representation(collection)),
+            )
+        }]);
     }
     let Some(named) = StdTrait::named(trait_.name()).filter(|t| trait_.is_std(*t)) else {
         return Err(internal(format!(

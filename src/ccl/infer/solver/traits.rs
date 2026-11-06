@@ -252,6 +252,9 @@ pub const ITERABLE_ELEMENTS: &str = "elements";
 /// `Iterable`'s associated type, the type of what [`ITERABLE_ELEMENTS`] returns.
 pub const ITERABLE_ELEMENTS_ASSOC: &str = "Elements";
 
+/// `Indexable`'s function, the collection a subscript `c[k]` reads at `k`.
+pub const INDEXABLE_ENTRIES: &str = "entries";
+
 /// An operator trait's associated type, the type its operator's result takes.
 pub const OUTPUT_ASSOC: &str = "Output";
 
@@ -283,10 +286,13 @@ pub enum StdTrait {
     /// `for x in c` and a comprehension's `for` clause: `elements` is the collection the
     /// loop walks, its `Elements`.
     Iterable,
+    /// `c[k]` and `c[k]!`: `entries` is the collection the subscript reads at `k`, its
+    /// `Entries`.
+    Indexable,
 }
 
 impl StdTrait {
-    pub const ALL: [StdTrait; 10] = [
+    pub const ALL: [StdTrait; 11] = [
         StdTrait::Addable,
         StdTrait::AddableRefined,
         StdTrait::Subtractable,
@@ -297,6 +303,7 @@ impl StdTrait {
         StdTrait::Orderable,
         StdTrait::Negatable,
         StdTrait::Iterable,
+        StdTrait::Indexable,
     ];
 
     /// The name `std` declares the trait by.
@@ -312,6 +319,7 @@ impl StdTrait {
             StdTrait::Orderable => "Orderable",
             StdTrait::Negatable => "Negatable",
             StdTrait::Iterable => "Iterable",
+            StdTrait::Indexable => "Indexable",
         }
     }
 
@@ -330,8 +338,9 @@ impl StdTrait {
             // for equality, and a tuple, lexicographically, for order.
             StdTrait::Equatable => Some((ProductReading::AnyProduct, false)),
             StdTrait::Orderable => Some((ProductReading::Tuples, false)),
-            // A collection iterates itself, so its `Elements` is the collection.
-            StdTrait::Iterable => Some((ProductReading::None, true)),
+            // A collection iterates itself, so its `Elements` is the collection, and is indexed
+            // as itself, so its `Entries` is the collection.
+            StdTrait::Iterable | StdTrait::Indexable => Some((ProductReading::None, true)),
             _ => None,
         }
     }
@@ -407,10 +416,20 @@ impl Trait {
         self.0.reads_collections
     }
 
+    /// The associated type a structural collection is when the collection rule answers this
+    /// trait: `Iterable`'s `Elements`, `Indexable`'s `Entries`. A trait that reads collections
+    /// associates exactly one type.
+    pub fn collection_assoc(&self) -> Assoc {
+        let [(assoc, _)] = self.0.assocs.as_slice() else {
+            panic!("`{self}` reads collections, so it associates exactly one type");
+        };
+        assoc.clone()
+    }
+
     /// Whether the collection rule could answer a requirement of this trait at `args`, with
     /// the associated types `assoc` names: the operand could be a structural collection, a
-    /// type parameter or a function, and a named `Elements` unifies with it, since the rule
-    /// makes a collection its own `Elements`.
+    /// type parameter or a function, and a named [`collection_assoc`](Self::collection_assoc)
+    /// unifies with it, since the rule makes a collection its own.
     pub fn collection_rule_admits(&self, args: &[Type], assoc: &[(Assoc, Type)]) -> bool {
         if !self.reads_collections() {
             return false;
@@ -426,7 +445,7 @@ impl Trait {
         }
         assoc
             .iter()
-            .filter(|(name, _)| *name == Assoc::Declared(ITERABLE_ELEMENTS_ASSOC.into()))
+            .filter(|(name, _)| *name == self.collection_assoc())
             .all(|(_, elements)| {
                 unify_all(
                     std::slice::from_ref(operand),
@@ -847,6 +866,10 @@ pub enum InstanceBody {
     /// `Set`, and its entries for a `Map` or a `FullMap` (`docs/chl-spec.md`, "4.6 `for` —
     /// iteration").
     Elements(crate::ccl::nominal::StdCollection),
+    /// `Indexable`'s `entries` of one of `std`'s collections: its representation, the function
+    /// from each of its keys to the value there (`docs/chl-spec.md`, "Subscript and unwrap
+    /// syntax").
+    Representation(crate::ccl::nominal::StdCollection),
 }
 
 /// `value`, a value of `ty`, one of `std`'s collections, as its representation, taken out of its
@@ -909,6 +932,18 @@ fn elements_body(
     .with_ty(codomain.clone())
 }
 
+/// `Indexable::entries` of `value`, of type `domain`, one of `std`'s collections: its
+/// representation, taken out of its constructor, the arguments keeping their refinements.
+fn representation_body(
+    collection: crate::ccl::nominal::StdCollection,
+    value: TypedExpr,
+    domain: &Type,
+) -> TypedExpr {
+    std_collection_representation(value, domain)
+        .unwrap_or_else(|| panic!("`Indexable` of `{}` reads a value of it", collection.name()))
+        .0
+}
+
 /// The `Elements` of `std`'s collection `collection` whose representation is `rep`: the keys
 /// of a `Set`, each `(k, v)` of a `Map` or a `FullMap`, over the representation's own keys.
 ///
@@ -950,14 +985,17 @@ impl InstanceBody {
     /// the call, as a filtered comprehension over the elements does, quotes `argument` itself
     /// rather than a binder out of its scope, which it would have to replace with the value.
     pub fn build_applied(&self, argument: TypedExpr, ty: &Type) -> TypedExpr {
-        if let (
-            InstanceBody::Elements(collection),
-            Type::Fun {
-                domain, codomain, ..
-            },
-        ) = (self, ty.peel_refinements())
-        {
-            return elements_body(*collection, argument, domain, codomain);
+        match (self, ty.peel_refinements()) {
+            (
+                InstanceBody::Elements(collection),
+                Type::Fun {
+                    domain, codomain, ..
+                },
+            ) => return elements_body(*collection, argument, domain, codomain),
+            (InstanceBody::Representation(collection), Type::Fun { domain, .. }) => {
+                return representation_body(*collection, argument, domain);
+            }
+            _ => {}
         }
         let function = self.build(ty);
         let TypedExprNode::Lambda { param, body } = function.node else {
@@ -1013,6 +1051,9 @@ impl InstanceBody {
             }
             (InstanceBody::Elements(collection), _) => {
                 elements_body(*collection, read(&param, &domain), &domain, &codomain)
+            }
+            (InstanceBody::Representation(collection), _) => {
+                representation_body(*collection, read(&param, &domain), &domain)
             }
         };
         TypedExpr::lambda(param, domain, body).with_ty(ty.clone())
@@ -1430,7 +1471,8 @@ impl InstanceTable {
     /// accepts them or the one that does associates no `name`. No two instances accept one
     /// list of operands, so the first that accepts them is the one.
     pub fn associated_at(&self, trait_: &Trait, args: &[Type], name: &Assoc) -> Option<Type> {
-        // The collection rule answers a structural collection, which is its own `Elements`.
+        // The collection rule answers a structural collection, which is its own `Elements` (or
+        // `Entries`).
         if let [operand] = args
             && trait_.reads_collections()
             && is_structural_collection(operand)
@@ -3002,7 +3044,7 @@ impl TraitObligation {
     }
 
     /// Answer the obligation by the collection rule: `contribution`, arriving at `pos`, is a
-    /// structural collection, so the operand is its own `Elements`.
+    /// structural collection, so the operand is its own `Elements` (or `Entries`).
     ///
     /// The first collection relates the operand's variable to `Elements`, and every later
     /// contribution reaches `Elements` along that edge. Copying each contribution instead
@@ -3028,11 +3070,12 @@ impl TraitObligation {
         let operand = self.operands.borrow()[pos as usize]
             .clone()
             .expect("a contribution arrives at a position `watch` has bound");
+        let collection_assoc = self.trait_.collection_assoc();
         let elements = self
             .assoc
             .iter()
-            .find(|p| p.name == Assoc::Declared(ITERABLE_ELEMENTS_ASSOC.into()))
-            .expect("a trait with a collection reading associates `Elements`")
+            .find(|p| p.name == collection_assoc)
+            .expect("a trait with a collection reading associates one type")
             .ty
             .borrow()
             .clone();
@@ -4438,7 +4481,8 @@ pub(super) fn link_watches(
             .filter(|b| is_structural_collection(&b.ty))
             .map(|b| (b.ty.clone(), b.origin))
             .collect();
-        // A method call reads a nominal type from above too ([`notify_upper`]).
+        // A method call, and a trait that reads collections, reads a nominal type from above
+        // too ([`notify_upper`]).
         let nominal_above: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = bounds
             .upper()
             .iter()
@@ -4482,7 +4526,7 @@ pub(super) fn link_watches(
                 deliver(obligation, *pos, collection, *origin, cache)?;
             }
         }
-        if obligation.trait_.is_method() {
+        if obligation.trait_.is_method() || obligation.trait_.reads_collections() {
             for (nominal, origin) in &nominal_above {
                 deliver(obligation, *pos, nominal, *origin, cache)?;
             }
@@ -4611,9 +4655,10 @@ fn deliver_in_frame(
 /// only. The collection rule asks only whether the position holds collections, and a
 /// structural collection above `var` settles that as one below it does: only a collection
 /// is below a collection. A bounded annotation `xs <: Map(K, V)` is the case with no lower
-/// bound at all. A method call asks only which type declares the method, and a nominal type
-/// above the receiver settles that the same way: only a nominal type is below it
-/// (`src/ccl/design/nominal-types.md`, "Method calls").
+/// bound at all, and there the bound is a nominal type, which settles the rows of a trait that
+/// reads collections as it settles a method call's. A method call asks only which type declares
+/// the method, and a nominal type above the receiver settles that the same way: only a nominal
+/// type is below it (`src/ccl/design/nominal-types.md`, "Method calls").
 pub(super) fn notify_upper(
     var: &Rc<InferVar>,
     bound: &Type,
@@ -4622,7 +4667,7 @@ pub(super) fn notify_upper(
     let reads = if is_structural_collection(bound) {
         Trait::reads_collections
     } else if matches!(bound.peel_refinements(), Type::Nominal(..)) {
-        Trait::is_method
+        |t: &Trait| t.is_method() || t.reads_collections()
     } else {
         return Ok(());
     };

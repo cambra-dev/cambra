@@ -4096,21 +4096,25 @@ reading at all.
 source `𝑐` lowers to `𝑐 ▷ Iterable::elements` (`lower_loop_source`), and over a data function, a
 sum, or a feed handle that call returns its argument. No row states it, so it is a **collection
 rule**: a candidate beside the rows, whose state an obligation records (`CollectionRule`). Only a
-trait with a collection reading has the rule (`Trait::reads_collections`), and only `Iterable` has
-one.
+trait with a collection reading has the rule (`Trait::reads_collections`): `Iterable`, and
+`Indexable`, whose `Entries` a subscript reads (`lower_entries`; see
+[collections.md, "Lookup: membership discharge"](collections.md#lookup-membership-discharge)).
+Each associates one type, the one the rule makes the collection (`Trait::collection_assoc`).
 
 - **The first collection applies it.** A contribution that is a function or an append history
   clears the rows and relates the operand's variable to `Elements` (`narrow_collection`). Later
-  contributions reach `Elements` along that edge. A contribution is delivered without the edge
+  contributions reach `Elements` along that edge. `Indexable`'s `Entries` is related the same way. A contribution is delivered without the edge
   substitutions it was recorded under, so a copy of it would name a dependent source's discharged
   binder free: a group-by's group names its key binder.
 - **A base or a nominal type rules it out**, as it rules out the product rule. A collection
   arriving after either is rejected, and a base or a nominal type arriving after a collection is
   rejected.
-- **An upper bound decides it as a lower bound does.** Only a collection is below a collection. A
-  structural upper bound on a watched variable is delivered to an obligation that reads
-  collections (`notify_upper`), and `link_watches` replays a linked variable's structural bounds on
-  both sides. A bounded annotation `xs <: Map(K, V)` gives its variable no lower bound at all.
+- **An upper bound decides it as a lower bound does.** Only a collection is below a collection,
+  and only a nominal type below a nominal type. A structural or nominal upper bound on a watched
+  variable is delivered to an obligation that reads collections (`notify_upper`), and
+  `link_watches` replays a linked variable's structural bounds on both sides and its nominal
+  upper bounds. A bounded annotation `xs <: Map(K, V)` gives its variable no lower bound at all,
+  so its nominal bound is what selects `Map`'s instance.
 - **While the rule may answer, the rows do not agree.** The rule associates the operand, which no
   row states, so `agreed_assoc` settles nothing for an obligation whose rule is open. Otherwise a
   program with one `Iterable` instance would deposit that instance's `Elements` on every loop
@@ -4118,8 +4122,8 @@ one.
 - **The requirement sweep skips the obligation** while the rule may answer, as it skips one the
   product rule answered: the rule accepts every collection, which an intersection of bases cannot
   state.
-- **Coalescing removes the call.** `𝑐 ▷ Iterable::elements` whose operand resolves to a
-  structural collection is replaced by `𝑐` before any other rule reads it, in the tree and in
+- **Coalescing removes the call.** `𝑐 ▷ Iterable::elements` or `𝑐 ▷ Indexable::entries` whose
+  operand resolves to a structural collection is replaced by `𝑐` before any other rule reads it, in the tree and in
   each predicate copy (`elements_of_a_collection`). A message's predicate copy drops it the same
   way, so a diagnostic spells the source as the program does. A call a declared instance answers
   is replaced by that instance's function, as any trait function's is
@@ -4152,14 +4156,14 @@ A contribution arriving at a position is one of six things, and each has its own
 | a **base** or a **nominal type** | `Int`, `Two(Int)` | narrows the candidate set by its head, and by a nominal type's arguments where the instances differ below it ([An instance's arguments](#an-instances-arguments)) |
 | **not determined yet** | a variable, a hole, a `Feed` handle whose payload arrives separately, to every trait but `Iterable` | nothing to say |
 | a **product** | a tuple, a record | answered componentwise by a structural trait, rejected by every other ([A product is answered off the table](#a-product-is-answered-off-the-table)) |
-| a **collection** | a function, a sum; a feed handle, to `Iterable` | answered by `Iterable` as itself, rejected by every other trait ([A collection is answered off the table](#a-collection-is-answered-off-the-table)) |
+| a **collection** | a function, a sum; a feed handle, to `Iterable` | answered by `Iterable` and `Indexable` as itself, rejected by every other trait ([A collection is answered off the table](#a-collection-is-answered-off-the-table)) |
 | **determined, and none of these** | a variant | rejected — no instance accepts it ([What the tables hold](#what-the-tables-hold)) |
 | a **type parameter** | `T` in `def f(T, x: T)` | answered by a `requires` assumption naming it; otherwise its bound is offered in its place, and with no bound, `MissingRequirement` ([type-parameters.md, "Obligations under assumptions"](type-parameters.md#obligations-under-assumptions)) |
 
-A variant's rejection, and a collection's by every trait but `Iterable`, is not silence, because "no
-base here" is true of both it and the second row. A collection that merely failed to narrow would
-leave `[1, 2] == [3, 4]` well-typed: a comparison has no associated position to strand, so nothing
-downstream would object either.
+A variant's rejection, and a collection's by every trait but `Iterable` and `Indexable`, is not
+silence, because "no base here" is true of both it and the second row. A collection that merely
+failed to narrow would leave `[1, 2] == [3, 4]` well-typed: a comparison has no associated position
+to strand, so nothing downstream would object either.
 
 A position that stays in the second row for the whole program — nothing ever determines it — is not a rejection either. Its obligation simply never narrows, and the variable is reported as unresolved rather than as a missing instance.
 

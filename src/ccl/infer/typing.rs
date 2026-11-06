@@ -176,6 +176,10 @@ pub(super) trait Typing {
     /// The trait `std` declares as `named`, in the program being typed.
     fn std_trait(&self, named: StdTrait) -> Trait;
 
+    /// The associated type `name` of the instance of `trait_` that accepts `args`, at those
+    /// types ([`InstanceTable::associated_at`](crate::ccl::infer::solver::traits::InstanceTable::associated_at)).
+    fn associated_at(&self, trait_: &Trait, args: &[Type], name: &Assoc) -> Option<Type>;
+
     /// [`require_trait`](Self::require_trait) for an operator whose result is the associated
     /// type `assoc` refined by a predicate built from its operands: the type deposited there
     /// is refined by `refinement` applied to `operand_exprs`, as `^+`'s result is.

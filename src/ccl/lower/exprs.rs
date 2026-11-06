@@ -560,7 +560,9 @@ impl MintedTerm {
     }
 }
 
-/// Lower `target[index]!` as application and `target[index]` as checked lookup.
+/// Lower `target[index]` as checked lookup and `target[index]!` as the unwrap of it, each reading
+/// the collection through `Indexable::entries`: `(𝑐 ▷ entries, 𝑘) ▷ lookup?`, and the proven
+/// form as `𝑘 ▷ (𝑐 ▷ entries)`, where the key's type is the proof of its presence.
 /// Neither spelling projects a product; projection uses `.` regardless of the index's shape.
 /// See `docs/chl-spec.md`, "3.9 Subscript and attribute access".
 pub(super) fn lower_subscript(
@@ -570,7 +572,7 @@ pub(super) fn lower_subscript(
     span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    let collection = lower_expr(target, ctx)?;
+    let collection = lower_entries(target, ctx)?;
     let key = lower_expr(index, ctx)?;
     if checked {
         // Pair collection and key so point-free conversion can treat lookup as a morphism
@@ -600,6 +602,33 @@ pub(super) fn lower_subscript(
     }
     // Evaluate the finite function at the point.
     Ok(Expr::apply(key, collection))
+}
+
+/// Lower a subscript's collection, `𝑐` of `𝑐[𝑘]`, to the function the subscript reads:
+/// `𝑐 ▷ summon(Indexable(_))::entries` (`docs/chl-spec.md`, "Subscript and unwrap syntax").
+///
+/// The call places the requirement `Indexable(C)` on `𝑐`'s type, which waits for that type where
+/// it is not known yet. Coalescing removes the call again where `𝑐` is a structural collection,
+/// which is its own `Entries`.
+fn lower_entries(
+    target: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    use crate::ccl::infer::solver::traits::{INDEXABLE_ENTRIES, StdTrait};
+    let collection = lower_expr(target, ctx)?;
+    let trait_ = ctx.instances.std_trait(StdTrait::Indexable);
+    let label = "lower.indexable_entries";
+    let entries = ctx.tag_machinery(
+        Expr::new(TypedExprNode::TraitFn {
+            operands: (0..trait_.arity()).map(|_| Type::Hole).collect(),
+            assoc: Vec::new(),
+            trait_,
+            function: INDEXABLE_ENTRIES.into(),
+        }),
+        target.span,
+        label,
+    );
+    Ok(ctx.tag_machinery(Expr::apply(collection, entries), target.span, label))
 }
 
 /// Lower a user-function call argument. A **bare variable** argument is the only

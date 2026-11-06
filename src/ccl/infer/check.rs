@@ -221,6 +221,10 @@ impl Typing for CheckCtx {
         self.instances.std_trait(named)
     }
 
+    fn associated_at(&self, trait_: &Trait, args: &[Type], name: &Assoc) -> Option<Type> {
+        self.instances.associated_at(trait_, args, name)
+    }
+
     fn pred_memo(&self) -> TermMemo {
         self.pred_memo.clone()
     }

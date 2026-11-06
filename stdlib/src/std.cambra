@@ -211,3 +211,27 @@ instance forall (K) Iterable(Set(K))
 instance forall (K, V) Iterable(Map(K, V))
 @Builtin
 instance forall (K, V: K => Type) Iterable(FullMap(K, V))
+
+# --- Indexing -----------------------------------------------------------------------------------
+
+# Types a subscript reads: `entries(c)` is `c` as the function from each of its keys to the value
+# there, of type `Entries`. `c[k]` looks `k` up in it, answering `Option::some` of the value when
+# `k` is a key and `Option::none` when not, and `c[k]!` unwraps that where `k`'s type proves it is
+# one (docs/chl-spec.md, "Subscript and unwrap syntax [Decided]").
+#
+# A structural collection is `Indexable` as itself, its `Entries` the collection and `entries`
+# the identity, which no instance states: the compiler answers it. A nominal type is `Indexable`
+# through the instance its module declares.
+@Builtin
+pub trait Indexable(C):
+    Entries <: _ |=> _
+    def entries(c: C) => Entries
+
+# A set's, a map's and a full map's entries are its representation, over the collection's own
+# keys: a set holds `unit` at each. The compiler supplies each `Entries`, which no CHL type spells.
+@Builtin
+instance forall (K) Indexable(Set(K))
+@Builtin
+instance forall (K, V) Indexable(Map(K, V))
+@Builtin
+instance forall (K, V: K => Type) Indexable(FullMap(K, V))

@@ -1763,6 +1763,10 @@ impl Typing for InferCtx {
         self.instances.std_trait(named)
     }
 
+    fn associated_at(&self, trait_: &Trait, args: &[Type], name: &Assoc) -> Option<Type> {
+        self.instances.associated_at(trait_, args, name)
+    }
+
     fn defer_method(
         &mut self,
         function: &mut Expr,
