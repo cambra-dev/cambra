@@ -87,10 +87,28 @@ fn params_bound(root: &Expr, boundary: &str) {
     root.walk_children(|c| params_bound(c, boundary));
 }
 
-/// Panic on any [`violations`] of `root` at `boundary`, or on a generalized type parameter read
-/// outside its `Poly` ([`params_bound`]).
+/// Panic on a type slot in `root` holding, at any depth, an unnamed function whose codomain
+/// reads the function by index ([`Type::unbound_index_function`]). `Expr::with_ty` checks the
+/// top of each type it stores; this covers every slot however it was written, and every depth.
+fn indices_bound(root: &Expr, boundary: &str) {
+    root.walk_type_slots(|ty| {
+        if let Some(f) = ty.unbound_index_function() {
+            panic!(
+                "{boundary}: an unnamed function's codomain reads the function by index: {f} in \
+                 {ty} at `{}`",
+                crate::ccl::symbolic::symbolic(root)
+            );
+        }
+    });
+    root.walk_children(|c| indices_bound(c, boundary));
+}
+
+/// Panic on any [`violations`] of `root` at `boundary`, on a generalized type parameter read
+/// outside its `Poly` ([`params_bound`]), or on an index no binder provides
+/// ([`indices_bound`]).
 pub(crate) fn assert_well_scoped(root: &Expr, boundary: &str) {
     params_bound(root, boundary);
+    indices_bound(root, boundary);
     let found = violations(root);
     if let Some(v) = found.first() {
         let innermost = innermost_reader(&v.ty, &v.name)

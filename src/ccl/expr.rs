@@ -1195,6 +1195,8 @@ impl TypedExpr {
     ///
     /// Used to pre-fill the type in tests or when the type is known at construction time.
     pub fn with_ty(self, ty: Type) -> Self {
+        #[cfg(debug_assertions)]
+        ty.assert_indices_bound();
         TypedExpr { ty, ..self }
     }
 

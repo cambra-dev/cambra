@@ -4322,11 +4322,7 @@ pub(super) fn emit_transact<C: Typing>(
         None => Type::Record(fields),
         Some(p) => {
             let record = Type::Record(fields);
-            if crate::ccl::subst::type_free_vars(&record).contains(&enclosing) {
-                Type::pi(enclosing, enclosing_component(p), record)
-            } else {
-                fun(enclosing_component(p), record)
-            }
+            Type::fun_over(enclosing, enclosing_component(p), record, FunKind::Compute)
         }
     })
 }

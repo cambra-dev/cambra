@@ -2255,16 +2255,12 @@ pub(crate) fn fold_induction_loop(
     // The recurrence binds the loop's history, so it is a collection — and a `Type::fun`
     // here rode down into everything lambda elimination mints out of the position binder,
     // the loop's own iteration source among them.
-    let hist_ty = if crate::ccl::subst::type_free_vars(&decision_ty).contains(&r) {
-        Type::pi_kinded(
-            r.clone(),
-            domain_ty.clone(),
-            decision_ty.clone(),
-            crate::ccl::ty::FunKind::Data(None),
-        )
-    } else {
-        crate::ccl::ccl_utils::history_ty(&domain_ty, &decision_ty)
-    };
+    let hist_ty = Type::fun_over(
+        r.clone(),
+        domain_ty.clone(),
+        decision_ty.clone(),
+        crate::ccl::ty::FunKind::Data(None),
+    );
 
     // The recurrence guard reads the *writes projection* of the history:
     // `get_prev_seq((__hist ≫ .writes, r, (acc₀: init₀, …)))` — a projection of
@@ -3667,11 +3663,12 @@ impl<'a> WriterWalk<'a> {
         }
         let decision = crate::ccl::ccl_utils::wrap_decision_variant(sink_prefix(decision));
         // A fed row whose keys depend on the loop variable reads the parameter in its type.
-        let ty = if crate::ccl::subst::type_free_vars(&decision.ty).contains(&param.name) {
-            Type::pi(param.name.clone(), param.ty.clone(), decision.ty.clone())
-        } else {
-            Type::fun(param.ty.clone(), decision.ty.clone())
-        };
+        let ty = Type::fun_over(
+            param.name.clone(),
+            param.ty.clone(),
+            decision.ty.clone(),
+            crate::ccl::ty::FunKind::Compute,
+        );
         (
             Expr::lambda(param.name, param.ty, decision).with_ty(ty),
             self.feeds,
