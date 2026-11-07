@@ -330,6 +330,7 @@ struct PipelineInfo {
     /// Per pipeline it reads, in the order of its `reads`, whether it decides the input only once
     /// it is whole ([`decides_whole_only`](Dispatcher::decides_whole_only)).
     whole_only: Vec<bool>,
+    required_keys: Vec<Vec<Value>>,
     ingress: Option<std::ops::Range<usize>>,
 }
 
@@ -548,6 +549,7 @@ impl Dispatcher {
                 opens: false,
                 reach: Vec::new(),
                 whole_only: Vec::new(),
+                required_keys: Vec::new(),
                 ingress: None,
             })
             .collect();
@@ -637,6 +639,7 @@ impl Dispatcher {
             opens: false,
             reach: Vec::new(),
             whole_only: Vec::new(),
+            required_keys: Vec::new(),
             ingress: None,
         });
         *self.unfinished.get_mut() += 1;
@@ -1214,6 +1217,45 @@ impl Dispatcher {
             );
     }
 
+    pub(crate) fn require_final_keys(
+        &mut self,
+        reader: PipelineId,
+        source: PipelineId,
+        keys: Vec<Value>,
+    ) {
+        let info = &mut self.infos[reader.0];
+        let at = info
+            .reads
+            .iter()
+            .position(|read| *read == source.0)
+            .expect("a completion belongs to a read pipeline");
+        info.required_keys.resize_with(info.reads.len(), Vec::new);
+        info.required_keys[at] = keys;
+        info.whole_only.resize(info.reads.len(), false);
+        info.whole_only[at] = true;
+    }
+
+    fn land_completed_keys(&self, source: usize, keys: &[Value]) {
+        if keys.is_empty() {
+            return;
+        }
+        for &reader in &self.infos[source].readers {
+            let info = &self.infos[reader];
+            let required: Vec<&Value> = info
+                .reads
+                .iter()
+                .enumerate()
+                .filter(|(_, read)| {
+                    self.infos[**read].pushes_with == self.infos[source].pushes_with
+                })
+                .flat_map(|(at, _)| info.required_keys.get(at).into_iter().flatten())
+                .collect();
+            if !required.is_empty() && required.iter().all(|key| keys.contains(key)) {
+                self.record_decided(reader, source, None);
+            }
+        }
+    }
+
     /// Mark `pipeline` as consuming its morsels one at a time, in the order they were queued, then
     /// its finish. Its breaker's state advances through them in order, as a loop's store decides
     /// its positions ascending.
@@ -1273,6 +1315,7 @@ impl Dispatcher {
             pipeline: pipeline.0,
             morsels: Vec::new(),
             decided: None,
+            completed_keys: Vec::new(),
         }
     }
 
@@ -1717,6 +1760,7 @@ impl Dispatcher {
             return;
         }
         self.land_decided(p, decided.as_ref(), pushes.to.as_ref());
+        self.land_completed_keys(p, &pushes.completed_keys);
         if morsels.is_empty() {
             return;
         }
@@ -1785,7 +1829,7 @@ impl Dispatcher {
             from: pipeline,
             widened: false,
         };
-        to.borrow_mut().push(decided, &mut landing);
+        to.borrow_mut().notify(decided, &mut landing);
         let Target::Decided { reached, .. } = landing.target else {
             unreachable!("a decided landing stays one");
         };
@@ -1843,7 +1887,7 @@ impl Dispatcher {
                             "pipeline {pipeline} pushes regions of its keys: {why}"
                         ))
                     });
-                    to.borrow_mut().push(&region, &mut landing);
+                    to.borrow_mut().notify(&region, &mut landing);
                 }
             }
             // A test's push ([`Pushes::push`]) names no consumer and lands in each reader as it is.
@@ -1890,6 +1934,7 @@ impl Dispatcher {
         #[cfg(test)]
         self.record(Event::Finish(PipelineId(p)));
         self.land_decided(p, decided.as_ref(), pushes.to.as_ref());
+        self.land_completed_keys(p, &pushes.completed_keys);
         // At its finish every pipeline it reads has decided all of what it reaches (the
         // planner's end-of-run check), so nothing stays parked.
         {
@@ -1907,7 +1952,7 @@ impl Dispatcher {
         }
         // The store's own pipelines wait for its seed input's consume; a reader of the store
         // reads that pipeline too, but waits for what the store decides.
-        if self.infos[p].opens && self.states[p].acknowledged.load(Ordering::Acquire) > 0 {
+        if self.infos[p].opens {
             for &reader in &self.infos[p].readers {
                 if self.infos[reader].pushes_with == self.infos[p].pushes_with {
                     self.record_decided(reader, p, None);
@@ -2064,7 +2109,7 @@ impl Drop for Worker<'_> {
 /// What a breaker pushes through: one morsel of its keys per work package. The dispatcher
 /// [lands](Dispatcher::land) them, as the driver does after each consume, or
 /// [finishes](Dispatcher::finish) the pipeline: each morsel climbs the breaker's consumer as a push
-/// ([`Consumer::push`]), each operator on the way restates it in its own keys, and the [`Entry`] of
+/// ([`Consumer::notify`]), each operator on the way restates it in its own keys, and the [`Entry`] of
 /// each breaker it reaches queues it for that breaker's pipeline.
 pub struct Pushes<'d> {
     dispatcher: &'d Dispatcher,
@@ -2073,6 +2118,7 @@ pub struct Pushes<'d> {
     /// The region of its keys the breaker has decided, as a projection, which climbs the
     /// consumer chain beside the morsels ([`Landing::is_decided`]); `None` where it pushed none.
     decided: Option<Projection>,
+    completed_keys: Vec<Value>,
     /// The consumer the morsels climb, the pushing breaker's.
     to: Option<SharedConsumer>,
 }
@@ -2093,6 +2139,7 @@ impl Pushes<'_> {
         if self.dispatcher.infos[self.pipeline].readers.is_empty() {
             return;
         }
+        self.completed_keys = breaker.completed_keys().to_vec();
         let to = breaker.base().downstream.clone();
         self.dispatcher.ensure(to.is_some(), || {
             format!(
@@ -2235,6 +2282,10 @@ impl Landing<'_> {
                 .is_none_or(|from| from.contains(&self.from)),
             Target::Probe(_) | Target::ProbeDecided(_) => true,
         }
+    }
+
+    pub(crate) fn is_delivery(&self) -> bool {
+        matches!(self.target, Target::Queue { .. } | Target::Decided { .. })
     }
 
     /// A landing that records where `from`'s push arrives, and queues nothing.
@@ -2399,6 +2450,7 @@ impl Landing<'_> {
 pub struct Routes {
     widened: bool,
     decides_part: bool,
+    final_key: Option<Value>,
     reached: Vec<Route>,
 }
 
@@ -2412,6 +2464,7 @@ pub(crate) struct Route {
     /// Whether the decided region the path passes on names only part of what a row it reaches
     /// depends on ([`Routes::deciding_part`]).
     pub(crate) decides_part: bool,
+    pub(crate) final_key: Option<Value>,
 }
 
 impl Routes {
@@ -2420,6 +2473,7 @@ impl Routes {
         Routes {
             widened: false,
             decides_part: false,
+            final_key: None,
             reached: Vec::new(),
         }
     }
@@ -2435,7 +2489,14 @@ impl Routes {
             pipeline,
             keeps_keys: !self.widened,
             decides_part: self.decides_part,
+            final_key: self.final_key.clone(),
         });
+    }
+
+    pub(crate) fn requiring_final_key(&mut self, key: &Value, route: impl FnOnce(&mut Self)) {
+        let was = self.final_key.replace(key.clone());
+        route(self);
+        self.final_key = was;
     }
 
     /// Walk on through `route` as widened: the operator declares that it reads its input's keys
@@ -2471,8 +2532,8 @@ impl Routes {
 /// those keys.
 pub struct Entry {
     pipeline: Placement,
+    inline: Option<Box<dyn Consumer>>,
     input: Tiling,
-    inner: Box<dyn Consumer>,
     /// Where an unplaced entry still records a decided push ([`DecidedTarget`]).
     decides: DecidedTarget,
 }
@@ -2494,12 +2555,12 @@ pub type Placement = Rc<Cell<Option<PipelineId>>>;
 
 impl Entry {
     /// The entry of `pipeline`, whose breaker reads `input`, in front of `inner`.
-    pub fn new(pipeline: PipelineId, input: Tiling, inner: Box<dyn Consumer>) -> Self {
+    pub fn new(pipeline: PipelineId, input: Tiling) -> Self {
         Entry {
             pipeline: Rc::new(Cell::new(Some(pipeline))),
             input,
-            inner,
             decides: DecidedTarget::default(),
+            inline: None,
         }
     }
 
@@ -2507,15 +2568,20 @@ impl Entry {
     /// the breaker keeps for a planner to set ([`ProducerBase::placement`]).
     ///
     /// [`ProducerBase::placement`]: crate::interpreter::tile_operators::ProducerBase
-    pub fn unplaced(input: Tiling, inner: Box<dyn Consumer>) -> (Self, Placement) {
+    pub fn unplaced(input: Tiling) -> (Self, Placement) {
         let pipeline: Placement = Rc::new(Cell::new(None));
         let entry = Entry {
             pipeline: pipeline.clone(),
             input,
-            inner,
             decides: DecidedTarget::default(),
+            inline: None,
         };
         (entry, pipeline)
+    }
+
+    pub(crate) fn inline_through(mut self, consumer: Box<dyn Consumer>) -> Self {
+        self.inline = Some(consumer);
+        self
     }
 
     /// The target this entry records a decided push at while it is unplaced, which the holder
@@ -2526,7 +2592,7 @@ impl Entry {
 }
 
 // Whether this thread is in a compiled program's dispatched run (`run_program`), which a debug
-// build checks no consumer is notified in.
+// build checks no cache invalidation is delivered in.
 //
 // shared-state-ok: a debug check's one bit. Nothing crosses it between operators; the run sets it
 // and the consumers a notification passes read it.
@@ -2536,8 +2602,7 @@ thread_local! {
     static IN_A_RUN: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Run `run` as a compiled program's dispatched run on this thread, in which no consumer is
-/// notified ([`debug_assert_outside_a_run`]).
+/// Execute `run` within a dispatched pipeline's evaluation context.
 pub(crate) fn in_a_run<R>(run: impl FnOnce() -> R) -> R {
     struct Leave(bool);
     impl Drop for Leave {
@@ -2554,29 +2619,19 @@ pub(crate) fn is_in_a_run() -> bool {
     IN_A_RUN.with(Cell::get)
 }
 
-/// Panic in a debug build where a consumer is notified inside a compiled program's dispatched
-/// run ([`in_a_run`]): the run has the producers that cache what they read read it again directly
-/// (`tile_operators::read_again_toward`), and pushes carry what a pipeline's readers take.
-pub(crate) fn debug_assert_outside_a_run() {
-    debug_assert!(
-        !is_in_a_run(),
-        "a dispatched run notifies no consumer: a producer that caches what it reads reads it \
-         again through `read_again_toward`"
-    );
-}
-
 impl Consumer for Entry {
-    fn notify(&mut self, arrived: &Projection) {
-        debug_assert_outside_a_run();
-        self.inner.notify(arrived);
-    }
-
-    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
         if let Some(pipeline) = self.pipeline.get()
             && landing.accepts_entry(pipeline)
         {
             if let Some(guard) = pushed_guard(region, &self.input) {
                 landing.queue(pipeline, &guard);
+            }
+            return;
+        }
+        if self.pipeline.get().is_none() && landing.is_delivery() && !landing.is_decided() {
+            if let Some(inline) = &mut self.inline {
+                inline.notify(region, landing);
             }
             return;
         }
@@ -2742,8 +2797,7 @@ pub(crate) enum Event {
 /// pipeline, starts with its breaker's input whole, as one package per morsel ([`seed`]), and is
 /// closed. The driver consumes the package of the lowest pipeline that has one; when no pipeline
 /// has one, it finishes the lowest pipeline that may finish. It stops when every pipeline has
-/// finished. Every breaker takes its consuming mode before the first
-/// package, as in a compiled program's run.
+/// finished. Every breaker initializes its per-run state before the first package.
 ///
 /// # Panics
 ///
@@ -2752,15 +2806,80 @@ pub(crate) enum Event {
 /// when a pipeline consumes a region it consumed before, or when a breaker's morsels do not
 /// partition its final guard; and at any of the invariants [`finish_pipeline`] asserts.
 pub fn run(dispatcher: &Dispatcher, breakers: &[BreakerHandle]) {
-    for breaker in breakers {
-        breaker.borrow_mut().enter_consuming_mode();
+    in_a_run(|| {
+        for breaker in breakers {
+            breaker.borrow_mut().begin_run();
+        }
+        assert_eq!(
+            breakers.len(),
+            dispatcher.infos.len(),
+            "one breaker per pipeline"
+        );
+        drive(dispatcher, &mut handles(breakers));
+    });
+}
+
+/// Execute a component operation as one dispatched unit command.
+#[cfg(any(test, feature = "test-helpers"))]
+pub(crate) fn in_pipeline_for_test<R>(work: impl FnOnce() -> R) -> R {
+    if is_in_a_run() {
+        return work();
     }
-    assert_eq!(
-        breakers.len(),
-        dispatcher.infos.len(),
-        "one breaker per pipeline"
-    );
-    drive(dispatcher, &mut handles(breakers));
+    struct Command<F, R> {
+        work: Option<F>,
+        result: Option<R>,
+    }
+    impl<F: FnOnce() -> R, R> Breaker for Command<F, R> {
+        fn as_producer(&self) -> Option<&dyn BreakingProducer> {
+            None
+        }
+        fn consume_impl(&mut self, _: InputId, _: TileGuard) {
+            self.result = Some(self.work.take().expect("one command")());
+        }
+        fn input_tiling(&self, _: InputId) -> Tiling {
+            Tiling::Scalar(Extent::Base(crate::interpreter::BaseType::Unit))
+        }
+        fn input_released(&self, _: InputId) -> TileGuard {
+            TileGuard::Scalar(if self.work.is_none() {
+                Predicate::True
+            } else {
+                Predicate::False
+            })
+        }
+    }
+    let mut command = Command {
+        work: Some(work),
+        result: None,
+    };
+    let dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
+    in_a_run(|| {
+        drive(&dispatcher, &mut |_, call| {
+            call(&mut command, InputId::ONLY)
+        })
+    });
+    command.result.expect("the dispatcher consumes the command")
+}
+
+/// Evaluate a component query inside one dispatched unit command, for protocol fixtures.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn read_for_test<P: crate::interpreter::tile_operators::TileProducer + ?Sized>(
+    producer: &mut P,
+    guard: TileGuard,
+) -> crate::interpreter::Tile {
+    in_pipeline_for_test(|| producer.get(guard))
+}
+
+#[cfg(test)]
+pub(crate) fn notify_for_test<C: Consumer + ?Sized>(consumer: &mut C, region: &Projection) {
+    let dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
+    let mut landing = Landing {
+        target: Target::Queue {
+            dispatcher: &dispatcher,
+        },
+        from: 0,
+        widened: false,
+    };
+    consumer.notify(region, &mut landing);
 }
 
 /// Each pipeline's breaker, reached for one call at a time: through a handle ([`handles`]), or by
@@ -2874,6 +2993,9 @@ fn push_held(
     pipelines: impl IntoIterator<Item = PipelineId>,
 ) {
     for pipeline in pipelines {
+        if dispatcher.states[pipeline.0].phase.load() == Phase::Finished {
+            continue;
+        }
         let mut landed = None;
         reach(pipeline, &mut |breaker, _| {
             if let Some(producer) = breaker.as_producer() {
@@ -2932,7 +3054,7 @@ fn finish_with(
             },
         );
         let mut pushes = dispatcher.pushes(pipeline);
-        breaker.finish(&mut pushes);
+        breaker.finish(input, &mut pushes);
         finished = Some(pushes);
     });
     dispatcher.finish(finished.expect("a reach calls the breaker it reaches"));
@@ -3357,24 +3479,12 @@ mod in_a_run_tests {
     use super::*;
     use crate::interpreter::tile_operators::Arrivals;
 
-    /// A consumer notified inside a compiled program's dispatched run panics in a debug build.
-    #[test]
-    #[cfg_attr(
-        debug_assertions,
-        should_panic(expected = "a dispatched run notifies no consumer")
-    )]
-    fn a_consumer_notified_inside_a_run_panics() {
-        let mut consumer = Arrivals::new().consumer(Box::new(|| {}));
-        in_a_run(|| consumer.notify(&Projection::Everything));
-    }
-
     /// A run that panics leaves the thread outside a run, so a later notification passes.
     #[test]
     fn a_run_that_panics_leaves_the_thread_outside_a_run() {
         let unwound = std::panic::catch_unwind(|| in_a_run(|| panic!("the run fails")));
         assert!(unwound.is_err());
         assert!(!is_in_a_run());
-        let mut consumer = Arrivals::new().consumer(Box::new(|| {}));
-        consumer.notify(&Projection::Everything);
+        let _consumer = Arrivals::new().consumer(Box::new(|| {}));
     }
 }

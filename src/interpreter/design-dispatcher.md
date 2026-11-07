@@ -41,13 +41,21 @@ breaker ends a pipeline. The nearest upstream breakers supply its dependencies; 
 has one identity across all paths that reach it. A transaction store has a pipeline for each input,
 and an induction store has request, body and step pipelines.
 
+The plan holds each ordinary breaker through its subscription's shared cell. The producer chain
+holds a forwarding reader of that cell; package consumption and publication borrow the cell
+without walking from a sink or store root. Shared paths identify a subscription by its cell.
+Cyclic stores retain their existing store cells, including deferred releases at mutable borrow
+boundaries, and sink breakers remain owned by the run's target list. A loop's body members hold
+the same breaker cells as their readers. Run teardown drops these handles while retained producer
+chains preserve subscriptions across reload.
+
 Consumer routes describe how input regions reach a pipeline. A route can preserve or restate keys,
 or widen a change to the whole input. A widened change supplies no claim that output is complete.
 The planner records both the dependencies and the part of the input each dependency can decide.
-Operators left in pull mode remain inside a pipeline's chain.
+Operators without their own pipeline read their inputs inside a scheduled pipeline's chain.
 
-Compilation defers sink pulls until planning succeeds. A planning refusal therefore occurs before
-execution consumes anything. Refusals include an already-pulled sink, an unsupported store shape,
+Compilation builds the subscribed graph without executing its outputs. A planning refusal occurs
+before execution consumes anything. Refusals include an unsupported store shape,
 a shared producer without the required fan-out, and a live source whose arrivals cannot reach its
 pipeline as supported regions. The store restrictions are specified in
 [A store as a breaker](design-operators.md#a-store-as-a-breaker).
@@ -72,16 +80,26 @@ answer at completion. A live main output emits package answers as they arrive an
 when its sources close. Main-output packages are ordered. Returning several tiles does not change
 the collection's value or imply an order among its elements.
 
-`CAMBRA_DISPATCH` enables dispatch, including under `--inspect` and `--control`.
-`CAMBRA_MORSEL_ROWS` selects a positive morsel size, defaulting to 1024. An initial planning refusal
-can fall back to pull execution in the same compilation context. A refusal after dispatched
-execution has consumed state is an error; it cannot restart that state in pull mode.
+The binary runs every program through the dispatcher, including under `--inspect` and `--control`.
+`CAMBRA_MORSEL_ROWS` selects a positive morsel size, defaulting to 1024. Compilation builds the graph
+without executing sinks. A planning refusal reports an error before execution.
+
+Transaction and induction drivers sample the store's committed snapshot. The planner waits for
+seed opening before admitting their source items. Transaction replies commit as taps and are
+rekeyed from commit ticks to their original source positions.
+
+Live concatenation can wait for source closure. Rebuilding a feed reader across reload can replay
+values emitted before the cut. Field-specific publication from a memo remains a follow-up: a live
+collection inside a record or nested row can wait for source closure before its consumer receives
+a whole row. Bare collection outputs continue to stream completed keys.
 
 ### Pause and reload
 
 A control request is serviced at a drained boundary. The dispatcher and its run-local scheduling
 metadata are then discarded. Retained breakers keep their accumulated values, snapshots and input
-releases. A new plan starts with fresh queue and publication records.
+releases. Store finish counts restart for each run. A flat induction store publishes a ready seed at
+a drained boundary even before its first source position, so an idle version can hand its carried
+value to a later version. A new plan starts with fresh queue and publication records.
 
 To reconstruct runnable work, retained breakers publish what they still hold and sources announce
 what they have yielded. Each breaker filters input announcements by its own releases. Dispatcher
@@ -128,10 +146,15 @@ row's prerequisites, one union of path regions cannot establish readiness. That 
 whole unless the paths' requirements can be tracked separately. A lookup table also used as input
 rows is such a case.
 
+An operator replacing a value preserves notifications above that value's level. A change beneath
+it names the enclosing rows. A decided region beneath it passes only where it decides the whole
+value. A nested store publishes completed enclosing rows; a final read retains those row keys and
+participates in the body's pipeline dependencies, so the outer step waits for the read's value.
+
 Static ranges are decided at the start. Live ranges publish their decided extent as it grows.
 Breakers that publish while consuming announce their decided regions after each consume; breakers
-that hold output announce them in a later publication pass. Completion publishes final progress. Ordinary pull-mode
-notifications and deferred wakeups do not schedule dispatched execution.
+that hold output announce them in a later publication pass. Completion publishes final progress.
+Notifications queue dispatcher work and mark inline caches dirty; no deferred wakeup schedules work.
 
 ## Reading each row once
 

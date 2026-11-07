@@ -1,16 +1,18 @@
 //! Loop request control and body graph planning for the run's shared dispatcher.
 //! See `src/interpreter/design-dispatcher.md`, "A loop in rounds".
 
-use super::plan::{ChainPaths, Planned, probe, routes_to};
+use super::plan::{Planned, probe, routes_to};
 use super::*;
 use crate::interpreter::commit_operator::InductionStoreProducer;
+#[cfg(test)]
+use crate::interpreter::tile_operators::test_helpers::ConsumeInPipeline as _;
 use crate::interpreter::tile_operators::{StoreCell, TileProducer};
 
 /// Where a loop scope finds the breaker of one of its inner pipelines.
 #[derive(Clone)]
 pub(super) enum Member {
-    /// In the store's chain, by its address (`plan::address`).
-    Chain(usize),
+    /// The shared cell owning an inner pipeline's breaker subscription.
+    Chain(BreakerHandle),
     /// The scope of a loop nested in this one, which runs the rounds of one row of its store per
     /// round, the row of the round's position.
     Scope(StoreCell),
@@ -23,8 +25,6 @@ pub(crate) struct InductionRun {
     pub(super) body_graph: Option<Dispatcher>,
     pub(super) shared: Option<SharedLoop>,
     pub(super) members: Vec<Member>,
-    /// Where each of `members`' breakers in the store's chain was last reached.
-    chain_paths: ChainPaths,
     /// Entries placed at global body IDs after activation. Explicitly queued source entries
     /// stay unplaced so external source pushes reach their completeness targets.
     placements: Vec<Vec<Placement>>,
@@ -69,7 +69,6 @@ impl InductionRun {
             body_graph: Some(body_graph),
             shared: None,
             members,
-            chain_paths: ChainPaths::default(),
             placements,
             starts,
             planned,
@@ -253,7 +252,7 @@ impl InductionStoreProducer {
 
     fn reach_local(&mut self, pipeline: PipelineId, call: &mut Call<'_>) {
         let member = self.run().members[pipeline.0].clone();
-        reach_member(self, &member, pipeline, call);
+        reach_member(&member, call);
     }
 
     pub(super) fn clear_run(&mut self) {
@@ -275,13 +274,11 @@ impl InductionStoreProducer {
         self.run = None;
     }
 
-    pub(crate) fn enter_loop_consuming(&mut self) {
+    pub(crate) fn begin_loop_run(&mut self) {
         let Some(run) = &self.run else { return };
         let count = run.members.len();
         for local in 0..count {
-            self.reach_local(PipelineId(local), &mut |breaker, _| {
-                breaker.enter_consuming_mode()
-            });
+            self.reach_local(PipelineId(local), &mut |breaker, _| breaker.begin_run());
         }
     }
 
@@ -395,7 +392,7 @@ impl InductionStoreProducer {
         let region = Projection::of(guard)
             .unwrap_or_else(|why| panic!("a loop's round names a row of its store: {why}"));
         let mut landing = Landing::probe(self.pipeline(drive));
-        consumer.borrow_mut().push(&region, &mut landing);
+        consumer.borrow_mut().notify(&region, &mut landing);
         let arrivals = landing.arrivals();
         readers
             .iter()
@@ -568,45 +565,21 @@ impl InductionStoreProducer {
 
 /// Call `call` with `member`'s breaker, the inner pipeline `pipeline`'s: in `store`'s chain, or
 /// a nested loop's scope.
-pub(super) fn reach_member(
-    store: &mut InductionStoreProducer,
-    member: &Member,
-    pipeline: PipelineId,
-    call: &mut Call<'_>,
-) {
+pub(super) fn reach_member(member: &Member, call: &mut Call<'_>) {
     match member {
         Member::Scope(store) => call(&mut *induction(store), InputId::ONLY),
-        Member::Chain(id) => {
-            let mut call = Some(call);
-            // The paths live on the store's run, and the walk borrows the store whole. A planner
-            // reaches a member before the run is installed, with no paths to keep.
-            let mut paths = store
-                .run
-                .as_mut()
-                .map(|run| std::mem::take(&mut run.chain_paths))
-                .unwrap_or_default();
-            let found = paths.reach_or_walk_again(store, *id, &mut call);
-            if let Some(run) = store.run.as_mut() {
-                run.chain_paths = paths;
-            }
-            assert!(
-                found,
-                "inner pipeline {} has its breaker in the store's chain",
-                pipeline.0
-            );
-        }
+        Member::Chain(handle) => call(&mut *handle.borrow_mut(), InputId::ONLY),
     }
 }
 
 impl InductionStoreProducer {
-    /// The addresses of the breakers of the inner pipelines in the store's chain
-    /// ([`address`]), the ones a round queues or pushes packages to.
-    pub(super) fn chain_breakers(&self) -> Vec<usize> {
+    /// The breaker subscriptions of the inner pipelines a round queues or publishes.
+    pub(super) fn chain_breakers(&self) -> Vec<BreakerHandle> {
         self.run()
             .members
             .iter()
             .filter_map(|member| match member {
-                Member::Chain(id) => Some(*id),
+                Member::Chain(handle) => Some(handle.clone()),
                 Member::Scope(_) => None,
             })
             .collect()
@@ -704,7 +677,6 @@ mod tests {
     impl Compiled {
         fn of(source: &str) -> Self {
             let mut ctx = GlobalContext::default();
-            ctx.defer_sink_pulls();
             let _sink = ctx.register_test_sink("out");
             let loaded = LoadedProgram::test(source);
             compile_program(&mut ctx, &loaded, Box::new(|| {}))
@@ -724,7 +696,7 @@ mod tests {
             assert_eq!(planner.scopes.len(), 1, "an induction store runs in rounds");
             let mut runs = InductionRuns::new();
             let scope = planner.build_scope(0, usize::MAX, &mut Vec::new(), &mut runs);
-            induction(&scope).enter_consuming_mode();
+            induction(&scope).begin_run();
             let mut dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
             dispatcher.order(PipelineId(0));
             let execution = Execution::new(&[Some(scope.clone())], &mut dispatcher);
@@ -815,7 +787,7 @@ mod tests {
     }
 
     /// A morsel of one position is one round, which decides the position; the round of the last
-    /// position leaves the store terminal, holding what pull mode writes, and its body released.
+    /// position leaves the store terminal, holding the expected writes, and its body released.
     #[test]
     fn a_round_decides_its_position() {
         let compiled = Compiled::of(SUM);
@@ -982,7 +954,7 @@ mod tests {
         let mut pulls = 0;
         drive.visit_input_producers(&mut |role, input| {
             if role == "source" {
-                pulls = input.base().pulls;
+                pulls = input.base().reads;
             }
         });
         pulls
@@ -999,7 +971,7 @@ mod tests {
         {
             let mut store = induction(&compiled.scope);
             let none = store.input_tiling(InputId::ONLY).empty_guard();
-            store.consume_impl(InputId::ONLY, none);
+            store.consume_in_pipeline(InputId::ONLY, none);
         }
         let held = |drive: &mut dyn TileProducer| {
             drive
@@ -1012,8 +984,8 @@ mod tests {
             let breaker = drive
                 .as_breaking_mut()
                 .expect("the drive is a pipeline breaker");
-            breaker.consume_impl(InputId::ONLY, keys_between(1, 1));
-            breaker.consume_impl(
+            breaker.consume_in_pipeline(InputId::ONLY, keys_between(1, 1));
+            breaker.consume_in_pipeline(
                 InputId::ONLY,
                 breaker.input_tiling(InputId::ONLY).empty_guard(),
             );
@@ -1024,7 +996,7 @@ mod tests {
             let breaker = drive
                 .as_breaking_mut()
                 .expect("the drive is a pipeline breaker");
-            breaker.consume_impl(InputId::ONLY, keys_between(0, 0));
+            breaker.consume_in_pipeline(InputId::ONLY, keys_between(0, 0));
             assert!(
                 held(drive).covers_path(&[Value::UInt(0)]),
                 "position 0 emitted"

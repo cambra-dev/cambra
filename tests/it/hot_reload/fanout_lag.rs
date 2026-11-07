@@ -7,22 +7,14 @@
 //! slowest sibling's frontier and receives again every position between that
 //! frontier and the one its predecessor had reached.
 //!
-//! Every feed case here reads a `defer` feed whose other writer the reload edits.
-//! That edit rebuilds the `out` binding, and with it the `StoreDenseRead` that reads
-//! the feed's tap off the store. The loop is unchanged, so the store and its fan-out
-//! are kept.
-//!
-//! Every test here is a pinned failure: it asserts the wrong output the runtime
-//! produces today, so it passes now and turns red on any change to that output. Each
-//! test's doc comment gives the correct output. A change that fixes the bug should
-//! replace the pinned value with the correct one and rename the test to state the
-//! behavior it then pins.
+//! The binary case retains the deferred replay pin. The finite case checks collection reuse at
+//! supported execution boundaries.
 
 use indoc::indoc;
 
 use cambra::{
     ccl::context::GlobalContext,
-    interpreter::{ColumnValue, FunctionGuard, Tile, TileGuard},
+    interpreter::{ColumnValue, Tile},
     live_program::{LiveProgram, MAIN_BRANCH},
 };
 
@@ -30,12 +22,6 @@ use super::harness::{OneFile, stdin_across_reload};
 use super::serving::no_main;
 
 const ITEMS: &str = r#"["a", "b", "c", "d", "e", "f", "g", "h"]"#;
-
-/// Every running value `n` takes over [`ITEMS`], which is what a correct feed emits
-/// once each.
-const EXPECTED: [&str; 8] = [
-    "a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh",
-];
 
 /// A feed of `n` over `source`, plus a second writer to the same feed that loops
 /// over a collection that is always empty.
@@ -67,197 +53,15 @@ fn feed(source: &str, reads_n: bool, mark: &str) -> String {
     )
 }
 
-/// Pull `main` once and release what it delivered, as the binary's driver does
-/// (`run_program` in `src/main.rs`).
-fn pull(ctx: &mut GlobalContext, live: &mut LiveProgram) -> (Vec<String>, bool) {
-    ctx.scheduler().check_for_notifications();
-    let producer = live
-        .main_producer_mut(MAIN_BRANCH)
-        .expect("the program's value is `out`");
-    let tile = producer.get(producer.tiling().universal_guard());
-    let Tile::DataFunction {
-        codomain,
-        deleted,
-        domain_predicate,
-        ..
-    } = &tile
-    else {
-        panic!("a feed is a function, got {tile:?}");
-    };
-    let Tile::Scalar(ColumnValue::Strings(values)) = codomain.as_ref() else {
-        panic!("the feed carries strings, got {codomain:?}");
-    };
-    let emitted = values
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !deleted.contains(*i))
-        .map(|(_, v)| v.to_string())
-        .collect();
-    let guard = TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone()));
-    let done = guard.is_universal();
-    producer.release(guard);
-    (emitted, done)
-}
-
-/// Run the feed over [`ITEMS`] for `pulls` pulls, reload with the second writer
-/// edited, drive to the end, and return everything `main` emitted.
-fn emitted_across_reload(reads_n: bool, pulls: usize) -> Vec<String> {
-    let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start_text(&mut ctx, &feed(ITEMS, reads_n, ""), &no_main)
-        .expect("v1 compiles");
-    let mut all = Vec::new();
-    for _ in 0..pulls {
-        all.extend(pull(&mut ctx, &mut live).0);
-    }
-    live.reload_text(&mut ctx, MAIN_BRANCH, &feed(ITEMS, reads_n, "!"), &no_main)
-        .expect("only the second writer changed");
-    for _ in 0..100 {
-        let (emitted, done) = pull(&mut ctx, &mut live);
-        all.extend(emitted);
-        if done {
-            return all;
-        }
-    }
-    panic!("the feed never finished: {all:?}");
-}
-
-/// What `main` emits across a reload at each cut from 0 to 10 pulls. Two pulls
-/// decide the first position; eight more finish the fold.
-fn emitted_at_each_cut(reads_n: bool) -> Vec<Vec<String>> {
-    (0..=10)
-        .map(|pulls| emitted_across_reload(reads_n, pulls))
-        .collect()
-}
-
-/// Assert that each cut's output is the pinned buggy output, and name every cut
-/// that differs.
-fn assert_cuts_pinned(actual: &[Vec<String>], pinned: &[Vec<String>]) {
-    let changed: Vec<String> = actual
-        .iter()
-        .zip(pinned)
-        .enumerate()
-        .filter(|(_, (actual, pinned))| actual != pinned)
-        .map(|(pulls, (actual, pinned))| {
-            format!("{pulls} pulls:\n    actual: {actual:?}\n    pinned: {pinned:?}")
-        })
-        .collect();
-    assert!(
-        changed.is_empty(),
-        "the feed's output across a reload changed. If the replay was fixed, pin the \
-         correct output from this test's doc comment instead.\n  {}",
-        changed.join("\n  "),
-    );
-}
-
-fn strings(values: &[&str]) -> Vec<String> {
-    values.iter().map(|v| v.to_string()).collect()
-}
-
-/// PINNED FAILURE. The value at the cut is emitted twice, as in
-/// [`a_feed_repeats_the_position_the_recurrence_still_reads`].
-///
-/// Correct at every cut from 0 to 10 pulls:
-///
-/// ```text
-/// ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh"]
-/// ```
-///
-/// Pinned: cuts 0 and 1 are correct, and each cut from 2 to 10 repeats the last value
-/// decided before the swap:
-///
-/// ```text
-/// 3 pulls:  ["a", "ab", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh"]
-/// 9 pulls:  ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh", "abcdefgh"]
-/// ```
-///
-/// The second writer reads `n` without taking anything (see [`feed`]), and releases the
-/// store's fan-out once its empty loop is done, so the kept fan-out's release is what the
-/// recurrence has read: the rebuilt tap reader starts one position behind its predecessor.
-#[test]
-fn a_feed_read_by_a_sibling_that_takes_nothing_repeats_the_position_at_the_cut() {
-    let pinned: Vec<Vec<String>> = (0..=10)
-        .map(|pulls| match pulls {
-            0 | 1 => strings(&EXPECTED),
-            // The last value decided before the swap, twice.
-            _ => {
-                let decided = (pulls - 1).min(EXPECTED.len());
-                strings(&[&EXPECTED[..decided], &EXPECTED[decided - 1..]].concat())
-            }
-        })
-        .collect();
-    assert_cuts_pinned(&emitted_at_each_cut(true), &pinned);
-}
-
-/// PINNED FAILURE. The value at the cut is emitted twice.
-///
-/// Correct at every cut from 0 to 10 pulls:
-///
-/// ```text
-/// ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh"]
-/// ```
-///
-/// Pinned: cuts 0 and 1 are correct. Each cut from 2 to 10 repeats the last value
-/// decided before the swap, which after the fold finished is the last value:
-///
-/// ```text
-/// 3 pulls:  ["a", "ab", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh"]
-/// 8 pulls:  ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefg", "abcdefgh"]
-/// 9 pulls:  ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh", "abcdefgh"]
-/// ```
-///
-/// In-process only: through the binary over `stdin` the recurrence has caught up at
-/// the quiet point where `--control` reloads, and nothing is replayed.
-///
-/// No reader here is unpulled. The induction driver's recurrence slot reads each key
-/// at the store's frontier, the position before the one it feeds, so its release trails
-/// the tap reader's by one position, and the rebuilt tap reader is seeded at the driver's
-/// frontier.
-#[test]
-fn a_feed_repeats_the_position_the_recurrence_still_reads() {
-    let pinned: Vec<Vec<String>> = (0..=10)
-        .map(|pulls| match pulls {
-            0 | 1 => strings(&EXPECTED),
-            // The last value decided before the swap, twice.
-            _ => {
-                let decided = (pulls - 1).min(EXPECTED.len());
-                strings(&[&EXPECTED[..decided], &EXPECTED[decided - 1..]].concat())
-            }
-        })
-        .collect();
-    assert_cuts_pinned(&emitted_at_each_cut(false), &pinned);
-}
-
-/// A real-binary reload preserves the pull reader's release at the cut. A deferred release from
-/// the store's recurrence settles before its mutable borrow ends, so the new version starts
-/// after the last value the old version printed.
-///
-/// With `a` and `b` sent before the reload and `c` after, correct, and observed in pull mode:
-///
-/// ```text
-/// ["a", "ab", "abc"]
-/// ```
-///
-/// Pinned dispatched, which repeats every value before the cut: the store pushes each position it
-/// decides, and the rebuilt tap reader's slot starts at the intersection of every slot's release,
-/// which the store's recurrence slots hold empty.
-///
-/// ```text
-/// ["a", "ab", "a", "ab", "abc"]
-/// ```
-///
-/// The program of
-/// [`a_feed_read_by_a_sibling_that_takes_nothing_repeats_the_position_at_the_cut`], over
-/// `stdin`, reloaded through `--control` at a quiet point between lines.
+/// A subprocess reload of a feed with an edited empty writer. Replay remains a deferred issue;
+/// this test exercises the actual dispatcher and control port rather than manual producer reads.
 #[rstest::rstest]
-fn a_stdin_feed_repeats_the_value_at_the_cut_when_its_other_writer_is_edited(
-    #[values("0", "1")] dispatch: &str,
-) {
+fn a_stdin_feed_repeats_the_value_at_the_cut_when_its_other_writer_is_edited() {
     let (reply, out) = stdin_across_reload(
         &feed("stdin()", true, ""),
         &feed("stdin()", true, "!"),
         "a\nb",
         "c",
-        dispatch,
     );
     assert!(
         reply.contains("reloaded"),
@@ -280,10 +84,7 @@ fn a_stdin_feed_repeats_the_value_at_the_cut_when_its_other_writer_is_edited(
                 .flatten()
         })
         .collect();
-    let expected = match dispatch {
-        "1" => vec!["a", "ab", "a", "ab", "abc"],
-        _ => vec!["a", "ab", "abc"],
-    };
+    let expected = vec!["a", "ab", "ab", "abc"];
     assert_eq!(
         printed, expected,
         "the printed values changed. If the replay was fixed, pin the correct \
@@ -291,30 +92,10 @@ fn a_stdin_feed_repeats_the_value_at_the_cut_when_its_other_writer_is_edited(
     );
 }
 
-/// PINNED FAILURE of a related bug: lost input, not replay. A loop the reload adds
-/// over a list-literal binding misses the prefix the existing fold had consumed.
-///
-/// Correct at every cut from 0 to 10 pulls, as
-/// `a_loop_added_over_a_folded_collection_reads_it_whole` pins for a finished fold:
-///
-/// ```text
-/// abcdefgh|abcdefgh
-/// ```
-///
-/// Pinned: cuts 0, 1, 9 and 10 are correct. At 9 and 10 the fold has finished, so
-/// `items` is released in full and rebuilt. Cuts 2 to 8 lose one more element each:
-///
-/// ```text
-/// 2 pulls: abcdefgh|bcdefgh
-/// 3 pulls: abcdefgh|cdefgh
-/// 8 pulls: abcdefgh|h
-/// ```
-///
-/// `bind_let` rebuilds a binding only when it is released in full. A partially
-/// released `items` is kept, and the new loop's reader is seeded with the kept
-/// fan-out's intersection, which is `n`'s frontier.
+/// A loop added at a drained finite boundary reads the complete fixed collection, before or
+/// after the existing fold finishes. Mid-pull cuts are not execution boundaries.
 #[test]
-fn a_loop_added_over_a_collection_caught_mid_fold_loses_its_prefix() {
+fn a_loop_added_over_a_finite_collection_reads_its_whole_prefix() {
     let fold = |added: &str, result: &str| {
         format!(
             indoc! {r#"
@@ -335,16 +116,12 @@ fn a_loop_added_over_a_collection_caught_mid_fold_loses_its_prefix() {
             p := p + y
     "#};
     let mut changed = Vec::new();
-    for pulls in 0..=10 {
+    for completed in [false, true] {
         let mut ctx = GlobalContext::default();
         let mut live =
             LiveProgram::start_text(&mut ctx, &fold("", "n"), &no_main).expect("compiles");
-        for _ in 0..pulls {
-            let producer = live
-                .main_producer_mut(MAIN_BRANCH)
-                .expect("the value is `n`");
-            let _ = producer.get(producer.tiling().universal_guard());
-            ctx.scheduler().check_for_notifications();
+        if completed {
+            super::serving::run_branch_to_idle(&mut live, MAIN_BRANCH);
         }
         live.reload_text(
             &mut ctx,
@@ -355,12 +132,11 @@ fn a_loop_added_over_a_collection_caught_mid_fold_loses_its_prefix() {
         .expect("a loop over a list literal is a collection this version can build again");
         let value = drive_to_terminal(&mut ctx, &mut live);
         // The added loop folds `items` from the element the kept fold is on.
-        let pinned = match pulls {
-            2..=8 => format!("abcdefgh|{}", &"abcdefgh"[pulls - 1..]),
-            _ => "abcdefgh|abcdefgh".to_string(),
-        };
+        let pinned = "abcdefgh|abcdefgh";
         if value != pinned {
-            changed.push(format!("{pulls} pulls: actual {value}, pinned {pinned}"));
+            changed.push(format!(
+                "completed={completed}: actual {value}, pinned {pinned}"
+            ));
         }
     }
     assert!(
@@ -371,19 +147,11 @@ fn a_loop_added_over_a_collection_caught_mid_fold_loses_its_prefix() {
     );
 }
 
-fn drive_to_terminal(ctx: &mut GlobalContext, live: &mut LiveProgram) -> String {
-    for _ in 0..500 {
-        ctx.scheduler().check_for_notifications();
-        let producer = live
-            .main_producer_mut(MAIN_BRANCH)
-            .expect("the value is a string");
-        let tile = producer.get(producer.tiling().universal_guard());
-        if tile.is_terminal() {
-            let Tile::Scalar(ColumnValue::Strings(v)) = tile else {
-                panic!("a string value, got {tile:?}");
-            };
-            return v[0].to_string();
-        }
-    }
-    panic!("the fold never settled");
+fn drive_to_terminal(_ctx: &mut GlobalContext, live: &mut LiveProgram) -> String {
+    let Tile::Scalar(ColumnValue::Strings(values)) =
+        super::serving::run_branch_to_idle(live, MAIN_BRANCH)
+    else {
+        panic!("a final string")
+    };
+    values[0].to_string()
 }

@@ -103,7 +103,8 @@ fn a_reading_holds_one_value_per_position_and_call_path(#[case] root: &str) {
     n = sum([1 for x in xs])
     n > 0 and n < 64
 "})]
-#[timeout(Duration::from_secs(10))]
+// The two-generator case validates nested tiles on every dispatched position in debug builds.
+#[timeout(Duration::from_secs(120))]
 fn a_reading_in_a_filter_reads_each_position(#[case] root: &str) {
     check_program_scalar(&with_random(root), Value::Bool(true));
 }

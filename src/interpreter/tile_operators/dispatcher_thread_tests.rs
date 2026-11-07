@@ -419,8 +419,6 @@ impl TileProducer for ScriptBreaker {
 }
 
 impl Breaker for ScriptBreaker {
-    fn enter_consuming_mode(&mut self) {}
-
     fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
         self.consumed |= mask_of(&guard);
     }
@@ -1494,8 +1492,6 @@ impl TileProducer for SharedHeld {
 }
 
 impl Breaker for SharedHeld {
-    fn enter_consuming_mode(&mut self) {}
-
     fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
         self.consumed.fetch_or(mask_of(&guard), SeqCst);
     }

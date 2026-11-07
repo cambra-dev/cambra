@@ -1,9 +1,6 @@
 use super::*;
 use crate::interpreter::operator_graph::value;
-use crate::interpreter::scheduler::restating;
-use crate::interpreter::{
-    BaseType, ColumnValue, Consumer, Extent, SubscribeContext, Value, tuple_field,
-};
+use crate::interpreter::{BaseType, ColumnValue, Consumer, Extent, Value, tuple_field};
 
 /// Re-keys a collection of pairs by each pair's first component, `𝐾 ⤇ (𝐽, 𝑉)` to `𝐽 ⤇ 𝑉`, where
 /// those keys are distinct: the `map` constructor's re-keying (group by the new key, then take the
@@ -29,12 +26,8 @@ use crate::interpreter::{
 /// those rows from its output itself. Its one input today, a reply tap's `StoreValueStream`,
 /// honors only a prefix of commit ticks, so a prefix is also all it could be told.
 ///
-/// A region an input pushes or notifies names input positions, and which output keys sit at
-/// those positions is data the operator reads only at its next pull. The caller supplies the
-/// restatement, `restate`, from what it knows of the input: a reply tap's store records the
-/// item each commit answered ([`CommittedItems`]).
-///
-/// [`CommittedItems`]: crate::interpreter::commit_operator::CommittedItems
+/// Its pipeline consumes input positions into retained output keyed by the pairs' first
+/// component. Publication names the output keys after those positions have been consumed.
 pub struct RekeySorted {
     /// Output tiling: `DataFunction { domain: 𝐽, codomain: 𝑉 }`.
     base: OperatorBase,
@@ -43,8 +36,6 @@ pub struct RekeySorted {
     /// The output's domain, the pairs' first component, which a prefix of a union key needs
     /// for its tags.
     key: Extent,
-    /// A region of input positions restated as the output keys at those positions.
-    restate: Rc<dyn Fn(&Projection) -> Projection>,
     /// Whether the keys rise with the input's positions.
     order: KeyOrder,
 }
@@ -73,17 +64,12 @@ impl KeyOrder {
 }
 
 impl RekeySorted {
-    pub fn new(
-        input: Box<dyn TileOperator>,
-        restate: Rc<dyn Fn(&Projection) -> Projection>,
-        order: KeyOrder,
-    ) -> Self {
+    pub fn new(input: Box<dyn TileOperator>, order: KeyOrder) -> Self {
         let (tiling, key) = rekeyed_tiling(input.tiling());
         Self {
             base: OperatorBase::new(tiling),
             input,
             key,
-            restate,
             order,
         }
     }
@@ -129,23 +115,22 @@ impl TileOperator for RekeySorted {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        Box::new(RekeySortedProducer {
+        let input = BreakerInput::new(consumer, self.input.tiling(), false);
+        share_breaker(RekeySortedProducer {
             base: ProducerBase::new(
                 RekeySortedProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
                 cx,
-            ),
-            input: self.input.subscribe(
-                self.tiling().universal_guard(),
-                {
-                    let restate = self.restate.clone();
-                    restating(Box::new(move |region| restate(region)), consumer)
-                },
-                cx,
-            ),
+            )
+            .breaking(input.downstream, input.placement),
+            input: self
+                .input
+                .subscribe(self.input.tiling().universal_guard(), input.consumer, cx),
+            output: self.tiling().empty_tile(),
             held: Vec::new(),
             complete: Complete::new(self.order),
+            consumed: Predicate::False,
             key: self.key.clone(),
         })
     }
@@ -155,19 +140,21 @@ impl TileOperator for RekeySorted {
 struct RekeySortedProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
-    /// The rows the input returned on the last pull, as `(key, position)` in the input's
-    /// order, which is also key order under [`KeyOrder::Rising`].
+    output: Tile,
+    /// Position-to-key mappings above the consumed input prefix. These survive output release
+    /// until an earlier input gap closes and their keys can advance output completeness.
     held: Vec<(Value, Value)>,
     /// The keys the output has called complete. They only grow, and a release of their rows
     /// does not shrink them.
     complete: Complete,
+    consumed: Predicate,
     /// The output's domain ([`RekeySorted::key`]).
     key: Extent,
 }
 
 impl TileProducer for RekeySortedProducer {
     fn state_info(&self) -> ProducerStateInfo {
-        ProducerStateInfo::holding(self.held.len())
+        ProducerStateInfo::holding(self.output.cell_count() + self.held.len())
     }
 
     impl_producer_base!();
@@ -180,9 +167,79 @@ impl TileProducer for RekeySortedProducer {
         visit("input", &mut *self.input);
     }
 
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let projection = projection_guard.projection_for(self);
-        let input = self.input.get(self.input.tiling().universal_guard());
+    fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
+        Some(self)
+    }
+
+    fn get_impl(&mut self, guard: TileGuard) -> Tile {
+        if self.base.reads_input() {
+            let mut tile = self.read_input(self.input.tiling().universal_guard());
+            tile.restrict_to(&guard.projection_for(self), self.tiling());
+            tile
+        } else {
+            self.offer_impl(guard)
+        }
+    }
+
+    fn release_impl(&mut self, _obsolete_guard: TileGuard) {
+        self.output.remove_guarded(self.obsolete_guard().clone());
+        if self
+            .base
+            .placement
+            .as_ref()
+            .is_some_and(|at| at.get().is_some())
+        {
+            return;
+        }
+        // The accumulated guard, not the increment: a release that closes a gap releases the
+        // rows above it that an earlier release named.
+        let released = self.obsolete_guard().clone();
+        if released.is_universal() {
+            return self.input.release(self.input.tiling().universal_guard());
+        }
+        let through = self
+            .held
+            .iter()
+            .take_while(|(key, _)| released.covers_path(std::slice::from_ref(key)))
+            .last()
+            .map(|(_, at)| at.clone());
+        let Some(through) = through else {
+            return;
+        };
+        self.held.retain(|(_, at)| at > &through);
+        self.input
+            .release(TileGuard::Function(FunctionGuard::Domain(
+                Predicate::at_or_below(through),
+            )));
+    }
+}
+
+impl RekeySortedProducer {
+    /// Only the continuous consumed prefix can advance a prefix-releasing input.
+    fn consumed_prefix(&self) -> Predicate {
+        match &self.consumed {
+            Predicate::True => Predicate::True,
+            Predicate::False => Predicate::False,
+            Predicate::Intervals(intervals) => {
+                intervals
+                    .intervals()
+                    .first()
+                    .map_or(Predicate::False, |first| {
+                        let prefix =
+                            Predicate::intervals(intervalsets::IntervalSet::from(first.clone()));
+                        if prefix.as_at_or_below().is_some() {
+                            prefix
+                        } else {
+                            Predicate::False
+                        }
+                    })
+            }
+            other => panic!("RekeySorted consumes a region of ordered input positions: {other:?}"),
+        }
+    }
+
+    fn read_input(&mut self, input_guard: TileGuard) -> Tile {
+        let input = self.input.get(input_guard);
         let Tile::DataFunction {
             row_starts,
             domain: positions,
@@ -237,12 +294,21 @@ impl TileProducer for RekeySortedProducer {
             "a row arrived under a key {} has already released",
             self.name()
         );
-        for (key, at) in &rows {
-            if domain_predicate.contains(at) {
+        self.consumed = self.consumed.union(&domain_predicate);
+        for row in &rows {
+            if !self.held.iter().any(|(_, at)| at == &row.1) {
+                self.held.push(row.clone());
+            }
+        }
+        self.held
+            .sort_by(|a, b| a.1.partial_cmp(&b.1).expect("ordered input positions"));
+        let prefix = self.consumed_prefix();
+        for (key, at) in &self.held {
+            if prefix.contains(at) {
                 self.complete.add(key);
             }
         }
-        let complete = match domain_predicate.is_true() {
+        let complete = match prefix.is_true() {
             true => Predicate::True,
             false => self.complete.predicate(&self.key),
         };
@@ -265,7 +331,6 @@ impl TileProducer for RekeySortedProducer {
                 values.select_rows(&order),
             ),
         };
-        self.held = rows;
         let mut out = Tile::data_function(keys, Box::new(values), complete, deleted);
         // The rows above a gap in the released keys, which the input still holds.
         let released = self.obsolete_guard().clone();
@@ -274,31 +339,50 @@ impl TileProducer for RekeySortedProducer {
         }
         // The input is read whole, because a key's position is known only once its row
         // arrives; the answer is cut to the pull's keys.
-        out.restrict_to(&projection, self.tiling());
         out
     }
+}
 
-    fn release_impl(&mut self, _obsolete_guard: TileGuard) {
-        // The accumulated guard, not the increment: a release that closes a gap releases the
-        // rows above it that an earlier release named.
-        let released = self.obsolete_guard().clone();
-        if released.is_universal() {
-            return self.input.release(self.input.tiling().universal_guard());
-        }
-        let through = self
-            .held
-            .iter()
-            .take_while(|(key, _)| released.covers_path(std::slice::from_ref(key)))
-            .last()
-            .map(|(_, at)| at.clone());
-        let Some(through) = through else {
-            return;
-        };
-        self.held.retain(|(_, at)| at > &through);
+impl Breaker for RekeySortedProducer {
+    fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
+        let tile = self.read_input(guard.clone());
+        self.output.merge(tile);
+        let prefix = self.consumed_prefix();
         self.input
-            .release(TileGuard::Function(FunctionGuard::Domain(
-                Predicate::at_or_below(through),
-            )));
+            .release(TileGuard::Function(FunctionGuard::Domain(prefix.clone())));
+        self.held.retain(|(_, position)| !prefix.contains(position));
+    }
+    fn input_tiling(&self, _: InputId) -> Tiling {
+        self.input.tiling().clone()
+    }
+    fn input_released(&self, _: InputId) -> TileGuard {
+        self.input.obsolete_guard().clone()
+    }
+    fn as_producer(&self) -> Option<&dyn BreakingProducer> {
+        Some(self)
+    }
+}
+
+impl BreakingProducer for RekeySortedProducer {
+    fn held(&self) -> TileGuard {
+        self.output.to_guard()
+    }
+    fn offer_impl(&mut self, guard: TileGuard) -> Tile {
+        let mut tile = self.output.clone();
+        tile.restrict_to(&guard.projection_for(self), self.tiling());
+        tile
+    }
+    fn morsels(&self, guard: &TileGuard, rows: usize) -> Vec<TileGuard> {
+        cut_at_keys(
+            guard,
+            self.output
+                .live_keys()
+                .into_iter()
+                .flatten()
+                .map(|(_, key)| key),
+            rows,
+            self.tiling(),
+        )
     }
 }
 
@@ -390,10 +474,13 @@ mod tests {
         let mut producer = RekeySortedProducer {
             base: ProducerBase::unowned(RekeySortedProducer::alloc_id(), &tiling),
             input: Box::new(spy),
+            output: tiling.empty_tile(),
             held: Vec::new(),
             complete: Complete::new(order),
+            consumed: Predicate::False,
             key,
         };
+        producer.consume_in_pipeline(InputId::ONLY, pair_tiling().universal_guard());
         let out = producer.get(tiling.universal_guard());
         (producer, out, released)
     }
@@ -404,6 +491,54 @@ mod tests {
 
     fn uint(n: u64) -> Value {
         Value::UInt(n)
+    }
+
+    /// A later morsel cannot release an unread earlier tick or rule its output key absent.
+    #[test]
+    fn reverse_morsels_release_only_the_consumed_prefix() {
+        use crate::interpreter::tile_operators::test_helpers::ProjectionSpy;
+        let input_tiling = pair_tiling();
+        let (spy, _, releases) = ProjectionSpy::new(
+            pairs(&[0, 1], &[0, 1], &[10, 20], Predicate::True),
+            input_tiling,
+        );
+        let (tiling, key) = rekeyed_tiling(&pair_tiling());
+        let mut producer = RekeySortedProducer {
+            base: ProducerBase::unowned(RekeySortedProducer::alloc_id(), &tiling),
+            input: Box::new(spy),
+            output: tiling.empty_tile(),
+            held: Vec::new(),
+            complete: Complete::new(KeyOrder::Rising),
+            consumed: Predicate::False,
+            key,
+        };
+        producer.consume_in_pipeline(InputId::ONLY, keys(Predicate::point(uint(1))));
+        assert!(producer.input.obsolete_guard().is_empty());
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &producer.output
+        else {
+            unreachable!()
+        };
+        assert!(!domain_predicate.contains(&uint(0)));
+        producer.release(keys(Predicate::point(uint(1))));
+        producer.consume_in_pipeline(InputId::ONLY, keys(Predicate::point(uint(0))));
+        assert!(
+            producer
+                .complete
+                .predicate(&producer.key)
+                .contains(&uint(1))
+        );
+        assert_eq!(
+            producer.input.obsolete_guard(),
+            &keys(Predicate::at_or_below(uint(1)))
+        );
+        assert!(
+            releases
+                .borrow()
+                .iter()
+                .all(|guard| guard.is_empty() || *guard == keys(Predicate::at_or_below(uint(1))))
+        );
     }
 
     /// The output is complete through the key at the input's last complete position, before
@@ -430,48 +565,6 @@ mod tests {
         assert_eq!(domain_predicate, Predicate::at_or_below(uint(1)));
     }
 
-    /// A prefix of keys is released as the prefix of positions that carries them.
-    #[test]
-    fn a_key_prefix_releases_a_position_prefix() {
-        let (mut producer, _, released) = pulled(pairs(
-            &[3, 7, 9],
-            &[0, 1, 2],
-            &[10, 20, 30],
-            Predicate::True,
-        ));
-        producer.release(keys(Predicate::at_or_below(uint(1))));
-        assert_eq!(
-            *released.borrow(),
-            vec![keys(Predicate::at_or_below(uint(7)))]
-        );
-    }
-
-    /// A release with a gap below it forwards nothing until the gap is released, and the key
-    /// above the gap leaves the output meanwhile.
-    #[test]
-    fn a_gap_holds_the_rows_above_it() {
-        let (mut producer, _, released) = pulled(pairs(
-            &[3, 7, 9],
-            &[0, 1, 2],
-            &[10, 20, 30],
-            Predicate::True,
-        ));
-        producer.release(keys(Predicate::point(uint(1))));
-        assert!(released.borrow().is_empty(), "{:?}", released.borrow());
-        let out = producer.get(producer.tiling().universal_guard());
-        assert_eq!(
-            out.live_keys()
-                .map(|k| k.map(|(_, key)| key).collect::<Vec<_>>()),
-            Some(vec![uint(0), uint(2)])
-        );
-        producer.release(keys(Predicate::point(uint(0))));
-        assert_eq!(
-            *released.borrow(),
-            vec![keys(Predicate::at_or_below(uint(7)))]
-        );
-    }
-
-    /// A pull at some keys reads the input whole and answers those keys alone.
     #[test]
     fn a_pull_at_some_keys_answers_those_keys() {
         let (mut producer, _, _) = pulled(pairs(
@@ -517,28 +610,6 @@ mod tests {
         assert_eq!(
             domain_predicate,
             Predicate::point(uint(0)).union(&Predicate::point(uint(2)))
-        );
-    }
-
-    /// Under keys in any order, the input is released through the last position whose key, and
-    /// every key at a position before it, is released.
-    #[test]
-    fn keys_in_any_order_release_a_position_prefix() {
-        let (mut producer, _, released) = pulled_in(
-            pairs(&[3, 7, 9], &[0, 2, 1], &[10, 20, 30], Predicate::True),
-            KeyOrder::Any,
-        );
-        producer.release(keys(Predicate::point(uint(1))));
-        assert!(released.borrow().is_empty(), "{:?}", released.borrow());
-        producer.release(keys(Predicate::point(uint(0))));
-        assert_eq!(
-            *released.borrow(),
-            vec![keys(Predicate::at_or_below(uint(3)))]
-        );
-        producer.release(keys(Predicate::point(uint(2))));
-        assert_eq!(
-            released.borrow().last(),
-            Some(&keys(Predicate::at_or_below(uint(9))))
         );
     }
 

@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use smol_str::SmolStr;
 use std::collections::HashMap;
 
@@ -81,7 +83,7 @@ impl TileOperator for PermuteRecordDomain {
                     let permutation = self.permutation.clone();
                     // The keys are the input's with their fields renamed, so a region of the
                     // input's keys is the region of the same keys renamed.
-                    crate::interpreter::scheduler::restating(
+                    crate::interpreter::notifications::restating(
                         Box::new(move |region| {
                             at_outermost(region, &|keys| permute_componentwise(keys, &permutation))
                         }),
@@ -543,11 +545,22 @@ impl TileOperator for FlattenTupleDomain {
                 self.tiling().universal_guard(),
                 {
                     let field_map = self.field_map.clone();
+                    let at = self.level;
                     // The keys are the input's with some fields' fields spliced in, so a region
                     // of the input's keys is the region of the same keys spliced.
-                    crate::interpreter::scheduler::restating(
-                        Box::new(move |region| {
-                            at_outermost(region, &|keys| flatten_predicate(keys, &field_map))
+                    crate::interpreter::notifications::restating(
+                        Box::new(move |region| match region {
+                            Projection::Keys { level, keys } if *level >= at => {
+                                Projection::keys_at(
+                                    *level,
+                                    keys.with_component_restated(
+                                        level.index(),
+                                        at.index(),
+                                        &|keys| flatten_predicate(keys, &field_map),
+                                    ),
+                                )
+                            }
+                            _ => region.clone(),
                         }),
                         consumer,
                     )
@@ -1079,7 +1092,7 @@ mod tests {
             level: CurryLevel::OUTERMOST,
             empty_level: flat_tiling.empty_at_no_rows(),
         };
-        let result = producer.get(producer.tiling().universal_guard());
+        let result = producer.read_in_pipeline(producer.tiling().universal_guard());
         let Tile::DataFunction {
             domain,
             domain_predicate,
@@ -1151,7 +1164,7 @@ mod tests {
     #[test]
     fn flatten_producer_flattens_each_group_beneath_a_standing_level() {
         let mut producer = flatten_beneath_a_standing_level();
-        let result = producer.get(producer.tiling().universal_guard());
+        let result = producer.read_in_pipeline(producer.tiling().universal_guard());
         let Tile::DataFunction {
             domain: rows,
             codomain,
@@ -1263,7 +1276,7 @@ mod tests {
             level: CurryLevel::OUTERMOST,
             empty_level: out_tiling.empty_at_no_rows(),
         };
-        let result = producer.get(producer.tiling().universal_guard());
+        let result = producer.read_in_pipeline(producer.tiling().universal_guard());
         let Tile::DataFunction { domain, .. } = result else {
             panic!("expected Function");
         };
@@ -1314,7 +1327,7 @@ mod tests {
             input: Box::new(TestTileProducer::new(input_tile, input_tiling)),
             permutation,
         };
-        let result = producer.get(producer.tiling().universal_guard());
+        let result = producer.read_in_pipeline(producer.tiling().universal_guard());
         let Tile::DataFunction { domain, .. } = result else {
             panic!("expected Function");
         };
@@ -1339,7 +1352,7 @@ mod tests {
             input: Box::new(TestTileProducer::new(input_tile, input_tiling)),
             permutation,
         };
-        let result = producer.get(producer.tiling().universal_guard());
+        let result = producer.read_in_pipeline(producer.tiling().universal_guard());
         let Tile::DataFunction { domain, .. } = result else {
             panic!("expected Function");
         };
@@ -1379,7 +1392,7 @@ mod tests {
             input: Box::new(TestTileProducer::new(input_tile, input_tiling)),
             permutation,
         };
-        let result = producer.get(producer.tiling().universal_guard());
+        let result = producer.read_in_pipeline(producer.tiling().universal_guard());
         let Tile::DataFunction {
             domain_predicate, ..
         } = result
@@ -1615,7 +1628,7 @@ mod tests {
             input: Box::new(TestTileProducer::new(input_tile, input_tiling)),
             permutation: vec![2usize, 0, 1],
         };
-        let result = producer.get(producer.tiling().universal_guard());
+        let result = producer.read_in_pipeline(producer.tiling().universal_guard());
         let Tile::DataFunction {
             domain_predicate, ..
         } = result
@@ -1772,7 +1785,7 @@ mod projection_tests {
     #[test]
     fn permuted_pairs_asked_for_nothing_pull_nothing() {
         let (mut swapped, pulled) = swapped_pairs();
-        let tile = swapped.get(swapped.tiling().empty_guard());
+        let tile = swapped.read_in_pipeline(swapped.tiling().empty_guard());
         assert_eq!(tile, swapped.tiling().empty_tile());
         assert!(pulled.borrow().is_empty());
     }
@@ -1831,7 +1844,7 @@ mod projection_tests {
     #[test]
     fn flattened_triples_asked_for_nothing_pull_nothing() {
         let (mut flat, pulled) = flattened_triples();
-        let tile = flat.get(flat.tiling().empty_guard());
+        let tile = flat.read_in_pipeline(flat.tiling().empty_guard());
         assert_eq!(tile, flat.tiling().empty_tile());
         assert!(pulled.borrow().is_empty());
     }

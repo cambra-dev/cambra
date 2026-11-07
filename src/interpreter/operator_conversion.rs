@@ -1,5 +1,7 @@
 use crate::ccl::Label;
 use crate::ccl::RecordEntry;
+#[cfg(test)]
+use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use bit_set::BitSet;
 use log::trace;
 use smol_str::SmolStr;
@@ -4013,16 +4015,6 @@ fn store_key_extent(arms: Vec<(Label, Extent)>) -> Extent {
     ))
 }
 
-/// The restatement a read of the reply tap `key` re-keys by: a region of the store's commit
-/// ticks as the items the tap committed at them ([`CommittedItems::restate`]).
-fn items_of_tap(
-    items: &CommittedItems,
-    key: &Value,
-) -> Rc<dyn Fn(&crate::interpreter::Projection) -> crate::interpreter::Projection> {
-    let (items, key) = (items.clone(), key.clone());
-    Rc::new(move |region| items.restate(&key, region))
-}
-
 /// Build a [`Type::Txn`] transactional store: a multi-key [`CommitOperator`] wired in a cyclic
 /// [`FanOut`], one *fused* [`CommitWriter`] per writer (a slot of the shared store output). Each
 /// fused writer reads the cyclic store, runs its body — the ``let k₀ = p.0 in … let item = p.r in
@@ -4215,7 +4207,6 @@ fn build_commit_store(
             ));
             let fan = Rc::new(FanOut::new(Box::new(RekeySorted::new(
                 stream,
-                items_of_tap(items, &info.runtime_key),
                 items.order(&info.runtime_key),
             ))));
             scope.rebuilt.insert(fed.name.clone());
@@ -5666,7 +5657,11 @@ fn convert_store_settled_read(
     // the levels standing above the stores are the store tiling's collection levels.
     let levels_above = fan.tiling().levels();
     Ok(Box::new(StoreFinalRead::per_row_at(
-        fan.slot(),
+        if levels_above == 0 {
+            fan.current_slot()
+        } else {
+            fan.slot()
+        },
         runtime_key,
         value_extent,
         levels_above,
@@ -5713,11 +5708,7 @@ fn convert_store_read(
             Ok(match by_item {
                 Some(items) => {
                     let order = items.order(&runtime_key);
-                    Box::new(RekeySorted::new(
-                        stream,
-                        items_of_tap(&items, &runtime_key),
-                        order,
-                    ))
+                    Box::new(RekeySorted::new(stream, order))
                 }
                 None => stream,
             })
@@ -6572,12 +6563,12 @@ mod variant_ctor_tests {
     use crate::ccl::{
         BaseType as CclBase, BindingTransparency, Lit, Type, TypedExpr, TypedExprNode,
     };
+    use crate::interpreter::UnionArm;
     use crate::interpreter::tile_operators::{
         ProducerBase, Tile, TileProducer, impl_producer_base,
     };
     use crate::interpreter::tiling::{Predicate, TileGuard};
     use crate::interpreter::{ColumnValue, Consumer, SubscribeContext, Value};
-    use crate::interpreter::{Projection, UnionArm};
     use crate::pretty_graph::VizOptions;
     use crate::pretty_tree::InspectNode;
     use bit_set::BitSet;
@@ -6601,7 +6592,7 @@ mod variant_ctor_tests {
         let mut op = op;
         let mut cx = SubscribeContext::new();
         let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut cx);
-        producer.get(producer.tiling().universal_guard())
+        producer.read_in_pipeline(producer.tiling().universal_guard())
     }
 
     /// A scalar `` `commit(7) `` op-converts to a `Scalar(Union)` tile whose single
@@ -6747,10 +6738,9 @@ mod variant_ctor_tests {
         fn subscribe(
             &mut self,
             _intent_guard: TileGuard,
-            mut consumer: Box<dyn Consumer>,
+            _consumer: Box<dyn Consumer>,
             _cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
-            consumer.notify(&Projection::Everything);
             Box::new(FixedStreamProducer {
                 base: ProducerBase::unowned(FixedStreamProducer::alloc_id(), &self.tiling),
                 tile: self.tile.clone(),

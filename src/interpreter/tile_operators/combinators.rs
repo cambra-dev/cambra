@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use bit_set::BitSet;
 use log::trace;
 use std::collections::HashMap;
@@ -77,19 +79,18 @@ impl TileOperator for Converse {
         // region of them restates exactly there and the inverse reads only the rows it names. It
         // keeps of earlier pulls only what a release and the absent keys rest on
         // (`ConverseProducer::held`, `read`, `seen`).
-        let (shared, gate) = shared_consumer(consumer);
-        let wakeups = cx.scheduler().wakeup_queue();
+        let shared = shared_consumer(consumer);
+
         let input = self.input.subscribe(
             self.input.tiling().universal_guard(),
-            crate::interpreter::scheduler::one_level_in(
+            crate::interpreter::notifications::one_level_in(
                 self.level,
-                forwarding_consumer_keeping_keys(&shared, &wakeups),
+                forwarding_consumer_keeping_keys(&shared),
             ),
             cx,
         );
         Box::new(ConverseProducer::new(
-            ProducerBase::new(ConverseProducer::alloc_id(), self.tiling(), &self.base, cx)
-                .sharing(gate),
+            ProducerBase::new(ConverseProducer::alloc_id(), self.tiling(), &self.base, cx),
             input,
             self.level,
             self.tiling().values_at(self.level).empty_at_no_rows(),
@@ -775,11 +776,11 @@ impl TileOperator for Uncurry {
         // change widens, and an outer key decides every pair whose first field it is.
         let level = self.level;
         let consumer = match level == CurryLevel::OUTERMOST {
-            true => crate::interpreter::scheduler::widening_restating_decided(
+            true => crate::interpreter::notifications::widening_restating_decided(
                 |region| paired(region, CurryLevel::OUTERMOST),
                 consumer,
             ),
-            false => crate::interpreter::scheduler::restating(
+            false => crate::interpreter::notifications::restating(
                 Box::new(move |region| paired(region, level)),
                 consumer,
             ),
@@ -1204,7 +1205,7 @@ impl TileOperator for Filter {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        let (shared, gate) = shared_consumer(consumer);
+        let shared = shared_consumer(consumer);
         // A side that is a collection is pulled at the projection and shares the mask's keys; a
         // side that is not is read whole.
         let predicate_producer = subscribe_forwarding_keeping_keys_if(
@@ -1220,8 +1221,7 @@ impl TileOperator for Filter {
             cx,
         );
         Box::new(FilterProducer {
-            base: ProducerBase::new(FilterProducer::alloc_id(), self.tiling(), &self.base, cx)
-                .sharing(gate),
+            base: ProducerBase::new(FilterProducer::alloc_id(), self.tiling(), &self.base, cx),
             input: input_producer,
             predicate: predicate_producer,
             level: self.level,
@@ -1616,7 +1616,6 @@ fn pair_one_level(outer: &Tile, inner: &Tile, pair: &Tiling, second: Paired) -> 
         Tile::DataFunction {
             domain: inner_rows,
             codomain: groups,
-            domain_predicate: inner_complete,
             ..
         },
     ) = (outer, inner)
@@ -1667,7 +1666,7 @@ fn pair_one_level(outer: &Tile, inner: &Tile, pair: &Tiling, second: Paired) -> 
         domain_predicate, ..
     } = &mut emitted
     {
-        *domain_predicate = domain_predicate.intersect(inner_complete);
+        *domain_predicate = outer.complete_keys().intersect(&inner.complete_keys());
     }
     // A pair is complete where the inner side calls its key complete under the row, by the
     // group's statement or the row's (`Tile::completion_at`), and the outer row's value is whole.
@@ -1677,14 +1676,10 @@ fn pair_one_level(outer: &Tile, inner: &Tile, pair: &Tiling, second: Paired) -> 
     let mut rows = Predicate::from_column_value(
         &outer_keys.select_indices(paired.iter().copied(), paired.len()),
     );
-    if let Tile::DataFunction {
-        codomain,
-        domain_predicate: outer_complete,
-        ..
-    } = outer
+    if let Tile::DataFunction { codomain, .. } = outer
         && codomain.holds_a_level()
     {
-        rows = rows.intersect(outer_complete);
+        rows = rows.intersect(&outer.complete_keys());
     }
     let stated = inner
         .completion_at(CurryLevel::new(1))
@@ -1915,17 +1910,25 @@ impl TileOperator for Product {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        let (shared, gate) = shared_consumer(consumer);
+        let shared = shared_consumer(consumer);
         let level = self
             .paired
             .enclosing()
             .unwrap_or_else(|| unreachable!("the paired level is beneath a row"));
         let empty_level = self.tiling().values_at(level).empty_at_no_rows();
+        let outer_consumer = forwarding_consumer_keeping_keys(&shared);
+        let outer_consumer = crate::interpreter::notifications::through_values(
+            CurryLevel::new(level.index() + 1),
+            self.tiling(),
+            outer_consumer,
+        );
+        let outer = self
+            .outer
+            .subscribe(self.outer.tiling().universal_guard(), outer_consumer, cx);
         Box::new(ProductProducer {
-            base: ProducerBase::new(ProductProducer::alloc_id(), self.tiling(), &self.base, cx)
-                .sharing(gate),
+            base: ProducerBase::new(ProductProducer::alloc_id(), self.tiling(), &self.base, cx),
             // Both sides are pulled at the projection, aligned row for row.
-            outer: subscribe_forwarding_keeping_keys(&mut *self.outer, &shared, cx),
+            outer,
             inner: subscribe_forwarding_keeping_keys(&mut *self.inner, &shared, cx),
             level,
             empty_level,
@@ -2329,7 +2332,7 @@ mod tests {
             predicate: Box::new(predicate),
             level: CurryLevel::new(1),
         };
-        filter.get(filter.tiling().universal_guard())
+        filter.read_in_pipeline(filter.tiling().universal_guard())
     }
 
     /// A two-level predicate masks each row's inner keys, so the survivors differ by row and
@@ -2601,7 +2604,7 @@ mod tests {
         };
 
         // Get the result from UncurryProducer
-        let result = uncurry.get(uncurry.tiling().universal_guard());
+        let result = uncurry.read_in_pipeline(uncurry.tiling().universal_guard());
 
         // Verify the result is a Function
         match result {
@@ -2719,7 +2722,7 @@ mod tests {
             empty_pair: output_tiling.empty_at_no_rows(),
         };
 
-        let result = uncurry.get(uncurry.tiling().universal_guard());
+        let result = uncurry.read_in_pipeline(uncurry.tiling().universal_guard());
 
         match result {
             Tile::DataFunction {
@@ -2804,7 +2807,7 @@ mod tests {
             empty_pair: output_tiling.empty_at_no_rows(),
         };
 
-        let result = uncurry.get(uncurry.tiling().universal_guard());
+        let result = uncurry.read_in_pipeline(uncurry.tiling().universal_guard());
 
         match result {
             Tile::DataFunction {
@@ -2871,7 +2874,7 @@ mod tests {
             empty_pair: output_tiling.empty_at_no_rows(),
         };
 
-        let result = uncurry.get(uncurry.tiling().universal_guard());
+        let result = uncurry.read_in_pipeline(uncurry.tiling().universal_guard());
 
         match result {
             Tile::DataFunction {
@@ -2899,7 +2902,7 @@ mod tests {
             CurryLevel::OUTERMOST,
             output_tiling.empty_at_no_rows(),
         );
-        producer.get(producer.tiling().universal_guard())
+        producer.read_in_pipeline(producer.tiling().universal_guard())
     }
 
     fn one_level_tiling() -> Tiling {
@@ -2936,13 +2939,13 @@ mod tests {
             CurryLevel::OUTERMOST,
             output_tiling.empty_at_no_rows(),
         );
-        let _ = producer.get(producer.tiling().universal_guard());
+        let _ = producer.read_in_pipeline(producer.tiling().universal_guard());
         producer.release(TileGuard::Function(FunctionGuard::Domain(
             Predicate::point(Value::Int(10)),
         )));
         // Row 0 was released upstream; row 1 joins group 10 and row 2 starts group 20.
         *next.borrow_mut() = input_at(vec![1, 2], vec![10, 20]);
-        let mut out = producer.get(producer.tiling().universal_guard());
+        let mut out = producer.read_in_pipeline(producer.tiling().universal_guard());
         out.compact();
         let Tile::DataFunction { domain, .. } = &out else {
             panic!("converse yields a collection: {out:?}")
@@ -3042,7 +3045,7 @@ mod tests {
     #[test]
     fn a_nested_map_domain_replaces_each_rows_values_by_its_keys() {
         let mut map = nested_map_domain();
-        let out = map.get(map.tiling().universal_guard());
+        let out = map.read_in_pipeline(map.tiling().universal_guard());
         let Tile::DataFunction {
             domain, codomain, ..
         } = &out
@@ -3115,7 +3118,7 @@ mod tests {
     #[test]
     fn a_nested_converse_releases_one_rows_group_to_its_input() {
         let mut converse = nested_converse();
-        converse.get(converse.tiling().universal_guard());
+        converse.read_in_pipeline(converse.tiling().universal_guard());
         converse.release(under_a_row(TileGuard::Function(FunctionGuard::Domain(
             Predicate::exactly(&[Value::Int(1), Value::Int(10)]),
         ))));
@@ -3129,7 +3132,7 @@ mod tests {
     #[test]
     fn a_nested_converse_releases_part_of_a_group_to_its_input() {
         let mut converse = nested_converse();
-        converse.get(converse.tiling().universal_guard());
+        converse.read_in_pipeline(converse.tiling().universal_guard());
         converse.release(under_a_row(under_a_row(TileGuard::Function(
             FunctionGuard::Domain(Predicate::exactly(&[
                 Value::Int(1),
@@ -3147,7 +3150,7 @@ mod tests {
     #[test]
     fn a_nested_converse_releases_a_group_under_every_row_to_its_input() {
         let mut converse = nested_converse();
-        converse.get(converse.tiling().universal_guard());
+        converse.read_in_pipeline(converse.tiling().universal_guard());
         converse.release(under_a_row(TileGuard::Function(FunctionGuard::Domain(
             Predicate::point(Value::Int(10)),
         ))));
@@ -3165,12 +3168,12 @@ mod tests {
     #[test]
     fn a_nested_converse_releases_a_row_that_joins_a_released_group() {
         let (mut converse, next) = growing_nested_converse();
-        converse.get(converse.tiling().universal_guard());
+        converse.read_in_pipeline(converse.tiling().universal_guard());
         converse.release(under_a_row(TileGuard::Function(FunctionGuard::Domain(
             Predicate::exactly(&[Value::Int(1), Value::Int(10)]),
         ))));
         *next.borrow_mut() = growing_rows(&[10, 10, 20, 10], &[10]);
-        let mut out = converse.get(converse.tiling().universal_guard());
+        let mut out = converse.read_in_pipeline(converse.tiling().universal_guard());
         out.compact();
         assert!(
             !out.paths_at(CurryLevel::new(2))
@@ -3234,7 +3237,7 @@ mod tests {
         let mut cx = SubscribeContext::new();
         let mut producer =
             converse.subscribe(out_tiling.universal_guard(), Box::new(|| {}), &mut cx);
-        let out = producer.get(out_tiling.universal_guard());
+        let out = producer.read_in_pipeline(out_tiling.universal_guard());
         let groups: Vec<(Value, Value, Value)> = out
             .paths_at(CurryLevel::new(2))
             .into_iter()
@@ -3438,7 +3441,7 @@ mod tests {
             pair: out_tiling.deepest_values().clone(),
             second: Paired::Key,
         };
-        let out = producer.get(out_tiling.universal_guard());
+        let out = producer.read_in_pipeline(out_tiling.universal_guard());
         let Tile::DataFunction { codomain, .. } = &out else {
             panic!("Product tiles as a collection of collections, got {out:?}")
         };
@@ -3515,7 +3518,7 @@ mod tests {
         let mut cx = SubscribeContext::new();
         let mut producer =
             product.subscribe(out_tiling.universal_guard(), Box::new(|| {}), &mut cx);
-        let out = producer.get(out_tiling.universal_guard());
+        let out = producer.read_in_pipeline(out_tiling.universal_guard());
         let Tile::DataFunction { codomain, .. } = &out else {
             panic!("Product tiles as a collection of collections, got {out:?}")
         };
@@ -3590,7 +3593,7 @@ mod tests {
             pair: out_tiling.deepest_values().clone(),
             second: Paired::Key,
         };
-        let _ = producer.get(out_tiling.universal_guard());
+        let _ = producer.read_in_pipeline(out_tiling.universal_guard());
         let first_pair = TileGuard::Function(FunctionGuard::Codomain(Box::new(
             TileGuard::Function(FunctionGuard::Domain(Predicate::qualified(
                 Predicate::point(Value::UInt(0)),
@@ -3667,7 +3670,7 @@ mod tests {
             pair: out_tiling.deepest_values().clone(),
             second: Paired::Key,
         };
-        let out = producer.get(out_tiling.universal_guard());
+        let out = producer.read_in_pipeline(out_tiling.universal_guard());
         let Tile::DataFunction {
             domain_predicate, ..
         } = out.values_at(CurryLevel::new(1))
@@ -3724,7 +3727,7 @@ mod tests {
             pair: out_tiling.deepest_values().clone(),
             second: Paired::Key,
         };
-        let out = producer.get(out_tiling.universal_guard());
+        let out = producer.read_in_pipeline(out_tiling.universal_guard());
         assert!(
             !out.is_empty(),
             "the key row 0 holds is paired already: {out:?}"
@@ -3789,7 +3792,7 @@ mod tests {
             pair: out_tiling.deepest_values().clone(),
             second: Paired::Key,
         };
-        let out = producer.get(out_tiling.universal_guard());
+        let out = producer.read_in_pipeline(out_tiling.universal_guard());
         assert!(
             !out.is_empty(),
             "the key row 0 holds is paired already: {out:?}"
@@ -3861,7 +3864,7 @@ mod filter_projection_tests {
     #[test]
     fn a_filtered_morsel_keeps_the_passing_rows_and_pulls_both_sides_at_it() {
         let (mut filter, input_pulled, predicate_pulled) = keep_even_positions();
-        let morsel = filter.get(keys_between(2, 5));
+        let morsel = filter.read_in_pipeline(keys_between(2, 5));
         assert_eq!(int_entries(&morsel), [(2, 20), (4, 40)]);
         assert_eq!(*input_pulled.borrow(), [keys_between(2, 5)]);
         assert_eq!(*predicate_pulled.borrow(), [keys_between(2, 5)]);
@@ -3907,7 +3910,7 @@ mod filter_projection_tests {
             ProjectionSpy::new(answers, filter.predicate.tiling().clone());
         filter.input = Box::new(input);
         filter.predicate = Box::new(predicate);
-        let kept = filter.get(keys_between(0, ROWS - 1));
+        let kept = filter.read_in_pipeline(keys_between(0, ROWS - 1));
         assert_eq!(int_entries(&kept), [(0, 0), (2, 20), (4, 40), (6, 60)]);
         filter.release(kept.to_guard());
         let everything = || keys_between(0, ROWS - 1);
@@ -3983,7 +3986,7 @@ mod filter_projection_tests {
             level: CurryLevel::OUTERMOST,
         };
 
-        let first = filter.get(keys_between(0, ROWS - 1));
+        let first = filter.read_in_pipeline(keys_between(0, ROWS - 1));
         assert_eq!(int_entries(&first), [(0, 0), (2, 20), (3, 30), (6, 60)]);
         let Tile::DataFunction {
             domain_predicate, ..
@@ -3999,7 +4002,7 @@ mod filter_projection_tests {
         filter.release(first.to_guard());
         *input_cell.borrow_mut() = column(vec![4, 5, 7], from_4.clone(), value);
         *predicate_cell.borrow_mut() = column(vec![4, 5, 7], Predicate::True, answer);
-        let second = filter.get(keys_between(0, ROWS - 1));
+        let second = filter.read_in_pipeline(keys_between(0, ROWS - 1));
         assert_eq!(int_entries(&second), [(5, 50)]);
         let Tile::DataFunction {
             domain_predicate, ..
@@ -4218,7 +4221,7 @@ mod restrict_projection_tests {
     #[test]
     fn a_restricted_morsel_keeps_the_passing_positions_and_pulls_the_predicate_at_it() {
         let (mut restrict, pulled) = every_third();
-        let morsel = restrict.get(keys_between(2, 7));
+        let morsel = restrict.read_in_pipeline(keys_between(2, 7));
         assert_eq!(live_keys(&morsel), [3, 6]);
         assert_eq!(*pulled.borrow(), [keys_between(2, 7)]);
     }
@@ -4278,7 +4281,7 @@ mod map_domain_projection_tests {
     #[test]
     fn a_stream_keeps_its_morsel_and_takes_its_keys_as_values() {
         let (mut keys, pulled) = keys_of_a_stream();
-        let morsel = keys.get(keys_between(1, 3));
+        let morsel = keys.read_in_pipeline(keys_between(1, 3));
         let Tile::DataFunction {
             domain, codomain, ..
         } = &morsel
@@ -4494,7 +4497,7 @@ mod uncurry_projection_tests {
         let domain = |p: Predicate| TileGuard::Function(FunctionGuard::Domain(p));
         let guard = codomain(domain(Predicate::qualified(pair, point(5))));
         let (mut uncurry, pulled) = paired_groups_of_collections();
-        uncurry.get(guard.clone());
+        uncurry.read_in_pipeline(guard.clone());
         assert_eq!(
             *pulled.borrow(),
             [codomain(codomain(domain(Predicate::qualified(
@@ -4547,7 +4550,7 @@ mod uncurry_projection_tests {
     fn a_morsel_of_pairs_reads_the_groups_that_head_them() {
         let (mut uncurry, pulled) = paired_groups();
         let guard = pairs(groups_one_and_three(), Predicate::True);
-        let morsel = uncurry.get(guard);
+        let morsel = uncurry.read_in_pipeline(guard);
         assert_eq!(pair_count(&morsel), 3);
         assert_eq!(
             *pulled.borrow(),
@@ -4563,7 +4566,7 @@ mod uncurry_projection_tests {
     fn a_morsel_of_second_components_reads_that_member_under_every_group() {
         let (mut uncurry, pulled) = paired_groups();
         let guard = pairs(Predicate::True, Predicate::point(Value::UInt(1)));
-        let morsel = uncurry.get(guard);
+        let morsel = uncurry.read_in_pipeline(guard);
         assert_eq!(pair_count(&morsel), 1, "only the pair (2, 1)");
         assert_eq!(
             *pulled.borrow(),
@@ -4602,7 +4605,7 @@ mod uncurry_projection_tests {
             &mut Default::default(),
         );
         let guard = pairs(Predicate::True, Predicate::point(Value::UInt(1)));
-        let morsel = producer.get(guard.clone());
+        let morsel = producer.read_in_pipeline(guard.clone());
         let (mut whole, _) = paired_groups();
         let mut expected = whole.get(out.universal_guard());
         expected.restrict_to(&Projection::of(&guard).unwrap(), &out);
@@ -4828,7 +4831,7 @@ mod product_projection_tests {
     #[test]
     fn a_range_of_rows_pulls_both_sides_at_it() {
         let (mut product, outer_pulled, inner_pulled) = rows_and_their_keys();
-        let rows = product.get(keys_between(1, 2));
+        let rows = product.read_in_pipeline(keys_between(1, 2));
         let Tile::DataFunction {
             domain, codomain, ..
         } = &rows
@@ -4891,7 +4894,7 @@ mod product_projection_tests {
             pair: out_tiling.deepest_values().clone(),
             second: Paired::Key,
         };
-        let out = producer.get(out_tiling.universal_guard());
+        let out = producer.read_in_pipeline(out_tiling.universal_guard());
         let Tile::DataFunction {
             domain,
             domain_predicate,
@@ -5095,7 +5098,7 @@ mod converse_projection_tests {
             )
         };
         let (mut converse, pulled) = make();
-        converse.get(keys_between(1, 1));
+        converse.read_in_pipeline(keys_between(1, 1));
         assert_eq!(*pulled.borrow(), [keys_between(1, 1)]);
         assert_conforms(|| Box::new(make().0), keys_between(1, 1));
     }
@@ -5192,7 +5195,7 @@ mod converse_pull_tests {
     fn a_value_no_row_holds_is_recorded_absent_once_every_key_is_read() {
         let source = source_of(0..KEYS, group_of);
         let mut converse = converse_over(&source);
-        let answer = converse.get(out_tiling().universal_guard());
+        let answer = converse.read_in_pipeline(out_tiling().universal_guard());
         let Tile::DataFunction { absent_keys, .. } = &answer else {
             panic!("a collection of groups, got {answer:?}")
         };

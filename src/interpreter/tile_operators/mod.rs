@@ -14,9 +14,13 @@
 //! `impl_*_base` macros, and [`TilePathStep`]) and re-exports every cluster so
 //! consumers continue to reach items as `tile_operators::X`.
 
+#[cfg(test)]
+use crate::interpreter::tile_operators::test_helpers::ConsumeInPipeline as _;
+#[cfg(test)]
+use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use smol_str::SmolStr;
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::HashMap,
     rc::Rc,
     sync::{Mutex, OnceLock},
@@ -35,7 +39,7 @@ use crate::{
     interpreter::operator_graph::{EdgeKind, InputEdgeSpec},
     interpreter::value_probe::ProbeSlot,
     interpreter::{
-        ColumnValue, Consumer, Extent, Gate, GatedConsumer, Projection, SubscribeContext, Value,
+        ColumnValue, Consumer, Extent, Projection, SharedConsumer, SubscribeContext, Value,
         forwarding_consumer, forwarding_consumer_keeping_keys, validate_tile, widening,
     },
     pretty_graph::VizOptions,
@@ -43,6 +47,8 @@ use crate::{
 };
 
 mod aggregate;
+mod breaker_reader;
+pub(crate) use breaker_reader::share_breaker;
 mod combinators;
 mod cycle_slot;
 #[cfg(test)]
@@ -204,12 +210,12 @@ static PRODUCER_COUNTERS: OnceLock<Mutex<HashMap<&'static str, usize>>> = OnceLo
 /// ([`shared_consumer`](crate::interpreter::shared_consumer)).
 pub(crate) fn subscribe_forwarding(
     op: &mut dyn TileOperator,
-    shared: &GatedConsumer,
+    shared: &SharedConsumer,
     cx: &mut SubscribeContext,
 ) -> Box<dyn TileProducer> {
     op.subscribe(
         op.tiling().universal_guard(),
-        forwarding_consumer(shared, &cx.scheduler().wakeup_queue()),
+        forwarding_consumer(shared),
         cx,
     )
 }
@@ -233,12 +239,12 @@ pub(crate) fn consumer_keeping_keys_if(
 /// region reaches the operator's consumer as it is.
 pub(crate) fn subscribe_forwarding_keeping_keys(
     op: &mut dyn TileOperator,
-    shared: &GatedConsumer,
+    shared: &SharedConsumer,
     cx: &mut SubscribeContext,
 ) -> Box<dyn TileProducer> {
     op.subscribe(
         op.tiling().universal_guard(),
-        forwarding_consumer_keeping_keys(shared, &cx.scheduler().wakeup_queue()),
+        forwarding_consumer_keeping_keys(shared),
         cx,
     )
 }
@@ -247,7 +253,7 @@ pub(crate) fn subscribe_forwarding_keeping_keys(
 pub(crate) fn subscribe_forwarding_keeping_keys_if(
     keeps_keys: bool,
     op: &mut dyn TileOperator,
-    shared: &GatedConsumer,
+    shared: &SharedConsumer,
     cx: &mut SubscribeContext,
 ) -> Box<dyn TileProducer> {
     match keeps_keys {
@@ -258,16 +264,13 @@ pub(crate) fn subscribe_forwarding_keeping_keys_if(
 
 /// What a pipeline breaker's operator passes its input, and what the breaker keeps. The breaker
 /// keeps the consumer it was subscribed with, shared so the breaker can push to it. The consumer
-/// is shared behind a gate that passes every notification (`Notified::Always`), so sharing it
-/// changes no notification it receives. The input's notifications reach it unchanged where the
-/// breaker keeps its input's keys, and as `Everything` where it re-keys or reads the input whole.
-/// In front of the input sits the [`Entry`](crate::interpreter::dispatcher::Entry) a planner
-/// places in the breaker's pipeline.
+/// is shared with notification forwarders. A placed input queues work for its breaker; an
+/// unplaced input forwards news to caches inside the enclosing scheduled pipeline.
 pub(crate) struct BreakerInput {
     /// The consumer to subscribe the input with.
     pub(crate) consumer: Box<dyn Consumer>,
     /// The breaker's own consumer, shared, which it pushes to (`ProducerBase::breaking`).
-    pub(crate) downstream: crate::interpreter::SharedConsumer,
+    pub(crate) downstream: SharedConsumer,
     /// The pipeline the entry queues for (`ProducerBase::breaking`).
     pub(crate) placement: crate::interpreter::dispatcher::Placement,
 }
@@ -275,22 +278,16 @@ pub(crate) struct BreakerInput {
 impl BreakerInput {
     /// The input consumer of a breaker subscribed with `consumer`, whose input answers `input`,
     /// and which keeps its input's keys where `keeps_keys`.
-    pub(crate) fn new(
-        consumer: Box<dyn Consumer>,
-        input: &Tiling,
-        keeps_keys: bool,
-        cx: &mut SubscribeContext,
-    ) -> Self {
-        let shared = GatedConsumer::new(consumer, Notified::Always);
-        let forwarding = match keeps_keys {
-            true => forwarding_consumer_keeping_keys(&shared, &cx.scheduler().wakeup_queue()),
-            false => forwarding_consumer(&shared, &cx.scheduler().wakeup_queue()),
-        };
-        let (entry, placement) =
-            crate::interpreter::dispatcher::Entry::unplaced(input.clone(), forwarding);
+    pub(crate) fn new(consumer: Box<dyn Consumer>, input: &Tiling, keeps_keys: bool) -> Self {
+        let shared = crate::interpreter::shared_consumer(consumer);
+        let (entry, placement) = crate::interpreter::dispatcher::Entry::unplaced(input.clone());
         BreakerInput {
-            consumer: Box::new(entry),
-            downstream: shared.shared().clone(),
+            consumer: Box::new(entry.inline_through(if keeps_keys {
+                forwarding_consumer_keeping_keys(&shared)
+            } else {
+                forwarding_consumer(&shared)
+            })),
+            downstream: shared.clone(),
             placement,
         }
     }
@@ -368,102 +365,6 @@ macro_rules! impl_operator_base {
 // it to the crate root.
 pub(crate) use impl_operator_base;
 
-/// Whether an input notification has arrived since the flag was last taken.
-/// `subscribe` installs [`Self::consumer`] on the input before the producer exists;
-/// `Rc<Cell<_>>` connects the two and carries no tile values.
-/// Each producer has one consumer, including each
-/// `FanOut` slot. See `src/interpreter/design-operators.md`, "The notification contract".
-/// [`Self::clear`] starts clear, so the first notification passes, including during `subscribe`.
-/// [`ProducerBase::sharing`] clears it on every pull, even without reading the input.
-#[derive(Clone)]
-pub enum Notified {
-    /// The input's notification does not reach this producer, so every pull reads —
-    /// what an operator whose `subscribe` installs no flag gets.
-    Always,
-    /// Set when the input notifies, cleared by a pull.
-    // shared-state-ok: see the type doc.
-    Flag(Rc<Cell<bool>>),
-}
-
-impl Notified {
-    /// A [`Flag`](Self::Flag) starting set, so the first pull can read before a notification.
-    pub fn flag() -> Self {
-        Self::Flag(Rc::new(Cell::new(true)))
-    }
-
-    /// A live [`Flag`](Self::Flag), starting clear: the gate on an operator's shared consumer,
-    /// or on a fan-out's branches, which has passed nothing on yet.
-    pub fn clear() -> Self {
-        Self::Flag(Rc::new(Cell::new(false)))
-    }
-
-    /// Record that the input has new data, and say whether that is news: the flag was clear.
-    /// `Always` is always news.
-    pub fn mark_news(&self) -> bool {
-        match self {
-            Self::Always => true,
-            Self::Flag(c) => !c.replace(true),
-        }
-    }
-
-    /// Whether the flag is set, without clearing it. `Always` reads set.
-    pub fn is_set(&self) -> bool {
-        match self {
-            Self::Always => true,
-            Self::Flag(c) => c.get(),
-        }
-    }
-
-    /// Record that the input has new data.
-    pub fn mark(&self) {
-        if let Self::Flag(c) = self {
-            c.set(true);
-        }
-    }
-
-    /// Read and clear. `Always` reads set and stays set.
-    pub fn take(&self) -> bool {
-        match self {
-            Self::Always => true,
-            Self::Flag(c) => c.replace(false),
-        }
-    }
-
-    /// An input consumer that sets this flag before forwarding the notification downstream.
-    pub fn consumer(&self, downstream: Box<dyn Consumer>) -> Box<dyn Consumer> {
-        Box::new(FlaggingConsumer {
-            flag: self.clone(),
-            downstream,
-        })
-    }
-}
-
-/// What [`Notified::consumer`] returns: sets the flag, then forwards the region unchanged.
-struct FlaggingConsumer {
-    flag: Notified,
-    downstream: Box<dyn Consumer>,
-}
-
-impl Consumer for FlaggingConsumer {
-    fn notify(&mut self, arrived: &Projection) {
-        crate::interpreter::dispatcher::debug_assert_outside_a_run();
-        self.flag.mark();
-        self.downstream.notify(arrived);
-    }
-
-    /// A push is no change to read, so it sets no flag.
-    fn push(
-        &mut self,
-        region: &Projection,
-        landing: &mut crate::interpreter::dispatcher::Landing<'_>,
-    ) {
-        self.downstream.push(region, landing);
-    }
-    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
-        self.downstream.route(routes);
-    }
-}
-
 /// The regions an input has notified since they were last taken.
 ///
 /// `subscribe` installs [`Self::consumer`] on the input before the producer exists;
@@ -513,19 +414,16 @@ struct RecordingConsumer {
 }
 
 impl Consumer for RecordingConsumer {
-    fn notify(&mut self, arrived: &Projection) {
-        crate::interpreter::dispatcher::debug_assert_outside_a_run();
-        self.arrivals.record(arrived);
-        self.downstream.notify(arrived);
-    }
-
-    /// A push is no change of the input, so it records nothing.
-    fn push(
+    /// Delivered notifications record the region; planning probes leave it unchanged.
+    fn notify(
         &mut self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
-        self.downstream.push(region, landing);
+        if landing.is_delivery() {
+            self.arrivals.record(region);
+        }
+        self.downstream.notify(region, landing);
     }
     fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
         self.downstream.route(routes);
@@ -929,8 +827,11 @@ fn completeness_violation(
 pub struct ProducerBase {
     /// Instance-unique ID, allocated by [`TileProducer::alloc_id`].
     pub id: usize,
-    /// The operator that built this producer. `None` only for a test double
-    /// built with `ProducerBase::unowned`.
+    /// The cell owning this breaker subscription. Weak so the producer cannot retain itself.
+    // shared-state-ok: execution ownership metadata; readers still exchange tiles through get.
+    pub(crate) breaker_handle: Option<std::rc::Weak<RefCell<dyn BreakingProducer>>>,
+    /// The operator that built this producer. `None` for an unprobed forwarding reader
+    /// or a protocol test double built with `ProducerBase::unowned`.
     pub node_id: Option<NodeId>,
     /// The probe slot of the subscribe context this producer was subscribed under,
     /// written on every [`TileProducer::get`] while it holds a table.
@@ -939,26 +840,28 @@ pub struct ProducerBase {
     pub tiling: Tiling,
     /// Obsolete region of the tiling
     pub obsolete_guard: TileGuard,
-    /// The gate on the consumer this producer's operator shares between its inputs
-    /// ([`shared_consumer`](crate::interpreter::scheduler::shared_consumer)), cleared by
-    /// every pull. `None` for an operator that shares none.
-    pub(crate) gate: Option<Notified>,
-    /// How many times this producer has been pulled, for the debug check that a woken
-    /// consumer pulls (`scheduler::pull_laps`).
-    pub(crate) pulls: u64,
+    #[cfg(test)]
+    pub(crate) reads: u64,
     /// The last tile `get` returned, for the debug check that the complete region never
     /// changes ([`completeness_violation`]). Debug builds only; `None` in release.
     pub(crate) last_output: Option<Tile>,
     /// For a pipeline breaker, the consumer its pushes climb (`dispatcher::Pushes`), which is
     /// its reader's chain; for a range (`IterateExtent`), the consumer a planner pushes its region
     /// through once. `None` for every other producer.
-    pub(crate) downstream: Option<crate::interpreter::SharedConsumer>,
+    pub(crate) downstream: Option<SharedConsumer>,
     /// For a pipeline breaker, the pipeline the [`Entry`](crate::interpreter::dispatcher::Entry)
     /// at its input queues for, which a planner sets. `None` for every other producer.
     pub(crate) placement: Option<crate::interpreter::dispatcher::Placement>,
 }
 
 impl ProducerBase {
+    /// A breaker reads its input directly only inside another scheduled pipeline. Its own
+    /// placement delegates execution to consume; outside execution a read observes held state.
+    pub(crate) fn reads_input(&self) -> bool {
+        crate::interpreter::dispatcher::is_in_a_run()
+            && self.placement.as_ref().is_none_or(|at| at.get().is_none())
+    }
+
     /// Initialize a producer for `owner`'s operator.
     pub(crate) fn new(
         id: usize,
@@ -968,12 +871,14 @@ impl ProducerBase {
     ) -> Self {
         Self {
             id,
+            breaker_handle: None,
             node_id: Some(owner.id),
             probes: cx.probes().clone(),
             tiling: tiling.clone(),
             obsolete_guard: tiling.empty_guard(),
-            gate: None,
-            pulls: 0,
+
+            #[cfg(test)]
+            reads: 0,
             last_output: None,
             downstream: None,
             placement: None,
@@ -984,7 +889,7 @@ impl ProducerBase {
     /// subscribed with, and the entry at its input queues for the pipeline `placement` names.
     pub(crate) fn breaking(
         mut self,
-        downstream: crate::interpreter::SharedConsumer,
+        downstream: SharedConsumer,
         placement: crate::interpreter::dispatcher::Placement,
     ) -> Self {
         self.downstream = Some(downstream);
@@ -994,50 +899,33 @@ impl ProducerBase {
 
     /// This producer has no input, and a planner pushes its region through `consumer`, the one it
     /// was subscribed with.
-    pub(crate) fn leaf(mut self, consumer: crate::interpreter::SharedConsumer) -> Self {
+    pub(crate) fn leaf(mut self, consumer: SharedConsumer) -> Self {
         self.downstream = Some(consumer);
         self
     }
 
     /// Push this breaker's work to `consumer`, the head of its reader's chain.
     #[cfg(test)]
-    pub(crate) fn pushing_to(&mut self, consumer: crate::interpreter::SharedConsumer) {
+    pub(crate) fn pushing_to(&mut self, consumer: SharedConsumer) {
         self.downstream = Some(consumer);
     }
 
-    /// This producer's operator shares one consumer between its inputs
-    /// ([`shared_consumer`](crate::interpreter::shared_consumer)), whose `gate` every pull
-    /// clears. `None` for an operator that, in this subscription, shares none.
-    pub(crate) fn sharing(mut self, gate: impl Into<Option<Gate>>) -> Self {
-        self.gate = gate.into().map(|Gate(notified)| notified);
-        self
-    }
-
-    /// Clear the gate on the shared consumer, before a read of the inputs: a pull clears it,
-    /// and so does a breaker's consume that reads its inputs as a pull would. A notification
-    /// that arrives while the read runs then passes, since the read may already have read past
-    /// the input that sent it.
-    pub(crate) fn clear_gate(&self) {
-        if let Some(gate) = &self.gate {
-            gate.take();
-        }
-    }
-
-    /// A producer no operator built, for a test double constructing one
-    /// directly. It names no operator and is never probed.
-    #[cfg(test)]
+    /// A producer with no operator or probe of its own: a protocol test double or a
+    /// forwarding reader whose underlying breaker owns the probe.
     pub(crate) fn unowned(id: usize, tiling: &Tiling) -> Self {
         Self {
             id,
+            breaker_handle: None,
             node_id: None,
             probes: ProbeSlot::default(),
             tiling: tiling.clone(),
             obsolete_guard: tiling.empty_guard(),
-            gate: None,
-            pulls: 0,
+
+            #[cfg(test)]
+            reads: 0,
             last_output: None,
             downstream: None,
-            placement: None,
+            placement: Some(Rc::new(std::cell::Cell::new(None))),
         }
     }
 }
@@ -1534,16 +1422,11 @@ pub trait Breaker {
     ///
     /// # Panics
     ///
-    /// When the breaker has no consuming mode for its shape, which is the only way a caller learns
-    /// it; in a debug build, for a breaker that keeps a mode, before
-    /// [`enter_consuming_mode`](Self::enter_consuming_mode).
+    /// When the breaker cannot consume its input's shape.
     fn consume_impl(&mut self, input: InputId, guard: TileGuard);
 
-    /// Put the breaker in consuming mode: a pull answers what its consumes have rendered and
-    /// never steps it. A dispatched run calls it on every breaker it drives once its plan stands,
-    /// before any package, and a pull-mode run never calls it, so the mode is fixed for the run.
-    /// [`consume_impl`](Self::consume_impl) runs only after it.
-    fn enter_consuming_mode(&mut self);
+    /// Initialize per-run publication and loop control before the first package executes.
+    fn begin_run(&mut self) {}
 
     /// The tiling of input `input`, which `consume_impl` pulls: what a package's guard is a guard of, and
     /// what a source pipeline's first packages cut.
@@ -1564,11 +1447,11 @@ pub trait Breaker {
         1
     }
 
-    /// Why this breaker has no consuming mode for its shape, where it has none: a planner asks
+    /// Why this breaker cannot dispatch its shape, where it has none: a planner asks
     /// before it plans the breaker's pipeline, since [`consume_impl`](Self::consume_impl) and
     /// [`input_tiling`](Self::input_tiling) panic for such a breaker. `None` for a breaker that
     /// consumes.
-    fn no_consuming_mode(&self) -> Option<String> {
+    fn unsupported_dispatch(&self) -> Option<String> {
         None
     }
 
@@ -1587,7 +1470,7 @@ pub trait Breaker {
     /// # Panics
     ///
     /// As [`BreakingProducer::final_guard`].
-    fn finish(&mut self, pushes: &mut Pushes<'_>) {
+    fn finish(&mut self, _input: InputId, pushes: &mut Pushes<'_>) {
         if let Some(producer) = self.as_producer() {
             pushes.push_final(producer);
         }
@@ -1609,6 +1492,11 @@ pub trait Breaker {
 /// [`finish`]: Breaker::finish
 /// [`offer_impl`]: Self::offer_impl
 pub trait BreakingProducer: TileProducer + Breaker {
+    /// Store keys whose writers have all completed. Other breakers declare none.
+    fn completed_keys(&self) -> &[Value] {
+        &[]
+    }
+
     /// The guard of what the producer holds: the state's own statement, before what a release
     /// removed is taken out of it. Empty when it holds nothing.
     fn held(&self) -> TileGuard;
@@ -1780,8 +1668,10 @@ pub trait TileProducer {
     /// projection names keys at a level [`restates`](Self::restates) refuses.
     /// See `src/interpreter/design-operators.md`, "The producer protocol".
     fn get(&mut self, projection_guard: TileGuard) -> Tile {
-        self.base().clear_gate();
-        self.base_mut().pulls += 1;
+        #[cfg(test)]
+        {
+            self.base_mut().reads += 1;
+        }
         #[cfg(debug_assertions)]
         let _pull = {
             pull_levels::check_input_level(
@@ -1979,20 +1869,9 @@ pub trait TileProducer {
     }
 
     /// Hand `visit` each producer this one pulls, with the role it plays. It is what
-    /// [`add_inspect_children`](Self::add_inspect_children) lists by default, and what
-    /// `scheduler::pull_laps`'s debug check that a woken
-    /// consumer pulls walks. A producer that pulls nothing visits nothing.
+    /// [`add_inspect_children`](Self::add_inspect_children) lists by default. A producer with
+    /// no input visits nothing.
     fn visit_input_producers(&self, _visit: &mut dyn FnMut(&str, &dyn TileProducer)) {}
-
-    /// Whether this producer's last answer did not depend on its input `role`, a role
-    /// [`visit_input_producers`](Self::visit_input_producers) names, and its next answer
-    /// that does depend on it comes from a pull another input's notification brings, which
-    /// reads it again. Such an input's later notifications are not needed until then, so
-    /// `scheduler::pull_laps`'s debug check does not require the pull that would clear its
-    /// flag (`src/interpreter/design-operators.md`, "The notification contract").
-    fn answered_without(&self, _role: &str) -> bool {
-        false
-    }
 
     /// [`visit_input_producers`](Self::visit_input_producers) with each producer mutable: the
     /// same producers, in the same order, under the same roles. A dispatched run walks it to reach
@@ -2136,6 +2015,38 @@ pub enum TilePathStep {
 
 #[cfg(test)]
 pub(crate) mod test_helpers {
+    #[cfg(test)]
+    pub(crate) trait ReadInPipeline: TileProducer {
+        fn read_in_pipeline(&mut self, guard: TileGuard) -> Tile {
+            crate::interpreter::dispatcher::read_for_test(self, guard)
+        }
+    }
+    #[cfg(test)]
+    impl<P: TileProducer + ?Sized> ReadInPipeline for P {}
+
+    #[cfg(test)]
+    pub(crate) trait ConsumeInPipeline: super::Breaker {
+        fn consume_in_pipeline(&mut self, input: super::InputId, guard: TileGuard) {
+            if let Some(producer) = self.as_producer()
+                && let Some(placement) = &producer.base().placement
+            {
+                placement.set(Some(crate::interpreter::dispatcher::PipelineId(0)));
+            }
+            crate::interpreter::dispatcher::in_pipeline_for_test(|| {
+                self.consume_impl(input, guard)
+            });
+        }
+    }
+    impl<P: super::Breaker + ?Sized> ConsumeInPipeline for P {}
+
+    pub(crate) trait Announce: super::Consumer {
+        fn announce(&mut self, region: &Projection) {
+            crate::interpreter::dispatcher::notify_for_test(self, region);
+        }
+    }
+    #[cfg(test)]
+    impl<C: super::Consumer + ?Sized> Announce for C {}
+
     use super::{
         InspectNode, ProducerBase, Tile, TileGuard, TileOperator, TileProducer, Tiling, VizOptions,
     };
@@ -2151,7 +2062,7 @@ pub(crate) mod test_helpers {
         let input = breaker.tiling().clone();
         let entries = readers
             .iter()
-            .map(|&reader| Entry::new(PipelineId(reader), input.clone(), Box::new(|| {})))
+            .map(|&reader| Entry::new(PipelineId(reader), input.clone()))
             .collect();
         breaker
             .base_mut()
@@ -2178,15 +2089,13 @@ pub(crate) mod test_helpers {
     struct Readers(Vec<crate::interpreter::dispatcher::Entry>);
 
     impl crate::interpreter::Consumer for Readers {
-        fn notify(&mut self, _arrived: &Projection) {}
-
-        fn push(
+        fn notify(
             &mut self,
             region: &Projection,
             landing: &mut crate::interpreter::dispatcher::Landing<'_>,
         ) {
             for entry in &mut self.0 {
-                crate::interpreter::Consumer::push(entry, region, landing);
+                crate::interpreter::Consumer::notify(entry, region, landing);
             }
         }
 
@@ -2323,9 +2232,9 @@ pub(crate) mod test_helpers {
             }
         };
         let mut projected = make();
-        let answer = normal(projected.get(guard.clone()));
+        let answer = normal(projected.read_in_pipeline(guard.clone()));
         let mut whole = make();
-        let mut expected = whole.get(whole.tiling().universal_guard());
+        let mut expected = whole.read_in_pipeline(whole.tiling().universal_guard());
         expected.restrict_to(
             &Projection::of(&guard).expect("assert_conforms takes a projection guard"),
             whole.tiling(),
@@ -2453,10 +2362,9 @@ pub(crate) mod test_helpers {
         fn subscribe(
             &mut self,
             _intent_guard: TileGuard,
-            mut consumer: Box<dyn super::Consumer>,
+            _consumer: Box<dyn super::Consumer>,
             _cx: &mut super::SubscribeContext,
         ) -> Box<dyn TileProducer> {
-            consumer.notify(&Projection::Everything);
             let (mut spy, _, _) = ProjectionSpy::new(self.tile.clone(), self.tiling.clone());
             spy.pulled = self.pulled.clone();
             spy.released = self.released.clone();
@@ -2571,10 +2479,9 @@ pub(crate) mod test_helpers {
         fn subscribe(
             &mut self,
             _intent_guard: TileGuard,
-            mut consumer: Box<dyn super::Consumer>,
+            _consumer: Box<dyn super::Consumer>,
             _cx: &mut super::SubscribeContext,
         ) -> Box<dyn TileProducer> {
-            consumer.notify(&Projection::Everything);
             Box::new(ScriptedProducer {
                 base: ProducerBase::unowned(ScriptedProducer::alloc_id(), &self.tiling),
                 tile: self.cell.clone(),
@@ -2600,8 +2507,12 @@ pub(crate) mod test_helpers {
     }
 
     impl super::Consumer for RegionLog {
-        fn notify(&mut self, arrived: &Projection) {
-            self.regions.borrow_mut().push(arrived.clone());
+        fn notify(
+            &mut self,
+            region: &Projection,
+            _: &mut crate::interpreter::dispatcher::Landing<'_>,
+        ) {
+            self.regions.borrow_mut().push(region.clone());
         }
     }
 
@@ -2678,11 +2589,10 @@ pub(crate) mod test_helpers {
 
     /// Notify through the consumer a [`NotifyingOp`] was subscribed with.
     pub(crate) fn notify_input(consumer: &InputConsumer, arrived: &Projection) {
-        consumer
-            .borrow_mut()
-            .as_mut()
-            .expect("the operator was subscribed")
-            .notify(arrived);
+        crate::interpreter::dispatcher::notify_for_test(
+            &mut **consumer.borrow_mut().as_mut().unwrap(),
+            arrived,
+        );
     }
 
     /// A store's parts are collections held to the contract like any other: a decided set
@@ -2950,6 +2860,7 @@ pub(crate) mod test_helpers {
 
 #[cfg(test)]
 mod tests {
+    use super::test_helpers::ReadInPipeline as _;
     use super::{
         Consumer, InputEdgeSpec, OperatorBase, ProducerBase, SubscribeContext, Tile, TileGuard,
         TileOperator, TileProducer, Tiling,
@@ -3009,7 +2920,7 @@ mod tests {
         use super::FunctionGuard;
         use crate::interpreter::{Predicate, Value};
         let (mut deepening, _) = deepening();
-        deepening.get(TileGuard::Function(FunctionGuard::Domain(
+        deepening.read_in_pipeline(TileGuard::Function(FunctionGuard::Domain(
             Predicate::point(Value::UInt(0)),
         )));
     }

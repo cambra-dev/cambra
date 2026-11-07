@@ -190,7 +190,7 @@ pub enum Tile {
         closed_keys: Vec<Value>,
         /// Per writer of a transaction store that takes its writers' decisions ahead of their
         /// commits, what it says to that writer of the decisions it took ([`WriterTakes`]).
-        /// Empty for a store in pull mode and for an induction store. The level's, as
+        /// Empty before a transaction store opens and for an induction store. The level's, as
         /// `closed_keys` is, and it grows by join.
         writer_takes: Vec<WriterTakes>,
     },
@@ -388,8 +388,10 @@ impl Tile {
             Tile::Scalar(cv) => !cv.is_empty(),
             Tile::Record { fields: m, .. } => m.values().all(Tile::is_terminal),
             Tile::DataFunction {
-                domain_predicate, ..
-            } => domain_predicate.as_bool().unwrap_or(false),
+                domain_predicate,
+                absent_keys,
+                ..
+            } => domain_predicate.union(absent_keys).is_true(),
             Tile::Aggregation { terminal, .. } => {
                 terminal.as_single().map(|t| t.as_bool()).unwrap_or(false)
             }
@@ -1245,8 +1247,11 @@ impl Tile {
                 domain,
                 codomain,
                 domain_predicate,
+                absent_keys,
                 ..
             } => {
+                let complete = domain_predicate.union(absent_keys);
+                let domain_predicate = &complete;
                 if domain_predicate.is_true() {
                     return TileGuard::Function(FunctionGuard::Domain(Predicate::True));
                 }
@@ -1267,7 +1272,11 @@ impl Tile {
                 );
                 let beneath = codomain.stated_by_path(1);
                 if let Some(held) = self.held_prefix(&row_paths[0]) {
-                    return TileGuard::flatten_or(vec![held.guard(), beneath]);
+                    return TileGuard::flatten_or(vec![
+                        held.guard(),
+                        beneath,
+                        TileGuard::Function(FunctionGuard::Domain(absent_keys.clone())),
+                    ]);
                 }
                 // The codomain arm names what the **open** keys hold. A key the predicate
                 // calls whole is released by its own key, and a codomain guard is read
@@ -1309,7 +1318,7 @@ impl Tile {
             // collection's — consumers release a prefix of it. A tick naming any key is a
             // change of the store, so the ticks are the union over the key changelogs.
             Tile::Store {
-                frontier, terminal, ..
+                decided, terminal, ..
             } => {
                 if *terminal {
                     TileGuard::Function(FunctionGuard::Domain(Predicate::True))
@@ -1320,7 +1329,7 @@ impl Tile {
                             .fold(Predicate::False, |changed, (written, _)| {
                                 changed.union(&Predicate::from_column_value(written))
                             })
-                            .union(&running_frontier(frontier)),
+                            .union(&decided.completion_at(CurryLevel::OUTERMOST)),
                     ))
                 }
             }
@@ -1536,10 +1545,21 @@ impl Tile {
     }
 
     /// This tile with its outermost statement closed over `tiling`, as [`TileGuard::closed_over`]
-    /// closes a guard: a statement under every tag of a tagged union's domain, each saying
-    /// everything or each saying nothing, is that. An answer assembled arm by arm states each
-    /// arm on its own, and only the closed statement reads as terminal.
-    pub(crate) fn closed_over(mut self, tiling: &Tiling) -> Tile {
+    /// closes a guard. Completion of every nested value and every absent outer key states the
+    /// whole collection complete. Statements under all tags of a union close the same way.
+    pub fn closed_over(mut self, tiling: &Tiling) -> Tile {
+        if self.is_data_function()
+            && !self.is_terminal()
+            && self.to_guard().closed_over(tiling).is_universal()
+        {
+            if let Tile::DataFunction {
+                domain_predicate, ..
+            } = &mut self
+            {
+                *domain_predicate = Predicate::True;
+            }
+            return self;
+        }
         if let Tile::DataFunction {
             domain_predicate, ..
         } = &mut self
@@ -1551,6 +1571,24 @@ impl Tile {
             *domain_predicate = closed;
         }
         self
+    }
+
+    /// Whole outer keys: those stated complete, and held keys whose values are complete.
+    /// A statement beneath the keys can finish a held row without asserting that an
+    /// enclosing key which has not arrived will never arrive.
+    pub(crate) fn complete_keys(&self) -> Predicate {
+        let Tile::DataFunction {
+            domain,
+            domain_predicate,
+            absent_keys,
+            ..
+        } = self
+        else {
+            panic!("complete_keys reads a collection")
+        };
+        domain_predicate
+            .union(absent_keys)
+            .union(&Predicate::from_column_value(domain).intersect(&self.to_guard().whole_keys()))
     }
 
     /// Which paths through `level` are complete, over whole paths: those `level` calls
@@ -1566,14 +1604,18 @@ impl Tile {
             let Tile::DataFunction {
                 codomain,
                 domain_predicate,
+                absent_keys,
                 ..
             } = node
             else {
                 panic!("{level} of {self:?} has no level there")
             };
             complete = match depth {
-                0 => domain_predicate.clone(),
-                _ => complete.descend(1).union(domain_predicate),
+                0 => domain_predicate.union(absent_keys),
+                _ => complete
+                    .descend(1)
+                    .union(domain_predicate)
+                    .union(absent_keys),
             };
             node = codomain;
         }
@@ -2146,11 +2188,15 @@ impl Tile {
     /// not name (`src/interpreter/design-operators.md`, "The release contract").
     fn stated_by_path(&self, level: usize) -> TileGuard {
         let Tile::DataFunction {
-            domain_predicate, ..
+            domain_predicate,
+            absent_keys,
+            ..
         } = self
         else {
             return TileGuard::Function(FunctionGuard::Domain(Predicate::False));
         };
+        let complete = domain_predicate.union(absent_keys);
+        let domain_predicate = &complete;
         debug_assert!(
             super::projection::qualifying_levels(domain_predicate) <= level,
             "a statement at level {level} names a path through at most {level} levels above: \
@@ -2170,11 +2216,15 @@ impl Tile {
     /// holding alike.
     fn stated_keys(&self, row_paths: &[Vec<Value>]) -> Predicate {
         let Tile::DataFunction {
-            domain_predicate, ..
+            domain_predicate,
+            absent_keys,
+            ..
         } = self
         else {
             panic!("stated_keys is a collection's: {self:?}")
         };
+        let complete = domain_predicate.union(absent_keys);
+        let domain_predicate = &complete;
         let mut groups: Vec<(Predicate, Vec<usize>)> = Vec::new();
         for (row, path) in row_paths.iter().enumerate() {
             let stated = domain_predicate.within(path, 0);
@@ -7015,6 +7065,54 @@ mod tests {
         };
         *absent_keys = Predicate::True.minus(&Predicate::at_or_below(Value::UInt(4)));
         tile
+    }
+
+    #[test]
+    fn absent_keys_are_complete_at_their_level_and_beneath_it() {
+        let tile = groups_with_absent_keys();
+        assert!(tile.to_guard().whole_keys().contains(&Value::UInt(7)));
+        assert!(
+            tile.completion_at(CurryLevel::OUTERMOST)
+                .contains(&Value::UInt(7))
+        );
+        assert!(
+            tile.completion_at(CurryLevel::new(1))
+                .contains_path(&[Value::UInt(7), Value::UInt(3)])
+        );
+        assert!(!tile.complete_keys().contains(&Value::UInt(0)));
+    }
+
+    #[test]
+    fn released_groups_and_absent_keys_close_the_collection() {
+        use crate::interpreter::BaseType;
+        let mut tile = groups_with_absent_keys();
+        if let Tile::DataFunction {
+            absent_keys,
+            codomain,
+            ..
+        } = &mut tile
+        {
+            *absent_keys = Predicate::True
+                .minus(&Predicate::point(Value::UInt(0)).union(&Predicate::point(Value::UInt(1))));
+            if let Tile::DataFunction {
+                domain_predicate, ..
+            } = &mut **codomain
+            {
+                *domain_predicate = Predicate::True;
+            }
+        }
+        tile.remove_guarded(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::point(Value::UInt(0)).union(&Predicate::point(Value::UInt(1))),
+        )));
+        tile.compact();
+        let tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::data_function(
+                Extent::Base(BaseType::UInt),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        assert!(tile.closed_over(&tiling).is_terminal());
     }
 
     /// A cut beneath the outermost keys keeps the keys recorded absent: they have no path in any

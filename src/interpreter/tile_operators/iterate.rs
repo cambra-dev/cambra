@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 mod cartesian;
 
 use cartesian::CartesianIteration;
@@ -13,8 +15,8 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use super::*;
 use crate::ccl::TagMap;
 use crate::interpreter::{
-    BaseType, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, NotifyOrSubscribeResult,
-    Projection, SharedConsumer, SubscribeContext, UnionArm, Value, scheduler::shared_consumer,
+    BaseType, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, Projection,
+    SharedConsumer, SubscribeContext, UnionArm, Value, notifications::shared_consumer,
 };
 
 /// Produces a function tile whose domain and codomain both equal `extent`.
@@ -37,14 +39,9 @@ impl IterateExtent {
         }
     }
 
-    fn add_all_source_handles(
-        extent: &Extent,
-        consumer: SharedConsumer,
-        cx: &mut SubscribeContext,
-    ) {
+    fn add_all_source_handles(extent: &Extent, cx: &mut SubscribeContext) {
         extent.for_each_source(&mut |source| {
-            cx.scheduler()
-                .add_source_handle(source.clone(), Rc::downgrade(&consumer));
+            cx.source_registry().add_source_handle(source.clone());
         });
     }
 }
@@ -57,7 +54,7 @@ impl TileOperator for IterateExtent {
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
-        mut consumer: Box<dyn Consumer>,
+        consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         if let Extent::Record(fields) = &self.extent
@@ -65,25 +62,7 @@ impl TileOperator for IterateExtent {
         {
             return cartesian::subscribe(self, fields, consumer, cx);
         }
-        let NotifyOrSubscribeResult { notify, subscribe } =
-            self.extent.subscribe_to_iteration_action();
-        if notify {
-            consumer.notify(&Projection::Everything);
-        }
-        // The producer owns the registration: the scheduler holds only a `Weak`, so this
-        // handle is what keeps the source waking this producer, and dropping the producer
-        // deregisters it.
-        let (source_wakeup, gate, leaf) = match subscribe {
-            true => {
-                let (wakeup, gate) = shared_consumer(consumer);
-                let leaf = wakeup.shared().clone();
-                (Some(wakeup), Some(gate), leaf)
-            }
-            false => {
-                let leaf: SharedConsumer = Rc::new(RefCell::new(consumer));
-                (None, None, leaf)
-            }
-        };
+        let leaf = shared_consumer(consumer);
         let mut producer = Box::new(IterateExtentProducer {
             base: ProducerBase::new(
                 IterateExtentProducer::alloc_id(),
@@ -91,16 +70,14 @@ impl TileOperator for IterateExtent {
                 &self.base,
                 cx,
             )
-            .sharing(gate)
-            .leaf(leaf),
+            .leaf(leaf.clone()),
             iteration: Iteration::Direct(DirectIteration {
                 extent: self.extent.clone(),
                 released: Predicate::False,
-                _source_wakeup: source_wakeup.as_ref().map(|w| w.shared().clone()),
             }),
         });
-        if let Some(source_wakeup) = source_wakeup {
-            Self::add_all_source_handles(&self.extent, source_wakeup.shared().clone(), cx);
+        if self.extent.reads_a_source() {
+            Self::add_all_source_handles(&self.extent, cx);
             let name = producer.name();
             // Register this producer with any data sources in the extent by calling release with
             // a false predicate.  This way the sources knows about all producers that read it
@@ -165,15 +142,6 @@ struct DirectIteration {
     /// be safely shrunk (shrinking source2's key 0 would prevent future
     /// cross-product pairs like (1, 0) from ever being produced).
     released: Predicate,
-    /// The wake-up this producer registered with the scheduler, which holds only
-    /// a `Weak` to it.
-    ///
-    /// Owning it here ties the registration's lifetime to the producer's: a
-    /// producer carried across a program reload keeps waking, and one the reload
-    /// dropped is pruned on the next
-    /// [`check_for_notifications`](Scheduler::check_for_notifications).
-    /// `None` when the extent needs no source subscription.
-    _source_wakeup: Option<Rc<RefCell<dyn Consumer>>>,
 }
 
 /// Convert a `IntervalSet<Value::UInt>` values into an
@@ -596,10 +564,9 @@ mod tests {
             iteration: Iteration::Direct(DirectIteration {
                 extent,
                 released: Predicate::False,
-                _source_wakeup: None,
             }),
         };
-        let tile = producer.get(producer.tiling().universal_guard());
+        let tile = producer.read_in_pipeline(producer.tiling().universal_guard());
         let Tile::DataFunction { domain, .. } = tile else {
             panic!()
         };
@@ -672,7 +639,6 @@ mod projection_tests {
             iteration: Iteration::Direct(DirectIteration {
                 extent,
                 released: Predicate::False,
-                _source_wakeup: None,
             }),
         }
     }
@@ -715,7 +681,7 @@ mod projection_tests {
         let mut head = head(Extent::uint_range(10));
         let mut seen = Vec::new();
         for (first, last) in [(0, 3), (4, 7), (8, 9)] {
-            let morsel = head.get(keys_between(first, last));
+            let morsel = head.read_in_pipeline(keys_between(first, last));
             assert_eq!(positions(&morsel), (first..=last).collect::<Vec<_>>());
             assert_eq!(
                 completeness(&morsel),
@@ -734,7 +700,7 @@ mod projection_tests {
     #[test]
     fn a_morsel_past_the_end_holds_what_the_range_holds() {
         let mut head = head(Extent::uint_range(10));
-        let morsel = head.get(keys_between(8, 20));
+        let morsel = head.read_in_pipeline(keys_between(8, 20));
         assert_eq!(positions(&morsel), [8, 9]);
         assert_eq!(completeness(&morsel), between(8, 20));
     }
@@ -742,9 +708,9 @@ mod projection_tests {
     #[test]
     fn a_released_morsel_is_not_answered_again() {
         let mut head = head(Extent::uint_range(10));
-        head.get(keys_between(0, 3));
+        head.read_in_pipeline(keys_between(0, 3));
         head.release(keys_between(0, 3));
-        let rest = head.get(head.tiling().universal_guard());
+        let rest = head.read_in_pipeline(head.tiling().universal_guard());
         assert_eq!(positions(&rest), (4..10).collect::<Vec<_>>());
     }
 
@@ -752,7 +718,7 @@ mod projection_tests {
     fn nothing_names_no_positions() {
         let mut head = head(Extent::uint_range(10));
         assert_eq!(
-            head.get(head.tiling().empty_guard()),
+            head.read_in_pipeline(head.tiling().empty_guard()),
             head.tiling().empty_tile()
         );
     }
@@ -780,13 +746,13 @@ mod projection_tests {
             .borrow_mut()
             .set_yield_predicate(Predicate::at_or_below(Value::UInt(4)));
 
-        let inside = head.get(keys_between(1, 2));
+        let inside = head.read_in_pipeline(keys_between(1, 2));
         assert_eq!(positions(&inside), [1, 2]);
         assert_eq!(completeness(&inside), between(1, 2));
         head.release(keys_between(1, 2));
 
         // Positions 5 to 9 have not arrived, so the morsel is complete over 3 and 4 only.
-        let straddling = head.get(keys_between(3, 9));
+        let straddling = head.read_in_pipeline(keys_between(3, 9));
         assert_eq!(positions(&straddling), [3, 4]);
         assert_eq!(completeness(&straddling), between(3, 4));
     }
@@ -811,7 +777,7 @@ mod projection_tests {
             .into_iter()
             .collect(),
         );
-        let tile = head.get(TileGuard::Function(FunctionGuard::Domain(first_a)));
+        let tile = head.read_in_pipeline(TileGuard::Function(FunctionGuard::Domain(first_a)));
         let Tile::DataFunction { domain, .. } = &tile else {
             panic!("a collection")
         };
