@@ -159,6 +159,7 @@ pipeline; individual pass contracts belong to the linked design documents.
 | Infer | Infer types, specialize uses and validate the typed tree; see [type inference](../src/ccl/design/type-inference.md). Each module's check tree is inferred first, alone, and a failed check stops the compile; see [checking a module on its own](modules.md#checking-a-module-on-its-own). Read naming is undone before the post-inference pane. || Inline | Inline capability bindings and beta-reduce calls; see [inlining](../src/ccl/design/optimization.md#inlining-pass-cclinliners). |
 | Eliminate transactions | `transact_phase::run` constructs transaction histories after keyed-write desugaring and value-type views. |
 | Eliminate induction mutation | `mut_elim::run` constructs induction histories. |
+| Erase refinements | `erase_refinements::run` drops every refinement except those on data function domains; see [refinement erasure](../src/ccl/design/optimization.md#refinement-erasure-cclerase_refinementsrs). |
 | Channelize | `channelize::run` resolves deferred collections and feeds; see [mutability compilation](../src/ccl/design/mutability.md#compilation-pipeline). |
 | Rewrite as-of reads | `transact_phase::rewrite_as_of_reads` rewrites fed-out mutable reads after channelization, before lambda elimination. |
 | Eliminate lambdas | Convert to point-free combinators; see [lambda elimination](../src/ccl/design/optimization.md#lambda-elimination-ccllambda_elimrs). |

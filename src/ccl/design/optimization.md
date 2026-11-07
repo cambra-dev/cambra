@@ -1,9 +1,10 @@
 # Optimization & compilation passes
 
 After inference, the compiler rewrites typed CCL into an operator graph. `context.rs` runs
-`inline`, transaction rewriting, `mut_elim`, `channelize`, the as-of-read rewrite,
-`lambda_elim`, `planning::plan_loops`, and `planning::run`, in that order. Lambda elimination
-runs `simplify` internally; planning also runs it before and after iteration-site marking.
+`inline`, transaction rewriting, `mut_elim`, refinement erasure, `channelize`, the as-of-read
+rewrite, `lambda_elim`, `planning::plan_loops`, and `planning::run`, in that order. Lambda
+elimination runs `simplify` internally; planning also runs it before and after iteration-site
+marking.
 `interpreter/operator_conversion.rs` then converts the planned CCL to `TileOperator`s. The
 transaction and mutation phases are described in [mutability.md](mutability.md); the AST is
 described in [ir.md](ir.md).
@@ -178,6 +179,27 @@ operator conversion.
 - **Body duplication:** An eligible function body is copied at each use in the CCL tree. The pass
   has no use-count or cost test.
 - **Recursive UDFs**: unsupported (already noted in `operator_conversion.rs`).
+
+---
+
+## Refinement Erasure (`ccl/erase_refinements.rs`)
+
+Refinement erasure runs after `mut_elim` and before `channelize`. It removes every refinement from
+every type slot except inside a data function's domain, which is the extent planning and
+op-conversion iterate. A data function lambda's parameter is bound at that domain and keeps its
+refinements. Within a kept domain, the refinements on its components stay as well: join planning
+reads a nested comprehension's guard off the component of the product domain that carries it. A
+Σ's witness kinds stay, since each candidate is a data function's domain. A nominal type's
+arguments stay whole, since the declaration may place one at a domain, as `Groups(K, V) = (k: K)
+|=> V(k)` places `K`.
+
+Every type check from this phase through planning runs under `infer::RefinementBlind`, which
+selects `Derivation::RefinementBlind` for the constraint walk. That walk compares refinements only
+inside the domain edge of two data functions, and inside the kind premise between their Σ
+binders. Everywhere else it relates a refined type by its base, and a `UInt` or a range by the
+`UInt` a range `0..𝑛` refines. A proven lookup's key, erased to `UInt`, meets its list's domain
+`0..𝑛` this way. The scope is thread-local rather than a parameter because planning type-checks
+the fragments it builds through `typecheck` at each rewrite.
 
 ---
 

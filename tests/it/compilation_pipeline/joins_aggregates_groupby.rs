@@ -335,13 +335,11 @@ fn a_bare_groupby_tail_is_driven() {
 // 30s: among the heaviest compiles here; like `test_joins`, reaches ~9.5s wall on a slow CI VM.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
-// A literal's type is its singleton, and by this point planning has compiled the
-// predicate to point-free form — so it renders as the operator chain rather than the
-// `__elem == 1` the type layer wrote. Nothing executes it (see the key-domain note on
-// `case_21`); it is a carried refinement that happens to survive to here.
+// A literal's singleton refinement is erased before planning
+// (`crate::ccl::erase_refinements`), which keeps refinements on data function domains only.
 #[case(
     "1",
-    "1:{Int | __elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)}",
+    "1:Int",
     Tile::Scalar(ColumnValue::Ints(vec![1]))
 )]
 // Closed arithmetic reaches op conversion as the literal it computes, a whole chain of it
@@ -379,7 +377,7 @@ fn a_bare_groupby_tail_is_driven() {
 // nothing eliminating a `let` whose body no longer reads it.
 #[case(
     "y = 10; [x + y for x in [1,2,3]]",
-    "let y : {Int | __elem ▷ ((id, 10 ▷ const) ▷ zip ≫ eq)} = 10\nin iterate ≫ [1, 2, 3] ≫ (id, 10 ▷ const) ▷ zip ≫ add:(0..3 ⤇ Int)",
+    "let y : Int = 10\nin iterate ≫ [1, 2, 3] ≫ (id, 10 ▷ const) ▷ zip ≫ add:(0..3 ⤇ Int)",
     make_int_list(&[11,12,13])
 )]
 #[case(
@@ -1408,16 +1406,11 @@ fn a_comprehension_over_each_group_of_a_group_by(#[case] row: &str, #[case] expe
 }
 
 /// An inner comprehension reading only the outer element, one level further in. The enclosing
-/// value holds the group inside the pair with `z`, which the filter on `x` refines, and
-/// `collection_typed_at` (`src/ccl/planning/correlated.rs`) does not look through a refinement,
-/// so planning refuses the site. It answers `[[[1 -> 4]], [[2 -> 9, 3 -> 12, 4 -> 15]], [[5 ->
-/// 18, 6 -> 21, 7 -> 24]]]`.
+/// value holds the group inside the pair with `z`. Refinement erasure removes the refinement the
+/// filter on `x` put on that pair, so `collection_typed_at` (`src/ccl/planning/correlated.rs`)
+/// finds the collection.
 #[test]
-#[should_panic(
-    expected = "a correlated inner comprehension whose domain differs per row, over a collection \
-                the enclosing value does not hold, is not supported yet"
-)]
-fn a_comprehension_reading_only_the_element_under_a_further_level_not_compiled_yet() {
+fn a_comprehension_reading_only_the_element_under_a_further_level() {
     check_sink(
         indoc! {r"
             out = test_sink()

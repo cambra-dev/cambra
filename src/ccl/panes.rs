@@ -149,6 +149,7 @@ pub(crate) const PANES: [PaneSpec; 7] = [
             Phase::Inline,
             Phase::Transact,
             Phase::Letrec,
+            Phase::EraseRefinements,
             Phase::Channelize,
         ],
         gated: true,
