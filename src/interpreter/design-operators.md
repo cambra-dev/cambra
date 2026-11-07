@@ -1304,13 +1304,12 @@ source builds from the enclosing positions, `⟨𝑥.1, 𝑥.0 ▷ 𝐷⟩ ≫ a
 function stays unsupported, since a compute function has no compiled form as a value.
 
 The rows stand at the level the node is converted at, and each row's collection is a level
-beneath it, one run of keys per row. A row is answered as soon as its key arrives in its run,
-because a value at a key never changes and no row waits for an absence to be decided, which
-[`CheckedLookup`] does. A row whose key has not arrived is left out, and every level states the
-input's completeness less that row's path, the rule `CheckedLookup` applies to a key it has not
-decided. An input that is complete answers every row, and `Lookup` fails loudly where one does
-not. The answer keeps the input's keys at every level above the rows, so a release passes
-through to the input, each row's collection going with its row.
+beneath it, one run of keys per row. A row is answered as soon as its key arrives in its run.
+A pending key is withheld through `Tile::withhold`, which removes its path from every enclosing
+level's completeness. A key proven absent is omitted without withholding completion. A tag
+projection can produce this absence in an unselected match arm after refinements are erased.
+The answer keeps the input's keys at every level above the rows, so a release passes through
+to the input, each row's collection going with its row.
 
 ### Where a collection is materialized
 

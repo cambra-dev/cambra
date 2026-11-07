@@ -822,6 +822,64 @@ fn a_group_s_filtered_elements_fed_per_group(#[case] body: &str, #[case] expecte
     );
 }
 
+/// An `if` in a loop over the outer element's group or boxed row. The guard becomes a filter on
+/// the inner loop's domain, whose source reads the outer element, so the filtered source is that
+/// element's collection read under the filter.
+#[rstest]
+#[case::fed_from_a_group(
+    indoc! {r"
+        g = groupby([1, 2, 3, 4, 5], \x -> x > 2)
+        ch: Feed(_)
+        for g2 in g:
+            for q in g2:
+                if q > 1:
+                    ch << q
+        sum([v for v in ch])
+    "},
+    14
+)]
+#[case::fed_from_a_boxed_row(
+    indoc! {r"
+        ch: Feed(_)
+        for xs in [box([1, 2]), box([3, 4, 5])]:
+            for q in xs:
+                if q > 1:
+                    ch << q
+        sum([v for v in ch])
+    "},
+    14
+)]
+#[case::accumulated_from_a_boxed_row(
+    indoc! {r"
+        acc := 0
+        for xs in [box([1, 2]), box([3, 4, 5])]:
+            for q in xs:
+                if q > 1:
+                    acc := acc + q
+        acc
+    "},
+    14
+)]
+#[case::both_branches_fed(
+    indoc! {r"
+        ch: Feed(_)
+        for xs in [box([1, 2]), box([3, 4, 5])]:
+            for q in xs:
+                if q > 2:
+                    ch << q
+                else:
+                    ch << 100
+        sum([v for v in ch])
+    "},
+    212
+)]
+fn a_guard_in_a_loop_over_the_outer_element_s_collection(
+    #[case] code: &str,
+    #[case] expected: i64,
+) {
+    check_scalar(code, Value::Int(expected));
+}
+
 /// The sharing [`test_shared_grouping`] *describes*, pinned.
 ///
 /// Those value assertions hold whether the partition is bucketized once or

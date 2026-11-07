@@ -3914,10 +3914,14 @@ states it: exponential beta rewrites `⟨𝑔, curry(ℎ)⟩ ≫ apply` to `⟨i
 zip's pairs with `ℎ`'s domain refinements (`simplify::stating_domain_of`), since every pair it
 gives, `(𝑥, 𝑔(𝑥))`, is one `ℎ` was applied to.
 
+A filtered cast whose value is a collection rather than a lambda is the lambda reading it at
+each element, and takes the same rule. That holds where the collection reads `𝑎`, as an `if`
+inside a loop over the outer element's row or group makes it: the guard narrows the inner domain,
+and the source the cast filters is `𝑎`'s collection.
+
 Only a data function's binder carries filters. A compute function's parameter refinement is the
 type each argument already has, as `λ 𝑛 : Int@10 → …` over the values of `[10]`, so it stays on
 the second component and nothing lifts.
-
 
 ### Iterating a dependent tuple
 
