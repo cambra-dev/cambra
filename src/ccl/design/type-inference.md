@@ -3770,6 +3770,11 @@ applies it as `filter_values` over the pair of `𝑎` and the keys (`planning/co
 `emit_component_filter`). Keys that read `𝑎`, a boxed row's `σ₁(𝑎)`, keep that pair the dependent
 tuple `(𝑎 : 𝐴) × 𝐾(𝑎)`.
 
+A filtered cast whose value is a collection rather than a lambda is the lambda reading it at
+each element, and takes the same rule. That holds where the collection reads `𝑎`, as an `if`
+inside a loop over the outer element's row or group makes it: the guard narrows the inner domain,
+and the source the cast filters is `𝑎`'s collection.
+
 Only a data function's binder carries filters. A compute function's parameter refinement is the
 type each argument already has, as `λ 𝑛 : Int@10 → …` over the values of `[10]`, so it stays on
 the second component and nothing lifts.
