@@ -331,7 +331,12 @@ impl MapResultProducer {
         if let Some(dropped) = dropped {
             self.input.release(dropped);
         }
-        let function_tile = self.function.get(self.function.tiling().universal_guard());
+        // The function's deleted keys are keys it does not hold: `Restrict` marks the keys its
+        // predicate rejects deleted rather than dropping them, and an argument at one of them
+        // finds nothing. Every path below indexes the function's domain whole, so they go
+        // before it is read.
+        let mut function_tile = self.function.get(self.function.tiling().universal_guard());
+        function_tile.compact();
 
         // A function whose values are themselves a collection needs special-case handling:
         // the application adds a level, so it rebuilds the tile around it rather than
@@ -612,6 +617,7 @@ impl MapResultProducer {
         // function that takes one is applied to the tile instead ([`FunctionDef::apply_tile`]
         // — `insert`, whose collection operand reaches it opened).
         let level = self.level;
+        drop_rows_the_collection_lacks(&mut input_tile, level, &function_tile);
         let arguments = std::mem::replace(
             input_tile.values_at_mut(level),
             Tile::Scalar(ColumnValue::Units(0)),
@@ -636,6 +642,50 @@ impl MapResultProducer {
         };
         input_tile
     }
+}
+
+/// Drop the rows at `level` whose argument `function` settles as absent, when `function` is a
+/// collection.
+///
+/// A collection answers only at its keys. Applied at one it lacks, it has no value, and the row
+/// is not in the result: a conditional's gated leg is the restricted extent it is read through
+/// (`Restrict`), and a row its gate rejects is absent from that leg. An argument the collection
+/// has not settled might still arrive, and its row's completeness would have to be withdrawn
+/// rather than the row dropped, which this does not do.
+fn drop_rows_the_collection_lacks(input_tile: &mut Tile, level: CurryLevel, function: &Tile) {
+    let (
+        Tile::DataFunction {
+            domain,
+            domain_predicate,
+            ..
+        },
+        Some(enclosing),
+    ) = (function, level.enclosing())
+    else {
+        return;
+    };
+    let Tile::Scalar(arguments) = input_tile.values_at(level) else {
+        return;
+    };
+    let held: std::collections::HashSet<Value> =
+        (0..domain.len()).map(|i| domain.index_at(i)).collect();
+    let keep: Vec<bool> = (0..arguments.len())
+        .map(|i| {
+            let argument = arguments.index_at(i);
+            let answered = held.contains(&argument);
+            assert!(
+                answered || domain_predicate.contains(&argument),
+                "MapResult applied a collection at {argument:?}, which it neither holds nor \
+                 settles as absent: the row's completeness would have to be withdrawn"
+            );
+            answered
+        })
+        .collect();
+    if keep.iter().all(|k| *k) {
+        return;
+    }
+    input_tile.values_at_mut(enclosing).mark_deleted(&keep);
+    input_tile.compact();
 }
 
 impl TileProducer for MapResultProducer {
