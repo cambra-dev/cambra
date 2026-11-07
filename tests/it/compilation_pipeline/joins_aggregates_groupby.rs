@@ -1522,16 +1522,9 @@ fn a_comprehension_over_each_group_of_a_group_by(#[case] row: &str, #[case] expe
 }
 
 /// An inner comprehension reading only the outer element, one level further in. The enclosing
-/// value holds the group inside the pair with `z`, which the filter on `x` refines, and
-/// `collection_typed_at` (`src/ccl/planning/correlated.rs`) does not look through a refinement,
-/// so planning refuses the site. It answers `[[[1 -> 4]], [[2 -> 9, 3 -> 12, 4 -> 15]], [[5 ->
-/// 18, 6 -> 21, 7 -> 24]]]`.
+/// value holds the group inside the pair with `z`.
 #[test]
-#[should_panic(
-    expected = "a correlated inner comprehension whose domain differs per row, over a collection \
-                the enclosing value does not hold, is not supported yet"
-)]
-fn a_comprehension_reading_only_the_element_under_a_further_level_not_compiled_yet() {
+fn a_comprehension_reading_only_the_element_under_a_further_level() {
     check_sink(
         indoc! {r"
             out = test_sink()
