@@ -1373,6 +1373,9 @@ fn elim_lambda_impl(
     }
 
     let body_id = body.node_id();
+    // Read before the body is taken apart: the nested-lambda rule lifts an inner binder's
+    // filter only off a collection's domain.
+    let body_is_data = body.ty.fun_kind().is_some_and(|k| k.resolved().is_data());
     let TypedExpr {
         node: body_node, ..
     } = body;
@@ -1421,6 +1424,12 @@ fn elim_lambda_impl(
             // component refinement. So the two copies serve different readers: the
             // component states what `y` is, the pair states what to narrow.
             //
+            // **A compute function's refinement is its argument's type, not a filter.** On a
+            // collection's domain a refinement says which entries the collection has, which a
+            // filter decides. On a compute function's parameter it is what each argument
+            // already is (`λ len : Int@10 → …` over `[10]`'s values), so the pair's second
+            // component carries it and nothing lifts.
+            //
             // **A filter reading `param` stays where the pair is otherwise not dependent.** The
             // component is then `{𝐾 | 𝑝(param, ·)}`, a type chosen by the first component's
             // value, so the pair is the dependent tuple `(param : 𝐴) × {𝐾 | 𝑝(param, ·)}` and
@@ -1435,7 +1444,7 @@ fn elim_lambda_impl(
                 && refinements.iter().any(|r| {
                     !r.is_collection_membership() && is_free_in_value(param, &r.predicate)
                 });
-            let lifting: Vec<Refinement> = if filter_dependent {
+            let lifting: Vec<Refinement> = if filter_dependent || !body_is_data {
                 Vec::new()
             } else {
                 refinements

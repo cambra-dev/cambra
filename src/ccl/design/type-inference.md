@@ -3763,6 +3763,10 @@ applies it as `filter_values` over the pair of `𝑎` and the keys (`planning/co
 `emit_component_filter`). Keys that read `𝑎`, a boxed row's `σ₁(𝑎)`, keep that pair the dependent
 tuple `(𝑎 : 𝐴) × 𝐾(𝑎)`.
 
+Only a data function's binder carries filters. A compute function's parameter refinement is the
+type each argument already has, as `λ 𝑛 : Int@10 → …` over the values of `[10]`, so it stays on
+the second component and nothing lifts.
+
 ### Iterating a dependent tuple
 
 A curried site over a dependent tuple, `curry(𝑔)` with `𝑔 : ((𝑥 : 𝑋) × 𝐷(𝑥)) ⤇ 𝑉`, has no one
