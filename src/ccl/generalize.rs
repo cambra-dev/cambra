@@ -573,6 +573,17 @@ fn match_direct(
 /// parameter's refinements join what replaces it ([`Type::refined`]), and a family's
 /// application is its instance with the instance's binders discharged to the arguments.
 fn substitute(ty: &Type, bound: &HashMap<TypeParamId, Instance>) -> Type {
+    substitute_sharing(ty, bound, &crate::ccl::ccl_utils::PredMemo::default())
+}
+
+/// [`substitute`], rewriting each quoted term once however many type slots it is reached
+/// through: a predicate's type slots quote predicates of their own, and a predicate shared by
+/// every slot (a group's membership) would otherwise be rewritten again at each level.
+fn substitute_sharing(
+    ty: &Type,
+    bound: &HashMap<TypeParamId, Instance>,
+    memo: &crate::ccl::ccl_utils::PredMemo,
+) -> Type {
     // An application's arguments read the binders around it, so they are discharged into the
     // instance with those binders read by name, an index being loose there.
     let families = bound
@@ -586,19 +597,18 @@ fn substitute(ty: &Type, bound: &HashMap<TypeParamId, Instance>) -> Type {
     // The terms a type quotes carry type slots of their own, written over the same
     // parameters. The rewrite is the same type's, so it keeps the identities it copies.
     crate::ccl::provenance::preserving_ids(|| {
-        crate::ccl::ccl_utils::walk_quoted_terms_mut(
-            &mut out,
-            &crate::ccl::ccl_utils::PredMemo::default(),
-            &(),
-            &mut |term, _| {
-                fn in_term(e: &mut crate::ccl::Expr, bound: &HashMap<TypeParamId, Instance>) {
-                    e.walk_type_slots_mut(|t| *t = substitute(t, bound));
-                    e.walk_children_mut(|c| in_term(c, bound));
-                }
-                in_term(term, bound);
-                true
-            },
-        )
+        crate::ccl::ccl_utils::walk_quoted_terms_mut(&mut out, memo, &(), &mut |term, memo| {
+            fn in_term(
+                e: &mut crate::ccl::Expr,
+                bound: &HashMap<TypeParamId, Instance>,
+                memo: &crate::ccl::ccl_utils::PredMemo,
+            ) {
+                e.walk_type_slots_mut(|t| *t = substitute_sharing(t, bound, memo));
+                e.walk_children_mut(|c| in_term(c, bound, memo));
+            }
+            in_term(term, bound, memo);
+            true
+        })
     });
     out
 }
@@ -1491,43 +1501,50 @@ fn abstract_deep(
     d: &Type,
     out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool,
 ) -> Type {
-    abstract_deep_go(ty, group, d, out_of_scope, &mut false)
+    abstract_deep_go(
+        ty,
+        group,
+        d,
+        out_of_scope,
+        &mut false,
+        &crate::ccl::ccl_utils::PredMemo::default(),
+    )
 }
 
 /// [`abstract_deep`], setting `replaced` where it replaced anything. Reported rather than read
 /// off the result: a type compares a Σ's binder by identity, not by its candidates, so a rewrite
 /// of a candidate leaves the type equal to what it was.
+///
+/// `memo` is shared by the whole walk, as [`substitute`]'s is, so a quoted term reached through
+/// many type slots is rewritten once.
 fn abstract_deep_go(
     ty: &Type,
     group: &Type,
     d: &Type,
     out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool,
     replaced: &mut bool,
+    memo: &crate::ccl::ccl_utils::PredMemo,
 ) -> Type {
     let mut out = abstract_go(ty, group, d, replaced);
-    crate::ccl::ccl_utils::walk_quoted_terms_mut(
-        &mut out,
-        &crate::ccl::ccl_utils::PredMemo::default(),
-        &(),
-        &mut |term, _| {
-            fn in_term(
-                e: &mut crate::ccl::Expr,
-                group: &Type,
-                d: &Type,
-                out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool,
-            ) -> bool {
-                let mut changed = false;
-                e.walk_type_slots_mut(|t| {
-                    *t = abstract_deep_go(t, group, d, out_of_scope, &mut changed);
-                });
-                e.walk_children_mut(|c| changed |= in_term(c, group, d, out_of_scope));
-                changed
-            }
-            let changed = in_term(term, group, d, out_of_scope);
-            *replaced |= changed;
+    crate::ccl::ccl_utils::walk_quoted_terms_mut(&mut out, memo, &(), &mut |term, memo| {
+        fn in_term(
+            e: &mut crate::ccl::Expr,
+            group: &Type,
+            d: &Type,
+            out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool,
+            memo: &crate::ccl::ccl_utils::PredMemo,
+        ) -> bool {
+            let mut changed = false;
+            e.walk_type_slots_mut(|t| {
+                *t = abstract_deep_go(t, group, d, out_of_scope, &mut changed, memo);
+            });
+            e.walk_children_mut(|c| changed |= in_term(c, group, d, out_of_scope, memo));
             changed
-        },
-    );
+        }
+        let changed = in_term(term, group, d, out_of_scope, memo);
+        *replaced |= changed;
+        changed
+    });
     out
 }
 
