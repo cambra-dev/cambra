@@ -320,13 +320,17 @@ impl Bound {
                 {
                     // Binders the inversion does NOT transport (the term part,
                     // plus a non-injective rename remainder) must be absent
-                    // from the content (post-discharge context).
+                    // from the content (post-discharge context). The content is
+                    // read as its own side leaves it: `ty_subst` acts first, so a
+                    // binder it discharges is gone (both sides of a dependent
+                    // application discharge the parameter), and a name its terms
+                    // bring in is there.
                     let transported: BTreeSet<_> = if inv.is_id() {
                         Default::default()
                     } else {
                         ren.binders().collect()
                     };
-                    let fv = subst::type_free_vars(&self.ty);
+                    let fv = self.ty_subst.names_after(subst::type_free_vars(&self.ty));
                     debug_assert!(
                         self.self_subst
                             .binders()
