@@ -4067,6 +4067,11 @@ Eta expansion opens that collection's codomain at its fresh element binder and b
 in the lambda's type. Lifted filters read pair components through `pair_projection`. If the
 selected component reads an earlier component, the projection's function type binds the pair.
 
+Only a data function's binder carries filters. A compute function's parameter refinement is the
+type each argument already has, as `λ 𝑛 : Int@10 → …` over the values of `[10]`, so it stays on
+the second component and nothing lifts.
+
+
 ### Iterating a dependent tuple
 
 A curried site over a dependent tuple, `curry(𝑔)` with `𝑔 : ((𝑥 : 𝑋) × 𝐷(𝑥)) ⤇ 𝑉`, has no one
