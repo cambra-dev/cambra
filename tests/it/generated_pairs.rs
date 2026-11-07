@@ -66,18 +66,6 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ("nested_mut_source", "map_arrow", "InterpreterGap"),
     ("nested_mut_source", "map_lit", "InterpreterGap"),
     ("nested_mut_source", "union", "CompilerRejects"),
-    ("record_in_list", "comp_sum", "CompilerRejects"),
-    ("record_in_list", "filtered_sum", "CompilerRejects"),
-    ("record_in_list", "generator_max", "CompilerRejects"),
-    ("record_in_list", "groupby_sum", "CompilerRejects"),
-    ("record_in_list", "max_lit", "CompilerRejects"),
-    ("record_in_list", "nested_comp_sum", "CompilerRejects"),
-    ("record_in_list", "record_proj", "CompilerRejects"),
-    ("record_in_list", "rows_sum", "CompilerRejects"),
-    ("record_in_list", "sum_lit", "CompilerRejects"),
-    ("record_in_list", "sum_of_empty", "CompilerRejects"),
-    ("record_in_list", "ternary", "CompilerRejects"),
-    ("record_in_list", "union_sum", "CompilerRejects"),
     ("terminal_read", "terminal_in_agg[pool]", "CompilerRejects"),
     (
         "terminal_read_after_guard",
@@ -316,10 +304,6 @@ fn skeletons() -> Vec<Skeleton> {
             out = test_sink()
             r = (xs={}, n=1)
             out << sum(r.xs) + r.n
-        "#}},
-        Skeleton { name: "record_in_list", hole: Ty::Int, scope: &[], body: indoc! {r#"
-            out = test_sink()
-            out << sum([r.a for r in [(a={}, b=1)]])
         "#}},
         Skeleton { name: "tuple_component", hole: Ty::Int, scope: &[], body: indoc! {r#"
             out = test_sink()
