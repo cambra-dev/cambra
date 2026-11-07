@@ -3905,6 +3905,11 @@ states it: exponential beta rewrites `⟨𝑔, curry(ℎ)⟩ ≫ apply` to `⟨i
 zip's pairs with `ℎ`'s domain refinements (`simplify::stating_domain_of`), since every pair it
 gives, `(𝑥, 𝑔(𝑥))`, is one `ℎ` was applied to.
 
+Only a data function's binder carries filters. A compute function's parameter refinement is the
+type each argument already has, as `λ 𝑛 : Int@10 → …` over the values of `[10]`, so it stays on
+the second component and nothing lifts.
+
+
 ### Iterating a dependent tuple
 
 A curried site over a dependent tuple, `curry(𝑔)` with `𝑔 : ((𝑥 : 𝑋) × 𝐷(𝑥)) ⤇ 𝑉`, has no one
