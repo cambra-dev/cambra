@@ -2842,7 +2842,9 @@ fn call_instance_function(expr: &mut Expr, call: &OperatorCall, function: &str, 
 }
 
 /// Make an operator a compiler instance answers run that instance's primitive: `+` of two
-/// strings is `Concat`.
+/// strings is `Concat`. An operator whose primitive is what it already computes keeps its
+/// own kind, so a `^` sibling (`^-` answered by `Sub`) keeps the operation its result type
+/// names.
 fn run_instance_primitive(expr: &mut Expr) {
     let TypedExprNode::BinOp { left, op, right } = &mut expr.node else {
         return;
@@ -2865,7 +2867,9 @@ fn run_instance_primitive(expr: &mut Expr) {
             Some(Implementation::Primitive(InstanceBody::Binary(primitive))) => Some(*primitive),
             _ => None,
         });
-    if let Some(primitive) = primitive {
+    if let Some(primitive) = primitive
+        && primitive != op.unrefined()
+    {
         *op = primitive;
     }
 }

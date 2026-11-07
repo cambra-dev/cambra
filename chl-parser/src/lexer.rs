@@ -159,6 +159,43 @@ pub enum Token {
     /// Experimental, and so absent from `docs/chl-spec.md`.
     #[token("^+")]
     CaretPlus,
+    /// Refining subtraction `^-`, the `^` sibling of `-` (`ArithmeticKind::SubRefined`).
+    /// Maximal munch takes it over `Caret` then `Minus`, so `a ^-b` is `a ^- b` and not
+    /// `a ^ (-b)`; the latter never type-checks, `-` having no `Bool` row.
+    ///
+    /// Experimental, and so absent from `docs/chl-spec.md`, as is every `^` sibling below.
+    #[token("^-")]
+    CaretMinus,
+    /// Refining multiplication `^*` (`ArithmeticKind::MulRefined`). CHL has no unary `*`,
+    /// so `a ^ *b` is not a competing parse.
+    #[token("^*")]
+    CaretStar,
+    /// Refining equality `^==` (`CompareKind::EqualsRefined`). Maximal munch takes it
+    /// over `CaretEq` then `Eq`.
+    #[token("^==")]
+    CaretEqEq,
+    /// Refining `^<` (`CompareKind::LessRefined`).
+    #[token("^<")]
+    CaretLt,
+    /// Refining `^<=` (`CompareKind::LessOrEqRefined`).
+    #[token("^<=")]
+    CaretLtE,
+    /// Refining `^>` (`CompareKind::GreaterRefined`).
+    #[token("^>")]
+    CaretGt,
+    /// Refining `^>=` (`CompareKind::GreaterOrEqRefined`).
+    #[token("^>=")]
+    CaretGtE,
+    /// Refining `^and` (`LogicKind::AndRefined`). A caret directly followed by a longer
+    /// identifier, `a ^andy`, is `^` then that identifier: [`raw_tokens`] splits it.
+    #[token("^and")]
+    CaretAnd,
+    /// Refining `^or` (`LogicKind::OrRefined`), split by [`raw_tokens`] as `^and` is.
+    #[token("^or")]
+    CaretOr,
+    /// Refining `^not` (`UnaryOpKind::NotRefined`), split by [`raw_tokens`] as `^and` is.
+    #[token("^not")]
+    CaretNot,
     /// Opaque binding `^=` — a `let` whose binder is bound at the initializer's
     /// type and never discharged to the initializer, so a refinement mentioning
     /// the binder keeps the initializer's term out
@@ -501,6 +538,16 @@ pub fn highlight_class(token: &Token) -> Option<HighlightClass> {
         | Token::PlusPlus
         | Token::PlusEq
         | Token::CaretPlus
+        | Token::CaretMinus
+        | Token::CaretStar
+        | Token::CaretEqEq
+        | Token::CaretLt
+        | Token::CaretLtE
+        | Token::CaretGt
+        | Token::CaretGtE
+        | Token::CaretAnd
+        | Token::CaretOr
+        | Token::CaretNot
         | Token::CaretEq
         | Token::MinusEq
         | Token::Arrow
@@ -773,6 +820,16 @@ impl fmt::Display for Token {
             Token::PlusPlus => "++",
             Token::PlusEq => "+=",
             Token::CaretPlus => "^+",
+            Token::CaretMinus => "^-",
+            Token::CaretStar => "^*",
+            Token::CaretEqEq => "^==",
+            Token::CaretLt => "^<",
+            Token::CaretLtE => "^<=",
+            Token::CaretGt => "^>",
+            Token::CaretGtE => "^>=",
+            Token::CaretAnd => "^and",
+            Token::CaretOr => "^or",
+            Token::CaretNot => "^not",
             Token::CaretEq => "^=",
             Token::MinusEq => "-=",
             Token::Arrow => "->",
@@ -1064,6 +1121,23 @@ fn raw_tokens(file: FileId, source: &str) -> RawTokens {
         let range = lex.span();
         let span = Span::new(file, range.start, range.end);
         if let Ok(tok) = result {
+            if matches!(tok, Token::CaretAnd | Token::CaretOr | Token::CaretNot) {
+                // `^and` matched the head of an identifier, `a ^andy`: the source is `^`
+                // followed by that identifier, which logos's longest match cannot see.
+                let word_end = source[span.start + 1..]
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .map_or(source.len(), |i| span.start + 1 + i);
+                if word_end > span.end {
+                    lex.bump(word_end - span.end);
+                    let word = &source[span.start + 1..word_end];
+                    tokens.push((Token::Caret, Span::new(file, span.start, span.start + 1)));
+                    tokens.push((
+                        Token::Ident(SmolStr::from(word)),
+                        Span::new(file, span.start + 1, word_end),
+                    ));
+                    continue;
+                }
+            }
             tokens.push((tok, span));
             continue;
         }
@@ -2198,6 +2272,48 @@ mod tests {
                 Token::Ident("c".into()),
                 Token::Plus,
                 Token::Ident("d".into()),
+                Token::Newline,
+            ]
+        );
+    }
+
+    /// Every `^` sibling of an operator is one token, taken by maximal munch over `^`
+    /// followed by the operator.
+    #[test]
+    fn caret_siblings_are_one_token_each() {
+        assert_eq!(
+            tokens("^- ^* ^== ^< ^<= ^> ^>= ^and ^or ^not"),
+            vec![
+                Token::CaretMinus,
+                Token::CaretStar,
+                Token::CaretEqEq,
+                Token::CaretLt,
+                Token::CaretLtE,
+                Token::CaretGt,
+                Token::CaretGtE,
+                Token::CaretAnd,
+                Token::CaretOr,
+                Token::CaretNot,
+                Token::Newline,
+            ]
+        );
+    }
+
+    /// A caret directly before an identifier that merely starts with `and`, `or` or `not`
+    /// is `^` then the identifier, as it is before any other identifier.
+    #[test]
+    fn a_caret_before_a_longer_identifier_is_xor() {
+        assert_eq!(
+            tokens("a ^andy ^order ^not_b ^and"),
+            vec![
+                Token::Ident("a".into()),
+                Token::Caret,
+                Token::Ident("andy".into()),
+                Token::Caret,
+                Token::Ident("order".into()),
+                Token::Caret,
+                Token::Ident("not_b".into()),
+                Token::CaretAnd,
                 Token::Newline,
             ]
         );

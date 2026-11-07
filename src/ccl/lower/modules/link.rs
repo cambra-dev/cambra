@@ -264,7 +264,10 @@ fn fold(expr: &mut Expr) -> bool {
             TypedExprNode::Lit(Lit::Int(n)) => n.checked_neg().map(Lit::Int),
             _ => None,
         },
-        TypedExprNode::UnaryOp(crate::ccl::UnaryOpKind::Not, operand) => match operand.node {
+        TypedExprNode::UnaryOp(
+            crate::ccl::UnaryOpKind::Not | crate::ccl::UnaryOpKind::NotRefined,
+            operand,
+        ) => match operand.node {
             TypedExprNode::Lit(Lit::Bool(b)) => Some(Lit::Bool(!b)),
             _ => None,
         },

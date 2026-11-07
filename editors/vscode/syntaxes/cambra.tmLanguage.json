@@ -242,19 +242,19 @@
     },
     "operator-assignment-augmented": {
       "name": "keyword.operator.assignment.augmented.cambra",
-      "match": "//=|\\+=|-=|\\*=|\\^="
+      "match": "//=|\\+=|-=|\\*=|\\^=(?!=)"
     },
     "operator-comparison": {
       "name": "keyword.operator.comparison.cambra",
-      "match": "==|!=|<=|>=|<|>"
+      "match": "\\^==|\\^<=|\\^>=|\\^<|\\^>|==|!=|<=|>=|<|>"
     },
     "operator-arithmetic": {
       "name": "keyword.operator.arithmetic.cambra",
-      "match": "\\*\\*|//|\\+\\+|\\^\\+|\\+|-|\\*"
+      "match": "\\*\\*|//|\\+\\+|\\^\\+|\\^-|\\^\\*|\\+|-|\\*"
     },
     "operator-logical": {
       "name": "keyword.operator.logical.cambra",
-      "match": "&|\\||\\^"
+      "match": "\\^(?:and|or|not)(?![A-Za-z0-9_])|&|\\||\\^"
     },
     "operator-assignment": {
       "name": "keyword.operator.assignment.cambra",

@@ -91,7 +91,7 @@ fn check_compile_error(code: &str, needle: &str) {
 // (`pool: Mut({Int where _ >= 0}, Txn)`) has no case here, blocked twice over.
 //
 // A `^+` write records its sum, so `pool := pool ^+ 1` types the written value
-// `{Int | __elem == pool ^+ 1}` — a predicate naming the mutable binder.
+// `{Int | __elem == pool + 1}` — a predicate naming the mutable binder.
 // `close_let_type` holds a `:=` definiens back from the closing discharge (a
 // history denotes no value to substitute), so nothing eliminates the name and
 // `check_scope_valid` reports a `ScopeViolation` on a well-typed program.

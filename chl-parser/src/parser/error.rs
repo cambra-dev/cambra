@@ -302,6 +302,9 @@ const CATEGORIES: &[(&str, &[Token])] = &[
             Token::Pipe,
             Token::Caret,
             Token::PlusPlus,
+            Token::CaretPlus,
+            Token::CaretMinus,
+            Token::CaretStar,
         ],
     ),
     (
@@ -313,9 +316,17 @@ const CATEGORIES: &[(&str, &[Token])] = &[
             Token::LtE,
             Token::Gt,
             Token::GtE,
+            Token::CaretEqEq,
+            Token::CaretLt,
+            Token::CaretLtE,
+            Token::CaretGt,
+            Token::CaretGtE,
         ],
     ),
-    ("boolean operator", &[Token::And, Token::Or]),
+    (
+        "boolean operator",
+        &[Token::And, Token::Or, Token::CaretAnd, Token::CaretOr],
+    ),
     (
         "postfix operation",
         &[Token::Dot, Token::LParen, Token::LBracket],

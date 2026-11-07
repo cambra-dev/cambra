@@ -1178,7 +1178,7 @@ fn a_refinement_may_depend_on_a_read(#[case] code: &str, #[case] expected: Vec<i
         x := x ^+ n
         x
     "#},
-    "found {Int | __elem == x ^+ n}"
+    "found {Int | __elem == x + n}"
 )]
 #[case::a_filter_on_the_variable(
     indoc! {r#"
@@ -1217,7 +1217,7 @@ fn a_diagnostic_keeps_a_user_written_opaque_binder() {
         y
     "#});
     assert!(
-        rendered.contains("found {Int | __elem == x0 ^+ n}"),
+        rendered.contains("found {Int | __elem == x0 + n}"),
         "expected the user's own binder in:\n{rendered}"
     );
 }
@@ -2552,7 +2552,7 @@ fn a_plain_collection_initializing_a_sum_is_told_to_box() {
 }
 
 /// `test(x)` passes the mutable variable itself, and the declared output
-/// `{Int | __elem == a ^+ a}` discharges its binder to the argument's term — so
+/// `{Int | __elem == a + a}` discharges its binder to the argument's term — so
 /// `x` lands in a refinement, which no binding form can keep it out of. The
 /// program compiles until the unified phase, which has no history to rewrite a
 /// mutable reference inside a type into.
@@ -2575,7 +2575,7 @@ fn dependent_codomain_discharges_mut_var_argument_into_refinement() {
 
 /// `^=` binds `x1` without a definiens, so the body's type is lifted with `x1`
 /// in it rather than with `x` discharged into it: the body types as
-/// `{Int | __elem == a ^+ x1}`, and `x1`'s own refinement is what admits that
+/// `{Int | __elem == a + x1}`, and `x1`'s own refinement is what admits that
 /// against the declared output. The call is still `test(x)`, so the program
 /// stops where its sibling above stops — at the same internal error, pinned
 /// for the same reason.
@@ -2613,7 +2613,7 @@ fn call_site_argument_carries_mut_var_into_refinement() {
 }
 
 /// The same binder at the top level, with the function's output annotation
-/// removed so the inferred output stands: `{Int | __elem == a ^+ x0}`, naming
+/// removed so the inferred output stands: `{Int | __elem == a + x0}`, naming
 /// the opaque binder and not the mutable variable.
 ///
 /// The call supplies `x0`, so nothing carries the mutable variable into a
@@ -2762,7 +2762,7 @@ x
 }
 
 /// A snapshot write to a mutable variable with no annotation. The contribution
-/// `{Int | __elem == __read ^+ 1}` names the read binder, and the value variable
+/// `{Int | __elem == __read + 1}` names the read binder, and the value variable
 /// it lands on was minted at the declaration, outside that binder. The binder is
 /// opaque, which puts it in every telescope of the walk. The join over the seed
 /// and the write establishes neither predicate, so the variable types as `Int`.
@@ -2857,7 +2857,7 @@ x
 /// A write inside a loop crosses the loop's target binder, so the edge into the mutable
 /// variable joins over every value of `p` (`src/ccl/design/type-inference.md`, "A
 /// contribution crosses the binders after its target"): the refinement
-/// `{Int | __elem == __read ^+ p}` states a value per `p`, and the join drops it.
+/// `{Int | __elem == __read + p}` states a value per `p`, and the join drops it.
 #[test]
 fn a_write_in_a_loop_joins_over_the_loop_binder() {
     check_scalar(
@@ -2975,7 +2975,7 @@ fn checking_writes_only_assumes_annotation_refinement() {
 x : Mut({Int where _ <= 5}) := 0;
 x := x ^+ 1
 "#},
-        "Type mismatch for write to mutable variable `x`: expected {Int | __elem <= 5}, found {Int | __elem == x ^+ 1}",
+        "Type mismatch for write to mutable variable `x`: expected {Int | __elem <= 5}, found {Int | __elem == x + 1}",
     )
 }
 

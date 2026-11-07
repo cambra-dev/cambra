@@ -4,7 +4,7 @@
 //! A refinement's predicate is a term, and every node of that term carries a type
 //! (`Refinement::predicate`). Those interior types accumulate refinements of their
 //! own — `^+` records its sum, so the `1 ^+ 3` node inside the predicate
-//! `__elem == 1 ^+ 3 ^+ 2` is itself typed `{Int | __elem == 1 ^+ 3}`. An interior
+//! `__elem == 1 ^+ 3 + 2` is itself typed `{Int | __elem == 1 + 3}`. An interior
 //! refinement restates what the predicate holding it already says, and it is the
 //! copy a substitution leaves stale: coalesce discharges the predicate a type
 //! carries as that type crosses a binder, and an interior copy the discharge did

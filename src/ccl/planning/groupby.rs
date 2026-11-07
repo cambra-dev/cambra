@@ -158,14 +158,12 @@ struct PartitionKey<'a> {
 /// `cast`, or `Compose` — matching the term a site is spelled in is
 /// [`match_pointful_site`]'s job.
 fn partition_key_of(predicate: &Expr) -> Option<PartitionKey<'_>> {
-    let TypedExprNode::BinOp {
-        left,
-        op: BinOpKind::Compare(CompareKind::Equals),
-        right,
-    } = &predicate.node
-    else {
+    let TypedExprNode::BinOp { left, op, right } = &predicate.node else {
         return None;
     };
+    if op.unrefined() != BinOpKind::Compare(CompareKind::Equals) {
+        return None;
+    }
     // One side extracts the element; the other is the free key binder.
     let extract = if side_extracts_element(left) && is_free_var(right) {
         left

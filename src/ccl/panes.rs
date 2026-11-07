@@ -294,15 +294,16 @@ mod tests {
     };
     use crate::ccl::load::{InMemory, RootFile};
     use crate::ccl::provenance::Link;
-    use crate::ccl::test_corpus::pipeline_corpus as corpus;
+    use crate::ccl::test_corpus::{pipeline_corpus as corpus, spelled, with_caret_operators};
     use crate::chl_parser::ast::Span;
     use crate::interpreter::Consumer;
 
-    /// Compile `code` through the full pipeline, panicking on error.
+    /// Compile `code` through the full pipeline, panicking on error. Inside
+    /// [`with_caret_operators`] it compiles `code` spelled with `^` operators.
     fn compile_ok(code: &str) -> CompiledProgram {
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
-        match compile_program(&mut ctx, &LoadedProgram::test(code), consumer) {
+        match compile_program(&mut ctx, &LoadedProgram::test(spelled(code)), consumer) {
             Ok(p) => p,
             Err(errs) => panic!("expected a successful compile, got {errs:?}"),
         }
@@ -374,6 +375,22 @@ mod tests {
         }
     }
 
+    // TODO: pinned on `^+`, `^*`, `^<`, `^>=` or `^==`, each of which fails this test on its own.
+    // With all of them refined, lambda elimination's type assert rejects the comprehension filter
+    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only. With it
+    // off, inference rejects a later corpus program whose comprehension element type reads the key.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
+    #[cfg_attr(
+        not(debug_assertions),
+        should_panic(
+            expected = "a value that is one type for every key of the collection it is part of"
+        )
+    )]
+    fn pane_pair_folds_have_no_structural_leaks_with_caret_operators() {
+        with_caret_operators(pane_pair_folds_have_no_structural_leaks);
+    }
+
     /// Require every phase recorded by a corpus compile to belong to exactly one
     /// pair. Otherwise its rows are omitted or folded at multiple boundaries.
     #[test]
@@ -388,6 +405,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    // TODO: pinned on `^+`, `^*`, `^<`, `^>=` or `^==`, each of which fails this test on its own.
+    // With all of them refined, lambda elimination's type assert rejects the comprehension filter
+    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only. With it
+    // off, inference rejects a later corpus program whose comprehension element type reads the key.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
+    #[cfg_attr(
+        not(debug_assertions),
+        should_panic(
+            expected = "a value that is one type for every key of the collection it is part of"
+        )
+    )]
+    fn every_recorded_phase_belongs_to_exactly_one_pane_pair_with_caret_operators() {
+        with_caret_operators(every_recorded_phase_belongs_to_exactly_one_pane_pair);
     }
 
     /// Check endpoint membership and survivor self-edges across the corpus.
@@ -448,6 +481,22 @@ mod tests {
         }
     }
 
+    // TODO: pinned on `^+`, `^*`, `^<`, `^>=` or `^==`, each of which fails this test on its own.
+    // With all of them refined, lambda elimination's type assert rejects the comprehension filter
+    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only. With it
+    // off, inference rejects a later corpus program whose comprehension element type reads the key.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
+    #[cfg_attr(
+        not(debug_assertions),
+        should_panic(
+            expected = "a value that is one type for every key of the collection it is part of"
+        )
+    )]
+    fn the_pane_folds_derive_a_non_vacuous_provenance_map_with_caret_operators() {
+        with_caret_operators(the_pane_folds_derive_a_non_vacuous_provenance_map);
+    }
+
     /// The `program / pane pair` names at which a **blame** edge reaches the
     /// provenance map — where a rewrite named blame and the fold labelled the
     /// edge it contributed. See
@@ -484,6 +533,22 @@ mod tests {
             relating, RELATING_BOUNDARIES,
             "the pane pairs at which blame contributes an edge have changed",
         );
+    }
+
+    // TODO: pinned on `^+`, `^*`, `^<`, `^>=` or `^==`, each of which fails this test on its own.
+    // With all of them refined, lambda elimination's type assert rejects the comprehension filter
+    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only. With it
+    // off, inference rejects a later corpus program whose comprehension element type reads the key.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
+    #[cfg_attr(
+        not(debug_assertions),
+        should_panic(
+            expected = "a value that is one type for every key of the collection it is part of"
+        )
+    )]
+    fn blame_reaches_the_provenance_map_labelled_with_caret_operators() {
+        with_caret_operators(blame_reaches_the_provenance_map_labelled);
     }
 
     /// A statement's downstream IDs, separated into ancestry and blame relations.
@@ -600,6 +665,16 @@ mod tests {
         assert_disjoint(&images);
     }
 
+    // TODO: pinned on `^+`: `mut_elim` refuses a feed whose rows' type now reads the loop's
+    // accumulator.
+    #[test]
+    #[should_panic(
+        expected = "a feed whose rows depend on a mutable variable its loop writes is not supported yet"
+    )]
+    fn a_loop_body_statement_reaches_its_own_products_with_caret_operators() {
+        with_caret_operators(a_loop_body_statement_reaches_its_own_products);
+    }
+
     /// **Two accumulators resolve to two write statements.** One recurrence
     /// carries a slot per accumulator, and the slots differ only by the index
     /// they project — so a recording that named the loop, or that named the
@@ -628,6 +703,16 @@ mod tests {
             );
         }
         assert_disjoint(&images);
+    }
+
+    // TODO: pinned on `^+`: `mut_elim` refuses a feed whose rows' type now reads the loop's
+    // accumulator.
+    #[test]
+    #[should_panic(
+        expected = "a feed whose rows depend on a mutable variable its loop writes is not supported yet"
+    )]
+    fn each_accumulator_reaches_the_statement_that_writes_it_with_caret_operators() {
+        with_caret_operators(each_accumulator_reaches_the_statement_that_writes_it);
     }
 
     /// **A feed reaches its own products whether or not the loop accumulates,
@@ -1153,6 +1238,16 @@ mod tests {
         }
     }
 
+    // TODO: pinned on `^+` or `^==`, each of which fails this test on its own. With all of them
+    // refined, inference rejects a comprehension whose element type now reads the key.
+    #[test]
+    #[should_panic(
+        expected = "a value that is one type for every key of the collection it is part of"
+    )]
+    fn a_nested_join_blames_both_join_conditions_with_caret_operators() {
+        with_caret_operators(a_nested_join_blames_both_join_conditions);
+    }
+
     /// Corpus fixtures selected to exercise generalized-definition specialization.
     const SPECIALIZING: &[&str] = &["generator_pipeline", "udf_chain"];
 
@@ -1179,6 +1274,22 @@ mod tests {
         }
     }
 
+    // TODO: pinned on `^+`, `^*`, `^<`, `^>=` or `^==`, each of which fails this test on its own.
+    // With all of them refined, lambda elimination's type assert rejects the comprehension filter
+    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only. With it
+    // off, inference rejects a later corpus program whose comprehension element type reads the key.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
+    #[cfg_attr(
+        not(debug_assertions),
+        should_panic(
+            expected = "a value that is one type for every key of the collection it is part of"
+        )
+    )]
+    fn monomorphization_explains_every_node_it_produces_with_caret_operators() {
+        with_caret_operators(monomorphization_explains_every_node_it_produces);
+    }
+
     /// Require no structural leaks across the Inline/Transact/Letrec/Channelize pair.
     /// Selected rewriting fixtures must also have deaths, preventing an unchanged
     /// tree from satisfying every assertion.
@@ -1203,6 +1314,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    // TODO: pinned on `^+`, `^*`, `^<`, `^>=` or `^==`, each of which fails this test on its own.
+    // With all of them refined, lambda elimination's type assert rejects the comprehension filter
+    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only. With it
+    // off, inference rejects a later corpus program whose comprehension element type reads the key.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
+    #[cfg_attr(
+        not(debug_assertions),
+        should_panic(
+            expected = "a value that is one type for every key of the collection it is part of"
+        )
+    )]
+    fn the_second_pane_pair_explains_every_node_its_phases_produce_with_caret_operators() {
+        with_caret_operators(the_second_pane_pair_explains_every_node_its_phases_produce);
     }
 
     /// Deaths are the live-set difference and nothing else: what the fold reports
@@ -1250,6 +1377,22 @@ mod tests {
             "{} predicate id collisions: {found:?}",
             found.len(),
         );
+    }
+
+    // TODO: pinned on `^+`, `^*`, `^<`, `^>=` or `^==`, each of which fails this test on its own.
+    // With all of them refined, lambda elimination's type assert rejects the comprehension filter
+    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only. With it
+    // off, inference rejects a later corpus program whose comprehension element type reads the key.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
+    #[cfg_attr(
+        not(debug_assertions),
+        should_panic(
+            expected = "a value that is one type for every key of the collection it is part of"
+        )
+    )]
+    fn distinct_predicate_terms_never_share_a_node_id_with_caret_operators() {
+        with_caret_operators(distinct_predicate_terms_never_share_a_node_id);
     }
 
     /// Pin the recorded phase set for the transaction fixture, sorted by phase name.
@@ -1453,6 +1596,22 @@ mod tests {
         }
     }
 
+    // TODO: pinned on `^+`, `^*`, `^<`, `^>=` or `^==`, each of which fails this test on its own.
+    // With all of them refined, lambda elimination's type assert rejects the comprehension filter
+    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only. With it
+    // off, inference rejects a later corpus program whose comprehension element type reads the key.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
+    #[cfg_attr(
+        not(debug_assertions),
+        should_panic(
+            expected = "a value that is one type for every key of the collection it is part of"
+        )
+    )]
+    fn the_operator_graph_carries_its_output_boundary_with_caret_operators() {
+        with_caret_operators(the_operator_graph_carries_its_output_boundary);
+    }
+
     /// Whether the subscription relation is acyclic, optionally with the edges
     /// wired through a `CycleSlot` removed. Kahn over the whole graph.
     fn subscription_relation_is_acyclic(
@@ -1541,6 +1700,22 @@ mod tests {
         );
     }
 
+    // TODO: pinned on `^+`, `^*`, `^<`, `^>=` or `^==`, each of which fails this test on its own.
+    // With all of them refined, lambda elimination's type assert rejects the comprehension filter
+    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only. With it
+    // off, inference rejects a later corpus program whose comprehension element type reads the key.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
+    #[cfg_attr(
+        not(debug_assertions),
+        should_panic(
+            expected = "a value that is one type for every key of the collection it is part of"
+        )
+    )]
+    fn every_operator_graph_cycle_runs_through_a_deferred_edge_with_caret_operators() {
+        with_caret_operators(every_operator_graph_cycle_runs_through_a_deferred_edge);
+    }
+
     /// **Each writer of a transaction names some operator of its own.**
     ///
     /// Every operator of the commit complex is minted after the writer's own
@@ -1579,6 +1754,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    // TODO: pinned on `^+`, `^*`, `^<`, `^>=` or `^==`, each of which fails this test on its own.
+    // With all of them refined, lambda elimination's type assert rejects the comprehension filter
+    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only. With it
+    // off, inference rejects a later corpus program whose comprehension element type reads the key.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
+    #[cfg_attr(
+        not(debug_assertions),
+        should_panic(
+            expected = "a value that is one type for every key of the collection it is part of"
+        )
+    )]
+    fn every_writer_site_has_an_operator_attributed_inside_it_with_caret_operators() {
+        with_caret_operators(every_writer_site_has_an_operator_attributed_inside_it);
     }
 
     /// Every conditional-induction shape reaches every pane pair clean.
@@ -1641,6 +1832,14 @@ mod tests {
                 );
             }
         }
+    }
+
+    // TODO: pinned on `^+`: letrec recognition merges two `case` arms without merging their result
+    // refinements.
+    #[test]
+    #[should_panic(expected = "post-letrec produced an invalid tree")]
+    fn conditional_induction_panes_are_leak_free_with_caret_operators() {
+        with_caret_operators(conditional_induction_panes_are_leak_free);
     }
 
     fn perf_repetitions(value: Result<String, VarError>) -> NonZeroUsize {
@@ -1795,6 +1994,14 @@ mod tests {
              something the source names; labels seen: {:?}",
             seen,
         );
+    }
+
+    // TODO: pinned on `^+` or `^==`, each of which fails this test on its own. With all of them
+    // refined, a collection domain refined by the comparison fails the invariant domain check.
+    #[test]
+    #[should_panic(expected = "post-inference produced an invalid tree")]
+    fn planning_labels_carry_their_declared_nature_with_caret_operators() {
+        with_caret_operators(planning_labels_carry_their_declared_nature);
     }
 
     /// **One `Phase::Planning` scope covers both halves of planning.**

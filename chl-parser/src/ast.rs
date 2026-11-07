@@ -1307,7 +1307,11 @@ pub enum BinOp {
     /// [`Add`](Self::Add), a different trait (`src/ccl/ops.rs`, `ArithmeticKind`).
     AddRefined,
     Sub,
+    /// `^-` — subtraction whose result type records the difference.
+    SubRefined,
     Mul,
+    /// `^*` — multiplication whose result type records the product.
+    MulRefined,
     FloorDiv,
     /// `**` — exponentiation. Right-associative, and tighter than the unary minus
     /// on its left, so `-2 ** 2` is `-(2 ** 2)` (`docs/chl-spec.md`,
@@ -1328,24 +1332,74 @@ pub enum BinOp {
 pub enum UnaryOp {
     Neg,
     Not,
+    /// `^not` — negation whose result type records the operation.
+    NotRefined,
+}
+
+impl UnaryOp {
+    /// The operator computing what this one computes: `Not` for `NotRefined`, itself
+    /// otherwise. A `^` sibling differs from its operator only in its result type.
+    pub fn unrefined(self) -> Self {
+        match self {
+            UnaryOp::NotRefined => UnaryOp::Not,
+            op => op,
+        }
+    }
 }
 
 /// Short-circuiting boolean operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoolOp {
     And,
+    /// `^and` — conjunction whose result type records the operation.
+    AndRefined,
     Or,
+    /// `^or` — disjunction whose result type records the operation.
+    OrRefined,
+}
+
+impl BoolOp {
+    /// The operator computing what this one computes, as [`UnaryOp::unrefined`].
+    pub fn unrefined(self) -> Self {
+        match self {
+            BoolOp::AndRefined => BoolOp::And,
+            BoolOp::OrRefined => BoolOp::Or,
+            op => op,
+        }
+    }
 }
 
 /// Comparison operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Each `…Refined` variant is the `^` sibling of the comparison it names (`^==`, `^<`, …),
+/// whose result type records the comparison.
 pub enum CmpOp {
     Eq,
+    EqRefined,
     NotEq,
     Lt,
+    LtRefined,
     LtE,
+    LtERefined,
     Gt,
+    GtRefined,
     GtE,
+    GtERefined,
+}
+
+impl CmpOp {
+    /// The operator computing what this one computes, as [`UnaryOp::unrefined`].
+    pub fn unrefined(self) -> Self {
+        match self {
+            CmpOp::EqRefined => CmpOp::Eq,
+            CmpOp::LtRefined => CmpOp::Lt,
+            CmpOp::LtERefined => CmpOp::LtE,
+            CmpOp::GtRefined => CmpOp::Gt,
+            CmpOp::GtERefined => CmpOp::GtE,
+            op => op,
+        }
+    }
 }
 
 /// Augmented-assignment operators.

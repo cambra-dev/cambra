@@ -1,8 +1,8 @@
 //! Semantic refinement subtyping, discharged to an SMT solver.
 //!
 //! Refinement subtyping in [`super::constrain`] matches refinements by structural
-//! predicate equality, which is sound and incomplete: `{Int | __elem == 1 ^+ 3 ^+ 2}`
-//! and `{Int | __elem == 1 ^+ 5}` denote one set and compare unequal. This module
+//! predicate equality, which is sound and incomplete: `{Int | __elem == 1 + 3 + 2}`
+//! and `{Int | __elem == 1 + 5}` denote one set and compare unequal. This module
 //! decides the leftover cases by asking whether the lhs predicates entail the rhs
 //! ones.
 //!
@@ -803,9 +803,11 @@ impl<'a> Encode<'a> {
             },
             TypedExprNode::UnaryOp(op, operand) => {
                 let operand = self.expr(operand)?;
-                Ok(match op {
+                // `^not` computes what `not` computes, as a binary `^` sibling does.
+                Ok(match op.unrefined() {
                     UnaryOpKind::Neg => self.ctx.negate(operand),
                     UnaryOpKind::Not => self.ctx.not(operand),
+                    UnaryOpKind::NotRefined => unreachable!("`unrefined` answers no `NotRefined`"),
                 })
             }
             TypedExprNode::BinOp { left, op, right } => {
@@ -825,10 +827,10 @@ impl<'a> Encode<'a> {
         r: SExpr,
     ) -> Result<SExpr, String> {
         let c = self.ctx;
-        Ok(match op {
-            // `^+` computes what `+` computes and differs only in the trait it
-            // states (`src/ccl/ops.rs`), so both are SMT's `+`.
-            BinOpKind::Arithmetic(ArithmeticKind::Add | ArithmeticKind::AddRefined) => c.plus(l, r),
+        // A `^` sibling computes what its operator computes and differs only in its result
+        // type (`src/ccl/ops.rs`), so both are one SMT operation.
+        Ok(match op.unrefined() {
+            BinOpKind::Arithmetic(ArithmeticKind::Add) => c.plus(l, r),
             BinOpKind::Arithmetic(ArithmeticKind::Sub) => c.sub(l, r),
             // A product stays linear when one factor is a constant.
             BinOpKind::Arithmetic(ArithmeticKind::Mul)
@@ -865,6 +867,7 @@ impl<'a> Encode<'a> {
                     symbolic(right)
                 ));
             }
+            refined => unreachable!("`unrefined` answers no `{refined:?}`"),
         })
     }
 
@@ -1061,7 +1064,66 @@ mod tests {
     }
 
     fn add(l: TypedExpr, r: TypedExpr) -> TypedExpr {
-        TypedExpr::binop(l, BinOpKind::Arithmetic(ArithmeticKind::AddRefined), r).with_ty(int())
+        TypedExpr::binop(l, BinOpKind::Arithmetic(ArithmeticKind::Add), r).with_ty(int())
+    }
+
+    /// A `^` operator encodes as its unrefined sibling: `__elem == (𝑎 ^op 𝑏)` and
+    /// `__elem == (𝑎 op 𝑏)` entail each other, for every operator with a `^` sibling.
+    #[test]
+    fn a_caret_operator_encodes_as_its_sibling() {
+        use crate::ccl::{LogicKind, UnaryOpKind};
+        let boolean = || Type::Base(BaseType::Bool);
+        let flag = |name: &str| TypedExpr::var(Name::raw(name)).with_ty(boolean());
+        let equal_to = |base: Type, operation: TypedExpr| {
+            Refinement::born(Rc::new(
+                TypedExpr::binop(
+                    TypedExpr::var(Name::elem()).with_ty(base.clone()),
+                    BinOpKind::Compare(CompareKind::Equals),
+                    operation.with_ty(base),
+                )
+                .with_ty(boolean()),
+            ))
+        };
+        let binops = [
+            ArithmeticKind::AddRefined,
+            ArithmeticKind::SubRefined,
+            ArithmeticKind::MulRefined,
+        ]
+        .map(|kind| (BinOpKind::Arithmetic(kind), int(), var("x"), lit(3)))
+        .into_iter()
+        .chain(
+            [
+                CompareKind::EqualsRefined,
+                CompareKind::LessRefined,
+                CompareKind::LessOrEqRefined,
+                CompareKind::GreaterRefined,
+                CompareKind::GreaterOrEqRefined,
+            ]
+            .map(|kind| (BinOpKind::Compare(kind), boolean(), var("x"), lit(3))),
+        )
+        .chain(
+            [LogicKind::AndRefined, LogicKind::OrRefined]
+                .map(|kind| (BinOpKind::BoolLogic(kind), boolean(), flag("p"), flag("q"))),
+        );
+        let mut cases: Vec<_> = binops
+            .map(|(op, base, l, r)| {
+                assert!(op.is_refined(), "{op:?} is a `^` operator");
+                let at = |op| TypedExpr::binop(l.clone(), op, r.clone());
+                (base, at(op), at(op.unrefined()))
+            })
+            .collect();
+        let not = |op| TypedExpr::unary(op, flag("p"));
+        cases.push((
+            boolean(),
+            not(UnaryOpKind::NotRefined),
+            not(UnaryOpKind::Not),
+        ));
+        for (base, caret, plain) in cases {
+            let caret = [equal_to(base.clone(), caret)];
+            let plain = [equal_to(base.clone(), plain)];
+            assert!(smt_sub(&base, &caret, &plain, &NoScope).unwrap());
+            assert!(smt_sub(&base, &plain, &caret, &NoScope).unwrap());
+        }
     }
 
     /// The case `constrain`'s structural matching cannot decide: two sums that
@@ -1283,7 +1345,7 @@ mod tests {
     }
 
     /// A refinement on a field's type is an assumption about that field:
-    /// `__elem == t ^+ x.b` entails `__elem == t + 3` exactly when the scope says
+    /// `__elem == t + x.b` entails `__elem == t + 3` exactly when the scope says
     /// `x`'s `b` is `3`.
     #[test]
     fn a_field_refinement_is_an_assumption() {
@@ -1391,7 +1453,7 @@ mod tests {
     }
 
     /// A refinement on the type a name is bound at is an assumption about that
-    /// name: `__elem == t ^+ x` entails `__elem == t ^+ 2` exactly when the scope
+    /// name: `__elem == t + x` entails `__elem == t + 2` exactly when the scope
     /// says `x` is `2`.
     #[test]
     fn a_scope_refinement_is_an_assumption() {

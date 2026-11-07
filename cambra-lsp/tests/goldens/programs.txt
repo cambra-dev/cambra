@@ -49,16 +49,16 @@ folds:
   8-9
 == tests/programs/discount_contract/program.cambra
 diagnostics:
-  10:12-10:17 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
+  10:12-10:17 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
     10:5-10:11 while parsing statement
     10:5-10:11 while parsing expression
-  11:12-11:20 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
+  11:12-11:20 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
     11:5-11:11 while parsing statement
     11:5-11:11 while parsing expression
-  12:12-12:20 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
+  12:12-12:20 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
     12:5-12:11 while parsing statement
     12:5-12:11 while parsing expression
-  14:12-14:13 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
+  14:12-14:13 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
     14:5-14:11 while parsing statement
     14:5-14:11 while parsing expression
 symbols:
@@ -220,7 +220,7 @@ symbols:
 folds:
 == tests/programs/nonneg_inventory/program.cambra
 diagnostics:
-  11:12-11:15 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
+  11:12-11:15 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
     11:5-11:11 while parsing statement
     11:5-11:11 while parsing expression
 symbols:
@@ -251,7 +251,7 @@ symbols:
 folds:
 == tests/programs/reachability/program.cambra
 diagnostics:
-  16:5-16:15 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
+  16:5-16:15 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
     16:1-16:4 while parsing statement
     16:1-16:4 while parsing expression
 symbols:
@@ -300,10 +300,10 @@ symbols:
 folds:
 == tests/programs/storefront/v0.cambra
 diagnostics:
-  41:23-41:25 found 'in', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '|=>', '**', '}', or '::'
+  41:23-41:25 found 'in', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '->', '=>', '|=>', '**', '}', or '::'
     41:1-41:41 while parsing statement
     41:21-41:22 while parsing expression
-  62:12-62:18 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
+  62:12-62:18 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
     62:5-62:11 while parsing statement
     62:5-62:11 while parsing expression
   76:14-76:18 found 'with', expected 'if', or 'match'
@@ -349,10 +349,10 @@ folds:
   117-118
 == tests/programs/storefront/v1.cambra
 diagnostics:
-  38:23-38:25 found 'in', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '|=>', '**', '}', or '::'
+  38:23-38:25 found 'in', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '->', '=>', '|=>', '**', '}', or '::'
     38:1-38:41 while parsing statement
     38:21-38:22 while parsing expression
-  75:12-75:18 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
+  75:12-75:18 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
     75:5-75:11 while parsing statement
     75:5-75:11 while parsing expression
   89:14-89:18 found 'with', expected 'if', or 'match'
@@ -453,7 +453,7 @@ folds:
   2-3
 == tests/programs/while_counter/program.cambra
 diagnostics:
-  2:7-2:8 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'if', '<<', '<:', '^+', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', or '::'
+  2:7-2:8 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'if', '<<', '<:', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', or '::'
     2:1-2:6 while parsing statement
     2:1-2:6 while parsing expression
 symbols:
@@ -484,27 +484,27 @@ symbols:
   variable resps 18:1-18:48 (name 18:7-18:12)
   variable total 20:1-21:21 (name 21:1-21:6)
   variable events 23:1-23:16 (name 23:1-23:7)
-  function bump 27:1-36:29 (name 27:5-27:9)
-  function evens 38:1-40:16 (name 38:5-38:10)
-  variable opaque 50:1-50:16 (name 50:1-50:7)
-  variable pairs 51:1-51:59 (name 51:1-51:6)
-  variable escapes 52:1-52:29 (name 52:1-52:8)
-  variable totals 53:1-53:46 (name 53:1-53:7)
-  variable inc 54:1-54:18 (name 54:1-54:4)
-  variable held 55:1-55:28 (name 55:1-55:5)
-  variable apply 56:1-56:22 (name 56:1-56:6)
-  variable evens 57:1-57:43 (name 57:1-57:6)
-  variable n 72:1-72:42 (name 72:1-72:2)
+  function bump 27:1-37:29 (name 27:5-27:9)
+  function evens 39:1-41:16 (name 39:5-39:10)
+  variable opaque 51:1-51:16 (name 51:1-51:7)
+  variable pairs 52:1-52:59 (name 52:1-52:6)
+  variable escapes 53:1-53:29 (name 53:1-53:8)
+  variable totals 54:1-54:46 (name 54:1-54:7)
+  variable inc 55:1-55:18 (name 55:1-55:4)
+  variable held 56:1-56:28 (name 56:1-56:5)
+  variable apply 57:1-57:22 (name 57:1-57:6)
+  variable evens 58:1-58:43 (name 58:1-58:6)
+  variable n 73:1-73:42 (name 73:1-73:2)
 folds:
   1-5 comment
   12-13
-  27-36
+  27-37
   28-29
   30-31
   32-33
-  38-40
-  39-40
-  42-48
-  43-47
-  44-45
-  46-47
+  39-41
+  40-41
+  43-49
+  44-48
+  45-46
+  47-48

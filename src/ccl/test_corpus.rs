@@ -15,8 +15,11 @@
 /// syntax, `Feed(_)` types) that pin errors and so have no panes to fold,
 /// and the three HTTP demos bind a real listening socket during lowering,
 /// which collides with itself under a parallel test runner.
+///
+/// Inside [`with_caret_operators`] each program is spelled with `^` operators
+/// ([`caret_operators`]).
 pub(crate) fn pipeline_corpus() -> Vec<(&'static str, String)> {
-    vec![
+    let corpus = vec![
         (
             "arithmetic",
             include_str!("../../tests/programs/arithmetic/program.cambra").to_string(),
@@ -76,5 +79,143 @@ pub(crate) fn pipeline_corpus() -> Vec<(&'static str, String)> {
             "feed_loop",
             "out: Feed(_)\nfor x in [1, 2, 3]:\n    out << x * 2\nout\n".to_string(),
         ),
-    ]
+    ];
+    corpus
+        .into_iter()
+        .map(|(name, code)| (name, spelled(&code)))
+        .collect()
+}
+
+thread_local! {
+    /// Whether [`spelled`] rewrites programs to `^` operators: set for the duration of
+    /// [`with_caret_operators`].
+    static CARET_OPERATORS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `test` with every program [`spelled`] passes spelled with `^` operators.
+///
+/// This is how a test pinned on a `^` operator's refinement duplicates a test of the
+/// unrefined operators without restating its body: the test helpers that compile a
+/// program (the corpora, `compile_ok` in `panes.rs`, `compile` in
+/// `inspector_model/wire.rs`) pass it through [`spelled`]. The setting is per thread, so
+/// tests running in parallel do not see each other's.
+pub(crate) fn with_caret_operators(test: fn()) {
+    CARET_OPERATORS.with(|c| c.set(true));
+    test();
+    CARET_OPERATORS.with(|c| c.set(false));
+}
+
+/// `src` as the running test spells its programs: [`caret_operators`] inside
+/// [`with_caret_operators`], unchanged otherwise.
+pub(crate) fn spelled(src: &str) -> String {
+    if CARET_OPERATORS.with(|c| c.get()) {
+        caret_operators(src)
+    } else {
+        src.to_string()
+    }
+}
+
+/// `src` with every operator that has a `^` sibling replaced by it: `+`, binary `-`, `*`,
+/// `==`, `<`, `<=`, `>`, `>=`, `and`, `or` and `not`. Every other byte is kept, so the
+/// layout, the comments and every other operator are unchanged.
+///
+/// A refinement's predicate, from `where` to the brace closing its refinement, is kept as
+/// written: a predicate states the operation an operator's refinement records, which is the
+/// unrefined operator's (`RefinementTemplate::predicate`).
+///
+/// A `-` is binary when the token before it ends an operand: a name, a literal or a
+/// closing bracket. Any other `-` negates. A `+` beside a string literal concatenates, and
+/// `^+` has no `String` row, so it is kept.
+pub(crate) fn caret_operators(src: &str) -> String {
+    use chl_parser::lexer::{Token, tokenize};
+    let lexed = tokenize(chl_parser::FileId::ROOT, src);
+    assert!(
+        lexed.errors.is_empty(),
+        "a corpus program lexes: {:?}",
+        lexed.errors
+    );
+    let mut out = String::with_capacity(src.len() + src.len() / 8);
+    let mut copied = 0;
+    let mut previous: Option<&Token> = None;
+    let mut braces = 0usize;
+    // The brace depth of the refinement whose predicate the token is in.
+    let mut predicate_of: Option<usize> = None;
+    let tokens: Vec<_> = lexed
+        .tokens
+        .iter()
+        // A layout token is zero-width, and no operand.
+        .filter(|(_, span)| span.start != span.end)
+        .collect();
+    for (i, (token, span)) in tokens.iter().enumerate() {
+        let operand_before = matches!(
+            previous,
+            Some(
+                Token::Ident(_)
+                    | Token::Int(_)
+                    | Token::String(_)
+                    | Token::True
+                    | Token::False
+                    | Token::RParen
+                    | Token::RBracket
+                    | Token::RBrace
+            )
+        );
+        let concatenates = matches!(previous, Some(Token::String(_)))
+            || matches!(tokens.get(i + 1), Some((Token::String(_), _)));
+        match token {
+            Token::LBrace => braces += 1,
+            Token::RBrace => {
+                if predicate_of == Some(braces) {
+                    predicate_of = None;
+                }
+                braces = braces.saturating_sub(1);
+            }
+            Token::Where if predicate_of.is_none() => predicate_of = Some(braces),
+            _ => {}
+        }
+        let rewrites = predicate_of.is_none()
+            && match token {
+                Token::Minus => operand_before,
+                Token::Plus => !concatenates,
+                Token::Star
+                | Token::EqEq
+                | Token::Lt
+                | Token::LtE
+                | Token::Gt
+                | Token::GtE
+                | Token::And
+                | Token::Or
+                | Token::Not => true,
+                _ => false,
+            };
+        if rewrites {
+            out.push_str(&src[copied..span.start]);
+            out.push('^');
+            copied = span.start;
+        }
+        previous = Some(token);
+    }
+    out.push_str(&src[copied..]);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::caret_operators;
+
+    #[test]
+    fn caret_operators_rewrites_exactly_the_operators_with_a_sibling() {
+        assert_eq!(
+            caret_operators("y = -x + (a - -1) * 2 if not p and q or r == s <= t else u // v\n"),
+            "y = -x ^+ (a ^- -1) ^* 2 if ^not p ^and q ^or r ^== s ^<= t else u // v\n",
+        );
+        assert_eq!(
+            caret_operators("[\"> \" + x for x in xs if x + \"\" == x]\n"),
+            "[\"> \" + x for x in xs if x + \"\" ^== x]\n",
+        );
+        assert_eq!(
+            caret_operators("z: {Int where _ == {a: 1}.a + 3 and _ > 0} = 1 + 3\n"),
+            "z: {Int where _ == {a: 1}.a + 3 and _ > 0} = 1 ^+ 3\n",
+        );
+    }
 }

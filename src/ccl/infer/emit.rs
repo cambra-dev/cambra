@@ -1500,7 +1500,7 @@ fn require_single_obligation<C: Typing>(
     at: &dyn Fn() -> String,
 ) -> Result<Type, LocatedInferError> {
     match result {
-        OperatorResult::AssociatedRefined(name, refinement) => ctx.require_trait_refined(
+        OperatorResult::Associated(name, Some(refinement)) => ctx.require_trait_refined(
             trait_,
             operator_node_id,
             operand_types,
@@ -1509,7 +1509,7 @@ fn require_single_obligation<C: Typing>(
             *refinement,
             at,
         ),
-        OperatorResult::Associated(name) => {
+        OperatorResult::Associated(name, None) => {
             let ty = ctx.require_trait(
                 trait_,
                 operator_node_id,
@@ -1519,11 +1519,64 @@ fn require_single_obligation<C: Typing>(
             )?;
             Ok(ty.expect("an operator asking for an association gets its position back"))
         }
-        OperatorResult::Fixed(base) => {
+        OperatorResult::Fixed(base, refinement) => {
             ctx.require_trait(trait_, operator_node_id, operand_types, None, at)?;
-            Ok(Type::Base(base.clone()))
+            let result = Type::Base(base.clone());
+            Ok(refine_result(
+                operator_node_id,
+                *refinement,
+                result,
+                operand_exprs,
+            ))
         }
     }
+}
+
+/// A scheme-typed operator's result, refined by what the operator states of it.
+///
+/// The refinement rides the scheme's own result base and not `result`, the variable the rule
+/// minted for it: a refinement around a variable is dropped where the variable resolves. A
+/// scheme stating a refinement is monomorphic (`and`, `or`, `not`), so its result base is the
+/// innermost codomain of its body.
+fn refine_scheme_result(
+    operator_node_id: NodeId,
+    scheme: &PolyScheme,
+    result: Type,
+    refinement: Option<crate::ccl::RefinementTemplate>,
+    operand_exprs: &[&Expr],
+) -> Type {
+    if refinement.is_none() {
+        return result;
+    }
+    let mut base = &scheme.body;
+    while let Type::Fun { codomain, .. } = base {
+        base = codomain;
+    }
+    debug_assert!(
+        matches!(base, Type::Base(_)),
+        "a scheme stating a refinement of its result has a base result, not `{base}`"
+    );
+    refine_result(operator_node_id, refinement, base.clone(), operand_exprs)
+}
+
+/// `result` refined by `refinement` applied to the operand terms, under a recording naming the
+/// operator: the predicate copies the operand nodes.
+fn refine_result(
+    operator_node_id: NodeId,
+    refinement: Option<crate::ccl::RefinementTemplate>,
+    result: Type,
+    operand_exprs: &[&Expr],
+) -> Type {
+    let Some(refinement) = refinement else {
+        return result;
+    };
+    let _f = crate::ccl::provenance::enter(
+        operator_node_id,
+        "infer.refine_result",
+        crate::ccl::provenance::Nature::Machinery,
+    );
+    let operands: Vec<crate::ccl::TypedExpr> = operand_exprs.iter().map(|e| (*e).clone()).collect();
+    refinement.refine(result, &operands)
 }
 
 /// The declared parameter type an argument is passed at, or `None` when the callee is
@@ -1572,7 +1625,16 @@ pub(super) fn emit_binop<C: Typing>(
     let right_ty = emit_value_read(right, ctx)?;
     let at = || "BinOp".to_string();
     match sig {
-        OpSignature::Scheme(scheme) => apply_binary_scheme(ctx, scheme, &left_ty, &right_ty, &at),
+        OpSignature::Scheme(scheme, refinement) => {
+            let result = apply_binary_scheme(ctx, scheme, &left_ty, &right_ty, &at)?;
+            Ok(refine_scheme_result(
+                operator_node_id,
+                scheme,
+                result,
+                *refinement,
+                &[left, right],
+            ))
+        }
         OpSignature::SingleObligation { trait_, result } => require_single_obligation(
             ctx,
             trait_.clone(),
@@ -1594,7 +1656,16 @@ pub(super) fn emit_unary<C: Typing>(
     let inner_ty = emit_value_read(inner, ctx)?;
     let at = || "UnaryOp".to_string();
     match sig {
-        OpSignature::Scheme(scheme) => apply_unary_scheme(ctx, scheme, &inner_ty, &at),
+        OpSignature::Scheme(scheme, refinement) => {
+            let result = apply_unary_scheme(ctx, scheme, &inner_ty, &at)?;
+            Ok(refine_scheme_result(
+                operator_node_id,
+                scheme,
+                result,
+                *refinement,
+                &[inner],
+            ))
+        }
         OpSignature::SingleObligation { trait_, result } => require_single_obligation(
             ctx,
             trait_.clone(),

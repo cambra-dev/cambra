@@ -932,7 +932,7 @@ fn temp_read(name: &Name, definition: &Expr) -> Expr {
 ///
 /// A sealed chain in a position about to be hoisted nests one binding's scope inside another's
 /// definiens — `let __anf₂ = (let __anf₁ = x in __anf₁ ^+ 1)` — and inference refines a binding
-/// by the term that computed it, so `__anf₂`'s type reads `{Int | __elem == __anf₁ ^+ 1}`, naming
+/// by the term that computed it, so `__anf₂`'s type reads `{Int | __elem == __anf₁ + 1}`, naming
 /// a binder bound inside the term it types. A read's binder is opaque, so the type keeps naming it
 /// outside its scope, which the Barendregt check in [`crate::ccl::subst`] reports. A transparent
 /// binder is replaced by its definition as the type leaves its scope, which copies the

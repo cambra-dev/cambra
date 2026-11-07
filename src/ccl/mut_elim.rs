@@ -2896,7 +2896,7 @@ fn assert_statement_end(end: &Expr) {
 ///
 /// A value whose type names a term is inlined, because a binder of that type carries the
 /// name out of the value: into the tap type of a feed that reads it, or, for a refined
-/// write's contribution `{Int | __elem == __anf ^+ 1}`, to a read segment's snapshot binder
+/// write's contribution `{Int | __elem == __anf + 1}`, to a read segment's snapshot binder
 /// that an opaque binding leaves standing in the type (see the walk's `Let` arm). A value
 /// that is a lambda or a cast is inlined too: bound at the writer's domain, a
 /// comprehension's collection has a type reading the writer's parameter
@@ -3043,7 +3043,7 @@ impl<'a> WriterWalk<'a> {
             // binding A-normalization hoisted and `mut_read` sealed, one per segment
             // (`crate::ccl::mut_read`, "A read A-normalization already named") — and a
             // refined mutable variable's contribution predicate names its binder:
-            // `{Int | __elem == __anf ^+ 1}` on the value the next segment writes.
+            // `{Int | __elem == __anf + 1}` on the value the next segment writes.
             // Keeping the binder leaves that predicate pointing at a `let` the
             // point-free rebuild turns into a function of the writer parameter, whose
             // codomain then references an enclosing function with no binder to open at

@@ -84,7 +84,7 @@ use crate::ccl::nominal::NominalDecl;
 use crate::ccl::ty::{TypeParam, TypeParamId};
 use crate::ccl::{
     ArithmeticKind, BarrierVar, BaseType, BinOpKind, CompareKind, FieldKey, InferVar, InferVarId,
-    Name, Refinement, RefinementSet, Type, TypedExpr, TypedExprNode, UnaryOpKind, provenance,
+    Name, Type, TypedExpr, TypedExprNode, UnaryOpKind, provenance,
 };
 
 use super::constrain::{ConstrainCache, ConstrainError, constrain_subtype};
@@ -1278,15 +1278,21 @@ impl OperatorCall {
 
     /// The call a binary operator makes, or `None` for one with a fixed signature, a
     /// boolean connective or `++`.
+    ///
+    /// A `^` sibling makes its operator's call, except `^+`, whose trait is
+    /// `AddableRefined`.
     pub fn of_binop(op: BinOpKind) -> Option<OperatorCall> {
-        Some(match op {
+        if op == BinOpKind::Arithmetic(ArithmeticKind::AddRefined) {
+            return Some(OperatorCall::new(Trait::addable_refined()));
+        }
+        Some(match op.unrefined() {
             BinOpKind::Arithmetic(kind) => match kind {
                 ArithmeticKind::Add => OperatorCall::new(Trait::addable()),
-                ArithmeticKind::AddRefined => OperatorCall::new(Trait::addable_refined()),
                 ArithmeticKind::Sub => OperatorCall::new(Trait::subtractable()),
                 ArithmeticKind::Mul => OperatorCall::new(Trait::multipliable()),
                 ArithmeticKind::FloorDiv => OperatorCall::new(Trait::divisible()),
                 ArithmeticKind::Pow => OperatorCall::new(Trait::exponentiable()),
+                refined => unreachable!("`unrefined` answers no `{refined:?}`"),
             },
             BinOpKind::Compare(CompareKind::Equals | CompareKind::NotEquals) => {
                 OperatorCall::new(Trait::equatable())
@@ -1300,7 +1306,7 @@ impl OperatorCall {
     pub fn of_unary(op: UnaryOpKind) -> Option<OperatorCall> {
         match op {
             UnaryOpKind::Neg => Some(OperatorCall::new(Trait::negatable())),
-            UnaryOpKind::Not => None,
+            UnaryOpKind::Not | UnaryOpKind::NotRefined => None,
         }
     }
 }
@@ -1602,7 +1608,7 @@ pub struct TraitObligation {
     /// still narrows and still rejects, it simply determines nothing.
     assoc: Vec<AssocPosition>,
     /// The refinement the operator that minted this obligation states of one associated
-    /// type, built from its operands when that type is deposited: `^+`'s
+    /// type, built from its operands when that type is deposited: `^-`'s
     /// ([`refine_output`](Self::refine_output)).
     ///
     /// A `RefCell`, as [`AssocPosition::ty`] is: freshening rewrites the operands to the
@@ -1712,7 +1718,7 @@ impl CollectionRule {
 }
 
 /// A refinement an operator states of the associated type it asks for, which no instance
-/// states: `^+`'s result is the sum of its operands, whichever instance answers.
+/// states: `^-`'s result is the difference of its operands on whichever numeric row answers.
 #[derive(Clone)]
 pub struct OutputRefinement {
     /// The associated type it refines.
@@ -2884,10 +2890,7 @@ impl TraitObligation {
             );
             let target = position.ty.borrow().clone();
             let ty = match &*self.output_refinement.borrow() {
-                Some(r) if r.assoc == position.name => Type::Refinement(
-                    Box::new(settled),
-                    RefinementSet::one(Refinement::born_from_template(r.template, &r.operands)),
-                ),
+                Some(r) if r.assoc == position.name => r.template.refine(settled, &r.operands),
                 _ => settled,
             };
             constrain_subtype(&ty, &target, cache)?;
@@ -4515,6 +4518,7 @@ pub(crate) fn replace_params(ty: &Type, map: &HashMap<TypeParamId, Type>) -> Typ
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::Refinement;
     use crate::ccl::infer::solver::fresh_var;
 
     /// The operand expressions an obligation substitutes into an instance's
@@ -4619,7 +4623,9 @@ mod tests {
             if refined {
                 ob.refine_output(OutputRefinement {
                     assoc: Assoc::Output,
-                    template: crate::ccl::infer::schemes::sum_of_the_operands,
+                    template: crate::ccl::RefinementTemplate::BinOp(BinOpKind::Arithmetic(
+                        ArithmeticKind::AddRefined,
+                    )),
                     operands: operands(),
                 });
             }
@@ -4641,7 +4647,7 @@ mod tests {
         assert_eq!(deposited(Trait::addable(), false), vec!["Int"]);
         assert_eq!(
             deposited(Trait::addable_refined(), true),
-            vec!["{Int | __elem == 1 ^+ 2}"],
+            vec!["{Int | __elem == 1 + 2}"],
         );
     }
 

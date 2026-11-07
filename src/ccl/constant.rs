@@ -169,7 +169,8 @@ impl ConstTerm {
                 (ConstTerm::Lit(a), ConstTerm::Lit(b)) => binop(op, a, b).map(ConstTerm::Lit),
                 (a, b) if a.is_value() && b.is_value() && is_equality(op) => {
                     let equal = a == b;
-                    let answer = matches!(op, BinOpKind::Compare(CompareKind::Equals)) == equal;
+                    let answer =
+                        matches!(op.unrefined(), BinOpKind::Compare(CompareKind::Equals)) == equal;
                     Ok(ConstTerm::Lit(Lit::Bool(answer)))
                 }
                 _ => Ok(ConstTerm::BinOp(op, l, r)),
@@ -229,7 +230,7 @@ impl ConstTerm {
 /// Whether `op` is `==` or `!=`, which compare compound values too.
 fn is_equality(op: BinOpKind) -> bool {
     matches!(
-        op,
+        op.unrefined(),
         BinOpKind::Compare(CompareKind::Equals | CompareKind::NotEquals)
     )
 }
@@ -238,7 +239,7 @@ fn is_equality(op: BinOpKind) -> bool {
 /// `+` lowers to `Arithmetic(Add)` for every operand type, and the runtime picks the
 /// operation by the operands: on strings it concatenates.
 pub fn fold_binop(op: BinOpKind, a: &Lit, b: &Lit) -> Option<Lit> {
-    let op = match (op, a, b) {
+    let op = match (op.unrefined(), a, b) {
         (BinOpKind::Arithmetic(ArithmeticKind::Add), Lit::String(_), Lit::String(_)) => {
             BinOpKind::Concat
         }
@@ -259,27 +260,13 @@ fn binop(op: BinOpKind, a: &Lit, b: &Lit) -> Result<Lit, NoValue> {
     })
 }
 
-/// How CHL spells `op`.
+/// How CHL spells `op`: [`BinOpKind::sym`], except xor, which CHL writes `^`, and string
+/// concatenation, which it writes `+`.
 fn symbol(op: BinOpKind) -> &'static str {
     match op {
-        BinOpKind::Arithmetic(ArithmeticKind::Add) | BinOpKind::Concat => "+",
-        BinOpKind::Arithmetic(ArithmeticKind::AddRefined) => "^+",
-        BinOpKind::Arithmetic(ArithmeticKind::Sub) => "-",
-        BinOpKind::Arithmetic(ArithmeticKind::Mul) => "*",
-        BinOpKind::Arithmetic(ArithmeticKind::FloorDiv) => "//",
-        BinOpKind::Arithmetic(ArithmeticKind::Pow) => "**",
-        BinOpKind::Compare(CompareKind::Equals) => "==",
-        BinOpKind::Compare(CompareKind::NotEquals) => "!=",
-        BinOpKind::Compare(CompareKind::Less) => "<",
-        BinOpKind::Compare(CompareKind::LessOrEq) => "<=",
-        BinOpKind::Compare(CompareKind::Greater) => ">",
-        BinOpKind::Compare(CompareKind::GreaterOrEq) => ">=",
-        BinOpKind::BoolLogic(LogicKind::And) => "and",
-        BinOpKind::BoolLogic(LogicKind::Or) => "or",
+        BinOpKind::Concat => "+",
         BinOpKind::BoolLogic(LogicKind::Xor) => "^",
-        BinOpKind::BoolLogic(LogicKind::Nand) => "nand",
-        BinOpKind::BoolLogic(LogicKind::Nor) => "nor",
-        BinOpKind::BoolLogic(LogicKind::Xnor) => "xnor",
+        _ => op.sym(),
     }
 }
 

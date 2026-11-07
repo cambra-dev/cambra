@@ -4794,10 +4794,75 @@ pub type PredicateId = *const TypedExpr;
 /// ([`crate::ccl::Name::elem_at`]).
 pub const REFINEMENT_BINDER: &str = "__elem";
 
-/// A predicate over an operator's result, as a function of the operand terms of one use:
-/// `^+`'s, which its obligation applies to the operands it recorded when it deposits the
-/// result ([`OutputRefinement`](crate::ccl::infer::solver::traits::OutputRefinement)).
-pub type RefinementTemplate = fn(&[TypedExpr]) -> TypedExpr;
+/// The refinement an operator states of its result: the result is the operation applied to the
+/// operands of one use, `__elem == 𝑎 op 𝑏` or `__elem == op 𝑎`.
+///
+/// The template holds the `^` operator whose use states it, and the predicate applies that
+/// operator's unrefined sibling: `^-`'s result is refined by `__elem == 𝑎 - 𝑏`. A predicate is
+/// a proposition, never typed by inference, so a `^` operator in one would state nothing more
+/// than its sibling does.
+///
+/// A trait-typed operator's obligation applies it to the operands it recorded when it deposits
+/// the result ([`OutputRefinement`](crate::ccl::infer::solver::traits::OutputRefinement)); a
+/// scheme-typed one applies it where its rule types the node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefinementTemplate {
+    /// The result is `𝑎 op 𝑏`.
+    BinOp(crate::ccl::BinOpKind),
+    /// The result is `op 𝑎`.
+    UnaryOp(crate::ccl::UnaryOpKind),
+}
+
+impl RefinementTemplate {
+    /// The bare predicate refining a result of base `result` computed from `operands`, or
+    /// `None` where `result` is not a base the operation's predicate states: `Int`, `UInt`
+    /// and `Bool`. `+`'s `String` row is concatenation and a declared instance's `Output` is
+    /// whatever its function computes, so neither is refined.
+    ///
+    /// Bare in the sense of [`crate::ccl::ccl_utils::refine_with_bare`]: [`crate::ccl::Name::elem`]
+    /// is free, and the refinement it lands in binds it. The element and the operation's node
+    /// are typed at `result`, the comparison at `Bool`.
+    ///
+    /// # Panics
+    ///
+    /// If `operands` does not hold one term per operand of the operation.
+    pub fn predicate(self, result: &Type, operands: &[TypedExpr]) -> Option<TypedExpr> {
+        if !matches!(
+            result,
+            Type::Base(BaseType::Int | BaseType::UInt | BaseType::Bool)
+        ) {
+            return None;
+        }
+        let operation = match (self, operands) {
+            (Self::BinOp(op), [a, b]) => TypedExpr::binop(a.clone(), op.unrefined(), b.clone()),
+            (Self::UnaryOp(op), [a]) => TypedExpr::unary(op.unrefined(), a.clone()),
+            _ => panic!(
+                "{self:?} receives one term per operand of its operation, not {}",
+                operands.len()
+            ),
+        };
+        Some(
+            TypedExpr::binop(
+                TypedExpr::var(crate::ccl::Name::elem()).with_ty(result.clone()),
+                crate::ccl::BinOpKind::Compare(crate::ccl::CompareKind::Equals),
+                operation.with_ty(result.clone()),
+            )
+            .with_ty(Type::Base(BaseType::Bool)),
+        )
+    }
+
+    /// `result` refined by [`Self::predicate`], or `result` unchanged where the predicate
+    /// states nothing of it.
+    pub fn refine(self, result: Type, operands: &[TypedExpr]) -> Type {
+        match self.predicate(&result, operands) {
+            Some(predicate) => Type::Refinement(
+                Box::new(result),
+                RefinementSet::one(Refinement::born(Rc::new(predicate))),
+            ),
+            None => result,
+        }
+    }
+}
 
 /// A refinement predicate is a **boolean expression over
 /// [`crate::ccl::REFINEMENT_BINDER`]**: it holds no `MutDecl`, `MutWrite`, `For`,
@@ -4908,12 +4973,6 @@ impl Refinement {
             predicate,
             normal: NormalFormCache::default(),
         }
-    }
-
-    /// Construct a refinement by applying a template function to a
-    /// list of argument expressions.
-    pub fn born_from_template(template: RefinementTemplate, args: &[TypedExpr]) -> Self {
-        Self::born(Rc::new(template(args)))
     }
 
     /// Construct a refinement **deliberately sharing** an existing predicate

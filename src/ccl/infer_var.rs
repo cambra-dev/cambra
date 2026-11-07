@@ -497,7 +497,7 @@ impl InferBounds {
 /// its lexical scope, and so does a bound that mentions it. Sharing is what
 /// admits the bound whose *holder* was minted before the binder was entered: a
 /// write to a mutable variable declared outside contributes
-/// `{Int | __elem == __read ^+ 1}` to a value variable minted at the
+/// `{Int | __elem == __read + 1}` to a value variable minted at the
 /// declaration. The end-of-inference check states the same rule tree-wide, by
 /// seeding its root scope with every opaque binder the tree holds
 /// (`infer::solve`'s `check_scope_valid`).

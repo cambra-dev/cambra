@@ -64,7 +64,7 @@
 //! to refer to (`src/ccl/design/mutability.md`, "A read is named while inference
 //! runs"). Inference refines a computed value by the term that computed it, so a read
 //! reaching an operand puts the mutable variable in that operand's refinement:
-//! `x ^+ 1` types as `{Int | __elem == x ^+ 1}`, which names `x` where nothing
+//! `x ^+ 1` types as `{Int | __elem == x + 1}`, which names `x` where nothing
 //! binds it. Read through a binder, the same operand types as `{Int | __elem ==
 //! __read ^+ 1}`.
 //!

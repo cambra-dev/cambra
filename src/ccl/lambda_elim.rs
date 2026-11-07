@@ -295,9 +295,9 @@ pub(crate) fn compose(f: Expr, g: Expr) -> Expr {
 /// the operation's own input (`src/ccl/design/type-inference.md`, "A chain names each
 /// position").
 ///
-/// `result` was written over the operand terms, `{Int | __elem == 𝑙 ^+ 𝑟}` say. The
+/// `result` was written over the operand terms, `{Int | __elem == 𝑙 + 𝑟}` say. The
 /// operation's input `𝑞` is the operands, so each occurrence of an operand term reads as
-/// `𝑞`'s component, `(𝑞 : (Int, Int)) ⇒ {Int | __elem == 𝑞.0 ^+ 𝑞.1}`: wherever the
+/// `𝑞`'s component, `(𝑞 : (Int, Int)) ⇒ {Int | __elem == 𝑞.0 + 𝑞.1}`: wherever the
 /// operation runs, the component and the operand are one value. A single operand is `𝑞`
 /// itself. A result that reads no operand is the plain function from the operands' type.
 fn operation_type(operands: &[&Expr], input: &Type, result: &Type) -> Type {

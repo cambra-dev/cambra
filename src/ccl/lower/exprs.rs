@@ -840,7 +840,9 @@ fn chl_binop_to_ccl(op: ChlBinOp) -> BinOpKind {
         ChlBinOp::Add => BinOpKind::Arithmetic(ArithmeticKind::Add),
         ChlBinOp::AddRefined => BinOpKind::Arithmetic(ArithmeticKind::AddRefined),
         ChlBinOp::Sub => BinOpKind::Arithmetic(ArithmeticKind::Sub),
+        ChlBinOp::SubRefined => BinOpKind::Arithmetic(ArithmeticKind::SubRefined),
         ChlBinOp::Mul => BinOpKind::Arithmetic(ArithmeticKind::Mul),
+        ChlBinOp::MulRefined => BinOpKind::Arithmetic(ArithmeticKind::MulRefined),
         ChlBinOp::FloorDiv => BinOpKind::Arithmetic(ArithmeticKind::FloorDiv),
         ChlBinOp::Pow => BinOpKind::Arithmetic(ArithmeticKind::Pow),
         ChlBinOp::LogicalAnd => BinOpKind::BoolLogic(LogicKind::And),
@@ -959,6 +961,7 @@ pub(super) fn lower_unaryop(
     let kind = match op {
         UnaryOp::Neg => UnaryOpKind::Neg,
         UnaryOp::Not => UnaryOpKind::Not,
+        UnaryOp::NotRefined => UnaryOpKind::NotRefined,
     };
     // Constant-fold `-Int(n)` to `Lit(Int(-n))`. Downstream stages
     // (`operator_conversion`'s list-literal path in particular) only accept
@@ -1008,11 +1011,16 @@ pub(super) fn lower_compare(
     for (i, op) in ops.iter().enumerate() {
         let kind = match op {
             CmpOp::Eq => CompareKind::Equals,
+            CmpOp::EqRefined => CompareKind::EqualsRefined,
             CmpOp::NotEq => CompareKind::NotEquals,
             CmpOp::Lt => CompareKind::Less,
+            CmpOp::LtRefined => CompareKind::LessRefined,
             CmpOp::LtE => CompareKind::LessOrEq,
+            CmpOp::LtERefined => CompareKind::LessOrEqRefined,
             CmpOp::Gt => CompareKind::Greater,
+            CmpOp::GtRefined => CompareKind::GreaterRefined,
             CmpOp::GtE => CompareKind::GreaterOrEq,
+            CmpOp::GtERefined => CompareKind::GreaterOrEqRefined,
         };
         // Operand `i` is this pair's left side and, for `i > 0`, was pair `i-1`'s
         // right side; operand `i+1` is this pair's right side and may be the next
@@ -1066,7 +1074,9 @@ pub(super) fn lower_boolop(
     }
     let kind = match op {
         BoolOp::And => BinOpKind::BoolLogic(LogicKind::And),
+        BoolOp::AndRefined => BinOpKind::BoolLogic(LogicKind::AndRefined),
         BoolOp::Or => BinOpKind::BoolLogic(LogicKind::Or),
+        BoolOp::OrRefined => BinOpKind::BoolLogic(LogicKind::OrRefined),
     };
     // Fold left-to-right: `a and b and c` → `(a and b) and c`. Each folded
     // BinOp images (a prefix of) the operator chain the user wrote, so the

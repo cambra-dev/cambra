@@ -10,32 +10,30 @@ use std::collections::BTreeMap;
 use crate::ccl::FieldKey;
 use crate::ccl::infer::solver::traits::{Assoc, OperatorCall, Trait};
 use crate::ccl::infer::solver::{PolyScheme, fresh_var, fun, prim};
-use crate::ccl::{
-    AggregateKind, ArithmeticKind, BaseType, BinOpKind, Builtin, Level, Type, UnaryOpKind,
-};
+use crate::ccl::{AggregateKind, BaseType, BinOpKind, Builtin, Level, Type, UnaryOpKind};
 
 use super::product;
 
-/// Where a trait-typed operator's result type comes from.
+/// Where a trait-typed operator's result type comes from, and the refinement the operator
+/// states of it.
 ///
 /// This is the operator's half of the contract, which is why it lives here beside the
 /// signatures rather than with the traits: a trait *associates* a type when that type
 /// depends on the types satisfying it, and an operator whose result is the same
 /// whatever it accepts states that itself. Keeping the two apart is what stops a
 /// constant from being mis-recorded as an associated type.
+///
+/// The refinement ([`refinement_of_binop`]) is the operator's in either case, the same
+/// whichever instance answers: `^-`'s result is `Subtractable`'s `Output` refined by
+/// `__elem == 𝑎 - 𝑏`, and `^<`'s is `Bool` refined by `__elem == (𝑎 < 𝑏)`.
 #[derive(Debug, Clone)]
 pub enum OperatorResult {
     /// An associated type of the required trait — `+`'s result is `Addable`'s
     /// `Output`.
-    Associated(Assoc),
-    /// An associated type, refined by a predicate the operator builds from its operands:
-    /// `^+`'s result is `AddableRefined`'s `Output` refined by `__elem == 𝑎 ^+ 𝑏`
-    /// ([`sum_of_the_operands`]). The refinement is the operator's, the same whichever
-    /// instance answers.
-    AssociatedRefined(Assoc, crate::ccl::RefinementTemplate),
+    Associated(Assoc, Option<crate::ccl::RefinementTemplate>),
     /// Fixed by the operator regardless of the operand types — `==` yields `Bool` for
     /// every pair `Equatable` accepts, which is why `Equatable` associates nothing.
-    Fixed(BaseType),
+    Fixed(BaseType, Option<crate::ccl::RefinementTemplate>),
 }
 
 /// How an operator states what it requires of its operands.
@@ -46,8 +44,9 @@ pub enum OperatorResult {
 /// operands is that they share a variable, which also forces every other lattice
 /// dimension to agree.
 pub(super) enum OpSignature {
-    /// A fixed signature: `and`, `or`, …, `++`, and `not`.
-    Scheme(PolyScheme),
+    /// A fixed signature: `and`, `or`, …, `++`, and `not`, with the refinement the operator
+    /// states of its result, if it states one.
+    Scheme(PolyScheme, Option<crate::ccl::RefinementTemplate>),
     /// The operands — **all of them, in order** — are the arguments of exactly one
     /// obligation `trait_(𝐴₁, …, 𝐴ₙ)`, and the operator's result is either fixed or
     /// one of *that* obligation's associated types.
@@ -68,31 +67,19 @@ pub(super) enum OpSignature {
     },
 }
 
-/// The bare predicate `__elem == a1 ^+ a2` refining `^+`'s result: it is the sum of its
-/// operands.
-///
-/// Bare in the sense of [`crate::ccl::ccl_utils::refine_with_bare`] — [`crate::ccl::Name::elem`]
-/// is free, and the refinement it lands in is what binds it. Every node is typed at
-/// construction because `AddableRefined`'s instances fix both operand bases and the associated
-/// base at `Int` or `UInt`, leaving nothing for inference to resolve, the same reason
-/// [`crate::ccl::infer::singleton_predicate`]'s term is ground.
-pub(super) fn sum_of_the_operands(args: &[crate::ccl::TypedExpr]) -> crate::ccl::TypedExpr {
-    use crate::ccl::{ArithmeticKind, CompareKind, Name, TypedExpr};
-    let [a1, a2] = args else {
-        panic!("`^+` is binary, so its refinement receives two operands");
-    };
-    let int = prim(BaseType::Int);
-    TypedExpr::binop(
-        TypedExpr::var(Name::elem()).with_ty(int.clone()),
-        BinOpKind::Compare(CompareKind::Equals),
-        TypedExpr::binop(
-            a1.clone(),
-            BinOpKind::Arithmetic(ArithmeticKind::AddRefined),
-            a2.clone(),
-        )
-        .with_ty(int),
-    )
-    .with_ty(prim(BaseType::Bool))
+/// The refinement `op` states of its result, `__elem == 𝑎 op 𝑏`, or `None` for an operator
+/// whose result is unrefined. Exactly the `^` siblings refine their result: `^+`, `^-`, `^*`,
+/// the comparisons other than `!=`, `^and` and `^or`.
+fn refinement_of_binop(op: BinOpKind) -> Option<crate::ccl::RefinementTemplate> {
+    op.is_refined()
+        .then_some(crate::ccl::RefinementTemplate::BinOp(op))
+}
+
+/// The refinement `op` states of its result, `__elem == op 𝑎`: `^not`'s, and none for any
+/// other unary operator.
+fn refinement_of_unary(op: UnaryOpKind) -> Option<crate::ccl::RefinementTemplate> {
+    op.is_refined()
+        .then_some(crate::ccl::RefinementTemplate::UnaryOp(op))
 }
 
 /// Schemes for operators that lift cleanly to fixed signatures.
@@ -408,21 +395,20 @@ impl OperatorSchemes {
     /// released before the rule takes `ctx` mutably; a [`PolyScheme`] is `Rc`-shaped,
     /// so this is cheap.
     pub(super) fn binop(&self, op: BinOpKind) -> OpSignature {
+        let refinement = refinement_of_binop(op);
         let Some(call) = OperatorCall::of_binop(op) else {
-            return match op {
-                BinOpKind::BoolLogic(_) => OpSignature::Scheme(self.bool_logic.clone()),
-                BinOpKind::Concat => OpSignature::Scheme(self.concat.clone()),
+            let scheme = match op {
+                BinOpKind::BoolLogic(_) => self.bool_logic.clone(),
+                BinOpKind::Concat => self.concat.clone(),
                 _ => unreachable!("`{op:?}` requires a trait"),
             };
+            return OpSignature::Scheme(scheme, refinement);
         };
         let result = match op {
             // Every comparison yields `Bool` whatever operands it accepts, so the result
             // is the operator's to state and `Equatable`/`Orderable` associate nothing.
-            BinOpKind::Compare(_) => OperatorResult::Fixed(BaseType::Bool),
-            BinOpKind::Arithmetic(ArithmeticKind::AddRefined) => {
-                OperatorResult::AssociatedRefined(Assoc::Output, sum_of_the_operands)
-            }
-            _ => OperatorResult::Associated(Assoc::Output),
+            BinOpKind::Compare(_) => OperatorResult::Fixed(BaseType::Bool, refinement),
+            _ => OperatorResult::Associated(Assoc::Output, refinement),
         };
         OpSignature::SingleObligation {
             trait_: call.trait_,
@@ -433,12 +419,13 @@ impl OperatorSchemes {
     /// See [`Self::binop`] — the same split. `not` is genuinely monomorphic
     /// (`Bool → Bool`), so it keeps a scheme.
     pub(super) fn unary(&self, op: UnaryOpKind) -> OpSignature {
+        let refinement = refinement_of_unary(op);
         match OperatorCall::of_unary(op) {
             Some(call) => OpSignature::SingleObligation {
                 trait_: call.trait_,
-                result: OperatorResult::Associated(Assoc::Output),
+                result: OperatorResult::Associated(Assoc::Output, refinement),
             },
-            None => OpSignature::Scheme(self.not_op.clone()),
+            None => OpSignature::Scheme(self.not_op.clone(), refinement),
         }
     }
 

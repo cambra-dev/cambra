@@ -3672,6 +3672,41 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_multi_same_type_with_caret_operators() {
+        // λ x → Apply(λ a:Int → a, Var(x)) ^+ Apply(λ b:Int → b, Var(x))
+        let f = Expr::lambda(
+            "a",
+            Occurrence::mint(),
+            Type::Base(BaseType::Int),
+            Expr::var("a"),
+        );
+        let g = Expr::lambda(
+            "b",
+            Occurrence::mint(),
+            Type::Base(BaseType::Int),
+            Expr::var("b"),
+        );
+        let mut expr = Expr::lambda(
+            "x",
+            Occurrence::mint(),
+            Type::infer(),
+            Expr::binop(
+                Expr::apply(Expr::var("x"), f),
+                BinOpKind::Arithmetic(ArithmeticKind::AddRefined),
+                Expr::apply(Expr::var("x"), g),
+            ),
+        );
+        let mut ctx = TypeInferenceContext::new();
+        let ty = infer(&mut expr, &mut ctx).unwrap();
+        // TODO: pinned on `^+`: the codomain records the sum, so it names `x` and the function
+        // type takes a named binder.
+        assert_eq!(
+            ty.to_string(),
+            "((x: Int) ⇒ {Int | __elem == x ▷ (λ a : Int → a) + x ▷ (λ b : Int → b)})"
+        );
+    }
+
+    #[test]
     fn test_infer_type_annotation_mismatch() {
         let mut ctx = TypeInferenceContext::new();
         // (42 : String)  =>  annotation conflict
@@ -3996,6 +4031,21 @@ mod tests {
     }
 
     #[test]
+    fn test_infer_type_annotation_overrides_inferred_with_caret_operators() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::binop(
+            Expr::lit(Lit::Int(1)),
+            BinOpKind::Arithmetic(ArithmeticKind::AddRefined),
+            Expr::lit(Lit::Int(2)),
+        )
+        .with_user_annotation(Type::Base(BaseType::Int));
+        let ty = infer(&mut expr, &mut ctx).unwrap();
+        // TODO: pinned on `^+`. The bare `Int` annotation does not replace the inferred type:
+        // the sum's refinement survives it.
+        assert_eq!(ty.to_string(), "{Int | __elem == 1 + 2}");
+    }
+
+    #[test]
     fn test_infer_let_mismatch() {
         let mut ctx = TypeInferenceContext::new();
         // let x : String = 42 in x  =>  AnnotationMismatch
@@ -4207,6 +4257,22 @@ mod tests {
     }
 
     #[test]
+    fn test_infer_binop_compare_returns_bool_with_caret_operators() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::binop(
+            Expr::lit(Lit::Int(1)),
+            BinOpKind::Compare(CompareKind::LessRefined),
+            Expr::lit(Lit::Int(2)),
+        );
+        // TODO: pinned on `^<`, whose result records its operation. Restate what this test
+        // checks once the refined operators land.
+        assert_eq!(
+            infer(&mut expr, &mut ctx).map(|t| t.to_string()),
+            Ok("{Bool | __elem == (1 < 2)}".to_string())
+        );
+    }
+
+    #[test]
     fn test_infer_binop_bool_logic_returns_bool() {
         let mut ctx = TypeInferenceContext::new();
         // True and False  =>  Bool
@@ -4216,6 +4282,22 @@ mod tests {
             Expr::lit(Lit::Bool(false)),
         );
         assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::Bool)));
+    }
+
+    #[test]
+    fn test_infer_binop_bool_logic_returns_bool_with_caret_operators() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::binop(
+            Expr::lit(Lit::Bool(true)),
+            BinOpKind::BoolLogic(LogicKind::AndRefined),
+            Expr::lit(Lit::Bool(false)),
+        );
+        // TODO: pinned on `^and`, whose result records its operation. Restate what this test
+        // checks once the refined operators land.
+        assert_eq!(
+            infer(&mut expr, &mut ctx).map(|t| t.to_string()),
+            Ok("{Bool | __elem == (true and false)}".to_string())
+        );
     }
 
     #[test]
@@ -4254,6 +4336,22 @@ mod tests {
     }
 
     #[test]
+    fn test_binop_int_add_with_caret_operators() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::binop(
+            Expr::lit(Lit::Int(1)),
+            BinOpKind::Arithmetic(ArithmeticKind::AddRefined),
+            Expr::lit(Lit::Int(2)),
+        );
+        // TODO: pinned on `^+`, whose result records its operation. Restate what this test
+        // checks once the refined operators land.
+        assert_eq!(
+            infer(&mut expr, &mut ctx).map(|t| t.to_string()),
+            Ok("{Int | __elem == 1 + 2}".to_string())
+        );
+    }
+
+    #[test]
     fn test_binop_type_mismatch() {
         let mut ctx = TypeInferenceContext::new();
         // Int + Bool → type error; Int ⊔ Bool is inexpressible under inference.
@@ -4278,6 +4376,22 @@ mod tests {
             Expr::lit(Lit::Int(2)),
         );
         assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::Bool)));
+    }
+
+    #[test]
+    fn test_binop_compare_bool_result_with_caret_operators() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::binop(
+            Expr::lit(Lit::Int(1)),
+            BinOpKind::Compare(CompareKind::LessRefined),
+            Expr::lit(Lit::Int(2)),
+        );
+        // TODO: pinned on `^<`, whose result records its operation. Restate what this test
+        // checks once the refined operators land.
+        assert_eq!(
+            infer(&mut expr, &mut ctx).map(|t| t.to_string()),
+            Ok("{Bool | __elem == (1 < 2)}".to_string())
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4971,6 +5085,19 @@ mod tests {
     }
 
     #[test]
+    fn test_unary_not_bool_with_caret_operators() {
+        let mut ctx = TypeInferenceContext::new();
+        use crate::ccl::UnaryOpKind;
+        let mut expr = Expr::unary(UnaryOpKind::NotRefined, Expr::lit(Lit::Bool(true)));
+        // TODO: pinned on `^not`, whose result records its operation. Restate what this test
+        // checks once the refined operators land.
+        assert_eq!(
+            infer(&mut expr, &mut ctx).map(|t| t.to_string()),
+            Ok("{Bool | __elem == (not true)}".to_string())
+        );
+    }
+
+    #[test]
     fn test_unary_neg_wrong_type() {
         let mut ctx = TypeInferenceContext::new();
         use crate::ccl::UnaryOpKind;
@@ -5070,6 +5197,33 @@ mod tests {
         });
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(ty, Type::Base(BaseType::Int));
+    }
+
+    #[test]
+    fn test_infer_case_let_binding_in_arm_with_caret_operators() {
+        let mut ctx = TypeInferenceContext::new();
+        // { true → let x = 42 in x ^+ 1 }
+        let mut expr = Expr::new(TypedExprNode::Case {
+            scrutinee: None,
+            branches: vec![Branch {
+                pattern: None,
+                guard: Expr::lit(Lit::Bool(true)),
+                body: Expr::let_bind(
+                    "x",
+                    Occurrence::mint(),
+                    Expr::lit(Lit::Int(42)),
+                    Expr::binop(
+                        Expr::var("x"),
+                        BinOpKind::Arithmetic(ArithmeticKind::AddRefined),
+                        Expr::lit(Lit::Int(1)),
+                    ),
+                ),
+            }],
+        });
+        let ty = infer(&mut expr, &mut ctx).unwrap();
+        // TODO: pinned on `^+`: the arm's type records the sum, with `x` discharged to its
+        // definiens.
+        assert_eq!(ty.to_string(), "{Int | __elem == 42 + 1}");
     }
 
     /// All `Case` branches must agree on the result type; unification of

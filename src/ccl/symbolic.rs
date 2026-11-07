@@ -408,6 +408,10 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
                 let s = format!("not {}", fmt(operand, Precedence::Not, opts));
                 (Precedence::Not, s)
             }
+            UnaryOpKind::NotRefined => {
+                let s = format!("^not {}", fmt(operand, Precedence::Not, opts));
+                (Precedence::Not, s)
+            }
         },
 
         TypedExprNode::Apply { function, argument } => {
@@ -849,16 +853,15 @@ fn binop_binding(op: &BinOpKind) -> Binding {
         left: own,
         right: own.next_highest(),
     };
-    match op {
+    match op.unrefined() {
         BinOpKind::BoolLogic(LogicKind::Or | LogicKind::Nor | LogicKind::Xor | LogicKind::Xnor) => {
             leftward(Precedence::Or)
         }
         BinOpKind::BoolLogic(LogicKind::And | LogicKind::Nand) => leftward(Precedence::And),
         BinOpKind::Compare(_) => leftward(Precedence::Cmp),
-        BinOpKind::Arithmetic(
-            ArithmeticKind::Add | ArithmeticKind::AddRefined | ArithmeticKind::Sub,
-        )
-        | BinOpKind::Concat => leftward(Precedence::Add),
+        BinOpKind::Arithmetic(ArithmeticKind::Add | ArithmeticKind::Sub) | BinOpKind::Concat => {
+            leftward(Precedence::Add)
+        }
         BinOpKind::Arithmetic(ArithmeticKind::Mul | ArithmeticKind::FloorDiv) => {
             leftward(Precedence::Mul)
         }
@@ -873,6 +876,7 @@ fn binop_binding(op: &BinOpKind) -> Binding {
             // minus there is already tighter than this level.
             right: Precedence::Pow,
         },
+        refined => unreachable!("`unrefined` answers no `{refined:?}`"),
     }
 }
 

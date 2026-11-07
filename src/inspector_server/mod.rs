@@ -344,4 +344,65 @@ mod tests {
             );
         }
     }
+
+    // TODO: pinned on `^+`: inlining cannot discharge a singleton parameter against an argument
+    // typed plain `Int`.
+    #[test]
+    #[should_panic(expected = "beta reduction would silently drop the precondition")]
+    fn pane_links_inline_fanout_edges_non_empty_for_udf_program_with_caret_operators() {
+        let code = indoc! {r#"
+            add1 = \x -> x ^+ 1
+            a = add1(10)
+            b = add1(20)
+            a ^+ b
+        "#};
+        let mut ctx = GlobalContext::default();
+        let consumer: Box<dyn Consumer> = Box::new(|| {});
+        let compiled = compile_program(&mut ctx, &LoadedProgram::test(code), consumer)
+            .expect("program compiles");
+
+        let json = snapshot_json(&compiled, "udf.chl");
+        let v: Value = serde_json::from_str(&json).expect("payload is valid JSON");
+
+        // The live node ids of a pane are its shipped node table, read directly.
+        let panes = v["panes"].as_array().expect("panes is an array");
+        let pane_ids = |id: &str| -> std::collections::HashSet<u64> {
+            let pane = panes
+                .iter()
+                .find(|s| s["id"] == id)
+                .unwrap_or_else(|| panic!("pane {id} is present"));
+            pane["nodes"]
+                .as_array()
+                .expect("nodes is an array")
+                .iter()
+                .map(|n| n["nodeId"].as_u64().expect("nodeId is a number"))
+                .collect()
+        };
+        let up_ids = pane_ids("post-inference");
+        let down_ids = pane_ids("post-channelize");
+
+        let pane_links = v["paneLinks"].as_array().expect("paneLinks is an array");
+        let link = pane_links
+            .iter()
+            .find(|l| l["from"] == "post-inference" && l["to"] == "post-channelize")
+            .expect("the post-inference → post-channelize link entry is present");
+        let edges = link["edges"].as_array().expect("edges is an array");
+        assert!(
+            !edges.is_empty(),
+            "a two-site UDF fan-out must yield non-empty post-inference → post-channelize edges"
+        );
+        for (i, e) in edges.iter().enumerate() {
+            let pair = e.as_array().expect("edge is an [up, down] pair");
+            let u = pair[0].as_u64().expect("upstream id is a number");
+            let d = pair[1].as_u64().expect("downstream id is a number");
+            assert!(
+                up_ids.contains(&u),
+                "edges[{i}] upstream id {u} is a node in the post-inference pane"
+            );
+            assert!(
+                down_ids.contains(&d),
+                "edges[{i}] downstream id {d} is a node in the post-channelize pane"
+            );
+        }
+    }
 }

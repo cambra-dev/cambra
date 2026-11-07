@@ -225,7 +225,7 @@ pub(super) struct InferCtx {
     ///
     /// A type lifted past such a binder keeps the name (`close_let_type`), so a
     /// query about that type outside the scope needs the binder's own
-    /// refinements to decide it — `{Int | __elem == a ^+ x1}` entails
+    /// refinements to decide it — `{Int | __elem == a + x1}` entails
     /// `{Int | __elem >= 0}` only given `x1 >= 0`. Entries accumulate and are
     /// never removed: a uniquified name denotes one binding, so the fact it
     /// records stays true.
