@@ -1807,8 +1807,9 @@ Compilation, restriction typing, and checking agree on the order because the fir
 stamps it into the predicates. `compile_refinements` in `planning/predicates.rs` types each
 predicate at its stage type, so a compiled predicate's type slots carry `{𝐷 | earlier}` for every
 refinement applied before it. `dependency_order` reads those slots back as dependencies. Every
-later site that orders the set (map-filter insertion, re-compilation, and the post-planning check)
-therefore recovers the order of the first compilation, whatever the compiled terms render to. The
+later site that orders the set (map-filter insertion, a correlated site's `filter_values` chain in
+`planning/correlated.rs`, re-compilation, and the post-planning check) therefore recovers the order
+of the first compilation, whatever the compiled terms render to. The
 rendered-predicate tie-break decides only among predicates that had no dependency before their
 first compilation. The argument rests on one equality: the copy of an earlier refinement inside a
 later predicate's types compares equal to its sibling in the set, which the shared

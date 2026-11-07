@@ -778,6 +778,37 @@ fn groups_read_at_the_keys_of_nested_for_loops(#[case] body: &str, #[case] expec
     );
 }
 
+/// A loop over a group's filtered elements, fed out per group. The group is defined only at its
+/// own keys, so the filter reading it runs after the one narrowing the keys to the group's.
+#[rstest]
+#[case::one_level(
+    indoc! {r"
+        for g1 in g:
+            for q in [u for u in g1 if u > 1]:
+                ch << q
+    "},
+    14
+)]
+#[case::beneath_another_group_loop(
+    indoc! {r"
+        for g1 in g:
+            for g2 in g:
+                for q in [u for u in g2 if u > 1]:
+                    ch << q
+    "},
+    28
+)]
+fn a_group_s_filtered_elements_fed_per_group(#[case] body: &str, #[case] expected: i64) {
+    check_scalar(
+        &formatdoc! {r"
+            g = groupby([1, 2, 3, 4, 5], \x -> x > 2)
+            ch: Feed(_)
+            {body}sum([v for v in ch])
+        "},
+        Value::Int(expected),
+    );
+}
+
 /// The sharing [`test_shared_grouping`] *describes*, pinned.
 ///
 /// Those value assertions hold whether the partition is bucketized once or
