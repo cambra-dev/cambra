@@ -906,7 +906,14 @@ pub(super) fn denoted_domains(ct: &CompactType) -> Option<Vec<Type>> {
 /// A position that **names** rather than fills — a bare variable, a witness reference — is
 /// not a domain to disagree with: consuming a sum is what resolves it, and
 /// [`denoted_domains`] excludes witness atoms for the same reason.
-fn data_domains_disagree(a: &CompactType, b: &CompactType) -> bool {
+///
+/// **This is the one rule for whether two data domains are one.** The solver asks it of two
+/// collections' lower bounds before relating either to a consumer
+/// (`constrain::distinct_data_domains`), and the merge asks it of two function slots and of
+/// two invariant nominal arguments. The domain is the data at every position, so a record
+/// field or tuple component that differs makes the domains differ: `(0..1, 0..1)` and
+/// `(0..1, 0..2)` are two domains, not one to meet.
+pub(super) fn data_domains_disagree(a: &CompactType, b: &CompactType) -> bool {
     let names_only = |ct: &CompactType| {
         let o = ct.occupied();
         (o.atoms == 0 && o.fun.is_none() && !o.others)
@@ -934,10 +941,23 @@ fn data_domains_disagree(a: &CompactType, b: &CompactType) -> bool {
                 .map(|d| TupleWidth::Exactly(d.components.len()))
         })
     };
+    // A record's fields in key order, or a dependent tuple's components in position order:
+    // with equal keys, the two sequences pair position by position.
+    fn components(ct: &CompactType) -> Vec<&CompactType> {
+        match (&ct.rec, &ct.dep_tuple) {
+            (Some(rec), _) => rec.values().collect(),
+            (None, Some(d)) => d.components.iter().collect(),
+            (None, None) => Vec::new(),
+        }
+    }
     a.refinements != b.refinements
         || a.atoms != b.atoms
         || keys(a) != keys(b)
         || width(a) != width(b)
+        || components(a)
+            .into_iter()
+            .zip(components(b))
+            .any(|(x, y)| data_domains_disagree(x, y))
 }
 
 /// Merge binder kinds positionally, retaining the lesser existing ID at each position.
@@ -5006,6 +5026,21 @@ mod tests {
             ])),
             "the met domain is the union of the two records' fields"
         );
+    }
+
+    /// Two domains agree at every position or are two domains: a tuple component that differs
+    /// makes the tuples differ, as the whole domain would.
+    #[test]
+    fn data_domains_differing_in_a_component_disagree() {
+        let domain = |n: usize| {
+            compact_type(&Type::tuple(vec![
+                Type::index_range(1),
+                Type::index_range(n),
+            ]))
+            .term
+        };
+        assert!(data_domains_disagree(&domain(1), &domain(2)));
+        assert!(!data_domains_disagree(&domain(2), &domain(2)));
     }
 
     /// The merge is commutative under `CompactType`'s own equality, including once

@@ -3307,6 +3307,13 @@ arms, not an implicit upper bound of the plain collections.
 The list conversion does not preserve which original domain supplied the rows. Its lookup
 is checked; see [Lookup: membership discharge](collections.md#lookup-membership-discharge).
 
+One rule decides whether two data domains are one, `compact::data_domains_disagree`. The solver
+asks it of two collections among a variable's lower bounds (`distinct_data_domains`), and the
+merge asks it of two function slots and of two arguments at an invariant nominal parameter. Two
+domains are one when they agree at every position: atoms, refinements, record keys, tuple width,
+and each field or component in turn. `(0..1, 0..1)` and `(0..1, 0..2)` are two domains. A
+position that names a variable or a witness rather than holding a domain agrees with anything.
+
 #### Where the candidates come from
 
 `emit_case` constrains each arm into a shared result variable. Compaction joins the

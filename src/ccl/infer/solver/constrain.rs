@@ -935,7 +935,14 @@ fn distinct_data_domains(lows: &[Bound]) -> Option<(Type, Type)> {
         {
             continue;
         }
-        if let Some(prev) = seen.iter().find(|p| **p != d) {
+        // Compaction's rule, so the solver and the merge never answer this differently.
+        let disagree = |p: &Type| {
+            super::compact::data_domains_disagree(
+                &super::compact::compact_type(p).term,
+                &super::compact::compact_type(&d).term,
+            )
+        };
+        if let Some(prev) = seen.iter().find(|p| disagree(p)) {
             return Some((prev.clone(), d));
         }
         if !seen.contains(&d) {
