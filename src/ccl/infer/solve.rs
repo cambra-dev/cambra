@@ -268,6 +268,11 @@ pub(super) struct CoalesceCtx {
     /// instantiation variables.
     #[cfg(debug_assertions)]
     in_predicate: usize,
+    /// The refinements whose predicates' types the walk is coalescing, outermost first: one
+    /// reached again while its own predicate's types are coalescing reads itself, which no
+    /// coalescing finishes ([`coalesce_type_predicates`]). Compared as refinements compare, by
+    /// value: each round of such a cycle materializes the refinement afresh.
+    predicates_in_progress: Vec<crate::ccl::Refinement>,
     /// The right-hand sides [`pin_empty_list_elements`] skipped as generalized, whose
     /// literals only the walk's copies pin. The walk checks that it generalizes each of
     /// them too: one it walked as monomorphic would keep a literal nothing pins. Debug
@@ -1644,6 +1649,7 @@ pub(super) fn coalesce_pass(
         reads: Vec::new(),
         #[cfg(debug_assertions)]
         in_predicate: 0,
+        predicates_in_progress: Vec::new(),
         #[cfg(debug_assertions)]
         skipped_as_generalized: std::collections::HashSet::new(),
     };
@@ -3081,6 +3087,11 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
     );
 }
 
+/// How many times coalescing may reach one refinement inside its own predicate's types before it
+/// reports that the refinement reads itself ([`coalesce_type_predicates`]). A finite nesting,
+/// a singleton's literal typed at that singleton, stays below it.
+const SELF_NESTING_BOUND: usize = 8;
+
 /// [`coalesce_type_predicates`] carrying the functions it has descended
 /// through, so a predicate it rebuilds leaves closed against them.
 ///
@@ -3128,7 +3139,30 @@ fn coalesce_type_predicates_go(
             let base = inner.clone();
             refinements.rewrite_each(|_, r| {
                 let entered = Rc::clone(&r.predicate);
+                // **A refinement may not read itself through its predicate's types.** Each type
+                // coalescing reaches inside the predicate is coalesced in turn, so one that holds
+                // this refinement again recurses without end, a solver that conjoined two domains
+                // into one that its own predicates read being the shape that did. A refinement
+                // nests in its own predicate's types a bounded number of times legitimately, a
+                // singleton `{Int | __elem == 5}` stating the literal `5` it quotes at that same
+                // type, so the walk is stopped where one is nested deeper than any such does.
+                let this = r.clone();
                 memo.rebuild(r, &(), |pred| {
+                    assert!(
+                        ctx.predicates_in_progress
+                            .iter()
+                            .filter(|p| **p == this)
+                            .count()
+                            < SELF_NESTING_BOUND,
+                        "coalescing reached the refinement `{}` {SELF_NESTING_BOUND} times inside \
+                         its own predicate's types: {} reads itself",
+                        symbolic(&entered),
+                        Type::Refinement(
+                            base.clone(),
+                            crate::ccl::RefinementSet::one(this.clone())
+                        ),
+                    );
+                    ctx.predicates_in_progress.push(this.clone());
                     #[cfg(debug_assertions)]
                     {
                         ctx.in_predicate += 1;
@@ -3138,6 +3172,7 @@ fn coalesce_type_predicates_go(
                     {
                         ctx.in_predicate -= 1;
                     }
+                    ctx.predicates_in_progress.pop();
                     crate::ccl::ccl_utils::type_element_reads_from_base(pred, &base);
                     true
                 });

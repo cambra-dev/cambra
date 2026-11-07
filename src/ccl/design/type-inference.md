@@ -686,6 +686,12 @@ its pre-coalesce predicate allocation and unresolved interior types. A value bin
 directly because no later specialization rebuilds its definition. Grouping values and matches
 over conditionally constructed collections exercise that path.
 
+Visiting a predicate's slots coalesces their types, which can hold refinements in turn, so the
+walk would not finish on a refinement whose predicate's types read that refinement. A singleton
+nests its own refinement a bounded number of times (`{Int | __elem == 5}` quotes the literal `5`
+at that type), so `coalesce_type_predicates` panics only where one refinement is reached
+`SELF_NESTING_BOUND` times inside its own predicate's types, reporting the refinement.
+
 Monomorphic variable uses share their binder's inference variables; they do not need a lexical
 lookup merely to read those bounds. Generalized uses do require the specialization scope, and
 lambda-parameter domain refresh is a separate operation. Slot resolution uses the type stored on
