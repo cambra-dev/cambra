@@ -52,15 +52,6 @@ use panic_message::panic_message;
 /// outside this list and [`UNDEFINED`] to agreement and every cell here to its kind, so a fix
 /// that makes one agree removes it, and a cell that starts failing another way fails the grid.
 const BROKEN: &[(&str, &str, &str)] = &[
-    ("groups2_comp", "coll_max[g1]", "CompilerRejects"),
-    ("groups2_comp", "coll_sum[g1]", "CompilerRejects"),
-    ("groups3_comp", "coll_max[g1]", "CompilerRejects"),
-    ("groups3_comp", "coll_max[g2]", "CompilerRejects"),
-    ("groups3_comp", "coll_sum[g1]", "CompilerRejects"),
-    ("groups3_comp", "coll_sum[g2]", "CompilerRejects"),
-    ("groups3_source", "coll_boxed[g1]", "CompilerRejects"),
-    ("groups3_source", "coll_filtered[g1]", "CompilerRejects"),
-    ("groups3_source", "coll_mapped[g1]", "CompilerRejects"),
     ("groups3_source", "dup_union", "CompilerRejects"),
     ("groups3_source", "union", "CompilerRejects"),
     ("loop_source_in_loop", "dup_union", "CompilerRejects"),
