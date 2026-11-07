@@ -793,7 +793,7 @@ fn is_filter_values_led(leg: &Expr) -> bool {
 ///
 /// `𝑚` is a term lifted out of a type into the tree, so it is planned as every such term is
 /// (`src/ccl/design/optimization.md`, "Planning a lifted term").
-fn membership_keys(
+pub(super) fn membership_keys(
     collection: &Expr,
     present: &Type,
     ctx: &mut PlanningCtx,

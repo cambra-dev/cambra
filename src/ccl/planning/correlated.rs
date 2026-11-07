@@ -210,6 +210,18 @@ fn through_strength(expr: &Expr, ctx: &mut PlanningCtx) -> Result<Option<Expr>, 
                 Type::data_fun(inner_domain.clone(), inner_domain.clone()),
             )
         }
+        // **A membership's keys are its collection's image**, as an iteration site's are
+        // (`iterate::membership_keys`): a body that never applies the collection still ranges
+        // over the keys it holds. Only a collection the row does not read is one set of keys
+        // every row shares; one that reads it is a dependent tuple's, which `keys_family` reads.
+        None if let [membership] = inner_domain.refinements()
+            && let Some(collection) = membership.membership_collection()
+            && crate::ccl::subst::expr_free_vars(collection)
+                .iter()
+                .all(|n| n.is_elem()) =>
+        {
+            iterate::membership_keys(collection, &inner_domain, ctx)?
+        }
         None if inner_domain
             .refinements()
             .iter()
