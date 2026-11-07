@@ -781,7 +781,7 @@ directly because no later specialization rebuilds its definition. Grouping value
 over conditionally constructed collections exercise that path.
 
 Visiting a predicate's slots coalesces their types, including further predicates. The active
-resolution path records the predicate and all its quoted type slots, stopping at inference
+resolution path records the predicate and all its held type slots, stopping at inference
 variables. Repeating this input repeats a resolution dependency and panics. The panic is an
 invariant check, not a diagnostic: a well-formed constraint graph never repeats one, so no source
 program reaches it unless inference built a predicate that reads itself. Predicate equality
@@ -946,7 +946,7 @@ an SMT encoding for point-free expressions.
 
 The check after planning rebuilds every node's type, a dependent result included, and compares it
 with the recorded type in full. Planning rewrites terms in the tree but not the copies of them that
-types quote, so a rebuilt type can quote the planned spelling of a term the recorded type quotes
+types hold, so a rebuilt type can hold the planned spelling of a term the recorded type holds
 unplanned. Each such rewrite has a reading in the normal form under which the two spellings are
 equal ([Predicates are compared by normal form](#predicates-are-compared-by-normal-form)). A
 rewrite with no reading leaves the two types unequal, and the check reports the mismatch
@@ -1076,7 +1076,7 @@ results. At the end of a successful coalesce pass, `assert_reads_stable` resolve
 the final graph.
 
 The verification batch shares complete `compact_type` results by root type and the identities of its
-immutable carriers: quoted terms, settled witness lists, declarations and capabilities. `Type`
+immutable carriers: held terms, settled witness lists, declarations and capabilities. `Type`
 equality omits typed information in those carriers. The cache keeps them alive and distinguishes
 their identities so equal-looking roots cannot substitute a different typed view.
 
@@ -1317,7 +1317,7 @@ element of `box(f(2))` says nothing of what the element is. A use that is fully 
 as before.
 
 A copy of a use takes the clone of the use it copies, whether or not the key determines that
-clone. A refinement predicate quotes the term it refines by, so a call in a group-by key or a
+clone. A refinement predicate holds the term it refines by, so a call in a group-by key or a
 filter occurs once in the tree and once more in each type the predicate rides. Every occurrence
 carries the same instantiation variables, so one join surrounds them all, and the pins of the
 clone minted for the first occurrence already answer it. `specialize_use` records each clone's
@@ -1429,7 +1429,7 @@ Two refinements are equal when their predicates' normal forms are equal as terms
 form. `ccl_utils::normal_form` computes it, and `Refinement` caches it beside the predicate it was
 computed for.
 
-A type quotes terms, and passes respell the terms it quotes. A-normalization names operands,
+A type holds terms, and passes respell the terms it holds. A-normalization names operands,
 inlining moves a definition into place, lambda elimination rewrites a definition point-free while a
 type's copy keeps its lambdas, and planning stages a term for execution. The normal form is the
 spelling every such copy reaches. Each rule below is an equivalence: the two spellings it relates
@@ -1449,7 +1449,7 @@ give the same value at every argument the term is applied at.
   `𝑥 ▷ (⊔ᵢ (π̂ᵢ ▷ filter_values ≫ 𝑒ᵢ))`, reads back as `{ 𝑔ᵢ → 𝑥 ▷ 𝑒ᵢ }`. Leg `𝑖` filters by
   the first-match predicate `π̂ᵢ = 𝑔ᵢ ∧ ¬𝑔₀ ∧ … ∧ ¬𝑔ᵢ₋₁`, and peeling the earlier guards off it
   leaves `𝑔ᵢ`. A second leg guarded by the literal `true` has `true ∧ ¬𝑔₀`, which constant
-  folding reduces to `¬𝑔₀`; that reads back as the guard `true`. A type quoting a conditional
+  folding reduces to `¬𝑔₀`; that reads back as the guard `true`. A type holding a conditional
   chosen per row then compares equal to the point-free definition lambda elimination wrote for it;
 - an applied form planning stages reads as the term it stages, since an application reaches only
   keys in its function's domain:
@@ -2471,11 +2471,11 @@ where every element reference it acts on or puts in place is one refinement furt
 ([A refinement's element is referenced by index](#a-refinements-element-is-referenced-by-index)).
 
 Compaction already applies a substitution to a variable met in a type's structure, by walking the
-variable's bounds under it. A variable met in a type slot of a term the type quotes is different.
+variable's bounds under it. A variable met in a type slot of a term the type holds is different.
 The slot is part of a refinement's predicate, which compaction forces whole
 (`Subst::force_refinement`), and coalescing resolves the slot later, on its own
 (`coalesce_type_predicates`). Without the suspension, `σ` misses what the slot resolves to. A
-dependent type quotes terms whose slots are such variables: a loop's source read at a position, a
+dependent type holds terms whose slots are such variables: a loop's source read at a position, a
 `let`'s definition, a key's projection. Discharging a loop variable into one leaves its slots
 naming the variable once they resolve.
 
@@ -2810,9 +2810,9 @@ its seed, and a write is not the written value. They are eliminated before consu
 lifted type use that representation.
 
 Coalescing closes the result using the resolved body and definition. Nested lets close from
-inside outward. If lambda elimination rewrites a definition quoted by the result type, its let
+inside outward. If lambda elimination rewrites a definition held by the result type, its let
 rebuild must discharge the rewritten definition again. The post-pass check likewise reconstructs
-from the tree it receives, not from a pre-transformation quoted term.
+from the tree it receives, not from a pre-transformation held term.
 
 #### A lambda's codomain drops the body's opaque binders
 
@@ -3068,9 +3068,9 @@ nested chain splices its elements in place.
 A chain's own type is a function of its input alone. Each position its codomain reads is written
 as the input carried there: `(𝑥₀ : 𝐷) ⇒ 𝐶[𝑥ᵢ ↦ 𝑥₀ ▷ 𝑒₀ ≫ … ≫ 𝑒ᵢ₋₁]`, where leading morphisms that map
 each position to itself (`id`, an iteration source, `filter_values`) drop out of the read. The
-quoted morphisms keep their types, whose binders can share a name with a binder of the type that
-quotes them, so a substitution through the type checks for capture only at the binders whose
-scope it acts inside (`Subst::under_binder`). A read through several morphisms quotes their
+held morphisms keep their types, whose binders can share a name with a binder of the type that
+holds them, so a substitution through the type checks for capture only at the binders whose
+scope it acts inside (`Subst::under_binder`). A read through several morphisms holds their
 composite, whose type binds its input under a fresh name rather than the first morphism's binder:
 its codomain names later positions, which the discharge replaces by reads at `𝑥₀`, and under `𝑥₀`'s
 own binder those reads would be captured (`ccl_utils::read_at_position`).
@@ -3272,7 +3272,7 @@ arms would agree. Arms whose filters differ report `DomainJoinConflict`, naming 
 domain as the program wrote it: a domain variable both arms reach unions their filters, and keeps
 the two sets it met (`met_refinements`) for the report. Arms with the same filter join, whether
 written inline, bound by `let` or passed as parameters: A-normalization names a variable's
-collection read once in scope (`share_collection_reads`), so the two filters quote one temp.
+collection read once in scope (`share_collection_reads`), so the two filters hold one temp.
 
 ## 4.7 Dependent sums
 
@@ -3448,7 +3448,7 @@ names none of them, and nothing is minted before the binders exist.
 - anything else is not a collection and is unchanged.
 
 The component is separate from the witness half, so storing a bound does not force it, and it
-acts on type structure only: a quoted term's type slots are what the term says. A chain of
+acts on type structure only: a held term's type slots are what the term says. A chain of
 substitutions keeps its eliminations in order, so a group read out of a sum read out of another
 eliminates both. The solver eliminates on entry to an edge (`eliminate_at`), and a variable arm
 relates an eliminated end's funkind as plain. Compaction applies the kind's binder correspondence
@@ -3835,7 +3835,7 @@ combination of their candidates, and every candidate has at least one leg. A `Re
 leg, or not typed as a sum over listed candidates, is a compiler bug. The legs' disjointness is
 their first-match gates', which no type records.
 
-The node also keeps the `Case` it replaces as the term it stages. A consumer's type quotes that
+The node also keeps the `Case` it replaces as the term it stages. A consumer's type holds that
 `Case`, and normal form reads the node as it, so the type rebuilt over the realized tree equals
 the recorded one
 ([The check after planning reads planning's rewrites back](#the-check-after-planning-reads-plannings-rewrites-back)).
@@ -3865,7 +3865,7 @@ funkind variable that stood before it, above the cutoff, is reached from the ins
 clone's type slots, through their structure or the copies' bounds and funkind edges. Such a one
 would be shared between the scheme and every use, and would carry whatever one use records into the
 others.
-The audit enters quoted predicate, family-argument and projection terms, and follows copied
+The audit enters held predicate, family-argument and projection terms, and follows copied
 variables' bounds and funkind edges. A function's own funkind is checked even when its domain
 and codomain contain no inference variables. Reaching an enclosing variable or funkind at or
 below the cutoff stops that path: its graph is shared by design.

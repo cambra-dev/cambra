@@ -51,7 +51,7 @@
 //! | ANF morphism binding | `let x = 𝑚 in 𝑏` (`x` an ANF temp, `𝑚` a morphism, used once) | `𝑏[x := 𝑚]` | ✓ |
 
 use crate::ccl::ccl_utils::{
-    PredMemo, apply_primitive, count_free, is_builtin, walk_quoted_terms_mut,
+    PredMemo, apply_primitive, count_free, is_builtin, walk_held_terms_mut,
 };
 use crate::ccl::lambda_elim::{id, strength_over, typed_tuple, zip_pair};
 use crate::ccl::ty::FunKind;
@@ -171,7 +171,7 @@ fn simplify_once(expr: &mut Expr, memo: &PredMemo) -> (bool, bool) {
     // compares by structural refinement equality.
     let mut slot_changed = false;
     expr.walk_type_slots_mut(|ty| {
-        slot_changed |= walk_quoted_terms_mut(ty, memo, &(), &mut |pred, memo| {
+        slot_changed |= walk_held_terms_mut(ty, memo, &(), &mut |pred, memo| {
             // Reporting "unchanged" keeps the origin `Rc` in the slot, so a
             // predicate simplify has nothing to say about stays pointer-shared with
             // every other occurrence — including ones in nodes this walk never
@@ -2096,7 +2096,7 @@ fn restate_behind(f: &mut Expr, curry_ty: &Type) -> Restated {
     }
     let mut result = result;
     let memo = PredMemo::default();
-    walk_quoted_terms_mut(&mut result, &memo, &(), &mut |term, _| {
+    walk_held_terms_mut(&mut result, &memo, &(), &mut |term, _| {
         restate(term, &read, &binder)
     });
     let map_ty = Type::pi_kinded(c, input, result, fun_kind);

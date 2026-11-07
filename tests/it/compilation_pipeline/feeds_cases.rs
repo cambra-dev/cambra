@@ -2388,7 +2388,7 @@ fn boxed_rows_fed_from_a_loop(#[case] source: &str, #[case] expected: &str) {
 }
 
 /// A loop over rows feeds a filtered comprehension over each row beside an aggregate of the row,
-/// in a tuple or a record. The row's type quotes the pairing that reads the row twice, whose
+/// in a tuple or a record. The row's type holds the pairing that reads the row twice, whose
 /// type binds the loop's variable as the row's own type does.
 #[rstest]
 #[case::in_a_tuple(indoc! {r#"

@@ -366,7 +366,7 @@ pub(crate) fn assert_copied_apart_from(
             for r in ty.refinements() {
                 self.term(&r.predicate);
             }
-            ty.quoted_terms().for_each(|term| self.term(term));
+            ty.held_terms().for_each(|term| self.term(term));
             ty.walk_children(|child| self.ty(child));
         }
     }
@@ -1208,7 +1208,7 @@ pub fn freshen_above(
         // [`Type::alpha_convert_sum`] on the way out of the `Fun` arm; a kind variable's is
         // re-minted with the variable ([`freshen_kind_var`]), and the cache is what carries
         // that rename to the references — in this type and in the bounds copied with it.
-        // A projection quotes a term as a predicate does, and `unbox`'s stamped type quotes
+        // A projection holds a term as a predicate does, and `unbox`'s stamped type holds
         // its own parameter, whose type holds the stamping's variables. Its slots freshen
         // as a predicate's do, so a specialization's projection resolves against the
         // clone's variables rather than sharing the definition's.
@@ -2136,19 +2136,19 @@ mod copy_audit_tests {
     use crate::ccl::{BaseType, Expr, InferVar, Name};
 
     #[test]
-    fn the_copy_audit_enters_every_quoted_type() {
+    fn the_copy_audit_enters_every_held_term() {
         let variable = super::super::fresh_var(1);
-        let quoted = Rc::new(Expr::var("condition").with_ty(variable));
+        let held = Rc::new(Expr::var("condition").with_ty(variable));
         let roots = [
             Type::refined_one(
                 Type::Base(BaseType::Int),
-                Refinement::born(Rc::clone(&quoted)),
+                Refinement::born(Rc::clone(&held)),
             ),
             Type::FamilyApp(crate::ccl::ty::FamilyApp::new(
                 crate::ccl::TypeParam::declared_family("V", 1),
-                vec![Rc::clone(&quoted)],
+                vec![Rc::clone(&held)],
             )),
-            Type::WitnessProjection(crate::ccl::ty::WitnessProjection::new(quoted, 0)),
+            Type::WitnessProjection(crate::ccl::ty::WitnessProjection::new(held, 0)),
         ];
         let before = Minted::now();
         for root in roots {
@@ -2157,7 +2157,7 @@ mod copy_audit_tests {
                     assert_copied_apart(0, &[root], &FreshenCache::new(), before);
                 }))
                 .is_err(),
-                "a quoted variable shared above the cutoff must be rejected"
+                "a held variable shared above the cutoff must be rejected"
             );
         }
     }

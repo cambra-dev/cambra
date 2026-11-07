@@ -2327,7 +2327,7 @@ pub enum JoinedPosition {
 }
 
 /// A root and the immutable views its equality omits. The root keeps the allocations alive
-/// while their addresses distinguish quoted type slots, settled witness ranges and declarations.
+/// while their addresses distinguish held type slots, settled witness ranges and declarations.
 #[cfg(debug_assertions)]
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CompactionInput {
@@ -2366,7 +2366,7 @@ impl CompactionInput {
                 }
                 _ => {}
             }
-            out.extend(ty.quoted_terms().map(|term| Rc::as_ptr(term) as usize));
+            out.extend(ty.held_terms().map(|term| Rc::as_ptr(term) as usize));
             ty.walk_children(|child| views(child, out));
         }
         let mut read_views = Vec::new();
@@ -3747,13 +3747,13 @@ fn compact_go_inner(
                 ..CompactType::value()
             }
         }
-        // A projection quotes a term, so a term substitution acts on it, as it does on
+        // A projection holds a term, so a term substitution acts on it, as it does on
         // a predicate: a dependent application's `[c ↦ 𝑎]` turns `σ₁(c)` into `σ₁(𝑎)`.
         //
-        // A family's arguments are quoted terms, substituted and closed as a projection's is.
+        // A family's arguments are held terms, substituted and closed as a projection's is.
         // Only Check meets one: a generalized type is born after inference.
         Type::WitnessProjection(_) | Type::FamilyApp(_) => {
-            // The quoted terms are substituted as terms; the witness half has nothing in them
+            // The held terms are substituted as terms; the witness half has nothing in them
             // to act on.
             let mut ty = subst_acc
                 .without_witnesses()
@@ -3766,11 +3766,11 @@ fn compact_go_inner(
             }
             // Landing closes, as a refinement's does: references to the walk's enclosing
             // binders become indices.
-            for quoted in ty.quoted_terms_mut() {
-                st.scope.close_quoted(quoted);
+            for held in ty.held_terms_mut() {
+                st.scope.close_held(held);
             }
             let atom = AtomKey::from_type(&ty).unwrap_or_else(|| {
-                unreachable!("a substitution keeps a quoting type's form or reads it back: {ty}")
+                unreachable!("a substitution keeps a holding type's form or reads it back: {ty}")
             });
             CompactType::from_atom(atom)
         }
@@ -4976,7 +4976,7 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
-    fn final_graph_compactions_preserve_each_quoted_term() {
+    fn final_graph_compactions_preserve_each_held_term() {
         let make = || Rc::new(TypedExpr::var("p").with_ty(Type::Base(BaseType::Bool)));
         let first = make();
         let second = make();

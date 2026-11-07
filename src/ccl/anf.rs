@@ -259,10 +259,10 @@ pub fn temp_respelling(expr: &Expr) -> Subst {
 
 /// `e` with each temp that names a collection read an enclosing temp already names replaced by
 /// that temp: `let 𝑡₂ = xs ▷ Iterable::elements` inside the body of
-/// `let 𝑡₁ = xs ▷ Iterable::elements` is dropped, and its reads, the types quoting it included,
+/// `let 𝑡₁ = xs ▷ Iterable::elements` is dropped, and its reads, the types holding it included,
 /// read `𝑡₁`.
 ///
-/// A comprehension's domain is refined by predicates that quote its source's temp. Two
+/// A comprehension's domain is refined by predicates that hold its source's temp. Two
 /// comprehensions over one variable with one filter then state one domain, and a join of them
 /// compares equal (`src/ccl/design/type-inference.md`, "A variable base takes a guarded bound"). Only
 /// a read of an immutable variable by a trait that reads collections is shared: it is the

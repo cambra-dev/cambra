@@ -3457,7 +3457,7 @@ fn collect_type_errors(
             // refinement) is a DAG, so this dedups it. (Immutable predicates
             // are acyclic — dedup, not cycle-breaking.)
             //
-            // The same visited-set pattern lives in `crate::ccl::free_names`'s `Walk::quoted`
+            // The same visited-set pattern lives in `crate::ccl::free_names`'s `Walk::held`
             // and in [`crate::ccl::lambda_elim`]'s own predicate walk (via
             // [`crate::ccl::ccl_utils::walk_refined_predicates`]). This site doesn't share
             // either because it mixes per-node error checks with the refinement walk.

@@ -262,7 +262,7 @@ fn hash_type<'a>(
         // A type parameter's identity is per-compilation, like a binder's `uid`, so
         // its spelling is what is folded. Only a generalized one survives inference.
         T::Param(param) => param.spelling.hash(state),
-        // A family is a parameter, folded by its spelling, applied to terms the type quotes,
+        // A family is a parameter, folded by its spelling, applied to terms the type holds,
         // each hashed as a predicate is.
         T::FamilyApp(app) => {
             app.param.spelling.hash(state);
@@ -356,7 +356,7 @@ fn hash_type<'a>(
                 depth.hash(state);
             }
         }
-        // The projected sum is a term the type quotes, hashed as a predicate is.
+        // The projected sum is a term the type holds, hashed as a predicate is.
         T::WitnessProjection(p) => {
             p.position.hash(state);
             hash_rel(&p.term, env, wenv, free).hash(state);

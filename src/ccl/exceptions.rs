@@ -1435,7 +1435,7 @@ impl Cx {
             Elim::Raising(body) => {
                 let state_ty = Self::outcome(&unit_ty, &inner);
                 let state = Name::exception_loop();
-                // A projected domain quotes its source. Bind a computed sum once so later
+                // A projected domain holds its source. Bind a computed sum once so later
                 // rewrites reach its definition rather than a second copy inside the type.
                 let (iter, source) = if iter.ty.read_view().sum().is_some()
                     && !matches!(iter.node, TypedExprNode::Var(_))

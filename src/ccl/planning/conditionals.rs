@@ -110,7 +110,7 @@ fn instantiate_erased_witnesses(
     memo: &PredMemo<()>,
     in_predicate: bool,
 ) {
-    // **A conditional a predicate quotes stays whole**, as realization leaves it
+    // **A conditional a predicate holds stays whole**, as realization leaves it
     // ([`realize_everywhere`]): its arms keep their `box`es, so their sums keep their
     // binders, whichever of those binders the tree's realized copy erased.
     if in_predicate && collection_value_ty(&expr.ty).is_some() && is_value_case(expr) {
@@ -544,7 +544,7 @@ fn realize(
     // [`TypedExprNode::Realized`] typed as the sum it realizes, which the legs are bodies of
     // (`check_realized`). Nothing that mentions the site's type has to change, and the value is
     // the leg holding rows, keyed by its own keys under the sum's bound. The node keeps the
-    // conditional it replaces as the term it stages: a consumer's type quotes the conditional
+    // conditional it replaces as the term it stages: a consumer's type holds the conditional
     // (`σ₁(𝑐)`), and normal form reads the node as that term, so the two compare as one.
     //
     // A site that names no witness is a same-domain conditional: every leg is a gated
@@ -664,7 +664,7 @@ fn collapse_determined_sums(expr: &mut Expr) {
             // A sum's body can be another, and dropping one binder is what exposes it.
             ty = ty.instantiate_sum(&sole);
         }
-        // A projection names its witness through the term it quotes, whose type binds it under
+        // A projection names its witness through the term it holds, whose type binds it under
         // the id that term was typed with, so the witness is gathered from there.
         if let Type::WitnessProjection(p) = &ty {
             gather(&p.term, out);

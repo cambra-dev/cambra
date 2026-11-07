@@ -1007,8 +1007,8 @@ pub enum TypedExprNode {
     Realized {
         /// The gated legs: what op-conversion compiles.
         legs: Vec<TypedExpr>,
-        /// The conditional realization replaced, quoted as a type quotes a term. Term walks
-        /// do not reach it. Normal form reads the node as this term, so a type quoting the
+        /// The conditional realization replaced, held as a type holds a term. Term walks
+        /// do not reach it. Normal form reads the node as this term, so a type holding the
         /// conditional and the realized tree compare equal.
         staged: std::rc::Rc<TypedExpr>,
     },
@@ -2699,12 +2699,12 @@ impl TypedExpr {
         }
     }
 
-    /// Every term this node quotes: each term its type slots quote
-    /// ([`Type::walk_quoted_terms`]), a refinement's predicate or a projection's sum, then the
+    /// Every term this node holds: each term its type slots hold
+    /// ([`Type::walk_held_terms`]), a refinement's predicate or a projection's sum, then the
     /// conditional a [`TypedExprNode::Realized`] stages. Term walks reach none of them; id
     /// enumeration must reach all of them.
-    pub fn walk_quoted_terms<'a>(&'a self, f: &mut impl FnMut(&'a std::rc::Rc<TypedExpr>)) {
-        self.walk_type_slots(|t| t.walk_quoted_terms(f));
+    pub fn walk_held_terms<'a>(&'a self, f: &mut impl FnMut(&'a std::rc::Rc<TypedExpr>)) {
+        self.walk_type_slots(|t| t.walk_held_terms(f));
         if let TypedExprNode::Realized { staged, .. } = &self.node {
             f(staged);
         }

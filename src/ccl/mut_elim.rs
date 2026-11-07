@@ -1863,9 +1863,9 @@ fn source_value(iter: &Expr) -> Expr {
 /// already: `for x in e: …` becomes `let __src = e in for x in __src: …`.
 ///
 /// A loop over a sum types its history over the source's projected witness ([`loop_domain`]),
-/// and a projection quotes its term. Quoting a variable leaves every later rewrite of the
+/// and a projection holds its term. Holding a variable leaves every later rewrite of the
 /// source to the binding's definition, where the passes after this phase already reach it;
-/// a quoted copy of the source itself is a second copy those passes skip. Runs ahead of the
+/// a held copy of the source itself is a second copy those passes skip. Runs ahead of the
 /// transactional slice and [`run`], which both fold a loop through [`loop_domain`].
 ///
 /// Only a source no enclosing loop varies is bound: one reading nothing an enclosing loop binds

@@ -1462,7 +1462,7 @@ fn constrain_go(
     if let Some(r2) = discharged_witness(rhs, sr) {
         return constrain_go(lhs, &r2, sl, &Subst::id(), cache, scope);
     }
-    // A projection quotes a term, and a substitution acting on that term makes it the
+    // A projection holds a term, and a substitution acting on that term makes it the
     // projection of what the term becomes: compared as that, as a predicate is.
     if let Some(l2) = substituted_projection(lhs, sl) {
         return constrain_go(&l2, rhs, &Subst::id(), sr, cache, scope);

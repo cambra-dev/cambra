@@ -9,9 +9,9 @@ use std::rc::Rc;
 use crate::ccl::feed_nest::FeedValue;
 use crate::ccl::subst::Subst;
 use crate::ccl::{
-    BaseType, BinOpKind, BindingTransparency, Branch, Builtin, Expr, F_WRITES, FieldKey, Lit,
-    LogicKind, Name, PredicateId, ProjKey, QuotedTerm, Refinement, RefinementSet, Type,
-    TypedBinding, TypedExprNode, UnaryOpKind, V_FIRED, V_IDLE,
+    BaseType, BinOpKind, BindingTransparency, Branch, Builtin, Expr, F_WRITES, FieldKey, HeldTerm,
+    Lit, LogicKind, Name, PredicateId, ProjKey, Refinement, RefinementSet, Type, TypedBinding,
+    TypedExprNode, UnaryOpKind, V_FIRED, V_IDLE,
 };
 
 /// Disjoin control-flow `paths` into one boolean gate: where a write or a feed fires, true
@@ -568,7 +568,7 @@ pub(crate) fn predicate_term(term: &Expr) -> Expr {
 /// The normal form of a predicate term, the form refinements are compared and hashed in
 /// (`src/ccl/design/type-inference.md`, "Predicates are compared by normal form").
 ///
-/// Passes rewrite the terms a predicate quotes: A-normalization names operands, and lambda
+/// Passes rewrite the terms a predicate holds: A-normalization names operands, and lambda
 /// elimination spells a definition point-free while a type's copy of it keeps the lambdas. Each
 /// spelling denotes one value, and the normal form is the spelling they share:
 ///
@@ -3390,12 +3390,12 @@ struct Entry<C> {
 }
 
 impl<C> MemoStore<C> {
-    /// Point `quoted` at `to`, counting it when the `Rc` actually changes.
-    fn point_at(&mut self, quoted: &mut (impl QuotedTerm + ?Sized), to: Rc<Expr>) {
-        if !Rc::ptr_eq(quoted.quoted(), &to) {
+    /// Point `held` at `to`, counting it when the `Rc` actually changes.
+    fn point_at(&mut self, held: &mut (impl HeldTerm + ?Sized), to: Rc<Expr>) {
+        if !Rc::ptr_eq(held.held(), &to) {
             self.revision += 1;
         }
-        quoted.requote(to);
+        held.replace_held(to);
     }
 }
 
@@ -3419,7 +3419,7 @@ impl<C: PartialEq + Clone> PredMemo<C> {
     /// See `src/ccl/design/type-inference.md`, "Predicate rebuild completion".
     pub fn rebuild(
         &self,
-        refinement: &mut (impl QuotedTerm + ?Sized),
+        refinement: &mut (impl HeldTerm + ?Sized),
         context: &C,
         f: impl FnOnce(&mut Expr) -> bool,
     ) -> bool {
@@ -3427,7 +3427,7 @@ impl<C: PartialEq + Clone> PredMemo<C> {
             let mut store = self.0.borrow_mut();
             let hit = store
                 .entries
-                .get(&Rc::as_ptr(refinement.quoted()))
+                .get(&Rc::as_ptr(refinement.held()))
                 .and_then(|es| es.iter().find(|e| e.context == *context))
                 .map(|e| Rc::clone(&e.rebuilt));
             match hit {
@@ -3436,7 +3436,7 @@ impl<C: PartialEq + Clone> PredMemo<C> {
                     return false;
                 }
                 None => {
-                    let keepalive = Rc::clone(refinement.quoted());
+                    let keepalive = Rc::clone(refinement.held());
                     let rev = store.revision;
                     (keepalive, rev)
                 }
@@ -3491,8 +3491,8 @@ impl TermMemo {
     /// Ordinary callback return completes installation; unwinding does not.
     /// Later copies are discarded after their callbacks, retaining per-occurrence
     /// effects without splitting the shared allocation.
-    pub fn rebuild_always(&self, refinement: &mut impl QuotedTerm, f: impl FnOnce(&mut Expr)) {
-        let keepalive = Rc::clone(refinement.quoted());
+    pub fn rebuild_always(&self, refinement: &mut impl HeldTerm, f: impl FnOnce(&mut Expr)) {
+        let keepalive = Rc::clone(refinement.held());
         // Copy and rewrite under the memo's declared intent; see `rebuild`.
         let pred = if self.0.is_replacing() {
             crate::ccl::provenance::preserving_ids(|| {
@@ -3659,19 +3659,14 @@ where
     changed
 }
 
-/// [`walk_refined_predicates_mut`] over every term `ty` quotes: each refinement's predicate
-/// and each witness projection's sum ([`Type::walk_quoted_terms`]).
+/// [`walk_refined_predicates_mut`] over every term `ty` holds: each refinement's predicate
+/// and each witness projection's sum ([`Type::walk_held_terms`]).
 ///
 /// For a rewrite that keeps a term's type, which a projection's term owes as a predicate
 /// does: substituting a binder's definition, simplifying, eliminating lambdas. A rewrite that
 /// changes a sum's type (erasing a determined `box`) takes the refinement-only walk and
 /// replaces the projection whole.
-pub fn walk_quoted_terms_mut<C, F>(
-    ty: &mut Type,
-    memo: &PredMemo<C>,
-    context: &C,
-    f: &mut F,
-) -> bool
+pub fn walk_held_terms_mut<C, F>(ty: &mut Type, memo: &PredMemo<C>, context: &C, f: &mut F) -> bool
 where
     C: PartialEq + Clone,
     F: FnMut(&mut Expr, &PredMemo<C>) -> bool,
@@ -3682,12 +3677,12 @@ where
             changed |= memo.rebuild(refinement, context, |pred| f(pred, memo));
         }),
         _ => {
-            for quoted in ty.quoted_terms_mut() {
-                changed |= memo.rebuild(quoted, context, |term| f(term, memo));
+            for held in ty.held_terms_mut() {
+                changed |= memo.rebuild(held, context, |term| f(term, memo));
             }
         }
     }
-    ty.walk_children_mut(|child| changed |= walk_quoted_terms_mut(child, memo, context, f));
+    ty.walk_children_mut(|child| changed |= walk_held_terms_mut(child, memo, context, f));
     changed
 }
 

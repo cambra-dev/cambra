@@ -77,7 +77,7 @@ use crate::ccl::{
     TypedBinding, TypedExprNode,
     ccl_utils::{
         PredMemo, count_free, discharge_transparent_lets, free_names, free_names_in_value, is_free,
-        refresh_let_binder, spelled_in_a_type, walk_quoted_terms_mut,
+        refresh_let_binder, spelled_in_a_type, walk_held_terms_mut,
     },
     lambda_elim::substitute,
     provenance,
@@ -608,7 +608,7 @@ fn inline_list_element_reads(mut expr: Expr, memo: &PredMemo) -> (Expr, bool) {
     let mut moved = false;
 
     expr.walk_type_slots_mut(|ty| {
-        walk_quoted_terms_mut(ty, memo, &(), &mut |pred, memo| {
+        walk_held_terms_mut(ty, memo, &(), &mut |pred, memo| {
             let old = std::mem::replace(pred, Expr::lit(Lit::Unit));
             let (rewritten, pred_moved) = inline_list_element_reads(old, memo);
             *pred = rewritten;
@@ -771,7 +771,7 @@ fn move_into_list_elements(
     }
     if types {
         body.walk_type_slots_mut(|ty| {
-            walk_quoted_terms_mut(ty, memo, &(), &mut |pred, memo| {
+            walk_held_terms_mut(ty, memo, &(), &mut |pred, memo| {
                 // A predicate the binder does not occur in is reported unchanged, so
                 // it keeps its origin `Rc` and stays pointer-shared with its
                 // occurrences on other nodes rather than being reallocated at each.
@@ -1799,7 +1799,7 @@ fn inline_in_type_predicates(
     scope: &mut BinderScope,
     memo: &PredMemo,
 ) {
-    walk_quoted_terms_mut(ty, memo, &(), &mut |pred, memo| {
+    walk_held_terms_mut(ty, memo, &(), &mut |pred, memo| {
         // A predicate the inlined binder does not occur in is reported
         // *unchanged*, so it keeps its origin `Rc` and stays pointer-shared with
         // its occurrences on other nodes rather than being reallocated at each

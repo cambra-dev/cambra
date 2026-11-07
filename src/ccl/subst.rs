@@ -516,7 +516,7 @@ impl Subst {
         }
     }
 
-    /// This substitution without its elimination: what acts on a quoted term's type slots.
+    /// This substitution without its elimination: what acts on a held term's type slots.
     fn without_elim(&self) -> Cow<'_, Subst> {
         if self.elims.is_empty() {
             return Cow::Borrowed(self);
@@ -933,7 +933,7 @@ impl Subst {
                     .flat_map(|t| crate::ccl::ccl_utils::free_names(t)),
             )
             .chain(self.witness_mappings().flat_map(|(_, m)| match m {
-                // A discharged witness's domain is a type, and a projection in it quotes a
+                // A discharged witness's domain is a type, and a projection in it holds a
                 // term whose names the suspension's content then reads.
                 WitnessMapping::Discharge(t) => type_free_vars(t).into_iter().collect(),
                 WitnessMapping::Rename(_) => Vec::new(),
@@ -2453,14 +2453,14 @@ impl Subst {
             // `Poly` that declares it, reached by the arm below.
             | Type::Param(_)
             | Type::BarrierVar(_) => {}
-            // A projected sum and a family's arguments are terms the type quotes, each rebuilt
+            // A projected sum and a family's arguments are terms the type holds, each rebuilt
             // once per substitution as a predicate is. They bind no element, so the
             // substitution acts on each whole, and as on a collection's domain, which a witness
             // projection is wherever it stands ([`Self::in_data_domain`]).
             Type::WitnessProjection(_) | Type::FamilyApp(_) => {
                 let s = self.in_data_domain();
-                for quoted in ty.quoted_terms_mut() {
-                    memo.rebuild(quoted, &s, |term| {
+                for held in ty.held_terms_mut() {
+                    memo.rebuild(held, &s, |term| {
                         if !s.acts_on(term) {
                             return false;
                         }
@@ -2628,7 +2628,7 @@ impl Subst {
     /// discharge applied twice yields the same term.
     ///
     /// A type binder's scope can nest inside a type binding the same name: a chain's type
-    /// quotes its earlier morphisms, whose types bind the name lambda elimination gave every
+    /// holds its earlier morphisms, whose types bind the name lambda elimination gave every
     /// morphism it built from one lambda. The assertion is made for the entries that act inside
     /// the binder's scope ([`Self::under_binder_ty`], and the dependent-tuple arms), where a
     /// collision would capture.
@@ -2901,21 +2901,21 @@ impl Subst {
                 None => self.eliminated_witness(w).unwrap_or_else(|| ty.clone()),
             },
 
-            // The projected sum is a term the type quotes: substituted as a term, so a binder
+            // The projected sum is a term the type holds: substituted as a term, so a binder
             // the projection leaves projects that binder's definition. A witness projection is
             // a collection's domain wherever it stands, so a binder the substitution joins over
             // is read at the key ([`Self::in_data_domain`]): whether the function around it is
             // a collection may not be known yet. A substitution acting on nothing in it keeps
             // the `Rc`.
             //
-            // A family's arguments are substituted as the term a projection quotes is.
+            // A family's arguments are substituted as the term a projection holds is.
             Type::WitnessProjection(_) | Type::FamilyApp(_) => {
                 let s = self.in_data_domain();
                 let mut out = ty.clone();
-                if ty.quoted_terms().any(|t| s.acts_on(t)) {
-                    for quoted in out.quoted_terms_mut() {
-                        let substituted = Rc::new(s.apply_expr(quoted.quoted()));
-                        quoted.requote(substituted);
+                if ty.held_terms().any(|t| s.acts_on(t)) {
+                    for held in out.held_terms_mut() {
+                        let substituted = Rc::new(s.apply_expr(held.held()));
+                        held.replace_held(substituted);
                     }
                 }
                 // Read back, the projection is a binder of the holder's function, which the
@@ -3284,7 +3284,7 @@ fn is_var_named(e: &TypedExpr, name: &Name) -> bool {
 
 // ---- contexts: the *checking* device (free vars ⊆ context) ----
 
-/// The free term-variable names of `ty`: the names the terms it quotes read that no binder
+/// The free term-variable names of `ty`: the names the terms it holds read that no binder
 /// of `ty` or of those terms binds ([`crate::ccl::free_names`]).
 pub fn type_free_vars(ty: &Type) -> BTreeSet<Binder> {
     crate::ccl::free_names::names_in_type(ty)
@@ -4100,7 +4100,7 @@ impl<'a> PiWalk<'a> {
             Type::Refinement(base, refinements) => {
                 self.ty(base, depth);
                 self.elems += 1;
-                refinements.rewrite_each(|_, r| self.quoted(r, depth));
+                refinements.rewrite_each(|_, r| self.held(r, depth));
                 self.elems -= 1;
             }
             Type::Tuple(ts) | Type::OpenTuple(ts) => ts.iter_mut().for_each(|t| self.ty(t, depth)),
@@ -4140,8 +4140,8 @@ impl<'a> PiWalk<'a> {
             // A projected sum and a family's arguments are converted as a predicate is; they
             // bind no element.
             Type::WitnessProjection(_) | Type::FamilyApp(_) => {
-                for quoted in ty.quoted_terms_mut() {
-                    self.quoted(quoted, depth);
+                for held in ty.held_terms_mut() {
+                    self.held(held, depth);
                 }
             }
         }
@@ -4182,14 +4182,14 @@ impl<'a> PiWalk<'a> {
         }
     }
 
-    /// Convert a term a type quotes — a refinement's predicate or a projection's sum — once
+    /// Convert a term a type holds — a refinement's predicate or a projection's sum — once
     /// per pass, every occurrence re-pointed at the one conversion.
-    fn quoted(&mut self, r: &mut (impl crate::ccl::QuotedTerm + ?Sized), depth: u32) {
+    fn held(&mut self, r: &mut (impl crate::ccl::HeldTerm + ?Sized), depth: u32) {
         let shadow = self.shadow_key();
         let pass_key = self
             .conversion_key()
-            .map(|c| (Rc::as_ptr(r.quoted()), c, depth, shadow.clone()));
-        let key = (Rc::as_ptr(r.quoted()), depth, self.elems, shadow);
+            .map(|c| (Rc::as_ptr(r.held()), c, depth, shadow.clone()));
+        let key = (Rc::as_ptr(r.held()), depth, self.elems, shadow);
         let from_pass = pass_key.as_ref().and_then(|k| {
             CONVERSION_MEMO.with(|m| {
                 m.borrow()
@@ -4201,8 +4201,8 @@ impl<'a> PiWalk<'a> {
             self.memo.insert(key.clone(), Rc::clone(&done));
         }
         if let Some(done) = self.memo.get(&key) {
-            if !Rc::ptr_eq(done, r.quoted()) {
-                r.requote(Rc::clone(done));
+            if !Rc::ptr_eq(done, r.held()) {
+                r.replace_held(Rc::clone(done));
                 // A memo hit is a rewrite, and an enclosing predicate's walk reads
                 // this counter to decide whether its own clone was touched. Leaving
                 // the hit uncounted makes that decision depend on visit order: the
@@ -4224,14 +4224,14 @@ impl<'a> PiWalk<'a> {
         // `PredMemo::rebuild` uses for its deriving branch. Without the guard the
         // fresh ids are minted with nothing recording, and surface as dangling
         // parents once a later recorded rewrite names the converted root.
-        let r_origin = Rc::clone(r.quoted());
+        let r_origin = Rc::clone(r.held());
         let (pred, before) = {
             let _g = crate::ccl::provenance::enter(
-                r.quoted().node_id(),
+                r.held().node_id(),
                 "predicate.coordinate",
                 crate::ccl::provenance::Nature::Machinery,
             );
-            let mut pred = (**r.quoted()).clone();
+            let mut pred = (**r.held()).clone();
             let before = self.changed;
             self.expr(&mut pred, depth);
             (pred, before)
@@ -4240,10 +4240,10 @@ impl<'a> PiWalk<'a> {
             // Occurrences that shared the original re-share the conversion
             // through the memo.
             let done = Rc::new(pred);
-            r.requote(Rc::clone(&done));
+            r.replace_held(Rc::clone(&done));
             done
         } else {
-            Rc::clone(r.quoted())
+            Rc::clone(r.held())
         };
         if let Some(k) = pass_key {
             let origin = Rc::clone(&r_origin);
@@ -4421,7 +4421,7 @@ pub fn references_binder_within(ty: &Type, within: u32) -> bool {
             // A witness reference is a leaf in its own namespace: it neither is
             // nor crosses a Pi index.
             Type::WitnessRef(_) => false,
-            Type::WitnessProjection(_) | Type::FamilyApp(_) => ty.quoted_terms().any(|t| {
+            Type::WitnessProjection(_) | Type::FamilyApp(_) => ty.held_terms().any(|t| {
                 visited.insert((Rc::as_ptr(t), depth)) && expr_scan(t, depth, within, visited)
             }),
         }
@@ -4561,7 +4561,7 @@ impl RefinementScope {
         }
         let mut walk = PiWalk::new(PiMode::Close(&self.enclosing));
         let mut out = r.clone();
-        walk.quoted(&mut out, 0);
+        walk.held(&mut out, 0);
         self.memo.insert(
             key,
             ClosedRefinement {
@@ -4578,13 +4578,13 @@ impl RefinementScope {
         close_pi_binders(&self.enclosing, ty)
     }
 
-    /// [`close`](Self::close), in place, for a term a type quotes outside a refinement
-    /// ([`Type::quoted_terms`]).
-    pub(crate) fn close_quoted(&mut self, q: &mut (impl crate::ccl::QuotedTerm + ?Sized)) {
+    /// [`close`](Self::close), in place, for a term a type holds outside a refinement
+    /// ([`Type::held_terms`]).
+    pub(crate) fn close_held(&mut self, q: &mut (impl crate::ccl::HeldTerm + ?Sized)) {
         if self.enclosing.iter().all(Option::is_none) {
             return;
         }
-        PiWalk::new(PiMode::Close(&self.enclosing)).quoted(q, 0);
+        PiWalk::new(PiMode::Close(&self.enclosing)).held(q, 0);
     }
 }
 
@@ -4696,8 +4696,8 @@ mod tests {
     }
 
     /// A substitution whose range names a binder passes under that binder where it acts on
-    /// nothing inside, in both modes: a type quoting a term whose type binds a name the
-    /// substitution renames to, as a chain's type quotes its earlier morphisms.
+    /// nothing inside, in both modes: a type holding a term whose type binds a name the
+    /// substitution renames to, as a chain's type holds its earlier morphisms.
     #[test]
     fn a_rename_passes_under_a_same_named_binder_it_does_not_reach() {
         let int_ty = Type::Base(crate::ccl::BaseType::Int);

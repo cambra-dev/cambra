@@ -188,7 +188,7 @@ pub(super) struct CoalesceCtx {
     /// instantiation variables.
     #[cfg(debug_assertions)]
     in_predicate: usize,
-    /// Predicate-resolution inputs on the current recursion path, including quoted type
+    /// Predicate-resolution inputs on the current recursion path, including held type
     /// slots. Equal predicates alone do not identify a resolution input.
     predicates_in_progress: Vec<crate::ccl::Refinement>,
     /// The right-hand sides [`pin_unreached_values`] skipped as generalized, whose
@@ -579,7 +579,7 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
         // spelling: the stored positional form and the in-flight named form are
         // one occurrence read at two moments.
         (Type::WitnessRef(_), Type::WitnessRef(_)) => true,
-        // A projection agrees with one quoting an equal term, by normal form.
+        // A projection agrees with one holding an equal term, by normal form.
         (Type::WitnessProjection(a), Type::WitnessProjection(b)) => a == b,
         _ => false,
     }
@@ -810,13 +810,13 @@ struct Specialization {
     shareable: bool,
     /// The instantiation of the use that minted this specialization, as it stood before the
     /// pin. A use with this same instantiation, the same variables, is a copy of that use (a
-    /// refinement predicate quotes the term it refines by), so the pins answered its join, and
+    /// refinement predicate holds the term it refines by), so the pins answered its join, and
     /// it shares this clone whether or not the key determines it.
     instantiation: Type,
     /// Whether the use that minted this specialization sits inside a refinement
     /// predicate. Debug builds only, for the assertion in [`specialize_use`].
     #[cfg(debug_assertions)]
-    quoted: bool,
+    held: bool,
     /// Whether the use that minted this specialization is a trait function's call
     /// [`use_instance_function`] made. Debug builds only, for the assertion in
     /// [`specialize_use`].
@@ -3316,9 +3316,9 @@ impl PredicateResolution {
         ) {
             e.walk_type_slots(|ty| {
                 slots.push(ty.clone());
-                ty.walk_quoted_terms(&mut |quoted| {
-                    if seen.insert(Rc::as_ptr(quoted)) {
-                        term(quoted, slots, seen);
+                ty.walk_held_terms(&mut |held| {
+                    if seen.insert(Rc::as_ptr(held)) {
+                        term(held, slots, seen);
                     }
                 });
             });
@@ -3465,7 +3465,7 @@ fn coalesce_type_predicates_go(
         Type::FamilyApp(app) if app.param.generalized => {
             unreachable!("a generalized family is born after inference")
         }
-        // A declared family's arguments are quoted terms, resolved as a projection's is.
+        // A declared family's arguments are held terms, resolved as a projection's is.
         Type::FamilyApp(app) => {
             let memo = ctx.pred_memo.clone();
             for arg in &mut app.args {
@@ -3473,7 +3473,7 @@ fn coalesce_type_predicates_go(
                     coalesce_node(term, level, ctx);
                     true
                 });
-                scope.close_quoted(arg);
+                scope.close_held(arg);
             }
         }
         // The body is inside every binder; a domain stands where the family does.
@@ -3487,7 +3487,7 @@ fn coalesce_type_predicates_go(
             coalesce_type_predicates_go(body, level, ctx, scope);
             binders.iter().for_each(|_| scope.exit());
         }
-        // A projection quotes a term as a predicate does, so its slots resolve the same way
+        // A projection holds a term as a predicate does, so its slots resolve the same way
         // and it leaves closed against the functions entered.
         Type::WitnessProjection(p) => {
             let memo = ctx.pred_memo.clone();
@@ -3506,7 +3506,7 @@ fn coalesce_type_predicates_go(
                 *ty = scope.closed_type(&sole);
                 return;
             }
-            scope.close_quoted(p);
+            scope.close_held(p);
         }
         // A barrier var survives coalescing only in a slot whose
         // resolution failed, as an `Infer` does, and
@@ -3750,7 +3750,7 @@ pub(super) fn specialize_use(
         #[cfg(debug_assertions)]
         assert!(
             (shareable && spec.shareable && spec.key == key)
-                || spec.quoted
+                || spec.held
                 || ctx.in_predicate > 0
                 || (spec.instance_call && instance_call),
             "two uses of `{}` in the tree share the instantiation {instantiation}: \
@@ -4241,7 +4241,7 @@ pub(super) fn specialize_use(
                 shareable,
                 instantiation,
                 #[cfg(debug_assertions)]
-                quoted: ctx.in_predicate > 0,
+                held: ctx.in_predicate > 0,
                 #[cfg(debug_assertions)]
                 instance_call,
                 name: spec_name,
@@ -4269,7 +4269,7 @@ pub(super) fn specialize_use(
         shareable,
         instantiation,
         #[cfg(debug_assertions)]
-        quoted: ctx.in_predicate > 0,
+        held: ctx.in_predicate > 0,
         #[cfg(debug_assertions)]
         instance_call,
         name: spec_name,

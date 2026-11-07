@@ -658,7 +658,7 @@ fn assumptions_chain_through_a_binders_own_refinement() {
 
 /// TODO(refinement-through-a-call): a call in the body leaves the result
 /// unrefined. `bar(t)` types as an `Apply`, which carries no predicate relating
-/// its result to its argument, so the body's refinement quotes the call term
+/// its result to its argument, so the body's refinement holds the call term
 /// itself — `t ▷ bar` — which is outside the encoded fragment and decides
 /// nothing. Inlining `bar` first would make the annotation hold.
 #[test]
@@ -1556,7 +1556,7 @@ t
     )
 }
 
-/// A `^+` in a comprehension element: the element's refinement quotes the generator's own
+/// A `^+` in a comprehension element: the element's refinement holds the generator's own
 /// source lookup, which lambda elimination rewrites with the rest of the body.
 #[test]
 fn refined_add_in_a_comprehension_element() {
@@ -1769,7 +1769,7 @@ fn dependent_function_composition() {
 /// TODO: Allow a comprehension over a collection whose elements read a mutable
 /// variable.
 ///
-/// The consuming element's refinement quotes the producing comprehension whole,
+/// The consuming element's refinement holds the producing comprehension whole,
 /// read and all, so the read's opaque binder sits inside a term a later
 /// refinement names rather than standing between the mutable variable and the
 /// type. Inference rejects it as `MutableInRefinedType`.

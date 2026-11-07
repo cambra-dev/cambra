@@ -1516,7 +1516,7 @@ pub(crate) fn predicate_id_collisions(expr: &Expr) -> Vec<(NodeId, &'static str)
         }
     }
     fn from_expr_ty(e: &Expr, acc: &mut HashMap<usize, HashSet<NodeId>>) {
-        e.walk_quoted_terms(&mut |term| from_term(term, acc));
+        e.walk_held_terms(&mut |term| from_term(term, acc));
         e.walk_children(|c| from_expr_ty(c, acc));
     }
     let mut terms: HashMap<usize, HashSet<NodeId>> = HashMap::new();
@@ -1561,7 +1561,7 @@ pub(crate) fn collect_main_tree_ids(expr: &Expr) -> HashSet<NodeId> {
 /// Uniqueness covers the same domains with different sharing rules; see
 /// `src/ccl/design/provenance.md`, "Walking the ids".
 pub(crate) fn collect_tree_ids(expr: &Expr) -> HashSet<NodeId> {
-    fn from_expr(e: &Expr, acc: &mut HashSet<NodeId>, quoted: &mut HashSet<*const Expr>) {
+    fn from_expr(e: &Expr, acc: &mut HashSet<NodeId>, held: &mut HashSet<*const Expr>) {
         // The node's id and every occurrence it holds
         // (`src/ccl/design/provenance.md`, "Walking the ids with occurrences").
         e.for_each_own_id(|id| {
@@ -1574,17 +1574,17 @@ pub(crate) fn collect_tree_ids(expr: &Expr) -> HashSet<NodeId> {
         // `DanglingParent` against an id the input pane demonstrably holds.
         // `f: (Int => {Int where _ == 9}) = …` is the shape: the predicate rides
         // the `let` binder's annotation and nothing else.
-        // Every term the node quotes (a refinement's predicate, a projection's sum, the
+        // Every term the node holds (a refinement's predicate, a projection's sum, the
         // conditional a realization stages) carries ids the projections must explain. A term
         // shared by `Rc` across slots carries the same ids wherever it is reached, so it is
         // walked once: walked again from every slot, the walk is exponential in how deeply
         // shared predicates nest.
-        e.walk_quoted_terms(&mut |term| {
-            if quoted.insert(Rc::as_ptr(term)) {
-                from_expr(term, acc, quoted);
+        e.walk_held_terms(&mut |term| {
+            if held.insert(Rc::as_ptr(term)) {
+                from_expr(term, acc, held);
             }
         });
-        e.walk_children(|c| from_expr(c, acc, quoted));
+        e.walk_children(|c| from_expr(c, acc, held));
     }
 
     let mut acc = HashSet::new();
@@ -3757,7 +3757,7 @@ fn compile_version(
 }
 
 /// Replace every `unbox(𝑐)` whose argument binds no witness by `𝑐`, in predicates and the
-/// terms projections quote included: a plain collection is the sum over no binders, and
+/// terms projections hold included: a plain collection is the sum over no binders, and
 /// `unbox` of it is the collection (`src/ccl/design/collections.md`, "Typing"). A projection
 /// compares by its term's normal form, which reads `unbox` as the identity, so dropping one
 /// changes no projection's identity.
@@ -3772,10 +3772,9 @@ fn drop_plain_unboxes(expr: &mut Expr) {
 fn drop_plain_unboxes_in(expr: &mut Expr, memo: &crate::ccl::ccl_utils::PredMemo) -> bool {
     let mut dropped = false;
     expr.walk_type_slots_mut(|ty| {
-        dropped |=
-            crate::ccl::ccl_utils::walk_quoted_terms_mut(ty, memo, &(), &mut |term, memo| {
-                drop_plain_unboxes_in(term, memo)
-            });
+        dropped |= crate::ccl::ccl_utils::walk_held_terms_mut(ty, memo, &(), &mut |term, memo| {
+            drop_plain_unboxes_in(term, memo)
+        });
     });
     expr.walk_children_mut(|child| dropped |= drop_plain_unboxes_in(child, memo));
     if let TypedExprNode::Apply { function, argument } = &mut expr.node
