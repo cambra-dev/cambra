@@ -340,9 +340,10 @@ impl MapResultProducer {
             f_index.entry(f_domain.index_at(i)).or_default().push(i);
         }
         withhold_unanswered(&mut input_tile, self.level, f_domain_predicate, f_domain);
-        // Every argument left is settled and held. One the function settles without holding, a
-        // key it states absent, had its row dropped by `withhold_unanswered`, so it is absent
-        // from the result.
+        // Every argument left is settled and held. An argument the function settles without
+        // holding has had its row dropped by `withhold_unanswered`, so it is absent from the
+        // result. `Restrict`'s rejected keys are such arguments, because [`Self::apply`] reads
+        // the function without its deleted keys.
         let Tile::Scalar(held) = input_tile.values_at(self.level) else {
             unreachable!("`withhold_unanswered` read a scalar argument column")
         };
@@ -389,6 +390,10 @@ impl MapResultProducer {
         if let Some(dropped) = dropped {
             self.input.release(dropped);
         }
+        // The function's deleted keys are keys it does not hold: `Restrict` marks the keys its
+        // predicate rejects deleted rather than dropping them, and an argument at one of them
+        // finds nothing. Every path below indexes the function's domain whole, so they go
+        // before it is read.
         let function_guard = match projection {
             Projection::Keys { .. } if self.projection_reaches_function() => {
                 projection.guard(self.function.tiling())
@@ -404,7 +409,8 @@ impl MapResultProducer {
             }
             _ => f_tiling.universal_guard(),
         };
-        let function_tile = self.function.get(function_guard);
+        let mut function_tile = self.function.get(function_guard);
+        function_tile.compact();
 
         // A function whose values are themselves a collection needs special-case handling:
         // the application adds a level, so it rebuilds the tile around it rather than
@@ -2179,7 +2185,8 @@ mod tests {
     }
 
     /// An argument beneath two levels that the function has settled without holding is a key it
-    /// states absent: its row is absent from the result.
+    /// states absent, for example a key a gated leg's `Restrict` rejected: its row is absent from
+    /// the result.
     #[test]
     fn a_grouping_applied_beneath_two_levels_drops_a_row_at_a_settled_absent_key() {
         let uint = || Extent::Base(BaseType::UInt);
