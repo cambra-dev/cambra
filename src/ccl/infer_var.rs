@@ -305,21 +305,31 @@ impl Bound {
                 {
                     // Binders the inversion does NOT transport (the term part,
                     // plus a non-injective rename remainder) must be absent
-                    // from the content (post-discharge context).
+                    // from the content (post-discharge context). The content is
+                    // read as its own side leaves it: `ty_subst` acts first, so a
+                    // binder it discharges is gone (both sides of a dependent
+                    // application discharge the parameter), and a name its terms
+                    // bring in is there.
                     let transported: BTreeSet<_> = if inv.is_id() {
                         Default::default()
                     } else {
                         ren.binders().collect()
                     };
-                    let fv = subst::type_free_vars(&self.ty);
-                    debug_assert!(
-                        self.self_subst
-                            .binders()
-                            .filter(|b| !transported.contains(b))
-                            .all(|b| !fv.contains(b)),
-                        "non-invertible holder side: bound content must not mention \
-                         the untransported binders (post-discharge context)",
-                    );
+                    // Reading the content's names walks every discharge term, and this runs on
+                    // each `rendered_names`, so it is read only when some binder is untransported.
+                    let untransported: Vec<_> = self
+                        .self_subst
+                        .binders()
+                        .filter(|b| !transported.contains(b))
+                        .collect();
+                    if !untransported.is_empty() {
+                        let fv = self.ty_subst.names_after(subst::type_free_vars(&self.ty));
+                        debug_assert!(
+                            untransported.iter().all(|b| !fv.contains(*b)),
+                            "non-invertible holder side: bound content must not mention \
+                             the untransported binders (post-discharge context)",
+                        );
+                    }
                 }
                 // **An elimination's inverse is its read-back.** The content is in the frame
                 // the holder side eliminates into, where a witness the holder's function binds
