@@ -1022,7 +1022,14 @@ fn distinct_data_domains(lows: &[Bound]) -> Option<(Type, Type)> {
         {
             continue;
         }
-        if let Some(prev) = seen.iter().find(|p| **p != d) {
+        // Compaction's rule, so the solver and the merge never answer this differently.
+        let disagree = |p: &Type| {
+            super::compact::data_domains_disagree(
+                &super::compact::compact_type(p).term,
+                &super::compact::compact_type(&d).term,
+            )
+        };
+        if let Some(prev) = seen.iter().find(|p| disagree(p)) {
             return Some((prev.clone(), d));
         }
         if !seen.contains(&d) {
@@ -5652,6 +5659,29 @@ mod tests {
             v.resolved(),
             KindPin::Plain,
             "pinned to a plain collection, and no compute function met this var"
+        );
+    }
+}
+
+#[cfg(test)]
+mod data_domain_tests {
+    use super::*;
+
+    #[test]
+    fn variant_payload_domains_must_disagree() {
+        let dom = |n| {
+            Type::Variant(
+                vec![(FieldKey::Name("a".into()), Type::UIntRange(n))],
+                crate::ccl::ty::Openness::Closed,
+            )
+        };
+        let lows = vec![
+            Bound::conc(Type::data_fun(dom(1), Type::Base(BaseType::Int))),
+            Bound::conc(Type::data_fun(dom(2), Type::Base(BaseType::Int))),
+        ];
+        assert!(
+            distinct_data_domains(&lows).is_some(),
+            "different variant payload domains are distinct data domains"
         );
     }
 }

@@ -3434,6 +3434,15 @@ arms, not an implicit upper bound of the plain collections.
 The list conversion does not preserve which original domain supplied the rows. Its lookup
 is checked; see [Lookup: membership discharge](collections.md#lookup-membership-discharge).
 
+The solver and compaction share one test for conflicting data domains. The solver
+asks it of two collections among a variable's lower bounds (`distinct_data_domains`), and the
+merge asks it of two function slots and of two arguments at an invariant nominal parameter. Two
+domains are one when their represented shapes agree recursively, including variant tags and
+payloads, nominal arguments, function domains and codomains, histories, and families.
+`(0..1, 0..1)` and `(0..1, 0..2)` are two domains. The exhaustive compact-position comparison
+supplies this walk; a position naming an unresolved variable or
+witness cannot yet establish disagreement. Function binder spellings do not distinguish domains.
+
 #### Where the candidates come from
 
 `emit_case` constrains each arm into a shared result variable. Compaction joins the
