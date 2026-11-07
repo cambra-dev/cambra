@@ -8,7 +8,7 @@ use super::*;
 use crate::interpreter::operator_graph::{share, value};
 use crate::{
     interpreter::{
-        Consumer, Position, Scheduler,
+        Consumer, Position, Projection, Scheduler,
         scheduler::{GatedConsumer, WakeupQueue, forwarding_consumer, shared_consumer},
     },
     pretty_graph::VizOptions,
@@ -754,16 +754,32 @@ impl TileProducer for FanOutProducer {
         }
     }
 
+    fn restates(&self) -> Restates {
+        Restates::Every
+    }
+
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection_for(self);
+        let shared_rc = self.shared();
+        // Reopened before the pull, as an operator's gate is (`TileProducer::get`), and so by
+        // a pull that reads nothing.
+        shared_rc.borrow().forwarded.take();
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let cyclic = shared_rc.borrow().reentrancy.is_some();
+        // A sibling that re-enters mid-pull is answered from the cache of the last completed
+        // pull, which has to cover whatever region that sibling asks for: a cyclic fan-out reads
+        // its input whole.
+        let projection_guard = match cyclic {
+            true => self.tiling().universal_guard(),
+            false => projection.guard(self.tiling()),
+        };
         // In cyclic mode, take the inner producer out during the pull so
         // sibling-slot re-entrance can detect re-entrance by finding
         // `producer == None` and serve from the cached tile.  In
         // non-cyclic mode, the producer stays in `shared` and we pull
         // through a regular borrow.
-        let shared_rc = self.shared();
-        // Reopened before the pull, as an operator's gate is (`TileProducer::get`).
-        shared_rc.borrow().forwarded.take();
-        let cyclic = shared_rc.borrow().reentrancy.is_some();
         let mut result = if cyclic {
             let producer_opt = shared_rc.borrow_mut().producer.take();
             if let Some(producer) = producer_opt {
@@ -820,6 +836,7 @@ impl TileProducer for FanOutProducer {
         let guard = shared_rc.borrow().release_guards[self.index()].clone();
         trace!("{} removing {guard:?} from {result:?}", self.name());
         result.remove_guarded(guard);
+        result.restrict_to(&projection, self.tiling());
         result
     }
 
@@ -936,6 +953,8 @@ impl TileOperator for Memo {
                 scheduler,
             ),
             cached_tile: self.tiling().empty_tile(),
+            read: Projection::Nothing,
+            stale: Projection::Nothing,
             upstream_drained: false,
             drain_probed: false,
             gate_probed: false,
@@ -953,6 +972,16 @@ struct MemoProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
     cached_tile: Tile,
+    /// The union of the projections this memo has read its input at.
+    ///
+    /// A notification-free pull answers from the cache only over a region the memo has
+    /// already read: the input's silence says nothing about a region never pulled.
+    read: Projection,
+    /// The part of [`read`](Self::read) whose input has notified since it was read.
+    ///
+    /// One notification stands for news anywhere the memo has read, and a pull at part of that
+    /// region sees only its part: the rest stays here until a pull reads it.
+    stale: Projection,
     /// Set once this producer has released its input **universally**, which it
     /// does as soon as the input hands over a complete tile.
     ///
@@ -982,6 +1011,16 @@ struct MemoProducer {
     wakeups: WakeupQueue,
 }
 
+impl MemoProducer {
+    /// The cache cut to `projection`: it holds whatever was read, which can be more than the
+    /// pull asks for.
+    fn answer(&self, projection: &Projection) -> Tile {
+        let mut tile = self.cached_tile.clone();
+        tile.restrict_to(projection, self.tiling());
+        tile
+    }
+}
+
 impl TileProducer for MemoProducer {
     fn state_info(&self) -> ProducerStateInfo {
         ProducerStateInfo::holding(self.cached_tile.cell_count())
@@ -993,7 +1032,16 @@ impl TileProducer for MemoProducer {
         visit("input", &*self.input);
     }
 
+    fn restates(&self) -> Restates {
+        Restates::Every
+    }
+
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection_for(self);
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let covered = self.read.union(&projection) == self.read;
         // Everything the input will ever produce is already cached, so the pull below can
         // only return what was released — which a conforming input answers empty, merging to
         // nothing. A release build skips it.
@@ -1008,9 +1056,13 @@ impl TileProducer for MemoProducer {
         // which grows with the nesting of the fan-outs over it.
         //
         // `cfg!` rather than `#[cfg]` so both configurations stay compiled.
-        let notified = self.base.notified.take();
+        if self.base.notified.take() {
+            self.stale = self.read.clone();
+        }
+        // News the pull will see: the input notified since this region was read.
+        let notified = self.stale.intersect(&projection) != Projection::Nothing;
         if self.upstream_drained && (!cfg!(debug_assertions) || (self.drain_probed && !notified)) {
-            return self.cached_tile.clone();
+            return self.answer(&projection);
         }
         // The cache is cumulative, so when nothing has notified since the last pull it is
         // already the answer, empty or not, and pulling walks the subtree below to merge
@@ -1022,12 +1074,7 @@ impl TileProducer for MemoProducer {
         // input, which on a first lap is mostly empty. A drained input is left to the rule
         // above rather than gated here, which is what keeps that rule's debug probe: gating
         // a drained input would shield it in every build.
-        if !notified && !self.upstream_drained {
-            debug_assert!(
-                projection_guard.is_universal(),
-                "a memo answers a gated pull from its whole cache, which is the projection \
-                 asked for only while every pull is universal; got {projection_guard:?}"
-            );
+        if !notified && !self.upstream_drained && covered {
             // The gate trusts the notification contract, so a debug build checks it, once
             // per read: an input that changed without notifying answers something new.
             if cfg!(debug_assertions) && !self.gate_probed && self.wakeups.is_empty() {
@@ -1044,9 +1091,11 @@ impl TileProducer for MemoProducer {
                     self.cached_tile,
                 );
             }
-            return self.cached_tile.clone();
+            return self.answer(&projection);
         }
         self.gate_probed = false;
+        self.read = self.read.union(&projection);
+        self.stale = self.stale.minus(&projection);
         let mut input = self.input.get(projection_guard);
         trace!("{} received {input:?}", self.name());
         let upstream_obsolete = input.to_guard();
@@ -1079,7 +1128,7 @@ impl TileProducer for MemoProducer {
             self.name(),
             self.cached_tile
         );
-        if notified {
+        if notified || !covered {
             self.cached_tile.merge(input);
         } else {
             let before = self.cached_tile.clone();
@@ -1088,7 +1137,7 @@ impl TileProducer for MemoProducer {
                 self.wakeups.request(self.consumer.shared().clone());
             }
         }
-        self.cached_tile.clone()
+        self.answer(&projection)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -1122,6 +1171,77 @@ fn holds_the_same(a: &Tile, b: &Tile) -> bool {
             .iter()
             .zip(&theirs)
             .all(|(x, y)| x.subsumes(y) && y.subsumes(x))
+}
+
+#[cfg(test)]
+mod nested_projection_tests {
+    use super::*;
+    use crate::interpreter::tile_operators::test_helpers::{
+        ProjectionSpyOp, assert_conforms_beneath, paths_guard, two_levels_of_ints,
+    };
+    use crate::interpreter::{Predicate, Value};
+
+    fn spy() -> Box<dyn TileOperator> {
+        let (tile, tiling) = two_levels_of_ints();
+        Box::new(ProjectionSpyOp::new(tile, tiling).0)
+    }
+
+    #[test]
+    fn a_memo_answers_a_projection_of_paths() {
+        assert_conforms_beneath(|| Box::new(Memo::new(spy())));
+    }
+
+    fn path(k: u64, j: u64) -> TileGuard {
+        paths_guard(Predicate::qualified(
+            Predicate::point(Value::UInt(k)),
+            Predicate::point(Value::UInt(j)),
+        ))
+    }
+
+    /// A memo pulled at one path reads its input there, answers a second path from a second
+    /// read, and a pull of everything after them is the input's whole answer: what it read at
+    /// the paths merges into the cache with what it reads after.
+    #[test]
+    fn a_memo_reads_each_path_it_is_pulled_at_and_caches_them() {
+        let (tile, tiling) = two_levels_of_ints();
+        let (input, pulled, _) = ProjectionSpyOp::new(tile.clone(), tiling.clone());
+        let mut memo = Memo::new(Box::new(input));
+        let mut producer = memo.subscribe(
+            tiling.universal_guard(),
+            Box::new(|| {}),
+            &mut Scheduler::new(),
+        );
+        for (k, j) in [(0, 1), (1, 0)] {
+            let mut expected = tile.clone();
+            expected.restrict_to(&Projection::of(&path(k, j)).unwrap(), &tiling);
+            assert_eq!(producer.get(path(k, j)), expected);
+        }
+        assert_eq!(pulled.borrow()[..2], [path(0, 1), path(1, 0)]);
+        let cells = |tile: &Tile| {
+            let mut live = tile.clone();
+            live.compact();
+            let paths = live.paths_at(CurryLevel::new(1));
+            let Tile::Scalar(ColumnValue::Ints(values)) = live.values_at(CurryLevel::new(2)) else {
+                panic!("ints beneath two levels: {live:?}")
+            };
+            let mut cells: Vec<(Vec<Value>, i64)> =
+                paths.into_iter().zip(values.iter().copied()).collect();
+            cells.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("positions are ordered"));
+            cells
+        };
+        let whole = producer.get(tiling.universal_guard());
+        assert_eq!(
+            cells(&whole),
+            cells(&tile),
+            "a merge appends the paths it adds"
+        );
+        assert!(whole.is_terminal());
+    }
+
+    #[test]
+    fn a_fan_out_slot_answers_a_projection_of_paths() {
+        assert_conforms_beneath(|| FanOut::new(spy()).slot());
+    }
 }
 
 #[cfg(test)]
@@ -1631,6 +1751,8 @@ mod tests {
             base: ProducerBase::unowned(MemoProducer::alloc_id(), &tiling),
             input: Box::new(upstream),
             cached_tile: tiling.empty_tile(),
+            read: Projection::Nothing,
+            stale: Projection::Nothing,
             upstream_drained: false,
             gate_probed: false,
             drain_probed: false,
@@ -1653,5 +1775,210 @@ mod tests {
             memo.upstream_drained,
             "the complete tile should have been released universally on the first pull"
         );
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use crate::interpreter::tile_operators::Scheduler;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, ProjectionSpyOp, int_entries, ints_by_position, keys_between,
+    };
+    use crate::interpreter::{BaseType, Extent};
+
+    const ROWS: u64 = 8;
+
+    fn ints() -> Tiling {
+        Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        )
+    }
+
+    /// A fan-out over a stream of `0..ROWS`, with two slots subscribed, and the input's logs.
+    fn two_slots() -> (Box<dyn TileProducer>, Box<dyn TileProducer>, GuardLog) {
+        let values: Vec<i64> = (0..ROWS as i64).collect();
+        let (input, pulled, _) = ProjectionSpyOp::new(ints_by_position(&values, true), ints());
+        let fan = FanOut::new(Box::new(input));
+        let mut sched = Scheduler::new();
+        let first = fan
+            .slot()
+            .subscribe(ints().empty_guard(), Box::new(|| {}), &mut sched);
+        let second = fan
+            .slot()
+            .subscribe(ints().empty_guard(), Box::new(|| {}), &mut sched);
+        (first, second, pulled)
+    }
+
+    /// `xs ▷ map(c)` fans a stream into two consumers that each read their own morsels. Each
+    /// slot's answer is its own morsel, and the shared input is pulled at the region of the slot
+    /// that pulls it: a producer states completeness only for the region it returns, so a pull of
+    /// one region withdraws nothing it said of another.
+    #[test]
+    fn slots_read_their_own_morsels_through_one_input() {
+        let (mut first, mut second, pulled) = two_slots();
+
+        let one = first.get(keys_between(0, 3));
+        assert_eq!(int_entries(&one), vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
+
+        let two = second.get(keys_between(4, 7));
+        assert_eq!(int_entries(&two), vec![(4, 4), (5, 5), (6, 6), (7, 7)]);
+
+        let pulled = pulled.borrow();
+        assert_eq!(pulled[0], keys_between(0, 3));
+        assert_eq!(
+            pulled[1],
+            keys_between(4, 7),
+            "the second pull is the second slot's morsel alone"
+        );
+    }
+
+    /// A slot pulled at `Nothing` before any other asks pulls nothing upstream, and the input
+    /// stays untouched until a slot wants a region.
+    #[test]
+    fn a_slot_that_asks_for_nothing_pulls_nothing() {
+        let (mut first, _second, pulled) = two_slots();
+        let tile = first.get(ints().empty_guard());
+        assert!(int_entries(&tile).is_empty());
+        assert!(pulled.borrow().is_empty());
+    }
+
+    /// A slot that asks for everything after another took a morsel gets everything, and the
+    /// morsel's slot is still answered at its own region afterwards.
+    #[test]
+    fn a_later_universal_pull_reads_everything_and_the_first_slot_keeps_its_region() {
+        let (mut first, mut second, pulled) = two_slots();
+        first.get(keys_between(0, 1));
+        let all = second.get(ints().universal_guard());
+        assert_eq!(int_entries(&all).len(), ROWS as usize);
+        assert_eq!(*pulled.borrow().last().unwrap(), ints().universal_guard());
+
+        let again = first.get(keys_between(0, 1));
+        assert_eq!(int_entries(&again), vec![(0, 0), (1, 1)]);
+    }
+
+    /// A `Memo` over a stream, built by hand and pulled by hand.
+    fn memo_over_stream() -> (MemoProducer, GuardLog, GuardLog) {
+        let values: Vec<i64> = (0..ROWS as i64).collect();
+        let (upstream, pulled, released) =
+            ProjectionSpy::new(ints_by_position(&values, true), ints());
+        let memo = MemoProducer {
+            base: ProducerBase::unowned(MemoProducer::alloc_id(), &ints()),
+            input: Box::new(upstream),
+            cached_tile: ints().empty_tile(),
+            read: Projection::Nothing,
+            stale: Projection::Nothing,
+            upstream_drained: false,
+            gate_probed: false,
+            drain_probed: false,
+            consumer: shared_consumer(Box::new(|| {})).0,
+            wakeups: WakeupQueue::default(),
+        };
+        (memo, pulled, released)
+    }
+
+    /// A memo reads its input over the morsel it is asked for and releases only that, so the
+    /// input keeps the rest for the next morsel. The answer is the morsel, not the cache.
+    #[test]
+    fn a_memo_reads_and_releases_one_morsel_at_a_time() {
+        let (mut memo, pulled, released) = memo_over_stream();
+
+        let first = memo.get(keys_between(0, 3));
+        assert_eq!(int_entries(&first), vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
+        assert_eq!(pulled.borrow()[0], keys_between(0, 3));
+        assert_eq!(released.borrow()[0], keys_between(0, 3));
+        memo.release(keys_between(0, 3));
+
+        let second = memo.get(keys_between(4, 7));
+        assert_eq!(int_entries(&second), vec![(4, 4), (5, 5), (6, 6), (7, 7)]);
+        assert_eq!(pulled.borrow()[1], keys_between(4, 7));
+    }
+
+    /// A region the memo has read is answered from the cache with no pull, even once the
+    /// input is silent. A region it has not read pulls the input, and the answer joins the
+    /// cache.
+    #[test]
+    fn a_memo_answers_a_read_region_from_its_cache_and_reads_a_new_one() {
+        let (mut memo, pulled, _) = memo_over_stream();
+        memo.get(keys_between(0, 3));
+        memo.release(keys_between(0, 1));
+
+        let kept = memo.get(keys_between(2, 3));
+        assert_eq!(int_entries(&kept), vec![(2, 2), (3, 3)]);
+        // A debug build probes a silent input once, at the same region.
+        assert!(
+            pulled.borrow()[1..]
+                .iter()
+                .all(|guard| *guard == keys_between(2, 3)),
+            "a read region reaches the input only as a probe: {:?}",
+            pulled.borrow()
+        );
+
+        let wider = memo.get(keys_between(2, 5));
+        assert_eq!(
+            *pulled.borrow().last().unwrap(),
+            keys_between(2, 5),
+            "an unread region reaches the input"
+        );
+        assert_eq!(wider_keys(&wider), vec![2, 3, 4, 5]);
+    }
+
+    /// A pull at `Nothing` answers empty and touches neither the cache nor the input.
+    #[test]
+    fn a_memo_asked_for_nothing_reads_nothing() {
+        let (mut memo, pulled, _) = memo_over_stream();
+        let tile = memo.get(ints().empty_guard());
+        assert!(int_entries(&tile).is_empty());
+        assert!(pulled.borrow().is_empty());
+    }
+
+    fn wider_keys(tile: &Tile) -> Vec<u64> {
+        int_entries(tile).into_iter().map(|(k, _)| k).collect()
+    }
+
+    /// One notification stands for news anywhere the memo has read. A pull at one region
+    /// reads that region only, so the news for the other stays pending until it is pulled.
+    #[test]
+    fn a_pull_at_one_region_leaves_the_news_for_another_region_pending() {
+        use crate::interpreter::tile_operators::Notified;
+        use crate::interpreter::tile_operators::test_helpers::ScriptedProducer;
+
+        let (input, rows) = ScriptedProducer::new(ints_by_position(&[], false), ints());
+        let mut memo = MemoProducer {
+            base: ProducerBase::unowned(MemoProducer::alloc_id(), &ints()),
+            input: Box::new(input),
+            cached_tile: ints().empty_tile(),
+            read: Projection::Nothing,
+            stale: Projection::Nothing,
+            upstream_drained: false,
+            gate_probed: false,
+            drain_probed: false,
+            consumer: shared_consumer(Box::new(|| {})).0,
+            wakeups: WakeupQueue::default(),
+        };
+        memo.base.notified = Notified::clear();
+        memo.get(keys_between(0, 3));
+        memo.get(keys_between(4, 7));
+
+        // The input answers each region with its own rows once they land.
+        let rows_at = |keys: std::ops::RangeInclusive<u64>| {
+            Tile::data_function(
+                ColumnValue::from_uints(keys.clone().collect()),
+                Box::new(Tile::Scalar(ColumnValue::Ints(
+                    keys.map(|key| key as i64).collect(),
+                ))),
+                Predicate::False,
+                bit_set::BitSet::new(),
+            )
+        };
+        *rows.borrow_mut() = rows_at(0..=3);
+        memo.base.notified.mark_news();
+        memo.get(keys_between(0, 3));
+        memo.release(keys_between(0, 3));
+
+        *rows.borrow_mut() = rows_at(4..=7);
+        let later = memo.get(keys_between(4, 7));
+        assert_eq!(int_entries(&later), vec![(4, 4), (5, 5), (6, 6), (7, 7)]);
     }
 }
