@@ -1581,15 +1581,11 @@ fn elim_lambda_impl(
         // bound once the term binder is gone, and it is what planning's pointful
         // group-by recognizer reads the key off.
         //
-        // A closed value that is not a lambda, a filtered collection read under the loop
-        // around it, takes the second path: the value lifts under `const` whatever it is.
-        TypedExprNode::Cast { value, target }
-            if matches!(value.node, TypedExprNode::Lambda { .. }) || !is_free(param, &value) =>
-        {
-            debug_assert!(
-                cast_target_refinement(&target).is_some(),
-                "cast-wrapped lambda must carry a Fun(Refinement(_, _), _) target; got {target:?}"
-            );
+        // The arm takes every cast whose target carries a refinement. A value that is not a
+        // lambda is a collection the cast filters, eta-expanded into the lambda reading it at
+        // each element: a closed one, read under the loop around it, or one read out of
+        // `param`, a loop's source that is the outer element's row or group.
+        TypedExprNode::Cast { value, target } if cast_target_refinement(&target).is_some() => {
             // `param` in the cast's **value** as well as its refinement: an inner
             // comprehension over the outer binder, `[s.amount for s in g if …]`.
             // The value varies with `param`, so there is no `const` to lift. Move

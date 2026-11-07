@@ -4074,14 +4074,19 @@ states it: exponential beta rewrites `⟨𝑔, curry(ℎ)⟩ ≫ apply` to `⟨i
 zip's pairs with `ℎ`'s domain refinements (`simplify::stating_domain_of`), since every pair it
 gives, `(𝑥, 𝑔(𝑥))`, is one `ℎ` was applied to.
 
-Eta expansion opens that collection's codomain at its fresh element binder and binds the name
+A filtered cast can wrap a collection `𝑐` instead of a lambda: `cast(𝑐, {𝐷 | 𝑝} ⤇ 𝑉)`. Lambda
+elimination eta-expands `𝑐` to `λ 𝑦 → 𝑦 ▷ 𝑐` (`lambda_elim.rs`, `eta_expanded`), which makes the
+cast `λ 𝑦 : {𝐷 | 𝑝} → 𝑦 ▷ 𝑐`, and the nested-lambda rule lifts `𝑝` onto the pair as above. A
+guarded loop over the outer loop's element produces this shape with a `𝑐` that reads `𝑎`: the
+element is a boxed row or a group, and `𝑐` is that element.
+
+Eta expansion opens `𝑐`'s codomain at its fresh element binder and binds the name
 in the lambda's type. Lifted filters read pair components through `pair_projection`. If the
 selected component reads an earlier component, the projection's function type binds the pair.
 
 Only a data function's binder carries filters. A compute function's parameter refinement is the
 type each argument already has, as `λ 𝑛 : Int@10 → …` over the values of `[10]`, so it stays on
 the second component and nothing lifts.
-
 
 ### Iterating a dependent tuple
 
