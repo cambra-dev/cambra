@@ -211,6 +211,16 @@ fn through_strength(expr: &Expr, ctx: &mut PlanningCtx) -> Result<Option<Expr>, 
                 Type::data_fun(inner_domain.clone(), inner_domain.clone()),
             )
         }
+        // **A membership's keys are its collection's image**, as an iteration site's are
+        // (`iterate::membership_keys`): a body that never applies the collection still ranges
+        // over the keys it holds. Only a collection the row does not read is one set of keys
+        // every row shares; one that reads it is a dependent tuple's, which `keys_family` reads.
+        None if let [membership] = inner_domain.refinements()
+            && let Some(collection) = membership.membership_collection()
+            && ccl_utils::free_names(collection).is_empty() =>
+        {
+            iterate::membership_keys(collection, &inner_domain, ctx)?
+        }
         None if inner_domain
             .refinements()
             .iter()
@@ -218,8 +228,8 @@ fn through_strength(expr: &Expr, ctx: &mut PlanningCtx) -> Result<Option<Expr>, 
         {
             return Err(format!(
                 "a correlated inner comprehension over a collection its body never applies is \
-                 not supported yet: its domain {inner_domain} is a membership refinement over \
-                 the whole key type, which nothing enumerates"
+                 not supported yet: its domain {inner_domain} carries a membership whose \
+                 collection reads the enclosing row, or refinements besides the membership"
             ));
         }
         // A generalized parameter is a domain that differs per row; `iterate` would enumerate its
