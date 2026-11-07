@@ -549,6 +549,28 @@ fn a_collection_valued_field_of_differing_lengths_is_refused() {
     );
 }
 
+/// A join of two collections whose domains differ in one component of their tuple keys, `(0..1,
+/// 0..1)` and `(0..1, 0..2)`, has no common domain, directly and through a generic function. It
+/// is refused with a diagnostic where the domain comparison read the keys as one shape and
+/// post-inference panicked.
+#[rstest]
+#[case::a_conditional(indoc! {r"
+    c = 1 > 0
+    xs = [i for i in [1] for j in [1]] if c else [i for i in [1] for j in [1, 2]]
+    7
+"})]
+#[case::a_generic_function(indoc! {r"
+    def pick(a, b, c):
+        a if c else b
+
+    c = 1 > 0
+    xs = pick([i for i in [1] for j in [1]], [i for i in [1] for j in [1, 2]], c)
+    7
+"})]
+fn collections_whose_tuple_keys_differ_in_a_component_are_refused(#[case] code: &str) {
+    check_compile_error(code, "no common answer");
+}
+
 // ---------------------------------------------------------------------------
 // Crossed with the commit store
 // ---------------------------------------------------------------------------
