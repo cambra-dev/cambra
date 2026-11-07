@@ -38,7 +38,7 @@ Concretely:
   through it at `get` time.
 - Side effects (I/O, sinks, notifications) live at the boundary —
   `compile_program` wires a `SinkConsumer` to the final operator, and
-  `Scheduler::check_for_notifications` drives them.  Operators
+  `SourceRegistry::notify_changes` drives them.  Operators
   themselves only manipulate tiles.
 
 If you find yourself reaching for a back-channel to avoid a tile

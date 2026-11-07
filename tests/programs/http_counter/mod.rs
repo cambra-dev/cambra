@@ -20,11 +20,13 @@ fn http_counter() {
     let mut ctx = compile_sink(&source);
 
     let got = exchange(&mut ctx, move || {
+        assert_eq!(http_get(port, "/get"), "(none)");
         // Two overwrites, then read: the live mutable variable must reflect the *latest*
         // committed value (`bob`) — not the init `(none)`, nor the first write
         // `alice`. Writes precede the read, so it isn't racing cross-endpoint
         // commit visibility.
         http_post(port, "/set", "alice");
+        assert_eq!(http_get(port, "/get"), "alice");
         http_post(port, "/set", "bob");
         http_get(port, "/get")
     });

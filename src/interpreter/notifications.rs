@@ -107,21 +107,21 @@ struct Gated {
 }
 
 impl Consumer for Gated {
-    fn notify(&mut self, arrived: &Projection) {
+    fn invalidate(&mut self, arrived: &Projection) {
         crate::interpreter::dispatcher::debug_assert_outside_a_run();
         debug_assert!(
             *arrived != Projection::Nothing,
             "no producer notifies of an empty region"
         );
         if self.admit.admits(arrived) {
-            self.consumer.notify(arrived);
+            self.consumer.invalidate(arrived);
         }
     }
 
     /// A push passes the gate whatever it says, and leaves it as it is: every pushed region is a
     /// work package, which no pull replaces.
-    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
-        self.consumer.push(region, landing);
+    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        self.consumer.notify(region, landing);
     }
 
     fn route(&mut self, routes: &mut Routes) {
@@ -146,8 +146,8 @@ impl GatedConsumer {
     }
 
     /// Notify the operator's consumer now, through the gate.
-    pub fn notify(&self, arrived: &Projection) {
-        self.shared.borrow_mut().notify(arrived);
+    pub fn invalidate(&self, arrived: &Projection) {
+        self.shared.borrow_mut().invalidate(arrived);
     }
 }
 
@@ -212,18 +212,18 @@ pub fn widening(consumer: Box<dyn Consumer>) -> Box<dyn Consumer> {
 struct Widening(Box<dyn Consumer>);
 
 impl Consumer for Widening {
-    fn notify(&mut self, _arrived: &Projection) {
-        self.0.notify(&Projection::Everything);
+    fn invalidate(&mut self, _arrived: &Projection) {
+        self.0.invalidate(&Projection::Everything);
     }
 
     /// A change widens to every key. A decided region passes as every key where its source is
     /// wholly decided, and not at all otherwise: each output key depends on every input key.
-    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
         match region {
-            Projection::Everything => self.0.push(region, landing),
-            _ if landing.is_wholly_decided() => self.0.push(&Projection::Everything, landing),
+            Projection::Everything => self.0.notify(region, landing),
+            _ if landing.is_wholly_decided() => self.0.notify(&Projection::Everything, landing),
             _ if landing.is_decided() => {}
-            _ => landing.widened(|landing| self.0.push(&Projection::Everything, landing)),
+            _ => landing.widened(|landing| self.0.notify(&Projection::Everything, landing)),
         }
     }
 
@@ -249,15 +249,15 @@ pub fn widening_restating_decided(
 struct WideningRestatingDecided(fn(&Projection) -> Projection, Box<dyn Consumer>);
 
 impl Consumer for WideningRestatingDecided {
-    fn notify(&mut self, _arrived: &Projection) {
-        self.1.notify(&Projection::Everything);
+    fn invalidate(&mut self, _arrived: &Projection) {
+        self.1.invalidate(&Projection::Everything);
     }
 
-    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
         match region {
-            Projection::Everything => self.1.push(region, landing),
-            _ if landing.is_decided() => self.1.push(&(self.0)(region), landing),
-            _ => landing.widened(|landing| self.1.push(&Projection::Everything, landing)),
+            Projection::Everything => self.1.notify(region, landing),
+            _ if landing.is_decided() => self.1.notify(&(self.0)(region), landing),
+            _ => landing.widened(|landing| self.1.notify(&Projection::Everything, landing)),
         }
     }
 
@@ -280,12 +280,12 @@ pub fn restating_lookup(
 struct RestatingLookup(Restating);
 
 impl Consumer for RestatingLookup {
-    fn notify(&mut self, arrived: &Projection) {
-        self.0.notify(arrived);
+    fn invalidate(&mut self, arrived: &Projection) {
+        self.0.invalidate(arrived);
     }
 
-    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
-        self.0.push(region, landing);
+    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        self.0.notify(region, landing);
     }
 
     fn route(&mut self, routes: &mut Routes) {
@@ -306,12 +306,12 @@ pub fn restating(
 struct Restating(Box<dyn Fn(&Projection) -> Projection>, Box<dyn Consumer>);
 
 impl Consumer for Restating {
-    fn notify(&mut self, arrived: &Projection) {
-        self.1.notify(&(self.0)(arrived));
+    fn invalidate(&mut self, arrived: &Projection) {
+        self.1.invalidate(&(self.0)(arrived));
     }
 
-    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
-        self.1.push(&(self.0)(region), landing);
+    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        self.1.notify(&(self.0)(region), landing);
     }
 
     /// The path keeps the keys, under another spelling.
@@ -330,12 +330,12 @@ pub fn tagging(tag: FieldKey, consumer: Box<dyn Consumer>) -> Box<dyn Consumer> 
 struct Tagging(FieldKey, Box<dyn Consumer>);
 
 impl Consumer for Tagging {
-    fn notify(&mut self, arrived: &Projection) {
-        self.1.notify(&arrived.tagged(&self.0));
+    fn invalidate(&mut self, arrived: &Projection) {
+        self.1.invalidate(&arrived.tagged(&self.0));
     }
 
-    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
-        self.1.push(&region.tagged(&self.0), landing);
+    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        self.1.notify(&region.tagged(&self.0), landing);
     }
 
     /// The arm's keys under its tag are the union's keys, so the path keeps them.
@@ -355,9 +355,9 @@ struct Forwarding {
 impl Consumer for Forwarding {
     /// A push is passed on at once, past the gate. A push climbs from one breaker to the next, so
     /// one that re-enters a consumer it is passing through has met a cycle, which fails the run.
-    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
         match self.gated.shared.try_borrow_mut() {
-            Ok(mut consumer) => consumer.push(region, landing),
+            Ok(mut consumer) => consumer.notify(region, landing),
             Err(_) => landing.reentered(),
         }
     }
@@ -369,7 +369,7 @@ impl Consumer for Forwarding {
         }
     }
 
-    fn notify(&mut self, arrived: &Projection) {
+    fn invalidate(&mut self, arrived: &Projection) {
         let GatedConsumer { shared, admission } = &self.gated;
         // A notification that re-enters a consumer already being notified is deferred to
         // the next drain of the wakeup queue. A recurrence's notification graph is cyclic,
@@ -388,7 +388,7 @@ impl Consumer for Forwarding {
         // again on every poll after. One naming a key that has not passed is deferred, and
         // delivered as `Everything`, since the wakeup queue holds handles and not regions.
         match shared.try_borrow_mut() {
-            Ok(mut consumer) => consumer.notify(arrived),
+            Ok(mut consumer) => consumer.invalidate(arrived),
             Err(_) if admission.covers(arrived) => {}
             Err(_) => self.wakeups.request(shared.clone()),
         }
@@ -425,30 +425,32 @@ impl OneLevelIn {
 }
 
 impl Consumer for OneLevelIn {
-    fn notify(&mut self, arrived: &Projection) {
+    fn invalidate(&mut self, arrived: &Projection) {
         let restated = self.restated(arrived).unwrap_or(Projection::Everything);
-        self.consumer.notify(&restated);
+        self.consumer.invalidate(&restated);
     }
 
     /// A decided region of the standing levels passes as it is. One that names keys at or beneath
     /// level `at` passes as every key where its source is wholly decided, and not at all
     /// otherwise: which output keys an input row stands beneath depends on its values, which no
     /// region carries.
-    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
         if landing.is_decided() {
             match region {
                 Projection::Keys { level, .. } if *level >= self.at => {
                     if landing.is_wholly_decided() {
-                        self.consumer.push(&Projection::Everything, landing);
+                        self.consumer.notify(&Projection::Everything, landing);
                     }
                 }
-                standing => self.consumer.push(standing, landing),
+                standing => self.consumer.notify(standing, landing),
             }
             return;
         }
         match self.restated(region) {
-            Some(restated) => self.consumer.push(&restated, landing),
-            None => landing.widened(|landing| self.consumer.push(&Projection::Everything, landing)),
+            Some(restated) => self.consumer.notify(&restated, landing),
+            None => {
+                landing.widened(|landing| self.consumer.notify(&Projection::Everything, landing))
+            }
         }
     }
 
@@ -467,7 +469,7 @@ pub struct WakeupQueue(Rc<RefCell<Vec<SharedConsumer>>>);
 
 impl WakeupQueue {
     /// Request that `consumer` be notified at the next
-    /// [`Scheduler::check_for_notifications`] — i.e. once the current `get`
+    /// [`SourceRegistry::notify_changes`] — i.e. once the current `get`
     /// stack has fully unwound.
     ///
     /// Inside a compiled program's dispatched run a request is dropped: nothing delivers it there,
@@ -486,12 +488,12 @@ impl WakeupQueue {
     }
 
     /// Notify every queued consumer of `Everything`, outside the cascade that queued it, and say
-    /// whether one was queued: [`Scheduler::deliver`] does so. A request made during the drain
+    /// whether one was queued: [`SourceRegistry::deliver`] does so. A request made during the drain
     /// waits for the next one ([`take`](Self::take)).
     fn deliver(&self) -> bool {
         let mut delivered = false;
         for consumer in self.take() {
-            consumer.borrow_mut().notify(&Projection::Everything);
+            consumer.borrow_mut().invalidate(&Projection::Everything);
             delivered = true;
         }
         delivered
@@ -514,11 +516,9 @@ impl WakeupQueue {
 /// Poll registered source handles and deliver source notifications and deferred wakeups.
 /// See `src/interpreter/design-operators.md`, "The notification contract".
 #[derive(Default)]
-pub struct Scheduler {
+pub struct SourceRegistry {
     source_handles: HashMap<String, SourceHandle>,
     wakeups: WakeupQueue,
-    /// Sinks' pulls, run after the wakes that queued them in the same call.
-    sink_pulls: WakeupQueue,
 }
 
 type SourceHandle = (
@@ -526,14 +526,14 @@ type SourceHandle = (
     Vec<Weak<RefCell<dyn Consumer>>>,
 );
 
-impl Scheduler {
+impl SourceRegistry {
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Every registered source, by name.
     ///
-    /// The scheduler already holds these to poll them; a reader of a source's
+    /// The registry holds these for polling; a reader of a source's
     /// retained window needs the same handles and has nowhere else to get them.
     pub fn sources(
         &self,
@@ -575,7 +575,7 @@ other's subscribers",
     /// Called when a version stops serving the endpoint behind it
     /// ([`SourceSinkRegistry::retire_routes_absent_from`](crate::ccl::context::SourceSinkRegistry)).
     /// A source handle outlives the version that opened it, and nothing else ever
-    /// removes one, so without this the scheduler polls a retired route's source
+    /// removes one, so without this the registry polls a retired route's source
     /// for the life of the process. It is also what lets the address be served
     /// again: a re-opened route mints a fresh source under the same id, which
     /// `add_source_handle` refuses to register alongside the stale one.
@@ -585,24 +585,14 @@ other's subscribers",
 
     /// A handle to the deferred-wakeup queue, for producers that must request
     /// their own re-pull (see [`WakeupQueue`]). Obtained at `subscribe` time and
-    /// stored, since `get` has no access to the scheduler.
+    /// stored, since `get` has no access to the registry.
     pub fn wakeup_queue(&self) -> WakeupQueue {
         self.wakeups.clone()
     }
 
-    /// The queue a sink schedules its pull on. A pull queued while [`deliver`](Self::deliver)
-    /// delivers its wakes runs in the same call, after them.
-    pub fn sink_pull_queue(&self) -> WakeupQueue {
-        self.sink_pulls.clone()
-    }
-
     /// Pull what each source has received into its buffer, and return the
-    /// consumers to wake, without waking them.
-    ///
-    /// No consumer is notified, so no `get` runs and nothing is released. A
-    /// source's retained window read between this and [`deliver`](Self::deliver)
-    /// holds this pass's arrivals. After `deliver`, a sink has pulled them and a
-    /// `Memo` may have released them.
+    /// consumers whose caches need invalidating, without invalidating them.
+    /// Neither this operation nor [`deliver`](Self::deliver) reads a producer or releases data.
     pub fn poll_sources(&mut self) -> Delivery {
         let mut woken = Vec::new();
         for (source, consumers) in self.source_handles.values_mut() {
@@ -616,40 +606,33 @@ other's subscribers",
         Delivery(woken)
     }
 
-    /// Notify the consumers a [`poll_sources`](Self::poll_sources) found data
-    /// for, then the deferred wakeups, then run the sink pulls they queued, and say
-    /// whether anything was delivered. A sink pulls here, once per call.
+    /// Invalidate the caches named by a source poll and drain deferred invalidations.
+    /// Returns whether anything was delivered. No sink executes here.
     pub fn deliver(&mut self, mut delivery: Delivery) -> bool {
         let mut delivered = false;
         for consumer in std::mem::take(&mut delivery.0) {
-            consumer.borrow_mut().notify(&Projection::Everything);
+            consumer.borrow_mut().invalidate(&Projection::Everything);
             delivered = true;
         }
         // Take the queue after source delivery, outside its notification cascades.
         delivered |= self.wakeups.deliver();
-        // Then pull every sink the wakes above reached, once each, so a change reaches a
-        // sink in the call that delivers it.
-        for pull in self.sink_pulls.take() {
-            pull.borrow_mut().notify(&Projection::Everything);
-            delivered = true;
-        }
         delivered
     }
 
     /// [`poll_sources`](Self::poll_sources) then [`deliver`](Self::deliver), for
     /// a caller with nothing to do between them. Says whether anything was
     /// delivered.
-    pub fn check_for_notifications(&mut self) -> bool {
+    pub fn notify_changes(&mut self) -> bool {
         let delivery = self.poll_sources();
         self.deliver(delivery)
     }
 }
 
-/// Pending source notifications returned by [`Scheduler::poll_sources`].
+/// Pending source notifications returned by [`SourceRegistry::poll_sources`].
 /// Holds consumers strongly until delivery, even if their registrations are dropped meanwhile.
-/// [`Scheduler::deliver`] consumes it. Dropping a nonempty delivery leaves arrivals unannounced
+/// [`SourceRegistry::deliver`] consumes it. Dropping a nonempty delivery leaves arrivals unannounced
 /// and triggers a debug assertion unless the thread is unwinding.
-#[must_use = "a polled delivery must be passed to `Scheduler::deliver`"]
+#[must_use = "a polled delivery must be passed to `SourceRegistry::deliver`"]
 pub struct Delivery(Vec<SharedConsumer>);
 
 impl Drop for Delivery {
@@ -658,7 +641,7 @@ impl Drop for Delivery {
         if !std::thread::panicking() {
             debug_assert!(
                 self.0.is_empty(),
-                "a Delivery of {} consumer(s) was dropped without `Scheduler::deliver`",
+                "a Delivery of {} consumer(s) was dropped without `SourceRegistry::deliver`",
                 self.0.len(),
             );
         }
@@ -669,12 +652,12 @@ impl Drop for Delivery {
 /// Returns the last tile. Without delivery, a [`Notified`]-gated producer answers from its
 /// cache instead of reading its input again.
 /// Stops early when `done` succeeds or, after the first lap, no notification was delivered,
-/// the result is unchanged and both wakeup and sink-pull queues are empty.
+/// the result is unchanged and the wakeup queue is empty.
 /// With zero laps, return an empty tile.
 /// See `src/interpreter/design-operators.md`, "The notification contract".
 #[cfg(any(test, feature = "test-helpers"))]
 pub fn pull_laps(
-    scheduler: &mut Scheduler,
+    scheduler: &mut SourceRegistry,
     producer: &mut dyn crate::interpreter::tile_operators::TileProducer,
     laps: usize,
     done: impl Fn(&crate::interpreter::Tile) -> bool,
@@ -683,7 +666,7 @@ pub fn pull_laps(
     let mut tile = producer.tiling().empty_tile();
     for lap in 0..laps {
         let pulls_before = cfg!(debug_assertions).then(|| pull_counts(&*producer));
-        let delivered = scheduler.check_for_notifications();
+        let delivered = scheduler.notify_changes();
         let pulled = producer.get(guard.clone());
         if done(&pulled) {
             return pulled;
@@ -692,12 +675,7 @@ pub fn pull_laps(
         // wakeup, so every operator saw what it saw before and nothing moves until an input
         // changes: the laps left would only repeat this one. A wakeup this pull queued is
         // delivered by the next lap's check, so that lap is not a repeat.
-        if lap > 0
-            && !delivered
-            && pulled == tile
-            && scheduler.wakeups.is_empty()
-            && scheduler.sink_pulls.is_empty()
-        {
+        if lap > 0 && !delivered && pulled == tile && scheduler.wakeups.is_empty() {
             let ignored = pulls_before
                 .map(|before| ignored_inputs(&*producer, &before))
                 .unwrap_or_default();
@@ -794,17 +772,17 @@ mod tests {
     fn a_closed_gate_passes_only_keys_it_has_not_passed_since_the_last_pull() {
         let (log, regions) = RegionLog::new();
         let (gated, gate) = shared_consumer(Box::new(log));
-        gated.notify(&keys(0, 3));
-        gated.notify(&keys(1, 2));
-        gated.notify(&keys(10, 12));
-        gated.notify(&keys(11, 12));
+        gated.invalidate(&keys(0, 3));
+        gated.invalidate(&keys(1, 2));
+        gated.invalidate(&keys(10, 12));
+        gated.invalidate(&keys(11, 12));
         assert_eq!(*regions.borrow_mut(), [keys(0, 3), keys(10, 12)]);
         assert!(gate.0.take());
         // The pull starts the region passed afresh: keys that passed only before it pass again.
-        gated.notify(&keys(10, 12));
-        gated.notify(&keys(1, 2));
+        gated.invalidate(&keys(10, 12));
+        gated.invalidate(&keys(1, 2));
         // A region naming some keys that passed and some that did not passes whole.
-        gated.notify(&keys(2, 5));
+        gated.invalidate(&keys(2, 5));
         assert_eq!(
             *regions.borrow_mut(),
             [
@@ -823,9 +801,9 @@ mod tests {
         let (log, regions) = RegionLog::new();
         let (gated, gate) = shared_consumer(Box::new(log));
         let wakeups = WakeupQueue::default();
-        forwarding_consumer(&gated, &wakeups).notify(&keys(2, 4));
+        forwarding_consumer(&gated, &wakeups).invalidate(&keys(2, 4));
         assert!(gate.0.take());
-        forwarding_consumer_keeping_keys(&gated, &wakeups).notify(&keys(2, 4));
+        forwarding_consumer_keeping_keys(&gated, &wakeups).invalidate(&keys(2, 4));
         assert_eq!(*regions.borrow_mut(), [Projection::Everything, keys(2, 4)]);
     }
 
@@ -835,8 +813,8 @@ mod tests {
         let count = Rc::new(RefCell::new(0));
         let count_c = count.clone();
         let mut consumer: Box<dyn Consumer> = Box::new(move || *count_c.borrow_mut() += 1);
-        consumer.notify(&keys(2, 4));
-        consumer.notify(&Projection::Everything);
+        consumer.invalidate(&keys(2, 4));
+        consumer.invalidate(&Projection::Everything);
         assert_eq!(*count.borrow_mut(), 2);
     }
 
@@ -845,8 +823,8 @@ mod tests {
     fn widening_sends_everything_for_any_region() {
         let (log, regions) = RegionLog::new();
         let mut consumer = widening(Box::new(log));
-        consumer.notify(&keys(2, 4));
-        consumer.notify(&Projection::Everything);
+        consumer.invalidate(&keys(2, 4));
+        consumer.invalidate(&Projection::Everything);
         assert_eq!(
             *regions.borrow_mut(),
             [Projection::Everything, Projection::Everything]
@@ -862,7 +840,7 @@ mod tests {
         let mut input = forwarding_consumer_keeping_keys(&gated, &WakeupQueue::default());
         let sent = [keys(2, 4), Projection::Everything, keys(6, 7)];
         for region in &sent {
-            input.notify(region);
+            input.invalidate(region);
             assert!(gate.0.take());
         }
         assert_eq!(*regions.borrow_mut(), sent);
@@ -909,7 +887,7 @@ mod tests {
             input: Box::new(input),
         };
         let before = pull_counts(&consumer);
-        woken.notify(&Projection::Everything);
+        woken.invalidate(&Projection::Everything);
         assert!(
             ignored_inputs(&consumer, &before).is_empty(),
             "the consumer has not been pulled since"
@@ -949,15 +927,15 @@ mod tests {
             let rest = fb.borrow_mut().take();
             if let Some(mut arm_b) = rest {
                 d.set(d.get() + 1);
-                arm_b.notify(&Projection::Everything);
+                arm_b.invalidate(&Projection::Everything);
             }
         });
         let shared = GatedConsumer::new(downstream, gate);
-        let mut scheduler = Scheduler::new();
+        let mut scheduler = SourceRegistry::new();
         let mut arm_a = forwarding_consumer(&shared, &scheduler.wakeup_queue());
         *feedback.borrow_mut() = Some(forwarding_consumer(&shared, &scheduler.wakeup_queue()));
-        arm_a.notify(&Projection::Everything);
-        scheduler.check_for_notifications();
+        arm_a.invalidate(&Projection::Everything);
+        scheduler.notify_changes();
         assert_eq!(
             seen.get(),
             data.get(),
@@ -973,11 +951,11 @@ mod tests {
         let notified = Rc::new(Cell::new(0u32));
         let n = notified.clone();
         let (shared, gate) = shared_consumer(Box::new(move || n.set(n.get() + 1)));
-        let scheduler = Scheduler::new();
+        let scheduler = SourceRegistry::new();
         let mut arm_a = forwarding_consumer(&shared, &scheduler.wakeup_queue());
         let mut arm_b = forwarding_consumer(&shared, &scheduler.wakeup_queue());
-        arm_a.notify(&Projection::Everything);
-        arm_b.notify(&Projection::Everything);
+        arm_a.invalidate(&Projection::Everything);
+        arm_b.invalidate(&Projection::Everything);
         assert_eq!(
             notified.get(),
             1,
@@ -985,7 +963,7 @@ mod tests {
         );
         // The operator's pull, as `TileProducer::get` makes it.
         gate.0.take();
-        arm_b.notify(&Projection::Everything);
+        arm_b.invalidate(&Projection::Everything);
         assert_eq!(
             notified.get(),
             2,
@@ -1007,20 +985,20 @@ mod tests {
             // The cycle: arm B's notification re-enters the operator this one is inside.
             let rest = fb.borrow_mut().take();
             if let Some(mut arm_b) = rest {
-                arm_b.notify(&Projection::Everything);
+                arm_b.invalidate(&Projection::Everything);
             }
         });
         // Nothing pulls the operator here, so its gate is never cleared.
         let (shared, _gate) = shared_consumer(downstream);
-        let mut scheduler = Scheduler::new();
+        let mut scheduler = SourceRegistry::new();
         let mut arm_a = forwarding_consumer(&shared, &scheduler.wakeup_queue());
         *feedback.borrow_mut() = Some(forwarding_consumer(&shared, &scheduler.wakeup_queue()));
-        arm_a.notify(&Projection::Everything);
+        arm_a.invalidate(&Projection::Everything);
         assert!(
             scheduler.wakeups.is_empty(),
             "the re-entrant notification was deferred"
         );
-        scheduler.check_for_notifications();
+        scheduler.notify_changes();
         assert_eq!(notified.get(), 1);
     }
 
@@ -1036,13 +1014,13 @@ mod tests {
             feedback: Rc<RefCell<Option<Box<dyn Consumer>>>>,
         }
         impl Consumer for Log {
-            fn notify(&mut self, arrived: &Projection) {
+            fn invalidate(&mut self, arrived: &Projection) {
                 self.arrivals.borrow_mut().push(arrived.clone());
                 // The cycle: arm B's notification, of other keys, re-enters the operator this
                 // one is inside.
                 let rest = self.feedback.borrow_mut().take();
                 if let Some(mut arm_b) = rest {
-                    arm_b.notify(&keys(2, 3));
+                    arm_b.invalidate(&keys(2, 3));
                 }
             }
         }
@@ -1052,20 +1030,20 @@ mod tests {
         });
         // Nothing pulls the operator here, so its gate is never cleared.
         let (shared, _gate) = shared_consumer(downstream);
-        let mut scheduler = Scheduler::new();
+        let mut scheduler = SourceRegistry::new();
         let mut arm_a = forwarding_consumer_keeping_keys(&shared, &scheduler.wakeup_queue());
         *feedback.borrow_mut() = Some(forwarding_consumer_keeping_keys(
             &shared,
             &scheduler.wakeup_queue(),
         ));
-        arm_a.notify(&keys(0, 1));
+        arm_a.invalidate(&keys(0, 1));
         assert!(
             !scheduler.wakeups.is_empty(),
             "the re-entrant notification of a new key was dropped"
         );
-        scheduler.check_for_notifications();
+        scheduler.notify_changes();
         assert_eq!(*arrivals.borrow(), vec![keys(0, 1), Projection::Everything]);
-        arm_a.notify(&keys(2, 3));
+        arm_a.invalidate(&keys(2, 3));
         assert_eq!(
             arrivals.borrow().len(),
             2,
@@ -1109,7 +1087,7 @@ mod tests {
             }
             fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
         }
-        let mut scheduler = Scheduler::new();
+        let mut scheduler = SourceRegistry::new();
         let mut producer = WakesOnSecondPull {
             base: ProducerBase::unowned(0, &Tiling::Scalar(Extent::Base(BaseType::Int))),
             pulls: 0,
@@ -1123,7 +1101,7 @@ mod tests {
     }
 
     /// A source with new data, and a consumer that counts its notifications.
-    fn polled_source() -> (Scheduler, Rc<RefCell<u32>>, SharedConsumer) {
+    fn polled_source() -> (SourceRegistry, Rc<RefCell<u32>>, SharedConsumer) {
         use crate::{
             ccl::Type,
             interpreter::{BaseType, Extent, TestDataSource},
@@ -1137,7 +1115,7 @@ mod tests {
         let count = Rc::new(RefCell::new(0u32));
         let count_c = count.clone();
         let consumer: SharedConsumer = Rc::new(RefCell::new(move || *count_c.borrow_mut() += 1));
-        let mut scheduler = Scheduler::new();
+        let mut scheduler = SourceRegistry::new();
         scheduler.add_source_handle(Rc::new(RefCell::new(source)), Rc::downgrade(&consumer));
         (scheduler, count, consumer)
     }
@@ -1156,7 +1134,7 @@ mod tests {
 
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "dropped without `Scheduler::deliver`")]
+    #[should_panic(expected = "dropped without `SourceRegistry::deliver`")]
     fn a_delivery_dropped_undelivered_is_refused() {
         let (mut scheduler, _count, _consumer) = polled_source();
         let delivery = scheduler.poll_sources();
@@ -1164,12 +1142,12 @@ mod tests {
     }
 
     /// A requested wakeup is not delivered synchronously — only by the next
-    /// `check_for_notifications` — and it is delivered exactly once (the queue is
+    /// `notify_changes` — and it is delivered exactly once (the queue is
     /// drained). This is the between-pulls delivery that lets a self-advancing
     /// producer request a re-pull without notifying from inside `get`.
     #[test]
     fn wakeup_is_deferred_and_delivered_once() {
-        let mut scheduler = Scheduler::new();
+        let mut scheduler = SourceRegistry::new();
         let count = Rc::new(RefCell::new(0u32));
         let count_c = count.clone();
         let consumer: Rc<RefCell<dyn Consumer>> =
@@ -1179,21 +1157,21 @@ mod tests {
         // Deferred: nothing fires until the scheduler is polled.
         assert_eq!(*count.borrow_mut(), 0);
 
-        scheduler.check_for_notifications();
+        scheduler.notify_changes();
         assert_eq!(*count.borrow_mut(), 1);
 
         // Drained: a second poll with no new request delivers nothing.
-        scheduler.check_for_notifications();
+        scheduler.notify_changes();
         assert_eq!(*count.borrow_mut(), 1);
     }
 
     /// A wakeup requested *during* delivery lands in the next drain, not the
     /// current one — one poll delivers one round, so the driver keeps control of
     /// pacing (a still-converging producer re-arming does not run to completion
-    /// inside a single `check_for_notifications`).
+    /// inside a single `notify_changes`).
     #[test]
     fn wakeup_requested_during_delivery_defers_to_next_poll() {
-        let mut scheduler = Scheduler::new();
+        let mut scheduler = SourceRegistry::new();
         let queue = scheduler.wakeup_queue();
         let log = Rc::new(RefCell::new(Vec::<&'static str>::new()));
 
@@ -1210,11 +1188,11 @@ mod tests {
         }));
 
         queue.request(a);
-        scheduler.check_for_notifications(); // delivers A; A's request for B defers
+        scheduler.notify_changes(); // delivers A; A's request for B defers
         assert_eq!(*log.borrow_mut(), vec!["a"]);
-        scheduler.check_for_notifications(); // now delivers B
+        scheduler.notify_changes(); // now delivers B
         assert_eq!(*log.borrow_mut(), vec!["a", "b"]);
-        scheduler.check_for_notifications(); // nothing left
+        scheduler.notify_changes(); // nothing left
         assert_eq!(*log.borrow_mut(), vec!["a", "b"]);
     }
 
@@ -1226,7 +1204,7 @@ mod tests {
         use crate::interpreter::{Predicate, Value};
         struct Record(Rc<RefCell<Vec<Projection>>>);
         impl Consumer for Record {
-            fn notify(&mut self, arrived: &Projection) {
+            fn invalidate(&mut self, arrived: &Projection) {
                 self.0.borrow_mut().push(arrived.clone());
             }
         }
@@ -1236,9 +1214,9 @@ mod tests {
         let standing = Projection::keys_at(CurryLevel::OUTERMOST, point(4));
         let inverted = Predicate::qualified(point(4), point(7));
         let beneath = Predicate::qualified(Predicate::qualified(point(4), point(7)), point(1));
-        consumer.notify(&standing);
-        consumer.notify(&Projection::keys_at(CurryLevel::new(1), inverted.clone()));
-        consumer.notify(&Projection::keys_at(CurryLevel::new(2), beneath));
+        consumer.invalidate(&standing);
+        consumer.invalidate(&Projection::keys_at(CurryLevel::new(1), inverted.clone()));
+        consumer.invalidate(&Projection::keys_at(CurryLevel::new(2), beneath));
         assert_eq!(
             *arrivals.borrow(),
             vec![

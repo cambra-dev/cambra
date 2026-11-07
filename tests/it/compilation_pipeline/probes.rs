@@ -51,7 +51,7 @@ fn every_probed_node_is_an_operator_of_the_served_graph() {
         .and_then(|output| output.producer.as_mut())
         .expect("the program has a `main` output");
     for _ in 0..100 {
-        ctx.scheduler().check_for_notifications();
+        ctx.source_registry().notify_changes();
         if producer
             .get(producer.tiling().universal_guard())
             .is_terminal()

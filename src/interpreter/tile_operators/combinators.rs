@@ -78,10 +78,10 @@ impl TileOperator for Converse {
         // keeps of earlier pulls only what a release and the absent keys rest on
         // (`ConverseProducer::held`, `read`, `seen`).
         let (shared, gate) = shared_consumer(consumer);
-        let wakeups = cx.scheduler().wakeup_queue();
+        let wakeups = cx.source_registry().wakeup_queue();
         let input = self.input.subscribe(
             self.input.tiling().universal_guard(),
-            crate::interpreter::scheduler::one_level_in(
+            crate::interpreter::notifications::one_level_in(
                 self.level,
                 forwarding_consumer_keeping_keys(&shared, &wakeups),
             ),
@@ -764,11 +764,11 @@ impl TileOperator for Uncurry {
         // change widens, and an outer key decides every pair whose first field it is.
         let level = self.level;
         let consumer = match level == CurryLevel::OUTERMOST {
-            true => crate::interpreter::scheduler::widening_restating_decided(
+            true => crate::interpreter::notifications::widening_restating_decided(
                 |region| paired(region, CurryLevel::OUTERMOST),
                 consumer,
             ),
-            false => crate::interpreter::scheduler::restating(
+            false => crate::interpreter::notifications::restating(
                 Box::new(move |region| paired(region, level)),
                 consumer,
             ),

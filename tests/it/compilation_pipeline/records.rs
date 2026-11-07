@@ -399,7 +399,7 @@ fn test_datasource_named_record_join() {
     let loaded = LoadedProgram::test(code);
     let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
     assert!(*notified.borrow());
 
     let tile = sort_function_by_domain(producer.get(producer.tiling().universal_guard()));
@@ -529,7 +529,7 @@ fn test_list_of_records_holding_collections() {
                             vec![0, 2],
                             ColumnValue::UInts(vec![0, 1, 0, 1]),
                             Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 4, 5]))),
-                            Predicate::True,
+                            Predicate::False,
                             BitSet::new(),
                         ),
                     ),

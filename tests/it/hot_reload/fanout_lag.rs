@@ -70,7 +70,7 @@ fn feed(source: &str, reads_n: bool, mark: &str) -> String {
 /// Pull `main` once and release what it delivered, as the binary's driver does
 /// (`run_program` in `src/main.rs`).
 fn pull(ctx: &mut GlobalContext, live: &mut LiveProgram) -> (Vec<String>, bool) {
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
     let producer = live
         .main_producer_mut(MAIN_BRANCH)
         .expect("the program's value is `out`");
@@ -271,7 +271,7 @@ fn a_stdin_feed_repeats_the_value_at_the_cut_when_its_other_writer_is_edited(
         .collect();
     let expected = match dispatch {
         "1" => vec!["a", "ab", "a", "ab", "abc"],
-        _ => vec!["a", "ab", "abc"],
+        _ => vec!["a", "ab", "a", "ab", "abc"],
     };
     assert_eq!(
         printed, expected,
@@ -333,7 +333,7 @@ fn a_loop_added_over_a_collection_caught_mid_fold_loses_its_prefix() {
                 .main_producer_mut(MAIN_BRANCH)
                 .expect("the value is `n`");
             let _ = producer.get(producer.tiling().universal_guard());
-            ctx.scheduler().check_for_notifications();
+            ctx.source_registry().notify_changes();
         }
         live.reload_text(
             &mut ctx,
@@ -362,7 +362,7 @@ fn a_loop_added_over_a_collection_caught_mid_fold_loses_its_prefix() {
 
 fn drive_to_terminal(ctx: &mut GlobalContext, live: &mut LiveProgram) -> String {
     for _ in 0..500 {
-        ctx.scheduler().check_for_notifications();
+        ctx.source_registry().notify_changes();
         let producer = live
             .main_producer_mut(MAIN_BRANCH)
             .expect("the value is a string");

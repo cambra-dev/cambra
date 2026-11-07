@@ -338,8 +338,8 @@ reload diffs against its own version, so a parent's reload never has to be follo
 the `released_position` of every fan-out it reads stops rising, per [Guards intersect at a
 fan-out](#guards-intersect-at-a-fan-out). A reload that keeps such a fan-out as an iteration input
 is refused, per [Routes across branches](#routes-across-branches). A branch's outputs stay
-subscribed and pulled for as long as its entry exists. The binary's driver pulls every branch's
-`main` output (`LiveProgram::pull_mains`). It prints `main`'s value as `Got value: …` and every
+subscribed for as long as its entry exists. `LiveProgram::run` schedules every branch's outputs
+through one shared dispatcher. It prints `main`'s value as `Got value: …` and every
 other branch's as `Got value from <branch>: …`, so a branch created under the name `main` after the
 first one is deleted prints unlabelled. A version whose `main` output has finished is no longer
 pulled. The process exits when every branch's `main` output has finished and every branch's sink
@@ -1224,7 +1224,7 @@ holds a weak reference.
 - **Fan-out slots.** `FanOutShared::subscribers` holds a weak reference per slot, and the strong
   side lives in the `FanOutProducer` that slot handed out. A dead slot is skipped and renumbered per
   [Guards intersect at a fan-out](#guards-intersect-at-a-fan-out).
-- **Scheduler wake-ups.** `Scheduler::add_source_handle` records a `Weak<RefCell<dyn Consumer>>`,
+- **SourceRegistry wake-ups.** `SourceRegistry::add_source_handle` records a `Weak<RefCell<dyn Consumer>>`,
   and the `IterateExtentProducer` that registered it owns the strong side. A source handle outlives
   a version and the subscriptions against it do not. A strong registration would keep every operator
   any version ever subscribed alive and notified.

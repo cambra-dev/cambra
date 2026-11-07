@@ -349,6 +349,7 @@ struct PipelineInfo {
     /// Whether it is a store's seed input, which the store's other pipelines read and wait for
     /// the consume of ([`opens_before`](Dispatcher::opens_before)).
     opens: bool,
+    opening_readers: Vec<usize>,
     /// Per pipeline it reads, in the order of its `reads`, the region of its input that
     /// pipeline's pushes reach along routes that keep its keys, `None` where they reach all of
     /// it ([`reaches`](Dispatcher::reaches)).
@@ -573,6 +574,7 @@ impl Dispatcher {
                 pushed_rows: Vec::new(),
                 parks: false,
                 opens: false,
+                opening_readers: Vec::new(),
                 reach: Vec::new(),
                 whole_only: Vec::new(),
                 ingress: None,
@@ -662,6 +664,7 @@ impl Dispatcher {
             pushed_rows: Vec::new(),
             parks: false,
             opens: false,
+            opening_readers: Vec::new(),
             reach: Vec::new(),
             whole_only: Vec::new(),
             ingress: None,
@@ -862,6 +865,12 @@ impl Dispatcher {
             pipeline.0
         );
         self.infos[pipeline.0].opens = true;
+    }
+
+    /// Have `reader` await the seed pipeline's opening before sampling its store.
+    pub(crate) fn sample_after_open(&mut self, reader: PipelineId, seed: PipelineId) {
+        assert!(self.infos[seed.0].opens && self.infos[reader.0].reads.contains(&seed.0));
+        self.infos[seed.0].opening_readers.push(reader.0);
     }
 
     /// Record that `read`, a pipeline `reader` reads, decides `reader`'s input only once it is
@@ -1842,7 +1851,7 @@ impl Dispatcher {
             from: pipeline,
             widened: false,
         };
-        to.borrow_mut().push(decided, &mut landing);
+        to.borrow_mut().notify(decided, &mut landing);
         let Target::Decided { reached, .. } = landing.target else {
             unreachable!("a decided landing stays one");
         };
@@ -1900,7 +1909,7 @@ impl Dispatcher {
                             "pipeline {pipeline} pushes regions of its keys: {why}"
                         ))
                     });
-                    to.borrow_mut().push(&region, &mut landing);
+                    to.borrow_mut().notify(&region, &mut landing);
                 }
             }
             // A test's push ([`Pushes::push`]) names no consumer and lands in each reader as it is.
@@ -1964,9 +1973,11 @@ impl Dispatcher {
         }
         // The store's own pipelines wait for its seed input's consume; a reader of the store
         // reads that pipeline too, but waits for what the store decides.
-        if self.infos[p].opens && self.states[p].acknowledged.load(Ordering::Acquire) > 0 {
+        if self.infos[p].opens {
             for &reader in &self.infos[p].readers {
-                if self.infos[reader].pushes_with == self.infos[p].pushes_with {
+                if self.infos[reader].pushes_with == self.infos[p].pushes_with
+                    || self.infos[p].opening_readers.contains(&reader)
+                {
                     self.record_decided(reader, p, None);
                 }
             }
@@ -2121,7 +2132,7 @@ impl Drop for Worker<'_> {
 /// What a breaker pushes through: one morsel of its keys per work package. The dispatcher
 /// [lands](Dispatcher::land) them, as the driver does after each consume, or
 /// [finishes](Dispatcher::finish) the pipeline: each morsel climbs the breaker's consumer as a push
-/// ([`Consumer::push`]), each operator on the way restates it in its own keys, and the [`Entry`] of
+/// ([`Consumer::notify`]), each operator on the way restates it in its own keys, and the [`Entry`] of
 /// each breaker it reaches queues it for that breaker's pipeline.
 pub struct Pushes<'d> {
     dispatcher: &'d Dispatcher,
@@ -2583,7 +2594,7 @@ impl Entry {
 }
 
 // Whether this thread is in a compiled program's dispatched run (`run_program`), which a debug
-// build checks no consumer is notified in.
+// build checks no cache invalidation is delivered in.
 //
 // shared-state-ok: a debug check's one bit. Nothing crosses it between operators; the run sets it
 // and the consumers a notification passes read it.
@@ -2593,8 +2604,8 @@ thread_local! {
     static IN_A_RUN: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Run `run` as a compiled program's dispatched run on this thread, in which no consumer is
-/// notified ([`debug_assert_outside_a_run`]).
+/// Run `run` as a compiled program's dispatched run, which delivers no cache invalidations
+/// through consumers ([`debug_assert_outside_a_run`]).
 pub(crate) fn in_a_run<R>(run: impl FnOnce() -> R) -> R {
     struct Leave(bool);
     impl Drop for Leave {
@@ -2611,24 +2622,24 @@ pub(crate) fn is_in_a_run() -> bool {
     IN_A_RUN.with(Cell::get)
 }
 
-/// Panic in a debug build where a consumer is notified inside a compiled program's dispatched
+/// Panic in a debug build where a cache invalidation arrives inside a compiled program's dispatched
 /// run ([`in_a_run`]): the run has the producers that cache what they read read it again directly
 /// (`tile_operators::read_again_toward`), and pushes carry what a pipeline's readers take.
 pub(crate) fn debug_assert_outside_a_run() {
     debug_assert!(
         !is_in_a_run(),
-        "a dispatched run notifies no consumer: a producer that caches what it reads reads it \
+        "a dispatched run delivers no cache invalidation: a producer that caches what it reads reads it \
          again through `read_again_toward`"
     );
 }
 
 impl Consumer for Entry {
-    fn notify(&mut self, arrived: &Projection) {
+    fn invalidate(&mut self, arrived: &Projection) {
         debug_assert_outside_a_run();
-        self.inner.notify(arrived);
+        self.inner.invalidate(arrived);
     }
 
-    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
         if let Some(pipeline) = self.pipeline.get()
             && landing.accepts_entry(pipeline)
         {
@@ -2948,6 +2959,9 @@ fn push_held(
     pipelines: impl IntoIterator<Item = PipelineId>,
 ) {
     for pipeline in pipelines {
+        if dispatcher.states[pipeline.0].phase.load() == Phase::Finished {
+            continue;
+        }
         let mut landed = None;
         reach(pipeline, &mut |breaker, _| {
             if let Some(producer) = breaker.as_producer() {
@@ -3318,15 +3332,15 @@ mod in_a_run_tests {
     use super::*;
     use crate::interpreter::tile_operators::Arrivals;
 
-    /// A consumer notified inside a compiled program's dispatched run panics in a debug build.
+    /// A cache invalidation inside a dispatched run panics in a debug build.
     #[test]
     #[cfg_attr(
         debug_assertions,
-        should_panic(expected = "a dispatched run notifies no consumer")
+        should_panic(expected = "a dispatched run delivers no cache invalidation")
     )]
-    fn a_consumer_notified_inside_a_run_panics() {
+    fn a_cache_invalidation_inside_a_run_panics() {
         let mut consumer = Arrivals::new().consumer(Box::new(|| {}));
-        in_a_run(|| consumer.notify(&Projection::Everything));
+        in_a_run(|| consumer.invalidate(&Projection::Everything));
     }
 
     /// A run that panics leaves the thread outside a run, so a later notification passes.
@@ -3336,6 +3350,6 @@ mod in_a_run_tests {
         assert!(unwound.is_err());
         assert!(!is_in_a_run());
         let mut consumer = Arrivals::new().consumer(Box::new(|| {}));
-        consumer.notify(&Projection::Everything);
+        consumer.invalidate(&Projection::Everything);
     }
 }

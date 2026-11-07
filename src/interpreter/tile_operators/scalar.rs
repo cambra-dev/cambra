@@ -121,7 +121,7 @@ impl TileOperator for Constant {
         mut consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        consumer.notify(&Projection::Everything);
+        consumer.invalidate(&Projection::Everything);
         Box::new(ConstantProducer {
             base: ProducerBase::new(ConstantProducer::alloc_id(), self.tiling(), &self.base, cx),
             tile: self.tile.clone(),
@@ -1069,7 +1069,7 @@ mod tests {
             mut consumer: Box<dyn Consumer>,
             _cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
-            consumer.notify(&Projection::Everything);
+            consumer.invalidate(&Projection::Everything);
             Box::new(TestTileProducer::new(
                 self.tile.clone(),
                 self.tiling.clone(),

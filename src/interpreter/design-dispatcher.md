@@ -46,8 +46,8 @@ or widen a change to the whole input. A widened change supplies no claim that ou
 The planner records both the dependencies and the part of the input each dependency can decide.
 Operators left in pull mode remain inside a pipeline's chain.
 
-Compilation defers sink pulls until planning succeeds. A planning refusal therefore occurs before
-execution consumes anything. Refusals include an already-pulled sink, an unsupported store shape,
+Compilation builds the subscribed graph without executing its outputs. A planning refusal occurs
+before execution consumes anything. Refusals include an unsupported store shape,
 a shared producer without the required fan-out, and a live source whose arrivals cannot reach its
 pipeline as supported regions. The store restrictions are specified in
 [A store as a breaker](design-operators.md#a-store-as-a-breaker).
@@ -72,16 +72,27 @@ answer at completion. A live main output emits package answers as they arrive an
 when its sources close. Main-output packages are ordered. Returning several tiles does not change
 the collection's value or imply an order among its elements.
 
-`CAMBRA_DISPATCH` enables dispatch, including under `--inspect` and `--control`.
-`CAMBRA_MORSEL_ROWS` selects a positive morsel size, defaulting to 1024. An initial planning refusal
-can fall back to pull execution in the same compilation context. A refusal after dispatched
-execution has consumed state is an error; it cannot restart that state in pull mode.
+The binary runs every program through the dispatcher, including under `--inspect` and `--control`.
+`CAMBRA_MORSEL_ROWS` selects a positive morsel size, defaulting to 1024. Compilation builds the graph
+without executing sinks. A planning refusal reports an error before execution.
+
+`AsOf` samples the store's committed snapshot for each trigger position. Its source is a sampled
+input (`TileProducer::sampled_inputs`): the planner discovers the store's writer pipelines but adds
+only its seed-opening dependency to the reader. The reader's trigger supplies work and preserves
+its keys. `Dispatcher::sample_after_open` releases that dependency when the seed pipeline finishes;
+it does not require the live writers to finish. A store whose seeds are constant publishes them on
+entering consuming mode. A sampled value is final for its trigger position once latched.
+
+Live concatenation can wait for source closure. Resuming a transaction driver across reload remains
+unsupported. Rebuilding a feed reader across reload can replay values emitted before the cut.
 
 ### Pause and reload
 
 A control request is serviced at a drained boundary. The dispatcher and its run-local scheduling
 metadata are then discarded. Retained breakers keep their accumulated values, snapshots and input
-releases. A new plan starts with fresh queue and publication records.
+releases. Store finish counts restart for each run. A flat induction store publishes a ready seed at
+a drained boundary even before its first source position, so an idle version can hand its carried
+value to a later version. A new plan starts with fresh queue and publication records.
 
 To reconstruct runnable work, retained breakers publish what they still hold and sources announce
 what they have yielded. Each breaker filters input announcements by its own releases. Dispatcher

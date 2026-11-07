@@ -699,7 +699,7 @@ mod tests {
             .borrow_mut()
             .as_mut()
             .unwrap()
-            .notify(&Projection::Everything);
+            .invalidate(&Projection::Everything);
         assert_eq!(notifications.get(), 0, "bug pin: the fallback wake is lost");
         let Tile::Scalar(result) = producer.get(guard) else {
             panic!("expected a scalar fallback");

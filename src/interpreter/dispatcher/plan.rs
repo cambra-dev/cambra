@@ -16,9 +16,8 @@ use crate::interpreter::tile_operators::StoreCell;
 use crate::interpreter::tiling::Tile;
 use crate::interpreter::{BaseType, DataSink, DataSourceDomainExtentImpl, Extent};
 
-/// Run `program`'s pipelines through a dispatcher of `morsel_rows` on the calling thread, the
-/// program compiled with its sinks unpulled (`GlobalContext::defer_sink_pulls`). The breakers are
-/// the producers in the chains under its sinks' producers and its `main` output's that are pipeline
+/// Run `program`'s pipelines through a dispatcher of `morsel_rows` on the calling thread.
+/// The breakers are the producers in the chains under its sinks' producers and its `main` output's that are pipeline
 /// breakers (`TileProducer::as_breaking_mut`), each store a reader slot reaches, and each sink's
 /// own and the `main` output's ([`SinkBreaker`]), whose pipeline no pipeline reads. A breaker's
 /// pipeline reads the pipelines of the nearest breakers beneath it, and the consumer at the
@@ -55,7 +54,7 @@ use crate::interpreter::{BaseType, DataSink, DataSourceDomainExtentImpl, Extent}
 /// # Errors
 ///
 /// Where planning encounters an unsupported program shape, before execution and with no entry or
-/// sink left placed: sinks compiled in pull mode; live ranges whose arrivals cannot be routed to
+/// sink left placed: live ranges whose arrivals cannot be routed to
 /// a supported input projection; incompatible direct shared reads; a breaker with no consuming
 /// mode; or a store refused by [`Planner::store_pipeline`].
 ///
@@ -116,13 +115,6 @@ pub fn run_program_into(
     main: Arc<dyn DataSink>,
     on_idle: &mut dyn FnMut(),
 ) -> Result<Vec<Planned>, Refused> {
-    if !program.sink_pulls_deferred() {
-        return Err(Refused(
-            "the program was compiled with its sinks pulled, which runs part of it in pull mode \
-             (`GlobalContext::defer_sink_pulls`)"
-                .to_string(),
-        ));
-    }
     // A `main` output's producer is the driver's to pull; the run takes it into a slot, as a
     // sink's sits in one, and hands it back after. A program has at most one.
     let mut taken = None;
@@ -163,17 +155,16 @@ pub fn run_program_into(
         program.outputs[*at].producer = producer;
     }
     let planned = result?;
-    pull_sinks(&targets);
+    complete_sinks(&targets);
     Ok(planned)
 }
 
-/// The run's last pull of each sink of `targets`, as pull mode's last: its producer answers from
-/// what the breakers consumed and is released whole, so the pull hands the sink nothing new and
-/// finds it done, which signals `CompiledProgram::done` once every sink has.
-fn pull_sinks(targets: &[RunTarget]) {
+/// Reconcile terminal output after every pipeline finishes and signal each sink's completion.
+/// Producers answer from completed breakers and are released whole.
+fn complete_sinks(targets: &[RunTarget]) {
     for (_, _, entry) in targets {
         if let TargetEntry::Sink(consumer) = entry {
-            consumer.borrow().pull_now();
+            consumer.borrow_mut().complete();
         }
     }
 }
@@ -262,7 +253,7 @@ impl Targets {
     ) -> Result<Ended, Refused> {
         let ended = run_targets(&self.0, morsel_rows, observer)?;
         if let Ended::Done(_) = ended {
-            pull_sinks(&self.0);
+            complete_sinks(&self.0);
         }
         Ok(ended)
     }
@@ -498,15 +489,12 @@ fn run_targets(
         true,
         &members.kinds,
         &members.pushes_with,
+        &members.opens_before,
+        &members.sampled,
         morsel_rows,
         &mut reach,
         &mut end_of,
     );
-    for (pipeline, &opens) in members.opens_before.iter().enumerate() {
-        if opens {
-            dispatcher.opens_before(PipelineId(pipeline));
-        }
-    }
     // A `main` output's pipeline consumes its packages in queue order.
     for ((_, _, entry), (pipeline, breaker)) in targets
         .iter()
@@ -1024,6 +1012,7 @@ impl Execution {
     pub(super) fn resume(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>) -> bool {
         let mut progressed = false;
         for scope in self.scopes() {
+            progressed |= induction(scope).initialize_seed();
             let finished = induction(scope).take_shared_finish(dispatcher);
             if let Some((pipeline, consumed)) = finished {
                 finish_with(dispatcher, reach, pipeline, consumed);
@@ -1105,7 +1094,7 @@ fn reads_a_scope(located: &[&Located], reads: &[Vec<usize>], pipeline: usize) ->
 }
 
 /// Unplace every entry `placements` holds and every sink consumer of `targets`: a refused run
-/// runs nothing, so it leaves nothing placed. A later run in pull mode pushes nothing, but a
+/// runs nothing and leaves nothing placed. A later run can place the graph again, and a
 /// placed entry claims a pipeline that no dispatcher holds.
 fn unplace(placements: &[Vec<Placement>], targets: &[RunTarget]) {
     for placement in placements.iter().flatten() {
@@ -1119,7 +1108,7 @@ fn unplace(placements: &[Vec<Placement>], targets: &[RunTarget]) {
     }
 }
 
-/// Why the planner refuses a program: a shape no pipeline runs yet, which pull mode runs.
+/// Why the planner refuses a program before any pipeline runs.
 #[derive(Debug)]
 pub struct Refused(String);
 
@@ -1166,11 +1155,23 @@ pub(super) fn plan_edges(
     opens: bool,
     kinds: &[Consumes],
     pushes_with: &[usize],
+    opening: &[bool],
+    sampled: &[Vec<usize>],
     morsel_rows: usize,
     reach: &mut Reach<'_>,
     end_of: &mut dyn FnMut(PipelineId) -> Option<(SharedConsumer, bool)>,
 ) -> (Dispatcher, Vec<Planned>) {
     let mut dispatcher = Dispatcher::new(reads.to_vec(), morsel_rows);
+    for (pipeline, &opens) in opening.iter().enumerate() {
+        if opens {
+            dispatcher.opens_before(PipelineId(pipeline));
+        }
+    }
+    for (reader, sources) in sampled.iter().enumerate() {
+        for &source in sources {
+            dispatcher.sample_after_open(PipelineId(reader), PipelineId(source));
+        }
+    }
     // A store decides its positions in order; a scope steps its store in order.
     for (pipeline, kind) in kinds.iter().enumerate() {
         if *kind != Consumes::Pushes {
@@ -1262,6 +1263,9 @@ pub(super) fn plan_edges(
         let mut seen: Vec<usize> = Vec::new();
         let read_all = read;
         for &read in read {
+            if sampled[reader].contains(&read) {
+                continue;
+            }
             // A nested loop's scope runs a row per round of the scope around it, and a reader
             // inside the cycle around it reads the row once the nested scope is quiescent.
             if kinds[read] == Consumes::Rounds {
@@ -1450,7 +1454,7 @@ pub(super) fn probe(
     reader: usize,
 ) -> Vec<Arrival> {
     let mut landing = Landing::probe(from);
-    consumer.borrow_mut().push(region, &mut landing);
+    consumer.borrow_mut().notify(region, &mut landing);
     landing
         .arrivals()
         .into_iter()
@@ -1468,7 +1472,7 @@ pub(super) fn decided_reach(
     let mut landing = Landing::probe_decided(from);
     consumer
         .borrow_mut()
-        .push(&Projection::Everything, &mut landing);
+        .notify(&Projection::Everything, &mut landing);
     landing
         .arrivals()
         .into_iter()
@@ -1531,6 +1535,7 @@ pub(super) struct Members<'p> {
     /// Per pipeline, whether it is a store's seed input, which the store's other pipelines wait
     /// for the consume of (`Dispatcher::opens_before`).
     pub(super) opens_before: Vec<bool>,
+    sampled: Vec<Vec<usize>>,
 }
 
 /// Pipelines discovered beneath a program's outputs, grouped by lexical loop scope during planning.
@@ -1556,6 +1561,7 @@ pub(super) struct Planner {
     /// The pipelines of stores' seed inputs, which the store's other pipelines read and wait for
     /// the consume of (`Dispatcher::opens_before`).
     opens_before: Vec<usize>,
+    sampled: Vec<Vec<usize>>,
     /// The edges `(read, reader)` whose reader's breaker reads the breaker of `read` directly.
     direct: Vec<(usize, usize)>,
     pub(super) scopes: Vec<PlannedScope>,
@@ -1570,6 +1576,7 @@ pub(super) struct Planner {
 /// What a chain holds beneath a producer, up to the nearest breakers.
 #[derive(Default)]
 struct Beneath {
+    sampled: Vec<usize>,
     /// The pipelines of the nearest breakers, each once, and whether that breaker is the producer
     /// itself rather than beneath it.
     pipelines: Vec<(usize, bool)>,
@@ -1689,10 +1696,23 @@ impl Planner {
         let mut inputs = 0;
         let mut seen = 0;
         producer.visit_input_producers(&mut |_, _| seen += 1);
+        let sampled = producer.sampled_inputs();
         producer.visit_input_producers_mut(&mut |role, input| {
             inputs += 1;
-            let under = self.pipelines_under(input, role);
+            let mut under = self.pipelines_under(input, role);
+            if sampled.contains(&role) {
+                under
+                    .pipelines
+                    .retain(|(pipeline, _)| self.opens_before.contains(pipeline));
+                under
+                    .sampled
+                    .extend(under.pipelines.iter().map(|(pipeline, _)| *pipeline));
+                under.leaves.clear();
+                under.live.clear();
+                under.unprobed.clear();
+            }
             below.read_once(under.pipelines);
+            below.sampled.extend(under.sampled);
             below.leaves.extend(under.leaves);
             below.unprobed.extend(under.unprobed);
             below.live.extend(under.live);
@@ -2040,6 +2060,7 @@ impl Planner {
         self.placements.push(Vec::new());
         self.reads
             .push(below.pipelines.iter().map(|(read, _)| *read).collect());
+        self.sampled.push(below.sampled);
         self.leaves.push(below.leaves);
         self.live.push(below.live);
         pipeline
@@ -2139,6 +2160,15 @@ impl Planner {
             }
         }
         Members {
+            sampled: ids
+                .iter()
+                .map(|&pipeline| {
+                    self.sampled[pipeline]
+                        .iter()
+                        .map(|&source| self.local[source])
+                        .collect()
+                })
+                .collect(),
             located: ids
                 .iter()
                 .map(|pipeline| &self.located[*pipeline])
@@ -2278,6 +2308,8 @@ impl Planner {
                 false,
                 &kinds,
                 &(0..names.len()).collect::<Vec<_>>(),
+                &vec![false; names.len()],
+                &vec![Vec::new(); names.len()],
                 morsel_rows,
                 &mut reach,
                 &mut |pipeline| match &members[kept[pipeline.0]] {
@@ -2828,7 +2860,6 @@ mod tests {
         use crate::ccl::load::LoadedProgram;
         use indoc::indoc;
         let mut ctx = GlobalContext::default();
-        ctx.defer_sink_pulls();
         let _sink = ctx.register_test_sink("out");
         let program = compile_program(
             &mut ctx,
@@ -2904,7 +2935,6 @@ mod tests {
             "},
         ] {
             let mut ctx = GlobalContext::default();
-            ctx.defer_sink_pulls();
             let _sink = ctx.register_test_sink("out");
             let program = compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {}))
                 .expect("the loop compiles");

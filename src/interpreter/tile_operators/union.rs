@@ -426,7 +426,7 @@ impl TileOperator for UnionOperator {
                 false => {
                     let consumer = crate::interpreter::forwarding_consumer_tagging(
                         &shared,
-                        &cx.scheduler().wakeup_queue(),
+                        &cx.source_registry().wakeup_queue(),
                         crate::ccl::FieldKey::Index(arm),
                     );
                     op.subscribe(op.tiling().universal_guard(), consumer, cx)

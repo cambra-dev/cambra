@@ -21,25 +21,16 @@ use indoc::{formatdoc, indoc};
 /// The drive loop is capped so a program that never completes fails the test rather than
 /// hanging it.
 fn observe(source: &str, names: &[&str]) -> Vec<Result<Value, SinkReadError>> {
-    const CAP: usize = 10_000;
-
     let mut ctx = GlobalContext::default();
     let sinks: Vec<_> = names.iter().map(|n| ctx.register_test_sink(*n)).collect();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let program = match compile_program(&mut ctx, &LoadedProgram::test(source), consumer) {
+    let mut program = match compile_program(&mut ctx, &LoadedProgram::test(source), consumer) {
         Ok(p) => p,
         Err(e) => panic!("compile failed: {e:?}"),
     };
 
-    let mut completed = false;
-    for _ in 0..CAP {
-        ctx.scheduler().check_for_notifications();
-        if program.done.try_recv().is_ok() {
-            completed = true;
-            break;
-        }
-    }
-    assert!(completed, "sinks did not all complete within {CAP} pulls");
+    cambra::interpreter::dispatcher::run_program(&mut program, 1).expect("sink program dispatches");
+    assert!(program.done.try_recv().is_ok(), "all sinks completed");
 
     sinks.iter().map(|s| s.value()).collect()
 }
@@ -492,14 +483,12 @@ fn a_sink_accumulates_across_two_deliveries() {
         for x in nums():
             out << x * 10
     "#};
-    let program = match compile_program(&mut ctx, &LoadedProgram::test(code), consumer) {
+    let mut program = match compile_program(&mut ctx, &LoadedProgram::test(code), consumer) {
         Ok(p) => p,
         Err(e) => panic!("compile failed: {e:?}"),
     };
 
-    for _ in 0..200 {
-        ctx.scheduler().check_for_notifications();
-    }
+    crate::serving::dispatch_until_idle(&mut program);
     assert_eq!(
         sink.value(),
         Err(SinkReadError::Incomplete),
@@ -509,15 +498,8 @@ fn a_sink_accumulates_across_two_deliveries() {
     src.borrow_mut()
         .add_data(&[(Value::UInt(1), Value::Int(2))]);
     src.borrow_mut().set_yield_predicate(Predicate::True);
-    let mut completed = false;
-    for _ in 0..200 {
-        ctx.scheduler().check_for_notifications();
-        if program.done.try_recv().is_ok() {
-            completed = true;
-            break;
-        }
-    }
-    assert!(completed, "the program did not complete within 200 pulls");
+    crate::serving::dispatch_until_idle(&mut program);
+    assert!(program.done.try_recv().is_ok(), "the program completes");
 
     assert_eq!(
         format!("{}", sink.value().expect("a value")),
@@ -546,11 +528,6 @@ fn a_sink_accumulates_across_a_reload() {
                 out << x * {factor}
         "#}
     };
-    let pump = |ctx: &mut GlobalContext| {
-        for _ in 0..200 {
-            ctx.scheduler().check_for_notifications();
-        }
-    };
 
     let mut live = LiveProgram::start(&mut ctx, &LoadedProgram::test(version(10)), &consumer)
         .expect("v1 compiles");
@@ -560,7 +537,7 @@ fn a_sink_accumulates_across_a_reload() {
     ]);
     src.borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::UInt(1)));
-    pump(&mut ctx);
+    crate::serving::dispatch_until_idle(&mut live);
 
     live.reload(
         &mut ctx,
@@ -574,18 +551,8 @@ fn a_sink_accumulates_across_a_reload() {
         (Value::UInt(3), Value::Int(4)),
     ]);
     src.borrow_mut().set_yield_predicate(Predicate::True);
-    let mut completed = false;
-    for _ in 0..200 {
-        ctx.scheduler().check_for_notifications();
-        if live.poll_finished() {
-            completed = true;
-            break;
-        }
-    }
-    assert!(
-        completed,
-        "the replacement did not complete within 200 pulls"
-    );
+    crate::serving::dispatch_until_idle(&mut live);
+    assert!(live.poll_finished(), "the replacement completes");
 
     // The value is a function of its keys, so its bindings compare in key order.
     let Value::Function(bindings) = sink.value().expect("a value") else {
@@ -657,32 +624,23 @@ fn a_correlated_loop_over_a_streaming_source_waits_for_both_deliveries() {
         for i in [1, 2]:
             out << sum([x + i for x in nums()])
     "#};
-    let program = match compile_program(&mut ctx, &LoadedProgram::test(code), consumer) {
+    let mut program = match compile_program(&mut ctx, &LoadedProgram::test(code), consumer) {
         Ok(p) => p,
         Err(e) => panic!("compile failed: {e:?}"),
     };
 
-    for _ in 0..200 {
-        ctx.scheduler().check_for_notifications();
-    }
+    crate::serving::dispatch_until_idle(&mut program);
     assert_eq!(
         sink.value(),
-        Err(SinkReadError::Incomplete),
+        Err(SinkReadError::NothingWritten),
         "a sum over a source that may still deliver is not complete"
     );
 
     src.borrow_mut()
         .add_data(&[(Value::UInt(1), Value::Int(2))]);
     src.borrow_mut().set_yield_predicate(Predicate::True);
-    let mut completed = false;
-    for _ in 0..400 {
-        ctx.scheduler().check_for_notifications();
-        if program.done.try_recv().is_ok() {
-            completed = true;
-            break;
-        }
-    }
-    assert!(completed, "the program did not complete within 400 pulls");
+    crate::serving::dispatch_until_idle(&mut program);
+    assert!(program.done.try_recv().is_ok(), "the program completes");
 
     // i = 1: (1 + 1) + (2 + 1) = 5; i = 2: (1 + 2) + (2 + 2) = 7.
     assert_eq!(

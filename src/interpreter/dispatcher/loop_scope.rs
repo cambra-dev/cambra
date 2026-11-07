@@ -392,7 +392,7 @@ impl InductionStoreProducer {
         let region = Projection::of(guard)
             .unwrap_or_else(|why| panic!("a loop's round names a row of its store: {why}"));
         let mut landing = Landing::probe(self.pipeline(drive));
-        consumer.borrow_mut().push(&region, &mut landing);
+        consumer.borrow_mut().notify(&region, &mut landing);
         let arrivals = landing.arrivals();
         readers
             .iter()
@@ -694,7 +694,6 @@ mod tests {
     impl Compiled {
         fn of(source: &str) -> Self {
             let mut ctx = GlobalContext::default();
-            ctx.defer_sink_pulls();
             let _sink = ctx.register_test_sink("out");
             let loaded = LoadedProgram::test(source);
             compile_program(&mut ctx, &loaded, Box::new(|| {}))

@@ -42,9 +42,8 @@
 //! parameterized by an iteration input that is not part of the term, so the term
 //! does not identify it.
 
-use crate::interpreter::Projection;
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::{HashMap, HashSet},
     fmt,
     rc::{Rc, Weak},
@@ -130,11 +129,7 @@ struct Branch {
     /// outputs stay borrowable while the driver pulls it. `None` for a sink
     /// program and for a torn-down version.
     main_producer: Option<Box<dyn TileProducer>>,
-    /// Set by the `main` output's consumer and by an install, cleared by the
-    /// pull that answers it.
-    main_notified: Rc<Cell<bool>>,
-    /// Whether the `main` output has released everything, after which the
-    /// driver stops pulling it.
+    /// Whether the dispatcher has released `main` whole, after which later plans omit it.
     main_finished: bool,
     /// Whether every sink output has reached a terminal tile. Latched, because
     /// [`CompiledProgram::done`] fires once.
@@ -196,7 +191,6 @@ impl Branch {
         self.main_finished = false;
         self.sinks_done = false;
         // The new graph has subscribed and nothing has pulled it yet.
-        self.main_notified.set(true);
     }
 }
 
@@ -205,20 +199,6 @@ impl Branch {
 fn driving(mut program: CompiledProgram) -> (CompiledProgram, Option<Box<dyn TileProducer>>) {
     let main_producer = program.main_mut().and_then(|o| o.producer.take());
     (program, main_producer)
-}
-
-/// The consumer a branch's `main` output is subscribed with: it marks the
-/// branch as having something to pull, then wakes the driver.
-fn branch_main_consumer(
-    notified: &Rc<Cell<bool>>,
-    main_consumer: MainConsumerFactory<'_>,
-) -> Box<dyn Consumer> {
-    let notified = notified.clone();
-    let mut wake = main_consumer();
-    Box::new(move || {
-        notified.set(true);
-        wake.notify(&Projection::Everything);
-    })
 }
 
 /// A branch's `main` output in a dispatched run ([`LiveProgram::run`]): it hands each answer to
@@ -556,12 +536,7 @@ impl LiveProgram {
         loaded: &LoadedProgram,
         main_consumer: MainConsumerFactory<'_>,
     ) -> Result<Self, Vec<CompileError>> {
-        let main_notified = Rc::new(Cell::new(false));
-        let program = compile_program(
-            ctx,
-            loaded,
-            branch_main_consumer(&main_notified, main_consumer),
-        )?;
+        let program = compile_program(ctx, loaded, main_consumer())?;
         let (program, main_producer) = driving(program);
         let main = Branch {
             name: MAIN_BRANCH.to_string(),
@@ -572,7 +547,6 @@ impl LiveProgram {
             history: vec![(1, ctx.reuse())],
             program,
             main_producer,
-            main_notified,
             main_finished: false,
             sinks_done: false,
             operator_map: ctx.take_operator_map(),
@@ -607,34 +581,6 @@ impl LiveProgram {
     pub fn main_producer_mut(&mut self, name: &str) -> Option<&mut Box<dyn TileProducer>> {
         let at = self.index_of(name).ok()?;
         self.branches[at].main_producer.as_mut()
-    }
-
-    /// Pull every branch's `main` output that has something new, in creation
-    /// order.
-    ///
-    /// `pull` is handed the branch's name and the producer, and answers whether
-    /// that output has now finished. A finished output is not pulled again
-    /// (`src/ccl/design/program-evolution.md`, "A reload changes no other
-    /// branch"). Returns whether anything was pulled.
-    pub fn pull_mains(
-        &mut self,
-        mut pull: impl FnMut(&str, &mut dyn TileProducer) -> bool,
-    ) -> bool {
-        let mut pulled = false;
-        for branch in &mut self.branches {
-            if branch.main_finished || !branch.main_notified.get() {
-                continue;
-            }
-            let Some(producer) = branch.main_producer.as_mut() else {
-                continue;
-            };
-            branch.main_notified.set(false);
-            pulled = true;
-            if pull(&branch.name, producer.as_mut()) {
-                branch.main_finished = true;
-            }
-        }
-        pulled
     }
 
     /// Run every branch through one dispatcher until `observer` breaks or every live source
@@ -680,25 +626,6 @@ impl LiveProgram {
             branch.main_finished |= output.finished.load(Ordering::Relaxed);
         }
         ended
-    }
-
-    /// Pull every branch's sinks once, as a compile that does not defer its sink pulls does
-    /// (`GlobalContext::defer_sink_pulls`): what a driver falling back to pull mode does first.
-    pub fn pull_sinks(&self) {
-        for branch in &self.branches {
-            for output in branch.program.sinks() {
-                if let Some(consumer) = &output.sink_consumer {
-                    consumer.borrow().pull_now();
-                }
-            }
-        }
-    }
-
-    /// Whether some branch has a `main` output it has not finished.
-    pub fn any_main_running(&self) -> bool {
-        self.branches
-            .iter()
-            .any(|b| b.main_producer.is_some() && !b.main_finished)
     }
 
     /// Whether every branch has finished: its `main` output, where it has one,
@@ -1027,7 +954,7 @@ the lagging branch first"
         let program = compile_replacement(
             ctx,
             loaded,
-            branch_main_consumer(&branch.main_notified, main_consumer),
+            main_consumer(),
             &branch.program.ast,
             &bound_elsewhere,
         )
@@ -1102,11 +1029,10 @@ the lagging branch first"
         let p = &self.branches[from];
         ctx.carry_release_from(&p.source_producers());
         ctx.offer_predecessor(&p.operator_map);
-        let main_notified = Rc::new(Cell::new(false));
         let program = compile_replacement(
             ctx,
             loaded,
-            branch_main_consumer(&main_notified, main_consumer),
+            main_consumer(),
             &p.program.ast,
             &bound_elsewhere,
         )
@@ -1118,7 +1044,6 @@ the lagging branch first"
         };
         let version = self.tombstones.remove(name).unwrap_or(0) + 1;
         let (program, main_producer) = driving(program);
-        main_notified.set(true);
         self.branches.push(Branch {
             name: name.to_string(),
             origin: Some(origin.clone()),
@@ -1126,7 +1051,6 @@ the lagging branch first"
             history: vec![(version, reuse)],
             program,
             main_producer,
-            main_notified,
             main_finished: false,
             sinks_done: false,
             operator_map: ctx.take_operator_map(),

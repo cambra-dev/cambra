@@ -40,7 +40,7 @@ use crate::{
         transact_phase, uniquify,
     },
     interpreter::{
-        Consumer, DataSink, DataSourceDomainExtentImpl, Scheduler, StdinDataSource,
+        Consumer, DataSink, DataSourceDomainExtentImpl, SourceRegistry, StdinDataSource,
         SubscribeContext,
         http_server::SharedHttpServer,
         operator_conversion::{
@@ -832,7 +832,7 @@ impl SourceSinkRegistry {
     fn retire_routes_absent_from(
         &mut self,
         still_bound: &HashSet<String>,
-        scheduler: &mut Scheduler,
+        scheduler: &mut SourceRegistry,
     ) {
         let dropped: Vec<String> = self
             .http_routes
@@ -969,14 +969,11 @@ pub struct GlobalContext {
     inference: TypeInferenceContext,
     /// Operator Conversion context.
     conversion: OpConversionContext,
-    /// What every `subscribe` records about the producers it builds, and pull mode's scheduler.
+    /// Operator subscriptions and their registered sources.
     subscribe: SubscribeContext,
     /// The sources and sinks the program holds open, which outlive any one
     /// version of it.
     sources_and_sinks: SourceSinkRegistry,
-    /// Whether a compile leaves each sink unpulled, for a dispatched run that
-    /// takes the sinks as pipelines of the program ([`Self::defer_sink_pulls`]).
-    sink_pulls_deferred: bool,
 }
 
 impl GlobalContext {
@@ -992,7 +989,6 @@ impl GlobalContext {
             conversion: OpConversionContext::new(),
             subscribe: SubscribeContext::new(),
             sources_and_sinks: SourceSinkRegistry::default(),
-            sink_pulls_deferred: false,
         };
         let stdin = Rc::new(RefCell::new(StdinDataSource::new()));
         result.register_source(stdin);
@@ -1012,7 +1008,6 @@ impl GlobalContext {
             conversion: OpConversionContext::new(),
             subscribe: SubscribeContext::new(),
             sources_and_sinks: SourceSinkRegistry::default(),
-            sink_pulls_deferred: false,
         }
     }
 
@@ -1061,10 +1056,10 @@ impl GlobalContext {
     /// The scheduler's *subscriptions* need no attention here: they are weak and
     /// owned by the producers that made them, so dropping the graph prunes
     /// exactly the ones whose producer went with it (see
-    /// [`Scheduler::add_source_handle`]). Its handle on the source itself is
+    /// [`SourceRegistry::add_source_handle`]). Its handle on the source itself is
     /// strong and outlives every version, which is what a source outliving the
     /// program reading it means; that handle goes when the route behind it is
-    /// retired ([`Scheduler::forget_source`]).
+    /// retired ([`SourceRegistry::forget_source`]).
     pub fn offer_predecessor(&mut self, predecessor: &OperatorMap) {
         self.conversion = OpConversionContext::new();
         self.conversion.accept_offer(predecessor.handover());
@@ -1088,7 +1083,7 @@ impl GlobalContext {
             subscribe,
             ..
         } = self;
-        sources_and_sinks.retire_routes_absent_from(still_bound, subscribe.scheduler());
+        sources_and_sinks.retire_routes_absent_from(still_bound, subscribe.source_registry());
     }
 
     /// Install a fresh [`LoweringContext`] seeded from the source/sink registry,
@@ -1147,8 +1142,8 @@ impl GlobalContext {
         &mut self.conversion
     }
 
-    pub fn scheduler(&mut self) -> &mut Scheduler {
-        self.subscribe.scheduler()
+    pub fn source_registry(&mut self) -> &mut SourceRegistry {
+        self.subscribe.source_registry()
     }
 
     /// What every `subscribe` of this context's compilations records.
@@ -1166,25 +1161,6 @@ impl GlobalContext {
         let name = source.borrow().get_id().to_string();
         self.lowering.register_source(name.clone(), source.clone());
         self.sources_and_sinks.sources.insert(name, source);
-    }
-
-    /// Compile without the pull each sink takes once it is subscribed, so a dispatched run takes
-    /// the sinks as pipelines of the program
-    /// ([`run_program`](crate::interpreter::dispatcher::run_program)).
-    pub fn defer_sink_pulls(&mut self) {
-        self.sink_pulls_deferred = true;
-    }
-
-    /// Undo [`Self::defer_sink_pulls`]: each later compile pulls each sink once it is subscribed,
-    /// as pull mode does. For a driver that falls back to pull mode, which pulls the sinks the
-    /// compiles so far left unpulled itself.
-    pub fn resume_sink_pulls(&mut self) {
-        self.sink_pulls_deferred = false;
-    }
-
-    /// Whether a compile pulls each sink once it is subscribed.
-    fn pulls_sinks(&self) -> bool {
-        !self.sink_pulls_deferred
     }
 
     /// Supply the sink that `name = test_sink()` binds, and keep a handle on it.
@@ -1259,7 +1235,7 @@ impl CompiledOutput {
     }
 }
 
-/// A compiled CHL program ready for the scheduler to drive.
+/// A compiled CHL program ready for the dispatcher to run.
 ///
 /// Holds the join-planned AST, one [`CompiledOutput`] per program output, and a
 /// `done` receiver that fires when every sink output has reached a terminal tile.
@@ -1345,19 +1321,9 @@ pub struct CompiledProgram {
     /// the compilation that built it; the producers under a kept operator are
     /// read off its fan-out instead ([`OperatorMap::source_producers`]).
     pub source_producers: HashSet<String>,
-    /// Whether the compile left out the pull each sink takes once subscribed
-    /// ([`GlobalContext::defer_sink_pulls`]), which a dispatched run needs: a sink pulled in pull
-    /// mode has run part of the program already.
-    sink_pulls_deferred: bool,
 }
 
 impl CompiledProgram {
-    /// Whether the compile left out the pull each sink takes once subscribed, which a dispatched
-    /// run needs ([`GlobalContext::defer_sink_pulls`]).
-    pub fn sink_pulls_deferred(&self) -> bool {
-        self.sink_pulls_deferred
-    }
-
     /// Every file the program was compiled from.
     ///
     /// Inspector queries need the source text to produce snippets (`hover`'s
@@ -3092,8 +3058,7 @@ fn compile_version(
                 .clone();
 
             let notifier = notifiers.pop().unwrap();
-            let (sink_consumer, producer_slot) =
-                SinkConsumer::new(sink, notifier, ctx.scheduler().sink_pull_queue());
+            let (sink_consumer, producer_slot) = SinkConsumer::new(sink, notifier);
             let consumer_rc = Rc::new(RefCell::new(sink_consumer));
             let sink_producer = op.subscribe(
                 universal,
@@ -3111,14 +3076,6 @@ fn compile_version(
                 )
             );
             *producer_slot.borrow_mut() = Some(sink_producer);
-            // Pull the sink now it has something to pull. A first compile is carried
-            // by the source reporting its data as new; a *replacement* is not,
-            // because the version it replaces has already taken that report, so
-            // without this pull a reload lands with unfinished work and nothing
-            // pulls it until the next arrival.
-            if ctx.pulls_sinks() {
-                consumer_rc.borrow().pull_now();
-            }
             outputs.push(CompiledOutput {
                 name,
                 op,
@@ -3151,7 +3108,6 @@ fn compile_version(
         loaded: program.clone(),
         routes,
         source_producers,
-        sink_pulls_deferred: !ctx.pulls_sinks(),
     };
 
     // Optionally check the compiled program's selected pane pairs.

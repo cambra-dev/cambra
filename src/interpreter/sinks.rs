@@ -2,7 +2,7 @@
 //!
 //! These types are independent of any particular data source (HTTP, stdin, etc.)
 //! and are used by [`crate::ccl::context`] to wire compiled sink operators into
-//! the scheduler.
+//! dispatcher runs.
 
 use crate::interpreter::Projection;
 use std::{
@@ -15,11 +15,7 @@ use std::{
     },
 };
 
-use crate::interpreter::{
-    Consumer, DataSink,
-    scheduler::{SharedConsumer, WakeupQueue},
-    tile_operators::TileProducer,
-};
+use crate::interpreter::{Consumer, DataSink, tile_operators::TileProducer};
 use crate::interpreter::{
     dispatcher::{Landing, PipelineId, Routes, pushed_guard},
     tile_operators::Tiling,
@@ -73,86 +69,56 @@ impl DoneNotifier {
 // Sink consumer
 // ---------------------------------------------------------------------------
 
-/// A [`Consumer`] that, on notification, schedules a pull of the wrapped producer on the
-/// scheduler's sink pull queue
-/// ([`Scheduler::sink_pull_queue`](crate::interpreter::Scheduler::sink_pull_queue)). The pull
-/// passes the current tile to the paired [`DataSink`] and fires the [`DoneNotifier`] when a
-/// terminal tile is received.
-///
-/// The pull is scheduled rather than made in [`notify`](Consumer::notify) because a change
-/// reaches a sink once along every notification path from where it happened, and the queue
-/// holds one pull however many arrive (`src/interpreter/design-operators.md`, "The
-/// notification contract").
-///
-/// The producer reference is held in an `Option` that starts as `None` and is
-/// filled after [`crate::interpreter::tile_operators::TileOperator::subscribe`] returns (solving the chicken-and-egg:
-/// the consumer must exist before subscribe is called, but subscribe is what
-/// creates the producer).
-///
-/// A pull scheduled *during* `subscribe` — an induction store notifies to start its
-/// loop — waits on that queue and runs at the scheduler's next delivery, by which time the
-/// slot is filled. [`pull_now`](Self::pull_now) pulls at once instead, which is what
-/// [`crate::ccl::context::compile_program`] does once it has filled the slot.
+/// The dispatcher consumer of a program's sink output.
+/// A region delivery queues work for its sink pipeline. After every pipeline finishes,
+/// [`complete`](Self::complete) reconciles terminal output and signals [`DoneNotifier`].
+/// The producer slot is filled after subscription returns.
 pub struct SinkConsumer {
     /// The compiled responses producer, filled in after subscribe returns.
     producer: ProducerSlot,
-    /// The sink a pull hands the producer's answer to, which a dispatched run's sink breaker
-    /// hands its packages' answers to instead.
+    /// The sink that receives completed packages and the final terminal tile.
     sink: Arc<dyn DataSink>,
-    /// The pull a notification schedules: one `get` of the producer, handed to the sink.
-    pull: SharedConsumer,
-    /// Where a notification schedules [`pull`](Self::pull).
-    wakeups: WakeupQueue,
+    done: Option<DoneNotifier>,
     /// The sink's pipeline in a dispatched run, and the tiling of the producer it pulls,
     /// which a push names regions of ([`place`](Self::place)).
     placed: Option<(PipelineId, Tiling)>,
 }
 
 impl SinkConsumer {
-    /// Create a new consumer paired with `sink` and `done`.
-    ///
-    /// The returned consumer holds a shared handle to the `producer` slot. The
-    /// caller fills it with the `TileProducer` returned by
-    /// [`crate::interpreter::tile_operators::TileOperator::subscribe`] and then pulls
-    /// once ([`pull_now`](Self::pull_now)).
-    pub fn new(
-        sink: Arc<dyn DataSink>,
-        done: DoneNotifier,
-        wakeups: WakeupQueue,
-    ) -> (Self, ProducerSlot) {
-        let slot: ProducerSlot = Rc::new(RefCell::new(None));
-        let producer = slot.clone();
-        let mut done = Some(done);
-        let sink_handle = sink.clone();
-        let pull: SharedConsumer = Rc::new(RefCell::new(move || {
-            if let Some(prod) = producer.borrow_mut().as_mut() {
-                let guard = prod.tiling().universal_guard();
-                let tile = prod.get(guard).closed_over(prod.tiling());
-                sink.process(&tile);
-                let is_terminal = tile.is_terminal();
-                prod.release(tile.to_guard());
-                if is_terminal && let Some(notifier) = done.take() {
-                    notifier.signal();
-                }
-            }
-        }));
+    /// Pair `sink` and `done` with an empty producer slot for the caller to fill after subscription.
+    pub fn new(sink: Arc<dyn DataSink>, done: DoneNotifier) -> (Self, ProducerSlot) {
+        let producer = Rc::new(RefCell::new(None));
         (
             Self {
-                producer: slot.clone(),
-                sink: sink_handle,
-                pull,
-                wakeups,
+                producer: producer.clone(),
+                sink,
+                done: Some(done),
                 placed: None,
             },
-            slot,
+            producer,
         )
     }
 
-    /// Pull now rather than when the scheduler next drains. Installing a version pulls it
-    /// at once: the version a reload replaces hands its state to its successor, and one
-    /// replaced before it was ever pulled has opened none to hand on.
-    pub fn pull_now(&self) {
-        self.pull.borrow_mut().notify(&Projection::Everything);
+    /// Reconcile terminal output and signal completion after all sink pipelines finish.
+    pub(crate) fn complete(&mut self) {
+        if self.done.is_none() {
+            return;
+        }
+        let mut slot = self.producer.borrow_mut();
+        let producer = slot.as_mut().expect("a compiled sink holds its producer");
+        let tile = producer
+            .get(producer.tiling().universal_guard())
+            .closed_over(producer.tiling());
+        self.sink.process(&tile);
+        producer.release(tile.to_guard());
+        assert!(
+            tile.is_terminal(),
+            "a finished sink reconciles a terminal tile"
+        );
+        self.done
+            .take()
+            .expect("completion is signalled once")
+            .signal();
     }
 
     /// Stop dispatching and release the producer chain behind this consumer.
@@ -192,14 +158,12 @@ impl SinkConsumer {
 }
 
 impl Consumer for SinkConsumer {
-    /// Schedules one pull rather than pulling. A change reaches the sink once along every
-    /// path from where it happened, and the queue holds a pull once however many arrive.
-    fn notify(&mut self, _arrived: &Projection) {
+    /// Cache invalidation executes no sink; output delivery is scheduled by `notify`.
+    fn invalidate(&mut self, _arrived: &Projection) {
         crate::interpreter::dispatcher::debug_assert_outside_a_run();
-        self.wakeups.request(self.pull.clone());
     }
 
-    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
         if let Some((pipeline, input)) = &self.placed
             && let Some(guard) = pushed_guard(region, input)
         {

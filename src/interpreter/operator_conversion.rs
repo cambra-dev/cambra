@@ -6606,7 +6606,7 @@ mod variant_ctor_tests {
             mut consumer: Box<dyn Consumer>,
             _cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
-            consumer.notify(&Projection::Everything);
+            consumer.invalidate(&Projection::Everything);
             Box::new(FixedStreamProducer {
                 base: ProducerBase::unowned(FixedStreamProducer::alloc_id(), &self.tiling),
                 tile: self.tile.clone(),

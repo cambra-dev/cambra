@@ -205,7 +205,7 @@ pub(crate) fn subscribe_forwarding(
 ) -> Box<dyn TileProducer> {
     op.subscribe(
         op.tiling().universal_guard(),
-        forwarding_consumer(shared, &cx.scheduler().wakeup_queue()),
+        forwarding_consumer(shared, &cx.source_registry().wakeup_queue()),
         cx,
     )
 }
@@ -234,7 +234,7 @@ pub(crate) fn subscribe_forwarding_keeping_keys(
 ) -> Box<dyn TileProducer> {
     op.subscribe(
         op.tiling().universal_guard(),
-        forwarding_consumer_keeping_keys(shared, &cx.scheduler().wakeup_queue()),
+        forwarding_consumer_keeping_keys(shared, &cx.source_registry().wakeup_queue()),
         cx,
     )
 }
@@ -279,8 +279,8 @@ impl BreakerInput {
     ) -> Self {
         let shared = GatedConsumer::new(consumer, Notified::Always);
         let forwarding = match keeps_keys {
-            true => forwarding_consumer_keeping_keys(&shared, &cx.scheduler().wakeup_queue()),
-            false => forwarding_consumer(&shared, &cx.scheduler().wakeup_queue()),
+            true => forwarding_consumer_keeping_keys(&shared, &cx.source_registry().wakeup_queue()),
+            false => forwarding_consumer(&shared, &cx.source_registry().wakeup_queue()),
         };
         let (entry, placement) =
             crate::interpreter::dispatcher::Entry::unplaced(input.clone(), forwarding);
@@ -441,19 +441,19 @@ struct FlaggingConsumer {
 }
 
 impl Consumer for FlaggingConsumer {
-    fn notify(&mut self, arrived: &Projection) {
+    fn invalidate(&mut self, arrived: &Projection) {
         crate::interpreter::dispatcher::debug_assert_outside_a_run();
         self.flag.mark();
-        self.downstream.notify(arrived);
+        self.downstream.invalidate(arrived);
     }
 
     /// A push is no change to read, so it sets no flag.
-    fn push(
+    fn notify(
         &mut self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
-        self.downstream.push(region, landing);
+        self.downstream.notify(region, landing);
     }
     fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
         self.downstream.route(routes);
@@ -509,19 +509,19 @@ struct RecordingConsumer {
 }
 
 impl Consumer for RecordingConsumer {
-    fn notify(&mut self, arrived: &Projection) {
+    fn invalidate(&mut self, arrived: &Projection) {
         crate::interpreter::dispatcher::debug_assert_outside_a_run();
         self.arrivals.record(arrived);
-        self.downstream.notify(arrived);
+        self.downstream.invalidate(arrived);
     }
 
     /// A push is no change of the input, so it records nothing.
-    fn push(
+    fn notify(
         &mut self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
-        self.downstream.push(region, landing);
+        self.downstream.notify(region, landing);
     }
     fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
         self.downstream.route(routes);
@@ -936,11 +936,11 @@ pub struct ProducerBase {
     /// Obsolete region of the tiling
     pub obsolete_guard: TileGuard,
     /// The gate on the consumer this producer's operator shares between its inputs
-    /// ([`shared_consumer`](crate::interpreter::scheduler::shared_consumer)), cleared by
+    /// ([`shared_consumer`](crate::interpreter::notifications::shared_consumer)), cleared by
     /// every pull. `None` for an operator that shares none.
     pub(crate) gate: Option<Notified>,
     /// How many times this producer has been pulled, for the debug check that a woken
-    /// consumer pulls (`scheduler::pull_laps`).
+    /// consumer pulls (`notifications::pull_laps`).
     pub(crate) pulls: u64,
     /// The last tile `get` returned, for the debug check that the complete region never
     /// changes ([`completeness_violation`]). Debug builds only; `None` in release.
@@ -1837,7 +1837,7 @@ pub trait TileProducer {
 
     /// Hand `visit` each producer this one pulls, with the role it plays. It is what
     /// [`add_inspect_children`](Self::add_inspect_children) lists by default, and what
-    /// `scheduler::pull_laps`'s debug check that a woken
+    /// `notifications::pull_laps`'s debug check that a woken
     /// consumer pulls walks. A producer that pulls nothing visits nothing.
     fn visit_input_producers(&self, _visit: &mut dyn FnMut(&str, &dyn TileProducer)) {}
 
@@ -1862,6 +1862,12 @@ pub trait TileProducer {
     /// one: an operator inside that fan-out's store's cycle reads the store through it.
     fn recurrence_of(&self) -> Option<usize> {
         None
+    }
+
+    /// Inputs sampled at their current committed snapshot rather than awaited to completion.
+    /// The planner still plans their pipelines and awaits their seed inputs before sampling.
+    fn sampled_inputs(&self) -> &'static [&'static str] {
+        &[]
     }
 
     /// The cyclic fan-out this producer reads through a reader slot, where it is one: a reader
@@ -2025,15 +2031,15 @@ pub(crate) mod test_helpers {
     struct Readers(Vec<crate::interpreter::dispatcher::Entry>);
 
     impl crate::interpreter::Consumer for Readers {
-        fn notify(&mut self, _arrived: &Projection) {}
+        fn invalidate(&mut self, _arrived: &Projection) {}
 
-        fn push(
+        fn notify(
             &mut self,
             region: &Projection,
             landing: &mut crate::interpreter::dispatcher::Landing<'_>,
         ) {
             for entry in &mut self.0 {
-                crate::interpreter::Consumer::push(entry, region, landing);
+                crate::interpreter::Consumer::notify(entry, region, landing);
             }
         }
 
@@ -2303,7 +2309,7 @@ pub(crate) mod test_helpers {
             mut consumer: Box<dyn super::Consumer>,
             _cx: &mut super::SubscribeContext,
         ) -> Box<dyn TileProducer> {
-            consumer.notify(&Projection::Everything);
+            consumer.invalidate(&Projection::Everything);
             let (mut spy, _, _) = ProjectionSpy::new(self.tile.clone(), self.tiling.clone());
             spy.pulled = self.pulled.clone();
             spy.released = self.released.clone();
@@ -2421,7 +2427,7 @@ pub(crate) mod test_helpers {
             mut consumer: Box<dyn super::Consumer>,
             _cx: &mut super::SubscribeContext,
         ) -> Box<dyn TileProducer> {
-            consumer.notify(&Projection::Everything);
+            consumer.invalidate(&Projection::Everything);
             Box::new(ScriptedProducer {
                 base: ProducerBase::unowned(ScriptedProducer::alloc_id(), &self.tiling),
                 tile: self.cell.clone(),
@@ -2447,7 +2453,7 @@ pub(crate) mod test_helpers {
     }
 
     impl super::Consumer for RegionLog {
-        fn notify(&mut self, arrived: &Projection) {
+        fn invalidate(&mut self, arrived: &Projection) {
             self.regions.borrow_mut().push(arrived.clone());
         }
     }
@@ -2529,7 +2535,7 @@ pub(crate) mod test_helpers {
             .borrow_mut()
             .as_mut()
             .expect("the operator was subscribed")
-            .notify(arrived);
+            .invalidate(arrived);
     }
 
     /// A store's parts are collections held to the contract like any other: a decided set
