@@ -7,7 +7,9 @@ use crate::ccl::module_type::AliasType;
 use crate::ccl::provenance::NodeId;
 use smol_str::SmolStr;
 
-use crate::ccl::{AggregateKind, BinOpKind, Builtin, Label, Lit, Name, ProjKey, Type, UnaryOpKind};
+use crate::ccl::{
+    AggregateKind, BinOpKind, Builtin, FunKind, Label, Lit, Name, ProjKey, Type, UnaryOpKind,
+};
 use crate::chl_parser::ModulePath;
 use crate::chl_parser::ast::Span;
 
@@ -1801,16 +1803,25 @@ impl TypedExpr {
     /// known (lowering phase); pass the concrete type when it is already known.
     /// Do not pass `Type::Infer(fresh_infer_var())` from lowering — `Hole` is
     /// the correct lowering placeholder.
+    ///
+    /// The lambda is a compute function, typed by [`Type::pi_if_dependent`]: a body whose type
+    /// reads `param` makes it a Pi over `param`.
     pub fn lambda(
         param: impl Into<Name>,
         occurrence: Occurrence,
         param_ty: Type,
         body: TypedExpr,
     ) -> Self {
-        let result_ty = Type::fun(param_ty.clone(), body.ty.clone());
+        let param = param.into();
+        let result_ty = Type::pi_if_dependent(
+            param.clone(),
+            param_ty.clone(),
+            body.ty.clone(),
+            FunKind::Compute,
+        );
         Self::new(TypedExprNode::Lambda {
             param: TypedBinding {
-                name: param.into(),
+                name: param,
                 occurrence,
                 ty: param_ty,
                 user_annotation: None,

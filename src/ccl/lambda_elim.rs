@@ -1311,15 +1311,8 @@ fn elim_lambda_impl(
     let in_body_type = crate::ccl::subst::codomain_depends_on(param, &body_ty);
     let result_ty = if param_ty.is_unresolved() || body_ty.is_unresolved() {
         Type::Hole
-    } else if in_body_type {
-        Type::pi_kinded(param, param_ty.clone(), body_ty.clone(), fun_kind.clone())
     } else {
-        Type::Fun {
-            name: None,
-            fun_kind: fun_kind.clone(),
-            domain: Box::new(param_ty.clone()),
-            codomain: Box::new(body_ty.clone()),
-        }
+        Type::pi_if_dependent(param, param_ty.clone(), body_ty.clone(), fun_kind.clone())
     };
     assert_ne!(Type::Hole, result_ty);
 
@@ -1863,23 +1856,13 @@ fn elim_lambda_impl(
                 "lambda_elim.let_as_application",
                 provenance::Nature::Machinery,
             );
-            let lambda_ty = if crate::ccl::subst::codomain_depends_on(&binding.name, &let_body.ty) {
-                Type::pi(
-                    binding.name.clone(),
-                    binding.ty.clone(),
-                    let_body.ty.clone(),
-                )
-            } else {
-                Type::fun(binding.ty.clone(), let_body.ty.clone())
-            };
             // The lambda's binder is the `let`'s, moved: it keeps the binder's occurrence.
             let lambda = Expr::lambda(
                 &binding.name,
                 binding.occurrence,
                 binding.ty.clone(),
                 *let_body,
-            )
-            .with_ty(lambda_ty);
+            );
             let application = Expr::apply(*def, lambda).with_ty(body_ty.clone());
             elim_lambda_kinded(ctx, param, param_ty, application, fun_kind)
         }

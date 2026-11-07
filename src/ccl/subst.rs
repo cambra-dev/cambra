@@ -3896,7 +3896,14 @@ impl<'a> PiWalk<'a> {
         }
     }
 
+    // `ty` and `expr` recurse into each other through refinement predicates, one frame
+    // per nesting level of the type and of every term inside it; grow on demand, as
+    // the other pass-level walks do.
     fn ty(&mut self, ty: &mut Type, depth: u32) {
+        stacker::maybe_grow(512 * 1024, 1024 * 1024, || self.ty_inner(ty, depth))
+    }
+
+    fn ty_inner(&mut self, ty: &mut Type, depth: u32) {
         match ty {
             // No structural children. An `Infer`'s bounds are the live
             // graph's, name-spelled — a construction-time
@@ -4099,6 +4106,10 @@ impl<'a> PiWalk<'a> {
     }
 
     fn expr(&mut self, e: &mut TypedExpr, depth: u32) {
+        stacker::maybe_grow(512 * 1024, 1024 * 1024, || self.expr_inner(e, depth))
+    }
+
+    fn expr_inner(&mut self, e: &mut TypedExpr, depth: u32) {
         match &self.mode {
             PiMode::Close(enclosing) => {
                 if let TypedExprNode::Var(n) = &e.node

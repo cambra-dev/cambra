@@ -1101,11 +1101,8 @@ fn component_of(tuple: &Type, of: &Expr, j: usize, opened: &Type) -> Expr {
     let at_own = tuple
         .component_type(j, |i, ty| component_of(tuple, &of_own, i, ty))
         .expect("a projected component exists");
-    let projection_ty = if crate::ccl::subst::type_free_vars(&at_own).contains(&own) {
-        Type::pi(own, tuple.clone(), at_own)
-    } else {
-        Type::fun(tuple.clone(), at_own)
-    };
+    let projection_ty =
+        Type::pi_if_dependent(own, tuple.clone(), at_own, crate::ccl::FunKind::Compute);
     Expr::apply(
         of.clone_preserving_ids(),
         Expr::proj_index(j).with_ty(projection_ty),

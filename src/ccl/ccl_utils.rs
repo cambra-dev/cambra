@@ -1678,21 +1678,7 @@ pub(crate) fn indexed_loop(position: Option<Name>, source: Expr, step: Expr) -> 
         Type::Fun { codomain, .. } => (**codomain).clone(),
         other => panic!("a loop's step is a function, got {other}"),
     };
-    let ty = if crate::ccl::subst::type_free_vars(&value).contains(&position.name) {
-        Type::pi_kinded(
-            position.name.clone(),
-            (*domain).clone(),
-            value.clone(),
-            fun_kind,
-        )
-    } else {
-        Type::Fun {
-            name: None,
-            fun_kind,
-            domain,
-            codomain: Box::new(value.clone()),
-        }
-    };
+    let ty = Type::pi_if_dependent(position.name.clone(), *domain, value.clone(), fun_kind);
     let body = Expr::apply(read, step).with_ty(value);
     let TypedExprNode::Lambda { param, body } =
         Expr::lambda(position.name, position.occurrence, Type::Hole, body).node

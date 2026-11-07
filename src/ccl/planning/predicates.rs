@@ -233,32 +233,19 @@ pub(crate) fn fn_of_bare_predicate(
     } else {
         crate::ccl::ty::FunKind::Data(Some(Rc::new(slot.to_vec())))
     };
-    // Only the *kind* is declared. The shape is whatever the η-expansion built, so a bare
-    // predicate that is already function-valued keeps the codomain it has.
+    // The kind is the only part of the type chosen here. The domain is `base` and the codomain is
+    // the body's own type, so a bare predicate that is already function-valued keeps the codomain
+    // it has.
     //
     // The parameter is a fresh name: element references are bound by refinements alone, and
     // no lambda binds one. The rename reaches a nested refinement's `__elem^1` too
     // (`src/ccl/design/type-inference.md`, "A refinement's element is referenced by index").
     let param = Name::fresh("elem");
     let body = crate::ccl::subst::Subst::rename(Name::elem(), param.clone()).apply_expr(bare);
-    let lam = Expr::lambda(param, Occurrence::mint(), base.clone(), body);
-    let lam = match &lam.ty {
-        Type::Fun {
-            name,
-            domain,
-            codomain,
-            ..
-        } => {
-            let restated = Type::Fun {
-                name: name.clone(),
-                fun_kind,
-                domain: domain.clone(),
-                codomain: codomain.clone(),
-            };
-            lam.with_ty(restated)
-        }
-        _ => lam,
-    };
+    // A refined operator's result type records its operands, so the body's type can read
+    // `param`, and the function is then a Pi over it.
+    let ty = Type::pi_if_dependent(param.clone(), base.clone(), body.ty.clone(), fun_kind);
+    let lam = Expr::lambda(param, Occurrence::mint(), base.clone(), body).with_ty(ty);
     eliminate_lifted(lam).expect("lambda-elim of refinement predicate")
 }
 

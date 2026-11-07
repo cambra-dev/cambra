@@ -3299,6 +3299,33 @@ impl Type {
         }
     }
 
+    /// The type of a function binding `name` over `codomain`: [`Type::pi_kinded`] where
+    /// `codomain` depends on `name` ([`crate::ccl::subst::codomain_depends_on`]), and an
+    /// unnamed `Fun` otherwise.
+    ///
+    /// This is the rule coalescing applies to an inferred function type
+    /// (`src/ccl/design/type-inference.md`, "4.5 Dependent refinements via Pi types"), for a
+    /// function built after inference around a codomain read off its body. An unnamed `Fun`
+    /// around a codomain that reads `name` leaves `name` free in the type.
+    pub fn pi_if_dependent(
+        name: impl Into<crate::ccl::Name>,
+        domain: Self,
+        codomain: Self,
+        fun_kind: FunKind,
+    ) -> Self {
+        let name = name.into();
+        if crate::ccl::subst::codomain_depends_on(&name, &codomain) {
+            Type::pi_kinded(name, domain, codomain, fun_kind)
+        } else {
+            Type::Fun {
+                name: None,
+                fun_kind,
+                domain: Box::new(domain),
+                codomain: Box::new(codomain),
+            }
+        }
+    }
+
     /// The family `\\𝑘₀: 𝐾₀, … -> body` ([`Type::Family`]), closing the body's references
     /// to the binders by name into indices, as [`Type::pi`] closes a codomain.
     pub fn family(binders: Vec<(crate::ccl::Name, Self)>, body: Self) -> Self {

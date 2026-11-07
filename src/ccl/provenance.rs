@@ -2693,17 +2693,12 @@ mod tests {
         );
     }
 
-    // TODO: pinned on `^+`, `^*`, `^<`, `^>=` or `^==`, each of which fails this test on its own.
-    // With all of them refined, lambda elimination's type assert rejects the comprehension filter
-    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only. With it
-    // off, inference rejects a later corpus program whose comprehension element type reads the key.
+    // TODO: pinned on `^+` or `^*`, each of which fails this test on its own. `^+` alone fails the
+    // post-inference collection domain check; `^*` alone, and all of them refined, make inference
+    // reject a corpus program whose comprehension element type reads the key.
     #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
-    #[cfg_attr(
-        not(debug_assertions),
-        should_panic(
-            expected = "a value that is one type for every key of the collection it is part of"
-        )
+    #[should_panic(
+        expected = "a value that is one type for every key of the collection it is part of"
     )]
     fn the_predicate_sweep_skips_this_many_nodes_over_the_corpus_with_caret_operators() {
         crate::ccl::test_corpus::with_caret_operators(

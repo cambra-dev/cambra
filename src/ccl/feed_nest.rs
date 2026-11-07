@@ -54,16 +54,7 @@ pub(crate) fn contribution_lambda(
             },
         )
         .unwrap_or(FunKind::Compute);
-    let ty = if crate::ccl::subst::type_free_vars(&codomain).contains(&param.name) {
-        Type::pi_kinded(param.name.clone(), param.ty.clone(), codomain, fun_kind)
-    } else {
-        Type::Fun {
-            name: None,
-            fun_kind,
-            domain: Box::new(param.ty.clone()),
-            codomain: Box::new(codomain),
-        }
-    };
+    let ty = Type::pi_if_dependent(param.name.clone(), param.ty.clone(), codomain, fun_kind);
     Expr::lambda(
         &param.name,
         param.occurrence.clone(),
