@@ -3648,7 +3648,23 @@ pub(super) fn specialize_use(
     } else {
         FreshenLevel::Raise(raise)
     };
+    #[cfg(debug_assertions)]
+    let before = crate::ccl::infer::solver::scheme::Minted::now();
     freshen_expr_type_slots(&mut clone, cutoff, target, &mut fresh);
+    // The clone is this use's own: nothing above the cutoff is shared with the definition.
+    #[cfg(debug_assertions)]
+    crate::ccl::infer::solver::scheme::assert_copied_apart_from(
+        cutoff,
+        &fresh,
+        before,
+        &mut |visit| {
+            fn slots(e: &Expr, visit: &mut dyn FnMut(&Type)) {
+                e.walk_type_slots(&mut *visit);
+                e.walk_children(|c| slots(c, visit));
+            }
+            slots(&clone, visit)
+        },
+    );
 
     // Pin the clone to the use's live instantiation type. Outward, clone below
     // use, the pin connects the clone into the use's component of the live

@@ -2978,9 +2978,39 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             // level, linked to the original by the appropriate bound. It
             // proxies the original, so it inherits the original's telescope —
             // the bounds copied below close against the same scope.
+            // Each field of the original, and what the proxy makes of it.
+            let crate::ccl::infer_var::InferVarFields {
+                // The proxy's own.
+                uid: (),
+                // The target level.
+                level: (),
+                // The original's: the bounds copied below close against the same scope.
+                telescope: (),
+                // Linked to the original, and the side the polarity reads copied, below.
+                bounds: (),
+                // Its own funkind variable, related to the original's as the link bound relates
+                // the two variables (`relate_proxy_funkinds`).
+                fun_kind: (),
+                // The original's (`copy_watches`).
+                watches: (),
+                // A memo of the variables reading this one under substitutions, minted afresh as
+                // the proxy is read.
+                suspensions: (),
+                // Marked, so a function edge whose domain is the proxy is an equation as one
+                // whose domain is the original is.
+                named_domain: (),
+                // `inherit_stands_for`.
+                stands_for: (),
+                // `inherit_witness_placement`.
+                witness_scopes: (),
+            } = tv.fields();
             let nvs = InferVar::fresh_in(target_level, &tv.telescope);
             nvs.inherit_witness_placement(tv);
             nvs.inherit_stands_for(tv);
+            if tv.names_domain() {
+                nvs.mark_named_domain();
+            }
+            relate_proxy_funkinds(tv, &nvs, &[pol]);
             cache.vars.insert((tv.uid, pol), Rc::clone(&nvs));
             copy_watches(tv, &nvs);
             // Kinding constraints ride along at **both** polarities, unlike the bounds
@@ -3051,6 +3081,26 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             }
             Type::Infer(nvs)
         }
+    }
+}
+
+/// Record between `original`'s funkind variable and `proxy`'s the edges the bound linking the two
+/// draws, as relating two variables records their funkinds' (`constrain_go`): `original <: proxy`
+/// for a positive direction, `proxy <: original` for a negative one. The link is written directly,
+/// so without this the proxy's funkind variable relates to nothing the original's does.
+fn relate_proxy_funkinds(original: &InferVar, proxy: &InferVar, directions: &[bool]) {
+    for &positive in directions {
+        let (lower, upper) = if positive {
+            (original, proxy)
+        } else {
+            (proxy, original)
+        };
+        upper
+            .fun_kind
+            .record(FunKind::Var(Rc::clone(&lower.fun_kind)), true);
+        lower
+            .fun_kind
+            .record(FunKind::Var(Rc::clone(&upper.fun_kind)), false);
     }
 }
 
@@ -3154,8 +3204,38 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
                 .clone()
                 .or_else(|| cached_neg.clone())
                 .unwrap_or_else(|| InferVar::fresh_in(target_level, &tv.telescope));
+            // Each field of the original, and what the proxy makes of it.
+            let crate::ccl::infer_var::InferVarFields {
+                // The proxy's own.
+                uid: (),
+                // The target level.
+                level: (),
+                // The original's: the bounds copied below close against the same scope.
+                telescope: (),
+                // Linked both ways, and both sides copied, below.
+                bounds: (),
+                // Its own funkind variable, related to the original's as the link bound relates
+                // the two variables (`relate_proxy_funkinds`).
+                fun_kind: (),
+                // The original's (`copy_watches`).
+                watches: (),
+                // A memo of the variables reading this one under substitutions, minted afresh as
+                // the proxy is read.
+                suspensions: (),
+                // Marked, so a function edge whose domain is the proxy is an equation as one
+                // whose domain is the original is.
+                named_domain: (),
+                // `inherit_stands_for`.
+                stands_for: (),
+                // `inherit_witness_placement`.
+                witness_scopes: (),
+            } = tv.fields();
             nvs.inherit_witness_placement(tv);
             nvs.inherit_stands_for(tv);
+            if tv.names_domain() {
+                nvs.mark_named_domain();
+            }
+            relate_proxy_funkinds(tv, &nvs, &[true, false]);
             // Which bound links does the reused proxy already carry? A polar
             // proxy under the `true` key has the positive link (`tv <: proxy`);
             // under the `false` key, the negative link (`proxy <: tv`). A fresh

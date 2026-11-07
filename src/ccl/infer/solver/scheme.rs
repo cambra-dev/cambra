@@ -94,12 +94,18 @@ impl PolyScheme {
     /// gets independent constraints (e.g. two uses of `Compare` can
     /// compare `Int`s and `String`s respectively without conflict).
     pub fn instantiate(&self, current_level: Level) -> Type {
-        freshen_above(
+        #[cfg(debug_assertions)]
+        let before = Minted::now();
+        let mut cache = FreshenCache::new();
+        let ty = freshen_above(
             self.level,
             &self.body,
             FreshenLevel::At(current_level),
-            &mut FreshenCache::new(),
-        )
+            &mut cache,
+        );
+        #[cfg(debug_assertions)]
+        assert_copied_apart(self.level, std::slice::from_ref(&ty), &cache, before);
+        ty
     }
 
     /// [`instantiate`](Self::instantiate) for a scheme that may quantify **type
@@ -115,6 +121,8 @@ impl PolyScheme {
     /// under the binders its original stood under inside the definition
     /// ([`FreshenCache::use_telescope`]).
     pub fn instantiate_with_params(&self, current_level: Level, telescope: &Telescope) -> Instance {
+        #[cfg(debug_assertions)]
+        let before = Minted::now();
         let mut cache = FreshenCache::new();
         cache.param_telescope = Some(telescope.clone());
         cache.use_telescope = Some(telescope.clone());
@@ -163,6 +171,8 @@ impl PolyScheme {
                 bounds.push((var, bound, param.bound_at));
             }
         }
+        #[cfg(debug_assertions)]
+        assert_copied_apart(self.level, std::slice::from_ref(&ty), &cache, before);
         Instance {
             ty,
             bounds,
@@ -181,14 +191,102 @@ impl PolyScheme {
     /// binders the definition's own stood under, entered after the use site's
     /// ([`FreshenCache::use_telescope`]).
     pub fn instantiate_in(&self, current_level: Level, telescope: &Telescope) -> Type {
+        #[cfg(debug_assertions)]
+        let before = Minted::now();
         let mut cache = FreshenCache::new();
         cache.site_telescope = Some(telescope.clone());
-        freshen_above(
+        let ty = freshen_above(
             self.level,
             &self.body,
             FreshenLevel::At(current_level),
             &mut cache,
-        )
+        );
+        #[cfg(debug_assertions)]
+        assert_copied_apart(self.level, std::slice::from_ref(&ty), &cache, before);
+        ty
+    }
+}
+
+/// The first variable and funkind variable ids an instantiation could mint: whatever has a smaller
+/// id stood before it, and whatever has a larger one the instantiation made.
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy)]
+pub(crate) struct Minted {
+    var: InferVarId,
+    funkind: FunKindVarId,
+}
+
+#[cfg(debug_assertions)]
+impl Minted {
+    pub(crate) fn now() -> Self {
+        Minted {
+            var: crate::ccl::infer_var::next_infer_var_id(),
+            funkind: crate::ccl::ty::next_fun_kind_var_id(),
+        }
+    }
+}
+
+/// Panic where an instantiation shares with its scheme something above the cutoff `lim`: a
+/// variable or a funkind variable that stood before the instantiation (`before`), stands above
+/// `lim`, and is reached from the instance, through its structure or a copy's bounds and funkind
+/// edges. What stands at or below `lim` is an enclosing scope's and is shared by design; above it,
+/// each use owns its own copy, and one shared with the scheme carries whatever a later use
+/// records into every other (`src/ccl/design/type-inference.md`, "Funkind variables are copied by
+/// level").
+#[cfg(debug_assertions)]
+fn assert_copied_apart(lim: Level, roots: &[Type], cache: &FreshenCache, before: Minted) {
+    assert_copied_apart_from(lim, cache, before, &mut |visit| {
+        roots.iter().for_each(visit)
+    });
+}
+
+/// A walk handing each root type of a copy to the visitor it is given.
+#[cfg(debug_assertions)]
+pub(crate) type Roots<'a> = dyn FnMut(&mut dyn FnMut(&Type)) + 'a;
+
+/// [`assert_copied_apart`] over the roots `roots` hands its visitor: a specialization's are its
+/// clone's type slots, walked in place.
+#[cfg(debug_assertions)]
+pub(crate) fn assert_copied_apart_from(
+    lim: Level,
+    cache: &FreshenCache,
+    before: Minted,
+    roots: &mut Roots<'_>,
+) {
+    fn reach(ty: &Type, out: &mut Vec<Rc<InferVar>>) {
+        if let Type::Infer(v) = ty {
+            out.push(Rc::clone(v));
+        }
+        ty.walk_children(|c| reach(c, out));
+    }
+    let mut reached = Vec::new();
+    roots(&mut |root| reach(root, &mut reached));
+    for copy in cache.vars.values() {
+        let bounds = copy.bounds.borrow();
+        for b in bounds.lower().iter().chain(bounds.upper().iter()) {
+            reach(&b.ty, &mut reached);
+        }
+        drop(bounds);
+        for (k, _) in copy
+            .fun_kind
+            .lower_edges()
+            .into_iter()
+            .chain(copy.fun_kind.upper_edges())
+        {
+            if let FunKind::Var(k) = k {
+                assert!(
+                    k.uid >= before.funkind || k.level().is_some_and(|l| l <= lim),
+                    "an instantiation shares a funkind variable above the cutoff {lim} with its \
+                     scheme: {k:?}, related to the copy {copy:?}"
+                );
+            }
+        }
+    }
+    for v in reached {
+        assert!(
+            v.uid >= before.var || v.level() <= lim,
+            "an instantiation shares a variable above the cutoff {lim} with its scheme: {v:?}"
+        );
     }
 }
 
@@ -381,6 +479,22 @@ fn freshen_kind_var(
     if kv.level().is_some_and(|l| l <= lim) {
         return Rc::clone(kv);
     }
+    // Each field of the original, and what the copy makes of it.
+    let crate::ccl::ty::FunKindVarFields {
+        // The copy's own.
+        uid: (),
+        // An annotation's funkind hole is normalized away before inference, so no funkind
+        // variable a freshening copies is one.
+        hole: (),
+        // The target's level for the original's, below.
+        level: (),
+        // The stamp, the binders and every edge, below.
+        bounds: (),
+        // Memos of what the funkind variable resolved to, recomputed for the copy when it is
+        // read.
+        resolved_at: (),
+        component_at: (),
+    } = kv.fields();
     let f = FunKindVar::fresh();
     if let Some(l) = kv.level() {
         f.place_at(target.level_of(l));
@@ -962,6 +1076,31 @@ pub fn freshen_above(
                         .rescoped(|_| false, cache.entered_binders.iter().cloned()),
                 },
             };
+            // Each field of the original, and what the copy makes of it.
+            let crate::ccl::infer_var::InferVarFields {
+                // The copy's own.
+                uid: (),
+                // The target's level for the original's (`new_level`).
+                level: (),
+                // Rescoped to the use (`telescope`, above).
+                telescope: (),
+                // Freshened below, lower, upper and type kinds.
+                bounds: (),
+                // The original's funkind variable freshened (above), related by
+                // `relate_kind_copy`.
+                fun_kind: (),
+                // Freshened, each obligation's frames copied (`freshen_watches`).
+                watches: (),
+                // A memo of the variables reading this one under substitutions, minted afresh as
+                // the copy is read; the memberships recorded on them come across below.
+                suspensions: (),
+                // `mark_named_domain`, below.
+                named_domain: (),
+                // `inherit_stands_for`, below.
+                stands_for: (),
+                // `inherit_witness_placement_renamed`, below.
+                witness_scopes: (),
+            } = tv.fields();
             let v = InferVar::fresh_over(new_level, &telescope, fun_kind);
             // The kinds the original sits under are this copy's kinds, whichever this walk
             // reaches first: a variable copied before the function it is a part of would
