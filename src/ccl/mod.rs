@@ -31,6 +31,7 @@ pub mod mut_scope;
 pub mod names;
 pub mod nominal;
 pub mod opaque_output;
+pub(crate) mod pairing;
 pub mod panes;
 pub mod planning;
 pub mod provenance;

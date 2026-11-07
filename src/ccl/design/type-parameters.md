@@ -579,6 +579,11 @@ two binders spelled alike is one part. A refinement reading the type's own binde
 of scope stays outside the parameter, around its occurrence. A binder spelled like a name the type
 also reads free is renamed apart first, so the two stay distinct.
 
+Matching and alignment walk the two types together through `pairing::paired_parts`, which states
+the positions two types share for every shape of type, a function's Σ candidates among them, and
+the binders each side puts around a position. A shape the walk does not pair is a leaf, a
+refinement or a generic type, which the walk handles itself.
+
 Check instantiates a generalized type where it is used: at a chain edge from the codomain before it,
 at a chain's head from the chain's input, and at an application from the argument
 (`generalize::instantiate`). It matches the type's domain against what it receives, with every
