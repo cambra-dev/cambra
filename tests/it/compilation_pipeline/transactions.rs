@@ -2150,8 +2150,8 @@ fn a_finite_mut_var_completes_despite_a_live_unrelated_writer() {
     // terminal yield predicate — so `b`'s writer never drains.
     src.borrow_mut()
         .add_data(&[(Value::UInt(0), Value::Int(100))]);
-    ctx.scheduler().check_for_notifications();
-    let result = pull_laps(ctx.scheduler(), &mut *producer, 65, |_| false);
+    ctx.source_registry().notify_changes();
+    let result = pull_laps(ctx.source_registry(), &mut *producer, 65, |_| false);
 
     let Tile::Record { fields, .. } = &result else {
         panic!("expected a record of both replies, got {result:?}");
@@ -2211,8 +2211,8 @@ fn a_finite_mut_var_completes_despite_a_live_writer_it_shares_a_block_with() {
 
     src.borrow_mut()
         .add_data(&[(Value::UInt(0), Value::Int(100))]);
-    ctx.scheduler().check_for_notifications();
-    let result = pull_laps(ctx.scheduler(), &mut *producer, 65, |_| false);
+    ctx.source_registry().notify_changes();
+    let result = pull_laps(ctx.source_registry(), &mut *producer, 65, |_| false);
 
     let Tile::Record { fields, .. } = &result else {
         panic!("expected a record of both replies, got {result:?}");
@@ -2268,8 +2268,8 @@ fn a_read_only_mentioned_key_completes_while_a_live_writer_runs() {
 
     src.borrow_mut()
         .add_data(&[(Value::UInt(0), Value::Int(5))]);
-    ctx.scheduler().check_for_notifications();
-    let result = pull_laps(ctx.scheduler(), &mut *producer, 65, |_| false);
+    ctx.source_registry().notify_changes();
+    let result = pull_laps(ctx.source_registry(), &mut *producer, 65, |_| false);
     assert_eq!(
         result,
         Tile::Scalar(ColumnValue::Ints(vec![100])),
@@ -2415,7 +2415,7 @@ fn live_reply_combines_request_and_store() {
     // store on every `get`, and the writer's self-re-arm steps one commit per pull.
     for _ in 0..16 {
         producer.get(producer.tiling().universal_guard());
-        ctx.scheduler().check_for_notifications();
+        ctx.source_registry().notify_changes();
     }
 
     src.borrow_mut().add_data(&[
@@ -2423,9 +2423,9 @@ fn live_reply_combines_request_and_store() {
         (Value::UInt(1), Value::Int(15)),
     ]);
     src.borrow_mut().set_yield_predicate(Predicate::True);
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
 
-    let mut result = pull_laps(ctx.scheduler(), &mut *producer, 65, Tile::is_terminal);
+    let mut result = pull_laps(ctx.source_registry(), &mut *producer, 65, Tile::is_terminal);
     result.compact();
     assert_eq!(
         sort_function_by_domain(result),
@@ -3088,7 +3088,7 @@ fn broadcast_read_races_a_second_writer() {
 /// reply — one commit, `pool = 100 − 3 = 97` at commit tick 1. This is the case
 /// the old in-`get` pump could not handle (it spun without yielding to the
 /// scheduler); the deferred-wakeup path drives it — each not-ready pull re-arms
-/// the writer, and `check_for_notifications` delivers both the source's data and
+/// the writer, and `notify_changes` delivers both the source's data and
 /// the writer's wakeups until the sibling loop (and the commit) resolve. Driven
 /// exactly as `src/main.rs` does — notification-gated, re-pull to terminal.
 #[test]
@@ -3137,7 +3137,7 @@ fn broadcast_off_async_source_sibling_loop() {
     while !result.is_terminal() {
         iters += 1;
         assert!(iters < 1024, "async-source broadcast did not converge");
-        ctx.scheduler().check_for_notifications();
+        ctx.source_registry().notify_changes();
         result = producer.get(universal.clone());
     }
     result.compact();
@@ -3292,11 +3292,11 @@ fn live_read_progresses_past_deny() {
     // Drive the cyclic store — with its interior deny — to completion, then deliver
     // request 1 (req = 200). Arrival order is what makes its observation assertable:
     // it latches after the writer has drained.
-    let _ = pull_laps(ctx.scheduler(), &mut *producer, 32, |_| false);
+    let _ = pull_laps(ctx.source_registry(), &mut *producer, 32, |_| false);
     src.borrow_mut()
         .add_data(&[(Value::UInt(1), Value::Int(200))]);
     src.borrow_mut().set_yield_predicate(Predicate::True);
-    let mut result = pull_laps(ctx.scheduler(), &mut *producer, 32, |_| false);
+    let mut result = pull_laps(ctx.source_registry(), &mut *producer, 32, |_| false);
     result.compact();
 
     let result = sort_function_by_domain(result);
@@ -3930,7 +3930,7 @@ fn a_checked_lookup_of_an_absent_key_in_a_read_only_block_answers_none() {
 /// running that program does not exit. A key off a source, such as the storefront's
 /// `inventory[req.body.sku]`, reaches the same stall.
 #[test]
-#[should_panic(expected = "producer stopped short of a terminal tile")]
+#[should_panic(expected = "is consumed only for positions its input releases")]
 fn a_checked_lookup_of_an_absent_key_in_a_writing_block() {
     check_scalar(
         indoc! {r#"
@@ -3974,7 +3974,7 @@ fn a_counter_over_an_induction_map_at_a_present_key() {
 /// position of `m`. The absent-key stall of a writing `Txn` block
 /// (`a_checked_lookup_of_an_absent_key_in_a_writing_block`) on an induction map.
 #[test]
-#[should_panic(expected = "producer stopped short of a terminal tile")]
+#[should_panic(expected = "is consumed only for positions its input releases")]
 fn a_counter_over_an_induction_map_at_an_absent_key() {
     let value = final_mut_var_value(indoc! {r#"
         def or_zero(o: Option(Int)) => Int:

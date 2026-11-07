@@ -193,9 +193,8 @@ fn posted_rejection(error: &ReloadError, posted: &LoadedProgram) -> String {
 /// Answer `request` against the running branch table.
 ///
 /// The main loop's half of the control port, a library function so a test can
-/// drive every verb without a socket. A reload or a creation arms the reloaded
-/// branch's `main` output for the driver's next pass
-/// ([`LiveProgram::pull_mains`]).
+/// drive every verb without a socket. A reload or creation takes effect in the next
+/// [`LiveProgram::run`].
 pub fn service(
     request: &ControlRequest,
     ctx: &mut GlobalContext,

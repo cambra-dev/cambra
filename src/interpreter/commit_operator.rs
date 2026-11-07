@@ -995,6 +995,7 @@ impl SteppedStore for InductionStoreProducer {
 impl Breaker for InductionStoreProducer {
     fn enter_consuming_mode(&mut self) {
         self.breaker.consuming = true;
+        self.breaker.last_finishes = 0;
         self.enter_loop_consuming();
     }
 
@@ -1153,12 +1154,12 @@ fn subscribe_seed(
     Box<dyn TileProducer>,
     crate::interpreter::dispatcher::Placement,
 ) {
-    let forward = forwarding_consumer(consumer, &cx.scheduler().wakeup_queue());
+    let forward = forwarding_consumer(consumer, &cx.source_registry().wakeup_queue());
     let (entry, placement) =
         crate::interpreter::dispatcher::Entry::unplaced(seed_input_tiling(), forward);
     let seed = op.subscribe(
         op.tiling().universal_guard(),
-        crate::interpreter::scheduler::widening(Box::new(entry)),
+        crate::interpreter::notifications::widening(Box::new(entry)),
         cx,
     );
     (seed, placement)
@@ -1229,6 +1230,20 @@ impl SteppedStore for CommitProducer {
 impl Breaker for CommitProducer {
     fn enter_consuming_mode(&mut self) {
         self.breaker.consuming = true;
+        self.breaker.last_finishes = 0;
+        if self.breaker.snapshot.is_none() && self.seed_producers.is_empty() {
+            self.taking_ahead = true;
+            assert!(self.open_store(), "constant seeds open without input");
+            let tile = self.render_store();
+            if let Some(cycle) = &self.breaker.cycle {
+                cycle.publish(&tile);
+            }
+            self.breaker.snapshot = Some(tile);
+            #[cfg(debug_assertions)]
+            {
+                self.takes_published = true;
+            }
+        }
     }
 
     fn no_consuming_mode(&self) -> Option<String> {
@@ -2494,7 +2509,7 @@ impl TileOperator for CommitOperator {
         // tap off a live commit store would never be notified and would hang.
         // Kick once immediately to start the drain loop.
         let (consumer, gate) = shared_consumer(consumer);
-        consumer.notify(&Projection::Everything);
+        consumer.invalidate(&Projection::Everything);
         // A seed stays subscribed rather than being drained here: it is ordinary dataflow, so a
         // seed computed from a loop settles over as many pulls as that loop takes, and the
         // pull it settles on is the one that opens the store. Draining at subscribe
@@ -2528,7 +2543,7 @@ impl TileOperator for CommitOperator {
                          being subscribed twice (the first subscribe takes the slot)"
                     )
                 });
-                let forward = forwarding_consumer(&consumer, &cx.scheduler().wakeup_queue());
+                let forward = forwarding_consumer(&consumer, &cx.source_registry().wakeup_queue());
                 let (producer, placement) = subscribe_behind_entry(&mut *input, forward, cx);
                 placements.push(placement);
                 producer
@@ -3452,7 +3467,7 @@ impl TileOperator for InductionStore {
         // the first pull (a batch/list source is complete on the first pull, so
         // it never needed the wiring — an async source does). Kick once to start.
         let (consumer, gate) = shared_consumer(consumer);
-        consumer.notify(&Projection::Everything);
+        consumer.invalidate(&Projection::Everything);
         let mut body_op = self.body_input.take().expect(
             "InductionStore: the decision body is unwired at subscribe — either \
                  `body_input_setter` was never called, or this store is being subscribed \
@@ -3461,7 +3476,7 @@ impl TileOperator for InductionStore {
         // The body is the store's input as a pipeline breaker: the entry in front of it queues
         // what a pipeline beneath pushes for the store's pipeline once a planner places it, and
         // stops every push before then.
-        let forward = forwarding_consumer(&consumer, &cx.scheduler().wakeup_queue());
+        let forward = forwarding_consumer(&consumer, &cx.source_registry().wakeup_queue());
         let (body_producer, placement) = subscribe_behind_entry(&mut *body_op, forward, cx);
         // A seed stays subscribed rather than being drained here: it is ordinary dataflow, so a
         // seed computed from a loop settles over as many pulls as that loop takes, and the
@@ -3529,7 +3544,7 @@ impl ChangeNotifier {
     fn new(consumer: GatedConsumer, cx: &mut SubscribeContext) -> Self {
         Self {
             consumer,
-            wakeups: cx.scheduler().wakeup_queue(),
+            wakeups: cx.source_registry().wakeup_queue(),
             last: None,
         }
     }
@@ -3656,6 +3671,25 @@ impl InductionStoreProducer {
             }
         }
         walk(&self.engines).map(Path::from)
+    }
+
+    /// Publish a flat store's seed before its source delivers the first loop position.
+    /// A carried seed must remain available to the next handover while the source is idle.
+    pub(crate) fn initialize_seed(&mut self) -> bool {
+        if !matches!(self.engines, Engines::Store(None)) {
+            return false;
+        }
+        let row = Path::default();
+        let Some(seed) = self.row_seeds().remove(&row) else {
+            return false;
+        };
+        self.open_at(&row, &seed);
+        let tile = self.render_store();
+        if let Some(cycle) = &self.breaker.cycle {
+            cycle.publish(&tile);
+        }
+        self.breaker.snapshot = Some(tile);
+        true
     }
 
     /// Each row's value before any of its positions, read from the per-key seed streams.
@@ -4218,7 +4252,7 @@ impl TileOperator for StoreValueStream {
         // woken once (the kick) and never again. The store starts at its tick-0
         // value, so kick once to start the drain loop.
         let (consumer, gate) = shared_consumer(consumer);
-        consumer.notify(&Projection::Everything);
+        consumer.invalidate(&Projection::Everything);
         // The stream is keyed by the store's commit ticks, so a region of ticks the store
         // decided names the stream's keys as it is.
         let store_producer = subscribe_forwarding_keeping_keys(&mut *self.store_op, &consumer, cx);
@@ -4464,7 +4498,7 @@ impl TileOperator for StoreFinalRead {
         // not settled until the store says so, and the consumer has to be woken to
         // re-pull when that happens. Kick once to start the drain loop.
         let (consumer, gate) = shared_consumer(consumer);
-        consumer.notify(&Projection::Everything);
+        consumer.invalidate(&Projection::Everything);
         let store_producer = subscribe_forwarding(&mut *self.store_op, &consumer, cx);
         Box::new(StoreFinalReadProducer {
             base: ProducerBase::new(
@@ -4741,7 +4775,7 @@ impl TileOperator for StoreDenseRead {
         // position to emit and the value to emit there, so it is the only news this
         // read has. Kick once to start.
         let (consumer, gate) = shared_consumer(consumer);
-        consumer.notify(&Projection::Everything);
+        consumer.invalidate(&Projection::Everything);
         let store_producer = subscribe_forwarding_keeping_keys(&mut *self.store_op, &consumer, cx);
         Box::new(StoreDenseReadProducer {
             base: ProducerBase::new(
@@ -5209,14 +5243,23 @@ impl TileOperator for AsOf {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        // Both inputs wake the consumer: a new *trigger* position needs a fresh
-        // latch, and *source* progress (a new commit) is what lets an
-        // already-seen trigger position finally latch a value — and, crucially,
-        // re-pulls until the cyclic store converges (the source's first pull may
-        // only propose; later pulls commit and render).
+        // Trigger positions schedule samples. Store progress changes the next sample but cannot
+        // change a value already latched for a trigger.
         let (consumer, gate) = shared_consumer(consumer);
-        let trigger = subscribe_forwarding(&mut *self.trigger, &consumer, cx);
-        let source = subscribe_forwarding(&mut *self.source, &consumer, cx);
+        let trigger = self.trigger.subscribe(
+            self.trigger.tiling().universal_guard(),
+            crate::interpreter::forwarding_consumer_keeping_keys(
+                &consumer,
+                &cx.source_registry().wakeup_queue(),
+            ),
+            cx,
+        );
+        let invalidated = consumer.clone();
+        let source = self.source.subscribe(
+            self.source.tiling().universal_guard(),
+            Box::new(move || invalidated.invalidate(&Projection::Everything)),
+            cx,
+        );
         let b_extent = match self.tiling() {
             Tiling::DataFunction { domain, .. } => domain.clone(),
             _ => unreachable!("AsOf tiles as a function"),
@@ -5327,15 +5370,12 @@ impl TileProducer for AsOfProducer {
         visit("source", &mut *self.source);
     }
 
+    fn sampled_inputs(&self) -> &'static [&'static str] {
+        &["source"]
+    }
+
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        // Sample the store's **current** tile once (consumer-driven): a request
-        // observes the store as of *this* pull's watermark — an arbitrary as-of
-        // position, which the unordered transactional model permits. We do not
-        // drive the store to a fixpoint here; the store's own writer steps one
-        // commit per pull and re-arms itself on the wakeup queue, and that wakeup
-        // fans through the cyclic `FanOut` to re-pull this reader as commits land.
-        // A trigger position latched this pull freezes to the watermark it sees;
-        // a later position, re-pulled after further commits, latches a later value.
+        // Each trigger observes one committed frontier; later commits cannot change that value.
         let sg = self.source.tiling().universal_guard();
         let source_tile = self.source.get(sg);
         // Fold the store snapshot **once**, at the current frontier, for every
@@ -5402,22 +5442,17 @@ impl TileProducer for AsOfProducer {
         if let Some(f) = &frontier {
             release_store_below(&mut *self.source, &source_tile, f);
         }
-        // Terminality gate. This reader samples one watermark per pull — it does not
-        // drive the store to a fixpoint itself — and relies on being re-pulled (via the
-        // writer's wakeup fanning through the cyclic `FanOut`) to converge. So it must stay
-        // **non-terminal** until the store itself is terminal, or it could report "done"
-        // while the store is still committing and freeze a store no other consumer drives.
-        //
-        // The unlatched-position half covers the one way a terminal store can still owe a
-        // value: the snapshot above is all-or-nothing, so a key with no decided value
-        // withholds it. Every present position latches on the pull that finds a snapshot,
-        // which is why this is otherwise false by the time the gate reads it.
+        // Dispatched writers progress independently. A direct producer probe retains the store
+        // terminality gate because it also drives the store through this read.
         let has_unlatched_position = matches!(&trigger_tile, Tile::DataFunction { domain, .. }
         if (0..domain.len()).any(|i| {
             let b = domain.index_at(i);
             !self.is_released(&b) && !self.seen.contains(&b)
         }));
-        let emit_pred = if store_terminal && !has_unlatched_position {
+        let emit_pred = if (store_terminal || crate::interpreter::dispatcher::is_in_a_run())
+            && snapshot.is_some()
+            && !has_unlatched_position
+        {
             trigger_pred
         } else {
             Predicate::False
@@ -6003,7 +6038,7 @@ fn subscribe_pulled(
     consumer: &GatedConsumer,
     cx: &mut SubscribeContext,
 ) -> Box<dyn TileProducer> {
-    let forward = forwarding_consumer(consumer, &cx.scheduler().wakeup_queue());
+    let forward = forwarding_consumer(consumer, &cx.source_registry().wakeup_queue());
     subscribe_behind_entry(op, forward, cx).0
 }
 
@@ -6055,7 +6090,7 @@ fn subscribe_driver_inputs(
     // and the source is read by pull.
     let forward = source_news.consumer(forwarding_consumer(
         &consumer,
-        &cx.scheduler().wakeup_queue(),
+        &cx.source_registry().wakeup_queue(),
     ));
     let (source_producer, placement, decides) = subscribe_deciding(source_op, forward, cx);
     // The store's progress changes what the drive renders — the next position it may
@@ -6308,7 +6343,7 @@ impl TileOperator for InductionDriver {
             source: DecodedSource::default(),
             nested,
             consumer,
-            wakeups: cx.scheduler().wakeup_queue(),
+            wakeups: cx.source_registry().wakeup_queue(),
             read_keys: self.read_keys.clone(),
             window: DriverWindow::new(
                 self.positions.clone(),
@@ -7215,7 +7250,7 @@ impl TileOperator for TransactDriver {
             source_entry: inputs.placement,
             source: DecodedSource::default(),
             consumer: inputs.consumer,
-            wakeups: cx.scheduler().wakeup_queue(),
+            wakeups: cx.source_registry().wakeup_queue(),
             read_keys: self.read_keys.clone(),
             // A transaction driver's body-input domain is its own attempt counter, not
             // its source's positions: a retried item takes a fresh attempt position.
@@ -8727,7 +8762,7 @@ mod tests {
     // The consumer helpers own shared-cell construction for the operators here; the
     // fixtures below build their own recording cells, hence the direct imports.
     use crate::ccl::{FieldKey, TagMap, V_ABORT, V_COMMIT};
-    use crate::interpreter::scheduler::pull_laps;
+    use crate::interpreter::notifications::pull_laps;
     use crate::interpreter::tile_operators::{Constant, FanOut, Memo};
     use crate::interpreter::tiling::{one_row_decided, row_frontier};
     use crate::interpreter::validate_tile;
@@ -8758,7 +8793,6 @@ mod tests {
         impl Fixture {
             fn new() -> Self {
                 let mut ctx = GlobalContext::default();
-                ctx.defer_sink_pulls();
                 let feed = Rc::new(RefCell::new(TestDataSource::new(
                     "source1",
                     crate::ccl::Type::Base(BaseType::Int),
@@ -8898,7 +8932,6 @@ mod tests {
             assert_eq!(store_frontier(&progress(&fixture.store).0), Some(pos(1)));
 
             let mut extra_ctx = GlobalContext::default();
-            extra_ctx.defer_sink_pulls();
             let extra_sink = extra_ctx.register_test_sink("extra");
             let extra = compile_program(
                 &mut extra_ctx,
@@ -9379,7 +9412,7 @@ mod tests {
         let mut producer = op.subscribe(guard, Box::new(|| {}), &mut cx);
         for _ in 0..4 {
             producer.get(producer.tiling().universal_guard());
-            cx.scheduler().check_for_notifications();
+            cx.source_registry().notify_changes();
         }
         let both = |g: &TileGuard| (0..2).all(|p| g.covers_path(&[Value::UInt(p)]));
         assert!(
@@ -9593,7 +9626,7 @@ mod tests {
     /// the closing one); the bound is generous and failing it means divergence.
     fn pull_to_terminal(cx: &mut SubscribeContext, producer: &mut Box<dyn TileProducer>) -> Tile {
         let tile = pull_laps(
-            cx.scheduler(),
+            cx.source_registry(),
             &mut **producer,
             MAX_CYCLE_PULLS,
             Tile::is_terminal,
@@ -10650,7 +10683,7 @@ mod tests {
         let mut producer = external.subscribe(guard, Box::new(|| {}), &mut cx);
 
         // Drive the cycle: bootstrap + 3 commits + a fixpoint pull, with margin.
-        let latest = pull_laps(cx.scheduler(), &mut *producer, 7, |_| false);
+        let latest = pull_laps(cx.source_registry(), &mut *producer, 7, |_| false);
         // Store: init 0 @0, then 1@1, 2@2, 3@3 — the counter reached 3.
         assert_eq!(store_at(&latest, &acct("n")), Some((pos(3), 3)));
     }
@@ -10860,7 +10893,12 @@ mod tests {
         let guard = external.tiling().universal_guard();
         let mut cx = SubscribeContext::new();
         let mut producer = external.subscribe(guard, Box::new(|| {}), &mut cx);
-        let latest = pull_laps(cx.scheduler(), &mut *producer, MAX_CYCLE_PULLS, |_| false);
+        let latest = pull_laps(
+            cx.source_registry(),
+            &mut *producer,
+            MAX_CYCLE_PULLS,
+            |_| false,
+        );
 
         // Every draw committed exactly once: the pool conserves.
         assert_eq!(
@@ -11135,7 +11173,7 @@ mod tests {
         let mut cx = SubscribeContext::new();
         let mut producer = external.subscribe(guard, Box::new(|| {}), &mut cx);
 
-        let latest = pull_laps(cx.scheduler(), &mut *producer, 7, |_| false);
+        let latest = pull_laps(cx.source_registry(), &mut *producer, 7, |_| false);
         // Exactly one draw commits: 100−70=30 < 50 and 100−50=50 < 70, so
         // whichever commits first, the other denies. The round-robin drain picks
         // the winner, so the resting value is schedule-dependent (30 or 50) but
@@ -11182,7 +11220,7 @@ mod tests {
         let mut cx = SubscribeContext::new();
         let mut producer = external.subscribe(guard, Box::new(|| {}), &mut cx);
 
-        let latest = pull_laps(cx.scheduler(), &mut *producer, 11, |_| false);
+        let latest = pull_laps(cx.source_registry(), &mut *producer, 11, |_| false);
         // Which draws fit (and in what order) is schedule-dependent under the
         // round-robin drain, but the token-pool safety invariant holds under every
         // serialization: the pool is never oversold (≥ 0) and never exceeds its
@@ -11298,7 +11336,7 @@ mod tests {
 
         // Pulling the reader drives the cycle. Before the watermark reaches 2 the
         // read is ⊥ (empty); once it does, it resolves to the value at tick 2.
-        let latest = pull_laps(cx.scheduler(), &mut *producer, 8, |_| false);
+        let latest = pull_laps(cx.source_registry(), &mut *producer, 8, |_| false);
         let Tile::Scalar(cv) = &latest else { panic!() };
         assert_eq!(cv.as_single(), Some(int(2)));
     }
@@ -11428,7 +11466,7 @@ mod tests {
         let mut cx = SubscribeContext::new();
         let mut producer = external.subscribe(guard, Box::new(|| {}), &mut cx);
 
-        pull_laps(cx.scheduler(), &mut *producer, pulls + 1, |_| false)
+        pull_laps(cx.source_registry(), &mut *producer, pulls + 1, |_| false)
     }
 
     /// Two writers transfer over *disjoint* account pairs — A: alice→bob 30,
@@ -12196,7 +12234,7 @@ mod tests {
             if closing.is_terminal() {
                 break;
             }
-            cx.scheduler().check_for_notifications();
+            cx.source_registry().notify_changes();
             if laggard_first {
                 let _ = lagging.get(guard.clone());
                 closing = leading.get(guard.clone());
@@ -12214,7 +12252,7 @@ mod tests {
             if lagged.is_terminal() {
                 break;
             }
-            cx.scheduler().check_for_notifications();
+            cx.source_registry().notify_changes();
             lagged = lagging.get(guard.clone());
         }
         assert_eq!(
@@ -12565,7 +12603,7 @@ mod tests {
             })
             .step(pos(0), Some(HashMap::from([(acc.clone(), int(1))])));
         *store.borrow_mut() = render(&engines);
-        cx.scheduler().check_for_notifications();
+        cx.source_registry().notify_changes();
         let second = producer.get(producer.tiling().universal_guard());
         let paths = emitted(&second);
         assert!(
@@ -12785,7 +12823,7 @@ mod tests {
         let mut pulls_after_open = 0;
         let mut gets_at_open = None;
         for _ in 0..MAX_CYCLE_PULLS {
-            cx.scheduler().check_for_notifications();
+            cx.source_registry().notify_changes();
             let t = producer.get(producer.tiling().universal_guard());
             if store_frontier(&t).is_some() {
                 gets_at_open.get_or_insert(*gets.borrow());
@@ -12822,7 +12860,7 @@ mod tests {
         let mut producer = op.subscribe(g, Box::new(|| {}), &mut cx);
         let mut last = None;
         for _ in 0..4 {
-            cx.scheduler().check_for_notifications();
+            cx.source_registry().notify_changes();
             last = Some(producer.get(producer.tiling().universal_guard()));
         }
         let last = last.unwrap();
@@ -12856,7 +12894,7 @@ mod tests {
         producer.release(TileGuard::Function(FunctionGuard::Domain(
             Predicate::from_column_value(&ColumnValue::from_uints(vec![0, 2])),
         )));
-        cx.scheduler().check_for_notifications();
+        cx.source_registry().notify_changes();
         let tile = producer.get(producer.tiling().universal_guard());
         let Tile::Store { decided, .. } = &tile else {
             panic!("a store")

@@ -9,7 +9,7 @@ use crate::interpreter::operator_graph::{share, value};
 use crate::{
     interpreter::{
         Consumer, Position, Projection, SubscribeContext,
-        scheduler::{
+        notifications::{
             GatedConsumer, WakeupQueue, forwarding_consumer_keeping_keys, shared_consumer,
         },
     },
@@ -128,7 +128,7 @@ struct FanOutShared {
     /// reopens. A second notification before that, naming no key the ones passed since did not,
     /// says nothing they did not, so it stops here, as it does at an operator's shared consumer
     /// (`crate::interpreter::GatedConsumer`).
-    admission: crate::interpreter::scheduler::Admission,
+    admission: crate::interpreter::notifications::Admission,
 }
 
 impl FanOutShared {
@@ -384,7 +384,7 @@ struct FanOutInput {
 }
 
 impl Consumer for FanOutInput {
-    fn notify(&mut self, arrived: &Projection) {
+    fn invalidate(&mut self, arrived: &Projection) {
         crate::interpreter::dispatcher::debug_assert_outside_a_run();
         // Clone the consumer handles while holding a short borrow, then release the borrow before
         // calling notify(). This prevents a re-entrant panic when a consumer (e.g. SinkConsumer)
@@ -403,7 +403,7 @@ impl Consumer for FanOutInput {
                 .collect::<Vec<_>>()
         };
         for c in &consumers {
-            c.borrow_mut().notify(arrived);
+            c.borrow_mut().invalidate(arrived);
         }
     }
 
@@ -411,14 +411,14 @@ impl Consumer for FanOutInput {
     /// notification, since every pushed region is a work package of a pipeline that reads a slot.
     /// It skips a recurrence slot: the operators inside a store's cycle read the store in pull
     /// mode, within its own pipeline.
-    fn push(
+    fn notify(
         &mut self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
         for c in &self.reader_consumers() {
             match c.try_borrow_mut() {
-                Ok(mut consumer) => consumer.push(region, landing),
+                Ok(mut consumer) => consumer.notify(region, landing),
                 Err(_) => landing.reentered(),
             }
         }
@@ -533,7 +533,7 @@ impl FanOut {
             released_position: None,
             subscribers: Vec::new(),
             reentrancy,
-            admission: crate::interpreter::scheduler::Admission::new(Notified::clear()),
+            admission: crate::interpreter::notifications::Admission::new(Notified::clear()),
             source_producers: Vec::new(),
         }));
         Self {
@@ -1246,7 +1246,7 @@ impl TileOperator for Memo {
             self.input.tiling().clone(),
             arrivals.consumer(forwarding_consumer_keeping_keys(
                 &consumer,
-                &cx.scheduler().wakeup_queue(),
+                &cx.source_registry().wakeup_queue(),
             )),
         );
         Box::new(MemoProducer::new(
@@ -1256,7 +1256,7 @@ impl TileOperator for Memo {
             self.input.subscribe(intent_guard, Box::new(entry), cx),
             arrivals,
             consumer,
-            cx.scheduler().wakeup_queue(),
+            cx.source_registry().wakeup_queue(),
         ))
     }
 
@@ -1922,7 +1922,7 @@ mod tests {
             .borrow_mut()
             .as_mut()
             .expect("the memo installed a consumer on its input")
-            .notify(&Projection::Everything);
+            .invalidate(&Projection::Everything);
     }
 
     impl TileOperator for Scripted {
@@ -2051,54 +2051,6 @@ mod tests {
             [2, 2],
             "a branch's pull did not let the next notification through"
         );
-    }
-
-    /// A sink under a diamond, one memoized input fanned out to both fields of a record, is
-    /// pulled once per scheduler call: the change reaches the record along both branches, and the
-    /// record's gate passes one notification, which schedules the sink's one pull.
-    #[test]
-    fn a_sink_under_a_diamond_is_pulled_once_per_scheduler_call() {
-        use crate::interpreter::DataSink;
-        use crate::interpreter::sinks::{DoneNotifier, SinkConsumer};
-        use crate::interpreter::tile_operators::MakeRecord;
-        use std::sync::{Arc, Mutex};
-
-        /// How many tiles the sink was handed.
-        #[derive(Default)]
-        struct Counting(Mutex<usize>);
-        impl DataSink for Counting {
-            fn process(&self, _tile: &Tile) {
-                *self.0.lock().unwrap() += 1;
-            }
-        }
-
-        let tiling = partial_tiling();
-        let (input, _pulls, notifier) = Scripted::new(vec![one_row(0, 7), one_row(1, 8)], &tiling);
-        let fan = FanOut::new(Box::new(Memo::new(Box::new(input))));
-        let mut record = MakeRecord::new(vec![fan.slot(), fan.slot()]);
-        let mut cx = SubscribeContext::new();
-        let sink = Arc::new(Counting::default());
-        let (done, _finished) = DoneNotifier::create(1);
-        let (consumer, slot) = SinkConsumer::new(
-            sink.clone(),
-            done.into_iter().next().expect("one notifier"),
-            cx.scheduler().sink_pull_queue(),
-        );
-        let universal = record.tiling().universal_guard();
-        let producer = record.subscribe(universal, Box::new(consumer), &mut cx);
-        *slot.borrow_mut() = Some(producer);
-        let processed = || *sink.0.lock().unwrap();
-
-        for call in 1..=2 {
-            notify(&notifier);
-            cx.scheduler().check_for_notifications();
-            assert_eq!(
-                processed(),
-                call,
-                "the sink was pulled {} times",
-                processed()
-            );
-        }
     }
 
     /// A memo shared by two branches of a fan-out reads its input once per notification: the
@@ -2723,7 +2675,7 @@ mod projection_tests {
             if self.pulls == 2 {
                 self.arrivals
                     .consumer(Box::new(|| {}))
-                    .notify(&Projection::Everything);
+                    .invalidate(&Projection::Everything);
             }
             match self.pulls {
                 1 => ints_by_position(&[], false),
@@ -2795,7 +2747,7 @@ mod projection_tests {
         *rows.borrow_mut() = rows_at(0..=3);
         memo.arrivals
             .consumer(Box::new(|| {}))
-            .notify(&Projection::Everything);
+            .invalidate(&Projection::Everything);
         memo.get(keys_between(0, 3));
         memo.release(keys_between(0, 3));
 
@@ -2917,7 +2869,7 @@ mod consuming_tests {
         let (mut memo, mut notifier) = memo_over(&source);
         let region = Keys(2, 5);
 
-        notifier.notify(&region.projection());
+        notifier.invalidate(&region.projection());
         assert!(memo.arrivals.pending());
         memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, region.guard());
@@ -2939,7 +2891,7 @@ mod consuming_tests {
         let source = source(0..10);
         let (mut memo, mut notifier) = memo_over(&source);
         for region in [Keys(1, 2), Keys(7, 9)] {
-            notifier.notify(&region.projection());
+            notifier.invalidate(&region.projection());
             memo.enter_consuming_mode();
             memo.consume_impl(InputId::ONLY, region.guard());
         }
@@ -2964,7 +2916,7 @@ mod consuming_tests {
         let source = source(0..10);
         let (mut memo, mut notifier) = memo_over(&source);
         for region in [Keys(2, 5), Keys(4, 8)] {
-            notifier.notify(&region.projection());
+            notifier.invalidate(&region.projection());
             memo.enter_consuming_mode();
             memo.consume_impl(InputId::ONLY, region.guard());
         }
@@ -2984,7 +2936,7 @@ mod consuming_tests {
     fn everything_notified_and_consumed_has_the_universe_as_final_guard() {
         let source = source(0..10);
         let (mut memo, mut notifier) = memo_over(&source);
-        notifier.notify(&Projection::Everything);
+        notifier.invalidate(&Projection::Everything);
         memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, All.guard());
         assert_eq!(entries(&memo.cached_tile), rows_of(0..10));
@@ -2997,7 +2949,7 @@ mod consuming_tests {
     fn nothing_notified_is_consumed_as_nothing() {
         let source = source(0..10);
         let (mut memo, mut notifier) = memo_over(&source);
-        notifier.notify(&Projection::Nothing);
+        notifier.invalidate(&Projection::Nothing);
         assert!(!memo.arrivals.pending());
         memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, ints().empty_guard());
@@ -3131,7 +3083,7 @@ mod consuming_tests {
         memo.release(keys_between(2, 3));
 
         source.borrow_mut().rows.insert(9, value(9));
-        notifier.notify(&Keys(6, 11).projection());
+        notifier.invalidate(&Keys(6, 11).projection());
         memo.consume_impl(InputId::ONLY, All.guard());
 
         let guard = keys_of(&memo.final_guard());
@@ -3328,13 +3280,13 @@ mod consuming_tests {
     /// announced.
     #[test]
     fn the_consumer_of_a_consuming_memo_is_woken_by_the_input_notification() {
-        use crate::interpreter::scheduler::forwarding_consumer_keeping_keys;
+        use crate::interpreter::notifications::forwarding_consumer_keeping_keys;
 
         let woken = Rc::new(Cell::new(0));
         let counted = woken.clone();
         let (consumer, gate) = shared_consumer(Box::new(move || counted.set(counted.get() + 1)));
         let mut cx = SubscribeContext::new();
-        let wakeups = cx.scheduler().wakeup_queue();
+        let wakeups = cx.source_registry().wakeup_queue();
         let arrivals = Arrivals::new();
         let mut notifier = arrivals.consumer(forwarding_consumer_keeping_keys(&consumer, &wakeups));
         let (mut memo, _) = memo_over(&source(0..4));
@@ -3344,8 +3296,8 @@ mod consuming_tests {
         // A pull of the memo reopens the gate the notification closed, as it does in a program.
         memo.base = ProducerBase::unowned(MemoProducer::alloc_id(), &ints()).sharing(gate);
 
-        notifier.notify(&All.projection());
-        cx.scheduler().check_for_notifications();
+        notifier.invalidate(&All.projection());
+        cx.source_registry().notify_changes();
         assert_eq!(
             woken.get(),
             1,
@@ -3354,7 +3306,7 @@ mod consuming_tests {
 
         memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, All.guard());
-        cx.scheduler().check_for_notifications();
+        cx.source_registry().notify_changes();
         assert_eq!(
             woken.get(),
             1,
@@ -3373,13 +3325,13 @@ mod consuming_tests {
     /// that merges the new rows wakes it no more. The package `finish` pushes announces them.
     #[test]
     fn a_consume_wakes_no_consumer_that_pulled_since_the_notification() {
-        use crate::interpreter::scheduler::forwarding_consumer_keeping_keys;
+        use crate::interpreter::notifications::forwarding_consumer_keeping_keys;
 
         let woken = Rc::new(Cell::new(0));
         let counted = woken.clone();
         let (consumer, gate) = shared_consumer(Box::new(move || counted.set(counted.get() + 1)));
         let mut cx = SubscribeContext::new();
-        let wakeups = cx.scheduler().wakeup_queue();
+        let wakeups = cx.source_registry().wakeup_queue();
         let arrivals = Arrivals::new();
         let mut notifier = arrivals.consumer(forwarding_consumer_keeping_keys(&consumer, &wakeups));
         let (mut memo, _) = memo_over(&source(0..4));
@@ -3391,8 +3343,8 @@ mod consuming_tests {
 
         memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, Keys(0, 1).guard());
-        notifier.notify(&Keys(2, 3).projection());
-        cx.scheduler().check_for_notifications();
+        notifier.invalidate(&Keys(2, 3).projection());
+        cx.source_registry().notify_changes();
         assert_eq!(woken.get(), 1, "the notification wakes the consumer");
 
         let pulled = memo.get(All.guard());
@@ -3403,7 +3355,7 @@ mod consuming_tests {
         );
 
         memo.consume_impl(InputId::ONLY, Keys(2, 3).guard());
-        cx.scheduler().check_for_notifications();
+        cx.source_registry().notify_changes();
         assert_eq!(woken.get(), 1, "a consuming memo wakes no consumer");
         assert_eq!(
             entries(&memo.get(All.guard())),
@@ -3467,9 +3419,9 @@ mod consuming_tests {
             }
         }
 
-        fn notify(&mut self, region: Projection) {
-            self.consuming_notifier.notify(&region);
-            self.lazy_notifier.notify(&region);
+        fn invalidate(&mut self, region: Projection) {
+            self.consuming_notifier.invalidate(&region);
+            self.lazy_notifier.invalidate(&region);
         }
 
         fn apply(&mut self, step: Step) {
@@ -3480,16 +3432,16 @@ mod consuming_tests {
                         for source in [&self.consuming_source, &self.lazy_source] {
                             source.borrow_mut().rows.insert(key, value(key));
                         }
-                        self.notify(Keys(key, key).projection());
+                        self.invalidate(Keys(key, key).projection());
                     }
                 }
-                Notify(region) => self.notify(region.projection()),
+                Notify(region) => self.invalidate(region.projection()),
                 Close => {
                     self.input.closed = true;
                     for source in [&self.consuming_source, &self.lazy_source] {
                         source.borrow_mut().closed = true;
                     }
-                    self.notify(Projection::Everything);
+                    self.invalidate(Projection::Everything);
                 }
                 Consume(region) => {
                     self.consuming.consume_impl(InputId::ONLY, region.guard());
@@ -3668,7 +3620,7 @@ mod consuming_tests {
 mod cycle_tests {
     use super::*;
     use crate::interpreter::dispatcher::{Entry, Landing, PipelineId};
-    use crate::interpreter::scheduler::SharedConsumer;
+    use crate::interpreter::notifications::SharedConsumer;
     use crate::interpreter::tile_operators::SubscribeContext;
     use crate::interpreter::{BaseType, ColumnValue, Extent};
 
@@ -3900,7 +3852,8 @@ mod cycle_tests {
             .clone()
             .expect("the store was subscribed");
         let mut landing = Landing::probe(PipelineId(0));
-        own.borrow_mut().push(&Projection::Everything, &mut landing);
+        own.borrow_mut()
+            .notify(&Projection::Everything, &mut landing);
         let reached: Vec<_> = landing
             .arrivals()
             .into_iter()

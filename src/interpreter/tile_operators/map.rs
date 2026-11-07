@@ -272,10 +272,10 @@ impl TileOperator for MapResult {
         }
         let function_producer = match looked_up_at_keys {
             Some(at) => {
-                let wakeups = cx.scheduler().wakeup_queue();
+                let wakeups = cx.source_registry().wakeup_queue();
                 self.function.subscribe(
                     self.function.tiling().universal_guard(),
-                    crate::interpreter::scheduler::restating_lookup(
+                    crate::interpreter::notifications::restating_lookup(
                         Box::new(move |region| keys_looked_up(region, at)),
                         forwarding_consumer_keeping_keys(&shared, &wakeups),
                     ),

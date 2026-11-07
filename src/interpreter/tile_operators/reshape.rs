@@ -81,7 +81,7 @@ impl TileOperator for PermuteRecordDomain {
                     let permutation = self.permutation.clone();
                     // The keys are the input's with their fields renamed, so a region of the
                     // input's keys is the region of the same keys renamed.
-                    crate::interpreter::scheduler::restating(
+                    crate::interpreter::notifications::restating(
                         Box::new(move |region| {
                             at_outermost(region, &|keys| permute_componentwise(keys, &permutation))
                         }),
@@ -527,7 +527,7 @@ impl TileOperator for FlattenTupleDomain {
                     let field_map = self.field_map.clone();
                     // The keys are the input's with some fields' fields spliced in, so a region
                     // of the input's keys is the region of the same keys spliced.
-                    crate::interpreter::scheduler::restating(
+                    crate::interpreter::notifications::restating(
                         Box::new(move |region| {
                             at_outermost(region, &|keys| flatten_predicate(keys, &field_map))
                         }),

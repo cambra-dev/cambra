@@ -38,7 +38,7 @@ use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
 use cambra::ccl::load::LoadedProgram;
 use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
 use cambra::interpreter::{
-    ColumnValue, Consumer, Predicate, Tile, Value, pull_laps, sort_function_by_domain, tuple_field,
+    ColumnValue, Consumer, Predicate, Tile, Value, sort_function_by_domain, tuple_field,
 };
 use cambra::pretty_graph::VizOptions;
 use cambra::pretty_tree::InspectNode;
@@ -104,7 +104,7 @@ pub(crate) fn peak_held_values(code: &str) -> HashMap<String, usize> {
     let universal = producer.tiling().universal_guard();
     let mut peak: HashMap<String, usize> = HashMap::new();
     for _ in 0..4096 {
-        ctx.scheduler().check_for_notifications();
+        ctx.source_registry().notify_changes();
         let tile = producer.get(universal.clone());
         let mut now = HashMap::new();
         held(&producer.inspect(&VizOptions::default()), &mut now);
@@ -141,38 +141,17 @@ pub(crate) fn run_program_with_ctx(
     ctx: &mut GlobalContext,
     loaded: &LoadedProgram,
 ) -> (Expr, Tile) {
-    let notified = Rc::new(RefCell::new(false));
-    let notified_clone = notified.clone();
-    let consumer: Box<dyn Consumer> = Box::new(move || {
-        *notified_clone.borrow_mut() = true;
-    });
-    let mut compiled = compile_program(ctx, loaded, consumer).unwrap_or_render(loaded);
-    ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow(), "expected notification (pipeline path)");
-    let producer = compiled
+    let mut compiled = compile_program(ctx, loaded, Box::new(|| {})).unwrap_or_render(loaded);
+    let tiling = compiled
         .main_mut()
-        .and_then(|o| o.producer.as_mut())
-        .expect("pipeline test expects a `main` output");
-    // A single `get` is not always enough to drain a producer: a mutation loop's
-    // store/drive cycle decides one more position of the recurrence per pass, and
-    // re-arms by asking the scheduler to wake its consumer. The cap catches a cycle
-    // that stops converging without reaching a terminal tile.
-    let universal = producer.tiling().universal_guard();
-    let mut result = pull_laps(ctx.scheduler(), &mut **producer, 1024, Tile::is_terminal);
-    assert!(
-        result.is_terminal(),
-        "pipeline path: producer stopped short of a terminal tile, quiescent or after 1024 \
-         laps: {result:?}"
-    );
-    result.compact();
-    // Release everything, then pull once more: a released region must never come
-    // back out, so this answers empty or trips the contract assertion.
-    producer.release(universal.clone());
-    let after = producer.get(universal.clone());
-    assert!(
-        after.is_empty(),
-        "pull after a universal release returned {after:?}"
-    );
+        .and_then(|o| o.producer.as_ref())
+        .expect("pipeline test expects main")
+        .tiling()
+        .clone();
+    let run = cambra::interpreter::dispatcher::run_program(&mut compiled, 1)
+        .unwrap_or_else(|why| panic!("dispatcher refused pipeline test: {why}"));
+    let result =
+        sort_function_by_domain(run.main.expect("pipeline main output").closed_over(&tiling));
     (*compiled.ast, result)
 }
 

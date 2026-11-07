@@ -505,7 +505,8 @@ that producer with an intent guard, a consumer notification handle and a `Subscr
 | Call | Contract |
 | --- | --- |
 | `subscribe(intent, consumer, cx)` | Establish the subscription for the requested region of the output tiling. |
-| `Consumer::notify(region)` | Signal that the consumer should pull again. It carries no tile and does not count individual changes. |
+| `Consumer::invalidate(region)` | Mark cached reads dirty outside a dispatched run. |
+| `Consumer::notify(region, landing)` | Deliver a decided region through the dispatcher routes. |
 | `get(projection)` | Request the current tile for a projection. Tile values cross the edge only through this call. |
 | `release(obsolete)` | Permanently relinquish a region; see [The release contract](#the-release-contract). |
 
@@ -528,14 +529,15 @@ not with the entire accumulated guard. When the closure makes the accumulated gu
 calls `release_impl` with the universal guard instead, which overlaps the pieces released before
 it: a `release_impl` reclaims everything only on a universal guard.
 
-Sources are polled separately from producers. `Scheduler::poll_sources` buffers source arrivals
-and returns a `Delivery` without notifying consumers. `Scheduler::deliver` notifies those
-consumers, drains deferred wakeups, then runs queued sink pulls. `check_for_notifications`
-performs both operations. The deferred queue deduplicates consumers by handle identity; a wake
+Sources are polled separately from producers. `SourceRegistry::poll_sources` buffers source arrivals
+and returns a `Delivery` without notifying consumers. `SourceRegistry::deliver` notifies those
+consumers' cached reads and drains deferred invalidations. `notify_changes` performs both
+operations. Neither operation executes a sink; program execution belongs to the
+dispatcher. The deferred queue deduplicates consumers by handle identity; a wake
 requested during its drain remains for the next drain.
 
-The poll/delivery split permits inspection of buffered arrivals before a sink pulls and releases
-them. A `Delivery` retains its consumers strongly until delivery. Dropping a nonempty delivery
+The poll/delivery split permits inspection of buffered arrivals before explicit producer reads.
+A `Delivery` retains its consumers strongly until delivery. Dropping a nonempty delivery
 without delivering it is a debug assertion failure, except during unwinding; the data remains
 buffered but no consumer has been woken. [The notification contract](#the-notification-contract)
 specifies forwarding and reentrancy.
@@ -749,19 +751,24 @@ no further restriction.
 
 ## The notification contract
 
-An output change discovered during a pull must wake readers that may still hold the previous
-result. That wake is deferred through `WakeupQueue`, not delivered synchronously inside
-`get`: a feedback path could re-enter a producer while its `RefCell` is borrowed.
+`Consumer::notify(region, landing)` delivers a decided region of a producer's keys at any level.
+Consumers restate the region through the operator chain; a placed pipeline entry queues the work
+in `landing`. Every region is work, so cache gates do not coalesce deliveries. `Consumer::route`
+declares the same paths without delivering work.
 
-A notification carries the region of the notifying producer's outermost keys that changed:
-`Consumer::notify(arrived: &Projection)`. A producer that cannot name the region sends `Everything`,
-and none sends `Nothing`. A closure consumer ignores the region. A consumer that pulls on
-notification has no use for it, since its pull reads whatever arrived. A consumer that does not pull
-acts on the region instead.
+`Consumer::invalidate(arrived)` marks cached reads dirty outside a dispatched run. A producer that
+cannot name its changed outermost keys sends `Everything`; none sends `Nothing`. Invalidations
+execute no sink. Direct producer protocol tests use them before an explicit read. Producers inside
+a dispatched pipeline are told to read again through `read_again_toward`; a run rejects cache
+invalidations synchronously delivered through consumers.
+
+An output change discovered during a direct producer read defers invalidation through `WakeupQueue`.
+A feedback path could otherwise re-enter a producer while its `RefCell` is borrowed. The following
+coalescing rules apply to invalidations.
 
 A component that merges notifications to one consumer unites their regions with
 `Projection::union` and narrows none. A gate passes the first notification after a pull, and after
-it each one that names a key no notification passed since that pull named (`scheduler::Admission`).
+it each one that names a key no notification passed since that pull named (`notifications::Admission`).
 It drops the rest, whose keys its consumer has already heard of: a consumer that pulls reads them in
 its next pull, and one that acts on the region, as a memo marks it dirty, has marked them.
 
@@ -793,7 +800,7 @@ pulls.
 | `MakeRecord` | every field | widens | A record of values has no keys. |
 | `Filter` | the predicate, the input | keeps for a side that is a collection, else widens | A collection side shares the mask's keys; the other is read whole. |
 | `Uncurry` | the input | restates beneath a standing level, widens at the outermost | A region at or beneath the paired level names the pairs it heads; pairing the outermost collection re-keys it, and a decided region of outer keys names every pair they head. |
-| `Converse` | the input | keeps the standing keys, and restates the inverted level's keys one level in, beneath every value (`scheduler::one_level_in`) | Each input key stands beneath exactly one value. |
+| `Converse` | the input | keeps the standing keys, and restates the inverted level's keys one level in, beneath every value (`notifications::one_level_in`) | Each input key stands beneath exactly one value. |
 | `UnionOperator` | every arm | keeps for a flat union, restates under the arm's tag for a tagged one | Flat arms are disjoint slices of one collection; a tagged union keys an arm's rows by the arm's keys under its tag, and `Everything` of an arm is every key under that tag. |
 | `CheckedLookup` | a stream of keys, or the pairs | keeps | Each answer sits at its key's position. |
 | `CheckedLookup` | one key | widens | One key has no keys to project. |
@@ -832,11 +839,9 @@ need no further pull. When `pull_laps` reaches quiescence, a debug check walks
 `TileProducer::visit_input_producers` and rejects an input whose forwarding flag remains set after
 its reader was pulled that lap.
 
-A sink does not pull when notified. It queues its pull on a queue of its own, which holds it
-once however many notifications arrive. `Scheduler::check_for_notifications` delivers its wakes
-first and then runs the sink pulls queued so far, so each sink is pulled once per call, in the
-call that delivered the change. Installing a version pulls its sinks at once, because a version
-a reload replaces hands its state to its successor only if it was pulled.
+A sink's `notify` queues a region in its dispatcher pipeline. `SinkConsumer::complete` reconciles
+terminal output and signals completion after every pipeline finishes. Compilation and cache
+invalidation never execute sink reads.
 
 - `ChangeNotifier` compares successive store outputs and queues a wake when they differ,
   including initialization, decided positions, commits and closure.
@@ -952,7 +957,7 @@ accumulators it covers and forwards to the input, as in pull mode.
 the input's keys at that level one level in, beneath the values that become the keys there, and each
 input key stands beneath exactly one value. So a region of the input's keys names exactly the output
 paths it changed, with the value step admitting anything: `Converse` passes its input a consumer
-that restates the region there (`scheduler::one_level_in`), and a pull at such a region pulls the
+that restates the region there (`notifications::one_level_in`), and a pull at such a region pulls the
 input at the same keys (`Predicate::without_open_level`) and inverts only those rows. A region of
 the standing keys above the inverted level passes through as it is. It keeps the input rows it read
 and has not released, which a release of a group names by their values. At the outermost level it
@@ -1209,8 +1214,8 @@ through `take`. An empty `take` cannot distinguish a never-filled slot from an a
 the subscribing caller must reject either case when it requires an input. Each setter closure is
 `FnOnce`, but separate setters can be obtained; a debug assertion rejects filling an occupied cell.
 
-A data source is not a graph node. `IterateExtent` enumerates its domain and registers scheduler
-wake-ups; `MapResultWithSource` reads values at supplied keys. A source lookup descends from an
+A data source is not a graph node. `IterateExtent` enumerates its domain and registers its source
+handle with `SourceRegistry`; `MapResultWithSource` reads values at supplied keys. A source lookup descends from an
 iteration of that source, since inference admits no literal source-domain key. The invariant is
 pinned by `a_source_read_descends_from_an_iteration_of_that_source` in
 `tests/it/inspector_goldens.rs`. Neither operator adds an edge to the source itself.
@@ -1465,11 +1470,29 @@ A writer body returns one **decision variant** per transaction, `` {`commit{𝑃
 
 ### Convergence: the writer re-arms, one step per pull
 
-A writer processes **one source item per pull** and re-arms itself on the scheduler's deferred-wakeup queue whenever an item remains, returning non-terminal — the same one-step-per-pull idiom the induction and commit stores share. That single re-arm covers every continuation uniformly: a **commit** (the commit-ack `release` advances it, so the next pull takes the next item), a **deny** (it advances locally with no commit — invisible in the store frontier, which a frontier-growth signal alone would miss), and a **not-ready** decision (it does not advance, and reuses the pending body-input row). It is the *writer's* re-arm, not any reader's, that converges the store: the wakeup fans through the cyclic `FanOut` to re-pull the `AsOf` / `StoreValueStream` readers as commits land, so no reader drives a store to fixpoint. A writer **drained but live** does not re-arm, so an idle live server does not busy-poll — a future arrival wakes it through its source-forwarding consumer.
+Dispatcher packages drive writers from their source positions. The store takes decisions and
+arbitrates ready proposals as specified in [Ready transaction
+decisions](#ready-transaction-decisions). Readers sample the committed snapshot; they do not drive
+the store to completion.
+
+Direct producer probes retain deferred invalidation: a writer processes one source item per pull and
+re-arms through `WakeupQueue` while it has a commit, deny or not-ready decision to continue. A
+drained live writer waits for its source to gain items.
 
 ### Every fed-out mutable variable read is an as-of sample
 
-A mutable variable read **fed out** of its `with begin():` block compiles to `AsOf` (born in `transact_phase::rewrite_as_of_reads`, from the `as_of_read` term the read is minted as) — a sample at an **arbitrary** position in the commit order — whatever the reading trigger's domain: a live `DataSource` request stream, a finite loop, or a standalone read's synthesized singleton. A bare read *outside* a block never reaches here: lowering rejects it (`lower_expr`'s read gate). There is no static finiteness classification anywhere on this path; the read folds to `AsOf` purely because its history domain is `Type::Txn`. Every trigger position latches at its own arrival, uniformly — a finite trigger has no special timing, so a read of a store still committing reports whatever it has committed, commonly the seed. `AsOf` stays non-terminal until the store is terminal *and* every live trigger position is latched, so it cannot report "done" while a store no other consumer drives is still committing.
+A mutable variable read fed out of its `with begin():` block compiles to `AsOf`, through
+`transact_phase::rewrite_as_of_reads`. It samples at an arbitrary committed position, whether its
+trigger is a live request stream, a finite loop or a synthesized singleton. Lowering rejects a bare
+transactional read outside a block.
+
+Each trigger position latches one committed snapshot after the store opens its seeds. `AsOf`
+declares its store source through `TileProducer::sampled_inputs`: its dispatcher dependency waits
+for seed opening, and its trigger schedules the samples. The writers execute independently. Store
+progress changes what a later trigger can sample but queues no additional sample and cannot change a
+latched value. Once every present trigger position is latched, completion follows the trigger rather
+than waiting for the live writers to finish. Direct producer probes retain the store-terminality
+gate because their explicit reads also drive the store.
 
 The **terminal** read is a different term, not a different classification of this one: `await_final(x)` (see `src/ccl/design/mutability.md`, "`await_final`") is a `StoreFinalRead`, the same sample of the same key through the same `store_current` — what differs is what fixes the position, a trigger's arrival here and the key's own closure there. The two are distinct terms all the way down from the surface — `as_of_read` and `final_read` — so which read a program gets never depends on the shape of the tree around it.
 

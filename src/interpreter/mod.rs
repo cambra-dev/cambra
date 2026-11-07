@@ -7,11 +7,11 @@ mod binop;
 pub mod commit_operator;
 pub mod dispatcher;
 pub mod http_server;
+mod notifications;
 pub mod operator_conversion;
 pub mod operator_graph;
 mod producer_releases;
 mod scalar_expr;
-mod scheduler;
 pub mod sinks;
 mod stdio;
 mod stream_buffer;
@@ -29,8 +29,8 @@ pub mod value_probe;
 
 pub use binop::*;
 pub use http_server::HttpServerDataSource;
+pub use notifications::*;
 pub use scalar_expr::ScalarProgram;
-pub use scheduler::*;
 pub use stdio::*;
 pub use subscribe_context::*;
 #[cfg(any(test, feature = "test-helpers"))]
@@ -48,34 +48,23 @@ use std::rc::Rc;
 // Consumer Protocol
 // ============================================================================
 
-/// Receives a signal that a producer's output changed; notifications carry no tile data.
-///
-/// A notification names the region of the producer's outermost keys that changed. A producer
-/// that cannot name it sends [`Projection::Everything`]. Deferred or coalesced notifications
-/// need not correspond one-to-one with changed results, and coalescing unites their regions.
-/// See `src/interpreter/design-operators.md`, "The notification contract".
+/// Receives decided regions from a producer and declares their dispatcher routes.
+/// Regions carry no tile data. See `src/interpreter/design-operators.md`,
+/// "The notification contract".
 pub trait Consumer {
-    /// Notify the consumer that the keys `arrived` changed, and that it should pull again if it
-    /// reads this producer.
-    fn notify(&mut self, arrived: &Projection);
+    /// Invalidate cached reads outside a dispatcher run.
+    /// The next explicit producer read observes `arrived` again. This callback executes no
+    /// program; direct producer protocol tests and subscription setup use it.
+    fn invalidate(&mut self, arrived: &Projection);
 
-    /// Hand on `region` of the producer's keys at any level, which a pipeline breaker pushed
-    /// ([`dispatcher::Pushes`]): a consumer between two breakers restates it as it restates a
-    /// notification and passes it on, and the next breaker's [`dispatcher::Entry`] queues it in
-    /// `landing` as a work package of the breaker's pipeline. No gate holds a push back, since
-    /// every region becomes a package, and a consumer that pulls ignores it, which is the default:
-    /// a push wakes no one.
-    ///
-    /// TODO: this is a second path beside `notify` while runs still pull. Once every run goes
-    /// through the dispatcher, `notify`, its gates (`GatedConsumer`) and `WakeupQueue` go, and
-    /// this method takes `notify`'s place.
-    fn push(&mut self, _region: &Projection, _landing: &mut dispatcher::Landing<'_>) {}
+    /// Deliver a decided region of the producer's keys at any level.
+    /// Intermediate consumers restate it, and a pipeline entry queues the corresponding work in
+    /// `landing`. Every delivered region is a work package, so invalidation gates never coalesce it.
+    fn notify(&mut self, _region: &Projection, _landing: &mut dispatcher::Landing<'_>) {}
 
-    /// Declare where a push through this consumer goes and how, in `routes`, without pushing: a
-    /// consumer that passes a push on walks on to the consumers it passes it to, one that widens
-    /// it walks them through [`Routes::widened`](dispatcher::Routes::widened), and the
-    /// [`dispatcher::Entry`] of a placed breaker records its pipeline. It mirrors
-    /// [`push`](Self::push): a consumer that ignores a push declares nothing, which is the default.
+    /// Declare the routes a notification follows without delivering one.
+    /// A consumer that widens a region uses [`Routes::widened`](dispatcher::Routes::widened).
+    /// A placed breaker's [`dispatcher::Entry`] records its pipeline.
     fn route(&mut self, _routes: &mut dispatcher::Routes) {}
 }
 
@@ -83,12 +72,12 @@ pub trait Consumer {
 // shared-state-ok: this is what makes a shared *notification* handle a consumer;
 // a wakeup carries no value, so it is not a dataflow edge.
 impl<C: Consumer> Consumer for Rc<RefCell<C>> {
-    fn notify(&mut self, arrived: &Projection) {
-        self.borrow_mut().notify(arrived)
+    fn invalidate(&mut self, arrived: &Projection) {
+        self.borrow_mut().invalidate(arrived)
     }
 
-    fn push(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
-        self.borrow_mut().push(region, landing)
+    fn notify(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
+        self.borrow_mut().notify(region, landing)
     }
     fn route(&mut self, routes: &mut dispatcher::Routes) {
         self.borrow_mut().route(routes)
@@ -98,12 +87,12 @@ impl<C: Consumer> Consumer for Rc<RefCell<C>> {
 /// A boxed consumer is one, so it can be shared behind an `Rc<RefCell<_>>` as a
 /// [`SharedConsumer`].
 impl Consumer for Box<dyn Consumer> {
-    fn notify(&mut self, arrived: &Projection) {
-        (**self).notify(arrived)
+    fn invalidate(&mut self, arrived: &Projection) {
+        (**self).invalidate(arrived)
     }
 
-    fn push(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
-        (**self).push(region, landing)
+    fn notify(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
+        (**self).notify(region, landing)
     }
     fn route(&mut self, routes: &mut dispatcher::Routes) {
         (**self).route(routes)
@@ -116,7 +105,7 @@ impl<F> Consumer for F
 where
     F: FnMut(),
 {
-    fn notify(&mut self, _arrived: &Projection) {
+    fn invalidate(&mut self, _arrived: &Projection) {
         dispatcher::debug_assert_outside_a_run();
         self()
     }

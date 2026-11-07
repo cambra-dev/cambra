@@ -27,21 +27,16 @@ use cambra::{
 // Sink programs (HTTP, etc.)
 // ---------------------------------------------------------------------------
 
-/// Compile `source` for a sink program and return the surrounding
-/// [`GlobalContext`].  Sink programs (e.g. `http_serve`) have no `main`
-/// output; their sinks bind their resources during `compile_program` and
-/// then await scheduler ticks to dispatch values.
-///
-/// The caller must keep the returned context alive (and drive its scheduler
-/// via [`drive_until`]) for the duration of the test — sinks are only
-/// serviced while the scheduler is running.
-// The gallery's: a suite that replaces a version wants `start_sink`.
-pub fn compile_sink(source: &str) -> GlobalContext {
+/// Compile a sink program and retain its resource context for dispatched execution.
+pub fn compile_sink(source: &str) -> SinkProgram {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(source);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    ctx
+    let program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    SinkProgram {
+        _context: ctx,
+        program,
+    }
 }
 
 /// Start `source` as a [`LiveProgram`], for a test that replaces it with
@@ -115,28 +110,107 @@ pub fn raw_http_response(port: u16, request: &str) -> String {
     raw
 }
 
-/// Drive `ctx`'s scheduler on the current thread until `rx` delivers a
-/// value or `timeout` elapses.
-///
-/// HTTP sink dispatch is handled automatically by `SinkConsumer` when the
-/// scheduler notifies it; this function only needs to keep the scheduler
-/// ticking while the request-sending thread runs.
-///
-/// `check_for_notifications` has no blocking form, so the scheduler has to be
-/// pumped on a timer; `recv_timeout` supplies that cadence while still returning
-/// the instant the response lands, rather than up to a tick later.
-pub fn drive_until<T>(ctx: &mut GlobalContext, rx: &mpsc::Receiver<T>, timeout: Duration) -> T {
-    const PUMP_INTERVAL: Duration = Duration::from_millis(10);
+/// Run `program` until `rx` delivers a value or `timeout` elapses.
+/// The observer checks the response channel at drained dispatcher boundaries.
+pub fn drive_until<T>(
+    program: &mut impl DispatchProgram,
+    rx: &mpsc::Receiver<T>,
+    timeout: Duration,
+) -> T {
+    drive_until_named(program, rx, timeout, "sink response")
+}
 
-    let deadline = Instant::now() + timeout;
-    loop {
-        ctx.scheduler().check_for_notifications();
-        match rx.recv_timeout(PUMP_INTERVAL) {
-            Ok(value) => return value,
-            Err(mpsc::RecvTimeoutError::Timeout) => assert!(
-                Instant::now() < deadline,
-                "timed out after {timeout:?} waiting for sink response",
-            ),
+pub fn drive_until_named<T>(
+    program: &mut impl DispatchProgram,
+    rx: &mpsc::Receiver<T>,
+    timeout: Duration,
+    what: &'static str,
+) -> T {
+    let mut response = Response {
+        rx,
+        deadline: Instant::now() + timeout,
+        timeout,
+        what,
+        value: None,
+    };
+    program.dispatch(&mut response);
+    response
+        .value
+        .expect("the program stays live until its response")
+}
+
+/// Run available work and pause at the first drained boundary.
+pub fn dispatch_until_idle(program: &mut impl DispatchProgram) {
+    struct Pause;
+    impl cambra::interpreter::dispatcher::RunObserver for Pause {
+        fn drained(&mut self, _: bool) -> std::ops::ControlFlow<()> {
+            std::ops::ControlFlow::Break(())
+        }
+    }
+    program.dispatch(&mut Pause);
+}
+
+pub struct SinkProgram {
+    _context: GlobalContext,
+    program: cambra::ccl::context::CompiledProgram,
+}
+
+pub trait DispatchProgram {
+    fn dispatch(&mut self, observer: &mut dyn cambra::interpreter::dispatcher::RunObserver);
+}
+
+impl DispatchProgram for SinkProgram {
+    fn dispatch(&mut self, observer: &mut dyn cambra::interpreter::dispatcher::RunObserver) {
+        self.program.dispatch(observer);
+    }
+}
+
+impl DispatchProgram for cambra::ccl::context::CompiledProgram {
+    fn dispatch(&mut self, observer: &mut dyn cambra::interpreter::dispatcher::RunObserver) {
+        let mut targets = cambra::interpreter::dispatcher::Targets::default();
+        targets.add_sinks(self);
+        targets
+            .run(1, observer)
+            .unwrap_or_else(|why| panic!("sink program dispatches: {why}"));
+    }
+}
+
+struct IgnoreMain;
+impl cambra::interpreter::DataSink for IgnoreMain {
+    fn process(&self, _: &cambra::interpreter::Tile) {}
+}
+
+impl DispatchProgram for LiveProgram {
+    fn dispatch(&mut self, observer: &mut dyn cambra::interpreter::dispatcher::RunObserver) {
+        self.run(1, &|_| std::sync::Arc::new(IgnoreMain), observer)
+            .unwrap_or_else(|why| panic!("live program dispatches: {why}"));
+    }
+}
+
+struct Response<'a, T> {
+    rx: &'a mpsc::Receiver<T>,
+    deadline: Instant,
+    timeout: Duration,
+    what: &'static str,
+    value: Option<T>,
+}
+
+impl<T> cambra::interpreter::dispatcher::RunObserver for Response<'_, T> {
+    fn drained(&mut self, _: bool) -> std::ops::ControlFlow<()> {
+        match self.rx.recv_timeout(Duration::from_millis(10)) {
+            Ok(value) => {
+                self.value = Some(value);
+                std::ops::ControlFlow::Break(())
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                assert!(
+                    Instant::now() < self.deadline,
+                    "timed out after {:?} waiting for {}",
+                    self.timeout,
+                    self.what
+                );
+                std::ops::ControlFlow::Continue(())
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 panic!("request thread dropped the channel without sending a response")
             }
@@ -149,14 +223,14 @@ pub fn drive_until<T>(ctx: &mut GlobalContext, rx: &mpsc::Receiver<T>, timeout: 
 /// [`drive_until`] with the channel and the thread it always comes with: a
 /// request blocks on a response the scheduler has not computed yet, so the
 /// requests have to run somewhere other than the thread doing the driving.
-pub fn exchange<T, F>(ctx: &mut GlobalContext, requests: F) -> T
+pub fn exchange<T, F>(program: &mut impl DispatchProgram, requests: F) -> T
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
     let (tx, rx) = mpsc::channel::<T>();
     thread::spawn(move || tx.send(requests()).unwrap());
-    drive_until(ctx, &rx, Duration::from_secs(5))
+    drive_until(program, &rx, Duration::from_secs(5))
 }
 
 /// The main-output consumer a sink-only program never uses.

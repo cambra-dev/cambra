@@ -51,16 +51,12 @@ const EMIT: &str = indoc! {"
 /// Run `program` to completion with a test sink registered under each of
 /// `sinks`, and answer what each received.
 fn observe(program: &LoadedProgram, sinks: &[&str]) -> Vec<String> {
-    const CAP: usize = 10_000;
     let mut ctx = GlobalContext::default();
     let handles: Vec<_> = sinks.iter().map(|n| ctx.register_test_sink(*n)).collect();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let compiled = compile_program(&mut ctx, program, consumer).unwrap_or_render(program);
-    let completed = (0..CAP).any(|_| {
-        ctx.scheduler().check_for_notifications();
-        compiled.done.try_recv().is_ok()
-    });
-    assert!(completed, "sinks did not all complete within {CAP} pulls");
+    let mut compiled = compile_program(&mut ctx, program, consumer).unwrap_or_render(program);
+    cambra::interpreter::dispatcher::run_program(&mut compiled, 1).expect("sinks dispatch");
+    assert!(compiled.done.try_recv().is_ok(), "sinks complete");
     handles
         .iter()
         .map(|s| format!("{}", s.value().expect("a value")))

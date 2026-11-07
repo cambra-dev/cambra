@@ -1539,7 +1539,7 @@ impl Tile {
     /// closes a guard: a statement under every tag of a tagged union's domain, each saying
     /// everything or each saying nothing, is that. An answer assembled arm by arm states each
     /// arm on its own, and only the closed statement reads as terminal.
-    pub(crate) fn closed_over(mut self, tiling: &Tiling) -> Tile {
+    pub fn closed_over(mut self, tiling: &Tiling) -> Tile {
         if let Tile::DataFunction {
             domain_predicate, ..
         } = &mut self

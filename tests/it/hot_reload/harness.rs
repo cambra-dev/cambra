@@ -25,8 +25,8 @@ use super::serving::{raw_http, reserve_test_port};
 /// Driven as a subprocess because a `main` output belongs to the binary's own
 /// loop, not to a sink a test can pump. Such a program is not short-lived: its
 /// source is unbounded, so it keeps running and is as reloadable as any other.
-/// `dispatch` is the binary's `CAMBRA_DISPATCH`: `"1"` runs the program
-/// dispatched, `"0"` in pull mode.
+/// `dispatch` supplies the retired `CAMBRA_DISPATCH` flag. Both values exercise dispatcher
+/// execution; the flag no longer selects a driver.
 pub(crate) fn stdin_across_reload(
     program: &str,
     reloaded: &str,
@@ -1031,7 +1031,7 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
             .collect()
     };
     let pull = |ctx: &mut GlobalContext, live: &mut LiveProgram| -> Tile {
-        ctx.scheduler().check_for_notifications();
+        ctx.source_registry().notify_changes();
         let producer = live
             .main_producer_mut(MAIN_BRANCH)
             .expect("the program's value is pulled");

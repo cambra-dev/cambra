@@ -14,7 +14,7 @@ use super::*;
 use crate::ccl::TagMap;
 use crate::interpreter::{
     BaseType, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, NotifyOrSubscribeResult,
-    Projection, SharedConsumer, SubscribeContext, UnionArm, Value, scheduler::shared_consumer,
+    Projection, SharedConsumer, SubscribeContext, UnionArm, Value, notifications::shared_consumer,
 };
 
 /// Produces a function tile whose domain and codomain both equal `extent`.
@@ -43,7 +43,7 @@ impl IterateExtent {
         cx: &mut SubscribeContext,
     ) {
         extent.for_each_source(&mut |source| {
-            cx.scheduler()
+            cx.source_registry()
                 .add_source_handle(source.clone(), Rc::downgrade(&consumer));
         });
     }
@@ -68,7 +68,7 @@ impl TileOperator for IterateExtent {
         let NotifyOrSubscribeResult { notify, subscribe } =
             self.extent.subscribe_to_iteration_action();
         if notify {
-            consumer.notify(&Projection::Everything);
+            consumer.invalidate(&Projection::Everything);
         }
         // The producer owns the registration: the scheduler holds only a `Weak`, so this
         // handle is what keeps the source waking this producer, and dropping the producer
@@ -171,7 +171,7 @@ struct DirectIteration {
     /// Owning it here ties the registration's lifetime to the producer's: a
     /// producer carried across a program reload keeps waking, and one the reload
     /// dropped is pruned on the next
-    /// [`check_for_notifications`](Scheduler::check_for_notifications).
+    /// [`notify_changes`](SourceRegistry::notify_changes).
     /// `None` when the extent needs no source subscription.
     _source_wakeup: Option<Rc<RefCell<dyn Consumer>>>,
 }

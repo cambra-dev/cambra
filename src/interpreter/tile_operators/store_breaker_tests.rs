@@ -58,7 +58,6 @@ impl Compiled {
 
     fn with(source: &str, setup: impl FnOnce(&mut GlobalContext)) -> Self {
         let mut ctx = GlobalContext::default();
-        ctx.defer_sink_pulls();
         let _sink = ctx.register_test_sink("out");
         setup(&mut ctx);
         let loaded = LoadedProgram::test(source);
@@ -72,6 +71,11 @@ impl Compiled {
         let fan = stores.next().expect("a store's fan-out is cyclic");
         assert!(stores.next().is_none(), "one store");
         let store = fan.store().expect("the program subscribed its store");
+        store
+            .borrow_mut()
+            .as_breaking_mut()
+            .expect("a store breaks a pipeline")
+            .enter_consuming_mode();
         Self {
             _ctx: ctx,
             program,
@@ -84,7 +88,11 @@ impl Compiled {
     fn pull_sinks(&self) {
         for output in &self.program.outputs {
             if let Some(consumer) = &output.sink_consumer {
-                consumer.borrow().pull_now();
+                let root = consumer.borrow().producer_slot().clone();
+                let mut root = root.borrow_mut();
+                let producer = root.as_mut().unwrap();
+                let tile = producer.get(producer.tiling().universal_guard());
+                producer.release(tile.to_guard());
             }
         }
     }
@@ -96,7 +104,6 @@ impl Compiled {
         let store = store
             .as_breaking_mut()
             .expect("a store is a pipeline breaker");
-        store.enter_consuming_mode();
         f(store)
     }
 

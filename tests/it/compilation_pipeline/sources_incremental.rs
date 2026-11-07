@@ -64,7 +64,7 @@ fn test_test_source(#[case] code: &str) {
     let loaded = LoadedProgram::test(code);
     let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
     assert!(*notified.borrow());
 
     let tile = producer.get(producer.tiling().universal_guard());
@@ -97,14 +97,14 @@ fn test_test_source(#[case] code: &str) {
     data_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
     assert!(*notified.borrow());
     // Restating the guard it already has changes nothing, and must not notify.
     *notified.borrow_mut() = false;
     data_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
     assert!(!*notified.borrow());
 }
 
@@ -134,7 +134,7 @@ fn test_source_filter_nonterminal() {
     let loaded = LoadedProgram::test(code);
     let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
     assert!(*notified.borrow());
 
     let mut tile = producer.get(producer.tiling().universal_guard());
@@ -213,7 +213,7 @@ fn test_inner_join(#[case] code: &str) {
     let loaded = LoadedProgram::test(code);
     let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
     assert!(*notified.borrow());
 
     let tile = producer.get(producer.tiling().universal_guard());
@@ -316,7 +316,7 @@ fn test_inner_join(#[case] code: &str) {
         .borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::from(20u64)));
 
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
     assert!(*notified.borrow());
     let tile = producer.get(producer.tiling().universal_guard());
     *notified.borrow_mut() = false;
@@ -342,7 +342,7 @@ fn test_inner_join(#[case] code: &str) {
         .borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::from(30u64)));
 
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
     assert!(*notified.borrow());
     let tile = producer.get(producer.tiling().universal_guard());
     *notified.borrow_mut() = false;
@@ -395,7 +395,7 @@ fn test_incremental_join_simple(#[case] code: &str) {
     let loaded = LoadedProgram::test(code);
     let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
     assert!(*notified.borrow());
     let tile = producer.get(producer.tiling().universal_guard());
     *notified.borrow_mut() = false;
@@ -435,7 +435,7 @@ fn test_incremental_join_simple(#[case] code: &str) {
     src2.borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::from(20u64)));
 
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
     assert!(*notified.borrow());
     let tile = producer.get(producer.tiling().universal_guard());
 
@@ -448,7 +448,7 @@ fn test_incremental_join_simple(#[case] code: &str) {
     src1.borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::from(2u64)));
 
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
     assert!(*notified.borrow());
     let tile = producer.get(producer.tiling().universal_guard());
 
@@ -638,7 +638,7 @@ fn test_a_projection_after_a_source_is_read_from_the_source() {
     );
 
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
     let result = producer.get(producer.tiling().universal_guard());
     assert_eq!(
         result,
@@ -684,7 +684,7 @@ fn test_two_projections_of_a_source_are_read_from_the_source_together() {
     );
 
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
     let result = producer.get(producer.tiling().universal_guard());
     let expected: i64 = (0..8i64).map(|k| k * 9 - k * 3).sum();
     assert_eq!(
@@ -755,7 +755,7 @@ fn test_a_source_reads_the_fields_its_planned_chain_projects() {
         );
 
         let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-        ctx.scheduler().check_for_notifications();
+        ctx.source_registry().notify_changes();
         let result = producer.get(producer.tiling().universal_guard());
         assert_eq!(
             result,
@@ -841,7 +841,7 @@ fn test_a_source_reads_the_nested_leaves_its_planned_chain_projects() {
         }
 
         let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-        ctx.scheduler().check_for_notifications();
+        ctx.source_registry().notify_changes();
         let result = producer.get(producer.tiling().universal_guard());
         assert_eq!(
             result,
@@ -887,10 +887,10 @@ x";
     test_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
 
     let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
-    let result = pull_laps(ctx.scheduler(), &mut *producer, 4, |t| *t != empty);
+    let result = pull_laps(ctx.source_registry(), &mut *producer, 4, |t| *t != empty);
     assert_eq!(
         result,
         Tile::Scalar(ColumnValue::Ints(vec![50])),
@@ -934,9 +934,9 @@ o";
     test_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
 
-    let result = pull_laps(ctx.scheduler(), &mut *producer, 16, Tile::is_terminal);
+    let result = pull_laps(ctx.source_registry(), &mut *producer, 16, Tile::is_terminal);
     // Compare as a function (position → value), independent of internal ordering.
     assert_eq!(
         sort_function_by_domain(result),
@@ -995,10 +995,10 @@ x";
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
     assert!(*notified.borrow(), "first batch should fire a notification");
     assert_eq!(
-        pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
+        pull_laps(ctx.source_registry(), &mut *producer, 3, |t| *t != empty),
         empty,
         "after first batch: should produce no output yet"
     );
@@ -1008,13 +1008,13 @@ x";
     test_source
         .borrow_mut()
         .add_data(&[(Value::UInt(2), Value::Int(30))]);
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
     assert!(
         *notified.borrow(),
         "second batch should fire a notification"
     );
     assert_eq!(
-        pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
+        pull_laps(ctx.source_registry(), &mut *producer, 3, |t| *t != empty),
         empty,
         "after second batch: should produce no output yet"
     );
@@ -1026,8 +1026,8 @@ x";
     test_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
-    ctx.scheduler().check_for_notifications();
-    let result = pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty);
+    ctx.source_registry().notify_changes();
+    let result = pull_laps(ctx.source_registry(), &mut *producer, 3, |t| *t != empty);
     assert_eq!(
         result,
         Tile::Scalar(ColumnValue::Ints(vec![60])),
@@ -1091,7 +1091,7 @@ fn test_a_source_growing_under_a_running_induction_driver_is_read_again() {
     // The first batch runs the driver through positions 0, 1 and 2. At least two iterations
     // are done when the release covers position 1.
     deliver(&[(0, 10), (1, 20), (2, 30)]);
-    pull_laps(ctx.scheduler(), &mut *producer, 64, |_| false);
+    pull_laps(ctx.source_registry(), &mut *producer, 64, |_| false);
     assert!(
         released_through(1),
         "the driver should have run its first positions before the next batch arrives: {:?}",
@@ -1106,7 +1106,7 @@ fn test_a_source_growing_under_a_running_induction_driver_is_read_again() {
     // The second batch arrives under a driver that has already emitted. Its positions are
     // only reached if the driver reads the source again on the notification.
     deliver(&[(3, 40), (4, 50)]);
-    pull_laps(ctx.scheduler(), &mut *producer, 64, |_| false);
+    pull_laps(ctx.source_registry(), &mut *producer, 64, |_| false);
     assert!(
         released_through(4),
         "the driver should read the rows that arrived after its first iterations: {:?}",
@@ -1115,10 +1115,15 @@ fn test_a_source_growing_under_a_running_induction_driver_is_read_again() {
 
     // A third batch, to read again once more, and then the source closes.
     deliver(&[(5, 60)]);
-    pull_laps(ctx.scheduler(), &mut *producer, 64, |_| false);
+    pull_laps(ctx.source_registry(), &mut *producer, 64, |_| false);
     assert!(released_through(5));
     source.borrow_mut().set_yield_predicate(Predicate::True);
-    let mut total = pull_laps(ctx.scheduler(), &mut *producer, 256, Tile::is_terminal);
+    let mut total = pull_laps(
+        ctx.source_registry(),
+        &mut *producer,
+        256,
+        Tile::is_terminal,
+    );
     total.compact();
     assert_eq!(
         total,
@@ -1175,7 +1180,7 @@ fn test_a_source_growing_under_a_running_transaction_driver_is_read_again() {
     };
 
     deliver(&[(0, 10), (1, 20), (2, 30)]);
-    pull_laps(ctx.scheduler(), &mut *producer, 256, |_| false);
+    pull_laps(ctx.source_registry(), &mut *producer, 256, |_| false);
     assert!(
         released_through(1),
         "the driver should have committed its first items before the next batch arrives: {:?}",
@@ -1190,7 +1195,7 @@ fn test_a_source_growing_under_a_running_transaction_driver_is_read_again() {
     // The second batch arrives under a driver that has already attempted items. Its items
     // are only reached if the driver reads the source again on the notification.
     deliver(&[(3, 40), (4, 50)]);
-    pull_laps(ctx.scheduler(), &mut *producer, 256, |_| false);
+    pull_laps(ctx.source_registry(), &mut *producer, 256, |_| false);
     assert!(
         released_through(4),
         "the driver should read the items that arrived after its first attempts: {:?}",
@@ -1198,7 +1203,12 @@ fn test_a_source_growing_under_a_running_transaction_driver_is_read_again() {
     );
 
     source.borrow_mut().set_yield_predicate(Predicate::True);
-    let mut total = pull_laps(ctx.scheduler(), &mut *producer, 512, Tile::is_terminal);
+    let mut total = pull_laps(
+        ctx.source_registry(),
+        &mut *producer,
+        512,
+        Tile::is_terminal,
+    );
     total.compact();
     assert_eq!(
         total,
@@ -1243,8 +1253,8 @@ await_final(pool)";
     test_source
         .borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::UInt(1)));
-    ctx.scheduler().check_for_notifications();
-    pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty);
+    ctx.source_registry().notify_changes();
+    pull_laps(ctx.source_registry(), &mut *producer, 3, |t| *t != empty);
     assert_eq!(
         test_source.borrow().get_released_predicate(),
         Predicate::at_or_below(Value::UInt(1)),
@@ -1255,9 +1265,9 @@ await_final(pool)";
     test_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
     assert_eq!(
-        pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
+        pull_laps(ctx.source_registry(), &mut *producer, 3, |t| *t != empty),
         Tile::Scalar(ColumnValue::Ints(vec![100])),
     );
 }
@@ -1290,9 +1300,9 @@ x";
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
     assert_eq!(
-        pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
+        pull_laps(ctx.source_registry(), &mut *producer, 3, |t| *t != empty),
         empty,
         "a source that is not done yields no accumulator"
     );
@@ -1300,9 +1310,9 @@ x";
     test_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
     assert_eq!(
-        pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
+        pull_laps(ctx.source_registry(), &mut *producer, 3, |t| *t != empty),
         Tile::Scalar(ColumnValue::Ints(vec![7])),
     );
     assert_eq!(
@@ -1336,9 +1346,9 @@ x";
     test_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
     assert_eq!(
-        pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
+        pull_laps(ctx.source_registry(), &mut *producer, 3, |t| *t != empty),
         Tile::Scalar(ColumnValue::Ints(vec![0])),
     );
 }
@@ -1364,7 +1374,7 @@ fn test_incremental_aggregates() {
     let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
     assert!(*notified.borrow(), "expected notification (pipeline path)");
     *notified.borrow_mut() = false;
 
@@ -1458,7 +1468,7 @@ fn test_source_backed_collection_component(#[case] code: &str, #[case] expected:
     let loaded = LoadedProgram::test(code);
     let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
 
     let mut tile = producer.get(producer.tiling().universal_guard());
     tile.compact();
@@ -1502,7 +1512,7 @@ fn test_a_collection_component_grows_with_its_source(#[case] code: &str) {
         if done {
             source.borrow_mut().set_yield_predicate(Predicate::True);
         }
-        let mut tile = pull_laps(ctx.scheduler(), &mut *producer, 1, |_| false);
+        let mut tile = pull_laps(ctx.source_registry(), &mut *producer, 1, |_| false);
         tile.compact();
         sort_function_by_domain(tile)
     };
@@ -1567,7 +1577,7 @@ fn test_a_released_collection_component_is_not_redelivered(#[case] code: &str) {
                 .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
                 .collect::<Vec<_>>(),
         );
-        let mut tile = pull_laps(ctx.scheduler(), &mut *producer, 1, |_| false);
+        let mut tile = pull_laps(ctx.source_registry(), &mut *producer, 1, |_| false);
         tile.compact();
         producer.release(tile.to_guard());
         sort_function_by_domain(tile)
@@ -1623,13 +1633,13 @@ fn released_by_a_sink_over_a_live_source(code: &str, rows: &[i64], laps: usize) 
     test_source
         .borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::uint_from_row(rows.len() - 1)));
-    ctx.scheduler().check_for_notifications();
+    ctx.source_registry().notify_changes();
     for _ in 0..laps {
         let tile = producer.get(producer.tiling().universal_guard());
         if tile.is_data_function() {
             producer.release(tile.to_guard());
         }
-        ctx.scheduler().check_for_notifications();
+        ctx.source_registry().notify_changes();
     }
     test_source.borrow().get_released_predicate()
 }
@@ -1736,12 +1746,17 @@ fn run_in_batches_seeing(code: &str, batches: &[(&[(u64, i64)], u64)]) -> (Vec<T
         source
             .borrow_mut()
             .set_yield_predicate(Predicate::at_or_below(Value::UInt(*upto)));
-        let mut seen = pull_laps(ctx.scheduler(), &mut *producer, 64, |_| false);
+        let mut seen = pull_laps(ctx.source_registry(), &mut *producer, 64, |_| false);
         seen.compact();
         each.push(seen);
     }
     source.borrow_mut().set_yield_predicate(Predicate::True);
-    let mut tile = pull_laps(ctx.scheduler(), &mut *producer, 256, Tile::is_terminal);
+    let mut tile = pull_laps(
+        ctx.source_registry(),
+        &mut *producer,
+        256,
+        Tile::is_terminal,
+    );
     assert!(
         tile.is_terminal(),
         "{code}: stopped short of a terminal tile: {tile:?}"
@@ -1938,7 +1953,7 @@ fn a_collection_per_row_released_as_it_is_read() {
             .collect();
         source.borrow_mut().add_data(&data);
         source.borrow_mut().set_yield_predicate(yielded);
-        let mut tile = pull_laps(ctx.scheduler(), &mut *producer, 256, until);
+        let mut tile = pull_laps(ctx.source_registry(), &mut *producer, 256, until);
         tile.compact();
         producer.release(tile.to_guard());
         let Tile::DataFunction { codomain, .. } = &tile else {

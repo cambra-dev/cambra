@@ -34,7 +34,7 @@ fn an_edit_to_the_accumulating_loop_takes_effect() {
     let port = reserve_test_port();
     let (mut ctx, mut live) = start_sink(&source(include_str!("program.cambra"), port));
 
-    let before = exchange(&mut ctx, move || {
+    let before = exchange(&mut live, move || {
         vec![
             http_post(port, "/sign", "alice"),
             http_post(port, "/sign", "bob"),
@@ -59,7 +59,7 @@ bob
     )
     .expect("editing a loop body is a change between existing endpoints");
 
-    let after = exchange(&mut ctx, move || vec![http_post(port, "/sign", "carol")]);
+    let after = exchange(&mut live, move || vec![http_post(port, "/sign", "carol")]);
     assert_eq!(
         after,
         // The store is rebuilt, and resumes from the value the replaced version

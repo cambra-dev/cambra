@@ -1463,16 +1463,16 @@ fn an_aggregate_pushes_its_value_once_it_is_final() {
 struct Boxed(Box<dyn Consumer>);
 
 impl Consumer for Boxed {
-    fn notify(&mut self, arrived: &Projection) {
-        self.0.notify(arrived);
+    fn invalidate(&mut self, arrived: &Projection) {
+        self.0.invalidate(arrived);
     }
 
-    fn push(
+    fn notify(
         &mut self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
-        self.0.push(region, landing);
+        self.0.notify(region, landing);
     }
 
     fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
@@ -1602,15 +1602,15 @@ fn a_push_reaching_a_reader_twice_is_queued_once() {
 struct Paths(Vec<Box<dyn Consumer>>);
 
 impl Consumer for Paths {
-    fn notify(&mut self, _arrived: &Projection) {}
+    fn invalidate(&mut self, _arrived: &Projection) {}
 
-    fn push(
+    fn notify(
         &mut self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
         for path in &mut self.0 {
-            path.push(region, landing);
+            path.notify(region, landing);
         }
     }
 
@@ -1653,11 +1653,11 @@ fn a_route_declares_whether_each_path_decides_part_of_a_row() {
     let mut paths = Paths(vec![
         forwarding_consumer(&shared, &wakeups),
         forwarding_consumer_keeping_keys(&shared, &wakeups),
-        crate::interpreter::scheduler::widening_restating_decided(
+        crate::interpreter::notifications::widening_restating_decided(
             |region| region.clone(),
             forwarding_consumer_keeping_keys(&shared, &wakeups),
         ),
-        crate::interpreter::scheduler::restating_lookup(
+        crate::interpreter::notifications::restating_lookup(
             Box::new(|region| region.clone()),
             forwarding_consumer_keeping_keys(&shared, &wakeups),
         ),
@@ -1757,15 +1757,15 @@ fn a_push_that_re_enters_its_chain_fails_the_run() {
     /// A consumer whose push climbs `back`, a forwarder into the consumer this one sits behind.
     struct Cycle(test_helpers::InputConsumer);
     impl Consumer for Cycle {
-        fn notify(&mut self, _arrived: &Projection) {}
+        fn invalidate(&mut self, _arrived: &Projection) {}
 
-        fn push(
+        fn notify(
             &mut self,
             region: &Projection,
             landing: &mut crate::interpreter::dispatcher::Landing<'_>,
         ) {
             if let Some(back) = self.0.borrow_mut().as_mut() {
-                back.push(region, landing);
+                back.notify(region, landing);
             }
         }
     }
@@ -1832,9 +1832,9 @@ fn a_push_reaches_every_slot_of_a_fan_out() {
 struct Through(test_helpers::InputConsumer);
 
 impl Consumer for Through {
-    fn notify(&mut self, _arrived: &Projection) {}
+    fn invalidate(&mut self, _arrived: &Projection) {}
 
-    fn push(
+    fn notify(
         &mut self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
@@ -1843,7 +1843,7 @@ impl Consumer for Through {
             .borrow_mut()
             .as_mut()
             .expect("the operator was subscribed")
-            .push(region, landing);
+            .notify(region, landing);
     }
 
     fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
@@ -2016,7 +2016,7 @@ fn appended_ingress_keeps_external_pushes_at_the_control_boundary() {
     let entry =
         crate::interpreter::dispatcher::Entry::new(PipelineId(3), input.clone(), Box::new(|| {}));
     *entry.decided_target().borrow_mut() = Some((PipelineId(1), input.clone()));
-    let consumer: crate::interpreter::scheduler::SharedConsumer = Rc::new(RefCell::new(entry));
+    let consumer: crate::interpreter::notifications::SharedConsumer = Rc::new(RefCell::new(entry));
 
     for (pusher, expected_reader) in [(0, 1), (2, 3)] {
         let breaker = Scripted::holding(input.universal_guard());
