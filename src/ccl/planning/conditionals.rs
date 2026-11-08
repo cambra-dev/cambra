@@ -573,30 +573,56 @@ fn realize(
 /// One arm per branch, with the first-match path condition each is gated by.
 ///
 /// `witness` is the sum this fan-out realizes, absent for a same-domain conditional that
-/// names none. `None` where an arm's domain cannot be read: a multi-candidate arm is a
-/// genuinely nested conditional collection, and an arm naming no candidate needs the runtime
-/// witness, so either way the rewrite does not apply and the `Case` is left for
-/// op-conversion to reject.
+/// names none.
+///
+/// An arm whose domain its type does not name is a sum whose witness only its value knows.
+/// Under a sum whose kind describes its domains, `List`'s `UIntRanges` say, the leg is that arm
+/// opened by `unbox`, over its own witness's projection, which the kind admits as it admits any
+/// of its domains. Under a sum listing candidates a leg must be one of them, so such an arm is
+/// a nested conditional collection and the rewrite does not apply: `None`, and the `Case` is
+/// left for op-conversion to reject.
 fn arm_choices(
     branches: Vec<crate::ccl::Branch>,
     witness: Option<crate::ccl::ty::Witness>,
 ) -> Option<Vec<ArmChoice>> {
+    let described = witness
+        .as_ref()
+        .is_some_and(|w| !matches!(w.type_kind(), crate::ccl::ty::TypeKind::Enumerated(_)));
     let mut arms = Vec::new();
     let mut prior_guards: Vec<Expr> = Vec::new();
     // Flatten `elif` chains first, so a nested conditional collapses into one N-choice
     // fan-out rather than a union of unions.
     for b in flatten_trailing_value_case(branches) {
-        let dom = arm_domain(&b.body.ty)?;
+        let (arm, dom) = match arm_domain(&b.body.ty) {
+            Some(dom) => (discharge_determined_witnesses(b.body), dom),
+            None if described => unboxed_arm(b.body)?,
+            None => return None,
+        };
         let gate = synthesize_arm_predicate(&b.guard, &prior_guards);
         prior_guards.push(b.guard);
         arms.push(ArmChoice {
             witness: witness.clone(),
             gate,
-            arm: discharge_determined_witnesses(b.body),
+            arm,
             dom,
         });
     }
     Some(arms)
+}
+
+/// `arm ▷ unbox`, the collection a sum-typed arm holds, with its domain: the projection of
+/// the arm's own witness. `None` when the arm's type binds no witness.
+fn unboxed_arm(arm: Expr) -> Option<(Expr, Type)> {
+    let _g = provenance::enter(
+        arm.node_id(),
+        "planning.unboxed_arm",
+        provenance::Nature::Machinery,
+    );
+    let stamp = crate::ccl::ty::unbox_type(&arm.ty)?;
+    let ty = crate::ccl::ty::unboxed_type(&arm.ty, &Rc::new(arm.clone()))?;
+    let dom = ty.domain()?;
+    let unboxed = Expr::apply(arm, Expr::builtin(Builtin::Unbox).with_ty(stamp)).with_ty(ty);
+    Some((unboxed, dom))
 }
 
 /// An arm with every **determined** witness discharged — the term *and* the types.

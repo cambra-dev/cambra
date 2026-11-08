@@ -752,6 +752,17 @@ pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
         {
             is_iteration_bearing(argument)
         }
+        // A collection projected out of one variant value is the payload it holds, keys and
+        // all, as `unbox`'s is: an `iterate` over its type's domain would rebuild what the
+        // value already carries.
+        TypedExprNode::Apply { function, argument }
+            if matches!(
+                builtin_at_function_position(function),
+                Some(Builtin::VariantProject(_))
+            ) && !matches!(argument.ty.peel_refinements(), Type::Fun { .. }) =>
+        {
+            true
+        }
         TypedExprNode::Apply { function, .. } => match builtin_at_function_position(function) {
             // `Iterate` is the canonical head marker; `Restrict` heads a
             // refined site whose upstream is itself iteration-bearing

@@ -3125,12 +3125,7 @@ fn convert_impl_inner(
                 // `variant_project(c)`, but every key of the domain is answered,
                 // which is what a writer decision's guard position takes.
                 Builtin::VariantIs(tag) => {
-                    let ok = match input.tiling() {
-                        t @ (Tiling::Scalar(_) | Tiling::Union(_)) => is_a_union(t),
-                        Tiling::DataFunction { codomain, .. } => is_a_union(codomain),
-                        _ => false,
-                    };
-                    if !ok {
+                    if !is_a_union(input.tiling().deepest_values()) {
                         return Err(ConversionError::TypeError(format!(
                             "variant_is({tag}) expects a union scrutinee, got {}",
                             input.tiling()

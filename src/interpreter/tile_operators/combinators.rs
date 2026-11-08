@@ -485,19 +485,22 @@ impl TileProducer for MapDomainProducer {
             panic!("MapDomain expected a collection at {}", self.level)
         };
         **codomain = Tile::Scalar(domain.clone());
+        // Part of a value released releases nothing upstream (`release_impl`), so the input
+        // hands it out again and it is taken back out here.
+        if !self.base.obsolete_guard.is_empty() {
+            tile.remove_guarded(self.base.obsolete_guard.clone());
+        }
         tile
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         // The keys at 𝐿 stand as well as the levels above it: only the values beneath them
-        // are replaced.
-        let input_guard = crate::interpreter::tiling::through_standing_levels(
+        // are replaced. A value released whole releases the input's; part of one names no
+        // part of the input's value, which is kept until the whole of it is released.
+        let input_guard = crate::interpreter::tiling::through_shared_levels(
             obsolete_guard,
             self.level.index() + 1,
             self.input.tiling(),
-            &mut |values| {
-                todo!("MapDomain cannot yet release part of the keys it made values: {values:?}")
-            },
         );
         self.input.release(input_guard);
     }

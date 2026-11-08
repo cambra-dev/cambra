@@ -602,6 +602,77 @@ fn a_loop_writing_over_a_conditional_ranges_over_the_chosen_keys(
     check_scalar(code, expected);
 }
 
+/// **A conditional between collections whose domains only their values hold**: arms typed
+/// `List(Int)`, a sum over `UIntRanges` naming no candidate. Each leg is its arm opened by
+/// `unbox`, gated by the arm's path condition.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::annotated_bindings(indoc! {r"
+    c: Bool = True
+    a: List(Int) = box([1, 2])
+    b: List(Int) = box([3])
+    sum(a if c else b)
+"}, Value::Int(3))]
+#[case::a_function_s_parameters(indoc! {r"
+    def pick(c: Bool, a: List(Int), b: List(Int)) => List(Int):
+        a if c else b
+    sum(pick(False, box([1, 2]), box([3])))
+"}, Value::Int(3))]
+#[case::chosen_per_row(indoc! {r"
+    a: List(Int) = box([1, 2])
+    b: List(Int) = box([3])
+    total := 0
+    for i in [1, 2]:
+        for x in (a if i > 1 else b):
+            total += x * i
+    total
+"}, Value::Int(9))]
+fn a_conditional_between_collections_whose_domains_their_values_hold(
+    #[case] code: &str,
+    #[case] expected: Value,
+) {
+    check_scalar(code, expected);
+}
+
+/// **A `match` selecting a collection** is a conditional collection, gated by tag tests, as an
+/// `if` is by its guards: one leg per arm, the arm's payload projected out of the scrutinee.
+/// Read under nested loops, where no one-row collapse applies.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::the_second_arm(indoc! {r"
+    type Coll:
+        a(List(Int))
+        b(List(Int))
+    def items(c: Coll) => List(Int):
+        match c:
+            case Coll::a(v):
+                v
+            case Coll::b(v):
+                v
+    sum(items(Coll::b(box([1, 2]))))
+"}, Value::Int(3))]
+#[case::under_nested_loops(indoc! {r"
+    type Coll:
+        a(List(Int))
+        b(List(Int))
+    def items(c: Coll) => List(Int):
+        match c:
+            case Coll::a(v):
+                v
+            case Coll::b(v):
+                v
+    c = Coll::b(box([1, 2, 3]))
+    total := 0
+    for i in [1, 2]:
+        for j in [1, 2]:
+            for x in items(c):
+                total += x * i
+    total
+"}, Value::Int(36))]
+fn a_match_selecting_a_collection(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
 /// **A loop feeding a sink over a conditional chosen per row** is keyed by the row and the chosen
 /// arm's keys. The realized conditional is bound as a collection over the enclosing positions,
 /// a value `Case` fanned out over its input, and planning drives it with an `iterate` over those
