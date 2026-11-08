@@ -493,9 +493,9 @@ fn onto_wrapped_arm(
 ///
 /// **Two input shapes, both yielding a `DataFunction` keyed by the scrutinee's
 /// domain:**
-/// - `Scalar(Union)` — a bare union column (the `VariantCtor`/`VariantWrap`
-///   shape). The domain is *implicit* `0..N`, so the projected keys are the
-///   `UInt` positions carrying the tag.
+/// - `Scalar(Union)` or `Union` — one variant value (the `VariantCtor`/`VariantWrap`
+///   shape). Projecting it is applying the projection: the output is the payload,
+///   with no key of its own, and holds nothing while the value carries another tag.
 /// - `DataFunction { D ⇒ Scalar(Union) }` — a union *stream* whose element
 ///   domain `D` is explicit (a variant field of a record stream, `x.f`). The
 ///   projected keys are the **actual `D` keys** at the tagged positions,
@@ -540,17 +540,19 @@ pub struct VariantProject {
     /// has no meaning across a grouping, so each enclosing row is projected on its own.
     level: Option<CurryLevel>,
     /// The projected level, empty — what an enclosing row the scrutinee has not reached
-    /// contributes to the regrouped result.
+    /// contributes to the regrouped result. For a bare union, the payload while the union
+    /// holds none: nothing delivered yet.
     empty_level: Option<Tile>,
-    /// Output tiling — `DataFunction { <scrutinee domain> ⇒ the `tag` arm }`.
+    /// Output tiling — `DataFunction { <scrutinee domain> ⇒ the `tag` arm }`, or the arm
+    /// itself for a bare union.
     base: OperatorBase,
 }
 
 impl VariantProject {
     /// Construct a `VariantProject` reading arm `tag` out of the scrutinee's
     /// union. The projected sub-domain is keyed by the scrutinee's own domain: a
-    /// bare `Scalar(Union)` scrutinee has the implicit `UInt` `0..N` domain,
-    /// while a `DataFunction { D ⇒ Scalar(Union) }` scrutinee keeps `D`. All
+    /// `DataFunction { D ⇒ Scalar(Union) }` scrutinee keeps `D`, and a bare union,
+    /// one value, projects to its payload alone. All
     /// arms of one `match` share the scrutinee's domain extent, so they
     /// flat-merge back to the full domain.
     /// `payload_extent` is the projected arm's extent, taken from the node's own
@@ -562,9 +564,7 @@ impl VariantProject {
     pub fn new(input: Box<dyn TileOperator>, tag: FieldKey, payload_extent: Extent) -> Self {
         // The scrutinee is a union, either bare or as the values of a function of any
         // arity. The output keeps that arity and narrows only the codomain, so a union
-        // per innermost element projects per innermost element. The output is a function
-        // either way: a bare union is keyed by the implicit `0..N` positions the tile
-        // materializes.
+        // per innermost element projects per innermost element.
         // The payload carries its own levels where it is a collection: an arm holding one is
         // handed to its consumer as a level rather than as a map in a cell
         // ([`Tiling::from_extent`]).
@@ -579,9 +579,9 @@ impl VariantProject {
             _ => Tiling::from_extent(&payload_extent),
         };
         let tiling = match input.tiling() {
-            union @ (Tiling::Scalar(Extent::Union(_)) | Tiling::Union(_)) => {
-                Tiling::data_function(Extent::Base(BaseType::UInt), arm_tiling(union))
-            }
+            // A bare union is one value, and projecting it is applying the projection to it:
+            // the output is the payload, with no position of its own.
+            union @ (Tiling::Scalar(Extent::Union(_)) | Tiling::Union(_)) => arm_tiling(union),
             t @ Tiling::DataFunction { .. } => {
                 assert!(
                     matches!(
@@ -601,7 +601,10 @@ impl VariantProject {
         // across a grouping, so a scrutinee under standing levels is projected one
         // enclosing row at a time ([`Tile::regroup_beneath`]).
         let level = CurryLevel::innermost_of(input.tiling());
-        let empty_level = level.map(|l| tiling.values_at(l).empty_at_no_rows());
+        let empty_level = Some(match level {
+            Some(l) => tiling.values_at(l).empty_at_no_rows(),
+            None => tiling.empty_tile(),
+        });
         Self {
             base: OperatorBase::new(tiling),
             input,
@@ -746,6 +749,11 @@ impl TileProducer for VariantProjectProducer {
             self.input.release(guard);
             return;
         }
+        // Part of a bare union's payload names no part of the union, which stays requested;
+        // `get_impl` takes the released part back out of each projection.
+        if self.level.is_none() && !obsolete_guard.is_universal() {
+            return;
+        }
         // Anything else is all-or-nothing: there is no other sub-region of the scrutinee
         // this producer could stop requesting.
         if obsolete_guard.expect_universal_or_empty(&self.name()) {
@@ -760,8 +768,7 @@ impl VariantProjectProducer {
     fn project_level(&self, tile: Tile) -> Tile {
         // The scrutinee's own domain keys (explicit for a union *stream*, so the
         // projected payload co-iterates by key with the outer element) and its
-        // union codomain. A bare `Scalar(Union)` has an implicit `0..N` domain,
-        // supplied below as the positions themselves.
+        // union codomain. A bare union is one value, at position 0.
         let (domain_col, domain_predicate, deleted, scrutinee) = match tile {
             Tile::Scalar(cv) => (
                 None,
@@ -853,6 +860,26 @@ impl VariantProjectProducer {
                 open_collections(&values, &self.payload_extent)
             }
         };
+        // A bare union's payload is the value: its one row, or none while the scrutinee is
+        // unknown. A scrutinee known to carry another tag holds no rows of a collection
+        // payload, as a keyed scrutinee's projection holds none at a row of another tag, and
+        // that result is complete. The union needs each unselected branch's empty result.
+        if self.level.is_none() {
+            let known = match &scrutinee {
+                Scrutinee::Column(arms) => arms.values().any(|arm| !arm.rows().is_empty()),
+                Scrutinee::Tiles(arms) => arms.values().any(|arm| !arm.rows.is_empty()),
+            };
+            return match (slots.is_empty(), known, self.tiling()) {
+                (false, _, _) => out_codomain,
+                (true, true, Tiling::DataFunction { domain, codomain }) => Tile::data_function(
+                    ColumnValue::from_values(Vec::new(), domain),
+                    Box::new(codomain.empty_at_no_rows()),
+                    Predicate::True,
+                    BitSet::new(),
+                ),
+                (true, _, _) => self.empty_level.clone().expect("set for every scrutinee"),
+            };
+        }
         let mut out = Tile::data_function(
             out_domain,
             Box::new(out_codomain),
@@ -894,13 +921,13 @@ fn scrutinee_of(values: Tile) -> Scrutinee {
 /// **An absent arm is not an error** — it answers `false` everywhere, matching
 /// [`VariantProject`]'s empty projection on a width-subtype scrutinee.
 pub struct VariantIs {
-    /// The scrutinee operator, producing a `Scalar(Union)` tile or a
-    /// `DataFunction { D ⇒ Scalar(Union) }` tile.
+    /// The scrutinee operator, producing a union (a column or arm tiles), bare or under
+    /// any number of collection levels.
     input: Box<dyn TileOperator>,
     /// The tag to test for.
     tag: FieldKey,
     /// Identity and the output tiling — the scrutinee's, with `Bool` in place of the union:
-    /// `Scalar(Bool)` or `DataFunction { <scrutinee domain> ⇒ Bool }`.
+    /// `Scalar(Bool)` or `DataFunction { <scrutinee domain> ⇒ … ⇒ Bool }`.
     base: OperatorBase,
 }
 
@@ -908,24 +935,19 @@ impl VariantIs {
     /// Construct a `VariantIs` testing arm `tag` of the scrutinee's union. The output has the
     /// scrutinee's shape with `Bool` in place of the union: a test answers every position, so
     /// it keeps every key, and a scalar scrutinee gets a scalar answer. [`VariantProject`]
-    /// differs on a scalar because a restriction needs a domain to narrow.
+    /// differs on a collection payload, which it hands out with the payload's own keys.
     pub fn new(input: Box<dyn TileOperator>, tag: FieldKey) -> Self {
-        let tiling = match input.tiling() {
-            Tiling::Scalar(Extent::Union(_)) | Tiling::Union(_) => {
-                Tiling::Scalar(Extent::Base(BaseType::Bool))
-            }
-            t @ Tiling::DataFunction { .. } => {
-                assert!(
-                    matches!(
-                        t.deepest_values(),
-                        Tiling::Scalar(Extent::Union(_)) | Tiling::Union(_)
-                    ),
-                    "VariantIs: a scrutinee's values must be a union, got {t:?}"
-                );
-                change_tiling_result(t, |_| Tiling::Scalar(Extent::Base(BaseType::Bool)))
-            }
-            other => panic!("VariantIs: a scrutinee must be a union, got {other:?}"),
-        };
+        let tiling = input.tiling();
+        assert!(
+            matches!(
+                tiling.deepest_values(),
+                Tiling::Scalar(Extent::Union(_)) | Tiling::Union(_)
+            ),
+            "VariantIs: a scrutinee's values must be a union, got {tiling:?}"
+        );
+        // The union sits under the levels the scrutinee stands at, however many: a match
+        // inside a nested loop tests one value per innermost position.
+        let tiling = change_tiling_result(tiling, |_| Tiling::Scalar(Extent::Base(BaseType::Bool)));
         Self {
             base: OperatorBase::new(tiling),
             input,
@@ -986,7 +1008,10 @@ impl TileProducer for VariantIsProducer {
     }
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        // A test answers every position, preserving the scrutinee's levels and keys.
+        // A test answers every position, so the scrutinee's levels, keys, groupings and
+        // deletions stand as they are, and only its values change: each union value becomes
+        // whether it carries the tag. A union of arm tiles holds levels inside its arms, but
+        // its tags are one per row like a column's, which is all this reads.
         let mut tile = self.input.get(projection_guard);
         let values = tile.deepest_values_mut();
         // The arm records which rows carry the tag, so the test is a membership
@@ -1020,10 +1045,55 @@ impl TileProducer for VariantIsProducer {
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         // Every key in is a key out, so a released region of the output names
-        // exactly the region of the scrutinee that produced it. `VariantProject`
-        // forwards a release on the same key-preserving argument, over the
-        // narrower domain it emits.
-        self.input.release(obsolete_guard);
+        // exactly the region of the scrutinee that produced it. Only the values
+        // differ in shape: an answer is one cell where the union it tests may be
+        // arm tiles, and that cell's region is the whole of the union at its rows.
+        let input = self.input.tiling();
+        let upstream = match obsolete_guard {
+            g if g.is_empty() => input.empty_guard(),
+            g if g.is_universal() => input.universal_guard(),
+            g => onto_tested_union(g, input),
+        };
+        self.input.release(upstream);
+    }
+}
+
+/// `guard`, a region of a [`VariantIs`] output, restated over the union it tests (`input`):
+/// the levels pass through, and an answer's cell is the whole union value at its row.
+fn onto_tested_union(guard: TileGuard, input: &Tiling) -> TileGuard {
+    match (guard, input) {
+        (TileGuard::Or(arms), _) => TileGuard::flatten_or(
+            arms.into_iter()
+                .map(|arm| onto_tested_union(arm, input))
+                .collect(),
+        ),
+        (g @ TileGuard::Function(FunctionGuard::Domain(_)), Tiling::DataFunction { .. }) => g,
+        (
+            TileGuard::Function(FunctionGuard::Codomain(inner)),
+            Tiling::DataFunction { codomain, .. },
+        ) => TileGuard::Function(FunctionGuard::Codomain(Box::new(onto_tested_union(
+            *inner, codomain,
+        )))),
+        (TileGuard::Scalar(pred), union) => whole_at_rows(union, &pred),
+        (g, t) => unreachable!("a VariantIs release is shaped as its output, got {g:?} over {t:?}"),
+    }
+}
+
+/// The guard naming all of a value of `tiling` under the paths `pred` names a keyless leaf at.
+fn whole_at_rows(tiling: &Tiling, pred: &Predicate) -> TileGuard {
+    match tiling {
+        Tiling::Scalar(_) => TileGuard::Scalar(pred.clone()),
+        Tiling::Aggregation { .. } => TileGuard::Aggregation(pred.clone()),
+        Tiling::DataFunction { .. } | Tiling::Store { .. } => {
+            TileGuard::Function(FunctionGuard::Domain(pred.clone()))
+        }
+        Tiling::Record(fields) => TileGuard::Record(
+            fields
+                .iter()
+                .map(|(name, field)| (name.clone(), whole_at_rows(field, pred)))
+                .collect(),
+        ),
+        Tiling::Union(arms) => TileGuard::Union(arms.map(|_, arm| whole_at_rows(arm, pred))),
     }
 }
 
@@ -1059,18 +1129,33 @@ mod tests {
         }
     }
 
+    /// A collection of variants over `0..N`. A bare union holds one variant.
+    fn union_stream(column: ColumnValue, extent: Extent) -> FixedOp {
+        let keys = ColumnValue::from_uints((0..column.len() as u64).collect());
+        FixedOp {
+            tile: Tile::data_function(
+                keys,
+                Box::new(Tile::Scalar(column)),
+                Predicate::True,
+                BitSet::new(),
+            ),
+            tiling: Tiling::data_function(Extent::Base(BaseType::UInt), Tiling::Scalar(extent)),
+        }
+    }
+
     /// A mixed `[commit(Int) | abort(Unit)]` stream: positions 0,2 carry
     /// `commit`, position 1 carries `abort`.
     fn commit_abort_scrutinee() -> FixedOp {
-        let tile = Tile::Scalar(ColumnValue::positional_union(
-            &[0, 1, 0],
-            vec![ColumnValue::Ints(vec![10, 30]), ColumnValue::Units(1)],
-        ));
-        let tiling = Tiling::Scalar(Extent::Union(TagMap::from_positional(vec![
-            Extent::Base(BaseType::Int),
-            Extent::Base(BaseType::Unit),
-        ])));
-        FixedOp { tile, tiling }
+        union_stream(
+            ColumnValue::positional_union(
+                &[0, 1, 0],
+                vec![ColumnValue::Ints(vec![10, 30]), ColumnValue::Units(1)],
+            ),
+            Extent::Union(TagMap::from_positional(vec![
+                Extent::Base(BaseType::Int),
+                Extent::Base(BaseType::Unit),
+            ])),
+        )
     }
 
     /// ``VariantProject(`commit)`` narrows to the tag-0 sub-domain (positions 0, 2)
@@ -1130,20 +1215,18 @@ mod tests {
         let commit = FieldKey::Name("commit".into());
         let abort = FieldKey::Name("abort".into());
         // The column carries *only* `abort` — `commit` is absent, not empty.
-        let tile = Tile::Scalar(ColumnValue::Union(TagMap::from_arms(vec![(
-            abort.clone(),
-            UnionArm::new(vec![0], ColumnValue::Units(1)),
-        )])));
-        let tiling = Tiling::Scalar(Extent::Union(TagMap::from_arms(vec![
-            (commit.clone(), Extent::Base(BaseType::Int)),
-            (abort, Extent::Base(BaseType::Unit)),
-        ])));
-
-        let mut op = VariantProject::new(
-            Box::new(FixedOp { tile, tiling }),
-            commit,
-            Extent::Base(BaseType::Int),
+        let scrutinee = union_stream(
+            ColumnValue::Union(TagMap::from_arms(vec![(
+                abort.clone(),
+                UnionArm::new(vec![0], ColumnValue::Units(1)),
+            )])),
+            Extent::Union(TagMap::from_arms(vec![
+                (commit.clone(), Extent::Base(BaseType::Int)),
+                (abort, Extent::Base(BaseType::Unit)),
+            ])),
         );
+
+        let mut op = VariantProject::new(Box::new(scrutinee), commit, Extent::Base(BaseType::Int));
         let mut sched = Scheduler::new();
         let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut sched);
         let out = producer.get(producer.tiling().universal_guard());
@@ -1172,28 +1255,29 @@ mod tests {
     fn variant_elim_fanout_re_totals() {
         // tags [0,1,0,1] → commit(10), abort'(20), commit(30), abort'(40),
         // with both arms carrying Int so the union codomain is uniform.
-        let tile = Tile::Scalar(ColumnValue::positional_union(
-            &[0, 1, 0, 1],
-            vec![
-                ColumnValue::Ints(vec![10, 30]),
-                ColumnValue::Ints(vec![20, 40]),
-            ],
-        ));
-        let tiling = Tiling::Scalar(Extent::Union(TagMap::from_positional(vec![
-            Extent::Base(BaseType::Int),
-            Extent::Base(BaseType::Int),
-        ])));
+        let scrutinee = || {
+            union_stream(
+                ColumnValue::positional_union(
+                    &[0, 1, 0, 1],
+                    vec![
+                        ColumnValue::Ints(vec![10, 30]),
+                        ColumnValue::Ints(vec![20, 40]),
+                    ],
+                ),
+                Extent::Union(TagMap::from_positional(vec![
+                    Extent::Base(BaseType::Int),
+                    Extent::Base(BaseType::Int),
+                ])),
+            )
+        };
 
         let arm0: Box<dyn TileOperator> = Box::new(VariantProject::new(
-            Box::new(FixedOp {
-                tile: tile.clone(),
-                tiling: tiling.clone(),
-            }),
+            Box::new(scrutinee()),
             FieldKey::Index(0),
             Extent::Base(BaseType::Int),
         ));
         let arm1: Box<dyn TileOperator> = Box::new(VariantProject::new(
-            Box::new(FixedOp { tile, tiling }),
+            Box::new(scrutinee()),
             FieldKey::Index(1),
             Extent::Base(BaseType::Int),
         ));
@@ -1431,8 +1515,9 @@ mod tests {
         assert!(!tile.is_terminal(), "the collection is still growing");
     }
 
-    /// **A projection hands out an arm's level as it is**: the arm's rows are the keys, and its
-    /// tile their values, with nothing opened or copied.
+    /// **A projection hands out an arm's level as it is.** Projecting one variant value is
+    /// applying the projection to it, so the payload is the output, with nothing opened or
+    /// copied.
     #[test]
     fn projecting_a_collection_arm_hands_out_its_level() {
         let some = FieldKey::Name("some".into());
@@ -1461,14 +1546,10 @@ mod tests {
         );
         let mut sched = Scheduler::new();
         let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut sched);
-        let Tile::DataFunction {
-            domain, codomain, ..
-        } = producer.get(producer.tiling().universal_guard())
-        else {
-            panic!("a projection is keyed by the positions carrying the tag");
-        };
-        assert_eq!(domain, ColumnValue::from_uints(vec![0]));
-        assert_eq!(*codomain, growing_collection());
+        assert_eq!(
+            producer.get(producer.tiling().universal_guard()),
+            growing_collection()
+        );
     }
 
     /// `VariantWrap` is domain-preserving, so output position `d` is payload

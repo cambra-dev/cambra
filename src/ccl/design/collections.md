@@ -584,6 +584,22 @@ Unboxed arms sharing a domain need no sum; boxed arms sharing a domain still hav
 one-candidate sum. A same-domain boxed conditional is realized like any other, and the realized
 conditional's type keeps its binder.
 
+### A `match` selecting a collection
+
+A `match` in value position whose arms are collections is a conditional collection. Lambda
+elimination rewrites it to a guard `Case` and leaves it standing, as it leaves an `if` whose arms
+are collections (`value_tag_case_to_guard_case`). Arm `𝑐ᵢ(𝑤ᵢ) → 𝑒ᵢ` becomes the guard
+``𝑠 ▷ variant_is(`𝑐ᵢ)`` with body ``𝑒ᵢ[𝑤ᵢ ↦ 𝑠 ▷ variant_project(`𝑐ᵢ)]``. The tags are exhaustive,
+so the last arm's guard is `true`. Planning realizes the result as it realizes any conditional
+collection.
+
+A `match` with one arm selects nothing, and lambda elimination binds its payload instead:
+`match 𝑠 { 𝑐(𝑤) → 𝑒 }` is ``let 𝑤 = 𝑠 ▷ variant_project(`𝑐) in 𝑒``.
+
+``variant_project(`𝑐)`` applied to one variant value, rather than to a collection of them, is the
+payload: the collection itself where the payload is one. A value known to carry another tag holds
+no rows of a collection payload, so that projection is the empty collection, complete. An unselected branch reads that projection, so its empty result completes the union.
+
 ### A conditional chosen per row
 
 A conditional whose condition reads a loop's or a comprehension's variable chooses an arm for each
@@ -650,6 +666,12 @@ Each leg is one arm, gated by its first-match path condition `π̂ᵢ`. The arm'
 the `Case`'s witness, which the leg instantiates with the arm's domain, in its refinement
 predicates as well (`read_the_arm_instead` and `instantiate_witness_in_types` in
 `src/ccl/planning/conditionals.rs`).
+
+An arm typed `List(Int)` carries its domain in its value. A result over `UIntRanges` or
+`SubtypesOf(𝐾)` can use `unbox` and the arm's domain projection. The result type supplies the
+extent bound, and [checking the legs](type-inference.md#a-realized-conditional-is-typed-as-its-sum)
+checks the projected domain for membership. For `Enumerated`, each candidate needs a leg with
+a known domain. A nested conditional without such a domain stays for operator conversion.
 
 Two conditional generators in one comprehension are two `Case`s, each realized where it stands.
 The comprehension reads each source through `unbox`, so its domain is the product of their

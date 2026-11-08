@@ -356,7 +356,6 @@ fn a_conditional_on_a_loop_in_a_comprehension_element(#[case] program: &str, #[c
 fn a_match_in_an_inner_loop(#[case] program: &str, #[case] total: i64) {
     check_scalar(program, Value::Int(total));
 }
-
 // ---------------------------------------------------------------------------
 // Crossed with the write forms
 // ---------------------------------------------------------------------------

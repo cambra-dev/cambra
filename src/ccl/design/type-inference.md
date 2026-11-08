@@ -3657,9 +3657,14 @@ the sum `Σ (σ : 𝐾). σ ⤇ 𝑉` the `Case` had, so enclosing compositions,
 keep that type. The check after planning holds each leg to the sum's body at one candidate:
 the leg's domain is a candidate `𝑑 ∈ 𝐾` further refined by its gate, and its type is a subtype
 of `𝑑 ⤇ 𝑉` over that domain (`check_realized`). A sum over several witnesses has a leg per
-combination of their candidates, and every candidate has at least one leg. A `Realized` with no
-leg, or not typed as a sum over listed candidates, is a compiler bug. The legs' disjointness is
-their first-match gates', which no type records.
+combination of their candidates, and every candidate has at least one leg.
+
+For a sum over `UIntRanges` or `SubtypesOf(𝐾)`, a leg instantiates the sum's body at its own
+domain. The domain before the branch condition must belong to the type kind. The condition is
+constant in the element, so it selects the whole domain or the empty collection.
+
+A `Realized` with no leg, or typed with a domain-membership check over several witnesses, is a
+compiler bug. First-match branch conditions make the legs disjoint.
 
 The node also keeps the `Case` it replaces as the term it stages. A consumer's type quotes that
 `Case`, and normal form reads the node as it, so the type rebuilt over the realized tree equals
