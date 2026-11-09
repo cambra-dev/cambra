@@ -3239,3 +3239,19 @@ fn an_inner_list_literal_reading_the_enclosing_binder_is_refused() {
         "a list element must be a constant",
     );
 }
+
+/// Rule 2 checks a binder's own type, not only the type of the node it binds: the `f = …`
+/// binding carries its own diagnostic. A `Let` forwards its tail, so its node-type check is
+/// skipped and the only diagnostic located at the binding comes from the binder slot.
+#[test]
+fn rule2_reports_at_the_binder_slot() {
+    let rendered = compile_errors(indoc! {r#"
+        x := 0
+        f = \z -> x
+        f
+    "#});
+    assert!(
+        rendered.contains("<compile-error-test>:2:1]"),
+        "expected a rule-2 diagnostic located at the `f` binding in:\n{rendered}"
+    );
+}
