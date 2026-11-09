@@ -1106,31 +1106,6 @@ pub fn store_delta_at(tile: &Tile, t: &Position, key: &Value) -> Option<Value> {
         .map(|i| changelog_value(values, i))
 }
 
-/// Fold `key`'s value at changelog tick `t` under the store's **carry policy** —
-/// the one place the carry-vs-tap distinction lives, shared by both changelog
-/// readers ([`StoreValueStream`] over commit ticks and [`StoreDenseRead`] over
-/// loop positions):
-///
-/// - a **carry** (`carry_forward: true`) holds its latest write
-///   forward — the value as-of `t` is the latest write ≤ `t` ([`store_value_at`]);
-/// - a **reply tap** (`carry_forward: false`) is a per-tick event — a value only
-///   at the tick that actually wrote it ([`store_delta_at`]), `None` elsewhere.
-///
-/// Both readers differ in *which* ticks they fold and how they label the domain
-/// (commit clock vs loop position), but the per-tick fold is this.
-pub fn fold_changelog_key(
-    tile: &Tile,
-    t: &Position,
-    key: &Value,
-    carry_forward: bool,
-) -> Option<Value> {
-    if carry_forward {
-        store_value_at(tile, t, key)
-    } else {
-        store_delta_at(tile, t, key)
-    }
-}
-
 /// A store's decided positions at `row` of its enclosing level, ascending.
 ///
 /// The positions are the collection's *keys*: a set is a collection holding nothing, so
@@ -1165,10 +1140,10 @@ fn decided_positions_tile(rows: &[Vec<Position>], domain: &Extent, complete: Pre
 }
 
 /// Fold `key` over an **ascending** sequence of `query_positions` in a single
-/// O(changes + queries) pass — the incremental form of [`fold_changelog_key`],
-/// so a full-stream reader folding every position is linear, not O(changes ×
-/// queries) (a per-position [`fold_changelog_key`] each re-scans the whole log). Both
-/// changelog readers ([`StoreValueStream`], [`StoreDenseRead`]) share it.
+/// O(changes + queries) pass, so a full-stream reader folding every position is
+/// linear, not O(changes × queries) as a per-position [`store_value_at`] or
+/// [`store_delta_at`], each re-scanning the whole log, would be. Both changelog
+/// readers ([`StoreValueStream`], [`StoreDenseRead`]) share it.
 ///
 /// Result element `i` is the fold at `query_positions[i]` under the carry policy: the
 /// latest write ≤ the position (`carry_forward: true`, an accumulator carried across
@@ -3478,8 +3453,8 @@ impl StoreFinalReadProducer {
 /// through here.
 ///
 /// This and [`StoreValueStream`] are the same changelog projection over different clocks:
-/// loop positions here, commit ticks there. Both share the per-position fold, where a carry
-/// holds and a tap is an event ([`fold_changelog_key`]).
+/// loop positions here, commit ticks there. Both share the changelog fold, where a carry
+/// holds and a tap is an event ([`fold_changelog_key_ascending`]).
 pub struct StoreDenseRead {
     /// Output tiling [`read_tiling`] over `D`.
     base: OperatorBase,
@@ -7861,8 +7836,8 @@ mod tests {
     }
 
     /// The shared single-pass fold ([`fold_changelog_key_ascending`]) agrees with
-    /// the per-tick [`fold_changelog_key`] at every query tick, for both the carry
-    /// and tap policies — the invariant the O(N) rewrite of both changelog readers
+    /// the per-tick oracle at every query tick ([`store_value_at`] for a carry,
+    /// [`store_delta_at`] for a tap) — the invariant the O(N) rewrite of both changelog readers
     /// rests on. Uses a *sparse* changelog (a key not written at every tick) so the
     /// carry-forward vs exact-delta distinction is exercised.
     #[test]
@@ -7891,7 +7866,13 @@ mod tests {
                 fold_changelog_key_ascending(&store, queries.iter().copied().map(pos), &acc, carry);
             let per_tick: Vec<Option<Value>> = queries
                 .iter()
-                .map(|t| fold_changelog_key(&store, &pos(*t), &acc, carry))
+                .map(|t| {
+                    if carry {
+                        store_value_at(&store, &pos(*t), &acc)
+                    } else {
+                        store_delta_at(&store, &pos(*t), &acc)
+                    }
+                })
                 .collect();
             assert_eq!(batched, per_tick, "ascending fold diverges (carry={carry})");
         }
