@@ -1746,10 +1746,6 @@ mod tests {
         ]
         {
             arithmetic,
-            // TODO: pinned on `^>=`: lambda elimination's type assert rejects the comprehension
-            // filter `u.age ^>= 18`, whose result now records the comparison. The assert is
-            // debug-only, and without it the program passes every check.
-            #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
             filter_and_aggregate,
             for_accumulator,
             // TODO: pinned on `^` operators: inference rejects a comprehension whose element type

@@ -2137,6 +2137,10 @@ when `codomain_depends_on` finds a dependency, including an indexed reference. O
 non-dependent output therefore need not retain a Pi name. The name is an opening address and
 display spelling; closed bound-reference identity is specified below.
 
+A function built after inference around a codomain read off its body is typed by the same rule:
+`Type::pi_if_dependent` builds a closed Pi when `codomain_depends_on` finds a dependency and an
+unnamed function otherwise. `Expr::lambda` types every lambda it builds this way.
+
 Three mechanisms have distinct responsibilities:
 
 - `Subst` transports term references and typed replacement expressions through types and terms.
@@ -2880,8 +2884,10 @@ slot could bind a witness that the new type's domain never names; see
 
 The function form of a collection predicate yields one boolean per domain element.
 `fn_of_bare_predicate` constructs a data function; when its domain is a bound witness, the function
-carries the corresponding sum binders. Its bare stored form remains `__elem ▷ predicate_function`.
-`Restrict` evaluates the function over the collection's extent.
+carries the corresponding sum binders. A predicate whose result type reads the element, as a refined
+operator's result does, makes the function dependent: its Pi names the fresh parameter and closes
+the codomain over it (`Type::pi_if_dependent`). Its bare stored form remains
+`__elem ▷ predicate_function`. `Restrict` evaluates the function over the collection's extent.
 
 `FunKind::Compute` has no witness-binder slot. Stamping that kind on a predicate whose domain names
 a bound witness would leave its function type relying on an external witness context. The data

@@ -3749,13 +3749,8 @@ impl<'a> WriterWalk<'a> {
         }
         let decision = crate::ccl::ccl_utils::wrap_decision_variant(sink_prefix(decision));
         // A fed row whose keys depend on the loop variable reads the parameter in its type.
-        let ty = if crate::ccl::subst::type_free_vars(&decision.ty).contains(&param.name) {
-            Type::pi(param.name.clone(), param.ty.clone(), decision.ty.clone())
-        } else {
-            Type::fun(param.ty.clone(), decision.ty.clone())
-        };
         (
-            Expr::lambda(param.name, Occurrence::mint(), param.ty, decision).with_ty(ty),
+            Expr::lambda(param.name, Occurrence::mint(), param.ty, decision),
             self.feeds,
         )
     }

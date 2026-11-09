@@ -2881,10 +2881,9 @@ mod tests {
         }
     }
 
-    // TODO: pinned on `^>=`: lambda elimination's type assert rejects the comprehension filter
-    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only.
+    // TODO: remove this test once refinements are added to non-`^` operations, since it will
+    // then be a duplicate of `both_entry_points_compile_to_one_tree`.
     #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
     fn both_entry_points_compile_to_one_tree_with_caret_operators() {
         // `compile_program` and `compile_to` run one frontend, so the tree a
         // diff is taken over is the tree the operator graph is built from.
@@ -2925,10 +2924,9 @@ mod tests {
         );
     }
 
-    // TODO: pinned on `^>=`: lambda elimination's type assert rejects the comprehension filter
-    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only.
+    // TODO: remove this test once refinements are added to non-`^` operations, since it will
+    // then be a duplicate of `both_entry_points_agreement_is_not_vacuous`.
     #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
     fn both_entry_points_agreement_is_not_vacuous_with_caret_operators() {
         // The agreement above would pass on any two trees the differ happened to
         // match wholesale, so pin that a genuinely different phase output fails
