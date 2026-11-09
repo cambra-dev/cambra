@@ -3122,22 +3122,11 @@ fn eliminated_acc(
 ) -> Subst {
     use crate::ccl::ty::FunKind;
     match fun_kind {
-        FunKind::Data(Some(ws)) => ws.iter().enumerate().fold(rest.clone(), |acc, (i, w)| {
-            acc.extended_witness_discharge(
-                w.id(),
-                &Type::WitnessProjection(crate::ccl::ty::WitnessProjection::new(
-                    Rc::clone(term),
-                    i,
-                )),
-            )
-        }),
-        FunKind::Var(k) => {
-            let renamed = match kind_renames(k) {
-                Some((mine, hop)) => Subst::then(&rest.shadow_witnesses(&mine), &hop),
-                None => rest.clone(),
-            };
-            Subst::then(&renamed, &Subst::kind_elim(k, term))
-        }
+        FunKind::Data(Some(ws)) => rest.clone().discharged_through(ws, term),
+        FunKind::Var(k) => Subst::then(
+            &fun_kind_correspondence(fun_kind, rest),
+            &Subst::kind_elim(k, term),
+        ),
         FunKind::Data(None) | FunKind::Compute => rest.clone(),
     }
 }
