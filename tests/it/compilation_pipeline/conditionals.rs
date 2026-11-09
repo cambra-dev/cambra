@@ -1736,19 +1736,12 @@ fn test_boxed_conditional_collection(#[case] code: &str, #[case] expected: Value
     "sum([r for q in box([y for y in [1, 2, 3] if y > 1]) for r in box([z for z in [1, 2, 3] if z > q])])",
     3
 )]
+#[case::a_box_of_boxes(
+    "sum([sum([sum(r) for r in box([box([y for y in [1, 2, 3] if y > k + z]) for z in [0, 1]])]) for k in [0, 1]])",
+    19
+)]
 fn a_collection_boxed_under_the_binder_its_domain_reads(#[case] code: &str, #[case] expected: i64) {
     check_scalar(code, Value::Int(expected));
-}
-
-/// Not compiled yet: a box holding boxes, under a loop whose binder the inner domain reads. The
-/// outer collection's values are collections, and a lookup reads values only as one column. The
-/// program sums to 19.
-#[test]
-fn a_box_of_boxes_under_the_binder_its_domain_reads_is_not_compiled_yet() {
-    check_compile_error(
-        "sum([sum([sum(r) for r in box([box([y for y in [1, 2, 3] if y > k + z]) for z in [0, 1]])]) for k in [0, 1]])",
-        "`apply` reading a collection whose values are not one column is not supported yet",
-    );
 }
 
 /// A boxed conditional chosen once and observed by its keys. Realization unions one gated leg
