@@ -2598,7 +2598,7 @@ fn merged_rows(
                 fields: r,
                 absent: r_absent,
             },
-        ) if !l_absent.is_empty() || !r_absent.is_empty() => {
+        ) => {
             assert_eq!(l.len(), r.len(), "a record merges with its own shape");
             let (l_rows, r_rows) = (record_rows(l, l_absent), record_rows(r, r_absent));
             let mut absent = HashMap::new();
@@ -2630,22 +2630,6 @@ fn merged_rows(
                 })
                 .collect();
             Tile::Record { fields, absent }
-        }
-        (Tile::Record { fields: l, .. }, Tile::Record { fields: r, .. }) => {
-            assert_eq!(l.len(), r.len(), "a record merges with its own shape");
-            Tile::record(
-                l.iter()
-                    .map(|(field, tile)| {
-                        let other = r
-                            .get(field)
-                            .unwrap_or_else(|| panic!("Record missing field {field}"));
-                        (
-                            field.clone(),
-                            merged_rows(tile, other, order, settled, row_paths),
-                        )
-                    })
-                    .collect(),
-            )
         }
         (
             Tile::DataFunction {
