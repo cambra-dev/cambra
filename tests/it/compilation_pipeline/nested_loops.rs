@@ -247,6 +247,58 @@ fn a_conditional_after_an_inner_loop(#[case] program: &str, #[case] total: i64) 
     check_scalar(program, Value::Int(total));
 }
 
+/// A conditional on a loop's result in a comprehension's element, whose arms read the
+/// collection the loop ran over or the loop's result. An arm that reads only part of the
+/// element releases the rest at every position, the ones whose loop has not finished included;
+/// each arm still answers at its own positions and only there.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// `x = 0` keeps `c` at 1 and answers `sum([0, 1])`; `x = 2` ends at 3 and answers 300.
+#[case::an_if_on_the_result(
+    indoc! {r"
+        def g(x):
+            es = [x + j for j in [0, 1]]
+            c := 0
+            for e in es:
+                c := e
+            sum(es) if c < 2 else 100 * c
+        sum([g(x) for x in [0, 2]])
+    "},
+    301
+)]
+#[case::an_arm_reading_only_the_result(
+    indoc! {r"
+        def g(x):
+            es = [x + j for j in [0, 1]]
+            c := 0
+            for e in es:
+                c := e
+            1 if x < 1 else 1000 + c
+        sum([g(x) for x in [0, 2]])
+    "},
+    1004
+)]
+#[case::a_match_on_the_result(
+    indoc! {r"
+        def g(x):
+            es = [x + j for j in [0, 1]]
+            c := `ok(0)
+            for e in es:
+                if e > 2:
+                    c := `bad(e)
+            match c:
+                case `ok(z):
+                    sum(es)
+                case `bad(z):
+                    100 * z
+        sum([g(x) for x in [0, 2]])
+    "},
+    301
+)]
+fn a_conditional_on_a_loop_in_a_comprehension_element(#[case] program: &str, #[case] total: i64) {
+    check_scalar(program, Value::Int(total));
+}
+
 /// A `match` in an inner loop's body. The scrutinee stands under both loops' positions, so
 /// each arm's tag test answers one value per inner position, beneath the outer ones.
 #[rstest]
