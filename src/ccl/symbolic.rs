@@ -289,7 +289,7 @@ fn statement_head<'e>(expr: &'e Expr, opts: &SymbolicOpts) -> Option<(String, &'
             )
         }
         // Mutually recursive group: `letrec b₁ = e₁; …; bₙ = eₙ`, bindings separated
-        // by `; `. An `impl` block's group renders the same way under `defs`.
+        // by `; `. An `impl` or `instance` block's group renders the same way under `defs`.
         TypedExprNode::LetRec { bindings, body } | TypedExprNode::DefGroup { bindings, body } => {
             let keyword = if matches!(expr.node, TypedExprNode::LetRec { .. }) {
                 "letrec"

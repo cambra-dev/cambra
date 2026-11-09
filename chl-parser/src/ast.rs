@@ -373,8 +373,8 @@ pub enum Stmt {
     ///
     /// **Invariant:** in a parse with no errors, the inner statement is a
     /// [`Stmt::Assign`], [`Stmt::AnnAssign`], [`Stmt::Declare`], [`Stmt::MutAssign`],
-    /// [`Stmt::LoadFrom`] or [`Stmt::FunctionDef`]. The parser
-    /// reports `pub` on any other statement as a parse error. Whether a `:=`
+    /// [`Stmt::LoadFrom`], [`Stmt::FunctionDef`], [`Stmt::TypeDecl`] or [`Stmt::TraitDecl`]. The
+    /// parser reports `pub` on any other statement as a parse error. Whether a `:=`
     /// introduces a mutable variable, and whether the statement stands at a
     /// module's top level, are left to lowering.
     Pub {

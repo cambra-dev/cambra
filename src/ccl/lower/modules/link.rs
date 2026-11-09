@@ -23,8 +23,8 @@ pub fn is_module_body(expr: &Expr) -> bool {
 
 /// The rest of the module below `expr`, when `expr` stands on a module's spine:
 /// the body of a `let`, a mutable variable, a statement, a type alias, an `impl`
-/// block's group of functions, or a `run`. A module's top level is the chain of
-/// these bodies from the root.
+/// or `instance` block's group of functions, or a `run`. A module's top level is
+/// the chain of these bodies from the root.
 pub(in crate::ccl::lower) fn spine_body(expr: &Expr) -> Option<&Expr> {
     match &expr.node {
         TypedExprNode::Let { body, .. }
