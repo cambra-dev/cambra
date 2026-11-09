@@ -1700,7 +1700,7 @@ fn is_name_in_function_position(expr: &Expr, name: &Name) -> bool {
 /// `PartialEq`), because the case that must succeed — an argument whose type carries
 /// the very refinement the parameter acquired *from* it — is an equality and the two
 /// copies legitimately differ in inference metadata. A demand the argument entails
-/// without matching it — `Int@6` against `{Int | __elem == 1 ^+ 5}` — goes to the
+/// without matching it — `Int@6` against `{Int | __elem == 1 + 5}` — goes to the
 /// same semantic fallback the deficit rule uses during inference ([`smt_sub`]), under
 /// the binders in scope at the call ([`Scope`]). An argument A-normalization named reads
 /// a binder (`__anf ^+ 2`, where `__anf = 1 ^+ 3`), and only the scope says what it is.

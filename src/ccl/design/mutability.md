@@ -206,10 +206,10 @@ segment references the segment's binder, which is opaque (`^=`), so a type lifte
 keeps the binder rather than reading the mutable variable back in its place.
 
 A refinement is what demands the name. Inference refines a computed value by the term that computed
-it, so an operand reading `x` types as `{Int | __elem == x ^+ 1}` — a type naming a mutable
+it, so an operand reading `x` types as `{Int | __elem == x + 1}` — a type naming a mutable
 variable, which is [what no type may do](#a-mutable-variable-read-is-an-explicit-operation) and
 which nothing binds where the type travels. Read through a binder, the same operand types as
-`{Int | __elem == __read ^+ 1}`.
+`{Int | __elem == __read + 1}`.
 
 A `for` body reads a variable it never writes through the enclosing block's segment binder, so
 the binding stands once ahead of the loop rather than once per iteration. No iteration changes the
@@ -237,14 +237,14 @@ or op-conversion's — spells such a read `__anf`, the rename below reaching inf
 
 A diagnostic spells the binder as the variable it reads. `mut_read::read_respelling` builds that
 rename and `compile_program` applies it to an inference error's types and the binders it names, so
-a message reports `{Int | __elem == x ^+ 1}` where the type carries the binder. The rename is
+a message reports `{Int | __elem == x + 1}` where the type carries the binder. The rename is
 display alone: substituting the variable into a type inference still holds is
 [what no type may do](#a-mutable-variable-read-is-an-explicit-operation). A binder the user wrote
 keeps its spelling — `x0 ^= x` names the read itself.
 
 An unannotated mutable variable takes such a refinement as a contribution. Its value type is an
 inference variable minted at the declaration, outside every read binder. `x := 0` followed by
-`x := x ^+ 1` records `{Int | __elem == __read ^+ 1}` on that variable, over a binder the variable's
+`x := x + 1` records `{Int | __elem == __read + 1}` on that variable, over a binder the variable's
 own scope does not hold; the binder is opaque, which is what admits the reference
 (`src/ccl/design/type-inference.md`, "The invariant"). The join over the seed and the write
 establishes neither predicate, so the variable types as `Int`, and the joined value type of a
@@ -938,7 +938,7 @@ to a function of the lambda's parameter, so a copy placed in the seed would make
 The walk inlines five kinds of binding rather than keeping them:
 
 - An **opaque** binding (`x ^= 𝑒`), the read segment's snapshot `mut_read` mints. A refined mutable
-  variable's contribution predicate names that binder — `{Int | __elem == __anf ^+ 1}` on the value
+  variable's contribution predicate names that binder — `{Int | __elem == __anf + 1}` on the value
   the next segment writes — so keeping the binder leaves the predicate pointing at a `let` the
   point-free rebuild turns into a function of the writer parameter, whose codomain then references
   an enclosing function with no binder to open at (`subst::open_codomain`).

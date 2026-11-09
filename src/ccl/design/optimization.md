@@ -87,7 +87,7 @@ entail the parameter's refinements. The pass asserts when it cannot establish th
 since dropping the parameter without preserving its precondition would be unsound. The query runs
 under the binders enclosing the call, a transparent `let` at its definition too
 ([The scope a query runs in](type-inference.md#the-scope-a-query-runs-in)): an argument naming a
-binder, `__anf ^+ 2` where `__anf = 1 ^+ 3`, is decided by what the binder is. For
+binder, `__anf + 2` where `__anf = 1 + 3`, is decided by what the binder is. For
 multi-argument UDFs lowered with a tuple parameter, substitution can leave
 `Apply(Tuple(...), Proj(Index(i)))`. A tuple that holds a function is folded here
 ([Functions held in products](#functions-held-in-products)), and

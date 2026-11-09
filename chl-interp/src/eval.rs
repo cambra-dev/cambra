@@ -521,12 +521,13 @@ const BUILTIN_FUNCTIONS: &[(&str, &str, &[usize])] = &[
 ];
 
 /// The function of an operator's trait an arithmetic operator calls (`docs/chl-spec.md`,
-/// "Trait requirements"). `^+` calls none: its trait declares none.
+/// "Trait requirements"). `^+` calls none: its trait declares none. `^-` and `^*` call what
+/// `-` and `*` call, their trait being the same.
 fn arithmetic_function(op: BinOp) -> Option<(&'static str, &'static str)> {
     Some(match op {
         BinOp::Add => ("Addable", "add"),
-        BinOp::Sub => ("Subtractable", "sub"),
-        BinOp::Mul => ("Multipliable", "mul"),
+        BinOp::Sub | BinOp::SubRefined => ("Subtractable", "sub"),
+        BinOp::Mul | BinOp::MulRefined => ("Multipliable", "mul"),
         BinOp::FloorDiv => ("Divisible", "div"),
         BinOp::Pow => ("Exponentiable", "pow"),
         _ => return None,
@@ -1930,17 +1931,17 @@ impl Interp {
         if any_pending([&l, &r]) {
             return Ok(Value::Pending);
         }
-        let ord = match op {
+        let ord = match op.unrefined() {
             CmpOp::Eq => return Ok(Value::Bool(l == r)),
             CmpOp::NotEq => return Ok(Value::Bool(l != r)),
             _ => self.order(&l, &r)?,
         };
-        Ok(Value::Bool(match op {
+        Ok(Value::Bool(match op.unrefined() {
             CmpOp::Lt => ord.is_lt(),
             CmpOp::LtE => ord.is_le(),
             CmpOp::Gt => ord.is_gt(),
             CmpOp::GtE => ord.is_ge(),
-            CmpOp::Eq | CmpOp::NotEq => unreachable!(),
+            _ => unreachable!("`unrefined` answers an unrefined comparison"),
         }))
     }
 
@@ -2839,7 +2840,7 @@ impl Interp {
                 {
                     return self.dispatch("Negatable", "neg", vec![v]);
                 }
-                match (op, v) {
+                match (op.unrefined(), v) {
                     (_, Value::Pending) => Ok(Value::Pending),
                     (UnaryOp::Neg, Value::Int(i)) => i
                         .checked_neg()
@@ -2886,6 +2887,7 @@ impl Interp {
 
             // Short-circuiting, so an operand past the decisive one is never evaluated.
             Expr::BoolOp { op, operands } => {
+                let op = op.unrefined();
                 let mut last = matches!(op, BoolOp::And);
                 for (i, operand) in operands.iter().enumerate() {
                     let b = match self.eval(operand)? {
@@ -3483,8 +3485,8 @@ fn binop(op: BinOp, l: Value, r: Value) -> Result<Value, Error> {
     match (op, &l, &r) {
         (BinOp::Add | BinOp::AddRefined, Value::Int(a), Value::Int(b)) => int(a.checked_add(*b)),
         (BinOp::Add, Value::Str(a), Value::Str(b)) => Ok(Value::Str(format!("{a}{b}"))),
-        (BinOp::Sub, Value::Int(a), Value::Int(b)) => int(a.checked_sub(*b)),
-        (BinOp::Mul, Value::Int(a), Value::Int(b)) => int(a.checked_mul(*b)),
+        (BinOp::Sub | BinOp::SubRefined, Value::Int(a), Value::Int(b)) => int(a.checked_sub(*b)),
+        (BinOp::Mul | BinOp::MulRefined, Value::Int(a), Value::Int(b)) => int(a.checked_mul(*b)),
         (BinOp::FloorDiv, Value::Int(a), Value::Int(b)) => int(floor_div(*a, *b)),
         // The interpreter discharges no refinement, so a negative exponent the compiler rejects
         // where it is written (`docs/chl-spec.md`, "3.3 Arithmetic and logical operators")

@@ -15,8 +15,8 @@ use crate::ccl::provenance;
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
-    BaseType, BindingTransparency, Builtin, Expr, FieldKey, Level, Name, Refinement, RefinementSet,
-    Type, TypedBinding, TypedExpr, TypedExprNode,
+    BaseType, BindingTransparency, Builtin, Expr, FieldKey, Level, Name, Type, TypedBinding,
+    TypedExpr, TypedExprNode,
 };
 
 use super::emit::{
@@ -319,10 +319,7 @@ impl Typing for CheckCtx {
             provenance::Nature::Machinery,
         );
         let args: Vec<TypedExpr> = operand_exprs.iter().map(|e| (*e).clone()).collect();
-        Ok(Type::Refinement(
-            Box::new(base),
-            RefinementSet::one(Refinement::born_from_template(refinement, &args)),
-        ))
+        Ok(refinement.refine(base, &args))
     }
 
     fn require_trait(
@@ -507,7 +504,7 @@ impl Typing for CheckCtx {
         //
         // **In the scope the edge is drawn in**, so a refinement deficit reaches the
         // deficit rule's semantic fallback with the program's own binders as
-        // assumptions. A write of `{Int | __elem == __read ^+ 1}` to a variable declared
+        // assumptions. A write of `{Int | __elem == __read + 1}` to a variable declared
         // `{Int | __elem >= 0}` is the shape that needs it: the two predicates match
         // nowhere structurally, and the entailment holds given the type `__read` is
         // bound at.
@@ -1487,7 +1484,7 @@ fn check_located_memoized(
 mod tests {
     use super::*;
     use crate::ccl::Occurrence;
-    use crate::ccl::{BinOpKind, CompareKind, Lit, TypedExpr};
+    use crate::ccl::{BinOpKind, CompareKind, Lit, Refinement, TypedExpr};
     use std::rc::Rc;
 
     /// `{Int | p}` over the predicate `__elem <op> rhs`.

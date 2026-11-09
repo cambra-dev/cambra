@@ -91,8 +91,14 @@ pub enum ArithmeticKind {
     AddRefined,
     /// Integer subtraction (`-`).
     Sub,
+    /// Subtraction whose result type records the difference (`^-`): `Subtractable`, as
+    /// [`Sub`](Self::Sub) is, with the result refined by `__elem == a₁ - a₂`.
+    SubRefined,
     /// Integer multiplication (`*`).
     Mul,
+    /// Multiplication whose result type records the product (`^*`), as
+    /// [`SubRefined`](Self::SubRefined) is to [`Sub`](Self::Sub).
+    MulRefined,
     /// Floor division (`//`).
     FloorDiv,
     /// Exponentiation (`**`).
@@ -109,16 +115,28 @@ pub enum ArithmeticKind {
 pub enum CompareKind {
     /// Equality (`==`).
     Equals,
+    /// Equality whose result type records the comparison (`^==`): `Equatable`, as
+    /// [`Equals`](Self::Equals) is, with the result refined by `__elem == (a₁ == a₂)`.
+    /// Every `…Refined` comparison is its operator's sibling in the same way.
+    EqualsRefined,
     /// Inequality (`!=`).
     NotEquals,
     /// Less than (`<`).
     Less,
+    /// `^<`.
+    LessRefined,
     /// Less than or equal (`<=`).
     LessOrEq,
+    /// `^<=`.
+    LessOrEqRefined,
     /// Greater than (`>`).
     Greater,
+    /// `^>`.
+    GreaterRefined,
     /// Greater than or equal (`>=`).
     GreaterOrEq,
+    /// `^>=`.
+    GreaterOrEqRefined,
 }
 
 /// Boolean logic sub-operations for [`BinOpKind::BoolLogic`].
@@ -126,10 +144,14 @@ pub enum CompareKind {
 pub enum LogicKind {
     /// Logical AND.
     And,
+    /// Logical AND whose result type records the operation (`^and`).
+    AndRefined,
     /// Logical NAND.
     Nand,
     /// Logical OR.
     Or,
+    /// Logical OR whose result type records the operation (`^or`).
+    OrRefined,
     /// Logical NOR.
     Nor,
     /// Logical XOR.
@@ -161,10 +183,11 @@ pub enum BinOpKind {
 impl From<BinOpKind> for crate::scalar_ops::BinOpKind {
     fn from(op: BinOpKind) -> Self {
         use crate::scalar_ops as rt;
-        match op {
-            // `^+` and `+` compute the same sum, so they share one runtime operation; the
-            // refinement `^+` carries is spent by the time either caller runs.
-            BinOpKind::Arithmetic(ArithmeticKind::Add | ArithmeticKind::AddRefined) => {
+        // A `^` sibling computes what its operator computes, so the two share one runtime
+        // operation; the refinement the sibling carries is spent by the time either caller
+        // runs.
+        match op.unrefined() {
+            BinOpKind::Arithmetic(ArithmeticKind::Add) => {
                 rt::BinOpKind::Arithmetic(rt::ArithmeticKind::Add)
             }
             BinOpKind::Arithmetic(ArithmeticKind::Sub) => {
@@ -187,6 +210,7 @@ impl From<BinOpKind> for crate::scalar_ops::BinOpKind {
                 CompareKind::LessOrEq => rt::CompareKind::LessOrEq,
                 CompareKind::Greater => rt::CompareKind::Greater,
                 CompareKind::GreaterOrEq => rt::CompareKind::GreaterOrEq,
+                refined => unreachable!("`unrefined` answers no `{refined:?}`"),
             }),
             BinOpKind::BoolLogic(l) => rt::BinOpKind::BoolLogic(match l {
                 LogicKind::And => rt::LogicKind::And,
@@ -195,12 +219,43 @@ impl From<BinOpKind> for crate::scalar_ops::BinOpKind {
                 LogicKind::Nor => rt::LogicKind::Nor,
                 LogicKind::Xor => rt::LogicKind::Xor,
                 LogicKind::Xnor => rt::LogicKind::Xnor,
+                refined => unreachable!("`unrefined` answers no `{refined:?}`"),
             }),
+            refined => unreachable!("`unrefined` answers no `{refined:?}`"),
         }
     }
 }
 
 impl BinOpKind {
+    /// Whether this is the `^` sibling of another operator (`^+`, `^<`, `^and`, …), whose
+    /// result type records the operation.
+    pub fn is_refined(self) -> bool {
+        self != self.unrefined()
+    }
+
+    /// The operator computing what this one computes: `+` for `^+`, `<` for `^<`, itself for
+    /// an operator with no `^`. A `^` sibling differs from its operator only in the type
+    /// inference gives its result, so evaluation, solver encoding, folding and planning
+    /// read an operator through this.
+    pub fn unrefined(self) -> Self {
+        use ArithmeticKind as A;
+        use CompareKind as C;
+        use LogicKind as L;
+        match self {
+            Self::Arithmetic(A::AddRefined) => Self::Arithmetic(A::Add),
+            Self::Arithmetic(A::SubRefined) => Self::Arithmetic(A::Sub),
+            Self::Arithmetic(A::MulRefined) => Self::Arithmetic(A::Mul),
+            Self::Compare(C::EqualsRefined) => Self::Compare(C::Equals),
+            Self::Compare(C::LessRefined) => Self::Compare(C::Less),
+            Self::Compare(C::LessOrEqRefined) => Self::Compare(C::LessOrEq),
+            Self::Compare(C::GreaterRefined) => Self::Compare(C::Greater),
+            Self::Compare(C::GreaterOrEqRefined) => Self::Compare(C::GreaterOrEq),
+            Self::BoolLogic(L::AndRefined) => Self::BoolLogic(L::And),
+            Self::BoolLogic(L::OrRefined) => Self::BoolLogic(L::Or),
+            op => op,
+        }
+    }
+
     /// Returns the canonical infix symbol for this operator (e.g. `"+"`, `"and"`, `"<="`).
     ///
     /// Used by formatters such as the symbolic printer and the pretty-tree
@@ -211,19 +266,28 @@ impl BinOpKind {
             Self::Arithmetic(ArithmeticKind::Add) => "+",
             Self::Arithmetic(ArithmeticKind::AddRefined) => "^+",
             Self::Arithmetic(ArithmeticKind::Sub) => "-",
+            Self::Arithmetic(ArithmeticKind::SubRefined) => "^-",
             Self::Arithmetic(ArithmeticKind::Mul) => "*",
+            Self::Arithmetic(ArithmeticKind::MulRefined) => "^*",
             Self::Arithmetic(ArithmeticKind::FloorDiv) => "//",
             Self::Arithmetic(ArithmeticKind::Pow) => "**",
             Self::Concat => "++",
             Self::Compare(CompareKind::Less) => "<",
+            Self::Compare(CompareKind::LessRefined) => "^<",
             Self::Compare(CompareKind::LessOrEq) => "<=",
+            Self::Compare(CompareKind::LessOrEqRefined) => "^<=",
             Self::Compare(CompareKind::Greater) => ">",
+            Self::Compare(CompareKind::GreaterRefined) => "^>",
             Self::Compare(CompareKind::GreaterOrEq) => ">=",
+            Self::Compare(CompareKind::GreaterOrEqRefined) => "^>=",
             Self::Compare(CompareKind::Equals) => "==",
+            Self::Compare(CompareKind::EqualsRefined) => "^==",
             Self::Compare(CompareKind::NotEquals) => "!=",
             Self::BoolLogic(LogicKind::And) => "and",
+            Self::BoolLogic(LogicKind::AndRefined) => "^and",
             Self::BoolLogic(LogicKind::Nand) => "nand",
             Self::BoolLogic(LogicKind::Or) => "or",
+            Self::BoolLogic(LogicKind::OrRefined) => "^or",
             Self::BoolLogic(LogicKind::Nor) => "nor",
             Self::BoolLogic(LogicKind::Xor) => "xor",
             Self::BoolLogic(LogicKind::Xnor) => "xnor",
@@ -242,19 +306,28 @@ impl BinOpKind {
             Self::Arithmetic(ArithmeticKind::Add) => "add",
             Self::Arithmetic(ArithmeticKind::AddRefined) => "add_refined",
             Self::Arithmetic(ArithmeticKind::Sub) => "sub",
+            Self::Arithmetic(ArithmeticKind::SubRefined) => "sub_refined",
             Self::Arithmetic(ArithmeticKind::Mul) => "mul",
+            Self::Arithmetic(ArithmeticKind::MulRefined) => "mul_refined",
             Self::Arithmetic(ArithmeticKind::FloorDiv) => "floor_div",
             Self::Arithmetic(ArithmeticKind::Pow) => "pow",
             Self::Concat => "concat",
             Self::Compare(CompareKind::Equals) => "eq",
+            Self::Compare(CompareKind::EqualsRefined) => "eq_refined",
             Self::Compare(CompareKind::NotEquals) => "neq",
             Self::Compare(CompareKind::Less) => "lt",
+            Self::Compare(CompareKind::LessRefined) => "lt_refined",
             Self::Compare(CompareKind::LessOrEq) => "le",
+            Self::Compare(CompareKind::LessOrEqRefined) => "le_refined",
             Self::Compare(CompareKind::Greater) => "gt",
+            Self::Compare(CompareKind::GreaterRefined) => "gt_refined",
             Self::Compare(CompareKind::GreaterOrEq) => "ge",
+            Self::Compare(CompareKind::GreaterOrEqRefined) => "ge_refined",
             Self::BoolLogic(LogicKind::And) => "and",
+            Self::BoolLogic(LogicKind::AndRefined) => "and_refined",
             Self::BoolLogic(LogicKind::Nand) => "nand",
             Self::BoolLogic(LogicKind::Or) => "or",
+            Self::BoolLogic(LogicKind::OrRefined) => "or_refined",
             Self::BoolLogic(LogicKind::Nor) => "nor",
             Self::BoolLogic(LogicKind::Xor) => "xor",
             Self::BoolLogic(LogicKind::Xnor) => "xnor",
@@ -269,6 +342,25 @@ pub enum UnaryOpKind {
     Neg,
     /// Boolean negation (`not x`).
     Not,
+    /// Boolean negation whose result type records the operation (`^not x`).
+    NotRefined,
+}
+
+impl UnaryOpKind {
+    /// Whether this is the `^` sibling of another operator, whose result type records the
+    /// operation.
+    pub fn is_refined(self) -> bool {
+        self != self.unrefined()
+    }
+
+    /// The operator computing what this one computes: `Not` for `NotRefined`, itself
+    /// otherwise.
+    pub fn unrefined(self) -> Self {
+        match self {
+            Self::NotRefined => Self::Not,
+            op => op,
+        }
+    }
 }
 
 /// Built-in primitive functions used by the lowered point-free CCL.
@@ -930,10 +1022,11 @@ impl Builtin {
     }
 
     /// Built-in name for a unary [`UnaryOpKind`].
+    /// A `^` sibling takes its operator's: the refinement it states is on the node's type.
     pub fn for_unaryop(op: UnaryOpKind) -> Self {
-        match op {
+        match op.unrefined() {
             UnaryOpKind::Neg => Self::Neg,
-            UnaryOpKind::Not => Self::NotFn,
+            UnaryOpKind::Not | UnaryOpKind::NotRefined => Self::NotFn,
         }
     }
 

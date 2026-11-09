@@ -544,9 +544,9 @@ impl Printer {
                 Prec::Unary,
                 format!("-{}", self.expr(operand, Prec::Unary, env)),
             ),
-            TypedExprNode::UnaryOp(UnaryOpKind::Not, operand) => (
+            TypedExprNode::UnaryOp(op @ (UnaryOpKind::Not | UnaryOpKind::NotRefined), operand) => (
                 Prec::Not,
-                format!("not {}", self.expr(operand, Prec::Not, env)),
+                format!("{} {}", unary_text(*op), self.expr(operand, Prec::Not, env)),
             ),
             TypedExprNode::List(elts) => {
                 let parts: Vec<String> = elts
@@ -736,17 +736,24 @@ impl Prec {
 fn binop_prec(op: &BinOpKind) -> Option<(Prec, Prec, Prec)> {
     use crate::ccl::{ArithmeticKind as A, LogicKind as L};
     let leftward = |own: Prec| Some((own, own, own.next()));
-    match op {
+    match op.unrefined() {
         BinOpKind::BoolLogic(L::Or) => leftward(Prec::Or),
         BinOpKind::BoolLogic(L::And) => leftward(Prec::And),
         BinOpKind::BoolLogic(L::Xor) => leftward(Prec::Xor),
         BinOpKind::BoolLogic(L::Nand | L::Nor | L::Xnor) => None,
         BinOpKind::Compare(_) => Some((Prec::Cmp, Prec::Cmp.next(), Prec::Cmp.next())),
-        BinOpKind::Arithmetic(A::Add | A::AddRefined | A::Sub) | BinOpKind::Concat => {
-            leftward(Prec::Add)
-        }
+        BinOpKind::Arithmetic(A::Add | A::Sub) | BinOpKind::Concat => leftward(Prec::Add),
         BinOpKind::Arithmetic(A::Mul | A::FloorDiv) => leftward(Prec::Mul),
         BinOpKind::Arithmetic(A::Pow) => Some((Prec::Pow, Prec::Postfix, Prec::Pow)),
+        refined => unreachable!("`unrefined` answers no `{refined:?}`"),
+    }
+}
+
+/// A boolean negation's CHL spelling.
+fn unary_text(op: UnaryOpKind) -> &'static str {
+    match op {
+        UnaryOpKind::NotRefined => "^not",
+        _ => "not",
     }
 }
 

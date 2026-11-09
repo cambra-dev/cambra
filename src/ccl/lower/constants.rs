@@ -275,12 +275,17 @@ impl LoweringContext {
             ChlExpr::Name(name) => self.const_name(name, span, at),
             ChlExpr::Qualified(q) => self.const_member(q, span),
             ChlExpr::BinOp { left, op, right } => {
+                // A constant is a value, so a `^` sibling folds as its operator does.
                 let op = match op {
                     ChlBinOp::Add | ChlBinOp::AddRefined => {
                         BinOpKind::Arithmetic(ArithmeticKind::Add)
                     }
-                    ChlBinOp::Sub => BinOpKind::Arithmetic(ArithmeticKind::Sub),
-                    ChlBinOp::Mul => BinOpKind::Arithmetic(ArithmeticKind::Mul),
+                    ChlBinOp::Sub | ChlBinOp::SubRefined => {
+                        BinOpKind::Arithmetic(ArithmeticKind::Sub)
+                    }
+                    ChlBinOp::Mul | ChlBinOp::MulRefined => {
+                        BinOpKind::Arithmetic(ArithmeticKind::Mul)
+                    }
                     ChlBinOp::FloorDiv => BinOpKind::Arithmetic(ArithmeticKind::FloorDiv),
                     ChlBinOp::Pow => BinOpKind::Arithmetic(ArithmeticKind::Pow),
                     ChlBinOp::LogicalAnd => BinOpKind::BoolLogic(LogicKind::And),
@@ -298,17 +303,18 @@ impl LoweringContext {
             }
             ChlExpr::UnaryOp { op, operand } => {
                 let operand = Box::new(self.const_term(operand, at)?);
-                match op {
+                match op.unrefined() {
                     UnaryOp::Neg => ConstTerm::Neg(operand),
-                    UnaryOp::Not => ConstTerm::Not(operand),
+                    UnaryOp::Not | UnaryOp::NotRefined => ConstTerm::Not(operand),
                 }
                 .normalized()
                 .map_err(no_value)
             }
             ChlExpr::BoolOp { op, operands } => {
+                let op = op.unrefined();
                 let kind = match op {
-                    BoolOp::And => LogicKind::And,
-                    BoolOp::Or => LogicKind::Or,
+                    BoolOp::And | BoolOp::AndRefined => LogicKind::And,
+                    BoolOp::Or | BoolOp::OrRefined => LogicKind::Or,
                 };
                 // As the runtime does, an operand that decides the answer leaves the rest
                 // unread.
@@ -342,13 +348,13 @@ impl LoweringContext {
                 let mut acc: Option<ConstTerm> = None;
                 for (op, rhs) in ops.iter().zip(comparators) {
                     let rhs = self.const_term(rhs, at)?;
-                    let kind = BinOpKind::Compare(match op {
-                        CmpOp::Eq => CompareKind::Equals,
+                    let kind = BinOpKind::Compare(match op.unrefined() {
+                        CmpOp::Eq | CmpOp::EqRefined => CompareKind::Equals,
                         CmpOp::NotEq => CompareKind::NotEquals,
-                        CmpOp::Lt => CompareKind::Less,
-                        CmpOp::LtE => CompareKind::LessOrEq,
-                        CmpOp::Gt => CompareKind::Greater,
-                        CmpOp::GtE => CompareKind::GreaterOrEq,
+                        CmpOp::Lt | CmpOp::LtRefined => CompareKind::Less,
+                        CmpOp::LtE | CmpOp::LtERefined => CompareKind::LessOrEq,
+                        CmpOp::Gt | CmpOp::GtRefined => CompareKind::Greater,
+                        CmpOp::GtE | CmpOp::GtERefined => CompareKind::GreaterOrEq,
                     });
                     let step = ConstTerm::BinOp(kind, Box::new(lhs), Box::new(rhs.clone()))
                         .normalized()

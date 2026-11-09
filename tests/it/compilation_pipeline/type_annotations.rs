@@ -403,7 +403,7 @@ fn type_annotation_naming_a_parameter_is_unbound(#[case] code: &str, #[case] nam
 
 #[test]
 fn refined_add() {
-    check_scalar("z: {Int where _ == 1 ^+ 3} = 1 ^+ 3\n()", Value::Unit)
+    check_scalar("z: {Int where _ == 1 + 3} = 1 ^+ 3\n()", Value::Unit)
 }
 
 // ---------------------------------------------------------------------------
@@ -416,13 +416,13 @@ fn refined_add() {
 // ---------------------------------------------------------------------------
 
 /// A chain of `let`s whose definitions are substituted into the body's
-/// refinement: `y` is `1 ^+ 3 ^+ 2`, which entails `_ == 1 ^+ 5` without matching
+/// refinement: `y` is `1 ^+ 3 ^+ 2`, which entails `_ == 1 + 5` without matching
 /// it.
 #[test]
 fn a_let_chain_entails_the_result_annotation() {
     check_scalar(
         indoc! {r#"
-            def foo(t: Int) => {Int where _ == 1 ^+ 5}:
+            def foo(t: Int) => {Int where _ == 1 + 5}:
                 x = 1 ^+ 3
                 y = x ^+ 2
                 y
@@ -470,7 +470,7 @@ fn a_nested_sum_with_no_let_refines_the_same_way() {
 fn refined_arg_entailed_only_semantically() {
     check_scalar(
         indoc! {r#"
-            def foo(t: {Int where _ == 1 ^+ 5}):
+            def foo(t: {Int where _ == 1 + 5}):
                 t
             foo((1 ^+ 3) ^+ 2)
         "#},
@@ -538,7 +538,7 @@ fn a_let_bound_call_result_carries_no_refinement() {
 // ---------------------------------------------------------------------------
 
 /// A transparent binder is assumed equal to its definition. `y`'s type is `Int`, since
-/// `+` puts no refinement on its result, so `w`'s refinement `__elem == y ^+ 0` meets the
+/// `+` puts no refinement on its result, so `w`'s refinement `__elem == y + 0` meets the
 /// annotation only through `y == x + 1`. The checks after lambda elimination read the
 /// definition `(x, 1) ▷ add` in its normal form and assume the same fact.
 #[test]
@@ -631,7 +631,7 @@ fn a_call_in_the_body_leaves_the_result_unrefined() {
 
             foo(2)
         "#},
-        "inferred as {Int where _ == t ^+ y ^+ bar(t)}",
+        "inferred as {Int where _ == t ^+ y + bar(t)}",
     )
 }
 
@@ -869,7 +869,7 @@ f(1)
 fn refined_add_uint_row() {
     check_compile_error(
         indoc! {r#"
-def f(p) => {UInt where _ == p ^+ p}:
+def f(p) => {UInt where _ == p + p}:
     p ^+ p
 f(1)
         "#},
@@ -907,7 +907,7 @@ fn a_type_error_in_a_chain_holding_a_read() {
 /// TODO: The typecheck for uses of polymorphic functions occurs
 /// during Coalesce, in which SMT is not currently used. In this
 /// example, structural equality comparison cannot reconcile the
-/// semantically equivalent refinements {_ == 4 ^+ 1} and {_ == a}.
+/// semantically equivalent refinements {_ == 4 + 1} and {_ == a}.
 #[test]
 fn monomorphization_check_is_not_smt() {
     check_compile_error(
@@ -1199,7 +1199,7 @@ ys
 }
 
 /// A refinement on a value computed from a read reaches planning stated over the value the
-/// read took, which mutability elimination names: `y`'s `__elem == x ^+ x` is `0 ^+ 0` by then,
+/// read took, which mutability elimination names: `y`'s `__elem == x + x` is `0 + 0` by then,
 /// so the post-planning check compares it like any other.
 #[test]
 fn a_refinement_on_a_read_reaches_planning_over_the_value_read() {
@@ -1458,7 +1458,7 @@ fn a_use_meets_a_refined_domain_of_a_function_parameter() {
 }
 
 /// An opaque `let`'s body type names an enclosing binder: the read of `x` types
-/// `y` as `{Int | __elem == __anf ^+ a}`, and meeting `z`'s annotation needs both
+/// `y` as `{Int | __elem == __anf + a}`, and meeting `z`'s annotation needs both
 /// `__anf`'s refinement and the parameter `a`'s. Coalescing decides it under the
 /// walk's lexical scope, which supplies `a`.
 #[test]
@@ -1479,7 +1479,7 @@ fn an_opaque_let_body_entailed_under_an_enclosing_binder() {
 
 /// Two reads of a refined mutable variable meet a refined annotation: `y` is the opaque
 /// `let __anf : {Int | __elem >= 0} ^= x in __anf ^+ __anf`, and its body type
-/// `{Int | __elem == __anf ^+ __anf}` entails `{Int | __elem >= 0}` given `__anf`'s
+/// `{Int | __elem == __anf + __anf}` entails `{Int | __elem >= 0}` given `__anf`'s
 /// refinement.
 #[test]
 fn two_reads_of_a_refined_mut_meet_a_refined_annotation() {
@@ -1579,7 +1579,7 @@ zs
     )
 }
 
-/// `(i: {Int | __elem >= 1 and __elem <= 5}) ⤇ {Int | __elem == i ^+ 1}`: a collection
+/// `(i: {Int | __elem >= 1 and __elem <= 5}) ⤇ {Int | __elem == i + 1}`: a collection
 /// mapping the keys 1 through 5 to the values 2 through 6, whose codomain names its key.
 fn pi_typed_collection() -> Type {
     let int = || Type::Base(BaseType::Int);

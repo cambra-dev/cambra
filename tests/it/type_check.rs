@@ -315,7 +315,7 @@ fn an_operator_result_carries_no_operand_refinement(#[case] code: &str) {
 /// carry no refinement into it (the case above), and the equation is the
 /// instance's, from `AddableRefined`'s one row.
 #[rstest]
-#[case::literals("2 ^+ 3", "{Int | __elem == 2 ^+ 3}")]
+#[case::literals("2 ^+ 3", "{Int | __elem == 2 + 3}")]
 #[case::parameters(
     indoc! {r#"
         def f(a: Int, b: Int):
@@ -323,7 +323,7 @@ fn an_operator_result_carries_no_operand_refinement(#[case] code: &str) {
 
         f
     "#},
-    "((__arg_tuple_0: (Int, Int)) ⇒ {Int | __elem == __arg_tuple_0.0 ^+ __arg_tuple_0.1})"
+    "((__arg_tuple_0: (Int, Int)) ⇒ {Int | __elem == __arg_tuple_0.0 + __arg_tuple_0.1})"
 )]
 fn refining_addition_records_the_sum(#[case] code: &str, #[case] expected: &str) {
     assert_eq!(format!("{}", infer_program(code)), expected);
@@ -354,14 +354,14 @@ fn refining_addition_is_int_only() {
         y = 5
         y ^+ y
     "#},
-    "{Int | __elem == 5 ^+ 5}"
+    "{Int | __elem == 5 + 5}"
 )]
 #[case::opaque(
     indoc! {r#"
         y ^= 5
         y ^+ y
     "#},
-    "{Int | __elem == y ^+ y}"
+    "{Int | __elem == y + y}"
 )]
 fn a_binder_s_transparency_decides_what_its_uses_leave_in_a_type(
     #[case] code: &str,
@@ -401,7 +401,7 @@ fn an_opaque_binder_inherits_its_initializer_s_refinement() {
             r ^+ 0
         f(2)
     "#},
-    "{Int | __elem == r ^+ 0}"
+    "{Int | __elem == r + 0}"
 )]
 fn a_function_s_codomain_drops_its_body_s_opaque_binders(
     #[case] code: &str,
@@ -4571,7 +4571,7 @@ fn the_alpha_variant_join_is_arrival_order_independent() {
 /// A `let` whose binder reaches the enclosing function's result refinement is
 /// eliminated as that refinement leaves the binder's scope, by substituting the
 /// `let`'s definition into the predicate. `m` defined as `n ^+ 1` makes the
-/// refinement `{Int | __elem == n ^+ 1 ^+ 1}`, whose only free name is the
+/// refinement `{Int | __elem == n ^+ 1 + 1}`, whose only free name is the
 /// parameter, which the function type binds.
 ///
 /// Asserted as the whole type rather than as a probe over the rendering: the
@@ -4599,7 +4599,7 @@ fn let_binder_does_not_escape_into_result_refinement() {
 
         g
     "#});
-    assert_eq!(ty.to_string(), "((n: Int) ⇒ {Int | __elem == n ^+ 1 ^+ 1})");
+    assert_eq!(ty.to_string(), "((n: Int) ⇒ {Int | __elem == n ^+ 1 + 1})");
 }
 
 /// The contrast: a result refinement over the **parameter** needs no
@@ -4614,7 +4614,7 @@ fn a_result_refinement_over_the_parameter_is_well_scoped() {
     "#});
     let rendered = ty.to_string();
     assert!(
-        rendered.contains("^+") && rendered.contains("__elem"),
+        rendered.contains("__elem == n + 1"),
         "the parameter's refinement rides the function type; got {rendered}"
     );
 }

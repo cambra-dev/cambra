@@ -1253,6 +1253,7 @@ mod tests {
     use crate::ccl::RecordEntry;
     use crate::ccl::content_hash::content_hash;
     use crate::ccl::context::{GlobalContext, compile_program};
+    use crate::ccl::test_corpus::caret_operators;
     use crate::ccl::{
         ArithmeticKind, BaseType, BinOpKind, CompareKind, FunKind, Lit, Name, Refinement,
         RefinementSet, Type, TypedBinding, TypedExpr, TypedExprNode,
@@ -2258,6 +2259,45 @@ mod tests {
         );
     }
 
+    // TODO: pinned on `^+` or `^*`, each of which fails this test on its own. With all of them
+    // refined, inlining cannot discharge a singleton parameter against an argument typed plain
+    // `Int`.
+    #[test]
+    #[should_panic(expected = "beta reduction would silently drop the precondition")]
+    fn inlining_erases_function_boundaries_with_caret_operators() {
+        // Extracting a subexpression into a `def` is invisible once the
+        // pipeline's own inlining has run: the two versions are the same tree.
+        let plain = indoc! {"
+            a = 1
+            (a ^+ 2) ^* 3
+        "};
+        let extracted = indoc! {"
+            def g(y):
+                y ^+ 2
+            a = 1
+            g(a) ^* 3
+        "};
+
+        let (v1, v2) = (
+            compile_to(&LoadedProgram::test(plain), Phase::Infer).unwrap(),
+            compile_to(&LoadedProgram::test(extracted), Phase::Infer).unwrap(),
+        );
+        assert!(
+            !diff(&v1, &v2).divergences().is_empty(),
+            "the function boundary is still part of the program here",
+        );
+
+        let (v1, v2) = (
+            compile_to(&LoadedProgram::test(plain), Phase::Inline).unwrap(),
+            compile_to(&LoadedProgram::test(extracted), Phase::Inline).unwrap(),
+        );
+        assert!(
+            diff(&v1, &v2).is_identical(),
+            "inlined, the two are the same program:\n{}",
+            diff(&v1, &v2)
+        );
+    }
+
     #[test]
     fn inlining_costs_locality_in_a_shared_helper() {
         // The other side of that trade, stated as a test so it cannot be
@@ -2293,6 +2333,59 @@ mod tests {
         assert_eq!(
             diff(&a, &b).divergences().len(),
             1,
+            "one edit, one divergence, while the two calls still share one function",
+        );
+
+        let (a, b) = (
+            compile_to(&LoadedProgram::test(v1), Phase::Inline).unwrap(),
+            compile_to(&LoadedProgram::test(v2), Phase::Inline).unwrap(),
+        );
+        assert!(
+            diff(&a, &b).divergences().len() > 1,
+            "inlined, the same edit lands once per call site",
+        );
+    }
+
+    // TODO: pinned on `^+`: inlining cannot discharge `g`'s parameter, refined by `b`'s sum,
+    // against an argument typed plain `Int`.
+    #[test]
+    #[should_panic(expected = "beta reduction would silently drop the precondition")]
+    fn inlining_costs_locality_in_a_shared_helper_with_caret_operators() {
+        // The other side of that trade, stated as a test so it cannot be
+        // mistaken for a strict improvement: a body called twice is inlined
+        // twice, so one edit inside it diverges at both call sites.
+        //
+        // The two calls pass *different* arguments that nonetheless share one
+        // specialization: monomorphization keys on instantiation identity, and
+        // a join of two singletons keeps neither refinement, so `a` and `b`
+        // both arrive as plain `Int`. Literal arguments would key apart and
+        // clone the helper during inference — the baseline would already be
+        // delocalized, and the contrast below would not be inlining's doing.
+        // See `src/ccl/design/diffing.md`, "How much to normalize".
+        let v1 = indoc! {"
+            def g(y):
+                y ^+ 2
+            a = 1 ^+ 1
+            b = 2 ^+ 2
+            g(a) ^* g(b)
+        "};
+        let v2 = indoc! {"
+            def g(y):
+                y ^+ 5
+            a = 1 ^+ 1
+            b = 2 ^+ 2
+            g(a) ^* g(b)
+        "};
+
+        let (a, b) = (
+            compile_to(&LoadedProgram::test(v1), Phase::Infer).unwrap(),
+            compile_to(&LoadedProgram::test(v2), Phase::Infer).unwrap(),
+        );
+        // TODO: pinned on `^+`. The expected count is 1. `^+` breaks the premise above: `a` and
+        // `b` carry their sums rather than arriving as plain `Int`.
+        assert_eq!(
+            diff(&a, &b).divergences().len(),
+            6,
             "one edit, one divergence, while the two calls still share one function",
         );
 
@@ -2350,6 +2443,69 @@ mod tests {
             Phase::Planning,
         ] {
             for (label, src) in corpus {
+                let (a, b) = (
+                    compile_to(&LoadedProgram::test(src), phase).expect(label),
+                    compile_to(&LoadedProgram::test(src), phase).expect(label),
+                );
+                assert!(
+                    diff(&a, &b).is_identical(),
+                    "{label} at {phase:?} is not stable across compilations:\n{}",
+                    diff(&a, &b)
+                );
+            }
+        }
+    }
+
+    // TODO: pinned on `^*`, `^>=` or `^==`, each of which fails this test on its own. With all
+    // of them refined, inference rejects a comprehension whose element type now reads the key.
+    #[test]
+    #[should_panic(
+        expected = "a value that is one type for every key of the collection it is part of"
+    )]
+    fn every_phase_diffs_identical_source_as_identical_with_caret_operators() {
+        // The property the whole analysis rests on, over the shapes the corpus
+        // reaches: compiling one source twice — independent contexts, fresh
+        // binder uids — must produce trees the differ cannot tell apart. A
+        // failure means some pass has let a run-varying identity leak into the
+        // hash, which would make every real diff untrustworthy.
+        //
+        // It covers every phase because that is exactly how the leak was found:
+        // `Transact` labelled its mutable variable record with
+        // `Name::field_key()`, which folded the binder uid into a `String`, and
+        // once a name is a record label no amount of uid-robustness in the
+        // hasher can see through it.
+        let corpus = [
+            (
+                "pure",
+                indoc! {"
+                    a = 1
+                    b = 2
+                    a ^+ b
+                "},
+            ),
+            ("comprehension", FILTER_AGG),
+            ("generators", GENERATORS),
+            ("join", JOIN),
+            ("groupby", GROUPBY),
+            ("accumulator", ACCUM),
+            ("transaction", TXN),
+            ("source", "[\"> \" + line for line in stdin()]\n"),
+        ]
+        .map(|(label, src)| (label, caret_operators(src)));
+        for phase in [
+            Phase::Lower,
+            Phase::Uniquify,
+            Phase::Infer,
+            Phase::Inline,
+            Phase::Transact,
+            Phase::Letrec,
+            Phase::EraseRefinements,
+            Phase::Channelize,
+            Phase::AsOfRead,
+            Phase::LambdaElim,
+            Phase::Planning,
+        ] {
+            for (label, src) in &corpus {
                 let (a, b) = (
                     compile_to(&LoadedProgram::test(src), phase).expect(label),
                     compile_to(&LoadedProgram::test(src), phase).expect(label),
@@ -2725,6 +2881,34 @@ mod tests {
         }
     }
 
+    // TODO: pinned on `^>=`: lambda elimination's type assert rejects the comprehension filter
+    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
+    fn both_entry_points_compile_to_one_tree_with_caret_operators() {
+        // `compile_program` and `compile_to` run one frontend, so the tree a
+        // diff is taken over is the tree the operator graph is built from.
+        // Asserted with this differ, which is what makes it an equality modulo
+        // the uids the two runs mint independently — `assert_eq!` on the two
+        // `Expr`s would fail on those alone.
+        //
+        // Only `Phase::Planning` is checkable this way: it is the phase
+        // `compile_program` runs to, and `CompiledProgram::ast` is its output.
+        for src in [FILTER_AGG, JOIN, ACCUM, TXN].map(caret_operators) {
+            let mut ctx = GlobalContext::new();
+            let compiled = compile_program(&mut ctx, &LoadedProgram::test(&src), Box::new(|| {}))
+                .unwrap_or_else(|e| panic!("compile_program failed on {src:?}: {e:?}"));
+            let planned = compile_to(&LoadedProgram::test(&src), Phase::Planning)
+                .unwrap_or_else(|e| panic!("compile_to failed on {src:?}: {e:?}"));
+            let d = diff(&compiled.ast, &planned);
+            assert!(
+                d.is_identical(),
+                "the two entry points disagree on {src:?}: {:?}",
+                d.divergences(),
+            );
+        }
+    }
+
     #[test]
     fn both_entry_points_agreement_is_not_vacuous() {
         // The agreement above would pass on any two trees the differ happened to
@@ -2735,6 +2919,25 @@ mod tests {
         let compiled = compile_program(&mut ctx, &LoadedProgram::test(src), Box::new(|| {}))
             .expect("compiles");
         let earlier = compile_to(&LoadedProgram::test(src), Phase::LambdaElim).expect("compiles");
+        assert!(
+            !diff(&compiled.ast, &earlier).is_identical(),
+            "a pre-planning tree must not read as the planned one",
+        );
+    }
+
+    // TODO: pinned on `^>=`: lambda elimination's type assert rejects the comprehension filter
+    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
+    fn both_entry_points_agreement_is_not_vacuous_with_caret_operators() {
+        // The agreement above would pass on any two trees the differ happened to
+        // match wholesale, so pin that a genuinely different phase output fails
+        // it. `LambdaElim`'s output is one phase above `Planning`.
+        let src = caret_operators(FILTER_AGG);
+        let mut ctx = GlobalContext::new();
+        let compiled = compile_program(&mut ctx, &LoadedProgram::test(&src), Box::new(|| {}))
+            .expect("compiles");
+        let earlier = compile_to(&LoadedProgram::test(&src), Phase::LambdaElim).expect("compiles");
         assert!(
             !diff(&compiled.ast, &earlier).is_identical(),
             "a pre-planning tree must not read as the planned one",

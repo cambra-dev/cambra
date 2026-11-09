@@ -903,6 +903,7 @@ where
             .foldl_with(
                 choice((
                     just(Token::Star).to(BinOp::Mul),
+                    just(Token::CaretStar).to(BinOp::MulRefined),
                     just(Token::DoubleSlash).to(BinOp::FloorDiv),
                 ))
                 .then(unary.clone())
@@ -918,6 +919,7 @@ where
                     just(Token::Plus).to(BinOp::Add),
                     just(Token::CaretPlus).to(BinOp::AddRefined),
                     just(Token::Minus).to(BinOp::Sub),
+                    just(Token::CaretMinus).to(BinOp::SubRefined),
                 ))
                 .then(product.clone())
                 .repeated(),
@@ -977,6 +979,11 @@ where
             just(Token::LtE).to(CmpOp::LtE),
             just(Token::Gt).to(CmpOp::Gt),
             just(Token::GtE).to(CmpOp::GtE),
+            just(Token::CaretEqEq).to(CmpOp::EqRefined),
+            just(Token::CaretLt).to(CmpOp::LtRefined),
+            just(Token::CaretLtE).to(CmpOp::LtERefined),
+            just(Token::CaretGt).to(CmpOp::GtRefined),
+            just(Token::CaretGtE).to(CmpOp::GtERefined),
         ));
         let comparison = log_or
             .clone()
@@ -1000,18 +1007,21 @@ where
 
         // ---- `not` (right-associative prefix) -----------------------
         let bool_not = recursive(|n| {
-            just(Token::Not)
-                .ignore_then(n.clone())
-                .map_with(|operand, e| {
-                    Spanned::new(
-                        e.span(),
-                        Expr::UnaryOp {
-                            op: UnaryOp::Not,
-                            operand: Box::new(operand),
-                        },
-                    )
-                })
-                .or(comparison.clone())
+            choice((
+                just(Token::Not).to(UnaryOp::Not),
+                just(Token::CaretNot).to(UnaryOp::NotRefined),
+            ))
+            .then(n.clone())
+            .map_with(|(op, operand), e| {
+                Spanned::new(
+                    e.span(),
+                    Expr::UnaryOp {
+                        op,
+                        operand: Box::new(operand),
+                    },
+                )
+            })
+            .or(comparison.clone())
         })
         .boxed();
 
@@ -1019,51 +1029,29 @@ where
         let bool_and = bool_not
             .clone()
             .then(
-                just(Token::And)
-                    .ignore_then(bool_not.clone())
-                    .repeated()
-                    .collect::<Vec<_>>(),
+                choice((
+                    just(Token::And).to(BoolOp::And),
+                    just(Token::CaretAnd).to(BoolOp::AndRefined),
+                ))
+                .then(bool_not.clone())
+                .repeated()
+                .collect::<Vec<_>>(),
             )
-            .map_with(|(first, rest), e| {
-                if rest.is_empty() {
-                    first
-                } else {
-                    let mut operands = vec![first];
-                    operands.extend(rest);
-                    Spanned::new(
-                        e.span(),
-                        Expr::BoolOp {
-                            op: BoolOp::And,
-                            operands,
-                        },
-                    )
-                }
-            })
+            .map_with(|(first, rest), e| make_bool_op(first, rest, e.span()))
             .boxed();
 
         let bool_or = bool_and
             .clone()
             .then(
-                just(Token::Or)
-                    .ignore_then(bool_and.clone())
-                    .repeated()
-                    .collect::<Vec<_>>(),
+                choice((
+                    just(Token::Or).to(BoolOp::Or),
+                    just(Token::CaretOr).to(BoolOp::OrRefined),
+                ))
+                .then(bool_and.clone())
+                .repeated()
+                .collect::<Vec<_>>(),
             )
-            .map_with(|(first, rest), e| {
-                if rest.is_empty() {
-                    first
-                } else {
-                    let mut operands = vec![first];
-                    operands.extend(rest);
-                    Spanned::new(
-                        e.span(),
-                        Expr::BoolOp {
-                            op: BoolOp::Or,
-                            operands,
-                        },
-                    )
-                }
-            })
+            .map_with(|(first, rest), e| make_bool_op(first, rest, e.span()))
             .boxed();
 
         // ---- Ternary `then if cond else else_` ----------------------
@@ -1317,6 +1305,40 @@ enum PostfixOp {
     Attribute(Spanned<SmolStr>, Vec<Spanned<SmolStr>>),
     /// `.m(args)`: the method's name, its path's qualifier, and the arguments.
     MethodCall(Spanned<SmolStr>, Vec<Spanned<SmolStr>>, Vec<Spanned<Expr>>),
+}
+
+/// The n-ary boolean operation `first op₁ e₁ op₂ e₂ …`, flattened while the operator repeats.
+/// A change of operator, `a and b ^and c`, closes the run so far as the first operand of the
+/// next, so a mixed run associates left.
+fn make_bool_op(
+    first: Spanned<Expr>,
+    rest: Vec<(BoolOp, Spanned<Expr>)>,
+    span: Span,
+) -> Spanned<Expr> {
+    let close = |op: BoolOp, operands: Vec<Spanned<Expr>>| {
+        let start = operands[0].span;
+        let end = operands[operands.len() - 1].span.end;
+        Spanned::new(
+            Span::new(start.file, start.start, end),
+            Expr::BoolOp { op, operands },
+        )
+    };
+    let mut operands = vec![first];
+    let mut run: Option<BoolOp> = None;
+    for (op, operand) in rest {
+        match run {
+            Some(current) if current != op => {
+                operands = vec![close(current, std::mem::take(&mut operands))];
+            }
+            _ => {}
+        }
+        run = Some(op);
+        operands.push(operand);
+    }
+    match run {
+        None => operands.pop().expect("the first operand"),
+        Some(op) => Spanned::new(span, Expr::BoolOp { op, operands }),
+    }
 }
 
 /// A variant tag and the `::` qualifier before its backtick: `` `some `` is

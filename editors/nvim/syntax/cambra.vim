@@ -20,7 +20,7 @@ syn keyword cambraKeywordOther def where and or not forall requires type impl in
 " defined last, so the mutation, feed and define operators below win over the
 " `:`, `<` and `<=` prefixes matched here.
 syn match cambraOperator "[-+*&|^=<>!]"
-syn match cambraOperator "\*\*\|//=\=\|++\|\^[+=]\|[-+*]=\|[=!<>]=\|<:\|->\|=>\||=>"
+syn match cambraOperator "\*\*\|//=\=\|++\|\^\%(==\|<=\|>=\|[-*<>]\)\|\^\%(and\|or\|not\)\>\|\^[+=]\|[-+*]=\|[=!<>]=\|<:\|->\|=>\||=>"
 syn match cambraPunctuation "[,;:.]"
 syn match cambraMutation ":="
 syn match cambraFeed "<<=\="

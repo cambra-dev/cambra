@@ -937,15 +937,18 @@ mod tests {
     use crate::ccl::context::{CompiledProgram, GlobalContext, collect_tree_ids, compile_program};
     use crate::ccl::load::LoadedProgram;
     use crate::ccl::panes::PANES;
+    use crate::ccl::test_corpus::{spelled, with_caret_operators};
     use crate::chl_parser::{FileId, SourceMap};
     use crate::interpreter::Consumer;
     use indoc::indoc;
     use std::collections::{HashMap, HashSet};
 
+    /// Inside [`with_caret_operators`] it compiles `code` spelled with `^` operators.
     fn compile(code: &str) -> CompiledProgram {
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
-        compile_program(&mut ctx, &LoadedProgram::test(code), consumer).expect("program compiles")
+        compile_program(&mut ctx, &LoadedProgram::test(spelled(code)), consumer)
+            .expect("program compiles")
     }
 
     /// The span of the `n`-th (0-based) byte occurrence of `needle` in the root
@@ -1110,6 +1113,19 @@ mod tests {
         }
     }
 
+    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
+    // refined, inference rejects a comprehension whose element type now reads the key.
+    #[test]
+    #[should_panic(
+        expected = "a value that is one type for every key of the collection it is part of"
+    )]
+    fn the_payload_ships_one_pane_entry_per_declared_pane_and_one_link_per_pair_with_caret_operators()
+     {
+        with_caret_operators(
+            the_payload_ships_one_pane_entry_per_declared_pane_and_one_link_per_pair,
+        );
+    }
+
     /// Every pane-link endpoint is a node of the tree it points into.
     ///
     /// This is why every walk that builds the payload descends into refinement
@@ -1146,6 +1162,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
+    // refined, inference rejects a comprehension whose element type now reads the key.
+    #[test]
+    #[should_panic(
+        expected = "a value that is one type for every key of the collection it is part of"
+    )]
+    fn every_pane_link_endpoint_is_a_node_of_the_tree_it_points_into_with_caret_operators() {
+        with_caret_operators(every_pane_link_endpoint_is_a_node_of_the_tree_it_points_into);
     }
 
     /// `wire_spans` establishes the ordering both node shapes promise, over
@@ -1286,6 +1312,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
+    // refined, inference rejects a comprehension whose element type now reads the key.
+    #[test]
+    #[should_panic(
+        expected = "a value that is one type for every key of the collection it is part of"
+    )]
+    fn a_nodes_spans_are_its_attributions_narrowest_first_with_caret_operators() {
+        with_caret_operators(a_nodes_spans_are_its_attributions_narrowest_first);
     }
 
     /// A shipped node carries the row `src/inspector_model/design.md`, "A node on
@@ -1439,6 +1475,16 @@ mod tests {
         );
     }
 
+    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
+    // refined, inference rejects a comprehension whose element type now reads the key.
+    #[test]
+    #[should_panic(
+        expected = "a value that is one type for every key of the collection it is part of"
+    )]
+    fn a_wire_node_carries_its_id_spans_type_and_children_with_caret_operators() {
+        with_caret_operators(a_wire_node_carries_its_id_spans_type_and_children);
+    }
+
     /// Every child id, every operator input id, and every walk start of every
     /// pane names a node of that pane's own table. A dangling id is the failure
     /// the node table makes possible and a nested tree could not express.
@@ -1506,6 +1552,16 @@ mod tests {
         }
     }
 
+    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
+    // refined, inference rejects a comprehension whose element type now reads the key.
+    #[test]
+    #[should_panic(
+        expected = "a value that is one type for every key of the collection it is part of"
+    )]
+    fn every_child_id_resolves_in_its_own_table_with_caret_operators() {
+        with_caret_operators(every_child_id_resolves_in_its_own_table);
+    }
+
     /// A pane's table holds each node exactly once, and holds exactly the ids
     /// `collect_tree_ids` enumerates for that pane's tree — the main tree plus
     /// everything reachable through its type slots.
@@ -1551,6 +1607,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
+    // refined, inference rejects a comprehension whose element type now reads the key.
+    #[test]
+    #[should_panic(
+        expected = "a value that is one type for every key of the collection it is part of"
+    )]
+    fn a_pane_table_holds_each_node_exactly_once_with_caret_operators() {
+        with_caret_operators(a_pane_table_holds_each_node_exactly_once);
     }
 
     /// No node claims one span twice. A node is visited once and its spans come
@@ -1599,6 +1665,16 @@ mod tests {
         }
     }
 
+    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
+    // refined, inference rejects a comprehension whose element type now reads the key.
+    #[test]
+    #[should_panic(
+        expected = "a value that is one type for every key of the collection it is part of"
+    )]
+    fn an_operator_node_carries_its_role_tiling_and_ordered_spans_with_caret_operators() {
+        with_caret_operators(an_operator_node_carries_its_role_tiling_and_ordered_spans);
+    }
+
     #[test]
     fn no_node_repeats_a_span() {
         for code in corpus() {
@@ -1617,6 +1693,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
+    // refined, inference rejects a comprehension whose element type now reads the key.
+    #[test]
+    #[should_panic(
+        expected = "a value that is one type for every key of the collection it is part of"
+    )]
+    fn no_node_repeats_a_span_with_caret_operators() {
+        with_caret_operators(no_node_repeats_a_span);
     }
 
     /// No node names one predicate twice. `walk_type_slots` yields a `Lambda`'s
@@ -1657,6 +1743,16 @@ mod tests {
         }
     }
 
+    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
+    // refined, inference rejects a comprehension whose element type now reads the key.
+    #[test]
+    #[should_panic(
+        expected = "a value that is one type for every key of the collection it is part of"
+    )]
+    fn no_node_repeats_a_predicate_edge_with_caret_operators() {
+        with_caret_operators(no_node_repeats_a_predicate_edge);
+    }
+
     /// Neither `payloadKind` value is a pane id. The success value was
     /// `"post-inference"`, which is also a pane's id, so one word on the wire
     /// named two unrelated things and a consumer rendering the kind as a header
@@ -1674,6 +1770,16 @@ mod tests {
                 "payloadKind {kind:?} is also a pane id"
             );
         }
+    }
+
+    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
+    // refined, inference rejects a comprehension whose element type now reads the key.
+    #[test]
+    #[should_panic(
+        expected = "a value that is one type for every key of the collection it is part of"
+    )]
+    fn a_payload_kind_is_never_a_pane_id_with_caret_operators() {
+        with_caret_operators(a_payload_kind_is_never_a_pane_id);
     }
 
     /// A predicate several *nodes* reach is one entry in the table, named by an
@@ -1715,6 +1821,16 @@ mod tests {
             1,
             "the shared predicate {shared} is one entry in the table"
         );
+    }
+
+    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
+    // refined, inference rejects a comprehension whose element type now reads the key.
+    #[test]
+    #[should_panic(
+        expected = "a value that is one type for every key of the collection it is part of"
+    )]
+    fn a_shared_predicate_is_one_entry_named_by_several_edges_with_caret_operators() {
+        with_caret_operators(a_shared_predicate_is_one_entry_named_by_several_edges);
     }
 
     /// A parse failure — the most common one — ships a message a person can read
@@ -1808,6 +1924,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
+    // refined, inference rejects a comprehension whose element type now reads the key.
+    #[test]
+    #[should_panic(
+        expected = "a value that is one type for every key of the collection it is part of"
+    )]
+    fn every_node_of_every_pane_carries_an_attribution_with_caret_operators() {
+        with_caret_operators(every_node_of_every_pane_carries_an_attribution);
     }
 
     /// A degraded payload carries the diagnostics and no IR: same type as the
@@ -1961,6 +2087,14 @@ a + b
             "post-inference",
             "post-channelize",
         );
+    }
+
+    // TODO: pinned on `^+`: inlining cannot discharge a singleton parameter against an argument
+    // typed plain `Int`.
+    #[test]
+    #[should_panic(expected = "beta reduction would silently drop the precondition")]
+    fn inline_fanout_links_post_inference_to_post_channelize_copies_with_caret_operators() {
+        with_caret_operators(inline_fanout_links_post_inference_to_post_channelize_copies);
     }
 
     /// A monomorphic program changes no **main-tree** identity across inference:
@@ -2125,6 +2259,15 @@ max(totals)
             list.iter().any(|l| l.contains("List")),
             "`[1, 2, 3, 4]` → List; got {list:?}"
         );
+    }
+
+    // TODO: pinned on `^*`: inference rejects a comprehension whose element type now reads the key.
+    #[test]
+    #[should_panic(
+        expected = "a value that is one type for every key of the collection it is part of"
+    )]
+    fn generator_mapped_spans_resolve_to_expected_nodes_with_caret_operators() {
+        with_caret_operators(generator_mapped_spans_resolve_to_expected_nodes);
     }
 
     /// DEFER: the source constructs that map name the expected IR node.

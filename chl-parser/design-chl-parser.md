@@ -110,7 +110,11 @@ The grammar does not accept every token in operator position. For example, `in` 
 consumed by iteration clauses, not an implemented membership operator. `>>` is two `Gt`
 tokens, and `is` is an identifier. `/`, `%` and `~` start no token and lex as `Token::Error`.
 `operators_absent_from_chl` covers the lexical cases.
-Experimental `^+` and `^=` tokens are accepted but omitted from the language reference.
+Experimental `^=` is accepted but omitted from the language reference. So are the `^` siblings of
+the refinable operators (`^+`, `^-`, `^*`, `^==`, `^<`, `^<=`, `^>`, `^>=`, `^and`, `^or`, `^not`),
+which are temporary scaffolding ([type-inference.md](../src/ccl/design/type-inference.md#an-operator-is-refined-by-the-operation-it-computes)).
+Each sibling is one token by maximal munch, so `a ^-b` is `a ^- b`. `raw_tokens` splits a `^and`,
+`^or` or `^not` that a longer identifier continues: `a ^andy` is `^` then `andy`.
 
 ### Stage 3 — AST (`ast.rs`)
 

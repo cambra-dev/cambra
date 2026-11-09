@@ -812,8 +812,8 @@ types inside a refinement predicate. It runs after successful coalescing and bef
 scope check.
 
 A predicate is an expression tree whose nodes carry types. Arithmetic within it can acquire a
-refinement that repeats part of the enclosing predicate. For example, an interior `1 ^+ 3`
-can carry its own sum refinement while the outer predicate states `__elem == 1 ^+ 3 ^+ 2`.
+refinement that repeats part of the enclosing predicate. For example, an interior `1 + 3`
+can carry its own sum refinement while the outer predicate states `__elem == 1 + 3 + 2`.
 A discharge that updates the outer predicate can leave an interior copy naming a binder that has
 gone out of scope. The stripping pass removes that redundant copy rather than relying on both
 representations remaining synchronized.
@@ -1609,24 +1609,41 @@ The singleton supplies facts needed by obligations such as an array index-range 
 ordinary refinement and is not erased wholesale after inference. Exact annotations can discard it;
 see [Annotation kinds: exact and bounded](#annotation-kinds-exact-and-bounded).
 
+#### An operator is refined by the operation it computes
+
 An operator computing a new value must not inherit an operand's refinement by sharing its type
 variable. Arithmetic and comparison trait requirements use separate operand and result positions.
 `an_operator_result_carries_no_operand_refinement` checks this distinction. Monomorphic boolean
 and collection operators use their declared rules; aggregates must retain the collection-domain
 information their rules consume.
 
-Computing a result refinement is different from inheriting one. The `AddRefined` operation `^+`
-refines its result by the sum it is: its obligation builds `__elem == 𝑎 ^+ 𝑏` from its operands
-when it deposits `Output` (`OperatorResult::AssociatedRefined`, `OutputRefinement`), so the
-refinement is the operator's whichever instance answers. It rides the deposited lower bound, on the
-base the instance settles, rather than wrapping the result variable: a refinement around a variable
-is dropped where the variable resolves, so a mutable variable's write would lose it, and a `let`
-chain's discharge reads it off the bound. It does not establish that ordinary `+` propagates
-singletons or that arbitrary arithmetic predicates are inferred. Any proposed richer rule must
-remain valid as operand bounds accumulate: a refinement inferred from only one lower-bound
-contribution can become too strong after another arrives. Recurrences also require soundness when
-an operand is resolved through the operation's own output. Supported semantic comparisons are
-bounded by [the SMT encoding](#semantic-entailment-as-a-fallback).
+Computing a result refinement is different from inheriting one. A refinable operator (`+`, `-`,
+`*`, `==`, `<`, `<=`, `>`, `>=`, `and`, `or`, `not`) refines its result by the operation it
+computes: `𝑎 - 𝑏` types as `{Int | __elem == 𝑎 - 𝑏}`. A trait-typed operator's obligation builds
+`__elem == 𝑎 - 𝑏` from its operands when it deposits `Output` (`OperatorResult::Associated`,
+`OutputRefinement`), so the refinement is the operator's whichever instance answers. It rides the
+deposited lower bound, on the base the instance settles, rather than wrapping the result variable:
+a refinement around a variable is dropped where the variable resolves, so a mutable variable's
+write would lose it, and a `let` chain's discharge reads it off the bound. A scheme-typed operator
+(`and`, `or`, `not`) refines its scheme's result base where `emit_binop` or `emit_unary` types the
+node. `RefinementTemplate::predicate` states the operation only of an `Int`, `UInt` or `Bool`
+result. These refinements do not establish that arbitrary arithmetic predicates are inferred. Any
+proposed richer rule must remain valid as operand bounds accumulate: a refinement inferred from
+only one lower-bound contribution can become too strong after another arrives. Recurrences also
+require soundness when an operand is resolved through the operation's own output. Supported
+semantic comparisons are bounded by [the SMT encoding](#semantic-entailment-as-a-fallback).
+
+Temporary scaffolding: today the refinement is stated by an experimental `^` sibling of each
+refinable operator (`^+`, `^-`, …, `^not`; `BinOpKind::is_refined`, `refinement_of_binop`), and the
+plain operator computes the same value with no refinement. The split holds the tests that refining
+the plain operators breaks; it goes away once they pass. The design docs write the plain operator
+where the refining one is meant.
+
+The predicate a `^` operator states names its plain sibling: `𝑎 ^- 𝑏` types as
+`{Int | __elem == 𝑎 - 𝑏}` (`RefinementTemplate::predicate`). A `^` operator still reaches a
+predicate inside a term substituted into it, as a `let` binder's discharge does
+(`{Int | __elem == n ^+ 1 + 1}`), and the SMT encoding reads it as its sibling
+(`BinOpKind::unrefined`).
 
 At a merge position, a refinement survives only when every incoming value establishes it.
 Different singleton arms such as `1` and `2` lose their singleton on joining; two `5` arms can
@@ -1690,7 +1707,7 @@ see [Simplification](#simplification).
 
 For a concrete base with a structural deficit, `smt_sub` in `infer/solver/smt.rs` asks whether
 the producer's predicates entail the consumer's. For example,
-`{Int | __elem == 1 ^+ 3 ^+ 2} <: {Int | __elem == 1 ^+ 5}` can succeed without structural equality.
+`{Int | __elem == 1 + 3 + 2} <: {Int | __elem == 1 + 5}` can succeed without structural equality.
 
 The query asks Z3 whether `Γ ∧ ⋀S₁ ∧ ¬⋀S₂` is unsatisfiable. `Γ` contains supported assumptions
 from the caller's scope. The predicates have already been transported by
@@ -1732,7 +1749,7 @@ An unsupported subject base prevents encoding predicates about it.
 Assumptions are collected at every prefix of a path. A product refinement
 `{{b: Int} | __elem.b == 3}` and a field type `{b: Int@3}` can both establish `x.b == 3`.
 Within the root's own predicate, `__elem.b` is rerooted onto `x.b`; it does not become an unrelated
-query-subject field. For `x = (a=10, b=2 ^+ 1)`, a function body `t ^+ x.b` can therefore satisfy
+query-subject field. For `x = (a=10, b=2 + 1)`, a function body `t + x.b` can therefore satisfy
 the result refinement `__elem == t + 3`.
 
 ##### The scope a query runs in
@@ -1751,8 +1768,8 @@ The definition is stated in its predicate normal form
 after lambda elimination reads `(x, 1) ▷ add` as `x + 1`. Only a definition built from the
 encoder's term forms is stated.
 
-Lookups are demand-driven. For `x = 2`, the predicate `t ^+ x == t + 2` needs the assumption
-`x == 2`. For `y = x ^+ 1`, translating `y`'s refinement can trigger the lookup of `x`.
+Lookups are demand-driven. For `x = 2`, the predicate `t + x == t + 2` needs the assumption
+`x == 2`. For `y = x + 1`, translating `y`'s refinement can trigger the lookup of `x`.
 Paths are marked before their assumptions are traversed, preventing recursive re-entry.
 The encoder does not enumerate unused binders or all fields of a product. Besides avoiding work,
 this prevents an unrelated contradictory binder from proving an otherwise unsupported query.
@@ -1832,7 +1849,7 @@ under [The post-inference check](#the-post-inference-check-shared-rules).
 
 The check builds Γ from lexical and opaque binder types, as described under
 [The scope a query runs in](#the-scope-a-query-runs-in). For
-`x: Mut({Int where _ >= 0}) := 0` followed by `x := x ^+ 1`, structural matching alone does not
+`x: Mut({Int where _ >= 0}) := 0` followed by `x := x + 1`, structural matching alone does not
 establish the annotation: SMT proves the seed nonnegative and uses the read binder's declared
 refinement to prove the write nonnegative.
 
@@ -2355,7 +2372,7 @@ site's telescope with its template binders entered after it, as that instantiati
 Each telescope also shares a growing set of opaque binders with the other telescopes from its
 root. `enter_opaque` adds a name to that set, including for variables created before entry.
 This permits a mutable variable declared outside a read binder to receive a refinement naming
-that read: `x := x ^+ 1` contributes `__elem == __read ^+ 1` to the variable created for `x`.
+that read: `x := x + 1` contributes `__elem == __read + 1` to the variable created for `x`.
 A transparent let is discharged instead; a `for` target has no such exemption.
 
 `check_scope_valid` likewise seeds its root with every opaque binder present in the tree.
@@ -2803,7 +2820,7 @@ After inference every pass that builds or rebuilds a chain types it by the same 
 (`ccl_utils::chain_type_of`).
 
 Lambda elimination states an operation's dependent result over the operation's own input,
-`(𝑞 : (Int, Int)) ⇒ {Int | __elem == 𝑞.0 ^+ 𝑞.1}`, rather than over the eliminated parameter its
+`(𝑞 : (Int, Int)) ⇒ {Int | __elem == 𝑞.0 + 𝑞.1}`, rather than over the eliminated parameter its
 operands were written with (`operation_type`). An application whose result reads the parameter
 states `apply`'s type the same way, over the pair of argument and function:
 `(𝑞 : (𝐴, (𝑘 : 𝐴) ⤇ 𝐶(𝑘))) ⇒ 𝐶(𝑞.0)`.
@@ -3807,7 +3824,9 @@ about the operand positions.
 
 The compiler's traits have `𝑁 ∈ {1, 2}`, `𝐴 ∈ {0, 1}` (`Output`, or nothing) and `𝐹 ∈ {0, 1}`:
 each arithmetic trait associates the function its operator calls, `add` for `+`, and
-`Equatable`, `Orderable` and `AddableRefined` associate none. A trait a module declares has any
+`Equatable`, `Orderable` and `AddableRefined` (the trait of the temporary `^+`; see
+[An operator is refined by the operation it computes](#an-operator-is-refined-by-the-operation-it-computes))
+associate none. A trait a module declares has any
 `𝑁`, `𝐴` and `𝐹` ([Trait functions](#trait-functions)).
 
 An arithmetic trait's rows denote distinct functions: `Addable(String, String ⇝ String)` is
@@ -4238,9 +4257,11 @@ coalesce, from the operands' resolved types (`dispatch_operator`, `run_instance_
   program that declares an instance of the trait resolves its operators' operand types here,
   since resolving copies the refinements' predicates.
 - **An operator a compiler instance answers runs the instance's primitive.** The node stays, and
-  its operator becomes the row's (`InstanceBody::Binary`): `Concat` for two strings. A `TraitFn`
-  a compiler instance answers, `summon(Addable(_, _))::add(1, 2)`, becomes the primitive's function
-  (`build_instance_function`).
+  its operator becomes the row's (`InstanceBody::Binary`): `Concat` for two strings. A temporary `^`
+  operator whose row runs the operation it already computes keeps its own kind (`^-` answered by
+  `Sub` stays `SubRefined`), and its `unrefined` sibling is the operation its result type names. A
+  `TraitFn` a compiler instance answers, `summon(Addable(_, _))::add(1, 2)`, becomes the
+  primitive's function (`build_instance_function`).
 - **A comparison stays a comparison.** `==` on a nominal type compares the representation, a
   constructor and its argument, which a nominal type's instance of `Equatable` admits
   (`compares_by_value`). An ordering on a type holding a nominal one is compiled to a comparison
@@ -4280,7 +4301,8 @@ per-group domain contracts.
 | Op kind | Operand requirement | Result |
 | --- | --- | --- |
 | Arithmetic | Separate operand positions in `Addable`, `Subtractable`, `Multipliable`, `Divisible` or `Exponentiable` | Associated `Output` |
-| Internal `AddRefined` | `AddableRefined` | Associated `Output` |
+| Temporary `^+` (`AddRefined`) | `AddableRefined` | Associated `Output`, refined by the sum |
+| Any other temporary `^` operator (`SubRefined`, `EqualsRefined`, …) | Its operator's trait | Its operator's result, refined by the operation |
 | Equality comparison | `Equatable` | `Bool` |
 | Ordering comparison | `Orderable` | `Bool` |
 | `Concat` | Both operands flow into `String` | `String` |

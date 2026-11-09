@@ -312,9 +312,9 @@ fn gate_operand_at(
     if operands.len() != 2 {
         return None;
     }
-    let absorbing = match kind {
-        LogicKind::And => false,
-        LogicKind::Or => true,
+    let absorbing = match BinOpKind::BoolLogic(*kind).unrefined() {
+        BinOpKind::BoolLogic(LogicKind::And) => false,
+        BinOpKind::BoolLogic(LogicKind::Or) => true,
         _ => return None,
     };
     for (literal, other) in [(0, 1), (1, 0)] {
