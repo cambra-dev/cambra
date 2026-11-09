@@ -1752,19 +1752,7 @@ impl Tile {
     /// path names an element — which is what two collections have to agree on before
     /// anything pairs them row for row.
     pub fn paths_at(&self, level: CurryLevel) -> Vec<Vec<Value>> {
-        let mut node = self;
-        let mut paths = vec![Vec::new()];
-        for depth in 0..=level.index() {
-            paths = node.key_paths(&paths);
-            if depth == level.index() {
-                break;
-            }
-            let Tile::DataFunction { codomain, .. } = node else {
-                panic!("{level} of {self:?} has no level there")
-            };
-            node = codomain;
-        }
-        paths
+        self.row_paths_at(level.index() + 1)
     }
 
     /// The predicate admitting exactly the nodes of `level`: the union of [`Predicate::exactly`]
@@ -1775,10 +1763,7 @@ impl Tile {
     /// where the union of [`Predicate::exactly`] builds one per key. At the outermost level there
     /// is one row with the empty path, and the predicate is the one over the whole domain column.
     pub fn paths_predicate(&self, level: CurryLevel) -> Predicate {
-        let row_paths = match level.enclosing() {
-            Some(above) => self.paths_at(above),
-            None => vec![Vec::new()],
-        };
+        let row_paths = self.row_paths_at(level.index());
         let node = self.values_at(level);
         let Tile::DataFunction { domain, .. } = node else {
             panic!("paths_predicate is a collection's: {self:?}")
