@@ -295,17 +295,41 @@ pub struct IrChild {
 }
 
 /// What an [`IrChild`] is to the node that lists it.
+///
+/// Five kinds are occurrences the parent holds, one per kind of occurrence
+/// (`src/ccl/design/provenance.md`, "Name occurrences"), and the kind is the edge
+/// label a tree pane draws for one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChildKind {
     /// A value child, at its positional index.
     Value,
-    /// An occurrence the parent holds: a binding, applied, label, head or annotation
-    /// occurrence (`src/ccl/design/provenance.md`, "Name occurrences").
-    Occurrence,
+    /// A binding occurrence: the name a binder introduces.
+    Binder,
+    /// An applied occurrence held as a field: a use of a binder bound elsewhere.
+    Use,
+    /// A label occurrence: a record literal's label or a variant constructor's tag.
+    Label,
+    /// A head occurrence: the tag or constructor a `match` arm matches.
+    Head,
+    /// An annotation occurrence: the type a binder's annotation writes.
+    Annotation,
     /// A refinement predicate riding one of the parent's type slots
     /// (`src/inspector_model/design.md`, "Predicates are nodes").
     Predicate,
+}
+
+impl ChildKind {
+    /// The kind of the edge to an occurrence of `of`.
+    fn occurrence(of: &OccurrenceOf<'_>) -> Self {
+        match of {
+            OccurrenceOf::Binder(_) => ChildKind::Binder,
+            OccurrenceOf::Annotation(_) => ChildKind::Annotation,
+            OccurrenceOf::Use(_) => ChildKind::Use,
+            OccurrenceOf::Label(_) | OccurrenceOf::Tag { .. } => ChildKind::Label,
+            OccurrenceOf::Head(_) => ChildKind::Head,
+        }
+    }
 }
 
 /// A node's rewrite tag — the
@@ -717,12 +741,13 @@ fn build_node_table(expr: &Expr, projection: &SourceProjection) -> (u64, Vec<IrN
         // the rest (see [`predicate_children`]).
         expr.walk_occurrences(|occurrence, of| {
             let id = occurrence.id();
+            let kind = ChildKind::occurrence(&of);
             if visited.insert(id) {
                 out.push(occurrence_entry(id, of, projection, binders));
             }
             children.push(IrChild {
                 id: id.as_u64(),
-                kind: ChildKind::Occurrence,
+                kind,
             });
         });
         for predicate in predicate_children(expr) {
@@ -1293,7 +1318,11 @@ mod tests {
             assert!(
                 kinds.is_sorted_by_key(|k| match k {
                     ChildKind::Value => 0,
-                    ChildKind::Occurrence => 1,
+                    ChildKind::Binder
+                    | ChildKind::Use
+                    | ChildKind::Label
+                    | ChildKind::Head
+                    | ChildKind::Annotation => 1,
                     ChildKind::Predicate => 2,
                 }),
                 "{}'s children run value, occurrence, predicate; got {kinds:?}",
@@ -1367,26 +1396,24 @@ mod tests {
         let pre = pane("pre-inference");
         let post = pane("post-inference");
 
-        for label in [
-            "Binder(p)",
-            "Binder(out)",
-            "Use(out)",
-            "Label(x)",
-            "Label(ok)",
-            "Head(ok)",
-            "Annotation",
+        for (label, kind) in [
+            ("Binder(p)", ChildKind::Binder),
+            ("Binder(out)", ChildKind::Binder),
+            ("Use(out)", ChildKind::Use),
+            ("Label(x)", ChildKind::Label),
+            ("Label(ok)", ChildKind::Label),
+            ("Head(ok)", ChildKind::Head),
+            ("Annotation", ChildKind::Annotation),
         ] {
             let entry = node_named(pre, label);
             assert!(entry.children.is_empty(), "{label} is a leaf");
-            let holders: Vec<&IrNode> = ir_nodes(pre)
+            let edges: Vec<ChildKind> = ir_nodes(pre)
                 .iter()
-                .filter(|n| {
-                    n.children
-                        .iter()
-                        .any(|c| c.id == entry.node_id && c.kind == ChildKind::Occurrence)
-                })
+                .flat_map(|n| &n.children)
+                .filter(|c| c.id == entry.node_id)
+                .map(|c| c.kind)
                 .collect();
-            assert_eq!(holders.len(), 1, "one node holds {label}");
+            assert_eq!(edges, [kind], "one `{kind:?}` edge names {label}");
         }
         assert!(
             !ir_nodes(post).iter().any(|n| n.label == "Annotation"),

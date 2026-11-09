@@ -161,7 +161,7 @@ Each node carries:
 | `spans` | every source span it traces to, narrowest first, empty when it traces to none |
 | `rewritten` | `null` for a lowering root, else `{ via, nature, label }` |
 | `type` | its type, rendered ([Types on the wire](#types-on-the-wire)) |
-| `children` | `{ id, kind }` — the child's id in this same table, and what it is to the node: `value`, `occurrence` or `predicate` ([An occurrence on the wire](#an-occurrence-on-the-wire)) |
+| `children` | `{ id, kind }` — the child's id in this same table, and what it is to the node: `value`, `predicate`, or an occurrence's kind ([An occurrence on the wire](#an-occurrence-on-the-wire)) |
 
 A node carries every span its attribution records, so a node several source positions fan into is
 reachable from each of them. `fold` unions blame spans, which is what makes that plural. There is no
@@ -311,7 +311,7 @@ A child carries a `kind`:
 | `kind` | the child is |
 |---|---|
 | `value` | a value child |
-| `occurrence` | an occurrence the parent holds, of any of the five kinds |
+| `binder`, `use`, `label`, `head` or `annotation` | an occurrence the parent holds, of that kind: binding, applied, label, head or annotation |
 | `predicate` | a refinement predicate riding one of the parent's type slots |
 
 Children ship value children first, then occurrences in `walk_occurrences` order, then predicates
@@ -343,18 +343,19 @@ annotation that holds it.
 
 The type is what makes an occurrence worth drawing. A tree pane draws an occurrence as a row under
 the node that holds it, so a click on a name in the source selects that row, and the row shows the
-binder's type in that pane. The row's edge label is the leading word of the entry's `label`,
-lowercased: `binder`, `use`, `label`, `head` or `annotation` (`childEdge` in `web/src/treeView.ts`).
+binder's type in that pane. The row's edge label is the child's `kind` (`childEdge` in
+`web/src/treeView.ts`), so a change to an entry's `label` leaves the edge label as it is.
 The positional queries (`tightestNodeAt`, `typesAt`) include occurrences; a predicate stays excluded
 from them because the tree draws no row for one. `tightestNodeAt` takes a node over an occurrence of
 equal extent. An occurrence the source writes is recorded at the name, narrower than the node
 holding it, so it wins on extent; one the source does not write, such as `__arg_tuple_0`, is
 recorded at its holder's span and does not take a click on `def` from the lambda that holds it.
 
-Both wire validators check that `kind` is `value`, `occurrence` or `predicate`, that an occurrence
-entry has no children, and that one child edge names each occurrence. `kind` replaced a boolean
-`predicate` without a [schema version](#the-schema-version) bump, which the rule leaves at 1 while
-no durable consumer exists.
+Both wire validators check that `kind` is `value`, `predicate`, or one of the five occurrence
+kinds, that an occurrence entry has no children, and that one child edge names each occurrence.
+`kind` replaced a boolean `predicate`, and the five occurrence kinds replaced a single `occurrence`,
+without a [schema version](#the-schema-version) bump, which the rule leaves at 1 while no durable
+consumer exists.
 
 ### Types on the wire
 

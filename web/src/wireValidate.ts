@@ -31,7 +31,7 @@ import type {
   Snapshot,
   Span,
 } from "./types";
-import { CHILD_KINDS, walkStarts } from "./types";
+import { CHILD_KINDS, isOccurrence, walkStarts } from "./types";
 
 class WireError extends Error {
   constructor(path: string, expected: string, got: unknown) {
@@ -417,7 +417,7 @@ function validatePane(v: unknown, path: string): PaneEntry {
   const occurrenceEdges = new Map<number, number>();
   for (const n of nodes) {
     for (const c of n.children) {
-      if (c.kind === "occurrence") occurrenceEdges.set(c.id, (occurrenceEdges.get(c.id) ?? 0) + 1);
+      if (isOccurrence(c.kind)) occurrenceEdges.set(c.id, (occurrenceEdges.get(c.id) ?? 0) + 1);
     }
   }
   nodes.forEach((n, i) => {

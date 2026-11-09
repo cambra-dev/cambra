@@ -1043,7 +1043,10 @@ fn merge_writing_case(bound: Option<TypedBinding>, case: Expr, rest: Expr) -> Ex
         let fresh = Name::fresh_like(&a.name);
         rename_uses(&mut rest, &a.name, &fresh);
         let read = proj_of(&merge.name, &tuple_ty, offset + j, &a.ty);
-        reads.push((binding(fresh, a.ty.clone()), read));
+        // The variable's value after the `Case` is a copy of its first write's binder.
+        let mut after = binding(fresh, a.ty.clone());
+        after.occurrence = Occurrence::copied_from(a.occurrence);
+        reads.push((after, read));
     }
     let mut out = rewrite(rest);
     for (b, read) in reads.into_iter().rev() {
@@ -2922,11 +2925,15 @@ fn keeps(value: &Expr) -> bool {
 /// merge, to a fresh binder in `kept`, and return the read of it the environment holds:
 /// inlined, each value that reads `name` twice doubles what follows it. A value [`keeps`]
 /// declines is returned as it is.
-fn bind_value(kept: &mut Vec<Kept>, name: &Name, value: Expr) -> Expr {
+///
+/// The binder is at `occurrence`: the declaration's or the write's, which the walk consumes,
+/// or for a merge a copy of the last of those.
+fn bind_value(kept: &mut Vec<Kept>, name: &Name, occurrence: Occurrence, value: Expr) -> Expr {
     if !keeps(&value) {
         return value;
     }
-    let b = binding(Name::fresh_like(name), value.ty.clone());
+    let mut b = binding(Name::fresh_like(name), value.ty.clone());
+    b.occurrence = occurrence;
     let read = tvar(&b.name, b.ty.clone());
     kept.push(Kept::Let(None, b, value));
     read
@@ -2988,6 +2995,9 @@ pub(crate) struct WriterWalk<'a> {
     /// The feeds the block declares ([`walk_channel`](Self::walk_channel)). A feed into one
     /// stays in its binding, so it does not commit.
     channels: HashSet<Name>,
+    /// The occurrence that last named each mutable variable the walk binds a value of: its
+    /// declaration or a write. The binder of a merged value copies it ([`bind_value`]).
+    named_at: HashMap<Name, NodeId>,
 }
 
 impl<'a> WriterWalk<'a> {
@@ -3005,6 +3015,7 @@ impl<'a> WriterWalk<'a> {
             allowed_writes,
             writes,
             channels: HashSet::new(),
+            named_at: HashMap::new(),
         }
     }
 
@@ -3072,7 +3083,8 @@ impl<'a> WriterWalk<'a> {
                 body,
             } => {
                 let seed = Subst::discharge_env_in_place(*init, &self.env);
-                let seed = bind_value(kept, &b.name, seed);
+                self.named_at.insert(b.name.clone(), b.occurrence.id());
+                let seed = bind_value(kept, &b.name, b.occurrence, seed);
                 self.env.insert(b.name, seed);
                 self.walk_chain(*body, kept)
             }
@@ -3110,7 +3122,12 @@ impl<'a> WriterWalk<'a> {
                         self.walk_case(branches, kept, None);
                         self.walk_chain(*body, kept)
                     }
-                    TypedExprNode::MutWrite { name, value, .. } => {
+                    TypedExprNode::MutWrite {
+                        name_occurrence,
+                        name,
+                        value,
+                        ..
+                    } => {
                         // A block's writes target the variables its caller recorded, the
                         // only ones its write set holds: a write to any other name would
                         // be dropped from the decision.
@@ -3121,7 +3138,8 @@ impl<'a> WriterWalk<'a> {
                              does not hold, would be dropped from the decision"
                         );
                         let value = Subst::discharge_env_in_place(*value, &self.env);
-                        let value = bind_value(kept, &name, value);
+                        self.named_at.insert(name.clone(), name_occurrence.id());
+                        let value = bind_value(kept, &name, name_occurrence, value);
                         self.env.insert(name, value);
                         self.commit_paths.push(bool_lit(true));
                         self.walk_chain(*body, kept)
@@ -3518,7 +3536,11 @@ impl<'a> WriterWalk<'a> {
                 branches,
             });
             merged.ty = value_before.ty.clone();
-            let merged = bind_value(kept, name, merged);
+            let occurrence = self
+                .named_at
+                .get(name)
+                .map_or_else(Occurrence::mint, |&id| Occurrence::copied_from(id));
+            let merged = bind_value(kept, name, occurrence, merged);
             self.env.insert(name.clone(), merged);
         }
         let ty = value_ty?;

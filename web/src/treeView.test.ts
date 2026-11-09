@@ -8,7 +8,7 @@ import { describe, expect, it } from "vitest";
 
 import { resolvedTypeTooltip, serializeTree } from "./treeView";
 import { allNodes, fixture, irPaneById } from "./__fixtures__/helpers";
-import type { IrChild, IrNode } from "./types";
+import type { IrChild, IrNode, OccurrenceKind } from "./types";
 
 import listMinJson from "./__fixtures__/list_min.snapshot.json";
 
@@ -101,11 +101,11 @@ describe("serializeTree", () => {
     expect(serializeTree(5, nodes)).toBe("Lit(Int(1)) : Int@1 #5");
   });
 
-  it("labels an occurrence by what it locates, after the value children", () => {
+  it("labels an occurrence by its kind, after the value children", () => {
     // `λ p → p`: the binder is a row under the lambda, edge-labelled `binder`
     // rather than by position, and the value child keeps its positional index.
     const nodes = table(
-      node("Lambda", "(Int ⇒ Int)", 1, [value(2), { id: 3, kind: "occurrence" }]),
+      node("Lambda", "(Int ⇒ Int)", 1, [value(2), { id: 3, kind: "binder" }]),
       node("Var(p)", "Int", 2),
       node("Binder(p)", "Int", 3),
     );
@@ -114,15 +114,23 @@ describe("serializeTree", () => {
     );
   });
 
-  it("names each kind of occurrence by its entry's label", () => {
-    const occurrence = (id: number): IrChild => ({ id, kind: "occurrence" });
+  it("names each kind of occurrence by its edge's kind, not its entry's label", () => {
+    // No entry label here leads with its kind's word, so the rows show that the
+    // edge label comes from the kind alone.
+    const occurrence = (id: number, kind: OccurrenceKind): IrChild => ({ id, kind });
     const nodes = table(
-      node("Feed", "Unit", 1, [occurrence(2), occurrence(3), occurrence(4), occurrence(5), occurrence(6)]),
-      node("Use(out)", "Feed(Int)", 2),
-      node("Label(x)", "Int", 3),
-      node("Head(rect)", "{w: Int, h: Int}", 4),
-      node("Annotation", "String", 5),
-      node("Binder(p)", "Int", 6),
+      node("Feed", "Unit", 1, [
+        occurrence(2, "use"),
+        occurrence(3, "label"),
+        occurrence(4, "head"),
+        occurrence(5, "annotation"),
+        occurrence(6, "binder"),
+      ]),
+      node("Name(out)", "Feed(Int)", 2),
+      node("Tag(x)", "Int", 3),
+      node("Pattern(rect)", "{w: Int, h: Int}", 4),
+      node("Ann", "String", 5),
+      node("Bound(p)", "Int", 6),
     );
     expect(serializeTree(1, nodes).split("\n").map((l) => l.trim().split(":")[0])).toEqual([
       "Feed ",

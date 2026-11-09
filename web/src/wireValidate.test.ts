@@ -395,8 +395,8 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     const leaf = { ...nodes[0], nodeId: 1000, label: "Binder(x)", children: [] };
     nodes.push(leaf);
     nodes[0].children = [
-      { id: 1000, kind: "occurrence" },
-      { id: 1000, kind: "occurrence" },
+      { id: 1000, kind: "binder" },
+      { id: 1000, kind: "binder" },
     ];
     expect(() => validateSnapshot(bad)).toThrow(/an occurrence named by one child edge/);
   });
@@ -406,13 +406,14 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     const nodes = paneNodes(bad);
     const leaf = { ...nodes[0], nodeId: 1000, label: "Binder(x)", children: [{ id: 0, kind: "value" }] };
     nodes.push(leaf);
-    nodes[0].children = [{ id: 1000, kind: "occurrence" }];
+    nodes[0].children = [{ id: 1000, kind: "binder" }];
     expect(() => validateSnapshot(bad)).toThrow(/no children on an occurrence/);
   });
 
-  it("throws on a child kind outside value, occurrence and predicate", () => {
+  it("throws on a child kind outside value, the occurrence kinds and predicate", () => {
     const bad = minimalSuccess();
-    paneNodes(bad)[0].children = [{ id: 0, kind: "binder" }];
+    // The kinds are the occurrences' own, so the category's name is not one.
+    paneNodes(bad)[0].children = [{ id: 0, kind: "occurrence" }];
     expect(() => validateSnapshot(bad)).toThrow(/children\[0\]\.kind/);
   });
 

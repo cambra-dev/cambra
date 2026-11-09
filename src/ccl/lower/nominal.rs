@@ -2179,8 +2179,9 @@ fn check_binders(decl: &NominalDecl, pattern: &ConstructorPattern) -> Result<(),
     }
 }
 
-/// The [`Pattern`] a checked constructor pattern lowers to, and the parameters to bind
-/// from its payload by position.
+/// The [`Pattern`] a checked constructor pattern lowers to, where the pattern writes the
+/// payload's name (`None` when the name is minted), and the parameters to bind from its
+/// payload by position.
 ///
 /// The pattern binds the constructor's payload ([`NominalCtor::payload`]). For one
 /// parameter that is the parameter, so the pattern binds it under the parameter's own
@@ -2191,7 +2192,7 @@ pub(super) fn constructor_arm_pattern(
     decl: &Rc<NominalDecl>,
     pattern: &ConstructorPattern,
     ctx: &mut LoweringContext,
-) -> (Pattern, Vec<ParameterBind>) {
+) -> (Pattern, Option<Span>, Vec<ParameterBind>) {
     let binders = pattern.binders.as_deref().unwrap_or(&[]);
     let (payload, payload_span, binds) = match binders {
         [] => (ctx.fresh_ignored_payload(), None, Vec::new()),
@@ -2227,7 +2228,7 @@ pub(super) fn constructor_arm_pattern(
         binding: TypedBinding::new_unannotated(payload, occurrence),
         empty_payload: binders.is_empty(),
     };
-    (pattern, binds)
+    (pattern, payload_span, binds)
 }
 
 /// A named parameter of a constructor pattern of several: its name, where the pattern
@@ -2352,11 +2353,7 @@ pub(super) fn check_constructor_assignment(
             ),
         ));
     }
-    let payload_span = match pattern.binders.as_deref() {
-        Some([only]) if only.node.is_some() => Some(only.span),
-        _ => None,
-    };
-    let (pattern, binds) = constructor_arm_pattern(&decl, pattern, ctx);
+    let (pattern, payload_span, binds) = constructor_arm_pattern(&decl, pattern, ctx);
     Ok(ConstructorAssignment {
         pattern,
         payload_span,

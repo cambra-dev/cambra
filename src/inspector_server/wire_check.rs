@@ -702,15 +702,17 @@ fn assert_ir_node(
         let kind = c["kind"]
             .as_str()
             .unwrap_or_else(|| panic!("{at}.children[{i}].kind is a string"));
+        let is_occurrence = matches!(kind, "binder" | "use" | "label" | "head" | "annotation");
         assert!(
-            matches!(kind, "value" | "occurrence" | "predicate"),
-            "{at}.children[{i}].kind is `value`, `occurrence` or `predicate`; got {kind}"
+            is_occurrence || matches!(kind, "value" | "predicate"),
+            "{at}.children[{i}].kind is `value`, `predicate`, or an occurrence's kind \
+             (`binder`, `use`, `label`, `head` or `annotation`); got {kind}"
         );
         let is_predicate = kind == "predicate";
         let id = c["id"]
             .as_u64()
             .unwrap_or_else(|| panic!("{at}.children[{i}].id is a number"));
-        if kind == "occurrence" {
+        if is_occurrence {
             *occurrence_edges.entry(id).or_default() += 1;
         }
         assert!(

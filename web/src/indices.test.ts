@@ -431,7 +431,7 @@ describe("an occurrence at a position", () => {
   const occurrenceNodes: IrNode[] = [
     node(20, "Let(g)", { file: 0, start: 0, end: 6 }, "Int", [
       value(21),
-      { id: 22, kind: "occurrence" },
+      { id: 22, kind: "binder" },
     ]),
     node(21, "Lit(Int(10))", { file: 0, start: 4, end: 6 }, "Int@10"),
     node(22, "Binder(g)", { file: 0, start: 0, end: 1 }, "Int@10"),
@@ -455,7 +455,7 @@ describe("an occurrence on its holder's span", () => {
   const heldNodes: IrNode[] = [
     node(30, "Lambda(__arg_tuple_0)", { file: 0, start: 7, end: 32 }, "((Int, Int) ⇒ Int)", [
       value(31),
-      { id: 32, kind: "occurrence" },
+      { id: 32, kind: "binder" },
     ]),
     node(31, "Var(g)", { file: 0, start: 30, end: 31 }, "Int"),
     node(32, "Binder(__arg_tuple_0)", { file: 0, start: 7, end: 32 }, "(Int, Int)"),

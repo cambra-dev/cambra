@@ -7,7 +7,7 @@
 // the tables and answers no positional query (`src/inspector_model/design.md`,
 // "The usage model"), so this is the only implementation of that policy.
 
-import type { Definition, IrNode } from "./types";
+import { isOccurrence, type Definition, type IrNode } from "./types";
 
 export interface Indices {
   /** Every node keyed by its id — the pane's node table, read directly. */
@@ -103,7 +103,7 @@ export function buildIndices(
     // Reversed, so the LIFO stack pops children in wire order.
     for (let i = node.children.length - 1; i >= 0; i--) {
       const child = node.children[i];
-      if (child.kind === "occurrence") occurrenceIds.add(child.id);
+      if (isOccurrence(child.kind)) occurrenceIds.add(child.id);
       stack.push({
         id: child.id,
         depth: depth + 1,

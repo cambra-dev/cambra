@@ -27,9 +27,11 @@ export interface IrChild {
   // What the child is to its parent.
   //
   // - `value`: a value child, at its positional index.
-  // - `occurrence`: a name the parent holds in a field rather than as a node — a
-  //   binder's name, a use a `Feed` names, a record label, a `match` arm's head,
-  //   or a binder's annotation. A leaf, drawn as a row under its holder.
+  // - an `OccurrenceKind`: a name the parent holds in a field rather than as a
+  //   node — `binder` for a binder's name, `use` for a use a `Feed` names,
+  //   `label` for a record label or a variant constructor's tag, `head` for a
+  //   `match` arm's head, `annotation` for a binder's annotation. A leaf, drawn
+  //   as a row under its holder with the kind as its edge label.
   // - `predicate`: a type-interior subtree, a refinement predicate riding one of
   //   the parent's type slots. Predicates are on the wire because the compiler's
   //   pane fold explains their node ids, so a link can point at one; they are
@@ -39,9 +41,24 @@ export interface IrChild {
   kind: ChildKind;
 }
 
-export type ChildKind = "value" | "occurrence" | "predicate";
+export type OccurrenceKind = "binder" | "use" | "label" | "head" | "annotation";
 
-export const CHILD_KINDS: readonly ChildKind[] = ["value", "occurrence", "predicate"];
+export type ChildKind = "value" | OccurrenceKind | "predicate";
+
+export const OCCURRENCE_KINDS: readonly OccurrenceKind[] = [
+  "binder",
+  "use",
+  "label",
+  "head",
+  "annotation",
+];
+
+export const CHILD_KINDS: readonly ChildKind[] = ["value", ...OCCURRENCE_KINDS, "predicate"];
+
+/** Whether a child of this kind is an occurrence its parent holds. */
+export function isOccurrence(kind: ChildKind): kind is OccurrenceKind {
+  return (OCCURRENCE_KINDS as readonly ChildKind[]).includes(kind);
+}
 
 // A node's rewrite tag: how a phase produced this node. `null` on an `IrNode`
 // means the node is a lowering root, or that the pane's projection does not

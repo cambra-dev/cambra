@@ -1268,14 +1268,17 @@ pub(super) fn lower_middle_stmt(
                 }
                 None => None,
             };
-            let annotation_span = annotation.as_ref().map(|a| a.ty.span);
             // The annotation is the whole annotation of the parameter's `let`, so it may be
             // polymorphic (`docs/chl-spec.md`, "Polymorphic type annotations").
             let annotation = match (annotation, default) {
                 (Some(annotation), Some(default)) => {
-                    Some(lower_let_annotation(&name.node, annotation, default, ctx)?)
+                    let ty = lower_let_annotation(&name.node, annotation, default, ctx)?;
+                    Some(Annotation::new(ty, ctx.occurrence_at(annotation.ty.span)))
                 }
-                (Some(annotation), None) => Some(lower_type_expr_or_poly(&annotation.ty, ctx)?),
+                (Some(annotation), None) => {
+                    let ty = lower_type_expr_or_poly(&annotation.ty, ctx)?;
+                    Some(Annotation::new(ty, ctx.occurrence_at(annotation.ty.span)))
+                }
                 (None, _) => None,
             };
             ctx.parameters.push(modules::Parameter {
@@ -1283,23 +1286,20 @@ pub(super) fn lower_middle_stmt(
                 declared: stmt.span,
                 default: default.is_some(),
                 kind: modules::ParameterKind::Value {
-                    ty: annotation.clone(),
+                    ty: annotation.as_ref().map(|a| a.ty.clone()),
                     constant,
                 },
             });
             let occurrence = ctx.occurrence_at(name.span);
-            let bound = match (annotation, annotation_span) {
-                (Some(ty), Some(span)) => {
-                    let annotation = Annotation::new(ty, ctx.occurrence_at(span));
-                    Expr::let_bind_annotated(
-                        name.node.as_str(),
-                        occurrence,
-                        value,
-                        body,
-                        annotation,
-                    )
-                }
-                _ => Expr::let_bind(name.node.as_str(), occurrence, value, body),
+            let bound = match annotation {
+                Some(annotation) => Expr::let_bind_annotated(
+                    name.node.as_str(),
+                    occurrence,
+                    value,
+                    body,
+                    annotation,
+                ),
+                None => Expr::let_bind(name.node.as_str(), occurrence, value, body),
             };
             Ok(ctx.tag_image(bound, stmt.span))
         }
@@ -4829,7 +4829,7 @@ pub(super) fn lower_match_over(
     let mut branches = Vec::with_capacity(arms.len());
     for arm in arms {
         if let (Some(ArmPattern::Constructor(pattern)), Some(decl)) = (&arm.pattern, &nominal) {
-            let (pattern, binds) = nominal::constructor_arm_pattern(decl, pattern, ctx);
+            let (pattern, _, binds) = nominal::constructor_arm_pattern(decl, pattern, ctx);
             // Every name the arm binds shadows an outer one in its body, as a tag arm's
             // binder does: the payload's, which is the parameter's own name for a
             // constructor of one parameter, and each projected parameter's.
