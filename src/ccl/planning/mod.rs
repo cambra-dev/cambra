@@ -30,7 +30,7 @@ use crate::ccl::{
     BaseType, BinOpKind, Builtin, CompareKind, Expr, Lit, LogicKind, Name, ProjKey, Type,
     TypedExprNode,
     ccl_utils::apply_primitive,
-    infer::{solver::traits::InstanceTable, typecheck_in},
+    infer::{CheckMode, InferError, solver::traits::InstanceTable, typecheck_in},
     lambda_elim::{self, compose, id},
     provenance,
     simplify::simplify,
@@ -56,25 +56,49 @@ use std::rc::Rc;
 pub(crate) struct PlanningCtx {
     /// What realization decided about each witness.
     pub(super) witnesses: Witnesses,
-    /// The program's instances, which the checks of the terms planning builds read: a
-    /// rewrite's term can state an obligation an instance the program declares answers, as
-    /// `converse` states `Equatable` of its keys.
-    pub(super) instances: Rc<InstanceTable>,
+    /// The check of each term planning builds.
+    pub(super) checker: FragmentChecker,
 }
 
 /// The context of a program that declares no instance, before realization.
 impl Default for PlanningCtx {
     fn default() -> PlanningCtx {
-        PlanningCtx::of(InstanceTable::builtin())
+        PlanningCtx::of(FragmentChecker::default())
     }
 }
 
 impl PlanningCtx {
-    fn of(instances: Rc<InstanceTable>) -> PlanningCtx {
+    fn of(checker: FragmentChecker) -> PlanningCtx {
         PlanningCtx {
             witnesses: Witnesses::default(),
-            instances,
+            checker,
         }
+    }
+}
+
+/// The check planning runs on each term it builds: [`typecheck_in`] against the program's
+/// instances, in the mode of the check planning's input answers to.
+#[derive(Clone)]
+pub(super) struct FragmentChecker {
+    /// The program's instances: a rewrite's term can state an obligation an instance the
+    /// program declares answers, as `converse` states `Equatable` of its keys.
+    instances: Rc<InstanceTable>,
+    mode: CheckMode,
+}
+
+/// The check of a program that declares no instance, with every refinement kept.
+impl Default for FragmentChecker {
+    fn default() -> FragmentChecker {
+        FragmentChecker {
+            instances: InstanceTable::builtin(),
+            mode: CheckMode::Full,
+        }
+    }
+}
+
+impl FragmentChecker {
+    pub(super) fn check(&self, fragment: &Expr) -> Result<(), Vec<InferError>> {
+        typecheck_in(fragment, &self.instances, self.mode)
     }
 }
 
@@ -130,7 +154,9 @@ pub(crate) use predicates::fn_of_bare_predicate;
 /// the tree or in a lifted term (`correlated::pair_correlated_sites`), a lifted term applying
 /// a union at its element ([`refuse_a_union_applied_at_the_input`]), or a per-group narrowing
 /// no filter materializes ([`per_group_filter::reject_unmaterialized_narrowings`]).
-pub fn run(expr: Expr, instances: &Rc<InstanceTable>) -> Result<Expr, String> {
+///
+/// Every term planning builds is checked in `mode`, the mode of the check `expr` answers to.
+pub fn run(expr: Expr, instances: &Rc<InstanceTable>, mode: CheckMode) -> Result<Expr, String> {
     // Live cross-endpoint reads are recognized earlier, in
     // `transact_phase::rewrite_as_of_reads` (pre-lambda-elim), so by here every
     // such read is already an `as_of` join — nothing to do at planning time.
@@ -141,7 +167,10 @@ pub fn run(expr: Expr, instances: &Rc<InstanceTable>) -> Result<Expr, String> {
             expr,
             Root::Program,
             &PlanningPhase::ALL,
-            &mut PlanningCtx::of(Rc::clone(instances)),
+            &mut PlanningCtx::of(FragmentChecker {
+                instances: Rc::clone(instances),
+                mode,
+            }),
         )
     })?;
     // Projection pruning runs on the planned program, after the final `simplify`

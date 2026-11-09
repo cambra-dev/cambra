@@ -12,6 +12,7 @@ use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates, walk_refined_predicates_mut};
+use crate::ccl::infer::CheckMode;
 use crate::ccl::infer::solver::compact::JoinedPosition;
 use crate::ccl::infer::solver::display::InferredPoly;
 use crate::ccl::infer::solver::traits::InstanceTable;
@@ -2732,17 +2733,21 @@ fn collect_type_errors(
 /// precondition self-enforcing rather than an implicit caller obligation.
 /// Returns `Ok(())` if no errors are found, or all discovered errors as
 /// `Err(errs)`.
+///
+/// Checks in [`CheckMode::Full`], for a tree before refinement erasure; [`typecheck_in`] takes
+/// the mode.
 pub fn typecheck(expr: &Expr) -> Result<(), Vec<InferError>> {
-    typecheck_in(expr, &InstanceTable::builtin())
+    typecheck_in(expr, &InstanceTable::builtin(), CheckMode::Full)
 }
 
-/// [`typecheck`] of a program declaring `instances`.
+/// [`typecheck`] of a program declaring `instances`, in `mode`.
 pub(crate) fn typecheck_in(
     expr: &Expr,
     instances: &Rc<InstanceTable>,
+    mode: CheckMode,
 ) -> Result<(), Vec<InferError>> {
     check_fully_typed(expr)?;
-    crate::ccl::infer::check::check_located(expr, instances).map_err(unlocated)
+    crate::ccl::infer::check::check_located(expr, instances, mode).map_err(unlocated)
 }
 
 /// [`typecheck`] for planning's output, at [`Strictness::Planned`], where a refinement predicate
@@ -2754,39 +2759,48 @@ pub(crate) fn typecheck_planned(
     expr: &Expr,
     sources: &HashMap<String, Type>,
     instances: &Rc<InstanceTable>,
+    mode: CheckMode,
 ) -> Result<(), Vec<InferError>> {
     check_annotated(expr, Strictness::Planned).map_err(unlocated)?;
-    crate::ccl::infer::check::check_located_against(expr, Some(sources), instances)
+    crate::ccl::infer::check::check_located_against(expr, Some(sources), instances, mode)
         .map_err(unlocated)
 }
 
 /// [`typecheck`] against the types of the registered data sources ([`typecheck_planned`]
-/// without its planning-only strictness).
+/// without its planning-only strictness), in [`CheckMode::Full`].
 pub fn typecheck_against(
     expr: &Expr,
     sources: &HashMap<String, Type>,
 ) -> Result<(), Vec<InferError>> {
     check_fully_typed(expr)?;
-    crate::ccl::infer::check::check_located_against(expr, Some(sources), &InstanceTable::builtin())
-        .map_err(unlocated)
+    crate::ccl::infer::check::check_located_against(
+        expr,
+        Some(sources),
+        &InstanceTable::builtin(),
+        CheckMode::Full,
+    )
+    .map_err(unlocated)
 }
 
 /// [`typecheck`] for the window between inference and `channelize`:
 /// the same hole-freeness and semantic checks, but transient histories
 /// (`Feed` channels with a `ChanDom` domain, `Overwrite`s with an `Infer` domain)
 /// are permitted — the unified phase and `channelize` erase them (see
-/// [`Strictness::PreChannelize`]).
+/// [`Strictness::PreChannelize`]). Checks in [`CheckMode::Full`].
 pub fn check_pre_channelize(expr: &Expr) -> Result<(), Vec<InferError>> {
-    check_pre_channelize_located(expr, &InstanceTable::builtin()).map_err(unlocated)
+    check_pre_channelize_located(expr, &InstanceTable::builtin(), CheckMode::Full)
+        .map_err(unlocated)
 }
 
-/// [`check_pre_channelize`], keeping the node each error was raised at.
+/// [`check_pre_channelize`] of a program declaring `instances`, in `mode`, keeping the node
+/// each error was raised at.
 ///
 /// The pipeline's post-inference check reports a residual `Type::Infer` as an
 /// ambiguous program, a user error, so it needs the node to point at.
 pub(crate) fn check_pre_channelize_located(
     expr: &Expr,
     instances: &Rc<InstanceTable>,
+    mode: CheckMode,
 ) -> Result<(), Vec<LocatedInferError>> {
     // The relaxation applies only when the tree carries transient histories
     // (feed/mutable machinery). A program with none should be fully resolved
@@ -2799,7 +2813,7 @@ pub(crate) fn check_pre_channelize_located(
         Strictness::Strict
     };
     check_annotated(expr, strictness)?;
-    crate::ccl::infer::check::check_located(expr, instances)
+    crate::ccl::infer::check::check_located(expr, instances, mode)
 }
 
 /// The errors of a located list, for a caller whose errors are compiler bugs:
@@ -5749,8 +5763,13 @@ mod tests {
             Expr::lit(Lit::Int(1)).with_ty(int_lit_ty(1)),
         );
         typecheck(&tree).expect("before planning, a predicate holding a `defer` is source form");
-        let errs = typecheck_planned(&tree, &HashMap::new(), &InstanceTable::builtin())
-            .expect_err("a feed handle in a predicate passed");
+        let errs = typecheck_planned(
+            &tree,
+            &HashMap::new(),
+            &InstanceTable::builtin(),
+            CheckMode::Full,
+        )
+        .expect_err("a feed handle in a predicate passed");
         assert!(
             errs.iter()
                 .any(|e| format!("{e:?}").contains("feed handle type survived channelize")),
@@ -5773,7 +5792,12 @@ mod tests {
         let bound = Expr::lit(Lit::Int(1)).with_ty(int_lit_ty(1));
         let tree = Expr::let_bind("y", Occurrence::mint(), bound, body)
             .with_ty(Type::Base(BaseType::String));
-        let errs = typecheck_planned(&tree, &HashMap::new(), &InstanceTable::builtin());
+        let errs = typecheck_planned(
+            &tree,
+            &HashMap::new(),
+            &InstanceTable::builtin(),
+            CheckMode::Full,
+        );
         assert!(
             errs.is_err(),
             "a `let` typed `String` over an `Int` body passed the check"
@@ -5800,8 +5824,14 @@ mod tests {
         let let_bound = |recorded: Type| {
             Expr::let_bind("y", Occurrence::mint(), bound.clone(), body.clone()).with_ty(recorded)
         };
-        let check =
-            |tree: &Expr| typecheck_planned(tree, &HashMap::new(), &InstanceTable::builtin());
+        let check = |tree: &Expr| {
+            typecheck_planned(
+                tree,
+                &HashMap::new(),
+                &InstanceTable::builtin(),
+                CheckMode::Full,
+            )
+        };
         let one = Expr::lit(Lit::Int(1)).with_ty(int_lit_ty(1));
         let two = Expr::lit(Lit::Int(2)).with_ty(int_lit_ty(2));
         check(&let_bound(equals(one))).expect("the closed body type is the recorded one");

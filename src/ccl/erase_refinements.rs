@@ -2,10 +2,10 @@
 //! refinement except those inside a data function's domain.
 //!
 //! A data function's domain refinement is the extent planning and op-conversion iterate, so the
-//! phase keeps it. No phase below reads any other refinement. Every check from this phase on is
-//! refinement-blind outside the domains of two data functions
-//! ([`crate::ccl::infer::RefinementBlind`]). See `src/ccl/design/optimization.md`, "Refinement
-//! Erasure (`ccl/erase_refinements.rs`)".
+//! phase keeps it. No phase below reads any other refinement. Every check from this phase on runs
+//! in [`crate::ccl::infer::CheckMode::RefinementBlind`], which compares refinements only between
+//! the domains of two data functions. See `src/ccl/design/optimization.md`, "Refinement Erasure
+//! (`ccl/erase_refinements.rs`)".
 
 use crate::ccl::{Expr, Type, TypedExprNode};
 

@@ -697,7 +697,7 @@ fn build_join_plan(
 fn plan_loop_join(
     arm_types: &[Type],
     refinement: &Expr,
-    instances: &Rc<InstanceTable>,
+    checker: &FragmentChecker,
 ) -> Option<(JoinPlan, Vec<usize>)> {
     let n = arm_types.len();
     if n < 2 {
@@ -733,9 +733,9 @@ fn plan_loop_join(
         let mut key_a = raw_a.clone();
         let mut key_b = raw_b.clone();
         replace_tuple_project_with_id(&mut key_a, &arm_types[arm_a]);
-        typecheck_in(&key_a, instances).ok()?;
+        checker.check(&key_a).ok()?;
         replace_tuple_project_with_id(&mut key_b, &arm_types[arm_b]);
-        typecheck_in(&key_b, instances).ok()?;
+        checker.check(&key_b).ok()?;
 
         trace!(
             "plan_loop_join: condition arm{arm_a}={} : {}  arm{arm_b}={} : {}",
@@ -798,7 +798,7 @@ fn flatten_tuple_types(indices_to_flatten: &[i64], a: &Type, b: &Type) -> Type {
 fn join_plan_to_expr(
     plan: &JoinPlan,
     types: &[Type],
-    instances: &Rc<InstanceTable>,
+    checker: &FragmentChecker,
     lifted: &mut Vec<NodeId>,
 ) -> Result<Expr, String> {
     match plan {
@@ -814,7 +814,7 @@ fn join_plan_to_expr(
         // and op-conversion recognises it as a filter-free iteration.
         JoinPlan::Loop { arms, predicate } => {
             let base_iteration = if arms.len() == 1 {
-                match convert_refinement_to_join(&types[arms[0]], instances, lifted)? {
+                match convert_refinement_to_join(&types[arms[0]], checker, lifted)? {
                     Some(transformed) => {
                         trace!(
                             "Converted iteration to {} : {}",
@@ -880,7 +880,7 @@ fn join_plan_to_expr(
             // Build side: group by the build key using converse.
             // Use the full build output tuple type so that converse groups entire
             // build tuples (not just the key arm), preserving all arms through the join.
-            let build_input = join_plan_to_expr(build, types, instances, lifted)?;
+            let build_input = join_plan_to_expr(build, types, checker, lifted)?;
             let build_output_ty = build_input.ty.codomain().unwrap().clone();
             let build_key = if let Some(build_key_idx) = build_key_idx {
                 typed_compose(vec![
@@ -902,7 +902,7 @@ fn join_plan_to_expr(
                 Type::data_fun(build_output_ty.clone(), build_output_ty.clone()),
             );
             let build_side = apply_primitive(build_key, Builtin::Converse, converse_ty);
-            typecheck_in(&build_side, instances).expect("Bad build expr");
+            checker.check(&build_side).expect("Bad build expr");
 
             trace!(
                 "join_plan_to_expr: build_side={} : {}",
@@ -912,7 +912,7 @@ fn join_plan_to_expr(
 
             // Probe side: compose the probe key with the build side lookup.
             // Use the full probe output tuple type for the same reason.
-            let probe_input = join_plan_to_expr(probe, types, instances, lifted)?;
+            let probe_input = join_plan_to_expr(probe, types, checker, lifted)?;
             let probe_output_ty = probe_input.ty.codomain().unwrap().clone();
             let probe_key = if let Some(probe_key_idx) = probe_key_idx {
                 typed_compose(vec![
@@ -928,7 +928,7 @@ fn join_plan_to_expr(
             };
 
             let probe_expr = typed_compose(vec![probe_key, build_side]);
-            typecheck_in(&probe_expr, instances).expect("Bad probe expr");
+            checker.check(&probe_expr).expect("Bad probe expr");
 
             trace!(
                 "join_plan_to_expr: probe={} : {}",
@@ -1028,7 +1028,7 @@ fn join_plan_to_expr(
                 map_domain
             };
 
-            typecheck_in(&result, instances).expect("Bad hash join expr");
+            checker.check(&result).expect("Bad hash join expr");
             Ok(result)
         }
     }
@@ -1086,7 +1086,7 @@ fn plan_lifted_terms(
 fn convert_loop_join(
     base_ty: &Type,
     refinement: &Expr,
-    instances: &Rc<InstanceTable>,
+    checker: &FragmentChecker,
     lifted: &mut Vec<NodeId>,
 ) -> Result<Option<Expr>, String> {
     trace!(
@@ -1101,11 +1101,11 @@ fn convert_loop_join(
         trace!("convert_loop_join: base_ty is not a tuple");
         return Ok(None);
     };
-    let Some((plan, arm_order)) = plan_loop_join(arm_types, refinement, instances) else {
+    let Some((plan, arm_order)) = plan_loop_join(arm_types, refinement, checker) else {
         return Ok(None);
     };
     trace!("convert_loop_join: planning succeeded. Plan:\n{plan:#?}");
-    let expr = join_plan_to_expr(&plan, arm_types, instances, lifted)?;
+    let expr = join_plan_to_expr(&plan, arm_types, checker, lifted)?;
 
     // The morphism produces the join-satisfying extent; surface that on its
     // codomain so downstream consumers (e.g. a `cast({base | r} ⇒ …)` reading
@@ -1173,7 +1173,7 @@ fn convert_loop_join(
         Type::data_fun(canonical_ty.clone(), canonical_ty.clone()),
     );
     let result = refine_extent(result, refinement);
-    typecheck_in(&result, instances).expect("Bad permute_domain expr");
+    checker.check(&result).expect("Bad permute_domain expr");
     Ok(Some(result))
 }
 
@@ -1189,7 +1189,7 @@ fn convert_loop_join(
 /// that cannot be planned ([`extent_iteration`]).
 fn convert_refinement_to_join(
     domain_ty: &Type,
-    instances: &Rc<InstanceTable>,
+    checker: &FragmentChecker,
     lifted: &mut Vec<NodeId>,
 ) -> Result<Option<Expr>, String> {
     let Type::Refinement(base, refinements) = domain_ty else {
@@ -1208,7 +1208,7 @@ fn convert_refinement_to_join(
         );
         // `convert_loop_join` only reads the predicate (it builds a new expr),
         // so borrow the immutable term rather than clone it.
-        if let Some(joined) = convert_loop_join(&rest, &r.predicate, instances, lifted)? {
+        if let Some(joined) = convert_loop_join(&rest, &r.predicate, checker, lifted)? {
             return Ok(Some(joined));
         }
     }
@@ -1291,7 +1291,7 @@ pub(super) fn try_hash_join_rewrite(
         provenance::Nature::Machinery,
     );
     let mut lifted = Vec::new();
-    let Some(mut transformed) = convert_refinement_to_join(domain_ty, &ctx.instances, &mut lifted)?
+    let Some(mut transformed) = convert_refinement_to_join(domain_ty, &ctx.checker, &mut lifted)?
     else {
         trace!("Hash-join pattern did not match");
         return Ok(false);
@@ -1346,10 +1346,10 @@ mod tests {
     fn planned_loop_join(
         base_ty: &Type,
         refinement: &Expr,
-        instances: &Rc<InstanceTable>,
+        checker: &FragmentChecker,
         lifted: &mut Vec<NodeId>,
     ) -> Option<Expr> {
-        convert_loop_join(base_ty, refinement, instances, lifted)
+        convert_loop_join(base_ty, refinement, checker, lifted)
             .expect("these joins' arms enumerate their own keys")
     }
 
@@ -1370,7 +1370,7 @@ mod tests {
         let result = planned_loop_join(
             &int_ty_val,
             &refinement,
-            &InstanceTable::builtin(),
+            &FragmentChecker::default(),
             &mut Vec::new(),
         );
         assert_eq!(result, None);
@@ -1390,7 +1390,7 @@ mod tests {
         let result = planned_loop_join(
             &triple_tuple,
             &refinement,
-            &InstanceTable::builtin(),
+            &FragmentChecker::default(),
             &mut Vec::new(),
         );
         assert_eq!(result, None);
@@ -1406,7 +1406,7 @@ mod tests {
         let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
-            &InstanceTable::builtin(),
+            &FragmentChecker::default(),
             &mut Vec::new(),
         );
         assert_eq!(result, None);
@@ -1430,7 +1430,7 @@ mod tests {
         let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
-            &InstanceTable::builtin(),
+            &FragmentChecker::default(),
             &mut Vec::new(),
         );
         assert_eq!(result, None);
@@ -1453,7 +1453,7 @@ mod tests {
         let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
-            &InstanceTable::builtin(),
+            &FragmentChecker::default(),
             &mut Vec::new(),
         );
         assert_eq!(result, None);
@@ -1477,7 +1477,7 @@ mod tests {
         let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
-            &InstanceTable::builtin(),
+            &FragmentChecker::default(),
             &mut Vec::new(),
         );
         assert_eq!(result, None);
@@ -1510,7 +1510,7 @@ mod tests {
         let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
-            &InstanceTable::builtin(),
+            &FragmentChecker::default(),
             &mut Vec::new(),
         );
         assert_eq!(result, None);
@@ -1539,7 +1539,7 @@ mod tests {
         let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
-            &InstanceTable::builtin(),
+            &FragmentChecker::default(),
             &mut Vec::new(),
         );
         assert_eq!(result, None);
@@ -1569,7 +1569,7 @@ mod tests {
         let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
-            &InstanceTable::builtin(),
+            &FragmentChecker::default(),
             &mut Vec::new(),
         );
         assert_eq!(result, None);
@@ -1608,7 +1608,7 @@ mod tests {
         let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
-            &InstanceTable::builtin(),
+            &FragmentChecker::default(),
             &mut Vec::new(),
         );
         assert_eq!(result, None);
@@ -1655,7 +1655,7 @@ mod tests {
         let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
-            &InstanceTable::builtin(),
+            &FragmentChecker::default(),
             &mut Vec::new(),
         );
         assert!(
@@ -2027,7 +2027,12 @@ mod tests {
         });
 
         // Should succeed: eq condition drives the hash join, filter becomes a predicate.
-        let result = planned_loop_join(&t, &refinement, &InstanceTable::builtin(), &mut Vec::new());
+        let result = planned_loop_join(
+            &t,
+            &refinement,
+            &FragmentChecker::default(),
+            &mut Vec::new(),
+        );
         assert!(
             result.is_some(),
             "convert_loop_join should succeed when eq conditions + extra filter are present"
@@ -2057,7 +2062,7 @@ mod tests {
         .with_ty(fun_ty(t.clone(), bool_ty_val));
 
         assert_eq!(
-            planned_loop_join(&t, &filter, &InstanceTable::builtin(), &mut Vec::new()),
+            planned_loop_join(&t, &filter, &FragmentChecker::default(), &mut Vec::new()),
             None,
             "should return None when no equality conditions are present"
         );

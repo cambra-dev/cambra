@@ -193,13 +193,14 @@ reads a nested comprehension's guard off the component of the product domain tha
 arguments stay whole, since the declaration may place one at a domain, as `Groups(K, V) = (k: K)
 |=> V(k)` places `K`.
 
-Every type check from this phase through planning runs under `infer::RefinementBlind`, which
-selects `Derivation::RefinementBlind` for the constraint walk. That walk compares refinements only
-inside the domain edge of two data functions, and inside the kind premise between their Σ
+Every type check from this phase through planning runs in `infer::CheckMode::RefinementBlind`,
+which selects `Derivation::RefinementBlind` for the constraint walk. That walk compares refinements
+only inside the domain edge of two data functions, and inside the kind premise between their Σ
 binders. Everywhere else it relates a refined type by its base, and a `UInt` or a range by the
 `UInt` a range `0..𝑛` refines. A proven lookup's key, erased to `UInt`, meets its list's domain
-`0..𝑛` this way. The scope is thread-local rather than a parameter because planning type-checks
-the fragments it builds through `typecheck` at each rewrite.
+`0..𝑛` this way. Each check entry point takes the mode as a parameter, and the pipeline
+(`ccl/context.rs`) passes it at every boundary. `planning::run` takes it too, and its
+`FragmentChecker` checks every term a rewrite builds in it.
 
 ---
 

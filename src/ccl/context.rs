@@ -22,7 +22,7 @@ use crate::{
     ccl::{
         Expr, Home, Name, Type, TypedExprNode, anf, channelize, comprehension, erase_refinements,
         infer::{
-            Contract, InferError, LocatedInferError, TypeInferenceContext, check_module,
+            CheckMode, Contract, InferError, LocatedInferError, TypeInferenceContext, check_module,
             check_mut_discipline, check_mut_write_targets, check_pre_channelize_located, infer,
             solver::traits::InstanceTable, typecheck_in, typecheck_planned,
         },
@@ -1763,8 +1763,9 @@ fn pre_channelize_wall(
     boundary: &str,
     blame: &Blame<'_>,
     instances: &Rc<InstanceTable>,
+    mode: CheckMode,
 ) -> Result<(), Vec<CompileError>> {
-    check_pre_channelize_located(expr, instances).map_err(|errs| {
+    check_pre_channelize_located(expr, instances, mode).map_err(|errs| {
         if errs.iter().all(|e| {
             matches!(
                 e.error,
@@ -1820,6 +1821,7 @@ fn settle(
     ir: &Expr,
     boundary: &str,
     check: Check<'_>,
+    mode: CheckMode,
     instances: &Rc<InstanceTable>,
 ) -> Result<(), Vec<CompileError>> {
     assert_unique_node_ids(ir, boundary);
@@ -1831,12 +1833,12 @@ fn settle(
     debug!("{boundary} CCL (typed):\n{}", symbolic_typed(ir));
     let outcome = match check {
         Check::PreChannelizeReportingAmbiguity(blame) => {
-            return pre_channelize_wall(ir, boundary, blame, instances);
+            return pre_channelize_wall(ir, boundary, blame, instances, mode);
         }
-        Check::PreChannelize => check_pre_channelize_located(ir, instances)
+        Check::PreChannelize => check_pre_channelize_located(ir, instances, mode)
             .map_err(|errs| errs.into_iter().map(|e| e.error).collect()),
-        Check::Typed => typecheck_in(ir, instances),
-        Check::Planned(sources) => typecheck_planned(ir, sources, instances),
+        Check::Typed => typecheck_in(ir, instances, mode),
+        Check::Planned(sources) => typecheck_planned(ir, sources, instances, mode),
     };
     outcome.unwrap_or_else(|errs| invalid_tree(ir, boundary, &errs));
     Ok(())
@@ -2578,6 +2580,7 @@ fn run_passes(
         &expr,
         "post-inference",
         Check::PreChannelizeReportingAmbiguity(&blame),
+        CheckMode::Full,
         &instances,
     )?;
 
@@ -2643,6 +2646,7 @@ fn run_passes(
         &expr,
         "post-inline",
         Check::PreChannelizeReportingAmbiguity(&blame),
+        CheckMode::Full,
         &instances,
     )?;
     if at_phase_output(Phase::Inline, &expr, stop, capture, panes) {
@@ -2689,7 +2693,13 @@ fn run_passes(
         transact_phase::run(expr, &txn_mut_vars)
     })
     .map_err(|error| blame.unsupported(error, None))?;
-    settle(&expr, "post-transact", Check::PreChannelize, &instances)?;
+    settle(
+        &expr,
+        "post-transact",
+        Check::PreChannelize,
+        CheckMode::Full,
+        &instances,
+    )?;
     if at_phase_output(Phase::Transact, &expr, stop, capture, panes) {
         return Ok(expr);
     }
@@ -2706,7 +2716,13 @@ fn run_passes(
     let audit_mutelim = ProvenanceAudit::start("mutelim", "post-transact..post-letrec", &expr);
     let phase_out = recorded(capture_provenance, Phase::Letrec, || mut_elim::run(expr));
     audit_mutelim.finish(&phase_out);
-    settle(&phase_out, "post-letrec", Check::PreChannelize, &instances)?;
+    settle(
+        &phase_out,
+        "post-letrec",
+        Check::PreChannelize,
+        CheckMode::Full,
+        &instances,
+    )?;
     audit_letrec.finish(&phase_out);
     if at_phase_output(Phase::Letrec, &phase_out, stop, capture, panes) {
         return Ok(phase_out);
@@ -2716,13 +2732,14 @@ fn run_passes(
     let phase_out = recorded(capture_provenance, Phase::EraseRefinements, || {
         erase_refinements::run(phase_out)
     });
-    // Every check from here on compares refinements only between two data function domains:
-    // the phase erased the rest, including the ones a node's typing rule derives.
-    let _refinement_blind = crate::ccl::infer::RefinementBlind::enter();
+    // Every check from here on, planning's checks of the terms it builds included, is
+    // `CheckMode::RefinementBlind`: the phase erased every refinement outside a data function
+    // domain, including the ones a node's typing rule derives.
     settle(
         &phase_out,
         "post-erase-refinements",
         Check::PreChannelize,
+        CheckMode::RefinementBlind,
         &instances,
     )?;
     if at_phase_output(Phase::EraseRefinements, &phase_out, stop, capture, panes) {
@@ -2752,7 +2769,13 @@ fn run_passes(
             related: blame.run_labels(node_id, span, None),
         }]
     })?;
-    settle(&channelized, "post-channelize", Check::Typed, &instances)?;
+    settle(
+        &channelized,
+        "post-channelize",
+        Check::Typed,
+        CheckMode::RefinementBlind,
+        &instances,
+    )?;
 
     // Retain the post-channelize tree for the inspector's downstream pane. On the
     // post-inference channelize order this snapshot is *downstream* of
@@ -2779,7 +2802,13 @@ fn run_passes(
             message,
         }]
     })?;
-    settle(&channelized, "post-as-of-read", Check::Typed, &instances)?;
+    settle(
+        &channelized,
+        "post-as-of-read",
+        Check::Typed,
+        CheckMode::RefinementBlind,
+        &instances,
+    )?;
     if at_phase_output(Phase::AsOfRead, &channelized, stop, capture, panes) {
         return Ok(channelized);
     }
@@ -2818,7 +2847,13 @@ fn run_passes(
     })?;
     // `typecheck` enforces hole-freeness as its first phase, so the check here
     // covers both.
-    settle(&lambda_elim, "post-lambda-elim", Check::Typed, &instances)?;
+    settle(
+        &lambda_elim,
+        "post-lambda-elim",
+        Check::Typed,
+        CheckMode::RefinementBlind,
+        &instances,
+    )?;
     if at_phase_output(Phase::LambdaElim, &lambda_elim, stop, capture, panes) {
         return Ok(lambda_elim);
     }
@@ -2841,13 +2876,13 @@ fn run_passes(
         crate::ccl::generalize::close_free_params(&mut recognized);
         crate::ccl::generalize::generalize_out_of_scope(&mut recognized).map_err(|u| u.0)?;
         debug!("Letrec recognized CCL:\n{}", symbolic(&recognized));
-        if let Err(errs) = typecheck_in(&recognized, &instances) {
+        if let Err(errs) = typecheck_in(&recognized, &instances, CheckMode::RefinementBlind) {
             invalid_tree(&recognized, "letrec recognition", &errs);
         }
         // Planning reads generic types by their bodies and builds types of its own, some
         // under binders the morphisms it builds then leave (`src/ccl/design/type-parameters.md`,
         // "Generalized types").
-        planning::run(recognized, &instances).and_then(|mut planned| {
+        planning::run(recognized, &instances, CheckMode::RefinementBlind).and_then(|mut planned| {
             crate::ccl::generalize::close_free_params(&mut planned);
             crate::ccl::generalize::generalize_out_of_scope(&mut planned).map_err(|u| u.0)?;
             Ok(planned)
@@ -2875,6 +2910,7 @@ fn run_passes(
         &join_planned,
         "post-planning",
         Check::Planned(ctx.inference_ctx().source_types()),
+        CheckMode::RefinementBlind,
         &instances,
     )?;
 
