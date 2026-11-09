@@ -2953,9 +2953,9 @@ fn check_no_nested_mut(
     }
 }
 
-/// Rule 2 (no nested `Mut`) on a single binder slot. `For`, `Case`-pattern,
-/// `LetRec`, `Lambda`, `MutDecl`, and `Let` binder types are unreachable by
-/// `walk_children`, so the caller invokes this on each explicitly.
+/// Rule 2 (no nested `Mut`) on a single binder slot. Binder slots are unreachable by
+/// `walk_children`; the caller enumerates them with
+/// [`TypedExpr::walk_binders`](crate::ccl::TypedExpr::walk_binders).
 ///
 /// There is no longer a rule about an *undeclared* binder holding a `Mut`: only
 /// [`TypedExprNode::MutDecl`] and a pass-by-reference `Lambda` param can bind a
