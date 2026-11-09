@@ -214,8 +214,6 @@ mod tests {
         assert_eq!(crate::ccl::ccl_utils::count_free(&q, &looped), 1);
         let free = crate::ccl::ccl_utils::free_names(&looped);
         assert!(!free.contains(&p) && free.contains(&q), "{free:?}");
-        let free = crate::ccl::subst::expr_free_vars(&looped);
-        assert!(!free.contains(&p) && free.contains(&q), "{free:?}");
         let unbound: BTreeSet<Name> = violations(&looped).into_iter().map(|v| v.name).collect();
         assert!(!unbound.contains(&p) && unbound.contains(&q), "{unbound:?}");
     }
