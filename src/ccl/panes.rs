@@ -342,30 +342,8 @@ mod tests {
         let mut totals: std::collections::HashMap<String, LeakCounts> =
             std::collections::HashMap::new();
         for (name, code) in corpus() {
-            let program = compile_ok(&code);
-            let panes = program.materialize_panes();
-            for pair in panes.gated_pane_pairs() {
-                let c = LeakCounts::tally(&pair.leaks);
-                let pair_name = &pair.name;
-                assert_eq!(
-                    c.dangling_parent, 0,
-                    "{name}: structural leaks between the {pair_name} panes: {c:?}"
-                );
-                assert_eq!(
-                    c.unrecorded, 0,
-                    "{name}: unrecorded output nodes between the {pair_name} panes — a rewrite \
-                     that mints with nothing recording: {c:?}"
-                );
-                eprintln!("[pane {name} / {pair_name}] {c:?}");
-                totals.entry(pair.name.clone()).or_default().add(&c);
-            }
-            // Require nonempty products through the contiguous gated prefix.
-            let reached = panes.pairs.iter().take_while(|p| p.gated).count();
-            for (i, projection) in panes.projections.iter().take(reached + 1).enumerate() {
-                assert!(!projection.is_empty(), "{name}: {}", PANES[i].name);
-            }
-            for pair in panes.pairs.iter().take(reached) {
-                assert!(!pair.map.edges().is_empty(), "{name}: {}", pair.name);
+            for (pair, c) in pane_pair_folds_have_no_structural_leaks_in(name, &code) {
+                totals.entry(pair).or_default().add(&c);
             }
         }
         let mut names: Vec<_> = totals.keys().cloned().collect();
@@ -375,20 +353,39 @@ mod tests {
         }
     }
 
-    // TODO: pinned on `^+`, `^*`, `^<`, `^>=` or `^==`, each of which fails this test on its own.
-    // With all of them refined, lambda elimination's type assert rejects the comprehension filter
-    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only. With it
-    // off, inference rejects a later corpus program whose comprehension element type reads the key.
-    #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
-    #[cfg_attr(
-        not(debug_assertions),
-        should_panic(
-            expected = "a value that is one type for every key of the collection it is part of"
-        )
-    )]
-    fn pane_pair_folds_have_no_structural_leaks_with_caret_operators() {
-        with_caret_operators(pane_pair_folds_have_no_structural_leaks);
+    /// [`pane_pair_folds_have_no_structural_leaks`] on one program, answering each gated
+    /// pair's counts.
+    fn pane_pair_folds_have_no_structural_leaks_in(
+        name: &str,
+        code: &str,
+    ) -> Vec<(String, LeakCounts)> {
+        let program = compile_ok(code);
+        let panes = program.materialize_panes();
+        let mut counts = Vec::new();
+        for pair in panes.gated_pane_pairs() {
+            let c = LeakCounts::tally(&pair.leaks);
+            let pair_name = &pair.name;
+            assert_eq!(
+                c.dangling_parent, 0,
+                "{name}: structural leaks between the {pair_name} panes: {c:?}"
+            );
+            assert_eq!(
+                c.unrecorded, 0,
+                "{name}: unrecorded output nodes between the {pair_name} panes — a rewrite \
+                 that mints with nothing recording: {c:?}"
+            );
+            eprintln!("[pane {name} / {pair_name}] {c:?}");
+            counts.push((pair.name.clone(), c));
+        }
+        // Require nonempty products through the contiguous gated prefix.
+        let reached = panes.pairs.iter().take_while(|p| p.gated).count();
+        for (i, projection) in panes.projections.iter().take(reached + 1).enumerate() {
+            assert!(!projection.is_empty(), "{name}: {}", PANES[i].name);
+        }
+        for pair in panes.pairs.iter().take(reached) {
+            assert!(!pair.map.edges().is_empty(), "{name}: {}", pair.name);
+        }
+        counts
     }
 
     /// Require every phase recorded by a corpus compile to belong to exactly one
@@ -396,31 +393,19 @@ mod tests {
     #[test]
     fn every_recorded_phase_belongs_to_exactly_one_pane_pair() {
         for (name, code) in corpus() {
-            let program = compile_ok(&code);
-            for p in program.provenance_table.recorded_phases() {
-                let pairs = PANES.iter().filter(|s| s.phases.contains(&p)).count();
-                assert_eq!(
-                    pairs, 1,
-                    "{name}: {p:?} belongs to {pairs} pane pairs, want exactly 1",
-                );
-            }
+            every_recorded_phase_belongs_to_exactly_one_pane_pair_in(name, &code);
         }
     }
 
-    // TODO: pinned on `^+`, `^*`, `^<`, `^>=` or `^==`, each of which fails this test on its own.
-    // With all of them refined, lambda elimination's type assert rejects the comprehension filter
-    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only. With it
-    // off, inference rejects a later corpus program whose comprehension element type reads the key.
-    #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
-    #[cfg_attr(
-        not(debug_assertions),
-        should_panic(
-            expected = "a value that is one type for every key of the collection it is part of"
-        )
-    )]
-    fn every_recorded_phase_belongs_to_exactly_one_pane_pair_with_caret_operators() {
-        with_caret_operators(every_recorded_phase_belongs_to_exactly_one_pane_pair);
+    fn every_recorded_phase_belongs_to_exactly_one_pane_pair_in(name: &str, code: &str) {
+        let program = compile_ok(code);
+        for p in program.provenance_table.recorded_phases() {
+            let pairs = PANES.iter().filter(|s| s.phases.contains(&p)).count();
+            assert_eq!(
+                pairs, 1,
+                "{name}: {p:?} belongs to {pairs} pane pairs, want exactly 1",
+            );
+        }
     }
 
     /// Check endpoint membership and survivor self-edges across the corpus.
@@ -430,45 +415,9 @@ mod tests {
     fn the_pane_folds_derive_a_non_vacuous_provenance_map() {
         let mut exercised: HashSet<usize> = HashSet::new();
         for (name, code) in corpus() {
-            let program = compile_ok(&code);
-            let panes = program.materialize_panes();
-            let ids = program.pane_ids();
-
-            for (i, pane_pair) in panes.pairs.iter().enumerate() {
-                if !pane_pair.gated {
-                    continue;
-                }
-                let (pair, map) = (&pane_pair.name, &pane_pair.map);
-                let (input_ids, output_ids) = (&ids[i], &ids[i + 1]);
-                let edges = map.edges();
-                assert!(
-                    !edges.is_empty(),
-                    "{name}: the {pair} fold derived no edges at all",
-                );
-                for (u, d) in &edges {
-                    assert!(
-                        input_ids.contains(u),
-                        "{name}: {u:?} is an edge origin at {pair} but not an input-pane id",
-                    );
-                    assert!(
-                        output_ids.contains(&d.id),
-                        "{name}: {:?} is an edge target at {pair} but not an output-pane id",
-                        d.id,
-                    );
-                }
-                // Surviving corpus IDs must have ancestry self-edges.
-                for id in input_ids.intersection(output_ids) {
-                    let self_edge = map.upstream(id).iter().find(|l| l.id == *id);
-                    assert!(
-                        self_edge.is_some_and(|l| l.labels.has_ancestry()),
-                        "{name}: {id:?} survives {pair} without an ancestry self-edge",
-                    );
-                }
-                // Identity-only maps do not witness use of a recorded row.
-                if edges.iter().any(|(u, d)| *u != d.id) {
-                    exercised.insert(i);
-                }
-            }
+            exercised.extend(the_pane_folds_derive_a_non_vacuous_provenance_map_in(
+                name, &code,
+            ));
         }
         for (i, spec) in PANES.iter().enumerate().skip(1).filter(|(_, s)| s.gated) {
             assert!(
@@ -481,20 +430,52 @@ mod tests {
         }
     }
 
-    // TODO: pinned on `^+`, `^*`, `^<`, `^>=` or `^==`, each of which fails this test on its own.
-    // With all of them refined, lambda elimination's type assert rejects the comprehension filter
-    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only. With it
-    // off, inference rejects a later corpus program whose comprehension element type reads the key.
-    #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
-    #[cfg_attr(
-        not(debug_assertions),
-        should_panic(
-            expected = "a value that is one type for every key of the collection it is part of"
-        )
-    )]
-    fn the_pane_folds_derive_a_non_vacuous_provenance_map_with_caret_operators() {
-        with_caret_operators(the_pane_folds_derive_a_non_vacuous_provenance_map);
+    /// The per-program checks of [`the_pane_folds_derive_a_non_vacuous_provenance_map`],
+    /// answering the indices of the gated pairs whose fold reads a recorded row.
+    fn the_pane_folds_derive_a_non_vacuous_provenance_map_in(
+        name: &str,
+        code: &str,
+    ) -> HashSet<usize> {
+        let program = compile_ok(code);
+        let panes = program.materialize_panes();
+        let ids = program.pane_ids();
+        let mut exercised = HashSet::new();
+        for (i, pane_pair) in panes.pairs.iter().enumerate() {
+            if !pane_pair.gated {
+                continue;
+            }
+            let (pair, map) = (&pane_pair.name, &pane_pair.map);
+            let (input_ids, output_ids) = (&ids[i], &ids[i + 1]);
+            let edges = map.edges();
+            assert!(
+                !edges.is_empty(),
+                "{name}: the {pair} fold derived no edges at all",
+            );
+            for (u, d) in &edges {
+                assert!(
+                    input_ids.contains(u),
+                    "{name}: {u:?} is an edge origin at {pair} but not an input-pane id",
+                );
+                assert!(
+                    output_ids.contains(&d.id),
+                    "{name}: {:?} is an edge target at {pair} but not an output-pane id",
+                    d.id,
+                );
+            }
+            // Surviving corpus IDs must have ancestry self-edges.
+            for id in input_ids.intersection(output_ids) {
+                let self_edge = map.upstream(id).iter().find(|l| l.id == *id);
+                assert!(
+                    self_edge.is_some_and(|l| l.labels.has_ancestry()),
+                    "{name}: {id:?} survives {pair} without an ancestry self-edge",
+                );
+            }
+            // Identity-only maps do not witness use of a recorded row.
+            if edges.iter().any(|(u, d)| *u != d.id) {
+                exercised.insert(i);
+            }
+        }
+        exercised
     }
 
     /// The `program / pane pair` names at which a **blame** edge reaches the
@@ -513,21 +494,10 @@ mod tests {
     /// the mixed-label algebra is tested separately in `provenance.rs`.
     #[test]
     fn blame_reaches_the_provenance_map_labelled() {
-        let mut relating: Vec<String> = Vec::new();
-        for (name, code) in corpus() {
-            let program = compile_ok(&code);
-            let panes = program.materialize_panes();
-            for pane_pair in panes.gated_pane_pairs() {
-                if pane_pair
-                    .map
-                    .edges()
-                    .iter()
-                    .any(|(_, d)| d.labels.has_blame())
-                {
-                    relating.push(format!("{name} / {}", pane_pair.name));
-                }
-            }
-        }
+        let mut relating: Vec<String> = corpus()
+            .into_iter()
+            .flat_map(|(name, code)| relating_boundaries(name, &code))
+            .collect();
         relating.sort();
         assert_eq!(
             relating, RELATING_BOUNDARIES,
@@ -535,20 +505,31 @@ mod tests {
         );
     }
 
-    // TODO: pinned on `^+`, `^*`, `^<`, `^>=` or `^==`, each of which fails this test on its own.
-    // With all of them refined, lambda elimination's type assert rejects the comprehension filter
-    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only. With it
-    // off, inference rejects a later corpus program whose comprehension element type reads the key.
-    #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
-    #[cfg_attr(
-        not(debug_assertions),
-        should_panic(
-            expected = "a value that is one type for every key of the collection it is part of"
-        )
-    )]
-    fn blame_reaches_the_provenance_map_labelled_with_caret_operators() {
-        with_caret_operators(blame_reaches_the_provenance_map_labelled);
+    /// [`blame_reaches_the_provenance_map_labelled`] on one program: its entries of
+    /// [`RELATING_BOUNDARIES`].
+    fn blame_reaches_the_provenance_map_labelled_in(name: &str, code: &str) {
+        let mut relating = relating_boundaries(name, code);
+        relating.sort();
+        let expected: Vec<&str> = RELATING_BOUNDARIES
+            .iter()
+            .copied()
+            .filter(|b| b.starts_with(&format!("{name} / ")))
+            .collect();
+        assert_eq!(
+            relating, expected,
+            "{name}: the pane pairs at which blame contributes an edge have changed",
+        );
+    }
+
+    /// The `program / pane pair` names at which a blame edge of `code` reaches the
+    /// provenance map.
+    fn relating_boundaries(name: &str, code: &str) -> Vec<String> {
+        let panes = compile_ok(code).materialize_panes();
+        panes
+            .gated_pane_pairs()
+            .filter(|p| p.map.edges().iter().any(|(_, d)| d.labels.has_blame()))
+            .map(|p| format!("{name} / {}", p.name))
+            .collect()
     }
 
     /// A statement's downstream IDs, separated into ancestry and blame relations.
@@ -1257,37 +1238,25 @@ mod tests {
     #[test]
     fn monomorphization_explains_every_node_it_produces() {
         for (name, code) in corpus() {
-            let panes = compile_ok(&code).materialize_panes();
-            let pair = panes.pair("pre-inference → post-inference");
-            let c = LeakCounts::tally(&pair.leaks);
-            assert_eq!(c.dangling_parent, 0, "{name}: {c:?}");
-            assert_eq!(
-                c.unrecorded, 0,
-                "{name}: pre-inference → post-inference is uncaptured: {c:?}"
-            );
-            if SPECIALIZING.contains(&name) {
-                assert!(
-                    !pair.deaths.is_empty(),
-                    "{name}: specializes, so the generalized definition must die"
-                );
-            }
+            monomorphization_explains_every_node_it_produces_in(name, &code);
         }
     }
 
-    // TODO: pinned on `^+`, `^*`, `^<`, `^>=` or `^==`, each of which fails this test on its own.
-    // With all of them refined, lambda elimination's type assert rejects the comprehension filter
-    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only. With it
-    // off, inference rejects a later corpus program whose comprehension element type reads the key.
-    #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
-    #[cfg_attr(
-        not(debug_assertions),
-        should_panic(
-            expected = "a value that is one type for every key of the collection it is part of"
-        )
-    )]
-    fn monomorphization_explains_every_node_it_produces_with_caret_operators() {
-        with_caret_operators(monomorphization_explains_every_node_it_produces);
+    fn monomorphization_explains_every_node_it_produces_in(name: &str, code: &str) {
+        let panes = compile_ok(code).materialize_panes();
+        let pair = panes.pair("pre-inference → post-inference");
+        let c = LeakCounts::tally(&pair.leaks);
+        assert_eq!(c.dangling_parent, 0, "{name}: {c:?}");
+        assert_eq!(
+            c.unrecorded, 0,
+            "{name}: pre-inference → post-inference is uncaptured: {c:?}"
+        );
+        if SPECIALIZING.contains(&name) {
+            assert!(
+                !pair.deaths.is_empty(),
+                "{name}: specializes, so the generalized definition must die"
+            );
+        }
     }
 
     /// Require no structural leaks across the Inline/Transact/Letrec/Channelize pair.
@@ -1295,41 +1264,29 @@ mod tests {
     /// tree from satisfying every assertion.
     #[test]
     fn the_second_pane_pair_explains_every_node_its_phases_produce() {
-        /// Reaches `transact_phase` or `channelize` — the whole-program
-        /// rewrites, where naming one node is least obviously applicable.
-        const WHOLE_PROGRAM_REWRITES: &[&str] = &["transaction", "feed_loop", "generator_pipeline"];
         for (name, code) in corpus() {
-            let panes = compile_ok(&code).materialize_panes();
-            let pair = panes.pair("post-inference → post-channelize");
-            let c = LeakCounts::tally(&pair.leaks);
-            assert_eq!(c.dangling_parent, 0, "{name}: {c:?}");
-            assert_eq!(
-                c.unrecorded, 0,
-                "{name}: post-inference → post-channelize is uncaptured: {c:?}"
-            );
-            if WHOLE_PROGRAM_REWRITES.contains(&name) {
-                assert!(
-                    !pair.deaths.is_empty(),
-                    "{name}: rewrites its whole shape, so nodes must die"
-                );
-            }
+            the_second_pane_pair_explains_every_node_its_phases_produce_in(name, &code);
         }
     }
 
-    // TODO: pinned on `^+`, `^*`, `^<`, `^>=` or `^==`, each of which fails this test on its own.
-    // With all of them refined, lambda elimination's type assert rejects the comprehension filter
-    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only. With it
-    // off, inference rejects a later corpus program whose comprehension element type reads the key.
-    #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
-    #[cfg_attr(
-        not(debug_assertions),
-        should_panic(
-            expected = "a value that is one type for every key of the collection it is part of"
-        )
-    )]
-    fn the_second_pane_pair_explains_every_node_its_phases_produce_with_caret_operators() {
-        with_caret_operators(the_second_pane_pair_explains_every_node_its_phases_produce);
+    fn the_second_pane_pair_explains_every_node_its_phases_produce_in(name: &str, code: &str) {
+        /// Reaches `transact_phase` or `channelize` — the whole-program
+        /// rewrites, where naming one node is least obviously applicable.
+        const WHOLE_PROGRAM_REWRITES: &[&str] = &["transaction", "feed_loop", "generator_pipeline"];
+        let panes = compile_ok(code).materialize_panes();
+        let pair = panes.pair("post-inference → post-channelize");
+        let c = LeakCounts::tally(&pair.leaks);
+        assert_eq!(c.dangling_parent, 0, "{name}: {c:?}");
+        assert_eq!(
+            c.unrecorded, 0,
+            "{name}: post-inference → post-channelize is uncaptured: {c:?}"
+        );
+        if WHOLE_PROGRAM_REWRITES.contains(&name) {
+            assert!(
+                !pair.deaths.is_empty(),
+                "{name}: rewrites its whole shape, so nodes must die"
+            );
+        }
     }
 
     /// Deaths are the live-set difference and nothing else: what the fold reports
@@ -1359,40 +1316,28 @@ mod tests {
     /// "Walking the ids".
     #[test]
     fn distinct_predicate_terms_never_share_a_node_id() {
-        let mut found: Vec<(String, usize, &'static str)> = Vec::new();
         for (name, code) in corpus() {
-            let program = compile_ok(&code);
-            for (pane, tree) in [
-                ("pre-inference", &program.pre_inference_ir),
-                ("post-inference", &program.post_inference_ir),
-                ("post-channelize", &program.post_channelize_ir),
-            ] {
-                for (_, kind) in predicate_id_collisions(tree) {
-                    found.push((format!("{name} / {pane}"), 1, kind));
-                }
+            distinct_predicate_terms_never_share_a_node_id_in(name, &code);
+        }
+    }
+
+    fn distinct_predicate_terms_never_share_a_node_id_in(name: &str, code: &str) {
+        let program = compile_ok(code);
+        let mut found: Vec<(&'static str, &'static str)> = Vec::new();
+        for (pane, tree) in [
+            ("pre-inference", &program.pre_inference_ir),
+            ("post-inference", &program.post_inference_ir),
+            ("post-channelize", &program.post_channelize_ir),
+        ] {
+            for (_, kind) in predicate_id_collisions(tree) {
+                found.push((pane, kind));
             }
         }
         assert!(
             found.is_empty(),
-            "{} predicate id collisions: {found:?}",
+            "{name}: {} predicate id collisions: {found:?}",
             found.len(),
         );
-    }
-
-    // TODO: pinned on `^+`, `^*`, `^<`, `^>=` or `^==`, each of which fails this test on its own.
-    // With all of them refined, lambda elimination's type assert rejects the comprehension filter
-    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only. With it
-    // off, inference rejects a later corpus program whose comprehension element type reads the key.
-    #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
-    #[cfg_attr(
-        not(debug_assertions),
-        should_panic(
-            expected = "a value that is one type for every key of the collection it is part of"
-        )
-    )]
-    fn distinct_predicate_terms_never_share_a_node_id_with_caret_operators() {
-        with_caret_operators(distinct_predicate_terms_never_share_a_node_id);
     }
 
     /// Pin the recorded phase set for the transaction fixture, sorted by phase name.
@@ -1400,10 +1345,7 @@ mod tests {
     /// not establish that the phase was skipped.
     #[test]
     fn a_rewriting_phase_tags_its_rows_with_itself() {
-        let (_, code) = corpus()
-            .into_iter()
-            .find(|(name, _)| *name == "transaction")
-            .expect("the transaction fixture");
+        let code = corpus_program("transaction");
         let program = compile_ok(&code);
         let mut recorded = program.provenance_table.recorded_phases();
         recorded.sort_by_key(|p| format!("{p:?}"));
@@ -1561,55 +1503,43 @@ mod tests {
     /// resolves to a span.
     #[test]
     fn the_operator_graph_carries_its_output_boundary() {
-        use crate::interpreter::operator_graph::GraphNode;
-
         for (name, code) in corpus() {
-            let program = compile_ok(&code);
-            let graph = &program.operator_graph;
-            let sinks: Vec<&str> = graph
-                .nodes()
-                .iter()
-                .filter_map(|n| match n {
-                    GraphNode::Sink { name, .. } => Some(name.as_str()),
-                    _ => None,
-                })
-                .collect();
-            assert!(
-                !sinks.is_empty(),
-                "{name}: the graph has no sink, so it has no output boundary",
-            );
-
-            let projection = program.materialize_panes();
-            let attribution = projection
-                .projections
-                .last()
-                .expect("the operator pane's projection");
-            for node in graph.nodes() {
-                let GraphNode::Sink { id, name: sink, .. } = node else {
-                    continue;
-                };
-                assert!(
-                    attribution.contains_key(id),
-                    "{name}: sink {sink} carries no attribution, so it resolves to no span",
-                );
-            }
+            the_operator_graph_carries_its_output_boundary_in(name, &code);
         }
     }
 
-    // TODO: pinned on `^+`, `^*`, `^<`, `^>=` or `^==`, each of which fails this test on its own.
-    // With all of them refined, lambda elimination's type assert rejects the comprehension filter
-    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only. With it
-    // off, inference rejects a later corpus program whose comprehension element type reads the key.
-    #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
-    #[cfg_attr(
-        not(debug_assertions),
-        should_panic(
-            expected = "a value that is one type for every key of the collection it is part of"
-        )
-    )]
-    fn the_operator_graph_carries_its_output_boundary_with_caret_operators() {
-        with_caret_operators(the_operator_graph_carries_its_output_boundary);
+    fn the_operator_graph_carries_its_output_boundary_in(name: &str, code: &str) {
+        use crate::interpreter::operator_graph::GraphNode;
+
+        let program = compile_ok(code);
+        let graph = &program.operator_graph;
+        let sinks: Vec<&str> = graph
+            .nodes()
+            .iter()
+            .filter_map(|n| match n {
+                GraphNode::Sink { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !sinks.is_empty(),
+            "{name}: the graph has no sink, so it has no output boundary",
+        );
+
+        let projection = program.materialize_panes();
+        let attribution = projection
+            .projections
+            .last()
+            .expect("the operator pane's projection");
+        for node in graph.nodes() {
+            let GraphNode::Sink { id, name: sink, .. } = node else {
+                continue;
+            };
+            assert!(
+                attribution.contains_key(id),
+                "{name}: sink {sink} carries no attribution, so it resolves to no span",
+            );
+        }
     }
 
     /// Whether the subscription relation is acyclic, optionally with the edges
@@ -1669,51 +1599,43 @@ mod tests {
     /// graph.
     #[test]
     fn every_operator_graph_cycle_runs_through_a_deferred_edge() {
-        use crate::interpreter::operator_graph::EdgeKind;
-
-        let mut cyclic_programs = 0usize;
-        for (name, code) in corpus() {
-            let program = compile_ok(&code);
-            let graph = &program.operator_graph;
-            let deferred = graph
-                .edges()
-                .filter(|(_, e)| matches!(e.kind, EdgeKind::Value { deferred: true }))
-                .count();
-
-            if !subscription_relation_is_acyclic(graph, false) {
-                cyclic_programs += 1;
-                assert!(
-                    deferred > 0,
-                    "{name}: the graph has a cycle and no deferred edge, so a construct closed a \
-                     cycle without a `CycleSlot` and the cycle set no longer names it",
-                );
-            }
-            assert!(
-                subscription_relation_is_acyclic(graph, true),
-                "{name}: a cycle survives with the {deferred} deferred edge(s) removed, so the \
-                 deferred edges are not the cycle set a layout can cut",
-            );
-        }
+        let cyclic_programs = corpus()
+            .into_iter()
+            .filter(|(name, code)| {
+                every_operator_graph_cycle_runs_through_a_deferred_edge_in(name, code)
+            })
+            .count();
         assert!(
             cyclic_programs > 0,
             "no corpus program builds a cyclic operator graph, so this check is vacuous",
         );
     }
 
-    // TODO: pinned on `^+`, `^*`, `^<`, `^>=` or `^==`, each of which fails this test on its own.
-    // With all of them refined, lambda elimination's type assert rejects the comprehension filter
-    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only. With it
-    // off, inference rejects a later corpus program whose comprehension element type reads the key.
-    #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
-    #[cfg_attr(
-        not(debug_assertions),
-        should_panic(
-            expected = "a value that is one type for every key of the collection it is part of"
-        )
-    )]
-    fn every_operator_graph_cycle_runs_through_a_deferred_edge_with_caret_operators() {
-        with_caret_operators(every_operator_graph_cycle_runs_through_a_deferred_edge);
+    /// The per-program checks of [`every_operator_graph_cycle_runs_through_a_deferred_edge`],
+    /// answering whether the program's operator graph is cyclic.
+    fn every_operator_graph_cycle_runs_through_a_deferred_edge_in(name: &str, code: &str) -> bool {
+        use crate::interpreter::operator_graph::EdgeKind;
+
+        let program = compile_ok(code);
+        let graph = &program.operator_graph;
+        let deferred = graph
+            .edges()
+            .filter(|(_, e)| matches!(e.kind, EdgeKind::Value { deferred: true }))
+            .count();
+        let cyclic = !subscription_relation_is_acyclic(graph, false);
+        if cyclic {
+            assert!(
+                deferred > 0,
+                "{name}: the graph has a cycle and no deferred edge, so a construct closed a \
+                 cycle without a `CycleSlot` and the cycle set no longer names it",
+            );
+        }
+        assert!(
+            subscription_relation_is_acyclic(graph, true),
+            "{name}: a cycle survives with the {deferred} deferred edge(s) removed, so the \
+             deferred edges are not the cycle set a layout can cut",
+        );
+        cyclic
     }
 
     /// **Each writer of a transaction names some operator of its own.**
@@ -1733,43 +1655,207 @@ mod tests {
     #[test]
     fn every_writer_site_has_an_operator_attributed_inside_it() {
         for (name, code) in corpus() {
-            let program = compile_ok(&code);
-            let mut writers: Vec<(HashSet<NodeId>, String)> = Vec::new();
-            collect_writer_domains(&program.ast, &mut writers);
-            if writers.is_empty() {
-                continue;
-            }
-            let panes = program.materialize_panes();
-            let pair = panes
-                .pairs
-                .last()
-                .expect("the operator pane pair is the last one");
-            for (ids, what) in &writers {
-                let attributed = ids.iter().any(|id| !pair.map.downstream(id).is_empty());
-                assert!(
-                    attributed,
-                    "{name}: no operator attributes to anything inside {what}, so the whole \
-                     transaction resolves to its binding — `build_commit_store` needs its \
-                     per-writer recording",
-                );
-            }
+            every_writer_site_has_an_operator_attributed_inside_it_in(name, &code);
         }
     }
 
-    // TODO: pinned on `^+`, `^*`, `^<`, `^>=` or `^==`, each of which fails this test on its own.
-    // With all of them refined, lambda elimination's type assert rejects the comprehension filter
-    // `u.age ^>= 18`, whose result now records the comparison. The assert is debug-only. With it
-    // off, inference rejects a later corpus program whose comprehension element type reads the key.
+    fn every_writer_site_has_an_operator_attributed_inside_it_in(name: &str, code: &str) {
+        let program = compile_ok(code);
+        let mut writers: Vec<(HashSet<NodeId>, String)> = Vec::new();
+        collect_writer_domains(&program.ast, &mut writers);
+        if writers.is_empty() {
+            return;
+        }
+        let panes = program.materialize_panes();
+        let pair = panes
+            .pairs
+            .last()
+            .expect("the operator pane pair is the last one");
+        for (ids, what) in &writers {
+            let attributed = ids.iter().any(|id| !pair.map.downstream(id).is_empty());
+            assert!(
+                attributed,
+                "{name}: no operator attributes to anything inside {what}, so the whole \
+                 transaction resolves to its binding — `build_commit_store` needs its \
+                 per-writer recording",
+            );
+        }
+    }
+
+    /// The corpus program `name`, spelled as the running test spells it.
+    fn corpus_program(name: &str) -> String {
+        corpus()
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("the corpus carries no program {name}"))
+            .1
+    }
+
+    /// Defines, for each `$check => $module` pair, a module `$module` holding one test per
+    /// listed corpus program. Each test runs `$check(name, code)` on its program spelled with
+    /// `^` operators, so a failing program does not keep the others from running. A program's
+    /// attributes apply to its test in every module: a pinned program fails in `compile_ok`,
+    /// before any check reads it.
+    macro_rules! corpus_checks_with_caret_operators {
+        ([$($check:ident => $module:ident),* $(,)?] $programs:tt) => {
+            corpus_checks_with_caret_operators!(@names $programs);
+            $(corpus_checks_with_caret_operators!(@check $check $module $programs);)*
+        };
+        (@names { $($(#[$pin:meta])* $program:ident),* $(,)? }) => {
+            const CARET_OPERATOR_PROGRAMS: &[&str] = &[$(stringify!($program)),*];
+        };
+        (@check $check:ident $module:ident { $($(#[$pin:meta])* $program:ident),* $(,)? }) => {
+            mod $module {
+                use super::*;
+                $(
+                    #[test]
+                    $(#[$pin])*
+                    fn $program() {
+                        with_caret_operators(|| {
+                            let name = stringify!($program);
+                            $check(name, &corpus_program(name));
+                        });
+                    }
+                )*
+            }
+        };
+    }
+
+    corpus_checks_with_caret_operators!(
+        [
+            pane_pair_folds_have_no_structural_leaks_in
+                => pane_pair_folds_have_no_structural_leaks_with_caret_operators,
+            every_recorded_phase_belongs_to_exactly_one_pane_pair_in
+                => every_recorded_phase_belongs_to_exactly_one_pane_pair_with_caret_operators,
+            the_pane_folds_derive_a_non_vacuous_provenance_map_in
+                => the_pane_folds_derive_a_non_vacuous_provenance_map_with_caret_operators,
+            blame_reaches_the_provenance_map_labelled_in
+                => blame_reaches_the_provenance_map_labelled_with_caret_operators,
+            monomorphization_explains_every_node_it_produces_in
+                => monomorphization_explains_every_node_it_produces_with_caret_operators,
+            the_second_pane_pair_explains_every_node_its_phases_produce_in
+                => the_second_pane_pair_explains_every_node_its_phases_produce_with_caret_operators,
+            distinct_predicate_terms_never_share_a_node_id_in
+                => distinct_predicate_terms_never_share_a_node_id_with_caret_operators,
+            the_operator_graph_carries_its_output_boundary_in
+                => the_operator_graph_carries_its_output_boundary_with_caret_operators,
+            every_operator_graph_cycle_runs_through_a_deferred_edge_in
+                => every_operator_graph_cycle_runs_through_a_deferred_edge_with_caret_operators,
+            every_writer_site_has_an_operator_attributed_inside_it_in
+                => every_writer_site_has_an_operator_attributed_inside_it_with_caret_operators,
+        ]
+        {
+            arithmetic,
+            // TODO: pinned on `^>=`: lambda elimination's type assert rejects the comprehension
+            // filter `u.age ^>= 18`, whose result now records the comparison. The assert is
+            // debug-only, and without it the program passes every check.
+            #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
+            filter_and_aggregate,
+            for_accumulator,
+            // TODO: pinned on `^` operators: inference rejects a comprehension whose element type
+            // now reads the key.
+            #[should_panic(
+                expected = "a value that is one type for every key of the collection it is part of"
+            )]
+            generator_pipeline,
+            inner_join,
+            // TODO: pinned on `^` operators: a collection domain refined by a comparison fails
+            // the invariant domain check.
+            #[should_panic(expected = "post-inference produced an invalid tree")]
+            join_then_groupby,
+            prefix_lines,
+            streaming_echo,
+            transaction,
+            // TODO: pinned on `^` operators: inference rejects a comprehension whose element type
+            // now reads the key.
+            #[should_panic(
+                expected = "a value that is one type for every key of the collection it is part of"
+            )]
+            group_by,
+            udf_chain,
+            feed_loop,
+        }
+    );
+
+    /// The per-program tests with `^` operators cover the whole corpus: a program added to
+    /// [`corpus`] needs its own entry in [`corpus_checks_with_caret_operators`]'s list.
     #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "u.age ^>= 18"))]
-    #[cfg_attr(
-        not(debug_assertions),
-        should_panic(
-            expected = "a value that is one type for every key of the collection it is part of"
-        )
-    )]
-    fn every_writer_site_has_an_operator_attributed_inside_it_with_caret_operators() {
-        with_caret_operators(every_writer_site_has_an_operator_attributed_inside_it);
+    fn every_corpus_program_is_checked_with_caret_operators() {
+        let names: Vec<&str> = corpus().into_iter().map(|(name, _)| name).collect();
+        assert_eq!(names, CARET_OPERATOR_PROGRAMS);
+    }
+
+    /// The conditional-induction shapes: each fans a loop body's `Case` across a different
+    /// copy/consume pairing in the letrec phase's statement-`Case` arm.
+    mod conditional_induction {
+        use indoc::indoc;
+
+        /// One conditional write: guard preserved into its own arm predicate,
+        /// echoed (freshened) into the carry arm's.
+        pub(super) const GUARD_ONLY: &str = indoc! {"
+            x := 0
+            for i in [1, 2, 3]:
+                if i > 1:
+                    x := x + i
+            x
+        "};
+
+        /// Unconditional write before the `Case`: its inlined value sits in
+        /// the read-your-writes env slot every branch clones.
+        pub(super) const UNCOND_BEFORE: &str = indoc! {"
+            x := 0
+            for i in [1, 2, 3]:
+                x := x + 1
+                if i > 1:
+                    x := x + 10
+            x
+        "};
+
+        /// Unconditional write after the `Case`: the remainder is spliced
+        /// onto every path, including the trailing carry arm.
+        pub(super) const UNCOND_AFTER: &str = indoc! {"
+            x := 0
+            for i in [1, 2, 3]:
+                if i > 1:
+                    x := x + 10
+                x := x + 1
+            x
+        "};
+
+        /// `if`/`else` writing one accumulator on both arms.
+        pub(super) const IF_ELSE: &str = indoc! {"
+            t := 0
+            for x in [1, 2, 3]:
+                if x > 2:
+                    t := t + x
+                else:
+                    t := t + 1
+            t
+        "};
+
+        /// Two accumulators, one unconditional and one conditional: a branch's
+        /// write set matches the carry for one accumulator and not the other.
+        pub(super) const TWO_ACCUMULATORS: &str = indoc! {"
+            cnt := 0
+            total := 0
+            for i in [1, 2, 3]:
+                cnt := cnt + 1
+                if i > 1:
+                    total := total + i
+            cnt * 10 + total
+        "};
+
+        /// Sibling `if`s (not `elif`) on one accumulator: two guard-Cases in
+        /// one body, so the second one's remainder is itself a spliced copy.
+        pub(super) const SIBLING_IFS: &str = indoc! {"
+            a := 0
+            for i in [1, 2, 3]:
+                if i > 1:
+                    a := a + i
+                if i < 3:
+                    a := a + 100
+            a
+        "};
     }
 
     /// Every conditional-induction shape reaches every pane pair clean.
@@ -1778,68 +1864,48 @@ mod tests {
     /// under [`CompiledProgram::materialize_panes`], so the compilation-pipeline
     /// suite — which compiles but never materializes — cannot see a leak in a
     /// rewrite it otherwise exercises heavily. The statement-`Case` arm of the
-    /// letrec phase is exactly that blind spot: it fans the post-`Case` remainder
-    /// and the entering read-your-writes env across every branch, so each shape
-    /// below stresses a different copy/consume pairing.
-    #[test]
-    fn conditional_induction_panes_are_leak_free() {
-        for (name, code) in [
-            // One conditional write: guard preserved into its own arm predicate,
-            // echoed (freshened) into the carry arm's.
-            (
-                "guard_only",
-                "x := 0\nfor i in [1, 2, 3]:\n    if i > 1:\n        x := x + i\nx\n",
-            ),
-            // Unconditional write *before* the `Case`: its inlined value sits in
-            // the read-your-writes env slot every branch clones.
-            (
-                "uncond_before",
-                "x := 0\nfor i in [1, 2, 3]:\n    x := x + 1\n    if i > 1:\n        x := x + 10\nx\n",
-            ),
-            // Unconditional write *after* the `Case`: the remainder is spliced
-            // onto every path, including the trailing carry arm.
-            (
-                "uncond_after",
-                "x := 0\nfor i in [1, 2, 3]:\n    if i > 1:\n        x := x + 10\n    x := x + 1\nx\n",
-            ),
-            // `if`/`else` writing one accumulator on both arms.
-            (
-                "if_else",
-                "t := 0\nfor x in [1, 2, 3]:\n    if x > 2:\n        t := t + x\n    else:\n        t := t + 1\nt\n",
-            ),
-            // Two accumulators, one unconditional and one conditional — the
-            // shape where a branch's write set matches the carry for *some*
-            // accumulator but not all.
-            (
-                "two_accumulators",
-                "cnt := 0\ntotal := 0\nfor i in [1, 2, 3]:\n    cnt := cnt + 1\n    if i > 1:\n        total := total + i\ncnt * 10 + total\n",
-            ),
-            // Sibling `if`s (not `elif`) on one accumulator: two guard-Cases in
-            // one body, so the second one's remainder is itself a spliced copy.
-            (
-                "sibling_ifs",
-                "a := 0\nfor i in [1, 2, 3]:\n    if i > 1:\n        a := a + i\n    if i < 3:\n        a := a + 100\na\n",
-            ),
-        ] {
-            let compiled = compile_ok(code);
-            let panes = compiled.materialize_panes();
-            for pair in panes.gated_pane_pairs() {
-                assert!(
-                    pair.leaks.is_empty(),
-                    "`{name}`: leaks between the {} panes: {:?}",
-                    pair.name,
-                    pair.leaks
-                );
-            }
-        }
+    /// letrec phase is that blind spot: it fans the post-`Case` remainder and the
+    /// entering read-your-writes env across every branch.
+    #[rstest::rstest]
+    #[case::guard_only(conditional_induction::GUARD_ONLY)]
+    #[case::uncond_before(conditional_induction::UNCOND_BEFORE)]
+    #[case::uncond_after(conditional_induction::UNCOND_AFTER)]
+    #[case::if_else(conditional_induction::IF_ELSE)]
+    #[case::two_accumulators(conditional_induction::TWO_ACCUMULATORS)]
+    #[case::sibling_ifs(conditional_induction::SIBLING_IFS)]
+    fn conditional_induction_panes_are_leak_free(#[case] code: &str) {
+        conditional_induction_panes_are_leak_free_in(code);
     }
 
-    // TODO: pinned on `^+`: letrec recognition merges two `case` arms without merging their result
-    // refinements.
-    #[test]
+    #[rstest::rstest]
+    #[case::guard_only(conditional_induction::GUARD_ONLY)]
+    // TODO: pinned on `^+`: letrec recognition merges two `case` arms without merging their
+    // result refinements.
     #[should_panic(expected = "post-letrec produced an invalid tree")]
-    fn conditional_induction_panes_are_leak_free_with_caret_operators() {
-        with_caret_operators(conditional_induction_panes_are_leak_free);
+    #[case::uncond_before(conditional_induction::UNCOND_BEFORE)]
+    #[case::uncond_after(conditional_induction::UNCOND_AFTER)]
+    #[case::if_else(conditional_induction::IF_ELSE)]
+    // TODO: pinned on `^` operators: the loop's exit rejects a value typed
+    // `{Int | __elem == __anf + __anf}` as holding a collection over a domain the loop determines.
+    #[should_panic(
+        expected = "a value crossing a loop's exit holds a collection over a domain the loop determines"
+    )]
+    #[case::two_accumulators(conditional_induction::TWO_ACCUMULATORS)]
+    #[case::sibling_ifs(conditional_induction::SIBLING_IFS)]
+    fn conditional_induction_panes_are_leak_free_with_caret_operators(#[case] code: &str) {
+        with_caret_operators(|| conditional_induction_panes_are_leak_free_in(code));
+    }
+
+    fn conditional_induction_panes_are_leak_free_in(code: &str) {
+        let panes = compile_ok(code).materialize_panes();
+        for pair in panes.gated_pane_pairs() {
+            assert!(
+                pair.leaks.is_empty(),
+                "leaks between the {} panes: {:?}",
+                pair.name,
+                pair.leaks
+            );
+        }
     }
 
     fn perf_repetitions(value: Result<String, VarError>) -> NonZeroUsize {
@@ -2016,10 +2082,7 @@ mod tests {
     /// `planning.iterate` is `run` wrapping an iteration site.
     #[test]
     fn one_planning_scope_covers_recognition_and_iteration() {
-        let (_, code) = corpus()
-            .into_iter()
-            .find(|(name, _)| *name == "transaction")
-            .expect("the corpus carries the transaction fixture");
+        let code = corpus_program("transaction");
         let program = compile_ok(&code);
         let labels: std::collections::BTreeSet<_> = collect_tree_ids(&program.ast)
             .into_iter()

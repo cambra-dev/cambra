@@ -99,7 +99,7 @@ thread_local! {
 /// program (the corpora, `compile_ok` in `panes.rs`, `compile` in
 /// `inspector_model/wire.rs`) pass it through [`spelled`]. The setting is per thread, so
 /// tests running in parallel do not see each other's.
-pub(crate) fn with_caret_operators(test: fn()) {
+pub(crate) fn with_caret_operators(test: impl FnOnce()) {
     CARET_OPERATORS.with(|c| c.set(true));
     test();
     CARET_OPERATORS.with(|c| c.set(false));
