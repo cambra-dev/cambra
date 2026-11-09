@@ -2364,8 +2364,11 @@ escape restrictions at record time instead of relying on later consumers to expo
 The read-binder contract is described under
 [A read is named while inference runs](mutability.md#a-read-is-named-while-inference-runs).
 
-`ConstrainCache::for_derivation` distinguishes `LiveSolve` from `PostPass` for the codomain-opening
-policy. It does not disable the bound-scope check. A transformed tree must still provide the
+`ConstrainCache::for_derivation` distinguishes `LiveSolve` from the two re-derivations, `PostPass`
+and `RefinementBlind`, for the codomain-opening policy. `RefinementBlind` is `PostPass` after
+refinement erasure: it compares refinements only between two data function domains (see
+[Refinement Erasure](optimization.md#refinement-erasure-cclerase_refinementsrs)). Neither
+disables the bound-scope check. A transformed tree must still provide the
 binders required by the types its rules reconstruct.
 
 Registered sources use `TypedExprNode::Source`, not a free `Var` reference. The source registry
@@ -2468,10 +2471,10 @@ contributions merge, before a final function is assembled, so waiting until mate
 too late. `coalesce_type_predicates` closes rebuilt predicates again: resolving their interior
 type slots can expose named references from the live graph after the enclosing type was closed.
 
-**Descent opens.** The function constraint arm opens a closed codomain at its binder's name
-when the reader needs named references. During `LiveSolve`, it does so toward a side whose
-codomain contains inference variables; concrete closed pairs can compare index-to-index.
-`PostPass` derivation opens dependent codomains unconditionally because different passes may
+**Descent opens.** The function constraint arm opens a closed codomain at its binder's name when the
+reader needs named references. During `LiveSolve`, it does so toward a side whose codomain contains
+inference variables; concrete closed pairs can compare index-to-index.  A `PostPass` or
+`RefinementBlind` derivation opens dependent codomains unconditionally because different passes may
 have produced different stored forms. Unconditionally opening concrete pairs during live solving
 could capture an unrelated free name matching a display spelling.
 

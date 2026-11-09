@@ -89,7 +89,7 @@ fn emit_groupby(
     key_binder: Option<Name>,
     key_dom: Type,
     value_ty: Type,
-    instances: &Rc<InstanceTable>,
+    checker: &FragmentChecker,
 ) -> Expr {
     // A partition is a **collection of collections**: keyed by `K`, each group the
     // index set of its members. Both are data — the transformer
@@ -116,16 +116,18 @@ fn emit_groupby(
 
     let converse_ty = partition(group_of(group_idx_ty.clone()));
     let grouped = apply_primitive(keys, Builtin::Converse, converse_ty);
-    typecheck_in(&grouped, instances).expect("Bad group expr");
+    checker.check(&grouped).expect("Bad group expr");
     let values_fn = apply_primitive(
         values,
         Builtin::Map,
         Type::fun(group_of(group_idx_ty.clone()), group_of(value_ty.clone())),
     );
     let grouped_values_ty = partition(group_of(value_ty));
-    typecheck_in(&values_fn, instances).expect("Bad values_fn expr");
+    checker.check(&values_fn).expect("Bad values_fn expr");
     let grouped_values = ccl_utils::chain_typed(vec![grouped, values_fn], grouped_values_ty);
-    typecheck_in(&grouped_values, instances).expect("Bad grouped_values expr");
+    checker
+        .check(&grouped_values)
+        .expect("Bad grouped_values expr");
     grouped_values
 }
 
@@ -405,7 +407,7 @@ fn rewrite_groupby_source(head: &Expr, ctx: &mut PlanningCtx) -> Result<Option<E
         site.key_binder,
         site.key_dom,
         site.value_ty,
-        &ctx.instances,
+        &ctx.checker,
     )))
 }
 

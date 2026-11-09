@@ -140,6 +140,31 @@ pub(super) struct CheckCtx {
     /// type is quantified over where it reads them. Parameters are unique, so the list only
     /// grows.
     opened_params: Vec<crate::ccl::ty::PolyParam>,
+    /// Which refinements every edge this check draws compares.
+    mode: CheckMode,
+}
+
+/// Which refinements a check compares, chosen by the phase whose output it checks.
+///
+/// [`crate::ccl::erase_refinements`] keeps refinements on data function domains only, so from
+/// that phase on a node's recorded type no longer carries the refinement its rule derives.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CheckMode {
+    /// Every refinement, under [`Derivation::PostPass`]: the tree's types carry every
+    /// refinement their rules derive.
+    Full,
+    /// Refinements only between the domains of two data functions, under
+    /// [`Derivation::RefinementBlind`]: the tree is past refinement erasure.
+    RefinementBlind,
+}
+
+impl CheckMode {
+    fn derivation(self) -> Derivation {
+        match self {
+            CheckMode::Full => Derivation::PostPass,
+            CheckMode::RefinementBlind => Derivation::RefinementBlind,
+        }
+    }
 }
 
 /// The environment a Check query runs in: the lexical scope at the query, plus
@@ -165,7 +190,7 @@ impl ScopeEnv for CheckScope<'_> {
 }
 
 impl CheckCtx {
-    fn new(root: NodeId, instances: Rc<InstanceTable>) -> Self {
+    fn new(root: NodeId, instances: Rc<InstanceTable>, mode: CheckMode) -> Self {
         // Level 0 matches inference (Stage 1 holds the level at 0) and the
         // scheme quantification level, so instantiated schemes mint vars at
         // the same level Check's `fresh` does.
@@ -185,6 +210,7 @@ impl CheckCtx {
             scratch_lambdas: Vec::new(),
             instances,
             opened_params: Vec::new(),
+            mode,
         }
     }
 
@@ -200,10 +226,9 @@ impl CheckCtx {
     /// from the walk's witness context.
     ///
     /// Check re-derives at a pass boundary, reconciling types two passes spelled in
-    /// different forms, so the derivation is always [`Derivation::PostPass`] — the one
-    /// respect in which Check's constraint solving differs from the live solve's.
+    /// different forms, so the derivation is the one the check's [`CheckMode`] names.
     fn cache(&self) -> ConstrainCache {
-        let mut cache = ConstrainCache::for_derivation(Derivation::PostPass);
+        let mut cache = ConstrainCache::for_derivation(self.mode.derivation());
         cache.seed_context(&self.witness_ctx);
         cache
     }
@@ -1380,7 +1405,7 @@ fn check_unbox(ty: &Type, label: &str, ctx: &mut CheckCtx) {
     let _ = ctx.require_sub(&recorded, &expected, &at);
 }
 
-/// Run the post-inference structural type-check over `expr`.
+/// Run the post-inference structural type-check over `expr`, in [`CheckMode::Full`].
 ///
 /// Drives the shared per-node typing rules in Check mode over a throwaway
 /// clone — the rules need `&mut Expr` for inference's in-place type writes, but
@@ -1402,16 +1427,18 @@ fn check_unbox(ty: &Type, label: &str, ctx: &mut CheckCtx) {
 pub fn check(expr: &Expr) -> Result<(), Vec<InferError>> {
     // Check-mode failures are compiler bugs (a pass produced an ill-typed tree), and
     // every caller of this entry `.expect()`s them, so the blame nodes go unread.
-    check_located(expr, &InstanceTable::builtin())
+    check_located(expr, &InstanceTable::builtin(), CheckMode::Full)
         .map_err(|errs| errs.into_iter().map(|e| e.error).collect())
 }
 
-/// [`check`] of a program declaring `instances`, keeping the node each error was raised at.
+/// [`check`] of a program declaring `instances`, in `mode`, keeping the node each error was
+/// raised at.
 pub(crate) fn check_located(
     expr: &Expr,
     instances: &Rc<InstanceTable>,
+    mode: CheckMode,
 ) -> Result<(), Vec<LocatedInferError>> {
-    check_located_against(expr, None, instances)
+    check_located_against(expr, None, instances, mode)
 }
 
 /// [`check_located`] against the types of the registered data sources, which verifies each
@@ -1420,20 +1447,24 @@ pub(crate) fn check_located_against(
     expr: &Expr,
     sources: Option<&HashMap<String, Type>>,
     instances: &Rc<InstanceTable>,
+    mode: CheckMode,
 ) -> Result<(), Vec<LocatedInferError>> {
     // The walk opens a type's binders to reach the predicates beneath them, once per node
     // that carries the type, so one memo keeps each opened predicate one allocation and
     // `checked_predicates` checks it once.
-    crate::ccl::subst::with_conversion_memo(|| check_located_memoized(expr, sources, instances))
+    crate::ccl::subst::with_conversion_memo(|| {
+        check_located_memoized(expr, sources, instances, mode)
+    })
 }
 
 fn check_located_memoized(
     expr: &Expr,
     sources: Option<&HashMap<String, Type>>,
     instances: &Rc<InstanceTable>,
+    mode: CheckMode,
 ) -> Result<(), Vec<LocatedInferError>> {
     let mut cloned = expr.clone_preserving_ids();
-    let mut ctx = CheckCtx::new(cloned.node_id(), Rc::clone(instances));
+    let mut ctx = CheckCtx::new(cloned.node_id(), Rc::clone(instances), mode);
     ctx.sources = sources.cloned();
     // Most rules *accumulate* into `ctx.errors` (see `require_sub`) so the walk keeps
     // going and reports everything it can. But a few propagate instead —
@@ -1593,6 +1624,44 @@ mod tests {
         assert_eq!(check(&tree), Ok(()), "`__elem == a` entails `__elem >= 0`");
     }
 
+    /// `xs ▷ g`, where `xs` is a function `over` `{Int | __elem > 0}` and `g` takes one `over`
+    /// `{Int | __elem < 0}`: neither domain refinement entails the other.
+    fn applied_across_unequal_domains(over: fn(Type, Type) -> Type) -> TypedExpr {
+        let int = prim(BaseType::Int);
+        let zero = || TypedExpr::lit(Lit::Int(0)).with_ty(int.clone());
+        let xs = TypedExpr::var(Name::fresh("xs"))
+            .with_ty(over(refined(CompareKind::Greater, zero()), int.clone()));
+        let g = TypedExpr::var(Name::fresh("g")).with_ty(Type::fun(
+            over(refined(CompareKind::Less, zero()), int.clone()),
+            int.clone(),
+        ));
+        TypedExpr::apply(xs, g).with_ty(int)
+    }
+
+    /// A data function's domain is its data, so after refinement erasure
+    /// ([`CheckMode::RefinementBlind`]) a check still compares the filtered domains of two data
+    /// functions and rejects unequal ones. The same mismatch between compute function domains
+    /// relates by base there, and only [`CheckMode::Full`] rejects it.
+    #[test]
+    fn a_refinement_blind_check_rejects_unequal_data_function_domains() {
+        let check_in = |tree: &TypedExpr, mode| {
+            check_located(tree, &InstanceTable::builtin(), mode).map_err(|errs| errs.len())
+        };
+        let data = applied_across_unequal_domains(Type::data_fun);
+        assert!(check_in(&data, CheckMode::Full).is_err());
+        assert!(
+            check_in(&data, CheckMode::RefinementBlind).is_err(),
+            "the data domains `{{Int | __elem > 0}}` and `{{Int | __elem < 0}}` differ after erasure"
+        );
+        let compute = applied_across_unequal_domains(Type::fun);
+        assert!(check_in(&compute, CheckMode::Full).is_err());
+        assert_eq!(
+            check_in(&compute, CheckMode::RefinementBlind),
+            Ok(()),
+            "erasure leaves a compute function's domain unrefined"
+        );
+    }
+
     /// Check mode accumulates: it records every failing rule instead of
     /// returning at the first, and each recorded error is blamed on the node
     /// whose rule raised it.
@@ -1613,7 +1682,7 @@ mod tests {
         let (a_id, b_id) = (bad_a.node_id(), bad_b.node_id());
         let mut tree = TypedExpr::tuple(vec![bad_a, bad_b]);
 
-        let mut ctx = CheckCtx::new(tree.node_id(), InstanceTable::builtin());
+        let mut ctx = CheckCtx::new(tree.node_id(), InstanceTable::builtin(), CheckMode::Full);
         let _ = check_node(&mut tree, &mut ctx);
 
         let blamed: Vec<_> = ctx.errors.iter().map(|e| e.node_id).collect();
@@ -1653,7 +1722,7 @@ mod tests {
         let errors_for = |result: Type| {
             let mut node = Expr::builtin(Builtin::StrengthOver)
                 .with_ty(Type::fun(operand.clone(), Type::fun(int.clone(), result)));
-            let mut ctx = CheckCtx::new(node.node_id(), InstanceTable::builtin());
+            let mut ctx = CheckCtx::new(node.node_id(), InstanceTable::builtin(), CheckMode::Full);
             let _ = check_node(&mut node, &mut ctx);
             ctx.errors
         };

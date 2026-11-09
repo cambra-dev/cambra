@@ -283,6 +283,10 @@ pub struct ConstrainCache {
     /// edge that relates the two sides the other way round runs under
     /// [`swapped`](Self::swapped), so the flag holds on every edge.
     value_on_right: bool,
+    /// Whether the edge being walked lies inside the domain edge of two data functions, or
+    /// inside the kind premise between their Σ binders. Under
+    /// [`Derivation::RefinementBlind`] only such an edge compares refinements.
+    in_data_domains: bool,
     /// The origins of the innermost edge that failed, set by the first error to unwind
     /// and read by the caller with [`take_failure`](Self::take_failure).
     failure: Option<(Option<Origin>, Option<Origin>)>,
@@ -313,6 +317,11 @@ pub enum Derivation {
     /// passes spelled in different coordinates, but every binder the tree's
     /// refinements reference is a binder the walk itself can enter.
     PostPass,
+    /// A [`PostPass`](Self::PostPass) re-derivation after [`crate::ccl::erase_refinements`],
+    /// which keeps refinements on data function domains only. A refined type relates by its
+    /// base, except inside an edge between the domains of two data functions, where both sides
+    /// kept their refinements ([`ConstrainCache::in_data_domains`]).
+    RefinementBlind,
 }
 
 impl Derivation {
@@ -343,6 +352,7 @@ impl ConstrainCache {
             rctx: crate::ccl::ty::WitnessContext::default(),
             origins: (None, None),
             value_on_right: false,
+            in_data_domains: false,
             failure: None,
             unreported: Vec::new(),
             extruded: HashMap::new(),
@@ -443,6 +453,22 @@ impl ConstrainCache {
         self.lctx = l;
         self.rctx = r;
         out
+    }
+
+    /// Run `f` with [`in_data_domains`](Self::in_data_domains) set when `both_data`, restoring
+    /// it after.
+    fn within_data_domains<R>(&mut self, both_data: bool, f: impl FnOnce(&mut Self) -> R) -> R {
+        let previous = self.in_data_domains;
+        self.in_data_domains |= both_data;
+        let out = f(self);
+        self.in_data_domains = previous;
+        out
+    }
+
+    /// Whether the edge being walked relates refined types by their bases: under
+    /// [`Derivation::RefinementBlind`], outside the domains of two data functions.
+    fn refinement_blind(&self) -> bool {
+        self.derivation == Derivation::RefinementBlind && !self.in_data_domains
     }
 
     /// Run `f` with the two sides traded, for a descent that relates them the other way
@@ -1467,6 +1493,14 @@ fn constrain_go_impl(
         // domains in both directions, and inclusion both ways is equality.
         (Type::UIntRange(a), Type::UIntRange(b)) if a <= b => Ok(()),
         (Type::UIntRange(_), Type::Base(BaseType::UInt)) => Ok(()),
+        // The bound `0..𝑛` puts on a `UInt` is a refinement the bases carry, so a
+        // refinement-blind edge relates the two by the `UInt` they refine. A proven lookup's
+        // key, erased to `UInt`, meets its list's domain `0..𝑛` this way.
+        (Type::Base(BaseType::UInt) | Type::UIntRange(_), Type::UIntRange(_))
+            if cache.refinement_blind() =>
+        {
+            Ok(())
+        }
         (Type::DataSource(a), Type::DataSource(b)) if a == b => Ok(()),
         // a channel's nominal domain is reflexively equal to
         // itself (the common read-vs-read case short-circuits here).
@@ -1582,20 +1616,24 @@ fn constrain_go_impl(
             // between two settled kinds: the arms that would record take a variable, and a
             // settled tree has none. What a check must not do is *decide* a kind, and this
             // does not — it reads what each side states.
+            // Each candidate of a kind is a data function's domain.
+            let both_data = k0.resolved().is_data() && k1.resolved().is_data();
             if let (Some(w0), Some(w1)) = (k0.sum_binders(), k1.sum_binders()) {
-                for (a, b) in w0.iter().zip(w1.iter()) {
-                    constrain_type_kinds(
-                        &a.type_kind(),
-                        &b.type_kind(),
-                        sl,
-                        sr,
-                        lhs,
-                        rhs,
-                        cache,
-                        scope,
-                        Membership::Solve,
-                    )?;
-                }
+                cache.within_data_domains(both_data, |cache| {
+                    w0.iter().zip(w1.iter()).try_for_each(|(a, b)| {
+                        constrain_type_kinds(
+                            &a.type_kind(),
+                            &b.type_kind(),
+                            sl,
+                            sr,
+                            lhs,
+                            rhs,
+                            cache,
+                            scope,
+                            Membership::Solve,
+                        )
+                    })
+                })?;
             }
             let corresponding;
             // **Between two variable kinds the correspondence names the kind.** Their arities
@@ -1680,8 +1718,8 @@ fn constrain_go_impl(
             // convention). A post-pass re-derivation opens unconditionally: it
             // reconciles types that different passes spelled in different
             // forms (a closed function's codomain against a rebuilt,
-            // discharged one). This is the only site that reads [`Derivation`]:
-            // the record sites enforce the closure invariant at every derivation.
+            // discharged one). The record sites enforce the closure invariant at
+            // every derivation; only the opening policy here depends on it.
             // The pre-scan keeps the common codomain that does not reference
             // this function untouched — the same dependence test descent and
             // application ask everywhere else.
@@ -1741,9 +1779,11 @@ fn constrain_go_impl(
                 if invariant_domains {
                     // Swapped with the substitutions: this edge relates the sides the other
                     // way round, and a reference in `d1` is classified by `d1`'s binders.
-                    let decided = cache
-                        .swapped(|cache| constrain_go(d1, d0, sr, sl, cache, scope))
-                        .and_then(|()| constrain_go(d0, d1, sl, sr, cache, scope));
+                    let decided = cache.within_data_domains(both_data, |cache| {
+                        cache
+                            .swapped(|cache| constrain_go(d1, d0, sr, sl, cache, scope))
+                            .and_then(|()| constrain_go(d0, d1, sl, sr, cache, scope))
+                    });
                     // Whichever edge found the two domains unequal, the report is the
                     // inequality and not the sub-comparison that exposed it — except for
                     // an `SmtError`, which established nothing: relabelling it would claim
@@ -2531,6 +2571,9 @@ fn constrain_go_impl(
         (Type::Refinement(..), _) | (_, Type::Refinement(..)) => {
             let (lbase, lrefs) = (lhs.peel_refinements(), lhs.refinements());
             let (rbase, rrefs) = (rhs.peel_refinements(), rhs.refinements());
+            if cache.refinement_blind() {
+                return constrain_go(lbase, rbase, sl, sr, cache, scope);
+            }
             // The refinements rhs requires that no transported lhs layer
             // matches (by `Refinement`'s structural `PartialEq`). Each side's
             // refinements are forced through its own morphism into the ambient frame

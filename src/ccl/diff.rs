@@ -2343,6 +2343,7 @@ mod tests {
             Phase::Inline,
             Phase::Transact,
             Phase::Letrec,
+            Phase::EraseRefinements,
             Phase::Channelize,
             Phase::AsOfRead,
             Phase::LambdaElim,
