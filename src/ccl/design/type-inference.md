@@ -356,9 +356,9 @@ Each later run's errors are added to the earlier runs', but for those saying the
 determine a type (`InferError::is_undetermined`): an unresolved variable or tuple width, or a
 method call with no receiver type. The constraints a stand-in removed may be what determines such a
 value, and they can raise nothing else, since removing constraints removes conflicts and adds none.
-An error saying what an earlier run's error said is that error, met again, so it is not added:
-every run reports every failure of each check it reaches, and a failure blamed outside the
-statement that causes it is met again at another node of the run that leaves that statement out.
+An error with an earlier run's message at the same node is not added. Restart copies preserve node
+identities. Equal messages at different nodes remain separate reports: a later run can uncover an
+independent failure at another site.
 
 Check mode shares the rules and does not recover at statements: its rules record a failed
 constraint and continue, and an error a rule returns ends the walk.
@@ -1528,6 +1528,10 @@ rather than serving as a lookup table.
 On drop, the arena takes the captured variables and clears both their bound lists and trait-watch
 lists. Watches can form another cycle: a variable watches an obligation whose output type refers
 back to a variable. Clearing only bounds would leave those references intact.
+
+An obligation copy holds a strong reference to its parent. These ancestry links form an acyclic
+chain; clearing every variable's watches also releases the copies and the parents they retain.
+`copied_requirements_release_their_ancestors_with_the_arena` checks this teardown.
 
 No borrow of a captured variable's bounds or watches may remain live across teardown, which mutably
 borrows both cells. Successful materialization creates fresh unresolved placeholders rather than
@@ -4131,7 +4135,25 @@ A pass between emission and coalesce closes this. For each value it intersects w
 A value that fails deposits nothing and the pass goes on, so each failing value is reported once,
 whichever variable the pass reaches it from and however many rounds it takes.
 
+An obligation records the obligation it copied (`TraitObligation::copied_from`). A copy with the
+same candidate rows carries the parent's requirement; narrowing those rows establishes a distinct
+requirement for that instantiation. The sweep identifies an unsatisfiable intersection by these
+requirement identities and operand positions, combining the variables of its copies before finding
+the node that owns the failure. A conflict containing every requirement of another conflict is a
+carrier too. Smaller conflicting sets are grouped first, independently of arena traversal order.
+Distinct instantiations that narrow the same source requirements differently remain distinct.
+
+The attribution walk reads the grouped variables from the emitted tree. Failing to find any is an
+attribution bug, not a reason to blame the program root: that root can be an unrelated definition
+that recovery would then omit. `defect_reports.rs` covers a broken definition carried through
+aliases, carriers with additional compatible requirements, and separately narrowed copies.
+
 Before depositing, the pass reads the bounds the value already carries. A base that disagrees is `RequirementContradictsBound`, naming both it and the required type. Left to the write, the same contradiction reaches coalesce as two `IncompatibleBounds` naming no trait: a *bounded* annotation and a monomorphic operator's operand are ordinary bounds, so no intersection of requirements sees them. An *exact* annotation does not reach here at all — it delivers a base, so the obligation narrows and fails on its own ([Annotation kinds: exact and bounded](#annotation-kinds-exact-and-bounded)).
+
+A deposit can also fail through a transitive bound that the direct base check does not see.
+`OperandFailure::Conflict` keeps the failed edge's origins and its place's variables. A recorded
+value origin locates the error even when the value's type is already concrete, as for a wrong-base
+checked lookup key. The error retains the edge's related positions too.
 
 Both rejections say no argument could work, and they differ in what collides. An empty intersection is the requirements contradicting each other. A bound conflict is the requirements agreeing, on something the program has already ruled out.
 

@@ -119,27 +119,10 @@ pub(super) fn variant_type(tags: BTreeMap<FieldKey, Type>) -> Type {
     Type::variant(tags.into_iter().collect())
 }
 
-/// The node to blame for a fact about a *place* — given the variables standing at it,
-/// the first node, in pre-order, whose own type mentions any of them.
-///
-/// Several variables because a place is not a variable: the requirements that
-/// contradict each other can sit on operator-minted variables no node's type ever
-/// names, while the value they constrain is a component of one that is. Each is tried
-/// in turn, against the whole tree, and the first that appears anywhere wins — so the
-/// result is the earliest *variable* that is named, not the outermost *node* naming
-/// any of them. Sharpening that would mean walking the tree once and asking each node
-/// about every variable, which buys a better span for a case that already falls back
-/// to a coarse one.
-///
-/// Blame is read *out of the tree* rather than stamped onto the solver structure that
-/// raised it. A `NodeId` is provenance, and a copy of one squirrelled away in the
-/// solver would be copied onward by every clone that structure makes — outliving the
-/// construct it identifies. The tree cannot go stale that way, because it *is* the
-/// thing being described.
-///
-/// Falls back to the root, so a span can be coarse but never wrong — an interior place
-/// is exactly the case where that can happen. Only reached on a failure path, so the
-/// walk costs nothing in the passing case.
+/// The first node whose type names a variable of a failing operand place.
+/// Equivalent requirement copies are grouped before this walk, so an arena-only copy
+/// contributes the live variables of the same conflict. No match is an attribution bug:
+/// the program root can belong to an unrelated statement and is no fallback for recovery.
 fn blame_node_for_place(expr: &Expr, uids: &[crate::ccl::InferVarId]) -> NodeId {
     /// Structural only — deliberately does **not** follow a variable's bounds. The
     /// question is which node's type *is written in terms of* this variable, and
@@ -213,9 +196,9 @@ fn blame_node_for_place(expr: &Expr, uids: &[crate::ccl::InferVarId]) -> NodeId 
         });
         found
     }
-    uids.iter()
-        .find_map(|uid| go(expr, *uid))
-        .unwrap_or_else(|| expr.node_id())
+    uids.iter().find_map(|uid| go(expr, *uid)).expect(
+        "a failing operand place is named by the emitted tree after equivalent copies are grouped",
+    )
 }
 
 /// Why two functions' kinds do not relate, read off what each side's kind settled to.
@@ -795,16 +778,15 @@ pub(crate) fn run_with_params(
         let Err(failure) = run_once(&mut rest, sources, instances, params, reported) else {
             break;
         };
-        // A run reports every failure of each check it reaches, so a later run's failure
-        // saying what an earlier one said is that failure, met again: at the same node,
-        // or at another one when the statement left out is not the one the failure was
-        // blamed in.
-        let said: HashSet<String> = errors.iter().map(|e| format!("{:?}", e.error)).collect();
-        errors.extend(
-            failure.errors.into_iter().filter(|e| {
-                !e.error.is_undetermined() && !said.contains(&format!("{:?}", e.error))
-            }),
-        );
+        // Restart copies preserve node identities. Equal messages at different nodes can
+        // report independent defects, so only a repeat at the same node is dropped.
+        let said: HashSet<(NodeId, String)> = errors
+            .iter()
+            .map(|e| (e.node_id, format!("{:?}", e.error)))
+            .collect();
+        errors.extend(failure.errors.into_iter().filter(|e| {
+            !e.error.is_undetermined() && !said.contains(&(e.node_id, format!("{:?}", e.error)))
+        }));
         recovered = failure.recovered;
     }
     drop_met_downstream(&pristine, &mut errors);
@@ -1078,12 +1060,13 @@ fn run_once(
         let mut cache = solver::ConstrainCache::new();
         let failures = solver::traits::resolve_operand_requirements(&mut cache);
         let located = failures.into_iter().map(|failure| {
-            let (blame_vars, error) = match failure {
+            let (blame_vars, error, origins) = match failure {
                 OperandFailure::Unsatisfiable { vars, requirements } => (
                     vars,
                     InferError::UnsatisfiableOperand {
                         requirements: requirements.into_iter().map(stated).collect(),
                     },
+                    (None, None),
                 ),
                 OperandFailure::ContradictsBound {
                     vars,
@@ -1097,20 +1080,23 @@ fn run_once(
                         required: Box::new(Type::Base(required)),
                         found: Box::new(Type::Base(found)),
                     },
+                    (None, None),
                 ),
-                // See `OperandFailure::Conflict`: no program is known to reach this,
-                // so it takes the generic vocabulary rather than one of its own.
-                OperandFailure::Conflict { error } => (
-                    Vec::new(),
+                OperandFailure::Conflict {
+                    vars,
+                    error,
+                    origins,
+                } => (
+                    vars,
                     map_constrain_err(error, "a value an operator constrains"),
+                    origins,
                 ),
             };
-            LocatedInferError {
-                error,
-                node_id: blame_node_for_place(expr, &blame_vars),
-                also: Box::default(),
-                related: RelatedPositions::default(),
-            }
+            let node_id = match origins.0 {
+                Some(crate::ccl::infer_var::Origin::Node(node)) => node,
+                _ => blame_node_for_place(expr, &blame_vars),
+            };
+            LocatedInferError::new(error, node_id).with_failure(origins)
         });
         let errors: Vec<_> = located.collect();
         if !errors.is_empty() {

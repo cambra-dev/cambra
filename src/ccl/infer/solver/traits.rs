@@ -1550,6 +1550,9 @@ pub struct TraitObligation {
     /// Stable, globally-unique identity. Freshening clones an obligation once per
     /// instantiation and keys the copy on this.
     pub uid: TraitObligationId,
+    /// The obligation this instantiation copied. An unchanged copy carries the same
+    /// requirement; narrowing its candidates can introduce a different failure.
+    copied_from: Option<Rc<TraitObligation>>,
     /// The trait being required.
     pub trait_: Trait,
     /// The program's instances, which a reset copy and a condition this obligation mints
@@ -1844,6 +1847,7 @@ impl TraitObligation {
     ) -> Rc<TraitObligation> {
         Rc::new(TraitObligation {
             uid: TraitObligationId(OBLIGATION_COUNTER.fetch_add(1, Ordering::Relaxed)),
+            copied_from: None,
             candidates: RefCell::new(candidates),
             table: Rc::clone(table),
             assumptions: RefCell::new(Vec::new()),
@@ -1893,6 +1897,7 @@ impl TraitObligation {
         let _f = provenance::copy_frame("infer.freshen_obligation");
         Rc::new(TraitObligation {
             uid: TraitObligationId(OBLIGATION_COUNTER.fetch_add(1, Ordering::Relaxed)),
+            copied_from: Some(Rc::clone(original)),
             trait_: original.trait_.clone(),
             table: Rc::clone(&original.table),
             candidates: RefCell::new(original.candidates()),
@@ -1919,6 +1924,36 @@ impl TraitObligation {
             required_at: original.required_at,
             method: original.method.clone(),
         })
+    }
+
+    /// Whether the operand sweep reads this position as a table requirement.
+    fn is_operand_requirement(&self, pos: u8) -> bool {
+        self.answered_by_product().is_none()
+            && !self.collection_rule_can_answer()
+            && !self.trait_.is_method()
+            && self.assumptions.borrow().is_empty()
+            && !self.is_arg_slot(pos)
+            && !self.has_variable_at(pos)
+    }
+
+    /// The earliest copy with the same candidates, before this use narrowed them.
+    fn requirement_source(&self, pos: u8) -> TraitObligationId {
+        let mut source = self;
+        while let Some(parent) = &source.copied_from {
+            let current = source.candidates.borrow();
+            let earlier = parent.candidates.borrow();
+            if current.len() != earlier.len()
+                || !current
+                    .iter()
+                    .zip(earlier.iter())
+                    .all(|(a, b)| Rc::ptr_eq(a, b))
+                || !parent.is_operand_requirement(pos)
+            {
+                break;
+            }
+            source = parent;
+        }
+        source.uid
     }
 
     /// State the refinement the minting operator gives the associated type `refinement.assoc`,
@@ -3465,6 +3500,7 @@ pub fn resolve_operand_requirements(cache: &mut ConstrainCache) -> Vec<OperandFa
     // later pass, reports once.
     let mut failed: std::collections::HashSet<Vec<InferVarId>> = std::collections::HashSet::new();
     let mut failures = Vec::new();
+    let mut reported = HashMap::new();
     loop {
         let before = deposited.len();
         // Re-read the arena every pass rather than snapshotting once. Every variable
@@ -3480,11 +3516,51 @@ pub fn resolve_operand_requirements(cache: &mut ConstrainCache) -> Vec<OperandFa
             &mut deposited,
             &mut failed,
             &mut failures,
+            &mut reported,
         );
         if deposited.len() == before {
-            return failures;
+            return group_operand_failures(failures, reported);
         }
     }
+}
+
+/// A carried conflict reports nothing when it contains every requirement of an earlier
+/// conflict. Process smaller sets first so a carrier cannot hide its cause by arena order.
+fn group_operand_failures(
+    mut failures: Vec<OperandFailure>,
+    reported: HashMap<Vec<(TraitObligationId, u8)>, usize>,
+) -> Vec<OperandFailure> {
+    let mut positions: Vec<_> = reported.into_iter().collect();
+    positions.sort_by_key(|(requirements, at)| (requirements.len(), *at));
+    let mut causes: Vec<(Vec<(TraitObligationId, u8)>, usize)> = Vec::new();
+    let mut carried = std::collections::HashSet::new();
+    for (requirements, at) in positions {
+        let cause = causes
+            .iter()
+            .find(|(seen, _)| seen.iter().all(|r| requirements.binary_search(r).is_ok()));
+        if let Some((_, cause)) = cause {
+            let OperandFailure::Unsatisfiable { vars, .. } = &mut failures[at] else {
+                unreachable!("only unsatisfiable requirements are indexed")
+            };
+            let vars = std::mem::take(vars);
+            let OperandFailure::Unsatisfiable { vars: original, .. } = &mut failures[*cause] else {
+                unreachable!("only unsatisfiable requirements are indexed")
+            };
+            for var in vars {
+                if !original.contains(&var) {
+                    original.push(var);
+                }
+            }
+            carried.insert(at);
+        } else {
+            causes.push((requirements, at));
+        }
+    }
+    failures
+        .into_iter()
+        .enumerate()
+        .filter_map(|(at, failure)| (!carried.contains(&at)).then_some(failure))
+        .collect()
 }
 
 /// One step into a value: how a sub-place is reached from the place above it.
@@ -3593,13 +3669,7 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
             // admits what no row lists, so its accepted heads are no intersection to take.
             //
             // A method call's rows are nominal types, which name no base to intersect.
-            if obligation.answered_by_product().is_some()
-                || obligation.collection_rule_can_answer()
-                || obligation.trait_.is_method()
-                || !obligation.assumptions.borrow().is_empty()
-                || obligation.is_arg_slot(*pos)
-                || obligation.has_variable_at(*pos)
-            {
+            if !obligation.is_operand_requirement(*pos) {
                 continue;
             }
             if !entry
@@ -3736,6 +3806,7 @@ fn resolve_pass(
     deposited: &mut std::collections::HashSet<(InferVarId, BaseType)>,
     failed: &mut std::collections::HashSet<Vec<InferVarId>>,
     failures: &mut Vec<OperandFailure>,
+    reported: &mut HashMap<Vec<(TraitObligationId, u8)>, usize>,
 ) {
     for root in vars {
         for place in places_under(root).into_values() {
@@ -3808,10 +3879,28 @@ fn resolve_pass(
                 // Nothing satisfies every requirement, so no argument ever could.
                 [] => {
                     failed.insert(key);
-                    failures.push(OperandFailure::Unsatisfiable {
-                        vars: blame(),
-                        requirements,
-                    });
+                    let mut sources: Vec<_> = place
+                        .reqs
+                        .iter()
+                        .map(|(o, pos)| (o.requirement_source(*pos), *pos))
+                        .collect();
+                    sources.sort();
+                    sources.dedup();
+                    let vars = blame();
+                    if let Some(&index) = reported.get(&sources) {
+                        let OperandFailure::Unsatisfiable { vars: seen, .. } = &mut failures[index]
+                        else {
+                            unreachable!("only unsatisfiable requirements are indexed")
+                        };
+                        for var in vars {
+                            if !seen.contains(&var) {
+                                seen.push(var);
+                            }
+                        }
+                    } else {
+                        reported.insert(sources, failures.len());
+                        failures.push(OperandFailure::Unsatisfiable { vars, requirements });
+                    }
                 }
                 // Exactly one base left: the requirements *determine* this value, so say
                 // so on the lattice rather than keeping it to ourselves. This is the
@@ -3859,7 +3948,11 @@ fn resolve_pass(
                         if let Err(error) =
                             constrain_subtype(&Type::Infer(Rc::clone(var)), &deposit, cache)
                         {
-                            failures.push(OperandFailure::Conflict { error });
+                            failures.push(OperandFailure::Conflict {
+                                vars: blame(),
+                                error,
+                                origins: cache.take_failure(),
+                            });
                             failed.insert(key.clone());
                         }
                     }
@@ -3880,7 +3973,11 @@ fn resolve_pass(
                                 "narrowing by a base the intersection just proved \
                                  acceptable emptied {obligation:?} at operand {pos}",
                             );
-                            failures.push(OperandFailure::Conflict { error });
+                            failures.push(OperandFailure::Conflict {
+                                vars: blame(),
+                                error,
+                                origins: cache.take_failure(),
+                            });
                         }
                     }
                 }
@@ -3926,16 +4023,19 @@ pub enum OperandFailure {
         /// The base already on the value.
         found: BaseType,
     },
-    /// The lattice refused the deposit.
-    ///
-    /// **Not known to be reachable.** `constrain_subtype` *records* a bound rather than
-    /// checking it against those already present, so the contradiction this would name
-    /// is caught one step earlier, by reading the bounds directly
-    /// ([`ContradictsBound`](Self::ContradictsBound)). Kept because the call is
-    /// fallible and swallowing its error would be worse than carrying an arm for it.
+    /// A deposited requirement conflicts with a transitive bound. The direct base
+    /// check sees only the bounds on the place; recording the deposit follows their
+    /// edges too. Wrong-base checked lookup keys reach this path.
     Conflict {
+        /// Variables naming the place whose deposit failed.
+        vars: Vec<InferVarId>,
         /// Whatever the lattice objected to.
         error: ConstrainError,
+        /// The recorded sources on the failed edge.
+        origins: (
+            Option<crate::ccl::infer_var::Origin>,
+            Option<crate::ccl::infer_var::Origin>,
+        ),
     },
 }
 
@@ -4559,6 +4659,32 @@ mod tests {
             TypedExpr::lit(crate::ccl::Lit::Int(1)),
             TypedExpr::lit(crate::ccl::Lit::Int(2)),
         ]
+    }
+
+    #[test]
+    fn copied_requirements_release_their_ancestors_with_the_arena() {
+        let (original, copied) = {
+            let _arena = crate::ccl::infer::InferArena::new();
+            let node = provenance::NodeId::fresh();
+            let original_value = fresh_var(0);
+            let copied_value = fresh_var(0);
+            let original = TraitObligation::new(
+                Trait::addable(),
+                vec![(Assoc::Output, original_value.clone())],
+                node,
+                crate::ccl::infer_var::Origin::Node(node),
+            );
+            original.watch(&original_value, 0);
+            let copied = TraitObligation::new_from(&original);
+            copied.set_assoc_types(vec![copied_value.clone()]);
+            copied.watch(&copied_value, 0);
+            (Rc::downgrade(&original), Rc::downgrade(&copied))
+        };
+        // The debug audit retains its own handles until the next run starts.
+        #[cfg(debug_assertions)]
+        clear_watch_log();
+        assert!(original.upgrade().is_none());
+        assert!(copied.upgrade().is_none());
     }
 
     /// Both narrowing orders reach the same answer — the property that lets the

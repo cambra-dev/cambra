@@ -257,6 +257,67 @@ fn a_defect_is_reported_once_per_site(#[case] code: &str, #[case] expected: &[&s
     assert_eq!(underlined(code), expected);
 }
 
+#[test]
+fn long_copy_chains_keep_independently_narrowed_conflicts_distinct() {
+    let mut code = indoc! {r#"
+        def add(a, b):
+            a + b
+        alias0 = add
+    "#}
+    .to_owned();
+    for n in 1..=12 {
+        use std::fmt::Write;
+        writeln!(code, "alias{n} = alias{}", n - 1).unwrap();
+    }
+    code.push_str(indoc! {r#"
+        def left(x):
+            (alias12(x, 1), alias12(x, "s"))
+        def right(x):
+            (alias12(x, 2), alias12(x, "t"))
+        1
+    "#});
+    assert_eq!(
+        underlined(&code),
+        &[
+            indoc! {r#"
+            def left(x):
+                (alias12(x, 1), alias12(x, "s"))
+        "#},
+            indoc! {r#"
+            def right(x):
+                (alias12(x, 2), alias12(x, "t"))
+        "#},
+        ]
+    );
+}
+
+#[test]
+fn a_carrier_of_two_conflicts_keeps_both_original_defects() {
+    let code = indoc! {r#"
+        def left(x):
+            (x + 1, x + "s")
+        def right(x):
+            (x + 2, x + "t")
+        def carrier(x):
+            (left(x), right(x), x > 0)
+        alias = carrier
+        1
+    "#};
+    assert_eq!(
+        underlined(code),
+        &[
+            indoc! {r#"
+            def left(x):
+                (x + 1, x + "s")
+        "#},
+            indoc! {r#"
+            def right(x):
+                (x + 2, x + "t")
+        "#},
+        ]
+    );
+}
+
 /// A failed statement hides no defect elsewhere: inference starts over without it, and what
 /// that run finds is reported too, but for a type nothing determines
 /// (`src/ccl/design/type-inference.md`, "An error stops its statement, not the pass").
@@ -314,6 +375,15 @@ fn a_defect_is_reported_once_per_site(#[case] code: &str, #[case] expected: &[&s
     "#},
     &["Int", r#"w + "t""#],
 )]
+#[case::equal_messages_at_different_sites_across_runs(
+    indoc! {r#"
+        x: Int = "s"
+        y = x + "t"
+        z = 1 + "u"
+        (y, z)
+    "#},
+    &["Int", r#"1 + "u""#, r#"x + "t""#],
+)]
 // The annotation fails without the definition too, so the second run leaves it out.
 #[case::a_join_past_a_result_annotation_that_fails(
     indoc! {r#"
@@ -336,6 +406,67 @@ fn a_defect_is_reported_once_per_site(#[case] code: &str, #[case] expected: &[&s
         f1(-5)
     "},
     &["nope"],
+)]
+#[case::a_broken_definition_its_aliases_carry(
+    indoc! {r#"
+        def healthy(x: Int) => Int:
+            x
+        def broken(x):
+            (x + 1, x + "s")
+        def indirect(x):
+            broken(x)
+        alias = indirect
+        1
+    "#},
+    &[indoc! {r#"
+        def broken(x):
+            (x + 1, x + "s")
+    "#}],
+)]
+#[case::copies_narrowed_in_different_definitions_are_different_defects(
+    indoc! {r#"
+        def add(a, b):
+            a + b
+        def g(x):
+            (add(x, 1), add(x, "s"))
+        def h(x):
+            (add(x, 2), add(x, "t"))
+        1
+    "#},
+    &[
+        indoc! {r#"
+            def g(x):
+                (add(x, 1), add(x, "s"))
+        "#},
+        indoc! {r#"
+            def h(x):
+                (add(x, 2), add(x, "t"))
+        "#},
+    ],
+)]
+#[case::a_carrier_adds_a_requirement_beside_an_existing_conflict(
+    indoc! {r#"
+        def broken(x):
+            (x + 1, x + "s")
+        def indirect(x):
+            (broken(x), x > 0)
+        1
+    "#},
+    &[indoc! {r#"
+        def broken(x):
+            (x + 1, x + "s")
+    "#}],
+)]
+#[case::a_transitive_key_conflict_names_the_lookup(
+    indoc! {r#"
+        def healthy(x: Int) => Int:
+            x
+        m = map([(1, 10), (2, 20)])
+        answer = m["nope"]
+        y = [1, "a"]
+        y
+    "#},
+    &[r#"m["nope"]"#, r#"[1, "a"]"#],
 )]
 fn each_defect_is_reported_past_a_failed_statement(#[case] code: &str, #[case] expected: &[&str]) {
     assert_eq!(underlined(code), expected);
