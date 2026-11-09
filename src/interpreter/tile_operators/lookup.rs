@@ -658,6 +658,11 @@ impl CheckedLookupProducer {
 /// The rows stand at `level`, each a `(key, collection)` pair. The collection is a level
 /// beneath its row, one run of keys per row, which is how a collection computed from each row
 /// arrives: the collection a dependent loop's source gives at each enclosing position, say.
+///
+/// The value read takes the pair's place under its row, whatever it tiles as: a column, a
+/// record of columns, or a collection a level beneath the key. A value holding levels of its
+/// own is a group moved from beneath `(row, key)` to beneath `row`, so its predicates are
+/// restated as `src/interpreter/design-operators.md`, "Restating a moved group" says.
 pub struct Lookup {
     /// The input's tiling with the pair at `level` replaced by the value read.
     base: OperatorBase,
@@ -685,15 +690,7 @@ impl Lookup {
             }
         }
         let value = match fields.get(&tuple_field(1)) {
-            Some(Tiling::DataFunction { codomain, .. }) => match codomain.as_ref() {
-                Tiling::Scalar(extent) => extent.clone(),
-                other => {
-                    return Err(format!(
-                        "`apply` reading a collection whose values are not one column is not \
-                         supported yet; its values tile as {other}"
-                    ));
-                }
-            },
+            Some(Tiling::DataFunction { codomain, .. }) => (**codomain).clone(),
             other => {
                 return Err(format!(
                     "`apply` compiles where its function is a collection, which field 1 tiles \
@@ -702,7 +699,7 @@ impl Lookup {
                 ));
             }
         };
-        let tiling = with_values_at(input.tiling(), level, Tiling::Scalar(value));
+        let tiling = with_values_at(input.tiling(), level, value);
         Ok(Self {
             base: OperatorBase::new(tiling),
             input,
@@ -767,105 +764,166 @@ impl TileProducer for LookupProducer {
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let mut tile = self.input.get(self.input.tiling().universal_guard());
-        let Tiling::Scalar(out_extent) = self.tiling().values_at(self.level) else {
-            unreachable!("`Lookup::new_at` puts one value at the level")
-        };
-        let out_extent = out_extent.clone();
         if !reaches(&tile, self.level) {
             return self.tiling().empty_tile();
         }
-        let Tile::Record { fields, absent } = tile.values_at(self.level) else {
-            unreachable!("checked by `reaches`")
+        let rows_level = self.level.enclosing();
+        // Each row's path through the levels above it. The outermost level is one row, reached
+        // by the empty path.
+        let paths = match rows_level {
+            Some(rows) => tile.paths_at(rows),
+            None => vec![Vec::new()],
         };
-        assert_no_absent_cells(absent);
-        let (Some(key_tile), Some(collection)) =
-            (fields.get(&tuple_field(0)), fields.get(&tuple_field(1)))
-        else {
-            panic!("Lookup: rows carry a key at .0 and a collection at .1; got {fields:?}")
+        // A key is complete in its row's collection where the collection calls it complete or a
+        // level above calls its row complete, completeness closing downward.
+        let rows_complete = match rows_level {
+            Some(rows) => tile.completion_at(rows).descend(1),
+            None => Predicate::False,
         };
-        let keys = match key_tile {
-            Tile::Scalar(col) => Cow::Borrowed(col),
-            record @ Tile::Record { .. } => Cow::Owned(scalar_tile_to_column_value(record.clone())),
-            other => panic!("Lookup: a key is one value; got {other:?}"),
+        let (found, pending, value) = {
+            let Tile::Record { fields, absent } = tile.values_at(self.level) else {
+                unreachable!("checked by `reaches`")
+            };
+            assert_no_absent_cells(absent);
+            let (Some(key_tile), Some(collection)) =
+                (fields.get(&tuple_field(0)), fields.get(&tuple_field(1)))
+            else {
+                panic!("Lookup: rows carry a key at .0 and a collection at .1; got {fields:?}")
+            };
+            let keys = match key_tile {
+                Tile::Scalar(col) => Cow::Borrowed(col),
+                record @ Tile::Record { .. } => {
+                    Cow::Owned(scalar_tile_to_column_value(record.clone()))
+                }
+                other => panic!("Lookup: a key is one value; got {other:?}"),
+            };
+            let Tile::DataFunction {
+                domain,
+                codomain,
+                domain_predicate,
+                deleted,
+                ..
+            } = collection
+            else {
+                panic!("Lookup: each row's collection is a level beneath it; got {collection:?}")
+            };
+            assert_eq!(
+                collection.rows(),
+                keys.len(),
+                "Lookup: each row holds its own collection, one run of keys per row"
+            );
+            let found: Vec<Option<usize>> = (0..keys.len())
+                .map(|row| {
+                    let key = keys.index_at(row);
+                    let (from, to) = collection.row_run(row);
+                    (from..to).find(|&i| !deleted.contains(i) && domain.index_at(i) == key)
+                })
+                .collect();
+            let complete = rows_complete.union(domain_predicate);
+            let pending: Vec<bool> = paths
+                .iter()
+                .zip(&found)
+                .enumerate()
+                .map(|(row, (path, at))| {
+                    let mut key_path = path.clone();
+                    key_path.push(keys.index_at(row));
+                    at.is_none() && !complete.contains_path(&key_path)
+                })
+                .collect();
+            let reads: Vec<ValueRead> = paths
+                .iter()
+                .zip(&found)
+                .filter_map(|(path, at)| {
+                    let mut entry = path.clone();
+                    entry.push(domain.index_at((*at)?));
+                    Some(ValueRead {
+                        complete: complete.contains_path(&entry),
+                        rows: if rows_level.is_none() {
+                            Predicate::True
+                        } else {
+                            Predicate::exactly(path)
+                        },
+                        from: entry,
+                    })
+                })
+                .collect();
+            let picked: Vec<usize> = found.iter().flatten().copied().collect();
+            let groups: Vec<_> = picked.into_iter().map(|row| vec![row]).collect();
+            let mut value = gather_applied(codomain, &groups);
+            value.map_level_predicates(&mut |depth, pred| moved_beneath_rows(pred, depth, &reads));
+            (found, pending, value)
         };
-        let Tile::DataFunction {
-            domain,
-            codomain,
-            deleted,
-            domain_predicate,
-            ..
-        } = collection
-        else {
-            panic!("Lookup: each row's collection is a level beneath it; got {collection:?}")
-        };
-        let Tile::Scalar(values) = codomain.as_ref() else {
-            panic!("Lookup: the collection's values are one column; got {codomain:?}")
-        };
-        assert_eq!(
-            collection.rows(),
-            keys.len(),
-            "Lookup: each row holds its own collection, one run of keys per row"
-        );
-        let answers: Vec<Option<Value>> = (0..keys.len())
-            .map(|row| {
-                let key = keys.index_at(row);
-                let (from, to) = collection.row_run(row);
-                (from..to)
-                    .find(|&i| !deleted.contains(i) && domain.index_at(i) == key)
-                    .map(|i| values.index_at(i))
-            })
-            .collect();
-        if self.level == CurryLevel::OUTERMOST {
-            return match answers.into_iter().next().flatten() {
-                Some(v) => Tile::Scalar(ColumnValue::from_values(vec![v], &out_extent)),
+        let Some(rows_level) = rows_level else {
+            return match found.first().copied().flatten() {
+                Some(_) => value,
                 None => self.tiling().empty_tile(),
             };
-        }
-        let rows_level = CurryLevel::new(self.level.index() - 1);
-        let paths = tile.paths_at(rows_level);
-        let complete = tile
-            .completion_at(rows_level)
-            .descend(1)
-            .union(domain_predicate);
-        let keep: Vec<bool> = answers.iter().map(Option::is_some).collect();
+        };
+        let keep: Vec<bool> = found.iter().map(Option::is_some).collect();
         if !keep.iter().all(|&held| held) {
             let withheld: Vec<&[Value]> = paths
                 .iter()
-                .zip(&answers)
-                .enumerate()
-                .filter(|(row, (path, answer))| {
-                    let mut key_path = (*path).clone();
-                    key_path.push(keys.index_at(*row));
-                    answer.is_none() && !complete.contains_path(&key_path)
-                })
-                .map(|(_, (path, _))| path.as_slice())
+                .zip(&pending)
+                .filter(|(_, pending)| **pending)
+                .map(|(path, _)| path.as_slice())
                 .collect();
             tile.withhold(rows_level, &keep, &withheld);
         }
-        *tile.values_at_mut(self.level) = Tile::Scalar(ColumnValue::from_values(
-            answers.into_iter().flatten().collect(),
-            &out_extent,
-        ));
+        *tile.values_at_mut(self.level) = value;
         tile
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         // The answer keeps the input's keys at every level above the rows, and each row's
-        // collection goes with its row.
-        if self.level == CurryLevel::OUTERMOST {
-            if obsolete_guard.expect_universal_or_empty(&self.name()) {
-                self.input.release(self.input.tiling().universal_guard());
-            }
-            return;
-        }
+        // pair goes with its row. A region of a row's answer is the same region beneath every
+        // key of that row's collection: its own key, whose value the answer holds, and the
+        // others, which this lookup never reads.
+        let level = self.level.index();
+        let Tiling::Record(pair) = self.input.tiling().values_at(self.level) else {
+            unreachable!("`Lookup::new_at` reads `(key, collection)` rows")
+        };
+        let key_kept = pair[&tuple_field(0)].empty_guard();
         let input_guard = crate::interpreter::tiling::through_standing_levels(
             obsolete_guard,
-            self.level.index(),
+            level,
             self.input.tiling(),
-            &mut |answer| todo!("Lookup cannot yet release part of a row's answer: {answer:?}"),
+            &mut |answer| {
+                let beneath_every_key = answer.map_level_predicates(&mut |depth, pred| {
+                    pred.with_level_inserted(level + depth, level)
+                });
+                TileGuard::Record(HashMap::from([
+                    (tuple_field(0), key_kept.clone()),
+                    (
+                        tuple_field(1),
+                        TileGuard::Function(FunctionGuard::Codomain(Box::new(beneath_every_key))),
+                    ),
+                ]))
+            },
         );
         self.input.release(input_guard);
     }
+}
+
+/// `pred`, stated over the input's paths `depth` levels into the values the rows read,
+/// restated over the answer's: each value taken out from beneath its entry
+/// ([`Predicate::within`]) and placed beneath its row ([`Predicate::beneath`]), which the
+/// outermost level, one row on the empty path, does not need. An unqualified statement names
+/// its keys beneath every entry, the read ones among them, so it reads the same over the
+/// answer's paths. A value whose entry is complete is complete throughout.
+fn moved_beneath_rows(pred: &Predicate, depth: usize, reads: &[ValueRead]) -> Predicate {
+    let arms: Vec<&Predicate> = match pred {
+        Predicate::Or(arms) => arms.iter().collect(),
+        one => vec![one],
+    };
+    let (qualified, everywhere): (Vec<&Predicate>, Vec<&Predicate>) =
+        arms.into_iter().partition(|arm| arm.qualifies());
+    let everywhere = everywhere
+        .into_iter()
+        .fold(Predicate::False, |all, arm| all.union(arm));
+    let qualified = qualified
+        .iter()
+        .fold(Predicate::False, |all, arm| all.union(arm));
+    restate_value_reads(&qualified, depth, reads, everywhere)
 }
 
 #[cfg(test)]
@@ -1165,5 +1223,197 @@ mod tests {
             ColumnValue::Ints(vec![20])
         );
         assert!(output.is_terminal());
+    }
+
+    /// Three rows, each reading a key in its own collection whose values are `(key, group)`
+    /// records, the group a collection beneath each entry. Row 0 reads `2` in
+    /// `{1: (1, [5]), 2: (2, [6, 7])}`, rows 1 and 2 read `1` in `{1: (1, [8])}` and
+    /// `{1: (1, [9])}`.
+    ///
+    /// Each read group is complete a different way: row 0's because the group's own level
+    /// calls it complete, row 1's because its collection calls the entry complete, and row 2's
+    /// not at all. The rows themselves are still growing.
+    fn rows_reading_groups() -> (LookupProducer, Rc<std::cell::RefCell<Vec<TileGuard>>>) {
+        let groups = Tile::grouped(
+            vec![0, 1, 3, 4],
+            ColumnValue::UInts(vec![0, 0, 1, 0, 0]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![5, 6, 7, 8, 9]))),
+            Predicate::True.beneath(&[Value::UInt(0), Value::Int(2)], 0),
+            BitSet::new(),
+        );
+        let entries = Tile::Record {
+            fields: HashMap::from([
+                (
+                    tuple_field(0),
+                    Tile::Scalar(ColumnValue::Ints(vec![1, 2, 1, 1])),
+                ),
+                (tuple_field(1), groups),
+            ]),
+            absent: HashMap::new(),
+        };
+        let record = Tile::Record {
+            fields: HashMap::from([
+                (
+                    tuple_field(0),
+                    Tile::Scalar(ColumnValue::Ints(vec![2, 1, 1])),
+                ),
+                (
+                    tuple_field(1),
+                    Tile::grouped(
+                        vec![0, 2, 3],
+                        ColumnValue::Ints(vec![1, 2, 1, 1]),
+                        Box::new(entries),
+                        Predicate::exactly(&[Value::UInt(1), Value::Int(1)]),
+                        BitSet::new(),
+                    ),
+                ),
+            ]),
+            absent: HashMap::new(),
+        };
+        let tile = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1, 2]),
+            Box::new(record),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let entry = Tiling::Record(HashMap::from([
+            (tuple_field(0), Tiling::Scalar(int())),
+            (
+                tuple_field(1),
+                Tiling::data_function(uint(), Tiling::Scalar(int())),
+            ),
+        ]));
+        let tiling = Tiling::data_function(
+            uint(),
+            Tiling::Record(HashMap::from([
+                (tuple_field(0), Tiling::Scalar(int())),
+                (tuple_field(1), Tiling::data_function(int(), entry.clone())),
+            ])),
+        );
+        let (spy, released) = ReleaseSpy::new(tile, tiling);
+        let out = Tiling::data_function(uint(), entry);
+        let lookup = LookupProducer {
+            base: ProducerBase::unowned(LookupProducer::alloc_id(), &out),
+            input: Box::new(spy),
+            level: CurryLevel::new(1),
+        };
+        (lookup, released)
+    }
+
+    /// A value that is a record holding a collection is read whole: each row gets its entry's
+    /// record, and the group in it moves from beneath the entry to beneath the row, complete
+    /// exactly where the input called it complete.
+    #[test]
+    fn a_value_holding_a_collection_moves_beneath_its_row() {
+        let (mut lookup, _) = rows_reading_groups();
+        let out = lookup.get(lookup.tiling().universal_guard());
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = &out
+        else {
+            panic!("the answer tiles as a collection: {out:?}")
+        };
+        assert_eq!(*domain, ColumnValue::UInts(vec![0, 1, 2]));
+        let Tile::Record { fields, .. } = codomain.as_ref() else {
+            panic!("each row holds its entry's record: {codomain:?}")
+        };
+        assert_eq!(
+            fields[&tuple_field(0)],
+            Tile::Scalar(ColumnValue::Ints(vec![2, 1, 1]))
+        );
+        let group = &fields[&tuple_field(1)];
+        let Tile::DataFunction {
+            row_starts,
+            domain,
+            codomain,
+            domain_predicate,
+            ..
+        } = group
+        else {
+            panic!("each row's group is a level beneath it: {group:?}")
+        };
+        assert_eq!(*row_starts, vec![0, 2, 3]);
+        assert_eq!(*domain, ColumnValue::UInts(vec![0, 1, 0, 0]));
+        assert_eq!(
+            **codomain,
+            Tile::Scalar(ColumnValue::Ints(vec![6, 7, 8, 9]))
+        );
+        let at = |row: u64, key: u64| {
+            domain_predicate.contains_path(&[Value::UInt(row), Value::UInt(key)])
+        };
+        assert!(
+            at(0, 0) && at(0, 1),
+            "row 0's group is complete: {domain_predicate:?}"
+        );
+        assert!(at(1, 0), "row 1's entry is complete: {domain_predicate:?}");
+        assert!(
+            !at(2, 0),
+            "nothing calls row 2's group complete: {domain_predicate:?}"
+        );
+    }
+
+    /// Releasing part of a row's group releases the same part beneath every key of that row's
+    /// collection, the row's key and the collection's keys staying.
+    #[test]
+    fn releasing_part_of_a_read_group_releases_it_beneath_the_keys() {
+        let (mut lookup, released) = rows_reading_groups();
+        lookup.get(lookup.tiling().universal_guard());
+        let first_of_row_0 = Predicate::qualified(
+            Predicate::exactly(&[Value::UInt(0)]),
+            Predicate::point(Value::UInt(0)),
+        );
+        let group_part = |pred: Predicate| {
+            TileGuard::Record(HashMap::from([
+                (tuple_field(0), TileGuard::Scalar(Predicate::False)),
+                (
+                    tuple_field(1),
+                    TileGuard::Function(FunctionGuard::Domain(pred)),
+                ),
+            ]))
+        };
+        lookup.release(TileGuard::Function(FunctionGuard::Codomain(Box::new(
+            group_part(first_of_row_0),
+        ))));
+        let beneath_every_key = Predicate::qualified(
+            Predicate::qualified(Predicate::exactly(&[Value::UInt(0)]), Predicate::True),
+            Predicate::point(Value::UInt(0)),
+        );
+        let expected = TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Record(
+            HashMap::from([
+                (tuple_field(0), TileGuard::Scalar(Predicate::False)),
+                (
+                    tuple_field(1),
+                    TileGuard::Function(FunctionGuard::Codomain(Box::new(group_part(
+                        beneath_every_key,
+                    )))),
+                ),
+            ]),
+        ))));
+        assert_eq!(*released.borrow(), vec![expected]);
+    }
+}
+
+#[cfg(test)]
+mod empty_lookup_tests {
+    use super::*;
+    use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
+
+    #[test]
+    fn bare_lookup_waits_for_its_input() {
+        let extent = Extent::Base(crate::interpreter::BaseType::Int);
+        let input_tiling = Tiling::tuple(&[
+            Tiling::Scalar(extent.clone()),
+            Tiling::data_function(extent.clone(), Tiling::Scalar(extent.clone())),
+        ]);
+        let out = Tiling::Scalar(extent);
+        let mut lookup = LookupProducer {
+            base: ProducerBase::unowned(LookupProducer::alloc_id(), &out),
+            input: Box::new(TestTileProducer::new(
+                input_tiling.empty_at_no_rows(),
+                input_tiling,
+            )),
+            level: CurryLevel::OUTERMOST,
+        };
+        assert!(lookup.get(out.universal_guard()).is_empty());
     }
 }

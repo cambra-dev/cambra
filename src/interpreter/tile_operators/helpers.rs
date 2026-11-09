@@ -201,6 +201,53 @@ pub fn try_scalar_tile_to_column_value(tile: Tile) -> Option<ColumnValue> {
     }
 }
 
+/// The values an application yields, given the function's values and, per output row, the
+/// entries of the function that row's argument matched.
+///
+/// Applying at a key yields that key's values. Where those values are a level, the key's
+/// group becomes a level of the output and several matched entries run together; where they
+/// are a record over the function's own rows, the key names one row of it and there is
+/// nothing to group.
+pub(crate) fn gather_applied(values: &Tile, groups: &[Vec<usize>]) -> Tile {
+    if values.is_data_function() {
+        return values.regroup_rows(groups);
+    }
+    let rows: Vec<usize> = groups.iter().flatten().copied().collect();
+    // Each retained output row selects exactly one source row for a non-collection payload.
+    assert_eq!(
+        rows.len(),
+        groups.len(),
+        "a function whose values are a record answers each argument with exactly one row"
+    );
+    values.select_rows(&rows)
+}
+
+/// A selected source value placed beneath destination rows. Completeness of its source
+/// entry makes every level of the value complete; otherwise its own predicates decide.
+pub(crate) struct ValueRead {
+    pub from: Vec<Value>,
+    pub rows: Predicate,
+    pub complete: bool,
+}
+
+/// Restate predicates of gathered values through their source and destination paths.
+/// `otherwise` states completion outside the selected reads, as the operator's input allows.
+pub(crate) fn restate_value_reads(
+    stated: &Predicate,
+    depth: usize,
+    reads: &[ValueRead],
+    otherwise: Predicate,
+) -> Predicate {
+    reads.iter().fold(otherwise, |all, read| {
+        let own = if read.complete {
+            Predicate::True
+        } else {
+            stated.within(&read.from, depth)
+        };
+        all.union(&own.qualified_by(&read.rows, depth))
+    })
+}
+
 /// Apply a function tile over a column of input values, producing a column of outputs.
 ///
 /// Handles three function tile representations:

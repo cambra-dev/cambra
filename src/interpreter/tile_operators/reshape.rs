@@ -205,6 +205,23 @@ fn tuple_field_index(field: &str) -> usize {
 fn flatten_predicate(pred: &Predicate, field_map: &[(SmolStr, Option<SmolStr>)]) -> Predicate {
     match pred {
         Predicate::True | Predicate::False => pred.clone(),
+        // A sub-record's region may itself be a union of componentwise predicates, and the
+        // record distributes over it: `{a: 𝑃 ∪ 𝑄, b: 𝑅}` is `{a: 𝑃, b: 𝑅} ∪ {a: 𝑄, b: 𝑅}`.
+        Predicate::Record(outer_preds)
+            if let Some((outer_k, Predicate::Or(arms))) = outer_preds
+                .iter()
+                .find(|(_, p)| matches!(p, Predicate::Or(_))) =>
+        {
+            Predicate::flatten_or(
+                arms.iter()
+                    .map(|arm| {
+                        let mut one = outer_preds.clone();
+                        one.insert(outer_k.clone(), arm.clone());
+                        flatten_predicate(&Predicate::Record(one), field_map)
+                    })
+                    .collect(),
+            )
+        }
         Predicate::Record(outer_preds) => Predicate::Record(
             field_map
                 .iter()

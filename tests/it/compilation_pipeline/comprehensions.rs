@@ -938,28 +938,30 @@ fn comprehensions_over_boxed_rows_beside_a_list_generator(
     check_sink(source, expected);
 }
 
-/// Dependent comprehensions that do not compile yet: each reads a row of boxed collections at
-/// its key, and the operator for that reading takes rows whose values are one column. Each case
-/// names the value it must answer.
+/// Dependent comprehensions reading a row of boxed collections at its key, where the value read
+/// is itself a collection.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // 2 + 3 + 4.
 #[case::three_levels_filtered(
-    "sum([x for xss in [box([box([1, 2]), box([3])]), box([box([4])])] for xs in xss for x in xs if x > 1])"
+    "sum([x for xss in [box([box([1, 2]), box([3])]), box([box([4])])] for xs in xss for x in xs if x > 1])",
+    9
 )]
 // (1 + 2 + 3 + 4) * 2 + 4.
 #[case::three_levels_after_an_independent_generator(
-    "sum([x + i for i in [0, 1] for xss in [box([box([1, 2]), box([3])]), box([box([4])])] for xs in xss for x in xs])"
+    "sum([x + i for i in [0, 1] for xss in [box([box([1, 2]), box([3])]), box([box([4])])] for xs in xss for x in xs])",
+    24
 )]
 // 1 + 2 + 3 + 4 + 5.
 #[case::four_levels(
-    "sum([x for xsss in [box([box([box([1, 2]), box([3])]), box([box([4])])]), box([box([box([5])])])] for xss in xsss for xs in xss for x in xs])"
+    "sum([x for xsss in [box([box([box([1, 2]), box([3])]), box([box([4])])]), box([box([box([5])])])] for xss in xsss for xs in xss for x in xs])",
+    15
 )]
-fn a_dependent_comprehension_reading_a_row_of_collections_is_refused(#[case] program: &str) {
-    check_compile_error(
-        program,
-        "`apply` reading a collection whose values are not one column is not supported yet",
-    );
+fn a_dependent_comprehension_reads_a_row_of_collections(
+    #[case] program: &str,
+    #[case] expected: i64,
+) {
+    check_scalar(program, Value::Int(expected));
 }
 
 /// A comprehension keyed by a dependent tuple and one keyed by a plain tuple are collections
