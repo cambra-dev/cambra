@@ -2846,9 +2846,11 @@ fn convert_impl_inner(
         }
 
         // Standalone projection morphism: project field _n from codomain of input.
-        TypedExprNode::Proj(ProjKey::Index(n)) => {
-            proj_field(expect_input(input, &format!("Proj({n})"))?, *n, ctx.level())
-        }
+        TypedExprNode::Proj(ProjKey::Index(n)) => proj_named_field(
+            expect_input(input, &format!("Proj({n})"))?,
+            &tuple_field(*n),
+            ctx.level(),
+        ),
 
         TypedExprNode::Proj(ProjKey::Field(name)) => proj_named_field(
             expect_input(input, &format!("Proj({name})"))?,
@@ -2901,7 +2903,11 @@ fn convert_impl_inner(
                             if depth == ctx.iterations.len() && ctx.narrowed > binding.narrowed =>
                         {
                             let level = ctx.level();
-                            proj_field(zip_arms_at(vec![input, op], level), 1, level)
+                            proj_named_field(
+                                zip_arms_at(vec![input, op], level),
+                                &tuple_field(1),
+                                level,
+                            )
                         }
                         // Read through: the binding already varies in lockstep with the
                         // surrounding iteration, so the slot the enclosing `Let` fanned for
@@ -5591,32 +5597,6 @@ fn selects_a_tile(tiling: &Tiling, name: &str) -> bool {
             Tiling::Record(fields) if fields.contains_key(name) && fields.values().any(Tiling::holds_a_level)
         ),
     }
-}
-
-/// Build an operator that extracts field `_n` from the record codomain of `input`.
-///
-/// Produces `MapResult(input, Constant(RecordField("_n")))`.
-fn proj_field(
-    input: Box<dyn TileOperator>,
-    n: usize,
-    level: CurryLevel,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
-    let field_name = tuple_field(n);
-    if selects_a_tile(input.tiling(), &field_name) {
-        return Ok(Box::new(SelectField::new(input, field_name)));
-    }
-    let record_extent = value_extent_at(input.tiling(), level);
-    let field_extent = field_extent_of(&record_extent, &field_name)?;
-    let fn_value = Value::ComputableFunction(FunctionDef::RecordField(field_name));
-    let fn_extent = Extent::Function {
-        domain: Box::new(record_extent),
-        codomain: Box::new(field_extent),
-    };
-    Ok(Box::new(MapResult::new_at(
-        input,
-        Box::new(Constant::new(fn_value, fn_extent)),
-        level,
-    )))
 }
 
 /// `strength_over` over `input`, one row per position of the level it is converted at: each row
