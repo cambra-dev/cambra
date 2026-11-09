@@ -39,8 +39,7 @@ pub fn is_mut_var(e: &Expr, muts: &Muts) -> bool {
 /// carries it in both.
 pub fn is_mut_param(param: &TypedBinding) -> bool {
     param
-        .user_annotation
-        .as_ref()
+        .annotation_ty()
         .unwrap_or(&param.ty)
         .mut_value_type()
         .is_some()

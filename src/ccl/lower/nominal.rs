@@ -13,6 +13,8 @@
 //! through the `Poly` annotation a `def` with type parameters carries. A constructor
 //! that declares none is a value, built where it is named.
 
+use crate::ccl::Annotation;
+use crate::ccl::Occurrence;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -350,6 +352,14 @@ fn kind_arrow_indices<'a>(
     }
 }
 
+/// Where `decl` writes its type parameter `spelling`: once, in its head.
+fn written_param_span(decl: &TypeDecl, spelling: &str) -> Option<Span> {
+    decl.params
+        .iter()
+        .find(|p| p.name == spelling)
+        .map(|p| p.name_span)
+}
+
 /// Lower the index types of each family parameter of `decl`, with its other parameters in
 /// scope ([`NominalDecl::set_family_domains`]).
 fn lower_family_domains(
@@ -361,6 +371,7 @@ fn lower_family_domains(
     for param in head.params.iter().filter(|p| p.arity == 0) {
         ctx.declare_type_throughout(
             param.spelling.as_str(),
+            written_param_span(decl, &param.spelling),
             crate::ccl::module_type::AliasType::Type(Type::Param(Rc::clone(param))),
         );
     }
@@ -555,6 +566,7 @@ fn lower_constructors(
         if param.arity == 0 {
             ctx.declare_type_throughout(
                 param.spelling.as_str(),
+                written_param_span(decl, &param.spelling),
                 crate::ccl::module_type::AliasType::Type(Type::Param(Rc::clone(param))),
             );
         } else {
@@ -1219,7 +1231,7 @@ impl AssociatedReach {
     /// Record the types `binding`, bound to `def`, carries: its own and each type in `def`.
     fn definition(&mut self, binding: &TypedBinding, def: &Expr) {
         self.types.push(binding.ty.clone());
-        self.types.extend(binding.user_annotation.clone());
+        self.types.extend(binding.annotation_ty().cloned());
         for_each_type_in(def, &mut |ty| self.types.push(ty.clone()));
     }
 
@@ -1405,7 +1417,7 @@ fn for_each_type_in(expr: &Expr, f: &mut dyn FnMut(&Type)) {
     expr.walk_type_slots(&mut *f);
     expr.walk_binders(|b| {
         f(&b.ty);
-        if let Some(annotation) = &b.user_annotation {
+        if let Some(annotation) = b.annotation_ty() {
             f(annotation);
         }
     });
@@ -1532,9 +1544,18 @@ fn bind_constructor(
         label,
     );
     let name = member_binding(decl, &ctor.name);
+    // A constructor line writes its name at `ctor.span`. The single-constructor form's
+    // `new` is written nowhere, and its span is the declaration's name, as is a
+    // compiler-provided declaration's.
+    let binder = if decl.is_builtin() || decl.declares_extract {
+        Occurrence::mint()
+    } else {
+        ctx.occurrence_at(ctor.span)
+    };
     bind_function(
         decl,
         name,
+        binder,
         arg,
         ctor.payload(),
         value,
@@ -1565,7 +1586,8 @@ fn bind_is_none(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) ->
                     decl: Rc::clone(decl),
                     ctor: tag.name().into(),
                 },
-                binding: TypedBinding::new_unannotated(payload),
+                head_occurrence: Occurrence::mint(),
+                binding: TypedBinding::new_unannotated(payload, Occurrence::mint()),
                 empty_payload,
             }),
             guard: ctx.tag_machinery(Expr::lit(Lit::Bool(true)), span, label),
@@ -1576,7 +1598,10 @@ fn bind_is_none(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) ->
     let name = member_binding(decl, IS_NONE);
     let self_ty = decl
         .applied_to_params(&mut |n, ty| ctx.tag_machinery(Expr::var(n).with_ty(ty), span, label));
-    bind_function(decl, name, arg, self_ty, case, acc, span, label, ctx)
+    let binder = Occurrence::mint();
+    bind_function(
+        decl, name, binder, arg, self_ty, case, acc, span, label, ctx,
+    )
 }
 
 /// The name a reference to `decl`'s member `name` reads, recording the member as used when
@@ -1629,7 +1654,8 @@ fn bind_extract(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) ->
                     decl: Rc::clone(decl),
                     ctor: ctor.name.clone(),
                 },
-                binding: TypedBinding::new_unannotated(payload),
+                head_occurrence: Occurrence::mint(),
+                binding: TypedBinding::new_unannotated(payload, Occurrence::mint()),
                 empty_payload: false,
             }),
             guard,
@@ -1640,15 +1666,20 @@ fn bind_extract(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) ->
     let name = member_binding(decl, "extract");
     let self_ty = decl
         .applied_to_params(&mut |n, ty| ctx.tag_machinery(Expr::var(n).with_ty(ty), span, label));
-    bind_function(decl, name, arg, self_ty, case, acc, span, label, ctx)
+    let binder = Occurrence::mint();
+    bind_function(
+        decl, name, binder, arg, self_ty, case, acc, span, label, ctx,
+    )
 }
 
 /// `let name = λ arg : param_ty → value in acc`, polymorphic over the declaration's type
-/// parameters when it has any, as a `def` with type parameters is.
+/// parameters when it has any, as a `def` with type parameters is. `binder` is the
+/// occurrence of `name` in the binding.
 #[allow(clippy::too_many_arguments)]
 fn bind_function(
     decl: &NominalDecl,
     name: String,
+    binder: Occurrence,
     arg: &str,
     param_ty: Type,
     value: Expr,
@@ -1657,13 +1688,15 @@ fn bind_function(
     label: crate::ccl::provenance::RewriteLabel,
     ctx: &mut LoweringContext,
 ) -> Expr {
-    let mut function = Expr::lambda(arg, Type::Hole, value);
+    // The function and its parameter are the compiler's own, so their occurrences record
+    // where the function is tagged, as does `binder` unless the caller recorded it.
+    let mut function = Expr::lambda(arg, Occurrence::mint(), Type::Hole, value);
     if let TypedExprNode::Lambda { param, .. } = &mut function.node {
-        param.declare(param_ty);
+        param.declare(Annotation::new(param_ty, Occurrence::mint()));
     }
     let function = ctx.tag_machinery(function, span, label);
     let binding = if decl.params.is_empty() {
-        Expr::let_bind(name, function, acc)
+        Expr::let_bind(name, binder, function, acc)
     } else {
         let poly = Type::Poly(Rc::new(PolyType {
             params: decl
@@ -1678,7 +1711,13 @@ fn bind_function(
             requires: Vec::new(),
             body: Type::Hole,
         }));
-        Expr::let_bind_annotated(name, function, acc, poly)
+        Expr::let_bind_annotated(
+            name,
+            binder,
+            function,
+            acc,
+            Annotation::new(poly, Occurrence::mint()),
+        )
     };
     ctx.tag_machinery(binding, span, label)
 }
@@ -1801,16 +1840,20 @@ pub(super) fn resolve_type(
         if !ctx.nominal_types.iter().any(|d| d.name == ty.node)
             && let Some((found, qualifier)) = ctx.used_nominal.get(&ty.node)
         {
+            ctx.resolved_nominal(ty.span, &ty.node, &found.decl);
             return Ok(Some(Named {
                 decl: Rc::clone(&found.decl),
                 foreign: Some((qualifier.clone(), found.functions.clone())),
             }));
         }
         return match ctx.nominal_type(&ty.node) {
-            Some(decl) => Ok(Some(Named {
-                decl,
-                foreign: None,
-            })),
+            Some(decl) => {
+                ctx.resolved_nominal(ty.span, &ty.node, &decl);
+                Ok(Some(Named {
+                    decl,
+                    foreign: None,
+                }))
+            }
             None => Err(LoweringError::unsupported(
                 ty.span,
                 format!("`{}` is not a nominal type this module declares", ty.node),
@@ -1821,9 +1864,12 @@ pub(super) fn resolve_type(
     let spelled = crate::ccl::names::QualifiedName::of_segments(qualifier);
     Ok(reached
         .reach_nominal(&spelled, &ty.node, first.span.join(ty.span))?
-        .map(|found| Named {
-            decl: found.decl,
-            foreign: Some((reached.name.clone(), found.functions)),
+        .map(|found| {
+            ctx.resolved_nominal(ty.span, &ty.node, &found.decl);
+            Named {
+                decl: found.decl,
+                foreign: Some((reached.name.clone(), found.functions)),
+            }
         }))
 }
 
@@ -2133,8 +2179,9 @@ fn check_binders(decl: &NominalDecl, pattern: &ConstructorPattern) -> Result<(),
     }
 }
 
-/// The [`Pattern`] a checked constructor pattern lowers to, and the parameters to bind
-/// from its payload by position.
+/// The [`Pattern`] a checked constructor pattern lowers to, where the pattern writes the
+/// payload's name (`None` when the name is minted), and the parameters to bind from its
+/// payload by position.
 ///
 /// The pattern binds the constructor's payload ([`NominalCtor::payload`]). For one
 /// parameter that is the parameter, so the pattern binds it under the parameter's own
@@ -2145,32 +2192,51 @@ pub(super) fn constructor_arm_pattern(
     decl: &Rc<NominalDecl>,
     pattern: &ConstructorPattern,
     ctx: &mut LoweringContext,
-) -> (Pattern, Vec<(String, usize)>) {
+) -> (Pattern, Option<Span>, Vec<ParameterBind>) {
     let binders = pattern.binders.as_deref().unwrap_or(&[]);
-    let (payload, binds) = match binders {
-        [] => (ctx.fresh_ignored_payload(), Vec::new()),
+    let (payload, payload_span, binds) = match binders {
+        [] => (ctx.fresh_ignored_payload(), None, Vec::new()),
         [only] => match &only.node {
-            Some(name) => (name.to_string(), Vec::new()),
-            None => (ctx.fresh_ignored_payload(), Vec::new()),
+            Some(name) => (name.to_string(), Some(only.span), Vec::new()),
+            None => (ctx.fresh_ignored_payload(), None, Vec::new()),
         },
         many => {
             let binds = many
                 .iter()
                 .enumerate()
-                .filter_map(|(i, b)| b.node.as_ref().map(|n| (n.to_string(), i)))
+                .filter_map(|(index, b)| {
+                    b.node.as_ref().map(|n| ParameterBind {
+                        name: n.to_string(),
+                        span: b.span,
+                        index,
+                    })
+                })
                 .collect();
-            (ctx.fresh_ignored_payload(), binds)
+            (ctx.fresh_ignored_payload(), None, binds)
         }
+    };
+    let occurrence = match payload_span {
+        Some(span) => ctx.occurrence_at(span),
+        None => Occurrence::mint(),
     };
     let pattern = Pattern {
         head: PatternHead::Constructor {
             decl: Rc::clone(decl),
             ctor: pattern.ctor.node.clone(),
         },
-        binding: TypedBinding::new_unannotated(payload),
+        head_occurrence: ctx.occurrence_at(pattern.ctor.span),
+        binding: TypedBinding::new_unannotated(payload, occurrence),
         empty_payload: binders.is_empty(),
     };
-    (pattern, binds)
+    (pattern, payload_span, binds)
+}
+
+/// A named parameter of a constructor pattern of several: its name, where the pattern
+/// writes it, and its position in the payload.
+pub(super) struct ParameterBind {
+    pub(super) name: String,
+    pub(super) span: Span,
+    pub(super) index: usize,
 }
 
 /// `body` with each of `binds` replaced by its position of the tuple `payload` names.
@@ -2182,17 +2248,25 @@ pub(super) fn constructor_arm_pattern(
 /// capture it.
 pub(super) fn bind_parameters(
     payload: &Name,
-    binds: Vec<(String, usize)>,
+    binds: Vec<ParameterBind>,
     body: Expr,
-    span: Span,
     ctx: &mut LoweringContext,
 ) -> Expr {
-    let label = "lower.constructor_pattern";
-    binds.into_iter().fold(body, |acc, (name, i)| {
-        let read = ctx.tag_machinery(Expr::var(payload.clone()), span, label);
-        let proj = ctx.tag_machinery(Expr::proj_index(i), span, label);
-        let field = ctx.tag_machinery(Expr::apply(read, proj), span, label);
-        super::functions::substitute_param_in_body(acc, &Name::raw(name.as_str()), &field, label)
+    // Tagged at the parameter's name in the pattern, as `uncurry_params` tags a
+    // function's: the projection is what became of the name, so each use's interior
+    // resolves to where the pattern declares it (`src/ccl/design/ir.md`, "Source
+    // locations on substituted parameter projections").
+    let label = "lower.param_proj";
+    binds.into_iter().fold(body, |acc, bind| {
+        let read = ctx.tag_machinery(Expr::var(payload.clone()), bind.span, label);
+        let proj = ctx.tag_machinery(Expr::proj_index(bind.index), bind.span, label);
+        let field = ctx.tag_machinery(Expr::apply(read, proj), bind.span, label);
+        super::functions::substitute_param_in_body(
+            acc,
+            &Name::raw(bind.name.as_str()),
+            &field,
+            label,
+        )
     })
 }
 
@@ -2206,7 +2280,9 @@ pub(super) fn bind_parameters(
 /// own name for a constructor of one parameter, and a minted name otherwise.
 pub(super) struct ConstructorAssignment {
     pattern: Pattern,
-    binds: Vec<(String, usize)>,
+    /// Where the pattern writes the payload's name, for a constructor of one parameter.
+    payload_span: Option<Span>,
+    binds: Vec<ParameterBind>,
 }
 
 impl ConstructorAssignment {
@@ -2216,17 +2292,18 @@ impl ConstructorAssignment {
     /// same, which a caller tracking the names in scope needs.
     pub(super) fn names(&self) -> Vec<String> {
         std::iter::once(self.pattern.binding.name.base().to_string())
-            .chain(self.binds.iter().map(|(name, _)| name.clone()))
+            .chain(self.binds.iter().map(|bind| bind.name.clone()))
             .collect()
     }
 
-    /// The bindings the assignment means, in order, each a name and its value.
+    /// The bindings the assignment means, in order, each a name, where the pattern writes
+    /// it (`None` for a payload's minted name), and its value.
     pub(super) fn bindings(
         self,
         value: Expr,
         span: Span,
         ctx: &mut LoweringContext,
-    ) -> Vec<(String, Expr)> {
+    ) -> Vec<(String, Option<Span>, Expr)> {
         let label = "lower.constructor_assignment";
         let payload = self.pattern.binding.name.clone();
         let read = ctx.tag_machinery(Expr::var(payload.clone()), span, label);
@@ -2241,13 +2318,15 @@ impl ConstructorAssignment {
         );
         let mut out = vec![(
             payload.base().to_string(),
+            self.payload_span,
             ctx.tag_machinery(case, span, label),
         )];
-        for (name, i) in self.binds {
+        for bind in self.binds {
             let read = ctx.tag_machinery(Expr::var(payload.clone()), span, label);
-            let proj = ctx.tag_machinery(Expr::proj_index(i), span, label);
+            let proj = ctx.tag_machinery(Expr::proj_index(bind.index), span, label);
             out.push((
-                name,
+                bind.name,
+                Some(bind.span),
                 ctx.tag_machinery(Expr::apply(read, proj), span, label),
             ));
         }
@@ -2274,8 +2353,12 @@ pub(super) fn check_constructor_assignment(
             ),
         ));
     }
-    let (pattern, binds) = constructor_arm_pattern(&decl, pattern, ctx);
-    Ok(ConstructorAssignment { pattern, binds })
+    let (pattern, payload_span, binds) = constructor_arm_pattern(&decl, pattern, ctx);
+    Ok(ConstructorAssignment {
+        pattern,
+        payload_span,
+        binds,
+    })
 }
 
 /// An associated function a module declares: `def N::f`, or a `def` in `impl N:`

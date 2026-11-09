@@ -42,6 +42,7 @@
 //! ([`Builtin::CurryOver`]), and op-conversion builds the operators the chain compiles to.
 
 use super::*;
+use crate::ccl::Occurrence;
 use std::rc::Rc;
 
 use crate::ccl::TypedExpr;
@@ -376,8 +377,10 @@ pub(super) fn keys_family(
     let per_row = predicates::eliminate_lifted(
         Expr::lambda(
             &x,
+            Occurrence::mint(),
             enclosing.clone(),
-            Expr::lambda(&r, indices.clone(), indexed).with_ty(image_ty.clone()),
+            Expr::lambda(&r, Occurrence::mint(), indices.clone(), indexed)
+                .with_ty(image_ty.clone()),
         )
         .with_ty(Type::pi(x.clone(), enclosing.clone(), image_ty.clone())),
     )
@@ -446,7 +449,7 @@ fn row_keys_family(
         (unboxed, unboxed_ty)
     };
     let per_row = predicates::eliminate_lifted(
-        Expr::lambda(x, enclosing.clone(), unboxed).with_ty(Type::pi(
+        Expr::lambda(x, Occurrence::mint(), enclosing.clone(), unboxed).with_ty(Type::pi(
             x.clone(),
             enclosing.clone(),
             unboxed_ty.clone(),

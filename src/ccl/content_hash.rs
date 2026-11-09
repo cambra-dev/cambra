@@ -462,7 +462,7 @@ fn hash_binding<'a>(
     if fold == Fold::Whole {
         hash_type(&b.ty, env, wenv, free, state);
     }
-    hash_opt_type(b.user_annotation.as_ref(), env, wenv, free, state);
+    hash_opt_type(b.annotation_ty(), env, wenv, free, state);
     // Authored at the binder and derived from nothing else in the tree, so it
     // rides both folds: `y = e` and `y ^= e` are different programs.
     std::mem::discriminant(&b.transparency).hash(state);
@@ -617,7 +617,7 @@ fn hash_payload<'a>(
         N::Record(fields) => {
             fields.len().hash(h);
             if fold == Fold::Own {
-                let mut names: Vec<&Label> = fields.iter().map(|(n, _)| n).collect();
+                let mut names: Vec<&Label> = fields.iter().map(|entry| &entry.label).collect();
                 names.sort_unstable();
                 names.hash(h);
             }
@@ -716,8 +716,11 @@ fn hash_rel<'a>(
         // Records are unordered by field name; field names are unique, so
         // sorting the (name, child-hash) pairs yields a canonical order.
         N::Record(fields) => {
-            let mut entries: Vec<(&Label, u64)> =
-                fields.iter().map(|(n, _)| n).zip(children).collect();
+            let mut entries: Vec<(&Label, u64)> = fields
+                .iter()
+                .map(|entry| &entry.label)
+                .zip(children)
+                .collect();
             entries.sort_unstable();
             entries.hash(&mut h);
         }
@@ -745,6 +748,9 @@ fn hash_rel<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::Annotation;
+    use crate::ccl::Occurrence;
+    use crate::ccl::RecordEntry;
     use crate::ccl::{
         ArithmeticKind, BaseType, BinOpKind, CompareKind, Refinement, RefinementSet, Type,
     };
@@ -757,7 +763,7 @@ mod tests {
         TypedExpr::lit(Lit::Int(n))
     }
     fn lam(param: &str, body: TypedExpr) -> TypedExpr {
-        TypedExpr::lambda(param, Type::Hole, body)
+        TypedExpr::lambda(param, Occurrence::mint(), Type::Hole, body)
     }
     fn add(l: TypedExpr, r: TypedExpr) -> TypedExpr {
         TypedExpr::binop(l, BinOpKind::Arithmetic(ArithmeticKind::Add), r)
@@ -849,8 +855,8 @@ mod tests {
         // The GumTree precondition: the same subterm in two versions hashes
         // equal even when its enclosing binder is bound to different things.
         // `x + y` is standalone-free in both, so it must match.
-        let v1 = TypedExpr::let_bind("x", var("a"), add(var("x"), var("y")));
-        let v2 = TypedExpr::let_bind("x", var("b"), add(var("x"), var("y")));
+        let v1 = TypedExpr::let_bind("x", Occurrence::mint(), var("a"), add(var("x"), var("y")));
+        let v2 = TypedExpr::let_bind("x", Occurrence::mint(), var("b"), add(var("x"), var("y")));
         let (TypedExprNode::Let { body: b1, .. }, TypedExprNode::Let { body: b2, .. }) =
             (&v1.node, &v2.node)
         else {
@@ -876,12 +882,12 @@ mod tests {
     #[test]
     fn records_are_order_insensitive_tuples_are_not() {
         let rec_ab = TypedExpr::new(TypedExprNode::Record(vec![
-            ("a".into(), int(1)),
-            ("b".into(), int(2)),
+            RecordEntry::new("a", Occurrence::mint(), int(1)),
+            RecordEntry::new("b", Occurrence::mint(), int(2)),
         ]));
         let rec_ba = TypedExpr::new(TypedExprNode::Record(vec![
-            ("b".into(), int(2)),
-            ("a".into(), int(1)),
+            RecordEntry::new("b", Occurrence::mint(), int(2)),
+            RecordEntry::new("a", Occurrence::mint(), int(1)),
         ]));
         assert_eq!(h(&rec_ab), h(&rec_ba));
 
@@ -906,7 +912,7 @@ mod tests {
 
     #[test]
     fn hash_all_covers_every_node() {
-        let e = TypedExpr::let_bind("x", var("a"), add(var("x"), var("y")));
+        let e = TypedExpr::let_bind("x", Occurrence::mint(), var("a"), add(var("x"), var("y")));
         let map = hash_all(&e);
         // Let, bound_expr Var(a), body BinOp, BinOp's Var(x), Var(y) = 5 nodes.
         assert_eq!(map.len(), 5);
@@ -1026,13 +1032,13 @@ mod tests {
                     let predicate = match slot {
                         "inferred" => var("p").with_ty(ty),
                         "annotation" => var("p").with_user_annotation(ty),
-                        "binding" => TypedExpr::lambda("p", ty, var("p")),
+                        "binding" => TypedExpr::lambda("p", Occurrence::mint(), ty, var("p")),
                         "binding_annotation" => {
                             let mut p = lam("p", var("p"));
                             let TypedExprNode::Lambda { param, .. } = &mut p.node else {
                                 unreachable!()
                             };
-                            param.user_annotation = Some(ty);
+                            param.user_annotation = Some(Annotation::new(ty, Occurrence::mint()));
                             p
                         }
                         "cast" => TypedExpr::new(TypedExprNode::Cast {

@@ -8,7 +8,7 @@ import { describe, expect, it } from "vitest";
 
 import { resolvedTypeTooltip, serializeTree } from "./treeView";
 import { allNodes, fixture, irPaneById } from "./__fixtures__/helpers";
-import type { IrChild, IrNode } from "./types";
+import type { IrChild, IrNode, OccurrenceKind } from "./types";
 
 import listMinJson from "./__fixtures__/list_min.snapshot.json";
 
@@ -62,7 +62,7 @@ function table(...nodes: IrNode[]): Map<number, IrNode> {
   return new Map(nodes.map((n) => [n.nodeId, n]));
 }
 
-const value = (id: number): IrChild => ({ id, predicate: false });
+const value = (id: number): IrChild => ({ id, kind: "value" });
 
 describe("serializeTree", () => {
   it("renders the position, node label, type, and node id of a row", () => {
@@ -95,10 +95,51 @@ describe("serializeTree", () => {
     // pane it claims to reproduce. The literal keeps its own row, and its
     // synthesized `__elem == 1` interior contributes none.
     const nodes = table(
-      node("Lit(Int(1))", "Int@1", 5, [{ id: 6, predicate: true }]),
+      node("Lit(Int(1))", "Int@1", 5, [{ id: 6, kind: "predicate" }]),
       node("BinOp(Eq)", "Bool", 6),
     );
     expect(serializeTree(5, nodes)).toBe("Lit(Int(1)) : Int@1 #5");
+  });
+
+  it("labels an occurrence by its kind, after the value children", () => {
+    // `λ p → p`: the binder is a row under the lambda, edge-labelled `binder`
+    // rather than by position, and the value child keeps its positional index.
+    const nodes = table(
+      node("Lambda", "(Int ⇒ Int)", 1, [value(2), { id: 3, kind: "binder" }]),
+      node("Var(p)", "Int", 2),
+      node("Binder(p)", "Int", 3),
+    );
+    expect(serializeTree(1, nodes)).toBe(
+      "Lambda : (Int ⇒ Int) #1\n  0: Var(p) : Int #2\n  binder: Binder(p) : Int #3",
+    );
+  });
+
+  it("names each kind of occurrence by its edge's kind, not its entry's label", () => {
+    // No entry label here leads with its kind's word, so the rows show that the
+    // edge label comes from the kind alone.
+    const occurrence = (id: number, kind: OccurrenceKind): IrChild => ({ id, kind });
+    const nodes = table(
+      node("Feed", "Unit", 1, [
+        occurrence(2, "use"),
+        occurrence(3, "label"),
+        occurrence(4, "head"),
+        occurrence(5, "annotation"),
+        occurrence(6, "binder"),
+      ]),
+      node("Name(out)", "Feed(Int)", 2),
+      node("Tag(x)", "Int", 3),
+      node("Pattern(rect)", "{w: Int, h: Int}", 4),
+      node("Ann", "String", 5),
+      node("Bound(p)", "Int", 6),
+    );
+    expect(serializeTree(1, nodes).split("\n").map((l) => l.trim().split(":")[0])).toEqual([
+      "Feed ",
+      "use",
+      "label",
+      "head",
+      "annotation",
+      "binder",
+    ]);
   });
 
   it("gives a shared node one row per position that reaches it", () => {

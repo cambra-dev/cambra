@@ -686,6 +686,8 @@ enum ScopeEntry {
 /// being coalesced.
 struct SpecializeFrame {
     name: Name,
+    /// The generalized binder's occurrence, which each specialization's binder copies.
+    occurrence: NodeId,
     /// The uncoalesced definition, cloned (and freshened) once per distinct use
     /// type by [`specialize_use`]. Its predicates are immutable, so a use-site
     /// clone never disturbs it — no privatization needed.
@@ -779,7 +781,17 @@ struct ActiveSpecialization {
 /// `def` that nothing has rewritten yet: [`Clone`] re-mints every id and keeps the
 /// shape, so a walk of the two in step pairs them.
 fn copied_nodes(def: &Expr, clone: &Expr, out: &mut HashMap<NodeId, NodeId>) {
-    out.insert(clone.node_id(), def.node_id());
+    // The node's own id and each occurrence it holds, which `Clone` re-mints alike.
+    let mut own = Vec::new();
+    def.for_each_own_id(|id| own.push(id));
+    let mut own_copies = Vec::new();
+    clone.for_each_own_id(|id| own_copies.push(id));
+    debug_assert_eq!(
+        own.len(),
+        own_copies.len(),
+        "a clone holds its original's occurrences"
+    );
+    out.extend(own_copies.into_iter().zip(own));
     let mut originals = Vec::new();
     def.walk_children(|c| originals.push(c));
     let mut copies = Vec::new();
@@ -872,6 +884,8 @@ struct Placed {
     binder: Name,
     /// The generalized binding it specializes.
     frame_name: Name,
+    /// The generalized binder's occurrence ([`SpecializeFrame::occurrence`]).
+    occurrence: NodeId,
     transparency: BindingTransparency,
     spec: Specialization,
 }
@@ -2365,8 +2379,8 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             }
         }
         TypedExprNode::Record(fs) => {
-            for (_, e) in fs.iter_mut() {
-                coalesce_node(e, level, ctx);
+            for entry in fs.iter_mut() {
+                coalesce_node(&mut entry.value, level, ctx);
             }
         }
         TypedExprNode::Case {
@@ -2766,7 +2780,7 @@ fn bind(value: Expr, body: impl FnOnce(Expr) -> Expr) -> Expr {
     let read = Expr::var(name.clone()).with_ty(value.ty.clone());
     let body = body(read);
     let ty = body.ty.clone();
-    Expr::let_bind(name, value, body).with_ty(ty)
+    Expr::let_bind(name, crate::ccl::Occurrence::mint(), value, body).with_ty(ty)
 }
 
 /// Rewrite an operator a declared instance answers into the call its [`OperatorCall`]
@@ -3899,6 +3913,7 @@ pub(super) fn specialize_use(
         ctx.placed.push(Placed {
             binder,
             frame_name,
+            occurrence: frame.occurrence,
             transparency,
             spec: Specialization {
                 key,
@@ -3988,7 +4003,7 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
     // A definition annotated with a polymorphic type holds its type parameters
     // opaque, opened one level above the binding, while it is checked alone, under
     // the `requires` clause `emit_let` left on the opened annotation.
-    let (own_params, requires): (Rc<[TypeParamId]>, _) = match &binding.user_annotation {
+    let (own_params, requires): (Rc<[TypeParamId]>, _) = match binding.annotation_ty() {
         Some(Type::Poly(poly)) => (
             poly.params.iter().map(|p| p.param.id).collect(),
             poly.requires.clone(),
@@ -4020,6 +4035,7 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
         .clone();
     ctx.scope
         .push(ScopeEntry::Generalized(Box::new(SpecializeFrame {
+            occurrence: binding.occurrence.id(),
             name: binding.name,
             def: *bound_expr,
             cutoff: level,
@@ -4140,14 +4156,19 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
     );
     let mut result = body;
     for spec in frame.specs.into_iter().rev().filter(|s| s.referenced) {
-        result = specialization_let(spec, transparency, result);
+        result = specialization_let(spec, frame.occurrence, transparency, result);
     }
     *expr = result;
     expr.user_annotation = saved_annotation;
 }
 
 /// `body` under the `let` binding `spec`'s clone, its type closed over the binder.
-fn specialization_let(spec: Specialization, transparency: BindingTransparency, body: Expr) -> Expr {
+fn specialization_let(
+    spec: Specialization,
+    occurrence: NodeId,
+    transparency: BindingTransparency,
+    body: Expr,
+) -> Expr {
     // The discharge only does work when the specialization binder is free
     // in the body type's refinement predicates; skip cloning `spec.def`
     // otherwise (it is still moved into the rebuilt `let` below).
@@ -4162,6 +4183,8 @@ fn specialization_let(spec: Specialization, transparency: BindingTransparency, b
     Expr::new(TypedExprNode::Let {
         binding: TypedBinding {
             name: spec.name,
+            // Each specialization is a copy of the generalized binder.
+            occurrence: crate::ccl::Occurrence::copied_from(occurrence),
             ty: spec.def.ty.clone(),
             user_annotation: None,
             transparency,
@@ -4190,7 +4213,7 @@ fn splice_placed(ctx: &mut CoalesceCtx, binders: &[Name], body: &mut Expr) {
     );
     let mut result = std::mem::take(body);
     for placed in here.into_iter().rev().filter(|p| p.spec.referenced) {
-        result = specialization_let(placed.spec, placed.transparency, result);
+        result = specialization_let(placed.spec, placed.occurrence, placed.transparency, result);
     }
     *body = result;
 }
@@ -4688,7 +4711,12 @@ mod tests {
         use super::check_scope_valid;
         let mut body = lit_int(1);
         body.ty = refined_int(TypedExpr::var("x"));
-        let mut lam = TypedExpr::lambda("x", Type::Base(BaseType::Int), body);
+        let mut lam = TypedExpr::lambda(
+            "x",
+            crate::ccl::Occurrence::mint(),
+            Type::Base(BaseType::Int),
+            body,
+        );
         lam.ty = Type::pi(
             "x",
             Type::Base(BaseType::Int),
@@ -4711,7 +4739,7 @@ mod tests {
         let mut init = lit_int(0);
         init.ty = refined_int(TypedExpr::var("x"));
         let init_id = init.node_id();
-        let decl = TypedExpr::mut_decl("x", Type::Hole, init, body);
+        let decl = TypedExpr::mut_decl("x", crate::ccl::Occurrence::mint(), Type::Hole, init, body);
         let mut errors = Vec::new();
         check_scope_valid(&decl, &std::collections::BTreeSet::new(), &mut errors);
         let [located] = errors.as_slice() else {
@@ -4769,7 +4797,7 @@ mod tests {
         for domain in [own.domain().unwrap(), foreign.domain().unwrap()] {
             let mut body = lit_int(0);
             body.ty = domain.clone();
-            let mut expr = TypedExpr::lambda("i", domain, body);
+            let mut expr = TypedExpr::lambda("i", crate::ccl::Occurrence::mint(), domain, body);
             expr.ty = own.clone();
             let mut errors = Vec::new();
             super::check_scope_valid(&expr, &Default::default(), &mut errors);
@@ -4787,11 +4815,16 @@ mod tests {
         // into one shared param var → `IncompatibleBounds`). Let-generalization
         // instantiates `id` independently per use, and the coalesce walk emits
         // one specialized definition per distinct resolved use type.
-        let id = TypedExpr::lambda("x", Type::Hole, TypedExpr::var("x"));
+        let id = TypedExpr::lambda(
+            "x",
+            crate::ccl::Occurrence::mint(),
+            Type::Hole,
+            TypedExpr::var("x"),
+        );
         let use_int = TypedExpr::apply(lit_int(1), TypedExpr::var("id"));
         let use_str = TypedExpr::apply(lit_string("a"), TypedExpr::var("id"));
         let body = TypedExpr::new(TypedExprNode::Tuple(vec![use_int, use_str]));
-        let mut e = TypedExpr::let_bind("id", id, body);
+        let mut e = TypedExpr::let_bind("id", crate::ccl::Occurrence::mint(), id, body);
         let ty = run_inference(&mut e).expect("polymorphic identity type-checks");
         assert_eq!(ty, Type::Tuple(vec![int_lit_ty(1), str_lit_ty("a")]));
     }
@@ -4806,13 +4839,18 @@ mod tests {
         // a shortfall: a refinement on an iterated domain is compiled (one
         // `restrict` filter per layer), so refinements are code and two clones
         // pinned to different ones are genuinely different code.
-        let f = TypedExpr::lambda("x", Type::Hole, TypedExpr::var("x"));
+        let f = TypedExpr::lambda(
+            "x",
+            crate::ccl::Occurrence::mint(),
+            Type::Hole,
+            TypedExpr::var("x"),
+        );
         let body = TypedExpr::new(TypedExprNode::Tuple(vec![
             TypedExpr::apply(lit_int(1), TypedExpr::var("f")),
             TypedExpr::apply(lit_int(2), TypedExpr::var("f")),
             TypedExpr::apply(lit_string("a"), TypedExpr::var("f")),
         ]));
-        let mut e = TypedExpr::let_bind("f", f, body);
+        let mut e = TypedExpr::let_bind("f", crate::ccl::Occurrence::mint(), f, body);
         let ty = run_inference(&mut e).expect("type-checks");
         assert_eq!(
             ty,
@@ -4838,13 +4876,18 @@ mod tests {
     #[test]
     fn identical_instantiations_share_one_specialization() {
         // let f = λx. x in (f 1, f 1, f "a")
-        let f = TypedExpr::lambda("x", Type::Hole, TypedExpr::var("x"));
+        let f = TypedExpr::lambda(
+            "x",
+            crate::ccl::Occurrence::mint(),
+            Type::Hole,
+            TypedExpr::var("x"),
+        );
         let body = TypedExpr::new(TypedExprNode::Tuple(vec![
             TypedExpr::apply(lit_int(1), TypedExpr::var("f")),
             TypedExpr::apply(lit_int(1), TypedExpr::var("f")),
             TypedExpr::apply(lit_string("a"), TypedExpr::var("f")),
         ]));
-        let mut e = TypedExpr::let_bind("f", f, body);
+        let mut e = TypedExpr::let_bind("f", crate::ccl::Occurrence::mint(), f, body);
         run_inference(&mut e).expect("type-checks");
         let (specializations, used_names) = specialization_stats(&e);
         assert_eq!(
@@ -4868,6 +4911,7 @@ mod tests {
         // let g = λx. x + 1 in let f = λa. g(1) in 1
         let g = TypedExpr::lambda(
             "x",
+            crate::ccl::Occurrence::mint(),
             Type::Hole,
             TypedExpr::binop(
                 TypedExpr::var("x"),
@@ -4877,10 +4921,16 @@ mod tests {
         );
         let f = TypedExpr::lambda(
             "a",
+            crate::ccl::Occurrence::mint(),
             Type::Hole,
             TypedExpr::apply(lit_int(1), TypedExpr::var("g")),
         );
-        let mut e = TypedExpr::let_bind("g", g, TypedExpr::let_bind("f", f, lit_int(1)));
+        let mut e = TypedExpr::let_bind(
+            "g",
+            crate::ccl::Occurrence::mint(),
+            g,
+            TypedExpr::let_bind("f", crate::ccl::Occurrence::mint(), f, lit_int(1)),
+        );
         let ty = run_inference(&mut e).expect("a dead definition's call type-checks");
         assert_eq!(ty, int_lit_ty(1));
         let (specializations, used_names) = specialization_stats(&e);
@@ -4913,6 +4963,7 @@ mod tests {
         // let g = λx. x + 1 in let f = λa. (let h = λb. g(b) in h(2)) in g(5)
         let g = TypedExpr::lambda(
             "x",
+            crate::ccl::Occurrence::mint(),
             Type::Hole,
             TypedExpr::binop(
                 TypedExpr::var("x"),
@@ -4922,18 +4973,31 @@ mod tests {
         );
         let h = TypedExpr::lambda(
             "b",
+            crate::ccl::Occurrence::mint(),
             Type::Hole,
             TypedExpr::apply(TypedExpr::var("b"), TypedExpr::var("g")),
         );
         let f = TypedExpr::lambda(
             "a",
+            crate::ccl::Occurrence::mint(),
             Type::Hole,
-            TypedExpr::let_bind("h", h, TypedExpr::apply(lit_int(2), TypedExpr::var("h"))),
+            TypedExpr::let_bind(
+                "h",
+                crate::ccl::Occurrence::mint(),
+                h,
+                TypedExpr::apply(lit_int(2), TypedExpr::var("h")),
+            ),
         );
         let mut e = TypedExpr::let_bind(
             "g",
+            crate::ccl::Occurrence::mint(),
             g,
-            TypedExpr::let_bind("f", f, TypedExpr::apply(lit_int(5), TypedExpr::var("g"))),
+            TypedExpr::let_bind(
+                "f",
+                crate::ccl::Occurrence::mint(),
+                f,
+                TypedExpr::apply(lit_int(5), TypedExpr::var("g")),
+            ),
         );
         run_inference(&mut e).expect("the nested dead call type-checks");
         let (specializations, used_names) = specialization_stats(&e);
@@ -4956,6 +5020,7 @@ mod tests {
         // (`(x, x)`), so no pre-inference beta-reduction rescues the chain.
         let f = TypedExpr::lambda(
             "x",
+            crate::ccl::Occurrence::mint(),
             Type::Hole,
             TypedExpr::new(TypedExprNode::Tuple(vec![
                 TypedExpr::var("x"),
@@ -4964,6 +5029,7 @@ mod tests {
         );
         let g = TypedExpr::lambda(
             "y",
+            crate::ccl::Occurrence::mint(),
             Type::Hole,
             TypedExpr::apply(TypedExpr::var("y"), TypedExpr::var("f")),
         );
@@ -4971,7 +5037,12 @@ mod tests {
             TypedExpr::apply(lit_int(1), TypedExpr::var("g")),
             TypedExpr::apply(lit_string("a"), TypedExpr::var("g")),
         ]));
-        let mut e = TypedExpr::let_bind("f", f, TypedExpr::let_bind("g", g, uses));
+        let mut e = TypedExpr::let_bind(
+            "f",
+            crate::ccl::Occurrence::mint(),
+            f,
+            TypedExpr::let_bind("g", crate::ccl::Occurrence::mint(), g, uses),
+        );
         let ty = run_inference(&mut e).expect("chained poly-calls-poly type-checks");
         // `f` duplicates its argument, so each half of a pair is that argument's own
         // type — the literal's singleton, not its base.
@@ -5000,8 +5071,10 @@ mod tests {
         use crate::ccl::{Branch, Pattern, TypedBinding};
         let arm = |tag: &str, b: &str| Branch {
             pattern: Some(Pattern {
+                head_occurrence: crate::ccl::Occurrence::mint(),
                 head: crate::ccl::PatternHead::Tag(tag.into()),
                 binding: TypedBinding {
+                    occurrence: crate::ccl::Occurrence::mint(),
                     name: b.into(),
                     ty: Type::Hole,
                     user_annotation: None,
@@ -5014,6 +5087,7 @@ mod tests {
         };
         let f = TypedExpr::lambda(
             "m",
+            crate::ccl::Occurrence::mint(),
             Type::Hole,
             TypedExpr::new(TypedExprNode::Case {
                 scrutinee: Some(Box::new(TypedExpr::var("m"))),
@@ -5028,14 +5102,20 @@ mod tests {
         let tail = TypedExpr::list(vec![TypedExpr::var(tail_reads), lit_int(0)]);
         let call = |n: i64| {
             TypedExpr::apply(
-                TypedExpr::variant_ctor("a", lit_int(n)),
+                TypedExpr::variant_ctor("a", crate::ccl::Occurrence::mint(), lit_int(n)),
                 TypedExpr::var("f"),
             )
         };
         let mut e = TypedExpr::let_bind(
             "f",
+            crate::ccl::Occurrence::mint(),
             f,
-            TypedExpr::let_bind("p", call(1), TypedExpr::let_bind("q", call(2), tail)),
+            TypedExpr::let_bind(
+                "p",
+                crate::ccl::Occurrence::mint(),
+                call(1),
+                TypedExpr::let_bind("q", crate::ccl::Occurrence::mint(), call(2), tail),
+            ),
         );
         run_inference(&mut e).expect("two-arm case UDF type-checks");
         collect_mono_param_types(&e)
@@ -5106,7 +5186,12 @@ mod tests {
     /// variant, no refinement set, just a projection whose result reaches a join.
     #[test]
     fn a_domain_does_not_read_back_the_join_its_results_meet_in() {
-        let g = TypedExpr::lambda("x", Type::infer(), TypedExpr::var("x"));
+        let g = TypedExpr::lambda(
+            "x",
+            crate::ccl::Occurrence::mint(),
+            Type::infer(),
+            TypedExpr::var("x"),
+        );
         let through_g = |i: usize| {
             TypedExpr::apply(
                 TypedExpr::apply(TypedExpr::var("t"), TypedExpr::proj_index(i)),
@@ -5115,14 +5200,21 @@ mod tests {
         };
         let f = TypedExpr::lambda(
             "t",
+            crate::ccl::Occurrence::mint(),
             Type::infer(),
             TypedExpr::tuple(vec![through_g(0), through_g(2)]),
         );
         let arg = TypedExpr::tuple(vec![lit_int(0), lit_int(1), lit_int(2)]);
         let mut e = TypedExpr::let_bind(
             "g",
+            crate::ccl::Occurrence::mint(),
             g,
-            TypedExpr::let_bind("f", f, TypedExpr::apply(arg, TypedExpr::var("f"))),
+            TypedExpr::let_bind(
+                "f",
+                crate::ccl::Occurrence::mint(),
+                f,
+                TypedExpr::apply(arg, TypedExpr::var("f")),
+            ),
         );
         run_inference(&mut e).expect("projection-through-identity program type-checks");
         assert_eq!(
@@ -5146,6 +5238,7 @@ mod tests {
         // demanding uses live inside freshly minted clones.
         let f = TypedExpr::lambda(
             "x",
+            crate::ccl::Occurrence::mint(),
             Type::Hole,
             TypedExpr::new(TypedExprNode::Tuple(vec![
                 TypedExpr::var("x"),
@@ -5154,6 +5247,7 @@ mod tests {
         );
         let g = TypedExpr::lambda(
             "y",
+            crate::ccl::Occurrence::mint(),
             Type::Hole,
             TypedExpr::apply(TypedExpr::var("y"), TypedExpr::var("f")),
         );
@@ -5162,7 +5256,12 @@ mod tests {
             TypedExpr::apply(lit_int(2), TypedExpr::var("g")),
             TypedExpr::apply(lit_string("a"), TypedExpr::var("g")),
         ]));
-        let mut e = TypedExpr::let_bind("f", f, TypedExpr::let_bind("g", g, uses));
+        let mut e = TypedExpr::let_bind(
+            "f",
+            crate::ccl::Occurrence::mint(),
+            f,
+            TypedExpr::let_bind("g", crate::ccl::Occurrence::mint(), g, uses),
+        );
         run_inference(&mut e).expect("chained poly with shared uses type-checks");
         let (specializations, used_names) = specialization_stats(&e);
         // A refinement makes two uses distinct, so a literal argument mints its own
@@ -5182,6 +5281,7 @@ mod tests {
         // re-entrant specialization must compound through every layer.
         let f = TypedExpr::lambda(
             "x",
+            crate::ccl::Occurrence::mint(),
             Type::Hole,
             TypedExpr::new(TypedExprNode::Tuple(vec![
                 TypedExpr::var("x"),
@@ -5190,11 +5290,13 @@ mod tests {
         );
         let g = TypedExpr::lambda(
             "y",
+            crate::ccl::Occurrence::mint(),
             Type::Hole,
             TypedExpr::apply(TypedExpr::var("y"), TypedExpr::var("f")),
         );
         let h = TypedExpr::lambda(
             "z",
+            crate::ccl::Occurrence::mint(),
             Type::Hole,
             TypedExpr::apply(TypedExpr::var("z"), TypedExpr::var("g")),
         );
@@ -5204,8 +5306,14 @@ mod tests {
         ]));
         let mut e = TypedExpr::let_bind(
             "f",
+            crate::ccl::Occurrence::mint(),
             f,
-            TypedExpr::let_bind("g", g, TypedExpr::let_bind("h", h, uses)),
+            TypedExpr::let_bind(
+                "g",
+                crate::ccl::Occurrence::mint(),
+                g,
+                TypedExpr::let_bind("h", crate::ccl::Occurrence::mint(), h, uses),
+            ),
         );
         let ty = run_inference(&mut e).expect("triple poly chain type-checks");
         // `f` duplicates its argument, so each half of a pair is that argument's own
@@ -5230,6 +5338,7 @@ mod tests {
         // specialization — the memo is per frame, not per demanding region.
         let f = TypedExpr::lambda(
             "x",
+            crate::ccl::Occurrence::mint(),
             Type::Hole,
             TypedExpr::new(TypedExprNode::Tuple(vec![
                 TypedExpr::var("x"),
@@ -5238,6 +5347,7 @@ mod tests {
         );
         let g = TypedExpr::lambda(
             "y",
+            crate::ccl::Occurrence::mint(),
             Type::Hole,
             TypedExpr::apply(TypedExpr::var("y"), TypedExpr::var("f")),
         );
@@ -5246,7 +5356,12 @@ mod tests {
             TypedExpr::apply(lit_int(1), TypedExpr::var("g")),
             TypedExpr::apply(lit_string("a"), TypedExpr::var("g")),
         ]));
-        let mut e = TypedExpr::let_bind("f", f, TypedExpr::let_bind("g", g, uses));
+        let mut e = TypedExpr::let_bind(
+            "f",
+            crate::ccl::Occurrence::mint(),
+            f,
+            TypedExpr::let_bind("g", crate::ccl::Occurrence::mint(), g, uses),
+        );
         run_inference(&mut e).expect("mixed direct + chained uses type-check");
         let (specializations, used_names) = specialization_stats(&e);
         // Two `g` specializations (Int, String) and two `f` ones — *not* three:
@@ -5272,17 +5387,29 @@ mod tests {
         // the pinned behavior here is "no panic, no error from infer".
         let f = TypedExpr::lambda(
             "x",
+            crate::ccl::Occurrence::mint(),
             Type::Hole,
             TypedExpr::new(TypedExprNode::Tuple(vec![
                 TypedExpr::var("x"),
                 TypedExpr::var("x"),
             ])),
         );
-        let g = TypedExpr::lambda("y", Type::Hole, TypedExpr::var("f"));
+        let g = TypedExpr::lambda(
+            "y",
+            crate::ccl::Occurrence::mint(),
+            Type::Hole,
+            TypedExpr::var("f"),
+        );
         let mut e = TypedExpr::let_bind(
             "f",
+            crate::ccl::Occurrence::mint(),
             f,
-            TypedExpr::let_bind("g", g, TypedExpr::apply(lit_int(1), TypedExpr::var("g"))),
+            TypedExpr::let_bind(
+                "g",
+                crate::ccl::Occurrence::mint(),
+                g,
+                TypedExpr::apply(lit_int(1), TypedExpr::var("g")),
+            ),
         );
         let ty = run_inference(&mut e).expect("unexercised generic use is tolerated");
         // The result is the unapplied `f` specialization: a function type
@@ -5306,6 +5433,7 @@ mod tests {
         // only come out right if each use hits its own definition.
         let outer_f = TypedExpr::lambda(
             "x",
+            crate::ccl::Occurrence::mint(),
             Type::Hole,
             TypedExpr::new(TypedExprNode::Tuple(vec![
                 TypedExpr::var("x"),
@@ -5314,18 +5442,30 @@ mod tests {
         );
         let g = TypedExpr::lambda(
             "y",
+            crate::ccl::Occurrence::mint(),
             Type::Hole,
             TypedExpr::apply(TypedExpr::var("y"), TypedExpr::var("f")),
         );
-        let inner_f = TypedExpr::lambda("x", Type::Hole, TypedExpr::var("x"));
+        let inner_f = TypedExpr::lambda(
+            "x",
+            crate::ccl::Occurrence::mint(),
+            Type::Hole,
+            TypedExpr::var("x"),
+        );
         let uses = TypedExpr::new(TypedExprNode::Tuple(vec![
             TypedExpr::apply(lit_int(1), TypedExpr::var("g")),
             TypedExpr::apply(lit_string("a"), TypedExpr::var("f")),
         ]));
         let mut e = TypedExpr::let_bind(
             "f",
+            crate::ccl::Occurrence::mint(),
             outer_f,
-            TypedExpr::let_bind("g", g, TypedExpr::let_bind("f", inner_f, uses)),
+            TypedExpr::let_bind(
+                "g",
+                crate::ccl::Occurrence::mint(),
+                g,
+                TypedExpr::let_bind("f", crate::ccl::Occurrence::mint(), inner_f, uses),
+            ),
         );
         let ty = run_inference(&mut e).expect("shadowed generalized bindings type-check");
         assert_eq!(
@@ -5350,16 +5490,28 @@ mod tests {
         // extrusion to a level-0 proxy, or the result would coalesce to `Infer`.
         let g_def = TypedExpr::lambda(
             "y",
+            crate::ccl::Occurrence::mint(),
             Type::Hole,
             TypedExpr::apply(TypedExpr::var("y"), TypedExpr::var("outer")),
         );
         let outer_body = TypedExpr::let_bind(
             "g",
+            crate::ccl::Occurrence::mint(),
             g_def,
             TypedExpr::apply(lit_int(1), TypedExpr::var("g")),
         );
-        let outer = TypedExpr::lambda("outer", Type::Hole, outer_body);
-        let id = TypedExpr::lambda("z", Type::Hole, TypedExpr::var("z"));
+        let outer = TypedExpr::lambda(
+            "outer",
+            crate::ccl::Occurrence::mint(),
+            Type::Hole,
+            outer_body,
+        );
+        let id = TypedExpr::lambda(
+            "z",
+            crate::ccl::Occurrence::mint(),
+            Type::Hole,
+            TypedExpr::var("z"),
+        );
         let mut e = TypedExpr::apply(id, outer);
         let ty = run_inference(&mut e).expect("captured-var application type-checks");
         assert_eq!(ty, int_lit_ty(1));
@@ -5377,14 +5529,25 @@ mod tests {
         // itself contains a generalized `let`.
         let g_def = TypedExpr::lambda(
             "y",
+            crate::ccl::Occurrence::mint(),
             Type::Hole,
             TypedExpr::apply(TypedExpr::var("y"), TypedExpr::var("p")),
         );
-        let mk_body = TypedExpr::let_bind("g", g_def, TypedExpr::var("g"));
-        let mk = TypedExpr::lambda("p", Type::Hole, mk_body);
-        let id = TypedExpr::lambda("z", Type::Hole, TypedExpr::var("z"));
+        let mk_body = TypedExpr::let_bind(
+            "g",
+            crate::ccl::Occurrence::mint(),
+            g_def,
+            TypedExpr::var("g"),
+        );
+        let mk = TypedExpr::lambda("p", crate::ccl::Occurrence::mint(), Type::Hole, mk_body);
+        let id = TypedExpr::lambda(
+            "z",
+            crate::ccl::Occurrence::mint(),
+            Type::Hole,
+            TypedExpr::var("z"),
+        );
         let applied = TypedExpr::apply(lit_int(5), TypedExpr::apply(id, TypedExpr::var("mk")));
-        let mut e = TypedExpr::let_bind("mk", mk, applied);
+        let mut e = TypedExpr::let_bind("mk", crate::ccl::Occurrence::mint(), mk, applied);
         let ty = run_inference(&mut e).expect("two-level nested generalization type-checks");
         assert_eq!(ty, int_lit_ty(5));
     }
@@ -5403,18 +5566,25 @@ mod tests {
         // collapsing `inner`'s deeper level makes it look monomorphic, so the
         // pass would not recurse and `inner` would stay a single bare-`Infer`
         // definition shared by both uses (under-determined, F1's concern).
-        let inner = TypedExpr::lambda("y", Type::Hole, TypedExpr::var("y"));
+        let inner = TypedExpr::lambda(
+            "y",
+            crate::ccl::Occurrence::mint(),
+            Type::Hole,
+            TypedExpr::var("y"),
+        );
         let inner_uses = TypedExpr::new(TypedExprNode::Tuple(vec![
             TypedExpr::apply(TypedExpr::var("w"), TypedExpr::var("inner")),
             TypedExpr::apply(lit_int(1), TypedExpr::var("inner")),
         ]));
         let outer = TypedExpr::lambda(
             "w",
+            crate::ccl::Occurrence::mint(),
             Type::Hole,
-            TypedExpr::let_bind("inner", inner, inner_uses),
+            TypedExpr::let_bind("inner", crate::ccl::Occurrence::mint(), inner, inner_uses),
         );
         let mut e = TypedExpr::let_bind(
             "outer",
+            crate::ccl::Occurrence::mint(),
             outer,
             TypedExpr::apply(lit_string("a"), TypedExpr::var("outer")),
         );
@@ -5458,11 +5628,13 @@ mod tests {
         // or loop.
         let g_def = TypedExpr::lambda(
             "y",
+            crate::ccl::Occurrence::mint(),
             Type::Hole,
             TypedExpr::apply(TypedExpr::var("y"), TypedExpr::var("y")),
         );
         let mut e = TypedExpr::let_bind(
             "g",
+            crate::ccl::Occurrence::mint(),
             g_def,
             TypedExpr::apply(lit_int(1), TypedExpr::var("g")),
         );

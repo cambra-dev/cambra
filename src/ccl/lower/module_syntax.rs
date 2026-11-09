@@ -317,7 +317,7 @@ impl Refusals {
             match &arm.pattern {
                 Some(ArmPattern::Tag(pattern)) => {
                     if let PayloadPattern::Named(binder) = &pattern.payload {
-                        self.binders.push((binder.clone(), pattern.tag_span));
+                        self.binders.push((binder.node.clone(), pattern.tag_span));
                     }
                 }
                 Some(ArmPattern::Constructor(pattern)) => self.constructor_pattern(pattern),

@@ -531,7 +531,12 @@ impl Parser {
                         .map(Val::Tuple),
                     TypedExprNode::Record(arms) => arms
                         .iter()
-                        .map(|(name, arm)| Some((name.runtime_key(), self.step(arm, cur.clone())?)))
+                        .map(|entry| {
+                            Some((
+                                entry.label.runtime_key(),
+                                self.step(&entry.value, cur.clone())?,
+                            ))
+                        })
                         .collect::<Option<Vec<_>>>()
                         .map(Val::Record),
                     _ => None,
@@ -677,6 +682,8 @@ pub fn fuse_prefix(chain: &[Expr], input: &Extent) -> Option<Fused> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::Occurrence;
+    use crate::ccl::RecordEntry;
     use crate::ccl::{ArithmeticKind, BinOpKind, CompareKind, Lit, LogicKind};
     use crate::interpreter::apply_binop_column;
 
@@ -1227,7 +1234,7 @@ mod tests {
     fn zip_record(arms: Vec<(&str, Expr)>) -> Expr {
         let arms = arms
             .into_iter()
-            .map(|(name, arm)| (name.into(), arm))
+            .map(|(name, arm)| RecordEntry::new(name, Occurrence::mint(), arm))
             .collect();
         Expr::apply(
             Expr::new(TypedExprNode::Record(arms)),

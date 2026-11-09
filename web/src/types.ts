@@ -18,21 +18,46 @@ export interface Source {
 // One edge out of an `IrNode`, naming a node of the *same* pane's table.
 //
 // The edge carries no label. Children arrive in order — the value children,
-// then the parent's refinement predicates — so a value child's index in
-// `children` is its positional index, and `treeView` derives the row prefix it
-// draws from that rather than from a shipped string.
+// then the occurrences the parent holds, then its refinement predicates — so a
+// value child's index in `children` is its positional index, and `treeView`
+// derives the row prefix it draws from that rather than from a shipped string.
 export interface IrChild {
   // The child's `nodeId`, an entry of the same pane's `nodes`.
   id: number;
-  // Whether the child is a type-interior subtree (a refinement predicate) rather
-  // than a value child.
+  // What the child is to its parent.
   //
-  // Predicates are on the wire because the compiler's pane fold explains their
-  // node ids, so a link can point at one; they are *not* part of the program's
-  // value tree, so a query about a value ("what does this hole resolve to", "the
-  // `Lit(Int(1))` node") must not wander into them. Every traversal that means
-  // "the program" filters on this flag.
-  predicate: boolean;
+  // - `value`: a value child, at its positional index.
+  // - an `OccurrenceKind`: a name the parent holds in a field rather than as a
+  //   node — `binder` for a binder's name, `use` for a use a `Feed` names,
+  //   `label` for a record label or a variant constructor's tag, `head` for a
+  //   `match` arm's head, `annotation` for a binder's annotation. A leaf, drawn
+  //   as a row under its holder with the kind as its edge label.
+  // - `predicate`: a type-interior subtree, a refinement predicate riding one of
+  //   the parent's type slots. Predicates are on the wire because the compiler's
+  //   pane fold explains their node ids, so a link can point at one; they are
+  //   *not* part of the program's value tree, so a query about a value ("what
+  //   does this hole resolve to", "the `Lit(Int(1))` node") must not wander into
+  //   them. Every traversal that means "the program" filters them out.
+  kind: ChildKind;
+}
+
+export type OccurrenceKind = "binder" | "use" | "label" | "head" | "annotation";
+
+export type ChildKind = "value" | OccurrenceKind | "predicate";
+
+export const OCCURRENCE_KINDS: readonly OccurrenceKind[] = [
+  "binder",
+  "use",
+  "label",
+  "head",
+  "annotation",
+];
+
+export const CHILD_KINDS: readonly ChildKind[] = ["value", ...OCCURRENCE_KINDS, "predicate"];
+
+/** Whether a child of this kind is an occurrence its parent holds. */
+export function isOccurrence(kind: ChildKind): kind is OccurrenceKind {
+  return (OCCURRENCE_KINDS as readonly ChildKind[]).includes(kind);
 }
 
 // A node's rewrite tag: how a phase produced this node. `null` on an `IrNode`

@@ -11,6 +11,8 @@
 //! to the name its row records, and each completed from its trait's signature at the
 //! instance's types.
 
+use crate::ccl::Annotation;
+use crate::ccl::Occurrence;
 use crate::ccl::lower::modules::{Qualifier, Reached, top_level_nominal_types, top_level_traits};
 use crate::ccl::module_type::AliasType;
 use std::collections::HashMap;
@@ -376,6 +378,7 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
         let param = TypeParam::declared(n.node.clone());
         ctx.declare_type_throughout(
             n.node.as_str(),
+            Some(n.span),
             AliasType::Type(Type::Param(Rc::clone(&param))),
         );
         ctx.type_params_in_scope.push(n.node.to_string());
@@ -907,6 +910,7 @@ fn declare_instance(
     for (name, param) in &variables {
         ctx.declare_type_throughout(
             name.as_str(),
+            None,
             AliasType::Type(Type::Param(Rc::clone(param))),
         );
         ctx.type_params_in_scope.push(name.to_string());
@@ -1504,6 +1508,10 @@ pub(super) fn lower_instance(
     };
     let mut lowered = Vec::new();
     for def in &block.defs {
+        let name_span = match &def.node {
+            ChlStmt::FunctionDef { name, .. } => name.span,
+            _ => def.span,
+        };
         let aliases = ctx.snapshot_type_aliases();
         let scoped = ctx.type_param_scope();
         let in_scope = ctx.named_requirements.len();
@@ -1512,9 +1520,14 @@ pub(super) fn lower_instance(
         ctx.end_type_params(scoped);
         ctx.restore_type_aliases(aliases);
         let (name, func, annotation) = result?;
+        let occurrence = ctx.occurrence_at(name_span);
         let binding = match annotation {
-            Some(poly) => TypedBinding::new_annotated(name, poly),
-            None => TypedBinding::new_unannotated(name),
+            Some(poly) => TypedBinding::new_annotated(
+                name,
+                occurrence,
+                Annotation::new(poly, Occurrence::mint()),
+            ),
+            None => TypedBinding::new_unannotated(name, occurrence),
         };
         lowered.push((binding, func));
     }
@@ -1567,7 +1580,7 @@ fn lower_instance_def(
     // function's own type parameters have to be determined by its arguments.
     let mut spans: Vec<Option<Span>> = Vec::new();
     for (n, p) in variables {
-        ctx.declare_type_throughout(n.as_str(), AliasType::Type(Type::Param(Rc::clone(p))));
+        ctx.declare_type_throughout(n.as_str(), None, AliasType::Type(Type::Param(Rc::clone(p))));
         ctx.type_params_in_scope.push(n.to_string());
         declared.push(PolyParam {
             param: Rc::clone(p),
@@ -1589,6 +1602,7 @@ fn lower_instance_def(
                 let mine = TypeParam::declared(p.spelling.clone());
                 ctx.declare_type_throughout(
                     p.spelling.as_str(),
+                    None,
                     AliasType::Type(Type::Param(Rc::clone(&mine))),
                 );
                 ctx.type_params_in_scope.push(p.spelling.to_string());
@@ -1673,7 +1687,7 @@ fn lower_instance_def(
         match &p.annotation {
             None => {
                 let alias = signature_alias(i);
-                ctx.declare_type_throughout(alias.as_str(), AliasType::Type(stated.clone()));
+                ctx.declare_type_throughout(alias.as_str(), None, AliasType::Type(stated.clone()));
                 p.annotation = Some(TypeAnnotation {
                     mode: AnnotationMode::Exact,
                     ty: Spanned::new(p.name_span, ChlExpr::Name(alias.into())),
@@ -1699,7 +1713,7 @@ fn lower_instance_def(
     let output = match output {
         None => {
             let alias = signature_alias(inputs.len());
-            ctx.declare_type_throughout(alias.as_str(), AliasType::Type(output_ty));
+            ctx.declare_type_throughout(alias.as_str(), None, AliasType::Type(output_ty));
             Spanned::new(def.span, ChlExpr::Name(alias.into()))
         }
         Some(written) => {

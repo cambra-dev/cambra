@@ -15,6 +15,7 @@
 mod alloc_probe;
 
 use alloc_probe::allocations;
+use cambra::ccl::Occurrence;
 use cambra::ccl::TypedBinding;
 use cambra::ccl::ccl_utils::is_free_in_value;
 use cambra::ccl::{Name, TypedExpr};
@@ -31,7 +32,7 @@ fn a_freeness_query_over_a_letrec_spine_does_not_allocate() {
         let bindings: Vec<_> = (0..GROUP)
             .map(|i| {
                 (
-                    TypedBinding::new_unannotated(format!("f{i}")),
+                    TypedBinding::new_unannotated(format!("f{i}"), Occurrence::mint()),
                     TypedExpr::var("x"),
                 )
             })

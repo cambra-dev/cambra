@@ -7,6 +7,7 @@
 //! [`crate::ccl::ccl_utils::bare_predicate_of_fn`] that the iterate/restrict and
 //! op-conversion lowering consume.
 
+use crate::ccl::Occurrence;
 use std::collections::HashSet;
 
 use super::*;
@@ -240,7 +241,7 @@ pub(crate) fn fn_of_bare_predicate(
     // (`src/ccl/design/type-inference.md`, "A refinement's element is referenced by index").
     let param = Name::fresh("elem");
     let body = crate::ccl::subst::Subst::rename(Name::elem(), param.clone()).apply_expr(bare);
-    let lam = Expr::lambda(param, base.clone(), body);
+    let lam = Expr::lambda(param, Occurrence::mint(), base.clone(), body);
     let lam = match &lam.ty {
         Type::Fun {
             name,

@@ -969,7 +969,9 @@ pub(crate) fn narrows_keys(expr: &Expr) -> bool {
             }
             match &argument.node {
                 TypedExprNode::Tuple(arms) => arms.iter().any(narrows_keys),
-                TypedExprNode::Record(fields) => fields.iter().any(|(_, arm)| narrows_keys(arm)),
+                TypedExprNode::Record(fields) => {
+                    fields.iter().any(|entry| narrows_keys(&entry.value))
+                }
                 _ => false,
             }
         }
@@ -994,7 +996,7 @@ fn preserves_domain(expr: &Expr) -> bool {
     match &expr.node {
         TypedExprNode::Compose(steps) => steps.iter().all(preserves_domain),
         TypedExprNode::Tuple(items) => items.iter().all(preserves_domain),
-        TypedExprNode::Record(fields) => fields.iter().all(|(_, item)| preserves_domain(item)),
+        TypedExprNode::Record(fields) => fields.iter().all(|entry| preserves_domain(&entry.value)),
         TypedExprNode::Apply { function, argument } => match &function.node {
             // `𝑐 ▷ const` returns `𝑐` at every key, and `ℎ ▷ map` maps the values and keeps
             // the keys; neither reads the keys, so what the argument holds is not their concern.
@@ -2114,6 +2116,7 @@ fn try_flatten_compose(expr: &mut Expr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::Occurrence;
     use crate::ccl::ccl_utils::{
         apply_primitive, make_iterate, make_restrict, trivially_true_predicate,
     };
@@ -2188,6 +2191,7 @@ mod tests {
         let name = Name::anf_temp();
         let expr = Expr::let_bind(
             name.clone(),
+            Occurrence::mint(),
             proj.clone(),
             typed_compose2(var_of(&name, fun_ty(pair.clone(), int_ty())), users.clone()),
         );
@@ -2202,6 +2206,7 @@ mod tests {
         let name = Name::anf_temp();
         let expr = Expr::let_bind(
             name.clone(),
+            Occurrence::mint(),
             var("f").with_ty(ty.clone()),
             typed_compose2(var_of(&name, ty.clone()), var_of(&name, ty.clone())),
         );
@@ -2215,6 +2220,7 @@ mod tests {
         let ty = fun_ty(int_ty(), int_ty());
         let expr = Expr::let_bind(
             Name::raw("s"),
+            Occurrence::mint(),
             var("f").with_ty(ty.clone()),
             typed_compose2(var("s").with_ty(ty.clone()), var("g").with_ty(ty.clone())),
         );

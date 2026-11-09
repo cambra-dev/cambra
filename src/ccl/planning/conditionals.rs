@@ -935,6 +935,7 @@ fn erase_determined_boxes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::ccl::{Branch, Lit, Name};
 
     /// **A `Case` inside a refinement predicate is left alone.** The gated union it would

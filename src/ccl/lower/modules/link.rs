@@ -2,6 +2,8 @@
 //! shared imports around the root (`docs/modules.md`, "Linking").
 
 use super::*;
+use crate::ccl::Annotation;
+use crate::ccl::Occurrence;
 use crate::ccl::{BaseType, BinOpKind, CompareKind, PredicateId, Refinement};
 
 /// The spelling of the placeholder a module's chain holds where the code below
@@ -211,7 +213,7 @@ pub(super) fn settle_const_params(
             ..
         } = &mut expr.node
             && let Some((term, span)) = values.get(&binding.name)
-            && let Some(Type::Base(base)) = binding.user_annotation.clone()
+            && let Some(Type::Base(base)) = binding.annotation_ty().cloned()
             && base != BaseType::Unit
         {
             const LABEL: &str = "link.const_singleton";
@@ -228,10 +230,10 @@ pub(super) fn settle_const_params(
                 value,
             );
             ctx.tag_predicate(&predicate, *span, LABEL);
-            binding.user_annotation = Some(Type::refined_one(
-                Type::Base(base),
-                Refinement::born(Rc::new(predicate)),
-            ));
+            if let Some(annotation) = &mut binding.user_annotation {
+                annotation.ty =
+                    Type::refined_one(Type::Base(base), Refinement::born(Rc::new(predicate)));
+            }
             // The `let` holds its term: a literal is its value, and a term over the
             // parameters of a module checked alone is a value known only by its type, the
             // singleton, in a tree that only the check reads.
@@ -1370,8 +1372,14 @@ impl<'a> ProgramLowering<'a> {
                 let value = ctx.tag_image(Expr::lit(value.clone()), *span);
                 let bound = argument_name(&prefix, &QualifiedName::new(parameter.clone()));
                 let bound = match ty {
-                    Some(ty) => Expr::let_bind_annotated(bound, value, chain, ty),
-                    None => Expr::let_bind(bound, value, chain),
+                    Some(ty) => Expr::let_bind_annotated(
+                        bound,
+                        Occurrence::mint(),
+                        value,
+                        chain,
+                        Annotation::new(ty, Occurrence::mint()),
+                    ),
+                    None => Expr::let_bind(bound, Occurrence::mint(), value, chain),
                 };
                 chain = ctx.tag_image(bound, *span);
             }

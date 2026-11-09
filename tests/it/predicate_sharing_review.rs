@@ -5,6 +5,7 @@
 //! source-level fixture, so a fix can be verified without reasoning about which
 //! program shape happens to produce the sharing.
 
+use cambra::ccl::Occurrence;
 use cambra::ccl::ccl_utils::{
     PredMemo, distinct_predicate_rcs, is_free, walk_refined_predicates_mut,
 };
@@ -54,8 +55,8 @@ fn rewrite_does_not_leak_an_outer_rebuild_into_a_shadowing_scope() {
     // λ k → (j > 0) : {_ | k > 0}          — the body's `k` is the lambda's own.
     //   with the lambda's own ty = ({_ | k > 0} ⇒ _), sharing that one predicate.
     let body = gt(var("j"), int(0)).with_ty(refined(&shared));
-    let mut e =
-        TypedExpr::lambda("k", Type::Hole, body).with_ty(Type::fun(refined(&shared), Type::Hole));
+    let mut e = TypedExpr::lambda("k", Occurrence::mint(), Type::Hole, body)
+        .with_ty(Type::fun(refined(&shared), Type::Hole));
 
     // [k ↦ 5, j ↦ 6]: `j` keeps the body reachable, `k` is shadowed by the lambda.
     let s = Subst::then(
@@ -92,8 +93,8 @@ fn rewrite_respects_shadowing_when_the_occurrences_are_not_shared() {
     let outer = Rc::new(gt(var("k"), int(0)));
     let inner = Rc::new(gt(var("k"), int(0)));
     let body = gt(var("j"), int(0)).with_ty(refined(&inner));
-    let mut e =
-        TypedExpr::lambda("k", Type::Hole, body).with_ty(Type::fun(refined(&outer), Type::Hole));
+    let mut e = TypedExpr::lambda("k", Occurrence::mint(), Type::Hole, body)
+        .with_ty(Type::fun(refined(&outer), Type::Hole));
 
     let s = Subst::then(
         &Subst::discharge("k", int(5)),
@@ -123,7 +124,7 @@ fn rewrite_respects_shadowing_when_the_occurrences_are_not_shared() {
 #[test]
 fn rewrite_reaches_the_lambda_param_type_slot() {
     let shared = Rc::new(gt(var("k"), int(0)));
-    let mut e = TypedExpr::lambda("x", refined(&shared), var("x"))
+    let mut e = TypedExpr::lambda("x", Occurrence::mint(), refined(&shared), var("x"))
         .with_ty(Type::fun(refined(&shared), Type::Hole));
 
     Subst::discharge("k", int(5)).rewrite_expr(&mut e);
@@ -156,6 +157,7 @@ fn is_free_sees_a_predicate_on_a_let_binding_slot() {
     let k = Name::raw("k");
     let mut e = Expr::let_bind(
         "y",
+        Occurrence::mint(),
         Expr::lit(Lit::Int(1)).with_ty(refined(&Rc::new(gt(var("k"), int(0))))),
         Expr::lit(Lit::Unit),
     );

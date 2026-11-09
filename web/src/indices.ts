@@ -7,7 +7,7 @@
 // the tables and answers no positional query (`src/inspector_model/design.md`,
 // "The usage model"), so this is the only implementation of that policy.
 
-import type { Definition, IrNode } from "./types";
+import { isOccurrence, type Definition, type IrNode } from "./types";
 
 export interface Indices {
   /** Every node keyed by its id — the pane's node table, read directly. */
@@ -87,6 +87,9 @@ export function buildIndices(
   // interior.
   const depthById = new Map<number, number>();
   const predicateIds = new Set<number>();
+  // An occurrence entry has no children and one parent edge, so its kind is
+  // read off that edge.
+  const occurrenceIds = new Set<number>();
   const stack: Array<{ id: number; depth: number; inPredicate: boolean }> = [
     { id: root, depth: 0, inPredicate: false },
   ];
@@ -100,10 +103,11 @@ export function buildIndices(
     // Reversed, so the LIFO stack pops children in wire order.
     for (let i = node.children.length - 1; i >= 0; i--) {
       const child = node.children[i];
+      if (isOccurrence(child.kind)) occurrenceIds.add(child.id);
       stack.push({
         id: child.id,
         depth: depth + 1,
-        inPredicate: inPredicate || child.predicate,
+        inPredicate: inPredicate || child.kind === "predicate",
       });
     }
   }
@@ -126,8 +130,8 @@ export function buildIndices(
   //   1. from the nodes' spans, take every row whose span contains the offset;
   //   2. pick the smallest extent (end - start);
   //   3. break ties (coincident spans: the `def` case, or monomorphized clones
-  //      sharing an origin span) by a construct before a synthesized unit, then
-  //      by greatest depth (innermost in the IR tree).
+  //      sharing an origin span) by a construct before an occurrence before a
+  //      synthesized unit, then by greatest depth (innermost in the IR tree).
   //
   // Depth-first is right almost everywhere: it is what answers a click on
   // `stdin()` with `Source(stdin)` rather than the `Apply` around it, and
@@ -137,6 +141,13 @@ export function buildIndices(
   // prefer the deepest non-leaf — change 70 and 67 of them respectively,
   // including those two for the worse. The unit clause changes 9, all of them
   // from a unit to the construct it stands for.
+  //
+  // An occurrence of a name the source writes is recorded at the name, which is
+  // narrower than the node holding it, so it wins on extent. One the source
+  // does not write — `__arg_tuple_0`, `__anf`, a declaration's `N::new` — is
+  // recorded at its holder's span, and as the holder's child it is one level
+  // deeper, so depth alone would answer a click on `def` with the tupled
+  // parameter's binder. The occurrence clause keeps the holder.
   //
   // Refinement predicates are excluded outright, as in `typesAt`: the tree
   // pane draws no row for one, so answering with a predicate node would name a
@@ -151,23 +162,28 @@ export function buildIndices(
   const tightestRowAt = (byteOffset: number): SpanRow | null => {
     let best: SpanRow | null = null;
     let bestExtent = Infinity;
-    let bestUnit = true;
+    let bestRank = Infinity;
     let bestDepth = -1;
     for (const row of spanRows) {
       if (predicateIds.has(row.nodeId)) continue;
       if (!spanContains(row.start, row.end, byteOffset)) continue;
       const extent = row.end - row.start;
-      const unit = isSynthesizedUnit(nodeById.get(row.nodeId));
+      // A construct, then an occurrence, then a synthesized unit.
+      const rank = isSynthesizedUnit(nodeById.get(row.nodeId))
+        ? 2
+        : occurrenceIds.has(row.nodeId)
+          ? 1
+          : 0;
       const depth = depthById.get(row.nodeId) ?? -1;
       const better =
         best === null ||
         extent < bestExtent ||
         (extent === bestExtent &&
-          ((bestUnit && !unit) || (bestUnit === unit && depth > bestDepth)));
+          (rank < bestRank || (rank === bestRank && depth > bestDepth)));
       if (better) {
         best = row;
         bestExtent = extent;
-        bestUnit = unit;
+        bestRank = rank;
         bestDepth = depth;
       }
     }

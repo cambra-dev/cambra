@@ -61,7 +61,10 @@ fn lower_clauses(
                 AssignTarget::Name(n) if n.as_str() != WILDCARD => {
                     let name = extract_name_target(target, "comprehension target")?;
                     out.push(Generator {
-                        target: TypedBinding::new_unannotated(name.clone()),
+                        target: TypedBinding::new_unannotated(
+                            name.clone(),
+                            ctx.occurrence_at(target.span),
+                        ),
                         iter,
                         guards: Vec::new(),
                     });
@@ -81,7 +84,7 @@ fn lower_clauses(
             let element_name = ctx.fresh_tuple_payload();
             let index = out.len();
             out.push(Generator {
-                target: TypedBinding::new_unannotated(element_name.clone()),
+                target: TypedBinding::new_unannotated(element_name.clone(), Occurrence::mint()),
                 iter,
                 guards: Vec::new(),
             });
@@ -93,11 +96,11 @@ fn lower_clauses(
             let element_read =
                 ctx.tag_machinery(Expr::var(element_name.as_str()), target.span, LABEL);
             let mut reads: Vec<(Name, Expr)> = Vec::new();
-            for (name, value, _) in leaves.bindings(element_read, target.span, ctx) {
+            for (binder, value) in leaves.bindings(element_read, target.span, ctx) {
                 let value = reads
                     .iter()
                     .fold(value, |v, (n, r)| substitute_param_in_body(v, n, r, LABEL));
-                reads.push((Name::raw(name.as_str()), value));
+                reads.push((Name::raw(binder.name.as_str()), value));
             }
             // The substitution reaches what the binder scopes over: its own guards, the
             // generators after it, and the element. Those last two are a comprehension of

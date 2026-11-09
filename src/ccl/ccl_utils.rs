@@ -1,6 +1,7 @@
 //! Miscellaneous utilities for working with CCL.
 
 use crate::ccl::Label;
+use crate::ccl::{Occurrence, RecordEntry};
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
@@ -206,7 +207,7 @@ pub fn writer_decision_record(commit: Expr, writes: Expr, feeds: &[(Label, Expr,
             .map(|(k, v)| (k.clone(), v.ty.clone()))
             .collect(),
     );
-    Expr::new(TypedExprNode::Record(fields)).with_ty(ty)
+    Expr::new(TypedExprNode::Record(RecordEntry::minted(fields))).with_ty(ty)
 }
 
 /// The tap variant type `` {`fired{𝑉} | `idle} `` over a fed value type `𝑉`.
@@ -432,28 +433,30 @@ pub fn wrap_decision_variant(decision: Expr) -> Expr {
             // Split the `commit` selector out from the payload fields (everything
             // else — `writes` and the `__to_<defer>*` taps, in order).
             let mut commit: Option<Expr> = None;
-            let mut payload_fields: Vec<(Label, Expr)> = Vec::with_capacity(fields.len());
-            for (k, v) in fields {
-                if k == COMMIT_SELECTOR {
-                    commit = Some(v);
+            let mut payload_fields: Vec<RecordEntry> = Vec::with_capacity(fields.len());
+            for entry in fields {
+                if entry.label == COMMIT_SELECTOR {
+                    commit = Some(entry.value);
                 } else {
-                    payload_fields.push((k, v));
+                    payload_fields.push(entry);
                 }
             }
             let commit = commit.expect("a writer decision record carries a `commit` selector");
             let payload_ty = Type::Record(
                 payload_fields
                     .iter()
-                    .map(|(k, v)| (k.clone(), v.ty.clone()))
+                    .map(|entry| (entry.label.clone(), entry.value.ty.clone()))
                     .collect(),
             );
             let payload =
                 Expr::new(TypedExprNode::Record(payload_fields)).with_ty(payload_ty.clone());
             let variant_ty = decision_variant_ty(payload_ty);
 
-            let commit_ctor = Expr::variant_ctor(V_COMMIT, payload).with_ty(variant_ty.clone());
+            let commit_ctor = Expr::variant_ctor(V_COMMIT, Occurrence::mint(), payload)
+                .with_ty(variant_ty.clone());
             let unit = Expr::new(TypedExprNode::Lit(Lit::Unit)).with_ty(unit_ty.clone());
-            let abort_ctor = Expr::variant_ctor(V_ABORT, unit).with_ty(variant_ty.clone());
+            let abort_ctor =
+                Expr::variant_ctor(V_ABORT, Occurrence::mint(), unit).with_ty(variant_ty.clone());
             let true_lit = Expr::new(TypedExprNode::Lit(Lit::Bool(true))).with_ty(bool_ty.clone());
 
             let mut case = Expr::new(TypedExprNode::Case {
@@ -766,7 +769,16 @@ fn reduce_application(
                         TypedExprNode::Tuple(parts.iter().map(&mut at).collect())
                     }
                     TypedExprNode::Record(fields) => TypedExprNode::Record(
-                        fields.iter().map(|(k, f)| (k.clone(), at(f))).collect(),
+                        fields
+                            .iter()
+                            .map(|entry| {
+                                RecordEntry::new(
+                                    entry.label.clone(),
+                                    Occurrence::PLACEHOLDER,
+                                    at(&entry.value),
+                                )
+                            })
+                            .collect(),
                     ),
                     _ => return None,
                 };
@@ -802,6 +814,7 @@ fn reduce_application(
                     Expr::throwaway(TypedExprNode::Tuple(vec![a(), element])).with_ty(Type::Hole);
                 let param = TypedBinding {
                     name: k,
+                    occurrence: Occurrence::PLACEHOLDER,
                     ty: Type::Hole,
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
@@ -834,6 +847,7 @@ fn reduce_application(
                 let body = applied(both, inner, Type::Hole, fuel);
                 let param = TypedBinding {
                     name: y,
+                    occurrence: Occurrence::PLACEHOLDER,
                     ty: Type::Hole,
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
@@ -903,8 +917,8 @@ fn reduce_application(
         TypedExprNode::Proj(ProjKey::Field(field)) => match &argument.node {
             TypedExprNode::Record(fields) => fields
                 .iter()
-                .find(|(n, _)| n == field)
-                .map(|(_, v)| v.clone_preserving_ids()),
+                .find(|entry| entry.label == *field)
+                .map(|entry| entry.value.clone_preserving_ids()),
             _ => None,
         },
         _ => None,
@@ -980,8 +994,10 @@ fn read_eliminated_match(argument: &Expr, ty: &Type, fuel: &mut usize) -> Option
         branches.push(Branch {
             pattern: Some(crate::ccl::Pattern {
                 head: crate::ccl::PatternHead::Tag(tag.clone()),
+                head_occurrence: Occurrence::PLACEHOLDER,
                 binding: TypedBinding {
                     name: payload,
+                    occurrence: Occurrence::PLACEHOLDER,
                     ty: Type::Hole,
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
@@ -1543,7 +1559,7 @@ pub(crate) fn pointwise_view(head: Expr, steps: Vec<Expr>) -> Expr {
             codomain: Box::new(body.ty.clone()),
         }
     };
-    Expr::lambda(position, *domain, body).with_ty(ty)
+    Expr::lambda(position, Occurrence::mint(), *domain, body).with_ty(ty)
 }
 
 /// The collection a [`pointwise_view`] reads and the steps it applies, in order; `None` where
@@ -1636,6 +1652,7 @@ pub(crate) fn indexed_loop(position: Option<Name>, source: Expr, step: Expr) -> 
     };
     let position = TypedBinding {
         name: position.unwrap_or_else(Name::iter_record),
+        occurrence: Occurrence::mint(),
         ty: (*domain).clone(),
         user_annotation: None,
         transparency: BindingTransparency::Transparent,
@@ -1677,7 +1694,8 @@ pub(crate) fn indexed_loop(position: Option<Name>, source: Expr, step: Expr) -> 
         }
     };
     let body = Expr::apply(read, step).with_ty(value);
-    let TypedExprNode::Lambda { param, body } = Expr::lambda(position.name, Type::Hole, body).node
+    let TypedExprNode::Lambda { param, body } =
+        Expr::lambda(position.name, position.occurrence, Type::Hole, body).node
     else {
         unreachable!("Expr::lambda builds a Lambda")
     };
@@ -3251,6 +3269,7 @@ mod tests {
             let xs = Expr::var(Name::from("xs")).with_ty(Type::data_fun(uint.clone(), int()));
             let filtered = Expr::let_bind(
                 t,
+                Occurrence::mint(),
                 Expr::lit(Lit::Int(bound)).with_ty(int()),
                 make_cast(xs, target),
             );
@@ -3360,6 +3379,7 @@ mod tests {
         };
         let named = Refinement::born(Rc::new(eq(Expr::let_bind(
             Name::from("__anf"),
+            Occurrence::mint(),
             sum(),
             Expr::var(Name::from("__anf")).with_ty(Type::Base(BaseType::Int)),
         ))));
@@ -3381,6 +3401,7 @@ mod tests {
     fn an_opaque_binding_is_left_standing() {
         let read = Expr::let_bind_with(
             Name::from("__read"),
+            Occurrence::mint(),
             Expr::var(Name::from("x")).with_ty(Type::Base(BaseType::Int)),
             Expr::var(Name::from("__read")).with_ty(Type::Base(BaseType::Int)),
             BindingTransparency::Opaque,

@@ -1030,6 +1030,8 @@ pub(crate) mod test_helpers {
 mod tests {
     use super::test_helpers::*;
     use super::*;
+    use crate::ccl::Occurrence;
+    use crate::ccl::RecordEntry;
     use crate::ccl::{BindingTransparency, TypedBinding, TypedExpr, TypedExprNode};
 
     #[test]
@@ -1037,6 +1039,7 @@ mod tests {
         // λx. x applied to 42 → Int
         let lam = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
+                occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Hole,
                 user_annotation: None,
@@ -1063,8 +1066,8 @@ mod tests {
     #[test]
     fn smoke_record_literal() {
         let mut e = TypedExpr::new(TypedExprNode::Record(vec![
-            ("a".into(), lit_int(1)),
-            ("b".into(), lit_string("x")),
+            RecordEntry::new("a", Occurrence::mint(), lit_int(1)),
+            RecordEntry::new("b", Occurrence::mint(), lit_string("x")),
         ]));
         let ty = run_inference(&mut e).expect("inference succeeds");
         assert_eq!(
@@ -1081,6 +1084,7 @@ mod tests {
         // let x = 42 in x → Int
         let mut e = TypedExpr::new(TypedExprNode::Let {
             binding: TypedBinding {
+                occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Hole,
                 user_annotation: None,

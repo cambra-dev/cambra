@@ -319,6 +319,9 @@ pub struct TypeMember {
     pub public: bool,
     /// The statement that declares it.
     pub declared: Span,
+    /// Where that statement writes the alias's name, which a use of a `use` name
+    /// for it resolves to.
+    pub name_span: Span,
 }
 
 /// One nominal type a module declares (`docs/chl-spec.md`, "9.5 Visibility"). Its
@@ -779,6 +782,7 @@ impl Interface {
                         ty: (*ty).clone(),
                         public: alias.public,
                         declared: alias.span,
+                        name_span: alias.name_span,
                     },
                 )
             })
@@ -910,7 +914,10 @@ pub(super) fn top_level_types(chain: &Expr) -> HashMap<&str, &AliasType> {
 #[derive(Debug, Clone)]
 pub struct TopLevelBinding {
     pub name: SmolStr,
+    /// The statement that binds the name.
     pub span: Span,
+    /// Where the statement writes the name.
+    pub name_span: Span,
     pub public: bool,
 }
 
@@ -933,12 +940,12 @@ fn def_arity(stmts: &[Spanned<ChlStmt>], span: Span) -> usize {
 /// The value bindings of `stmts`, a module's top level, in order. A type alias
 /// is a type member rather than a value, so it is not one.
 pub fn top_level_bindings(stmts: &[Spanned<ChlStmt>]) -> Vec<TopLevelBinding> {
-    fn names(target: &AssignTarget, out: &mut Vec<SmolStr>) {
-        match target {
-            AssignTarget::Name(n) => out.push(n.clone()),
+    fn names(target: &Spanned<AssignTarget>, out: &mut Vec<(SmolStr, Span)>) {
+        match &target.node {
+            AssignTarget::Name(n) => out.push((n.clone(), target.span)),
             AssignTarget::Tuple(targets) => {
                 for t in targets {
-                    names(&t.node, out);
+                    names(t, out);
                 }
             }
             AssignTarget::Constructor(pattern) => out.extend(
@@ -946,7 +953,7 @@ pub fn top_level_bindings(stmts: &[Spanned<ChlStmt>]) -> Vec<TopLevelBinding> {
                     .binders
                     .iter()
                     .flatten()
-                    .filter_map(|b| b.node.clone()),
+                    .filter_map(|b| Some((b.node.clone()?, b.span))),
             ),
             AssignTarget::Subscript { .. } | AssignTarget::Qualified(_) => {}
         }
@@ -963,19 +970,20 @@ pub fn top_level_bindings(stmts: &[Spanned<ChlStmt>]) -> Vec<TopLevelBinding> {
             | ChlStmt::AnnAssign { target, .. }
             | ChlStmt::MutAssign { target, .. }
             | ChlStmt::Declare { target, .. }
-            | ChlStmt::LoadFrom { target, .. } => names(&target.node, &mut bound),
+            | ChlStmt::LoadFrom { target, .. } => names(target, &mut bound),
             ChlStmt::FunctionDef {
                 owner: None, name, ..
-            } => bound.push(name.node.clone()),
+            } => bound.push((name.node.clone(), name.span)),
             _ => {}
         }
-        for name in bound {
+        for (name, name_span) in bound {
             if chl_parser::ast::is_type_name(&name) {
                 continue;
             }
             out.push(TopLevelBinding {
                 name,
                 span: stmt.span,
+                name_span,
                 public,
             });
         }
@@ -999,6 +1007,7 @@ pub fn top_level_aliases(stmts: &[Spanned<ChlStmt>]) -> Vec<TopLevelBinding> {
             Some(TopLevelBinding {
                 name: name.into(),
                 span: stmt.span,
+                name_span: target.span,
                 public,
             })
         })
@@ -1020,6 +1029,7 @@ pub fn top_level_nominal_types(stmts: &[Spanned<ChlStmt>]) -> Vec<TopLevelBindin
             Some(TopLevelBinding {
                 name: decl.name.node.clone(),
                 span: stmt.span,
+                name_span: decl.name.span,
                 public,
             })
         })
@@ -1041,6 +1051,7 @@ pub fn top_level_traits(stmts: &[Spanned<ChlStmt>]) -> Vec<TopLevelBinding> {
             Some(TopLevelBinding {
                 name: decl.name.node.clone(),
                 span: stmt.span,
+                name_span: decl.name.span,
                 public,
             })
         })

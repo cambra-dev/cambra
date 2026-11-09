@@ -2,6 +2,8 @@
 //! its runs and imports pass (`docs/modules.md`, "Checking a module on its own").
 
 use super::*;
+use crate::ccl::Annotation;
+use crate::ccl::Occurrence;
 
 /// A type argument, or a type member of a module argument, that a module's check
 /// compares with what its parameter states (`docs/modules.md`, "Checking a
@@ -82,9 +84,23 @@ pub(super) fn checked_by(
             let given = given.raw();
             let abstract_value = ctx.tag_image(Expr::new(TypedExprNode::Abstract), check.span);
             let read = ctx.tag_image(Expr::var(given.clone()), check.span);
-            let inner = Expr::let_bind_annotated(fits, read, body, to.clone());
+            // The check's binders and annotations are the compiler's: they record at the
+            // check, where each is tagged.
+            let inner = Expr::let_bind_annotated(
+                fits,
+                Occurrence::mint(),
+                read,
+                body,
+                Annotation::new(to.clone(), Occurrence::mint()),
+            );
             let inner = ctx.tag_image(inner, check.span);
-            let outer = Expr::let_bind_annotated(given, abstract_value, inner, from.clone());
+            let outer = Expr::let_bind_annotated(
+                given,
+                Occurrence::mint(),
+                abstract_value,
+                inner,
+                Annotation::new(from.clone(), Occurrence::mint()),
+            );
             body = ctx.tag_image(outer, check.span);
         }
     }
@@ -256,7 +272,13 @@ impl<'a> ProgramLowering<'a> {
                     .raw();
                 let span = parameter.declared;
                 wrap_parameter(&mut chain, &parameter.name, |rest| {
-                    let bound = Expr::let_bind_annotated(checked, default, rest, ty.clone());
+                    let bound = Expr::let_bind_annotated(
+                        checked,
+                        Occurrence::mint(),
+                        default,
+                        rest,
+                        Annotation::new(ty.clone(), Occurrence::mint()),
+                    );
                     ctx.tag_image(bound, span)
                 });
             }
@@ -510,8 +532,8 @@ fn read_through_atom(
         },
     );
     let outer = match annotation {
-        Some(ty) => Expr::let_bind_annotated(atom.clone(), value, inner, ty),
-        None => Expr::let_bind(atom.clone(), value, inner),
+        Some(ty) => Expr::let_bind_annotated(atom.clone(), Occurrence::mint(), value, inner, ty),
+        None => Expr::let_bind(atom.clone(), Occurrence::mint(), value, inner),
     };
     *at = ctx.tag_machinery(outer, declared, LABEL);
     (parameter_binder, atom)
