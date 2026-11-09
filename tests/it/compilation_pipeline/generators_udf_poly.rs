@@ -786,8 +786,7 @@ fn a_parameter_iterated_as_a_collection_resolves_data() {
 /// cast's value to reach its domain and codomain (`Typing::as_function`). That
 /// value is the comprehension's collection, `Data` by construction, so a demand
 /// stamping `Compute` rejects the program — the kinds are incomparable, and
-/// "what is this function's domain?" is the same question for either
-/// (`Type::fun_eliminated`).
+/// "what is this function's domain?" is the same question for either.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn destructuring_a_collection_does_not_demand_a_capability() {
