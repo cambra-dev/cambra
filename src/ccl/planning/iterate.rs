@@ -514,8 +514,8 @@ pub(super) fn wrap_with_iterate(
     // answer this refuses to produce is silent, and indistinguishable from the right one
     // in exactly the cases where the filter happens to admit every element. What is owed
     // is an extent for the witness — with one, the ordinary iterate-then-restricts chain
-    // below runs unchanged. Pinned by `sums.rs`, `a_filter_over_a_boxed_source_is_dropped`,
-    // and its conditional counterpart.
+    // below runs unchanged. Pinned by `sums.rs`, `a_filter_over_a_boxed_source_is_applied`,
+    // and `conditionals.rs`, `a_filter_over_a_conditional_source_is_applied`.
     if crate::ccl::ty::has_free_witness_ref(&domain_ty, &[]) {
         // **A realized sum owes nothing here.** Realization materializes the witness, and
         // with it discharges the restriction the site placed on that witness — as a gate
