@@ -145,6 +145,9 @@ pub struct ModuleCheck {
     /// For each other file the check reaches, the module's `import` or `run`
     /// statement that reaches it.
     pub reached_by: HashMap<FileId, Span>,
+    /// Each run or shared import in this check, identified separately from other
+    /// instantiations of the same module.
+    pub instantiations: RunSites,
     /// The module's value parameters whose annotation leaves part of their type
     /// to `_`, which the check infers from the module's uses.
     pub inferred_parameters: Vec<SmolStr>,
@@ -283,6 +286,7 @@ impl<'a> ProgramLowering<'a> {
                 });
             }
         }
+        self.check_sites = RunSites::default();
         // Each run's type arguments are checked below its statement, where the
         // run name is in scope, and each import's at the head of the module.
         insert_run_checks(&mut chain, &lowered.run_checks, ctx);
@@ -336,12 +340,22 @@ impl<'a> ProgramLowering<'a> {
         let copies = self.method_copies.clone();
         add_method_copies(&mut tree, &copies, ctx);
         settle_const_params(&mut tree, &self.const_values, &own, ctx);
+        for (statement, imported) in &self.imports {
+            if statement.file == file {
+                self.check_sites
+                    .statements
+                    .entry(Home::Import(imported.shared.clone()))
+                    .or_default()
+                    .push((*statement, String::new()));
+            }
+        }
         Some(ModuleCheck {
             module: lowered.interface.module.clone(),
             file,
             tree,
             params,
             reached_by: self.reached_by(file),
+            instantiations: std::mem::take(&mut self.check_sites),
             inferred_parameters: lowered.interface.inferred_parameters().cloned().collect(),
             arguments: self.inferred_arguments(file, &lowered.chain),
             interface: Rc::clone(&lowered.interface),

@@ -714,7 +714,11 @@ pub(crate) fn run(
     sources: &HashMap<String, Type>,
     instances: &Rc<solver::traits::InstanceTable>,
 ) -> Result<Type, Vec<LocatedInferError>> {
-    run_with_params(arena, expr, sources, instances, &[], &HashSet::new()).map(|(ty, _, _)| ty)
+    let outcome = run_with_params(arena, expr, sources, instances, &[], &HashSet::new(), false);
+    match outcome.typed {
+        Some((ty, _, _)) if outcome.errors.is_empty() => Ok(ty),
+        _ => Err(outcome.errors),
+    }
 }
 
 /// The scheme each generalized binding a module check reports was bound at.
@@ -723,6 +727,14 @@ pub(crate) type NotedSchemes = Vec<(Name, solver::display::InferredPoly)>;
 /// The variable each [`ModuleCheckParam::Inferred`] parameter is opened as, with the
 /// parameter.
 pub(crate) type OpenedVars = HashMap<crate::ccl::InferVarId, Rc<crate::ccl::ty::TypeParam>>;
+
+/// A run's errors and the result of its last successful recovery run.
+pub(crate) struct RunOutcome {
+    pub typed: Option<(Type, NotedSchemes, OpenedVars)>,
+    pub errors: Vec<LocatedInferError>,
+    pub recovered: HashMap<NodeId, StandIn>,
+    pub unavailable: HashSet<Name>,
+}
 
 /// [`run`] with a module's type parameters `params` open throughout `expr`,
 /// also returning the scheme each generalized binding in `reported` is bound at
@@ -739,6 +751,11 @@ pub(crate) type OpenedVars = HashMap<crate::ccl::InferVarId, Rc<crate::ccl::ty::
 /// ([`InferError::is_undetermined`]): the missing statements' constraints may be what
 /// determines it. Each run that stops so again starts over the same way. See
 /// `src/ccl/design/type-inference.md`, "An error stops its statement, not the pass".
+///
+/// Module checks set `recover_all`: failures after coalescing also omit their statements,
+/// and the last successful run supplies partial contracts. Its tree replaces `expr`, while
+/// errors from earlier runs remain reported. A failed function retains its declared
+/// parameters and result for checking its callers.
 pub(crate) fn run_with_params(
     arena: &mut InferArena,
     expr: &mut Expr,
@@ -746,16 +763,29 @@ pub(crate) fn run_with_params(
     instances: &Rc<solver::traits::InstanceTable>,
     params: &[ModuleCheckParam],
     reported: &HashSet<Name>,
-) -> Result<(Type, NotedSchemes, OpenedVars), Vec<LocatedInferError>> {
+    recover_all: bool,
+) -> RunOutcome {
     // Emission rewrites the tree it types, so a run that starts over needs it as it was: a
     // snapshot, at the same identities, since the statements recovered from are named by
     // node. Neither copy joins the tree `expr` is.
     let pristine = expr.clone_preserving_ids();
+    let mut unavailable = if recover_all {
+        unavailable_contracts(&pristine)
+    } else {
+        HashSet::new()
+    };
     let RunFailure {
         mut errors,
         mut recovered,
     } = match run_once(expr, sources, instances, params, reported) {
-        Ok(typed) => return Ok(typed),
+        Ok(typed) => {
+            return RunOutcome {
+                typed: Some(typed),
+                errors: Vec::new(),
+                recovered: HashMap::new(),
+                unavailable,
+            };
+        }
         Err(failure) => failure,
     };
     // A tree lowering failed in holds statements left out already, which may be what
@@ -764,6 +794,10 @@ pub(crate) fn run_with_params(
         errors.retain(|e| !e.error.is_undetermined());
     }
     let mut stood_in: HashMap<NodeId, StandIn> = HashMap::new();
+    let mut typed = None;
+    if recover_all && recovered.is_empty() {
+        recovered = failed_in_statements(&pristine, errors.clone()).recovered;
+    }
     loop {
         // A statement recovered from stands in; one that is recovered from as a stand-in
         // stands in bare. Each statement goes the two steps at most, so this ends.
@@ -782,12 +816,27 @@ pub(crate) fn run_with_params(
         }
         arena.restart();
         let mut rest = pristine.clone_preserving_ids();
-        stand_in_for_recovered(&mut rest, &stood_in);
-        let Err(failure) = run_once(&mut rest, sources, instances, params, reported) else {
-            break;
+        stand_in_for_recovered(&mut rest, &stood_in, recover_all);
+        if recover_all {
+            unavailable = unavailable_contracts(&rest);
+        }
+        let failure = match run_once(&mut rest, sources, instances, params, reported) {
+            Ok(found) => {
+                typed = Some(found);
+                if recover_all {
+                    *expr = rest;
+                }
+                break;
+            }
+            Err(failure) => failure,
         };
         // Restart copies preserve node identities. Equal messages at different nodes can
         // report independent defects, so only a repeat at the same node is dropped.
+        recovered = if recover_all && failure.recovered.is_empty() {
+            failed_in_statements(&pristine, failure.errors.clone()).recovered
+        } else {
+            failure.recovered
+        };
         for error in failure.errors {
             if !error.error.is_undetermined()
                 && !errors.iter().any(|said| {
@@ -797,10 +846,99 @@ pub(crate) fn run_with_params(
                 errors.push(error);
             }
         }
-        recovered = failure.recovered;
     }
     drop_met_downstream(&pristine, &mut errors);
-    Err(errors)
+    RunOutcome {
+        typed,
+        errors,
+        recovered: stood_in,
+        unavailable,
+    }
+}
+
+/// Bindings whose recovered definitions establish no complete contract. An unconstrained
+/// result of an omitted body is a poison for diagnosis, not a polymorphic export.
+fn unavailable_contracts(tree: &Expr) -> HashSet<Name> {
+    fn complete(ty: &Type) -> bool {
+        !ty.holds_type(&|ty| {
+            matches!(
+                ty,
+                Type::Hole
+                    | Type::Infer(_)
+                    | Type::BarrierVar(_)
+                    | Type::SharedHole(_)
+                    | Type::BoundedHole(_)
+            )
+        })
+    }
+    fn declared_reads(expr: &Expr) -> Option<std::collections::BTreeSet<Name>> {
+        match &expr.node {
+            crate::ccl::TypedExprNode::Lambda { param, body } => {
+                let annotation = param.annotation_ty().unwrap_or(&param.ty);
+                if !complete(annotation) {
+                    return None;
+                }
+                let mut reads = declared_reads(body)?;
+                reads.extend(crate::ccl::subst::type_free_vars(annotation));
+                reads.remove(&param.name);
+                Some(reads)
+            }
+            crate::ccl::TypedExprNode::Let { binding, .. }
+                if crate::ccl::opaque_output::is_annotated_result(expr) =>
+            {
+                binding
+                    .annotation_ty()
+                    .filter(|ty| complete(ty))
+                    .map(crate::ccl::subst::type_free_vars)
+            }
+            _ => None,
+        }
+    }
+    fn walk(
+        tree: &Expr,
+        out: &mut HashSet<Name>,
+        dependencies: &mut Vec<(Name, std::collections::BTreeSet<Name>)>,
+    ) {
+        if let crate::ccl::TypedExprNode::Let {
+            binding,
+            bound_expr,
+            ..
+        } = &tree.node
+        {
+            let declared = binding
+                .annotation_ty()
+                .filter(|ty| complete(ty))
+                .map(crate::ccl::subst::type_free_vars)
+                .or_else(|| declared_reads(bound_expr));
+            if holds_stand_in(bound_expr) && declared.is_none() {
+                out.insert(binding.name.clone());
+            }
+            // A complete declaration depends on its own types, independently of the body.
+            // Partial declarations remain on the recovered tree for checking callers;
+            // their missing parts do not establish an inferred export contract.
+            let mut reads =
+                declared.unwrap_or_else(|| crate::ccl::ccl_utils::free_names(bound_expr));
+            if let Some(annotation) = binding.annotation_ty() {
+                reads.extend(crate::ccl::subst::type_free_vars(annotation));
+            }
+            dependencies.push((binding.name.clone(), reads));
+        }
+        tree.walk_children(|child| walk(child, out, dependencies));
+    }
+    let mut out = HashSet::new();
+    let mut dependencies = Vec::new();
+    walk(tree, &mut out, &mut dependencies);
+    loop {
+        let before = out.len();
+        for (name, reads) in &dependencies {
+            if reads.iter().any(|read| out.contains(read)) {
+                out.insert(name.clone());
+            }
+        }
+        if out.len() == before {
+            return out;
+        }
+    }
 }
 
 /// Drop each error whose value came from inside a join already reported as having no common
@@ -887,7 +1025,7 @@ struct RunFailure {
 /// How much of a statement recovered from a run that starts over leaves out
 /// ([`run_with_params`]).
 #[derive(Clone, Copy)]
-enum StandIn {
+pub(crate) enum StandIn {
     /// Its expression: a `let` still binds at an exact annotation, and a `:=` at its
     /// declared history.
     Expression,
@@ -900,17 +1038,45 @@ enum StandIn {
 /// [`Error`](crate::ccl::TypedExprNode::Error) stand-in: a `let`'s right-hand side, an
 /// expression statement's expression, a `:=`'s initializer, or a
 /// [`DefGroup`](crate::ccl::TypedExprNode::DefGroup) member's definition. A
-/// [bare](StandIn::Bare) one's statement loses its declared type too.
-fn stand_in_for_recovered(expr: &mut Expr, stood_in: &HashMap<NodeId, StandIn>) {
+/// [bare](StandIn::Bare) one's statement loses its declared type too. With `keep_signature`,
+/// an omitted function retains its lambdas and annotated result: callers still have to
+/// meet declarations whose implementations failed.
+pub(crate) fn stand_in_for_recovered(
+    expr: &mut Expr,
+    stood_in: &HashMap<NodeId, StandIn>,
+    keep_signature: bool,
+) {
     use crate::ccl::TypedExprNode;
     /// Stand in for `part` if it is listed, returning whether to drop its declared type.
-    fn stand_in(part: &mut Expr, stood_in: &HashMap<NodeId, StandIn>) -> bool {
+    fn stand_in(
+        part: &mut Expr,
+        stood_in: &HashMap<NodeId, StandIn>,
+        keep_signature: bool,
+    ) -> bool {
         let Some(how) = stood_in.get(&part.node_id()) else {
             return false;
         };
-        part.node = TypedExprNode::Error;
-        part.ty = Type::Hole;
+        if keep_signature && matches!(how, StandIn::Expression) {
+            stand_in_body(part);
+        } else {
+            part.node = TypedExprNode::Error;
+            part.ty = Type::Hole;
+        }
         matches!(how, StandIn::Bare)
+    }
+    fn stand_in_body(part: &mut Expr) {
+        if let TypedExprNode::Lambda { body, .. } = &mut part.node {
+            stand_in_body(body);
+        } else if crate::ccl::opaque_output::is_annotated_result(part) {
+            let TypedExprNode::Let { bound_expr, .. } = &mut part.node else {
+                unreachable!()
+            };
+            bound_expr.node = TypedExprNode::Error;
+            bound_expr.ty = Type::Hole;
+        } else {
+            part.node = TypedExprNode::Error;
+            part.ty = Type::Hole;
+        }
     }
     match &mut expr.node {
         TypedExprNode::Let {
@@ -918,15 +1084,15 @@ fn stand_in_for_recovered(expr: &mut Expr, stood_in: &HashMap<NodeId, StandIn>) 
             bound_expr,
             ..
         } => {
-            if stand_in(bound_expr, stood_in) {
+            if stand_in(bound_expr, stood_in, keep_signature) {
                 binding.user_annotation = None;
             }
         }
         TypedExprNode::ExprStmt { expr: e, .. } => {
-            stand_in(e, stood_in);
+            stand_in(e, stood_in, keep_signature);
         }
         TypedExprNode::MutDecl { binding, init, .. } => {
-            if stand_in(init, stood_in)
+            if stand_in(init, stood_in, keep_signature)
                 && let Some((domain, _, _)) = binding.ty.history_parts()
             {
                 binding.ty = Type::mutable(domain.clone(), Type::Hole);
@@ -934,14 +1100,14 @@ fn stand_in_for_recovered(expr: &mut Expr, stood_in: &HashMap<NodeId, StandIn>) 
         }
         TypedExprNode::DefGroup { bindings, .. } => {
             for (binding, def) in bindings {
-                if stand_in(def, stood_in) {
+                if stand_in(def, stood_in, keep_signature) {
                     binding.user_annotation = None;
                 }
             }
         }
         _ => {}
     }
-    expr.walk_children_mut(|child| stand_in_for_recovered(child, stood_in));
+    expr.walk_children_mut(|child| stand_in_for_recovered(child, stood_in, keep_signature));
 }
 
 /// A run's failure in a check of the whole graph, the barrier check or the requirement

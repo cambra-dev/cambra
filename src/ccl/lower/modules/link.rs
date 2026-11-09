@@ -714,6 +714,8 @@ pub(super) struct ProgramLowering<'a> {
     /// What each `import` statement reaches, by the statement. An import whose
     /// arguments are in error reaches nothing.
     pub(super) imports: HashMap<Span, Imported>,
+    /// Instantiations in the check tree currently being assembled.
+    pub(super) check_sites: RunSites,
     /// The key of each type an import passes as an argument.
     pub(super) type_keys: TypeKeys,
     /// The names each shared import reaches ([`Created::names`]), or `None` when it
@@ -911,6 +913,7 @@ impl<'a> ProgramLowering<'a> {
             program,
             lowered: HashMap::new(),
             imports: HashMap::new(),
+            check_sites: RunSites::default(),
             type_keys: TypeKeys::default(),
             shared: HashMap::new(),
             import_refusals: HashSet::new(),
@@ -1503,22 +1506,21 @@ impl<'a> ProgramLowering<'a> {
             Some(place) if !self.checking => ctx.register_sinks(&declared, Some(place)),
             _ => (Vec::new(), Vec::new()),
         };
-        if !self.checking
-            && let Some(home) = &home
-        {
+        if let Some(home) = &home {
+            let sites = if self.checking {
+                &mut self.check_sites
+            } else {
+                &mut ctx.run_sites
+            };
             if let Some((path, statement)) = &place {
                 let label = format!("the run `{path}`, whose copy fails");
-                ctx.run_sites
+                sites
                     .statements
                     .entry(home.clone())
                     .or_default()
                     .push((*statement, label));
             }
-            ctx.run_sites
-                .by_file
-                .entry(file)
-                .or_default()
-                .push(home.clone());
+            sites.by_file.entry(file).or_default().push(home.clone());
         }
         self.errors.extend(refused);
         let scope = use_names(&lowered.scope, qualified);

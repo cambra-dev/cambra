@@ -612,12 +612,25 @@ impl<'a> Blame<'a> {
 /// where no such binding does.
 fn home_of(tree: &Expr, node: NodeId) -> Option<Home> {
     fn find(expr: &Expr, node: NodeId, home: Option<&Home>) -> Option<Option<Home>> {
-        if expr.node_id() == node {
-            return Some(home.cloned());
+        let mut holds_node = false;
+        expr.for_each_own_id(|id| holds_node |= id == node);
+        if holds_node {
+            let own = match &expr.node {
+                TypedExprNode::Let { binding, .. } | TypedExprNode::MutDecl { binding, .. } => {
+                    binding.name.home()
+                }
+                _ => None,
+            };
+            return Some(own.or(home).cloned());
         }
         if let TypedExprNode::Let {
             binding,
             bound_expr,
+            body,
+        }
+        | TypedExprNode::MutDecl {
+            binding,
+            init: bound_expr,
             body,
         } = &expr.node
         {
@@ -2147,6 +2160,131 @@ fn run_frontend(
     })
 }
 
+struct CheckedModules {
+    errors: Vec<CompileError>,
+    recovered: HashMap<RecoverySite, crate::ccl::infer::StandIn>,
+    rejected_runs: HashSet<Span>,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct RecoverySite {
+    span: Span,
+    binding: Option<SmolStr>,
+}
+
+fn statement_expressions(tree: &Expr, visit: &mut impl FnMut(&Expr, Option<&Name>, &Expr)) {
+    match &tree.node {
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            ..
+        } => visit(bound_expr, Some(&binding.name), tree),
+        TypedExprNode::MutDecl { binding, init, .. } => visit(init, Some(&binding.name), tree),
+        TypedExprNode::ExprStmt { expr, .. } => visit(expr, None, tree),
+        TypedExprNode::DefGroup { bindings, .. } => {
+            for (binding, definition) in bindings {
+                visit(definition, Some(&binding.name), tree);
+            }
+        }
+        _ => {}
+    }
+    tree.walk_children(|child| statement_expressions(child, visit));
+}
+
+fn recovery_site(
+    statement: &Expr,
+    expression: &Expr,
+    binding: Option<&Name>,
+    blame: &Blame<'_>,
+    tree: &Expr,
+) -> Option<RecoverySite> {
+    Some(RecoverySite {
+        span: blame
+            .traced(statement.node_id(), Some(tree))
+            .or_else(|| blame.traced(expression.node_id(), Some(tree)))?,
+        binding: binding.map(|name| SmolStr::from(name.base())),
+    })
+}
+
+/// Omit rejected statements in later copies, matching their source and declared binder.
+/// Generated caller expressions can trace to the same source as the definition they use.
+fn recover_checked_statements(
+    tree: &mut Expr,
+    recovered: &HashMap<RecoverySite, crate::ccl::infer::StandIn>,
+    blame: &Blame<'_>,
+) {
+    if recovered.is_empty() {
+        return;
+    }
+    let mut nodes = HashMap::new();
+    statement_expressions(tree, &mut |expr, binding, statement| {
+        if let Some(site) = recovery_site(statement, expr, binding, blame, tree)
+            && let Some(how) = recovered.get(&site)
+        {
+            nodes.insert(expr.node_id(), *how);
+        }
+    });
+    crate::ccl::infer::stand_in_for_recovered(tree, &nodes, true);
+}
+
+fn rejected_homes<'a>(runs: &'a RunSites, rejected: &HashSet<Span>) -> HashSet<&'a Home> {
+    runs.statements
+        .iter()
+        .filter_map(|(home, sites)| {
+            sites
+                .iter()
+                .any(|(span, _)| rejected.contains(span))
+                .then_some(home)
+        })
+        .collect()
+}
+
+/// Poison members of a run whose instantiation was rejected, before inferring its uses.
+fn recover_rejected_runs(tree: &mut Expr, runs: &RunSites, rejected: &HashSet<Span>) {
+    let homes = rejected_homes(runs, rejected);
+    fn walk(tree: &mut Expr, homes: &HashSet<&Home>) {
+        let failed = match &mut tree.node {
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                ..
+            } => {
+                if binding.name.home().is_some_and(|home| homes.contains(home)) {
+                    bound_expr.node = TypedExprNode::Error;
+                    bound_expr.ty = Type::Hole;
+                    binding.user_annotation = None;
+                    binding.ty = Type::Hole;
+                }
+                None
+            }
+            TypedExprNode::MutDecl {
+                binding,
+                init,
+                body,
+            } if binding.name.home().is_some_and(|home| homes.contains(home)) => {
+                let mut binding = binding.clone();
+                binding.ty = Type::Hole;
+                binding.user_annotation = None;
+                let mut failed = std::mem::take(init);
+                failed.node = TypedExprNode::Error;
+                failed.ty = Type::Hole;
+                failed.user_annotation = None;
+                Some(TypedExprNode::Let {
+                    binding,
+                    bound_expr: failed,
+                    body: std::mem::take(body),
+                })
+            }
+            _ => None,
+        };
+        if let Some(node) = failed {
+            tree.node = node;
+        }
+        tree.walk_children_mut(|child| walk(child, homes));
+    }
+    walk(tree, &homes);
+}
+
 /// Check each module on its own, in link order, against `checks`, its check
 /// tree (`docs/modules.md`, "Checking a module on its own"): the passes before
 /// inference, then inference. Return every error the checks raise, each once.
@@ -2162,10 +2300,12 @@ fn check_modules(
     blame: &Blame<'_>,
     contracts_of: Option<FileId>,
     contracts: &mut HashMap<SmolStr, Contract>,
-) -> Vec<CompileError> {
+) -> CheckedModules {
     let mut own: HashMap<FileId, Vec<(Span, InferError)>> = HashMap::new();
     let mut seen: Vec<(Span, InferError)> = Vec::new();
     let mut reported = Vec::new();
+    let mut recovered = HashMap::new();
+    let mut rejected_runs = HashSet::new();
     // The type each module's check infers for each of its unannotated value
     // parameters. The link order checks a module before every module that
     // passes it an argument.
@@ -2194,8 +2334,20 @@ fn check_modules(
         // As in `run_passes`: an error in a definition inference drops reads a binding the
         // tree it leaves no longer holds.
         let reads_named = mut_read::read_respelling(&tree);
+        recover_checked_statements(&mut tree, &recovered, &blame);
+        recover_rejected_runs(&mut tree, &check.instantiations, &rejected_runs);
+        let before = tree.clone_preserving_ids();
         let checked = check_module(&mut tree, ctx.inference_ctx(), &check.params, &wanted);
-        if checked.is_ok() {
+        statement_expressions(&before, &mut |expr, binding, statement| {
+            if let Some(how) = checked.recovered.get(&expr.node_id()) {
+                let site = recovery_site(statement, expr, binding, &blame, &before)
+                    .expect("a recovered statement has a source location");
+                if site.span.file == check.file {
+                    recovered.insert(site, *how);
+                }
+            }
+        });
+        if checked.has_typed_tree {
             note_parameter_types(
                 &tree,
                 &check.module,
@@ -2203,41 +2355,50 @@ fn check_modules(
                 &mut inferred,
             );
         }
-        let errors = match checked {
-            Ok(found) => {
-                reported.extend(private_traits_in_contracts(
-                    &check.module,
-                    &check.interface,
-                    &found,
-                ));
-                if contracts_of == Some(check.file) {
-                    contracts.extend(
-                        found
-                            .into_iter()
-                            .map(|(name, contract)| (SmolStr::from(name.base()), contract)),
-                    );
+        reported.extend(private_traits_in_contracts(
+            &check.module,
+            &check.interface,
+            &checked.contracts,
+        ));
+        if contracts_of == Some(check.file) {
+            contracts.extend(
+                checked
+                    .contracts
+                    .into_iter()
+                    .map(|(name, contract)| (SmolStr::from(name.base()), contract)),
+            );
+        }
+        let own_spans: Vec<Span> = checked
+            .errors
+            .iter()
+            .map(|error| blame.span(error.node_id, Some(&before)))
+            .filter(|span| span.file == check.file)
+            .collect();
+        for sites in check.instantiations.statements.values() {
+            for (statement, _) in sites {
+                if own_spans.iter().any(|at| {
+                    at.file == statement.file
+                        && statement.start <= at.start
+                        && at.end <= statement.end
+                }) {
+                    rejected_runs.insert(*statement);
                 }
-                continue;
             }
-            Err(errors) => errors,
-        };
+        }
+        let rejected = rejected_homes(&check.instantiations, &rejected_runs);
+        let errors = checked.errors.into_iter().filter(|error| {
+            home_of(&before, error.node_id).is_none_or(|home| !rejected.contains(&home))
+                || blame.span(error.node_id, Some(&before)).file == check.file
+        });
         let respelling =
             crate::ccl::subst::Subst::then(&mut_read::read_respelling(&tree), &reads_named);
         let errors = errors
-            .into_iter()
             .map(|mut located| {
                 located.respell(&respelling);
                 located
             })
             .collect();
         let errors = blame.infer(errors, &tree);
-        // The spans of the errors standing in the checked module's own code, which include
-        // each argument its runs and imports pass that does not fit its parameter.
-        let own_spans: Vec<Span> = errors
-            .iter()
-            .filter_map(CompileError::span)
-            .filter(|span| span.file == check.file)
-            .collect();
         for mut error in errors {
             let CompileError::Infer {
                 error: infer_error,
@@ -2256,15 +2417,6 @@ fn check_modules(
             {
                 continue;
             } else if let Some(statement) = check.reached_by.get(&span.file) {
-                // A module whose own check passed is sound at the types its parameters
-                // declare, so an error in its code that a run raises comes from an argument
-                // that does not fit them, which the run's statement reports.
-                if own_spans
-                    .iter()
-                    .any(|at| statement.start <= at.start && at.end <= statement.end)
-                {
-                    continue;
-                }
                 related.push((*statement, "brought in here".to_string()));
             }
             if !seen.contains(&key) {
@@ -2273,7 +2425,11 @@ fn check_modules(
             }
         }
     }
-    reported
+    CheckedModules {
+        errors: reported,
+        recovered,
+        rejected_runs,
+    }
 }
 
 /// One error per public member of `module`, declaring `interface`, whose contract, among those its check
@@ -2488,7 +2644,7 @@ pub fn check_program(
         .map(|check| Rc::clone(&check.interface));
     let blame = Blame::new(&projection, program.sources());
     let mut contracts = HashMap::new();
-    let errors = check_modules(ctx, checks, &blame, Some(root), &mut contracts);
+    let errors = check_modules(ctx, checks, &blame, Some(root), &mut contracts).errors;
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -2605,17 +2761,15 @@ fn run_passes(
 
     debug!("Lowered:\n{}", symbolic(&expr));
 
-    // Each module is checked on its own before the linked program is inferred. A module
-    // whose check fails reports through it: the program is inferred all the same and the
-    // compile stops after inference, and an error inference raises in code a check's error
-    // stands in is that check's to report (`docs/modules.md`, "Checking a module on its
-    // own").
-    let check_errors = check_modules(ctx, checks, &blame, None, &mut HashMap::new());
-    let checked_out: HashSet<FileId> = check_errors
-        .iter()
-        .filter_map(CompileError::span)
-        .map(|span| span.file)
-        .collect();
+    // Module checks report intrinsic failures and omit their statements from subsequent
+    // checks and linking's inference. Callers still meet surviving bodies and declared
+    // signatures (`docs/modules.md`, "Checking a module on its own").
+    let checked = check_modules(ctx, checks, &blame, None, &mut HashMap::new());
+    recover_checked_statements(&mut expr, &checked.recovered, &blame);
+    if let Some(runs) = blame.runs {
+        recover_rejected_runs(&mut expr, runs, &checked.rejected_runs);
+    }
+    let check_errors = checked.errors;
 
     // Inference runs on the user-shaped tree — before channelize — so type
     // errors are reported against the program the user wrote, not the
@@ -2656,21 +2810,8 @@ fn run_passes(
                 located
             })
             .collect();
-        // An error that names code a check's error stands in, at its primary span or a
-        // label, may be that error met through a use of the module: the check reports it.
-        let names_checked_out = |e: &CompileError| {
-            e.span()
-                .into_iter()
-                .chain(e.related().into_iter().flatten().map(|(span, _)| *span))
-                .any(|span| checked_out.contains(&span.file))
-        };
         let mut all = check_errors;
-        all.extend(
-            blame
-                .infer(errors, &expr)
-                .into_iter()
-                .filter(|e| !names_checked_out(e)),
-        );
+        all.extend(blame.infer(errors, &expr));
         return Err(all);
     }
     if !check_errors.is_empty() {
@@ -3352,6 +3493,74 @@ fn drop_plain_unboxes_in(expr: &mut Expr, memo: &crate::ccl::ccl_utils::PredMemo
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    #[test]
+    fn a_failed_module_retains_only_established_export_contracts() {
+        let text = indoc::indoc! {r#"
+            pub def healthy(x: Int) => Int:
+                x
+            pub def generic(x):
+                x
+            pub known: Int = 1
+            pub bad = [1, "a"]
+            pub def broken(x):
+                (x + 1, x + "s")
+            pub def declared(x: Int) => String:
+                x
+            pub def indirect(x):
+                broken(x)
+            pub alias = indirect
+            pub def partial(x: Int, y):
+                bad
+            pub def dependent(x: Int) => String:
+                ignored = indirect
+                "s"
+        "#};
+        let program = LoadedProgram::load(
+            crate::ccl::load::RootFile {
+                path: "main.cambra".to_owned(),
+                module: None,
+                text: text.to_owned(),
+            },
+            &mut crate::ccl::load::InMemory::default(),
+        );
+        let mut ctx = GlobalContext::default();
+        let lowering = LoweringSession::install();
+        assert!(lower_for_check(&program, ctx.lowering_ctx()).is_empty());
+        let checks = std::mem::take(&mut ctx.lowering_ctx().module_checks);
+        let ids = checks
+            .iter()
+            .flat_map(|check| collect_tree_ids(&check.tree))
+            .collect();
+        let (projection, leaks) = fold_lowering(&lowering.into_log(), &ids);
+        gate_leaks(&leaks, "lowering");
+        let blame = Blame::new(&projection, program.sources());
+        let mut contracts = HashMap::new();
+        let checked = check_modules(
+            &mut ctx,
+            checks,
+            &blame,
+            Some(program.sources().root()),
+            &mut contracts,
+        );
+        assert_eq!(
+            checked.errors.len(),
+            3,
+            "{}",
+            render_errors(&checked.errors, program.sources())
+        );
+        assert!(!checked.errors.iter().any(|error| {
+            program.sources().text(program.sources().root())
+                [error.span().unwrap().start..error.span().unwrap().end]
+                .starts_with("pub def healthy")
+        }));
+        assert_eq!(contracts.len(), 5, "{contracts:?}");
+        assert_eq!(contracts["dependent"].written(&[]), "Int => String");
+        assert_eq!(contracts["generic"].written(&[]), "forall (A) A => A");
+        assert_eq!(contracts["healthy"].written(&[]), "Int => Int");
+        assert_eq!(contracts["known"].written(&[]), "Int");
+        assert_eq!(contracts["declared"].written(&[]), "Int => String");
+    }
 
     /// The sources a default context registers are the sources `SURFACE_BUILTINS` lists.
     #[test]

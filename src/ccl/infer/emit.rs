@@ -2529,9 +2529,10 @@ struct LetBound {
 /// open for the caller to close.
 ///
 /// A failed right-hand side is recovered from ([`Typing::recover`], against
-/// `reads_before`): the annotation is reconciled against a poison (see [`poison`]),
-/// and the binding is bound at the poison unless an exact annotation declares its
-/// type instead. A `poly` whose bounds do not type is recovered from too, and
+/// `reads_before`). A usable annotation retains its declared constraints; without
+/// one the binding is bound at a poison (see [`poison`]). A failed initializer
+/// contributes no inferred type to a plain annotation. A `poly` whose bounds do not
+/// type is recovered from too, and
 /// declares nothing usable: the binding is bound at a poison, and the right-hand
 /// side is not emitted, since it would be typed without the parameters' bounds and
 /// the assumptions the annotation states.
@@ -2681,8 +2682,8 @@ fn emit_let_bound<C: Typing>(
         //
         // An exact annotation over a failed initializer still binds at what it
         // declares, so its uses are typed against the program's own statement and
-        // the binding is not poisoned. A bounded one resolves to the initializer's
-        // type, which is the poison.
+        // the binding is not poisoned. A bounded annotation retains its upper bound
+        // even without an initializer type, so independent uses still meet that bound.
         //
         // A polymorphic annotation is exact, and binds at its body: the
         // right-hand side is checked once against it with the parameters opaque. The
@@ -2714,11 +2715,21 @@ fn emit_let_bound<C: Typing>(
                 }
             }
         }
+        Some(ann) if !defined => {
+            poisoned = false;
+            at_annotation = true;
+            // A failed initializer supplies no subtype to infer. Its declared upper
+            // bound is still a usable guarantee; holes within it remain unknown.
+            let declared = match ann {
+                Type::BoundedHole(bound) => &**bound,
+                _ => ann,
+            };
+            ctx.in_let_rhs(|ctx| ctx.normalize(declared))
+        }
         Some(ann) => {
             let declared = match ann {
                 Type::BoundedHole(_) => ann.clone(),
                 _ => {
-                    poisoned = false;
                     // An annotation that is all hole declares the right-hand side's type.
                     at_annotation = !matches!(ann, Type::Hole);
                     complete_annotation(ann, &bound_ty)

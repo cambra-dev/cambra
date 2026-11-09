@@ -684,13 +684,38 @@ written as its module spells it (`error_key`), since each check holds its own co
 its own inference variables and its own names for the module's members. A check's error in another
 module's code is that module's own when its own check raised it. Otherwise the checked module's use
 raised it, and it carries a secondary label at the module's `import` or `run` statement that brings
-that code in (`ModuleCheck::reached_by`). A module whose own check passed is sound at the types
-its parameters declare, so an error a run raises in its code comes from an argument that does not
-fit them; where the statement bringing the code in has an error of its own, the module's error is
-dropped. A module whose check fails does not stop linking's inference: the program is inferred all
-the same and the compile stops after it. An error linking's inference raises that names, at its span
-or a label, a file a check's error stands in is dropped: it is that error met again, through the
-module's code or through a use of the module, which the check reports. A module with lowering errors
+that code in (`ModuleCheck::reached_by`). A module whose check fails does not stop linking's
+inference: the program is inferred all the same and the compile stops after it. A module check
+returns its errors alongside the contracts established by its surviving definitions and complete
+declarations (`ModuleCheckResult`). Recovery also continues after coalescing errors. A successful
+recovery run supplies the remaining contracts and inferred parameter types; an omitted body with no
+complete declaration supplies no export contract.
+
+A rejected run or import declaration is recorded separately from defects in the module it reaches.
+The linked tree poisons the members of that instantiation (`recover_rejected_runs`), identified by
+their `Home` and the declaration in `RunSites`. Its invalid arguments establish no instance whose
+body can be checked. The module's own errors are retained from its independent check, and other
+instantiations remain checked.
+
+Statements rejected by a module's own check are omitted from later checks and the linked program's
+inference (`recover_checked_statements`). A statement's source span and declared binder identify it
+across copies of the module's code. A generated caller expression can trace to the definition's
+span without declaring its binder, so that expression remains checked. A failed function retains
+all explicit parameter and result constraints, including upper bounds and annotations with holes.
+An incorrect caller is checked against those constraints even when the implementation is broken.
+A complete declaration depends on the names in its declared types; reading a broken definition in
+its body does not discard that contract. Unknown portions of a recovered signature establish no
+inferred export contract. Definitions not selected for recovery retain their bodies, since
+specialization can reject a use in ways their
+signatures do not express. A diagnostic's secondary label in a broken module suppresses nothing: the
+label can name a valid requirement that the caller violates.
+
+The operand-requirement sweep groups unchanged copies of conflicting requirements before
+attribution. The grouped failure retains the variables of its source and its carriers, so the
+attribution walk finds the owning definition without falling back to the program root. Recovery
+can then omit that definition while retaining unrelated exports.
+
+A module with lowering errors
 of its own has no check, and its code is not linked, so its type errors are not reported until its
 lowering errors are fixed. A module is checked against its dependencies' bodies, so each check infers them
 again; keeping each module's inferred schemes for its users would remove that cost.

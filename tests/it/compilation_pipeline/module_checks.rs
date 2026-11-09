@@ -17,6 +17,191 @@ const ADDER: &str = indoc! {"
     pub y = x + 1
 "};
 
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_module_defect_keeps_the_inferred_type_of_its_parameter() {
+    let worker = indoc! {r#"
+        param x: _
+        pub y = x + 1
+        pub bad = [1, "a"]
+    "#};
+    let root = indoc! {r#"
+        run worker(x="s") as w
+        w::y
+    "#};
+    let errors = compile_errors(&program(root, &[("worker", worker)]));
+    assert!(
+        errors.contains("The values that meet here have no common type"),
+        "{errors}"
+    );
+    assert!(
+        errors.contains("annotated as Int, but inferred as {String"),
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_module_defect_and_a_bad_type_argument_are_both_reported() {
+    let worker = indoc! {r#"
+        param T <: Int
+        param x: T
+        pub y = x + 1
+        pub bad = [1, "a"]
+    "#};
+    let root = indoc! {r#"
+        run worker(T=String, x="s") as w
+        w::y
+    "#};
+    let errors = compile_errors(&program(root, &[("worker", worker)]));
+    assert!(
+        errors.contains("The values that meet here have no common type"),
+        "{errors}"
+    );
+    assert!(
+        errors.contains("annotated as Int, but inferred as String"),
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
+#[rstest]
+#[case::rejected_first(true)]
+#[case::rejected_second(false)]
+#[timeout(Duration::from_secs(10))]
+fn rejecting_one_run_keeps_another_runs_call_checked(#[case] rejected_first: bool) {
+    let worker = indoc! {r#"
+        param T <: Int
+        pub def f(x):
+            x + 1
+        pub bad = [1, "a"]
+    "#};
+    let good = "run worker(T=Int) as good";
+    let bad = "run worker(T=String) as bad";
+    let (first, second) = if rejected_first {
+        (bad, good)
+    } else {
+        (good, bad)
+    };
+    let root = indoc::formatdoc! {r#"
+        {first}
+        {second}
+        good::f("s")
+    "#};
+    let errors = compile_errors(&program(&root, &[("worker", worker)]));
+    assert!(
+        errors.contains("No Addable instance for this call"),
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 3, "{errors}");
+}
+
+#[rstest]
+#[case::left_first(false)]
+#[case::right_first(true)]
+#[timeout(Duration::from_secs(10))]
+fn a_rejected_nested_run_keeps_the_other_side_of_a_diamond_checked(#[case] reverse: bool) {
+    let worker = indoc! {r#"
+        param T <: Int
+        pub def f(x):
+            x + 1
+        pub bad = [1, "a"]
+    "#};
+    let left = indoc! {r#"
+        run worker(T=String) as rejected
+        pub value = rejected::f(1)
+    "#};
+    let right = indoc! {r#"
+        run worker(T=Int) as accepted
+        pub def f(x):
+            accepted::f(x)
+    "#};
+    let (first, second) = if reverse {
+        ("right", "left")
+    } else {
+        ("left", "right")
+    };
+    let root = indoc::formatdoc! {r#"
+        run {first} as {first}
+        run {second} as {second}
+        right::f("s")
+    "#};
+    let errors = compile_errors(&program(
+        &root,
+        &[("worker", worker), ("left", left), ("right", right)],
+    ));
+    assert_eq!(report_count(&errors), 3, "{errors}");
+    assert!(
+        errors.contains("annotated as Int, but inferred as String"),
+        "{errors}"
+    );
+    assert!(
+        errors.contains("No Addable instance for this call"),
+        "{errors}"
+    );
+    assert!(errors.contains("main.cambra:3:"), "{errors}");
+}
+
+#[rstest]
+#[case::left_first(false)]
+#[case::right_first(true)]
+#[timeout(Duration::from_secs(10))]
+fn a_shared_broken_dependency_keeps_both_diamond_callers_checked(#[case] reverse: bool) {
+    let worker = indoc! {r#"
+        pub def f(x: Int) => Int:
+            x
+        pub bad = [1, "a"]
+    "#};
+    let wrapper = indoc! {r#"
+        import worker
+        pub def f(x):
+            worker::f(x)
+    "#};
+    let (first, second) = if reverse {
+        ("right", "left")
+    } else {
+        ("left", "right")
+    };
+    let root = indoc::formatdoc! {r#"
+        import {first}
+        import {second}
+        left::f(True)
+        right::f("s")
+    "#};
+    let errors = compile_errors(&program(
+        &root,
+        &[("worker", worker), ("left", wrapper), ("right", wrapper)],
+    ));
+    assert_eq!(report_count(&errors), 3, "{errors}");
+    assert!(errors.contains("main.cambra:3:"), "{errors}");
+    assert!(errors.contains("main.cambra:4:"), "{errors}");
+}
+
+#[rstest]
+#[case::self_reference(indoc! {r#"
+    pub def f(x: Int) => Int:
+        f(x)
+"#})]
+#[case::mutual_reference(indoc! {r#"
+    pub def f(x: Int) => Int:
+        g(x)
+    pub def g(x: Int) => Int:
+        f(x)
+"#})]
+#[timeout(Duration::from_secs(10))]
+fn unsupported_recursion_keeps_declared_inputs_checked(#[case] library: &str) {
+    let root = indoc! {r#"
+        import lib
+        lib::f(True)
+    "#};
+    let errors = compile_errors(&program(root, &[("lib", library)]));
+    assert_eq!(report_count(&errors), 2, "{errors}");
+    assert!(errors.contains("Unbound variable:"), "{errors}");
+    assert!(errors.contains("expected Int, found Bool"), "{errors}");
+    assert!(errors.contains("main.cambra:2:"), "{errors}");
+}
+
 /// A module with an error of its own is reported once, however many runs it has.
 #[rstest]
 #[timeout(Duration::from_secs(10))]

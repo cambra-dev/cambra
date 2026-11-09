@@ -1258,3 +1258,186 @@ fn the_inspector_refuses_a_program_of_several_modules() {
         "{payload}"
     );
 }
+
+#[rstest]
+#[case::an_unrelated_join(
+    indoc! {r#"
+        pub def f(x):
+            x + 1
+        pub bad = [1, "a"]
+    "#},
+    "The values that meet here have no common type",
+)]
+#[case::an_unrelated_unbound_name(
+    indoc! {"
+        pub def f(x):
+            x + 1
+        pub bad = nope
+    "},
+    "Unbound variable: 'nope'",
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_module_defect_and_a_bad_use_are_both_reported(#[case] library: &str, #[case] defect: &str) {
+    let root = indoc! {r#"
+        import lib
+        x = lib::f("s")
+        x
+    "#};
+    let errors = compile_errors(&program(root, &[("lib", library)]));
+    assert!(errors.contains(defect), "{errors}");
+    assert!(
+        errors.contains("No Addable instance for this call"),
+        "{errors}"
+    );
+    assert!(errors.contains("required here"), "{errors}");
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_broken_function_keeps_its_declared_contract_for_bad_uses() {
+    let library = indoc! {"
+        pub def f(x: Int) => String:
+            x
+    "};
+    let root = indoc! {"
+        import lib
+        lib::f(True)
+    "};
+    let errors = compile_errors(&program(root, &[("lib", library)]));
+    assert!(errors.contains("Annotation mismatch"), "{errors}");
+    assert!(errors.contains("expected Int, found Bool"), "{errors}");
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_module_defect_does_not_hide_a_failure_inside_a_specialized_body() {
+    let library = indoc! {r#"
+        pub def f(c, a):
+            a if c else "s"
+        pub bad = [1, "a"]
+    "#};
+    let root = indoc! {"
+        import lib
+        lib::f(True, 1)
+    "};
+    let errors = compile_errors(&program(root, &[("lib", library)]));
+    assert_eq!(report_count(&errors), 2, "{errors}");
+    assert!(errors.contains("main.cambra"), "{errors}");
+}
+
+#[rstest]
+#[case::bounded_parameter(
+    indoc! {r#"
+        pub def f(x <: Int):
+            [1, "a"]
+    "#},
+    "lib::f(True)",
+)]
+#[case::bounded_partial_parameters(
+    indoc! {r#"
+        pub def f(x <: {Int, ..}, y):
+            [1, "a"]
+    "#},
+    "lib::f((True, 1), 1)",
+)]
+#[case::bounded_type_parameter(
+    indoc! {r#"
+        pub def f(T <: Int, x: T):
+            [1, "a"]
+    "#},
+    "lib::f(True)",
+)]
+#[case::partial_parameters(
+    indoc! {r#"
+        pub def f(x: Int, y):
+            [1, "a"]
+    "#},
+    "lib::f(True, 1)",
+)]
+#[case::partial_nested_parameter(
+    indoc! {r#"
+        pub def f(x: {Int, _}):
+            [1, "a"]
+    "#},
+    "lib::f((True, 1))",
+)]
+#[case::result_only(
+    indoc! {r#"
+        pub def f(x) => Int:
+            [1, "a"]
+    "#},
+    "answer: String = lib::f(1)",
+)]
+#[case::bounded_value(
+    indoc! {r#"
+        pub f <: Int = [1, "a"]
+    "#},
+    "answer: String = lib::f",
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_broken_definition_keeps_its_explicit_constraints(
+    #[case] library: &str,
+    #[case] caller: &str,
+    #[values(false, true)] valid: bool,
+) {
+    let caller = if valid {
+        caller
+            .replace("True", "1")
+            .replace("answer: String", "answer: Int")
+    } else {
+        caller.to_owned()
+    };
+    let root = indoc::formatdoc! {"
+        import lib
+        {caller}
+        1
+    "};
+    let errors = compile_errors(&program(&root, &[("lib", library)]));
+    assert!(errors.contains("lib.cambra:"), "{errors}");
+    assert_eq!(report_count(&errors), if valid { 1 } else { 2 }, "{errors}");
+    assert_eq!(errors.contains("main.cambra:2:"), !valid, "{errors}");
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn recovery_does_not_invent_constraints_for_unannotated_positions() {
+    let library = indoc! {r#"
+        pub def f(x: Int, y):
+            [1, "a"]
+    "#};
+    let root = indoc! {r#"
+        import lib
+        a: String = lib::f(1, True)
+        b: Int = lib::f(1, "s")
+        1
+    "#};
+    let errors = compile_errors(&program(root, &[("lib", library)]));
+    assert_eq!(report_count(&errors), 1, "{errors}");
+    assert!(errors.contains("lib.cambra:"), "{errors}");
+}
+
+#[rstest]
+#[case::exact(":")]
+#[case::bounded("<:")]
+#[timeout(Duration::from_secs(10))]
+fn a_failed_value_keeps_declared_components_and_freshens_unknown_ones(
+    #[case] mode: &str,
+    #[values(false, true)] valid: bool,
+) {
+    let library = indoc::formatdoc! {r#"
+        pub f {mode} {{Int, _}} = [1, "a"]
+    "#};
+    let first = if valid { "Int" } else { "Bool" };
+    let root = indoc::formatdoc! {r#"
+        import lib
+        a: {{{first}, String}} = lib::f
+        b: {{Int, Bool}} = lib::f
+        1
+    "#};
+    let errors = compile_errors(&program(&root, &[("lib", &library)]));
+    assert_eq!(report_count(&errors), if valid { 1 } else { 2 }, "{errors}");
+    assert!(errors.contains("lib.cambra:"), "{errors}");
+    assert_eq!(errors.contains("main.cambra:2:"), !valid, "{errors}");
+}
