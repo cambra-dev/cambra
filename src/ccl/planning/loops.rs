@@ -483,9 +483,8 @@ enum TxnBinding {
     History,
     /// `commits_j : 𝐼 ⇒ {time, write_targets, decision} = let __t = begin in ⟨record⟩`.
     Commit,
-    /// ``__to_<defer> : Txn ⤇ {`fired{V} | `idle} = (commits_j ▷ by_commit_time) ≫ .decision ≫
-    /// variant_project(`commit) ≫ .field``, or keyed by item, ``commits_j ≫ .decision ≫ …``
-    /// ([`tap_field`]).
+    /// ``__to_<defer> : 𝐼 ⤇ {`fired{V} | `idle} = commits_j ≫ .decision ≫
+    /// variant_project(`commit) ≫ .field``, keyed by item ([`tap_field`]).
     Tap,
 }
 
@@ -587,37 +586,27 @@ fn recover_writer(site_dom: &Type, def: Expr) -> WriterSite {
         write_keys,
         source,
         body,
-        item_taps: Vec::new(),
         fed_back: Vec::new(),
     }
 }
 
-/// The history-record tap field a tap binding projects — its trailing field projection — and,
-/// for a tap keyed by item, the commit-record binding it reads.
+/// The history-record tap field a tap binding projects — its trailing field projection — and
+/// the commit-record binding it reads.
 ///
 /// A tap reads its site's commit records ``commits_j ≫ .decision ≫ variant_project(`commit) ≫
-/// .field``, either keyed by the commit time each carries, through `commits_j ▷ by_commit_time`,
-/// or keyed by the item each was committed for, as `commits_j` is: a block in value position's
-/// value ([`WriterSite::item_taps`]).
-fn tap_field(def: &Expr) -> (Label, Option<Name>) {
+/// .field``, keyed by the item each was committed for, as `commits_j` is.
+fn tap_field(def: &Expr) -> (Label, Name) {
     let TypedExprNode::Compose(elts) = &def.node else {
         panic!("letrec recognition: tap binding is not a composition");
     };
-    let by_item = match elts.first().map(|e| &e.node) {
-        Some(TypedExprNode::Apply { function, .. })
-            if matches!(function.node, TypedExprNode::Builtin(Builtin::ByCommitTime)) =>
-        {
-            None
-        }
-        Some(TypedExprNode::Var(commits)) => Some(commits.clone()),
-        _ => panic!(
-            "letrec recognition: a tap reads its site's commit records, by commit time or by \
-             item: {}",
+    let Some(TypedExprNode::Var(commits)) = elts.first().map(|e| &e.node) else {
+        panic!(
+            "letrec recognition: a tap reads its site's commit records: {}",
             symbolic(def)
-        ),
+        );
     };
     match elts.last().map(|e| &e.node) {
-        Some(TypedExprNode::Proj(ProjKey::Field(f))) => (f.clone(), by_item),
+        Some(TypedExprNode::Proj(ProjKey::Field(f))) => (f.clone(), commits.clone()),
         _ => panic!("letrec recognition: tap binding does not end in a field projection"),
     }
 }
@@ -655,10 +644,9 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
     let mut writers: Vec<WriterSite> = Vec::new();
     // Each commit-record binding's writer, by binding name, for the taps it is read through.
     let mut writer_of: HashMap<Name, usize> = HashMap::new();
-    // Each tap keyed by item, with the commit-record binding it reads.
-    let mut item_taps: Vec<(Name, Label)> = Vec::new();
-    // Tap binding name → (history-record field, value type).
-    let mut taps: Vec<(Name, Label, Type)> = Vec::new();
+    // Tap binding name → (history-record field, value type, the commit-record binding it
+    // reads).
+    let mut taps: Vec<(Name, Label, Type, Name)> = Vec::new();
     // Every binding name, to assert the continuation has no dangling references.
     let mut binding_names: Vec<Name> = Vec::with_capacity(bindings.len());
 
@@ -707,41 +695,25 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
                 writers.push(recover_writer(&site_dom, def));
             }
             TxnBinding::Tap => {
-                // The tap's store field keeps the binding's own type (``Txn ⤇ {`fired{𝑉} |
-                // `idle}`` keyed by commit time, or ``𝐼 ⤇ …`` keyed by item): the channel
-                // union channelize already assembled references the taps at that type.
-                let (field, by_item) = tap_field(&def);
-                if let Some(commits) = by_item {
-                    item_taps.push((commits, field.clone()));
-                }
-                taps.push((b.name.clone(), field, b.ty.clone()));
+                // The tap's store field keeps the binding's own type, ``𝐼 ⤇ {`fired{𝑉} |
+                // `idle}`` keyed by item: the channel union channelize already assembled
+                // references the taps at that type.
+                let (field, commits) = tap_field(&def);
+                taps.push((b.name.clone(), field, b.ty.clone(), commits));
             }
         }
     }
 
-    // Each item tap's writer, by tap binding name, for the later writers whose sources read it.
-    let mut item_tap_writer: HashMap<Name, usize> = HashMap::new();
-    for (commits, field) in item_taps {
-        let writer = writer_of
-            .get(&commits)
-            .unwrap_or_else(|| panic!("letrec recognition: a tap reads `{commits}`, no site's"));
-        if let Some((tap, _, _)) = taps.iter().find(|(_, f, _)| *f == field) {
-            item_tap_writer.insert(tap.clone(), *writer);
-        }
-        writers[*writer].item_taps.push(field);
-    }
-    // A writer's source reading an earlier writer's item tap reads it as a name the writer
-    // binds in its source ([`WriterSite::fed_back`]); the `Transact` has no binder of its own
-    // for its record to be read through.
+    // A writer's source reading an earlier writer's tap reads it as a name the writer binds in
+    // its source ([`WriterSite::fed_back`]); the `Transact` has no binder of its own for its
+    // record to be read through.
     for (j, writer) in writers.iter_mut().enumerate() {
-        for (tap, field, stream_ty) in &taps {
+        for (tap, field, stream_ty, commits) in &taps {
             if count_free(tap, &writer.source) == 0 {
                 continue;
             }
-            let from = item_tap_writer.get(tap).unwrap_or_else(|| {
-                panic!(
-                    "letrec recognition: a writer source reads `{tap}`, which no site keys by item"
-                )
+            let from = writer_of.get(commits).unwrap_or_else(|| {
+                panic!("letrec recognition: a tap reads `{commits}`, no site's")
             });
             assert!(
                 *from < j,
@@ -761,7 +733,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
         .iter()
         .map(|(n, v)| (n.field_key(), Type::data_fun(Type::Txn, v.clone())))
         .collect();
-    for (_, field, stream_ty) in &taps {
+    for (_, field, stream_ty, _) in &taps {
         hist_field_tys.push((field.clone(), stream_ty.clone()));
     }
     let hist_ty = hist_record(hist_field_tys);
@@ -783,7 +755,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
             (n.field_key(), Type::data_fun(Type::Txn, v.clone())),
         );
     }
-    for (n, field, stream_ty) in &taps {
+    for (n, field, stream_ty, _) in &taps {
         read_map.insert(n.clone(), (field.clone(), stream_ty.clone()));
     }
 
@@ -1235,7 +1207,6 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         write_keys: key_names,
         source,
         body: writer_body,
-        item_taps: Vec::new(),
         fed_back: Vec::new(),
     };
     // A nested `Transact` runs over its `(enclosing, position)` pairs, the domain its parameter

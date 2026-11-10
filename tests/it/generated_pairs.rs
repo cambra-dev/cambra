@@ -1734,7 +1734,6 @@ fn shape(v: &Value) -> String {
         Value::Str(_) => "Str".into(),
         Value::Bool(_) => "Bool".into(),
         Value::Unit => "()".into(),
-        Value::CommitTime(_) => "Txn".into(),
         Value::Pending => unreachable!("an interpreter's answer holds no pending value"),
         Value::Record(fields) => {
             let mut fields: Vec<String> = fields

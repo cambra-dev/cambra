@@ -695,20 +695,6 @@ pub enum Builtin {
     /// lives in the commit-record binding, not in the oracle.
     BeginTxn,
 
-    /// `by_commit_time : (𝐼 ⤇ {time: Txn, …}) ⇒ (Txn ⤇ {time: Txn, …})` — one `with
-    /// begin():` site's commit records, keyed by the commit time each carries rather than by
-    /// the iteration that produced it. A site's records carry distinct times, so the re-keying
-    /// is a function. A denied iteration's record has a time too in the model, where
-    /// `begin_<site>` is injective over iterations; the engine allocates no tick for it. The
-    /// tap's ``variant_project(`commit)`` drops it.
-    ///
-    /// Heads each in-block reply tap [`crate::ccl::transact_phase`] binds, which types a reply
-    /// `Txn ⤇ 𝑉`, keyed as the store serves it. A block's value is a tap read keyed by item, as
-    /// the records are, and does not pass through it. Minted after inference with its type stamped,
-    /// like [`Self::BeginTxn`], and consumed with the tap binding by
-    /// [`crate::ccl::planning::plan_loops`], so its op-conversion arm is a deliberate error.
-    ByCommitTime,
-
     /// `await_final : Mut(𝑉, Txn) ⇒ 𝑉` — the **terminal read** of a transactional
     /// mutable variable: its final committed value, once the whole commit history is
     /// complete. Applied to the mutable variable *handle* (`x ▷ await_final`), which is
@@ -1072,7 +1058,6 @@ impl Builtin {
             Self::GetPrevSeq => "get_prev_seq",
             Self::GetPrevTxn => "get_prev_txn",
             Self::BeginTxn => "begin",
-            Self::ByCommitTime => "by_commit_time",
             Self::AwaitFinal => "await_final",
             Self::Copair => "copair",
             Self::AsOfRead => "as_of_read",

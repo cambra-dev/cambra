@@ -109,8 +109,7 @@ struct Function {
 
 /// A `with begin():` block in progress.
 ///
-/// A block that neither writes nor replies is a denial and takes no commit time; `wrote`
-/// records whether it wrote.
+/// A block that neither writes nor replies is a denial; `wrote` records whether it wrote.
 struct TxnFrame {
     /// The block's source position, which identifies it as a writer of a `Txn` cell.
     site: usize,
@@ -118,8 +117,9 @@ struct TxnFrame {
     /// The mutable variables the block writes anywhere in its body. A read of a `Txn`
     /// variable the block does not write is an as-of read.
     writes: BTreeSet<String>,
-    /// Replies fed inside the block, held until the block commits and its commit time is known.
-    replies: Vec<(String, String, Value)>,
+    /// Replies fed inside the block, each with its channel, its site and the key of the
+    /// iteration that fed it, held until the block commits.
+    replies: Vec<(String, String, Value, Value)>,
     /// Each cell the block writes with the value it held before the block, which an
     /// exception escaping the block restores.
     before: Vec<(Rc<RefCell<MutCell>>, Value)>,
@@ -187,12 +187,6 @@ pub(crate) struct Interp {
     places: Rc<HashMap<usize, Place>>,
     /// The values a generator has yielded, while one is running.
     yielded: Option<Vec<(Value, Value)>>,
-    /// The commit times transaction blocks have taken. They are dense and 1-based: a block
-    /// that denies takes none, so they count commits rather than blocks.
-    commit_time: i64,
-    /// Whether [`Self::commit_time`] is the count: false once a block whose commit is
-    /// undecided has run, after which every commit time is pending.
-    clock_known: bool,
     /// The final contents of each channel an earlier pass completed.
     finals: BTreeMap<String, Value>,
     /// The channels this pass read before they were complete.
@@ -704,7 +698,7 @@ fn instance_prefix(trait_: &str, at: usize) -> String {
 /// (`docs/chl-spec.md`, "Ordered loops").
 ///
 /// An iteration's effects that outlive it make the loop's result depend on that order: a write
-/// to a cell made before the loop began, and a commit, which takes the next commit time. The
+/// to a cell made before the loop began, and a commit, which a later transaction reads. The
 /// watch records whether any happened, however the body reached them, through a call included.
 struct OrderWatch {
     /// [`Interp::cells_made`] when the loop began: a cell born earlier outlives the loop.
@@ -726,8 +720,6 @@ impl Interp {
             feed_sites,
             places,
             yielded: None,
-            commit_time: 0,
-            clock_known: true,
             finals,
             waited_on: BTreeSet::new(),
             speculating: 0,
@@ -1840,16 +1832,14 @@ impl Interp {
         });
         let frame = self.txn.take().expect("installed above");
         // An exception escaping the block aborts it: no write commits and no reply is sent
-        // (`docs/chl-spec.md`, "Exceptions"). A block that writes takes a commit time all the
-        // same, as a path of a block in value position that writes nothing does.
+        // (`docs/chl-spec.md`, "Exceptions"). A block that writes takes its place in the
+        // commit order all the same, as a path of a block in value position that writes
+        // nothing does.
         if let Err(Error::Raised(_)) = &outcome {
             for (cell, value) in &frame.before {
                 cell.borrow_mut().value = value.clone();
             }
-            if frame.uncertain {
-                self.clock_known = false;
-            } else if !frame.writes.is_empty() {
-                self.commit_time += 1;
+            if !frame.uncertain && !frame.writes.is_empty() {
                 for watch in &mut self.order_watches {
                     watch.moved = true;
                 }
@@ -1859,33 +1849,25 @@ impl Interp {
         let value = outcome?;
         let valued_commit = valued && !frame.writes.is_empty();
 
-        // A block that may or may not commit leaves every later commit time undecided,
-        // and its own replies may not happen.
+        // A block that may or may not commit may or may not send its replies.
         if frame.uncertain {
-            self.clock_known = false;
-            for (channel, site, _) in frame.replies {
+            for (channel, site, _, _) in frame.replies {
                 self.contribute(&channel)
                     .push((site, Value::Pending, Value::Pending));
             }
             return Ok(if valued { Value::Pending } else { value });
         }
         if !frame.wrote && frame.replies.is_empty() && !valued_commit {
-            // Denied: no write, no reply, no commit time.
+            // Denied: no write, no reply.
             return Ok(value);
         }
-        self.commit_time += 1;
-        // A commit takes the next commit time, so a loop around it takes its commits
-        // in iteration order.
+        // A commit takes the next place in the commit order, so a loop around it takes its
+        // commits in iteration order.
         for watch in &mut self.order_watches {
             watch.moved = true;
         }
-        let at = if self.clock_known {
-            Value::CommitTime(self.commit_time)
-        } else {
-            Value::Pending
-        };
-        for (channel, site, reply) in frame.replies {
-            self.contribute(&channel).push((site, at.clone(), reply));
+        for (channel, site, key, reply) in frame.replies {
+            self.contribute(&channel).push((site, key, reply));
         }
         Ok(value)
     }
@@ -2399,15 +2381,14 @@ impl Interp {
         // two `<<` in one program are two places whatever they write, and so is one `<<`
         // reached through two calls.
         let site = self.feed_site(&channel, target.span.start);
+        let key = self.site_key();
         if let Some(frame) = self.txn.as_mut() {
-            // A reply rides its block's commit, so it is indexed by commit time, not by
-            // the iteration that produced it. The commit time is not known until the block
-            // commits, so the reply waits here.
-            frame.replies.push((channel, site, contributed));
+            // A reply rides its block's commit and is keyed by the iteration that fed it. It
+            // is sent only if the block commits, so it waits here.
+            frame.replies.push((channel, site, key, contributed));
             frame.uncertain |= speculating;
             return Ok(());
         }
-        let key = self.site_key();
         self.contribute(&channel).push((site, key, contributed));
         Ok(())
     }
@@ -4312,7 +4293,7 @@ mod tests {
                     b += r
                     out << b
         "#});
-        assert_eq!(v.to_string(), "[t1 -> 2, t2 -> 5]");
+        assert_eq!(v.to_string(), "[2, 5]");
     }
 
     /// An exception escaping a `with begin():` block aborts it: none of its writes commits,
@@ -4341,7 +4322,7 @@ mod tests {
         "});
         assert_eq!(
             got.to_string(),
-            "[`out<<(()) -> 20, `out<<#1(()) -> 90, `y.out<<(t1) -> 90]"
+            "[`out<<(()) -> 20, `out<<#1(()) -> 90, `y.out<<(0) -> 90]"
         );
     }
 

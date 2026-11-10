@@ -733,19 +733,10 @@ fn a_reply_after_a_writing_block_answers_the_request() {
     );
 }
 
-/// A reply fed inside the block that writes a mutable variable never answers the request.
-///
-/// `docs/chl-spec.md`, "8.4 Feeds are the second form of mutability" admits a reply inside a
-/// block, sequenced after the commit and indexed by commit tick. The same in-block feed over a
-/// `stdin()` loop into a declared feed replies (`progress_feed_inside_tx` in
-/// `tests/it/compilation_pipeline/transactions.rs` covers the literal-list loop), and the reply
-/// moved after the block answers (the sibling above).
-// Pinned on the failure rather than deferred: an `#[ignore]` reports the same green whether the
-// gap closed, regressed, or went away, and nothing runs ignored tests here. The hang is pinned on
-// `drive_until`'s timeout, which returns control to the test, where rstest's `#[timeout]` would
-// leave the driving thread running.
+/// A reply fed inside the block that writes a mutable variable answers the request: it rides
+/// the transaction's commit and is keyed by the request it answers (`docs/chl-spec.md`, "8.4
+/// Feeds are the second form of mutability").
 #[test]
-#[should_panic(expected = "timed out after 5s waiting for HTTP response")]
 fn a_reply_inside_a_writing_block_answers_the_request() {
     let port = reserve_test_port();
     let code = formatdoc! {r#"
@@ -759,6 +750,36 @@ fn a_reply_inside_a_writing_block_answers_the_request() {
     assert_eq!(
         reply_to(&code, move || http_post(port, "/hit", "x")),
         "ok\n"
+    );
+}
+
+/// Each request is answered with the reply its own transaction fed: the reply is keyed by the
+/// request, and the commit order (here the arrival order) decides what each transaction read.
+#[test]
+fn a_reply_inside_a_writing_block_answers_each_request_with_its_own_value() {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        reqs, resps = http_serve("{port}", "POST", "/hit")
+        seen: Mut(String, Txn) := ""
+        for req in reqs:
+            with begin():
+                seen := seen + req
+                resps << seen
+    "#};
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut ctx = GlobalContext::default();
+    let loaded = LoadedProgram::test(&code);
+    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+
+    let (tx, rx) = mpsc::channel::<Vec<String>>();
+    thread::spawn(move || {
+        let a = http_post(port, "/hit", "a");
+        let b = http_post(port, "/hit", "b");
+        tx.send(vec![a, b]).unwrap();
+    });
+    assert_eq!(
+        drive_until(&mut ctx, &rx, Duration::from_secs(5)),
+        vec!["a", "ab"]
     );
 }
 

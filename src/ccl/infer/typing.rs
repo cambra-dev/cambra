@@ -629,8 +629,8 @@ pub(super) trait Typing {
     ) {
     }
 
-    /// Run `f` inside a transaction block. A feed inside the block is keyed by commit time
-    /// rather than by the positions of the loops around it, so Emit marks where the block
+    /// Run `f` inside a transaction block. A feed inside the block is keyed by the item its
+    /// transaction ran for, the position of its block's loop, so Emit marks where the block
     /// begins. Check keeps nothing.
     fn in_transaction<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R
     where

@@ -962,8 +962,8 @@ fn a_filter_keeps_its_survivors_positions() {
 }
 
 // ---------------------------------------------------------------------------
-// Transactions. A block is one commit record, at the next commit time or none at all, and
-// a reply fed inside it is indexed by that commit time rather than by the iteration.
+// Transactions. A block is one commit record, and a reply fed inside it rides that commit and
+// is keyed by the iteration that fed it.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -978,12 +978,9 @@ fn an_in_block_reply_per_commit() {
     "#});
 }
 
-/// A guard no path takes is a denial: no write, no reply, no commit time.
-///
-/// Agreement compares commit times by rank, which cannot see a single reply's time, so the
-/// compiled side's raw time is pinned too.
+/// A guard no path takes is a denial: no write and no reply.
 #[test]
-fn a_denied_block_takes_no_commit_time() {
+fn a_denied_block_replies_nothing() {
     let source = indoc! {r#"
         out = test_sink()
         pool: Mut(Int, Txn) := 100
@@ -994,15 +991,11 @@ fn a_denied_block_takes_no_commit_time() {
                     out << pool
     "#};
     agree(source);
-    assert_eq!(compiled(source).to_string(), "[t1 -> 30]");
 }
 
-/// Commit times are dense: the denied iteration leaves no gap.
-///
-/// Agreement compares commit times by rank, which cannot see a gap, so the compiled side's
-/// raw times are pinned too.
+/// A reply is keyed by the iteration that fed it, so the denied iteration leaves a gap.
 #[test]
-fn commit_times_are_dense_across_a_denial() {
+fn a_reply_is_keyed_by_its_iteration_across_a_denial() {
     let source = indoc! {r#"
         out = test_sink()
         q: Mut(Int, Txn) := 0
@@ -1013,7 +1006,7 @@ fn commit_times_are_dense_across_a_denial() {
                     out << q
     "#};
     agree(source);
-    assert_eq!(compiled(source).to_string(), "[t1 -> 2, t2 -> 3]");
+    assert_eq!(compiled(source).to_string(), "[1 -> 2, 2 -> 3]");
 }
 
 #[test]
@@ -1236,10 +1229,10 @@ fn two_writer_sites_on_one_store_are_not_judged() {
     assert!(refusal.contains("more than one `with` block"), "{refusal}");
 }
 
-/// Two stores, each written by its own loop. The two sides number commits differently, and a
-/// reply channel's keys have type `Txn`, so the comparison matches them by commit order.
+/// Two stores, each written by its own loop. A reply is keyed by its loop's iteration, so how
+/// either side numbers commits does not reach the output.
 #[test]
-fn two_writer_sites_on_two_stores_agree_up_to_commit_time_numbering() {
+fn two_writer_sites_on_two_stores() {
     agree(indoc! {r#"
         out = test_sink()
         a: Mut(Int, Txn) := 0

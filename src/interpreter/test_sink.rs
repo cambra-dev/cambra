@@ -1,9 +1,6 @@
 //! [`TestSink`]: a sink that keeps what a program wrote to it, readable as a [`Value`].
 //!
-//! It reads a tile of any shape and reports one it cannot read as a [`SinkReadError`]. A tile
-//! carries no types, so a `Txn` key, a commit time, reads as a `UInt` like an iteration
-//! position; the sink's field in the compiled program's type (`CompiledProgram::ast`) tells the
-//! two apart.
+//! It reads a tile of any shape and reports one it cannot read as a [`SinkReadError`].
 
 use smol_str::SmolStr;
 use std::sync::Mutex;

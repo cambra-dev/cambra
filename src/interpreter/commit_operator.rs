@@ -6534,16 +6534,15 @@ pub struct TransactWriter {
     /// value). A reply (`resps << e`) rides the writer body as a `__to_<defer>`
     /// decision field (a *tap*); op-conversion folds each tap into the committed
     /// write set as a write-only key, so the reply is committed atomically with
-    /// the transaction and read back as a `Fun(Txn, V)` value-stream.
+    /// the transaction.
     write_keys: Vec<Value>,
     /// Decision-record field names of the reply taps, in `write_keys` tail order.
     /// Their values are appended to each committed write set (a tap commits iff
-    /// its transaction does, so a denied request replies nothing).
+    /// its transaction does, so a denied request replies nothing). Each commits as the pair
+    /// `(item position, value)`, the position read off the driver's row
+    /// ([`F_ITEM_POSITION`]), which `RekeySorted` re-keys the tap's stream by, so a reply is
+    /// keyed by the item it answers.
     tap_fields: Vec<SmolStr>,
-    /// The taps read keyed by the item each was committed for, a subset of `tap_fields`. Each
-    /// commits as the pair `(item position, value)`, the position read off the driver's row
-    /// ([`F_ITEM_POSITION`]), which `RekeySorted` re-keys the tap's stream by.
-    item_taps: Vec<SmolStr>,
 }
 
 impl TransactWriter {
@@ -6555,7 +6554,6 @@ impl TransactWriter {
         read_keys: Vec<Value>,
         write_keys: Vec<Value>,
         tap_fields: Vec<SmolStr>,
-        item_taps: Vec<SmolStr>,
         key_extent: Extent,
         value_extent: Extent,
     ) -> Self {
@@ -6567,7 +6565,6 @@ impl TransactWriter {
             read_keys,
             write_keys,
             tap_fields,
-            item_taps,
         }
     }
 }
@@ -6606,7 +6603,6 @@ impl TileOperator for TransactWriter {
         // reaches this writer, and through it the commit cycle, along this edge.
         let driver_producer = subscribe_forwarding(&mut *self.driver_op, &consumer, scheduler);
         Box::new(TransactWriterProducer {
-            item_taps: self.item_taps.clone(),
             base: ProducerBase::new(
                 TransactWriterProducer::alloc_id(),
                 self.tiling(),
@@ -6666,8 +6662,6 @@ struct TransactWriterProducer {
     /// Reply-tap decision fields, appended to each write set (see
     /// [`TransactWriter::tap_fields`]).
     tap_fields: Vec<SmolStr>,
-    /// See [`TransactWriter::item_taps`].
-    item_taps: Vec<SmolStr>,
     /// The driver position whose decision this writer has already acted on, so a
     /// re-pull re-reads a *not-ready* decision without re-deciding a settled one.
     last_decided_pos: Option<Position>,
@@ -6989,7 +6983,7 @@ impl TileProducer for TransactWriterProducer {
                     );
                     let n_carry = self.write_keys.len() - self.tap_fields.len();
                     let item_position =
-                        (!self.item_taps.is_empty()).then(|| item_position_at(&driver_tile, &pos));
+                        (!self.tap_fields.is_empty()).then(|| item_position_at(&driver_tile, &pos));
                     let writes: HashMap<Value, Value> = self
                         .write_keys
                         .iter()
@@ -6998,14 +6992,12 @@ impl TileProducer for TransactWriterProducer {
                         .enumerate()
                         .filter(|(i, _)| *i < n_carry || tap_fired[*i - n_carry])
                         .map(|(i, (key, value))| {
-                            let by_item = i >= n_carry
-                                && self.item_taps.contains(&self.tap_fields[i - n_carry]);
-                            if !by_item {
+                            if i < n_carry {
                                 return (key, value);
                             }
                             let at = item_position
                                 .clone()
-                                .expect("a writer with a tap keyed by item reads item positions");
+                                .expect("a writer with a tap reads item positions");
                             let pair = Value::Record(HashMap::from([
                                 (tuple_field(0), at),
                                 (tuple_field(1), value),
@@ -8977,7 +8969,6 @@ mod tests {
                 driver_fan.slot(),
                 vec![pool.clone()],
                 vec![pool.clone()],
-                Vec::new(),
                 Vec::new(),
                 key_extent(),
                 value_extent(),

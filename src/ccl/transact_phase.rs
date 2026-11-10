@@ -57,7 +57,8 @@
 //! [`Builtin::FinalRead`] over the key's history binding. The two reads are **different
 //! terms** over the same history — [`Builtin::AsOfRead`] and [`Builtin::FinalRead`] — so
 //! neither pass can claim the other's read whatever the tree around it looks like. Each
-//! `__to_<defer>` tap compiles to a per-commit value-stream (`body_tap_fields`).
+//! `__to_<defer>` tap compiles to a value-stream keyed by the item its transaction ran for
+//! (`body_tap_fields`).
 //! The in-block feed mirrors the induction phase's in-loop feeds
 //! ([`crate::ccl::mut_elim`]).
 //!
@@ -656,8 +657,8 @@ struct RawSite {
 /// The block feeds its value to `defer` on its spine, which no channel declares: the feed makes
 /// the value a tap of the decision, and every path feeds it, so every path commits, a path that
 /// writes nothing committing its reads. [`plan_store`] binds the tap keyed by the item of the
-/// site's source rather than by commit time, `commits_j ≫ .decision ≫ … ≫ .field : 𝐼 ⤇ …`, and
-/// `values` to the value at each item. A standalone block's source is the singleton, and the
+/// site's source, as every tap, `commits_j ≫ .decision ≫ … ≫ .field : 𝐼 ⤇ …`, and `values` to
+/// the value at each item. A standalone block's source is the singleton, and the
 /// code after it reads its one value; a loop iterates `values` beside its source.
 #[derive(Clone)]
 struct BlockValue {
@@ -4360,12 +4361,6 @@ fn build_writer(
     // `commit`. An empty block commits. The in-block feeds ride as `__to_<defer>` taps,
     // each `` `fired `` on the positions its own path admits.
     let (body, feeds) = walk.body(kept, param, true);
-    // The block's value is read keyed by the item it was committed for.
-    let item_taps = feeds
-        .iter()
-        .filter(|f| site.value.as_ref().is_some_and(|v| v.defer == f.defer))
-        .map(|f| f.field.clone())
-        .collect();
 
     (
         WriterSite {
@@ -4373,7 +4368,6 @@ fn build_writer(
             write_keys: site.write_keys,
             source,
             body,
-            item_taps,
             // Recognition finds which of the store's own taps the source reads.
             fed_back: Vec::new(),
         },
@@ -4668,8 +4662,8 @@ fn record_field_ty(ty: &Type, field: &Label) -> Type {
     }
 }
 
-/// A hoisted in-block feed: the target defer and the tap binding (``Txn ⤇ {`fired{𝑉} |
-/// `idle}``, its site's commit records keyed by commit time) whose per-commit values feed it.
+/// A hoisted in-block feed: the target defer and the tap binding (``𝐼 ⤇ {`fired{𝑉} |
+/// `idle}``, its site's commit records keyed by item) whose per-commit values feed it.
 /// `recognize` maps a read of `tap` to the history record's tap field.
 struct HoistedFeed {
     defer: Name,
@@ -4696,9 +4690,8 @@ struct HoistedFeed {
 ///   (verbatim) applied to the mutable variable snapshot `(hist_rk(begin(r)) …,
 ///   source(r))` at the site's commit time, and whose `write_targets` names the
 ///   write-set keys' histories so recognition recovers the writer's write-set;
-/// - one **tap** binding per in-block feed — ``(commits_j ▷ by_commit_time) ≫ .decision ≫
-///   variant_project(`commit) ≫ .field``, keyed by commit time, and for a block's value
-///   ``commits_j ≫ .decision ≫ …``, keyed by item ([`BlockValue`]).
+/// - one **tap** binding per in-block feed — ``commits_j ≫ .decision ≫
+///   variant_project(`commit) ≫ .field``, keyed by item.
 ///
 /// The continuation rebinds each key variable's `let x = init` to a
 /// `final_or_default(hist_x, init)` read over its history, hoists each
@@ -4774,7 +4767,6 @@ fn plan_store(
             write_keys,
             mut source,
             body,
-            item_taps: _,
             fed_back: _,
         } = w;
         for (values, tap) in &own_values {
@@ -4859,42 +4851,24 @@ fn plan_store(
         ));
 
         // One tap binding per in-block feed:
-        // `(commits_j ▷ by_commit_time) ≫ .decision ≫ variant_project(`commit) ≫ .field`,
-        // the per-commit tap stream. `by_commit_time` keys the site's commit records by
-        // the commit time each carries, which is the key the store serves a reply under.
-        // The tap rides the (dense) `commit` payload, so the `` {`commit{𝑃} | `abort} ``
-        // decision is eliminated before the field read. Recognition maps a read of the
-        // tap to the history record's `field` tap. Emitted in feed (source) order across
-        // sites.
+        // ``commits_j ≫ .decision ≫ variant_project(`commit) ≫ .field``, keyed by the item the
+        // transaction ran for, as the commit records are. A reply rides its transaction's
+        // commit and answers the iteration that fed it, so a request's reply is keyed by the
+        // request. The tap rides the (dense) `commit` payload, so the
+        // `` {`commit{𝑃} | `abort} `` decision is eliminated before the field read.
+        // Recognition maps a read of the tap to the history record's `field` tap. Emitted in
+        // feed (source) order across sites.
         let payload_ty = crate::ccl::ccl_utils::commit_payload_ty(&decision_ty);
         let commits_ty = Type::data_fun(dom.clone(), rec_ty.clone());
-        let by_time_ty = Type::data_fun(Type::Txn, rec_ty.clone());
         for f in feeds {
             let tap_name = Name::fresh(f.field.name());
             // The tap is the commit log read through the field, so it is a collection at
             // the log's kind — and `recognize_txn_group` takes the history record's tap
             // field type straight off this binding.
             let tap_value_ty = crate::ccl::ccl_utils::tap_variant_ty(f.ty.clone());
-            // A block's value is read keyed by the item it was committed for, which is how the
-            // commit records are keyed; every other tap by the commit time it rides.
             let value = value.as_ref().filter(|v| v.defer == f.defer);
-            let (records, tap_ty) = match value {
-                Some(_) => (
-                    tvar(&commits[j], commits_ty.clone()),
-                    Type::fun_like(&commits_ty, dom.clone(), tap_value_ty.clone()),
-                ),
-                None => (
-                    apply_ty(
-                        tvar(&commits[j], commits_ty.clone()),
-                        builtin_ty(
-                            Builtin::ByCommitTime,
-                            Type::fun(commits_ty.clone(), by_time_ty.clone()),
-                        ),
-                        by_time_ty.clone(),
-                    ),
-                    Type::fun_like(&by_time_ty, Type::Txn, tap_value_ty.clone()),
-                ),
-            };
+            let records = tvar(&commits[j], commits_ty.clone());
+            let tap_ty = Type::fun_like(&commits_ty, dom.clone(), tap_value_ty.clone());
             let mut dec_proj = Expr::proj_field(F_DECISION);
             dec_proj.ty = Type::fun(rec_ty.clone(), decision_ty.clone());
             let vp = crate::ccl::ccl_utils::commit_project(&decision_ty);
@@ -5189,7 +5163,7 @@ impl StorePlan {
                         f.value_ty.clone(),
                     ),
                 );
-                // One value per commit: the tap is keyed by commit time alone.
+                // One value per item: the tap is keyed by the item its transaction ran for.
                 LoopFeed {
                     defer: f.defer.clone(),
                     view,
