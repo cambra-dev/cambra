@@ -987,6 +987,7 @@ impl InferCtx {
                     InferError::ExceptAroundEveryRaise {
                         clause: crate::ccl::chl_print::chl_type(&t.clauses[0]),
                         top: Capability::Every(top).to_string(),
+                        variable: false,
                     },
                     t.node,
                 ));
@@ -1009,13 +1010,30 @@ impl InferCtx {
                     hits[i] += 1;
                 }
             }
+            // A clause variable whose bound holds `Raise(*)`, `E <: Effect`, may raise every type
+            // at a use, so a clause the stated exceptions leave idle is one it would take part
+            // of: the writer states what the call raises beside it.
+            let raising_variable = t.var.resolved().into_iter().find(|c| match &c.item {
+                Capability::Param(p) => {
+                    p.of_causes
+                        && Every::of_direction(true)
+                            .less(p.except.iter().chain(&p.param.clause_except).cloned())
+                            .raises_anything()
+                }
+                _ => false,
+            });
             for (catches, _) in t.clauses.iter().zip(&hits).filter(|(_, n)| **n == 0) {
-                errors.push(LocatedInferError::new(
-                    InferError::ExceptCatchesNothing {
+                let error = match &raising_variable {
+                    Some(variable) => InferError::ExceptAroundEveryRaise {
+                        clause: crate::ccl::chl_print::chl_type(catches),
+                        top: variable.item.to_string(),
+                        variable: true,
+                    },
+                    None => InferError::ExceptCatchesNothing {
                         ty: crate::ccl::chl_print::chl_type(catches),
                     },
-                    t.node,
-                ));
+                };
+                errors.push(LocatedInferError::new(error, t.node));
             }
         }
         errors
@@ -1541,13 +1559,8 @@ impl InferCtx {
         let undetermined = |v: &CapabilityVar| {
             self.capability_calls.contains(&v.uid) && v.incoming().is_empty() && v.own().is_empty()
         };
-        // A top or a clause variable of the `causes` clause, `WriteTxn(*)` or `E`, stands for
-        // capabilities as a listed one does.
         let idle = |var: &CapabilityVar| {
-            let set = crate::ccl::capabilities::set_of(&var.resolved());
-            set.causes.is_empty()
-                && set.tops_of(true).next().is_none()
-                && !set.params.iter().any(|p| p.of_causes)
+            crate::ccl::capabilities::set_of(&var.resolved()).causes_nothing()
                 && !var.reaches(&undetermined)
         };
         let empty: Vec<&(NodeId, Rc<CapabilityVar>)> = self

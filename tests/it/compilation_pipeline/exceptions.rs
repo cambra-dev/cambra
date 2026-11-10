@@ -87,6 +87,59 @@ use rstest_log::rstest;
             0
     checked_or_zero(-3) * 10 + checked_or_zero(4)
 "}, Value::Int(4))]
+#[case::an_operand_feeds_before_a_later_operand_raises(indoc! {"
+    o: Feed(_)
+    def g(x: Int, o: Feed(Int)) => Int:
+        o << x
+        x
+    def f(x: Int) => Int:
+        if x > 0:
+            raise x
+        x
+    y = try:
+            g(5, o) + f(1)
+        except Int as e:
+            e
+    y * 100 + sum(o)
+"}, Value::Int(105))]
+#[case::a_function_raising_in_a_guard_called_twice(indoc! {"
+    def p(x: Int) => Bool:
+        if x == 3:
+            raise x
+        x > 5
+    def classify(x: Int) => Int:
+        if x == 1:
+            10
+        elif p(x):
+            20
+        else:
+            30
+    y = try:
+            classify(1) + classify(7)
+        except Int as e:
+            e * 1000
+    y
+"}, Value::Int(30))]
+#[case::a_caught_exception_and_a_passed_one(indoc! {"
+    type NotFound = {key: String}
+    type Timeout = {ms: Int}
+    def lookup(k: String) => Int:
+        if k == \"a\":
+            raise NotFound::new((key=k))
+        if k == \"b\":
+            raise Timeout::new((ms=50))
+        1
+    def safe(k: String) => Int:
+        try:
+            lookup(k)
+        except NotFound as nf:
+            0
+    y = try:
+            safe(\"a\") + safe(\"b\")
+        except Timeout as t:
+            -1
+    y
+"}, Value::Int(-1))]
 fn straight_line(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -219,6 +272,41 @@ fn straight_line(#[case] code: &str, #[case] expected: Value) {
             e
     r
 "}, 20)]
+#[case::over_a_retained_boxed_map(indoc! {"
+    items = box(map([3 -> 30, 1 -> 10, 2 -> 20]))
+    r = try:
+            for v in items:
+                raise v
+            0
+        except Int as e:
+            e
+    r + sum(items)
+"}, 70)]
+#[case::feeding_from_a_boxed_map(indoc! {"
+    o: Feed(_)
+    r = try:
+            for v in box(map([3 -> 30, 1 -> 10, 2 -> 20])):
+                o << v
+                if v == 20:
+                    raise v
+            0
+        except Int as e:
+            e
+    sum(o) * 10 + r
+"}, 320)]
+#[case::raising_source_with_boxed_map(indoc! {"
+    def src(n: Int):
+        if n < 0:
+            raise n
+        box(map([2 -> 20, 1 -> 10]))
+    r = try:
+            for v in src(0):
+                raise v
+            0
+        except Int as e:
+            e
+    r
+"}, 10)]
 fn loops(#[case] code: &str, #[case] expected: i64) {
     check_scalar(code, Value::Int(expected));
 }
@@ -497,6 +585,13 @@ fn raise_clauses(#[case] code: &str, #[case] expected: i64) {
     "},
     "does not list"
 )]
+fn refused(#[case] code: &str, #[case] needle: &str) {
+    check_compile_error(code, needle);
+}
+
+/// A shape exception elimination does not compile yet is refused at the source that wrote it:
+/// the block an exception escapes, and the `raise` in a function value.
+#[rstest]
 // An exception escaping a block aborts its transaction and leaves the block's outcome to the
 // code after it, which nothing carries out of the commit yet.
 #[case::an_exception_escaping_a_block(
@@ -511,7 +606,8 @@ fn raise_clauses(#[case] code: &str, #[case] expected: i64) {
                 e
         y
     "},
-    "escaping a `with begin():` block is not compiled yet"
+    "escaping a `with begin():` block is not compiled yet",
+    "with begin():"
 )]
 // A function value in a collection stays in the tree as a lambda that may raise, which
 // elimination does not rewrite yet.
@@ -526,10 +622,17 @@ fn raise_clauses(#[case] code: &str, #[case] expected: i64) {
                 [e]
         y
     "},
-    "an exception raised inside a Lambda"
+    "an exception raised inside a Lambda",
+    "raise x"
 )]
-fn refused(#[case] code: &str, #[case] needle: &str) {
-    check_compile_error(code, needle);
+fn refused_at_its_source(#[case] code: &str, #[case] needle: &str, #[case] source: &str) {
+    let message = compile_panic(code);
+    assert!(
+        message.contains(needle)
+            && message.contains(source)
+            && !message.contains("internal compiler error"),
+        "{message}"
+    );
 }
 
 /// Every type may be raised, and a clause catches by subtyping: a collection is caught by its

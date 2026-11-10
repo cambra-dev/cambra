@@ -2248,6 +2248,26 @@ fn a_top_orders_a_loop(#[case] top: &str) {
     );
 }
 
+/// A clause variable bounded by `Effect` may hold `Raise(*)`, so a `try` around a call causing it
+/// is refused as one around `Raise(*)` is, naming the variable, whatever a use passes
+/// (`docs/chl-spec.md`, "Exceptions").
+#[test]
+fn a_try_around_a_raising_clause_variable_names_it() {
+    let errors = errors_of(indoc! {"
+        def recover(E <: Effect, f: (Int => Int causes E), x: Int) => Int causes E:
+            try:
+                f(x)
+            except Int as e:
+                e + 1
+    "});
+    assert!(
+        errors.contains(
+            "this `except Int` is around a call that may cause `E`, whose bound holds `Raise(*)`"
+        ),
+        "{errors}"
+    );
+}
+
 /// `Effect` and `Raise(*)` raise every type: a `try` around either catches nothing, and a top
 /// level calling either raises past the program (`docs/chl-spec.md`, "Exceptions").
 #[rstest]

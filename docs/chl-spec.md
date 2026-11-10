@@ -3480,9 +3480,10 @@ is a trait's function, read from an instance, `summon(Area(_))::area(s)`
 
 **[Decided]** — naming another module's public transactional variable, `WriteTxn(inv::stock)`; sink
 functions and calls made outside the program ([Output outside the
-program](#output-outside-the-program)); and keeping readings across a reload and a restart ([Inputs
-from outside the program](#inputs-from-outside-the-program)). The rest of this section is
-implemented.
+program](#output-outside-the-program)); keeping readings across a reload and a restart ([Inputs
+from outside the program](#inputs-from-outside-the-program)); and an exception escaping a `with
+begin():` block, or raised by a function value held in a collection ([Exceptions](#exceptions)).
+The rest of this section is implemented.
 
 A function's type states what a call reads from its context, in its **`requires` clause**, and what
 the call contributes besides its result, in its **`causes` clause**. A requirement is an input that
@@ -3899,7 +3900,7 @@ def checked_or_zero(qty):
   does.
 - **An exception escaping a `with begin():` block aborts the transaction.** None of the block's
   writes commits and no output inside it is sent, and the exception continues outward. An exception
-  caught inside the block does not abort it.
+  caught inside the block does not abort it. **[Decided]**
 - **An exception escaping an iteration orders the iterations.** A `for` loop, or a comprehension
   whose element or condition may raise, raises the exception of its first raising iteration in
   position order, and nothing after that iteration takes effect. This is a dependency from one

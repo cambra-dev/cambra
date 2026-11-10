@@ -920,6 +920,27 @@ impl CapabilitySet {
         listed || self.tops.iter().any(|top| top.holds(item))
     }
 
+    /// Whether this causes nothing: it lists no effect, and holds no top or clause variable of
+    /// the `causes` clause, which stand for effects as a listed one does.
+    pub fn causes_nothing(&self) -> bool {
+        self.causes.is_empty()
+            && self.tops_of(true).next().is_none()
+            && !self.params.iter().any(|p| p.of_causes)
+    }
+
+    /// Whether this may raise: it lists a `Raise`, holds a top meeting `Raise(*)`, or holds a
+    /// clause variable of the `causes` clause whose bound does not take `Raise(*)` away.
+    pub fn may_raise(&self) -> bool {
+        let raise = Capability::Every(Family::Raise.top());
+        self.causes.iter().any(|e| matches!(e, Effect::Raise(_)))
+            || self.tops.iter().any(|top| top.overlaps(&raise))
+            || self.params.iter().any(|p| {
+                p.of_causes
+                    && !taken_away(&raise, &p.param.clause_except)
+                    && !taken_away(&raise, &p.except)
+            })
+    }
+
     /// This set with each exception at the type its bounds resolve to, as a contract states it.
     pub fn with_raises_resolved(mut self) -> CapabilitySet {
         self.causes = std::mem::take(&mut self.causes)

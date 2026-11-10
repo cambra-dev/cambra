@@ -4818,14 +4818,14 @@ does. A `try` lets out of its body what its clauses do not catch. Inlining gives
 a call's place what the call did of its own beyond what the body does, which a clause can make more
 than the body does (`Expr::doing_of_its_own`). The passes that compile a capability away discharge
 it from every node and function type at their end (`capabilities::discharge`): exception elimination
-every `Raise`, giving each node it keeps its own capabilities (`exceptions::restore_capabilities`),
-`transact_phase` every `RunTransaction`, `WriteTxn`, `ReadTxn` and `Transaction`, `mut_elim` every
-`Write` and `Read`, and `channelize` every `Append`. The program `lambda_elim` receives is
-pure-functional, requiring at most the input a source opens (`capabilities::assert_discharged`), and
-in debug builds each pass's output is checked to state, at every node, what it does of its own and
-what its children do, less what a block supplies or a `try` catches
-(`capabilities::assert_monotone`). An exception a node raises holds one of a subtype raised below
-it.
+every `Raise`, rebuilding each node it keeps with that node's own capabilities
+(`Expr::with_own_capabilities`), `transact_phase` every `RunTransaction`, `WriteTxn`, `ReadTxn` and
+`Transaction`, `mut_elim` every `Write` and `Read`, and `channelize` every `Append`. The program
+`lambda_elim` receives is pure-functional, requiring at most the input a source opens
+(`capabilities::assert_discharged`), and in debug builds each pass's output is checked to state, at
+every node, what it does of its own and what its children do, less what a block supplies or a `try`
+catches (`capabilities::assert_monotone`). An exception a node raises holds one of a subtype raised
+below it.
 
 ### Block footprints
 

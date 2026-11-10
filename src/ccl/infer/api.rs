@@ -403,8 +403,12 @@ pub enum InferError {
     /// the program (`docs/chl-spec.md`, "Exceptions").
     ExceptionEscapes { ty: String },
     /// An `except` clause around a call that may cause a top raising every type, `Effect` or
-    /// `Raise(*)`.
-    ExceptAroundEveryRaise { clause: String, top: String },
+    /// `Raise(*)`, or, with `variable`, a clause variable whose bound holds one.
+    ExceptAroundEveryRaise {
+        clause: String,
+        top: String,
+        variable: bool,
+    },
     /// An `except` clause catching nothing its `try` block raises.
     ExceptCatchesNothing { ty: String },
     /// An `except` clause, the first not to exclude the type of an exception its `try` block
@@ -1757,11 +1761,26 @@ impl std::fmt::Debug for InferError {
                 "this `except {clause}` would catch some exceptions of type `{raised}` and not \
                  others; catch a type holding all of `{raised}`, and test the value in the clause"
             ),
-            InferError::ExceptAroundEveryRaise { clause, top } => write!(
+            InferError::ExceptAroundEveryRaise {
+                clause,
+                top,
+                variable: false,
+            } => write!(
                 f,
                 "this `except {clause}` is around a call that may cause `{top}`, which raises \
                  every type, so a clause would catch some exceptions of a type and not others; \
                  state the types the call raises instead, taking `Raise(*)` away"
+            ),
+            InferError::ExceptAroundEveryRaise {
+                clause,
+                top,
+                variable: true,
+            } => write!(
+                f,
+                "this `except {clause}` is around a call that may cause `{top}`, whose bound \
+                 holds `Raise(*)`, so a clause would catch some exceptions of a type and not \
+                 others; state the types the call raises beside `{top}`, as `causes {top}, \
+                 Raise({clause})` does, taking `Raise(*)` out of its bound"
             ),
             InferError::ExceptCatchesNothing { ty } => write!(
                 f,

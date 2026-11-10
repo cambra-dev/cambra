@@ -3149,13 +3149,25 @@ fn run_passes(
 
     // Exception elimination runs with inlining: after it, every `raise` stands in the tree
     // it escapes through (`crate::ccl::exceptions`).
+    // A shape inlining and elimination do not compile yet is refused at the node a program
+    // wrote, with the tree that holds it where the tree is still whole.
+    enum Refused {
+        Internal(&'static str, String),
+        Unsupported(Located<String>, Option<Box<Expr>>),
+    }
     expr = recorded(capture_provenance, Phase::Inline, || {
         let expr = inline::inline_compute_lambdas(expr);
-        crate::ccl::observe_world::check_filters(&expr).map_err(|m| ("observeWorld", m))?;
-        crate::ccl::exceptions::refuse_escaping_blocks(&expr).map_err(|m| ("exceptions", m))?;
-        crate::ccl::exceptions::eliminate(expr).map_err(|m| ("exceptions", m))
+        crate::ccl::observe_world::check_filters(&expr)
+            .map_err(|m| Refused::Internal("observeWorld", m))?;
+        if let Err(at) = crate::ccl::exceptions::refuse_escaping_blocks(&expr) {
+            return Err(Refused::Unsupported(at, Some(Box::new(expr))));
+        }
+        crate::ccl::exceptions::eliminate(expr).map_err(|at| Refused::Unsupported(at, None))
     })
-    .map_err(|(stage, message)| vec![CompileError::Internal { stage, message }])?;
+    .map_err(|refused| match refused {
+        Refused::Internal(stage, message) => vec![CompileError::Internal { stage, message }],
+        Refused::Unsupported(at, tree) => blame.unsupported(at, tree.as_deref()),
+    })?;
     settle(
         &expr,
         "post-inline",

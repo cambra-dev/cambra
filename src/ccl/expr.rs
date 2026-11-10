@@ -1335,6 +1335,16 @@ impl TypedExpr {
         self
     }
 
+    /// This node doing `own` of its own besides what its children do: a rebuild of a node
+    /// whose own capabilities were `own`.
+    pub(crate) fn with_own_capabilities(
+        mut self,
+        own: crate::ccl::capabilities::Capabilities,
+    ) -> Self {
+        self.own_capabilities = own;
+        self.absorbing_children_capabilities()
+    }
+
     /// This node, a call's body inlined in place of the call, doing of its own what the call
     /// did, `call`, beyond what the body does: what the call's function states, a clause can make
     /// more than its body does.

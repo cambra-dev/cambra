@@ -256,7 +256,10 @@ fn a_raising_callback_requires_ordered_positions(#[case] source: &str, #[case] r
     "}
     .replace("SOURCE", source);
     if refused {
-        check_compile_error(&code, "this loop runs in its source's position order");
+        check_compile_error(
+            &code,
+            "this call runs a loop in its source's position order",
+        );
     } else {
         check_scalar(&code, Value::Int(1));
     }
@@ -342,7 +345,7 @@ fn a_caught_callback_retains_the_inner_loop_requirement() {
                 raise x
             handled(fail, [1] ++ [2])
         "},
-        "this loop runs in its source's position order",
+        "this call runs a loop in its source's position order",
     );
 }
 
@@ -429,7 +432,7 @@ fn importing_a_callback_function_preserves_its_ordering_requirement() {
     "};
     super::modules::assert_refused(
         &program(caller, &[("library", library)]),
-        "this loop runs in its source's position order",
+        "this call runs a loop in its source's position order",
     );
 }
 
@@ -477,8 +480,10 @@ fn a_printed_ordering_contract_can_annotate_its_definition(
         .unwrap_or_else(|errors| panic!("{errors:?}\n{interface}"));
 }
 
-#[test]
-fn a_callback_requirement_accepts_orderable_map_keys() {
+#[rstest]
+#[case::integer_keys("box(map([2 -> 20, 1 -> 10]))")]
+#[case::string_keys(r#"box(map(["b" -> 20, "a" -> 10]))"#)]
+fn a_callback_requirement_accepts_orderable_map_keys(#[case] source: &str) {
     let code = indoc! {"
         def each(f, xs):
             for x in xs:
@@ -486,13 +491,13 @@ fn a_callback_requirement_accepts_orderable_map_keys() {
             0
         def fail(x: Int) => Int:
             raise x
-        pub first = try:
-                        each(fail, box(map([2 -> 20, 1 -> 10])))
-                    except Int as e:
-                        e
-    "};
-    check_program(&mut GlobalContext::default(), &program(code, &[]))
-        .unwrap_or_else(|errors| panic!("{errors:?}"));
+        try:
+            each(fail, SOURCE)
+        except Int as e:
+            e
+    "}
+    .replace("SOURCE", source);
+    check_scalar(&code, Value::Int(10));
 }
 
 #[test]
@@ -558,7 +563,7 @@ fn evaluating_an_inner_source_can_order_the_outer_loop() {
             except Int as e:
                 e
         "},
-        "this loop runs in its source's position order",
+        "this call runs a loop in its source's position order",
     );
 }
 
@@ -603,14 +608,14 @@ fn a_written_ordering_requirement_is_checked_at_each_use(
     let code = format!("{definition}\n{caller}");
     let result = check_program(&mut GlobalContext::default(), &program(&code, &[]));
     if refused {
-        result.expect_err("a writing callback requires orderable positions");
+        result.expect_err("a raising callback requires orderable positions");
         // Once, at the call: the use's copies of the loop's requirement and of the written one
         // both fail there.
         let errors = super::modules::compile_errors(&program(&format!("{code}0\n"), &[]));
         assert_eq!(super::modules::report_count(&errors), 1, "{errors}");
         assert!(
             errors.contains("this call runs a loop in its source's position order")
-                && errors.contains("each(write, values)")
+                && errors.contains("each(fail, values)")
                 && !errors.contains("for x in xs"),
             "{errors}"
         );

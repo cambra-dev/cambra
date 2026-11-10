@@ -29,7 +29,7 @@ use crate::ccl::{
 
 /// Replace every `raise` and `try` in `expr`, which then raises nothing: every `Raise` is
 /// discharged (`src/ccl/design/type-inference.md`, "Discharging capabilities").
-pub fn eliminate(expr: Expr) -> Result<Expr, String> {
+pub fn eliminate(expr: Expr) -> Result<Expr, provenance::Located<String>> {
     use crate::ccl::capabilities::{Capability, Effect, Family};
     let mut expr = replace(expr)?;
     crate::ccl::capabilities::discharge(&mut expr, &|item| match item {
@@ -41,14 +41,10 @@ pub fn eliminate(expr: Expr) -> Result<Expr, String> {
 }
 
 /// [`eliminate`]'s rewrite.
-fn replace(expr: Expr) -> Result<Expr, String> {
+fn replace(expr: Expr) -> Result<Expr, provenance::Located<String>> {
     if !holds_raise(&expr) {
         return Ok(expr);
     }
-    // A node the rewrite keeps, by its id, does what it did, a write's, a feed's, a block's or a
-    // call's own capabilities included, which a rebuild over its rewritten children does not state.
-    let mut before = std::collections::HashMap::new();
-    capabilities_by_node(&expr, &mut before);
     let mut cx = Cx::default();
     let mut expr = match cx.elim(expr, &[]) {
         Elim::Pure(e) => e,
@@ -62,48 +58,27 @@ fn replace(expr: Expr) -> Result<Expr, String> {
     // A comprehension's filter rides the types of whatever its value reaches, and each copy
     // a filter's placement left takes the pure form.
     cx.purify_tree(&mut expr);
-    before.extend(std::mem::take(&mut cx.minted));
-    restore_capabilities(&mut expr, &before);
     match cx.refused {
         Some(message) => Err(message),
         None => Ok(expr),
     }
 }
 
-/// What each node of `e` does of its own, by its id.
-fn capabilities_by_node(
-    e: &Expr,
-    out: &mut std::collections::HashMap<provenance::NodeId, crate::ccl::capabilities::Capabilities>,
-) {
-    out.insert(e.node_id(), e.own_capabilities.clone());
-    e.walk_children(|c| capabilities_by_node(c, out));
-}
-
-/// Give each node of `e` what it did of its own, which `before` holds by its id, and what its
-/// children now do ([`Expr::absorb_children_capabilities`]): elimination rebuilds a node it keeps over
-/// its rewritten children, and a rebuild states nothing of its own.
-fn restore_capabilities(
-    e: &mut Expr,
-    before: &std::collections::HashMap<provenance::NodeId, crate::ccl::capabilities::Capabilities>,
-) {
-    e.walk_children_mut(|c| restore_capabilities(c, before));
-    if let Some(own) = before.get(&e.node_id()) {
-        e.own_capabilities = crate::ccl::capabilities::of_parts(&[&e.own_capabilities, own]);
-    }
-    e.absorb_children_capabilities();
-}
-
 /// Refuse an exception that escapes a `with begin():` block, which aborts the transaction
 /// (`docs/chl-spec.md`, "Exceptions"): its outcome would have to leave the commit, which
-/// nothing carries yet. An exception caught inside the block compiles.
-pub fn refuse_escaping_blocks(expr: &Expr) -> Result<(), String> {
+/// nothing carries yet. An exception caught inside the block compiles. The refusal stands at
+/// the block.
+pub fn refuse_escaping_blocks(expr: &Expr) -> Result<(), provenance::Located<String>> {
     if let TypedExprNode::Begin { body, .. } = &expr.node {
         let mut escaping = Vec::new();
         Cx::escapes(body, &mut escaping);
         if let Some(raised) = escaping.first() {
-            return Err(format!(
-                "an exception of type `{raised}` escaping a `with begin():` block is not \
-                 compiled yet; catch it inside the block"
+            return Err(provenance::Located::new(
+                format!(
+                    "an exception of type `{raised}` escaping a `with begin():` block is not \
+                     compiled yet; catch it inside the block"
+                ),
+                expr.node_id(),
             ));
         }
     }
@@ -114,6 +89,16 @@ pub fn refuse_escaping_blocks(expr: &Expr) -> Result<(), String> {
         }
     });
     result
+}
+
+/// The first `raise` in `e`, in a walk of its children.
+fn first_raise(e: &Expr) -> Option<provenance::NodeId> {
+    if matches!(e.node, TypedExprNode::Raise { .. }) {
+        return Some(e.node_id());
+    }
+    let mut found = None;
+    e.walk_children(|c| found = found.or_else(|| first_raise(c)));
+    found
 }
 
 /// `ty` with each refinement predicate structurally equal to `from` replaced by `to`, one
@@ -134,9 +119,30 @@ fn replace_filter_in(e: &mut Expr, memo: &PredMemo<()>, from: &Expr, to: &Expr) 
     e.walk_children_mut(|c| replace_filter_in(c, memo, from, to));
 }
 
+/// A node elimination rebuilds: its id, and what it does of its own, which the rebuild keeps.
+#[derive(Clone)]
+struct Kept {
+    id: provenance::NodeId,
+    own: crate::ccl::capabilities::Capabilities,
+}
+
+impl Kept {
+    fn of(e: &Expr) -> Self {
+        Kept {
+            id: e.node_id(),
+            own: e.own_capabilities.clone(),
+        }
+    }
+
+    /// `node` at this node's id, doing what this node did of its own.
+    fn rebuild(&self, node: TypedExprNode) -> Expr {
+        Expr::preserve(self.id, node).with_own_capabilities(self.own.clone())
+    }
+}
+
 /// A `let` [`take_let`] removed: its node, binding and definition.
 struct Taken {
-    id: provenance::NodeId,
+    kept: Kept,
     binding: TypedBinding,
     value: Expr,
 }
@@ -146,7 +152,7 @@ fn take_let(e: &mut Expr, name: &Name) -> Option<Taken> {
     if let TypedExprNode::Let { binding, .. } = &e.node
         && &binding.name == name
     {
-        let id = e.node_id();
+        let kept = Kept::of(e);
         let TypedExprNode::Let {
             binding,
             bound_expr,
@@ -157,7 +163,7 @@ fn take_let(e: &mut Expr, name: &Name) -> Option<Taken> {
         };
         *e = *body;
         return Some(Taken {
-            id,
+            kept,
             binding,
             value: *bound_expr,
         });
@@ -168,6 +174,9 @@ fn take_let(e: &mut Expr, name: &Name) -> Option<Taken> {
             found = take_let(c, name);
         }
     });
+    if found.is_some() {
+        e.absorb_children_capabilities();
+    }
     found
 }
 
@@ -182,10 +191,16 @@ fn insert_let(e: &mut Expr, taken: &mut Option<Taken>, pending: &mut HashSet<Nam
         .binding
         .name;
     if pending.is_empty() {
-        let Taken { id, binding, value } = taken.take().expect("a binding is placed once");
+        let Taken {
+            kept,
+            binding,
+            value,
+        } = taken.take().expect("a binding is placed once");
         let body = std::mem::take(e);
         let ty = body.ty.clone();
-        *e = Expr::let_in_preserving(id, binding, value, body).with_ty(ty);
+        *e = Expr::let_in_preserving(kept.id, binding, value, body)
+            .with_ty(ty)
+            .with_own_capabilities(kept.own);
         return true;
     }
     let mut named_here = false;
@@ -220,13 +235,80 @@ fn insert_let(e: &mut Expr, taken: &mut Option<Taken>, pending: &mut HashSet<Nam
         }
         i += 1;
     });
+    if placed {
+        e.absorb_children_capabilities();
+    }
     placed
+}
+
+/// `spine` with each `let` binding on its statement spine that `arms` read or bind renamed
+/// ([`refresh_let_binder`]), so the arms, placed at its end, meet no binder of theirs there
+/// (`src/ccl/design/ir.md`, "Structured names and α-uniquification (Barendregt convention)").
+fn apart_from(spine: Expr, arms: &[(Label, TypedBinding, Expr)]) -> Expr {
+    let taken = arm_names(arms);
+    fn go(e: Expr, taken: &HashSet<Name>) -> Expr {
+        let kept = Kept::of(&e);
+        match e.node {
+            TypedExprNode::Let {
+                mut binding,
+                bound_expr,
+                body,
+            } => {
+                let body = match taken.contains(&binding.name) {
+                    true => crate::ccl::ccl_utils::refresh_let_binder(&mut binding, *body),
+                    false => *body,
+                };
+                let body = go(body, taken);
+                kept.rebuild(TypedExprNode::Let {
+                    binding,
+                    bound_expr,
+                    body: Box::new(body),
+                })
+                .with_ty(e.ty)
+            }
+            TypedExprNode::ExprStmt { expr, body } => {
+                Expr::expr_stmt_preserving(kept.id, *expr, go(*body, taken))
+                    .with_ty(e.ty)
+                    .with_own_capabilities(kept.own.clone())
+            }
+            node => kept.rebuild(node).with_ty(e.ty),
+        }
+    }
+    go(spine, &taken)
+}
+
+/// Every name `arms` read or bind.
+fn arm_names(arms: &[(Label, TypedBinding, Expr)]) -> HashSet<Name> {
+    fn names(e: &Expr, out: &mut HashSet<Name>) {
+        e.walk_bound_names(|n| {
+            out.insert(n.clone());
+        });
+        if let TypedExprNode::Var(n) = &e.node {
+            out.insert(n.clone());
+        }
+        e.walk_children(|c| names(c, out));
+    }
+    let mut taken = HashSet::new();
+    for (_, binder, body) in arms {
+        taken.insert(binder.name.clone());
+        names(body, &mut taken);
+    }
+    taken
+}
+
+/// `body` with `binder`, which scopes over it, renamed where `taken` holds its name, as
+/// [`apart_from`] renames a spine's bindings.
+fn binder_apart(binder: &mut TypedBinding, body: Expr, taken: &HashSet<Name>) -> Expr {
+    match taken.contains(&binder.name) {
+        true => crate::ccl::ccl_utils::refresh_let_binder(binder, body),
+        false => body,
+    }
 }
 
 /// `e` with `f` applied to the value it ends in: a statement sequence keeps its statements,
 /// and a write or a feed that ends one stays a statement, its value `unit`.
 fn at_terminal(e: Expr, f: impl FnOnce(Expr) -> Expr) -> Expr {
-    let id = e.node_id();
+    let kept = Kept::of(&e);
     match e.node {
         TypedExprNode::Let {
             binding,
@@ -235,20 +317,19 @@ fn at_terminal(e: Expr, f: impl FnOnce(Expr) -> Expr) -> Expr {
         } => {
             let body = at_terminal(*body, f);
             let ty = body.ty.clone();
-            Expr::preserve(
-                id,
-                TypedExprNode::Let {
-                    binding,
-                    bound_expr,
-                    body: Box::new(body),
-                },
-            )
+            kept.rebuild(TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body: Box::new(body),
+            })
             .with_ty(ty)
         }
         TypedExprNode::ExprStmt { expr, body } => {
             let body = at_terminal(*body, f);
             let ty = body.ty.clone();
-            Expr::expr_stmt_preserving(id, *expr, body).with_ty(ty)
+            Expr::expr_stmt_preserving(kept.id, *expr, body)
+                .with_ty(ty)
+                .with_own_capabilities(kept.own.clone())
         }
         TypedExprNode::MutDecl {
             binding,
@@ -257,26 +338,23 @@ fn at_terminal(e: Expr, f: impl FnOnce(Expr) -> Expr) -> Expr {
         } => {
             let body = at_terminal(*body, f);
             let ty = body.ty.clone();
-            Expr::preserve(
-                id,
-                TypedExprNode::MutDecl {
-                    binding,
-                    init,
-                    body: Box::new(body),
-                },
-            )
+            kept.rebuild(TypedExprNode::MutDecl {
+                binding,
+                init,
+                body: Box::new(body),
+            })
             .with_ty(ty)
         }
         node @ (TypedExprNode::MutWrite { .. }
         | TypedExprNode::Feed { .. }
         | TypedExprNode::Define { .. }) => {
-            let statement = Expr::preserve(id, node).with_ty(e.ty.clone());
+            let statement = kept.rebuild(node).with_ty(e.ty.clone());
             let unit = Expr::lit(Lit::Unit).with_ty(Type::Base(BaseType::Unit));
             let value = f(unit);
             let ty = value.ty.clone();
             Expr::expr_stmt(statement, value).with_ty(ty)
         }
-        node => f(Expr::preserve(id, node).with_ty(e.ty)),
+        node => f(kept.rebuild(node).with_ty(e.ty)),
     }
 }
 
@@ -382,8 +460,9 @@ fn value_match(o: &TypedBinding, arms: Vec<(Label, TypedBinding, Expr)>, result:
 ///
 /// The scrutinee's statements stand on the statement spine, before the binding of the value it
 /// ends in: they are the statements before the one that raised, and a write advances its
-/// variable only on the spine. The binders are unique by this phase, so the statements' own
-/// bindings capture nothing in the arms they now scope over.
+/// variable only on the spine. The arms move under those statements' bindings, a scope they did
+/// not occupy, and a copy of one definition can stand on both sides, as two inlined calls of one
+/// function do. So a binding the arms read or bind is renamed first ([`apart_from`]).
 ///
 /// A scrutinee that ends in a constructor selects its arm here, which binds the payload. One
 /// that ends in a `match` or an `if` whose branches each end in a different constructor has
@@ -392,6 +471,7 @@ fn value_match(o: &TypedBinding, arms: Vec<(Label, TypedBinding, Expr)>, result:
 /// `let` does, has it moved into `𝑏`.
 fn dispatch(scrutinee: Expr, mut arms: Vec<(Label, TypedBinding, Expr)>, result: &Type) -> Expr {
     let result = result.clone();
+    let scrutinee = apart_from(scrutinee, &arms);
     at_terminal(scrutinee, |value| {
         if let TypedExprNode::VariantCtor { tag, payload, .. } = value.node {
             let at = arms
@@ -402,7 +482,7 @@ fn dispatch(scrutinee: Expr, mut arms: Vec<(Label, TypedBinding, Expr)>, result:
             return Expr::let_in(binder, *payload, body).with_ty(result);
         }
         if let Some(tags) = branch_constructors(&value) {
-            let id = value.node_id();
+            let kept = Kept::of(&value);
             let TypedExprNode::Case {
                 scrutinee,
                 branches,
@@ -413,57 +493,56 @@ fn dispatch(scrutinee: Expr, mut arms: Vec<(Label, TypedBinding, Expr)>, result:
             let branches = branches
                 .into_iter()
                 .zip(tags)
-                .map(|(b, tag)| {
+                .map(|(mut b, tag)| {
                     let at = arms
                         .iter()
                         .position(|(t, ..)| *t == tag)
                         .expect("an arm for every tag the outcome carries");
-                    let arm = arms.swap_remove(at);
+                    let arm = vec![arms.swap_remove(at)];
+                    let body = match &mut b.pattern {
+                        Some(p) => binder_apart(&mut p.binding, b.body, &arm_names(&arm)),
+                        None => b.body,
+                    };
                     Branch {
-                        body: dispatch(b.body, vec![arm], &result),
+                        body: dispatch(body, arm, &result),
                         ..b
                     }
                 })
                 .collect();
-            return Expr::preserve(
-                id,
-                TypedExprNode::Case {
+            return kept
+                .rebuild(TypedExprNode::Case {
                     scrutinee,
                     branches,
-                },
-            )
-            .with_ty(result);
+                })
+                .with_ty(result);
         }
         // `𝑎 ▷ (λ 𝑥 → 𝑏)` binds `𝑥` as `let` does, so the dispatch moves into `𝑏`.
         if let TypedExprNode::Apply { function, .. } = &value.node
             && matches!(function.node, TypedExprNode::Lambda { .. })
             && !function.ty.is_collection()
         {
-            let id = value.node_id();
+            let kept = Kept::of(&value);
             let TypedExprNode::Apply { argument, function } = value.node else {
                 unreachable!("matched as an `Apply`")
             };
-            let function_id = function.node_id();
+            let function_kept = Kept::of(&function);
             let function_ty = with_codomain(&function.ty, &result);
-            let TypedExprNode::Lambda { param, body } = function.node else {
+            let TypedExprNode::Lambda { mut param, body } = function.node else {
                 unreachable!("matched as a `Lambda`")
             };
-            let function = Expr::preserve(
-                function_id,
-                TypedExprNode::Lambda {
+            let body = binder_apart(&mut param, *body, &arm_names(&arms));
+            let function = function_kept
+                .rebuild(TypedExprNode::Lambda {
                     param,
-                    body: Box::new(dispatch(*body, arms, &result)),
-                },
-            )
-            .with_ty(function_ty);
-            return Expr::preserve(
-                id,
-                TypedExprNode::Apply {
+                    body: Box::new(dispatch(body, arms, &result)),
+                })
+                .with_ty(function_ty);
+            return kept
+                .rebuild(TypedExprNode::Apply {
                     argument,
                     function: Box::new(function),
-                },
-            )
-            .with_ty(result);
+                })
+                .with_ty(result);
         }
         let o = binding(Name::fresh("__outcome"), value.ty.clone());
         let case = value_match(&o, arms, &result);
@@ -570,9 +649,9 @@ fn branch_constructors(e: &Expr) -> Option<Vec<Label>> {
 ///
 /// Elimination ends a dispatch in its `match`, and a `try` statement's value arm in its
 /// `Unit` payload. A `Unit`-valued term that is not a statement is dropped for `unit`: it has
-/// one value, and it holds no write, feed or loop.
+/// one value, and it causes nothing.
 fn statement_form(e: Expr) -> Expr {
-    let id = e.node_id();
+    let kept = Kept::of(&e);
     let ty = e.ty.clone();
     let unit = || Expr::lit(Lit::Unit).with_ty(Type::Base(BaseType::Unit));
     match e.node {
@@ -580,48 +659,44 @@ fn statement_form(e: Expr) -> Expr {
             binding,
             bound_expr,
             body,
-        } => Expr::preserve(
-            id,
-            TypedExprNode::Let {
+        } => kept
+            .rebuild(TypedExprNode::Let {
                 binding,
                 bound_expr,
                 body: Box::new(statement_form(*body)),
-            },
-        )
-        .with_ty(ty),
+            })
+            .with_ty(ty),
         TypedExprNode::MutDecl {
             binding,
             init,
             body,
-        } => Expr::preserve(
-            id,
-            TypedExprNode::MutDecl {
+        } => kept
+            .rebuild(TypedExprNode::MutDecl {
                 binding,
                 init,
                 body: Box::new(statement_form(*body)),
-            },
-        )
-        .with_ty(ty),
+            })
+            .with_ty(ty),
         TypedExprNode::ExprStmt { expr, body } => {
-            Expr::expr_stmt_preserving(id, statement(*expr), statement_form(*body)).with_ty(ty)
+            Expr::expr_stmt_preserving(kept.id, statement(*expr), statement_form(*body))
+                .with_ty(ty)
+                .with_own_capabilities(kept.own.clone())
         }
-        TypedExprNode::Lit(Lit::Unit) => {
-            Expr::preserve(id, TypedExprNode::Lit(Lit::Unit)).with_ty(ty)
-        }
+        TypedExprNode::Lit(Lit::Unit) => kept.rebuild(TypedExprNode::Lit(Lit::Unit)).with_ty(ty),
         node @ (TypedExprNode::Case { .. }
         | TypedExprNode::MutWrite { .. }
         | TypedExprNode::Feed { .. }
         | TypedExprNode::Define { .. }
         | TypedExprNode::For { .. }
         | TypedExprNode::Begin { .. }) => {
-            let s = statement(Expr::preserve(id, node).with_ty(ty));
+            let s = statement(kept.rebuild(node).with_ty(ty));
             Expr::expr_stmt(s, unit()).with_ty(Type::Base(BaseType::Unit))
         }
         node => {
-            let dropped = Expr::preserve(id, node).with_ty(ty);
+            let dropped = kept.rebuild(node).with_ty(ty);
             assert!(
-                !holds_statement(&dropped),
-                "a `Unit` value dropped from a loop body holds a statement: {}",
+                dropped.capabilities.set().causes_nothing(),
+                "a `Unit` value dropped from a loop body causes something: {}",
                 crate::ccl::symbolic::symbolic(&dropped)
             );
             unit()
@@ -631,15 +706,14 @@ fn statement_form(e: Expr) -> Expr {
 
 /// A statement of a loop body in [`statement_form`]: a `match`'s arms are chains themselves.
 fn statement(e: Expr) -> Expr {
-    let id = e.node_id();
+    let kept = Kept::of(&e);
     let ty = e.ty.clone();
     match e.node {
         TypedExprNode::Case {
             scrutinee,
             branches,
-        } => Expr::preserve(
-            id,
-            TypedExprNode::Case {
+        } => kept
+            .rebuild(TypedExprNode::Case {
                 scrutinee,
                 branches: branches
                     .into_iter()
@@ -648,23 +722,10 @@ fn statement(e: Expr) -> Expr {
                         ..b
                     })
                     .collect(),
-            },
-        )
-        .with_ty(ty),
-        node => Expr::preserve(id, node).with_ty(ty),
+            })
+            .with_ty(ty),
+        node => kept.rebuild(node).with_ty(ty),
     }
-}
-
-/// Whether `e` writes, feeds, loops or opens a transaction anywhere.
-fn holds_statement(e: &Expr) -> bool {
-    matches!(
-        e.node,
-        TypedExprNode::MutWrite { .. }
-            | TypedExprNode::Feed { .. }
-            | TypedExprNode::Define { .. }
-            | TypedExprNode::For { .. }
-            | TypedExprNode::Begin { .. }
-    ) || e.any_child(holds_statement)
 }
 
 #[derive(Default)]
@@ -676,12 +737,9 @@ struct Cx {
     /// The filters [`Cx::elim_raising_filter`] read through a `__filter` binding, for
     /// [`Cx::place_filter`] to place once the whole program is eliminated.
     lifted: Vec<LiftedFilter>,
-    /// The first shape met that elimination does not compile, left in the tree as it stood.
-    /// [`eliminate`] answers it as an internal error once the walk ends.
-    refused: Option<String>,
-    /// The capabilities of each node the walk mints that does something of its own, by its id, for
-    /// [`restore_capabilities`] to keep through a later rebuild: a loop's write of its outcome.
-    minted: std::collections::HashMap<provenance::NodeId, crate::ccl::capabilities::Capabilities>,
+    /// The first shape met that elimination does not compile, left in the tree as it stood,
+    /// at the `raise` that reaches it. [`eliminate`] answers it once the walk ends.
+    refused: Option<provenance::Located<String>>,
 }
 
 /// A comprehension's filter that may raise, `raising`, which its domain states as `held`:
@@ -696,8 +754,9 @@ struct LiftedFilter {
 
 impl Cx {
     /// Note a shape elimination does not compile. The first is the one reported.
-    fn refuse(&mut self, message: String) {
-        self.refused.get_or_insert(message);
+    fn refuse(&mut self, message: String, at: provenance::NodeId) {
+        self.refused
+            .get_or_insert(provenance::Located::new(message, at));
     }
 
     fn ok() -> Label {
@@ -836,7 +895,7 @@ impl Cx {
             "exceptions.eliminate",
             provenance::Nature::Expansion,
         );
-        let id = e.node_id();
+        let kept = Kept::of(&e);
         let ty = e.ty.clone();
         let kind = e.node.kind_name();
         // A comprehension over several generators is a nest the `uncurry(𝑛)` it is applied to
@@ -882,14 +941,11 @@ impl Cx {
                 // has its statements spliced onto the spine before the binding.
                 let bind = |bound: Expr, body: Expr, body_ty: Type| {
                     at_terminal(bound, |value| {
-                        Expr::preserve(
-                            id,
-                            TypedExprNode::Let {
-                                binding: b.clone(),
-                                bound_expr: Box::new(value),
-                                body: Box::new(body),
-                            },
-                        )
+                        kept.rebuild(TypedExprNode::Let {
+                            binding: b.clone(),
+                            bound_expr: Box::new(value),
+                            body: Box::new(body),
+                        })
                         .with_ty(body_ty)
                     })
                 };
@@ -915,7 +971,9 @@ impl Cx {
                 // reaches what follows it.
                 let sequence = |effect: Expr, body: Expr, body_ty: Type| {
                     at_terminal(effect, |value| {
-                        Expr::expr_stmt_preserving(id, value, body).with_ty(body_ty)
+                        Expr::expr_stmt_preserving(kept.id, value, body)
+                            .with_ty(body_ty)
+                            .with_own_capabilities(kept.own.clone())
                     })
                 };
                 match (effect, body) {
@@ -938,7 +996,7 @@ impl Cx {
             TypedExprNode::Case {
                 scrutinee,
                 branches,
-            } => self.elim_case(id, scrutinee, branches, &ty, arms),
+            } => self.elim_case(kept, scrutinee, branches, &ty, arms),
             TypedExprNode::MutDecl {
                 binding: b,
                 init,
@@ -947,14 +1005,11 @@ impl Cx {
                 let init = self.elim(*init, arms);
                 let body = self.elim(*body, arms);
                 let rebuild = |init: Expr, body: Expr, ty: Type| {
-                    Expr::preserve(
-                        id,
-                        TypedExprNode::MutDecl {
-                            binding: b.clone(),
-                            init: Box::new(init),
-                            body: Box::new(body),
-                        },
-                    )
+                    kept.rebuild(TypedExprNode::MutDecl {
+                        binding: b.clone(),
+                        init: Box::new(init),
+                        body: Box::new(body),
+                    })
                     .with_ty(ty)
                 };
                 match (init, body) {
@@ -978,7 +1033,7 @@ impl Cx {
                 target,
                 iter,
                 body,
-            } => self.elim_for(id, *position, target, *iter, *body, &ty, arms),
+            } => self.elim_for(kept, *position, target, *iter, *body, &ty, arms),
             // `λ 𝑟 → (𝑟 ▷ 𝑠) ▷ (λ 𝑥 → body)` with a `Unit` body is a loop that only feeds, which
             // lowering gives that form before inference says whether a call in it raises
             // (`comprehension::index_loop`). One that may raise is the loop it is, over the
@@ -998,7 +1053,7 @@ impl Cx {
                     unreachable!("`is_feeding_loop` reads a `Lambda`")
                 };
                 self.elim_for(
-                    id,
+                    kept,
                     param.name,
                     target,
                     *iter,
@@ -1014,13 +1069,10 @@ impl Cx {
             {
                 let function = self.uncurried_outcomes(*function, arms);
                 Elim::Raising(
-                    Expr::preserve(
-                        id,
-                        TypedExprNode::Apply {
-                            argument,
-                            function: Box::new(function),
-                        },
-                    )
+                    kept.rebuild(TypedExprNode::Apply {
+                        argument,
+                        function: Box::new(function),
+                    })
                     .with_ty(Self::outcome(&ty, arms)),
                 )
             }
@@ -1030,7 +1082,7 @@ impl Cx {
             TypedExprNode::Apply { argument, function }
                 if matches!(function.node, TypedExprNode::Lambda { .. }) =>
             {
-                let function_id = function.node_id();
+                let function_kept = Kept::of(&function);
                 let function_ty = function.ty.clone();
                 let TypedExprNode::Lambda { param, body } = function.node else {
                     unreachable!("matched as a `Lambda`")
@@ -1040,22 +1092,17 @@ impl Cx {
                 let body = self.elim(*body, arms);
                 match (argument, body) {
                     (Elim::Pure(argument), Elim::Pure(body)) => {
-                        let function = Expr::preserve(
-                            function_id,
-                            TypedExprNode::Lambda {
+                        let function = function_kept
+                            .rebuild(TypedExprNode::Lambda {
                                 param,
                                 body: Box::new(body),
-                            },
-                        )
-                        .with_ty(function_ty);
+                            })
+                            .with_ty(function_ty);
                         Elim::Pure(
-                            Expr::preserve(
-                                id,
-                                TypedExprNode::Apply {
-                                    argument: Box::new(argument),
-                                    function: Box::new(function),
-                                },
-                            )
+                            kept.rebuild(TypedExprNode::Apply {
+                                argument: Box::new(argument),
+                                function: Box::new(function),
+                            })
                             .with_ty(ty),
                         )
                     }
@@ -1068,22 +1115,17 @@ impl Cx {
                             &param.name,
                             &Self::outcome(&body_ty, arms),
                         );
-                        let function = Expr::preserve(
-                            function_id,
-                            TypedExprNode::Lambda {
+                        let function = function_kept
+                            .rebuild(TypedExprNode::Lambda {
                                 param: param.clone(),
                                 body: Box::new(body),
-                            },
-                        )
-                        .with_ty(function_ty);
+                            })
+                            .with_ty(function_ty);
                         Elim::Raising(
-                            Expr::preserve(
-                                id,
-                                TypedExprNode::Apply {
-                                    argument: Box::new(argument),
-                                    function: Box::new(function),
-                                },
-                            )
+                            kept.rebuild(TypedExprNode::Apply {
+                                argument: Box::new(argument),
+                                function: Box::new(function),
+                            })
                             .with_ty(result),
                         )
                     }
@@ -1096,26 +1138,26 @@ impl Cx {
             }
             TypedExprNode::Lambda { param, body } if ty.is_collection() => {
                 let lambda_ty = ty.clone();
-                self.elim_collection(id, param, *body, &lambda_ty, None, &ty, arms)
+                self.elim_collection(kept, param, *body, &lambda_ty, None, &ty, arms)
             }
             TypedExprNode::Cast { value, target } if filter_raises(&target) => {
-                self.elim_raising_filter(id, *value, target, &ty, arms)
+                self.elim_raising_filter(kept, *value, target, &ty, arms)
             }
             // A filtered comprehension: the filter is the cast's, on the collection's domain.
             TypedExprNode::Cast { value, target }
                 if ty.is_collection() && matches!(value.node, TypedExprNode::Lambda { .. }) =>
             {
-                let lambda_id = value.node_id();
+                let lambda_kept = Kept::of(&value);
                 let lambda_ty = value.ty.clone();
                 let TypedExprNode::Lambda { param, body } = value.node else {
                     unreachable!("matched as a `Lambda`")
                 };
                 self.elim_collection(
-                    lambda_id,
+                    lambda_kept,
                     param,
                     *body,
                     &lambda_ty,
-                    Some((id, target)),
+                    Some((kept, target)),
                     &ty,
                     arms,
                 )
@@ -1124,12 +1166,9 @@ impl Cx {
             // commits as its body's statements decide.
             TypedExprNode::Begin { body } => match self.elim(*body, arms) {
                 Elim::Pure(body) => Elim::Pure(
-                    Expr::preserve(
-                        id,
-                        TypedExprNode::Begin {
-                            body: Box::new(body),
-                        },
-                    )
+                    kept.rebuild(TypedExprNode::Begin {
+                        body: Box::new(body),
+                    })
                     .with_ty(ty),
                 ),
                 Elim::Raising(_) => {
@@ -1139,11 +1178,15 @@ impl Cx {
             node @ (TypedExprNode::Lambda { .. }
             | TypedExprNode::LetRec { .. }
             | TypedExprNode::DefGroup { .. }) => {
-                self.refuse(format!(
-                    "an exception raised inside a {kind}, such as a function value held in a \
-                     collection, is not compiled yet"
-                ));
-                Elim::Pure(Expr { node, ..e })
+                let e = Expr { node, ..e };
+                self.refuse(
+                    format!(
+                        "an exception raised inside a {kind}, such as a function value held in \
+                         a collection, is not compiled yet"
+                    ),
+                    first_raise(&e).unwrap_or(e.node_id()),
+                );
+                Elim::Pure(e)
             }
             // `𝑎 and 𝑏` evaluates `𝑏` only where `𝑎` holds, and `𝑎 or 𝑏` only where it does not:
             // a `𝑏` that may raise is the branch of an `if`.
@@ -1157,9 +1200,8 @@ impl Cx {
                     LogicKind::And => (*right, constant),
                     _ => (constant, *right),
                 };
-                let case = Expr::preserve(
-                    id,
-                    TypedExprNode::Case {
+                let case = kept
+                    .rebuild(TypedExprNode::Case {
                         scrutinee: None,
                         branches: vec![
                             Branch {
@@ -1173,12 +1215,11 @@ impl Cx {
                                 body: otherwise,
                             },
                         ],
-                    },
-                )
-                .with_ty(ty);
+                    })
+                    .with_ty(ty);
                 self.elim(case, arms)
             }
-            node => self.elim_in_order(Expr::preserve(id, node).with_ty(ty), arms),
+            node => self.elim_in_order(kept.rebuild(node).with_ty(ty), arms),
         }
     }
 
@@ -1211,6 +1252,7 @@ impl Cx {
         }
         let mut rebuilt = rebuilt.into_iter();
         e.walk_children_mut(|c| *c = rebuilt.next().expect("one child per child taken"));
+        e.absorb_children_capabilities();
         if matched.is_empty() {
             return Elim::Pure(e);
         }
@@ -1224,7 +1266,7 @@ impl Cx {
 
     fn elim_case(
         &mut self,
-        id: provenance::NodeId,
+        kept: Kept,
         scrutinee: Option<Box<Expr>>,
         branches: Vec<Branch>,
         ty: &Type,
@@ -1260,13 +1302,10 @@ impl Cx {
                     guard: bool_true(),
                     body: split,
                 });
-                Expr::preserve(
-                    id,
-                    TypedExprNode::Case {
-                        scrutinee: None,
-                        branches,
-                    },
-                )
+                kept.rebuild(TypedExprNode::Case {
+                    scrutinee: None,
+                    branches,
+                })
                 .with_ty(ty.clone())
             };
             return self.elim(split, arms);
@@ -1313,14 +1352,12 @@ impl Cx {
                 }
             }
         };
-        let case = Expr::preserve(
-            id,
-            TypedExprNode::Case {
+        let case = kept
+            .rebuild(TypedExprNode::Case {
                 scrutinee,
                 branches,
-            },
-        )
-        .with_ty(result.clone());
+            })
+            .with_ty(result.clone());
         match matched {
             None if raising => Elim::Raising(case),
             None => Elim::Pure(case),
@@ -1356,7 +1393,7 @@ impl Cx {
     )]
     fn elim_for(
         &mut self,
-        id: provenance::NodeId,
+        kept: Kept,
         position: Name,
         target: TypedBinding,
         iter: Expr,
@@ -1376,15 +1413,12 @@ impl Cx {
         let unit_ty = Type::Base(BaseType::Unit);
         let unit = || Expr::lit(Lit::Unit).with_ty(Type::Base(BaseType::Unit));
         let lp = |iter: Expr, body: Expr| {
-            Expr::preserve(
-                id,
-                TypedExprNode::For {
-                    position: Box::new(position.clone()),
-                    target: target.clone(),
-                    iter: Box::new(iter),
-                    body: Box::new(body),
-                },
-            )
+            kept.rebuild(TypedExprNode::For {
+                position: Box::new(position.clone()),
+                target: target.clone(),
+                iter: Box::new(iter),
+                body: Box::new(body),
+            })
             .with_ty(ty.clone())
         };
         let (iter, matched) = match iter {
@@ -1403,11 +1437,17 @@ impl Cx {
             Elim::Raising(body) => {
                 let state_ty = Self::outcome(&unit_ty, &inner);
                 let state = Name::fresh("__loop");
-                // The accumulator of this one loop: its history is over the loop's positions.
-                let positions = iter_ty
-                    .read_view()
-                    .domain()
-                    .expect("a loop's source is a collection");
+                // A projected domain quotes its source. Bind a computed sum once so later
+                // rewrites reach its definition rather than a second copy inside the type.
+                let (iter, source) = if iter.ty.read_view().sum().is_some()
+                    && !matches!(iter.node, TypedExprNode::Var(_))
+                {
+                    let source = binding(Name::fresh("__source"), iter.ty.clone());
+                    (tvar(&source.name, source.ty.clone()), Some((source, iter)))
+                } else {
+                    (iter, None)
+                };
+                let positions = crate::ccl::mut_elim::loop_domain(&iter);
                 let history = Type::mutable(positions, state_ty.clone());
                 // `let 𝑙 ^= __loop in match 𝑙 { … }`: the arms over the variable's value here.
                 let read = |arms: Vec<(Label, TypedBinding, Expr)>, result: &Type| {
@@ -1448,8 +1488,6 @@ impl Cx {
                                 ..Default::default()
                             },
                         ));
-                    self.minted
-                        .insert(write.node_id(), write.own_capabilities.clone());
                     let recorded = Expr::expr_stmt(write, unit()).with_ty(unit_ty.clone());
                     record.push((tag.clone(), z, recorded));
                 }
@@ -1480,8 +1518,14 @@ impl Cx {
                 let start = Expr::variant_ctor(Self::ok(), Occurrence::mint(), unit())
                     .with_ty(state_ty.clone());
                 let sequenced = Expr::expr_stmt(lp(iter, guarded), after).with_ty(result.clone());
-                Expr::mut_decl(state, Occurrence::mint(), history, start, sequenced)
-                    .with_ty(result.clone())
+                let looped = Expr::mut_decl(state, Occurrence::mint(), history, start, sequenced)
+                    .with_ty(result.clone());
+                match source {
+                    Some((source, value)) => {
+                        Expr::let_in(source, value, looped).with_ty(result.clone())
+                    }
+                    None => looped,
+                }
             }
         };
         match matched {
@@ -1494,7 +1538,7 @@ impl Cx {
     /// nest replaced by its outcome over `arms`: the flattened collection of the outcomes, which
     /// a position reads without evaluating any other.
     fn uncurried_outcomes(&mut self, uncurried: Expr, arms: &Arms) -> Expr {
-        let id = uncurried.node_id();
+        let kept = Kept::of(&uncurried);
         let ty = uncurried.ty.clone();
         let TypedExprNode::Apply { argument, function } = uncurried.node else {
             unreachable!("an uncurried comprehension is an application of `uncurry`")
@@ -1506,33 +1550,27 @@ impl Cx {
         let flat_ty = Self::outcomes_beneath(&ty, 1, arms);
         let uncurry = Expr::builtin(Builtin::Uncurry(levels))
             .with_ty(Type::fun(nest.ty.clone(), flat_ty.clone()));
-        Expr::preserve(
-            id,
-            TypedExprNode::Apply {
-                argument: Box::new(nest),
-                function: Box::new(uncurry),
-            },
-        )
+        kept.rebuild(TypedExprNode::Apply {
+            argument: Box::new(nest),
+            function: Box::new(uncurry),
+        })
         .with_ty(flat_ty)
     }
 
     /// One level of an uncurried comprehension's nest, `λ 𝑟 → (𝑟 ▷ 𝑆) ▷ (λ 𝑥 → inner)`, with
     /// the `levels` levels from it inward answering each element's outcome over `arms`.
     fn outcome_level(&mut self, level: Expr, levels: usize, arms: &Arms) -> Expr {
-        let id = level.node_id();
+        let kept = Kept::of(&level);
         let ty = Self::outcomes_beneath(&level.ty, levels, arms);
         let kind = level.node.kind_name();
         let TypedExprNode::Lambda { param, body } = level.node else {
             panic!("a level of an uncurried comprehension is a lambda, got {kind}")
         };
         let body = self.outcome_spine(*body, levels, arms);
-        Expr::preserve(
-            id,
-            TypedExprNode::Lambda {
-                param,
-                body: Box::new(body),
-            },
-        )
+        kept.rebuild(TypedExprNode::Lambda {
+            param,
+            body: Box::new(body),
+        })
         .with_ty(ty)
     }
 
@@ -1544,7 +1582,7 @@ impl Cx {
     /// When a source or a binding between the levels may raise: only an element's outcome is
     /// read here, so what a level evaluates ahead of its elements raises nothing.
     fn outcome_spine(&mut self, spine: Expr, levels: usize, arms: &Arms) -> Expr {
-        let id = spine.node_id();
+        let kept = Kept::of(&spine);
         let ty = Self::outcomes_beneath(&spine.ty, levels - 1, arms);
         match spine.node {
             TypedExprNode::Let {
@@ -1557,14 +1595,11 @@ impl Cx {
                     "a binding between an uncurried comprehension's levels raises"
                 );
                 let body = self.outcome_spine(*body, levels, arms);
-                Expr::preserve(
-                    id,
-                    TypedExprNode::Let {
-                        binding,
-                        bound_expr,
-                        body: Box::new(body),
-                    },
-                )
+                kept.rebuild(TypedExprNode::Let {
+                    binding,
+                    bound_expr,
+                    body: Box::new(body),
+                })
                 .with_ty(ty)
             }
             TypedExprNode::Apply { argument, function }
@@ -1574,7 +1609,7 @@ impl Cx {
                     !holds_raise(&argument),
                     "a source inside an uncurried comprehension raises"
                 );
-                let function_id = function.node_id();
+                let function_kept = Kept::of(&function);
                 let function_ty = function.ty.clone();
                 let TypedExprNode::Lambda { param, body } = function.node else {
                     unreachable!("matched as a `Lambda`")
@@ -1594,21 +1629,16 @@ impl Cx {
                         arms,
                     ),
                 );
-                let function = Expr::preserve(
-                    function_id,
-                    TypedExprNode::Lambda {
+                let function = function_kept
+                    .rebuild(TypedExprNode::Lambda {
                         param,
                         body: Box::new(body),
-                    },
-                )
-                .with_ty(function_ty);
-                Expr::preserve(
-                    id,
-                    TypedExprNode::Apply {
-                        argument,
-                        function: Box::new(function),
-                    },
-                )
+                    })
+                    .with_ty(function_ty);
+                kept.rebuild(TypedExprNode::Apply {
+                    argument,
+                    function: Box::new(function),
+                })
                 .with_ty(ty)
             }
             other => panic!(
@@ -1648,11 +1678,11 @@ impl Cx {
     )]
     fn elim_collection(
         &mut self,
-        id: provenance::NodeId,
+        kept: Kept,
         param: TypedBinding,
         body: Expr,
         lambda_ty: &Type,
-        cast: Option<(provenance::NodeId, Type)>,
+        cast: Option<(Kept, Type)>,
         ty: &Type,
         arms: &Arms,
     ) -> Elim {
@@ -1664,26 +1694,22 @@ impl Cx {
         let element = Self::lift(element, &value_ty, &inner);
         let outcome_ty = Self::outcome(&value_ty, &inner);
         let lambda_ty = with_codomain_over(lambda_ty, &param.name, &outcome_ty);
-        let lambda = Expr::preserve(
-            id,
-            TypedExprNode::Lambda {
+        let lambda = kept
+            .rebuild(TypedExprNode::Lambda {
                 param,
                 body: Box::new(element),
-            },
-        )
-        .with_ty(lambda_ty);
+            })
+            .with_ty(lambda_ty);
         let elements_value = match cast {
             None => lambda,
-            Some((cast_id, target)) => {
+            Some((cast_kept, target)) => {
                 let target = with_codomain(&target, &outcome_ty);
-                Expr::preserve(
-                    cast_id,
-                    TypedExprNode::Cast {
+                cast_kept
+                    .rebuild(TypedExprNode::Cast {
                         value: Box::new(lambda),
                         target: target.clone(),
-                    },
-                )
-                .with_ty(target)
+                    })
+                    .with_ty(target)
             }
         };
         let elements_ty = elements_value.ty.clone();
@@ -1764,13 +1790,13 @@ impl Cx {
     /// so the types that state the domain stay in its scope ([`Self::place_filter`]).
     fn elim_raising_filter(
         &mut self,
-        id: provenance::NodeId,
+        cast_kept: Kept,
         value: Expr,
         mut target: Type,
         ty: &Type,
         arms: &Arms,
     ) -> Elim {
-        let value_id = value.node_id();
+        let value_kept = Kept::of(&value);
         let mut lambda_ty = value.ty.clone();
         let TypedExprNode::Lambda { param, body } = value.node else {
             unreachable!("a filter is a comprehension's, and it filters a lambda")
@@ -1928,28 +1954,24 @@ impl Cx {
         let mut ty = ty.clone();
         replace_filter(&mut ty, &memo, &filter, &held_here);
         self.lifted.push(LiftedFilter {
-            at: id,
+            at: cast_kept.id,
             name: filter_b.name.clone(),
             raising: filter,
             held: held_here,
         });
 
-        let lambda = Expr::preserve(
-            value_id,
-            TypedExprNode::Lambda {
+        let lambda = value_kept
+            .rebuild(TypedExprNode::Lambda {
                 param,
                 body: Box::new(element),
-            },
-        )
-        .with_ty(lambda_ty);
-        let cast = Expr::preserve(
-            id,
-            TypedExprNode::Cast {
+            })
+            .with_ty(lambda_ty);
+        let cast = cast_kept
+            .rebuild(TypedExprNode::Cast {
                 value: Box::new(lambda),
                 target,
-            },
-        )
-        .with_ty(ty.clone());
+            })
+            .with_ty(ty.clone());
         let kept_and_cast = Expr::let_in(positions_b, positions, cast).with_ty(ty.clone());
         self.elim(
             Expr::let_in(filter_b, filter_value, kept_and_cast).with_ty(ty),

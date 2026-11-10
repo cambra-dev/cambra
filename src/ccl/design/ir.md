@@ -740,8 +740,8 @@ them right after inlining, where each `raise` stands in the tree it escapes thro
 phase meets either.
 
 Inlining keeps every term that may raise. A binding whose definiens may raise stays bound rather
-than being moved to its one use or dropped (`may_raise`), because the exception is raised whether
-the value is read or not.
+than being moved to its one use or dropped, because the exception is raised whether the value is
+read or not. The definiens' capabilities say whether it may raise (`CapabilitySet::may_raise`).
 
 Elimination writes an expression that may raise as its **outcome**, a value of
 ``{`__ok{𝑇} | `__raise𝑖{𝐸𝑖} …}``: `𝑇` is the expression's type, with one arm per exception type that
@@ -757,9 +757,12 @@ to the `try` around it.
 - A loop whose body may raise carries the first exception out in a mutable variable of its own,
   `__loop : Mut(𝑆, 𝐷)` over the loop's positions `𝐷`, with `𝑆` the outcome of a `Unit`. An
   iteration runs where `__loop` holds `` `__ok ``, and one that raises writes its exception there.
-  `__loop` is an accumulator, so it orders the loop's iterations. A loop that only feeds reaches
-  elimination as the collection `λ 𝑟 → (𝑟 ▷ 𝑠) ▷ (λ 𝑥 → body)`, since lowering chooses that form
-  before inference says whether a call in the body raises; with a body that may raise it is
+  The history domain projects the source's witnesses through its value, as an ordinary mutation
+  loop's domain does. A computed sum source is bound before the history declaration so those
+  projections name one value. `__loop` is an accumulator, so it orders the loop's iterations.
+  A loop that only feeds reaches elimination as the collection
+  `λ 𝑟 → (𝑟 ▷ 𝑠) ▷ (λ 𝑥 → body)`, since lowering chooses that form before inference says whether
+  a call in the body raises; with a body that may raise it is
   eliminated as that loop, over the positions `𝑟` names.
 - A comprehension whose elements may raise is the collection of its elements' outcomes, scanned in
   position order by such a loop. Its value where nothing raised is each outcome's `` `__ok ``
