@@ -369,6 +369,7 @@ where
             name_occurrence: _,
             name,
             value,
+            site: _,
         }
         | N::Define {
             name_occurrence: _,

@@ -979,6 +979,10 @@ pub enum TypedExprNode {
         /// The applied occurrence of `name`.
         name_occurrence: Occurrence,
         value: Box<Expr>,
+        /// Which place in the program this feed is ([`crate::ccl::site`]): the tag its
+        /// contributions take in a channel fed from several places. A copy of the feed is
+        /// the same place and keeps it.
+        site: Option<std::rc::Rc<crate::ccl::site::Site>>,
     },
 
     /// Define a deferred output to a specific value: `x <<= value`.
@@ -1202,6 +1206,10 @@ pub struct TypedExpr {
     /// avoid the intermediate allocation, while field-wise rebuilds carry the existing ID.
     /// See `src/ccl/design/provenance.md`, "Duplication".
     pub(super) node_id: NodeId,
+    /// Which place in the program this is, for a feed and a call of a function
+    /// ([`crate::ccl::site`]). Unlike the node's id, a copy keeps it: a copy of a feed is the
+    /// same feed. Excluded from value equality.
+    pub(crate) site: Option<std::rc::Rc<crate::ccl::site::Site>>,
 }
 
 /// Type alias for backward compatibility. `Expr` is now [`TypedExpr`].
@@ -1227,6 +1235,7 @@ impl Clone for TypedExpr {
             node: self.node.clone(),
             user_annotation: self.user_annotation.clone(),
             node_id,
+            site: self.site.clone(),
         }
     }
 }
@@ -1261,6 +1270,7 @@ impl TypedExpr {
             ty: Type::Hole,
             user_annotation: None,
             node_id,
+            site: None,
         }
     }
 
@@ -1312,6 +1322,7 @@ impl TypedExpr {
             ty: Type::Hole,
             user_annotation: None,
             node_id,
+            site: None,
         }
     }
 
@@ -1362,6 +1373,7 @@ impl TypedExpr {
             node: self.node.clone(),
             user_annotation: self.user_annotation.clone(),
             node_id,
+            site: self.site.clone(),
         }
     }
 
@@ -1478,10 +1490,21 @@ impl TypedExpr {
     }
 
     pub fn feed(name: impl Into<Name>, name_occurrence: Occurrence, value: Self) -> Self {
+        Self::feed_at(name, name_occurrence, value, None)
+    }
+
+    /// [`Self::feed`] at `site`, the place in the program the feed is ([`crate::ccl::site`]).
+    pub fn feed_at(
+        name: impl Into<Name>,
+        name_occurrence: Occurrence,
+        value: Self,
+        site: Option<std::rc::Rc<crate::ccl::site::Site>>,
+    ) -> Self {
         Self::new(TypedExprNode::Feed {
             name: name.into(),
             name_occurrence,
             value: Box::new(value),
+            site,
         })
     }
 
@@ -2733,6 +2756,7 @@ impl Default for TypedExpr {
             ty: Type::Hole,
             user_annotation: None,
             node_id: NodeId::PLACEHOLDER,
+            site: None,
         }
     }
 }

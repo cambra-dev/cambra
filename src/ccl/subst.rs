@@ -1902,12 +1902,14 @@ impl Subst {
                 name_occurrence,
                 name,
                 value,
+                site,
             } => {
                 let (name, value) = self.apply_handle_use(name, value);
                 Feed {
                     name_occurrence: name_occurrence.clone(),
                     name,
                     value,
+                    site: site.clone(),
                 }
             }
             Define {
@@ -5480,6 +5482,7 @@ mod rewrite_tests {
                 name_occurrence: Occurrence::mint(),
                 name: Name::raw("h"),
                 value: Box::new(int(1)),
+                site: None,
             }),
             TypedExpr::new(TypedExprNode::Define {
                 name_occurrence: Occurrence::mint(),

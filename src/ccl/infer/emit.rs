@@ -359,6 +359,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             name_occurrence: _,
             name,
             value,
+            site: _,
         } => {
             let target_ty = ctx.instantiate_binding(name)?;
             emit_feed(name, &target_ty, value, &label, ctx).map_err(|e| {
@@ -377,7 +378,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             emit_define(name, &target_ty, value, &label, ctx)?
         }
 
-        TypedExprNode::Copair(exprs) => emit_copair(exprs, ctx)?,
+        TypedExprNode::Copair(exprs) => emit_copair(exprs, &recorded_ty, ctx)?,
         TypedExprNode::DisjointJoin(exprs) => emit_disjoint_join(exprs, &recorded_ty, ctx)?,
         TypedExprNode::Realized { .. } => {
             unreachable!("Realized is born in planning, after inference")
@@ -1948,6 +1949,7 @@ fn constrain_into_feed(
 
 pub(super) fn emit_copair<C: Typing>(
     exprs: &mut [Expr],
+    recorded: &Type,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     // Copair: the result is a collection (a function from index
@@ -1978,6 +1980,11 @@ pub(super) fn emit_copair<C: Typing>(
     // distinct from source-level `FieldKey::Name` tags, so a user variant
     // can never collide with a collection-union tag, and `Type::Display`
     // flattens all-`Index` variants back to a bare `A | B | C`.
+    //
+    // A channel fed from several places is a copairing channelize builds, after inference,
+    // with each operand tagged by its feed's site (`crate::ccl::site`). It records those tags
+    // on the node's type, and they stand.
+    let recorded_tags = crate::ccl::site::channel_tags(recorded, exprs.len());
     let cod_var = ctx.fresh();
     let mut tags = BTreeMap::new();
     for (i, e) in exprs.iter_mut().enumerate() {
@@ -1990,7 +1997,10 @@ pub(super) fn emit_copair<C: Typing>(
         ctx.require_sub_under(&cod, &binders, &cod_var, &[], &|| {
             "Copair codomain".to_string()
         })?;
-        tags.insert(FieldKey::Index(i), dom);
+        let tag = recorded_tags
+            .as_ref()
+            .map_or(FieldKey::Index(i), |tags| tags[i].clone());
+        tags.insert(tag, dom);
     }
     let dom_variant = variant_type(tags);
     // `++` produces a collection — a **data** function over the tagged union of

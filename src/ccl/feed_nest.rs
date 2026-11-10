@@ -34,6 +34,9 @@ pub(crate) struct LoopFeed {
     pub defer: Name,
     pub view: Expr,
     pub levels: usize,
+    /// The site of the feed the values came from, which the feed hoisted for them keeps
+    /// ([`crate::ccl::site`]).
+    pub site: Option<Rc<crate::ccl::site::Site>>,
 }
 
 /// `λ param → body`, a channel contribution built around a fed value, with the kind of
@@ -329,6 +332,7 @@ fn rebuild_let(
         user_annotation,
         // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
         node_id,
+        site: None,
     }
 }
 
@@ -476,6 +480,7 @@ fn rebuild_nest(
         node,
         user_annotation,
         node_id,
+        site,
         ..
     } = nest;
     match node {
@@ -496,6 +501,7 @@ fn rebuild_nest(
                 ty: Type::Hole,
                 user_annotation,
                 node_id,
+                site,
             };
             let Ok((position, source, step)) = crate::ccl::ccl_utils::into_loop(rebuilt) else {
                 panic!("a loop level of a feed contribution is a loop over a source")

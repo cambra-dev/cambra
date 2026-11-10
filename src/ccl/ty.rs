@@ -5623,11 +5623,13 @@ fn eq_term_modulo_ty_slots_go(
                 name_occurrence: _,
                 name: n1,
                 value: v1,
+                ..
             },
             N::Feed {
                 name_occurrence: _,
                 name: n2,
                 value: v2,
+                ..
             },
         )
         | (
