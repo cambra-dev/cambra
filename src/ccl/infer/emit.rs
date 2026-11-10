@@ -55,9 +55,13 @@ use std::collections::HashMap;
 /// in an already rejected program and cannot accept a program.
 pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedInferError> {
     let prev = ctx.enter_node(expr.node_id());
+    // The node's capabilities, and what it does of its own, which coalesce resolves in their slots
+    // as it resolves `ty` (`src/ccl/design/type-inference.md`, "4.9 Capabilities").
+    (expr.capabilities, expr.own_capabilities) = ctx.enter_node_capabilities(&expr.node);
     // One stack frame per node over the whole tree; grow on demand, as the other
     // pass-level walks do.
     let result = stacker::maybe_grow(512 * 1024, 1024 * 1024, || emit_node_inner(expr, ctx));
+    ctx.leave_node_capabilities();
     ctx.leave_node(prev);
     if result.is_err() {
         // A failed rule's selected calls report nothing, as a failed statement's waiting
@@ -338,7 +342,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             // annotation, and a later pass rebuilding a chain carries the
             // original node's function type across. A chain with neither would fall to
             // the `Compute` default silently, which is how a collection ends up
-            // reading as a capability.
+            // reading as a compute function.
             debug_assert!(
                 has_ann || matches!(recorded_ty, Type::Fun { .. }),
                 "a Compose reached inference with no kind stamp (node {node_id:?})"
@@ -1017,7 +1021,7 @@ pub(super) fn emit_lambda<C: Typing>(
     // unchanged.
     //
     // The rule derives the domain and the codomain; the **kind is inferred**. A
-    // `λ` node is the same node whether it denotes a collection or a capability —
+    // `λ` node is the same node whether it denotes a collection or a compute function —
     // a comprehension's `λ __iter_record → __iter_record ▷ xs ▷ f` and a plain
     // `λ x → x + 1` are indistinguishable *here* — so the rule says what it
     // knows: a function of some kind. What decides it is everywhere the lambda is
@@ -1025,7 +1029,7 @@ pub(super) fn emit_lambda<C: Typing>(
     // annotation from lowering, a declared `Data` recurrence carrier, an
     // aggregate's `Data` demand, a `Compute` parameter position. Each pins the
     // variable at the edge where the claim is actually made
-    // (`constrain_fun_kind`), and an unconstrained kind resolves to the capability
+    // (`constrain_fun_kind`), and an unconstrained kind resolves to the compute-function
     // default at coalesce (`FunKind::resolved`).
     //
     // In Check mode `recorded` is the node's resolved type, so reading the kind
@@ -1286,9 +1290,15 @@ pub(super) fn emit_apply<C: Typing>(
                     at: symbolic(argument),
                 })
             }
-            // The callee may write the variable, so the call does, whether or not the callee
-            // does (`docs/chl-spec.md`, "Discharging requirements and effects").
+            // The callee may read and write the variable, so the call does, whether or not the
+            // callee does (`docs/chl-spec.md`, "Discharging requirements and effects"). Passing
+            // a transactional variable needs no transaction: the callee writes it in a block of
+            // its own, or requires one.
             TempNames::Variable(variable, _) => {
+                ctx.record_capability(
+                    Capability::Requires(Requirement::read(variable.clone())),
+                    Some(&variable),
+                );
                 ctx.record_capability(
                     Capability::Causes(Effect::Write(variable.clone())),
                     Some(&variable),
@@ -1932,7 +1942,7 @@ fn emit_value_read<C: Typing>(e: &mut Expr, ctx: &mut C) -> Result<Type, Located
 
 /// `ty`, the type of `e`, read as a value: a mutable variable's handle becomes its value
 /// ([`read_through`]). A read of the mutable variable `x` requires `Read(x)`, and of a
-/// transactional one `Transaction` too (`src/ccl/design/type-inference.md`, "Effect
+/// transactional one `Transaction` too (`src/ccl/design/type-inference.md`, "Capability
 /// variables"), so this records them; a mention that stays a handle, passed by reference or to
 /// `await_final`, reads nothing.
 fn read_value<C: Typing>(e: &Expr, ty: &Type, ctx: &mut C) -> Type {
@@ -1959,7 +1969,7 @@ fn record_value_read<C: Typing>(e: &Expr, ty: &Type, ctx: &mut C) {
     if ty.mut_value_type().is_some()
         && let TypedExprNode::Var(name) = &denoted_expr(e).node
     {
-        ctx.record_read(name);
+        ctx.record_read(name, e);
     }
 }
 
@@ -4117,8 +4127,8 @@ pub(super) fn emit_compose<C: Typing>(
     // The chain's kind **rides its own type**, like a lambda's (`emit_lambda`).
     // It is not the head morphism's: a head can be a re-indexing rather than a
     // decision — `id ≫ xs` and `.0 ≫ xs` denote the collection `xs` re-addressed,
-    // not the capability `id`/`.0` — so reading the head would flatten every
-    // multi-generator comprehension's columns to capabilities. A rewrite that
+    // not the compute function `id`/`.0` — so reading the head would flatten every
+    // multi-generator comprehension's columns to compute functions. A rewrite that
     // rebuilds a chain carries the original node's type across, which is what puts
     // the right kind here to read.
     //

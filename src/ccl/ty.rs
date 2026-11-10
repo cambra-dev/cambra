@@ -292,11 +292,11 @@ impl Openness {
     }
 }
 
-/// Whether a [`Type::Fun`]'s domain is a **capability** or a **collection** — the
+/// Whether a [`Type::Fun`] is a **compute function** or a **collection** — the
 /// compute-function vs data-function distinction.
 ///
-/// - [`FunKind::Compute`] — `α ⇒ β`: the domain is a *capability*, the inputs
-///   the function accepts. No data sits behind it, so shrinking the domain only
+/// - [`FunKind::Compute`] — `α ⇒ β`: the domain is only the inputs the function
+///   accepts. No data sits behind it, so shrinking the domain only
 ///   under-promises; the contravariant meet at a control-flow join is a sound,
 ///   lossy simplification.
 /// - [`FunKind::Data`] — `α ⤇ β`: the domain is a *collection*'s index set.
@@ -323,7 +323,7 @@ impl Openness {
 /// solver resolves it, like a type variable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FunKind {
-    /// A compute function / capability (`⇒`): lossy meet at a join is fine.
+    /// A compute function (`⇒`): lossy meet at a join is fine.
     Compute,
     /// A data function / collection (`⤇`): the domain is data; joins must be lossless.
     ///
@@ -409,7 +409,7 @@ impl FunKind {
             FunKind::Data(..) => "⤇",
             // Every data spelling reads as a collection: `Data` is data with plain-vs-sum
             // still open, and `Plain` and `Sum` are the two ways it settles. Rendering
-            // those as `⇒` printed a collection as a capability.
+            // those as `⇒` printed a collection as a compute function.
             FunKind::Var(v) if v.resolved().is_data() => "⤇",
             FunKind::Var(_) => "⇒",
         }
@@ -431,7 +431,7 @@ impl FunKind {
     }
 
     /// Whether a function of this kind has **its domain as its data**: every kind but one
-    /// known to be a capability. A joined binder's refinement on such a domain states the
+    /// known to be a compute function's. A joined binder's refinement on such a domain states the
     /// collection's keys, which have no join, so it is kept rather than dropped
     /// ([`crate::ccl::subst::Mapping::Join`]). A kind nothing has settled counts, so an
     /// undecided domain is reported rather than widened.
@@ -469,7 +469,7 @@ impl FunKind {
     /// A fresh kind variable **pinned to `Data`** — a consumer's function, polymorphic in
     /// the slot but a collection by construction (`src/ccl/design/type-inference.md`,
     /// "Consuming a sum: pinning the consumer's kind"). The kind equation relates it to
-    /// a plain collection and to a sum alike; a capability flowing in is the conflict.
+    /// a plain collection and to a sum alike; a compute function flowing in is the conflict.
     pub fn fresh_data() -> FunKind {
         let v = FunKindVar::fresh();
         v.stamp_data();
@@ -595,15 +595,15 @@ impl KindPin {
             (Unpinned, p) | (p, Unpinned) => p,
             (Conflict, _) | (_, Conflict) => Conflict,
             (Compute, Compute) => Compute,
-            // A capability meeting data, in any of its three spellings.
+            // A compute function meeting data, in any of its three spellings.
             (Compute, _) | (_, Compute) => Conflict,
-            // `Data` says only "not a capability", so anything data refines it.
+            // `Data` says only "not a compute function", so anything data refines it.
             (Data, p) | (p, Data) => p,
             (Plain, Plain) => Plain,
             // **A plain collection and a sum do not merge.** Neither is below the other:
             // entering a sum is a term, and a sum is not a collection with the choice
             // forgotten. One function required to be both is the same contradiction a
-            // capability meeting a collection is.
+            // compute function meeting a collection is.
             (Plain, Sum(_)) | (Sum(_), Plain) => Conflict,
             // **Two sums at one kind are one consumption reached twice.** Their arities
             // must agree; a disagreement is a mismatch between the two types, not a state
@@ -701,7 +701,7 @@ fn built_width(sources: &[FunKind]) -> Option<usize> {
 /// the arity becomes known.
 ///
 /// The two eliminations cannot know a function's kind: applying a value and destructuring a
-/// function are one node for a collection and for a capability alike. Each mints one of
+/// function are one node for a collection and for a compute function alike. Each mints one of
 /// these, and the kinds that reach it are recorded as bounds.
 ///
 /// Bounds are **not identity**. Two variables related by an edge have *corresponding*
@@ -787,7 +787,7 @@ impl FunKindVar {
     /// **What this kind is**, as far as everything recorded says: the join of every point
     /// that has reached it, from either side.
     ///
-    /// Both sides, because the `FunKind` lattice is flat — a capability, a plain collection
+    /// Both sides, because the `FunKind` lattice is flat — a compute function, a plain collection
     /// and a sum of a given width are mutually incomparable — so an edge fixes a variable
     /// rather than bounding it, and which side the fact arrived on says nothing.
     ///
@@ -1253,10 +1253,10 @@ pub enum Type {
         /// renaming their Pi binder reconcile there (see the substitution
         /// machinery).
         name: Option<crate::ccl::Name>,
-        /// Whether this function is a capability (`Compute`) or a data collection
+        /// Whether this function is a compute function (`Compute`) or a data collection
         /// (`Data`). See [`FunKind`]. The derived [`PartialEq`] compares it: a
         /// data function and a compute function over the same domain/codomain
-        /// are genuinely different types (one carries data, one a capability).
+        /// are genuinely different types (one carries data, one computes).
         ///
         /// Nothing structural distinguishes the two — only the construction
         /// site knows — so downstream the kind is *carried, never re-derived*:
@@ -2833,8 +2833,8 @@ fn fmt_type(
         Type::BarrierVar(var) => write!(f, ":>{}", var.uid),
         Type::UIntRange(n) => write!(f, "0..{n}"),
         // The rendered symbol reflects the resolved `kind`: `⇒` for a compute
-        // capability (and an unresolved kind var), `⤇` for a data collection
-        // (see `FunKind::function`), making the collection/capability distinction
+        // function (and an unresolved kind var), `⤇` for a data collection
+        // (see `FunKind::function`), making the collection/compute distinction
         // legible in every type string.
         //
         // The codomain renders one function deeper, named or not: the index
@@ -3533,7 +3533,7 @@ impl Type {
     /// `channelize::erase_chan_domains_in_type` erases it to exactly that. A pass that
     /// rebuilds around a still-unerased handle — the chain a per-iteration feed becomes —
     /// has a kind to copy, and taking the `Compute` default there declares a collection a
-    /// capability. ([`HistoryKind::Overwrite`] is not this case: a mutable variable handle
+    /// compute function. ([`HistoryKind::Overwrite`] is not this case: a mutable variable handle
     /// erases to its *value*, so it states no function type to copy.)
     ///
     /// **A sum is a function.** `Σ (𝑤 : 𝐾). (𝑤 ⤇ 𝑉)` is a collection exactly as `𝐷 ⤇ 𝑉`

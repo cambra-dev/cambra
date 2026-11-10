@@ -1201,6 +1201,16 @@ pub struct TypedExpr {
     /// Checked against the inferred type by [`crate::ccl::infer::infer`]; `None` for all
     /// nodes produced by the current lowering pass.
     pub user_annotation: Option<Type>,
+    /// What evaluating this expression requires and causes, beside the type of its value
+    /// (`src/ccl/design/type-inference.md`, "4.9 Capabilities"). Inference writes it; every pass
+    /// after keeps it true of the node it builds, and a pass discharging an effect states what
+    /// remains. A function's latent capabilities are in its type, so making one causes nothing.
+    pub capabilities: crate::ccl::capabilities::Capabilities,
+    /// What evaluating this node does of its own, beyond what its children do: a variable's
+    /// mention its read, a call what its function does, a write, a feed, a definition or a block
+    /// what it states. `capabilities` is this and what the children do, so a pass that rebuilds the
+    /// node over other children recomputes it exactly ([`Self::absorb_children_capabilities`]).
+    pub own_capabilities: crate::ccl::capabilities::Capabilities,
     /// Provenance identity, excluded from value equality.
     ///
     /// Construction and ordinary cloning allocate fresh IDs and report them through
@@ -1240,13 +1250,15 @@ impl Clone for TypedExpr {
             ty: self.ty.clone(),
             node: self.node.clone(),
             user_annotation: self.user_annotation.clone(),
+            capabilities: self.capabilities.clone(),
+            own_capabilities: self.own_capabilities.clone(),
             node_id,
             site: self.site.clone(),
         }
     }
 }
 
-/// Compare `ty`, `node` and `user_annotation`, excluding provenance identity.
+/// Compare `ty`, `node`, `user_annotation` and `capabilities`, excluding provenance identity.
 ///
 /// A derived comparison would distinguish equal values solely because a rewrite
 /// allocated new IDs, changing value comparisons in compiler passes and tests.
@@ -1255,6 +1267,8 @@ impl PartialEq for TypedExpr {
         self.ty == other.ty
             && self.node == other.node
             && self.user_annotation == other.user_annotation
+            && self.capabilities == other.capabilities
+            && self.own_capabilities == other.own_capabilities
     }
 }
 
@@ -1271,13 +1285,51 @@ impl TypedExpr {
         }
         let node_id = NodeId::fresh();
         crate::ccl::provenance::on_mint(node_id);
-        TypedExpr {
+        let mut out = TypedExpr {
             node,
             ty: Type::Hole,
             user_annotation: None,
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
+            own_capabilities: crate::ccl::capabilities::Capabilities::none(),
             node_id,
             site: None,
+        };
+        // What its children do, which a container node does; a node with capabilities of its
+        // own has them stated by its builder.
+        out.capabilities = crate::ccl::capabilities::of_children(&out);
+        out
+    }
+
+    /// This node rebuilt over rewritten children: it does what they do and what it does of its
+    /// own ([`Self::own_capabilities`], [`crate::ccl::capabilities::of_children`]). What it held of code a
+    /// pass moved out from under it, it no longer does.
+    pub(crate) fn absorbing_children_capabilities(mut self) -> Self {
+        self.absorb_children_capabilities();
+        self
+    }
+
+    /// This node, a call's body inlined in place of the call, doing of its own what the call
+    /// did, `call`, beyond what the body does: what the call's function states, a clause can make
+    /// more than its body does.
+    pub(crate) fn doing_of_its_own(
+        mut self,
+        call: &crate::ccl::capabilities::Capabilities,
+    ) -> Self {
+        let beyond = call.set().without(&self.capabilities.set());
+        if !beyond.is_empty() {
+            self.own_capabilities = crate::ccl::capabilities::of_parts(&[
+                &self.own_capabilities,
+                &crate::ccl::capabilities::Capabilities::known(beyond),
+            ]);
+            self.absorb_children_capabilities();
         }
+        self
+    }
+
+    /// [`Self::absorbing_children_capabilities`] in place.
+    pub(crate) fn absorb_children_capabilities(&mut self) {
+        let below = crate::ccl::capabilities::of_children(self);
+        self.capabilities = crate::ccl::capabilities::of_parts(&[&self.own_capabilities, &below]);
     }
 
     /// Construct a node at an **already-minted** identity: a *preserve*, the dual
@@ -1323,13 +1375,17 @@ impl TypedExpr {
     /// `subst` and `lambda_elim` ask whether their rebuild should mint or preserve
     /// at all.
     pub(crate) fn preserve(node_id: NodeId, node: TypedExprNode) -> Self {
-        TypedExpr {
+        let mut out = TypedExpr {
             node,
             ty: Type::Hole,
             user_annotation: None,
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
+            own_capabilities: crate::ccl::capabilities::Capabilities::none(),
             node_id,
             site: None,
-        }
+        };
+        out.capabilities = crate::ccl::capabilities::of_children(&out);
+        out
     }
 
     /// Construct diagnostic-only material at `NodeId::PLACEHOLDER`.
@@ -1378,6 +1434,8 @@ impl TypedExpr {
             ty: self.ty.clone(),
             node: self.node.clone(),
             user_annotation: self.user_annotation.clone(),
+            capabilities: self.capabilities.clone(),
+            own_capabilities: self.own_capabilities.clone(),
             node_id,
             site: self.site.clone(),
         }
@@ -1506,22 +1564,42 @@ impl TypedExpr {
         value: Self,
         site: Option<std::rc::Rc<crate::ccl::site::Site>>,
     ) -> Self {
-        Self::new(TypedExprNode::Feed {
-            name: name.into(),
+        let name = name.into();
+        let capabilities = crate::ccl::capabilities::of_feed(&name, &value.capabilities);
+        let own = crate::ccl::capabilities::of_feed(
+            &name,
+            &crate::ccl::capabilities::Capabilities::none(),
+        );
+        let mut feed = Self::new(TypedExprNode::Feed {
+            name,
             name_occurrence,
             value: Box::new(value),
             row: Type::Hole,
             site,
-        })
+        });
+        // A feed appends to its target.
+        feed.capabilities = capabilities;
+        feed.own_capabilities = own;
+        feed
     }
 
     /// Construct a define expression.
     pub fn define(name: impl Into<Name>, name_occurrence: Occurrence, value: Self) -> Self {
-        Self::new(TypedExprNode::Define {
-            name: name.into(),
+        let name = name.into();
+        let capabilities = crate::ccl::capabilities::of_feed(&name, &value.capabilities);
+        let own = crate::ccl::capabilities::of_feed(
+            &name,
+            &crate::ccl::capabilities::Capabilities::none(),
+        );
+        let mut define = Self::new(TypedExprNode::Define {
+            name,
             name_occurrence,
             value: Box::new(value),
-        })
+        });
+        // A define appends its collection to its target.
+        define.capabilities = capabilities;
+        define.own_capabilities = own;
+        define
     }
 
     /// Construct a `with begin():` transaction-block marker over `body`.
@@ -2766,6 +2844,8 @@ impl Default for TypedExpr {
             node: TypedExprNode::Lit(Lit::Int(0)),
             ty: Type::Hole,
             user_annotation: None,
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
+            own_capabilities: crate::ccl::capabilities::Capabilities::none(),
             node_id: NodeId::PLACEHOLDER,
             site: None,
         }

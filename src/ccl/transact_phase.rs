@@ -182,6 +182,8 @@ fn rewrite_as_of_reads_go(expr: &mut Expr) {
         }
     }
     expr.walk_children_mut(rewrite_as_of_reads_go);
+    // A join built below brings what its parts do to the node it now stands under.
+    expr.absorb_children_capabilities();
 }
 
 /// Drop `let x = as_of_read(⟨history⟩) in body` where `body` does not name `x`.
@@ -373,7 +375,7 @@ fn build_zip_read(
     let zip_arg =
         Expr::new(TypedExprNode::Tuple(vec![trigger.clone(), as_of])).with_ty(zip_arg_ty.clone());
     // One (request, snapshot) pair per position of the trigger — the trigger again, at
-    // its kind; only the `zip` built-in itself is a capability.
+    // its kind; only the `zip` built-in itself is a compute function.
     let zip_out = Type::fun_like(&trigger.ty, b, pair_ty.clone());
     let zip_fn = Expr::builtin(Builtin::Zip).with_ty(Type::fun(zip_arg_ty, zip_out.clone()));
     let zip = Expr::apply(zip_arg, zip_fn).with_ty(zip_out);
@@ -657,6 +659,26 @@ type StoreWriters = (Vec<(NodeId, WriterSite)>, Vec<Vec<FeedSite>>);
 /// base name) makes the fold immune to an unrelated local variable merely
 /// *spelled* like a mutable variable.
 pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<String>> {
+    let mut out = compile_blocks(expr, txn_mut_vars)?;
+    // Every block is a commit site and every transactional variable a store's history, so
+    // nothing runs a transaction, needs one, or reads or writes a transactional variable.
+    crate::ccl::capabilities::discharge(&mut out, &|item| {
+        use crate::ccl::capabilities::{Capability, Effect};
+        use crate::ccl::infer::solver::traits::Trait;
+        match item {
+            Capability::Causes(e) => matches!(e, Effect::WriteTxn(_) | Effect::RunTransaction),
+            Capability::Requires(r) => {
+                let t = &r.requirement().trait_;
+                *t == Trait::transaction() || *t == Trait::read_txn()
+            }
+        }
+    });
+    Ok(out)
+}
+
+/// [`run`] up to its discharge: each block compiled to a commit site and each transactional
+/// variable to a store's history.
+fn compile_blocks(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<String>> {
     // Strip whenever a `with begin():` block is present. A block need not write a
     // transactional mutable variable — a read-only block (`out << balance`) has no write
     // yet must still be unwrapped off the loop spine — so we cannot short-circuit
@@ -1258,6 +1280,8 @@ fn strip(
             node,
             ty,
             user_annotation,
+            capabilities,
+            own_capabilities,
             node_id,
             site,
         } = expr;
@@ -1292,6 +1316,8 @@ fn strip(
             },
             ty,
             user_annotation,
+            capabilities,
+            own_capabilities,
             node_id,
             site,
         };
@@ -1312,12 +1338,16 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
             let node_id = block.node_id;
             let body = splice_block(*body, rest);
             let ty = body.ty.clone();
+            let capabilities =
+                crate::ccl::capabilities::of_parts(&[&expr.capabilities, &body.capabilities]);
             Expr {
                 node: TypedExprNode::ExprStmt {
                     expr,
                     body: Box::new(body),
                 },
                 ty,
+                capabilities,
+                own_capabilities: crate::ccl::capabilities::Capabilities::none(),
                 user_annotation: None,
                 node_id,
                 site: None,
@@ -1331,6 +1361,8 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
             let node_id = block.node_id;
             let body = splice_block(*body, rest);
             let ty = body.ty.clone();
+            let capabilities =
+                crate::ccl::capabilities::of_parts(&[&bound_expr.capabilities, &body.capabilities]);
             Expr {
                 node: TypedExprNode::Let {
                     binding,
@@ -1338,6 +1370,8 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
                     body: Box::new(body),
                 },
                 ty,
+                capabilities,
+                own_capabilities: crate::ccl::capabilities::Capabilities::none(),
                 user_annotation: None,
                 node_id,
                 site: None,
@@ -1418,6 +1452,8 @@ fn partition_spine(
         node,
         ty,
         user_annotation,
+        capabilities,
+        own_capabilities,
         node_id,
         site,
     } = expr;
@@ -1436,6 +1472,8 @@ fn partition_spine(
                 },
                 ty,
                 user_annotation,
+                capabilities,
+                own_capabilities,
                 node_id,
                 site,
             }
@@ -1469,6 +1507,8 @@ fn partition_spine(
                 },
                 ty,
                 user_annotation,
+                capabilities,
+                own_capabilities,
                 node_id,
                 site,
             }
@@ -1485,6 +1525,8 @@ fn partition_spine(
             node,
             ty,
             user_annotation,
+            capabilities,
+            own_capabilities,
             node_id,
             site,
         },
@@ -2440,7 +2482,7 @@ fn collect_key_inits(expr: &Expr, keys: &[Name], out: &mut HashMap<Name, MutVarD
 ///
 /// **A collection**, for the same reason an induction history is one: the engine stores one
 /// value per commit time of the domain, and every read of it is a read at a position — a
-/// `final_or_default` reduction, an `as_of` join. `Type::fun` would declare it a capability.
+/// `final_or_default` reduction, an `as_of` join. `Type::fun` would declare it a compute function.
 fn history_ty(value_ty: &Type) -> Type {
     Type::data_fun(Type::Txn, value_ty.clone())
 }
@@ -3309,7 +3351,8 @@ fn relink_spine_body(mut node: Expr, inner: Expr) -> Expr {
         | TypedExprNode::ExprStmt { body, .. } => **body = inner,
         _ => unreachable!("not a spine node"),
     }
-    node
+    // The statement stands over another continuation now, and does what it does.
+    node.absorbing_children_capabilities()
 }
 
 /// Replace every `await_final(x)` marker — `x ▷ await_final` —

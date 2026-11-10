@@ -365,12 +365,6 @@ fn freshen_fun_kind(
     }
 }
 
-/// Mint (or retrieve, cached by `uid`) the per-instantiation copy of a
-/// quantified kind var, carrying across whatever the def site was pinned to.
-///
-/// Caching by `uid` is what keeps repeated occurrences of one `κ` in a single
-/// copy identified; the copy decouples *this* instantiation's pin from the
-/// definition's and from every sibling instantiation's.
 /// A copy of the capability variable `v` and of every variable above `lim` flowing into it, each
 /// with its capabilities and edges; one at or below `lim` is shared, as a type variable is.
 fn freshen_capability_var(
@@ -398,6 +392,12 @@ fn freshen_capability_var(
     f
 }
 
+/// Mint (or retrieve, cached by `uid`) the per-instantiation copy of a
+/// quantified kind var, carrying across whatever the def site was pinned to.
+///
+/// Caching by `uid` is what keeps repeated occurrences of one `κ` in a single
+/// copy identified; the copy decouples *this* instantiation's pin from the
+/// definition's and from every sibling instantiation's.
 fn freshen_kind_var(
     kv: &Rc<FunKindVar>,
     lim: Level,
@@ -419,7 +419,7 @@ fn freshen_kind_var(
     // (`fresh_data`'s `Data`, which no edge spells), the bounds on either side, and what the
     // collection was built over — a comprehension's instantiation binds one position per
     // position of its sources exactly as the definition does, and a copy that drops the
-    // relation is a collection of unknown width that defaults to a capability.
+    // relation is a collection of unknown width that defaults to a compute function.
     if kv.stamped() == crate::ccl::ty::KindPin::Data {
         f.stamp_data();
     }
@@ -1339,6 +1339,13 @@ pub fn freshen_expr_type_slots(
     cache: &mut FreshenCache,
 ) {
     expr.walk_type_slots_mut(|ty| *ty = freshen_above(lim, ty, target, cache));
+    // The node's own capabilities, a variable the definition's emission minted: the clone's are the
+    // use's copy of it, as its types are.
+    for slot in [&mut expr.capabilities, &mut expr.own_capabilities] {
+        if let Repr::Var(v) = slot.repr() {
+            *slot = Capabilities::var(freshen_capability_var(lim, v, target, cache));
+        }
+    }
     expr.walk_children_mut(|c| freshen_expr_type_slots(c, lim, target, cache));
 }
 

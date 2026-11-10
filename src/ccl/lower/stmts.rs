@@ -965,6 +965,14 @@ pub(super) fn lower_middle_stmt(
             // registry — its mutability is this `Mut` type, checked
             // post-inference; its domain is the loop it accumulates over, which
             // the unified phase resolves. See src/ccl/design/mutability.md.
+            if is_txn && !is_top_level {
+                return Err(LoweringError::unsupported(
+                    stmt.span,
+                    format!(
+                        "`{name}` is a transactional mutable variable, which belongs to the run, so it is declared at a module's top level"
+                    ),
+                ));
+            }
             let domain = if is_txn {
                 ctx.register_transactional(name.clone());
                 Type::Txn

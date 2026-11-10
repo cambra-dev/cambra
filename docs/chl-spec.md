@@ -2402,7 +2402,7 @@ marked one carries its status per "How to read this document".)
   argument (§3.8): an n-parameter function's domain is the
   corresponding tuple type, and a keyword-argument function's domain
   is a record type — `{x: T, y: U} ⇒ V`. Surface syntax uses the `=>`
-  function. A `def` or a lambda is a callable capability, and a comprehension or a literal is a
+  function. A `def` or a lambda has a function type, and a comprehension or a literal is a
   collection: the construct decides, and an annotation states it.
 - `D |=> V` — data-function type: a collection over the domain `D` (§6.3).
 - `Module{name: T, Name <: U, …}` — the type of a module's public members,

@@ -342,8 +342,6 @@ impl StatedRequirement {
 pub enum InferError {
     /// A variable was referenced but not bound in the current scope.
     UnboundVariable(String),
-    /// A transactional mutable variable declared below a module's top level.
-    TransactionalOutsideTopLevel { name: String },
     /// A type mismatch was detected between two solved types.
     ///
     /// Named for the roles rather than positionally: `constrain_subtype(lhs, rhs)`
@@ -1030,7 +1028,6 @@ impl InferError {
             // No type to render: these carry a name, an id, a rendered label, or (the
             // binder join) a term `respell` rewrites.
             InferError::UnboundVariable(_)
-            | InferError::TransactionalOutsideTopLevel { .. }
             | InferError::NoJoinOverBinder { .. }
             | InferError::Unsupported(_)
             | InferError::EmptyCase { .. }
@@ -1503,11 +1500,6 @@ impl std::fmt::Debug for InferError {
         let w = crate::ccl::chl_print::Writer::default();
         match self {
             InferError::UnboundVariable(name) => write!(f, "Unbound variable: '{}'", name),
-            InferError::TransactionalOutsideTopLevel { name } => write!(
-                f,
-                "`{name}` is a transactional mutable variable, which belongs to the run, so it is \
-                 declared at a module's top level"
-            ),
             InferError::TypeMismatch {
                 ctx,
                 found,

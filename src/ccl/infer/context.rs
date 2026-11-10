@@ -141,6 +141,9 @@ pub(super) struct InferCtx {
     /// The function bodies under emission, innermost last, above the module's top level
     /// (`src/ccl/design/type-inference.md`, "Capability variables").
     capability_frames: Vec<CapabilityFrame>,
+    /// The nodes under emission, innermost last: each one's capability variable, which its
+    /// `capabilities` slot holds until coalesce resolves it.
+    node_capabilities: Vec<NodeCapabilities>,
     /// Where each mutable variable and feed in scope is bound, for the capability that names it.
     capability_binders: HashMap<Name, CapabilityBinder>,
     /// Lexical scope: name → [`Binding`] for in-scope variables and let-bound
@@ -338,36 +341,61 @@ impl DeferredMethod {
 /// A function body, or the module's top level, under emission: the variable collecting
 /// what it requires and causes.
 struct CapabilityFrame {
-    var: Rc<CapabilityVar>,
     /// How many function bodies enclose this one, 0 for the top level.
     depth: u32,
-    /// How many `with begin():` bodies inside this function enclose the emission.
-    transactions: u32,
 }
 
 impl CapabilityFrame {
-    /// What an edge into this frame's variable lets through: nothing naming a variable
-    /// the frame's own body binds, and no `Transaction` inside a `with begin():` body.
+    /// What reaches this frame's variable from its body's: nothing naming a variable the
+    /// frame's own body binds.
     fn filter(&self) -> Filter {
         Filter {
             when_data: None,
             below: Some(self.depth),
-            discharges: if self.transactions > 0 {
-                [Requirement::transaction()].into_iter().collect()
-            } else {
-                Default::default()
-            },
+            discharges: Default::default(),
         }
     }
+}
+
+/// How what a node's children require and cause reaches the node's own capabilities.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Inflow {
+    /// All of it: what a child does, evaluating the node does.
+    All,
+    /// All but `Transaction`, which a `with begin():` block supplies to its body.
+    DischargesTransaction,
+    /// None of it: making a function does nothing, and what its body does is latent in the
+    /// function's type, which the body's variable reaches through the frame's filter
+    /// ([`Typing::function_body`]).
+    Closed,
+}
+
+impl Inflow {
+    fn of(node: &TypedExprNode) -> Inflow {
+        match node {
+            TypedExprNode::Lambda { .. } => Inflow::Closed,
+            TypedExprNode::Begin { .. } => Inflow::DischargesTransaction,
+            _ => Inflow::All,
+        }
+    }
+}
+
+/// A node under emission: the variable collecting what evaluating it requires and causes, how
+/// its children's capabilities reach it, and, for a lambda, its body's variable.
+struct NodeCapabilities {
+    var: Rc<CapabilityVar>,
+    /// What the node does of its own, which `var` holds besides what its children do.
+    own: Rc<CapabilityVar>,
+    inflow: Inflow,
+    body: Option<Rc<CapabilityVar>>,
 }
 
 /// Where a mutable variable or feed is bound, for the [`ScopedCapability`] naming it.
 #[derive(Clone, Copy)]
 struct CapabilityBinder {
     depth: u32,
-    /// A parameter's history is its argument's, so the call records what is done to it
-    /// and the callee records nothing (`docs/chl-spec.md`, "Discharging requirements and
-    /// effects").
+    /// A parameter's history is its argument's, so the call records what is done to it, and
+    /// the function's type does not ([`ScopedCapability::parameter`]).
     parameter: bool,
     /// A transactional mutable variable: reading or writing it requires `Transaction`, and its
     /// capabilities are `ReadTxn` and `WriteTxn`.
@@ -379,6 +407,8 @@ pub(super) struct OpenGroup {
     pub(super) depth: usize,
     /// How many effect frames were open where the group stands.
     capability_frames: usize,
+    /// How many nodes were under emission where the group stands.
+    node_capabilities: usize,
     /// The emission position the group stands at: its level, its telescope, which has every
     /// member's name entered, the `Poly` parameters open there, and its assumptions.
     level: Level,
@@ -540,11 +570,8 @@ impl InferCtx {
             temps_written: HashMap::new(),
             method_calls: vec![Vec::new()],
             selected_methods: Rc::default(),
-            capability_frames: vec![CapabilityFrame {
-                var: CapabilityVar::fresh(0),
-                depth: 0,
-                transactions: 0,
-            }],
+            capability_frames: vec![CapabilityFrame { depth: 0 }],
+            node_capabilities: Vec::new(),
             capability_binders: HashMap::new(),
         }
     }
@@ -553,6 +580,81 @@ impl InferCtx {
         self.capability_frames
             .last()
             .expect("the top level's frame stays open through emission")
+    }
+
+    /// Begin emitting a node: a fresh variable collects what evaluating it requires and causes,
+    /// which its `capabilities` slot holds (`src/ccl/design/type-inference.md`, "4.9 Capabilities").
+    pub(super) fn enter_node_capabilities(
+        &mut self,
+        node: &TypedExprNode,
+    ) -> (Capabilities, Capabilities) {
+        let var = CapabilityVar::fresh(self.level);
+        let own = CapabilityVar::fresh(self.level);
+        var.flows_from(&own, Filter::default());
+        self.node_capabilities.push(NodeCapabilities {
+            var: Rc::clone(&var),
+            own: Rc::clone(&own),
+            inflow: Inflow::of(node),
+            body: None,
+        });
+        (Capabilities::var(var), Capabilities::var(own))
+    }
+
+    /// Finish emitting the innermost node: its capabilities reach its parent's as the parent lets
+    /// them in.
+    pub(super) fn leave_node_capabilities(&mut self) {
+        let node = self
+            .node_capabilities
+            .pop()
+            .expect("a node under emission entered its effects");
+        if let Some(parent) = self.node_capabilities.last_mut() {
+            match parent.inflow {
+                Inflow::All => parent.var.flows_from(&node.var, Filter::default()),
+                Inflow::DischargesTransaction => parent.var.flows_from(
+                    &node.var,
+                    Filter {
+                        discharges: [Requirement::transaction()].into_iter().collect(),
+                        ..Filter::default()
+                    },
+                ),
+                Inflow::Closed => parent.body = Some(node.var),
+            }
+        }
+    }
+
+    /// The capability variable of the node under emission.
+    /// The capability `item` is, which names the variable `name` where it names one.
+    fn capability_of(&self, item: Capability, name: Option<&Name>) -> ScopedCapability {
+        let binder = name.and_then(|n| self.capability_binders.get(n).copied());
+        // A transactional variable belongs to the run, so no scope discharges a read or a write
+        // of one (`docs/chl-spec.md`, "Discharging requirements and effects").
+        let (item, binder) = match item {
+            Capability::Causes(Effect::Write(x)) if binder.is_some_and(|b| b.transactional) => {
+                (Capability::Causes(Effect::WriteTxn(x)), None)
+            }
+            Capability::Requires(r) if binder.is_some_and(|b| b.transactional) => (
+                Capability::Requires(Requirement::read_txn(r.requirement().terms[0].clone())),
+                None,
+            ),
+            item => (item, binder),
+        };
+        // Recorded on the node, whatever binds the variable: a node's capabilities are what
+        // evaluating it does. A variable the enclosing function body binds, a parameter's
+        // included, stays out of the function's type at the frame's filter.
+        ScopedCapability {
+            item,
+            bound_at: binder.map(|b| b.depth),
+            parameter: binder.is_some_and(|b| b.parameter),
+        }
+    }
+
+    /// The variable collecting what the node under emission does of its own.
+    fn node_capability_var(&self) -> &Rc<CapabilityVar> {
+        &self
+            .node_capabilities
+            .last()
+            .expect("a capability is recorded while a node is under emission")
+            .own
     }
 
     /// Record where `name` is bound, at the innermost function body, when `ty` is a
@@ -564,16 +666,11 @@ impl InferCtx {
                 && matches!(history_kind, crate::ccl::ty::HistoryKind::Overwrite)
                 && matches!(domain, Type::Txn);
             let depth = self.capability_frame().depth;
-            // Transactional state belongs to the run, so a transactional variable is declared
-            // at a module's top level.
-            if transactional && depth > 0 {
-                self.errors.push(LocatedInferError::new(
-                    InferError::TransactionalOutsideTopLevel {
-                        name: name.base().to_string(),
-                    },
-                    self.current_node_id,
-                ));
-            }
+            debug_assert!(
+                !transactional || depth == 0,
+                "lowering refuses `{name}`, a transactional variable declared below a module's \
+                 top level"
+            );
             self.capability_binders.insert(
                 name.clone(),
                 CapabilityBinder {
@@ -590,15 +687,15 @@ impl InferCtx {
     /// call's are. A function's stay latent in its type. A kind still a variable decides
     /// once it resolves.
     fn settle_by_kind(&mut self, var: &Rc<CapabilityVar>, kind: Option<&crate::ccl::ty::FunKind>) {
-        let outer = self.capability_frame();
-        let filter = outer.filter();
+        // The node is the lambda, or the composition or cast, the function is.
+        let node = self.node_capability_var();
         match kind {
-            Some(crate::ccl::ty::FunKind::Data(_)) => outer.var.flows_from(var, filter),
-            Some(crate::ccl::ty::FunKind::Var(kind)) => outer.var.flows_from(
+            Some(crate::ccl::ty::FunKind::Data(_)) => node.flows_from(var, Filter::default()),
+            Some(crate::ccl::ty::FunKind::Var(kind)) => node.flows_from(
                 var,
                 Filter {
                     when_data: Some(Rc::clone(kind)),
-                    ..filter
+                    ..Filter::default()
                 },
             ),
             Some(crate::ccl::ty::FunKind::Compute) | None => {}
@@ -609,8 +706,8 @@ impl InferCtx {
     /// into the enclosing function body's, through the body's filter.
     fn call_capabilities(&mut self) -> Capabilities {
         let call = CapabilityVar::fresh(self.level);
-        let frame = self.capability_frame();
-        frame.var.flows_from(&call, frame.filter());
+        self.node_capability_var()
+            .flows_from(&call, Filter::default());
         Capabilities::var(call)
     }
 
@@ -632,6 +729,7 @@ impl InferCtx {
         self.groups.push(OpenGroup {
             depth: self.scopes.depth() - 1,
             capability_frames: self.capability_frames.len(),
+            node_capabilities: self.node_capabilities.len(),
             level: self.level,
             telescope: self.telescope.clone(),
             opened_params: self.opened_params.len(),
@@ -659,6 +757,7 @@ impl InferCtx {
         let group = &self.groups[g];
         let suspended = self.scopes.suspend_above(group.depth + 1);
         let frames = self.capability_frames.split_off(group.capability_frames);
+        let nodes = self.node_capabilities.split_off(group.node_capabilities);
         let level = std::mem::replace(&mut self.level, group.level);
         let telescope = std::mem::replace(&mut self.telescope, group.telescope.clone());
         let params = self.opened_params.split_off(group.opened_params);
@@ -667,6 +766,7 @@ impl InferCtx {
         let r = f(self);
         self.scopes.resume(suspended);
         self.capability_frames.extend(frames);
+        self.node_capabilities.extend(nodes);
         self.level = level;
         self.telescope = telescope;
         self.opened_params.extend(params);
@@ -2328,13 +2428,17 @@ impl Typing for InferCtx {
     ) -> (R, Capabilities) {
         let var = CapabilityVar::fresh(self.level);
         let depth = self.capability_frame().depth + 1;
-        self.capability_frames.push(CapabilityFrame {
-            var: Rc::clone(&var),
-            depth,
-            transactions: 0,
-        });
+        self.capability_frames.push(CapabilityFrame { depth });
         let r = f(self);
-        self.capability_frames.pop();
+        let frame = self.capability_frames.pop().expect("this body's frame");
+        // What the body does reaches the function's type through the frame's filter: nothing
+        // naming a variable the body binds, its parameter's included.
+        let body = self
+            .node_capabilities
+            .last_mut()
+            .and_then(|lambda| lambda.body.take())
+            .expect("a lambda's body is emitted inside its frame");
+        var.flows_from(&body, frame.filter());
         self.settle_by_kind(&var, recorded.fun_kind());
         (r, Capabilities::var(var))
     }
@@ -2358,30 +2462,8 @@ impl Typing for InferCtx {
     }
 
     fn record_capability(&mut self, item: Capability, name: Option<&Name>) {
-        let binder = name.and_then(|n| self.capability_binders.get(n).copied());
-        if binder.is_some_and(|b| b.parameter) {
-            return;
-        }
-        // A transactional variable belongs to the run, so no scope discharges a read or a write
-        // of one (`docs/chl-spec.md`, "Discharging requirements and effects").
-        let (item, binder) = match item {
-            Capability::Causes(Effect::Write(x)) if binder.is_some_and(|b| b.transactional) => {
-                (Capability::Causes(Effect::WriteTxn(x)), None)
-            }
-            Capability::Requires(r) if binder.is_some_and(|b| b.transactional) => (
-                Capability::Requires(Requirement::read_txn(r.requirement().terms[0].clone())),
-                None,
-            ),
-            item => (item, binder),
-        };
-        let capability = ScopedCapability {
-            item,
-            bound_at: binder.map(|b| b.depth),
-        };
-        let frame = self.capability_frame();
-        if frame.filter().admits(&capability) {
-            frame.var.record(capability);
-        }
+        let capability = self.capability_of(item, name);
+        self.node_capability_var().record(capability);
     }
 
     fn record_transactional_access(&mut self, name: &Name) {
@@ -2394,15 +2476,23 @@ impl Typing for InferCtx {
         }
     }
 
-    fn record_read(&mut self, name: &Name) {
+    fn record_read(&mut self, name: &Name, mention: &Expr) {
+        // The mention reads the variable, whatever node reads through it: its own capabilities
+        // state the read, so it stays where the mention does.
+        let Repr::Var(var) = mention.own_capabilities.repr() else {
+            unreachable!("a node under inference holds its capability variable")
+        };
+        let var = Rc::clone(var);
         if let Some(transactional) = self.capability_binders.get(name).map(|b| b.transactional) {
             if transactional {
-                self.record_capability(Capability::Requires(Requirement::transaction()), None);
+                var.record(
+                    self.capability_of(Capability::Requires(Requirement::transaction()), None),
+                );
             }
-            self.record_capability(
+            var.record(self.capability_of(
                 Capability::Requires(Requirement::read(name.clone())),
                 Some(name),
-            );
+            ));
         }
     }
 
@@ -2411,16 +2501,8 @@ impl Typing for InferCtx {
     }
 
     fn transaction_body<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        self.capability_frames
-            .last_mut()
-            .expect("the top level's frame stays open through emission")
-            .transactions += 1;
-        let r = f(self);
-        self.capability_frames
-            .last_mut()
-            .expect("the top level's frame stays open through emission")
-            .transactions -= 1;
-        r
+        // The `Begin` node discharges `Transaction` from its body's capabilities ([`Inflow`]).
+        f(self)
     }
 
     fn in_let_rhs<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -2672,7 +2754,7 @@ impl Typing for InferCtx {
         // shape as a lower bound on its own seed; nothing flows back into
         // `d`/`c` from `t`'s other bounds. Concretely `Compute`, unlike
         // `as_function`'s demand: the node *providing* a shape here is a `Proj`,
-        // and a projection is a capability.
+        // and a projection is a compute function.
         //
         // A dependent node type's binder rides the shape: the codomain it supplies reads the
         // binder, and an unnamed function would leave that reference with nothing to bind it.

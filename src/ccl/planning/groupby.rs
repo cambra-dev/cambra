@@ -93,7 +93,7 @@ fn emit_groupby(
 ) -> Expr {
     // A partition is a **collection of collections**: keyed by `K`, each group the
     // index set of its members. Both are data — the transformer
-    // (`map`, taking one collection to another) stays a capability.
+    // (`map`, taking one collection to another) stays a compute function.
     //
     // `group_idx_ty` is the group's *refined* index set `{I | key(i) == k}`, and
     // `key_binder` the `k` its predicate closes over, both taken from the source

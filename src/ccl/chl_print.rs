@@ -302,14 +302,41 @@ impl Printer {
             ),
             body => (body.clone(), crate::ccl::capabilities::Capabilities::none()),
         };
-        let body = self.ty(&body);
+        // The clauses after the body belong to its outermost arrow, so a function codomain is
+        // parenthesized where they follow.
+        let closed = !family_bounds.is_empty()
+            || !poly.requires.is_empty()
+            || !capabilities.to_string().is_empty();
+        let body = match &body {
+            Type::Fun {
+                name,
+                fun_kind,
+                domain,
+                codomain,
+                ..
+            } => self.fun(name.as_ref(), fun_kind, domain, codomain, closed),
+            body => self.ty(body),
+        };
         let mut requires = family_bounds;
-        requires.extend(poly.requires_text(|t| self.ty(t)));
+        requires.extend(poly.requires_text(|t| self.component(t)));
         format!(
             "forall ({}) {body}{}",
             params.join(", "),
             crate::ccl::capabilities::clauses(requires, &capabilities)
         )
+    }
+
+    /// `ty` as one of a list of types: a function type with clauses in parentheses, since a
+    /// clause runs on through each next item that begins with a capitalized name
+    /// (`docs/chl-spec.md`, "Writing requirements and effects").
+    fn component(&mut self, ty: &Type) -> String {
+        let text = self.ty(ty);
+        match ty {
+            Type::Fun { capabilities, .. } if !capabilities.to_string().is_empty() => {
+                format!("({text})")
+            }
+            _ => text,
+        }
     }
 
     fn ty(&mut self, ty: &Type) -> String {
@@ -334,14 +361,14 @@ impl Printer {
             Type::Family { binders, body } => self.family(binders, body),
             Type::Tuple(ts) => match ts.as_slice() {
                 [] => "{}".to_string(),
-                [only] => format!("{{{},}}", self.ty(only)),
+                [only] => format!("{{{},}}", self.component(only)),
                 _ => {
-                    let parts: Vec<String> = ts.iter().map(|t| self.ty(t)).collect();
+                    let parts: Vec<String> = ts.iter().map(|t| self.component(t)).collect();
                     format!("{{{}}}", parts.join(", "))
                 }
             },
             Type::OpenTuple(ts) => {
-                let parts: Vec<String> = ts.iter().map(|t| self.ty(t)).collect();
+                let parts: Vec<String> = ts.iter().map(|t| self.component(t)).collect();
                 format!("{{{}, ..}}", parts.join(", "))
             }
             Type::Record(fields) => {
@@ -399,10 +426,17 @@ impl Printer {
                 domain,
                 codomain,
                 capabilities,
-            } => format!(
-                "{}{capabilities}",
-                self.fun(name.as_ref(), fun_kind, domain, codomain)
-            ),
+            } => {
+                let capabilities = capabilities.to_string();
+                let fun = self.fun(
+                    name.as_ref(),
+                    fun_kind,
+                    domain,
+                    codomain,
+                    !capabilities.is_empty(),
+                );
+                format!("{fun}{capabilities}")
+            }
             Type::History {
                 function,
                 history_kind,
@@ -436,7 +470,7 @@ impl Printer {
                 if args.is_empty() {
                     return name;
                 }
-                let args: Vec<String> = args.iter().map(|t| self.ty(t)).collect();
+                let args: Vec<String> = args.iter().map(|t| self.component(t)).collect();
                 format!("{name}({})", args.join(", "))
             }
             // No program writes one; this names both sides.
@@ -506,12 +540,15 @@ impl Printer {
     }
 
     /// A function: a collection over its domain when its kind is data, a `=>` otherwise.
+    /// `clauses_follow` says whether clauses are written after it, which then parenthesize a
+    /// function codomain.
     fn fun(
         &mut self,
         name: Option<&Name>,
         fun_kind: &FunKind,
         domain: &Type,
         codomain: &Type,
+        clauses_follow: bool,
     ) -> String {
         let witnesses = fun_kind.witnesses();
         if !witnesses.is_empty() {
@@ -537,6 +574,13 @@ impl Printer {
             self.spelled.push(((*n).clone(), s.clone()));
         }
         let cod = self.ty(codomain);
+        // Clauses after an arrow whose codomain is an arrow would read as the codomain's
+        // (`docs/chl-spec.md`, "Writing requirements and effects").
+        let cod = if clauses_follow && matches!(codomain, Type::Fun { .. }) {
+            format!("({cod})")
+        } else {
+            cod
+        };
         if binder.is_some() {
             self.spelled.pop();
         }

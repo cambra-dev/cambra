@@ -5205,10 +5205,10 @@ mod tests {
     }
 
     /// Two undetermined-kind bounds over distinct domains still join: the merge keeps the
-    /// kind unpinned, and the resolved kind's rule — here the capability default nothing
+    /// kind unpinned, and the resolved kind's rule — here the compute-function default nothing
     /// pinned away from — applies once at coalesce, meeting the domains contravariantly.
     #[test]
-    fn two_undetermined_kinds_join_to_a_capability_over_the_met_domain() {
+    fn two_undetermined_kinds_join_to_a_compute_function_over_the_met_domain() {
         let merged = CompactType::merge(
             true,
             fun_over(KindPin::Unpinned, &["a"]),

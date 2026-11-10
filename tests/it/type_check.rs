@@ -1517,7 +1517,7 @@ fn test_conditional_collection_heterogeneous_domains_rejected() {
     // unrelated domains (`0..3` and `source(mysrc)`), so it rejects for the same
     // reason. This is the regression for the source-categorization invariant: a
     // registered source is a `Data` collection, and were it miscategorized as a
-    // `Compute` capability the join would become an honest domain meet and
+    // `Compute` function the join would become an honest domain meet and
     // *succeed*, silently discarding one branch's rows. The rejection is the
     // evidence the kind is right (`register_source_type` constructs the `Data`
     // function; the kind is intrinsic, not caller-supplied).
@@ -1545,7 +1545,7 @@ fn test_conditional_collection_heterogeneous_domains() {
     // A conditional over a list literal and a **registered source** joins their
     // (different-kind) domains losslessly into the Σ — `0..3` and
     // `source(mysrc)`. This only holds because a registered source is a `Data`
-    // collection: were it miscategorized as a `Compute` capability, the join
+    // collection: were it miscategorized as a `Compute` function, the join
     // would take the contravariant meet and collide at coalesce. Regression for
     // that source-categorization invariant (`register_source_type` constructs the
     // `Data` function; the kind is intrinsic, not caller-supplied).
@@ -2180,12 +2180,12 @@ fn test_map_consumption_is_kind_blind_interim() {
 
 #[test]
 fn test_aggregate_over_scalar_lambda_is_rejected() {
-    // Summing a plain lambda: a bare `λ` is a capability, built concrete
+    // Summing a plain lambda: a bare `λ` is a compute function, built concrete
     // `Compute` (kind is a provenance property, not a domain guess). `sum`
     // demands a `Data` collection to iterate, so the argument constraint is
     // `(Int ⇒ Int) <: (?  ⤇ Int)` — a concrete kind mismatch, rejected up front
     // in `constrain_fun_kind` (emission), never routed through a kind var.
-    // Regression that a capability supplied where a collection is demanded is a
+    // Regression that a compute function supplied where a collection is demanded is a
     // clean error, not a silent miskind or a debug panic.
     let errs = infer_program_err(indoc::indoc! {r#"
 
@@ -3616,7 +3616,7 @@ fn test_feed_through_param_compatible_types_ok() {
 
 #[test]
 fn test_plain_value_to_feeding_param_errors() {
-    // `g(5)` where g feeds its parameter: the write capability cannot be
+    // `g(5)` where g feeds its parameter: a feed handle cannot be
     // conjured from a plain value (`NotAFeed` at the call edge).
     let errs = infer_program_err(indoc::indoc! {r#"
 
@@ -4729,7 +4729,7 @@ mod annotation_kinds {
     }
 }
 
-/// Joining a capability with a collection has no answer, and the two can reach
+/// Joining a compute function with a collection has no answer, and the two can reach
 /// one position without ever meeting at an edge.
 ///
 /// `f` is a bare lambda, so `Compute`; `xs` is a list literal, so `Data`. Both
@@ -4742,7 +4742,7 @@ mod annotation_kinds {
 ///
 /// See `src/ccl/design/type-inference.md`, "Materialization".
 #[test]
-fn joining_a_capability_with_a_collection_is_a_kind_conflict() {
+fn joining_a_compute_function_with_a_collection_is_a_kind_conflict() {
     let errs = infer_program_err(indoc! {r#"
         xs = [1, 2]
         f = \x -> xs(x)

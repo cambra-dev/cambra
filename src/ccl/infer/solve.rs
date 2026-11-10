@@ -1667,7 +1667,23 @@ pub(super) fn coalesce_pass(
     if ctx.errors.is_empty() {
         crate::ccl::provenance::run_debug_check(|| assert_reads_stable(&ctx.reads));
     }
+    // Every node's capabilities are known once inference ends, those of a node the walk
+    // resolves no type at included.
+    settle_capabilities(expr);
     ctx.errors
+}
+
+/// Give each node of `expr` whose capabilities are still a variable what the variable resolves
+/// to.
+fn settle_capabilities(expr: &mut Expr) {
+    for slot in [&mut expr.capabilities, &mut expr.own_capabilities] {
+        if let crate::ccl::capabilities::Repr::Var(v) = slot.repr() {
+            *slot = crate::ccl::capabilities::Capabilities::known(
+                crate::ccl::capabilities::set_of(&v.resolved()),
+            );
+        }
+    }
+    expr.walk_children_mut(settle_capabilities);
 }
 
 /// Check term and witness references in each node's type against its enclosing scope.
@@ -2631,6 +2647,15 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // graph read and so is not what this guards.)
             ctx.record_read(&expr.ty, &ty, || label.clone());
             expr.ty = ty;
+            // The node's capabilities and its own, resolved as its type is (`src/ccl/design/
+            // type-inference.md`, "4.9 Capabilities").
+            for slot in [&mut expr.capabilities, &mut expr.own_capabilities] {
+                if let crate::ccl::capabilities::Repr::Var(v) = slot.repr() {
+                    *slot = crate::ccl::capabilities::Capabilities::known(
+                        crate::ccl::capabilities::set_of(&v.resolved()),
+                    );
+                }
+            }
         }
         Err(err) => {
             let ty = expr.ty.clone();

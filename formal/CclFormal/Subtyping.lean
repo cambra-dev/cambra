@@ -206,9 +206,9 @@ theorem lookupBy_eq_lookup {α} [BEq α] [LawfulBEq α]
         exact ih
 
 /-- The kind edge (`constrain.rs :: constrain_kind`): the two kinds relate by
-**equality**, so either mismatch is a rejection — a capability supplied where a collection is
-demanded, and a collection supplied where a capability is. The kinds denote different things (a
-collection carries data, a capability carries
+**equality**, so either mismatch is a rejection — a compute function supplied where a collection
+is demanded, and a collection supplied where a compute function is. The kinds denote different
+things (a collection carries data, a compute function carries
 none), so neither direction is a safe weakening. -/
 def kindOk : FunKind → FunKind → Prop
   | .compute, .compute => True

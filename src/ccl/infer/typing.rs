@@ -393,10 +393,10 @@ pub(super) trait Typing {
     /// mutable variable. Check records nothing.
     fn record_transactional_access(&mut self, _name: &Name) {}
 
-    /// Record what reading the mutable variable `name` as a value requires: a position in
-    /// its history, `Read(name)`, and `Transaction` too for a transactional one. Check records
-    /// nothing.
-    fn record_read(&mut self, _name: &Name) {}
+    /// Record what reading the mutable variable `name` as a value requires, on `mention`, the
+    /// variable's mention: a position in its history, `Read(name)`, and `Transaction` too for a
+    /// transactional one. Check records nothing.
+    fn record_read(&mut self, _name: &Name, _mention: &Expr) {}
 
     /// Record that `name`, just bound at `ty`, is a mutable variable its scope declares
     /// rather than a parameter, whose history would be its argument's.

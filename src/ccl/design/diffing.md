@@ -531,7 +531,7 @@ complete phase order. The following table states which representation a diff obs
 | `Comprehension` | Comprehensions lowered to the `cast`/`λ`/`▷` encoding. |
 | `OpaqueOutput` | Each lambda body binding an opaque variable bound to `__output` under a barrier-variable annotation. |
 | `Infer` | Types inferred and definitions specialized; mutable-read naming has been undone. |
-| `Inline` | Capability bindings inlined and calls beta-reduced. |
+| `Inline` | Compute-function bindings inlined and calls beta-reduced. |
 | `Transact` / `Letrec` | Intermediate transaction/induction history rewrites. |
 | `EraseRefinements` | Refinements dropped except on data function domains. |
 | `Channelize` | Deferred collections and feeds rewritten; as-of-read rewriting has not run. |

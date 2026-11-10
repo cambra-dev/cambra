@@ -855,7 +855,7 @@ fn a_generator_called_in_a_predicate(#[case] source: &str, #[case] expected: &st
 /// inference mints a `FunKind::Var`
 /// (`src/ccl/design/type-inference.md`, "4.6 Data vs compute functions"). Iterating it pins that variable to the `Data` of the
 /// collection passed in, and compilation *reads* the resolved kind — `inline`
-/// only inlines a capability, so a parameter left at the `Compute` default is
+/// only inlines a compute function, so a parameter left at the `Compute` default is
 /// inlined as one and the program compiles to the wrong shape.
 ///
 /// This is the one place a kind is genuinely solved rather than declared, so it
@@ -887,7 +887,7 @@ fn a_parameter_iterated_as_a_collection_resolves_data() {
 /// "what is this function's domain?" is the same question for either.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-fn destructuring_a_collection_does_not_demand_a_capability() {
+fn destructuring_a_collection_does_not_demand_a_compute_function() {
     check_tile(
         "[x for x in [1, 2, 3] if x > 1]",
         Tile::data_function(

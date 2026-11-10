@@ -1470,7 +1470,7 @@ pub fn flatten_trailing_value_case(mut branches: Vec<Branch>) -> Vec<Branch> {
 /// The chain's **kind** is the head morphism's, matching the inference rule
 /// (`emit_compose`): a chain's domain is the head's domain, so the chain denotes
 /// a collection exactly when the head does. Mapping a function over a collection
-/// (`xs ≫ f`) leaves a collection; a chain of capabilities stays a capability.
+/// (`xs ≫ f`) leaves a collection; a chain of compute functions stays a compute function.
 pub fn typed_compose(elts: Vec<Expr>) -> Expr {
     let fun_kind = match &elts[0].ty {
         Type::Fun { fun_kind, .. } => fun_kind.clone(),
@@ -2017,7 +2017,7 @@ pub fn make_iterate(predicate: Expr) -> Expr {
     // kind decide whether iterating is
     // acceptable at all — every chain led by an iteration source inherits `Data`
     // from here (`typed_compose`), so a site whose value-producer is a mere
-    // capability is a kind error rather than something a later stamp papers over.
+    // compute function is a kind error rather than something a later stamp papers over.
     apply_primitive(
         predicate,
         Builtin::Iterate,
@@ -2503,7 +2503,7 @@ pub fn canonicalize_cast_types(expr: &mut Expr) {
 /// `value_ty: None` computes the canonical *target* (born refinements alone);
 /// `Some` computes the canonical node *type* (value's domain refinements ∪ born).
 ///
-/// A cast re-views its value **at the target**, so the data-vs-capability answer comes from
+/// A cast re-views its value **at the target**, so the data-vs-compute answer comes from
 /// `born` — `emit_cast` reads it there, and a view rebuilt from a neighbour's type states
 /// whatever that neighbour was. Only that answer travels: the binder slot is named at each
 /// type's own domain position

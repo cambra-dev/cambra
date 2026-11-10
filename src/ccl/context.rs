@@ -2916,6 +2916,8 @@ fn run_passes(
     // Inference mints predicates (`lit_singleton`) and clones a definition per
     // instantiation (`specialize_use`), so its output is checked before the pane
     // below is taken off it.
+    #[cfg(debug_assertions)]
+    crate::ccl::capabilities::assert_monotone(&expr, "inference");
     settle(
         &expr,
         "post-inference",
@@ -2923,10 +2925,6 @@ fn run_passes(
         CheckMode::Full,
         &instances,
     )?;
-
-    // The last check that reads capabilities has run, so they are erased: every pass after this
-    // one builds function types that state none.
-    crate::ccl::capabilities::erase(&mut expr);
 
     // Give each named read its position back, now that inference has run and no
     // refinement needs a binder to mention (`crate::ccl::mut_read::unbind`).
@@ -2965,7 +2963,7 @@ fn run_passes(
     let audit_letrec = ProvenanceAudit::start("letrec", "post-inference..post-letrec", &expr);
 
     expr = recorded(capture_provenance, Phase::Inline, || {
-        inline::inline_capability_lambdas(expr)
+        inline::inline_compute_lambdas(expr)
     });
     settle(
         &expr,
@@ -2974,6 +2972,8 @@ fn run_passes(
         CheckMode::Full,
         &instances,
     )?;
+    #[cfg(debug_assertions)]
+    crate::ccl::capabilities::assert_monotone(&expr, "inline");
     if at_phase_output(Phase::Inline, &expr, stop, capture, panes) {
         return Ok(expr);
     }
@@ -3025,6 +3025,8 @@ fn run_passes(
         CheckMode::Full,
         &instances,
     )?;
+    #[cfg(debug_assertions)]
+    crate::ccl::capabilities::assert_monotone(&expr, "transact");
     if at_phase_output(Phase::Transact, &expr, stop, capture, panes) {
         return Ok(expr);
     }
@@ -3049,6 +3051,8 @@ fn run_passes(
         &instances,
     )?;
     audit_letrec.finish(&phase_out);
+    #[cfg(debug_assertions)]
+    crate::ccl::capabilities::assert_monotone(&phase_out, "letrec");
     if at_phase_output(Phase::Letrec, &phase_out, stop, capture, panes) {
         return Ok(phase_out);
     }
@@ -3107,6 +3111,8 @@ fn run_passes(
     // `post_inference_ir` (post-inline/transact/letrec/channelize); see the doc
     // comment on `post_channelize_ir`.
     // A pane snapshot; see `pre_inference_ir`.
+    #[cfg(debug_assertions)]
+    crate::ccl::capabilities::assert_monotone(&channelized, "channelize");
     if at_phase_output(Phase::Channelize, &channelized, stop, capture, panes) {
         return Ok(channelized);
     }
@@ -3138,6 +3144,9 @@ fn run_passes(
         return Ok(channelized);
     }
 
+    // The program is pure-functional from here: every effect has been discharged.
+    #[cfg(debug_assertions)]
+    crate::ccl::capabilities::assert_discharged(&channelized);
     let lambda_elim = recorded(capture_provenance, Phase::LambdaElim, || {
         // Every point-free morphism now serves every value of the parameters eliminated
         // around it, so a type stated under one is generalized over what it can no longer

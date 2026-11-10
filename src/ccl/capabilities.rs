@@ -108,6 +108,264 @@ pub enum Effect {
     AffectWorld,
 }
 
+impl Effect {
+    /// The variable this names, if it names one.
+    pub fn variable(&self) -> Option<&Name> {
+        match self {
+            Effect::Write(x) | Effect::WriteTxn(x) | Effect::Append(x) => Some(x),
+            Effect::RunTransaction | Effect::AffectWorld => None,
+        }
+    }
+
+    /// This naming `to` instead of the variable it names.
+    fn naming(&self, to: Name) -> Effect {
+        match self {
+            Effect::Write(_) => Effect::Write(to),
+            Effect::WriteTxn(_) => Effect::WriteTxn(to),
+            Effect::Append(_) => Effect::Append(to),
+            Effect::RunTransaction | Effect::AffectWorld => {
+                unreachable!("an effect naming no variable is not renamed")
+            }
+        }
+    }
+}
+
+/// Discharge from every node of `expr`, and every function type it carries, each requirement
+/// and effect `discharged` holds of: what a pass that compiles a construct away no longer leaves
+/// for anything to require or cause (`src/ccl/design/type-inference.md`, "Discharging
+/// capabilities").
+pub fn discharge(expr: &mut crate::ccl::Expr, discharged: &impl Fn(&Capability) -> bool) {
+    fn less(
+        capabilities: &Capabilities,
+        discharged: &impl Fn(&Capability) -> bool,
+    ) -> Capabilities {
+        let Repr::Known(set) = capabilities.repr() else {
+            return capabilities.clone();
+        };
+        Capabilities::known(CapabilitySet {
+            requires: set
+                .requires
+                .iter()
+                .filter(|r| !discharged(&Capability::Requires((*r).clone())))
+                .cloned()
+                .collect(),
+            causes: set
+                .causes
+                .iter()
+                .filter(|e| !discharged(&Capability::Causes((*e).clone())))
+                .cloned()
+                .collect(),
+        })
+    }
+    fn in_type(ty: &mut crate::ccl::Type, discharged: &impl Fn(&Capability) -> bool) {
+        if let crate::ccl::Type::Fun { capabilities, .. } = ty {
+            *capabilities = less(capabilities, discharged);
+        }
+        ty.walk_children_mut(|child| in_type(child, discharged));
+    }
+    expr.capabilities = less(&expr.capabilities, discharged);
+    expr.own_capabilities = less(&expr.own_capabilities, discharged);
+    expr.walk_type_slots_mut(|ty| in_type(ty, discharged));
+    expr.walk_children_mut(|child| discharge(child, discharged));
+}
+
+/// Panic, naming the pass `after`, unless every node of `expr` requires and causes at least what
+/// it does of its own and what each of its children does, evaluating a node evaluating its
+/// children, and a write, a feed and a block each state their own effect. A lambda's body is
+/// latent in the lambda's type, and a `with begin():` block supplies `Transaction` to its body.
+/// A pass that builds a node states its capabilities; this catches one that does not.
+pub fn assert_monotone(expr: &crate::ccl::Expr, after: &str) {
+    use crate::ccl::TypedExprNode as N;
+    if matches!(expr.node, N::Lambda { .. }) {
+        expr.walk_children(|child| assert_monotone(child, after));
+        return;
+    }
+    let total = expr.capabilities.set();
+    let own = expr.own_capabilities.set();
+    // A construct with an effect of its own has it.
+    let stated = match &expr.node {
+        N::MutWrite { name, .. } => {
+            own.causes.contains(&Effect::Write(name.clone()))
+                || own.causes.contains(&Effect::WriteTxn(name.clone()))
+        }
+        N::Feed { name, .. } | N::Define { name, .. } => {
+            own.causes.contains(&Effect::Append(name.clone()))
+        }
+        N::Begin { .. } => own.causes.contains(&Effect::RunTransaction),
+        _ => true,
+    };
+    assert!(
+        stated,
+        "after {after}: `{}` does not state its own effect",
+        crate::ccl::symbolic::symbolic(expr)
+    );
+    let check = |part: CapabilitySet, of: &dyn Fn() -> String| {
+        let missing = CapabilitySet {
+            requires: part.requires.difference(&total.requires).cloned().collect(),
+            causes: part.causes.difference(&total.causes).cloned().collect(),
+        };
+        if !missing.is_empty() {
+            panic!(
+                "after {after}: `{}` lacks `{missing:?}`, which {} has; it has `{total:?}`",
+                crate::ccl::symbolic::symbolic(expr),
+                of()
+            );
+        }
+    };
+    check(own.clone(), &|| "the node of its own".to_string());
+    expr.walk_children(|child| {
+        let mut theirs = child.capabilities.set();
+        if matches!(expr.node, N::Begin { .. }) {
+            theirs.requires.remove(&Requirement::transaction());
+        }
+        check(theirs, &|| {
+            format!("its child `{}`", crate::ccl::symbolic::symbolic(child))
+        });
+        assert_monotone(child, after);
+    });
+}
+
+/// Panic unless `expr` is pure-functional: no node and no function type it carries requires or
+/// causes anything but opening a source's input, which the run supplies. The passes that
+/// discharge capabilities, `transact_phase`, `mut_elim` and `channelize`, leave a program this holds
+/// of, which `lambda_elim` and every pass after it rely on
+/// (`src/ccl/design/type-inference.md`, "Discharging capabilities").
+pub fn assert_discharged(expr: &crate::ccl::Expr) {
+    fn residue(capabilities: &Capabilities) -> Option<CapabilitySet> {
+        let mut set = capabilities.set();
+        set.requires.remove(&Requirement::observe_world());
+        (!set.is_empty()).then_some(set)
+    }
+    fn in_type(ty: &crate::ccl::Type, at: &crate::ccl::Expr) {
+        if let crate::ccl::Type::Fun { capabilities, .. } = ty
+            && let Some(left) = residue(capabilities)
+        {
+            panic!(
+                "a function type at `{}` states `{left:?}` after the passes that discharge \
+                 capabilities",
+                crate::ccl::symbolic::symbolic(at)
+            );
+        }
+        ty.walk_children(|child| in_type(child, at));
+    }
+    if let Some(left) = residue(&expr.capabilities) {
+        panic!(
+            "`{}` requires or causes `{left:?}` after the passes that discharge capabilities",
+            crate::ccl::symbolic::symbolic(expr)
+        );
+    }
+    expr.walk_type_slots(|ty| in_type(ty, expr));
+    expr.walk_children(assert_discharged);
+}
+
+/// Whether `name` is named by the capabilities of a node in `expr` or of a function type it carries:
+/// a name a term substitution renames even where no term mentions it, as in a call of a
+/// closure that writes it.
+pub fn names_in_tree(name: &Name, expr: &crate::ccl::Expr) -> bool {
+    fn in_type(name: &Name, ty: &crate::ccl::Type) -> bool {
+        let here =
+            matches!(ty, crate::ccl::Type::Fun { capabilities, .. } if capabilities.names(name));
+        let mut below = false;
+        ty.walk_children(|child| below |= in_type(name, child));
+        here || below
+    }
+    if expr.capabilities.names(name) || expr.own_capabilities.names(name) {
+        return true;
+    }
+    let mut found = false;
+    expr.walk_type_slots(|ty| found |= in_type(name, ty));
+    found || expr.any_child(|child| names_in_tree(name, child))
+}
+
+impl Capabilities {
+    /// Whether a requirement or an effect this states names `name`. A variable is inference's,
+    /// which no term substitution reaches, and names nothing here.
+    pub fn names(&self, name: &Name) -> bool {
+        let Repr::Known(set) = self.repr() else {
+            return false;
+        };
+        set.requires
+            .iter()
+            .any(|r| r.requirement().terms.contains(name))
+            || set.causes.iter().any(|e| e.variable() == Some(name))
+    }
+
+    /// This with each variable its requirements and effects name mapped by `map`: renamed where
+    /// it gives a name, and dropped, with what names it, where it gives none. A variable is
+    /// inference's, which no term substitution reaches, and is kept.
+    pub fn mapped(&self, map: &impl Fn(&Name) -> Option<Name>) -> Capabilities {
+        let Repr::Known(set) = self.repr() else {
+            return self.clone();
+        };
+        let mapped = |names: &[Name]| names.iter().map(map).collect::<Option<Vec<Name>>>();
+        Capabilities::known(CapabilitySet {
+            requires: set
+                .requires
+                .iter()
+                .filter_map(|r| {
+                    let terms = mapped(&r.requirement().terms)?;
+                    Some(Requirement::of(r.requirement().trait_.clone(), terms))
+                })
+                .collect(),
+            causes: set
+                .causes
+                .iter()
+                .filter_map(|e| match e.variable() {
+                    None => Some(e.clone()),
+                    Some(x) => Some(e.naming(map(x)?)),
+                })
+                .collect(),
+        })
+    }
+}
+
+/// What `expr` requires and causes for what its children do: all of it, but nothing for a
+/// lambda, whose body is latent in its type, and no `Transaction` for a `with begin():`
+/// block, which supplies it. A node with capabilities of its own, a read, a call, a write, a
+/// feed or a block's commit, adds them to this.
+pub fn of_children(expr: &crate::ccl::Expr) -> Capabilities {
+    use crate::ccl::TypedExprNode as N;
+    if matches!(expr.node, N::Lambda { .. }) {
+        return Capabilities::none();
+    }
+    let mut set = CapabilitySet::default();
+    expr.walk_children(|child| {
+        if let Repr::Known(theirs) = child.capabilities.repr() {
+            if !theirs.is_empty() {
+                set = set.union(theirs);
+            }
+        } else {
+            set = set.union(&child.capabilities.set());
+        }
+    });
+    if matches!(expr.node, N::Begin { .. }) {
+        set.requires.remove(&Requirement::transaction());
+    }
+    if set.is_empty() {
+        Capabilities::none()
+    } else {
+        Capabilities::known(set)
+    }
+}
+
+/// What a node whose children's capabilities are `parts` requires and causes, when the node itself
+/// neither adds nor discharges anything: a statement sequence, say.
+pub fn of_parts(parts: &[&Capabilities]) -> Capabilities {
+    Capabilities::known(
+        parts
+            .iter()
+            .fold(CapabilitySet::default(), |acc, part| acc.union(&part.set())),
+    )
+}
+
+/// What a feed into `target` of a value whose capabilities are `value` requires and causes: an
+/// append to `target`, and what computing the value does.
+pub fn of_feed(target: &Name, value: &Capabilities) -> Capabilities {
+    let mut set = value.set();
+    set.causes.insert(Effect::Append(target.clone()));
+    Capabilities::known(set)
+}
+
 /// The requirements and effects a function type states.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct CapabilitySet {
@@ -125,6 +383,14 @@ impl CapabilitySet {
             requires: self.requires.union(&other.requires).cloned().collect(),
             causes: self.causes.union(&other.causes).cloned().collect(),
         }
+    }
+
+    /// This set less each requirement and effect `other` lists.
+    pub fn without(&self, other: &CapabilitySet) -> CapabilitySet {
+        let mut out = self.clone();
+        out.requires.retain(|r| !other.requires.contains(r));
+        out.causes.retain(|e| !other.causes.contains(e));
+        out
     }
 
     pub fn intersection(&self, other: &CapabilitySet) -> CapabilitySet {
@@ -170,6 +436,10 @@ pub enum Capability {
 pub struct ScopedCapability {
     pub item: Capability,
     pub bound_at: Option<u32>,
+    /// Whether it names a parameter, whose history is its argument's: what a function does to
+    /// its parameter is what each call does to the argument, which the call records, so it
+    /// reaches no function's type.
+    pub parameter: bool,
 }
 
 /// What an edge into a [`CapabilityVar`] lets through
@@ -181,7 +451,8 @@ pub struct Filter {
     /// body's, and a lambda that turns out to be a function's are latent in its type.
     pub when_data: Option<Rc<crate::ccl::ty::FunKindVar>>,
     /// The receiving function's body depth: a capability naming a variable bound at this depth
-    /// or deeper is that function's own, and stops here.
+    /// or deeper is that function's own, and stops here, as one naming a parameter does
+    /// ([`ScopedCapability::parameter`]).
     pub below: Option<u32>,
     /// Requirements the edge's context supplies, `Transaction` inside a `with begin():`
     /// body.
@@ -204,6 +475,7 @@ impl Filter {
             return false;
         }
         match (self.below, capability.bound_at) {
+            (Some(_), _) if capability.parameter => false,
             (Some(below), Some(at)) => at < below,
             _ => true,
         }
@@ -214,16 +486,16 @@ impl Filter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CapabilityVarId(pub(crate) u32);
 
-static EFFECT_VAR_COUNTER: AtomicU32 = AtomicU32::new(0);
+static CAPABILITY_VAR_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 thread_local! {
     /// How many facts have been written to capability variables on this thread. A resolution
     /// computed at the current count is still the answer.
-    static EFFECT_FACTS: Cell<u64> = const { Cell::new(0) };
+    static CAPABILITY_FACTS: Cell<u64> = const { Cell::new(0) };
 }
 
 fn capability_fact_written() {
-    EFFECT_FACTS.with(|n| n.set(n.get() + 1));
+    CAPABILITY_FACTS.with(|n| n.set(n.get() + 1));
 }
 
 /// The capabilities of a function type that inference has not finished collecting: the capabilities
@@ -244,7 +516,7 @@ pub struct CapabilityVar {
 impl CapabilityVar {
     pub fn fresh(level: Level) -> Rc<CapabilityVar> {
         Rc::new(CapabilityVar {
-            uid: CapabilityVarId(EFFECT_VAR_COUNTER.fetch_add(1, Ordering::Relaxed)),
+            uid: CapabilityVarId(CAPABILITY_VAR_COUNTER.fetch_add(1, Ordering::Relaxed)),
             level: Cell::new(level),
             own: RefCell::new(BTreeSet::new()),
             incoming: RefCell::new(Vec::new()),
@@ -295,7 +567,7 @@ impl CapabilityVar {
                   and a trait hashes and orders by its module path and name"
     )]
     pub fn resolved(&self) -> BTreeSet<ScopedCapability> {
-        let now = EFFECT_FACTS.with(Cell::get);
+        let now = CAPABILITY_FACTS.with(Cell::get);
         if let Some((at, capabilities)) = &*self.resolved_at.borrow()
             && *at == now
         {
@@ -460,6 +732,7 @@ impl Capabilities {
             .map(|item| ScopedCapability {
                 item,
                 bound_at: None,
+                parameter: false,
             })
             .collect()
     }
@@ -521,22 +794,6 @@ pub fn clauses(mut traits: Vec<String>, capabilities: &Capabilities) -> String {
         out.push_str(&causes.join(", "));
     }
     out
-}
-
-/// Set every function type's capabilities in `ty` to [`Capabilities::none`].
-pub fn erase_in_type(ty: &mut crate::ccl::Type) {
-    if let crate::ccl::Type::Fun { capabilities, .. } = ty {
-        *capabilities = Capabilities::none();
-    }
-    ty.walk_children_mut(erase_in_type);
-}
-
-/// Erase capabilities from every type `expr` carries. Inference's checks read them, and no pass
-/// after does: a pass rebuilding a function type, a composition among them, builds one that
-/// states none (`src/ccl/design/type-inference.md`, "Erasure").
-pub fn erase(expr: &mut crate::ccl::Expr) {
-    expr.walk_type_slots_mut(erase_in_type);
-    expr.walk_children_mut(erase);
 }
 
 /// Lower every capability variable in `ty` to at most `level`: `ty` is becoming a bound of a

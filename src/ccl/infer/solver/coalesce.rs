@@ -126,7 +126,7 @@ pub enum CoalesceError {
     /// [`super::constrain::ConstrainError::KindMismatch`], for the case where the
     /// violation only becomes provable once the variable's pins are all in
     /// (a kind-polymorphic parameter used as a collection at one site and as a
-    /// capability at another). See `src/ccl/design/type-inference.md`,
+    /// compute function at another). See `src/ccl/design/type-inference.md`,
     /// "4.6 Data vs compute functions".
     KindConflict {
         /// Pretty representation of the offending function slot.
@@ -714,7 +714,7 @@ fn coalesce_compact_go(
                     "a kind naming candidates reaches materialization with at least one"
                 );
                 return Err(CoalesceError::KindConflict {
-                    details: format!("a compute function (capability) over {type_kind}"),
+                    details: format!("a compute function over {type_kind}"),
                     position: FailedPosition::of(ct),
                 });
             }
@@ -746,10 +746,10 @@ fn coalesce_compact_go(
                     position: FailedPosition::of(ct),
                 });
             }
-            // Nothing pinned this kind, so the capability default applies — the
+            // Nothing pinned this kind, so the compute-function default applies — the
             // same shape as `Compute`, decided here rather than at the merge, where
             // "unrequired" still had to stay distinct from "required to be a
-            // capability" (`KindPin::Unpinned`).
+            // compute function" (`KindPin::Unpinned`).
             KindPin::Unpinned | KindPin::Compute => {
                 // A compute function's domain is an ordinary parameter type. A domain that
                 // names no candidates arises only from a sum's body, which is always `Data`,
@@ -1265,7 +1265,7 @@ mod tests {
         // Two domains with no common answer is a loud coalesce error, never a silent
         // domain drop — and it reports as a *domain* conflict, which is the fact it is.
         // The kind collision (`KindPin::Conflict`, a collection demanded of a compute
-        // capability) is a different fact, so it carries its own variant rather than
+        // function) is a different fact, so it carries its own variant rather than
         // being told apart from this one by the shape of the merged kind.
         let graph = CompactGraph {
             term: CompactType {
@@ -1301,7 +1301,7 @@ mod tests {
     fn coalesce_single_domain_conflict_is_a_kind_conflict() {
         use crate::ccl::infer::solver::compact::{CompactFun, KindPin};
         // A `Conflict` over a *single* domain is one function slot demanded as a
-        // data domain while being a compute capability — the coalesce-time face
+        // data domain while being a compute function — the coalesce-time face
         // of a kind conflict, reported as `KindConflict` rather
         // than the multi-domain `DomainJoinConflict`.
         let graph = CompactGraph {

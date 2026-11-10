@@ -21,7 +21,7 @@ inductive FieldKey where
 deriving Repr, DecidableEq
 
 /-- Mirror of the concrete part of `ccl::ty::FunKind` (`Var` excluded): two
-points, related by equality — a collection and a capability denote different
+points, related by equality — a collection and a compute function denote different
 things, so neither stands in for the other. -/
 inductive FunKind where
   | compute | data

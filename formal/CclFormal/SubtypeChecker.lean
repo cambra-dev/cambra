@@ -156,8 +156,8 @@ closed tuple. -/
   (.variant [(.name "some", .base .int)])
   (.variant [(.name "some", .base .int), (.name "none", .base .unit)]) = true
 
-/- The kinds relate by equality: neither a collection where a capability is
-demanded nor a capability where a collection is demanded. -/
+/- The kinds relate by equality: neither a collection where a compute function is
+demanded nor a compute function where a collection is demanded. -/
 #guard subtypeCheck
   (.fn none .data (.uintRange 2) (.base .int))
   (.fn none .compute (.uintRange 2) (.base .int)) = false

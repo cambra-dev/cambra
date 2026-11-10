@@ -456,7 +456,7 @@ pub(crate) fn pairing_components(element: &Expr) -> Option<Vec<Expr>> {
 /// `𝐴 ⇒ (𝐵 ⇒ 𝐶)` the nested `λ x → λ y → body` was, kinds included. Deriving the
 /// two function types from `f`'s tuple domain instead would rebuild both bare: the
 /// *inner* one is a group of a partition — a collection — and reading it as a
-/// capability strands the per-group aggregate that consumes it.
+/// compute function strands the per-group aggregate that consumes it.
 pub(crate) fn curry_at(f: Expr, curry_result: Type) -> Expr {
     let curry_fn_ty = Type::compute_fun_or_hole(&f.ty, &curry_result);
     let curry_var = Expr::builtin(Builtin::Curry).with_ty(curry_fn_ty);
@@ -513,7 +513,7 @@ pub(crate) fn substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
 /// morphism columns denotes what the lambda being eliminated denotes, and its first column
 /// is routinely `id`, the unit of composition, which is a collection in no chain it heads
 /// (`⟨id, xs ▷ const⟩ ≫ apply` is `xs`). Reading the kind off `id` is what flattens a
-/// collection's columns to capabilities, exactly as it does at a compose head
+/// collection's columns to compute functions, exactly as it does at a compose head
 /// ([`crate::ccl::simplify`]'s pairwise rewrite takes the chain's kind there for the same
 /// reason). Every caller has the kind it is building at: an elimination arm has the
 /// lambda's, a rewrite has the chain's.
@@ -991,7 +991,7 @@ fn build_scrutinee_case_cform(
 /// and every sub-morphism the recursion produces abstracts the *same* binder over
 /// the *same* domain, so each is a column of that one collection and shares its
 /// kind. Letting a rebuild flatten them to `Compute` is what would make a
-/// comprehension's own sub-morphisms read as capabilities.
+/// comprehension's own sub-morphisms read as compute functions.
 ///
 /// `Compute` is therefore the default only at an entry point with no enclosing
 /// function to inherit from — the kind of a bare `λ`.
@@ -1558,7 +1558,7 @@ fn elim_lambda_impl(
 
             // The merged pair morphism is the uncurried form of the same nested
             // abstraction, so it carries the enclosing function's kind: currying a
-            // collection does not make it a capability.
+            // collection does not make it a compute function.
             let inner_elim = elim_lambda_kinded(ctx, &pair, &pair_ty, merged, fun_kind.clone())?;
             Ok(curry_at(inner_elim, result_ty))
         }
@@ -1571,7 +1571,7 @@ fn elim_lambda_impl(
         //
         // Both paths below give the result the Pi type `(param) ⇒ {D | p} ⇒ V`,
         // keeping the eliminated lambda's own kind: a group-by partition denotes a
-        // collection, and `Type::pi` mints the capability kind, which would flatten
+        // collection, and `Type::pi` mints the compute kind, which would flatten
         // it. The binder must ride the type for the refinement's `param` to stay
         // bound once the term binder is gone, and it is what planning's pointful
         // group-by recognizer reads the key off.
@@ -1697,7 +1697,7 @@ fn elim_lambda_impl(
                                 // `A → C`, and a chain's kind is its head's — the
                                 // rule `typed_compose` builds by. A bare function type
                                 // makes composing onto a collection yield a
-                                // capability.
+                                // compute function.
                                 let chain = Type::fun_like(first, *a.clone(), *c.clone());
                                 // The step names the pair's binder exactly when the chain
                                 // references it — the rule every function type here is
@@ -1774,7 +1774,7 @@ fn elim_lambda_impl(
             let desugared = Expr::apply(tuple, fn_var).with_ty(body_ty);
             // Desugaring rewrites the *same* lambda's body, so the type it ends up
             // with is still this lambda's — carry the kind rather than re-entering at
-            // the capability default.
+            // the compute-function default.
             elim_lambda_kinded(ctx, param, param_ty, desugared, fun_kind)
         }
 
@@ -1795,7 +1795,7 @@ fn elim_lambda_impl(
             let desugared = Expr::apply(tuple, fn_var).with_ty(body_ty);
             // Desugaring rewrites the *same* lambda's body, so the type it ends up
             // with is still this lambda's — carry the kind rather than re-entering at
-            // the capability default.
+            // the compute-function default.
             elim_lambda_kinded(ctx, param, param_ty, desugared, fun_kind)
         }
 
@@ -1808,7 +1808,7 @@ fn elim_lambda_impl(
             let desugared = Expr::apply(inner, fn_var).with_ty(body_ty);
             // Desugaring rewrites the *same* lambda's body, so the type it ends up
             // with is still this lambda's — carry the kind rather than re-entering at
-            // the capability default.
+            // the compute-function default.
             elim_lambda_kinded(ctx, param, param_ty, desugared, fun_kind)
         }
 
@@ -1975,6 +1975,8 @@ fn elim_lambda_impl(
                     body,
                 },
                 user_annotation: None,
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
+                own_capabilities: crate::ccl::capabilities::Capabilities::none(),
                 node_id: body_id,
                 site: None,
             };
@@ -2082,7 +2084,7 @@ fn elim_lambda_impl(
             let desugared = Expr::apply(input, agg_var).with_ty(body_ty);
             // Desugaring rewrites the *same* lambda's body, so the type it ends up
             // with is still this lambda's — carry the kind rather than re-entering at
-            // the capability default.
+            // the compute-function default.
             elim_lambda_kinded(ctx, param, param_ty, desugared, fun_kind)
         }
 
@@ -2611,7 +2613,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             let refined_domain = Type::refined_one(source_domain, refinement);
             // A **domain-only** rewrite of the source, so it keeps the source's
             // own function type: `fun_like`, not a bare `Type::fun`, which would rebuild
-            // a collection as a capability (`src/ccl/design/type-inference.md`,
+            // a collection as a compute function (`src/ccl/design/type-inference.md`,
             // "4.6 Data vs compute functions").
             let refined_ty = Type::fun_like(&target_elim.ty, refined_domain, source_codomain);
             let refined_source = target_elim.with_ty(refined_ty);

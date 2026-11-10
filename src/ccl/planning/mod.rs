@@ -556,7 +556,7 @@ pub(crate) mod test_helpers {
     }
 
     /// A **collection** function — what a let-bound list or comprehension has, and
-    /// what distinguishes an iteration source from a capability of the same shape.
+    /// what distinguishes an iteration source from a compute function of the same shape.
     pub(crate) fn data_fun_ty(domain: Type, codomain: Type) -> Type {
         Type::data_fun(domain, codomain)
     }

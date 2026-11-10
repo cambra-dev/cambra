@@ -149,7 +149,7 @@ fn compile_cast_target(target: &mut Type, value_dom: Option<Type>, memo: &PredMe
             // base were wrong in opposite directions — the target's bare base drops the
             // narrowing the restrict pipeline gives this predicate, and the value's domain
             // hands the predicate a domain its own assertion already narrowed — which only
-            // reconciled while a predicate was a capability and contravariance absorbed it.
+            // reconciled while a predicate was a compute function and contravariance absorbed it.
             let assert_base = match &value_dom {
                 Some(Type::Refinement(value_base, value_set)) => {
                     let preceding = value_set

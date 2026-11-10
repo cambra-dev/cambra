@@ -1575,7 +1575,15 @@ impl Subst {
             );
             return e.clone();
         }
-        with_transport_memo(|| self.apply_expr_inner(e))
+        let mut out = with_transport_memo(|| self.apply_expr_inner(e));
+        // What `e` did of its own, renamed, the result does too: a term replacing it brings its
+        // own besides. Over its rebuilt children it does what they do.
+        out.own_capabilities = crate::ccl::capabilities::of_parts(&[
+            &out.own_capabilities,
+            &self.apply_capabilities(&e.own_capabilities),
+        ]);
+        out.absorb_children_capabilities();
+        out
     }
 
     /// Whether this substitution acts on `e` — the guard both vacuity short-circuits ask.
@@ -1593,7 +1601,11 @@ impl Subst {
         if !self.elims.is_empty() {
             return self.without_elim().acts_on(e);
         }
-        if self.binders.keys().any(|k| is_free(k, e)) {
+        if self
+            .binders
+            .keys()
+            .any(|k| is_free(k, e) || crate::ccl::capabilities::names_in_tree(k, e))
+        {
             return true;
         }
         if !self.witnesses.is_empty() && {
@@ -2115,6 +2127,24 @@ impl Subst {
         self.retarget(name).unwrap_or_else(|| name.clone())
     }
 
+    /// `capabilities` under this substitution. A capability names a mutable variable or a feed: one
+    /// mapped to a variable, as a parameter to its argument, is renamed to it, as a `Feed`
+    /// target is; one mapped to a term is replaced by its value, as `mut_elim` replaces an
+    /// induction variable by what it holds, so nothing remains for the capability to name and
+    /// the substitution discharges it.
+    fn apply_capabilities(
+        &self,
+        capabilities: &crate::ccl::capabilities::Capabilities,
+    ) -> crate::ccl::capabilities::Capabilities {
+        if !self.binders.keys().any(|k| capabilities.names(k)) {
+            return capabilities.clone();
+        }
+        capabilities.mapped(&|name: &Name| match self.binders.get(name) {
+            None => Some(name.clone()),
+            Some(mapping) => mapping.var_target(),
+        })
+    }
+
     /// Apply this substitution to a term **in place** — the pass-level mode
     /// (see module docs). Same traversal and shadowing rules as
     /// [`Self::apply_expr`], but refinement predicates are *rebuilt* (fresh
@@ -2209,7 +2239,11 @@ impl Subst {
         // Inert subtree (no substituted binder free in value or type slots):
         // leave it untouched — predicates in particular stay un-rebuilt,
         // mirroring the transport mode's `Rc`-sharing guarantee.
-        if !self.binders.keys().any(|k| is_free(k, e)) {
+        if !self
+            .binders
+            .keys()
+            .any(|k| is_free(k, e) || crate::ccl::capabilities::names_in_tree(k, e))
+        {
             return;
         }
         // A mapped `Var` is replaced wholesale (the replacement carries its
@@ -2230,7 +2264,11 @@ impl Subst {
                 Mapping::Rename(_) => self.apply_type(&e.ty),
                 _ => e.ty.clone(),
             };
+            // The occurrence's read, renamed, stays with what replaces it.
+            let own = self.apply_capabilities(&e.own_capabilities);
             *e = repl.as_expr_preserving(e.node_id, &occurrence_ty);
+            e.own_capabilities = crate::ccl::capabilities::of_parts(&[&e.own_capabilities, &own]);
+            e.absorb_children_capabilities();
             return;
         }
         // *Every* type slot the node carries, not just `ty` and the annotation: a
@@ -2241,6 +2279,7 @@ impl Subst {
         // unrestricted substitution is the right one for it, and the binder
         // crossings below still only guard the children.
         e.walk_type_slots_mut(|ty| self.rewrite_type_go(ty, memo));
+        e.own_capabilities = self.apply_capabilities(&e.own_capabilities);
 
         // Capture-avoiding descent, plus the node's own name occurrences. Which
         // children a binder scopes over, and which names a node mentions of its
@@ -2285,6 +2324,8 @@ impl Subst {
             // nothing a term substitution acts on.
             ScopedItemMut::KeyRef(_) => {}
         });
+        // A term substituted below brings what it does to every node it now stands under.
+        e.absorb_children_capabilities();
 
         // `Compose`'s type is derived from its elements, so rewriting them can
         // concretize it (substituting a `Var` whose type was a placeholder).
@@ -2373,10 +2414,9 @@ impl Subst {
                 fun_kind,
                 domain,
                 codomain,
-                // A capability names a variable bound outside the function, never a term
-                // this substitution maps (`src/ccl/design/type-inference.md`, "Capability variables").
-                capabilities: _,
+                capabilities,
             } => {
+                *capabilities = self.apply_capabilities(capabilities);
                 // A witness binder is a *type*-level binder, so a term substitution has
                 // no name to map here — only the kinds' type children need rewriting.
                 for w in fun_kind.witnesses_mut() {
@@ -2393,10 +2433,9 @@ impl Subst {
                 fun_kind,
                 domain,
                 codomain,
-                // A capability names a variable bound outside the function, never a term
-                // this substitution maps (`src/ccl/design/type-inference.md`, "Capability variables").
-                capabilities: _,
+                capabilities,
             } => {
+                *capabilities = self.apply_capabilities(capabilities);
                 for w in fun_kind.witnesses_mut() {
                     for t in w.types_mut() {
                         self.rewrite_type_go(t, memo);
@@ -2841,7 +2880,7 @@ impl Subst {
                 fun_kind: self.apply_fun_kind(fun_kind),
                 domain: Box::new(self.apply_domain(fun_kind, domain)),
                 codomain: Box::new(self.apply_type(codomain)),
-                capabilities: capabilities.clone(),
+                capabilities: self.apply_capabilities(capabilities),
             },
 
             Type::Fun {
@@ -2858,7 +2897,7 @@ impl Subst {
                     fun_kind: self.apply_fun_kind(fun_kind),
                     domain,
                     codomain: Box::new(inner),
-                    capabilities: capabilities.clone(),
+                    capabilities: self.apply_capabilities(capabilities),
                 }
             }
 

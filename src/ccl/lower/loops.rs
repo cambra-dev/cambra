@@ -218,7 +218,7 @@ pub(super) fn lower_generator_for(
 /// Stamped `Data`: a loop over a collection *is* that collection mapped, and
 /// this is the site that knows it. Leaving the function unstamped would hand the
 /// question to whatever consumed the chain, which is how a loop ends up reading
-/// as a capability.
+/// as a compute function.
 fn tagged_for_loop(
     iter_var: String,
     target_span: Span,

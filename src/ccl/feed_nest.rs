@@ -323,6 +323,8 @@ fn rebuild_let(
     node_id: NodeId,
     body: Expr,
 ) -> Expr {
+    let capabilities =
+        crate::ccl::capabilities::of_parts(&[&bound_expr.capabilities, &body.capabilities]);
     TypedExpr {
         ty: lifted_past(&binding, &bound_expr, &body.ty),
         node: TypedExprNode::Let {
@@ -331,6 +333,8 @@ fn rebuild_let(
             body: Box::new(body),
         },
         user_annotation,
+        capabilities,
+        own_capabilities: crate::ccl::capabilities::Capabilities::none(),
         // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
         node_id,
         site: None,
@@ -480,6 +484,8 @@ fn rebuild_nest(
     let TypedExpr {
         node,
         user_annotation,
+        capabilities,
+        own_capabilities,
         node_id,
         site,
         ..
@@ -501,6 +507,8 @@ fn rebuild_nest(
                 node: TypedExprNode::Lambda { param, body },
                 ty: Type::Hole,
                 user_annotation,
+                capabilities,
+                own_capabilities,
                 node_id,
                 site,
             };

@@ -1935,7 +1935,7 @@ private def widePosition : CompactTy := .mk [.uintRange 4] none none none (some 
   (.mk [.prim .int] none none none none none)
 
 -- `kindResolved` is what excludes the artifact: an `unknown` slot materializes by
--- the capability default, and the merge that pins it to `data` contradicts that
+-- the compute-function default, and the merge that pins it to `data` contradicts that
 -- default, so the operand's own type is not what the merge combined.
 #guard !MergeIsBoundAt true
   (.mk [] none none (some (.data, intPosition, intPosition)) (some []) none)

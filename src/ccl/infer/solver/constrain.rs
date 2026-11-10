@@ -107,20 +107,20 @@ pub enum ConstrainError {
     },
     /// A non-feed type flowed into a [`Type::History`] requirement — e.g.
     /// a plain value or a collection passed to a function that feeds its parameter.
-    /// The reverse direction is fine (a feed reads as its collection); only the
-    /// write capability cannot be conjured from a value.
+    /// The reverse direction is fine (a feed reads as its collection); only a
+    /// feed handle cannot be conjured from a value.
     NotAFeed {
         /// The non-feed type that was required to be a feed handle.
         found: Box<Type>,
         /// The feed type demanded.
         required: Box<Type>,
     },
-    /// Two function types met whose kinds disagree: a compute function (a
-    /// capability, `⇒`) where a data collection (`⤇`) is demanded, or the
+    /// Two function types met whose kinds disagree: a compute function (`⇒`) where a
+    /// data collection (`⤇`) is demanded, or the
     /// reverse. The kinds are incomparable, so neither direction is a legal
-    /// coercion — a capability used as a collection would iterate a *declared*
+    /// coercion — a compute function used as a collection would iterate a *declared*
     /// domain the value does not actually cover, and a collection used as a
-    /// capability would lose the invariance its domain is typed under.
+    /// compute function would lose the invariance its domain is typed under.
     KindMismatch {
         /// The supplied function.
         lhs: Box<Type>,
@@ -694,16 +694,6 @@ fn kind_edge_subst(own: &Subst, far: &Type, far_subst: &Subst) -> Subst {
     Bound::edge(own.clone(), far.clone(), far_subst.clone()).render_subst()
 }
 
-/// Relate two function kinds by **recording the edge**, and nothing else.
-///
-/// Whether the two are compatible, how many binders each is over, and what those binders
-/// range over are all read off the bounds once the kind graph is closed — not decided here,
-/// where a kind may not have been reached yet. The binder correspondence between them is
-/// derived then too, for the same reason: its positions do not exist until an arity does.
-///
-/// A concrete pair is the one thing settled at the edge, since neither side can learn
-/// anything later: two kinds that denote different points of the lattice have no common
-/// function, whichever side is which.
 /// Capabilities are covariant: a function that does less stands where one that may do more is
 /// expected, so what the left side's capabilities hold flows into the right side's
 /// (`src/ccl/design/type-inference.md`, "Capability variables").
@@ -718,12 +708,14 @@ fn constrain_capabilities(e0: &Capabilities, e1: &Capabilities) {
                 v1.record(ScopedCapability {
                     item: Capability::Requires(r.clone()),
                     bound_at: None,
+                    parameter: false,
                 });
             }
             for e in &set.causes {
                 v1.record(ScopedCapability {
                     item: Capability::Causes(e.clone()),
                     bound_at: None,
+                    parameter: false,
                 });
             }
         }
@@ -731,6 +723,16 @@ fn constrain_capabilities(e0: &Capabilities, e1: &Capabilities) {
     }
 }
 
+/// Relate two function kinds by **recording the edge**, and nothing else.
+///
+/// Whether the two are compatible, how many binders each is over, and what those binders
+/// range over are all read off the bounds once the kind graph is closed — not decided here,
+/// where a kind may not have been reached yet. The binder correspondence between them is
+/// derived then too, for the same reason: its positions do not exist until an arity does.
+///
+/// A concrete pair is the one thing settled at the edge, since neither side can learn
+/// anything later: two kinds that denote different points of the lattice have no common
+/// function, whichever side is which.
 fn constrain_fun_kind(
     k0: &FunKind,
     k1: &FunKind,
@@ -760,14 +762,14 @@ fn constrain_fun_kind(
         (other, FunKind::Var(v)) => {
             v.record_under(other.clone(), true, kind_edge_subst(sr, lhs, sl));
         }
-        // Both concrete: a capability is not a collection, a plain collection is not a sum —
+        // Both concrete: a compute function is not a collection, a plain collection is not a sum —
         // entering one is a term — and two sums of different width are two types. Nothing
         // arriving later can change any of that.
         _ if k0.resolved() == k1.resolved() => return Ok(()),
         _ => return Err(mismatch()),
     }
     // **A kind required to be two points is rejected at the edge that completed it.** A
-    // consumer is minted pinned `Data` ([`FunKind::fresh_data`]), so a capability reaching
+    // consumer is minted pinned `Data` ([`FunKind::fresh_data`]), so a compute function reaching
     // one is this rejection — the same one a concrete pair is, reported where both sides can
     // still be named rather than left for coalesce, which reaches a conflicted variable only
     // where some position happens to materialize from it.
@@ -2484,7 +2486,7 @@ fn constrain_go_impl(
         }
 
         // Feed handles are invariant in the payload: feeding writes into
-        // the channel (contravariant capability) while reading consumes it
+        // the channel (contravariant) while reading consumes it
         // (covariant), so a feed handle meeting a feed handle equates the
         // payloads. The bidirectional edge is what carries a feed
         // contribution made through a function parameter back to the
@@ -2514,7 +2516,7 @@ fn constrain_go_impl(
             _,
         ) => constrain_go(function, rhs, sl, sr, cache, scope),
         // Nothing but a feed satisfies a feed requirement: a feed reads as its collection,
-        // but the write capability cannot be conjured from a value, a collection included
+        // but a feed handle cannot be conjured from a value, a collection included
         // (`g(5)` or `g([1, 2])` where `g` feeds its parameter, `x = [1, 2]; x << 3`). A
         // `<<` targeting a `:=` mutable variable lands here
         // too, as the handle it is — the left side matches `_`, so the cross-kind pair
@@ -3705,7 +3707,7 @@ mod tests {
                 &mut ConstrainCache::new()
             )
             .is_ok(),
-            "a capability's domain is not data — acquiring a refinement is sound"
+            "a compute function's domain is not data — acquiring a refinement is sound"
         );
 
         // Nor either base direction.
@@ -4135,7 +4137,7 @@ mod tests {
     #[test]
     fn plain_value_is_not_a_feed() {
         // Int </: feed(D, Int) and (D ⤇ Int) </: feed(D, Int) — a feed reads as its
-        // collection, but the write capability cannot be conjured from a value, a
+        // collection, but a feed handle cannot be conjured from a value, a
         // collection included.
         for value in [
             prim(BaseType::Int),
@@ -5208,8 +5210,8 @@ mod tests {
     #[test]
     fn kind_data_where_compute_is_rejected() {
         // `Data ⋠ Compute`: there is no upcast from a collection to a
-        // capability. A collection's domain is invariant — it *is* the data — so
-        // re-viewing it as a capability, whose domain is contravariant, is not a
+        // compute function. A collection's domain is invariant — it *is* the data — so
+        // re-viewing it as a compute function, whose domain is contravariant, is not a
         // weakening of the same claim but a different one.
         // `0..3 ⤇ Int ⊀ 0..3 ⇒ Int`.
         let mut cache = ConstrainCache::new();
@@ -5225,7 +5227,7 @@ mod tests {
 
     #[test]
     fn kind_compute_where_data_is_rejected() {
-        // `Compute ⋠ Data`: a capability supplied where a collection is demanded is
+        // `Compute ⋠ Data`: a compute function supplied where a collection is demanded is
         // the rejection (the silent-row-loss guard). `0..3 ⇒ Int ⊀ 0..3 ⤇ Int`.
         let mut cache = ConstrainCache::new();
         assert!(matches!(
@@ -5308,7 +5310,7 @@ mod tests {
         )
         .expect("a var meeting Data records the pin");
         // `Data(None)` is a *plain* collection, one of the three concrete kinds — the pin
-        // records which, not merely that it is not a capability.
+        // records which, not merely that it is not a compute function.
         assert_eq!(a.resolved(), KindPin::Plain);
         assert_eq!(
             b.resolved(),
@@ -5351,7 +5353,7 @@ mod tests {
 
     /// **A plain collection and a sum do not merge.** Neither is below the other, so one
     /// function required to be both holds two fun kinds at once — the same contradiction a
-    /// capability meeting a collection is, and read at the same place.
+    /// compute function meeting a collection is, and read at the same place.
     #[test]
     fn a_plain_collection_and_a_sum_do_not_merge() {
         let v = FunKindVar::fresh();

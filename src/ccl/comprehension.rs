@@ -350,7 +350,7 @@ fn encode(
             // target's `Data` alone is not enough: a cast re-views its value at the target's
             // kind, so a `Compute` lambda underneath is a second, contradictory answer to what
             // this function is, one that survives into elimination, where the point-free form
-            // of the collection inherits the lambda's kind and reads as a capability.
+            // of the collection inherits the lambda's kind and reads as a compute function.
             let unrefined_lambda =
                 Expr::lambda(outer_var, Occurrence::mint(), Type::Hole, body_expr)
                     .with_user_annotation(Type::Fun {
