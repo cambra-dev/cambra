@@ -4614,11 +4614,14 @@ of a bound open: it is what flows there.
 
 A `with begin():` body collects on a variable of its own (`Typing::transaction_body`), bounded by an
 upper bound that forbids `RunTransaction` (`Upper::forbidden`, `Blame::NestedTransaction`), so a
-commit reaching it, directly or through a call, is a nested transaction. The bound is copied at each
-instantiation, so a call through a polymorphic definition's parameter is refused at each use that
-passes a committing function. Each function body's result type is noted (`Typing::note_result`), and
-a function in it requiring or causing a capability bound at the body's depth or deeper is refused
-(`InferCtx::escaping_results`, `InferError::EscapesItsVariable`): it would outlive the variable. So
+commit reaching it, directly or through a call, is a nested transaction, reported with the block as
+a secondary label. The bound is copied at each instantiation, and the copy notes the use
+(`CapabilityVar::note_use`), so a call through a polymorphic definition's parameter is refused at
+each use that passes a committing function, with the call inside the definition as a secondary
+label. Each function body's result is noted with the value it returns (`Typing::note_result`), and a
+function in its type requiring or causing a capability bound at the body's depth or deeper is
+refused at that value, with the function as a secondary label (`InferCtx::escaping_results`,
+`InferError::EscapesItsVariable`): it would outlive the variable. So
 is one a write or an append hands a variable bound outside that capability's scope
 (`Typing::note_handed_out`, `InferError::HandsOutItsVariable`): the target's type, read through the
 lower bounds of the inference variables in it, may hold no function with a capability bound below
@@ -4636,9 +4639,10 @@ a parameter, which only each use determines (`InferCtx::inert_statements`). Infe
 inert statements, and the compile reports them only where inference reports no error: an argument
 passed wrongly by reference, which inference refuses, is the more precise diagnosis.
 
-**Public functions.** A public function's capabilities naming an induction variable of the top
-level, `Bound::At(0)`, are an error at its `let` (`InferError::VariablePastItsScope`). An append to
-a private feed instead joins the top level's capabilities, since other modules append to the feed
+**Public members.** Every function nested in a public member's type is checked, including functions
+in products and returned functions. Its capabilities naming an induction variable of the top level,
+`Bound::At(0)`, are an error at its `let` (`InferError::VariablePastItsScope`). An append to a
+private feed instead joins the top level's capabilities, since other modules append to the feed
 through the function (`InferCtx::exported_capabilities`).
 
 ### Polymorphism and materialization

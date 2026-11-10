@@ -757,13 +757,36 @@ fn push_capability_failures(errors: &mut Vec<LocatedInferError>, expr: &Expr) {
                 },
                 at,
             ),
-            Blame::NestedTransaction(_) => {
-                errors.push(LocatedInferError {
-                    error: InferError::NestedTransaction,
-                    node_id: failure.capability.at.unwrap_or_else(|| expr.node_id()),
-                    also: Box::default(),
-                    related: RelatedPositions::default(),
+            // Through a polymorphic definition, the use passing what commits is at fault: the
+            // error is there, with the commit inside the definition and the block beside it.
+            Blame::NestedTransaction { block, used_at } => {
+                let committed = failure.capability.at;
+                let top = match &failure.capability.item {
+                    crate::ccl::capabilities::Capability::Every(_) => {
+                        Some(failure.capability.item.to_string())
+                    }
+                    _ => None,
+                };
+                let mut error = LocatedInferError::new(
+                    InferError::NestedTransaction {
+                        through_use: used_at.is_some(),
+                        top,
+                    },
+                    used_at.or(committed).unwrap_or_else(|| expr.node_id()),
+                );
+                if used_at.is_some()
+                    && let Some(committed) = committed
+                {
+                    error.related.set(Related {
+                        origin: Origin::Node(committed),
+                        role: RelatedRole::Commit,
+                    });
+                }
+                error.related.set(Related {
+                    origin: Origin::Node(block),
+                    role: RelatedRole::Block,
                 });
+                errors.push(error);
                 continue;
             }
             Blame::Written(at) => (InferError::CapabilityNotStated { item }, Some(at)),

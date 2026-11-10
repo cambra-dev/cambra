@@ -1343,8 +1343,13 @@ pub enum Blame {
     /// The trait's signature bounding an instance's function, where a program writes it: `None`
     /// for a compiler trait's.
     Signature(Option<chl_parser::ast::Span>),
-    /// A `with begin():` block, at its node, whose body may not commit.
-    NestedTransaction(NodeId),
+    /// A `with begin():` block, at its node `block`, whose body may not commit. In the copy a
+    /// use of a polymorphic definition makes, `used_at` is the use, which passes what the
+    /// definition calls in the block ([`CapabilityVar::note_use`]).
+    NestedTransaction {
+        block: NodeId,
+        used_at: Option<NodeId>,
+    },
     /// A written function type, whose clauses are exact.
     Written(chl_parser::ast::Span),
     /// A clause variable's bound, `E <: Effect except RunTransaction`, which each use's
@@ -1528,6 +1533,19 @@ impl CapabilityVar {
     /// The sets bounding this variable.
     pub fn uppers(&self) -> Vec<Upper> {
         self.uppers.borrow().clone()
+    }
+
+    /// Note that this variable is a copy the use at `at` made of a definition's: a block's
+    /// bound on it is failed by what the use passes, so it is reported there. A copy is noted by
+    /// the use that made it; a later instantiation reaching the same variable keeps that use.
+    pub fn note_use(&self, at: NodeId) {
+        for upper in self.uppers.borrow_mut().iter_mut() {
+            if let Blame::NestedTransaction { used_at, .. } = &mut upper.blame
+                && used_at.is_none()
+            {
+                *used_at = Some(at);
+            }
+        }
     }
 
     pub fn level(&self) -> Level {

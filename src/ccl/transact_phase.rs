@@ -1238,6 +1238,12 @@ fn strip(
                 // disassembled by `build_writer` under this same parent.
                 let g = provenance::enter(stmt_id, "transact.strip", provenance::Nature::Expansion);
                 g.blame(&[begin_id]);
+                // A commit inside the body would ride this site into the outer block and commit
+                // with it, silently: inference refuses one, so none is here.
+                assert!(
+                    !contains_begin(&block),
+                    "transact_phase: inference refuses a commit inside a `with begin():` body"
+                );
                 let (txn_block, lifted) = partition_block(*block, txn_mut_vars);
                 let (read_keys, write_keys) = collect_footprint(&txn_block, txn_mut_vars);
                 out.sites.push(RawSite {

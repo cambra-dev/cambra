@@ -149,6 +149,11 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                     // capability variables (`capabilities::UseCapabilities`).
                     ctx.use_capabilities
                         .record_use(node_id, &instance.capability_copies);
+                    // A block's bound copied with the definition is failed by what this use
+                    // passes, so it is reported here.
+                    for copy in instance.capability_copies.values() {
+                        copy.note_use(node_id);
+                    }
                     for (instantiation, bound, bound_at) in instance.bounds {
                         let check = |ctx: &mut InferCtx| {
                             ctx.require_sub(&instantiation, &bound, &|| {
@@ -1030,7 +1035,7 @@ pub(super) fn emit_lambda<C: Typing>(
         })
     });
     let body_ty = body_ty?;
-    ctx.note_result(&body_ty);
+    ctx.note_result(&body_ty, returned_node(body));
 
     // Emit a *named* Pi: the parameter binds in the codomain, so a refinement
     // predicate nested in `body_ty` that closes over the parameter (the
@@ -4712,6 +4717,17 @@ fn field_of(ty: &Type, key: &ProjKey) -> Result<Type, (FieldKey, Type)> {
         };
         (key, ty.clone())
     })
+}
+
+/// The node a statement sequence ends in, which it returns: past each `let`, mutable variable
+/// declaration and statement.
+fn returned_node(e: &Expr) -> NodeId {
+    match &e.node {
+        TypedExprNode::Let { body, .. }
+        | TypedExprNode::MutDecl { body, .. }
+        | TypedExprNode::ExprStmt { body, .. } => returned_node(body),
+        _ => e.node_id(),
+    }
 }
 
 #[cfg(test)]

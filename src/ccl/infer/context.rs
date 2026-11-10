@@ -249,10 +249,9 @@ pub(super) struct InferCtx {
     /// the obligation that decides which instance's, or which requirement's in scope, it is
     /// ([`InferCtx::settle_effect_links`]).
     effect_links: Vec<EffectLink>,
-    /// Each function body's result type, the depth of the body, and its lambda: a function
-    /// the body returns may name no variable the body binds
-    /// ([`InferCtx::escaping_results`]).
-    results: Vec<(Type, u32, NodeId, Declared)>,
+    /// Each function body's result: a function the body returns may name no variable the body
+    /// binds ([`InferCtx::escaping_results`]).
+    results: Vec<Returned>,
     /// What each function body under emission declares, innermost last, and what the last one
     /// to finish did: a function whose type holds a top holding writes or reads names every
     /// mutable variable, and one holding appends every feed, so it leaves no body declaring one.
@@ -469,6 +468,16 @@ struct EffectLink {
     /// The trait's parameter for the associated effect type.
     assoc: crate::ccl::ty::TypeParamId,
     target: Rc<CapabilityVar>,
+}
+
+/// A function body's result ([`InferCtx::escaping_results`]): its type, the depth of the body,
+/// the function's lambda, the value it returns, and what the body declares.
+struct Returned {
+    ty: Type,
+    depth: u32,
+    function: NodeId,
+    returned: NodeId,
+    binds: Declared,
 }
 
 /// A generalized `def` whose `requires` clause is an upper bound, which no trait requirement
@@ -914,66 +923,38 @@ impl InferCtx {
     /// function to a variable bound outside that variable's scope: the function would outlive
     /// the variable (`docs/chl-spec.md`, "Discharging requirements and effects").
     pub(super) fn escaping_results(&self) -> Vec<LocatedInferError> {
-        // An inference variable holds what flows into it: its lower bounds.
-        fn beyond(
-            ty: &Type,
-            depth: u32,
-            binds: Declared,
-            seen: &mut HashSet<*const InferVar>,
-        ) -> Option<ScopedCapability> {
-            if let Type::Infer(v) = ty.peel_refinements() {
-                if !seen.insert(Rc::as_ptr(v)) {
-                    return None;
-                }
-                let lowers: Vec<Type> = v
-                    .bounds
-                    .borrow()
-                    .lower()
-                    .iter()
-                    .map(|b| b.ty.clone())
-                    .collect();
-                return lowers.iter().find_map(|t| beyond(t, depth, binds, seen));
-            }
-            if let Type::Fun { capabilities, .. } = ty {
-                let capabilities = match capabilities.repr() {
-                    Repr::Var(v) => v.resolved().into_iter().collect(),
-                    _ => Capabilities::capabilities_of(capabilities),
-                };
-                // A top holding a family that names variables names every one, the body's own
-                // among them.
-                if let Some(capability) = capabilities.into_iter().find(|l| {
-                    matches!(l.bound, CapabilityBound::At(at) if at >= depth)
-                        || matches!(&l.item, Capability::Every(every) if binds.named_by(every))
-                }) {
-                    return Some(capability);
-                }
-            }
-            let mut found = None;
-            ty.walk_children(|child| {
-                if found.is_none() {
-                    found = beyond(child, depth, binds, seen);
-                }
-            });
-            found
-        }
+        let beyond = |ty: &Type, depth, binds: Declared| {
+            type_capabilities(ty).into_iter().find(|l| {
+                matches!(l.bound, CapabilityBound::At(at) if at >= depth)
+                    || matches!(&l.item, Capability::Every(every) if binds.named_by(every))
+            })
+        };
         let located = |error, node_id| LocatedInferError {
             error,
             node_id,
             also: Box::default(),
             related: crate::ccl::infer::api::RelatedPositions::default(),
         };
-        let returned = self.results.iter().filter_map(|(ty, depth, node, binds)| {
-            let capability = beyond(ty, *depth, *binds, &mut HashSet::new())?;
-            Some(located(
+        // The error is at the value returned, with the function returning it beside it.
+        let returned = self.results.iter().filter_map(|r| {
+            let capability = beyond(&r.ty, r.depth, r.binds)?;
+            let mut error = located(
                 InferError::EscapesItsVariable {
                     item: capability.item.to_string(),
                     every: matches!(capability.item, Capability::Every(_)),
                 },
-                *node,
-            ))
+                r.returned,
+            );
+            if r.returned != r.function {
+                error.related.set(crate::ccl::infer::api::Related {
+                    origin: Origin::Node(r.function),
+                    role: crate::ccl::infer::api::RelatedRole::Function,
+                });
+            }
+            Some(error)
         });
         let handed_out = self.handed_out.iter().filter_map(|h| {
-            let capability = beyond(&h.ty, h.depth, h.binds, &mut HashSet::new())?;
+            let capability = beyond(&h.ty, h.depth, h.binds)?;
             Some(located(
                 InferError::HandsOutItsVariable {
                     item: capability.item.to_string(),
@@ -3333,14 +3314,15 @@ impl Typing for InferCtx {
         });
     }
 
-    fn note_result(&mut self, ty: &Type) {
+    fn note_result(&mut self, ty: &Type, returned: NodeId) {
         let depth = self.capability_frame().depth + 1;
-        self.results.push((
-            ty.clone(),
+        self.results.push(Returned {
+            ty: ty.clone(),
             depth,
-            self.current_node_id,
-            self.last_body_binds,
-        ));
+            function: self.current_node_id,
+            returned,
+            binds: self.last_body_binds,
+        });
     }
 
     fn note_handed_out(&mut self, target: &Name, ty: &Type, appends: bool) {
@@ -3506,7 +3488,10 @@ impl Typing for InferCtx {
             of_requires: false,
             of_causes: false,
             forbidden: [Effect::RunTransaction].into_iter().collect(),
-            blame: Blame::NestedTransaction(node),
+            blame: Blame::NestedTransaction {
+                block: node,
+                used_at: None,
+            },
         });
         self.node_capabilities.push(NodeCapabilities {
             own: Rc::clone(&var),

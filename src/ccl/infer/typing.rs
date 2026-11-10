@@ -382,7 +382,7 @@ pub(super) trait Typing {
     /// Note the type a function body of the node being emitted results in: a function it
     /// returns may not require or cause anything naming a variable the body binds, which it
     /// would outlive. Check notes nothing.
-    fn note_result(&mut self, _ty: &Type) {}
+    fn note_result(&mut self, _ty: &Type, _returned: NodeId) {}
 
     /// Note that a write (or, with `appends`, an append) of the node being emitted hands a
     /// value to `target`, whose type is `ty`: a function `target` holds may not require or

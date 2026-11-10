@@ -420,16 +420,17 @@ symbols:
 folds:
   1-14 comment
   24-25
-  27-35
-  28-34
+  27-36
+  28-35
   29-31 comment
-  32-34
-  37-42
-  38-39
-  40-42
-  44-46 comment
-  47-50
-  48-50
+  32-35
+  33-34
+  38-43
+  39-40
+  41-43
+  45-47 comment
+  48-51
+  49-51
 == tests/programs/txn_multi_read/program.cambra
 diagnostics:
 symbols:
