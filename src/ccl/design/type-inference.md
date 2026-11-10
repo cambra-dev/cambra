@@ -3732,6 +3732,12 @@ applies it as `filter_values` over the pair of `𝑎` and the keys (`planning/co
 `emit_component_filter`). Keys that read `𝑎`, a boxed row's `σ₁(𝑎)`, keep that pair the dependent
 tuple `(𝑎 : 𝐴) × 𝐾(𝑎)`.
 
+Where the pair is iterated, planning applies the lifted filter (`emit_pair_filter` in
+`src/ccl/planning/correlated.rs`). Where it is built by applying the curried lambda, the zip
+states it: exponential beta rewrites `⟨𝑔, curry(ℎ)⟩ ≫ apply` to `⟨id, 𝑔⟩ ≫ ℎ` and refines the
+zip's pairs with `ℎ`'s domain refinements (`simplify::stating_domain_of`), since every pair it
+gives, `(𝑥, 𝑔(𝑥))`, is one `ℎ` was applied to.
+
 ### Iterating a dependent tuple
 
 A curried site over a dependent tuple, `curry(𝑔)` with `𝑔 : ((𝑥 : 𝑋) × 𝐷(𝑥)) ⤇ 𝑉`, has no one
