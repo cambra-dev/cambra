@@ -750,6 +750,33 @@ temp to its one use only when the definiens writes no variable the body reads or
 (`inline::writes_what_the_body_touches`, read off the two nodes' capabilities), so `stock :=
 take(1) + stock` reads `stock` after the call writes it.
 
+### A condition the channel's type cannot state
+
+`channelize` states a conditional feed's positions in its channel's type: the loop's source
+restricted by the condition (`refine_source_domain`), or outside a loop the unit refined by it. The
+channel's type stands where its deferred collection is declared, so a refinement can read only what
+is in scope there, or what a `let` after the declaration binds: a contribution reading such a
+binder takes a copy of the `let` along, with its type lifted past the binder. A value a recursive
+group computes has no such copy, and no spelling at the declaration. Such values include a mutable
+variable's value after the loop that writes it, a block's value, and the source of a loop over a
+block's values, all read out of a `letrec` the declaration encloses, and a `let` reading one
+(`channelize::recursive_values`).
+
+A feed under a condition reading such a value gates its values instead, as a tap of a recurrence or
+a transaction does. Its contribution keeps the source's unrefined domain:
+
+``source ≫ (λ 𝑝 → {𝑐 → `fired(𝑣); true → `idle}) ≫ variant_project(`fired)``
+
+Outside a loop the source is the one-row lift of the unit. The projection keeps the positions where
+`𝑐` holds, so the channel holds the rows a refinement would give it, and its type, `𝐷 ⤇ 𝑉`, reads
+nothing the declaration cannot see (`ccl_utils::gate_values`). Every other condition keeps the
+refinement.
+
+The projection states `𝑉` outside the step, so a value whose type reads the step's position or a
+`let` ahead of the feed has no type there: `out << [y for y in ys if y < r]` under such a
+condition, in a loop over `r`. `channelize` refuses that feed at the feed as not compiled yet
+(`DeferError::GatedValueReadsItsIteration`).
+
 ### How many commit stores a program has
 
 **One per set of mutable variables a `with begin():` block relates** — not one per program, and
@@ -1428,12 +1455,9 @@ while the loop reads the values the store commits, and no place for the store fo
 reading an earlier block's value compiles, as [A block reading another block's
 value](#a-block-reading-another-blocks-value) describes.
 
-A feed whose positions depend on a block's value is refused before the phase
-(`refuse_feeds_under_block_values`): a feed under a condition reading a writing block's value, or
-in a loop a read-only block's. `channelize` types a conditional feed's channel by restricting a
-source by the condition, and here the restriction reads the store. The channel's type leaves the store's scope at
-the declaration of the channel it feeds, and a type outside a `letrec` cannot state a value read
-from it.
+A feed under a condition reading a block's value reads a value the store computes. Its channel
+gates its values ([A condition the channel's type cannot
+state](#a-condition-the-channels-type-cannot-state)).
 
 ### A block in a branch
 
@@ -1498,6 +1522,12 @@ final at that commit, so the later site's source carries it: `restrict_to_path` 
 condition bind the loop's item and each value they read. Outside a loop a block's value is bound
 once on the top-level spine and read where it stands.
 
+The condition gates the source, as every branch's does ([A block in a
+branch](#a-block-in-a-branch)). Where the two blocks share a store, that store's `letrec`
+computes the value the condition reads, so no type of the site could name it. A feed's channel
+gates its values on similar grounds ([A condition the channel's type cannot
+state](#a-condition-the-channels-type-cannot-state)).
+
 A block in another store reads the earlier block's `__values` from the store placed outside its
 own. A block in the same store reads them inside the store's `letrec`, where `plan_store` binds the
 earlier site's tap: the later site's source reads ``tap ≫ variant_project(`fired)``. Recognition
@@ -1529,12 +1559,12 @@ position](#a-block-in-value-position) describes, with the decision gated on the 
 An aborted block commits its snapshots, which leaves every variable as it was, and takes a commit
 time like any other proposal.
 
-A feed after the block, in the same `try` block or in its `except` clause, in a loop or not, is a
-feed under a condition reading the block's outcome, refused at the condition as [A block in value
-position](#a-block-in-value-position) describes (`refuse_feeds_under_block_values`). A writing block
-in a loop an exception escapes runs where no earlier iteration raised, a condition on the
-accumulator exception elimination gives the loop (`Name::exception_loop`), refused at the block as
-[A block in a branch](#a-block-in-a-branch) describes.
+In a loop, the block's outcome is a value the loop iterates, so a clause that feeds is a feed under
+a condition reading a block's value, whose channel gates its values as [A block in value
+position](#a-block-in-value-position) describes. A writing block in a loop an exception escapes
+runs where no earlier iteration raised, a condition on the accumulator exception elimination gives
+the loop (`Name::exception_loop`), refused at the block as [A block in a
+branch](#a-block-in-a-branch) describes.
 
 Two shapes are refused at the block before the phase. An induction write in such a block is lifted
 onto the enclosing loop, and a block that writes no transactional variable is unwrapped onto it, so
@@ -1741,7 +1771,9 @@ The value-`Case` positions ride the same union-of-restricts:
   `` (λ __unused : Unit → 𝑠) ≫ variant_project(`𝑡ᵢ) ≫ (λ 𝑥ᵢ → 𝑣ᵢ) ``: the scrutinee as a one-row
   collection, restricted to the row carrying the arm's tag, so the arm's payload binder reads the
   projection over a domain rather than a scalar. A `case _` arm is the gated lift, on the
-  complement of the tag tests before it.
+  complement of the tag tests before it. A gate reading a value the channel's type cannot state
+  gates the fed value instead ([A condition the channel's type cannot
+  state](#a-condition-the-channels-type-cannot-state)).
 - **Loop-sourced conditional feeds** (`if c: good << i else: bad << i` in a `for` body) —
   *implemented* (`channelize`): each feeding arm becomes a channel over the iteration source
   restricted to that arm's first-match predicate, rather than the gated `Unit` lift above. One
@@ -1752,7 +1784,10 @@ The value-`Case` positions ride the same union-of-restricts:
   first-match predicate to the restriction of each feed in it. The fan-out reads a pattern arm
   through the tag-to-guard rewrite, which puts `variant_is` in the arm's refinement predicate
   and `variant_project` in its channel value; the rewrite runs on a copy, so the arm in the
-  tree keeps its scrutinee and its pattern for the next defer's pass to read.
+  tree keeps its scrutinee and its pattern for the next defer's pass to read. A restriction
+  reading a value the channel's type cannot state gates the arm's values over the unrestricted
+  source instead ([A condition the channel's type cannot
+  state](#a-condition-the-channels-type-cannot-state)).
 
   A conditional feed in a loop has **two representations**, chosen by whether the loop carries a
   mutable variable. A loop that does reaches `mut_elim`, where a feed becomes a `__to_<defer>_<n>`

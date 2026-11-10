@@ -3207,7 +3207,6 @@ fn run_passes(
     // commit. Reject it before the phase strips the sites.
     check_transact_rejections(&expr, &txn_mut_vars, &blame)?;
     transact_phase::refuse_valued_blocks_under_lambdas(&expr)
-        .and_then(|()| transact_phase::refuse_feeds_under_block_values(&expr, &txn_mut_vars))
         .map_err(|e| blame.unsupported(e, Some(&expr)))?;
     transact_phase::refuse_valued_blocks_reading_their_loop(&expr, &txn_mut_vars)
         .map_err(|e| blame.unsupported(e, Some(&expr)))?;

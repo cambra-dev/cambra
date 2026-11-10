@@ -2258,20 +2258,14 @@ fn restrict_to_path(
 /// branch, so those types would name them wherever the store's outputs are read, beyond the
 /// branch and before a channel declared ahead of them.
 fn gated_source(source: Expr, target: &TypedBinding, condition: Expr) -> Expr {
-    let item_ty = target.ty.clone();
-    let gated = crate::ccl::ccl_utils::tap_gated(
+    crate::ccl::ccl_utils::gate_values(
+        Some(source),
+        target,
+        crate::ccl::ty::FunKind::Compute,
         condition,
-        tvar(&target.name, item_ty.clone()),
-        item_ty.clone(),
-    );
-    let gated_ty = gated.ty.clone();
-    let step = Expr::lambda(&target.name, Occurrence::mint(), item_ty.clone(), gated)
-        .with_ty(Type::fun(item_ty.clone(), gated_ty));
-    crate::ccl::ccl_utils::compose_typed_or_hole(vec![
-        source,
-        step,
-        crate::ccl::ccl_utils::fired_project(item_ty),
-    ])
+        tvar(&target.name, target.ty.clone()),
+        |tap| tap,
+    )
 }
 
 /// Replace every transaction `For` site (`ExprStmt(For{…}, cont)` whose block
@@ -2779,116 +2773,6 @@ pub fn refuse_valued_blocks_reading_their_loop(
         result
     }
     walk(expr, txn_mut_vars, &mut HashSet::new(), false)
-}
-
-/// Refuse a feed whose positions depend on the value of a `with begin():` block, which
-/// `channelize` has no closed type for: a feed under a condition reading a writing block's
-/// value, or in a loop a read-only block's. `channelize` types a conditional feed's channel by
-/// restricting a source by the condition, and a block's value is the store's, so the
-/// restriction reads the store. The channel's type then leaves the store's scope at the
-/// declaration of the channel it feeds, where a type cannot state the store. A loop reads a
-/// writing block's value at its position where the block stands ([`strip_valued_block`]), not
-/// beside its source, so a condition that reads no value restricts the loop's own source. A read-only block's value in a loop
-/// is a read the restriction cannot carry either. Outside a loop a read-only block's value is
-/// read once, before the condition, and compiles.
-pub fn refuse_feeds_under_block_values(
-    expr: &Expr,
-    txn_mut_vars: &HashSet<Name>,
-) -> Result<(), Located<String>> {
-    /// Whether `e` feeds a channel outside the `with begin():` blocks in it, whose feeds the
-    /// commit sends.
-    fn feeds_outside_blocks(e: &Expr) -> bool {
-        match &e.node {
-            TypedExprNode::Feed { .. } => true,
-            TypedExprNode::Begin { .. } => false,
-            _ => e.any_child(feeds_outside_blocks),
-        }
-    }
-    struct Walk<'a> {
-        txn_mut_vars: &'a HashSet<Name>,
-        /// The bindings of a block's value the refusal applies to, and of values reading one.
-        derived: HashSet<Name>,
-        /// Those of them holding, or reading, the outcome of a block an exception escapes,
-        /// which exception elimination binds so the code after the block runs where it
-        /// committed.
-        aborting: HashSet<Name>,
-    }
-    impl Walk<'_> {
-        fn walk(&mut self, e: &Expr, in_loop: bool) -> Result<(), Located<String>> {
-            match &e.node {
-                TypedExprNode::Begin { .. } => return Ok(()),
-                TypedExprNode::For { iter, body, .. } => {
-                    self.walk(iter, in_loop)?;
-                    return self.walk(body, true);
-                }
-                TypedExprNode::Let {
-                    binding,
-                    bound_expr,
-                    ..
-                } => {
-                    let reads = free_names_in_value(bound_expr);
-                    let (derived, aborting) = match &bound_expr.node {
-                        TypedExprNode::Begin {
-                            body, commits_on, ..
-                        } => (
-                            in_loop || writes_any(body, self.txn_mut_vars),
-                            commits_on.is_some(),
-                        ),
-                        _ => (
-                            reads.iter().any(|n| self.derived.contains(n)),
-                            reads.iter().any(|n| self.aborting.contains(n)),
-                        ),
-                    };
-                    if derived {
-                        self.derived.insert(binding.name.clone());
-                        if aborting {
-                            self.aborting.insert(binding.name.clone());
-                        }
-                    }
-                }
-                TypedExprNode::Case {
-                    scrutinee,
-                    branches,
-                } => {
-                    let read: HashSet<Name> = scrutinee
-                        .iter()
-                        .map(|s| &**s)
-                        .chain(branches.iter().map(|b| &b.guard))
-                        .flat_map(free_names_in_value)
-                        .collect();
-                    if read.iter().any(|n| self.derived.contains(n))
-                        && branches.iter().any(|b| feeds_outside_blocks(&b.body))
-                    {
-                        let message = match read.iter().any(|n| self.aborting.contains(n)) {
-                            true => {
-                                "a feed after a `with begin():` block that an exception escapes, \
-                                 in the same `try` block or in its `except` clause, is not \
-                                 compiled yet"
-                            }
-                            false => {
-                                "a feed under a condition that reads the value of a `with \
-                                 begin():` block is not compiled yet"
-                            }
-                        };
-                        return Err(Located::new(message.to_string(), e.node_id()));
-                    }
-                }
-                _ => {}
-            }
-            let mut result = Ok(());
-            e.any_child(|c| {
-                result = self.walk(c, in_loop);
-                result.is_err()
-            });
-            result
-        }
-    }
-    Walk {
-        txn_mut_vars,
-        derived: HashSet::new(),
-        aborting: HashSet::new(),
-    }
-    .walk(expr, false)
 }
 
 /// Refuse a `with begin():` block an exception escapes ([`TypedExprNode::Begin`]'s

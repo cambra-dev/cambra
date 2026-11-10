@@ -283,6 +283,54 @@ pub(crate) fn tap_gated(fire: Expr, value: Expr, value_ty: Type) -> Expr {
     case
 }
 
+/// `value` kept at the positions where `condition` holds, over an unrefined domain:
+/// `` source ≫ (λ binder → {condition → `fired(value); true → `idle}) ≫ variant_project(`fired) ``,
+/// or the step and the projection alone where there is no `source`. `around` wraps the tap in
+/// what the step binds ahead of it, such as the `let`s ahead of a feed, and `fun_kind` is the
+/// step's kind.
+///
+/// The form a condition takes where a refinement of the domain would state it in a type that
+/// cannot: a site in a branch, whose condition reads the bindings around it
+/// (`transact_phase`'s `gated_source`), and a feed whose condition reads a value a recursive
+/// group computes (`channelize`'s `gated_contribution`; `src/ccl/design/mutability.md`, "A
+/// condition the channel's type cannot state").
+pub(crate) fn gate_values(
+    source: Option<Expr>,
+    binder: &TypedBinding,
+    fun_kind: crate::ccl::ty::FunKind,
+    condition: Expr,
+    value: Expr,
+    around: impl FnOnce(Expr) -> Expr,
+) -> Expr {
+    let value_ty = value.ty.clone();
+    assert!(
+        !crate::ccl::subst::type_free_vars(&value_ty).contains(&binder.name),
+        "a gated value's type reads the gate's binder `{}`, which the projection out of the \
+         gate cannot state: {value_ty}",
+        binder.name
+    );
+    let body = around(tap_gated(condition, value, value_ty.clone()));
+    let ty = Type::pi_if_dependent(
+        binder.name.clone(),
+        binder.ty.clone(),
+        body.ty.clone(),
+        fun_kind,
+    );
+    let step = Expr::lambda(
+        &binder.name,
+        binder.occurrence.clone(),
+        binder.ty.clone(),
+        body,
+    )
+    .with_ty(ty);
+    compose_typed_or_hole(
+        source
+            .into_iter()
+            .chain([step, fired_project(value_ty)])
+            .collect(),
+    )
+}
+
 /// The decision **variant** type `` {`commit{𝑃} | `abort} `` over a (dense) payload
 /// record type `𝑃` (`{writes, __to_<defer>*}`). Tag order is `commit`=0, `abort`=1
 /// — the positions [`wrap_decision_variant`] injects and `body_decision_at`
