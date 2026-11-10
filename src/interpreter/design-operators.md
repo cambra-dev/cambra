@@ -538,6 +538,14 @@ whole key; the `get` wrapper removes those previously released field cells befor
 it. `Zip` also preserves a row with an absent field when that field's input has already
 released its cell.
 
+A flat `Zip` forwards a field release only at pairs it has emitted. A field released at unpaired
+rows stays upstream until the pair can be assembled; the zip removes those fields from its own
+output. Beneath a standing level a `Zip` tracks no emitted keys, so it holds every field release
+until the whole pair is released. Whole-pair releases reach every arm. The row-presence and
+emitted-key tracking drops a pair once it is released whole, including when accumulated field
+releases together cover the pair, and drops a row an arm deletes where the zip gives the row back
+to that arm.
+
 ### Guard operations are exact
 
 Guard algebra is exact. `intersect`, `union`, `flatten_or`, and guard restatements must preserve

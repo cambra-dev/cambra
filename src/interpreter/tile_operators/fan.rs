@@ -381,7 +381,8 @@ impl TileProducer for ZipProducer {
         // what every arm agrees on is that the key is there and holds nothing.
         // Only where something stands above the pair's own enclosing level. One level up is
         // the flat case, which the presence intersection below already aligns over the
-        // outermost keys, and a path set per arm per pull is not worth building for it.
+        // outermost keys; the paths each arm holds are recorded for every zip above, flat or
+        // not, for what a release gives back.
         if let Some(above) = self.level.enclosing()
             && above.index() >= 1
             && tiles[0].is_data_function()
@@ -589,8 +590,11 @@ impl TileProducer for ZipProducer {
                         .collect(),
                     absent,
                 };
-                for (input, dropped) in self.inputs.iter_mut().zip(dropped) {
+                // A row an arm deleted reaches no consumer, so no consumer releases it: the arm
+                // gives it back here and stops tracking it.
+                for (arm, (input, dropped)) in self.inputs.iter_mut().zip(dropped).enumerate() {
                     if let Some(dropped) = dropped {
+                        held[arm].retain(|path| !dropped.covers_path(path));
                         input.release(dropped);
                     }
                 }
@@ -642,10 +646,13 @@ impl TileProducer for ZipProducer {
             ))),
             _ => self.base.tiling.empty_guard(),
         };
-        let released = TileGuard::flatten_or(vec![
-            whole_pair_rows(obsolete_guard.clone(), 0, level, &pair),
-            delivered,
-        ]);
+        let whole = TileGuard::flatten_or(vec![whole_pair_rows(
+            self.obsolete_guard().clone(),
+            0,
+            level,
+            &pair,
+        )]);
+        let released = TileGuard::flatten_or(vec![whole.clone(), delivered]);
         for (name, input) in self.names.iter().zip(self.inputs.iter_mut()) {
             let guard = match &released {
                 g if g.is_universal() => input.tiling().universal_guard(),
@@ -661,6 +668,14 @@ impl TileProducer for ZipProducer {
                 ),
             };
             input.release(guard);
+        }
+        for paths in &mut self.held {
+            paths.retain(|path| !whole.covers_path(path));
+        }
+        if whole.is_universal() {
+            self.emitted = Predicate::False;
+        } else if let TileGuard::Function(FunctionGuard::Domain(keys)) = &whole {
+            self.emitted = self.emitted.minus(keys);
         }
     }
 }
@@ -1814,6 +1829,108 @@ mod tests {
             !covers(&[Value::UInt(1)]),
             "arm 0 was released row 1, which arm 1 has not reached: {:?}",
             released0.borrow()
+        );
+        let other_field = TileGuard::Function(FunctionGuard::Codomain(Box::new(
+            TileGuard::Record(HashMap::from([
+                (tuple_field(0), TileGuard::Scalar(Predicate::False)),
+                (tuple_field(1), TileGuard::Scalar(Predicate::True)),
+            ])),
+        )));
+        let first_row =
+            TileGuard::Function(FunctionGuard::Domain(Predicate::exactly(&[Value::UInt(0)])));
+        zip.release(other_field.intersect(&first_row));
+        assert!(
+            zip.held
+                .iter()
+                .all(|paths| !paths.contains(&vec![Value::UInt(0)])),
+            "a released pair must leave the row-tracking state"
+        );
+        assert!(
+            zip.held[0].contains(&vec![Value::UInt(1)]),
+            "an unpaired row stays held until released"
+        );
+        assert!(
+            !zip.emitted.contains(&Value::UInt(0)),
+            "a released pair must leave the emitted-key predicate"
+        );
+        zip.release(out_tiling.universal_guard());
+        assert!(zip.held.iter().all(HashSet::is_empty));
+        assert_eq!(zip.emitted, Predicate::False);
+    }
+
+    /// An arm whose tile a test sets between pulls, returned as it stands, deleted rows
+    /// included.
+    struct Scripted {
+        base: ProducerBase,
+        tile: Rc<RefCell<Tile>>,
+    }
+
+    impl TileProducer for Scripted {
+        impl_producer_base!();
+
+        fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
+            node
+        }
+
+        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            self.tile.borrow().clone()
+        }
+
+        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+    }
+
+    /// A row an arm deletes reaches no consumer, so the zip stops tracking it where it gives the
+    /// row back to the arm, and a consumer's release of every pair it saw leaves nothing held.
+    #[test]
+    fn a_row_an_arm_deletes_leaves_the_row_tracking_state() {
+        let uint = || Extent::Base(BaseType::UInt);
+        let int = || Extent::Base(BaseType::Int);
+        let arm_tiling = Tiling::data_function(uint(), Tiling::Scalar(int()));
+        let rows = |keys: Vec<u64>, deleted: BitSet| {
+            let values = keys.iter().map(|k| *k as i64).collect();
+            Tile::data_function(
+                ColumnValue::from_uints(keys),
+                Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+                Predicate::False,
+                deleted,
+            )
+        };
+        // Arm 0 holds rows 0 and 1, arm 1 row 0.
+        let arm0 = Rc::new(RefCell::new(rows(vec![0, 1], BitSet::new())));
+        let arm1 = Rc::new(RefCell::new(rows(vec![0], BitSet::new())));
+        let out_tiling = Tiling::data_function(
+            uint(),
+            Tiling::Record(HashMap::from([
+                (tuple_field(0), Tiling::Scalar(int())),
+                (tuple_field(1), Tiling::Scalar(int())),
+            ])),
+        );
+        let scripted = |tile: &Rc<RefCell<Tile>>| -> Box<dyn TileProducer> {
+            Box::new(Scripted {
+                base: ProducerBase::unowned(Scripted::alloc_id(), &arm_tiling),
+                tile: Rc::clone(tile),
+            })
+        };
+        let mut zip = ZipProducer {
+            base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
+            names: vec![tuple_field(0), tuple_field(1)],
+            inputs: vec![scripted(&arm0), scripted(&arm1)],
+            level: CurryLevel::new(1),
+            held: vec![HashSet::new(); 2],
+            emitted: Predicate::False,
+        };
+        zip.get(out_tiling.universal_guard());
+        assert!(zip.held[0].contains(&vec![Value::UInt(1)]));
+        // Arm 0 deletes row 1, and the consumer releases row 0, the pair it saw.
+        *arm0.borrow_mut() = rows(vec![0, 1], BitSet::from_iter([1]));
+        zip.get(out_tiling.universal_guard());
+        zip.release(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::exactly(&[Value::UInt(0)]),
+        )));
+        assert!(
+            zip.held.iter().all(HashSet::is_empty),
+            "a deleted row stays tracked: {:?}",
+            zip.held
         );
     }
 }
