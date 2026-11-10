@@ -2259,11 +2259,8 @@ mod tests {
         );
     }
 
-    // TODO: pinned on `^+` or `^*`, each of which fails this test on its own. With all of them
-    // refined, inlining cannot discharge a singleton parameter against an argument typed plain
-    // `Int`.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(expected = "beta reduction would silently drop the precondition")]
     fn inlining_erases_function_boundaries_with_caret_operators() {
         // Extracting a subexpression into a `def` is invisible once the
         // pipeline's own inlining has run: the two versions are the same tree.
@@ -2346,10 +2343,7 @@ mod tests {
         );
     }
 
-    // TODO: pinned on `^+`: inlining cannot discharge `g`'s parameter, refined by `b`'s sum,
-    // against an argument typed plain `Int`.
     #[test]
-    #[should_panic(expected = "beta reduction would silently drop the precondition")]
     fn inlining_costs_locality_in_a_shared_helper_with_caret_operators() {
         // The other side of that trade, stated as a test so it cannot be
         // mistaken for a strict improvement: a body called twice is inlined

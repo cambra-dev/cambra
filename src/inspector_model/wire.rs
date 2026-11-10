@@ -2053,10 +2053,8 @@ a + b
         );
     }
 
-    // TODO: pinned on `^+`: inlining cannot discharge a singleton parameter against an argument
-    // typed plain `Int`.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(expected = "beta reduction would silently drop the precondition")]
     fn inline_fanout_links_post_inference_to_post_channelize_copies_with_caret_operators() {
         with_caret_operators(inline_fanout_links_post_inference_to_post_channelize_copies);
     }

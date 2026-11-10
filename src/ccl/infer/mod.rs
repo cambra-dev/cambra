@@ -21,7 +21,7 @@
 //!
 //! Builtins introduced after inference carry stamped types. Registered polymorphic
 //! builtins that reach inference, including `FinalOrDefault`, use instantiated
-//! schemes. Predicate stripping preserves interiors that planning must compile.
+//! schemes.
 
 mod api;
 mod check;
@@ -30,7 +30,6 @@ mod emit;
 mod schemes;
 pub(crate) mod solve;
 pub mod solver;
-mod strip;
 mod typing;
 
 // Public surface (consumed by `crate::ccl::infer`): the entry points, the check
@@ -880,13 +879,6 @@ pub(crate) fn run_with_params(
         return Err(errors);
     }
 
-    // Pass 3: drop the refinements riding type slots *inside* a refinement
-    // predicate. Coalesce discharges the predicate a type carries as that type
-    // crosses a binder; an interior copy of the same claim, one level down in the
-    // predicate's own type slots, restates it and is the copy a discharge can
-    // leave naming a binder it has left. Runs before the scope check below, which
-    // is what reports such a leftover. See `strip`.
-    strip::strip_predicate_interiors(expr);
     // Coalesce can retain a witness before its enclosing binder is known. Validate
     // the complete expression before accepting inference, in every build.
     let mut scope_errors = Vec::new();

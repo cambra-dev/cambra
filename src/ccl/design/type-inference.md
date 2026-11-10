@@ -266,8 +266,8 @@ requires an SMT encoding for the point-free forms.
 
 ## 2. The Inference Pipeline
 
-Inference emits constraints, materializes types while specializing generalized definitions, and
-strips redundant refinements from predicate interiors. These are the three passes described below.
+Inference emits constraints and materializes types while specializing generalized definitions.
+These are the two passes described below.
 Binder-slot resolution and specialization run inside the second pass, not as later repair passes.
 
 The entry points are `infer` in `infer/api.rs` and `run` in `infer/mod.rs`. Their order is:
@@ -276,13 +276,12 @@ The entry points are `infer` in `infer/api.rs` and `run` in `infer/mod.rs`. Thei
 2. Resolve the operand requirements accumulated during emission. This sweep runs before
    materialization, while generalized definitions and their variables remain available for blame.
 3. Run `coalesce_pass`, including binder-slot resolution and specialization.
-4. Run `strip_predicate_interiors`.
-5. In debug builds, check term-variable scope validity and the absence of free witnesses.
-6. On success, clear expression and binder annotations. On failure, retain annotations for
+4. In debug builds, check term-variable scope validity and the absence of free witnesses.
+5. On success, clear expression and binder annotations. On failure, retain annotations for
    diagnostics.
 
 Emission returns at its first error. Coalescing can accumulate multiple errors and returns before
-predicate stripping if it finds any. The requirement sweep also has debug checks around it:
+the scope check if it finds any. The requirement sweep also has debug checks around it:
 `verify_narrowing_is_complete` audits eager narrowing, and `seal_emission` marks the end of
 definition-obligation narrowing. See [Requirements are read together, once](#requirements-are-read-together-once).
 
@@ -804,40 +803,6 @@ not consulted.
 The first answer wins. A variable occurring in two positions that read differently is pinned to the
 first answer. The second position then joins two incompatible shapes, and coalescing reports
 `IncompatibleBounds` there.
-
-### Pass 3: Stripping Predicate Interiors
-
-`strip_predicate_interiors` in `infer/strip.rs` removes refinements from expression and binder
-types inside a refinement predicate. It runs after successful coalescing and before the debug
-scope check.
-
-A predicate is an expression tree whose nodes carry types. Arithmetic within it can acquire a
-refinement that repeats part of the enclosing predicate. For example, an interior `1 + 3`
-can carry its own sum refinement while the outer predicate states `__elem == 1 + 3 + 2`.
-A discharge that updates the outer predicate can leave an interior copy naming a binder that has
-gone out of scope. The stripping pass removes that redundant copy rather than relying on both
-representations remaining synchronized.
-
-The pass has two exceptions:
-
-- Refinements on a data function's data domain retain their predicate interiors, and an interior
-  type slot keeps every such refinement it carries. Planning compiles those predicates into
-  iteration or restriction, and operator conversion reads the interior types. A term substituted
-  into a predicate keeps the domains it filters, and a key it reads keeps the refinement that
-  makes a lookup by the key total; the post-inference check rejects either stripped.
-  `compiled_refinements` collects the exempt refinements before rewriting, from data domains
-  inside predicates as well as outside them.
-- A `Cast` target remains intact. It is an operand that specifies the cast, not just metadata
-  describing the result; comprehension filters are read from it.
-
-Exemptions are matched by `Refinement`'s structural equality, not a type-slot location or
-predicate address. One filter can occur in a source, map, cast, and consumer contract. Exempting it
-at one occurrence and rebuilding it at another would retain two equal terms at different
-allocations. The sharing tests cover that failure shape.
-
-Stripping does not establish that all later substitutions descend correctly into predicate type
-slots. It removes redundant interiors at this point in the pipeline. The remaining scope and
-sharing checks have separate responsibilities.
 
 ### The post-inference check (shared rules)
 
