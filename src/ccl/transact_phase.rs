@@ -22,11 +22,10 @@
 //! typed tree). This phase:
 //!
 //! 1. **strips** every such `For` site, building one [`WriterSite`] per site
-//!    (its read/write footprint, its loop source, and a
-//!    `` {`commit{writes, __to_<defer>*} | `abort} `` decision lambda built from the
-//!    block by threading read-your-writes ([`WriterWalk`]) — each in-block `<<` feed
-//!    rides the `` `commit `` payload as a `__to_<defer>` tap). This is the **same** writer/key
-//!    building the direct fold used; only the assembly below differs.
+//!    (its read/write footprint, its loop source, and a `{writes, __to_<defer>*}`
+//!    decision lambda built from the block by threading read-your-writes ([`WriterWalk`])
+//!    — each in-block `<<` feed rides the decision as a `__to_<defer>` tap). This is the
+//!    **same** writer/key building the direct fold used; only the assembly below differs.
 //! 2. **partitions** the keys into commit stores ([`partition_keys`]) and
 //!    **assembles** one `LetRec` per store (see [`plan_store`]): one **history** binding
 //!    `hist_k : Txn ⇒ V = λ t → get_prev_txn(view, t, init)` per key — reading
@@ -79,10 +78,9 @@ use crate::ccl::RecordEntry;
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::{
-    BaseType, BinOpKind, Builtin, Expr, F_DECISION, F_TIME, F_WRITE, F_WRITE_TARGETS, F_WRITES,
-    FieldKey, HistoryKind, Lit, LogicKind, Name, ProjKey, Type, TypedBinding, TypedExprNode,
-    WriterSite,
-    ccl_utils::{free_names_in_value, is_free, is_free_in_value, refresh_let_binder},
+    BaseType, BinOpKind, Builtin, Expr, F_DECISION, F_TIME, F_WRITE, F_WRITE_TARGETS, FieldKey,
+    HistoryKind, Lit, LogicKind, Name, ProjKey, Type, TypedBinding, TypedExprNode, WriterSite,
+    ccl_utils::{free_names_in_value, free_reads, is_free, is_free_in_value, refresh_let_binder},
     feed_nest::LoopFeed,
     mut_elim::{
         Declared, FeedSite, WriterParam, WriterWalk, binding, close_recurrence_group,
@@ -667,8 +665,7 @@ struct BlockValue {
     /// The binding the code after the block reads the values through, `𝐼 ⤇ 𝑉`.
     values: Name,
     /// The tag the value carries where the block commits ([`TypedExprNode::Begin`]). Where it
-    /// carries another, the writer writes back each variable's snapshot and sends no output,
-    /// so the block reads every variable it writes.
+    /// carries another, the writer writes nothing and sends no output.
     commits_on: Option<Label>,
 }
 
@@ -3161,14 +3158,7 @@ fn strip_valued_block(
     // the bindings it reads and the values of earlier blocks ([`restrict_to_path`]).
     let (site_target, source, txn_block, gate) =
         restrict_to_path(path, &target, source, txn_block, &enclosing_writes);
-    let (mut read_keys, write_keys) = block_keys(&footprint, &txn_block, txn_mut_vars);
-    if commits_on.is_some() {
-        for k in &write_keys {
-            if !read_keys.contains(k) {
-                read_keys.push(k.clone());
-            }
-        }
-    }
+    let (read_keys, write_keys) = block_keys(&footprint, &txn_block, txn_mut_vars);
     out.sites.push(RawSite {
         parent: stmt_id,
         target: site_target,
@@ -4094,16 +4084,12 @@ fn declaration_order(expr: &Expr, txn_mut_vars: &HashSet<Name>) -> Vec<Name> {
 /// each in name order until `run` orders them as declared. A top in it holds every key it holds
 /// of its family, `WriteTxn(*)` every key and `WriteTxn(inv::*)` each of `inv`'s.
 ///
-/// Two more keys join the read set, for how a commit encodes its writes rather than for what
-/// the block observes. `block`, the block's transactional remainder, decides both:
-///
-/// - A key the block writes but not on every path: on a path that leaves it alone the commit
-///   carries its previous value, which is only expressible as its snapshot. A write in a
-///   statement-`Case` arm (`if p: k := e`) is conditional, and a key the type states a write
-///   of and no statement writes is written on no path.
-/// - A key whose write rewrites it from its snapshot: a keyed write `m[k] := v`, desugared to
-///   `m := insert(m, k, v)` (`mut_elim::desugar_keyed_writes`), commits the whole collection,
-///   whose other keys come from the snapshot. Its type writes `m` and reads nothing of it.
+/// A key the block writes joins the read set where the block reads it, which its type may not
+/// state: a read after its own write within the block, or a keyed write `m[k] := v`, desugared
+/// to `m := insert(m, k, v)` (`mut_elim::desugar_keyed_writes`), which commits the whole
+/// collection, whose other keys come from the snapshot. `block`, the block's transactional
+/// remainder, decides it. A key the block writes and never reads needs no snapshot: a path that
+/// leaves it alone writes nothing to it (`mut_elim::WriterWalk::held_as_taps`).
 fn block_keys(
     footprint: &crate::ccl::capabilities::Capabilities,
     block: &Expr,
@@ -4124,79 +4110,22 @@ fn block_keys(
         .filter(|k| set.states(&Capability::Causes(Effect::WriteTxn((**k).clone()))))
         .map(|k| (*k).clone())
         .collect();
-    let written = written_keys(block, txn_mut_vars);
+    let read_by_block = free_reads(block);
     let reads = keys
         .iter()
         .filter(|k| {
             set.states(&Capability::Requires(Requirement::read_txn((**k).clone())))
-                || (writes.contains(k)
-                    && (written.on_some_path.contains(k)
-                        || !written.on_every_path.contains(k)
-                        || written.from_snapshot.contains(k)))
+                || (writes.contains(k) && read_by_block.contains(**k))
         })
         .map(|k| (*k).clone())
         .collect();
     (reads, writes)
 }
 
-/// How a block's statements write its keys ([`block_keys`]).
-#[derive(Default)]
-struct WrittenKeys {
-    /// Written on the block's spine, so on every path.
-    on_every_path: HashSet<Name>,
-    /// Written in a statement-`Case` arm, which only that arm's path writes.
-    on_some_path: HashSet<Name>,
-    /// Written with a value that reads the key's own snapshot.
-    from_snapshot: HashSet<Name>,
-}
-
-/// How `block` writes each of `txn_mut_vars` ([`WrittenKeys`]).
-fn written_keys(block: &Expr, txn_mut_vars: &HashSet<Name>) -> WrittenKeys {
-    fn walk(e: &Expr, txn_mut_vars: &HashSet<Name>, in_case: bool, out: &mut WrittenKeys) {
-        match &e.node {
-            TypedExprNode::MutWrite { name, value, .. } => {
-                walk(value, txn_mut_vars, in_case, out);
-                if txn_mut_vars.contains(name) {
-                    if in_case {
-                        &mut out.on_some_path
-                    } else {
-                        &mut out.on_every_path
-                    }
-                    .insert(name.clone());
-                    if is_free(name, value) {
-                        out.from_snapshot.insert(name.clone());
-                    }
-                }
-                return;
-            }
-            // A guard is evaluated on the spine, and an arm's body on its path alone.
-            TypedExprNode::Case {
-                scrutinee,
-                branches,
-            } => {
-                if let Some(scrutinee) = scrutinee {
-                    walk(scrutinee, txn_mut_vars, in_case, out);
-                }
-                for b in branches {
-                    walk(&b.guard, txn_mut_vars, in_case, out);
-                    walk(&b.body, txn_mut_vars, true, out);
-                }
-                return;
-            }
-            _ => {}
-        }
-        e.walk_children(|c| walk(c, txn_mut_vars, in_case, out));
-    }
-    let mut out = WrittenKeys::default();
-    walk(block, txn_mut_vars, false, &mut out);
-    out
-}
-
-/// Build one [`WriterSite`] from a stripped site: its ``{`commit{writes} | `abort}``
-/// decision lambda over the snapshot tuple ([`WriterParam`]), plus its footprint and source.
-/// The decision reads mutable variable snapshots and the loop item off the tuple, threads
-/// read-your-writes ([`WriterWalk`]), and picks the `` `commit ``/`` `abort `` tag on the
-/// disjunction of the paths every write and feed is reached on.
+/// Build one [`WriterSite`] from a stripped site: its decision lambda over the snapshot tuple
+/// ([`WriterParam`]), plus its footprint and source. The decision reads mutable variable
+/// snapshots and the loop item off the tuple, threads read-your-writes ([`WriterWalk`]), and
+/// fires each write and feed on the disjunction of the paths it is reached on.
 fn build_writer(
     site: RawSite,
     key_init: &HashMap<Name, MutVarDecl>,
@@ -4342,25 +4271,12 @@ fn build_writer(
     if let Some(value) = &site.value
         && let Some(tag) = &value.commits_on
     {
-        let snapshots =
-            site.write_keys
-                .iter()
-                .map(|wk| {
-                    let i =
-                        site.read_keys.iter().position(|rk| rk == wk).expect(
-                            "transact_phase: an aborting block reads every variable it writes",
-                        );
-                    (wk.clone(), param.snapshot(i))
-                })
-                .collect();
-        walk.commit_only_on(&value.defer, tag, &snapshots, &mut kept);
+        walk.commit_only_on(&value.defer, tag, &mut kept);
     }
 
-    // The decision variant over `{commit, writes, __to_<defer>*}`, keyed by the variables
-    // written: the whole-transaction grant/deny is the tag, the (dense) payload rides
-    // `commit`. An empty block commits. The in-block feeds ride as `__to_<defer>` taps,
-    // each `` `fired `` on the positions its own path admits.
-    let (body, feeds) = walk.body(kept, param, true);
+    // The decision record `{writes, __to_<defer>*}`, keyed by the variables written: each
+    // write and each in-block feed is `` `fired `` on the positions its own path admits.
+    let (body, feeds) = walk.body(kept, param);
 
     (
         WriterSite {
@@ -4554,32 +4470,18 @@ fn fun_parts(ty: &Type) -> (Type, Type) {
 }
 
 /// One site's **per-key commit view** — the point-free projection of its
-/// commit-record stream to `{time, write}` for one written key, eliminating the
-/// `` {`commit{𝑃} | `abort} `` decision with a one-arm `commit` read:
+/// commit-record stream to `{time, write}` for one written key:
 ///
 /// `⟨time: commits_j ≫ .time,
-///    write: commits_j ≫ .decision ≫ variant_project(`commit) ≫ .writes ≫ .k⟩`
+///    write: commits_j ≫ .decision ≫ .writes ≫ .k ≫ variant_project(`fired)⟩`
 ///
-/// The `write` leg is **partial** — ``variant_project(`commit)`` restricts to the
-/// requests that committed (an `abort` position carries nothing), so the `zip`'s
-/// inner-join keeps exactly the committing positions. (At runtime this narrowing
-/// is effectively vacuous: `commits_j` is allocate-on-commit, so its positions
-/// are already all `commit`. The `variant_project` is load-bearing for the *type*
-/// and the causal-slot story — not for dropping `abort` rows that never arrive.)
-/// This is the record shape
-/// `get_prev_txn`'s history argument searches (its declared `{time, write}`
-/// codomain — see [`crate::ccl::Builtin::GetPrevTxn`]); a multi-writer key's
-/// history unions one view per writing site. There is **no `commit` field**: the
-/// tag *is* the grant/deny, and the eliminator drops denied positions, so
-/// `get_prev_txn` searches the latest committed write `≤ t` with no filter.
-///
-/// Built point-free (a `zip` of two `commits_j` views) rather than as a one-arm
-/// `match` lambda: a `match` covering only `commit` over a two-tag scrutinee is a
-/// width-subtyping error at the strict `typecheck` (`` {`commit | `abort} ≮: {`commit} ``),
-/// whereas `variant_project` carries its own stamped type and reads the payload
-/// off the stream directly. The views are pointwise reads of the (guarded) commit
-/// stream, so the references to `commits_j` stay guarded
-/// (`letrec::is_causal_history_slot` accepts a `variant_project` step).
+/// The `write` leg is **partial**: ``variant_project(`fired)`` keeps the transactions that
+/// write `k`, so the `zip`'s inner-join keeps exactly those, and `get_prev_txn` searches the
+/// latest write of `k` `≤ t` with no filter (its declared `{time, write}` codomain — see
+/// [`crate::ccl::Builtin::GetPrevTxn`]). A multi-writer key's history unions one view per
+/// writing site. The views are pointwise reads of the (guarded) commit stream, so the
+/// references to `commits_j` stay guarded (`letrec::is_causal_history_slot` accepts a
+/// `variant_project` step).
 #[allow(clippy::too_many_arguments)]
 fn per_key_view(
     commits_j: &Name,
@@ -4598,8 +4500,6 @@ fn per_key_view(
     // The commit log is a collection: one decision record per position of the block's
     // extent, stored by the engine and read at positions.
     let commits_ty = Type::data_fun(dom.clone(), rec_ty.clone());
-    let payload_ty = crate::ccl::ccl_utils::commit_payload_ty(decision_ty);
-    let writes_ty = record_field_ty(&payload_ty, &F_WRITES);
 
     // time leg: commits_j ≫ .time : dom ⇒ Txn.
     // Each leg is the commit log read through a projection, so it is a collection too,
@@ -4612,17 +4512,18 @@ fn per_key_view(
         Type::fun_like(&commits_ty, dom.clone(), Type::Txn),
     );
 
-    // write leg: commits_j ≫ .decision ≫ variant_project(`commit) ≫ .writes ≫ .k.
-    let mut iproj = Expr::proj_field(key.clone());
-    iproj.ty = Type::fun(writes_ty.clone(), value_ty.clone());
+    // write leg: commits_j ≫ .decision ≫ .writes ≫ .k ≫ variant_project(`fired).
+    let mut steps = vec![
+        tvar(commits_j, commits_ty.clone()),
+        fproj(F_DECISION, rec_ty, decision_ty),
+    ];
+    steps.extend(crate::ccl::ccl_utils::write_view_steps(
+        decision_ty,
+        key,
+        value_ty,
+    ));
     let write_view = crate::ccl::ccl_utils::chain_typed(
-        vec![
-            tvar(commits_j, commits_ty.clone()),
-            fproj(F_DECISION, rec_ty, decision_ty),
-            crate::ccl::ccl_utils::commit_project(decision_ty),
-            fproj(F_WRITES, &payload_ty, &writes_ty),
-            iproj,
-        ],
+        steps,
         Type::fun_like(&commits_ty, dom.clone(), value_ty.clone()),
     );
 
@@ -4643,23 +4544,6 @@ fn per_key_view(
     let mut tap = Expr::apply(views, zip);
     tap.ty = tap_ty;
     tap
-}
-
-/// The declared type of `field` in a record type (through refinements).
-fn record_field_ty(ty: &Type, field: &Label) -> Type {
-    let mut t = ty;
-    while let Type::Refinement(inner, _) = t {
-        t = inner;
-    }
-    match t {
-        Type::Record(fs) => fs
-            .iter()
-            .find(|(n, _)| n == field)
-            .unwrap_or_else(|| panic!("transact_phase: record type lacks field `{field}`: {ty}"))
-            .1
-            .clone(),
-        other => panic!("transact_phase: expected a record type with `{field}`, got {other}"),
-    }
 }
 
 /// A hoisted in-block feed: the target defer and the tap binding (``𝐼 ⤇ {`fired{𝑉} |
@@ -4690,8 +4574,8 @@ struct HoistedFeed {
 ///   (verbatim) applied to the mutable variable snapshot `(hist_rk(begin(r)) …,
 ///   source(r))` at the site's commit time, and whose `write_targets` names the
 ///   write-set keys' histories so recognition recovers the writer's write-set;
-/// - one **tap** binding per in-block feed — ``commits_j ≫ .decision ≫
-///   variant_project(`commit) ≫ .field``, keyed by item.
+/// - one **tap** binding per in-block feed — `commits_j ≫ .decision ≫ .field`, keyed by
+///   item.
 ///
 /// The continuation rebinds each key variable's `let x = init` to a
 /// `final_or_default(hist_x, init)` read over its history, hoists each
@@ -4809,8 +4693,8 @@ fn plan_store(
         let mut snap_tuple = Expr::tuple(snap);
         snap_tuple.ty = Type::Tuple(snap_tys);
 
-        // decision = snapshot ▷ body — the writer's
-        // `` {`commit{writes, __to_<defer>*} | `abort} `` decision, body embedded verbatim.
+        // decision = snapshot ▷ body — the writer's `{writes, __to_<defer>*}` decision,
+        // body embedded verbatim.
         let decision = apply_ty(snap_tuple, body, decision_ty.clone());
 
         // write_targets: the write-set keys' history bindings, in write order —
@@ -4851,14 +4735,11 @@ fn plan_store(
         ));
 
         // One tap binding per in-block feed:
-        // ``commits_j ≫ .decision ≫ variant_project(`commit) ≫ .field``, keyed by the item the
-        // transaction ran for, as the commit records are. A reply rides its transaction's
-        // commit and answers the iteration that fed it, so a request's reply is keyed by the
-        // request. The tap rides the (dense) `commit` payload, so the
-        // `` {`commit{𝑃} | `abort} `` decision is eliminated before the field read.
-        // Recognition maps a read of the tap to the history record's `field` tap. Emitted in
-        // feed (source) order across sites.
-        let payload_ty = crate::ccl::ccl_utils::commit_payload_ty(&decision_ty);
+        // ``commits_j ≫ .decision ≫ .field``, keyed by the item the transaction ran for, as
+        // the commit records are. A reply rides its transaction's commit and answers the
+        // iteration that fed it, so a request's reply is keyed by the request. Recognition
+        // maps a read of the tap to the history record's `field` tap. Emitted in feed
+        // (source) order across sites.
         let commits_ty = Type::data_fun(dom.clone(), rec_ty.clone());
         for f in feeds {
             let tap_name = Name::fresh(f.field.name());
@@ -4871,16 +4752,15 @@ fn plan_store(
             let tap_ty = Type::fun_like(&commits_ty, dom.clone(), tap_value_ty.clone());
             let mut dec_proj = Expr::proj_field(F_DECISION);
             dec_proj.ty = Type::fun(rec_ty.clone(), decision_ty.clone());
-            let vp = crate::ccl::ccl_utils::commit_project(&decision_ty);
             // The decision carries the tap as `` {`fired{𝑉} | `idle} ``, and the
             // binding is that stream verbatim — recognition reads the history
             // record's tap field type off it, and the store holds what the
             // decision put there. The `` `fired `` elimination happens at the feed
             // hoist below, where the channel wants the fed value.
             let mut field_proj = Expr::proj_field(f.field.clone());
-            field_proj.ty = Type::fun(payload_ty.clone(), tap_value_ty.clone());
+            field_proj.ty = Type::fun(decision_ty.clone(), tap_value_ty.clone());
             let tap_expr = crate::ccl::ccl_utils::chain_typed(
-                vec![records, dec_proj, vp, field_proj],
+                vec![records, dec_proj, field_proj],
                 tap_ty.clone(),
             );
             tap_bindings.push((binding(tap_name.clone(), tap_ty.clone()), tap_expr));
@@ -4934,10 +4814,10 @@ fn plan_store(
         // ("multiple writer sites for one variable merge their commit
         // streams... before the search"). Each view projects the site's
         // commit stream pointwise to `{time, write}` — the commit clock and
-        // this key's proposed value `decision.writes.k`. There is no grant/deny
-        // bit: the commit stream carries only committed transactions
-        // (allocate-on-commit), so `get_prev_txn` searches the latest write
-        // `≤ t` with no filter (matching its declared `{time, write}` codomain).
+        // this key's write `decision.writes.k ▷ variant_project(`fired)`, which
+        // keeps the transactions that write the key, so `get_prev_txn` searches
+        // the latest write `≤ t` with no filter (matching its declared
+        // `{time, write}` codomain).
         // A key written by no site is read-only: it self-guards on its own
         // history. The pointwise maps and the union are guarded shapes
         // (`letrec::is_guarded_history_slot` — they change what is read at each

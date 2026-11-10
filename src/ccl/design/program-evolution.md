@@ -657,8 +657,8 @@ subscriber has said so. Reuse, resumption and retirement all follow from that ru
   body decides. `InductionDriver` is `InductionStore`'s cycle partner: store → body → drive → back
   to the store through a cyclic fan-out. The store's decided frontier is the next position to
   iterate, and the drive emits only that position, which makes the cycle well-founded.
-- **Decision**: the body's output at one position, either `` `commit `` appending a change or ``
-  `abort `` carrying the previous value forward. A decision is looked up by absolute position.
+- **Decision**: the body's output at one position, each write `` `fired `` appending a change or
+  `` `idle `` carrying the previous value forward. A decision is looked up by absolute position.
 
 ### Retention is the agreement, and a record dies with its producer
 

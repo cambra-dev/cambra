@@ -478,7 +478,8 @@ loops and transactions. It denotes a record whose fields are key histories, each
 over the shared sequencing domain 𝐷. A read of key `k` projects `__hist.k`. Each `TransactKey`
 carries its initial value, the seed: what the key holds before the domain's first position. Each
 `WriterSite` carries an iteration source, a point-free decision body, and read and write key lists.
-Its decision is either `` `commit(writes) `` or `` `abort(unit) ``. The store's feedback and
+Its decision is the record `{writes: {𝑘: …}, __to_<defer>*}`, each write and tap `` `fired(𝑣) `` or
+`` `idle ``. The store's feedback and
 scheduling belong to the compiled operator, while the node denotes the resulting history record.
 
 `planning::plan_loops` constructs `Transact` from a recognized causal `LetRec` after lambda

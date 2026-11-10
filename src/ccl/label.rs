@@ -12,8 +12,8 @@ use std::fmt;
 /// module is `None` for a label of the root module, and the root shares that
 /// namespace with two kinds of label no module writes:
 ///
-/// - the labels the compiler builds for itself, such as the decision record's
-///   `commit` and `writes`, which no source can name;
+/// - the labels the compiler builds for itself, such as the decision record's `writes` and
+///   its writes' `fired` and `idle`, which no source can name;
 /// - the tags of a compiler-provided nominal type's constructors, `Option`'s `some` and
 ///   `none`, which the runtime builds too.
 ///

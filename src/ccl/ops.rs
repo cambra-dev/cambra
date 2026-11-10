@@ -630,9 +630,10 @@ pub enum Builtin {
     /// by sorted domain value.
     FinalOrDefault,
 
-    /// `get_prev_seq : Tuple(Fun(I, V), I, V) → V` — the history value at
-    /// the *predecessor* of the given position, or the default at the first
-    /// position.
+    /// `get_prev_seq : Tuple(Fun(I, V), I, V) → V` — the history value at its latest
+    /// position *strictly before* the given one, or the default where it has none. A history
+    /// need not hold every position: an accumulator's is the view of its writes, which holds
+    /// only the positions that write it.
     ///
     /// Applied as a tupled argument, same convention as [`Self::FinalOrDefault`]:
     /// `Apply(Tuple([history, position, default]), Builtin(GetPrevSeq))`.

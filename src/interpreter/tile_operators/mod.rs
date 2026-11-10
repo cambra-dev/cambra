@@ -1044,6 +1044,16 @@ pub trait TileProducer {
     /// consumer pulls walks. A producer that pulls nothing visits nothing.
     fn visit_input_producers(&self, _visit: &mut dyn FnMut(&str, &dyn TileProducer)) {}
 
+    /// Whether this producer's last answer did not depend on its input `role`, a role
+    /// [`visit_input_producers`](Self::visit_input_producers) names, and its next answer
+    /// that does depend on it comes from a pull another input's notification brings, which
+    /// reads it again. Such an input's later notifications are not needed until then, so
+    /// `scheduler::pull_laps`'s debug check does not require the pull that would clear its
+    /// flag (`src/interpreter/design-operators.md`, "The notification contract").
+    fn answered_without(&self, _role: &str) -> bool {
+        false
+    }
+
     /// Hook for adding any children to the InspectNode: by default, each producer
     /// [`visit_input_producers`](Self::visit_input_producers) visits, under its role.
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {

@@ -21,8 +21,8 @@
 //!
 //! - `filter_values(true ▷ const)` becomes `id`: every position passes.
 //! - A [`TypedExprNode::DisjointJoin`] loses each arm headed by `filter_values(false ▷ const)`,
-//!   which holds no position, and one arm left is the join. A writer decision that commits
-//!   unconditionally is ``Case[true → `commit(…); true → `abort]``, so it plans to its commit
+//!   which holds no position, and one arm left is the join. A write a decision makes
+//!   unconditionally is ``Case[true → `fired(…); true → `idle]``, so it plans to its `fired`
 //!   arm alone.
 //! - A boolean gate `(𝑙 ▷ const, 𝑝) ▷ zip ≫ and` is 𝑝 where 𝑙 is `true` and `𝑙 ▷ const` where 𝑙 is
 //!   `false`. `≫ or` is 𝑝 where 𝑙 is `false` and `𝑙 ▷ const` where 𝑙 is `true`, and either operand

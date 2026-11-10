@@ -56,7 +56,7 @@ use std::rc::Rc;
 use crate::ccl::feed_nest::LoopFeed;
 use crate::ccl::opaque_output;
 use crate::ccl::{
-    BaseType, BindingTransparency, Branch, Builtin, Expr, F_WRITES, HistoryKind, Lit, Name, Type,
+    BaseType, BindingTransparency, Branch, Builtin, Expr, HistoryKind, Lit, Name, Type,
     TypedBinding, TypedExprNode,
     ccl_utils::{refresh_let_binder, synthesize_arm_predicate, unit_expr},
     letrec::check_letrec_causal,
@@ -2084,23 +2084,15 @@ fn read_at_position(ty: &Type, p: &Name, components: &[Expr], whole: &Expr, prev
     ty
 }
 
-/// ``λ 𝑟 → 𝑟 ▷ __hist ▷ variant_project(`commit) ▷ .writes ▷ .acc``, one accumulator's slice
-/// of the history's committing-write stream, a [`crate::ccl::ccl_utils::pointwise_view`] so
-/// that recognition and the causal-slot grammar match it structurally. The write set is keyed
-/// by accumulator name, so the slice is named too.
-fn writes_key_view(
-    h: &Name,
-    hist_ty: &Type,
-    writes_ty: &Type,
-    decision_ty: &Type,
-    acc: &Label,
-    vty: &Type,
-) -> Expr {
-    let mut steps = hist_field_steps(&F_WRITES, writes_ty, decision_ty);
-    let mut iproj = Expr::proj_field(acc);
-    iproj.ty = Type::fun(writes_ty.clone(), vty.clone());
-    steps.push(iproj);
-    crate::ccl::ccl_utils::pointwise_view(tvar(h, hist_ty.clone()), steps)
+/// ``__hist ≫ .writes ≫ .acc ≫ variant_project(`fired)``, one accumulator's writes: its value
+/// at the positions that write it, a [`crate::ccl::ccl_utils::pointwise_view`] so that
+/// recognition and the causal-slot grammar match it structurally. The write set is keyed by
+/// accumulator name, so the view is named too.
+fn writes_key_view(h: &Name, hist_ty: &Type, decision_ty: &Type, acc: &Label, vty: &Type) -> Expr {
+    crate::ccl::ccl_utils::pointwise_view(
+        tvar(h, hist_ty.clone()),
+        crate::ccl::ccl_utils::write_view_steps(decision_ty, acc, vty),
+    )
 }
 
 /// A [`TypedBinding`] with `name : ty` and no user annotation: a binder this pass
@@ -2114,19 +2106,6 @@ pub(crate) fn binding(name: Name, ty: Type) -> TypedBinding {
         transparency: BindingTransparency::Transparent,
         site: None,
     }
-}
-
-/// ``variant_project(`commit) ▷ .field``, the steps of a view of the history's
-/// committing-decision payload (`{writes, __to_<feed>*}`)
-/// ([`crate::ccl::ccl_utils::pointwise_view`]). The ``variant_project(`commit)`` step
-/// eliminates the `` {`commit{𝑃} | `abort} `` decision to its dense payload before the field
-/// read.
-fn hist_field_steps(field: &Label, field_ty: &Type, decision_ty: &Type) -> Vec<Expr> {
-    let payload_ty = crate::ccl::ccl_utils::commit_payload_ty(decision_ty);
-    let vp = crate::ccl::ccl_utils::commit_project(decision_ty);
-    let mut proj = Expr::proj_field(field.clone());
-    proj.ty = Type::fun(payload_ty, field_ty.clone());
-    vec![vp, proj]
 }
 
 /// Close a recurrence group: wrap `cont` in `letrec { bindings } in <feed hoists>
@@ -2258,10 +2237,10 @@ fn feed_each(defer: Name, collection: Expr, site: Option<Rc<crate::ccl::site::Si
 /// `transact_phase` emits for a commit decision:
 ///
 /// ```text
-/// __hist : D ⇒ {`commit{writes: {acc₀: V₀, …}, __to_<feed>*} | `abort} =
-///   λ r → let __prev = get_prev_seq((__hist ≫ variant_project(`commit) ≫ .writes, r, (acc₀: init₀, …)))
+/// __hist : D ⇒ {writes: {acc₀: {`fired{V₀} | `idle}, …}, __to_<feed>*} =
+///   λ r → let __prev = (acc₀: get_prev_seq((__hist ≫ .writes ≫ .acc₀ ≫ fired, r, init₀)), …)
 ///         in (__prev.acc₀, …, r ▷ iter) ▷ (λ __p → ⟨RYW chain over __p⟩
-///                                       ending in `commit(⟨writes, __to_*⟩) | `abort)
+///                                       ending in (writes: ⟨…⟩, __to_*: ⟨…⟩))
 /// ```
 ///
 /// Factoring here — where the pointful information exists — is what lets
@@ -2492,7 +2471,6 @@ pub(crate) struct InductionFold {
     /// The history binder and its shape, for per-position accumulator reads.
     pub hist: Name,
     pub hist_ty: Type,
-    pub writes_ty: Type,
     pub decision_ty: Type,
     /// Accumulating variables in first-write order. The order is the layout; a
     /// variable's slot in the write set is named by its `field_key`
@@ -2501,7 +2479,7 @@ pub(crate) struct InductionFold {
 }
 
 impl InductionFold {
-    /// `__hist ≫ .writes ≫ .acc : domain ⇒ vty` — accumulator `i`'s value stream,
+    /// `__hist ≫ .writes ≫ .acc ≫ fired : domain ⇒ vty` — accumulator `i`'s writes,
     /// read by the name it declares rather than by `i`.
     /// A per-position cross-domain read of that accumulator (`acc(pos)`) is this
     /// applied at `pos`; the transaction phase uses it to resolve a `commits(r)`
@@ -2519,7 +2497,6 @@ impl InductionFold {
         writes_key_view(
             &self.hist,
             &self.hist_ty,
-            &self.writes_ty,
             &self.decision_ty,
             &acc.name.field_key(),
             &acc.ty,
@@ -2623,8 +2600,8 @@ pub(crate) fn fold_induction_loop(
     let p = param.name.clone();
     let p_ty = param.ty.clone();
 
-    // A position commits where a write or a feed is reached, and `` `abort ``s elsewhere,
-    // so the changelog stays sparse: a position no write reaches records no change.
+    // A position writes the accumulators a write reaches, and the changelog records nothing
+    // for the rest, so it stays sparse.
     let mut feed_counter = 0;
     let writes = accs
         .iter()
@@ -2634,7 +2611,7 @@ pub(crate) fn fold_induction_loop(
     let mut kept = Vec::new();
     walk.walk(loop_body, &mut kept);
     // The opaque writer body: `λ __p → ⟨chain⟩ ending in the decision`.
-    let (body_lam, feeds) = walk.body(kept, param, false);
+    let (body_lam, feeds) = walk.body(kept, param);
 
     // The decision as the writer states it, over its parameter `__p`. The record is exactly
     // the one the walk built (its type propagates through the kept `let`s), so `hist_ty` and
@@ -2697,36 +2674,34 @@ pub(crate) fn fold_induction_loop(
         crate::ccl::ccl_utils::history_ty(&domain_ty, &decision_ty)
     };
 
-    // The recurrence guard reads the *writes projection* of the history:
-    // `get_prev_seq((__hist ≫ .writes, r, (acc₀: init₀, …)))` — a projection of
-    // the history is a causal reference (see `check_letrec_causal`); the defaults
-    // are the accumulators' pre-loop bindings, under the same labels as the write
-    // set they default.
-    let writes_view = crate::ccl::ccl_utils::pointwise_view(
-        tvar(&h, hist_ty.clone()),
-        hist_field_steps(&F_WRITES, &writes_ty, &decision_ty),
-    );
-    let seeds: Vec<(Label, Expr)> = accs
-        .iter()
-        .map(|a| {
-            let _g = a.enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
-            (a.name.field_key(), tvar(&a.name, a.ty.clone()))
-        })
-        .collect();
-    let mut defaults = Expr::new(TypedExprNode::Record(RecordEntry::minted(seeds)));
-    defaults.ty = writes_ty.clone();
+    // The recurrence guard reads each accumulator's own writes:
+    // `(acc₀: get_prev_seq((__hist ≫ .writes ≫ .acc₀ ≫ fired, r, init₀)), …)` — a view of
+    // the history is a causal reference (see `check_letrec_causal`), and an accumulator a
+    // position leaves alone keeps the value of its latest earlier write. The defaults are the
+    // accumulators' pre-loop bindings, under the labels of the write set they default.
     let guard = {
-        let mut arg = Expr::tuple(vec![writes_view, tvar(&r, domain_ty.clone()), defaults]);
-        arg.ty = Type::Tuple(vec![
-            crate::ccl::ccl_utils::history_ty(&domain_ty, &writes_ty),
-            domain_ty.clone(),
-            writes_ty.clone(),
-        ]);
-        let mut f = Expr::builtin(Builtin::GetPrevSeq);
-        f.ty = Type::fun(arg.ty.clone(), writes_ty.clone());
-        let mut app = Expr::apply(arg, f);
-        app.ty = writes_ty.clone();
-        app
+        let fields: Vec<(Label, Expr)> = accs
+            .iter()
+            .map(|a| {
+                let _g = a.enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
+                let label = a.name.field_key();
+                let view = writes_key_view(&h, &hist_ty, &decision_ty, &label, &a.ty);
+                let arg_ty = Type::Tuple(vec![
+                    crate::ccl::ccl_utils::history_ty(&domain_ty, &a.ty),
+                    domain_ty.clone(),
+                    a.ty.clone(),
+                ]);
+                let arg = Expr::tuple(vec![
+                    view,
+                    tvar(&r, domain_ty.clone()),
+                    tvar(&a.name, a.ty.clone()),
+                ])
+                .with_ty(arg_ty.clone());
+                let f = Expr::builtin(Builtin::GetPrevSeq).with_ty(Type::fun(arg_ty, a.ty.clone()));
+                (label, Expr::apply(arg, f).with_ty(a.ty.clone()))
+            })
+            .collect();
+        Expr::new(TypedExprNode::Record(RecordEntry::minted(fields))).with_ty(writes_ty.clone())
     };
 
     // λ r → let __prev = ⟨guard⟩ in (__prev.acc₀, …, r ▷ iter) ▷ __body.
@@ -2753,14 +2728,7 @@ pub(crate) fn fold_induction_loop(
     for acc in accs.iter() {
         let _g = acc.enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
         let vty = &acc.ty;
-        let view = writes_key_view(
-            &h,
-            &hist_ty,
-            &writes_ty,
-            &decision_ty,
-            &acc.name.field_key(),
-            vty,
-        );
+        let view = writes_key_view(&h, &hist_ty, &decision_ty, &acc.name.field_key(), vty);
         let mut f = Expr::builtin(Builtin::FinalRead);
         f.ty = Type::fun(view.ty.clone(), vty.clone());
         let mut read = Expr::apply(view, f);
@@ -2785,8 +2753,10 @@ pub(crate) fn fold_induction_loop(
             // ([`fired_project`](crate::ccl::ccl_utils::fired_project)).
             let value_ty = at_position(&f.ty);
             let tap_ty = crate::ccl::ccl_utils::tap_variant_ty(value_ty.clone());
-            let mut steps = hist_field_steps(&f.field, &tap_ty, &decision_ty);
-            steps.push(crate::ccl::ccl_utils::fired_project(value_ty.clone()));
+            let steps = vec![
+                Expr::proj_field(f.field.clone()).with_ty(Type::fun(decision_ty.clone(), tap_ty)),
+                crate::ccl::ccl_utils::fired_project(value_ty.clone()),
+            ];
             let view = crate::ccl::ccl_utils::pointwise_view(tvar(&h, hist_ty.clone()), steps);
             // This loop's positions are one more level over what the feed held.
             LoopFeed {
@@ -2813,7 +2783,6 @@ pub(crate) fn fold_induction_loop(
         feed_views,
         hist: h,
         hist_ty,
-        writes_ty,
         decision_ty,
         accs,
     }
@@ -3357,10 +3326,13 @@ struct Arm {
     pi: Expr,
     /// What each variable holds where the branch ends.
     env: HashMap<Name, Expr>,
+    /// The variables that hold their tap where the branch ends
+    /// ([`WriterWalk::held_as_taps`]).
+    held_as_taps: HashSet<Name>,
     /// The branch's own bindings.
     kept: Vec<Kept>,
-    /// The path within the branch on which it commits.
-    reached: Expr,
+    /// Each variable the branch writes, with the path within the branch on which it does.
+    written: Vec<(Name, Expr)>,
     /// The value the branch ends in, for a `Case` in value position.
     end: Option<Expr>,
     /// The feeds the branch makes, in the walk's `feeds`, each with its value and fire path
@@ -3390,9 +3362,15 @@ struct Arm {
 pub(crate) struct WriterWalk<'a> {
     /// What each name the walk resolves holds where it stands.
     env: HashMap<Name, Expr>,
-    /// The path of every write and feed, in walk order, relative to the branch the walk is
-    /// in.
-    commit_paths: Vec<Expr>,
+    /// The variables written on some paths that the block does not read, so no snapshot stands
+    /// in for them on the others (`transact_phase::block_keys`). Each holds its tap in `env`,
+    /// `` `fired(𝑣) `` where a path wrote `𝑣` and `` `idle `` elsewhere, until a write on the
+    /// spine gives it a value on every path. The decision reads the written value off the tap
+    /// where the write fires ([`body`](Self::body)).
+    held_as_taps: HashSet<Name>,
+    /// Each write, in walk order: the variable written and the path it is written on,
+    /// relative to the branch the walk is in.
+    written: Vec<(Name, Expr)>,
     feeds: Vec<FeedSite>,
     /// Numbers each feed's tap field, uniquely across the writers one store holds.
     feed_counter: &'a mut usize,
@@ -3420,7 +3398,8 @@ impl<'a> WriterWalk<'a> {
     ) -> Self {
         WriterWalk {
             env,
-            commit_paths: Vec::new(),
+            held_as_taps: HashSet::new(),
+            written: Vec::new(),
             feeds: Vec::new(),
             feed_counter,
             allowed_writes,
@@ -3553,8 +3532,9 @@ impl<'a> WriterWalk<'a> {
                         let value = Subst::discharge_env_in_place(*value, &self.env);
                         self.named_at.insert(name.clone(), name_occurrence.id());
                         let value = bind_value(kept, &name, name_occurrence, value);
-                        self.env.insert(name, value);
-                        self.commit_paths.push(bool_lit(true));
+                        self.env.insert(name.clone(), value);
+                        self.held_as_taps.remove(&name);
+                        self.written.push((name, bool_lit(true)));
                         self.walk_chain(*body, kept)
                     }
                     TypedExprNode::Feed {
@@ -3678,8 +3658,8 @@ impl<'a> WriterWalk<'a> {
                                 });
                             self.env.insert(acc.clone(), tvar(x_final, ty));
                         }
-                        if !fold.renames.is_empty() {
-                            self.commit_paths.push(bool_lit(true));
+                        for (acc, _) in &fold.renames {
+                            self.written.push((acc.clone(), bool_lit(true)));
                         }
                         // A feed from inside the inner loop is a feed of this body: it rides
                         // this decision as a tap holding the inner history's own tap, one
@@ -3785,7 +3765,6 @@ impl<'a> WriterWalk<'a> {
         levels: usize,
         fed_at: Option<Rc<crate::ccl::site::Site>>,
     ) {
-        let commits = !self.channels.contains(&defer);
         let field = defer.defer_tap_field(*self.feed_counter);
         *self.feed_counter += 1;
         self.feeds.push(FeedSite {
@@ -3798,9 +3777,6 @@ impl<'a> WriterWalk<'a> {
             levels,
             fed_at,
         });
-        if commits {
-            self.commit_paths.push(bool_lit(true));
-        }
     }
 
     /// Walk `body`, the rest of the block after `let 𝑐 = Defer`, a feed the block declares,
@@ -3878,6 +3854,7 @@ impl<'a> WriterWalk<'a> {
             "a statement `Case` ends in the `true` complement (totality)"
         );
         let before = self.env.clone();
+        let taps_before = self.held_as_taps.clone();
         let mut arms: Vec<Arm> = Vec::with_capacity(branches.len());
         let mut priors: Vec<Expr> = Vec::new();
         for br in branches {
@@ -3885,36 +3862,44 @@ impl<'a> WriterWalk<'a> {
             let pi = synthesize_arm_predicate(&guard, &priors);
             priors.push(guard.clone());
             self.env = before.clone();
+            self.held_as_taps = taps_before.clone();
             // The branch's bindings stay apart from the block's: binding one around the
             // decision would evaluate it on rows that never take the branch. Each value
             // leaving the branch takes the ones it reads with it.
             let mut arm_kept: Vec<Kept> = Vec::new();
-            let (paths_before, feeds_before) = (self.commit_paths.len(), self.feeds.len());
+            let (writes_before, feeds_before) = (self.written.len(), self.feeds.len());
             let end = self.walk_chain(br.body, &mut arm_kept);
             if value_ty.is_none() {
                 assert_statement_end(&end);
             }
-            let reached = crate::ccl::ccl_utils::disjoin(
-                self.commit_paths.drain(paths_before..),
-                false,
-                &Type::Base(BaseType::Bool),
-            );
+            let written = per_variable(self.written.drain(writes_before..));
             arms.push(Arm {
                 guard,
                 pi,
                 env: std::mem::take(&mut self.env),
+                held_as_taps: std::mem::take(&mut self.held_as_taps),
                 kept: arm_kept,
-                reached,
+                written,
                 end: value_ty.is_some().then_some(end),
                 feeds: feeds_before..self.feeds.len(),
             });
         }
         self.env = before.clone();
-        // Sorted, so the binders the merge mints come out in one order on every run.
-        let mut changed: Vec<Name> = before
+        self.held_as_taps = taps_before;
+        // Sorted, so the binders the merge mints come out in one order on every run. A
+        // variable before the `Case` changes where a branch leaves it holding another value,
+        // and one the writer writes that only a branch holds changes too. Any other name a
+        // branch binds stays in it.
+        let mut changed: Vec<Name> = arms
             .iter()
-            .filter(|(name, value)| arms.iter().any(|arm| arm.env.get(*name) != Some(*value)))
+            .flat_map(|arm| &arm.env)
+            .filter(|(name, value)| match before.get(*name) {
+                Some(before) => before != *value,
+                None => self.writes.iter().any(|(w, _)| w == *name),
+            })
             .map(|(name, _)| name.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
             .collect();
         changed.sort();
         let shared = arms.iter().any(|arm| {
@@ -3922,7 +3907,7 @@ impl<'a> WriterWalk<'a> {
                 .iter()
                 .filter_map(|name| arm.env.get(name).filter(|v| Some(*v) != before.get(name)))
                 .collect();
-            leaving.push(&arm.reached);
+            leaving.extend(arm.written.iter().map(|(_, path)| path));
             leaving.extend(&arm.end);
             for f in &self.feeds[arm.feeds.clone()] {
                 if self.leaves_in_a_slot(f, arm) {
@@ -3938,39 +3923,41 @@ impl<'a> WriterWalk<'a> {
             self.close_feeds(arm, false);
         }
         let mut values: Vec<Expr> = Vec::new();
-        let mut merged_arms: Vec<(Expr, HashMap<Name, Expr>)> = Vec::with_capacity(arms.len());
+        let mut merged_arms: Vec<(Expr, HashMap<Name, Expr>, HashSet<Name>)> =
+            Vec::with_capacity(arms.len());
         for arm in arms {
             let Arm {
                 guard,
                 pi,
                 mut env,
+                held_as_taps,
                 kept: arm_kept,
-                reached,
+                written,
                 end,
                 feeds: _,
             } = arm;
             if let Some(end) = end {
                 values.push(close_over(end, &arm_kept));
             }
-            if !matches!(reached.node, TypedExprNode::Lit(Lit::Bool(false))) {
-                let reached = close_over(reached, &arm_kept);
-                self.commit_paths.push(conjoin_path(&pi, &reached));
+            for (name, path) in written {
+                let path = close_over(path, &arm_kept);
+                self.written.push((name, conjoin_path(&pi, &path)));
             }
             for (name, value) in env.iter_mut() {
-                if before.get(name).is_some_and(|b| b != value) {
+                if before.get(name) != Some(value) {
                     *value = close_over(std::mem::take(value), &arm_kept);
                 }
             }
-            merged_arms.push((guard, env));
+            merged_arms.push((guard, env, held_as_taps));
         }
         for name in &changed {
-            let value_before = &before[name];
+            let as_tap = self.merges_as_tap(name, &before);
             let branches: Vec<Branch> = merged_arms
                 .iter()
-                .map(|(guard, env)| Branch {
+                .map(|(guard, env, taps)| Branch {
                     pattern: None,
                     guard: guard.clone(),
-                    body: env.get(name).unwrap_or(value_before).clone(),
+                    body: self.leaving_value(name, env, taps, as_tap),
                 })
                 .collect();
             let mut merged = Expr::new(TypedExprNode::Case {
@@ -3979,20 +3966,27 @@ impl<'a> WriterWalk<'a> {
             });
             // The variable's value type, as the write set states it: a refinement every value
             // of the variable carries holds of the merge, where the join of the arms' own
-            // types would drop it.
-            merged.ty = self.declared.value_ty(name).clone();
+            // types would drop it. A merge held as a tap carries it under `` `fired ``.
+            merged.ty = if as_tap {
+                crate::ccl::ccl_utils::tap_variant_ty(self.written_ty(name))
+            } else {
+                self.declared.value_ty(name).clone()
+            };
             let occurrence = self
                 .named_at
                 .get(name)
                 .map_or_else(Occurrence::mint, |&id| Occurrence::copied_from(id));
             let merged = bind_value(kept, name, occurrence, merged);
             self.env.insert(name.clone(), merged);
+            if as_tap {
+                self.held_as_taps.insert(name.clone());
+            }
         }
         let ty = value_ty?;
         let branches = merged_arms
             .into_iter()
             .zip(values)
-            .map(|((guard, _), body)| Branch {
+            .map(|((guard, _, _), body)| Branch {
                 pattern: None,
                 guard,
                 body,
@@ -4005,6 +3999,46 @@ impl<'a> WriterWalk<'a> {
             })
             .with_ty(ty),
         )
+    }
+
+    /// Whether the merge of `name` over a `Case` holds its tap ([`Self::held_as_taps`]): it
+    /// did before the `Case`, or only a branch writes it, with no value before the `Case` for
+    /// the other branches to keep.
+    fn merges_as_tap(&self, name: &Name, before: &HashMap<Name, Expr>) -> bool {
+        self.held_as_taps.contains(name) || !before.contains_key(name)
+    }
+
+    /// What `name` holds as it leaves a branch whose variables hold `env`, of which `taps`
+    /// hold their taps, for a merge that holds `name`'s tap where `as_tap`: a branch that
+    /// leaves it unwritten leaves `` `idle ``, and one that writes it on its spine leaves
+    /// `` `fired `` of the value.
+    fn leaving_value(
+        &self,
+        name: &Name,
+        env: &HashMap<Name, Expr>,
+        taps: &HashSet<Name>,
+        as_tap: bool,
+    ) -> Expr {
+        match env.get(name) {
+            Some(value) if !as_tap || taps.contains(name) => value.clone(),
+            Some(value) => crate::ccl::ccl_utils::tap_fired(value.clone(), self.written_ty(name)),
+            None => {
+                debug_assert!(
+                    as_tap,
+                    "a variable before a `Case` holds a value in each branch"
+                );
+                crate::ccl::ccl_utils::tap_idle(self.written_ty(name))
+            }
+        }
+    }
+
+    /// The value type of a variable the writer writes.
+    fn written_ty(&self, name: &Name) -> Type {
+        self.writes
+            .iter()
+            .find(|(w, _)| w == name)
+            .map(|(_, ty)| ty.clone())
+            .unwrap_or_else(|| panic!("writer walk: `{name}` is not a variable the writer writes"))
     }
 
     /// The merge of a `Case` some branch of which has a binding two of the values leaving
@@ -4031,7 +4065,20 @@ impl<'a> WriterWalk<'a> {
         kept: &mut Vec<Kept>,
         value_ty: Option<Type>,
     ) -> Option<Expr> {
-        let mut slots = changed.len() + 1 + usize::from(value_ty.is_some());
+        // The variables some branch writes, each with a slot for the path it is written on.
+        let written: Vec<Name> = changed
+            .iter()
+            .filter(|name| {
+                arms.iter()
+                    .any(|arm| arm.written.iter().any(|(w, _)| w == *name))
+            })
+            .cloned()
+            .collect();
+        let as_tap: Vec<bool> = changed
+            .iter()
+            .map(|name| self.merges_as_tap(name, before))
+            .collect();
+        let mut slots = changed.len() + written.len() + usize::from(value_ty.is_some());
         // Each feed leaving in a slot: its arm, its index in `feeds`, its tap's slot, and the
         // slot of its fire path within the arm, where that is not `true`.
         let mut feed_slots: Vec<(usize, usize, usize, Option<usize>)> = Vec::new();
@@ -4058,9 +4105,17 @@ impl<'a> WriterWalk<'a> {
             .map(|(a, arm)| {
                 let mut slots: Vec<Expr> = changed
                     .iter()
-                    .map(|name| arm.env.get(name).unwrap_or(&before[name]).clone())
+                    .zip(&as_tap)
+                    .map(|(name, &as_tap)| {
+                        self.leaving_value(name, &arm.env, &arm.held_as_taps, as_tap)
+                    })
                     .collect();
-                slots.push(arm.reached);
+                slots.extend(written.iter().map(|name| {
+                    arm.written
+                        .iter()
+                        .find(|(w, _)| w == name)
+                        .map_or_else(|| bool_lit(false), |(_, path)| path.clone())
+                }));
                 slots.extend(arm.end);
                 for &(owner, i, _, fire) in &feed_slots {
                     let f = &self.feeds[i];
@@ -4078,12 +4133,16 @@ impl<'a> WriterWalk<'a> {
                 }
                 // A variable's slot holds it at its value type, as the write set does: a
                 // refinement every value of the variable carries holds of the merge, where the
-                // join of the arms' own types would drop it.
+                // join of the arms' own types would drop it. A slot held as a tap carries it
+                // under `` `fired ``.
                 let ty = Type::Tuple(
                     slots
                         .iter()
                         .enumerate()
                         .map(|(j, s)| match changed.get(j) {
+                            Some(name) if as_tap[j] => {
+                                crate::ccl::ccl_utils::tap_variant_ty(self.written_ty(name))
+                            }
                             Some(name) => self.declared.value_ty(name).clone(),
                             None => s.ty.clone(),
                         })
@@ -4113,13 +4172,15 @@ impl<'a> WriterWalk<'a> {
         for (j, var) in changed.iter().enumerate() {
             let read = proj_of(&name, &tuple_ty, j, &slot_tys[j]);
             self.env.insert(var.clone(), read);
+            if as_tap[j] {
+                self.held_as_taps.insert(var.clone());
+            }
         }
-        self.commit_paths.push(proj_of(
-            &name,
-            &tuple_ty,
-            changed.len(),
-            &slot_tys[changed.len()],
-        ));
+        for (j, var) in written.iter().enumerate() {
+            let slot = changed.len() + j;
+            let path = proj_of(&name, &tuple_ty, slot, &slot_tys[slot]);
+            self.written.push((var.clone(), path));
+        }
         for (owner, i, tap, fire) in feed_slots {
             let f = &mut self.feeds[i];
             let value_ty = f.ty.clone();
@@ -4136,12 +4197,8 @@ impl<'a> WriterWalk<'a> {
             };
         }
         value_ty.map(|_| {
-            proj_of(
-                &name,
-                &tuple_ty,
-                changed.len() + 1,
-                &slot_tys[changed.len() + 1],
-            )
+            let slot = changed.len() + written.len();
+            proj_of(&name, &tuple_ty, slot, &slot_tys[slot])
         })
     }
 
@@ -4175,17 +4232,10 @@ impl<'a> WriterWalk<'a> {
     }
 
     /// Abort the writer where the value fed to `defer` does not carry `tag`
-    /// ([`TypedExprNode::Begin`]'s `commits_on`): there each variable it writes keeps its
-    /// snapshot, `snapshots[name]`, and no other feed fires (`docs/chl-spec.md`,
-    /// "Exceptions"). The value's own feed fires on every path, so the code after the block
-    /// reads the outcome of every iteration.
-    pub(crate) fn commit_only_on(
-        &mut self,
-        defer: &Name,
-        tag: &Label,
-        snapshots: &HashMap<Name, Expr>,
-        kept: &mut Vec<Kept>,
-    ) {
+    /// ([`TypedExprNode::Begin`]'s `commits_on`): there no write fires and no other feed does
+    /// (`docs/chl-spec.md`, "Exceptions"). The value's own feed fires on every path, so the
+    /// code after the block reads the outcome of every iteration.
+    pub(crate) fn commit_only_on(&mut self, defer: &Name, tag: &Label, kept: &mut Vec<Kept>) {
         let value = &self
             .feeds
             .iter()
@@ -4199,35 +4249,8 @@ impl<'a> WriterWalk<'a> {
             Occurrence::mint(),
             committed,
         );
-        for (name, ty) in &self.writes {
-            let written = self.env.remove(name).unwrap_or_else(|| {
-                panic!("writer walk: `{name}`, which the writer writes, holds no value")
-            });
-            let snapshot = snapshots.get(name).cloned().unwrap_or_else(|| {
-                panic!("writer walk: `{name}`, which an aborting writer writes, has no snapshot")
-            });
-            let kept_or_written = Expr::new(TypedExprNode::Case {
-                scrutinee: None,
-                branches: vec![
-                    Branch {
-                        pattern: None,
-                        guard: committed.clone(),
-                        body: written,
-                    },
-                    Branch {
-                        pattern: None,
-                        guard: bool_lit(true),
-                        body: snapshot,
-                    },
-                ],
-            })
-            .with_ty(ty.clone());
-            let occurrence = self
-                .named_at
-                .get(name)
-                .map_or_else(Occurrence::mint, |&id| Occurrence::copied_from(id));
-            let value = bind_value(kept, name, occurrence, kept_or_written);
-            self.env.insert(name.clone(), value);
+        for (_, path) in &mut self.written {
+            *path = conjoin_path(&committed, path);
         }
         for f in &mut self.feeds {
             if f.defer != *defer {
@@ -4238,38 +4261,39 @@ impl<'a> WriterWalk<'a> {
 
     /// The writer body `λ param → decision`, and the feeds whose taps the decision carries.
     ///
-    /// The decision is the variant over `{commit, writes, __to_<defer>*}` that
-    /// [`wrap_decision_variant`](crate::ccl::ccl_utils::wrap_decision_variant) builds, under
-    /// `kept` as [`sink_prefix`] places it. `writes` holds what each variable the writer
-    /// writes holds where the walk ends. The decision commits on the disjunction of the
-    /// paths every write and feed was reached on; `empty` is what it commits on where
-    /// there are none ([`disjoin`](crate::ccl::ccl_utils::disjoin)).
-    pub(crate) fn body(
-        self,
-        kept: Vec<Kept>,
-        param: WriterParam,
-        empty: bool,
-    ) -> (Expr, Vec<FeedSite>) {
-        let fields: Vec<(Label, Expr)> = self
+    /// The decision is the record [`writer_decision`](crate::ccl::ccl_utils::writer_decision)
+    /// builds, under `kept` as [`sink_prefix`] places it. Each variable the writer writes
+    /// fires on the disjunction of the paths it is written on, with what it holds where the
+    /// walk ends, and is `` `idle `` elsewhere.
+    pub(crate) fn body(self, kept: Vec<Kept>, param: WriterParam) -> (Expr, Vec<FeedSite>) {
+        let paths = per_variable(self.written);
+        let writes: Vec<(Label, Expr, Expr, Type)> = self
             .writes
             .iter()
-            .map(|(name, _)| {
+            .map(|(name, declared)| {
+                // A variable no path writes, one the block's type declares a write of, holds
+                // no value here and needs none: its write is `` `idle `` everywhere.
+                let Some((_, fire)) = paths.iter().find(|(w, _)| w == name) else {
+                    let unit = unit_expr();
+                    return (name.field_key(), unit, bool_lit(false), declared.clone());
+                };
                 let value = self.env.get(name).cloned().unwrap_or_else(|| {
                     panic!("writer walk: `{name}`, which the writer writes, holds no value")
                 });
-                (name.field_key(), value)
+                // A tap holds the written value where the write fires, which is where its
+                // projection is read.
+                let value = if self.held_as_taps.contains(name) {
+                    Expr::apply(
+                        value,
+                        crate::ccl::ccl_utils::fired_project(declared.clone()),
+                    )
+                    .with_ty(declared.clone())
+                } else {
+                    value
+                };
+                (name.field_key(), value, fire.clone(), declared.clone())
             })
             .collect();
-        let writes_ty = Type::Record(
-            self.writes
-                .iter()
-                .map(|(name, ty)| (name.field_key(), ty.clone()))
-                .collect(),
-        );
-        let writes =
-            Expr::new(TypedExprNode::Record(RecordEntry::minted(fields))).with_ty(writes_ty);
-        let commit =
-            crate::ccl::ccl_utils::disjoin(self.commit_paths, empty, &Type::Base(BaseType::Bool));
         let taps: Vec<(Label, Expr, Type, Expr)> = self
             .feeds
             .iter()
@@ -4282,11 +4306,11 @@ impl<'a> WriterWalk<'a> {
                 )
             })
             .collect();
-        let mut decision = crate::ccl::ccl_utils::writer_decision_record(commit, writes, &taps);
+        let mut decision = crate::ccl::ccl_utils::writer_decision(&writes, &taps);
         for entry in kept.into_iter().rev() {
             decision = entry.wrap(decision);
         }
-        let decision = crate::ccl::ccl_utils::wrap_decision_variant(sink_prefix(decision));
+        let decision = sink_prefix(decision);
         // A fed row whose keys depend on the loop variable reads the parameter in its type.
         (
             Expr::lambda(param.name, Occurrence::mint(), param.ty, decision),
@@ -4528,6 +4552,26 @@ fn conjoin_path(pi: &Expr, path: &Expr) -> Expr {
     .with_ty(Type::Base(BaseType::Bool))
 }
 
+/// `written`'s paths gathered per variable, each the disjunction of the paths that variable
+/// is written on, in the order each variable is first written.
+fn per_variable(written: impl IntoIterator<Item = (Name, Expr)>) -> Vec<(Name, Expr)> {
+    let mut grouped: Vec<(Name, Vec<Expr>)> = Vec::new();
+    for (name, path) in written {
+        match grouped.iter_mut().find(|(w, _)| *w == name) {
+            Some((_, paths)) => paths.push(path),
+            None => grouped.push((name, vec![path])),
+        }
+    }
+    let bool_ty = Type::Base(BaseType::Bool);
+    grouped
+        .into_iter()
+        .map(|(name, paths)| {
+            let path = crate::ccl::ccl_utils::disjoin(paths, false, &bool_ty);
+            (name, path)
+        })
+        .collect()
+}
+
 /// The literal `b`.
 fn bool_lit(b: bool) -> Expr {
     Expr::new(TypedExprNode::Lit(Lit::Bool(b))).with_ty(Type::Base(BaseType::Bool))
@@ -4691,7 +4735,7 @@ mod tests {
 
     /// Recognition lowers the group onto the domain-parameterized `Transact`
     /// node: `let __hist = transact (x = x) { [x]⇒[x] over … do λ __p → …
-    /// `commit(⟨writes: (x)⟩) | `abort } in __hist.x ▷ final_read``, with
+    /// (writes: (x: `fired(…))) } in __hist.x ▷ final_read``, with
     /// the key `init` read from the pre-loop binding and each accumulator read
     /// rewritten to a history-record projection.
     #[test]
@@ -4708,8 +4752,8 @@ mod tests {
         assert!(!s.contains("loop"), "the Loop node is retired: {s}");
         assert!(s.contains("transact"), "should build a Transact: {s}");
         assert!(
-            s.contains("variant_wrap(`commit)") && s.contains("writes:") && s.contains("`abort"),
-            "writer body must terminate in a `` `commit(⟨writes⟩) | `abort `` decision: {s}"
+            s.contains("variant_wrap(`fired)") && s.contains("writes:") && !s.contains("`abort"),
+            "writer body must terminate in a `(writes: (x: `fired(…)))` decision: {s}"
         );
         assert!(
             s.contains("__hist.x ▷ final_read"),

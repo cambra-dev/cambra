@@ -1712,10 +1712,10 @@ fn a_long_nest_holds_the_same_store_state_at_any_length() {
 /// `final_read`. A constant inner source is paired with each enclosing position through
 /// `strength_over`; a source the outer row holds is the row itself (`over .1`).
 ///
-/// A writer decision is a first-match `Case` over its gates, and a gate built from literals
-/// folds: the nests above write unconditionally and plan to their commit arm alone, with no
-/// filter and no abort arm. The flat loop at the end writes under a gate that varies with the
-/// item, so it keeps both arms and their filters.
+/// A writer decision fires each write on its gate, and a gate built from literals folds: the
+/// nests above write unconditionally and plan to a `` `fired `` write alone, with no filter.
+/// The flat loop at the end writes under a gate that varies with the item, so its write keeps
+/// a `` `fired `` and an `` `idle `` arm and their filters.
 #[rstest]
 #[case::a_constant_inner_source(
     indoc! {r#"
@@ -1728,9 +1728,9 @@ fn a_long_nest_holds_the_same_store_state_at_any_length() {
     indoc! {r#"
         let s : Int = 0
         in let __hist : {s: (0..2 ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [1, 2] do let __hist : ((Int, Int) ⇒ {s: (0..2 ⤇ Int)}) = transact under ((Int, Int), 0..2) (s = .0) { [s]⇒[s] over iterate ▷ const ▷ strength_over ≫ (.1 ≫ [10, 20]) ▷ map do let s : ((((Int, Int), 0..2), (Int, Int)) ⇒ Int) = (.1 ≫ .0, (.1 ≫ .1, .0 ≫ .0 ≫ .1) ▷ zip ≫ mul) ▷ zip ≫ add
-        in (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit) }
+        in (writes: (s: s ≫ variant_wrap(`fired)) ▷ zip) ▷ zip }
         in let s : ((Int, Int) ⇒ Int) = __hist ≫ .s ≫ final_read
-        in (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit) }
+        in (writes: (s: s ≫ variant_wrap(`fired)) ▷ zip) ▷ zip }
         in let s : Int = __hist.s ▷ final_read
         in s
     "#}
@@ -1746,9 +1746,9 @@ fn a_long_nest_holds_the_same_store_state_at_any_length() {
     indoc! {r#"
         let s : Int = 0
         in let __hist : {s: (0..2 ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [[1, 2], [3, 4]] do let __hist : ((Int, (0..2 ⤇ Int)) ⇒ {s: (0..2 ⤇ Int)}) = transact under ((Int, (0..2 ⤇ Int)), 0..2) (s = .0) { [s]⇒[s] over .1 do .1 ≫ (let s : ((Int, Int) ⇒ Int) = add
-        in (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit)) }
+        in (writes: (s: s ≫ variant_wrap(`fired)) ▷ zip) ▷ zip) }
         in let s : ((Int, (0..2 ⤇ Int)) ⇒ Int) = __hist ≫ .s ≫ final_read
-        in (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit) }
+        in (writes: (s: s ≫ variant_wrap(`fired)) ▷ zip) ▷ zip }
         in let s : Int = __hist.s ▷ final_read
         in s
     "#}
@@ -1764,7 +1764,7 @@ fn a_long_nest_holds_the_same_store_state_at_any_length() {
     indoc! {"
         let total : Int = 0
         in let __hist : {total: (0..3 ⤇ Int)} = transact (total = 0) { [total]⇒[total] over iterate ≫ [1, 2, 3] do let total : ((Int, Int) ⇒ Int) = ((.1, 1 ▷ const) ▷ zip ≫ gt) ▷ filter_values ≫ add ⊔ ((.1, 1 ▷ const) ▷ zip ≫ gt ≫ not_fn) ▷ filter_values ≫ .0
-        in ((.1, 1 ▷ const) ▷ zip ≫ gt) ▷ filter_values ≫ (writes: (total: total) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ ((.1, 1 ▷ const) ▷ zip ≫ gt ≫ not_fn) ▷ filter_values ≫ `abort(unit) ▷ const }
+        in (writes: (total: ((.1, 1 ▷ const) ▷ zip ≫ gt) ▷ filter_values ≫ total ≫ variant_wrap(`fired) ⊔ ((.1, 1 ▷ const) ▷ zip ≫ gt ≫ not_fn) ▷ filter_values ≫ unit ▷ variant_wrap(`idle) ▷ const) ▷ zip) ▷ zip }
         in let total : Int = __hist.total ▷ final_read
         in total
     "}

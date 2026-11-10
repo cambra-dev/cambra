@@ -291,7 +291,7 @@ impl UnionOperator {
 /// key. An arm is either a filtered slice of the *same* fed element stream (a
 /// writer-body value-`Case` fan-out `⧺ᵢ filter_values(π̂ᵢ) ≫ eᵢ`, or a `match`'s
 /// tag fan-out), whose keys are disjoint and reassemble the full column — which then
-/// co-iterates with the decision record's sibling `commit` field — or a leg of a
+/// co-iterates with the decision record's sibling fields — or a leg of a
 /// realized sum, over its own arm's domain, of which the first-match gates leave at most
 /// one holding rows. Either way the arms' keys are disjoint, and a key two arms claim
 /// fails the merge. The
@@ -373,7 +373,7 @@ fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling
         }
     }
     // Disjoint by first-match, so a stable sort by key reassembles the full column
-    // in the fed order — matching the sibling `commit` field's domain.
+    // in the fed order — matching the domain of the decision record's sibling fields.
     //
     // The keys come from one collection's domain, so they are one `Extent`'s
     // values and mutually comparable. An incomparable pair means two arms were fed

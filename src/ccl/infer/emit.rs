@@ -17,7 +17,7 @@ use crate::ccl::symbolic::symbolic;
 use crate::ccl::ty::FunKind;
 use crate::ccl::{
     AggregateKind, BaseType, BinOpKind, Branch, Expr, Name, PatternHead, ProjKey, Refinement,
-    TransactKey, Type, TypedBinding, TypedExprNode, UnaryOpKind, V_ABORT, V_COMMIT, WriterSite,
+    TransactKey, Type, TypedBinding, TypedExprNode, UnaryOpKind, WriterSite,
 };
 
 use super::context::InferCtx;
@@ -4397,7 +4397,7 @@ fn accumulator_body_domain(slots: impl IntoIterator<Item = Type>, item: Type) ->
 }
 
 /// The history of each `__to_<defer>` tap a writer's decision carries: the tap's value at each
-/// position of `domain`, in the order the decision's `commit` payload lists them. A
+/// position of `domain`, in the order the decision lists them. A
 /// transaction's tap is read keyed by the item it was committed for, so with `domain` the
 /// commit clock `Txn` its positions are the domain of the writer's `source` instead
 /// (`src/ccl/design/mutability.md`, "Replies ride their transaction").
@@ -4430,16 +4430,7 @@ pub(super) fn writer_tap_histories(
         return Vec::new();
     };
     let codom = crate::ccl::subst::open_codomain(body_ty, codomain);
-    let Type::Variant(tags, _) = codom.peel_refinements() else {
-        return Vec::new();
-    };
-    let Some((_, commit_payload)) = tags
-        .iter()
-        .find(|(k, _)| matches!(k, FieldKey::Name(n) if n == V_COMMIT))
-    else {
-        return Vec::new();
-    };
-    let Type::Record(fields) = commit_payload.peel_refinements() else {
+    let Type::Record(fields) = codom.peel_refinements() else {
         return Vec::new();
     };
     let _g = crate::ccl::provenance::enter(
@@ -4548,11 +4539,10 @@ pub(super) fn writer_tap_histories(
 /// Type one transaction writer against the mutable variable's per-key value types.
 ///
 /// `key_types` maps each mutable variable key to the type of one committed value. The body
-/// is ``Fun(Tuple(snap_{k₀}, …, snap_{k_{r-1}}, item), {`commit{writes: {w₀:
-/// new_{w₀}, …}, __to_<defer>*} | `abort})``, where snapshot position `i` is
-/// `read_keys[i]`'s value type and each `writes` entry `new_j <: write_keys[j]`'s
-/// value type. The `` `commit ``/`` `abort `` tag is the whole-transaction grant/deny;
-/// any extra `__to_<defer>` fields ride the `` `commit `` payload as width-subtyped taps.
+/// is ``Fun(Tuple(snap_{k₀}, …, snap_{k_{r-1}}, item), {writes: {w₀: {`fired{new_{w₀}} |
+/// `idle}, …}, __to_<defer>*})``, where snapshot position `i` is `read_keys[i]`'s value type
+/// and each `new_j <: write_keys[j]`'s value type. Any extra `__to_<defer>` fields ride the
+/// decision as width-subtyped taps.
 fn emit_transact_writer<C: Typing>(
     writer: &mut WriterSite,
     key_types: &HashMap<Name, Type>,
@@ -4603,29 +4593,26 @@ fn emit_transact_writer<C: Typing>(
         new_tys.push(new.clone());
         news.push((new, bound));
     }
-    // Decision codomain: the variant `` {`commit{𝑃} | `abort} ``. `𝑃` is the (dense)
-    // payload record carrying at least `writes: {k_j: new_j…}` — the body's real
-    // `commit` payload width-subtypes to it (its `__to_<defer>` taps are extra
-    // fields). Tag order is `commit`=0, `abort`=1, matching
-    // `ccl_utils::decision_variant_ty` and the runtime `body_decision_at` decode;
-    // variant subtyping matches tags by name, so the order is not load-bearing
-    // for the constraint, only for the stamped index resolution downstream.
+    // Decision codomain: the record carrying at least `writes: {k_j: {`fired{new_j} | `idle}…}`
+    // — the body's real decision width-subtypes to it (its `__to_<defer>` taps are extra
+    // fields). A writer that only reads writes nothing, and its `writes` is `unit`.
     let mut payload: BTreeMap<FieldKey, Type> = BTreeMap::new();
     payload.insert(
         FieldKey::Name(crate::ccl::F_WRITES),
-        Type::Record(
+        Type::record(
             writer
                 .write_keys
                 .iter()
                 .map(|wk| wk.field_key())
-                .zip(new_tys)
+                .zip(
+                    new_tys
+                        .into_iter()
+                        .map(crate::ccl::ccl_utils::tap_variant_ty),
+                )
                 .collect(),
         ),
     );
-    let decision_codom = Type::variant(vec![
-        (FieldKey::Name(V_COMMIT), product(payload)),
-        (FieldKey::Name(V_ABORT), prim(BaseType::Unit)),
-    ]);
+    let decision_codom = product(payload);
 
     let body_ty = ctx.subexpr(&mut writer.body)?;
     // A nested writer's body takes the pair `lambda_elim` merged its binders into

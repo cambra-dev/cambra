@@ -456,7 +456,8 @@ fn ignored_inputs(
         }
         consumer.visit_input_producers(&mut |role, input| {
             let closed = input.base().gate.as_ref().is_some_and(Notified::is_set);
-            if closed && !input.obsolete_guard().is_universal() {
+            if closed && !input.obsolete_guard().is_universal() && !consumer.answered_without(role)
+            {
                 ignored.push(format!("{} ({role} of {})", input.name(), consumer.name()));
             }
         });
