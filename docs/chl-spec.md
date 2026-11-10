@@ -170,23 +170,20 @@ trait, and `trait` a trait ([6.8 Nominal types and methods [Decided]](#68-nomina
 `forall` begins a polymorphic type (**[Planned]**,
 [Polymorphic type annotations](#polymorphic-type-annotations)), and in a `requires` clause a
 requirement at every value of a type ([Family parameters](#family-parameters)).
-`requires` begins a `requires` clause, which ends a `def` signature or a polymorphic type
-([Trait requirements](#trait-requirements)). `requires Transaction` is **[Planned]**
-([8.7 Transactions as contextual parameters](#87-transactions-as-contextual-parameters)).
+`requires` begins a `requires` clause and `causes` a `causes` clause, which end a `def` signature
+or a function type, and `only` and `nothing` bound one
+([Writing requirements and effects](#writing-requirements-and-effects)).
 
 > **Direction.** Planned binder/keyword vocabulary, not lexed today:
-> `rec` (recursive binding — §4.3, **[Decided]**),
+> `rec` (recursive binding — §4.3, **[Decided]**), and
 > `assert` and its `static assert` form (function contracts — §6, **[Decided]** as the
-> surface, **[Open]** as to what `static` demands), and `causes`, `only`, `nothing`, `raise`,
-> `try` and `except` (effects and exceptions —
-> [6.9 Capabilities](#69-capabilities), **[Decided]**).
-> Avoid taking these names for other purposes.
+> surface, **[Open]** as to what `static` demands). Avoid taking these names for other purposes.
 > (`with`, `:=`, `match`, `case`, `where`, `forall`, `requires`, `type`, `impl`, `instance`,
-> `trait` and the module keywords are **already** lexed — the first two carry today's transactions
-> and mutation, §8, `match`/`case` carry tag dispatch, §4.10, `where` separates a refinement's
-> predicate, §6.4, `forall` and `requires` begin a polymorphic type and a `requires` clause, §6.10,
-> and `type`, `impl`, `instance` and `trait` declare nominal types, their functions, instances and
-> traits, §6.8 and §6.10 — so they are not in this list.)
+> `trait` and the module keywords are **already** lexed — the first two carry today's
+> transactions and mutation, §8, `match`/`case` carry tag dispatch, §4.10, `where` separates a
+> refinement's predicate, §6.4, `forall` and `requires` begin a polymorphic type and a
+> `requires` clause, §6.10, and `type`, `impl`, `instance` and `trait` declare nominal types,
+> their functions, instances and traits, §6.8 and §6.10 — so they are not in this list.)
 
 ### 1.7 Literals
 
@@ -363,7 +360,7 @@ block_assign_stmt ::= assign_target "=" block_value
                    |  assign_target aug_op block_value
                    |  assign_target "<<=" block_value
 
-block_value     ::= if_stmt | match_stmt
+block_value     ::= if_stmt | match_stmt | try_stmt | with_stmt
 
 aug_op          ::= "+=" | "-=" | "*=" | "//="
 
@@ -443,8 +440,6 @@ as a `block_value` are **[Decided]**.
 > **Direction.** Planned statement forms, not in today's grammar: `rec x = e` recursive bindings
 > (**[Decided]**, §4.3), and out-of-line collection definition through a subscript target,
 > `c[i] = v` (**[Tentative]**, §6.3 — this would relax the no-subscript-target rule above). A
-> `causes` clause on a `def`, and the `raise` and `try`/`except` statements, are **[Decided]**, with
-> their grammar in [6.9 Capabilities](#69-capabilities). A
 > `type` declaration, a `def` whose name is qualified by a type (`def Price::discounted(…)`), and
 > `@RenamedFrom` on either a `type` or one of its constructors are **[Decided]**, with their grammar
 > in [6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided).
@@ -663,15 +658,16 @@ program, or an exception
 The effecting forms:
 
 - **Feed `<<`** (§3.7) appends its right-hand side to a feed.
-- **A call to an effecting function** — one that writes a `Mut(…)`
-  parameter (pass-by-reference, §6.2) or writes a transactional mutable variable
-  inside a `with begin():` block (§8) — performs that function's writes.
-  A function's effects are always visible in its type: its `causes` clause states them, written or
-  inferred. There are **no implicit-effect functions**, so an inert expression statement (§4.9)
-  stays detectable and rejected.
-- **[Decided]** — **`raise`**, a call that may raise, and an output outside
-  the program, such as binding a sink
-  ([6.9 Capabilities](#69-capabilities)).
+- **A call to an effecting function** — one that writes a `Mut(…)` parameter (pass-by-reference,
+  §6.2) or writes a transactional mutable variable in a `with begin():` block of its own or in the
+  block that calls it (§8, §8.7, **[Decided]**) — performs that function's writes. A function's
+  effects are always visible in its type: its `causes` clause states them, written or inferred
+  (**[Decided]**). There are **no
+  implicit-effect functions**, so an inert expression statement (§4.9) stays detectable and
+  rejected.
+- **`raise`** (**[Decided]**), a call that may raise, and an output outside the program, such
+  as binding a
+  sink ([6.9 Capabilities](#69-capabilities)).
 
 `yield` (§3.13) is not an effect in this sense: it adds its operand to the
 collection the enclosing generator function returns, which is that
@@ -693,13 +689,6 @@ sub-expressions that the freedoms below (unordered collections, unspecified eval
 Ordering *between* effects is not free-for-all: it is governed by the dependency-edge model of §8.5
 — effects are ordered exactly by the data dependencies among them, and unordered (freely
 interleaved) otherwise.
-
-> **Direction [Decided].** The `requires Transaction` contextual
-> requirement (§8.7) adds a *second* way for a call to be effecting — a
-> function that reads or writes a transactional mutable variable in the
-> block it is called in, rather than through a `Mut(…)` parameter. It is
-> not yet implemented; the `Mut(…)`-parameter and `with begin():`
-> effecting-call forms above are.
 
 ### Collections are unordered
 
@@ -784,6 +773,35 @@ loop runs in.
 The order is a fact about the source, not about the run, so two equal collections give an ordered
 loop the same result. A position decides it, not an element: `last := v` over a map ends at the
 value of the map's greatest key. A write to a variable bound outside two nested loops orders both.
+
+#### Conditional ordering requirements
+
+**[Decided]** Each loop places `OrderableFor(P, E)` on its source position type `P` and the
+capabilities `E` of its body that escape an iteration. This built-in requirement is satisfied when
+`E` excludes every effect that orders the loop. Otherwise it requires `Orderable(P, P)`.
+`OrderableFor` has no user-declared instances and cannot be summoned. A contract may state it in a
+`requires` clause. Its second argument is an effect clause, including clause variables and
+`except`, rather than a value type.
+
+An abstract clause that may contain an ordering effect retains `OrderableFor(P, E)` in the
+function's inferred requirements. Each use substitutes its position type and effect clause into
+the requirement. A callback that only appends admits unordered positions; one that may raise an
+exception escaping the iteration requires orderable positions. Forwarding a callback retains the
+requirement through each intervening function and module interface. A fully written function type
+must state the requirement or bounds that imply it. Establishing `Orderable(P, P)` permits an
+ordered iteration; the body's effects still determine whether the loop is ordered.
+
+**Each nested loop has its own requirement.** Its body excludes writes to variables declared in
+that iteration and exceptions caught within it. Discharging a capability outside that body does
+not discharge the loop's ordering requirement. A write to an accumulator declared in an outer
+iteration orders the inner loop but does not order the outer loop. An exception caught between
+the two bodies has the same effect. A write to a variable declared outside both loops, or an
+exception escaping both bodies, orders both. Evaluating an inner loop's source belongs to the
+outer body; it does not belong to the inner body.
+
+An inner loop's position type and effect clause are interpreted under the enclosing iteration's
+binders. Generalization and substitution preserve those binders and retain each requirement
+independently of the capabilities that escape the enclosing function.
 
 ### Evaluation order is unspecified
 
@@ -1174,21 +1192,20 @@ A call that mixes expressions and fields is an error.
 > product with both anonymous and named fields) is **[Open]**.
 > Recorded here only (2026-07-07, no brainstorm writeup yet).
 
-A *zero-argument* call is valid only against a name registered as a
-**data source** — `stdin()` or any source pre-registered by the host
-(§7.3) — against the builtin `empty_map()` (§3.11),
-or as the context of `with begin():` (§8.2). A zero-argument call against
-any other name is a compile-time error.
+A function may declare no parameters (**[Decided]**), and a call of it passes no arguments:
+`f()` applies `f` to
+the unit, the product of no components. `def zero() => Int:`, `\ -> 3`, an associated function
+`def Price::zero() => Price:` and a trait's `def one() => S` each take the unit. A call with no
+arguments also opens a registered **data source**, `stdin()` (§7.3), and builds the empty map,
+`empty_map()` (§3.11), and `begin()` is the context of `with begin():` (§8.2).
 
-> **Direction [Decided] — a function may declare no parameters.** A call of one passes no
-> arguments: `f()` applies `f` to the unit, the product of no components. `def zero() => Int:`,
-> `\ -> 3`, an associated function `def Price::zero() => Price:` and a trait's `def one() => S`
-> each take the unit. A pure function of no parameters returns one value at every call. One that
-> requires or causes something returns what its effects give at each call
-> ([6.9 Capabilities](#69-capabilities)): `time::now()`
-> takes a reading at each position and call path
-> ([Inputs from outside the program](#inputs-from-outside-the-program)). `empty_map()` becomes the
-> values `Map::empty` and `Set::empty`
+A pure function of no parameters returns one value at every call. One that requires or causes
+something returns what its effects give at each call
+([6.9 Capabilities](#69-capabilities)): `time::now()` takes
+a reading at each position and call path
+([Inputs from outside the program](#inputs-from-outside-the-program)).
+
+> **Direction [Decided].** `empty_map()` becomes the values `Map::empty` and `Set::empty`
 > ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)).
 
 ### 3.9 Subscript and attribute access
@@ -1408,11 +1425,11 @@ xsₙ ⟨guards…⟩`, the result contains one `element` value for each tuple
 `(x₁, …, xₙ) ∈ xs₁ × xs₂ × … × xsₙ` such that every interspersed `if`
 guard holds.
 
-The result's **positions** (**[Decided]**) are those of the tuples it is taken over: the tuple `(p₁, …, pₙ)` of
-the position `pᵢ` of each `xᵢ` in `xsᵢ`, or `p₁` alone for one `for` clause. A guard drops a
-position and leaves the others as they are. The output's elements are a bag (§3), and downstream
-consumers must not rely on the order in which the tuples were enumerated. An ordered loop over the
-result runs in the lexicographic order of its positions ([Ordered loops](#ordered-loops)).
+The result's **positions** (**[Decided]**) are those of the tuples it is taken over: the tuple `(p₁,
+…, pₙ)` of the position `pᵢ` of each `xᵢ` in `xsᵢ`, or `p₁` alone for one `for` clause. A guard
+drops a position and leaves the others as they are. The output's elements are a bag (§3), and
+downstream consumers must not rely on the order in which the tuples were enumerated. An ordered loop
+over the result runs in the lexicographic order of its positions ([Ordered loops](#ordered-loops)).
 
 A guard depending only on outer iteration variables (e.g. `if c(x₁)`
 sitting between `for x₁` and `for x₂`) acts as a *prune* on the outer
@@ -1625,13 +1642,10 @@ A function whose body contains a `yield` expression anywhere is a
 rest of this section apply to **non-generator** functions, whose body
 must produce a value explicitly.
 
-The body of a non-generator function is a non-empty block of
-statements whose last statement yields a value — i.e. one of:
-
-- a bare expression statement (its value is the function's result),
-- a `return e` statement,
-- an `if`/`elif`/`else` chain whose every branch ends in one of the
-  above (the branch's value is the function's result for that case).
+A non-generator function's body is a non-empty block whose last contributing statement supplies its
+result. That statement may be an expression, `return`, a terminal `if`, `match` or `try`
+(**[Decided]**), or a value-producing `with begin():` block (**[Decided]**). Each follows the
+[block-value rule](#a-block-is-also-the-value-it-computes).
 
 A function value captures the values of free names in its surrounding
 scope at definition time (lexical capture). A captured mutable variable is
@@ -1645,25 +1659,20 @@ cnt := 20
 f(0)          # 20
 ```
 
-Captured names are read-only: a function cannot mutate a name from an outer
-scope.
-Recursion through self-reference is **[Planned]**; for now each
-function must be definable without referring to its own name.
+A function cannot rebind a captured immutable name. It may read a captured induction variable while
+inside its scope, or read and write a captured transactional variable. A transactional read or write
+requires `Transaction`, which an enclosing `with begin():` block supplies, either in the function or
+at its call (**[Decided]**). The function's contract records its reads and writes
+([Capabilities](#69-capabilities)).
 
-> **Direction.** The read-only-*capture* rule is today's language:
-> mutation already crosses a function boundary, but through a `Mut(…)`
-> **parameter** (pass-by-reference — implemented, §8.1, §6.2), not by
-> capturing and writing an outer name. The **[Decided]** extension lets a
-> function mutate *captured* state whose type carries the wrapper — as the
-> north-star `txn_kv`'s `put` does to the top-level
-> `store: Mut(Map(…), Txn)`. Either way the capability is visible in the
-> types at the binder, not smuggled in.
+Recursion through self-reference is **[Planned]**; each function must be definable without referring
+to its own name.
 
-`=>` is the function-type arrow, so a `def`'s signature has an equivalent
-binding form: `f: (T => U) = \t -> …` binds `f` to a lambda checked against
-the function type `T => U` (§6), the same type `def f(t: T) => U:` gives it.
-Recommended style annotates both parameters and the return type on top-level
-`def`s; the north-star programs follow it.
+`=>` is the function-type arrow. `f: (T => U) = \t -> …` checks a lambda against the function type
+`T => U`, which requires and causes nothing. A `def f(t: T) => U:` fixes its parameter and result
+types but infers omitted capability clauses. An annotated binding admits capabilities only where its
+function type states them ([Writing requirements and effects](#writing-requirements-and-effects)).
+Recommended style annotates parameters and the result type of top-level `def`s.
 
 ### 4.2 `def` — generator function
 
@@ -2188,10 +2197,6 @@ count: a call that only reads the clock is inert. In a polymorphic `def`, a stat
 function parameter causes whatever that function does, which each use decides, so the definition
 does not reject it. See [Mutability, transactions, and feeds](#8-mutability-transactions-and-feeds).
 
-**[Decided]** Contextual transaction parameters add calls that obtain their transaction from
-context rather than a `Mut(…)` argument; its contract is specified under
-[transactions as contextual parameters](#87-transactions-as-contextual-parameters).
-
 ---
 
 ### 4.10 `match` — tag dispatch
@@ -2391,9 +2396,8 @@ marked one carries its status per "How to read this document".)
   [Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided) the checked
   lookup `m[k]` answers `{Option(V) where not _.is_none()}`, which `!` unwraps without a proof at
   the call.
-- `Time` — a position in the commit order, what a transaction handle's
-  `current_time()` answers (**[Tentative]**, §8.2). §8.2 calls the handle
-  itself a `Txn` value, and the two spellings are not reconciled.
+- `Time` — a position in the commit order (**[Tentative]**). A transaction's time is one, which
+  `txn::now()` answers for a transaction named `txn` (**[Decided]**, §8.7).
 - `{T₀, T₁, …} ⇒ U` — function type. A function takes exactly one
   argument (§3.8): an n-parameter function's domain is the
   corresponding tuple type, and a keyword-argument function's domain
@@ -3322,9 +3326,9 @@ none.
 - **A value identifies its constructor by name.** A value is held as the name of its constructor
   and that constructor's arguments. The name, and not the constructor's position in the
   declaration, identifies the constructor, so reordering a declaration's lines changes nothing.
-- **A value names its declaration** (**[Decided]**). A value of a declared nominal type carries the declaration its
-  constructor belongs to, as the version of the program that built it defines it, and compares in
-  that declaration's order ([Equality and order](#equality-and-order)).
+- **A value names its declaration** (**[Decided]**). A value of a declared nominal type carries the
+  declaration its constructor belongs to, as the version of the program that built it defines it,
+  and compares in that declaration's order ([Equality and order](#equality-and-order)).
 - **[Open] — erasure after inference.** The first implementation keeps a declared nominal type
   until operator conversion, which reads a value's shape off its constructors' parameter types, and
   erases the nominal builtins once inference has resolved their operations. Whether a value keeps
@@ -3384,8 +3388,7 @@ method it means, and the method as an unapplied value has no other spelling.
 - **A type's constructors, its associated functions, and the `new` and `extract` of the
   single-constructor form share one namespace.** Two entries of one type with one name are an error
   naming both sites. Two types in one module may each have a `discounted`.
-- **An associated function declares at least one value parameter.** `def Price::zero():` is an
-  error. **[Decided]** — an associated function may declare no parameters: `def Price::zero() =>
+- **An associated function may declare no parameters** (**[Decided]**). `def Price::zero() =>
   Price:` is called `Price::zero()` ([3.8 Function calls](#38-function-calls)). A constructor that
   declares no parameters is a value instead, written without parentheses.
 - **An associated function reaches nothing a run gives its module.** Every run of a module shares a
@@ -3478,18 +3481,14 @@ is a trait's function, read from an instance, `summon(Area(_))::area(s)`
 
 ### 6.9 Capabilities
 
-**[Decided]** — the rules of this section, apart from trait requirements
-([Trait requirements](#trait-requirements)) and the `Write` and `Append` effects of a function's
-body, read off the body rather than stated in its type
-([3. Expression semantics](#3-expression-semantics)), which are implemented.
+**[Decided]** — the rules of this section.
 
 A function's type states what a call reads from its context, in its **`requires` clause**, and what
 the call contributes besides its result, in its **`causes` clause**. A requirement is an input that
 the context supplies. An effect is an output.
 
-| Requirement | Supplied by | Required by |
+| Context requirement | Supplied by | Required by |
 | --- | --- | --- |
-| a trait instance | the instance that the call's types pick ([Summoning an instance](#summoning-an-instance)) | an operator, a `summon`, a trait's function, an ordered loop ([Ordered loops](#ordered-loops)) |
 | `Transaction` | a `with begin():` block, for its body ([8.7 Transactions as contextual parameters](#87-transactions-as-contextual-parameters)) | a read or a write of a transactional mutable variable |
 | `ObserveWorld` | the run, at every position ([Inputs from outside the program](#inputs-from-outside-the-program)) | opening a source, a reading |
 | `ReadTxn(x)` | the run, at every position | a read of the transactional mutable variable `x` |
@@ -3507,7 +3506,7 @@ the context supplies. An effect is an output.
 `yield` is not an effect: what a generator function yields is its result
 ([3.13 `yield`](#313-yield)).
 
-**A requirement and an effect are one kind of thing, a capability.** Each states what a call does
+**A context requirement and an effect are capabilities.** Each states what a call does
 besides computing its result, and they differ only in direction: a requirement is an input the call
 takes from its context, and an effect an output it gives its context. `Read(x)` and `Write(x)` are
 the two directions of an induction variable, `ReadTxn(x)` and `WriteTxn(x)` the two directions of
@@ -3530,26 +3529,27 @@ requirements](#trait-requirements)), so it is resolved where a function value is
 construct discharges it. Elsewhere in this section a requirement is a capability: `Transaction`,
 `ObserveWorld`, `ReadTxn(x)` or `Read(x)`.
 
-**A clause is a set of capabilities.** A `causes` clause is the set of its effects and a `requires`
-clause the set of its requirements, so a clause listing a capability twice, or its capabilities in
-another order, is the same clause. `nothing` is the empty set. A clause is not a type: no value has
-a clause as its type, and the join of [Joining the types of several
-values](#joining-the-types-of-several-values) never applies to one. A **clause variable** stands for
-a clause, as does an associated type that a trait bounds by `Effect` or `Context` ([Effects in
-traits](#effects-in-traits)). One stands in a clause beside its capabilities, and that clause is the
-union of the clause it stands for with the rest. `Effect` is the clause of every effect and
-`Context` the clause of every requirement, and each clause variable is bounded by one of them
-([Kinds and bounds](#kinds-and-bounds)). Written in a clause, each stands for that clause, so a
-function of type `Int => Int requires Context causes Effect` may require and cause anything. A
-family's **top** is the clause of every capability of the family: `Write(*)` of every write to an
-induction variable, `WriteTxn(*)` of every write to a transactional one, `Append(*)` of every
-append, `Read(*)` and `ReadTxn(*)` of every read of an induction and a transactional variable, and
-`Raise(*)` of every exception. A **run's top** is the clause of every read, `ReadTxn(inv::*)`, or
-every write, `WriteTxn(inv::*)`, of a transactional variable of the run `inv` or of a run it
-declares ([Transactional state belongs to the run](#discharging-requirements-and-effects)).
-`Effect` and `Context` are tops too, and a top stands in a clause as a capability does. A top
-is written with `*`, since `_` in a clause is a hole that inference fills ([Writing requirements
-and effects](#writing-requirements-and-effects)): `Write(_)` is an error.
+**Capabilities form sets.** A `causes` clause states a set of effects. The context requirements of a
+`requires` clause form a set too; its trait requirements state instance obligations separately.
+Listing a capability twice, or listing capabilities in another order, gives the same set. `nothing`
+is the empty set. A clause is not a type: no value has a clause as its type, and the join of
+[Joining the types of several values](#joining-the-types-of-several-values) never applies to one. A
+**clause variable** stands for a clause, as does an associated type that a trait bounds by `Effect`
+or `Context` ([Effects in traits](#effects-in-traits)). One stands in a clause beside its
+capabilities, and that clause is the union of the clause it stands for with the rest. `Effect` is
+the clause of every effect and `Context` the clause of every requirement, and each clause variable
+is bounded by one of them ([Kinds and bounds](#kinds-and-bounds)). Written in a clause, each stands
+for that clause, so a function of type `Int => Int requires Context causes Effect` may require and
+cause anything. A family's **top** is the clause of every capability of the family: `Write(*)` of
+every write to an induction variable, `WriteTxn(*)` of every write to a transactional one,
+`Append(*)` of every append, `Read(*)` and `ReadTxn(*)` of every read of an induction and a
+transactional variable, and `Raise(*)` of every exception. A **run's top** is the clause of every
+read, `ReadTxn(inv::*)`, or every write, `WriteTxn(inv::*)`, of a transactional variable of the run
+`inv` or of a run it declares ([Transactional state belongs to the
+run](#discharging-requirements-and-effects)). `Effect` and `Context` are tops too, and a top stands
+in a clause as a capability does. A top is written with `*`, since `_` in a clause is a hole that
+inference fills ([Writing requirements and effects](#writing-requirements-and-effects)): `Write(_)`
+is an error.
 
 An expression requires and causes what its parts and the calls it makes require and cause. A
 block, a function body and a module's top level require and cause what their statements do, less
@@ -3569,7 +3569,7 @@ requires_item   ::= requirement | "(" requirement except_requires ")"
 causes_item     ::= effect | "(" effect except_causes ")"
 except_requires ::= "except" ( requirement | "(" requirement ( "," requirement )* ")" )
 except_causes   ::= "except" ( effect | "(" effect ( "," effect )* ")" )
-requirement     ::= … | "Transaction" | "ObserveWorld" | "ReadTxn" "(" states ")"
+requirement     ::= … | [ ident ":" ] "Transaction" | "ObserveWorld" | "ReadTxn" "(" states ")"
                  |  "Read" "(" variables ")" | "Context" | Ident | "_"
 effect          ::= "Write" "(" variables ")" | "WriteTxn" "(" states ")"
                  |  "Append" "(" variables ")" | "RunTransaction" | "AffectWorld"
@@ -3581,7 +3581,10 @@ raised          ::= expression | "*"
 variable        ::= ( ident "::" )* ident
 ```
 
-`requirement`'s other alternatives are those of [Trait requirements](#trait-requirements). A
+`requirement`'s other alternatives are those of [Trait requirements](#trait-requirements).
+`txn: Transaction` names the transaction a call's block supplies `txn`, which the body uses only
+before `::`, as in `txn::now()` ([8.7 Transactions as contextual
+parameters](#87-transactions-as-contextual-parameters)). A
 capitalized name standing alone in a clause, other than the built-in `Transaction`, `ObserveWorld`,
 `RunTransaction`, `AffectWorld`, `Context` and `Effect`, is a clause variable or an associated type
 standing for a clause. One in a `causes` clause is bounded by `Effect`, and one in a `requires`
@@ -3601,7 +3604,9 @@ is an error, as an `except` item that takes nothing away is.
   every written requirement and effect whether the body has it or not, so a library may state an
   effect its body does not cause yet. A `@Builtin` function has no body to add to its clauses, so
   they are exact ([9.16 The std root](#916-the-std-root)).
-- **`only` makes a clause an upper bound.** Under `causes only WriteTxn(stock), Raise(NotFound)`,
+- **`only` also bounds what the body may add.** The listed capabilities remain in the contract,
+  even where the body does not require or cause them. Under
+  `causes only WriteTxn(stock), Raise(NotFound)`,
   an effect the body causes beyond those listed is an error at the line that causes it, with a
   secondary label at the clause. `nothing` is the empty upper bound:
   `def norm(v) requires nothing causes nothing:`.
@@ -3668,6 +3673,18 @@ is an error, as an `except` item that takes nothing away is.
 - **A diagnostic and `cambra check` print each clause in full,** inferred parts included
   ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)).
 
+The three forms relate the body's inferred effects `E` to the stated set `X` as follows:
+
+| Definition's clause | Contract |
+| --- | --- |
+| omitted | Infer `E` from the body. |
+| `causes X` | State `X` and add `E`. |
+| `causes only X` | State `X` and require every effect in `E` to be held by `X`. |
+
+A stated `WriteTxn(stock)` executes no assignment of its own. It counts as a write for transaction
+footprints and `await_final` dependencies even when the body makes no assignment
+([Discharging requirements and effects](#discharging-requirements-and-effects)).
+
 #### Discharging requirements and effects
 
 | Construct | Discharges |
@@ -3714,18 +3731,25 @@ is an error, as an `except` item that takes nothing away is.
   write or an append that hands out such a function is an error there. At a module's top level a public
   member is what leaves, and this rule is
   [9.10 Induction variables stay in their module](#910-induction-variables-stay-in-their-module).
-- **Another module writes a run's state through the run.** A transactional variable is private to
-  its module, so a module calling `inv::reserve`, which writes `inv`'s `stock`, cannot write
-  `WriteTxn(inv::stock)`, though its diagnostics print it. It writes `WriteTxn(inv::*)`, `inv`'s
-  top, which loses only what it cannot name. A Module type's entry writes the state of the module it
-  describes as `Module::*`, so
+- **Nothing that leaves a block or a function names its transaction.** A function value whose
+  body names `txn`, a block's transaction named by `with txn = begin():` or a caller's named by
+  `requires txn: Transaction`, needs that transaction, which only that block or that call
+  supplies. A result, an exception, a write or an append that hands such a function out of the
+  block, or out of the function whose requirement names `txn`, is an error there, as one that hands
+  out a function naming a variable whose history the scope ends is. **[Decided]**
+- **Another module writes a run's state through the run.** A module calling `inv::reserve`, which
+  writes `inv`'s private `stock`, cannot write `WriteTxn(inv::stock)`, though its diagnostics print
+  it. It writes `WriteTxn(inv::*)`, `inv`'s top, which loses only what it cannot name. A public
+  variable is named as it is reached, `WriteTxn(inv::stock)` for `pub stock`
+  ([9.5 Visibility](#95-visibility)). A Module type's entry writes the private state of the module
+  it describes as `Module::*`, so
   `Module{reserve: Int => {} causes WriteTxn(Module::*), RunTransaction}` is met by a run whose
   `reserve` commits a write to its own state, and a call through a parameter `counter` of that type
   causes `WriteTxn(counter::*)`: the state of the run the parameter takes, which stays abstract
   where the module is checked on its own. The interface `cambra check` prints writes a module's own
-  state as `Module::*` too ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)).
-  `Module::*` stands only in a Module type and in that interface, and `inv::*` names a run or a
-  Module-typed parameter.
+  private state as `Module::*` too
+  ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). `Module::*` stands only
+  in a Module type and in that interface, and `inv::*` names a run or a Module-typed parameter.
 - **The run supplies `ObserveWorld` and `ReadTxn(x)`,** at every position. No construct in a module
   discharges either, so a top level that requires one is run
   ([9.7 Importing asserts a shareable module](#97-importing-asserts-a-shareable-module)).
@@ -4031,12 +4055,13 @@ in the kind `K`:
   declaration's, a `def`'s or a `forall`'s parameter list
   ([Family parameters](#family-parameters)).
 
-**[Decided]** A clause variable of
-[6.9 Capabilities](#69-capabilities) is written in the
-bound form, though a clause is not a type: `E <: Effect` ranges over `causes` clauses and
-`R <: Context` over `requires` clauses. A bound may end in `except` as a clause does:
-`E <: Effect except RunTransaction` ranges over the `causes` clauses without `RunTransaction`, so a
-function passed as `f: Int => Int causes E` does not commit, and each use is checked against it.
+A clause variable of [6.9 Capabilities](#69-capabilities) (**[Decided]**) is written in the bound
+form, though a
+clause is not a type: `E <: Effect` ranges over `causes` clauses and `R <: Context` over `requires`
+clauses. A bound may end in `except` as a clause does: `E <: Effect except RunTransaction` ranges
+over the `causes` clauses without `RunTransaction`, so a function passed as
+`f: (Int => Int causes E)`
+does not commit, and each use is checked against it.
 
 Any other kind, such as a listing `T: [Int, String]`, is **[Open]** and an error.
 
@@ -4072,17 +4097,19 @@ With `a: {at: Int}` and a `{Int, {at: Int}}` result instead, `pair.1` is `{at: I
 ```ebnf
 requires_clause ::= "requires" requirement ( "," requirement )*
 requirement     ::= [ ident ":" ] trait_type | ident "::" Ident "<:" expression
+                 | "OrderableFor" "(" expression "," effect_clause ")"   (* [Decided] *)
+effect_clause   ::= "nothing" | causes_item ( "," causes_item )* [ except_causes ]
 trait_type      ::= trait_name [ "(" expression ( "," expression )* ")" ]
 trait_name      ::= ( ident "::" )* Ident   (* a qualified name is [Decided] *)
 ```
 
 A **trait** is a type whose values are **instances**. `Area(Circle)` is the type of an instance that
 gives `Circle` the functions `Area` declares, and a trait with operands is a family of such types,
-one for each list of operand types. A **requirement** in a definition's `requires` clause is a
+one for each list of operand types. A **trait requirement** in a definition's `requires` clause is a
 parameter of such a type that no call writes: each call passes the instance its types pick
 ([Summoning an instance](#summoning-an-instance)). Each operator places a requirement on its
 operand types. A module declares traits of its own ([Declaring a trait](#declaring-a-trait)), and a
-requirement names one as it names these, which are built in:
+trait requirement names one as it names these, which are built in:
 
 | Trait | Required by | Operands | Associated type | Function | Satisfied by |
 | --- | --- | --- | --- | --- | --- |
@@ -4155,14 +4182,14 @@ instance ([Equality and order](#equality-and-order)).
   satisfiable, and it has no other effect than the associated types it names.
 - **One clause holds every requirement.** `Transaction`
   ([8.7 Transactions as contextual parameters](#87-transactions-as-contextual-parameters))
-  is written in the same clause: `requires Transaction, Orderable(T, T)` (**[Planned]**).
+  is written in the same clause: `requires Transaction, Orderable(T, T)` (**[Decided]**).
 - **The body uses only what the clause states.** An operator whose operand type involves a type
   parameter is an error unless a requirement or the parameter's bound covers it. Where both do, the
   requirement decides: `x + y` under `T <: Int` and `requires a: Addable(T, T), a::Output <: T` is
   an `a::Output`, which is a `T`.
-- **[Decided]** — the context requirements `Transaction`, `ObserveWorld`, `ReadTxn(x)` and
-  `Read(x)`, a written clause as a lower bound, and `only` and `nothing`, are specified in
-  [Writing requirements and effects](#writing-requirements-and-effects).
+- **Context requirements stand in the clause too** (**[Decided]**). `Transaction`, `ObserveWorld`,
+  `ReadTxn(x)` and `Read(x)`, a written clause as a lower bound, and `only` and `nothing`, are
+  specified in [Writing requirements and effects](#writing-requirements-and-effects).
 - **Each call satisfies each requirement at its own instantiation,** and passes the instance that
   satisfies it. A call that does not is rejected at the call. A secondary label at the requirement
   is **[Decided]**.
@@ -4291,18 +4318,34 @@ trait Scales(V, F):
 ```
 
 - **A signature states every type.** Each parameter is annotated and the result is written. The
-  operands and associated types are types in every signature. A function may declare type
-  parameters of its own, as `tag` declares `R`, and a `requires` clause; each call opens the
-  parameters at its own types and satisfies the clause there. **[Decided]** A signature is a
-  written type, so one without a `causes` clause causes nothing, and an associated type
-  `Name <: Effect` lets instances cause different effects
-  ([Effects in traits](#effects-in-traits)).
+  operands and associated types are types in every signature. A function may declare type parameters
+  of its own, as `tag` declares `R`, and a `requires` clause; each call opens the parameters at its
+  own types and satisfies the clause there. A signature is a written type, so one without a `causes`
+  clause causes nothing, and an associated type `Name <: Effect` lets instances cause different
+  effects ([Effects in traits](#effects-in-traits)).
+- **A parameter may be pass-by-reference** (**[Decided]**). `Mut(V)`, `Mut(V, Txn)` and `Feed(V)`
+  state a parameter as they do on a `def` ([6.2 Non-purity as type
+  wrappers](#62-non-purity-as-type-wrappers)): the caller's variable or feed is the argument, and an
+  instance's function writes it. A signature states them nowhere else, neither nested in a type nor
+  as the result. An instance's function takes the signature's parameter without restating it, and a
+  call through a summon or a requirement passes the variable or feed as a `def`'s call does:
+
+  ```python
+  trait Take(T):
+      def take(t: T, s: Mut(Int, Txn), n: Int) => Int
+
+  instance Take(Box):
+      def take(t, s, n):
+          with begin():
+              s := s - n
+          n
+  ```
+
 - **A trait's function is no method.** No parameter of one is named `self`, in the trait or in an
   instance, and a call reads it from an instance: `summon(Scales(_, _))::scale_vec(2, v)`, not
   `2.scale_vec(v)` ([Associated functions and methods](#associated-functions-and-methods)).
-- **A function declares at least one parameter.** **[Decided]** — a function may declare no
-  parameters, and a call reads it from an instance like any trait function:
-  `summon(One(Circle))::one()` ([3.8 Function calls](#38-function-calls)).
+- **A function may declare no parameters** (**[Decided]**). A call reads it from an instance like
+  any trait function: `summon(One(Circle))::one()` ([3.8 Function calls](#38-function-calls)).
 - **Neither the trait's name nor a type's reaches a function.** `Area::area(c)` is an error, and
   `Circle::area(c)` names only a function `Circle` declares
   ([Summoning an instance](#summoning-an-instance)).
@@ -4399,8 +4442,8 @@ instance forall (T) Area(Two(T)) requires a: Area(T):
 - **The block defines each of the trait's functions, and nothing else.** A `def` in it is the
   trait's function at the instance's types. A parameter it leaves unannotated, its result, its own
   type parameters and its `requires` clause are the trait's there, and one it writes must be the
-  trait's. **[Decided]** It writes no `causes` clause and no context requirement: it requires and
-  causes what the trait's signature states, and its body causes nothing beyond that
+  trait's. It writes no `causes` clause and no context requirement: it requires and causes what the
+  trait's signature states, and its body causes nothing beyond that
   ([Effects in traits](#effects-in-traits)). A `def` names no type of its own, and `pub` does not
   mark one.
 - **No two instances of a trait accept one type.** Two instances overlap when some types match both
@@ -4571,9 +4614,9 @@ pick: forall (T) {T, T} => T = first
   and `pick: Pick = first` uses it as a whole annotation
   ([6.7 Type-alias statements](#67-type-alias-statements)). Such an alias inside another type is
   the nested case above.
-- **[Decided]** — **A polymorphic function type has one `requires` clause,** after its codomain,
-  holding the trait requirements on the types it quantifies and the context requirements of a
-  call: `forall (T) {T, T} => T requires Orderable(T, T), Transaction causes AffectWorld`
+- **A polymorphic function type has one `requires` clause,** after its codomain, holding the trait
+  requirements on the types it quantifies and the context requirements of a call:
+  `forall (T) {T, T} => T requires Orderable(T, T), Transaction causes AffectWorld`
   ([Writing requirements and effects](#writing-requirements-and-effects)).
 - **It is never a type constructor.** `forall (T) V` does not denote a function from types to
   types. A parameterised alias, if added, is written in the head form `Pair(T) = {T, T}`
@@ -4693,10 +4736,10 @@ Additional sources may be pre-registered by the host embedding (testing,
 demos, etc.). `std::time` adds a clock read and an alarm source and sink
 ([7.5 Time [Decided]](#75-time-decided)).
 
-**[Decided]** Opening a source requires `ObserveWorld`, and binding a sink causes `AffectWorld`
+Opening a source requires `ObserveWorld`, and binding a sink causes `AffectWorld`
 ([Inputs from outside the program](#inputs-from-outside-the-program),
-[Output outside the program](#output-outside-the-program)). A reading, such as the clock, is a
-call of a `@Builtin` function a std module declares ([9.16 The std root](#916-the-std-root)).
+[Output outside the program](#output-outside-the-program)). A reading, such as the clock, is a call
+of a `@Builtin` function a std module declares ([9.16 The std root](#916-the-std-root)).
 
 `http_serve` opens its route when the program starts, so a call is the
 whole right-hand side of a `=` in the top-level block, and its three
@@ -4871,7 +4914,8 @@ position in the commit order ([6. Types (informal sketch)](#6-types-informal-ske
 - **A call at a module's top level reads the clock once, when the program first starts.** A reload
   and a restart keep that reading
   ([Inputs from outside the program](#inputs-from-outside-the-program)).
-- **A reading orders nothing.** A reading is not an event and creates no dependency edge
+- **A reading introduces no additional sequencing.** A computation consuming its value has an
+  ordinary data dependency on it. Taking a reading does not order independent evaluations
   ([8.5 Ordering and concurrency](#85-ordering-and-concurrency)). Commit order never consults a
   reading, so a transaction that commits after another can hold an earlier reading. Both rules
   describe this clock, whose readings carry no order. A clock whose readings the commit engine
@@ -5054,33 +5098,28 @@ for req in incr_reqs:
   atomically** — the whole block's writes become visible together or not
   at all. There is no partially-visible commit.
 - Writes to a `Txn`-domain mutable variable are legal **only** inside a `with
-  begin():` block; a write outside one is rejected (§8.3), as is a write
-  reached through a transactional-writer function *called* inside a block
-  (a disguised nested transaction). **[Decided]** — a function the block
-  calls may write one too: it requires `Transaction` for the write, and the
-  block supplies it (§8.7). Only a call of a function that runs a block of its
-  own is a nested transaction.
+  begin():` block, or in a function the block calls, which requires
+  `Transaction` for them and gets it from the block (§8.7, **[Decided]**); a write that no
+  block encloses is rejected (§8.3). A call inside a block of a function
+  that runs a block of its own is a disguised nested transaction.
 - **Nested transactions are rejected** — a block commits as one unit, so a
   `with` inside it has no coherent meaning.
-- **[Decided]** A block causes `RunTransaction`, and its body supplies `Transaction` to what it
-  calls. A body that causes `RunTransaction`, directly or through a call, is the nested transaction
-  above ([Discharging requirements and effects](#discharging-requirements-and-effects)). An
-  exception that escapes the block aborts it: none of its writes commits and no output inside it is
-  sent ([Exceptions](#exceptions)).
+- A block causes `RunTransaction`, and its body supplies `Transaction` to what it calls. A body that
+  causes `RunTransaction`, directly or through a call, is the nested transaction above
+  ([Discharging requirements and effects](#discharging-requirements-and-effects)). An exception that
+  escapes the block aborts it: none of its writes commits and no output inside it is sent
+  ([Exceptions](#exceptions), **[Decided]**).
 - **Branch guards and tag dispatch.** A block may carry `if`/`elif`/`else`
   guards, more than one of them, and `match` dispatch. Each branch's
   writes are scoped to its own path and the transaction commits on the
   disjunction of the writing paths, so a write on the spine beside a
-  guard commits unconditionally. A bare `if p:` with no `else` is the
-  deny idiom: where `p` fails over the snapshot the transaction
-  contributes no write and no reply.
+  guard commits unconditionally. In a block in statement position, a bare `if p:` with no
+  `else` is the deny idiom: where `p` fails over the snapshot the transaction contributes no
+  write and no reply.
 - **An induction accumulator may not be written under a branch inside a
   block** (rejected with a diagnostic). Write it after the block, or, if
   it should be shared across the transaction, declare it `Mut(…, Txn)`
   and write it on the spine.
-- **Transaction handle — `with t = begin():` [Decided].** Binds `t` to the
-  transaction's commit time (a `Txn` value); designed but rejected at
-  lowering today.
 
 **Scope transactions minimally.** Only the operations that must be atomic
 go inside `with begin():` — input validation before it, response
@@ -5088,18 +5127,40 @@ assignment after it. The north-star handlers observe this throughout (e.g.
 `storefront`'s `/order` matches the catalog before opening the transaction
 around `reserve` + `quote` + the feed).
 
-> **Direction [Tentative] — a block is also the value it computes.**
-> Scoping minimally puts the reply outside the block, which leaves the
-> block needing to hand its result out: a `with begin():` block in value
-> position denotes the value of its last statement, the same rule a
-> function body follows (§4.1), and the enclosing binding carries it past
-> the block's end. Nothing admits it today — §2.2 has `with_stmt` as a
-> compound statement and an `assign_stmt` right-hand side as an
-> `expression`, and the two never meet. **[Open]** is how §8.4's gating
-> rule reads against it: a reply fed *inside* a block rides the commit and
-> a denied transaction replies nothing, while a reply outside fires
-> regardless — and this shape puts the reply outside with a value that
-> came from inside, so which of the two it inherits has to be said.
+#### A block is also the value it computes
+
+**[Decided]** — the rules of this section.
+
+A `with begin():` block on an assignment's right-hand side is the value of its last statement, by
+the rule a function body follows
+([4.1 `def` — function definition](#41-def--function-definition)): an expression, or an `if`,
+`match` or `try` whose blocks each end in a value. The binding carries the value past the block's
+end, so a handler scoped minimally replies outside the block with a value computed inside it:
+
+```python
+for req in withdraw_reqs:
+    result = with begin():
+        if balance >= req.amount:
+            balance := balance - req.amount
+            "ok"
+        else:
+            "insufficient funds"
+    withdraw_resps << result
+```
+
+- **The value is read in the block's snapshot,** after the writes its path made before it
+  (read-your-writes, [8.3 Reads](#83-reads)).
+- **Every path of a block in value position commits.** In a block where some path writes, a path
+  that writes nothing commits its reads, which places its value at a commit time. There is no deny:
+  where the bare `if p:` above fails, the transaction commits no write and the code after the block
+  still runs, with the value that path computed.
+- **The value is available once the block commits.** Inside a loop, each iteration binds its own
+  block's value, so a reply after the block is indexed by the iteration, as any reply outside a
+  block is ([8.4 Feeds are the second form of
+  mutability](#84-feeds-are-the-second-form-of-mutability)).
+- **A block that writes no transactional variable is a snapshot read.** It commits nothing, and its
+  value is as of an arbitrary commit position, as an as-of read's is ([8.3 Reads](#83-reads)). It
+  reads several variables at one snapshot: `(a, b) = with begin(): (a, b)`.
 
 ### 8.3 Reads
 
@@ -5116,9 +5177,8 @@ around `reserve` + `quote` + the feed).
   `def total(xs): s := 0; for x in xs: s += x; s` returns the sum, and
   `def available(): stock` reads `stock`, transactional, so it requires
   `Transaction` and `ReadTxn(stock)`.
-- **A `Txn` mutable variable is read only inside a `with begin():` block.**
-  **[Decided]** — or in a function the block calls, which requires
-  `Transaction` for it
+- **A `Txn` mutable variable is read only inside a `with begin():` block,** or in a function
+  the block calls (**[Decided]**), which requires `Transaction` for it
   ([8.7 Transactions as contextual parameters](#87-transactions-as-contextual-parameters)).
   A bare read that no block encloses is an error, and stays one: the block is what pins a
   **snapshot-consistent** view, so that several mutable variable reads in one
@@ -5150,10 +5210,11 @@ observable:
 - **Reply *inside* a block** (`out << e` within `with begin():`) rides the
   commit: it is **sequenced after the commit** and **gated** — a denied
   transaction replies nothing — and is indexed by commit tick.
-- **Reply *outside* the block** rides its own loop's domain and fires every
-  iteration regardless of commit — request-indexed, value-correct, but not
-  commit-ordered. **To gate or commit-order a reply, put it inside the
-  block.**
+- **Reply *outside* the block** rides its own loop's domain and fires every iteration regardless of
+  commit — request-indexed, value-correct, but not commit-ordered. A reply of a block's value waits
+  for that block to commit, which every path of it does
+  ([A block is also the value it computes](#a-block-is-also-the-value-it-computes)). **To gate or
+  commit-order a reply, put it inside the block.**
 
 ### 8.5 Ordering and concurrency
 
@@ -5169,10 +5230,14 @@ interleaved (or parallel) otherwise. The events:
 - **Program start.** Initializers, literals, constant loop sources
   (`[10, 20, 30]`), and top-level `=` bindings are available here; logic
   reading only them runs immediately.
-- **Incoming data on a source.** Each element arriving on a source
-  (`stdin()`, `http_serve`, …) is an event; logic consuming it depends on
-  its arrival. This is the event that **pins commit order**: a writer
-  driven by a live stream commits in the stream's real arrival order.
+- **Incoming data on a source.** Logic consuming an element depends on that element's arrival.
+  Arrival order gives the source's position order; it does not order the iterations of a loop over
+  the source. Those iterations are ordered only where their body requires it
+  ([Ordered loops](#ordered-loops)). A transactional write alone imposes no such requirement.
+  An arrival also depends on every commit whose output was sent out of the program before the
+  element arrived ([Output outside the program](#output-outside-the-program)): a request a client
+  sends once it holds a reply comes after the commit that reply rode. Requests sent concurrently
+  stay unordered.
 - **A data dependency forced by logic.** When logic reads a value another
   piece produces, the read depends on the write — read-your-writes in a
   block, a commit decision reading a snapshot, a reply consuming its own
@@ -5203,11 +5268,8 @@ Consequences a program may rely on:
   Blocks with no variable in common are **unordered**: nothing in the
   language imposes an order between them, and their transactions interleave
   freely. Two independent `for` loops relate their accumulators the same way.
-- **Commit order is not lexical order.** Two `with begin():` blocks do
-  **not** commit in the order they appear in source; each block's position
-  is fixed by its trigger event (a source arrival, or an iteration of a
-  batch writer's loop). A programmer's default lexical-order assumption is
-  wrong.
+- **Commit order is not lexical order.** A block's trigger makes it eligible to run. Two blocks
+  do not commit in their written order unless a dependency orders them.
 - **Commit order is not position order.** The iterations of a loop whose body
   runs a block commit in the order the transaction engine decides, which
   need not be the loop source's position order; the loop is ordered only by
@@ -5218,27 +5280,21 @@ Consequences a program may rely on:
   and commit order never consults one. A row an alarm source releases is a source arrival
   ([7.5 Time [Decided]](#75-time-decided)).
 - **Read-your-writes** within a block or iteration.
-- **Reply-after-commit / cross-endpoint monotonicity.** A reply fed from
-  inside a block is sequenced after that commit; combined with arrival-order
-  monotonicity this gives external consistency — a client that sees `ok 2`
-  then reads another endpoint observes `≥ 2`.
+- **Reply-after-commit / cross-endpoint monotonicity.** A reply fed inside a block depends on its
+  commit, and a request that arrives after the reply was sent depends on that commit in turn (the
+  arrival edge above). These edges, rather than the relative arrival order of independent
+  requests, give the cross-endpoint guarantee: a client that sees `ok 2` then reads the counter
+  observes `≥ 2`.
 - **Terminal vs. temporal reads.** `await_final` (and the trailing
   induction read) wait for a history's *completeness*; an as-of read waits
   only for the *frontier* (that no earlier-or-equal commit is still
   outstanding) and samples the mutable variable as of the reader's own position.
-- **A shared program-start anchor gives no *relative* order — by design,
-  not by omission.** A standalone `with begin():` or a literal-list loop
-  depends on **program start** like everything else, but on nothing more.
-  Program start is a *single* event: it sequences each block after itself,
-  yet imposes no order *among* the blocks it triggers, so they are mutually
-  unordered — the engine may serialize them any way and the program is
-  correct under all of them. (A live-stream writer differs because its
-  successive arrivals are *distinct* events carrying a real order, which
-  the commits inherit.) This is the contract, not a gap: to fix a relative
-  order, **supply a distinguishing edge** — drive the writers from the
-  source whose arrival order you mean, introduce a data dependence, or
-  bound the result with `await_final`. An order-sensitive body with no such
-  edge has nondeterministic denotation, by design.
+- **A trigger alone imposes no order between iterations.** Program start makes a batch of
+  transactions eligible without ordering them. Distinct source arrivals likewise order no loop
+  whose body requires no order. The engine may choose any serialization consistent with the
+  program's dependencies. To require position order, the loop body must introduce an ordering
+  dependency ([Ordered loops](#ordered-loops)). `await_final` waits for completion; it does not
+  choose an order for the transactions whose completion it awaits.
 
 ### 8.6 `await_final`
 
@@ -5289,12 +5345,12 @@ for r in reqs2:
 An **induction** accumulator may likewise be seeded from an await
 (`x := await_final(pool)`): a different recurrence, so there is no cycle.
 
-**[Decided]** — **the rules hold across modules.** `await_final(x)` requires nothing: its value is
-one value for the whole run, the same wherever it is evaluated
-([6.9 Capabilities](#69-capabilities)). A writer of `x` is any statement that causes `WriteTxn(x)`,
-or a top holding it, directly or through a call, a call of another module's function included, so
-the await waits for every writer of `x` in the program. A writer that depends on `await_final(x)`,
-directly or through another module's public value, is the cycle above and an error at the write.
+**The rules hold across modules** (**[Decided]**). `await_final(x)` requires nothing: its value is
+one value for the whole run, the same wherever it is evaluated ([6.9
+Capabilities](#69-capabilities)). A writer of `x` is any statement that causes `WriteTxn(x)`, or a
+top holding it, directly or through a call, a call of another module's function included, so the
+await waits for every writer of `x` in the program. A writer that depends on `await_final(x)`
+through another module's public value is the cycle above, and an error at the write.
 
 One restriction unrelated to cycles: `await_final` may not appear inside a `with
 begin():` block, which reads its mutable variables bare as a snapshot; awaiting
@@ -5319,11 +5375,9 @@ or every transaction denies, the await is `x`'s initializer.
 
 (2026-06-29 §6; the north-star `txn_kv` program is the worked example.)
 
-The implemented model above passes a transaction *implicitly by block
-scope* (`with begin():` establishes it; `Mut(…, Txn)` mutable variables are the
-shared state). A **[Decided]** further direction makes the transaction a
-contextual requirement, so a transaction reaches a called function without a `Mut`
-parameter:
+A transaction is passed *implicitly by block scope*: `with begin():` establishes it, and
+`Mut(…, Txn)` mutable variables are the shared state. It is a contextual requirement, so a
+transaction reaches a called function without a `Mut` parameter:
 
 - `def put(…) requires Transaction:` — the function declares it needs a
   transaction from context. A function reading or writing a transactional
@@ -5333,8 +5387,10 @@ parameter:
   block's transaction `txn`, and a requirement names the caller's, `requires txn: Transaction`.
   The name stands only before `::`, as a requirement's instance does
   ([Summoning an instance](#summoning-an-instance)): nothing passes, stores or returns a
-  transaction. `txn::now()` is the function on a transaction that answers its time, so a called
-  function reads it through its requirement rather than a parameter threading it there.
+  transaction, and a function value naming one does not leave the block or the function that names
+  it ([Discharging requirements and effects](#discharging-requirements-and-effects)). `txn::now()`
+  is the function on a transaction that answers its time, so a called function reads it through
+  its requirement rather than a parameter threading it there.
   **[Decided]** — naming a transaction, and `txn::now()`.
 
 Supporting decisions (same source):
@@ -5343,8 +5399,8 @@ Supporting decisions (same source):
   Cambra compiles to static dataflow; handler-based effects make control
   flow non-local and data flow handler-dependent — exactly what the
   dataflow compiler cannot see through. `requires Transaction` is ordinary
-  dictionary passing, resolved by the same solver that will serve general
-  typeclasses.
+  dictionary passing: `Transaction` is a context trait whose instance the
+  enclosing block supplies ([6.9 Capabilities](#69-capabilities)).
 - **Locally-scoped transactions, not global coherence.** A fresh transaction is
   minted per `with begin():` block; many exist over a program's life.
 - **[Open] — domains.** Every transaction is the one global domain's. A domain index,
@@ -5709,7 +5765,7 @@ pub type Price = {amount: Int}
 pub def Price::discounted(self, pct: Int) => Price: …
 ```
 
-**[Planned]** — `pub` on a mutable variable:
+**[Planned]** — `pub` on a transactional mutable variable:
 
 ```python
 pub stock: Mut(Map(String, Int), Txn) := Map::empty
@@ -5726,8 +5782,9 @@ pub held: Int
 
 - A member without `pub` is private. Only its own module can name it.
 - `pub` on `:=` is accepted (**[Planned]**) on the statement that introduces a `Txn` mutable
-  variable and refused on a later write to it. It is refused on an induction variable ([9.10
-  Induction variables stay in their module](#910-induction-variables-stay-in-their-module)).
+  variable, which states
+  its type `Mut(V, Txn)`, and refused on a later write to it. It is refused on an induction variable
+  ([9.10 Induction variables stay in their module](#910-induction-variables-stay-in-their-module)).
 - `pub` is refused on `import`, `run`, `param`, `op=`, `<<=`, `for`, `if`, `match`, `with`,
   expression statements, and anywhere but a module's top level.
 - A public name is bound exactly once at its module's top level. A later binding of the same
@@ -5784,12 +5841,9 @@ access](#39-subscript-and-attribute-access)). With `import shop::cart`, `run sho
 
 ### 9.7 Importing asserts a shareable module
 
-**[Decided]** — the rules of this section. Today a module is imported only when it performs no IO
-and declares no mutable state: its top level opens no source, binds no sink, introduces, writes or
-loads (`@LoadFrom`) no mutable variable, declares or defines no feed, and runs no module that does
-any of these. The rules of this section differ in two cases: a module whose only state is induction
-variables, private feeds and loaded declarations is imported, where today it is run, and a module
-that performs no IO and declares no state cannot be run.
+**[Decided]** — the rules of this section. Until they are implemented, the compiler refuses to
+import a module that declares mutable state, performs IO, runs another module, or has a top-level
+loop, `if`, `match` or `with`, and runs any module a `run` statement names.
 
 Importing a module asserts that it is **shareable**: its top level reads nothing from outside
 the program, and leaves behind no output and no state another module could reach
@@ -5887,8 +5941,9 @@ and through `Name <: T` or `Name: K` it cannot. A type member is in scope in the
 which is how `charge` above returns a `Receipt`.
 **[Decided]** `Module{Receipt requires Identified(Receipt), charge: {amount: Int} => Receipt}` is met by a run
 whose `Receipt` has an instance of `Identified`.
-**[Decided]** — an entry's clauses write the transactional state of the module the type describes as
-`Module::*`, and a run's state is the parameter's through it: `counter::*` for a parameter `counter`
+**[Decided]** An entry's clauses write the private transactional state of the module the type
+describes as `Module::*`, and a run's state is the parameter's through it: `counter::*` for a
+parameter `counter`, and `counter::stock` for its entry `stock: Mut(V, Txn)` (**[Planned]**)
 ([Discharging requirements and effects](#discharging-requirements-and-effects)).
 
 `Module{…}` 𝐴 is a subtype of `Module{…}` 𝐵 when 𝐴 has every member 𝐵 names. A value member's type
@@ -5934,10 +5989,15 @@ A program of modules means what the same code means written in one file, with ea
 by its qualified name. For mutable state, modules add visibility and nothing else:
 
 - **[Planned]** A public mutable variable is a `Txn` variable. It is read and written through a
-  qualified reference inside a `with begin():` block ([8.3 Reads](#83-reads)).
+  qualified reference inside a `with begin():` block, or in a function a block calls ([8.3
+  Reads](#83-reads)), and `await_final(eu::stock)` reads its final value ([8.6
+  `await_final`](#86-await_final)). `=` does not rebind one.
 - **[Planned]** A qualified reference is a bare variable reference, so `eu::stock` may be passed to
   a `Mut` parameter under the downward-only discipline of [8.1 Mutation is explicit: the `:=`
   operator](#81-mutation-is-explicit-the--operator).
+- **[Planned]** A Module type's entry `stock: Mut(V, Txn)` is the variable of the run passed for the
+  parameter, not a copy: `p::stock := e` writes the argument's `stock`. `Mut` is invariant, so the
+  argument's variable has value type `V` exactly.
 - A public feed is fed and read through a qualified reference. Append merges commutatively, so
   several writers are a feed's semantics.
 - A module that keeps its state private and exports functions over it relies on functions that
@@ -6139,12 +6199,12 @@ restrict what a type may mention.
 ### 9.14 Checking a module on its own
 
 A module is checked once, alone, with no root and nothing that uses it. `cambra check lib.cambra`
-runs that check and prints the module's interface. **[Decided]** — no other module names the
-module's transactional variables, which are private, or the state of the runs it declares, so the
-interface writes their reads and writes `ReadTxn(Module::*)` and `WriteTxn(Module::*)`, as a Module
-type of the module would. **[Planned]** — the interface writes each type with the alias names its
-module wrote: a member annotated `base: Count` is printed `base: Count`, not with the type `Count`
-names.
+runs that check and prints the module's interface. **[Decided]** No other module names the module's
+private transactional variables or the state of the runs it declares, so the interface writes their
+reads and writes `ReadTxn(Module::*)` and `WriteTxn(Module::*)`, as a Module type of the module
+would, and a public variable by its name (**[Planned]**). **[Planned]** — the interface writes each
+type with the alias names its module wrote: a member annotated `base: Count` is printed `base:
+Count`, not with the type `Count` names.
 
 - **Parameters are typed binders.** A value parameter has its annotated type, with each `_` in it
   the type its uses infer. A type parameter is opaque apart from its bound. One with no bound is
@@ -6155,7 +6215,7 @@ names.
 - **Imports are read through contracts.** A module sees each member another module exports through
   its contract, and whether the module is shareable
   ([9.7 Importing asserts a shareable module](#97-importing-asserts-a-shareable-module)).
-  **[Decided]** A function's contract includes its `requires` and `causes` clauses.
+  A function's contract includes its `requires` and `causes` clauses (**[Decided]**).
 - **A public member's contract is its type.** An exactly annotated member's contract is the
   annotation, checked against the body, and a module using the member reads no body. An unannotated
   member's contract is its inferred type, refinements and all, and a `<:` member's is its inferred
@@ -6219,7 +6279,7 @@ failure status. An omitted definition with no complete declaration supplies no e
 
 ### 9.16 The std root
 
-**[Planned]** — the rules of this section.
+**[Planned]** — the rules of this section, apart from `@Builtin` below, which is **[Decided]**.
 
 The compiler's own modules live under a **std root**, and every std module's path begins with `std`:
 `import std::http` binds `http`, then `http::serve(…)` and `http::ok(…)` ([7.3
@@ -6376,26 +6436,31 @@ pub type Capped = {Int where _ <= limit}
 - **A constant expression** is built from literals; constant bindings and `const` parameters in
   scope, including another module's public constant binding, `cfg::port`; operators, a ternary,
   and record, tuple and list literals over constants, and a field or element of one.
-  **[Planned]** — calls, with constant arguments, to functions that may be called in a constant. A
-  type, an import name and a run name are fixed at link time as well, and stand where a type or a
-  module is expected.
-- **A top-level `=` binding is a constant when its definition is a constant expression.**
-  `limit = max_rate * 2` is one; `n = len(xs)` is not, since a call is not a constant yet. A binding
-  that is not a constant is an ordinary value wherever no constant is required. Read where one is
-  required, it is an error at the read that names what its definition reads. A mutable variable, a
-  value parameter without `const`, and a function are never constants.
+  **[Planned]** — calls, with constant arguments, to functions that may be called in a constant.
+  A type, an import name and a run name are fixed at link time as well, and stand where a type or
+  a module is expected.
+- **A top-level `=` binding is a constant when its definition is a constant expression.** `limit =
+  max_rate * 2` is one, and so is `cap = scale(limit)` for a `scale` that may be called in a
+  constant (**[Planned]**). A binding that is not a constant is an ordinary value wherever no
+  constant is required. Read where one is required, it is an error at the read that names what its
+  definition reads. A mutable variable, a value parameter without `const`, and a function are never
+  constants.
 - **A `const` parameter is the only binding a run gives a constant**, since the obligation falls on
   every `run` and `import` of the module, and a module checked alone states it in its interface
   ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). `const` before any
   other statement is an error.
 - **[Planned]** **A function may be called in a constant when its body reads only its own
-  parameters, constants, and functions that may be, and it requires nothing and causes nothing**
+  parameters, constants,
+  and functions that may be, and it requires nothing and causes nothing**
   ([6.9 Capabilities](#69-capabilities)). Requiring and causing nothing is not
-  enough alone: a function that captures a value the run computes is not one. Functions carry no
-  marker. The check follows a `def` through its body and every function that body calls, and reads
-  an imported function through its module's interface, which records whether each public function
-  may be ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). A call to one
-  that may not is an error naming the binding, source, feed or mutable variable its body reads.
+  enough alone: a function that captures a value the run computes is not one. A call computes the
+  function's body with each parameter its argument. **[Planned]** — a body holding more than `=`
+  bindings and its value, each a constant expression over the parameters, and a call of a prelude
+  function such as `sum`. Functions carry no marker. The check follows a `def` through its body and
+  every function that body calls, and reads an imported function through its module's interface,
+  which records whether each public function may be
+  ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). A call to one that may
+  not is an error naming the binding, source, feed or mutable variable its body reads.
 - **A read of a constant is known to be the constant**, in a module checked alone too, where a
   `const` parameter has no value yet. There `Capped::new(max_rate)` meets
   `{Int where _ <= max_rate}`, and in a module that writes `run shop(max_rate=r + 1) as a`, a value
@@ -6419,9 +6484,6 @@ pub type Capped = {Int where _ <= limit}
 - **Packages.** Dependencies outside the module root, a search path of roots, versioning, and a
   manifest. The rules of [9.15 Module files](#915-module-files) extend to several roots with a
   collision between roots refused.
-- **Givens and instances across modules.** Transactions as contextual parameters are locally scoped.
-  General typeclass instances will need a rule for which module's instances are visible where, and a
-  coherence rule.
 - **Discarding and redeclaring one address.** A version that both writes `@Discard stock` and
   declares `stock` could mean a reset to the declared initial value, or be an error.
 - **First-class Module values.** A Module value is written only as an argument or as a member
@@ -6441,10 +6503,10 @@ is discarded.
 
 Sinks may observe the indices of collections passed to them if needed.
 
-**[Decided]** A sink is any operation that hands data out of the program: binding a feed to a sink,
-or calling a sink function that takes a collection and writes it out. Feeds are one way to build the
-collection, not the only one. Each causes `AffectWorld`
-([Output outside the program](#output-outside-the-program)).
+A sink is any operation that hands data out of the program, and each causes `AffectWorld`
+([Output outside the program](#output-outside-the-program)). Binding a feed to a sink is one.
+**[Decided]** — so is calling a sink function that takes a collection and writes it out: feeds are
+one way to build the collection, not the only one.
 
 ## 11. Errors and recovery
 
@@ -6493,7 +6555,6 @@ semantic reasons:
 
 - Use of an unsupported construct (e.g. `yield` outside a generator
   function, `while` loops, `http_serve` not at top level).
-- Use of an unknown name as a zero-argument call.
 - Type mismatches (e.g. comparing values of incompatible types,
   feeding a name that is not a feed).
 - Unsupported operator combination that the current planner can't
