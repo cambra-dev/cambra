@@ -4699,7 +4699,7 @@ through the function (`InferCtx::exported_capabilities`).
 Each loop records `OrderableIfRequiredBy(𝑃, 𝐸)` in its enclosing function's requirements
 ([Conditional ordering requirements](../../../docs/chl-spec.md#conditional-ordering-requirements)).
 `𝑃` is the source's position type. `𝐸` collects the body's capabilities after excluding writes to
-variables declared in the iteration. The requirement keeps its
+variables declared in the iteration and exceptions caught in the body. The requirement keeps its
 own capability variable, independently of the capabilities an enclosing scope discharges. An inner
 loop's source evaluates in the outer body, before the inner body's frame opens.
 
@@ -4707,7 +4707,7 @@ loop's source evaluates in the outer body, before the inner body's frame opens.
 instantiation copies both through the same `FreshenCache` as the function type, including its
 written upper bounds. The position variables retain their telescopes, and the requirement retains
 the trait assumptions available where it is used. A statement's frame passes the requirement
-outward even when its writes stop at a surrounding scope.
+outward even when its writes or exceptions stop at a surrounding scope.
 
 A requirement whose capabilities exclude ordering is discharged. Otherwise `check_loop_orders` uses
 the ordinary trait solver to require `Orderable(𝑃, 𝑃)`. An orderable position type also discharges a

@@ -237,6 +237,31 @@ fn an_escaping_raise_orders_a_loop_of_blocks() {
     );
 }
 
+#[rstest]
+#[case::a_list("[1, 2, 3]", false)]
+#[case::a_concatenation("[1, 2] ++ [3]", true)]
+#[case::a_map_with_record_keys("map([(a=1) -> 1, (a=2) -> 2])", true)]
+fn a_raising_callback_requires_ordered_positions(#[case] source: &str, #[case] refused: bool) {
+    let code = indoc! {"
+        def each(f, xs):
+            for x in xs:
+                f(x)
+            0
+        def fail(x: Int) => Int:
+            raise x
+        try:
+            each(fail, SOURCE)
+        except Int as e:
+            e
+    "}
+    .replace("SOURCE", source);
+    if refused {
+        check_compile_error(&code, "this loop runs in its source's position order");
+    } else {
+        check_scalar(&code, Value::Int(1));
+    }
+}
+
 #[test]
 fn an_appending_callback_needs_no_ordered_positions() {
     check_scalar(
@@ -253,6 +278,93 @@ fn an_appending_callback_needs_no_ordered_positions() {
     "},
         Value::Int(6),
     );
+}
+
+#[test]
+fn callback_ordering_is_checked_through_forwarding_and_per_use() {
+    check_scalar(
+        indoc! {"
+        out: Feed(_)
+        def each(f, xs):
+            for x in xs:
+                f(x)
+            0
+        def forward(f, xs):
+            each(f, xs)
+        def fail(x: Int) => Int:
+            raise x
+        def push(x: Int):
+            out << x
+        first = try:
+                    forward(fail, [3, 2, 1])
+                except Int as e:
+                    e
+        forward(push, [1, 2] ++ [3])
+        sum(out) + first
+    "},
+        Value::Int(9),
+    );
+}
+
+#[test]
+fn a_callback_uses_the_declared_order_of_map_keys() {
+    let code = indoc! {"
+        def each(f, xs):
+            for x in xs:
+                f(x)
+            0
+        pub def each_map(K, xs: Map(K, Int)) requires Orderable(K, K):
+            def fail(x: Int) => Int:
+                raise x
+            try:
+                each(fail, xs)
+            except Int as e:
+                e
+    "};
+    check_program(&mut GlobalContext::default(), &program(code, &[]))
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+}
+
+#[test]
+fn a_caught_callback_retains_the_inner_loop_requirement() {
+    check_compile_error(
+        indoc! {"
+            def each(f, xs):
+                for x in xs:
+                    f(x)
+                0
+            def handled(f, xs):
+                try:
+                    each(f, xs)
+                except Int as e:
+                    e
+            def fail(x: Int) => Int:
+                raise x
+            handled(fail, [1] ++ [2])
+        "},
+        "this loop runs in its source's position order",
+    );
+}
+
+#[test]
+fn catching_between_loops_keeps_the_outer_loop_unordered() {
+    let code = indoc! {"
+            out: Feed(_)
+            def each(f, xs):
+                for x in xs:
+                    f(x)
+                0
+            def fail(x: Int) => Int:
+                raise x
+            for x in [1] ++ [2]:
+                result = try:
+                            each(fail, [3, 4])
+                         except Int as e:
+                            e
+                out << result + x
+        "};
+    check_program(&mut GlobalContext::default(), &program(code, &[]))
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
 }
 
 #[test]
@@ -295,6 +407,29 @@ fn an_exact_callback_contract_must_retain_its_ordering_requirement() {
     assert!(
         format!("{errors:?}").contains("OrderableIfRequiredBy("),
         "{errors:?}"
+    );
+}
+
+#[test]
+fn importing_a_callback_function_preserves_its_ordering_requirement() {
+    let library = indoc! {"
+        pub def each(f, xs):
+            for x in xs:
+                f(x)
+            0
+    "};
+    let caller = indoc! {"
+        import library
+        def fail(x: Int) => Int:
+            raise x
+        try:
+            library::each(fail, [1] ++ [2])
+        except Int as e:
+            e
+    "};
+    super::modules::assert_refused(
+        &program(caller, &[("library", library)]),
+        "this loop runs in its source's position order",
     );
 }
 
@@ -343,6 +478,24 @@ fn a_printed_ordering_contract_can_annotate_its_definition(
 }
 
 #[test]
+fn a_callback_requirement_accepts_orderable_map_keys() {
+    let code = indoc! {"
+        def each(f, xs):
+            for x in xs:
+                f(x)
+            0
+        def fail(x: Int) => Int:
+            raise x
+        pub first = try:
+                        each(fail, box(map([2 -> 20, 1 -> 10])))
+                    except Int as e:
+                        e
+    "};
+    check_program(&mut GlobalContext::default(), &program(code, &[]))
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+}
+
+#[test]
 fn orderable_positions_discharge_a_conditional_requirement_in_an_exact_contract() {
     let code = indoc! {"
         pub def each(E <: Effect, f: (Int => Int causes E), xs: List(Int)) requires nothing causes E:
@@ -358,7 +511,7 @@ fn orderable_positions_discharge_a_conditional_requirement_in_an_exact_contract(
 #[test]
 fn excluding_ordering_effects_discharges_a_conditional_requirement() {
     let code = indoc! {"
-        pub def each(P, T, E <: Effect except Write(*), f: (T => Int causes E), xs: P |=> T) requires nothing causes E:
+        pub def each(P, T, E <: Effect except (Write(*), Raise(*)), f: (T => Int causes E), xs: P |=> T) requires nothing causes E:
             for x in xs:
                 f(x)
             0
@@ -385,6 +538,27 @@ fn an_external_write_orders_each_enclosing_callback_loop() {
             outer(write, [1] ++ [2], [3, 4])
         "},
         "this call runs a loop in its source's position order",
+    );
+}
+
+#[test]
+fn evaluating_an_inner_source_can_order_the_outer_loop() {
+    check_compile_error(
+        indoc! {"
+            out: Feed(_)
+            def source(x: Int) causes Raise(Int):
+                [3] ++ [4]
+            def outer(xs):
+                for x in xs:
+                    for y in source(x):
+                        out << y
+                0
+            try:
+                outer([1] ++ [2])
+            except Int as e:
+                e
+        "},
+        "this loop runs in its source's position order",
     );
 }
 
@@ -415,12 +589,15 @@ fn a_written_ordering_requirement_is_checked_at_each_use(
             for x in xs:
                 f(x)
             0
-        def write(x: Int) => Int causes Write(*):
-            x
+        def fail(x: Int) => Int:
+            raise x
     "};
     let caller = indoc! {"
         pub def caller(values: POSITIONS |=> Int) => Int:
-            each(write, values)
+            try:
+                each(fail, values)
+            except Int as e:
+                e
     "}
     .replace("POSITIONS", positions);
     let code = format!("{definition}\n{caller}");

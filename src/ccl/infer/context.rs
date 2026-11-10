@@ -949,7 +949,14 @@ impl InferCtx {
             .collect();
         let mut errors = Vec::new();
         for t in &self.capability_tries {
-            if reaches_any(&t.var, &open) {
+            if reaches_any(&t.var, &open)
+                || t.var.reaches(&|v| {
+                    v.open_input.get()
+                        && v.incoming().is_empty()
+                        && v.own().is_empty()
+                        && !v.closed().1
+                })
+            {
                 continue;
             }
             // A clause catches a type the compiler carries as an exception.
