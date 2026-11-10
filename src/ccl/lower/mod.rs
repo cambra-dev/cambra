@@ -732,6 +732,10 @@ pub struct LoweringContext {
     /// Where the module being lowered performs IO, if it does: the first call to
     /// a registered source (`docs/chl-spec.md`, "9.7 Importing asserts a shareable module").
     pub(super) io_site: Option<Span>,
+    /// The root's last statement, where `cambra check` lowers the root as a module: the
+    /// program's value, as it is where the program runs, so not an expression statement
+    /// ([`EXPRESSION_STATEMENT`]).
+    pub(super) root_value: Option<Span>,
     /// Each reference to a name a run's `use` clause binds, by its node, with
     /// where it is written ([`Self::reference`]).
     pub(super) run_use_reads: HashMap<crate::ccl::provenance::NodeId, Span>,
@@ -771,6 +775,9 @@ pub struct LoweringContext {
     /// inference rather than a module check, so they are kept here for the rule that decides
     /// whether a module is imported or run (`docs/chl-spec.md`, "Shareable modules").
     pub(crate) root_statements: Vec<modules::ModuleStatement>,
+    /// What the root declares, which tells the linked program's inference the root's public
+    /// members, as a module check is told its module's.
+    pub(crate) root_interface: Option<Rc<modules::Interface>>,
     /// Where each run of the linked program is brought in
     /// ([`modules::RunSites`]).
     pub(crate) run_sites: modules::RunSites,

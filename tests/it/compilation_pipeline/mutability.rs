@@ -3506,19 +3506,21 @@ fn a_store_waits_for_every_accumulators_seed() {
 }
 
 /// An inner loop whose only statement is a call that writes nothing is dropped, as a flat
-/// one is, leaving the enclosing loop on its own.
+/// one is, leaving the enclosing loop on its own. The call is of a parameter, which only each use
+/// knows to be pure: a call the definition knows does nothing is refused (`docs/chl-spec.md`,
+/// "4.9 Expression statement").
 #[test]
 fn an_inner_loop_calling_a_pure_function_is_dropped() {
     check_scalar(
         indoc! {r#"
-            def f(k):
-                k + 1
-            t := 0
-            for i in [1, 2]:
-                t += i
-                for k in [10, 20]:
-                    f(k)
-            t
+            def each(g):
+                t := 0
+                for i in [1, 2]:
+                    t += i
+                    for k in [10, 20]:
+                        g(k)
+                t
+            each(\k -> k + 1)
         "#},
         Value::Int(3),
     );

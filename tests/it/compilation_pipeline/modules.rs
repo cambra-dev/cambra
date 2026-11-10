@@ -1747,7 +1747,7 @@ fn a_rejected_run_reports_nothing_from_its_nonbinding_statements(
         param x: T
         visits := x
         visits := visits + 1
-        x + 1
+        visits := x + 1
         pub n = 1
     "};
     let mid = indoc! {r#"

@@ -713,6 +713,7 @@ pub(crate) fn run(
     expr: &mut Expr,
     sources: &HashMap<String, Type>,
     instances: &Rc<solver::traits::InstanceTable>,
+    public: &HashSet<Name>,
     statements: &HashSet<NodeId>,
 ) -> Result<(Type, Vec<LocatedInferError>), Vec<LocatedInferError>> {
     let outcome = run_with_params(
@@ -722,7 +723,7 @@ pub(crate) fn run(
         instances,
         &[],
         &HashSet::new(),
-        &HashSet::new(),
+        public,
         statements,
         false,
     );

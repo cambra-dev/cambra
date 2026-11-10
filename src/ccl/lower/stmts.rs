@@ -1168,7 +1168,7 @@ pub(super) fn lower_middle_stmt(
         ChlStmt::Expr { .. } | ChlStmt::If { .. } | ChlStmt::Match { .. } => {
             let effect = lower_final_stmt(stmt, preceding, outer_bindings, ctx)?;
             let label = match stmt.node {
-                ChlStmt::Expr { .. } => EXPRESSION_STATEMENT,
+                ChlStmt::Expr { .. } if ctx.root_value != Some(stmt.span) => EXPRESSION_STATEMENT,
                 _ => "lower.stmt_seq",
             };
             Ok(ctx.tag_machinery(Expr::expr_stmt(effect, body), stmt.span, label))

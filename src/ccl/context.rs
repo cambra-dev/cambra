@@ -2981,6 +2981,21 @@ fn run_passes(
     // The reads named before inference, for an error inference raises in a definition it then
     // drops, whose bindings the tree it leaves no longer holds.
     let reads_named = mut_read::read_respelling(&expr);
+    // The root's public members head the linked program's spine with no home.
+    let root_public = match &ctx.lowering_ctx().root_interface {
+        Some(interface) => expr
+            .chain_binders()
+            .into_iter()
+            .filter(|b| {
+                b.name.home().is_none()
+                    && (interface.is_public(b.name.base())
+                        || interface.is_public_function(b.name.base()))
+            })
+            .map(|b| b.name.clone())
+            .collect(),
+        None => HashSet::new(),
+    };
+    ctx.inference_ctx().root_public = root_public;
     let infer_outcome = recorded(capture_provenance, Phase::Infer, || {
         let out = infer(&mut expr, ctx.inference_ctx());
         if out.is_ok() {

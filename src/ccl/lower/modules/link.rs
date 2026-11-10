@@ -679,6 +679,7 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
     // The root's check is the linked program's inference, unless its parameters or the
     // arguments its own runs and imports pass need one of their own.
     if errors.iter().all(LoweringError::has_stand_in) && value.is_some() {
+        ctx.root_interface = root_lowered.as_ref().map(|r| Rc::clone(&r.interface));
         if let Some(root_lowered) = root_lowered
             && (!root_lowered.interface.parameters.is_empty()
                 || !lowering
@@ -1083,7 +1084,14 @@ impl<'a> ProgramLowering<'a> {
         let scope = self.scope(ast, Some(module.clone()), ctx);
         ctx.begin_module(scope.clone());
         ctx.places.add_module(module.segments(), &ast.body);
+        ctx.root_value = self
+            .program
+            .root()
+            .filter(|root| root.file == file)
+            .and_then(|root| root.body.last())
+            .map(|last| last.span);
         let lowered = lower_module_body(ast, ctx);
+        ctx.root_value = None;
         let sinks = std::mem::take(&mut ctx.declared_sinks);
         let run_checks = std::mem::take(&mut ctx.run_type_checks);
         let unimportable = sink_site(ast)

@@ -166,6 +166,10 @@ pub struct TypeInferenceContext {
     /// records ([`crate::ccl::lower::LoweringContext`]).
     pub(crate) expression_statements: HashSet<NodeId>,
 
+    /// The binders of the root's public members, which the linked program's inference holds
+    /// to what a public member's type may name, as a module check does its module's.
+    pub(crate) root_public: HashSet<Name>,
+
     /// The expression statements [`infer`] found to cause nothing, which the compile reports
     /// once the checks that diagnose a statement more precisely have run.
     pub(crate) inert: Vec<LocatedInferError>,
@@ -1519,12 +1523,15 @@ impl std::fmt::Debug for InferError {
             InferError::UnboundVariable(name) => write!(f, "Unbound variable: '{}'", name),
             InferError::InertStatement => write!(
                 f,
-                "this statement causes nothing and its value is discarded, so it does nothing"
+                "this statement causes nothing and its value is discarded, so it does nothing: \
+                 remove it, or write `_ = …` to compute it and keep nothing"
             ),
             InferError::VariablePastItsScope { member, item } => write!(
                 f,
                 "`{member}` is public and its type has `{item}`, which names an induction variable \
-                 of this module, which only this module may read or write"
+                 of this module, which only this module may read or write: take the variable as a \
+                 `Mut` parameter, feed its values out through a public feed, or bind its value at \
+                 the position you want to a public member"
             ),
             InferError::TypeMismatch {
                 ctx,
@@ -2078,6 +2085,7 @@ pub fn infer(
         expr,
         &ctx.source_types,
         &ctx.instances,
+        &ctx.root_public,
         &ctx.expression_statements,
     );
     #[cfg(debug_assertions)]

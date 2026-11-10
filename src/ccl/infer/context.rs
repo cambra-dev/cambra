@@ -154,8 +154,8 @@ pub(super) struct InferCtx {
     /// The `ExprStmt` of each expression statement the program writes, the statements an
     /// inert one is refused among.
     pub(super) expression_statements: HashSet<NodeId>,
-    /// Each public function of the module, with its capabilities and its `let`.
-    capability_public: Vec<(Name, Rc<CapabilityVar>, NodeId)>,
+    /// Each public member of the module, with its type and its `let`.
+    capability_public: Vec<(Name, Type, NodeId)>,
     /// The variable of every call site ([`InferCtx::call_capabilities`]).
     capability_calls: HashSet<crate::ccl::capabilities::CapabilityVarId>,
     /// Lexical scope: name → [`Binding`] for in-scope variables and let-bound
@@ -421,7 +421,7 @@ struct NodeCapabilities {
 struct CapabilityBinder {
     depth: u32,
     /// A parameter's history is its argument's, so the call records what is done to it, and
-    /// the function's type does not ([`ScopedCapability::parameter`]).
+    /// the function's type does not ([`crate::ccl::capabilities::Bound::Parameter`]).
     parameter: bool,
     /// A transactional mutable variable: reading or writing it requires `Transaction`, and its
     /// capabilities are `ReadTxn` and `WriteTxn`.
@@ -783,8 +783,8 @@ impl InferCtx {
     /// private feed, which makes the feed the run's.
     pub(super) fn exported_capabilities(&self) -> ExportedCapabilities {
         let mut out = ExportedCapabilities::default();
-        for (name, var, node) in &self.capability_public {
-            for capability in var.resolved() {
+        for (name, ty, node) in &self.capability_public {
+            for capability in type_capabilities(ty) {
                 if capability.bound != CapabilityBound::At(0) {
                     continue;
                 }
@@ -2636,13 +2636,9 @@ impl Typing for InferCtx {
     }
 
     fn note_binding(&mut self, name: &Name, ty: &Type, node: NodeId) {
-        if self.capability_frame().depth == 0
-            && self.public.contains(name)
-            && let Type::Fun { capabilities, .. } = ty.peel_refinements()
-            && let Repr::Var(v) = capabilities.repr()
-        {
+        if self.capability_frame().depth == 0 && self.public.contains(name) {
             self.capability_public
-                .push((name.clone(), Rc::clone(v), node));
+                .push((name.clone(), ty.clone(), node));
         }
     }
 
@@ -3041,6 +3037,39 @@ fn mark_constant_family_holes(body: &Type, param: &smol_str::SmolStr) {
         ));
     }
     body.walk_children(|c| mark_constant_family_holes(c, param));
+}
+
+/// The capabilities of every function nested in a value, through its inferred lower bounds.
+fn type_capabilities(ty: &Type) -> Vec<ScopedCapability> {
+    fn collect(ty: &Type, seen: &mut HashSet<*const InferVar>, out: &mut Vec<ScopedCapability>) {
+        if let Type::Infer(v) = ty.peel_refinements() {
+            if seen.insert(Rc::as_ptr(v)) {
+                let lowers: Vec<Type> = v
+                    .bounds
+                    .borrow()
+                    .lower()
+                    .iter()
+                    .map(|b| b.ty.clone())
+                    .collect();
+                for lower in lowers {
+                    collect(&lower, seen, out);
+                }
+            }
+            return;
+        }
+        if let Type::Fun { capabilities, .. } = ty {
+            out.extend(match capabilities.repr() {
+                Repr::Var(v) => v.resolved().into_iter().collect(),
+                _ => Capabilities::capabilities_of(capabilities),
+            });
+        }
+        ty.walk_children(|child| collect(child, seen, out));
+    }
+    let mut out = Vec::new();
+    collect(ty, &mut HashSet::new(), &mut out);
+    out.sort();
+    out.dedup();
+    out
 }
 
 #[cfg(test)]

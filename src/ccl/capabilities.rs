@@ -461,7 +461,7 @@ pub struct Filter {
     pub when_data: Option<Rc<crate::ccl::ty::FunKindVar>>,
     /// The receiving function's body depth: a capability naming a variable bound at this depth
     /// or deeper is that function's own, and stops here, as one naming a parameter does
-    /// ([`ScopedCapability::parameter`]).
+    /// ([`Bound::Parameter`]).
     pub below: Option<u32>,
     /// Requirements the edge's context supplies, `Transaction` inside a `with begin():`
     /// body.
