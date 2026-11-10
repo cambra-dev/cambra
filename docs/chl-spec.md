@@ -720,8 +720,8 @@ a finite function from `0..n` to values, so `xs[i]` is well-defined
 
 ### Ordered loops
 
-**[Decided]** — an exception escaping the body ([Exceptions](#exceptions)). The rest of this section
-is implemented.
+**[Decided]** — an exception escaping the body ([Exceptions](#exceptions)), and refusing an ordered
+loop over a feed fed from more than one `<<`. The rest of this section is implemented.
 
 A loop is **ordered** when its iterations interact: its body causes `Write(x)` for an induction
 variable `x` bound outside the loop, an accumulator update made directly or by a call (§4.6), or a
@@ -4584,7 +4584,11 @@ belongs to the whole program.
   definition's declares: `app`'s `instance Area(Square)` answering the requirement of a library's
   `def total(S, s: S) => Int requires a: Area(S)`. Which such instances a use may pass is open;
   the scoping rule of [Declaring an instance](#declaring-an-instance) orders one module's
-  declarations.
+  declarations. Deciding it also decides what a definition's type may take as settled about an
+  associated type: whether every instance its module reaches agreeing on one, as every
+  `Addable(_, Int)` instance gives an `Int`, holds at every use. A type stated or printed without
+  that agreement keeps the associated type open: `def inc(a): a + 1` prints as
+  `forall (A, B) A => B ∨ Int requires r: Addable(A, Int), r::Output <: B`.
 - **[Open] — a trait as a member of a Module type.** A Module type names no trait, so a module
   reaches the traits of a module it takes as an argument only through an import.
 
@@ -4592,6 +4596,7 @@ belongs to the whole program.
 
 ```ebnf
 poly_type       ::= "forall" "(" type_param ( "," type_param )* ")" expression [ requires_clause ]
+                    [ causes_clause ]
 ```
 
 In a type position, `forall (T, U <: B) V requires …` is the type of a polymorphic value: for
@@ -4622,15 +4627,17 @@ pick: forall (T) {T, T} => T = first
 - **A polymorphic function type has one `requires` clause,** after its codomain, holding the trait
   requirements on the types it quantifies and the context requirements of a call:
   `forall (T) {T, T} => T requires Orderable(T, T), Transaction causes AffectWorld`
-  ([Writing requirements and effects](#writing-requirements-and-effects)).
+  ([Writing requirements and effects](#writing-requirements-and-effects)). The `causes` clause
+  after it is the function type's, so a body that is not a function type takes none.
 - **It is never a type constructor.** `forall (T) V` does not denote a function from types to
   types. A parameterised alias, if added, is written in the head form `Pair(T) = {T, T}`
   ([6.7 Type-alias statements](#67-type-alias-statements)).
 - **A diagnostic prints an inferred polymorphic type in this notation.** A mismatch against a
   polymorphic annotation prints the right-hand side's type with each variable it quantifies as a
   parameter, `A`, `B`, … in order of first appearance, and each trait it requires of them as a
-  requirement, named where it has an associated type and that type bounded by what it is.
-  `def inc(a): a + 1` prints as `forall (A) A => Int requires r: Addable(A, Int), r::Output <: Int`.
+  requirement, named where it has an associated type. The associated type is written where the
+  type is that associated type alone, and otherwise bounded in the clause by what it is.
+  `def add(a, b): a + b` prints as `forall (A, B) {A, B} => r::Output requires r: Addable(A, B)`.
   A part of the type the notation cannot write, such as a parameter joined with another type, is
   marked in the printed type (`A ∨ Int`), not dropped.
 

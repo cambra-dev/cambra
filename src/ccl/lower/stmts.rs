@@ -2618,7 +2618,9 @@ pub(super) fn lower_requirements(
     if let Some(binder) = requires.iter().find_map(|r| match &r.node {
         Requirement::Trait { binder, .. } => binder.as_ref(),
         Requirement::Bound { instance, .. } => Some(instance),
-        Requirement::Subtype { .. } | Requirement::Forall { .. } => None,
+        Requirement::OrderableIfRequiredBy { .. }
+        | Requirement::Subtype { .. }
+        | Requirement::Forall { .. } => None,
     }) {
         return Err(LoweringError::unsupported(
             binder.span,
@@ -2677,8 +2679,28 @@ pub(super) fn lower_named_requirements(
     }
     ctx.named_requirements.truncate(in_scope);
     lowered?;
-    if let (Some(members), true) = (members, ctx.instances_declared) {
-        check_bounds_satisfiable(&named, members, &ctx.instances)?;
+    if let Some(members) = members {
+        let mut used = HashSet::new();
+        for param in members.iter() {
+            for ty in param.kind.children() {
+                collect_params(ty, &mut used);
+            }
+        }
+        for requirement in &out {
+            for ty in requirement
+                .args
+                .iter()
+                .chain(requirement.assoc.iter().map(|(_, ty)| ty))
+            {
+                collect_params(ty, &mut used);
+            }
+        }
+        // A written member bound replaces its trait's default bound. Its anonymous
+        // parameters have no source spelling and disappear when that bound no longer uses them.
+        members.retain(|p| !p.param.anonymous || used.contains(&p.param.id));
+        if ctx.instances_declared {
+            check_bounds_satisfiable(&named, members, &ctx.instances)?;
+        }
     }
     Ok((out, named))
 }
@@ -2749,6 +2771,7 @@ fn lower_requirement_item(
     ctx: &mut LoweringContext,
 ) -> Result<(), LoweringError> {
     match &req.node {
+        Requirement::OrderableIfRequiredBy { .. } => Ok(()),
         Requirement::Trait { binder, ty } => {
             let mut stated = lower_trait_type(ty, req.span, ctx)?;
             let mut members = members;
@@ -3188,7 +3211,7 @@ fn holes_to_params(
         }
         if matches!(ty, Type::Hole) {
             let spelling = format!("_{} of {bounded}", fresh.len() + 1);
-            let param = crate::ccl::ty::TypeParam::declared(spelling.as_str());
+            let param = crate::ccl::ty::TypeParam::anonymous(spelling.as_str());
             fresh.push(crate::ccl::ty::PolyParam {
                 param: Rc::clone(&param),
                 kind: crate::ccl::ty::TypeKind::Type,
@@ -3917,16 +3940,24 @@ fn split_forall_clause(
     ctx: &LoweringContext,
 ) -> (Spanned<ChlExpr>, Vec<Spanned<Requirement>>) {
     let mut body = body.clone();
-    let mut all = requires.to_vec();
-    if let ChlExpr::FunctionType { requires, .. } = &mut body.node {
-        let (context, traits): (Vec<_>, Vec<_>) = std::mem::take(&mut requires.items)
+    let mut all = Vec::new();
+    if let ChlExpr::FunctionType {
+        requires: inner, ..
+    } = &mut body.node
+    {
+        let (context, traits): (Vec<_>, Vec<_>) = std::mem::take(&mut inner.items)
             .into_iter()
+            .chain(requires.iter().cloned())
             .partition(|r| clauses::is_context_item(r, ctx));
-        if context.is_empty() && requires.only.is_none() {
-            requires.span = None;
+        if context.is_empty() && inner.only.is_none() {
+            inner.span = None;
+        } else if inner.span.is_none() {
+            inner.span = context.first().map(|r| r.span);
         }
-        requires.items = context;
+        inner.items = context;
         all.extend(traits);
+    } else {
+        all.extend_from_slice(requires);
     }
     (body, all)
 }
@@ -4254,7 +4285,9 @@ pub fn is_builtin_type_name(name: &str) -> bool {
 /// for a declaration that would rebind it. A trait name is spelled in the type world too, in
 /// a `requires` clause and before `::`, so a type of the same name would make both ambiguous.
 pub(super) fn reserved_name(name: &str) -> Option<&'static str> {
-    if is_builtin_type_name(name) {
+    if name == "OrderableIfRequiredBy" {
+        Some("requirement")
+    } else if is_builtin_type_name(name) {
         Some("type")
     } else if crate::ccl::infer::solver::traits::Trait::compiler_named(name).is_some() {
         Some("trait")
@@ -5500,6 +5533,20 @@ mod tests {
         let mut out = Vec::new();
         data_kinds(&lower_type(code), &mut out);
         assert_eq!(out, holes, "{code}");
+    }
+
+    /// Each hole in a written bound becomes an anonymous parameter, which a written member bound
+    /// replacing that bound drops where nothing uses it. Anonymity is the parameter's own, so a
+    /// declared parameter is never dropped that way, whatever its spelling.
+    #[test]
+    fn a_hole_in_a_bound_is_an_anonymous_parameter() {
+        let member = crate::ccl::ty::TypeParam::declared("r::Elements");
+        let mut params = Vec::new();
+        super::holes_to_params(&lower_type("{_, Int} => _"), &member, &mut params, 0);
+        let spellings: Vec<&str> = params.iter().map(|p| p.param.spelling.as_str()).collect();
+        assert_eq!(spellings, ["_1 of r::Elements", "_2 of r::Elements"]);
+        assert!(params.iter().all(|p| p.param.anonymous));
+        assert!(!crate::ccl::ty::TypeParam::declared("_1 of r::Elements").anonymous);
     }
 
     // -----------------------------------------------------------------------

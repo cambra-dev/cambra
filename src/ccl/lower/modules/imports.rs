@@ -448,6 +448,12 @@ pub(super) fn constant(expr: &ChlExpr) -> Option<Lit> {
 /// The names a requirement writes that could name a type or a module ([`mentioned_names`]).
 fn requirement_names(r: &chl_parser::ast::Requirement, names: &mut HashSet<SmolStr>) {
     match r {
+        chl_parser::ast::Requirement::OrderableIfRequiredBy { positions, effects } => {
+            mentioned_names(&positions.node, names);
+            for ty in effects.all_items() {
+                trait_type_names(&ty.node, names);
+            }
+        }
         chl_parser::ast::Requirement::Trait { ty, .. } => trait_type_names(ty, names),
         chl_parser::ast::Requirement::Bound { bound, .. } => mentioned_names(&bound.node, names),
         chl_parser::ast::Requirement::Subtype { sub, sup } => {

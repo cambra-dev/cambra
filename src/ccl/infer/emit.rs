@@ -142,9 +142,10 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             match ctx.scopes.lookup(name) {
                 None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
                 Some(binding) => {
-                    let instance = binding
-                        .scheme
-                        .instantiate_with_params(ctx.level, &ctx.telescope);
+                    let instance =
+                        binding
+                            .scheme
+                            .instantiate_with_params(ctx.level, &ctx.telescope, node_id);
                     // The specialization this use mints takes its copies of the definition's
                     // capability variables (`capabilities::UseCapabilities`).
                     ctx.use_capabilities
@@ -154,6 +155,8 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                     for copy in instance.capability_copies.values() {
                         copy.note_use(node_id);
                     }
+                    ctx.record_order_assumptions(&instance.capability_copies);
+                    ctx.assume_at_use(&instance.obligations);
                     for (instantiation, bound, bound_at) in instance.bounds {
                         let check = |ctx: &mut InferCtx| {
                             ctx.require_sub(&instantiation, &bound, &|| {
@@ -1069,7 +1072,7 @@ pub(super) fn emit_lambda<C: Typing>(
     // In Check mode `recorded` is the node's resolved type, so reading the kind
     // back reproduces what inference settled instead of minting a second
     // variable that nothing would constrain.
-    Ok(Type::Fun {
+    let ty = Type::Fun {
         name: Some(param.name.clone()),
         fun_kind: match recorded {
             Type::Fun { fun_kind, .. } => fun_kind.clone(),
@@ -1078,7 +1081,15 @@ pub(super) fn emit_lambda<C: Typing>(
         domain: Box::new(param_simple),
         codomain: Box::new(body_ty),
         capabilities,
-    })
+    };
+    if stamped
+        .unwrap_or(recorded)
+        .fun_kind()
+        .is_some_and(|k| k.resolved().is_data())
+    {
+        ctx.note_data_loop(ctx.current_node(), &ty);
+    }
+    Ok(ty)
 }
 
 /// Type a [`TypedExprNode::Cast`]: `cast(value, target)` re-views `value` at
@@ -3176,8 +3187,8 @@ pub(super) fn emit_for<C: Typing>(
                 .unordered_loop(node, iter.node_id(), &position_ty)
                 .unwrap_or(error));
         }
-        ctx.note_ordered_loop(node, iter.node_id(), &iter_ty, &position_ty);
     }
+    ctx.note_loop_order(node, iter.node_id(), &iter_ty, &position_ty);
     Ok(Type::Base(BaseType::Unit))
 }
 

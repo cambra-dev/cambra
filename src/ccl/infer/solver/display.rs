@@ -128,34 +128,34 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
         .filter_map(|o| Some((o.stated_requirement()?, o)))
         .unzip();
 
-    // One term, so a variable is one identity across the body and every
-    // requirement. A requirement's operands receive values, as a function's
-    // parameter does from an argument, so they stand at a positive position, where
-    // compaction reaches the variables flowing in; at a negative one it would reach
-    // only the fresh variable the operator minted. Its associated positions are
-    // pinned: the variable standing there may occur nowhere else at the opposite
-    // polarity, and it is what ties the requirement's `Output` to the body.
+    // One term, so a variable is one identity across the body and every requirement.
     let mut parts = vec![ty.clone()];
+    // A requirement's operands receive values from the body, so they stand at a positive
+    // position. Its associated types are what the body demands of the instance's, `r::A <: T`,
+    // so they stand at a negative one: the domain of a function.
+    let unit = || Type::Base(crate::ccl::BaseType::Unit);
     parts.extend(requirements.iter().map(|r| {
-        Type::Tuple(
-            r.args
-                .iter()
-                .cloned()
-                .chain(r.assoc.iter().map(|(_, t)| t.clone()))
-                .collect(),
-        )
+        let mut tys = r.args.clone();
+        if !r.assoc.is_empty() {
+            tys.push(Type::fun(
+                Type::Tuple(r.assoc.iter().map(|(_, t)| t.clone()).collect()),
+                unit(),
+            ));
+        }
+        Type::Tuple(tys)
     }));
-    let mut pinned: BTreeSet<InferVarId> = requirements
+    // An ordered loop's positions are a collection's domain, which is invariant: they stand
+    // at both polarities.
+    let positions: Vec<Type> = reach
+        .ordering
         .iter()
-        .flat_map(|r| &r.assoc)
-        .filter_map(|(_, t)| match t {
-            Type::Infer(v) => Some(v.uid),
-            _ => None,
-        })
+        .map(|r| r.ordering().unwrap().position_type())
         .collect();
-    // Polarity-correct throughout: where no value reached a positive position, the
-    // variable standing there is what it holds, and a fallback to its upper bound
-    // would show a demand as a value.
+    parts.extend(positions.iter().cloned());
+    if !positions.is_empty() {
+        parts.push(Type::fun(Type::Tuple(positions), unit()));
+    }
+    let mut pinned: BTreeSet<InferVarId> = BTreeSet::new();
     let mut compacted = compact_type_for_display(&Type::Tuple(parts));
     // A variable at or below the cutoff is one type of the enclosing scope's, not a
     // parameter, so it is pinned at the position it holds: dropped as polar-only, it
@@ -172,6 +172,7 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
     if !graph.rec_vars.is_empty() {
         return None;
     }
+    let members = associated_members(&mut graph.term, &requirements);
 
     let mut polarities = HashMap::new();
     occurrences(&mut graph.term, true, &mut polarities);
@@ -189,7 +190,7 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
     };
     let body = parts.remove(0);
 
-    let mut names = Naming::new(&st, &body, &parts);
+    let mut names = Naming::new(&st, &body, &parts, members);
     names.visit(&body);
     for part in &parts {
         names.visit(part);
@@ -215,6 +216,42 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
         })
         .collect();
     let mut requires: Vec<Rc<TraitRequirement>> = Vec::new();
+    let ordered_positions: HashMap<u32, Type> = reach
+        .ordering
+        .iter()
+        .zip(parts.iter().skip(requirements.len()))
+        .map(|(r, ty)| (r.ordering().unwrap().id, names.rename(ty)))
+        .collect();
+    fn name_ordering(ty: &mut Type, positions: &HashMap<u32, Type>) {
+        use crate::ccl::capabilities::{Capabilities, Repr};
+        if let Type::Fun { capabilities, .. } = ty {
+            let mut set = capabilities.set();
+            set.requires = set
+                .requires
+                .into_iter()
+                .map(|r| {
+                    let Some(order) = r.ordering() else { return r };
+                    let mut causes = order.capabilities.set();
+                    causes.requires.clear();
+                    causes.params.retain(|p| p.of_causes);
+                    causes.tops.retain(|t| t.of_causes);
+                    if let Repr::Var(v) = order.capabilities.repr() {
+                        causes.vars = v.reaching();
+                    }
+                    r.with_ordering(
+                        positions
+                            .get(&order.id)
+                            .cloned()
+                            .unwrap_or_else(|| order.positions.clone()),
+                        Capabilities::known(causes),
+                    )
+                })
+                .collect();
+            *capabilities = Capabilities::known(set);
+        }
+        ty.walk_children_mut(|c| name_ordering(c, positions));
+    }
+    name_ordering(&mut body, &ordered_positions);
     // The variables standing for a carried requirement's associated effect types, as the
     // requirement's members: `r::Writes` ([`TraitObligation::effects`]).
     let mut members: HashMap<CapabilityVarId, crate::ccl::capabilities::ClauseParam> =
@@ -229,7 +266,15 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
             .iter()
             .map(|t| crate::ccl::ccl_utils::strip_refinements(&names.rename(t)))
             .collect();
-        let (args, assoc_tys) = tys.split_at(stated.args.len());
+        let (args, rest) = tys.split_at(stated.args.len());
+        let assoc_tys: Vec<Type> = match rest {
+            [] => Vec::new(),
+            [Type::Fun { domain, .. }] => match &**domain {
+                Type::Tuple(tys) => tys.clone(),
+                other => vec![other.clone()],
+            },
+            _ => unreachable!("a requirement's associated types are one function's domain"),
+        };
         let mut effect_assoc = Vec::new();
         for (assoc, var) in obligation.effects() {
             let Some(declared) = stated
@@ -320,6 +365,17 @@ fn name_capability_vars(body: &mut Type, cutoff: Level, taken: &[PolyParam]) -> 
         } = ty
         {
             if let Repr::Known(set) = capabilities.repr() {
+                for r in &set.requires {
+                    if let Some(ordering) = r.ordering() {
+                        for (id, v) in &ordering.capabilities.set().vars {
+                            let entry = seen.entry(*id).or_insert_with(|| {
+                                order.push(Rc::clone(v));
+                                (false, false)
+                            });
+                            entry.0 = true;
+                        }
+                    }
+                }
                 for (id, v) in &set.vars {
                     let entry = seen.entry(*id).or_insert_with(|| {
                         order.push(Rc::clone(v));
@@ -436,18 +492,33 @@ fn name_capability_vars(body: &mut Type, cutoff: Level, taken: &[PolyParam]) -> 
     }
 
     fn rename(ty: &mut Type, names: &HashMap<CapabilityVarId, (Option<SmolStr>, Option<SmolStr>)>) {
-        if let Type::Fun { capabilities, .. } = ty
-            && let Repr::Known(set) = capabilities.repr()
-            && !set.vars.is_empty()
-        {
-            let mut set = set.clone();
+        fn rename_set(
+            mut set: crate::ccl::capabilities::CapabilitySet,
+            names: &HashMap<CapabilityVarId, (Option<SmolStr>, Option<SmolStr>)>,
+        ) -> crate::ccl::capabilities::CapabilitySet {
             for id in std::mem::take(&mut set.vars).into_keys() {
                 if let Some((r, e)) = names.get(&id) {
                     set.named_requires.extend(r.clone());
                     set.named_causes.extend(e.clone());
                 }
             }
-            *capabilities = Capabilities::known(set);
+            set.requires = set
+                .requires
+                .into_iter()
+                .map(|r| {
+                    let Some(order) = r.ordering() else { return r };
+                    r.with_ordering(
+                        order.positions.clone(),
+                        Capabilities::known(rename_set(order.capabilities.set(), names)),
+                    )
+                })
+                .collect();
+            set
+        }
+        if let Type::Fun { capabilities, .. } = ty
+            && let Repr::Known(set) = capabilities.repr()
+        {
+            *capabilities = Capabilities::known(rename_set(set.clone(), names));
         }
         ty.walk_children_mut(|child| rename(child, names));
     }
@@ -484,6 +555,7 @@ fn name_members(
 struct Reach {
     levels: HashMap<InferVarId, Level>,
     obligations: Vec<Rc<TraitObligation>>,
+    ordering: Vec<crate::ccl::capabilities::Requirement>,
 }
 
 impl Reach {
@@ -491,10 +563,22 @@ impl Reach {
         let mut reach = Reach {
             levels: HashMap::new(),
             obligations: Vec::new(),
+            ordering: Vec::new(),
         };
         let mut seen_obligations = HashSet::new();
         let mut pending = vec![ty.clone()];
         while let Some(ty) = pending.pop() {
+            fn collect(ty: &Type, requirements: &mut Vec<crate::ccl::capabilities::Requirement>) {
+                if let Type::Fun { capabilities, .. } = ty {
+                    for r in capabilities.set().requires {
+                        if r.ordering().is_some() && !requirements.contains(&r) {
+                            requirements.push(r);
+                        }
+                    }
+                }
+                ty.walk_children(|c| collect(c, requirements));
+            }
+            collect(&ty, &mut reach.ordering);
             ty.walk_infer_vars(&mut |v| {
                 if reach.levels.insert(v.uid, v.level()).is_some() || v.level() <= cutoff {
                     // A variable at or below the cutoff is the enclosing scope's: its
@@ -529,6 +613,112 @@ impl Reach {
 }
 
 /// The polarities each variable occurs at in `ct`.
+/// The variables standing for a requirement's associated type and nothing else, each with the
+/// member spelling it prints as, `_::Output`.
+///
+/// `requirements[i]` is the term's part `i + 1`: its operands, then a function whose domain
+/// holds its associated types. A slot holding one variable `B` alone states `r::Output <: B`, and
+/// where `B` stands nowhere else among the requirements, it is the associated type itself, which
+/// the contract writes `r::Output` (`docs/chl-spec.md`, "Trait requirements": a named
+/// requirement's associated types are types), wherever `B` stands alone. Where another type is joined with it, `B` stays a
+/// parameter: `B ∨ Int` holds more than `Output`. That holds even of an `Int` every instance the
+/// definition sees deposits on `Output`, which is a fact of those instances only
+/// (`src/ccl/design/type-inference.md`, "What an obligation determines").
+fn associated_members(
+    term: &mut CompactType,
+    requirements: &[TraitRequirement],
+) -> HashMap<InferVarId, SmolStr> {
+    let mut slots: Vec<(InferVarId, SmolStr)> = Vec::new();
+    for (i, r) in requirements.iter().enumerate() {
+        for (j, (name, _)) in r.assoc.iter().enumerate() {
+            let Some(v) =
+                associated_slot(term, i, r.args.len(), j, r.assoc.len()).and_then(bare_var)
+            else {
+                continue;
+            };
+            slots.push((v, SmolStr::from(format!("_::{name}"))));
+        }
+    }
+    let mut members = HashMap::new();
+    for (v, spelling) in slots {
+        let in_requirements: usize = term.rec.as_mut().map_or(0, |parts| {
+            parts
+                .iter_mut()
+                .filter(|(key, _)| match key {
+                    crate::ccl::ty::FieldKey::Index(k) => (1..=requirements.len()).contains(k),
+                    crate::ccl::ty::FieldKey::Name(_) => false,
+                })
+                .map(|(_, part)| mentions(part, v))
+                .sum()
+        });
+        if in_requirements == 1 && stands_alone(term, v) {
+            members.entry(v).or_insert(spelling);
+        }
+    }
+    members
+}
+
+/// The position holding associated type `j` of requirement `i`, which has `args` operands and
+/// `count` associated types ([`associated_members`]).
+fn associated_slot(
+    term: &mut CompactType,
+    i: usize,
+    args: usize,
+    j: usize,
+    count: usize,
+) -> Option<&mut CompactType> {
+    use crate::ccl::ty::FieldKey;
+    let part = term.rec.as_mut()?.get_mut(&FieldKey::Index(i + 1))?;
+    let slots = &mut part
+        .rec
+        .as_mut()?
+        .get_mut(&FieldKey::Index(args))?
+        .fun
+        .as_mut()?
+        .domain;
+    if slots.rec.is_none() {
+        return (count == 1).then_some(slots);
+    }
+    slots.rec.as_mut()?.get_mut(&FieldKey::Index(j))
+}
+
+/// The variable `ct` holds, where it holds one and nothing else.
+fn bare_var(ct: &mut CompactType) -> Option<InferVarId> {
+    let alone = ct.vars.len() == 1
+        && ct.atoms.is_empty()
+        && ct.rec.is_none()
+        && ct.fun.is_none()
+        && ct.var.is_none()
+        && ct.nominal.is_empty()
+        && ct.history_slot.is_none()
+        && ct.dep_tuple.is_none()
+        && ct.family.is_none();
+    alone.then(|| *ct.vars.iter().next().expect("one variable"))
+}
+
+/// Whether every position of `ct` holding `v` holds nothing else.
+fn stands_alone(ct: &mut CompactType, v: InferVarId) -> bool {
+    if ct.vars.contains(&v) && bare_var(ct).is_none() {
+        return false;
+    }
+    let mut alone = true;
+    for_each_child(ct, true, &mut |child, _| {
+        alone = alone && stands_alone(child, v);
+        Some(())
+    });
+    alone
+}
+
+/// How many positions of `ct` hold `v`.
+fn mentions(ct: &mut CompactType, v: InferVarId) -> usize {
+    let mut count = usize::from(ct.vars.contains(&v));
+    for_each_child(ct, true, &mut |child, _| {
+        count += mentions(child, v);
+        Some(())
+    });
+    count
+}
+
 fn occurrences(ct: &mut CompactType, pol: bool, out: &mut HashMap<InferVarId, (bool, bool)>) {
     for v in &ct.vars {
         let entry = out.entry(*v).or_default();
@@ -542,6 +732,12 @@ fn occurrences(ct: &mut CompactType, pol: bool, out: &mut HashMap<InferVarId, (b
         occurrences(child, child_pol, out);
         Some(())
     });
+    // A data function's domain is invariant: it stands at both polarities.
+    if let Some(cf) = &mut ct.fun
+        && super::simplify_type::is_data(cf)
+    {
+        occurrences(&mut cf.domain, pol, out);
+    }
 }
 
 /// What a placeholder parameter in the rewritten graph stands for.
@@ -679,6 +875,9 @@ struct Naming<'a> {
     params: std::cell::RefCell<HashMap<Named, Rc<TypeParam>>>,
     /// The joins and meets [`rename`](Self::rename) has met, each once.
     joins: std::cell::RefCell<Vec<Join>>,
+    /// The variables standing for an associated type, each spelled as its member, `_::Output`,
+    /// rather than with a letter ([`associated_members`]).
+    members: HashMap<InferVarId, SmolStr>,
 }
 
 /// What a final parameter stands for: a variable, a position nothing reached, or a
@@ -691,7 +890,12 @@ enum Named {
 }
 
 impl<'a> Naming<'a> {
-    fn new(st: &'a Parametrize<'a>, body: &Type, parts: &[Type]) -> Self {
+    fn new(
+        st: &'a Parametrize<'a>,
+        body: &Type,
+        parts: &[Type],
+        members: HashMap<InferVarId, SmolStr>,
+    ) -> Self {
         let mut taken = HashSet::new();
         let mut collect = |t: &Type| {
             visit_params(t, &mut |p| {
@@ -709,6 +913,7 @@ impl<'a> Naming<'a> {
             names: HashMap::new(),
             params: std::cell::RefCell::new(HashMap::new()),
             joins: std::cell::RefCell::new(Vec::new()),
+            members,
         }
     }
 
@@ -760,6 +965,12 @@ impl<'a> Naming<'a> {
             placed.push(waiting.remove(next));
         }
         for named in &placed {
+            if let Named::Var(v) = named
+                && let Some(member) = self.members.get(v)
+            {
+                self.names.insert(*named, member.clone());
+                continue;
+            }
             let spelling = (0..)
                 .map(|n: usize| {
                     let letter = char::from(b'A' + u8::try_from(n % 26).expect("n % 26 < 26"));

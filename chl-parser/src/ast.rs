@@ -743,6 +743,16 @@ pub struct Clause<T> {
     pub scoped: Vec<(Spanned<T>, Vec<Spanned<T>>)>,
 }
 
+impl<T> Clause<T> {
+    pub fn all_items(&self) -> impl Iterator<Item = &Spanned<T>> {
+        self.items.iter().chain(&self.except).chain(
+            self.scoped
+                .iter()
+                .flat_map(|(item, except)| std::iter::once(item).chain(except)),
+        )
+    }
+}
+
 impl<T> Default for Clause<T> {
     fn default() -> Self {
         Clause {
@@ -760,6 +770,10 @@ impl<T> Default for Clause<T> {
 /// Spec: `docs/chl-spec.md`, "Trait requirements".
 #[derive(Debug, Clone, PartialEq)]
 pub enum Requirement {
+    OrderableIfRequiredBy {
+        positions: Spanned<Expr>,
+        effects: Clause<TraitType>,
+    },
     /// A trait at its operands, and the name it binds the instance each call passes, if it
     /// names one: `a: Area(S)`.
     Trait {

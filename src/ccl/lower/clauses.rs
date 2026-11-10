@@ -13,6 +13,7 @@ use chl_parser::ast::{
 };
 
 use super::modules::QualifierKind;
+use super::stmts::lower_type_expr;
 use super::{LoweringContext, LoweringError};
 use crate::ccl::Name;
 use crate::ccl::capabilities::{
@@ -20,11 +21,13 @@ use crate::ccl::capabilities::{
     pruned,
 };
 use crate::ccl::infer::solver::traits::Trait;
+use crate::ccl::provenance::NodeId;
 
 /// Whether a `requires` item names a context trait or a parameter bounded by `Context`, or
 /// is `_`, rather than a trait instance search answers.
 pub(super) fn is_context_item(item: &Spanned<ChlRequirement>, ctx: &LoweringContext) -> bool {
     match &item.node {
+        ChlRequirement::OrderableIfRequiredBy { .. } => true,
         ChlRequirement::Trait { ty, .. } => {
             ty.name == "_"
                 || ty.instance.is_some()
@@ -73,7 +76,7 @@ pub(super) fn lower_clauses(
     causes: &Clause<TraitType>,
     site: Site,
     written_at: Span,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Option<Written>, LoweringError> {
     let at = match (requires.span, causes.span) {
         (None, None) if site == Site::Def => return Ok(None),
@@ -83,7 +86,10 @@ pub(super) fn lower_clauses(
     };
     let mut set = CapabilitySet::default();
     let mut hole_requires = false;
-    for item in requires.items.iter().filter(|r| is_context_item(r, ctx)) {
+    for item in &requires.items {
+        if !is_context_item(item, ctx) {
+            continue;
+        }
         for (span, lowered) in context_requirements(item, ctx)? {
             match lowered {
                 Lowered::Capability(r) => {
@@ -253,7 +259,7 @@ pub(super) fn bound_except(
 /// where it is written: a requirement, or `Read(*)`.
 fn requirement_taken(
     item: &Spanned<ChlRequirement>,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Vec<(Span, Capability)>, LoweringError> {
     if !is_context_item(item, ctx) {
         return Err(not_taken(item.span));
@@ -272,7 +278,7 @@ fn requirement_taken(
 /// where it is written: an effect, or a family's top.
 fn effect_taken(
     item: &Spanned<TraitType>,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Vec<(Span, Capability)>, LoweringError> {
     capabilities(item, ctx)?
         .into_iter()
@@ -508,7 +514,7 @@ fn unlisted<T>(
 /// names ([`listed`]).
 fn context_requirements(
     item: &Spanned<ChlRequirement>,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Vec<(Span, Lowered<Requirement>)>, LoweringError> {
     let ChlRequirement::Trait { binder, ty } = &item.node else {
         return Ok(vec![(item.span, context_requirement(item, ctx)?)]);
@@ -533,7 +539,7 @@ fn context_requirements(
 /// ([`listed`]).
 fn capabilities(
     item: &Spanned<TraitType>,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Vec<(Span, Lowered<Effect>)>, LoweringError> {
     let lowered = listed(item)?
         .iter()
@@ -547,9 +553,12 @@ fn capabilities(
 pub(super) fn item_naming_a_variable(
     requires: &Clause<ChlRequirement>,
     causes: &Clause<TraitType>,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Option<(Span, Capability)>, LoweringError> {
-    for item in requires.items.iter().filter(|r| is_context_item(r, ctx)) {
+    for item in &requires.items {
+        if !is_context_item(item, ctx) {
+            continue;
+        }
         for (span, lowered) in context_requirements(item, ctx)? {
             if let Lowered::Capability(r) = lowered {
                 let item = Capability::Requires(r);
@@ -608,8 +617,22 @@ fn bound<T>(clause: &Clause<T>, hole: bool, site: Site) -> Result<bool, Lowering
 /// The context requirement or the parameter `item` names.
 fn context_requirement(
     item: &Spanned<ChlRequirement>,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Lowered<Requirement>, LoweringError> {
+    if let ChlRequirement::OrderableIfRequiredBy { positions, effects } = &item.node {
+        let positions = lower_type_expr(positions, ctx)?;
+        let mut written = lower_clauses(&Clause::default(), effects, Site::Type, item.span, ctx)?
+            .expect("a written requirement has an effect clause");
+        written.open_requires = true;
+        return Ok(Lowered::Capability(Requirement::orderable_if_required_by(
+            positions,
+            crate::ccl::capabilities::Capabilities::written(written),
+            NodeId::PLACEHOLDER,
+            NodeId::PLACEHOLDER,
+            None,
+            Vec::new(),
+        )));
+    }
     let ChlRequirement::Trait { binder, ty } = &item.node else {
         unreachable!("a bound is no context requirement");
     };

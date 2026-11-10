@@ -473,16 +473,11 @@ pub(super) trait Typing {
         (f(self), false)
     }
 
-    /// Record the ordered loop `node` over `iter`, the source at `source`, whose positions are
-    /// `positions`, for the check of its keys' order once types are resolved. Check keeps
-    /// nothing.
-    fn note_ordered_loop(
-        &mut self,
-        _node: NodeId,
-        _source: NodeId,
-        _iter: &Type,
-        _positions: &Type,
-    ) {
+    /// Record a loop's conditional ordering requirement and retain its source for key checking.
+    /// Check records nothing.
+    fn note_data_loop(&mut self, _node: NodeId, _ty: &Type) {}
+
+    fn note_loop_order(&mut self, _node: NodeId, _source: NodeId, _iter: &Type, _positions: &Type) {
     }
 
     /// The refusal of the ordered loop `node` over the source at `source`, whose positions

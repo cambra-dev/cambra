@@ -223,6 +223,8 @@ pub enum ProductReading {
 /// and effects").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Supplier {
+    /// A compiler predicate over types and clauses: `OrderableIfRequiredBy`.
+    Conditional,
     /// Instance search, over the declared instances and the requirements in scope.
     Instances,
     /// A `with begin():` block, to its body: `Transaction`.
@@ -723,6 +725,12 @@ impl Trait {
     pub fn orderable() -> Trait {
         COMPILER_TRAITS.with(|c| c.orderable.clone())
     }
+
+    /// Conditional ordering, answered by its position and effect operands rather than instances.
+    pub fn orderable_if_required_by() -> Trait {
+        context_trait("OrderableIfRequiredBy", &[], Supplier::Conditional)
+    }
+
     /// Unary `-`'s trait.
     pub fn negatable() -> Trait {
         COMPILER_TRAITS.with(|c| c.negatable.clone())
@@ -3293,7 +3301,7 @@ impl TraitObligation {
             .as_ref()
             .expect("only a method call's obligation instantiates a method");
         let (level, telescope) = call.at.borrow().clone();
-        let instance = scheme.instantiate_with_params(level, &telescope);
+        let instance = scheme.instantiate_with_params(level, &telescope, self.operator_node_id);
         for (instantiation, bound, _) in &instance.bounds {
             constrain_subtype(instantiation, bound, cache)?;
         }

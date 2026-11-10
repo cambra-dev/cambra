@@ -787,14 +787,22 @@ pub(crate) fn run(
 /// An error for each capability variable's upper bound that its capabilities exceed, at the node where
 /// the first capability beyond it entered, with the clause or the written type as the secondary
 /// label.
-fn push_capability_failures(errors: &mut Vec<LocatedInferError>, expr: &Expr) {
+/// `beyond_clause` spells a capability a clause does not list ([`InferCtx::item_beyond_clause`]).
+fn push_capability_failures(
+    errors: &mut Vec<LocatedInferError>,
+    expr: &Expr,
+    beyond_clause: &dyn Fn(&crate::ccl::capabilities::Capability, chl_parser::ast::Span) -> String,
+) {
     use crate::ccl::capabilities::Blame;
     use crate::ccl::infer_var::Origin;
     // Each use of a polymorphic definition checks its own copy of the definition's bounds,
     // and the copies name the definition's nodes, so one failure is reported once.
     let mut reported = HashSet::new();
     for failure in crate::ccl::capabilities::exceeded_uppers() {
-        let item = failure.capability.item.to_string();
+        let item = match failure.blame {
+            Blame::Clause(at) => beyond_clause(&failure.capability.item, at),
+            _ => failure.capability.item.to_string(),
+        };
         if !reported.insert((failure.capability.at, item.clone(), failure.blame)) {
             continue;
         }
@@ -1369,8 +1377,6 @@ fn run_once(
     // checked here (`src/ccl/design/type-inference.md`, "Written clauses"), after each
     // associated effect type is given what the obligation standing for it selected.
     sub_ctx.settle_effect_links();
-    push_capability_failures(&mut errors, expr);
-    errors.extend(sub_ctx.requirements_beyond_clauses());
     errors.extend(sub_ctx.escaping_results());
     if !errors.is_empty() {
         return Err(sub_ctx.failure(errors));
@@ -1508,6 +1514,23 @@ fn run_once(
             ]));
         }
     }
+    // A loop's refusal moves to its written source, and a use's stays at the use; a
+    // capability's failure stays where it is raised, at a use of a definition among them.
+    let mut conditional: Vec<_> = sub_ctx
+        .check_loop_orders()
+        .into_iter()
+        .map(|e| match e.error {
+            InferError::UnorderedLoop { at_use: true, .. } => e,
+            _ => at_written_source(expr, e),
+        })
+        .collect();
+    push_capability_failures(&mut conditional, expr, &|item, clause| {
+        sub_ctx.item_beyond_clause(item, clause)
+    });
+    conditional.extend(sub_ctx.requirements_beyond_clauses());
+    if !conditional.is_empty() {
+        return Err(failed(conditional));
+    }
     // Sealed *after* the requirement sweep, not before: the sweep itself narrows, and
     // legitimately so. What must not happen is a later pass narrowing a definition's
     // obligation, which would leave the sweep's verdict stale.
@@ -1555,7 +1578,6 @@ fn run_once(
     debug_assert_no_free_witness(expr, "post-inference");
     // An expression statement, and a `with begin():` block, does something only by what it
     // causes.
-    sub_ctx.check_loop_orders();
     let inert: Vec<LocatedInferError> = sub_ctx
         .does_nothing()
         .into_iter()

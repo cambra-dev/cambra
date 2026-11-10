@@ -212,3 +212,235 @@ fn a_loop_of_blocks_over_a_concatenation_runs() {
         Value::Int(30),
     );
 }
+
+#[test]
+fn an_appending_callback_needs_no_ordered_positions() {
+    check_scalar(
+        indoc! {"
+        out: Feed(_)
+        def each(f, xs):
+            for x in xs:
+                f(x)
+            0
+        def push(x: Int):
+            out << x
+        each(push, [1, 2] ++ [3])
+        sum(out)
+    "},
+        Value::Int(6),
+    );
+}
+
+#[test]
+fn an_inferred_callback_contract_retains_orderable_if_required_by() {
+    let code = indoc! {"
+        pub def each(f, xs):
+            for x in xs:
+                f(x)
+            0
+    "};
+    let interface = check_program(&mut GlobalContext::default(), &program(code, &[]))
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert!(interface.contains("OrderableIfRequiredBy("), "{interface}");
+    assert!(!interface.contains("?"), "{interface}");
+}
+
+#[test]
+fn a_written_callback_contract_states_orderable_if_required_by() {
+    let code = indoc! {"
+        pub def each(P, T, E <: Effect, f: (T => Int causes E), xs: P |=> T) requires only OrderableIfRequiredBy(P, E) causes E:
+            for x in xs:
+                f(x)
+            0
+    "};
+    let interface = check_program(&mut GlobalContext::default(), &program(code, &[]))
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert!(interface.contains("OrderableIfRequiredBy("), "{interface}");
+}
+
+#[test]
+fn an_exact_callback_contract_must_retain_its_ordering_requirement() {
+    let code = indoc! {"
+        pub def each(P, T, E <: Effect, f: (T => Int causes E), xs: P |=> T) requires nothing causes E:
+            for x in xs:
+                f(x)
+            0
+    "};
+    let errors = check_program(&mut GlobalContext::default(), &program(code, &[]))
+        .expect_err("an exact contract must retain its conditional requirement");
+    assert!(
+        format!("{errors:?}").contains("OrderableIfRequiredBy("),
+        "{errors:?}"
+    );
+}
+
+/// A loop's printed ordering contract, written back as an annotation of its function, is
+/// accepted: the positions it requires to be orderable are its source's domain.
+#[rstest]
+#[case::a_callback_in_a_loop(
+    "each",
+    indoc! {"
+        pub def each(f, xs):
+            for x in xs:
+                f(x)
+            0
+    "}
+)]
+#[case::a_writer_in_a_loop(
+    "counted",
+    indoc! {"
+        def inc(x: Mut(Int)):
+            x += 1
+        pub def counted(xs):
+            c := 0
+            for x in xs:
+                inc(c)
+            c
+    "}
+)]
+fn a_printed_ordering_contract_can_annotate_its_definition(
+    #[case] name: &str,
+    #[case] definition: &str,
+) {
+    let interface = check_program(&mut GlobalContext::default(), &program(definition, &[]))
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    let signature = interface
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("pub {name}: ")))
+        .map(|line| {
+            line.split_once("  # ")
+                .map_or(line, |(signature, _)| signature)
+        })
+        .unwrap_or_else(|| panic!("{interface}"));
+    let implementation = definition.replace(&format!("pub def {name}"), &format!("def {name}"));
+    let code = format!("{implementation}\npub checked: {signature} = {name}\n");
+    check_program(&mut GlobalContext::default(), &program(&code, &[]))
+        .unwrap_or_else(|errors| panic!("{errors:?}\n{interface}"));
+}
+
+#[test]
+fn orderable_positions_discharge_a_conditional_requirement_in_an_exact_contract() {
+    let code = indoc! {"
+        pub def each(E <: Effect, f: (Int => Int causes E), xs: List(Int)) requires nothing causes E:
+            for x in xs:
+                f(x)
+            0
+    "};
+    let interface = check_program(&mut GlobalContext::default(), &program(code, &[]))
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert!(!interface.contains("OrderableIfRequiredBy("), "{interface}");
+}
+
+#[test]
+fn excluding_ordering_effects_discharges_a_conditional_requirement() {
+    let code = indoc! {"
+        pub def each(P, T, E <: Effect except Write(*), f: (T => Int causes E), xs: P |=> T) requires nothing causes E:
+            for x in xs:
+                f(x)
+            0
+    "};
+    let interface = check_program(&mut GlobalContext::default(), &program(code, &[]))
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert!(!interface.contains("OrderableIfRequiredBy("), "{interface}");
+}
+
+#[test]
+fn an_external_write_orders_each_enclosing_callback_loop() {
+    check_compile_error(
+        indoc! {"
+            def each(f, xs):
+                for x in xs:
+                    f(x)
+                0
+            def outer(f, xs, ys):
+                for x in xs:
+                    each(f, ys)
+                0
+            def write(x: Int) => Int causes Write(*):
+                x
+            outer(write, [1] ++ [2], [3, 4])
+        "},
+        "this call runs a loop in its source's position order",
+    );
+}
+
+#[rstest]
+#[case::declaration(indoc! {"
+    trait OrderableIfRequiredBy(P, E):
+        def order(x: P) => P
+"}, "requirement")]
+#[case::instance(indoc! {"
+    instance OrderableIfRequiredBy(Int, Int):
+        def order(x):
+            x
+"}, "names no trait")]
+#[case::summon("summon(OrderableIfRequiredBy(Int, Int))::order(1)", "is not a trait")]
+fn conditional_ordering_has_no_user_instances(#[case] code: &str, #[case] expected: &str) {
+    check_compile_error(code, expected);
+}
+
+#[rstest]
+#[case::ordered("UInt", false)]
+#[case::unordered("{k: Int}", true)]
+fn a_written_ordering_requirement_is_checked_at_each_use(
+    #[case] positions: &str,
+    #[case] refused: bool,
+) {
+    let definition = indoc! {"
+        def each(P, T, E <: Effect, f: (T => Int causes E), xs: P |=> T) requires only OrderableIfRequiredBy(P, E) causes E:
+            for x in xs:
+                f(x)
+            0
+        def write(x: Int) => Int causes Write(*):
+            x
+    "};
+    let caller = indoc! {"
+        pub def caller(values: POSITIONS |=> Int) => Int:
+            each(write, values)
+    "}
+    .replace("POSITIONS", positions);
+    let code = format!("{definition}\n{caller}");
+    let result = check_program(&mut GlobalContext::default(), &program(&code, &[]));
+    if refused {
+        result.expect_err("a writing callback requires orderable positions");
+        // Once, at the call: the use's copies of the loop's requirement and of the written one
+        // both fail there.
+        let errors = super::modules::compile_errors(&program(&format!("{code}0\n"), &[]));
+        assert_eq!(super::modules::report_count(&errors), 1, "{errors}");
+        assert!(
+            errors.contains("this call runs a loop in its source's position order")
+                && errors.contains("each(write, values)")
+                && !errors.contains("for x in xs"),
+            "{errors}"
+        );
+    } else {
+        result.unwrap_or_else(|errors| panic!("{errors:?}"));
+    }
+}
+
+#[test]
+fn a_nested_callback_contract_retains_each_loops_condition() {
+    let definition = indoc! {"
+        pub def nested(f, xss):
+            for xs in xss:
+                for x in xs:
+                    f(x)
+            0
+    "};
+    let interface = check_program(&mut GlobalContext::default(), &program(definition, &[]))
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert_eq!(
+        interface.matches("OrderableIfRequiredBy(").count(),
+        2,
+        "{interface}"
+    );
+    assert!(!interface.contains('?'), "{interface}");
+    let signature = interface
+        .lines()
+        .find_map(|line| line.strip_prefix("pub nested: "))
+        .expect("the public member has a contract");
+    let implementation = definition.replace("pub def nested", "def nested");
+    let code = format!("{implementation}\npub checked: {signature} = nested\n");
+    check_program(&mut GlobalContext::default(), &program(&code, &[]))
+        .unwrap_or_else(|errors| panic!("{errors:?}\n{interface}"));
+}

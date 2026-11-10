@@ -693,7 +693,8 @@ fn type_parameter_errors(#[case] code: &str, #[case] needle: &str) {
         pick: forall (T) T => T = inc
         1
     "},
-    "annotated as forall (T) T => T, but inferred as forall (A) A => Int requires r: Addable(A, Int), r::Output <: Int",
+    "annotated as forall (T) T => T, but inferred as forall (A, B) A => B ∨ Int requires r: Addable(A, Int), \
+     r::Output <: B",
 )]
 #[case::requirement_over_two_parameters(
     indoc! {"
@@ -711,7 +712,7 @@ fn type_parameter_errors(#[case] code: &str, #[case] needle: &str) {
         pick: forall (T) {T, T} => T = add
         1
     "},
-    "inferred as forall (A, B, C) {A, B} => C requires r: Addable(A, B), r::Output <: C",
+    "inferred as forall (A, B) {A, B} => r::Output requires r: Addable(A, B)",
 )]
 // An open tuple is written only as a bound, so a parameter holds the position it bounds.
 #[case::open_tuple_behind_a_parameter(
@@ -757,7 +758,7 @@ fn type_parameter_errors(#[case] code: &str, #[case] needle: &str) {
         pick: forall (T) T => T = \\x -> x + 1
         1
     "},
-    "inferred as forall (A) A => Int requires r: Addable(A, Int), r::Output <: Int",
+    "inferred as forall (A, B) A => B ∨ Int requires r: Addable(A, Int), r::Output <: B",
 )]
 #[case::filter_reading_a_collection(
     indoc! {"
@@ -786,7 +787,7 @@ fn type_parameter_errors(#[case] code: &str, #[case] needle: &str) {
             pick(1)
         outer(2)
     "},
-    "inferred as forall (A, B) A => B requires r: Addable(A, ‹?",
+    "inferred as forall (A) A => r::Output requires r: Addable(A, ‹?",
 )]
 fn an_annotation_mismatch_prints_the_inferred_polymorphic_type(
     #[case] code: &str,

@@ -478,7 +478,10 @@ the declaration writes by its fields as listed, a tuple by position. `Value`'s c
 reads it, so every ordering of a nominal value, a store's positions and the release predicates over
 them included, is the declaration's (`docs/chl-spec.md`, "Equality and order"). The id is one per
 identity and definition, spans left out, so versions agreeing on a definition share it and a changed
-definition takes a new one. A compiler-provided type, such as `Option`, which the runtime builds
+definition takes a new one. The table keys a definition structurally (`DeclKey`): the path, name and
+number of parameters, and each constructor's name, written orders and parameter types, each type by
+an id its thread gives every equal canonical type, since a type cannot key a table shared between
+threads. A compiler-provided type, such as `Option`, which the runtime builds
 values of too, keeps plain tags.
 The reload guard compares extents, which leave out the type's name and its declaration's
 refinements, so it refuses every variable whose type mentions a nominal type

@@ -508,12 +508,15 @@ including the separate [diagnostic walk of each definition alone](#checking-a-de
 #### Simplification
 
 `simplify_type` analyzes variable co-occurrence in the compact graph and rewrites variable
-identities. It applies three rules:
+identities. It applies four rules:
 
-1. Eliminate a non-recursive variable that occurs at only one polarity.
-2. Merge variables that co-occur symmetrically. Recursive and non-recursive variables are not merged
+1. Merge the variables standing at one invariant position, a data function's domain, which is one
+   type at either polarity. A group standing at one such position and nowhere else is eliminated,
+   as rule 2 eliminates a polar-only variable; any other group stays.
+2. Eliminate a non-recursive variable that occurs at only one polarity.
+3. Merge variables that co-occur symmetrically. Recursive and non-recursive variables are not merged
    with one another.
-3. Eliminate a variable absorbed by the same concrete atom at both polarities.
+4. Eliminate a variable absorbed by the same concrete atom at both polarities.
 
 These operations remove or replace variable contributions, not whole type positions. Concrete
 structure remains after a variable is removed; a position with no remaining structure can
@@ -4190,6 +4193,24 @@ A lower bound on an operand would invent a value the program never supplied, and
 
 How much is determined follows from the table. `λ 𝑥 → 𝑥 + 1` is `Int ⇒ Int`, because `Int` at the second position leaves only `Addable(Int, Int ⇝ Int)` and one surviving row fixes every position of it. `λ 𝑎 𝑏 → 𝑎 + 𝑏` determines nothing, and both parameters stay open. Adding `Addable(Float, Int ⇝ Float)` would reopen the first case, two rows disagreeing — which is why a deposit waits for agreement rather than firing on a unique candidate.
 
+**A deposit assumes the candidates are every instance a use can pass.** Non-overlap does not give
+that: `instance Addable(M, Int)` with `Output = M` overlaps no compiler row, and for `𝐴 = M` it
+breaks "every `Addable(_, Int)` gives an `Int`". It holds today because no use reaches an instance
+its definition's module did not see: within a module, an instance a use answers a generic
+definition with is declared above the definition (`docs/chl-spec.md`, "Declaring an
+instance"), and a use a module importing the definition's would answer is refused (whether one
+may is **[Open]** in "Traits and instances across modules [Decided]"). If that item
+is decided to admit such instances, a deposit inside a generic definition is no longer a fact of
+its uses, and has to wait for the use's types.
+
+Until it is decided, a printed contract does not rely on a deposit
+([type-parameters.md](type-parameters.md), "Printing an inferred polymorphic type"). The `Int`
+deposited on `inc`'s `Output` reaches its result, so `def inc(a): a + 1` prints as
+`forall (A, B) A => B ∨ Int requires r: Addable(A, Int), r::Output <: B`, with the join kept rather
+than read as implied by `Output`. That contract does not round-trip as an annotation, and neither
+does `forall (A) A => r::Output requires r: Addable(A, Int)`: the definition's result holds the
+deposited `Int`, which an abstract `r` does not promise.
+
 ### Requirements are read together, once
 
 Narrowing consumes one contribution at a time, so an obligation learns only what is *delivered* to it. Requirements that are individually satisfiable and jointly not therefore pass: in `λ 𝑎 → (𝑎 + 1, 𝑎 + "s")` each obligation narrows through its **other** operand, to `{Int}` and `{String}`; neither set is empty, and nothing compares them.
@@ -4528,12 +4549,12 @@ carries one, as `emit_node` applies it.
 
 ### Written clauses
 
-Lowering writes a function type's clauses as `Repr::Written`: the items, which clause ends in `_`,
-and where the clauses are written (`lower/clauses.rs`). A function type with no clause is written
-too, with no item and neither clause open, since a written type's clauses are exact.
+Lowering writes a function type's clauses as `Repr::Written`: the items, which clause contains a
+hole, and where the clauses are written (`lower/clauses.rs`). A function type with no clause is
+written too, with no item and neither clause open, since a written type's clauses are exact.
 `normalize_annotation` turns written clauses into a fresh variable holding the items, with an upper
-bound of the items over each clause not ending in `_` (`InferCtx::normalize_capabilities`).
-`uniquify` resolves the variables a clause names in the scope the clause is written in, and
+bound of the items over each clause without a hole (`InferCtx::normalize_capabilities`). `uniquify`
+resolves the variables a clause names in the scope the clause is written in, and
 `Typing::check_written` refuses one that names no variable of the kind its item takes
 (`InferError::ClauseNamesNoVariable`). The Check mode reads no capabilities, and normalizes a
 written clause to none.
@@ -4668,18 +4689,32 @@ through the function (`InferCtx::exported_capabilities`).
 
 ### Ordered loops
 
-**A loop whose iterations interact requires an order of its positions** (`docs/chl-spec.md`,
-"Ordered loops"). A `for` body is emitted on a frame of its own that keeps what names the enclosing
-function's own variables (`Typing::loop_body`). Where what it collects holds `Write(𝑥)` for an `𝑥`
-the body does not declare, the loop is ordered, and `emit_for` requires `Orderable(𝑃, 𝑃)` of its
-source's position type `𝑃`, during emission, so a definition's scheme states it.
-`WriteTxn(𝑥)` orders nothing: the run's transactions commit in commit order. A body that
-interacts only through a function passed to it is found to after emission, too late for the scheme;
-`check_loop_orders` asserts no loop is. A keyed collection's positions are its sum's binder `σ`,
-whose kind `SubtypesOf(𝐾)` gives them `𝐾`'s order, and which no instance answers or refuses, so
-once emission is done `InferCtx::order_keyed_loops` resolves each ordered loop's source and
-requires `Orderable(𝐾, 𝐾)` of its keys. A refusal names the capability that ordered the loop and
-what the source's positions are (`InferError::UnorderedLoop`), at the expression the loop walks.
+Each loop records `OrderableIfRequiredBy(𝑃, 𝐸)` in its enclosing function's requirements
+([Conditional ordering requirements](../../../docs/chl-spec.md#conditional-ordering-requirements)).
+`𝑃` is the source's position type. `𝐸` collects the body's capabilities after excluding writes to
+variables declared in the iteration. The requirement keeps its
+own capability variable, independently of the capabilities an enclosing scope discharges. An inner
+loop's source evaluates in the outer body, before the inner body's frame opens.
+
+`capabilities::Requirement` carries the conditional requirement's type and clause operands. Each
+instantiation copies both through the same `FreshenCache` as the function type, including its
+written upper bounds. The position variables retain their telescopes, and the requirement retains
+the trait assumptions available where it is used. A statement's frame passes the requirement
+outward even when its writes stop at a surrounding scope.
+
+A requirement whose capabilities exclude ordering is discharged. Otherwise `check_loop_orders` uses
+the ordinary trait solver to require `Orderable(𝑃, 𝑃)`. An orderable position type also discharges a
+requirement whose capabilities remain abstract. An abstract condition that cannot be discharged
+stays in the inferred contract; a fully written contract must retain it. A keyed collection's
+positions are ordered by the key bound of its source's witness, and an index ranging over
+`UIntRanges` has `UInt`'s order. A refusal names the effect and source at the loop.
+
+Loops whose ordering capabilities are already known during emission also place the ordinary
+`Orderable` obligation immediately. That obligation participates in the existing type-variable
+solver. Establishing an order never sets a loop's ordering flag: the body's capabilities determine
+it. Contract rendering compacts a conditional requirement's position operands with the function's
+other types, pins their identities, and names its clause variables with the callback's clauses.
+
 
 ### Polymorphism and materialization
 

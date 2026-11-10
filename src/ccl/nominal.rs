@@ -8,7 +8,7 @@
 //! constructor names and whose payloads are the constructors' parameter types. See
 //! `src/ccl/design/nominal-types.md`.
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
@@ -122,13 +122,45 @@ pub struct DeclId(u32);
 
 #[derive(Default)]
 struct DeclTable {
-    ids: HashMap<String, DeclId>,
+    ids: HashMap<DeclKey, DeclId>,
     /// Each declaration's constructors' payload orders, by constructor name.
     orders: Vec<HashMap<SmolStr, std::sync::Arc<crate::interpreter::ValueOrder>>>,
 }
 
 static DECLS: std::sync::LazyLock<std::sync::RwLock<DeclTable>> =
     std::sync::LazyLock::new(Default::default);
+
+/// A declaration's identity and definition, as [`DeclId`] keys them: its path, name and number
+/// of parameters, and each constructor's name, parameter types ([`TypeId`]) and written orders.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DeclKey {
+    module: Vec<SmolStr>,
+    name: SmolStr,
+    params: usize,
+    ctors: Vec<(SmolStr, Vec<TypeId>, Vec<WrittenOrder>)>,
+}
+
+/// A type in a [`DeclKey`]: equal canonical types ([`Type::canonical`]) get one id. A type is
+/// neither `Send` nor `Sync`, so it cannot key the process-wide table itself, and the ids are
+/// given per thread. The thread is part of the id, and one program and every version a reload
+/// replaces it with are compiled and run on one thread, since the operator graph holds `Rc`s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct TypeId(std::thread::ThreadId, u32);
+
+thread_local! {
+    static TYPE_IDS: RefCell<HashMap<Type, u32>> = RefCell::new(HashMap::new());
+}
+
+impl TypeId {
+    fn of(ty: &Type) -> Self {
+        let id = TYPE_IDS.with(|ids| {
+            let mut ids = ids.borrow_mut();
+            let next = u32::try_from(ids.len()).expect("fewer than 2³² types");
+            *ids.entry(ty.canonical()).or_insert(next)
+        });
+        TypeId(std::thread::current().id(), id)
+    }
+}
 
 /// The order the payload of `ctor`, a constructor of the declaration `decl`, compares in.
 pub fn payload_order(
@@ -250,7 +282,7 @@ pub struct NominalCtor {
 /// A record type has no order of its own, so the order of a record in a constructor's
 /// parameter types is the declaration's, kept here rather than read off [`Type::Record`],
 /// whose fields no pass keeps in any order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WrittenOrder {
     /// By the type's own order: a base type, a type parameter or a nominal type. A type
     /// with no order, such as a function, is one too, and no `Orderable` instance accepts
@@ -806,22 +838,20 @@ impl NominalDecl {
     /// This declaration's [`DeclId`], recording its constructors' payload orders the first
     /// time its definition is seen.
     fn runtime_id(&self) -> DeclId {
-        let definition: Vec<String> = self
-            .body()
-            .ctors
-            .iter()
-            .map(|c| {
-                let params: Vec<String> = c.params.iter().map(|(_, t)| t.to_string()).collect();
-                format!("{}({}) {:?}", c.name, params.join(", "), c.orders)
-            })
-            .collect();
-        let key = format!(
-            "{}::{}[{}] {}",
-            self.module.join("::"),
-            self.name,
-            self.params.len(),
-            definition.join("; ")
-        );
+        let key = DeclKey {
+            module: self.module.clone(),
+            name: self.name.clone(),
+            params: self.params.len(),
+            ctors: self
+                .body()
+                .ctors
+                .iter()
+                .map(|c| {
+                    let params = c.params.iter().map(|(_, t)| TypeId::of(t)).collect();
+                    (c.name.clone(), params, c.orders.clone())
+                })
+                .collect(),
+        };
         if let Some(id) = DECLS
             .read()
             .unwrap_or_else(|e| e.into_inner())
