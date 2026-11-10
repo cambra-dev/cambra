@@ -4,7 +4,7 @@ for r in [10, 20, 30]:
     with begin():
         if pool > r:
             pool := pool - r
-# `await_final` is the only terminal read; a bare `pool` fed out of a block
-# would sample an arbitrary commit position and pin no value.
+# `await_final` is the only terminal read; `pool` read in a block that only reads
+# would read at that block's place in the commit order and pin no value.
 out << await_final(pool)
 out

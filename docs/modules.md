@@ -660,7 +660,7 @@ inlined or the run tree assembled:
 | inlining (`Phase::Inline`), then `check_transact_rejections` | the mutable-variable checks: a nested transaction, a block that writes only induction variables, an induction variable written under a branch in a block, a reference after `await_final` |
 | the transaction phase (`Phase::Transact`) and `mut_elim` (`Phase::Letrec`) | recurrence shapes they do not support |
 | channelization (`Phase::Channelize`) | a feed whose contributions do not route |
-| the as-of-read rewrite, lambda elimination, planning | shapes the planner cannot emit dataflow for |
+| lambda elimination, planning | shapes the planner cannot emit dataflow for |
 | route uniqueness | one `(port, method, path)` served by two runs |
 | operator conversion (`Phase::Convert`) | a route or source the engine cannot open |
 

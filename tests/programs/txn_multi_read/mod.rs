@@ -12,9 +12,8 @@ fn every_guarded_write_commits() {
     // 100 − 10 − 20 − 30, every guard passing over the snapshot it reads.
     //
     // The program observes `pool` through `await_final` because that is the only
-    // terminal read of a mutable variable: a read fed out of a block that does
-    // not write `pool` is an as-of read at an arbitrary commit position
-    // (`docs/chl-spec.md`, "8.3 Reads"), which the seed satisfies as well as the
-    // folded value.
+    // terminal read of a mutable variable: a read in a block that does not write
+    // `pool` reads at that block's place in the commit order (`docs/chl-spec.md`,
+    // "8.3 Reads"), which the seed satisfies as well as the folded value.
     expect_scalar(include_str!("program.cambra"), "Function [ () -> 40 ]");
 }

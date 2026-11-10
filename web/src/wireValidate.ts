@@ -56,7 +56,6 @@ export const PANE_IDS = [
   "pre-inference",
   "post-inference",
   "post-channelize",
-  "post-as-of-read",
   "post-lambda-elim",
   "post-planning",
   "post-conversion",
@@ -70,14 +69,12 @@ const PANE_KINDS = [
   "typed",
   "typed",
   "typed",
-  "typed",
   "operators",
 ] as const;
 const PANE_WINDOWS = [
   ["pre-inference", "post-inference"],
   ["post-inference", "post-channelize"],
-  ["post-channelize", "post-as-of-read"],
-  ["post-as-of-read", "post-lambda-elim"],
+  ["post-channelize", "post-lambda-elim"],
   ["post-lambda-elim", "post-planning"],
   ["post-planning", "post-conversion"],
 ] as const;
@@ -101,7 +98,6 @@ const ALLOWED_VIA = [
   "Letrec",
   "EraseRefinements",
   "Channelize",
-  "AsOfRead",
   "LambdaElim",
   "Planning",
   "Convert",

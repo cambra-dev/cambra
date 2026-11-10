@@ -1,8 +1,8 @@
 # Optimization & compilation passes
 
 After inference, the compiler rewrites typed CCL into an operator graph. `context.rs` runs
-`inline`, transaction rewriting, `mut_elim`, refinement erasure, `channelize`, the as-of-read
-rewrite, `lambda_elim`, `planning::plan_loops`, and `planning::run`, in that order. Lambda
+`inline`, transaction rewriting, `mut_elim`, refinement erasure, `channelize`, `lambda_elim`,
+`planning::plan_loops`, and `planning::run`, in that order. Lambda
 elimination runs `simplify` internally; planning also runs it before and after iteration-site
 marking.
 `interpreter/operator_conversion.rs` then converts the planned CCL to `TileOperator`s. The
@@ -508,7 +508,7 @@ The complete `is_iteration_bearing` skip cases are:
 
 - Value-position `Tuple`, `Record`, `Copair`, and `DisjointJoin` nodes.
 - A `Var` whose function kind is `Data`.
-- An `Apply` headed by `Iterate`, `Restrict`, `AsOf`, or `FilterValues`, or by a builtin whose
+- An `Apply` headed by `Iterate`, `Restrict`, or `FilterValues`, or by a builtin whose
   `iterates_arg` property is true, including the domain-transforming combinators.
 - An `Apply` whose function position is not a builtin, such as a projection, variable, or curried
   application; its conversion path rejects an additional upstream input.

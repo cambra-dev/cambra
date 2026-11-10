@@ -235,14 +235,9 @@ fn a_top_level_mutable_variable_keeps_its_reading() {
 }
 
 /// A transactional variable holding a reading keeps it across a reload that edits its
-/// initializer: the declaration already ran, so the new initializer is not evaluated.
-///
-/// Wrong today: the new version reads its own initializer's reading. A variable a transaction
-/// only reads is still a key of its store, so it has an identity to carry; the reload appears to
-/// capture a value only for a key something has written. Not yet confirmed.
-// Pinned on the failure rather than deferred, as `tests/it/http_server.rs` explains.
+/// initializer: the declaration already ran, so the new initializer is not evaluated. A block
+/// that only reads `t` is a transaction of its store, so `t` is a key the reload carries.
 #[test]
-#[should_panic(expected = "the reload took the reading again")]
 fn a_transactional_variable_keeps_its_reading() {
     let (before, after) = across_a_reload(
         indoc! {"

@@ -112,10 +112,10 @@ path, so it answers 404. Segments are read by position, so a branch may be named
 
 ### `/diff`
 
-The phase is one of `lowered`, `inferred`, `inlined`, `channelized`, `as-of-read`, `lambda-elim` or
-`planned` (`OFFERED_PHASES`), `as-of-read` by default. The prefix is peeled only when `<p>` is
-lowercase letters and `-`; anything else is program text. A reply names the phase by that spelling,
-as `phase as-of-read: …` or `no difference at phase as-of-read` (`phase_spelling`). `/diff` compiles
+The phase is one of `lowered`, `inferred`, `inlined`, `channelized`, `lambda-elim` or `planned`
+(`OFFERED_PHASES`), `channelized` by default. The prefix is peeled only when `<p>` is lowercase
+letters and `-`; anything else is program text. A reply names the phase by that spelling, as
+`phase channelized: …` or `no difference at phase channelized` (`phase_spelling`). `/diff` compiles
 against the running endpoint registry and opens nothing, so asking changes nothing any branch
 serves.
 
@@ -136,7 +136,7 @@ table](#the-branch-table).
 ### `/reload`
 
 A 200 reply reads `reloaded: <kept>/<bound> operators kept`, a blank line, the difference at
-`as-of-read`, and the variables that begin above their loops' inputs. `<kept>` and `<bound>` are
+`channelized`, and the variables that begin above their loops' inputs. `<kept>` and `<bound>` are
 `ReuseTally`'s counts. A 400 carries the compile errors or the state conflicts. A branch the table
 does not hold answers 404. Every other refusal is [State takeover](#state-takeover)'s.
 
@@ -1067,7 +1067,7 @@ one.
 ### Order of a reload
 
 1. Render the difference between the predecessor's source and the new one, which compiles both to
-   `Phase::AsOfRead`.
+   `Phase::Channelize`.
 2. Compile the new version to `Phase::Planning` against the endpoint registry, binding any port it
    adds and registering no route, and run the state-takeover guard on the planned tree. Neither step
    builds an operator, so a version that fails either leaves every branch serving, and a refusal

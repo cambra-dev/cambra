@@ -24,7 +24,7 @@ serves.
   branch.
 - **IR panes** — one collapsible tree per pipeline pane, ordered
   upstream → downstream: **pre-inference**, **post-inference**,
-  **post-channelize**, **post-as-of-read**, **post-lambda-elim** and
+  **post-channelize**, **post-lambda-elim** and
   **post-planning**. The set is the compiler's `PANES` table, not a list the
   inspector keeps.
 - **Cross-pane links** — clicking in any pane highlights the corresponding

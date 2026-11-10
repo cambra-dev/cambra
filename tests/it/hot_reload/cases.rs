@@ -2645,7 +2645,7 @@ fn a_running_version_that_no_longer_compiles_renders_against_its_own_file() {
         &GlobalContext::default(),
         MAIN_BRANCH,
         &new,
-        Phase::AsOfRead,
+        Phase::Channelize,
     ) else {
         panic!("a running version that does not compile has no difference to report");
     };
@@ -2681,7 +2681,7 @@ fn diffing_a_running_http_program_leaves_it_untouched() {
             &ctx,
             MAIN_BRANCH,
             &source("guestbook", port),
-            Phase::AsOfRead,
+            Phase::Channelize,
         )
         .expect("the running source compiles against its own endpoints")
         .diff;
@@ -2695,7 +2695,7 @@ fn diffing_a_running_http_program_leaves_it_untouched() {
             &ctx,
             MAIN_BRANCH,
             &source("guestbook-stateless-edit", port),
-            Phase::AsOfRead,
+            Phase::Channelize,
         )
         .expect("the new version compiles against the running endpoints")
         .diff;
@@ -2921,7 +2921,7 @@ fn diffing_against_a_version_that_drops_a_route_does_not_retire_it() {
             &ctx,
             MAIN_BRANCH,
             &source("guestbook-drops-route", port),
-            Phase::AsOfRead,
+            Phase::Channelize,
         )
         .expect("the new version compiles against the running endpoints")
         .diff;

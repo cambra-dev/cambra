@@ -64,8 +64,7 @@ main tree; the boundary check asserts that condition in debug/test builds.
 `Phase` identifies the compiler stage in a row's `via` field. Each tag's runs lie within one pane
 pair, but a tag can run on both sides of another tag within that pair: `MutRead` runs before and
 after inference. Declaration-order range queries describe exact pipeline intervals only at
-pane-pair granularity. A rewrite crossing a pane boundary needs a distinct tag; `AsOfRead` is
-separate from `Transact` even though both are implemented in `transact_phase`.
+pane-pair granularity. A rewrite crossing a pane boundary needs a distinct tag.
 `PANES` in `src/ccl/panes.rs` assigns phases to snapshot intervals.
 
 ### Walking the ids
@@ -347,16 +346,14 @@ A binder that stands for a source binder copies that binder's occurrence:
   outside the loop the pass rewrites. `channelize_cluster` keeps the defer binders' occurrences with
   their names, and `normalize_bare_write` gives a `MutWrite`'s `name_occurrence` to the shadowing
   binder it builds.
-- `transact_phase`'s history binding and the rebind of a key's as-of read copy the occurrence of the
-  key's declaration, which `MutVarDecl` carries.
+- `transact_phase`'s history binding copies the occurrence of the key's declaration, which
+  `MutVarDecl` carries.
 - `lambda_elim`'s rebuilt `LetRec` group and rebuilt `let` replace what they are built from, so each
   binder keeps its occurrence. The `λ param` a filter lifted onto a pair binds copies the eliminated
   parameter's occurrence, which `ElimContext` holds by name.
 - `feed_nest`'s `read_level` keeps the loop binder it rebuilds a level from. `mut_elim`'s
   accumulator-free `with begin():` paths build `iter ≫ (λ target → …)` with a copy of the `For`
   target's occurrence, and move each feed's `name_occurrence` onto the feed they rebuild.
-- `transact_phase`'s as-of reply `λ read → …` copies the occurrence of the `let` binder its
-  parameter replaces, which `BoundRead` carries.
 
 `transact_phase`'s `walk_spine` clones store bindings before the `transact.store` recording opens,
 and `emit_group_member` clones a group member's binder only to write it back. Neither places a copy
@@ -934,7 +931,6 @@ The `CompiledProgram` fields retain these boundaries:
 | `pre_inference_ir` | After uniquification, before A-normalization; unresolved expression types. |
 | `post_inference_ir` | After inference and its checks, before inlining; typed expressions with lambdas. |
 | `post_channelize_ir` | After inlining, transaction/induction lowering and channelization. |
-| `post_as_of_read_ir` | After the fed-out mutable-read rewrite. |
 | `post_lambda_elim_ir` | After explicit lambdas are converted to point-free combinators. |
 | `ast` | After planning; retained in a stable allocation for the expression-to-operator map. |
 | `operator_graph` | After conversion, captured before subscription consumes graph inputs. |

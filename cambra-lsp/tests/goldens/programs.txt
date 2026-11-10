@@ -146,17 +146,17 @@ folds:
 == tests/programs/http_counter/program.cambra
 diagnostics:
 symbols:
-  variable set_reqs 27:1-27:59 (name 27:1-27:9)
-  variable set_resps 27:1-27:59 (name 27:11-27:20)
-  variable get_reqs 28:1-28:58 (name 28:1-28:9)
-  variable get_resps 28:1-28:58 (name 28:11-28:20)
-  variable latest 30:1-30:37 (name 30:1-30:7)
+  variable set_reqs 24:1-24:59 (name 24:1-24:9)
+  variable set_resps 24:1-24:59 (name 24:11-24:20)
+  variable get_reqs 25:1-25:58 (name 25:1-25:9)
+  variable get_resps 25:1-25:58 (name 25:11-25:20)
+  variable latest 27:1-27:37 (name 27:1-27:7)
 folds:
-  1-25 comment
-  32-35
-  33-34
-  37-39
-  38-39
+  1-22 comment
+  29-32
+  30-31
+  34-36
+  35-36
 == tests/programs/http_greeter/program.cambra
 diagnostics:
 symbols:

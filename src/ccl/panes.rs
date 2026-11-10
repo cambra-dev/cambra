@@ -62,7 +62,6 @@ impl CompiledProgram {
             &self.pre_inference_ir,
             &self.post_inference_ir,
             &self.post_channelize_ir,
-            &self.post_as_of_read_ir,
             &self.post_lambda_elim_ir,
             &self.ast,
         ]
@@ -118,12 +117,12 @@ pub(crate) struct PaneSpec {
 ///
 /// [`CompiledProgram::pane_trees`]' arity. The assertion below pins it against
 /// [`PANES`], so the trees zip against the [`PaneKind::Ir`] entries in order.
-pub(crate) const IR_PANE_COUNT: usize = 6;
+pub(crate) const IR_PANE_COUNT: usize = 5;
 
 /// Ordered snapshot topology. The first entry has no predecessor or selected
 /// phases and uses the lowering projection. Each remaining entry defines one
 /// pair; all current pairs are selected for leak checking.
-pub(crate) const PANES: [PaneSpec; 7] = [
+pub(crate) const PANES: [PaneSpec; 6] = [
     PaneSpec {
         name: "pre-inference",
         content: PaneKind::Ir,
@@ -152,12 +151,6 @@ pub(crate) const PANES: [PaneSpec; 7] = [
             Phase::EraseRefinements,
             Phase::Channelize,
         ],
-        gated: true,
-    },
-    PaneSpec {
-        name: "post-as-of-read",
-        content: PaneKind::Ir,
-        phases: &[Phase::AsOfRead],
         gated: true,
     },
     PaneSpec {
@@ -701,18 +694,18 @@ mod tests {
     /// binder and its guard — is the point being pinned, so the loop's empty
     /// descent is asserted rather than tolerated.
     ///
-    /// The read-only `with begin():` block is what reaches that path: a
-    /// non-transactional `for n in xs: out << n` is already a `Compose` by
-    /// `post-inference`, lowered without ever reaching `mut_elim`.
+    /// A `with begin():` block that mentions no transactional variable is what
+    /// reaches that path: it is unwrapped onto its loop, while a loop with no block,
+    /// `for n in xs: out << n`, is already a `Compose` by `post-inference`, lowered
+    /// without ever reaching `mut_elim`.
     #[test]
     fn a_feed_in_an_accumulator_free_loop_reaches_its_own_products() {
         let images = statement_images(
             indoc! {"
                 out: Feed(_)
-                pool: Mut(Int, Txn) := 100
                 for r in [10, 20, 30]:
                     with begin():
-                        out << pool
+                        out << r
                 max(out)
             "},
             &["loop", "feed"],
@@ -1347,13 +1340,11 @@ mod tests {
             recorded,
             vec![
                 Phase::Anf,
-                Phase::AsOfRead,
                 Phase::Channelize,
                 Phase::Convert,
                 Phase::Infer,
                 Phase::Inline,
                 Phase::LambdaElim,
-                Phase::Letrec,
                 Phase::Planning,
                 Phase::Transact
             ],

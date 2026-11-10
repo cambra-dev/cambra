@@ -569,101 +569,6 @@
       ]
     },
     {
-      "id": "post-as-of-read",
-      "label": "IR (POST-AS-OF-READ)",
-      "kind": "typed",
-      "root": 5,
-      "nodes": [
-        {
-          "label": "List",
-          "nodeId": 5,
-          "spans": [
-            {
-              "file": 0,
-              "start": 0,
-              "end": 12
-            }
-          ],
-          "rewritten": null,
-          "type": "(0..4 ⤇ Int)",
-          "children": [
-            {
-              "id": 1,
-              "kind": "value"
-            },
-            {
-              "id": 2,
-              "kind": "value"
-            },
-            {
-              "id": 3,
-              "kind": "value"
-            },
-            {
-              "id": 4,
-              "kind": "value"
-            }
-          ]
-        },
-        {
-          "label": "Lit(Int(1))",
-          "nodeId": 1,
-          "spans": [
-            {
-              "file": 0,
-              "start": 1,
-              "end": 2
-            }
-          ],
-          "rewritten": null,
-          "type": "Int",
-          "children": []
-        },
-        {
-          "label": "Lit(Int(2))",
-          "nodeId": 2,
-          "spans": [
-            {
-              "file": 0,
-              "start": 4,
-              "end": 5
-            }
-          ],
-          "rewritten": null,
-          "type": "Int",
-          "children": []
-        },
-        {
-          "label": "Lit(Int(3))",
-          "nodeId": 3,
-          "spans": [
-            {
-              "file": 0,
-              "start": 7,
-              "end": 8
-            }
-          ],
-          "rewritten": null,
-          "type": "Int",
-          "children": []
-        },
-        {
-          "label": "Lit(Int(4))",
-          "nodeId": 4,
-          "spans": [
-            {
-              "file": 0,
-              "start": 10,
-              "end": 11
-            }
-          ],
-          "rewritten": null,
-          "type": "Int",
-          "children": []
-        }
-      ]
-    },
-    {
       "id": "post-lambda-elim",
       "label": "IR (POST-LAMBDA-ELIM)",
       "kind": "typed",
@@ -1244,32 +1149,6 @@
     },
     {
       "from": "post-channelize",
-      "to": "post-as-of-read",
-      "edges": [
-        [
-          1,
-          1
-        ],
-        [
-          2,
-          2
-        ],
-        [
-          3,
-          3
-        ],
-        [
-          4,
-          4
-        ],
-        [
-          5,
-          5
-        ]
-      ]
-    },
-    {
-      "from": "post-as-of-read",
       "to": "post-lambda-elim",
       "edges": [
         [

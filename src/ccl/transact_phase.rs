@@ -35,27 +35,17 @@
 //!    snapshot `(hist_rk(begin(r)) …, source(r))` of the variables it reads, at commit
 //!    time `begin(r)` (the [`Builtin::BeginTxn`] oracle). The `hist_k ↔
 //!    commits_j` cycle crosses `get_prev_txn` once, so it is guarded.
-//! 3. **places** the stores ([`splice_stores`]), rebinding each key variable still
-//!    named in the continuation from `let x = init` to `let x = as_of_read(hist_x)` over
-//!    its history binding — an as-of read of it, at a position nothing has supplied yet.
-//!    A read fed out of a block that does not write `x` is broadcast over the reading
-//!    loop and, after `channelize`, joined with that loop into an `AsOf` by
-//!    [`rewrite_as_of_reads`] (this module, pre-lambda-elim), which is where the
-//!    position comes from; and
-//!    **hoists** each in-block feed to
+//! 3. **places** the stores ([`splice_stores`]) and **hoists** each in-block feed to
 //!    `Feed(defer, tap)` over its tap binding, for `channelize` to route as an
 //!    ordinary channel contribution.
 //!
 //! Recognition rebuilds the `Transact{domain: Txn}` node that op-conversion's
 //! `build_commit_store` compiles to the commit engine (`CommitOperator` + fused
-//! `TransactWriter`s in a cyclic `FanOut`). A read fed *out* of a block is
-//! rewritten to an `AsOf` (an as-of read at an arbitrary commit position) by
-//! [`rewrite_as_of_reads`] below — every such read, regardless of the reading
-//! loop's domain. The one **terminal** mutable variable read is the surface
+//! `TransactWriter`s in a cyclic `FanOut`). Every block that mentions a transactional
+//! variable is a site, a block that only reads included, so every read of one is a
+//! transaction's snapshot read. The one read outside a block is the surface
 //! [`Builtin::AwaitFinal`] marker, which [`resolve_await_finals`] replaces with a
-//! [`Builtin::FinalRead`] over the key's history binding. The two reads are **different
-//! terms** over the same history — [`Builtin::AsOfRead`] and [`Builtin::FinalRead`] — so
-//! neither pass can claim the other's read whatever the tree around it looks like. Each
+//! [`Builtin::FinalRead`] over the key's history binding. Each
 //! `__to_<defer>` tap compiles to a value-stream keyed by the item its transaction ran for
 //! (`body_tap_fields`).
 //! The in-block feed mirrors the induction phase's in-loop feeds
@@ -90,441 +80,6 @@ use crate::ccl::{
     provenance::{Located, NodeId},
     subst::Subst,
 };
-
-/// Recognize a **fed-out mutable variable read** and rewrite it to an as-of join, *before*
-/// lambda elimination. Run after `channelize`.
-///
-/// After channelization, a read-only reply is a chain of mutable variable reads feeding a
-/// broadcast over a reading loop:
-/// `let k₁ = final_or_default((balance.f₁, _)) in … let kₙ = … in trigger ≫ (λ r → e)`,
-/// where `e` reads the `kᵢ` and `mutable variable` is a commit log (`Txn`, a non-enumerable
-/// domain). Every such read is an **as-of read at an arbitrary commit position** —
-/// the reading transaction sees the mutable variable as of where it lands in the commit
-/// order — so it folds to `AsOf` uniformly, whatever the reading loop's domain (a
-/// live request stream, a finite loop, or a standalone singleton). There is no
-/// finiteness or standalone-vs-loop split.
-///
-/// **A terminal read is a different term.** The walk below matches only
-/// [`Builtin::AsOfRead`], the term [`StorePlan::reads`] mints; a terminal read is a
-/// [`Builtin::FinalRead`] ([`resolve_await_finals`]) and is not a chain element here
-/// whatever shape it sits in. Position would not be enough on its own: `channelize` copies a
-/// channel's captured bindings inside the channel, which puts a bound await's read
-/// (`f = await_final(x)`, read by a feed loop) directly above a broadcast — the shape
-/// this walk matches.
-///
-/// Every sample must find a trigger, so [`rewrite_as_of_reads`] rejects a survivor rather
-/// than leaving a read with no reducer.
-///
-/// The rewrite depends on how many mutable variables `e` reads:
-///
-/// - **one mutable variable** → `as_of((trigger, balance.f)) ≫ (λ k → e)`: the join latches
-///   `f`'s current value per trigger position (a bare read `resp << balance` is the
-///   identity reply, emitted as the `as_of` directly; a computed `resp << balance +
-///   1` keeps the `≫ (λ k → e)` map for the elim pass to point-free).
-/// - **several mutable variables** → `as_of((trigger, balance)) ≫ (λ snap → e[kᵢ ↦ snap.fᵢ])`:
-///   the join latches a whole-variable **snapshot record** per request — every field
-///   folded at *one* commit frontier (§I-c snapshot consistency) — and the reply
-///   projects each mutable variable off it.
-///
-/// The reply is indexed by the *trigger* (the outer request loop), not the commit
-/// clock. Running **pre-lambda-elim** is what makes a computed reply work at all:
-/// after elimination the body is a point-free `const`, and lifting `e` back into a
-/// per-request map would mean synthesizing a combinator by hand.
-pub fn rewrite_as_of_reads(expr: &mut Expr) -> Result<(), String> {
-    rewrite_as_of_reads_go(expr);
-    drop_dead_as_of_reads(expr);
-    // Every as-of read must have found its trigger. A survivor names a reading loop this
-    // pass did not recognize, and nothing downstream can read it — the position it reads
-    // at is exactly what the `AsOf` join supplies. Reporting it here names the pass that
-    // failed; op-conversion's arm for the builtin is the backstop if one escapes by
-    // another route.
-    match first_unpaired_as_of_read(expr) {
-        Some(hist) => Err(format!(
-            "the fed-out read of mutable variable `{}` was not paired with a reading loop \
-             — an as-of read is positioned by the loop that indexes it \
-             (transact_phase::rewrite_as_of_reads)",
-            hist.base()
-        )),
-        None => Ok(()),
-    }
-}
-
-fn rewrite_as_of_reads_go(expr: &mut Expr) {
-    // Match the whole read-chain at its outermost `let` *before* recursing, so an
-    // outer read binding captures the chain rather than the innermost `let` firing a
-    // single-variable rewrite in isolation (which would strand the outer reads
-    // unresolved).
-    //
-    // The recording names that outermost `let`, because the whole chain it heads is what
-    // the as-of join replaces: the `zip`/`as_of` scaffolding, the rebuilt reply
-    // lambda, and the snapshot projections all stand in for it, and the inner
-    // `let`s of the chain die with it (deaths are the boundary difference, so
-    // nothing names them). `Nature::Expansion` — `resp << balance` really is an
-    // as-of read; the join is the faithful rendering of what the user wrote, not
-    // plumbing.
-    //
-    // Recording the *attempt* rather than the firing is free: a non-matching
-    // node mints nothing, so the recording writes nothing. The walk below sits
-    // outside the recording, so a nested chain attributes to its own `let`.
-    //
-    // `compile_program` runs this rewrite under a `Phase::AsOfRead` scope, so
-    // these rows land in the table like any other phase's. The phase is its own
-    // rather than `Transact` because a phase is declared where the rewrite runs,
-    // and this one runs below the post-channelize pane.
-    {
-        let _g = provenance::enter(
-            expr.node_id(),
-            "transact.as_of_read",
-            provenance::Nature::Expansion,
-        );
-        if let Some(rewritten) = as_of_join(expr) {
-            *expr = rewritten;
-        }
-    }
-    expr.walk_children_mut(rewrite_as_of_reads_go);
-    // A join built below brings what its parts do to the node it now stands under.
-    expr.absorb_children_capabilities();
-}
-
-/// Drop `let x = as_of_read(⟨history⟩) in body` where `body` does not name `x`.
-///
-/// A fed-out read leaves two copies of its binding: the one on the spine where
-/// [`StorePlan::reads`] bound it, and the one `channelize` carries inside the channel it
-/// closes over ([`crate::ccl::channelize`]'s contribution wrap). The rewrite above pairs
-/// the copy adjacent to the broadcast, which is what leaves the other unread. Dropping it
-/// is not tidying: converted, it is a second reducer subscribed to the same store — and
-/// [`crate::interpreter::commit_operator::StoreValueStream`]'s changelog GC holds the
-/// whole stream for a scalar-final reader, so a dead one would bound nothing.
-fn drop_dead_as_of_reads(e: &mut Expr) {
-    if let TypedExprNode::Let {
-        binding,
-        bound_expr,
-        body,
-    } = &mut e.node
-        && as_of_read_source(bound_expr).is_some()
-        && !is_free_in_value(&binding.name, body)
-    {
-        // The body takes the dropped `let`'s position: a move, not a duplication.
-        let body = std::mem::take(&mut **body);
-        *e = body;
-        drop_dead_as_of_reads(e);
-        return;
-    }
-    e.walk_children_mut(drop_dead_as_of_reads);
-}
-
-/// The history binding of the first [`Builtin::AsOfRead`] left in `e`, if any.
-///
-/// [`as_of_read`] applies the builtin to a bare history `Var`, so there is always a name
-/// to report; a read over anything else did not come from this phase, and op-conversion's
-/// arm for the builtin is what catches it.
-fn first_unpaired_as_of_read(e: &Expr) -> Option<Name> {
-    if let TypedExprNode::Apply { function, argument } = &e.node
-        && matches!(&function.node, TypedExprNode::Builtin(Builtin::AsOfRead))
-        && let TypedExprNode::Var(hist) = &argument.node
-    {
-        return Some(hist.clone());
-    }
-    let mut found = None;
-    e.walk_children(|c| {
-        if found.is_none() {
-            found = first_unpaired_as_of_read(c);
-        }
-    });
-    found
-}
-
-/// One as-of read in a reply chain: its `let` binder, the history-binding
-/// reference (the as-of source for a single-variable read — recognition later
-/// rewrites it to a history-record projection), the history-record field its
-/// history will occupy (`hist.field_key()`, matching recognition's read map),
-/// and the mutable variable's value type.
-struct BoundRead {
-    name: Name,
-    /// The `let` binder's occurrence, which the reply's lambda copies: the lambda's
-    /// parameter stands for that binder.
-    occurrence: NodeId,
-    hist_read: Expr,
-    field: Label,
-    value_ty: Type,
-}
-
-/// Match a chain of as-of reads feeding a broadcast (see
-/// [`rewrite_as_of_reads`]) and return its as-of rewrite, or `None` if the shape /
-/// liveness / footprint guards don't hold.
-fn as_of_join(expr: &Expr) -> Option<Expr> {
-    // Walk consecutive `let kᵢ = final_or_default((⟨histᵢ⟩, _))` bindings —
-    // each a bare reference to a live history binding — down to the broadcast
-    // body. Pre-recognition there is no shared history record: several
-    // mutable variables are several history bindings; the snapshot case rebuilds
-    // their record below and recognition collapses it onto the mutable variable.
-    let mut reads: Vec<BoundRead> = Vec::new();
-    let mut cur = expr;
-    while let TypedExprNode::Let {
-        binding,
-        bound_expr,
-        body,
-    } = &cur.node
-    {
-        let Some((hist_read, field)) = as_of_read_source(bound_expr) else {
-            break;
-        };
-        reads.push(BoundRead {
-            name: binding.name.clone(),
-            occurrence: binding.occurrence.id(),
-            hist_read: hist_read.clone(),
-            field,
-            value_ty: hist_read.ty.codomain()?,
-        });
-        cur = body;
-    }
-    if reads.is_empty() {
-        return None;
-    }
-    // The chain body must be a loop over the trigger, `trigger ≫ (λ r → e)` or the same loop
-    // at its position, `λ 𝑝 → (𝑝 ▷ trigger) ▷ (λ r → e)`.
-    let (trigger, param, lam_body) = match &cur.node {
-        TypedExprNode::Compose(celts) => {
-            let [trigger, lam] = celts.as_slice() else {
-                return None;
-            };
-            let TypedExprNode::Lambda {
-                param,
-                body: lam_body,
-            } = &lam.node
-            else {
-                return None;
-            };
-            (trigger, param, &**lam_body)
-        }
-        _ => {
-            let parts = crate::ccl::ccl_utils::loop_parts(cur)?;
-            (parts.source, parts.element, parts.body)
-        }
-    };
-    // Every fed-out read of a `Txn` mutable variable is an **as-of read at an arbitrary
-    // position** — the mutable variable's value as of wherever the reading transaction lands
-    // in the commit order, indexed by the reading loop. This holds regardless of
-    // whether the reading loop is a live request stream, a finite literal, or the
-    // synthesized singleton of a standalone read, so there is no finiteness or
-    // standalone-vs-loop classification here; all such reads fold to `AsOf`. A
-    // program that wants the *completed* value asks for it by name (`await_final`),
-    // whose read is a different term — see this function's docs.
-    let used: Vec<&BoundRead> = reads
-        .iter()
-        .filter(|r| is_free_in_value(&r.name, lam_body))
-        .collect();
-    // A reply that also reads the trigger element `r` (`e = f(r, balance)`) is a
-    // function of *both* the request and the mutable variable: `zip((trigger, as_of)) ≫ (λ p
-    // → e[r ↦ p.0, kᵢ ↦ p.1])` — the request rides alongside the mutable variable snapshot.
-    if is_free_in_value(&param.name, lam_body) {
-        if used.is_empty() {
-            return None;
-        }
-        return build_zip_read(trigger, param, &used, lam_body, expr.ty.clone());
-    }
-    match used.len() {
-        0 => None,
-        1 => build_single(trigger, used[0], lam_body, expr.ty.clone()),
-        _ => build_snapshot(trigger, &used, lam_body, expr.ty.clone()),
-    }
-}
-
-/// An as-of read whose reply combines the **request element** with the mutable variable
-/// read(s): `zip((trigger, as_of((trigger, source)))) ≫ (λ p → e[r ↦ p.0, kᵢ ↦
-/// p.1(.fᵢ)])`. The `zip` pairs each request with its mutable variable snapshot; the reply
-/// projects the request off `.0` and each mutable variable off `.1` (bare for one
-/// mutable variable, by field for several). Unlike [`build_single`]/[`build_snapshot`]
-/// (variable-only replies), the request element survives into the reply. The `as_of`
-/// arm is a leaf source (its own domain), which op-conversion's `zip` co-iterates
-/// with the request stream (see `is_leaf_zip_arm`).
-fn build_zip_read(
-    trigger: &Expr,
-    param: &TypedBinding,
-    used: &[&BoundRead],
-    lam_body: &Expr,
-    out_ty: Type,
-) -> Option<Expr> {
-    let req_ty = param.ty.clone();
-    // The as-of source and the variable-snapshot value type: one mutable variable reads bare,
-    // several fold into a record (as in `build_snapshot`).
-    let (source, snap_ty) = if used.len() == 1 {
-        (used[0].hist_read.clone(), used[0].value_ty.clone())
-    } else {
-        let record_ty = Type::Record(
-            used.iter()
-                .map(|r| (r.field.clone(), r.value_ty.clone()))
-                .collect(),
-        );
-        let source_ty = Type::Record(
-            used.iter()
-                .map(|r| (r.field.clone(), r.hist_read.ty.clone()))
-                .collect(),
-        );
-        let source = Expr::new(TypedExprNode::Record(RecordEntry::minted(
-            used.iter().map(|r| (r.field.clone(), r.hist_read.clone())),
-        )))
-        .with_ty(source_ty);
-        (source, record_ty)
-    };
-    let as_of = build_as_of(trigger, &source, snap_ty.clone())?;
-
-    let b = trigger.ty.domain()?;
-    let pair_ty = Type::Tuple(vec![req_ty.clone(), snap_ty.clone()]);
-    let zip_arg_ty = Type::Tuple(vec![trigger.ty.clone(), as_of.ty.clone()]);
-    let zip_arg =
-        Expr::new(TypedExprNode::Tuple(vec![trigger.clone(), as_of])).with_ty(zip_arg_ty.clone());
-    // One (request, snapshot) pair per position of the trigger — the trigger again, at
-    // its kind; only the `zip` built-in itself is a compute function.
-    let zip_out = Type::fun_like(&trigger.ty, b, pair_ty.clone());
-    let zip_fn = Expr::builtin(Builtin::Zip).with_ty(Type::fun(zip_arg_ty, zip_out.clone()));
-    let zip = Expr::apply(zip_arg, zip_fn).with_ty(zip_out);
-
-    // reply: λ p:(req, snap) → e[param ↦ p.0, reads ↦ p.1 (bare) / p.1.field].
-    let p = Name::fresh("__zp");
-    // The request binder and every mutable variable read are discharged *simultaneously*:
-    // they are independent reads of the one new pair binder, and one traversal
-    // is both cheaper and the honest reading (a sequential fold would re-enter
-    // each replacement it had already installed).
-    let snap_expr = proj_pair(&p, &pair_ty, 1, &snap_ty);
-    let mut reads: HashMap<Name, Expr> =
-        HashMap::from([(param.name.clone(), proj_pair(&p, &pair_ty, 0, &req_ty))]);
-    if used.len() == 1 {
-        reads.insert(used[0].name.clone(), snap_expr);
-    } else {
-        for r in used {
-            let field = Expr::new(TypedExprNode::Proj(ProjKey::Field(r.field.clone())))
-                .with_ty(Type::fun(snap_ty.clone(), r.value_ty.clone()));
-            let field_read = Expr::apply(snap_expr.clone(), field).with_ty(r.value_ty.clone());
-            reads.insert(r.name.clone(), field_read);
-        }
-    }
-    let body = Subst::discharge_env_in_place(lam_body.clone(), &reads);
-    let reply = Expr::lambda(p, Occurrence::mint(), pair_ty, body);
-    Some(crate::ccl::ccl_utils::chain_typed(vec![zip, reply], out_ty))
-}
-
-/// `p ▷ .i : elt_ty` — project index `i` off a tuple-typed variable.
-fn proj_pair(p: &Name, pair_ty: &Type, i: usize, elt_ty: &Type) -> Expr {
-    let pvar = Expr::new(TypedExprNode::Var(p.clone())).with_ty(pair_ty.clone());
-    let proj = Expr::new(TypedExprNode::Proj(ProjKey::Index(i)))
-        .with_ty(Type::fun(pair_ty.clone(), elt_ty.clone()));
-    Expr::apply(pvar, proj).with_ty(elt_ty.clone())
-}
-
-/// Match `as_of_read(⟨hist⟩)` over a **commit-log** history — a bare reference to a
-/// `Txn`-domained letrec history binding — returning the read and the history-record
-/// field its history will occupy. `None` for any other bound expression.
-///
-/// The domain test is the exact `Type::Txn` commit-sequencing domain, not a derived
-/// finiteness classification: a transactional mutable variable's history is
-/// `Fun(Txn, V)` by construction. An induction accumulator never reaches here at all —
-/// its trailing read is a `final_or_default` `mut_elim` mints and `ExtractFinal`
-/// reduces, a different term from this one.
-fn as_of_read_source(bound_expr: &Expr) -> Option<(&Expr, Label)> {
-    let TypedExprNode::Apply {
-        function: sample_fn,
-        argument: hist_read,
-    } = &bound_expr.node
-    else {
-        return None;
-    };
-    if !matches!(&sample_fn.node, TypedExprNode::Builtin(Builtin::AsOfRead)) {
-        return None;
-    }
-    if !matches!(hist_read.ty.domain(), Some(Type::Txn)) {
-        return None;
-    }
-    let TypedExprNode::Var(hist) = &hist_read.node else {
-        return None;
-    };
-    Some((hist_read, hist.field_key()))
-}
-
-/// `as_of((trigger, source)) : Fun(B, codomain)`.
-fn build_as_of(trigger: &Expr, source: &Expr, codomain: Type) -> Option<Expr> {
-    let b = trigger.ty.domain()?;
-    // One sampled value per position of the trigger: the trigger read through the
-    // mutable variable, so a collection at the trigger's kind.
-    let out = Type::fun_like(&trigger.ty, b, codomain);
-    let arg_ty = Type::Tuple(vec![trigger.ty.clone(), source.ty.clone()]);
-    let arg = Expr::new(TypedExprNode::Tuple(vec![trigger.clone(), source.clone()]))
-        .with_ty(arg_ty.clone());
-    let as_of_fn = Expr::builtin(Builtin::AsOf).with_ty(Type::fun(arg_ty, out.clone()));
-    Some(Expr::apply(arg, as_of_fn).with_ty(out))
-}
-
-/// A single-variable as-of read: `as_of((trigger, balance.f))`, bare when the reply
-/// is the identity `read`, else `≫ (λ read → e)`.
-fn build_single(trigger: &Expr, read: &BoundRead, lam_body: &Expr, out_ty: Type) -> Option<Expr> {
-    let as_of = build_as_of(trigger, &read.hist_read, read.value_ty.clone())?;
-    if matches!(&lam_body.node, TypedExprNode::Var(n) if *n == read.name) {
-        return Some(as_of);
-    }
-    let reply = Expr::lambda(
-        read.name.clone(),
-        Occurrence::copied_from(read.occurrence),
-        read.value_ty.clone(),
-        lam_body.clone(),
-    );
-    Some(crate::ccl::ccl_utils::chain_typed(
-        vec![as_of, reply],
-        out_ty,
-    ))
-}
-
-/// A multi-variable as-of read: `as_of((trigger, (f_a: ⟨a-hist⟩, f_b:
-/// ⟨b-hist⟩))) ≫ (λ snap → e[kᵢ ↦ snap.fᵢ])` — one snapshot record per
-/// request (§I-c), the reply projecting each mutable variable off it. The source is a
-/// record *literal* of the history-binding reads (the shared history record
-/// does not exist pre-recognition); recognition rewrites each field to
-/// `__hist.f` and then collapses the literal onto the mutable variable itself,
-/// so the engine latches one whole-variable snapshot per request.
-fn build_snapshot(
-    trigger: &Expr,
-    used: &[&BoundRead],
-    lam_body: &Expr,
-    out_ty: Type,
-) -> Option<Expr> {
-    let record_ty = Type::Record(
-        used.iter()
-            .map(|r| (r.field.clone(), r.value_ty.clone()))
-            .collect(),
-    );
-    let source_ty = Type::Record(
-        used.iter()
-            .map(|r| (r.field.clone(), r.hist_read.ty.clone()))
-            .collect(),
-    );
-    let source = Expr::new(TypedExprNode::Record(RecordEntry::minted(
-        used.iter().map(|r| (r.field.clone(), r.hist_read.clone())),
-    )))
-    .with_ty(source_ty);
-    let as_of = build_as_of(trigger, &source, record_ty.clone())?;
-    let snap = Name::fresh("__snap");
-    let mut body = lam_body.clone();
-    project_reads(&mut body, used, &snap, &record_ty);
-    let reply = Expr::lambda(snap, Occurrence::mint(), record_ty, body);
-    Some(crate::ccl::ccl_utils::chain_typed(
-        vec![as_of, reply],
-        out_ty,
-    ))
-}
-
-/// Replace each `Var(read.name)` in `e` with `snap.read.field` — the projection
-/// of that mutable variable off the latched snapshot record.
-fn project_reads(e: &mut Expr, used: &[&BoundRead], snap: &Name, snap_ty: &Type) {
-    if let TypedExprNode::Var(n) = &e.node
-        && let Some(r) = used.iter().find(|r| &r.name == n)
-    {
-        let snap_var = Expr::new(TypedExprNode::Var(snap.clone())).with_ty(snap_ty.clone());
-        let proj = Expr::new(TypedExprNode::Proj(ProjKey::Field(r.field.clone())))
-            .with_ty(Type::fun(snap_ty.clone(), r.value_ty.clone()));
-        *e = Expr::apply(snap_var, proj).with_ty(r.value_ty.clone());
-        return;
-    }
-    e.walk_children_mut(|c| project_reads(c, used, snap, snap_ty));
-}
 
 /// Collect the α-unique [`Name`]s of every transactional mutable variable — a `Let`
 /// binding *bound at* `Mut(_, Txn)`. The type classifies a binding as one;
@@ -723,11 +278,10 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<Str
 /// [`run`] up to its discharge: each block compiled to a commit site and each transactional
 /// variable to a store's history.
 fn compile_blocks(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<String>> {
-    // Strip whenever a `with begin():` block is present. A block need not write a
-    // transactional mutable variable — a read-only block (`out << balance`) has no write
-    // yet must still be unwrapped off the loop spine — so we cannot short-circuit
-    // on `txn_mut_vars` alone; but with neither a mutable variable nor a block there is
-    // nothing to do.
+    // Strip whenever a `with begin():` block is present. A block need not mention a
+    // transactional mutable variable — one that mentions none (`out << r`) must still be
+    // unwrapped off the loop spine — so we cannot short-circuit on `txn_mut_vars` alone;
+    // but with neither a mutable variable nor a block there is nothing to do.
     if txn_mut_vars.is_empty() && !contains_begin(&expr) {
         return Ok(expr);
     }
@@ -776,17 +330,11 @@ fn compile_blocks(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Loca
         "transact_phase: a `MutWrite` to a transactional mutable variable survived stripping — an \
          out-of-block write inference should have refused"
     );
-    let Stripped {
-        mut sites,
-        mut read_only_footprints,
-    } = harvest;
+    let Stripped { mut sites } = harvest;
     let position = |k: &Name| order.iter().position(|d| d == k);
     for s in &mut sites {
         s.read_keys.sort_by_key(|k| position(k));
         s.write_keys.sort_by_key(|k| position(k));
-    }
-    for footprint in &mut read_only_footprints {
-        footprint.sort_by_key(|k| position(k));
     }
     // Mutable variable keys: the union of every writer's footprint (read ∪ write), in
     // declaration order. These are exact (α-unique) `Name`s.
@@ -801,7 +349,7 @@ fn compile_blocks(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Loca
     key_names.sort_by_key(|k| position(k));
     // One commit store per set of keys some block relates (see [`partition_keys`]),
     // matching the induction path's one-letrec-per-loop.
-    let groups = partition_keys(&key_names, &sites, &read_only_footprints);
+    let groups = partition_keys(&key_names, &sites);
 
     // A mutable variable **no site touches** has no commit history to complete, so its final
     // value is its seed — the empty-history case of `final_or_default`, with the
@@ -877,8 +425,7 @@ fn compile_blocks(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Loca
     //
     // Doing this before placement is what keeps placement await-blind: a resolved read
     // *names* a history binding, so [`StorePlan::is_read_by`] puts the statement inside
-    // the right store with no await-specific logic, and the shared
-    // `let k = as_of_read(…)` rebind is left to serve the as-of reads only.
+    // the right store with no await-specific logic.
     for _ in 0..=key_names.len() {
         if !key_init.values().any(|d| contains_await_final(&d.init)) {
             break;
@@ -965,18 +512,13 @@ fn compile_blocks(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Loca
 /// that must commit and be sampled together.
 ///
 /// A `with begin():` **block** is the unit that forces keys together, through its
-/// footprint: a writing block's `{reads ∪ writes}` advance at one commit tick and are
-/// read at one snapshot (atomicity), and a read-only block's reads are latched at one
-/// frontier (snapshot consistency). Nothing else forces sharing. The argument is in
+/// footprint: its `{reads ∪ writes}` are read at one snapshot and advance at one commit
+/// tick (atomicity), whether or not it writes. Nothing else forces sharing. The argument is in
 /// `src/ccl/design/mutability.md`, "How many commit stores a program has".
 ///
 /// Returns one key list per store, each in `key_names` order, the stores themselves
 /// ordered by their first key's occurrence.
-fn partition_keys(
-    key_names: &[Name],
-    sites: &[RawSite],
-    read_only_footprints: &[Vec<Name>],
-) -> Vec<Vec<Name>> {
+fn partition_keys(key_names: &[Name], sites: &[RawSite]) -> Vec<Vec<Name>> {
     // Union-find over key indices.
     let mut parent: Vec<usize> = (0..key_names.len()).collect();
     fn find(parent: &mut Vec<usize>, i: usize) -> usize {
@@ -1002,22 +544,13 @@ fn partition_keys(
     for s in sites {
         union_all(
             &mut parent,
-            &mut s.read_keys.iter().chain(s.write_keys.iter()).map(|k| {
-                index_of(k).expect("a writing site's footprint key is a mutable variable key")
-            }),
+            &mut s
+                .read_keys
+                .iter()
+                .chain(s.write_keys.iter())
+                .map(|k| index_of(k).expect("a site's footprint key is a mutable variable key")),
         );
     }
-    // A read-only footprint may name a mutable variable **no block writes**. Such a mutable variable
-    // is not a store key: nothing can advance it (the write gate admits a mutable variable
-    // write only inside a block, and a block write would put it in a write set), so
-    // its history is constant at its seed and every read of it is that seed. It keeps
-    // its `MutDecl` on the spine and relates nothing — reading it at a frontier would
-    // cost a store key to learn what the declaration already says. Only the keys some
-    // writer does touch are unioned.
-    for f in read_only_footprints {
-        union_all(&mut parent, &mut f.iter().filter_map(&index_of));
-    }
-
     // Group in `key_names` order, so each store's keys — and the stores
     // themselves — come out in first-occurrence order.
     let mut roots: Vec<usize> = Vec::new();
@@ -1964,17 +1497,12 @@ fn contains_begin(expr: &Expr) -> bool {
     matches!(expr.node, TypedExprNode::Begin { .. }) || expr.any_child(contains_begin)
 }
 
-/// What [`strip`] harvests off the spine: one [`RawSite`] per writing `with
-/// begin():` block, and the mutable variable footprint of every **read-only** block.
-///
-/// A block's footprint is what decides its keys' store ([`partition_keys`]). A writing
-/// block's rides its `RawSite`; a read-only block is unwrapped onto the spine and leaves
-/// no site, so its footprint is collected here or lost.
+/// What [`strip`] harvests off the spine: one [`RawSite`] per `with begin():` block that
+/// mentions a transactional variable, whose footprint decides its keys' store
+/// ([`partition_keys`]).
 #[derive(Default)]
 struct Stripped {
     sites: Vec<RawSite>,
-    /// One entry per read-only block: the mutable variable keys it reads together.
-    read_only_footprints: Vec<Vec<Name>>,
 }
 
 /// Where [`strip`] stands in the code around a block: the branches it is in, and the bindings
@@ -2266,10 +1794,10 @@ fn gated_source(source: Expr, target: &TypedBinding, condition: Expr) -> Expr {
     )
 }
 
-/// Replace every transaction `For` site (`ExprStmt(For{…}, cont)` whose block
-/// writes a transactional mutable variable) with its stripped continuation, accumulating a
-/// [`RawSite`] per site in source order (the commit serialization order). `path` is where
-/// `expr` stands in the loop body or branch around it ([`Path`]).
+/// Replace every transaction `For` site (`ExprStmt(For{…}, cont)` whose block reads or writes a
+/// transactional mutable variable) with its stripped continuation, accumulating a [`RawSite`] per
+/// site in source order (the commit serialization order). `path` is where `expr` stands in the loop
+/// body or branch around it ([`Path`]).
 fn strip(
     expr: Expr,
     txn_mut_vars: &HashSet<Name>,
@@ -2353,16 +1881,16 @@ fn strip(
             g.blame(&[begin_id]);
             Box::new(crate::ccl::ccl_utils::statement_tag_cases_to_guards(*block))
         };
-        // A block writes what its type states it writes (`block_keys`).
-        if !block_keys(&footprint, &block, txn_mut_vars).1.is_empty() {
-            // A writing block → a commit-record site keyed on the *enclosing*
-            // loop, or on a singleton outside one, restricted to the positions its
-            // branches run at. Partition it by mutable variable domain:
-            // the transactional remainder is the commit decision; each induction `MutWrite`
-            // is lifted onto the loop body as a sibling (after the stripped block, same
-            // iteration position), where `mut_elim` folds it into the loop recurrence.
-            // The two domains stay independent — an induction accumulator is
-            // never in the atomic commit.
+        if is_site(&footprint, &block, txn_mut_vars) {
+            // A block that mentions a transactional variable → a commit-record site keyed on the
+            // *enclosing* loop, or on a singleton outside one, restricted to the positions its
+            // branches run at. A block that only reads is a transaction like any other: it takes a
+            // tick, and its replies ride its commit (`src/ccl/design/mutability.md`, "Every
+            // transaction takes a tick"). Partition it by mutable variable domain: the
+            // transactional remainder is the commit decision; each induction `MutWrite` is lifted
+            // onto the loop body as a sibling (after the stripped block, same iteration position),
+            // where `mut_elim` folds it into the loop recurrence. The two domains stay independent
+            // — an induction accumulator is never in the atomic commit.
             let new_rest = {
                 // Recorded here: the source copy the site takes, the statement
                 // wrappers `prepend_effects` mints for the lifted induction
@@ -2401,49 +1929,21 @@ fn strip(
             };
             return strip(new_rest, txn_mut_vars, enclosing, path, out);
         }
-        // A read-only block (feeds a mutable variable read, no txn write) → unwrap it onto
-        // the loop spine. The fed mutable variable read then flows to `mut_elim`'s
-        // live/terminal as-of path unchanged (the shape a get-loop had before).
-        // Its footprint is kept even though the block is not: the mutable variables it reads
-        // are latched at one frontier, so they must share a store ([`partition_keys`]).
-        let (reads, _) = block_keys(&footprint, &block, txn_mut_vars);
-        if reads.len() > 1 {
-            out.read_only_footprints.push(reads);
-        }
+        // A block that mentions no transactional variable reads nothing a commit orders, so
+        // it is unwrapped onto the loop spine, or outside a loop where it stands.
         let spliced = {
             // `splice_block` re-types the spine as it re-points each statement's
-            // continuation, but preserves every id, so inside a loop this recording
-            // usually captures nothing and writes nothing. It is here because the arm is
-            // a rewrite: if a re-typed rebuild ever starts minting, the node lands
-            // on the statement it belongs to instead of becoming a leak. Outside a loop
-            // it records the singleton loop the block is unwrapped into.
+            // continuation, but preserves every id, so this recording usually captures
+            // nothing and writes nothing. It is here because the arm is a rewrite: if a
+            // re-typed rebuild ever starts minting, the node lands on the statement it
+            // belongs to instead of becoming a leak.
             let g = provenance::enter(
                 stmt_id,
                 "transact.unwrap_block",
                 provenance::Nature::Machinery,
             );
             g.blame(&[begin_id]);
-            match enclosing {
-                Some(_) => splice_block(*block, *rest),
-                // Outside a loop the block runs once, as the body of a loop over the
-                // singleton: an as-of read it feeds out is positioned by the loop that
-                // indexes it (`rewrite_as_of_reads`).
-                None => {
-                    let unit_ty = Type::Base(BaseType::Unit);
-                    let (position, target, source, _) = site_source(None);
-                    let mut unit = Expr::lit(Lit::Unit);
-                    unit.ty = unit_ty.clone();
-                    let mut once = Expr::new(TypedExprNode::For {
-                        position: Box::new(position),
-                        target,
-                        iter: Box::new(source),
-                        body: Box::new(splice_block(*block, unit)),
-                    });
-                    once.ty = unit_ty;
-                    let ty = rest.ty.clone();
-                    Expr::expr_stmt(once, *rest).with_ty(ty)
-                }
-            }
+            splice_block(*block, *rest)
         };
         return strip(spliced, txn_mut_vars, enclosing, path, out);
     }
@@ -2775,10 +2275,12 @@ pub fn refuse_valued_blocks_reading_their_loop(
 
 /// Refuse a `with begin():` block an exception escapes ([`TypedExprNode::Begin`]'s
 /// `commits_on`) where the abort is not compiled: one that writes a variable that is not
-/// transactional, and one that writes no transactional variable but sends output. The first's
+/// transactional, and one that mentions no transactional variable but sends output. The first's
 /// induction writes leave the block onto the enclosing loop ([`partition_block`]), and the
 /// second is unwrapped onto it, so in both the writes or the outputs stand whatever the block
-/// decides, where the abort must undo them (`docs/chl-spec.md`, "Exceptions").
+/// decides, where the abort must undo them (`docs/chl-spec.md`, "Exceptions"). A block that only
+/// reads a transactional variable is a site, and its abort sends nothing as a writing block's
+/// does.
 pub fn refuse_uncompiled_aborting_blocks(
     expr: &Expr,
     txn_mut_vars: &HashSet<Name>,
@@ -2786,7 +2288,6 @@ pub fn refuse_uncompiled_aborting_blocks(
     if let TypedExprNode::Begin {
         body,
         commits_on: Some(_),
-        ..
     } = &expr.node
     {
         if let Some(name) = first_non_txn_write(body, txn_mut_vars) {
@@ -2799,14 +2300,15 @@ pub fn refuse_uncompiled_aborting_blocks(
                 expr.node_id(),
             ));
         }
-        let causes = |f: fn(&crate::ccl::capabilities::Effect) -> bool| {
-            expr.capabilities.set().causes.iter().any(f)
-        };
-        let commits = causes(|c| matches!(c, crate::ccl::capabilities::Effect::WriteTxn(_)));
-        let sends = causes(|c| matches!(c, crate::ccl::capabilities::Effect::Append(_)));
-        if !commits && sends {
+        let sends = expr
+            .capabilities
+            .set()
+            .causes
+            .iter()
+            .any(|c| matches!(c, crate::ccl::capabilities::Effect::Append(_)));
+        if !is_site(&expr.capabilities, body, txn_mut_vars) && sends {
             return Err(Located::new(
-                "a `with begin():` block an exception escapes that sends output and writes no \
+                "a `with begin():` block an exception escapes that sends output and mentions no \
                  transactional variable is not compiled yet"
                     .to_string(),
                 expr.node_id(),
@@ -2821,15 +2323,15 @@ pub fn refuse_uncompiled_aborting_blocks(
     result
 }
 
-/// Refuse a `with begin():` block that writes a transactional variable where [`strip`] cannot
-/// give its site the positions it runs at ([`restrict_to_path`]):
+/// Refuse a `with begin():` block that reads or writes a transactional variable, a site of its
+/// store, where [`strip`] cannot give its site the positions it runs at ([`restrict_to_path`]):
 ///
 /// - in a branch whose condition reads an induction accumulator of another loop or the value of
-///   a block that writes nothing: no source the site could carry holds either. The value of a
-///   writing block is carried, and an accumulator of the block's own loop gates its source
-///   ([`restrict_to_path`], [`RawSite::gate`]);
-/// - in a loop under a branch whose condition reads the value of a writing block outside the
-///   loop, a value over the singleton that a source over the loop's positions cannot carry;
+///   a block that mentions no transactional variable: no source the site could carry holds
+///   either. The value of a site is carried, and an accumulator of the block's own loop gates
+///   its source ([`restrict_to_path`], [`RawSite::gate`]);
+/// - in a loop under a branch whose condition reads the value of a site outside the loop, a
+///   value over the singleton that a source over the loop's positions cannot carry;
 /// - reading, or under a condition reading, a binding in a loop's body or a branch whose value
 ///   writes, feeds, declares a channel or holds a loop or a block, which a copy would repeat.
 ///
@@ -2838,16 +2340,16 @@ pub fn refuse_uncompiled_aborting_blocks(
 ///
 /// Exception elimination places a block after a statement that may raise in the branch where
 /// nothing raised, and a block in a loop an exception escapes in the branch where no earlier
-/// iteration raised (`crate::ccl::exceptions`). A read-only block is unwrapped where it stands,
-/// so the branch still gates it.
-pub fn refuse_conditional_writing_blocks(
+/// iteration raised (`crate::ccl::exceptions`). A block that mentions no transactional variable
+/// is unwrapped where it stands, so the branch still gates it.
+pub fn refuse_conditional_sites(
     expr: &Expr,
     txn_mut_vars: &HashSet<Name>,
 ) -> Result<(), Located<String>> {
     struct Walk<'a> {
         txn_mut_vars: &'a HashSet<Name>,
-        /// Names a condition cannot read: induction accumulators, and bindings of a read-only
-        /// block's value or of a value reading one.
+        /// Names a condition cannot read: induction accumulators, and bindings of the value of a
+        /// block that mentions no transactional variable or of a value reading one.
         opaque: HashSet<Name>,
         /// Those of them holding or reading the exception a loop's earlier iterations raised,
         /// the accumulator exception elimination gives a loop an exception escapes.
@@ -2855,9 +2357,9 @@ pub fn refuse_conditional_writing_blocks(
         /// The bindings a site copies, in a loop's body or a branch: the names each reads,
         /// and whether its value has an effect a copy would repeat.
         local: HashMap<Name, (HashSet<Name>, bool)>,
-        /// Bindings of a writing block's value, or of a value reading one. Outside a loop such
-        /// a value is the one its site commits at the singleton, which a site in a loop cannot
-        /// carry over the loop's positions.
+        /// Bindings of a site's value, or of a value reading one. Outside a loop such a value is
+        /// the one its site commits at the singleton, which a site in a loop cannot carry over
+        /// the loop's positions.
         block_values: HashSet<Name>,
         /// The induction accumulators the innermost loop around the walk writes, and the
         /// bindings in it reading only those among the names a condition cannot read. A site
@@ -2887,15 +2389,17 @@ pub fn refuse_conditional_writing_blocks(
             seen
         }
 
-        /// Check the block `begin`, whose body is `body`, and refuse it at `begin`.
+        /// Check the block `begin`, whose body is `body` and whose capabilities are `footprint`,
+        /// and refuse it at `begin`.
         fn block(
             &self,
             begin: NodeId,
             body: &Expr,
+            footprint: &crate::ccl::capabilities::Capabilities,
             conditions: &[HashSet<Name>],
             outside: usize,
         ) -> Result<(), Located<String>> {
-            if !writes_any(body, self.txn_mut_vars) {
+            if !is_site(footprint, body, self.txn_mut_vars) {
                 return Ok(());
             }
             // The first `outside` conditions are those of the branches around the block's loop.
@@ -2906,8 +2410,9 @@ pub fn refuse_conditional_writing_blocks(
                 .any(|name| self.block_values.contains(name))
             {
                 return Err(Located::new(
-                    "a loop holding a `with begin():` block that writes, under a condition on the \
-                     value of a `with begin():` block outside the loop, is not compiled yet"
+                    "a loop holding a `with begin():` block that reads or writes a transactional \
+                     variable, under a condition on the value of a `with begin():` block outside \
+                     the loop, is not compiled yet"
                         .to_string(),
                     begin,
                 ));
@@ -2921,8 +2426,8 @@ pub fn refuse_conditional_writing_blocks(
             // exception its earlier iterations raised, held in an accumulator of its own.
             if opaque.iter().any(|name| self.escaping.contains(*name)) {
                 return Err(Located::new(
-                    "a `with begin():` block that writes, in a loop an exception escapes, is not \
-                     compiled yet"
+                    "a `with begin():` block that reads or writes a transactional variable, in a \
+                     loop an exception escapes, is not compiled yet"
                         .to_string(),
                     begin,
                 ));
@@ -2931,9 +2436,9 @@ pub fn refuse_conditional_writing_blocks(
             opaque.retain(|name| !self.own.contains(*name) || around_the_loop.contains(*name));
             if !opaque.is_empty() {
                 return Err(Located::new(
-                    "a `with begin():` block that writes, under a condition that reads an \
-                     induction accumulator or the value of a `with begin():` block that writes \
-                     nothing, is not compiled yet"
+                    "a `with begin():` block that reads or writes a transactional variable, under \
+                     a condition that reads an induction accumulator or the value of a `with \
+                     begin():` block that mentions no transactional variable, is not compiled yet"
                         .to_string(),
                     begin,
                 ));
@@ -2951,9 +2456,9 @@ pub fn refuse_conditional_writing_blocks(
                 .any(|(_, effect)| *effect)
             {
                 return Err(Located::new(
-                    "a `with begin():` block that writes, reading or under a condition reading a \
-                     binding in its loop or branch whose value writes, feeds or holds a loop or a \
-                     block, is not compiled yet"
+                    "a `with begin():` block that reads or writes a transactional variable, \
+                     reading or under a condition reading a binding in its loop or branch whose \
+                     value writes, feeds or holds a loop or a block, is not compiled yet"
                         .to_string(),
                     begin,
                 ));
@@ -2970,7 +2475,7 @@ pub fn refuse_conditional_writing_blocks(
         ) -> Result<(), Located<String>> {
             match &e.node {
                 TypedExprNode::Begin { body, .. } => {
-                    return self.block(e.node_id(), body, conditions, outside);
+                    return self.block(e.node_id(), body, &e.capabilities, conditions, outside);
                 }
                 TypedExprNode::MutDecl { binding, .. }
                     if !self.txn_mut_vars.contains(&binding.name) =>
@@ -2985,12 +2490,18 @@ pub fn refuse_conditional_writing_blocks(
                     bound_expr,
                     body,
                 } => {
-                    // The value of a writing block: a later block reads it from the values its
-                    // site commits, which its own source carries.
+                    // The value of a site: a later block reads it from the values its site
+                    // commits, which its own source carries.
                     let mut block_value = false;
                     if let TypedExprNode::Begin { body: block, .. } = &bound_expr.node {
-                        block_value = writes_any(block, self.txn_mut_vars);
-                        self.block(bound_expr.node_id(), block, conditions, outside)?;
+                        block_value = is_site(&bound_expr.capabilities, block, self.txn_mut_vars);
+                        self.block(
+                            bound_expr.node_id(),
+                            block,
+                            &bound_expr.capabilities,
+                            conditions,
+                            outside,
+                        )?;
                     } else {
                         self.walk(bound_expr, local, conditions, outside)?;
                     }
@@ -3092,13 +2603,12 @@ pub fn refuse_conditional_writing_blocks(
 /// the continuation that reads its value ([`BlockValue`]), with, in a loop, the binding `x` and
 /// the `values` it is read from, which a later block reading `x` has its source carry.
 ///
-/// A block that writes no transactional mutable variable needs no commit: its value is the
-/// value of its chain, whose reads are as-of reads, as a read-only block's are. A writing block
-/// becomes a site whose spine ends in `let __v = tail in __block_value << __v`: the walk merges a
-/// tail `Case` that writes as it merges a bound one ([`WriterWalk`]), so the feed sits on the
-/// spine and every path commits. Outside a loop the site runs over a singleton source, and
-/// the continuation binds `x` to the one value it commits. Inside one, `x` is the value committed
-/// at the loop's position, read where the block stood.
+/// A block that mentions no transactional mutable variable needs no commit: its value is the value
+/// of its chain. A block that mentions one becomes a site whose spine ends in `let __v = tail in
+/// __block_value << __v`: the walk merges a tail `Case` that writes as it merges a bound one
+/// ([`WriterWalk`]), so the feed sits on the spine and every path commits. Outside a loop the site
+/// runs over a singleton source, and the continuation binds `x` to the one value it commits. Inside
+/// one, `x` is the value committed at the loop's position, read where the block stood.
 fn strip_valued_block(
     expr: Expr,
     txn_mut_vars: &HashSet<Name>,
@@ -3125,7 +2635,7 @@ fn strip_valued_block(
     else {
         unreachable!("called on a `let` of a `Begin`")
     };
-    if block_keys(&footprint, &block, txn_mut_vars).1.is_empty() {
+    if !is_site(&footprint, &block, txn_mut_vars) {
         let g = provenance::enter(
             stmt_id,
             "transact.unwrap_block",
@@ -3266,10 +2776,10 @@ fn feed_block_value(block: Expr, defer: &Name, value_ty: &Type) -> Expr {
     }
 }
 
-/// Splice a `with begin():` block's statement chain onto an enclosing spine by
-/// replacing the block's terminal `Unit` with `rest`. Used to unwrap a
-/// read-only block (its feeds/local `let`s become ordinary loop-body
-/// statements). Each rebuilt node's type follows its new continuation.
+/// Splice a `with begin():` block's statement chain onto an enclosing spine by replacing the
+/// block's terminal `Unit` with `rest`. Used to unwrap a block that mentions no transactional
+/// variable (its feeds/local `let`s become ordinary loop-body statements). Each rebuilt node's type
+/// follows its new continuation.
 fn splice_block(block: Expr, rest: Expr) -> Expr {
     match block.node {
         TypedExprNode::Lit(Lit::Unit) => rest,
@@ -3326,7 +2836,8 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
             "splice_block: a mutable variable declared inside a `with begin():` block — \
              lowering cannot produce one yet"
         ),
-        // A read-only block is a `Let`/`ExprStmt`(feed) chain ending in `Unit`;
+        // A block that mentions no transactional variable is a `Let`/`ExprStmt`(feed)
+        // chain ending in `Unit`;
         // any other terminal is unexpected — sequence it defensively before rest.
         _ => {
             let ty = rest.ty.clone();
@@ -4122,6 +3633,18 @@ fn block_keys(
     (reads, writes)
 }
 
+/// Whether a `with begin():` block, `block` under the type that states `footprint`, reads or
+/// writes a transactional variable, which makes it a site of its store, a block that only reads
+/// included. A block reads and writes what its type states it does ([`block_keys`]).
+fn is_site(
+    footprint: &crate::ccl::capabilities::Capabilities,
+    block: &Expr,
+    txn_mut_vars: &HashSet<Name>,
+) -> bool {
+    let (reads, writes) = block_keys(footprint, block, txn_mut_vars);
+    !reads.is_empty() || !writes.is_empty()
+}
+
 /// Build one [`WriterSite`] from a stripped site: its decision lambda over the snapshot tuple
 /// ([`WriterParam`]), plus its footprint and source. The decision reads mutable variable
 /// snapshots and the loop item off the tuple, threads read-your-writes ([`WriterWalk`]), and
@@ -4363,14 +3886,12 @@ struct MutVarDecl {
     /// parent for everything built for this key.
     decl: NodeId,
     /// The declaration's binding occurrence, which each binder standing for the key
-    /// copies: its history binding and the rebind of its as-of read.
+    /// copies: its history binding.
     occurrence: NodeId,
     /// The tick-0 initial value, which carries the key's value type (its `.ty`).
     /// It reaches the output **once**, as the `get_prev_txn` default: the
-    /// trailing read is an [`as_of_read`], which carries no seed operand because
-    /// tick 0 of the store is its keys' seeds. Readers that want only the value
-    /// type — [`StorePlan::reads`], [`final_key`] — borrow it rather than
-    /// placing it.
+    /// terminal read carries no seed operand because tick 0 of the store is its keys'
+    /// seeds. [`final_key`] borrows its value type rather than placing it.
     init: Expr,
     /// The type of one committed value, read off the binder by [`mut_var_value_ty`] —
     /// so refinements above the `Mut` are peeled and the value type's own are kept.
@@ -4426,8 +3947,8 @@ fn collect_key_inits(expr: &Expr, keys: &[Name], out: &mut HashMap<Name, MutVarD
 /// `final_or_default`.
 ///
 /// **A collection**, for the same reason an induction history is one: the engine stores one
-/// value per commit time of the domain, and every read of it is a read at a position — a
-/// `final_or_default` reduction, an `as_of` join. `Type::fun` would declare it a compute function.
+/// value per commit time of the domain, and every read of it is a read at a position.
+/// `Type::fun` would declare it a compute function.
 fn history_ty(value_ty: &Type) -> Type {
     Type::data_fun(Type::Txn, value_ty.clone())
 }
@@ -4706,8 +4227,12 @@ fn plan_store(
             wt.push(tvar(&hist[wk], ty.clone()));
             wt_tys.push(ty);
         }
-        let mut wt_tuple = Expr::tuple(wt);
-        wt_tuple.ty = Type::Tuple(wt_tys);
+        // A site that only reads names no target: the empty product, `unit`.
+        let wt_tuple = if wt.is_empty() {
+            Expr::lit(Lit::Unit).with_ty(Type::Base(BaseType::Unit))
+        } else {
+            Expr::tuple(wt).with_ty(Type::Tuple(wt_tys))
+        };
 
         let rec_ty = Type::Record(vec![
             (F_TIME, Type::Txn),
@@ -4965,49 +4490,21 @@ impl StorePlan {
                 .any(|(b, _)| is_free_in_value(&b.name, e))
     }
 
-    /// The **as-of reads** to bind over `body`: one `let x = as_of_read(⟨history⟩)` per key
-    /// still *named* there.
-    ///
-    /// Every read that reaches here is fed out of a block, so every one of them is an
-    /// as-of sample; [`rewrite_as_of_reads`] pairs each with the reading loop that indexes
-    /// it and builds the `AsOf` join. The term is [`Builtin::AsOfRead`] rather than the
-    /// `final_or_default` an induction accumulator's trailing read gets, because a `Txn`
-    /// history has no final until a program asks for one by name — that read is
-    /// [`resolve_await_finals`]', and keeping the two terms distinct is what stops either
-    /// pass from claiming the other's read (`Builtin::AsOfRead`).
-    ///
-    /// One binding per key, shared by every read of it, rather than a sample substituted
-    /// at each read site: the chain of bindings is what lets [`as_of_join`] fold several
-    /// keys' reads into a single snapshot record at one commit frontier, which is
-    /// snapshot consistency for a reply that reads two variables.
-    ///
-    /// A key whose every read was an `await_final` has no reference left to bind:
-    /// [`resolve_await_finals`] already gave each await its own terminal read, so
-    /// binding an as-of read here too would leave a second, unconsumed read on the
-    /// store.
-    fn reads(
-        &self,
-        key_init: &HashMap<Name, MutVarDecl>,
-        body: &Expr,
-    ) -> Vec<(TypedBinding, Expr)> {
-        self.key_names
+    /// Assert that `body` reads no key of this store. Every read of a transactional variable
+    /// sits in a block, and every block that reads one is a site of its store, so the code
+    /// around the store reads a key only through `await_final`, which
+    /// [`resolve_await_finals`] has already made a read of the history binding.
+    fn assert_no_key_read(&self, body: &Expr) {
+        let read: Vec<&Name> = self
+            .key_names
             .iter()
             .filter(|k| is_free_in_value(k, body))
-            .map(|k| {
-                // The as-of read is the key's *second* stand-in for the declaration
-                // this phase drops (the history binding was the first), so it
-                // parents on that same `let`.
-                let _g = provenance::enter(
-                    key_init[k].decl,
-                    "transact.key_rebind",
-                    provenance::Nature::Expansion,
-                );
-                let v = key_init[k].value_ty.clone();
-                let mut rebind = binding(k.clone(), v.clone());
-                rebind.occurrence = Occurrence::copied_from(key_init[k].occurrence);
-                (rebind, as_of_read(&self.hist[k], v))
-            })
-            .collect()
+            .collect();
+        assert!(
+            read.is_empty(),
+            "transact_phase: the code around a store reads its keys {read:?} outside every \
+             `with begin():` block"
+        );
     }
 
     /// The node this store's `Transact` parents on: the **outermost** declaration among
@@ -5173,11 +4670,11 @@ fn walk_spine(
                     .drain(..)
                     .rev()
                     .fold(inner, |body, node| relink_spine_body(node, body));
+                store.assert_no_key_read(&inner);
                 let reads: Vec<(TypedBinding, Expr)> = store
                     .values
                     .iter()
                     .map(|(b, e)| (b.clone_preserving_ids(), e.clone_preserving_ids()))
-                    .chain(store.reads(key_init, &inner))
                     .collect();
                 // The plan's bindings move out of it rather than being duplicated:
                 // `stores` is borrowed and each plan is placed exactly once, so the
@@ -5333,12 +4830,6 @@ fn relink_spine_body(mut node: Expr, inner: Expr) -> Expr {
 /// [`StoreFinalRead`](crate::interpreter::commit_operator::StoreFinalRead) over the store
 /// branch. It carries no seed, tick 0 of the store being its keys' seeds.
 ///
-/// What keeps this read distinct from a fed-out one is the **term**, not where it sits:
-/// a fed-out read is [`Builtin::AsOfRead`], the only thing [`rewrite_as_of_reads`]
-/// matches. Position alone would leave the two indistinguishable for a bound await a feed
-/// loop reads, since `channelize` copies such a read into the channel it closes, directly
-/// above the broadcast.
-///
 /// A marker naming a non-key mutable variable cannot occur: one with no writer site is
 /// still a footprint key of any site that reads it, and one nothing touches at all is
 /// resolved earlier by [`resolve_writer_free_awaits`]. The post-condition assert in
@@ -5371,8 +4862,8 @@ fn resolve_await_finals(
 /// `final_read(hist_k)` — key `k`'s **terminal read**: its value at the position its own
 /// writers finish. Minted only for a [`Builtin::AwaitFinal`] marker.
 ///
-/// No seed operand, for the same reason [`as_of_read`] has none: this samples the carried
-/// value, and tick 0 of every store is its keys' seeds. The key's recorded value type is
+/// No seed operand: this samples the carried value, and tick 0 of every store is its keys'
+/// seeds. The key's recorded value type is
 /// still read here — it is the value type of the history the read names. A key no writer
 /// site writes never reaches here at all: [`resolve_writer_free_awaits`] has replaced its
 /// await with the seed.
@@ -5384,20 +4875,11 @@ fn final_key(k: &Name, hist: &HashMap<Name, Name>, key_init: &HashMap<Name, MutV
     sampling_read(&hist[k], v, Builtin::FinalRead)
 }
 
-/// `as_of_read(hist_k)` — a key's **as-of read**, awaiting the reading loop
-/// [`rewrite_as_of_reads`] pairs it with. No seed operand: the sampled position always
-/// has a value, because tick 0 of every store is its keys' seeds.
-fn as_of_read(hist: &Name, value_ty: Type) -> Expr {
-    sampling_read(hist, value_ty, Builtin::AsOfRead)
-}
-
 /// `⟨sample⟩(hist_k)` — a read of key `k`'s history that samples its carried value, applied
 /// to the history binding and carrying its own recorded type.
 ///
-/// The two such reads differ only in which builtin names the sampling position:
-/// [`Builtin::AsOfRead`] leaves it to the reading loop [`rewrite_as_of_reads`] pairs the read
-/// with, [`Builtin::FinalRead`] takes the point the key's own writers finish. Neither takes a
-/// seed operand, tick 0 of every store being its keys' seeds.
+/// [`Builtin::FinalRead`] samples at the point the key's own writers finish. It takes no seed
+/// operand, tick 0 of every store being its keys' seeds.
 fn sampling_read(hist: &Name, value_ty: Type, sample: Builtin) -> Expr {
     let stream = tvar(hist, history_ty(&value_ty));
     let mut sample = Expr::builtin(sample);
@@ -5508,7 +4990,7 @@ mod tests {
         let keys = vec![a.clone(), b.clone()];
         let sites = [footprint_site(&[&a], &[&a]), footprint_site(&[&b], &[&b])];
         assert_eq!(
-            base_names(&partition_keys(&keys, &sites, &[])),
+            base_names(&partition_keys(&keys, &sites)),
             vec![vec!["a"], vec!["b"]]
         );
     }
@@ -5521,7 +5003,7 @@ mod tests {
         let keys = vec![a.clone(), b.clone()];
         let sites = [footprint_site(&[&a, &b], &[&a, &b])];
         assert_eq!(
-            base_names(&partition_keys(&keys, &sites, &[])),
+            base_names(&partition_keys(&keys, &sites)),
             vec![vec!["a", "b"]]
         );
     }
@@ -5537,22 +5019,24 @@ mod tests {
             footprint_site(&[&b], &[&b]),
         ];
         assert_eq!(
-            base_names(&partition_keys(&keys, &sites, &[])),
+            base_names(&partition_keys(&keys, &sites)),
             vec![vec!["a", "b"]]
         );
     }
 
-    /// Snapshot consistency: a **read-only** block reading two mutable variables latches them
-    /// at one frontier, so they share a store even though no block writes both. The
-    /// block leaves no `RawSite`, which is why [`strip`] keeps its footprint.
+    /// Snapshot consistency: a block that only reads two mutable variables reads them at one
+    /// snapshot, so they share a store even though no block writes both.
     #[test]
     fn keys_read_together_share_a_store() {
         let (a, b) = (Name::fresh("a"), Name::fresh("b"));
         let keys = vec![a.clone(), b.clone()];
-        let sites = [footprint_site(&[&a], &[&a]), footprint_site(&[&b], &[&b])];
-        let snapshots = [vec![a.clone(), b.clone()]];
+        let sites = [
+            footprint_site(&[&a], &[&a]),
+            footprint_site(&[&b], &[&b]),
+            footprint_site(&[&a, &b], &[]),
+        ];
         assert_eq!(
-            base_names(&partition_keys(&keys, &sites, &snapshots)),
+            base_names(&partition_keys(&keys, &sites)),
             vec![vec!["a", "b"]]
         );
     }
@@ -5576,7 +5060,7 @@ mod tests {
             footprint_site(&[], &[&d]),
         ];
         assert_eq!(
-            base_names(&partition_keys(&keys, &sites, &[])),
+            base_names(&partition_keys(&keys, &sites)),
             vec![vec!["a", "b", "c"], vec!["d"]]
         );
     }

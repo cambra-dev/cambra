@@ -21,8 +21,10 @@ use cambra::interpreter::{
 
 /// Drive a program's `main` output exactly as `src/main.rs` does — pull only
 /// after a notification, stop on a universal release — but with iteration caps
-/// that convert a hang into a panic. Returns the final (terminal) tile.
-fn drive_main_output(code: &str) -> Tile {
+/// that convert a hang into a panic. Returns every tile pulled, the last one terminal: an
+/// entry the output states complete is released on the pull that delivers it, so a later
+/// tile no longer holds it.
+fn drive_main_output(code: &str) -> Vec<Tile> {
     const CAP: usize = 1000;
 
     let new_data = Rc::new(RefCell::new(false));
@@ -41,6 +43,7 @@ fn drive_main_output(code: &str) -> Tile {
     let universal = producer.tiling().universal_guard();
 
     let mut pulls = 0;
+    let mut tiles = Vec::new();
     loop {
         pulls += 1;
         assert!(
@@ -71,15 +74,19 @@ fn drive_main_output(code: &str) -> Tile {
         };
         let done = release_guard.is_universal();
         producer.release(release_guard);
+        tiles.push(tile);
         if done {
-            break tile;
+            break tiles;
         }
     }
 }
 
 /// Extract the single integer a scalar `main` output resolved to.
 fn drive_scalar_int(code: &str) -> i64 {
-    match drive_main_output(code) {
+    match drive_main_output(code)
+        .pop()
+        .expect("a driven output ends in a terminal tile")
+    {
         Tile::Scalar(cv) => match cv.as_single() {
             Some(Value::Int(n)) => n,
             other => panic!("expected a single Int, got {other:?}"),
@@ -141,15 +148,22 @@ fn aggregate_converges_in_one_pull() {
     assert_eq!(drive_scalar_int("sum([1, 2, 3, 4, 5])"), 15);
 }
 
-/// The integer codomain of a one-element `main` output stream (a trailing
-/// standalone read-only transaction's `AsOf` reply).
+/// The one integer a `main` output stream holds across every pull (a trailing standalone
+/// block's reply).
 fn drive_single_int(code: &str) -> i64 {
-    match drive_main_output(code) {
-        Tile::DataFunction { codomain, .. } => match *codomain {
-            Tile::Scalar(ColumnValue::Ints(v)) if v.len() == 1 => v[0],
-            other => panic!("expected a one-element Ints stream, got {other:?}"),
-        },
-        other => panic!("expected a Function stream, got {other:?}"),
+    let values: Vec<i64> = drive_main_output(code)
+        .into_iter()
+        .flat_map(|tile| match tile {
+            Tile::DataFunction { codomain, .. } => match *codomain {
+                Tile::Scalar(ColumnValue::Ints(v)) => v,
+                other => panic!("expected an Ints stream, got {other:?}"),
+            },
+            other => panic!("expected a Function stream, got {other:?}"),
+        })
+        .collect();
+    match values.as_slice() {
+        [v] => *v,
+        other => panic!("expected one value across the stream, got {other:?}"),
     }
 }
 
@@ -159,10 +173,9 @@ fn drive_single_int(code: &str) -> i64 {
 /// one-step-per-pull self-re-arm (not a reader-side drive-to-fixpoint) is what
 /// keeps stepping the store past the deny. Before that re-arm, removing the drive
 /// loop would strand the driver in `while !new_data` (a lost wakeup) — this test
-/// turns that hang into a `drive_main_output` cap panic. The trailing `out << q`
-/// is an as-of read; its value is a *member* of the as-of set (the seed `0` or a
-/// committed `q`), never asserted to be a specific "final" — here the batch drains
-/// so it observes a committed value, but membership is the guarantee.
+/// turns that hang into a `drive_main_output` cap panic. The trailing block is a
+/// transaction unordered against the loop's, so `out << q` replies the seed `0` or a
+/// committed `q`: membership is the guarantee.
 #[test]
 fn leading_deny_converges_no_stall() {
     // r=0 denies (guard `r != 0` false); r=1 commits q:=2; r=2 commits q:=3.
@@ -178,12 +191,12 @@ fn leading_deny_converges_no_stall() {
             out"#});
     assert!(
         [0, 2, 3].contains(&v),
-        "trailing as-of read {v} must be a member of the as-of set {{0, 2, 3}}"
+        "the trailing block's read {v} must be one of {{0, 2, 3}}"
     );
 }
 
 /// As `leading_deny_converges_no_stall`, but the deny sits in the **middle** of
-/// the writer stream (`[1, 0, 2]`): r=1 commits q:=2, r=0 denies (no tick), r=2
+/// the writer stream (`[1, 0, 2]`): r=1 commits q:=2, r=0 denies, r=2
 /// commits q:=3. The store must still step past the interior deny to terminal.
 #[test]
 fn middle_deny_converges_no_stall() {
@@ -199,6 +212,6 @@ fn middle_deny_converges_no_stall() {
             out"#});
     assert!(
         [0, 2, 3].contains(&v),
-        "trailing as-of read {v} must be a member of the as-of set {{0, 2, 3}}"
+        "the trailing block's read {v} must be one of {{0, 2, 3}}"
     );
 }

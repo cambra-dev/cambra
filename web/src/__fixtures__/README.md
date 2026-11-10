@@ -16,7 +16,7 @@ instead, in `tests/it/inspector_goldens.rs`.
 
 A successful **live** payload carries one entry of `panes` per declared pane, in
 pipeline order — `pre-inference` (kind `holes`), then `post-inference` (kind
-`typed`, the anchor), `post-channelize`, `post-as-of-read`, `post-lambda-elim`
+`typed`, the anchor), `post-channelize`, `post-lambda-elim`
 and `post-planning` (all `typed`), then `post-conversion` (kind `operators`) —
 and one `paneLinks` window per adjacent pair, so `paneLinks` is always one
 shorter than `panes`. The pane set is the compiler's `PANES` table;

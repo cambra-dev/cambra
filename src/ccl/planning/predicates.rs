@@ -261,8 +261,6 @@ pub(crate) fn fn_of_bare_predicate(
 /// - `channelize` skips a predicate holding a `defer` block, which a generator called in a
 ///   filter or a key leaves there. This runs it on such a term, then letrec recognition
 ///   (`plan_loops`), which reads the loop channelize builds as the collection it feeds.
-/// - `transact_phase::rewrite_as_of_reads` walks terms only, and a predicate holds no
-///   `as_of_read`: that read is bound in the tree, and a predicate reads its binder.
 /// - `lambda_elim` skips predicates, and this runs it.
 ///
 /// Debug builds assert that the result holds none of these passes' source forms.
@@ -309,7 +307,6 @@ fn pre_planning_source_form(e: &Expr) -> Option<&'static str> {
         N::For { .. } => Some("For"),
         N::Begin { .. } => Some("Begin"),
         N::LetRec { .. } => Some("LetRec"),
-        N::Apply { function, .. } if is_builtin(function, Builtin::AsOfRead) => Some("as_of_read"),
         _ => None,
     };
     let mut found = here;

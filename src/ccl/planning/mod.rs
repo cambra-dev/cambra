@@ -157,9 +157,6 @@ pub(crate) use predicates::fn_of_bare_predicate;
 ///
 /// Every term planning builds is checked in `mode`, the mode of the check `expr` answers to.
 pub fn run(expr: Expr, instances: &Rc<InstanceTable>, mode: CheckMode) -> Result<Expr, String> {
-    // Live cross-endpoint reads are recognized earlier, in
-    // `transact_phase::rewrite_as_of_reads` (pre-lambda-elim), so by here every
-    // such read is already an `as_of` join — nothing to do at planning time.
     // Planning compiles the predicates it reaches by eliminating their lambdas, so one memo
     // serves every binder conversion of a predicate shared across sites.
     let mut expr = crate::ccl::subst::with_conversion_memo(|| {

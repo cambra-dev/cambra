@@ -2432,7 +2432,6 @@ mod tests {
             Phase::Letrec,
             Phase::EraseRefinements,
             Phase::Channelize,
-            Phase::AsOfRead,
             Phase::LambdaElim,
             Phase::Planning,
         ] {
@@ -2491,7 +2490,6 @@ mod tests {
             Phase::Letrec,
             Phase::EraseRefinements,
             Phase::Channelize,
-            Phase::AsOfRead,
             Phase::LambdaElim,
             Phase::Planning,
         ] {

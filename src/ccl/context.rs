@@ -137,8 +137,8 @@ pub enum CompileError {
     /// A phase failed on a program it does not handle yet: a limitation of the
     /// compiler, not a mistake in the program.
     ///
-    /// The one variant with no span. These phases (the as-of read rewrite, lambda
-    /// elimination, operator conversion) run on trees rebuilt from nodes lowering
+    /// The one variant with no span. These phases (lambda elimination, operator
+    /// conversion) run on trees rebuilt from nodes lowering
     /// never saw, so there is no source position to report.
     Internal {
         /// The phase that failed, which the rendered message names.
@@ -1347,9 +1347,6 @@ pub struct CompiledProgram {
     /// Channelization has eliminated Defer/Feed/Define; surviving IDs remain shared
     /// with earlier snapshots. See `src/ccl/design/provenance.md`, "Retained snapshots".
     pub post_channelize_ir: Expr,
-    /// Snapshot after `transact_phase::rewrite_as_of_reads`. Its separate boundary
-    /// lets the pair isolate AsOfRead from lambda elimination.
-    pub post_as_of_read_ir: Expr,
     /// Snapshot after lambda elimination. Re-minted pass-through nodes require
     /// recorded ancestry rather than identity self-edges.
     pub post_lambda_elim_ir: Expr,
@@ -1424,7 +1421,7 @@ impl CompiledProgram {
 /// `MutRead` names reads before inference and resolves them after inference. Declaration order
 /// therefore does not order every run. Phase-range queries such as `ProvenanceTable::deaths`
 /// select exact pipeline intervals only at pane-pair granularity. A run across a pane boundary
-/// needs a distinct tag, as `AsOfRead` does from `Transact`.
+/// needs a distinct tag.
 /// Unlike `SyntheticKind`, which classifies binder roles, this enum identifies
 /// compilation stages. Not every stage necessarily writes a provenance row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
@@ -1463,9 +1460,6 @@ pub enum Phase {
     /// Eliminate Defer/Feed/Define through channel construction, recording new
     /// products while preserving IDs for unchanged material.
     Channelize,
-    /// Fed-out mutable-read rewriting after Channelize. It has a separate tag
-    /// from Transact because the two runs lie on opposite sides of a pane boundary.
-    AsOfRead,
     /// Lambda elimination: synthesizing point-free combinators (`Compose`,
     /// `Zip`, `Id`) from explicit lambdas.
     LambdaElim,
@@ -3199,7 +3193,7 @@ fn run_passes(
     // statement that may raise sits under the arm where it did not, which
     // `check_no_guarded_induction_write_in_block` would report as a branch the user wrote.
     transact_phase::refuse_uncompiled_aborting_blocks(&expr, &txn_mut_vars)
-        .and_then(|()| transact_phase::refuse_conditional_writing_blocks(&expr, &txn_mut_vars))
+        .and_then(|()| transact_phase::refuse_conditional_sites(&expr, &txn_mut_vars))
         .map_err(|e| blame.unsupported(e, Some(&expr)))?;
     // A transactional writer reaching a `with begin():` block via a function call
     // is a nested transaction — the callee's inlined `For` would otherwise be
@@ -3295,7 +3289,7 @@ fn run_passes(
     // remain: channelization is type-preserving by construction and closes
     // channel domains by substitution; the strict `typecheck` below is the
     // release-visible enforcement.
-    let mut channelized = recorded(capture_provenance, Phase::Channelize, || {
+    let channelized = recorded(capture_provenance, Phase::Channelize, || {
         channelize::run(phase_out)
     })
     .map_err(|Located { error, node_id, .. }| {
@@ -3324,33 +3318,6 @@ fn run_passes(
     #[cfg(debug_assertions)]
     crate::ccl::capabilities::assert_monotone(&channelized, "channelize");
     if at_phase_output(Phase::Channelize, &channelized, stop, capture, panes) {
-        return Ok(channelized);
-    }
-
-    // Fed-out mutable variable reads: rewrite a read-only reply that reads a mutable variable out of
-    // its block into an outer-indexed as-of join (an as-of read at the reading
-    // transaction's arbitrary commit position), *before* lambda elimination — so a
-    // computed reply (`resp << balance + 1`) stays a lambda the elim phase point-frees,
-    // rather than a point-free `const` a planning-time recognizer would have to
-    // reject. Uniform across the reading loop's domain. See
-    // `transact_phase::rewrite_as_of_reads`.
-    recorded(capture_provenance, Phase::AsOfRead, || {
-        transact_phase::rewrite_as_of_reads(&mut channelized)
-    })
-    .map_err(|message| {
-        vec![CompileError::Internal {
-            stage: "asOfRead",
-            message,
-        }]
-    })?;
-    settle(
-        &channelized,
-        "post-as-of-read",
-        Check::Typed,
-        CheckMode::RefinementBlind,
-        &instances,
-    )?;
-    if at_phase_output(Phase::AsOfRead, &channelized, stop, capture, panes) {
         return Ok(channelized);
     }
 
@@ -3560,11 +3527,10 @@ fn compile_version(
     //
     // Phase-internal consistency checks stay inside the frontend: firing one
     // means the compiler itself is wrong, not the user's input.
-    const PANES: [Phase; 5] = [
+    const PANES: [Phase; 4] = [
         Phase::Uniquify,
         Phase::Infer,
         Phase::Channelize,
-        Phase::AsOfRead,
         Phase::LambdaElim,
     ];
     let Frontend {
@@ -3596,17 +3562,10 @@ fn compile_version(
             .remove(&phase)
             .unwrap_or_else(|| unreachable!("a run to Planning passes {phase:?}'s output"))
     };
-    let (
-        pre_inference_ir,
-        post_inference_ir,
-        post_channelize_ir,
-        post_as_of_read_ir,
-        post_lambda_elim_ir,
-    ) = (
+    let (pre_inference_ir, post_inference_ir, post_channelize_ir, post_lambda_elim_ir) = (
         pane(Phase::Uniquify),
         pane(Phase::Infer),
         pane(Phase::Channelize),
-        pane(Phase::AsOfRead),
         pane(Phase::LambdaElim),
     );
     let table_session =
@@ -3749,7 +3708,6 @@ fn compile_version(
         pre_inference_ir,
         post_inference_ir,
         post_channelize_ir,
-        post_as_of_read_ir,
         post_lambda_elim_ir,
         provenance_table,
         operator_graph,

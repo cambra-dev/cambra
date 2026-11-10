@@ -372,18 +372,18 @@ fn a_one_branch_diff_compares_against_that_branchs_version() {
         ControlRequest::Diff {
             branch: "staging".into(),
             code: with_port(DASHED_LOG, port),
-            phase: Phase::AsOfRead,
+            phase: Phase::Channelize,
         },
     );
     assert_eq!(own.status, 200);
-    assert_eq!(own.body, "no difference at phase as-of-read\n");
+    assert_eq!(own.body, "no difference at phase channelized\n");
     let parents = ask(
         &mut ctx,
         &mut live,
         ControlRequest::Diff {
             branch: "staging".into(),
             code: source("running-log", port),
-            phase: Phase::AsOfRead,
+            phase: Phase::Channelize,
         },
     );
     assert_eq!(parents.status, 200);
@@ -408,7 +408,7 @@ fn a_two_branch_diff_compares_current_versions() {
     let diff = |from: &str, to: &str| ControlRequest::DiffBranches {
         from: from.into(),
         to: to.into(),
-        phase: Phase::AsOfRead,
+        phase: Phase::Channelize,
     };
 
     let across = ask(&mut ctx, &mut live, diff(MAIN_BRANCH, "staging"));
@@ -419,7 +419,7 @@ fn a_two_branch_diff_compares_current_versions() {
             &ctx,
             MAIN_BRANCH,
             &with_port(DASHED_LOG, port),
-            Phase::AsOfRead,
+            Phase::Channelize,
         )
         .expect("compiles")
         .diff;
@@ -429,7 +429,7 @@ fn a_two_branch_diff_compares_current_versions() {
     );
 
     let itself = ask(&mut ctx, &mut live, diff("staging", "staging"));
-    assert_eq!(itself.body, "no difference at phase as-of-read\n");
+    assert_eq!(itself.body, "no difference at phase channelized\n");
 
     assert_eq!(
         ask(&mut ctx, &mut live, diff(MAIN_BRANCH, "nowhere")).status,
@@ -745,7 +745,7 @@ fn the_last_branch_cannot_be_deleted() {
         ControlRequest::Diff {
             branch: MAIN_BRANCH.into(),
             code: with_port(DASHED_LOG, port),
-            phase: Phase::AsOfRead,
+            phase: Phase::Channelize,
         },
         create("scratch", MAIN_BRANCH, with_port(DASHED_LOG, port)),
     ] {

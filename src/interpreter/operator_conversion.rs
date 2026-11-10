@@ -35,9 +35,9 @@ use crate::{
         // (aliased `CommitWriter` to avoid clashing with the CCL `TransactWriter`
         // node field imported from `ccl` above).
         commit_operator::{
-            AsOf, AsOfField, CommitOperator, InductionDriver, InductionStore, StoreDenseRead,
-            StoreFinalRead, StoreValueStream, TransactDriver, TransactWriter as CommitWriter,
-            full_store_tiling, nested_engines_tiling, store_value_now,
+            CommitOperator, InductionDriver, InductionStore, StoreDenseRead, StoreFinalRead,
+            StoreValueStream, TransactDriver, TransactWriter as CommitWriter, full_store_tiling,
+            nested_engines_tiling, store_value_now,
         },
         operator_graph::{record_kept_operators, record_sink},
         scalar_expr,
@@ -2463,56 +2463,6 @@ fn convert_impl_inner(
             )
         }
 
-        // `as_of((trigger, source))` — the live cross-endpoint read. For each
-        // trigger position (a request loop), latch the shared store as of that
-        // request; the reply is indexed by the trigger (outer-indexed). Emitted by
-        // `transact_phase::rewrite_as_of_reads`. `AsOf` folds the raw `Tile::Store`
-        // fan directly (via `store_current`), so no `StoreValueStream`
-        // intermediary. Two source shapes:
-        //   - `__hist.k` (a bare mutable variable read) → a scalar `AsOf` sampling key `k`;
-        //   - `__hist` (the whole store) → a snapshot `AsOf` sampling every field
-        //     of the reply's record type at one commit frontier (§I-c), which the
-        //     reply then projects.
-        TypedExprNode::Apply { argument, function }
-            if as_builtin(function) == Some(Builtin::AsOf) =>
-        {
-            expect_no_input(input, "as_of")?;
-            let TypedExprNode::Tuple(elts) = &argument.node else {
-                return Err(ConversionError::Unsupported(format!(
-                    "as_of expects a (trigger, source) Tuple argument, got {:?}",
-                    argument.node
-                )));
-            };
-            let [trigger, source] = elts.as_slice() else {
-                return Err(ConversionError::Unsupported(format!(
-                    "as_of expects exactly (trigger, source), got {} args",
-                    elts.len()
-                )));
-            };
-            let trigger_op = convert_impl(trigger, None, ctx)?;
-            // A whole-store source (`Var(__hist)`) → snapshot read: the as_of's
-            // output codomain is the record of sampled fields.
-            if let TypedExprNode::Var(store_name) = &source.node
-                && ctx.lookup_store(store_name).is_some()
-            {
-                let fields = as_of_snapshot_fields(store_name, &expr.ty, ctx)?;
-                let store_fan = ctx.lookup_store(store_name).unwrap().fan.clone();
-                Ok(Box::new(AsOf::new_snapshot(
-                    trigger_op,
-                    store_fan.slot(),
-                    fields,
-                )))
-            } else {
-                let (store_fan, runtime_key, value_extent) = as_of_store_source(source, ctx)?;
-                Ok(Box::new(AsOf::new(
-                    trigger_op,
-                    store_fan,
-                    runtime_key,
-                    value_extent,
-                )))
-            }
-        }
-
         // map_domain transforms the codomain of its argument to a copy of the domain.
         //
         // Chain-head only. Every emitter puts `map_domain` in a source position — join
@@ -2724,27 +2674,10 @@ fn convert_impl_inner(
             ))
         }
 
-        // `as_of_read` is a fed-out mutable variable read still missing its position, and
-        // `rewrite_as_of_reads` pairs every one with its reading loop to build the `AsOf`
-        // join. Reaching this arm means one was never paired and the check at the end of
-        // that pass did not see it — a compiler bug, since the sampled position has no
-        // other source.
-        TypedExprNode::Apply { function, .. }
-            if as_builtin(function) == Some(Builtin::AsOfRead) =>
-        {
-            Err(ConversionError::Unsupported(
-                "as_of_read (a fed-out mutable variable read) reached operator conversion — \
-                 `transact_phase::rewrite_as_of_reads` must pair it with its reading loop \
-                 and build the `as_of` join before this pass"
-                    .into(),
-            ))
-        }
-
         // `final_read` is the terminal read of a store key: a sample of the key's carried
         // value at the position its own writers finish, a commit key's `await_final` or an
-        // induction accumulator's trailing read. Unlike `as_of_read` it needs no pairing —
-        // the position comes from the store's closure, not from a reading loop — so it is
-        // compiled here, to a `StoreFinalRead` over the store slot.
+        // induction accumulator's trailing read. The position comes from the store's
+        // closure, so it is compiled here, to a `StoreFinalRead` over the store slot.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::FinalRead) =>
         {
@@ -5646,82 +5579,6 @@ resolves to the other's value",
     })
 }
 
-/// Resolve an `as_of` read's `source` — a bare mutable variable read `__hist.k`
-/// off a registered commit store — to the raw store fan slot, its runtime key,
-/// and the key's value extent. `AsOf` folds the [`Tile::Store`] fan directly (via
-/// `store_current`), so the as-of path takes the fan + key rather than
-/// compiling `source` to a per-key [`StoreValueStream`].
-fn as_of_store_source(
-    source: &Expr,
-    ctx: &mut OpConversionContext,
-) -> Result<(Box<dyn TileOperator>, Value, Extent), ConversionError> {
-    let bad = || {
-        ConversionError::Unsupported(format!(
-            "as_of source must be a bare store mutable variable read `__hist.k`, got {:?}",
-            source.node
-        ))
-    };
-    let TypedExprNode::Apply { function, argument } = &source.node else {
-        return Err(bad());
-    };
-    let (TypedExprNode::Proj(ProjKey::Field(field)), TypedExprNode::Var(store_name)) =
-        (&function.node, &argument.node)
-    else {
-        return Err(bad());
-    };
-    let info = ctx.lookup_store(store_name).ok_or_else(|| {
-        ConversionError::Unsupported(format!("as_of reads unknown store {store_name}"))
-    })?;
-    let key = info.keys.get(field).ok_or_else(|| {
-        ConversionError::Unsupported(format!("as_of reads unknown store key {field}"))
-    })?;
-    // A live cross-endpoint read samples a mutable variable (a persistent `Txn` value),
-    // never a per-commit reply tap — the tap has no `keys` entry.
-    debug_assert!(
-        matches!(info.kind, StoreReadKind::Commit),
-        "an as_of read's source is a commit-store mutable variable"
-    );
-    let runtime_key = key.runtime_key.clone();
-    let value_extent = key.value_extent.clone();
-    let fan = info.fan.clone();
-    Ok((fan.slot(), runtime_key, value_extent))
-}
-
-/// The snapshot fields a whole-store `as_of` samples: the record fields of its
-/// output type `Fun(B, Record{field: V})`, each resolved to the store's runtime
-/// key and value extent via the registered store. Field order follows the record
-/// type (which follows the reply's read order), so the latched snapshot record
-/// lines up with the reply's projections.
-fn as_of_snapshot_fields(
-    store_name: &Name,
-    as_of_ty: &Type,
-    ctx: &OpConversionContext,
-) -> Result<Vec<AsOfField>, ConversionError> {
-    let Some(Type::Record(record_fields)) = as_of_ty.codomain() else {
-        return Err(ConversionError::Unsupported(format!(
-            "snapshot as_of output must be Fun(B, Record), got {as_of_ty}"
-        )));
-    };
-    let info = ctx.lookup_store(store_name).ok_or_else(|| {
-        ConversionError::Unsupported(format!("as_of reads unknown store {store_name}"))
-    })?;
-    record_fields
-        .iter()
-        .map(|(field, _)| {
-            let key = info.keys.get(field).ok_or_else(|| {
-                ConversionError::Unsupported(format!(
-                    "as_of snapshot field {field} is not a store key"
-                ))
-            })?;
-            Ok(AsOfField {
-                field: field.runtime_key(),
-                key: key.runtime_key.clone(),
-                value_extent: key.value_extent.clone(),
-            })
-        })
-        .collect()
-}
-
 /// The `(store, field)` of a `__hist.field` read on a registered store, if `e` is one.
 /// The same shape the generic `Apply`/`Proj` arm matches, factored out so the
 /// `FinalRead` arm can recognise its own operand.
@@ -6396,12 +6253,11 @@ impl ZipReaders {
     }
 }
 
-/// Whether a `zip` arm is a **leaf source** over its own domain — a store read `__hist.k` or an
-/// `as_of((trigger, store))` read — rather than an iteration-driven morphism. Such an arm is
-/// converted with *no* input (it would reject the fanned iteration input); [`zip_arms_at`]
-/// ([`zip_arms_named_at`] for a record) co-aligns it with the input-driven arms by domain position.
-/// This is the cross-domain co-iteration shape: a commit writer's source (`zip((reqs, __cnt.acc))`)
-/// or a reply combining the request with a store read (`zip((trigger, as_of(store)))`).
+/// Whether a `zip` arm is a **leaf source** over its own domain — a store read `__hist.k` — rather
+/// than an iteration-driven morphism. Such an arm is converted with *no* input (it would reject the
+/// fanned iteration input); [`zip_arms_at`] ([`zip_arms_named_at`] for a record) co-aligns it with
+/// the input-driven arms by domain position. This is the cross-domain co-iteration shape: a commit
+/// writer's source (`zip((reqs, __cnt.acc))`).
 fn is_leaf_zip_arm(expr: &Expr, ctx: &OpConversionContext) -> bool {
     // A nested store's read, `__hist ≫ .k` — one inner history per enclosing position, over the
     // store's own rows.
@@ -6415,9 +6271,6 @@ fn is_leaf_zip_arm(expr: &Expr, ctx: &OpConversionContext) -> bool {
         {
             matches!(&argument.node, TypedExprNode::Var(n) if ctx.lookup_store(n).is_some())
         }
-        // `as_of((trigger, store))` — a live as-of read (a leaf that internally
-        // drives its trigger).
-        TypedExprNode::Apply { function, .. } => as_builtin(function) == Some(Builtin::AsOf),
         _ => false,
     }
 }

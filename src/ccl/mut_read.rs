@@ -111,11 +111,6 @@
 //! mutable collection, `m[k]!`, puts the handle in the function position of the
 //! same node.
 //!
-//! **A bare read fed to a deferred output.** `out << x` reaches
-//! `transact_phase::rewrite_as_of_reads`, which turns a history read fed out of
-//! a read-only block into an as-of join by reading the term. A computed feed
-//! value is an ordinary operand.
-//!
 //! **A refined cast's value.** A cast target that refines its domain holds a
 //! copy of the term being cast, and inference dedups the two by structural
 //! equality. The copy rides a type slot, so rewriting the term alone leaves them
@@ -442,16 +437,6 @@ fn operand(mut expr: Expr, muts: &Muts, open: &mut Open, minted: &mut Minted) ->
                 *guard = operand(std::mem::take(guard), muts, open, minted);
                 *body = block(std::mem::take(body), muts);
             }
-            expr
-        }
-
-        // **A bare read fed to a deferred output.** `rewrite_as_of_reads` reads
-        // the term: a history read fed out of a read-only `with begin():` block
-        // becomes an outer-indexed as-of join, and it is the bare reference that
-        // says so. A computed feed value is an ordinary operand.
-        TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. }
-            if is_mut_var(value, muts) =>
-        {
             expr
         }
 

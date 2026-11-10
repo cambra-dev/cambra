@@ -11,9 +11,8 @@
 //! reads inside the block run with `in_tx_body = true`, so a bare mutable variable read is
 //! a snapshot (a bare mutable variable read *outside* a block is the rejected out-of-block
 //! read) and an assignment is a write; a nested `with begin():` is rejected. A
-//! read fed out of a block that does not write that mutable variable is a live as-of read;
-//! trailing sibling `<<` feeds are request-indexed replies (see
-//! `lower_transaction_loop`).
+//! block that only reads is a transaction too; trailing sibling `<<` feeds are
+//! request-indexed replies (see `lower_transaction_loop`).
 
 use smol_str::SmolStr;
 

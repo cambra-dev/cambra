@@ -176,7 +176,6 @@ pipeline; individual pass contracts belong to the linked design documents.
 | Eliminate induction mutation | `mut_elim::run` constructs induction histories. |
 | Erase refinements | `erase_refinements::run` drops every refinement except those on data function domains; see [refinement erasure](../src/ccl/design/optimization.md#refinement-erasure-cclerase_refinementsrs). |
 | Channelize | `channelize::run` resolves deferred collections and feeds; see [mutability compilation](../src/ccl/design/mutability.md#compilation-pipeline). |
-| Rewrite as-of reads | `transact_phase::rewrite_as_of_reads` rewrites fed-out mutable reads after channelization, before lambda elimination. |
 | Eliminate lambdas | Convert to point-free combinators; see [lambda elimination](../src/ccl/design/optimization.md#lambda-elimination-ccllambda_elimrs). |
 | Plan | `planning::plan_loops` recognizes causal histories as `Transact`, then `planning::run` plans joins and iteration; see [planning](../src/ccl/design/optimization.md#planning-cclplanning). |
 | Convert and subscribe | Build tile operators and subscribe output consumers; see [compilation](../src/ccl/design/optimization.md#compilation). |
@@ -186,8 +185,7 @@ naming. Diagnostics therefore refer to a tree that has already been rewritten, u
 projection to recover source spans. Inlining exposes called writers before the mutability passes
 process them. Channelization follows induction elimination so it can route feeds lifted from loops.
 
-As-of-read rewriting runs before lambda elimination because its computed replies still need lambda
-elimination. Loop recognition runs after lambda elimination and is part of `Phase::Planning`, not
+Loop recognition runs after lambda elimination and is part of `Phase::Planning`, not
 a separate phase boundary. The recognized transaction or induction domain determines the runtime
 engine during operator conversion. The detailed history contracts are owned by
 [the mutability reference](../src/ccl/design/mutability.md#compilation-pipeline).
