@@ -1219,12 +1219,8 @@ mod tests {
         }
     }
 
-    // TODO: pinned on `^+` or `^==`, each of which fails this test on its own. With all of them
-    // refined, inference rejects a comprehension whose element type now reads the key.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(
-        expected = "a value that is one type for every key of the collection it is part of"
-    )]
     fn a_nested_join_blames_both_join_conditions_with_caret_operators() {
         with_caret_operators(a_nested_join_blames_both_join_conditions);
     }
@@ -1748,25 +1744,12 @@ mod tests {
             arithmetic,
             filter_and_aggregate,
             for_accumulator,
-            // TODO: pinned on `^` operators: inference rejects a comprehension whose element type
-            // now reads the key.
-            #[should_panic(
-                expected = "a value that is one type for every key of the collection it is part of"
-            )]
             generator_pipeline,
             inner_join,
-            // TODO: pinned on `^` operators: a collection domain refined by a comparison fails
-            // the invariant domain check.
-            #[should_panic(expected = "post-inference produced an invalid tree")]
             join_then_groupby,
             prefix_lines,
             streaming_echo,
             transaction,
-            // TODO: pinned on `^` operators: inference rejects a comprehension whose element type
-            // now reads the key.
-            #[should_panic(
-                expected = "a value that is one type for every key of the collection it is part of"
-            )]
             group_by,
             udf_chain,
             feed_loop,
@@ -1875,9 +1858,6 @@ mod tests {
 
     #[rstest::rstest]
     #[case::guard_only(conditional_induction::GUARD_ONLY)]
-    // TODO: pinned on `^+`: letrec recognition merges two `case` arms without merging their
-    // result refinements.
-    #[should_panic(expected = "post-letrec produced an invalid tree")]
     #[case::uncond_before(conditional_induction::UNCOND_BEFORE)]
     #[case::uncond_after(conditional_induction::UNCOND_AFTER)]
     #[case::if_else(conditional_induction::IF_ELSE)]
@@ -2058,10 +2038,8 @@ mod tests {
         );
     }
 
-    // TODO: pinned on `^+` or `^==`, each of which fails this test on its own. With all of them
-    // refined, a collection domain refined by the comparison fails the invariant domain check.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(expected = "post-inference produced an invalid tree")]
     fn planning_labels_carry_their_declared_nature_with_caret_operators() {
         with_caret_operators(planning_labels_carry_their_declared_nature);
     }

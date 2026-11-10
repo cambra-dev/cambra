@@ -2745,8 +2745,10 @@ impl TraitObligation {
     /// supply. A component that is itself a product re-enters [`narrow_product`] on its
     /// condition.
     ///
-    /// A variable sits at its operand's level: a component flowing in from the operand must
-    /// not be carried below the level it was introduced at.
+    /// A variable sits at its operand's level and, where the operand is a variable, in its
+    /// scope: a component flowing in from the operand must not be carried below the level it
+    /// was introduced at, nor outside the binders it reads (`src/ccl/design/type-inference.md`,
+    /// "The invariant").
     ///
     /// [`narrow_product`]: Self::narrow_product
     fn apply_product_rule(
@@ -2768,9 +2770,13 @@ impl TraitObligation {
                 operands
                     .iter()
                     .map(|operand| {
-                        crate::ccl::infer::solver::fresh_var(
-                            operand.as_ref().map_or(0, super::type_level),
-                        )
+                        let level = operand.as_ref().map_or(0, super::type_level);
+                        match operand {
+                            Some(Type::Infer(v)) => {
+                                Type::Infer(InferVar::fresh_in(level, &v.telescope))
+                            }
+                            _ => crate::ccl::infer::solver::fresh_var(level),
+                        }
                     })
                     .collect()
             })

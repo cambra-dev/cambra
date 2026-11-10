@@ -2825,6 +2825,15 @@ struct CompactState {
     /// refinement naming a joined binder from it: the candidate then widens to every
     /// subtype of what remains ([`compact_type_kind`]).
     candidate_widened: Option<bool>,
+    /// For each binder the accumulated substitution joins over with no term at the key, the
+    /// polarity and the [`data_domain_depth`](Self::data_domain_depth) at the bound whose edge
+    /// introduced the join. The join is of that bound's values, so a refinement naming the
+    /// binder is judged by where it stands in the bound: a data domain the bound itself is in
+    /// does not count, and a position the bound is walked at opposite polarity to is positive
+    /// in it. A binder missing here is judged from the root of the walk: one joined before the
+    /// walk began, and one with a term at the key, which reads at the target's key in any data
+    /// domain.
+    join_entries: BTreeMap<Name, (bool, u32)>,
     join_violations: Vec<JoinViolation>,
     /// Each variable's own reads, for [`content_mentions`]. The graph does not change while one
     /// type compacts, and the question is asked of a variable once per bound each time the walk
@@ -2852,6 +2861,7 @@ impl CompactState {
             scope: RefinementScope::default(),
             data_domain_depth: 0,
             candidate_widened: None,
+            join_entries: BTreeMap::new(),
             join_violations: Vec::new(),
             own_content: Default::default(),
         }
@@ -2886,7 +2896,7 @@ fn join_barrier_lowers(
     let mut joined = CompactType::empty();
     for b in &lowers {
         let inner_acc = Subst::then(&b.render_subst(), subst_acc);
-        let bc = compact_go(&b.ty, true, &inner_acc, Position::default(), st);
+        let bc = compact_bound(&b.ty, true, &inner_acc, Position::default(), st);
         joined = CompactType::merge(true, joined, bc);
     }
     let mut escaped = Vec::new();
@@ -3209,6 +3219,32 @@ fn kind_renames(
     Some((mine, hop))
 }
 
+/// [`compact_go`] on a bound's type `ty` under `subst_acc`, the walk's substitution composed
+/// with the bound's edge: a binder the edge joins over with no term at the key enters
+/// [`CompactState::join_entries`] at this bound for the walk below it.
+fn compact_bound(
+    ty: &Type,
+    pol: bool,
+    subst_acc: &Subst,
+    pos: Position<'_>,
+    st: &mut CompactState,
+) -> CompactType {
+    let entered: Vec<Name> = subst_acc
+        .unkeyed_joined_binders()
+        .filter(|n| !st.join_entries.contains_key(*n))
+        .cloned()
+        .collect();
+    for n in &entered {
+        st.join_entries
+            .insert(n.clone(), (pol, st.data_domain_depth));
+    }
+    let ct = compact_go(ty, pol, subst_acc, pos, st);
+    for n in &entered {
+        st.join_entries.remove(n);
+    }
+    ct
+}
+
 /// Compact `ty` at polarity `pol`, composing `subst_acc` — the substitution
 /// accumulated from the edges walked so far — into every refinement predicate
 /// materialized along the way. `subst_acc` is `Subst::id()` for ordinary
@@ -3407,8 +3443,17 @@ fn compact_go_inner(
                 // polarity dropping it narrows the type, and the join keeps only a refinement
                 // every value establishes, which this walk does not compute, so it is
                 // reported; a term at the key does not answer it, since a parameter is not
-                // the key.
-                let in_data_domain = st.candidate_widened.is_none() && st.data_domain_depth > 0;
+                // the key. Data domains and polarity are counted from the bound whose values
+                // are joined ([`CompactState::join_entries`]).
+                let joined = subst_acc.joined_over_in(&r.predicate);
+                let entries = || {
+                    joined
+                        .iter()
+                        .map(|n| st.join_entries.get(n).copied().unwrap_or((true, 0)))
+                };
+                let in_data_domain = st.candidate_widened.is_none()
+                    && entries().any(|(_, depth)| st.data_domain_depth > depth);
+                let negative = entries().any(|(entered_pol, _)| pol != entered_pol);
                 let at_key = in_data_domain
                     && subst_acc.joins_refinement(r)
                     && !subst_acc.joins_unkeyed_refinement(r);
@@ -3421,7 +3466,7 @@ fn compact_go_inner(
                         None if in_data_domain => {
                             Some((subst_acc.joined_in(&r.predicate), JoinedPosition::Keys))
                         }
-                        None if !pol => Some((
+                        None if negative => Some((
                             subst_acc.joined_over_in(&r.predicate),
                             JoinedPosition::Parameter,
                         )),
@@ -3915,7 +3960,7 @@ fn compact_go_inner(
                 // arrives with every edge's morphism composed (design §3.6).
                 // Identity edges leave `subst_acc` unchanged (the common case).
                 let inner_acc = Subst::then(&b.render_subst(), subst_acc);
-                let bc = compact_go(&b.ty, pol, &inner_acc, pos.under(&new_parents), st);
+                let bc = compact_bound(&b.ty, pol, &inner_acc, pos.under(&new_parents), st);
                 bound = CompactType::merge(pol, bound, bc);
             }
             // Whether the *shape* collapse fires: the primary walk produced no
@@ -4002,7 +4047,7 @@ fn compact_go_inner(
             if read_opposite {
                 for b in opposite_bounds.iter().filter(|b| renders_as_own(b)) {
                     let inner_acc = Subst::then(&b.render_subst(), subst_acc);
-                    let bc = compact_go(&b.ty, !pol, &inner_acc, pos.under(&new_parents), st);
+                    let bc = compact_bound(&b.ty, !pol, &inner_acc, pos.under(&new_parents), st);
                     recovered = Some(match recovered {
                         None => bc,
                         Some(acc) => CompactType::merge(!pol, acc, bc),

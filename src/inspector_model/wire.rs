@@ -937,7 +937,7 @@ mod tests {
     use crate::ccl::context::{CompiledProgram, GlobalContext, collect_tree_ids, compile_program};
     use crate::ccl::load::LoadedProgram;
     use crate::ccl::panes::PANES;
-    use crate::ccl::test_corpus::{spelled, with_caret_operators};
+    use crate::ccl::test_corpus::{spelled, spells_caret_operators, with_caret_operators};
     use crate::chl_parser::{FileId, SourceMap};
     use crate::interpreter::Consumer;
     use indoc::indoc;
@@ -951,9 +951,10 @@ mod tests {
             .expect("program compiles")
     }
 
-    /// The span of the `n`-th (0-based) byte occurrence of `needle` in the root
-    /// file of `sources`, the map a program was compiled from.
+    /// The span of the `n`-th (0-based) byte occurrence of `needle`, [`spelled`] as the
+    /// program is, in the root file of `sources`, the map a program was compiled from.
     fn nth_span(sources: &SourceMap, needle: &str, n: usize) -> Span {
+        let needle = &spelled(needle);
         let file = sources.root();
         let start = sources
             .text(file)
@@ -1113,12 +1114,8 @@ mod tests {
         }
     }
 
-    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
-    // refined, inference rejects a comprehension whose element type now reads the key.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(
-        expected = "a value that is one type for every key of the collection it is part of"
-    )]
     fn the_payload_ships_one_pane_entry_per_declared_pane_and_one_link_per_pair_with_caret_operators()
      {
         with_caret_operators(
@@ -1164,12 +1161,8 @@ mod tests {
         }
     }
 
-    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
-    // refined, inference rejects a comprehension whose element type now reads the key.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(
-        expected = "a value that is one type for every key of the collection it is part of"
-    )]
     fn every_pane_link_endpoint_is_a_node_of_the_tree_it_points_into_with_caret_operators() {
         with_caret_operators(every_pane_link_endpoint_is_a_node_of_the_tree_it_points_into);
     }
@@ -1314,12 +1307,8 @@ mod tests {
         }
     }
 
-    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
-    // refined, inference rejects a comprehension whose element type now reads the key.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(
-        expected = "a value that is one type for every key of the collection it is part of"
-    )]
     fn a_nodes_spans_are_its_attributions_narrowest_first_with_caret_operators() {
         with_caret_operators(a_nodes_spans_are_its_attributions_narrowest_first);
     }
@@ -1368,13 +1357,22 @@ mod tests {
 
         // `x * 2` is the root of a lowered source expression, so its rewrite tag
         // null-compresses; it carries its own span and its inferred type.
-        let mul = node_named(pane, "BinOp(Arithmetic(Mul))");
+        let mul = ir_nodes(pane)
+            .iter()
+            .find(|n| n.label.starts_with("BinOp(Arithmetic(Mul"))
+            .expect("a `*` node in the post-inference table");
         assert_eq!(
             mul.spans,
-            [Span::new(prog.sources().root(), 24, 29)],
+            [nth_span(prog.sources(), "x * 2", 0)],
             "the span of `x * 2`"
         );
-        assert_eq!(mul.ty, "Int");
+        // `^*` refines its result by the product it computes.
+        let mul_ty = if spells_caret_operators() {
+            "{Int | __elem == x * 2}"
+        } else {
+            "Int"
+        };
+        assert_eq!(mul.ty, mul_ty);
         assert!(
             mul.rewritten.is_none(),
             "a `Nature::Source` tag null-compresses; got {:?}",
@@ -1398,7 +1396,9 @@ mod tests {
             .map(|n| n.label.as_str())
             .collect();
         assert!(
-            labels.contains(&"BinOp(Compare(Greater))"),
+            labels
+                .iter()
+                .any(|l| l.starts_with("BinOp(Compare(Greater")),
             "the `x > 2` filter is the predicate subtree; got {labels:?}"
         );
     }
@@ -1475,12 +1475,8 @@ mod tests {
         );
     }
 
-    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
-    // refined, inference rejects a comprehension whose element type now reads the key.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(
-        expected = "a value that is one type for every key of the collection it is part of"
-    )]
     fn a_wire_node_carries_its_id_spans_type_and_children_with_caret_operators() {
         with_caret_operators(a_wire_node_carries_its_id_spans_type_and_children);
     }
@@ -1552,12 +1548,8 @@ mod tests {
         }
     }
 
-    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
-    // refined, inference rejects a comprehension whose element type now reads the key.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(
-        expected = "a value that is one type for every key of the collection it is part of"
-    )]
     fn every_child_id_resolves_in_its_own_table_with_caret_operators() {
         with_caret_operators(every_child_id_resolves_in_its_own_table);
     }
@@ -1609,12 +1601,8 @@ mod tests {
         }
     }
 
-    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
-    // refined, inference rejects a comprehension whose element type now reads the key.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(
-        expected = "a value that is one type for every key of the collection it is part of"
-    )]
     fn a_pane_table_holds_each_node_exactly_once_with_caret_operators() {
         with_caret_operators(a_pane_table_holds_each_node_exactly_once);
     }
@@ -1665,12 +1653,8 @@ mod tests {
         }
     }
 
-    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
-    // refined, inference rejects a comprehension whose element type now reads the key.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(
-        expected = "a value that is one type for every key of the collection it is part of"
-    )]
     fn an_operator_node_carries_its_role_tiling_and_ordered_spans_with_caret_operators() {
         with_caret_operators(an_operator_node_carries_its_role_tiling_and_ordered_spans);
     }
@@ -1695,12 +1679,8 @@ mod tests {
         }
     }
 
-    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
-    // refined, inference rejects a comprehension whose element type now reads the key.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(
-        expected = "a value that is one type for every key of the collection it is part of"
-    )]
     fn no_node_repeats_a_span_with_caret_operators() {
         with_caret_operators(no_node_repeats_a_span);
     }
@@ -1743,12 +1723,8 @@ mod tests {
         }
     }
 
-    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
-    // refined, inference rejects a comprehension whose element type now reads the key.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(
-        expected = "a value that is one type for every key of the collection it is part of"
-    )]
     fn no_node_repeats_a_predicate_edge_with_caret_operators() {
         with_caret_operators(no_node_repeats_a_predicate_edge);
     }
@@ -1772,12 +1748,8 @@ mod tests {
         }
     }
 
-    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
-    // refined, inference rejects a comprehension whose element type now reads the key.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(
-        expected = "a value that is one type for every key of the collection it is part of"
-    )]
     fn a_payload_kind_is_never_a_pane_id_with_caret_operators() {
         with_caret_operators(a_payload_kind_is_never_a_pane_id);
     }
@@ -1823,12 +1795,8 @@ mod tests {
         );
     }
 
-    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
-    // refined, inference rejects a comprehension whose element type now reads the key.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(
-        expected = "a value that is one type for every key of the collection it is part of"
-    )]
     fn a_shared_predicate_is_one_entry_named_by_several_edges_with_caret_operators() {
         with_caret_operators(a_shared_predicate_is_one_entry_named_by_several_edges);
     }
@@ -1926,12 +1894,8 @@ mod tests {
         }
     }
 
-    // TODO: pinned on `^*` or `^>`, each of which fails this test on its own. With all of them
-    // refined, inference rejects a comprehension whose element type now reads the key.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(
-        expected = "a value that is one type for every key of the collection it is part of"
-    )]
     fn every_node_of_every_pane_carries_an_attribution_with_caret_operators() {
         with_caret_operators(every_node_of_every_pane_carries_an_attribution);
     }
@@ -2227,7 +2191,7 @@ max(totals)
         // generator body, which *does* carry the body span).
         let mul = at(nth_span(prog.sources(), "x * x", 0));
         assert!(
-            mul.iter().any(|l| l.contains("BinOp(Arithmetic(Mul))")),
+            mul.iter().any(|l| l.contains("BinOp(Arithmetic(Mul")),
             "`x * x` → Mul BinOp; got {mul:?}"
         );
 
@@ -2261,11 +2225,8 @@ max(totals)
         );
     }
 
-    // TODO: pinned on `^*`: inference rejects a comprehension whose element type now reads the key.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(
-        expected = "a value that is one type for every key of the collection it is part of"
-    )]
     fn generator_mapped_spans_resolve_to_expected_nodes_with_caret_operators() {
         with_caret_operators(generator_mapped_spans_resolve_to_expected_nodes);
     }

@@ -1010,6 +1010,24 @@ fn codomain_binder_gap(
     ))
 }
 
+/// The binders of the functions whose codomain edges the descent is inside that `bound` carries
+/// out of `holder`'s scope ([`Bound::reachable_names`]): the type reads one, or a variable it
+/// holds outside a function type is in one's scope. The holder is one type for every value of each, so a lower bound
+/// reaches it as the join over their values ([`Subst::join`]).
+fn crossed_codomain_binders(holder: &InferVar, bound: &Bound, cache: &ConstrainCache) -> Vec<Name> {
+    if cache.codomain_binders.is_empty() {
+        return Vec::new();
+    }
+    let reachable = bound.reachable_names();
+    let mut crossed: Vec<Name> = Vec::new();
+    for b in &cache.codomain_binders {
+        if reachable.contains(b) && !holder.telescope.contains(b) && !crossed.contains(b) {
+            crossed.push(b.clone());
+        }
+    }
+    crossed
+}
+
 /// The two domains a failed domain edge found unequal: the comparison at the bottom of `err`'s
 /// chain of domain mismatches, where it compares two types. `None` where it does not.
 fn colliding_domains(err: &ConstrainError) -> Option<Vec<Type>> {
@@ -2284,9 +2302,23 @@ fn constrain_go_impl(
                 if let Some(e) = param_reads_binder(rv, &bound, !cache.value_on_right) {
                     return Err(e);
                 }
-                if let Some(e) = codomain_binder_gap(rv, &bound, cache) {
-                    return Err(e);
+                // **A lower bound leaving a codomain binder's scope is joined over it.** The
+                // edge's content side gains the join, so compaction keeps what holds at every
+                // value of the binder by the polarity of each position: a refinement reading it
+                // is dropped at a covariant position, and reported at a contravariant one and
+                // in a data domain (`src/ccl/design/type-inference.md`, "The invariant").
+                let crossed = crossed_codomain_binders(rv, &bound, cache);
+                if !crossed.is_empty() {
+                    let join = crossed
+                        .into_iter()
+                        .fold(Subst::id(), |acc, b| Subst::then(&acc, &Subst::join(b)));
+                    return constrain_go(lhs, rhs, &Subst::then(sl, &join), sr, cache, scope);
                 }
+                debug_assert!(
+                    codomain_binder_gap(rv, &bound, cache).is_none(),
+                    "a lower bound reading a codomain binder outside its holder's scope is joined \
+                     over the binder before it is recorded"
+                );
                 crate::ccl::infer_var::enforce_bound_scope(rv, "lower", &bound);
                 let mut s = rv.bounds.borrow_mut();
                 s.lower_mut().push(bound);

@@ -33,16 +33,21 @@
 //! and operator conversion dispatches on the types of the nodes inside it, so
 //! those interior types are read rather than restated. Exemption is a property of
 //! the refinement, not of the position it was found at — see
-//! [`compiled_refinements`].
+//! [`compiled_refinements`]. An interior type slot of a stripped predicate keeps the
+//! exempt refinements it carries: a term substituted into the predicate keeps the
+//! domains it filters, and a key it reads the refinement that makes a lookup by the
+//! key total.
 //!
 //! A `Cast`'s `target` is kept wherever it sits. It is the cast's operand rather
 //! than an ascription of a node's type — `cast` takes the type it casts to as an
 //! argument — and a comprehension's filter is read off it, so replacing it changes
 //! what the term computes.
 
-use crate::ccl::ccl_utils::{PredMemo, strip_refinements};
+use crate::ccl::ccl_utils::{PredMemo, strip_refinements_except};
 use crate::ccl::ty::FunKind;
 use crate::ccl::{Expr, Refinement, Type};
+use std::collections::HashSet;
+use std::rc::Rc;
 
 /// Run the phase over a coalesced tree.
 pub(super) fn strip_predicate_interiors(expr: &mut Expr) {
@@ -72,7 +77,7 @@ fn strip_under_refinements(
     if let Type::Refinement(_, refinements) = ty {
         refinements.rewrite_each(|_, refinement| {
             if !compiled.contains(refinement) {
-                changed |= predicates.rebuild(refinement, &(), strip_type_slots);
+                changed |= predicates.rebuild(refinement, &(), |p| strip_type_slots(p, compiled));
             }
         });
     }
@@ -85,11 +90,13 @@ fn strip_under_refinements(
     changed
 }
 
-/// Replace every type slot in `pred`'s subtree with its unrefined form.
-fn strip_type_slots(pred: &mut Expr) -> bool {
+/// Replace every type slot in `pred`'s subtree with its form keeping only the refinements
+/// `compiled` exempts. Those are data wherever they sit: a key read inside the predicate keeps the
+/// refinement that proves a lookup by it total, and a data function its domain.
+fn strip_type_slots(pred: &mut Expr, compiled: &[Refinement]) -> bool {
     let mut changed = false;
     let mut go = |ty: &mut Type| {
-        let stripped = strip_refinements(ty);
+        let stripped = strip_refinements_except(ty, &|r| compiled.contains(r));
         if stripped != *ty {
             *ty = stripped;
             changed = true;
@@ -99,7 +106,7 @@ fn strip_type_slots(pred: &mut Expr) -> bool {
     // module docs), which is why the slots are spelled out rather than walked.
     go(&mut pred.ty);
     pred.walk_binders_mut(|b| go(&mut b.ty));
-    pred.walk_children_mut(|child| changed |= strip_type_slots(child));
+    pred.walk_children_mut(|child| changed |= strip_type_slots(child, compiled));
     changed
 }
 
@@ -115,17 +122,32 @@ fn strip_type_slots(pred: &mut Expr) -> bool {
 /// the split.
 fn compiled_refinements(expr: &Expr) -> Vec<Refinement> {
     let mut out = Vec::new();
-    collect_compiled_in_expr(expr, &mut out);
+    collect_compiled_in_expr(expr, &mut out, &mut HashSet::new());
     out
 }
 
-fn collect_compiled_in_expr(expr: &Expr, out: &mut Vec<Refinement>) {
-    expr.walk_type_slots(|ty| collect_compiled(ty, out));
-    expr.walk_children(|child| collect_compiled_in_expr(child, out));
+/// `entered` holds the predicates already walked, which a predicate shared across many type
+/// slots would otherwise be once per slot.
+fn collect_compiled_in_expr(
+    expr: &Expr,
+    out: &mut Vec<Refinement>,
+    entered: &mut HashSet<*const Expr>,
+) {
+    expr.walk_type_slots(|ty| collect_compiled(ty, out, entered));
+    expr.walk_children(|child| collect_compiled_in_expr(child, out, entered));
 }
 
-/// Walk for a data position, collecting nothing until one is reached.
-fn collect_compiled(ty: &Type, out: &mut Vec<Refinement>) {
+/// Walk for a data position, collecting nothing until one is reached. A predicate is walked
+/// for data positions too: substitution copies terms into predicates, and a copied term keeps
+/// the domains it filters ([`strip_type_slots`]).
+fn collect_compiled(ty: &Type, out: &mut Vec<Refinement>, entered: &mut HashSet<*const Expr>) {
+    if let Type::Refinement(_, refinements) = ty {
+        for refinement in refinements {
+            if entered.insert(Rc::as_ptr(&refinement.predicate)) {
+                collect_compiled_in_expr(&refinement.predicate, out, entered);
+            }
+        }
+    }
     if let Type::Fun {
         fun_kind,
         domain,
@@ -139,12 +161,12 @@ fn collect_compiled(ty: &Type, out: &mut Vec<Refinement>) {
         // structure puts it.
         match fun_kind {
             FunKind::Data(_) => collect_all(domain, out),
-            FunKind::Compute | FunKind::Var(_) => collect_compiled(domain, out),
+            FunKind::Compute | FunKind::Var(_) => collect_compiled(domain, out, entered),
         }
-        collect_compiled(codomain, out);
+        collect_compiled(codomain, out, entered);
         return;
     }
-    ty.walk_children(|child| collect_compiled(child, out));
+    ty.walk_children(|child| collect_compiled(child, out, entered));
 }
 
 /// Collect every refinement in `ty`, including those reachable only through a

@@ -3336,3 +3336,59 @@ fn an_inner_list_literal_reading_the_enclosing_binder_is_refused() {
         "a list element must be a constant",
     );
 }
+
+/// A variable that leaves an `if` with either branch's value types as the structural join of the
+/// values: a refinement holds of a component of the merge where every incoming value carries it at
+/// that component (`joined_ty` in `src/ccl/mut_elim.rs`).
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::scalar(
+    indoc! {r#"
+        x := 0
+        for i in [1, 2, 3]:
+            x := i ^+ 1
+            if i > 1:
+                x := i ^+ 2
+        x
+    "#},
+    5
+)]
+#[case::tuple(
+    indoc! {r#"
+        x := (0, 0)
+        for i in [1, 2, 3]:
+            x := (i ^+ 1, 0)
+            if i > 1:
+                x := (i ^+ 2, 0)
+        x.0 + x.1
+    "#},
+    5
+)]
+#[case::record(
+    indoc! {r#"
+        x := (a=0, b=0)
+        for i in [1, 2, 3]:
+            x := (a=i ^+ 1, b=0)
+            if i > 1:
+                x := (a=i ^+ 2, b=0)
+        x.a + x.b
+    "#},
+    5
+)]
+#[case::nested(
+    indoc! {r#"
+        x := ((0, 0), (b=0))
+        for i in [1, 2, 3]:
+            x := ((i ^+ 1, i ^+ 3), (b=i ^+ 1))
+            if i > 1:
+                x := ((i ^+ 2, i ^+ 3), (b=i ^+ 2))
+        x.0.0 + x.0.1 + x.1.b
+    "#},
+    16
+)]
+fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
+    #[case] code: &str,
+    #[case] value: i64,
+) {
+    check_scalar(code, Value::Int(value));
+}

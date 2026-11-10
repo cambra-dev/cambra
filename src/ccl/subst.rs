@@ -731,6 +731,14 @@ impl Subst {
         Subst::of_binders(m)
     }
 
+    /// The binders this substitution joins over with no term at the key ([`Mapping::Join`]).
+    pub fn unkeyed_joined_binders(&self) -> impl Iterator<Item = &Binder> {
+        self.binders
+            .iter()
+            .filter(|(_, m)| matches!(m, Mapping::Join(None)))
+            .map(|(k, _)| k)
+    }
+
     /// Whether a binder this substitution joins over occurs free in `e`.
     pub fn joins_in(&self, e: &TypedExpr) -> bool {
         self.binders
@@ -2549,10 +2557,16 @@ impl Subst {
             // legitimately *introduces* its target.) In a correct implementation
             // this never fires; it is the per-rewrite regression guard for
             // substitution-descent bugs, backing the end-of-inference
-            // `check_scope_valid` debug walk.
+            // `check_scope_valid` debug walk. The binders checked are `restricted`'s, as the
+            // predicate names them: under the element, an element reference the substitution
+            // discharges is one refinement further out. A discharge whose term reads its own
+            // binder, as re-basing the element onto a product does (`__elem ↦ __elem.1`),
+            // introduces it like a rename and is not checked.
             #[cfg(debug_assertions)]
-            for (b, m) in &self.binders {
-                if matches!(m, Mapping::Discharge(_)) {
+            for (b, m) in &restricted.binders {
+                if let Mapping::Discharge(term) = m
+                    && !is_free(b, term)
+                {
                     debug_assert!(
                         !is_free(b, &rewritten.predicate),
                         "discharged binder `{b}` still free after substitution into predicate",

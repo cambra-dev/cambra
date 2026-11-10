@@ -1643,11 +1643,10 @@ fn a_pi_typed_collection_parameter() {
 ///
 /// No CHL spelling applies the builtin to a bare collection, so the tree is built directly.
 ///
-/// TODO: the type template for collection_contains has no way to
-/// handle a Pi-binder referenced in the collection's codomain. See
-/// also `collection_contains_of_an_inferred_pi_typed_collection`.
+/// The template's codomain variable is one type for every key, and the collection's codomain
+/// refinement reads the Pi binder, so the variable's lower bound drops that refinement
+/// (`src/ccl/design/type-inference.md`, "The invariant").
 #[test]
-#[should_panic = "is not compiled yet"]
 fn collection_contains_of_a_pi_typed_collection() {
     check_over_pi_typed_collection(Expr::apply(
         Expr::var("c"),
@@ -1659,13 +1658,7 @@ fn collection_contains_of_a_pi_typed_collection() {
 ///
 /// No CHL spelling applies the builtin to a bare collection, so it is applied to the
 /// lowered program.
-///
-/// TODO: Currently fails because the collection codomain still
-/// references its Pi binder after being moved from the context of the
-/// collection Pi type into the non-Pi-type template of
-/// `collection_contains`: the bound naming `__iter_record` lands outside its scope.
 #[test]
-#[should_panic = "is not compiled yet"]
 fn collection_contains_of_an_inferred_pi_typed_collection() {
     let code = indoc! {r#"
         xs = [1, 2, 3, 4, 5]
@@ -1692,12 +1685,7 @@ fn collection_contains_of_an_inferred_pi_typed_collection() {
 /// `let fc = λ f1 : (String ⇒ Int) → f1 ≫ (λ i → i ^+ 1) in "Hello" ▷ ((λ s → 1) ▷ fc)`.
 ///
 /// CHL has no `≫` and no call of a call's result, so the tree is built directly.
-///
-/// TODO: Currently fails because the emit rule for >> uses the final
-/// function's codomain as-is, even though it has been removed from
-/// the context of its Pi-binder.
 #[test]
-#[should_panic = "is not compiled yet"]
 fn dependent_function_composition() {
     let fc = Expr::lambda(
         "f1",

@@ -2381,8 +2381,10 @@ mod tests {
             compile_to(&LoadedProgram::test(v1), Phase::Infer).unwrap(),
             compile_to(&LoadedProgram::test(v2), Phase::Infer).unwrap(),
         );
-        // TODO: pinned on `^+`. The expected count is 1. `^+` breaks the premise above: `a` and
-        // `b` carry their sums rather than arriving as plain `Int`.
+        // TODO: pinned on `^+`. The expected count is 1. `^+` breaks the premise above: `g`'s
+        // codomain records the sum over its argument, so `g(a)` and `g(b)` instantiate it at
+        // different refinements and key apart (`src/ccl/design/type-inference.md`, "Key timing
+        // and precision limits"). Arguments arriving as plain `Int` key apart as well.
         assert_eq!(
             diff(&a, &b).divergences().len(),
             6,
@@ -2456,12 +2458,8 @@ mod tests {
         }
     }
 
-    // TODO: pinned on `^*`, `^>=` or `^==`, each of which fails this test on its own. With all
-    // of them refined, inference rejects a comprehension whose element type now reads the key.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(
-        expected = "a value that is one type for every key of the collection it is part of"
-    )]
     fn every_phase_diffs_identical_source_as_identical_with_caret_operators() {
         // The property the whole analysis rests on, over the shapes the corpus
         // reaches: compiling one source twice — independent contexts, fresh

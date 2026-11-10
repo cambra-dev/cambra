@@ -2324,11 +2324,20 @@ pub fn refined_data_fun(
 ///   not part of the shape: [`Type::peel_refinements`](crate::ccl::Type::peel_refinements),
 ///   which borrows rather than dropping.
 pub(crate) fn strip_refinements(ty: &Type) -> Type {
+    strip_refinements_except(ty, &|_| false)
+}
+
+/// [`strip_refinements`] keeping each refinement `keep` accepts, at any depth.
+pub(crate) fn strip_refinements_except(ty: &Type, keep: &dyn Fn(&Refinement) -> bool) -> Type {
+    let strip = |t: &Type| strip_refinements_except(t, keep);
     match ty {
         // Annotation-position only, and structural: keep the wrapper and strip
         // inside it, so a bounded annotation's bound is stripped like any other.
-        Type::BoundedHole(t) => Type::BoundedHole(Box::new(strip_refinements(t))),
-        Type::Refinement(base, _) => strip_refinements(base),
+        Type::BoundedHole(t) => Type::BoundedHole(Box::new(strip(t))),
+        Type::Refinement(base, refinements) => Type::refined(
+            strip(base),
+            refinements.iter().filter(|r| keep(r)).cloned().collect(),
+        ),
         // The **witnesses' type kinds are left alone** (they ride the `kind` `fun_like`
         // copies).
         // A sum's candidates are domains, and the Σ rules match them by value, so two
@@ -2339,38 +2348,27 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
         // incidental spelling.
         Type::Fun {
             domain, codomain, ..
-        } => Type::fun_like(ty, strip_refinements(domain), strip_refinements(codomain)),
-        Type::Tuple(ts) => Type::Tuple(ts.iter().map(strip_refinements).collect()),
-        Type::OpenTuple(ts) => Type::OpenTuple(ts.iter().map(strip_refinements).collect()),
+        } => Type::fun_like(ty, strip(domain), strip(codomain)),
+        Type::Tuple(ts) => Type::Tuple(ts.iter().map(strip).collect()),
+        Type::OpenTuple(ts) => Type::OpenTuple(ts.iter().map(strip).collect()),
         // Stripping may remove every reference back, and the constructor then gives
         // the plain tuple.
-        Type::DepTuple(cs) => Type::dep_tuple(
-            cs.iter()
-                .map(|(n, t)| (n.clone(), strip_refinements(t)))
-                .collect(),
-        ),
+        Type::DepTuple(cs) => {
+            Type::dep_tuple(cs.iter().map(|(n, t)| (n.clone(), strip(t))).collect())
+        }
         Type::Family { binders, body } => Type::Family {
-            binders: binders
-                .iter()
-                .map(|(n, t)| (n.clone(), strip_refinements(t)))
-                .collect(),
-            body: Box::new(strip_refinements(body)),
+            binders: binders.iter().map(|(n, t)| (n.clone(), strip(t))).collect(),
+            body: Box::new(strip(body)),
         },
-        Type::Record(fs) => Type::Record(
-            fs.iter()
-                .map(|(n, t)| (n.clone(), strip_refinements(t)))
-                .collect(),
-        ),
+        Type::Record(fs) => Type::Record(fs.iter().map(|(n, t)| (n.clone(), strip(t))).collect()),
         Type::Variant(tags, openness) => Type::Variant(
-            tags.iter()
-                .map(|(k, t)| (k.clone(), strip_refinements(t)))
-                .collect(),
+            tags.iter().map(|(k, t)| (k.clone(), strip(t))).collect(),
             *openness,
         ),
         Type::History {
             function,
             history_kind,
-        } => Type::history_over(strip_refinements(function), *history_kind),
+        } => Type::history_over(strip(function), *history_kind),
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::Hole
@@ -2384,14 +2382,10 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
         | Type::Param(_)
         | Type::FamilyApp(_)
         | Type::Txn => ty.clone(),
-        Type::Poly(poly) => Type::Poly(Rc::new(poly.map_types(strip_refinements))),
-        Type::Nominal(decl, args) => {
-            Type::Nominal(decl.clone(), args.iter().map(strip_refinements).collect())
-        }
+        Type::Poly(poly) => Type::Poly(Rc::new(poly.map_types(strip))),
+        Type::Nominal(decl, args) => Type::Nominal(decl.clone(), args.iter().map(strip).collect()),
         // Stripped, the two sides may agree, and then they are one argument.
-        Type::Split { input, output } => {
-            crate::ccl::nominal::split(strip_refinements(input), strip_refinements(output))
-        }
+        Type::Split { input, output } => crate::ccl::nominal::split(strip(input), strip(output)),
     }
 }
 

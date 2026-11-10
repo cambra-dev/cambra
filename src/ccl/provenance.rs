@@ -2693,13 +2693,8 @@ mod tests {
         );
     }
 
-    // TODO: pinned on `^+` or `^*`, each of which fails this test on its own. `^+` alone fails the
-    // post-inference collection domain check; `^*` alone, and all of them refined, make inference
-    // reject a corpus program whose comprehension element type reads the key.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(
-        expected = "a value that is one type for every key of the collection it is part of"
-    )]
     fn the_predicate_sweep_skips_this_many_nodes_over_the_corpus_with_caret_operators() {
         crate::ccl::test_corpus::with_caret_operators(
             the_predicate_sweep_skips_this_many_nodes_over_the_corpus,

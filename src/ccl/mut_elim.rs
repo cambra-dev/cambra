@@ -3597,7 +3597,12 @@ impl<'a> WriterWalk<'a> {
                 scrutinee: None,
                 branches,
             });
-            merged.ty = value_before.ty.clone();
+            merged.ty = joined_ty(
+                value_before,
+                merged_arms
+                    .iter()
+                    .map(|(_, env)| env.get(name).unwrap_or(value_before)),
+            );
             let occurrence = self
                 .named_at
                 .get(name)
@@ -3649,7 +3654,17 @@ impl<'a> WriterWalk<'a> {
         value_ty: Option<Type>,
     ) -> Option<Expr> {
         let bool_ty = Type::Base(BaseType::Bool);
-        let mut slot_tys: Vec<Type> = changed.iter().map(|name| before[name].ty.clone()).collect();
+        let mut slot_tys: Vec<Type> = changed
+            .iter()
+            .map(|name| {
+                let value_before = &before[name];
+                joined_ty(
+                    value_before,
+                    arms.iter()
+                        .map(|arm| arm.env.get(name).unwrap_or(value_before)),
+                )
+            })
+            .collect();
         slot_tys.push(bool_ty.clone());
         slot_tys.extend(value_ty.clone());
         // Each feed leaving in a slot: its arm, its index in `feeds`, its tap's slot, and the
@@ -3858,6 +3873,54 @@ fn iteration_channel(channel: &TypedBinding, defer: Expr, own: Vec<FeedSite>) ->
     }
     let ty = body.ty.clone();
     Expr::let_in(binding(inner, channel.ty.clone()), defer, body).with_ty(ty)
+}
+
+/// The type of a merge of `values`, each a value a variable holding `value_before` may leave a
+/// branch with: the [`join_value_tys`] of the values' types. A refinement one branch's value
+/// carries does not hold of the merge (`src/ccl/design/type-inference.md`, "An operator is
+/// refined by the operation it computes").
+fn joined_ty<'a>(value_before: &Expr, values: impl Iterator<Item = &'a Expr>) -> Type {
+    values
+        .map(|v| v.ty.clone())
+        .reduce(|acc, ty| join_value_tys(&acc, &ty))
+        .unwrap_or_else(|| value_before.ty.clone())
+}
+
+/// The structural join of two types of values one variable holds: the refinements both carry at
+/// each position, through tuple components and record fields. Any other base is `a`'s, so a
+/// refinement nested in it holds of the join only where `a` and `b` agree on it.
+fn join_value_tys(a: &Type, b: &Type) -> Type {
+    let shared = crate::ccl::RefinementSet::from_iter(a.refinements().iter().cloned())
+        .intersect(&b.refinements().iter().cloned().collect());
+    let base = match (a.peel_refinements(), b.peel_refinements()) {
+        (Type::Tuple(xs), Type::Tuple(ys)) => {
+            debug_assert_eq!(
+                xs.len(),
+                ys.len(),
+                "the values a merge joins share a tuple width"
+            );
+            Type::Tuple(
+                xs.iter()
+                    .zip(ys)
+                    .map(|(x, y)| join_value_tys(x, y))
+                    .collect(),
+            )
+        }
+        (Type::Record(xs), Type::Record(ys)) => {
+            debug_assert!(
+                xs.iter().map(|(l, _)| l).eq(ys.iter().map(|(l, _)| l)),
+                "the values a merge joins share a record's labels"
+            );
+            Type::Record(
+                xs.iter()
+                    .zip(ys)
+                    .map(|((l, x), (_, y))| (l.clone(), join_value_tys(x, y)))
+                    .collect(),
+            )
+        }
+        (base, _) => base.clone(),
+    };
+    Type::refined(base, shared)
 }
 
 /// `{ fire → feed; true → () }`: a feed that fires on a condition of its own within the
@@ -4480,5 +4543,45 @@ mod tests {
                         && is_true_lit(&rest.guard)
                         && matches!(rest.body.node, TypedExprNode::Lit(Lit::Bool(false))))
         ));
+    }
+
+    /// `{Int | 𝑝}` for a predicate standing for `tag`. Only which tags two types share matters.
+    fn int_refined(tag: &str) -> Type {
+        Type::refined_one(
+            Type::Base(BaseType::Int),
+            crate::ccl::Refinement::born(Rc::new(Expr::var(Name::from(tag)))),
+        )
+    }
+
+    /// The join keeps a refinement every incoming value carries at a component, at whatever depth
+    /// of tuple or record it stands, and drops one the values disagree on.
+    #[test]
+    fn join_value_tys_keeps_the_refinements_shared_at_each_component() {
+        let value = |first: &str, field: &str| {
+            Type::refined_one(
+                Type::Tuple(vec![
+                    Type::Tuple(vec![int_refined(first), int_refined("shared")]),
+                    Type::Record(vec![
+                        ("a".into(), int_refined(field)),
+                        ("b".into(), int_refined("shared")),
+                    ]),
+                ]),
+                crate::ccl::Refinement::born(Rc::new(Expr::var(Name::from("outer")))),
+            )
+        };
+        let expected = Type::refined_one(
+            Type::Tuple(vec![
+                Type::Tuple(vec![Type::Base(BaseType::Int), int_refined("shared")]),
+                Type::Record(vec![
+                    ("a".into(), Type::Base(BaseType::Int)),
+                    ("b".into(), int_refined("shared")),
+                ]),
+            ]),
+            crate::ccl::Refinement::born(Rc::new(Expr::var(Name::from("outer")))),
+        );
+        assert_eq!(
+            join_value_tys(&value("one", "one"), &value("two", "two")),
+            expected
+        );
     }
 }

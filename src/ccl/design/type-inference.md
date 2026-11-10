@@ -820,9 +820,13 @@ representations remaining synchronized.
 
 The pass has two exceptions:
 
-- Refinements on a data function's data domain retain their predicate interiors. Planning compiles
-  those predicates into iteration or restriction, and operator conversion reads the interior
-  types. `compiled_refinements` collects the exempt refinements before rewriting.
+- Refinements on a data function's data domain retain their predicate interiors, and an interior
+  type slot keeps every such refinement it carries. Planning compiles those predicates into
+  iteration or restriction, and operator conversion reads the interior types. A term substituted
+  into a predicate keeps the domains it filters, and a key it reads keeps the refinement that
+  makes a lookup by the key total; the post-inference check rejects either stripped.
+  `compiled_refinements` collects the exempt refinements before rewriting, from data domains
+  inside predicates as well as outside them.
 - A `Cast` target remains intact. It is an operand that specifies the cast, not just metadata
   describing the result; comprehension filters are read from it.
 
@@ -2361,8 +2365,18 @@ record time, both reported before the bound is recorded:
   failure otherwise.
 - **A gap naming the binder of a function whose codomain edge records the bound**
   (`ConstrainCache::codomain_binders`) is a variable that is one type for every value of the
-  binder, which the edge would bound at each value: a meet or a join over the binder, which the
-  solver does not compute. It is reported as not compiled yet (`codomain_binder_gap`).
+  binder, which the edge would bound at each value: a meet or a join over the binder. A lower bound
+  is the join. The bound is recorded with its content side composed with a `Mapping::Join` over
+  each such binder it can reach (`crossed_codomain_binders`), and compaction decides each
+  refinement naming one by its position in the bound
+  ([A contribution crosses the binders after its target](#a-contribution-crosses-the-binders-after-its-target)).
+  A bound reaches a binder by naming it, or by holding a variable whose telescope holds it
+  (`Bound::reachable_names`), since that variable's resolution can name it later.
+  `max([x * x for x in xs])` bounds the aggregate's element below by
+  `{Int | __elem == xs(𝑘) * xs(𝑘)}` at each key `𝑘`, and the element is `Int`.
+  `set([(x ^+ 1, 0) for x in xs])` bounds the set's element below by `(?𝑒, Int@0)`, with `?𝑒` in
+  the scope of `x`, and the element's first component is `Int`. An upper bound is a meet, which
+  the solver does not compute. It is reported as not compiled yet (`codomain_binder_gap`).
 
 `InferCtx::fresh` passes the current telescope to `InferVar::fresh_in`. Emission extends that
 telescope for term binders, and normalization extends it when descending dependent annotations.
@@ -2714,7 +2728,12 @@ A history's type is the join of every value written to it (`docs/chl-spec.md`, "
 of several values"). The contribution is joined over the values of each joined binder. A loop's or
 lambda's binder takes one per iteration or call; a pattern's binder takes one per evaluation of its
 `match`. A join mapping has no term. Where the solver forces the edge, compaction composes it into
-the accumulated substitution, and a refinement naming a joined binder is decided by its position:
+the accumulated substitution, and a refinement naming a joined binder is decided by its position.
+The position is the refinement's place in the bound whose edge introduced the join
+(`CompactState::join_entries`): the join is over that bound's values, so a data domain enclosing
+the bound's holder does not count, and polarity is relative to the polarity the bound is walked
+at. A set's element type joined over the comprehension's key stands in the set's data domain, and
+its refinements are dropped as at any positive position.
 
 - On a sum's candidate, the candidate widens to `SubtypesOf` what remains and the candidates' kinds
   join. A row `box([v for v in xs if v > r])` fed from a loop over `r` contributes
@@ -3989,7 +4008,9 @@ contribution leaves it the one candidate and applies it (`apply_product_rule`), 
 arriving afterwards has to have the same shape. Applying it records:
 
 - One condition per field: an obligation of the same trait over a fresh variable per operand
-  position, the component that operand holds at that field.
+  position, the component that operand holds at that field. A variable is minted in its operand
+  variable's telescope, since the component it receives can name any binder the operand can
+  ([The invariant](#the-invariant)).
 - Each operand bounded above by a product of the shape over its own variables, which carries the
   operand's components into their positions as they arrive.
 
