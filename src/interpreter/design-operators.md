@@ -1329,9 +1329,14 @@ rather than leaving an adapter to open it downstream. Three do:
 - A **record field** of either keeps the tiling its own term produced, so a projection out
   of it is a tile operation (`SelectField`) rather than a column one.
 
-Two consumers still take the materialized shape, and both are cases where nothing would read
-the keys: `CheckedLookup` searches the bindings of the row's own value, and `Sole` and
-`Drain` fold a collection whole, so the element they yield is the collection itself.
+`CheckedLookup` answers each row against that row's own collection in either shape: the
+bindings of a materialized value, or the row's run of a collection level beneath the rows. A
+key the run lacks is decided absent once `[position, key]` is complete, and a row's run is
+complete wherever the level says so or the rows above it are complete, since completeness
+closes downward. A level holding one run for several rows is one collection they share, and a
+key it lacks is absent once the level is terminal. `Sole` and `Drain` still take the materialized
+shape, since nothing reads the keys: they fold a collection whole, so the element they yield
+is the collection itself.
 
 A **writer body's parameter record** opens its read slots the same way, so a collection-valued
 read reaches the body as a level it can iterate (`commit_operator.rs`'s `body_input_tiling`). Its
