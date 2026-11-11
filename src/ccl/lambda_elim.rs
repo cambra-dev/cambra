@@ -51,7 +51,9 @@ use crate::ccl::ccl_utils::{
 use crate::ccl::provenance;
 use crate::ccl::simplify::simplify;
 use crate::ccl::ty::FunKind;
-use crate::ccl::{BaseType, BindingTransparency, Branch, Builtin, FieldKey, Lit, Name, Refinement};
+use crate::ccl::{
+    BaseType, BindingTransparency, Branch, Builtin, FieldKey, Lit, Name, Refinement, RefinementSet,
+};
 use crate::ccl::{Expr, Type, TypedExpr, TypedExprNode, symbolic::symbolic};
 
 // ---------------------------------------------------------------------------
@@ -1441,7 +1443,7 @@ fn elim_lambda_impl(
                     .cloned()
                     .collect()
             };
-            let staying: Vec<Refinement> = refinements
+            let staying: RefinementSet = refinements
                 .iter()
                 .filter(|r| {
                     filter_dependent
@@ -1450,10 +1452,7 @@ fn elim_lambda_impl(
                 })
                 .cloned()
                 .collect();
-            let y_ty = Type::refined(
-                y_ty.peel_refinements().clone(),
-                staying.into_iter().collect(),
-            );
+            let y_ty = Type::refined(y_ty.peel_refinements().clone(), staying);
             // A `y_ty` naming the inner lambda's witness escapes the Σ binding it here.
             // [`compose_sum_generators`] keeps a generator over a sum from reaching this rule,
             // and [`refuse_escaped_pair_witness`] refuses any other `curry` that keeps one.
@@ -1488,7 +1487,7 @@ fn elim_lambda_impl(
                         .apply_expr(&on_element)
                 };
                 let key = (param.clone(), bare_pair.clone());
-                let lifted: Vec<Refinement> = lifting
+                let lifted: RefinementSet = lifting
                     .into_iter()
                     .map(|mut r| {
                         ctx.pair_lifts.rebuild(&mut r, &key, |predicate| {
@@ -1498,7 +1497,7 @@ fn elim_lambda_impl(
                         r
                     })
                     .collect();
-                Type::refined(bare_pair.clone(), lifted.into_iter().collect())
+                Type::refined(bare_pair.clone(), lifted)
             };
             // Annotate the projection morphisms with their concrete types so that
             // downstream type computations (e.g. zip_pair_ty) can see the domain.
