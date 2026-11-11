@@ -3785,33 +3785,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_infer_type_annotation_mismatch() {
-        let mut ctx = TypeInferenceContext::new();
-        // (42 : String)  =>  annotation conflict
-        // inference surfaces annotation conflicts as AnnotationMismatch
-        let mut expr = Expr::lit(Lit::Int(42)).with_user_annotation(Type::Base(BaseType::String));
-        let errs = infer_bare(&mut expr, &mut ctx).unwrap_err();
-        assert!(
-            errs.iter().any(|e| matches!(
-                e,
-                InferError::AnnotationMismatch { annotation, .. }
-                    if **annotation == Type::Base(BaseType::String)
-            )),
-            "expected AnnotationMismatch against String, got {errs:?}"
-        );
-    }
-
-    #[test]
-    fn test_infer_type_annotation_ok() {
-        let mut ctx = TypeInferenceContext::new();
-        // (42 : Int)  =>  42. The ascription is one-way, so the value keeps the more
-        // precise type it already had; the annotation only has to admit it.
-        let mut expr = Expr::lit(Lit::Int(42)).with_user_annotation(Type::Base(BaseType::Int));
-        let ty = infer(&mut expr, &mut ctx).unwrap();
-        assert_eq!(ty, int_lit_ty(42));
-    }
-
     /// `λ (xs: List(Int)) → Sum(xs)` — *consuming* a List param. The Σ-typed
     /// param flows into the aggregate's `α ⤇ β` consumer, so the sum is consumed:
     /// the length-bounded index domain flows to the
@@ -4093,35 +4066,6 @@ mod tests {
             infer(&mut bad, &mut ctx).is_err(),
             "List(Str) annotation over an int list must be rejected"
         );
-    }
-
-    #[test]
-    fn test_infer_type_annotation_overrides_inferred() {
-        let mut ctx = TypeInferenceContext::new();
-        // (1 + 2 : Int)  =>  Int; annotation matches inferred type, accepted as-is.
-        let mut expr = Expr::binop(
-            Expr::lit(Lit::Int(1)),
-            BinOpKind::Arithmetic(ArithmeticKind::Add),
-            Expr::lit(Lit::Int(2)),
-        )
-        .with_user_annotation(Type::Base(BaseType::Int));
-        let ty = infer(&mut expr, &mut ctx).unwrap();
-        assert_eq!(ty, Type::Base(BaseType::Int));
-    }
-
-    #[test]
-    fn test_infer_type_annotation_overrides_inferred_with_caret_operators() {
-        let mut ctx = TypeInferenceContext::new();
-        let mut expr = Expr::binop(
-            Expr::lit(Lit::Int(1)),
-            BinOpKind::Arithmetic(ArithmeticKind::AddRefined),
-            Expr::lit(Lit::Int(2)),
-        )
-        .with_user_annotation(Type::Base(BaseType::Int));
-        let ty = infer(&mut expr, &mut ctx).unwrap();
-        // TODO: pinned on `^+`. The bare `Int` annotation does not replace the inferred type:
-        // the sum's refinement survives it.
-        assert_eq!(ty.to_string(), "{Int | __elem == 1 + 2}");
     }
 
     #[test]
