@@ -216,6 +216,11 @@ the binding stands once ahead of the loop rather than once per iteration. No ite
 variable, so the two denote the same value, and a type naming the read, such as the rows of a feed
 in the loop filtered on it, names a binder bound outside the loop.
 
+A binding of `await_final(x)` that A-normalization hoisted is opaque as well. Its value reads `x`
+as a sampled read does, so a transparent binder would put `x` back into a type lifted out of its
+scope. It opens no segment: its value is the one the writes settle to, not the one the block holds
+at that point.
+
 A binder `mut_read` minted is substituted back immediately after inference, except where a type
 spells it: a binding on a writer's spine is an operator in the graph, and the phases below recognize
 a read by its term. Every use of such a binder precedes the write that ended the segment, which is

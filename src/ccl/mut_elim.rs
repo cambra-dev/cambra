@@ -1813,7 +1813,9 @@ fn proj_of(p: &Name, tuple_ty: &Type, i: usize, elt_ty: &Type) -> Expr {
 /// `whole`. The item's component reads the position, so a fed row whose keys depend on the
 /// loop variable depends on it. An accumulator's component is its previous value, read out of
 /// `prev`, the write set the history holds before the position, so a type reading it would be
-/// the type of the history it reads; that is refused.
+/// the type of the history it reads. A refinement reading `prev` is dropped, which widens the
+/// type. A domain reading it is refused: the collection would need a sum, which only a term
+/// builds.
 fn read_at_position(ty: &Type, p: &Name, components: &[Expr], whole: &Expr, prev: &Name) -> Type {
     if !crate::ccl::subst::type_free_vars(ty).contains(p) {
         return ty.clone();
@@ -1823,12 +1825,42 @@ fn read_at_position(ty: &Type, p: &Name, components: &[Expr], whole: &Expr, prev
     if crate::ccl::subst::type_free_vars(&ty).contains(p) {
         ty = Subst::discharge(p.clone(), whole.clone()).apply_type(&ty);
     }
+    let ty = without_value_refinements_reading(&ty, prev);
     assert!(
         !crate::ccl::subst::type_free_vars(&ty).contains(prev),
         "a feed whose rows depend on a mutable variable its loop writes is not supported yet: \
          the rows' type would read the history that holds them, got {ty}"
     );
     ty
+}
+
+/// `ty` without each refinement reading `name` outside a data function's domain.
+fn without_value_refinements_reading(ty: &Type, name: &Name) -> Type {
+    match ty {
+        Type::Refinement(base, rs) => Type::refined(
+            without_value_refinements_reading(base, name),
+            rs.iter()
+                .filter(|r| !crate::ccl::subst::refinement_free_vars(r).contains(name))
+                .cloned()
+                .collect(),
+        ),
+        Type::Fun {
+            name: binder,
+            fun_kind,
+            domain,
+            codomain,
+        } if fun_kind.resolved().is_data() => Type::Fun {
+            name: binder.clone(),
+            fun_kind: fun_kind.clone(),
+            domain: domain.clone(),
+            codomain: Box::new(without_value_refinements_reading(codomain, name)),
+        },
+        _ => {
+            let mut out = ty.clone();
+            out.walk_children_mut(|c| *c = without_value_refinements_reading(c, name));
+            out
+        }
+    }
 }
 
 /// ``λ 𝑟 → 𝑟 ▷ __hist ▷ variant_project(`commit) ▷ .writes ▷ .acc``, one accumulator's slice

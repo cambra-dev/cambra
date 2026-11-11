@@ -1149,10 +1149,11 @@ fn a_feed_beside_a_list_literal_in_a_tuple_is_fed() {
     );
 }
 
-/// TODO: Support refined writes to vars used with feeds.
+/// A row fed after a refined write reads the accumulator's previous value, which the loop's
+/// history holds, so the row's type drops that fact.
 #[test]
 fn refined_write_used_with_feed() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
 x: Mut({Int where _ >= 0}) := 0
 o: Feed(_)
@@ -1162,14 +1163,14 @@ for p in [1,2,3]:
     o << x
 x
         "#},
-        "a feed whose rows depend on a mutable variable its loop writes is not supported yet",
+        Value::Int(3),
     )
 }
 
-/// TODO: Support mut reads in refined ops used with feeds.
+/// A row computed by a refined operation over a read of an accumulator the loop writes.
 #[test]
 fn refined_read_used_with_feed() {
-    check_compile_error(
+    check_tile(
         indoc! {r#"
 x := 0
 o: Feed(_)
@@ -1179,7 +1180,12 @@ for p in [1, 2, 3]:
     x += 1
 o
         "#},
-        "a feed whose rows depend on a mutable variable its loop writes is not supported yet",
+        Tile::data_function(
+            ColumnValue::UInts(vec![0, 1, 2]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+            Predicate::True,
+            BitSet::new(),
+        ),
     )
 }
 

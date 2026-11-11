@@ -3597,9 +3597,6 @@ Error: lowering error
         "await_final(a)",
         1
     )]
-    // TODO: pinned on `^+`. Inference rejects the program first, with a scope violation: the sum
-    // `await_final(a) ^+ await_final(a)` records a refinement naming `a` outside `a`'s scope, and
-    // the error spans `a`'s declaration. Expected: the second `await_final(a)`.
     #[case::used_after_await_final_with_caret_operators(
         indoc::indoc! {"
             a: Mut(Int, Txn) := 0
@@ -3608,8 +3605,8 @@ Error: lowering error
                     a := a ^+ x
             await_final(a) ^+ await_final(a)
         "},
-        "a: Mut(Int, Txn) := 0",
-        0
+        "await_final(a)",
+        1
     )]
     #[case::feed_defined_twice(
         indoc::indoc! {"
