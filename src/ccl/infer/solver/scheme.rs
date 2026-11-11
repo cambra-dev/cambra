@@ -972,8 +972,7 @@ pub fn freshen_above(
             // Freshen the bound's type *and* its edge substitutions' discharge
             // payloads: a payload is a captured argument *term* whose type
             // slots still reference the source graph's variables, so it is
-            // freshened through the same `cache` (the uniform term+type freshen
-            // that subsumes the old separate `freshen_bound_substs` sweep).
+            // freshened through the same `cache`.
             let new_lows: Vec<_> = lows
                 .iter()
                 .map(|b| Bound {
