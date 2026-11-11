@@ -301,15 +301,9 @@ pub(super) fn uncurry_params(
         });
     }
 
-    // Mint the tuple name after `body_expr` is lowered so that inner
-    // multi-arg lambdas (which bump the counter during body lowering)
-    // receive strictly smaller ids than the outer lambda. Together with
-    // the reserved `__arg_tuple_` prefix (user code cannot bind
-    // double-underscore names here), this guarantees the outer
-    // substitution's inserted `Var(outer_name)` never collides with an
-    // inner binder.
-    // Minted here rather than by `uniquify`, so the binder carries what each position
-    // reads as: a diagnostic writes `__arg_tuple_N.0` as the parameter it stands for.
+    // Mint the tuple binder here so it carries the parameters' spellings for diagnostics.
+    // Its unique id separates nested tuple binders; the counter in the reserved
+    // `__arg_tuple_` spelling only keeps their printed base names distinct.
     let tuple_name = Name::fresh_tuple(
         ctx.fresh_tuple_arg(),
         params
@@ -434,11 +428,8 @@ pub(super) fn lower_lambda(
 /// mirroring the template's machinery attribution — so every substituted node
 /// stays covered by the lowering fold.
 ///
-/// Capture is structurally impossible at this (pre-uniquify, raw-name) call
-/// site: the replacement's `Var` uses the reserved `__arg_tuple_` prefix
-/// that user code cannot bind, with a fresh unique id per multi-arg lambda
-/// ([`LoweringContext::fresh_tuple_arg`]), so the engine's no-capture assert
-/// cannot fire.
+/// The replacement names a tuple binder minted by `uncurry_params`. Its unique id keeps
+/// it distinct from every binder in the body before `uniquify` runs.
 ///
 /// `label` names the lowering rule the copies are recorded under.
 pub(super) fn substitute_param_in_body(

@@ -12,6 +12,11 @@ would state it. A report of a compiler bug, such as `InferError::ScopeViolation`
 survived a pass that erases it, writes `Display for Type`: its reader is the compiler's
 developer.
 
+`chl_print::renders_alike` compares the text a diagnostic writes, including descriptions that
+hide structural differences. A mismatch whose sides read alike reports the hidden difference;
+a data-domain mismatch instead reports the sub-comparison that rejected it. Neither use decides
+type equality.
+
 A family applied at a binder the compiler minted, outside the family that binds it, is written at
 the spelling an unnamed binder of the text would take: `V(k)`.
 
@@ -67,18 +72,19 @@ holds.
   | Part | Written |
   | --- | --- |
   | an inference variable, whose occurrences are one type | `‹?7›` |
-  | a reference to the binder of a collection around the written type, whose values the written type is | `‹outer key›` |
+  | a reference to a function parameter or collection key bound outside the written type | `‹outer argument›` |
   | a sum's witness read inside the sum's values | `‹outer keys›` |
   | the witness projected through a value `c` | `‹the keys of c›` |
   | a dependent tuple's read of an earlier component | `‹position 0›`, inside the tuple `{𝐴, 𝐵}` |
-  | a demand admitting arms it does not list, as an open tuple writes `..` | ``{`a{Int} \| ..}`` |
+  | a demand admitting arms it does not list | ``{`a{Int} \| ‹more arms›}`` |
   | anything else: a channel domain, a positional variant, a sum of several witnesses | `‹not printable yet›` |
 
   The solver's binder for an application's expected function (`SyntheticKind::SolverArg`) is
-  written `‹outer key›` too: a type reading it is that function's result.
+  written `‹outer argument›` too: a type reading it is that function's result.
 
 `a_written_type_prints_as_an_annotation_that_lowers_back` (`ccl/chl_print.rs`) checks the rows
-marked "yes", and `tests/it/compilation_pipeline/chl_types.rs` checks each row end to end.
+marked "yes", and `tests/it/compilation_pipeline/chl_types.rs` checks the first table's rows
+end to end.
 
 ---
 

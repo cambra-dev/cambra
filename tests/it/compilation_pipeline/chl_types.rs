@@ -121,6 +121,22 @@ fn a_collection_is_written_in_chl(#[case] binding: &str, #[case] inferred: &str)
     );
 }
 
+#[test]
+fn a_group_key_is_distinct_from_a_tuple_parameters_name() {
+    let code = indoc! {"
+        def f(k: Int, n: Int):
+            xs = [1, 2, 3]
+            g = groupby(xs, \\x -> x + k)
+            z: Int = g
+            n
+        f(1, 2)
+    "};
+    check_compile_error(
+        code,
+        "(k1: {Int where _ in [x + k for x in xs]}) |=> {UInt where _ < 3 and xs[_]! + k == k1} |=> Int",
+    );
+}
+
 /// A predicate's operators and an inference variable, written in CHL.
 #[rstest]
 #[timeout(Duration::from_secs(10))]

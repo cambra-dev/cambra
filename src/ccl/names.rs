@@ -244,6 +244,8 @@ pub struct UniqueMeta {
     /// What each position of the tuple it binds reads as, for the tuple binder a
     /// `def` of several parameters lowers to (`uncurry_params` in
     /// `src/ccl/lower/functions.rs`): the parameters' spellings, in order.
+    /// Diagnostic formatting has neither source text nor a provenance projection. Keeping
+    /// the spellings on the name preserves them when predicates inside types are copied.
     positions: Option<Box<[SmolStr]>>,
 }
 

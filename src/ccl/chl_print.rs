@@ -12,7 +12,7 @@
 //! dependent function `(k: …) |=> …` or `(x: …) => …`, an index range written as
 //! `{UInt where _ < n}`. What the notation has no form for at all is described between
 //! `‹…›`, never dropped and never written with a name the program did not write: an
-//! inference variable as `‹?7›`, a key outside the written type as [`OUTER_KEY`], and
+//! inference variable as `‹?7›`, an argument outside the written type as [`OUTER_ARGUMENT`], and
 //! anything else as [`NOT_PRINTABLE`].
 
 use std::collections::HashSet;
@@ -29,16 +29,22 @@ use crate::ccl::{FieldKey, ProjKey, UnaryOpKind};
 /// What a written type says for a part CHL has no spelling for and no description fits.
 pub const NOT_PRINTABLE: &str = "‹not printable yet›";
 
-/// A key of a collection outside the written type: the written type is that
-/// collection's values, or part of them, and reads the key it is at.
-pub const OUTER_KEY: &str = "‹outer key›";
+/// An argument bound outside the written type, which reads a function's parameter or a
+/// collection's key without its binder in scope.
+pub const OUTER_ARGUMENT: &str = "‹outer argument›";
 
-/// The key type of a collection outside the written type, as [`OUTER_KEY`] is its key.
+/// The key type of a collection outside the written type.
 pub const OUTER_KEYS: &str = "‹outer keys›";
 
 /// `ty` written in CHL.
 pub fn chl_type(ty: &Type) -> String {
     Printer::for_type(ty).annotation(ty)
+}
+
+/// Whether two types have the same diagnostic text, including any descriptions that hide
+/// structural differences. This compares what the reader sees, not type equality.
+pub fn renders_alike(a: &Type, b: &Type) -> bool {
+    chl_type(a) == chl_type(b)
 }
 
 /// A refinement predicate written in CHL, `_` for the refined value.
@@ -300,9 +306,8 @@ impl Printer {
                     })
                     .collect();
                 let closed = VariantArms(arms).to_string();
-                // A demand admitting further arms ends in `..`, as an open tuple does.
                 match openness.permits_extra_tags() {
-                    true => format!("{} | ..}}", &closed[..closed.len() - 1]),
+                    true => format!("{} | ‹more arms›}}", &closed[..closed.len() - 1]),
                     false => closed,
                 }
             }
@@ -523,7 +528,7 @@ impl Printer {
         }
         // The collection type names no key, so a value reading it reads a key outside
         // the written value type.
-        self.binders.push(Some(OUTER_KEY.to_string()));
+        self.binders.push(Some(OUTER_ARGUMENT.to_string()));
         let cod = self.ty(codomain);
         self.binders.pop();
         match w.type_kind() {
@@ -590,7 +595,7 @@ impl Printer {
                         Some(i) => self.binders[i as usize]
                             .clone()
                             .unwrap_or_else(|| NOT_PRINTABLE.to_string()),
-                        None => OUTER_KEY.to_string(),
+                        None => OUTER_ARGUMENT.to_string(),
                     };
                     return (Prec::Atom, text);
                 }
@@ -608,7 +613,7 @@ impl Printer {
                             kind: SyntheticKind::SolverArg,
                             ..
                         },
-                    ) => OUTER_KEY.to_string(),
+                    ) => OUTER_ARGUMENT.to_string(),
                     (None, _) => NOT_PRINTABLE.to_string(),
                 };
                 (Prec::Atom, text)
@@ -1071,7 +1076,10 @@ fn type_spellings(ty: &Type, out: &mut HashSet<String>) {
 /// [`type_spellings`] for a predicate term.
 fn expr_spellings(e: &Expr, out: &mut HashSet<String>) {
     match &e.node {
-        TypedExprNode::Var(n) => out.extend(spelling(n)),
+        TypedExprNode::Var(n) => {
+            out.extend(spelling(n));
+            out.extend(n.positions().into_iter().flatten().map(ToString::to_string));
+        }
         TypedExprNode::Lambda { param, .. } => out.extend(spelling(&param.name)),
         _ => {}
     }
@@ -1101,7 +1109,7 @@ impl fmt::Display for VariantArms {
 mod tests {
     use std::rc::Rc;
 
-    use super::{NOT_PRINTABLE, OUTER_KEY, chl_type};
+    use super::{NOT_PRINTABLE, OUTER_ARGUMENT, chl_type};
     use crate::ccl::lower::test_helpers::lower_type;
     use crate::ccl::{
         BaseType, BinOpKind, Builtin, ChanLevel, CompareKind, Lit, LogicKind, Name, Refinement,
@@ -1236,7 +1244,7 @@ mod tests {
         };
         assert_eq!(
             chl_type(&codomain),
-            format!("{{Int where _ == {OUTER_KEY}}}")
+            format!("{{Int where _ == {OUTER_ARGUMENT}}}")
         );
     }
 

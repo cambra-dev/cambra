@@ -1510,10 +1510,7 @@ fn constrain_go_impl(
             {
                 Ok(())
             } else {
-                Err(ConstrainError::Mismatch {
-                    lhs: Box::new(lhs.clone()),
-                    rhs: Box::new(rhs.clone()),
-                })
+                Err(mismatch(lhs, rhs, sl, sr))
             }
         }
         // `Txn` is a nullary leaf: reflexively equal to itself, incomparable
@@ -2415,10 +2412,7 @@ fn constrain_go_impl(
                     constrain_go(&at, rhs, sl, sr, cache, scope)
                 }
                 Some(bound) => constrain_go(bound, rhs, sl, sr, cache, scope),
-                None => Err(ConstrainError::Mismatch {
-                    lhs: Box::new(lhs.clone()),
-                    rhs: Box::new(rhs.clone()),
-                }),
+                None => Err(mismatch(lhs, rhs, sl, sr)),
             }
         }
 
@@ -2609,14 +2603,14 @@ fn constrain_go_impl(
                     &rrefs_in_ambient,
                     scope,
                 )
-                .or_else(|error| smt_undecided_is_mismatch(error, lhs, rhs))?;
+                .or_else(|error| smt_undecided_is_mismatch(error, lhs, rhs, sl, sr))?;
                 if proven {
                     Ok(())
                 } else {
                     Err(mismatch(lhs, rhs, sl, sr))
                 }
             } else if super::smt::smt_sub(lbase, &lrefs_in_ambient, &rrefs_in_ambient, scope)
-                .or_else(|error| smt_undecided_is_mismatch(error, lhs, rhs))?
+                .or_else(|error| smt_undecided_is_mismatch(error, lhs, rhs, sl, sr))?
             {
                 constrain_go(lbase, rbase, sl, sr, cache, scope)
             } else {
@@ -2648,12 +2642,14 @@ fn smt_undecided_is_mismatch(
     error: SmtError,
     lhs: &Type,
     rhs: &Type,
+    sl: &Subst,
+    sr: &Subst,
 ) -> Result<bool, ConstrainError> {
     match error {
         SmtError::Encoding { .. } => Ok(false),
         error => Err(ConstrainError::SmtError {
-            lhs: Box::new(lhs.clone()),
-            rhs: Box::new(rhs.clone()),
+            lhs: Box::new(sl.apply_type(lhs)),
+            rhs: Box::new(sr.apply_type(rhs)),
             error: Box::new(error),
         }),
     }
@@ -3228,6 +3224,53 @@ mod tests {
     use crate::ccl::{
         BaseType, BinOpKind, CompareKind, Lit, Name, Refinement, Type, TypedExpr, TypedExprNode,
     };
+
+    #[test]
+    fn family_mismatches_report_the_substituted_sides() {
+        use crate::ccl::ty::{FamilyApp, TypeParam};
+        let family = Type::FamilyApp(FamilyApp::new(
+            TypeParam::declared_family("V", 1),
+            vec![Rc::new(TypedExpr::var("n"))],
+        ));
+        let sl = Subst::discharge("n", TypedExpr::lit(Lit::Int(1)));
+        let sr = Subst::discharge("n", TypedExpr::lit(Lit::Int(2)));
+        for demand in [&family, &Type::Base(BaseType::Int)] {
+            let error = constrain_go(
+                &family,
+                demand,
+                &sl,
+                &sr,
+                &mut ConstrainCache::new(),
+                &SkipSmtScope,
+            )
+            .expect_err("different family arguments, or an unbounded family meeting Int");
+            let ConstrainError::Mismatch { lhs, rhs } = error else {
+                panic!("expected a mismatch, got {error:?}");
+            };
+            assert_eq!(*lhs, sl.apply_type(&family));
+            assert_eq!(*rhs, sr.apply_type(demand));
+            assert_ne!(*lhs, family);
+        }
+    }
+
+    #[test]
+    fn solver_failures_report_the_substituted_sides() {
+        use crate::ccl::ty::{FamilyApp, TypeParam};
+        let ty = Type::FamilyApp(FamilyApp::new(
+            TypeParam::declared_family("V", 1),
+            vec![Rc::new(TypedExpr::var("n"))],
+        ));
+        let sl = Subst::discharge("n", TypedExpr::lit(Lit::Int(1)));
+        let sr = Subst::discharge("n", TypedExpr::lit(Lit::Int(2)));
+        let error = smt_undecided_is_mismatch(SmtError::SolverReportedUnknown, &ty, &ty, &sl, &sr)
+            .expect_err("an unanswered query reports a solver failure");
+        let ConstrainError::SmtError { lhs, rhs, .. } = error else {
+            panic!("expected a solver failure, got {error:?}");
+        };
+        assert_eq!(*lhs, sl.apply_type(&ty));
+        assert_eq!(*rhs, sr.apply_type(&ty));
+        assert_ne!(*lhs, *rhs);
+    }
 
     /// `{Int | escaped}` — a refinement naming a uniquified binder that nothing in
     /// scope binds, the shape the closure invariant rejects.

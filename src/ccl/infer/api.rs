@@ -1144,7 +1144,7 @@ fn without_node_ids(debug: &str) -> String {
 }
 
 fn identical_rendering_hint(type_a: &Type, type_b: &Type) -> Option<String> {
-    if chl_type(type_a) != chl_type(type_b) {
+    if !crate::ccl::chl_print::renders_alike(type_a, type_b) {
         return None;
     }
     // A predicate's node ids name where its nodes came from, not what the type says, so the
