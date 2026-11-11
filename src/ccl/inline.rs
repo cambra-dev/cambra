@@ -1123,20 +1123,6 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
             }
         }
 
-        // ANF defer-returning Compose source: when the first element of a Compose
-        // (i.e. the for-loop iteration source) is itself a defer-returning
-        // expression, wrap it in a fresh `let __for_src_N = source` binding so
-        // that `lift_defer` can physically rename its inner defer handle,
-        // preventing two same-named `__result` defers from coexisting in
-        // `channelize`. Re-running `inline_impl` on the wrapping `Let`
-        // triggers the defer lift on the new binding.
-        TypedExprNode::Compose(terms) => TypedExprNode::Compose(
-            terms
-                .into_iter()
-                .map(|term| inline_impl(term, scope, channels))
-                .collect(),
-        ),
-
         TypedExprNode::Lambda { param, body } => {
             let body = scope.under(&param.name, param.ty.clone(), |scope| {
                 inline_impl(*body, scope, channels)
@@ -2094,6 +2080,19 @@ mod tests {
         })
         .with_ty(int.clone());
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn a_let_inside_a_compose_element_is_inlined() {
+        // (let f = id in f) ≫ g  becomes  id ≫ g
+        let fun_ty = Type::fun(Type::Base(BaseType::Int), Type::Base(BaseType::Int));
+        let id_expr = TypedExpr::var("id").with_ty(fun_ty.clone());
+        let g = TypedExpr::var("g").with_ty(fun_ty.clone());
+        let f = TypedExpr::var("f").with_ty(fun_ty.clone());
+        let source = TypedExpr::let_bind("f", Occurrence::mint(), id_expr.clone(), f);
+        let expr = TypedExpr::compose(vec![source, g.clone()]).with_ty(fun_ty.clone());
+        let result = inline_capability_lambdas(expr);
+        assert_eq!(result, TypedExpr::compose(vec![id_expr, g]).with_ty(fun_ty));
     }
 
     #[test]
