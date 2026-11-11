@@ -1450,16 +1450,10 @@ fn elim_lambda_impl(
                 })
                 .cloned()
                 .collect();
-            let y_ty = {
-                let base = y_ty.peel_refinements().clone();
-                if staying.is_empty() {
-                    base
-                } else {
-                    let mut set = crate::ccl::ty::RefinementSet::new();
-                    set.extend(staying);
-                    Type::Refinement(Box::new(base), set)
-                }
-            };
+            let y_ty = Type::refined(
+                y_ty.peel_refinements().clone(),
+                staying.into_iter().collect(),
+            );
             // A `y_ty` naming the inner lambda's witness escapes the Σ binding it here.
             // [`compose_sum_generators`] keeps a generator over a sum from reaching this rule,
             // and [`refuse_escaped_pair_witness`] refuses any other `curry` that keeps one.
@@ -1504,13 +1498,7 @@ fn elim_lambda_impl(
                         r
                     })
                     .collect();
-                if lifted.is_empty() {
-                    bare_pair.clone()
-                } else {
-                    let mut set = crate::ccl::ty::RefinementSet::new();
-                    set.extend(lifted);
-                    Type::Refinement(Box::new(bare_pair.clone()), set)
-                }
+                Type::refined(bare_pair.clone(), lifted.into_iter().collect())
             };
             // Annotate the projection morphisms with their concrete types so that
             // downstream type computations (e.g. zip_pair_ty) can see the domain.

@@ -224,13 +224,7 @@ fn nest_as_product(contribution: Expr, generators: Vec<Generator>) -> Expr {
             lifted.push(Refinement::born(Rc::new(predicate)));
         }
     }
-    let keys = if lifted.is_empty() {
-        bare
-    } else {
-        let mut set = crate::ccl::ty::RefinementSet::new();
-        set.extend(lifted);
-        Type::Refinement(Box::new(bare), set)
-    };
+    let keys = Type::refined(bare, lifted.into_iter().collect());
     let record = Name::fresh("__iter_record");
     let nest_params: Vec<Name> = generators.iter().map(|g| g.param.name.clone()).collect();
     around_lets(contribution, &mut |nest| {
