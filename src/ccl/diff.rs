@@ -2259,11 +2259,8 @@ mod tests {
         );
     }
 
-    // TODO: pinned on `^+` or `^*`, each of which fails this test on its own. With all of them
-    // refined, inlining cannot discharge a singleton parameter against an argument typed plain
-    // `Int`.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(expected = "beta reduction would silently drop the precondition")]
     fn inlining_erases_function_boundaries_with_caret_operators() {
         // Extracting a subexpression into a `def` is invisible once the
         // pipeline's own inlining has run: the two versions are the same tree.
@@ -2346,22 +2343,17 @@ mod tests {
         );
     }
 
-    // TODO: pinned on `^+`: inlining cannot discharge `g`'s parameter, refined by `b`'s sum,
-    // against an argument typed plain `Int`.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(expected = "beta reduction would silently drop the precondition")]
     fn inlining_costs_locality_in_a_shared_helper_with_caret_operators() {
-        // The other side of that trade, stated as a test so it cannot be
-        // mistaken for a strict improvement: a body called twice is inlined
-        // twice, so one edit inside it diverges at both call sites.
-        //
-        // The two calls pass *different* arguments that nonetheless share one
-        // specialization: monomorphization keys on instantiation identity, and
-        // a join of two singletons keeps neither refinement, so `a` and `b`
-        // both arrive as plain `Int`. Literal arguments would key apart and
-        // clone the helper during inference — the baseline would already be
-        // delocalized, and the contrast below would not be inlining's doing.
-        // See `src/ccl/design/diffing.md`, "How much to normalize".
+        // The caret spelling of `inlining_costs_locality_in_a_shared_helper`, whose
+        // shared-specialization premise `^+` does not meet. `a` is typed
+        // `{Int | __elem == 1 + 1}` and `b` `{Int | __elem == 2 + 2}`, so `g(a)` and
+        // `g(b)` instantiate `g` at different refinements, key apart, and inference
+        // emits one `__mono` clone per call (`src/ccl/design/type-inference.md`, "Key
+        // timing and precision limits"). The edit therefore lands once per call site
+        // before inlining runs, and this test pins that inlining keeps it there rather
+        // than the one-to-many contrast the plain test checks.
         let v1 = indoc! {"
             def g(y):
                 y ^+ 2
@@ -2377,16 +2369,18 @@ mod tests {
             g(a) ^* g(b)
         "};
 
+        // Six: the literal in each clone, and, because each clone's codomain
+        // `{Int | __elem == y + 2}` records the literal, the clone reference at each
+        // call and each call result's use in the product.
         let (a, b) = (
             compile_to(&LoadedProgram::test(v1), Phase::Infer).unwrap(),
             compile_to(&LoadedProgram::test(v2), Phase::Infer).unwrap(),
         );
-        // TODO: pinned on `^+`. The expected count is 1. `^+` breaks the premise above: `a` and
-        // `b` carry their sums rather than arriving as plain `Int`.
         assert_eq!(
             diff(&a, &b).divergences().len(),
             6,
-            "one edit, one divergence, while the two calls still share one function",
+            "one edit, diverging in each of the two specializations of `g` and at every \
+             reference whose type records its codomain",
         );
 
         let (a, b) = (
@@ -2395,7 +2389,7 @@ mod tests {
         );
         assert!(
             diff(&a, &b).divergences().len() > 1,
-            "inlined, the same edit lands once per call site",
+            "inlined, the same edit still lands once per call site",
         );
     }
 
@@ -2456,12 +2450,8 @@ mod tests {
         }
     }
 
-    // TODO: pinned on `^*`, `^>=` or `^==`, each of which fails this test on its own. With all
-    // of them refined, inference rejects a comprehension whose element type now reads the key.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(
-        expected = "a value that is one type for every key of the collection it is part of"
-    )]
     fn every_phase_diffs_identical_source_as_identical_with_caret_operators() {
         // The property the whole analysis rests on, over the shapes the corpus
         // reaches: compiling one source twice — independent contexts, fresh

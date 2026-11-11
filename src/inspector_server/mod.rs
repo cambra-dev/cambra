@@ -345,10 +345,8 @@ mod tests {
         }
     }
 
-    // TODO: pinned on `^+`: inlining cannot discharge a singleton parameter against an argument
-    // typed plain `Int`.
+    // TODO: remove when `^` operators have been removed
     #[test]
-    #[should_panic(expected = "beta reduction would silently drop the precondition")]
     fn pane_links_inline_fanout_edges_non_empty_for_udf_program_with_caret_operators() {
         let code = indoc! {r#"
             add1 = \x -> x ^+ 1

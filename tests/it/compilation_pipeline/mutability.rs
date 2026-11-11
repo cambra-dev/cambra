@@ -3336,3 +3336,101 @@ fn an_inner_list_literal_reading_the_enclosing_binder_is_refused() {
         "a list element must be a constant",
     );
 }
+
+/// A variable that leaves an `if` with either branch's value types as a `Case` of the values: a
+/// refinement holds of a component of the merge where every incoming value carries it at that
+/// component, a record keeps the fields every value has, and a variant takes every value's tags
+/// (`joined_ty` in `src/ccl/mut_elim.rs`). `shared_binding` merges through `merge_as_tuple`,
+/// because the inner loop's recurrence is a binding of the branch both `x` and `y` read: each
+/// variable reads its slot of the merge at the slot's joined type, which drops the refinement
+/// `x := i ^+ 1` carries.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::scalar(
+    indoc! {r#"
+        x := 0
+        for i in [1, 2, 3]:
+            x := i ^+ 1
+            if i > 1:
+                x := i ^+ 2
+        x
+    "#},
+    5
+)]
+#[case::tuple(
+    indoc! {r#"
+        x := (0, 0)
+        for i in [1, 2, 3]:
+            x := (i ^+ 1, 0)
+            if i > 1:
+                x := (i ^+ 2, 0)
+        x.0 + x.1
+    "#},
+    5
+)]
+#[case::record(
+    indoc! {r#"
+        x := (a=0, b=0)
+        for i in [1, 2, 3]:
+            x := (a=i ^+ 1, b=0)
+            if i > 1:
+                x := (a=i ^+ 2, b=0)
+        x.a + x.b
+    "#},
+    5
+)]
+#[case::nested(
+    indoc! {r#"
+        x := ((0, 0), (b=0))
+        for i in [1, 2, 3]:
+            x := ((i ^+ 1, i ^+ 3), (b=i ^+ 1))
+            if i > 1:
+                x := ((i ^+ 2, i ^+ 3), (b=i ^+ 2))
+        x.0.0 + x.0.1 + x.1.b
+    "#},
+    16
+)]
+#[case::record_width(
+    indoc! {r#"
+        x := (a=0)
+        for i in [1, 2, 3]:
+            if i > 5:
+                x := (a=i, b=10)
+        x.a
+    "#},
+    0
+)]
+#[case::variant_tag(
+    indoc! {r#"
+        x := `some(0)
+        for i in [1, 2, 3]:
+            if i > 1:
+                x := `none
+        match x:
+            case `some(v):
+                v
+            case `none:
+                42
+    "#},
+    42
+)]
+#[case::shared_binding(
+    indoc! {r#"
+        x := 0
+        y := 0
+        for i in [1, 2, 3]:
+            x := i ^+ 1
+            if i > 1:
+                for j in [10, 20]:
+                    x += j
+                    y += j
+        x + y
+    "#},
+    94
+)]
+fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
+    #[case] code: &str,
+    #[case] value: i64,
+) {
+    check_scalar(code, Value::Int(value));
+}

@@ -1635,3 +1635,19 @@ fn a_nested_for_over_a_groups_rows() {
         String::from_utf8_lossy(&stderr)
     );
 }
+
+/// A comprehension's element type reads its key, and the consumer's element variable is one type
+/// for every key: its lower bound crosses the key binder as a join
+/// (`src/ccl/design/type-inference.md`, "The invariant"). The refinement reading the key is
+/// dropped wherever it stands in a covariant position, so a refined component of a tuple or a
+/// record joins as a refined scalar does.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[case::scalar("sum([1 for u in set([x ^+ 1 for x in [1, 2, 3]])])")]
+#[case::tuple_first("sum([1 for u in set([(x ^+ 1, 0) for x in [1, 2, 3]])])")]
+#[case::tuple_second("sum([1 for u in set([(0, x ^+ 1) for x in [1, 2, 3]])])")]
+#[case::record("sum([1 for u in set([(a=x ^+ 1, b=0) for x in [1, 2, 3]])])")]
+#[case::nested("sum([1 for u in set([((x ^+ 1, 0), (b=x ^+ 2)) for x in [1, 2, 3]])])")]
+fn a_set_of_key_dependent_elements(#[case] code: &str) {
+    check_scalar(code, Value::Int(3));
+}

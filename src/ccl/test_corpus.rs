@@ -105,10 +105,15 @@ pub(crate) fn with_caret_operators(test: impl FnOnce()) {
     CARET_OPERATORS.with(|c| c.set(false));
 }
 
+/// Whether the running test is inside [`with_caret_operators`].
+pub(crate) fn spells_caret_operators() -> bool {
+    CARET_OPERATORS.with(|c| c.get())
+}
+
 /// `src` as the running test spells its programs: [`caret_operators`] inside
 /// [`with_caret_operators`], unchanged otherwise.
 pub(crate) fn spelled(src: &str) -> String {
-    if CARET_OPERATORS.with(|c| c.get()) {
+    if spells_caret_operators() {
         caret_operators(src)
     } else {
         src.to_string()

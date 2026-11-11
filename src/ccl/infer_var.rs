@@ -348,6 +348,30 @@ impl Bound {
         self.holder_inverse().names_after(names)
     }
 
+    /// The term names this bound can put in its holder: the names it puts there now
+    /// ([`rendered_names`](Self::rendered_names)) and the names in the scope of each variable
+    /// its type holds outside any function type, which that variable's resolution can read.
+    /// Read name by name ([`subst::Subst::names_after`]), so nothing is applied and no variable
+    /// is suspended on; a witness half the edge carries is not read.
+    ///
+    /// A variable inside a function type is not followed. A collection's domain reads a key
+    /// through a witness projection on a term, a join leaves that term's occurrences in place
+    /// ([`subst::Mapping::Join`]), and compaction checks a joined binder in a data domain only
+    /// on refinements.
+    pub(crate) fn reachable_names(&self) -> BTreeSet<Name> {
+        fn scopes(ty: &Type, out: &mut BTreeSet<Name>) {
+            match ty {
+                Type::Infer(v) => v.telescope.extend_with_accounted(out),
+                Type::Fun { .. } => {}
+                _ => ty.walk_children(|c| scopes(c, out)),
+            }
+        }
+        let mut names = subst::type_free_vars(&self.ty);
+        scopes(&self.ty, &mut names);
+        let names = self.ty_subst.names_after(names);
+        self.holder_inverse().names_after(names)
+    }
+
     /// The bound type expressed in the holder's context — see
     /// [`render_subst`](Self::render_subst).
     #[cfg(any(test, feature = "test-helpers"))]
