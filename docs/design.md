@@ -169,7 +169,7 @@ pipeline; individual pass contracts belong to the linked design documents.
 | A-normalize | `anf::run` names compound operands before inference. |
 | Name mutable reads | `mut_read::run` gives mutable reads immutable names that refinements can reference. |
 | Lower comprehensions | `comprehension::run` lowers each comprehension to its `cast`/`λ`/`▷` encoding. |
-| Bind opaque outputs | `opaque_output::run` binds the body of each lambda that binds an opaque variable to `__output` under a barrier-variable annotation. |
+| Bind opaque outputs | `opaque_output::run` binds the body of each lambda that binds an opaque variable to `__output` under a barrier-variable annotation, and gives a `=> T` result's binding the same binder. |
 | Infer | Infer types, specialize uses and validate the typed tree; see [type inference](../src/ccl/design/type-inference.md). Each module's check tree is inferred first, alone, and a failed check stops the compile; see [checking a module on its own](modules.md#checking-a-module-on-its-own). Every expression keeps its capabilities; read naming is undone before the post-inference pane. |
 | Inline | Inline compute-function bindings and beta-reduce calls; see [inlining](../src/ccl/design/optimization.md#inlining-pass-cclinliners). |
 | Eliminate transactions | `transact_phase::run` constructs transaction histories after keyed-write desugaring and value-type views. |

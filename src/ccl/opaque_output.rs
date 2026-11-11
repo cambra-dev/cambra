@@ -46,6 +46,9 @@ pub fn run(expr: Expr) -> Expr {
 fn rewrite(mut expr: Expr) -> Expr {
     expr.map_children(rewrite);
     let lambda = expr.node_id();
+    if let TypedExprNode::Lambda { body, .. } = &mut expr.node {
+        adopt_lowered_result(body);
+    }
     if let TypedExprNode::Lambda { body, .. } = &mut expr.node
         && !has_concrete_result_annotation(body)
     {
@@ -59,6 +62,33 @@ fn rewrite(mut expr: Expr) -> Expr {
         }
     }
     expr
+}
+
+/// Rename the binder a `=> 𝑇` annotation's lowering binds the result under,
+/// [`OUTPUT_BINDER`](crate::ccl::lower::OUTPUT_BINDER), to [`Name::output`], so a lambda's
+/// result is read through one binder whichever bound it, and [`output_body`] reads both.
+fn adopt_lowered_result(body: &mut Expr) {
+    if !is_annotated_result(body) {
+        return;
+    }
+    let TypedExprNode::Let {
+        binding,
+        body: tail,
+        ..
+    } = &mut body.node
+    else {
+        unreachable!("an annotated result is a `let`")
+    };
+    if !matches!(&binding.name, Name::Unique { base, .. } if base == crate::ccl::lower::OUTPUT_BINDER)
+    {
+        return;
+    }
+    let output = Name::output();
+    binding.name = output.clone();
+    let TypedExprNode::Var(read) = &mut tail.node else {
+        unreachable!("an annotated result's continuation reads its binder")
+    };
+    *read = output;
 }
 
 /// Whether `expr` is `let 𝑦 : 𝑇 = body in 𝑦` with a user annotation `𝑇`.

@@ -578,13 +578,14 @@ would otherwise become a shadowing `let` that quietly discards committed values.
 
 ### `mut_elim` — the induction slice
 
-`flatten_spine` → `rewrite` → `erase_mut` → assert.
+`flatten_spine` → check → `rewrite` → `erase_mut` → assert.
 
 The first step is the one to know about: inlining a pass-by-reference writer splices its
 body at the call site and can bury a `MutWrite` off the statement spine, where the main walk
-reads it as a pure value and drops the update. Commuting conversions lift those back. The
-asserts fire in **release**, not debug, because a leaked marker is a miscompile and
-`lambda_elim`'s catch-all would pass one through silently.
+would read it as a pure value and drop the update. Commuting conversions lift those back, and
+the check after them panics on any write still off a spine. The asserts fire in **release**,
+not debug, because a leaked marker is a miscompile and `lambda_elim`'s catch-all would pass one
+through silently.
 
 **Example A** after it — the markers are gone and a causal `LetRec` has replaced them:
 

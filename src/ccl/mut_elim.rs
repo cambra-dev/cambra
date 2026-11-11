@@ -154,6 +154,7 @@ pub fn run(expr: Expr) -> Expr {
         push_bindings_into_writing_cases(peel_effectful_outputs(expr)),
         Spine::OutsideLoops,
     );
+    assert_writes_on_spines(&expr, Spine::OutsideLoops);
     let mut declared = Declared::of(&expr);
     let mut out = rewrite(expr, &mut declared);
     // The rewrite turns every mutable read/write into an ordinary recurrence
@@ -224,6 +225,33 @@ fn writes(e: &Expr) -> bool {
                 | crate::ccl::capabilities::Effect::WriteTxn(_)
         )
     })
+}
+
+/// Whether evaluating `e` causes an effect `target` picks out on a variable `e` does not bind
+/// itself ([`Expr::capabilities`]). A write to a mutable variable `e` declares, or a feed to a
+/// feed it binds, is `e`'s own and reaches nothing past it.
+fn causes_past(
+    e: &Expr,
+    target: impl Fn(&crate::ccl::capabilities::Effect) -> Option<&Name>,
+) -> bool {
+    let set = e.capabilities.set();
+    let targets: Vec<Name> = set
+        .causes
+        .iter()
+        .filter_map(|c| target(c).cloned())
+        .collect();
+    if targets.is_empty() {
+        return false;
+    }
+    fn bound(e: &Expr, names: &mut HashSet<Name>) {
+        e.walk_binders(|b| {
+            names.insert(b.name.clone());
+        });
+        e.walk_children(|c| bound(c, names));
+    }
+    let mut own = HashSet::new();
+    bound(e, &mut own);
+    targets.iter().any(|x| !own.contains(x))
 }
 
 /// Whether evaluating `e` feeds a feed ([`Expr::capabilities`]).
@@ -339,23 +367,20 @@ impl Spine {
         is_mut_write(e) || (self == Spine::LoopBody && matches!(e.node, TypedExprNode::Feed { .. }))
     }
 
-    /// Whether some path through `e` performs one of this spine's statements, following
-    /// `ExprStmt` effects/bodies, `Let` continuations, and a `Case`'s branches. Broader than
-    /// "heads a write": a pass-by-reference writer that computes an intermediate first
-    /// (`tmp = c + 1; c := tmp`) splices as a `Let`-headed body whose write sits *past* the
-    /// leading binding, and a conditional nested inside a block right-hand side normalizes to
-    /// a `Case` standing where a statement did (`push_binding_into_case`), which puts its
-    /// writes on the branches rather than on the spine. Used to gate `flatten_spine`'s
-    /// `Let`-hoist — it fires only for genuine writer bodies, never for a pure `Let` (a join
-    /// subplan spine holds no statement, so its reassociation is left undisturbed).
+    /// Whether evaluating `e` performs one of this spine's statements: writes an induction
+    /// variable, or on a loop body's spine feeds a feed. Read off `e`'s capabilities
+    /// ([`Expr::capabilities`]), so a write counts wherever inlining left it: past a leading
+    /// binding, in a nested binding's definiens, under a mutable variable the writer body
+    /// declares, in a statement `if` or `for`. Gates `flatten_spine`'s `Let`-hoist, so a pure
+    /// `Let` (a join subplan) is left undisturbed.
     fn performs(self, e: &Expr) -> bool {
-        match &e.node {
-            _ if self.statement(e) => true,
-            TypedExprNode::ExprStmt { expr, body } => self.statement(expr) || self.performs(body),
-            TypedExprNode::Let { body, .. } => self.performs(body),
-            TypedExprNode::Case { branches, .. } => branches.iter().any(|b| self.performs(&b.body)),
-            _ => false,
-        }
+        use crate::ccl::capabilities::Effect;
+        self.statement(e)
+            || causes_past(e, |c| match c {
+                Effect::Write(x) => Some(x),
+                Effect::Append(f) if self == Spine::LoopBody => Some(f),
+                _ => None,
+            })
     }
 }
 
@@ -450,6 +475,18 @@ fn splice_branch_value(name: &Name, branch: Expr, cont: Expr) -> Expr {
 /// *previous* value, so it never observes the binder — preserving evaluation
 /// order and scope.
 fn hoist_writer_body(binding: TypedBinding, writer_body: Expr, body: Expr, spine: Spine) -> Expr {
+    // A mutable variable the writer body declares scopes over the continuation too: its
+    // binder is unique, so nothing there names it.
+    if matches!(writer_body.node, TypedExprNode::MutDecl { .. }) {
+        let mut decl = writer_body;
+        let TypedExprNode::MutDecl { body: cont, .. } = &mut decl.node else {
+            unreachable!("matched as a `MutDecl`")
+        };
+        let taken = std::mem::take(&mut **cont);
+        **cont = hoist_writer_body(binding, taken, body, spine);
+        decl.ty = cont.ty.clone();
+        return decl;
+    }
     match writer_body.node {
         // 1:1 reparents — carry the input node's id (a preserve, not a mint): the
         // statement/binding survives at a new spine position, so its source span
@@ -474,7 +511,9 @@ fn hoist_writer_body(binding: TypedBinding, writer_body: Expr, body: Expr, spine
         ),
         // A bare writer terminal: its value is `unit`. The write itself moves to
         // a new spine position, keeping its id, source span and provenance.
-        _ if spine.statement(&writer_body) => {
+        _ if spine.statement(&writer_body)
+            || matches!(writer_body.node, TypedExprNode::For { .. }) =>
+        {
             Expr::expr_stmt(writer_body, Expr::let_in(binding, unit_expr(), body))
         }
         // A writing `Case` in terminal position. Its writes are conditional, so
@@ -490,16 +529,15 @@ fn hoist_writer_body(binding: TypedBinding, writer_body: Expr, body: Expr, spine
         TypedExprNode::Case { .. } => push_binding_into_branches(&binding.name, writer_body, body),
         // A pure terminal value: bind it directly.
         _ => {
-            // The arms above cover every node kind [`Spine::performs`] admits,
-            // and `flatten_spine` re-runs on whatever this returns. A writing
-            // terminal reaching this arm comes back unchanged, so that recursion
-            // never converges — the divergence between the two is a hang, not a
-            // wrong tree.
-            debug_assert!(
+            // A writing terminal no arm above sequences, a writer inside an operand,
+            // would come back unchanged, and `flatten_spine` re-running on it would
+            // never converge. Inlining keeps a writer bound ahead of what reads past it
+            // (`crate::ccl::inline`'s read-once guards), so none reaches here.
+            assert!(
                 !spine.performs(&writer_body),
-                "hoist_writer_body has no arm for a writing {:?}, which `flatten_spine` \
-                 would re-hoist unchanged forever",
-                std::mem::discriminant(&writer_body.node)
+                "a write off the statement spine: inlining left a writer in value position, \
+                 in {}",
+                symbolic(&writer_body)
             );
             Expr::let_in(binding, writer_body, body)
         }
@@ -720,10 +758,8 @@ fn push_writing_cases(mut expr: Expr, in_writer_body: bool) -> Expr {
         **body = push_writing_cases(taken_body, true);
         return expr;
     }
-    // Children before this node. Pushing a nested `Case` lifts its writes onto
-    // the branch spine of the `Case` enclosing it, and `Spine::performs` reads
-    // exactly that spine — so a binding whose branches write only through a
-    // block right-hand side of their own qualifies only after the inner push.
+    // Children before this node: pushing a nested `Case` lifts its writes onto
+    // the branch spine of the `Case` enclosing it.
     expr.map_children(|c| push_writing_cases(c, in_writer_body));
     if in_writer_body {
         return expr;
@@ -751,15 +787,14 @@ fn push_writing_cases(mut expr: Expr, in_writer_body: bool) -> Expr {
 /// - `ExprStmt(ExprStmt(𝑤, 𝑏), 𝑐)  →  ExprStmt(𝑤, ExprStmt(𝑏, 𝑐))` — a
 ///   multi-statement writer body (`def f(c): c += 1; c += 2`) spliced as one
 ///   effect.
-/// - A `Let` bound to a *value-position* writer body (`y = f(c)`) whose spine
-///   performs a mutable write: `hoist_writer_body` splices `let y = ⟨terminal⟩ in
-///   k` into the body's terminal position, lifting its leading statements and
-///   intermediate bindings onto the outer spine. This subsumes the direct
-///   cases `Let(𝑥, ExprStmt(𝑤, 𝑢), 𝑘)` and `Let(𝑥, MutWrite(..), 𝑘)` and the
-///   *intermediate-first* case `Let(𝑥, Let(tmp, 𝑒, 𝑤), 𝑘)`
-///   (`def f(c): tmp = c + 1; c := tmp`). Hoisting only the body's head reaches
-///   the first two and leaves the third's write trapped in the bound
-///   expression, silently mis-normalized or surviving the phase as a marker.
+/// - A `Let` bound to a *value-position* writer body (`y = f(c)`) that performs a
+///   mutable write ([`Spine::performs`]): `hoist_writer_body` splices `let y =
+///   ⟨terminal⟩ in k` into the body's terminal position, lifting its leading
+///   statements, intermediate bindings and mutable variable declarations onto the
+///   outer spine. A lifted binding whose own definiens writes is hoisted in turn
+///   (two writer calls in one function's body), and a statement `if` or `for` lands
+///   on the spine as a statement. A write left in the definiens would be scoped to it
+///   and never reach the statements after the call.
 ///
 /// and terminalizes a value-position write (a trailing `cnt += 1` with no
 /// read, whose final state is unobserved):
@@ -847,6 +882,11 @@ fn flatten_spine(mut e: Expr, spine: Spine) -> Expr {
             spine,
         );
     }
+    // Bind a writing slot evaluated before its node ahead of the node, where the `Let`-hoist
+    // below lifts its writes onto the spine.
+    if let Some(bound) = bind_writing_first_slot(&mut e, spine) {
+        return flatten_spine(bound, spine);
+    }
     // Hoist mutable writes out of a value-position writer body bound by a `Let`
     // (`y = f(c)`). `Spine::performs` fires for a genuine writer body only —
     // one that heads the write, sequences it after siblings, or computes an
@@ -922,6 +962,131 @@ fn flatten_spine(mut e: Expr, spine: Spine) -> Expr {
     }
     e.map_children(|c| flatten_spine(c, spine));
     e
+}
+
+/// `let 𝑣 = 𝑠 in 𝑒[𝑠 := 𝑣]`, for the slot `𝑠` of `e` evaluated before the rest of its node, where
+/// `𝑠` performs a write: a mutable variable's initial value, a loop's source, a write's or a
+/// feed's value, a `Case`'s scrutinee or its first guard. A-normalization names an operand
+/// but leaves these slots, which bind or test a value of their own, as written, so a writer
+/// call there inlines into the slot, off the spine. The node is `e` itself, a statement `e`
+/// sequences, or a `Case` `e` binds. `None` where no such slot writes.
+fn bind_writing_first_slot(e: &mut Expr, spine: Spine) -> Option<Expr> {
+    fn first_slot(node: &mut Expr) -> Option<&mut Expr> {
+        match &mut node.node {
+            TypedExprNode::MutDecl { init, .. } => Some(&mut **init),
+            TypedExprNode::For { iter, .. } => Some(&mut **iter),
+            TypedExprNode::MutWrite { value, .. } | TypedExprNode::Feed { value, .. } => {
+                Some(&mut **value)
+            }
+            TypedExprNode::Case {
+                scrutinee: Some(scrutinee),
+                ..
+            } => Some(&mut **scrutinee),
+            TypedExprNode::Case {
+                scrutinee: None,
+                branches,
+            } => branches.first_mut().map(|b| &mut b.guard),
+            _ => None,
+        }
+    }
+    let node_id = e.node_id();
+    let slot = match &mut e.node {
+        TypedExprNode::MutDecl { .. } => first_slot(e)?,
+        TypedExprNode::ExprStmt { expr, .. } => first_slot(expr)?,
+        TypedExprNode::Let { bound_expr, .. }
+            if matches!(bound_expr.node, TypedExprNode::Case { .. }) =>
+        {
+            first_slot(bound_expr)?
+        }
+        _ => return None,
+    };
+    if !spine.performs(slot) {
+        return None;
+    }
+    let _g = provenance::enter(
+        node_id,
+        "letrec.bind_first_slot",
+        provenance::Nature::Machinery,
+    );
+    let name = Name::fresh("__slot");
+    let ty = slot.ty.clone();
+    let value = std::mem::replace(slot, tvar(&name, ty.clone()));
+    let rest = std::mem::take(e);
+    Some(Expr::let_in(binding(name, ty), value, rest))
+}
+
+/// Panic on a write `flatten_spine` left off a spine, which the phase would scope to the
+/// expression holding it and drop. `e` stands on a spine of kind `spine`: each statement there is
+/// a write, a feed, a loop, a `Case` or a block, whose own bodies are spines, and every other
+/// expression is a value, which performs no write of a variable bound outside it
+/// ([`Spine::performs`]); what such a value declares itself stands on its own spines.
+fn assert_writes_on_spines(e: &Expr, spine: Spine) {
+    fn value(v: &Expr, spine: Spine) {
+        assert!(
+            !spine.performs(v),
+            "a write off the statement spine, which `flatten_spine` puts every write on: {}",
+            symbolic(v)
+        );
+        assert_writes_on_spines(v, spine);
+    }
+    fn statement(s: &Expr, spine: Spine) {
+        match &s.node {
+            TypedExprNode::MutWrite { value: v, .. } | TypedExprNode::Feed { value: v, .. } => {
+                value(v, spine)
+            }
+            TypedExprNode::For { iter, body, .. } => {
+                value(iter, spine);
+                assert_writes_on_spines(body, Spine::LoopBody);
+            }
+            TypedExprNode::Case {
+                scrutinee,
+                branches,
+            } => {
+                if let Some(scrutinee) = scrutinee {
+                    value(scrutinee, spine);
+                }
+                for b in branches {
+                    value(&b.guard, spine);
+                    assert_writes_on_spines(&b.body, spine);
+                }
+            }
+            TypedExprNode::Begin { body, .. } => assert_writes_on_spines(body, spine),
+            _ => assert_writes_on_spines(s, spine),
+        }
+    }
+    match &e.node {
+        TypedExprNode::ExprStmt { expr, body } => {
+            statement(expr, spine);
+            assert_writes_on_spines(body, spine);
+        }
+        TypedExprNode::Let {
+            bound_expr, body, ..
+        } => {
+            if is_writing_case(bound_expr) {
+                statement(bound_expr, spine);
+            } else {
+                value(bound_expr, spine);
+            }
+            assert_writes_on_spines(body, spine);
+        }
+        TypedExprNode::MutDecl { init, body, .. } => {
+            value(init, spine);
+            assert_writes_on_spines(body, spine);
+        }
+        TypedExprNode::Lambda { body, .. } => assert_writes_on_spines(body, Spine::OutsideLoops),
+        TypedExprNode::For { .. }
+        | TypedExprNode::Case { .. }
+        | TypedExprNode::Begin { .. }
+        | TypedExprNode::MutWrite { .. }
+        | TypedExprNode::Feed { .. } => statement(e, spine),
+        TypedExprNode::LetRec { bindings, body } => {
+            for (_, definition) in bindings {
+                value(definition, spine);
+            }
+            assert_writes_on_spines(body, spine);
+        }
+        _ => e.walk_children(|c| value(c, spine)),
+    }
 }
 
 fn rewrite(mut expr: Expr, declared: &mut Declared) -> Expr {
@@ -3212,6 +3377,7 @@ impl<'a> WriterWalk<'a> {
                 let site = StmtSite::new(stmt_id, effect_id);
                 let is_feed_loop = crate::ccl::ccl_utils::loop_parts(&effect).is_some()
                     || matches!(effect.node, TypedExprNode::Compose(_));
+                let discarded_value = effect.capabilities.set().causes.is_empty();
                 match effect.node {
                     TypedExprNode::Case {
                         scrutinee: None,
@@ -3385,6 +3551,11 @@ impl<'a> WriterWalk<'a> {
                         }
                         self.walk_chain(*body, kept)
                     }
+                    // The discarded terminal of a spliced writer body that ends in a value,
+                    // where its call is a statement: `def add(c: Mut(Int), n): c += n; n`
+                    // called as `add(t, x)` in a loop body leaves `n` before the call site's
+                    // continuation. Its capabilities cause nothing, so it is a no-op.
+                    _ if discarded_value => self.walk_chain(*body, kept),
                     other => panic!(
                         "writer walk: unexpected statement: {}",
                         symbolic(&Expr::throwaway(other))

@@ -805,21 +805,28 @@ Input: a typed, inlined, surface-CCL tree. Output: pure CCL (`let`/`letrec` alge
 `For`/`MutWrite`/`Begin`/`Feed`/`Defer` eliminated (feeds routed here, then discharged by `channelize`). It:
 
 0. **Normalizes to the flat-spine invariant** (`flatten_spine`). Inlining a pass-by-reference
-   writer splices its body — a bare `MutWrite`, possibly a multi-statement `ExprStmt` chain, or a
-   body that computes an intermediate first (`tmp = c + 1; c := tmp`) — at the call site, which can
-   bury a mutable write off the statement spine: under another `ExprStmt` (`bump2(cnt)` with a
-   two-write body), inside a `Let` bound to a value (`y = bump(cnt)`) or in a `Let`-headed effect
-   (a bare `bump(cnt)` whose body has a leading `let`), or in terminal/value position (a trailing
-   `cnt += 1`). Commuting conversions (gated on the affected body's spine performing a `MutWrite`,
-   so `Feed`/`Define` chains and unrelated `Let` subplans — a join subplan spine holds no
-   `MutWrite` — are untouched) lift every writer body's leading statements and intermediate `let`s
-   onto the spine so the write lands as a direct `ExprStmt` effect; a value-position write
-   terminalizes to `ExprStmt(MutWrite, unit)` (its mutable variable's final state is unobserved, so its value
-   is `unit`). Inside a for-loop body a `Feed` counts as a write does, because the loop's chain
-   reads each feed as a tap on its path: a function that feeds and returns a value, inlined into a
-   binding (`y = f(i)`), has its feed lifted onto the body's spine. Outside a loop, `channelize`
-   collects a feed wherever it sits. Downstream collection and read-your-writes rewriting then see
-   only on-spine writes, and only on-spine feeds in a loop body.
+   writer splices its body at the call site, which can bury a mutable write off the statement
+   spine: under another `ExprStmt` (`bump2(cnt)` with a two-write body), inside a `Let` bound to a
+   value (`y = bump(cnt)`), in a `Let`-headed effect (a bare `bump(cnt)` whose body has a leading
+   `let`), or in terminal/value position (a trailing `cnt += 1`). Whether an expression writes is
+   read off its capabilities, so a write counts wherever the body holds it: past a leading `let`,
+   in a nested binding's definiens (a writer calling another writer), under a mutable variable the
+   body declares, in a statement `if` or `for`. A write to a variable the expression declares
+   itself is its own and counts for nothing outside it. Commuting conversions lift every writer
+   body's leading statements, intermediate `let`s and declarations onto the spine so the write lands
+   as a direct `ExprStmt` effect, and a pure `Let` subplan is untouched; a value-position write
+   terminalizes to `ExprStmt(MutWrite, unit)` (its mutable variable's final state is unobserved, so
+   its value is `unit`). A slot evaluated before its node that A-normalization leaves unnamed (a
+   mutable variable's initial value, a loop's source, a write's or feed's value, a `Case`'s
+   scrutinee or first guard) is bound ahead of the node when it writes, and its writes lift from
+   there. A writer in an operand never arises: inlining keeps a definiens that writes a variable
+   it does not declare bound where A-normalization put it (`writes_a_variable_bound_outside`).
+   Inside a for-loop body a `Feed` counts as a write does, because the loop's chain reads each feed
+   as a tap on its path: a function that feeds and returns a value, inlined into a binding
+   (`y = f(i)`), has its feed lifted onto the body's spine. Outside a loop, `channelize` collects a
+   feed wherever it sits. A write left off a spine after normalization is a compiler bug, and the
+   phase panics on it (`assert_writes_on_spines`), so downstream collection and read-your-writes
+   rewriting see only on-spine writes, and only on-spine feeds in a loop body.
 1. **Collects** the `Mut` introductions and each variable's writing sites (loops, `with begin():`
    blocks — post-inline, so writes through `Mut` parameters have landed), and each feed's sites.
 2. **Resolves domains**: an induction variable takes its writing loop's source domain; a `Txn`

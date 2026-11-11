@@ -19,7 +19,9 @@ use crate::{
 
 /// The binder a `=> T` output annotation introduces to check the body's result.
 /// Reserved (double-underscore) so it cannot collide with a user name.
-const OUTPUT_BINDER: &str = "__output";
+/// [`crate::ccl::opaque_output`] renames it to the result's [`Name::output`], the one binder
+/// a lambda's result is read through.
+pub(crate) const OUTPUT_BINDER: &str = "__output";
 
 /// If `param` is annotated `Mut(…)` (a pass-by-reference mutable-variable parameter),
 /// return its mutable type `Mut(V, D)` and whether it is **transactional**
