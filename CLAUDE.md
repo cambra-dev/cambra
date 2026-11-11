@@ -23,6 +23,11 @@ cargo test <name>  # Run a specific test by name
 
 The local default is `./ci.sh fast` (or a bare `cargo test <name>`), including before pushing. Run the full `./ci.sh` when asked.
 
+GitHub's `build_tests` job builds the workspace test binaries with `opt-level=1`, packages them,
+and runs both doctest orders. The `test` and `test_reversed` jobs download that build and run it
+with their respective runtime gates. `.github/scripts/ci-test-bundle.py` preserves Cargo's test
+order and each package's working directory. Debug assertions stay enabled in this build.
+
 CI lints in **three configurations**, because each one compiles code the others do not. Passing the plain debug `cargo clippy` is **not** sufficient; the full `./ci.sh` and GitHub CI run all three.
 
 | Pass | What only it compiles |

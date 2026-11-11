@@ -4,11 +4,11 @@ description: >-
   cache, and the z3 binary refinement subtyping shells out to.
 
 inputs:
+  z3-only:
+    description: Set up Z3 for a job that runs prebuilt test binaries.
+    default: "false"
   cache-key:
-    description: >-
-      A `rust-cache` key to share with another job, for a job whose Cargo build
-      is identical to that one's. Empty (the default) keys the cache on this
-      job's own name, which is what a gate with a build of its own wants.
+    description: Override the job-based Cargo cache key.
     required: false
     default: ""
 
@@ -16,6 +16,7 @@ runs:
   using: composite
   steps:
     - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable as of 2026-02-05
+      if: inputs.z3-only != 'true'
       with:
         components: rustfmt, clippy
 
@@ -27,6 +28,7 @@ runs:
     # dependencies recompiles them on each push — the cost of one gate's
     # rebuild against a cache that stays warm for every other branch.
     - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      if: inputs.z3-only != 'true'
       with:
         # An empty `shared-key` is falsy to the action, which then keys on the
         # job name. A non-empty one replaces that name rather than extending it,

@@ -160,39 +160,82 @@ jobs:
         if: success() || failure()
         run: ./ci.sh doc
 
-  # The suite — the longest gate, so it sets the run's wall clock. The lint jobs
-  # are separate because clippy runs through clippy-driver, which cargo
-  # fingerprints separately from rustc: a clippy pass warms nothing the suite
-  # then reuses (see `ci_clippy` in ci.sh), so splitting them duplicates no
-  # compilation.
-  test:
+  # Both test orders use the same binaries. Optimizing the workspace crates
+  # adds compile time once and reduces execution time in both jobs.
+  build_tests:
     needs: repo_checks
     if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
     runs-on: ubuntu-latest
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Test bundle harness
+        run: python3 -m unittest discover -s .github/scripts -p test_ci_test_bundle.py
+      - uses: ./.github/actions/rust
+        with:
+          # Reuse the dependency cache populated under the `test` job ID.
+          cache-key: test
+
+      - name: Build and pack test binaries
+        run: python3 .github/scripts/ci-test-bundle.py build "$RUNNER_TEMP/test-binaries.tar.zst"
+
+      - name: Upload test binaries
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rust-test-binaries-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/test-binaries.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 2
+
+      # Cargo runs doctests with the compiled libraries on the build runner.
+      - name: Normal doctests
+        run: CAMBRA_PROVENANCE_GATE=1 python3 .github/scripts/ci-test-bundle.py doctest
+
+      - name: Reversed doctests
+        if: ${{ !cancelled() && steps.upload.outcome == 'success' }}
+        run: CAMBRA_REFINEMENT_ORDER=reverse python3 .github/scripts/ci-test-bundle.py doctest
+
+  # The normal suite checks provenance throughout the corpus. The reversed
+  # suite checks that refinement-set insertion order stays unobservable.
+  test:
+    name: ${{ matrix.job }}
+    needs: build_tests
+    if: ${{ !cancelled() && needs.build_tests.outputs.artifact_id != '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - job: test
+            gate: CAMBRA_PROVENANCE_GATE=1
+          - job: test_reversed
+            gate: CAMBRA_REFINEMENT_ORDER=reverse
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/rust
         with:
-          # `test_reversed` runs this job's command with one env var changed, so
-          # the two compile the same artifacts. One shared entry, rather than a
-          # second copy that starts cold. Both jobs save it on main; whichever
-          # loses that race logs "already exists" and continues.
-          cache-key: test
+          z3-only: "true"
+
+      - name: Download test binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.build_tests.outputs.artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}
+
+      - name: Unpack test binaries
+        run: tar --zstd -xf "$RUNNER_TEMP/test-binaries.tar.zst"
 
       - name: Test
-        # `CAMBRA_PROVENANCE_GATE=1` makes every compile fold every gated pane pair
-        # and gate the leak classes, so the gate's corpus is the whole test suite
-        # rather than the handful of programs `context.rs`'s `corpus()` lists. Two
-        # recording gaps lived outside that sample; measured at ~+4% on the test
-        # step, which is worth paying to keep the next one from doing the same.
-        run: CAMBRA_PROVENANCE_GATE=1 ./ci.sh test
+        env:
+          TEST_GATE: ${{ matrix.gate }}
+        run: env "$TEST_GATE" python3 .github/scripts/ci-test-bundle.py run
 
-  # The suite with `debug_assertions` off — the configuration a release build
-  # compiles, at `dev`'s compile cost (`profile.no-assertions`). Its own
-  # `rust-cache` entry, unlike `test_reversed`: that job changes an env var the
-  # binaries read at runtime, while `debug-assertions` is a codegen flag, so this
-  # job shares no artifacts with `test` and keying it on `test` would have the
-  # two evict each other.
+  # The no-assertions profile compiles with `debug_assertions` disabled and
+  # has its own build and cache entry.
   test_no_assertions:
     needs: repo_checks
     if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
@@ -203,33 +246,6 @@ jobs:
 
       - name: Test (no debug assertions)
         run: ./ci.sh test_no_assertions
-
-  # The same suite with every refinement set built in reversed physical order.
-  # A refinement set is unordered by contract, but two classes of
-  # order-dependence survive a compile-clean rewrite and only running the suite
-  # both ways exercises them: a consumer that iterates the set and lets the order
-  # reach something observable, and a dedup that keeps the first-inserted of two
-  # `eq`-equal refinements whose predicate terms carry different embedded type
-  # slots. Nothing in the type system catches either, so an unrun knob would rot
-  # exactly as an uncompiled feature does.
-  #
-  # Its own job, though the env var is read at runtime and a second step in
-  # `test` would reuse that job's binaries for free. Reusing them serialized 46s
-  # of pure execution behind the first run; compiling a second copy in parallel
-  # costs wall clock only if this job overtakes `test`, and it starts a whole
-  # compile behind.
-  test_reversed:
-    needs: repo_checks
-    if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: ./.github/actions/rust
-        with:
-          cache-key: test
-
-      - name: Test (reversed refinement order)
-        run: CAMBRA_REFINEMENT_ORDER=reverse ./ci.sh test
 
   # The Lean model: `lake build` elaborates every theorem and evaluates every
   # `#guard`, then the differential tests diff the model's verdicts against the
@@ -323,7 +339,7 @@ jobs:
   # Keeping that name on a job that only collects results is what lets the gates
   # above be split, renamed, or added to without a ruleset edit.
   check:
-    needs: [repo_checks, lint, clippy, clippy_release, test, test_reversed, test_no_assertions, formal, fixtures, web, editors]
+    needs: [repo_checks, lint, clippy, clippy_release, build_tests, test, test_no_assertions, formal, fixtures, web, editors]
     # `always()` so this runs when a gate failed; without it the job would be
     # skipped and the required check would never report.
     if: always()
