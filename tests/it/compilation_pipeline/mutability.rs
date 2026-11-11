@@ -3337,9 +3337,13 @@ fn an_inner_list_literal_reading_the_enclosing_binder_is_refused() {
     );
 }
 
-/// A variable that leaves an `if` with either branch's value types as the structural join of the
-/// values: a refinement holds of a component of the merge where every incoming value carries it at
-/// that component (`joined_ty` in `src/ccl/mut_elim.rs`).
+/// A variable that leaves an `if` with either branch's value types as a `Case` of the values: a
+/// refinement holds of a component of the merge where every incoming value carries it at that
+/// component, a record keeps the fields every value has, and a variant takes every value's tags
+/// (`joined_ty` in `src/ccl/mut_elim.rs`). `shared_binding` merges through `merge_as_tuple`,
+/// because the inner loop's recurrence is a binding of the branch both `x` and `y` read: each
+/// variable reads its slot of the merge at the slot's joined type, which drops the refinement
+/// `x := i ^+ 1` carries.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::scalar(
@@ -3385,6 +3389,44 @@ fn an_inner_list_literal_reading_the_enclosing_binder_is_refused() {
         x.0.0 + x.0.1 + x.1.b
     "#},
     16
+)]
+#[case::record_width(
+    indoc! {r#"
+        x := (a=0)
+        for i in [1, 2, 3]:
+            if i > 5:
+                x := (a=i, b=10)
+        x.a
+    "#},
+    0
+)]
+#[case::variant_tag(
+    indoc! {r#"
+        x := `some(0)
+        for i in [1, 2, 3]:
+            if i > 1:
+                x := `none
+        match x:
+            case `some(v):
+                v
+            case `none:
+                42
+    "#},
+    42
+)]
+#[case::shared_binding(
+    indoc! {r#"
+        x := 0
+        y := 0
+        for i in [1, 2, 3]:
+            x := i ^+ 1
+            if i > 1:
+                for j in [10, 20]:
+                    x += j
+                    y += j
+        x + y
+    "#},
+    94
 )]
 fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
     #[case] code: &str,

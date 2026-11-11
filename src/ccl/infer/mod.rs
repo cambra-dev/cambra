@@ -690,6 +690,35 @@ pub(crate) fn bool_lit_ty(b: bool) -> Type {
     lit_singleton(&Lit::Bool(b))
 }
 
+/// The type the `Case` rule gives a `Case` built after inference whose arms have the types
+/// `arms`: a fresh result variable with every arm's type as a lower bound, resolved
+/// (`emit_case`). Record width, variant tags, and refinements join as they do for a `Case`
+/// inference types.
+///
+/// Each arm is closed over the bindings local to it, so an arm type reads only names bound
+/// around the `Case`. The variable's telescope is those names, which is the part of the
+/// enclosing scope the bounds can mention.
+pub(crate) fn case_result_ty<'a>(
+    arms: impl IntoIterator<Item = &'a Type>,
+) -> Result<Type, InferError> {
+    let arms: Vec<&Type> = arms.into_iter().collect();
+    let mut telescope = crate::ccl::infer_var::Telescope::empty();
+    for name in arms
+        .iter()
+        .flat_map(|ty| crate::ccl::subst::type_free_vars(ty))
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        telescope = telescope.extended(name);
+    }
+    let result = Type::Infer(crate::ccl::InferVar::fresh_in(0, &telescope));
+    let mut cache = solver::ConstrainCache::for_derivation(solver::Derivation::PostPass);
+    for arm in arms {
+        solver::constrain_subtype_in(arm, &result, &mut cache, &solver::smt::NoScope)
+            .map_err(|e| map_constrain_err(e, "Case arm"))?;
+    }
+    resolve_var_type(&result).map_err(|e| map_coalesce_err(e, "Case arm"))
+}
+
 /// Run Cambra's type inference on `expr`.
 ///
 /// Two-pass: emit constraints, then coalesce. Source types come from

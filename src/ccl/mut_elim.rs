@@ -3598,10 +3598,9 @@ impl<'a> WriterWalk<'a> {
                 branches,
             });
             merged.ty = joined_ty(
-                value_before,
                 merged_arms
                     .iter()
-                    .map(|(_, env)| env.get(name).unwrap_or(value_before)),
+                    .map(|(_, env)| &env.get(name).unwrap_or(value_before).ty),
             );
             let occurrence = self
                 .named_at
@@ -3653,20 +3652,7 @@ impl<'a> WriterWalk<'a> {
         kept: &mut Vec<Kept>,
         value_ty: Option<Type>,
     ) -> Option<Expr> {
-        let bool_ty = Type::Base(BaseType::Bool);
-        let mut slot_tys: Vec<Type> = changed
-            .iter()
-            .map(|name| {
-                let value_before = &before[name];
-                joined_ty(
-                    value_before,
-                    arms.iter()
-                        .map(|arm| arm.env.get(name).unwrap_or(value_before)),
-                )
-            })
-            .collect();
-        slot_tys.push(bool_ty.clone());
-        slot_tys.extend(value_ty.clone());
+        let mut slots = changed.len() + 1 + usize::from(value_ty.is_some());
         // Each feed leaving in a slot: its arm, its index in `feeds`, its tap's slot, and the
         // slot of its fire path within the arm, where that is not `true`.
         let mut feed_slots: Vec<(usize, usize, usize, Option<usize>)> = Vec::new();
@@ -3677,18 +3663,17 @@ impl<'a> WriterWalk<'a> {
                 if !self.leaves_in_a_slot(f, arm) {
                     continue;
                 }
-                let tap = slot_tys.len();
-                slot_tys.push(crate::ccl::ccl_utils::tap_variant_ty(f.value.ty.clone()));
+                let tap = slots;
+                slots += 1;
                 let fire = (!is_true_lit(&f.fire)).then(|| {
-                    slot_tys.push(bool_ty.clone());
+                    slots += 1;
                     tap + 1
                 });
                 feed_slots.push((a, i, tap, fire));
             }
         }
-        let tuple_ty = Type::Tuple(slot_tys);
         let pis: Vec<Expr> = arms.iter().map(|arm| arm.pi.clone()).collect();
-        let branches = arms
+        let branches: Vec<Branch> = arms
             .into_iter()
             .enumerate()
             .map(|(a, arm)| {
@@ -3711,14 +3696,20 @@ impl<'a> WriterWalk<'a> {
                         slots.extend(fire.map(|_| bool_lit(false)));
                     }
                 }
-                let tuple = Expr::tuple(slots).with_ty(tuple_ty.clone());
+                let ty = Type::Tuple(slots.iter().map(|s| s.ty.clone()).collect());
                 Branch {
                     pattern: None,
                     guard: arm.guard,
-                    body: close_over(tuple, &arm.kept),
+                    body: close_over(Expr::tuple(slots).with_ty(ty), &arm.kept),
                 }
             })
             .collect();
+        let tuple_ty = joined_ty(branches.iter().map(|b| &b.body.ty));
+        let Type::Tuple(slot_tys) = tuple_ty.peel_refinements() else {
+            panic!("the join of the tuples a merge's arms hold is a tuple, not `{tuple_ty}`")
+        };
+        let slot_tys = slot_tys.clone();
+        debug_assert_eq!(slot_tys.len(), slots, "a merge's arms hold one tuple width");
         let merged = Expr::new(TypedExprNode::Case {
             scrutinee: None,
             branches,
@@ -3728,28 +3719,38 @@ impl<'a> WriterWalk<'a> {
         let name = merge.name.clone();
         kept.push(Kept::Let(None, merge, merged));
         for (j, var) in changed.iter().enumerate() {
-            let read = proj_of(&name, &tuple_ty, j, &before[var].ty);
+            let read = proj_of(&name, &tuple_ty, j, &slot_tys[j]);
             self.env.insert(var.clone(), read);
         }
-        self.commit_paths
-            .push(proj_of(&name, &tuple_ty, changed.len(), &bool_ty));
+        self.commit_paths.push(proj_of(
+            &name,
+            &tuple_ty,
+            changed.len(),
+            &slot_tys[changed.len()],
+        ));
         for (owner, i, tap, fire) in feed_slots {
             let f = &mut self.feeds[i];
             let value_ty = f.value.ty.clone();
-            let tap_ty = crate::ccl::ccl_utils::tap_variant_ty(value_ty.clone());
             f.value = Expr::apply(
-                proj_of(&name, &tuple_ty, tap, &tap_ty),
+                proj_of(&name, &tuple_ty, tap, &slot_tys[tap]),
                 crate::ccl::ccl_utils::fired_project(value_ty.clone()),
             )
             .with_ty(value_ty);
             // The fire slot is the feed's own condition in its arm and `false` in the others,
             // so read off the first-match merge it already holds the arm's predicate.
             f.fire = match fire {
-                Some(slot) => proj_of(&name, &tuple_ty, slot, &bool_ty),
+                Some(slot) => proj_of(&name, &tuple_ty, slot, &slot_tys[slot]),
                 None => conjoin_path(&pis[owner], &bool_lit(true)),
             };
         }
-        value_ty.map(|ty| proj_of(&name, &tuple_ty, changed.len() + 1, &ty))
+        value_ty.map(|_| {
+            proj_of(
+                &name,
+                &tuple_ty,
+                changed.len() + 1,
+                &slot_tys[changed.len() + 1],
+            )
+        })
     }
 
     /// Whether the feed `f` the branch `arm` makes leaves it in a slot of the merged tuple
@@ -3875,52 +3876,15 @@ fn iteration_channel(channel: &TypedBinding, defer: Expr, own: Vec<FeedSite>) ->
     Expr::let_in(binding(inner, channel.ty.clone()), defer, body).with_ty(ty)
 }
 
-/// The type of a merge of `values`, each a value a variable holding `value_before` may leave a
-/// branch with: the [`join_value_tys`] of the values' types. A refinement one branch's value
-/// carries does not hold of the merge (`src/ccl/design/type-inference.md`, "An operator is
-/// refined by the operation it computes").
-fn joined_ty<'a>(value_before: &Expr, values: impl Iterator<Item = &'a Expr>) -> Type {
-    values
-        .map(|v| v.ty.clone())
-        .reduce(|acc, ty| join_value_tys(&acc, &ty))
-        .unwrap_or_else(|| value_before.ty.clone())
-}
-
-/// The structural join of two types of values one variable holds: the refinements both carry at
-/// each position, through tuple components and record fields. Any other base is `a`'s, so a
-/// refinement nested in it holds of the join only where `a` and `b` agree on it.
-fn join_value_tys(a: &Type, b: &Type) -> Type {
-    let shared = crate::ccl::RefinementSet::from_iter(a.refinements().iter().cloned())
-        .intersect(&b.refinements().iter().cloned().collect());
-    let base = match (a.peel_refinements(), b.peel_refinements()) {
-        (Type::Tuple(xs), Type::Tuple(ys)) => {
-            debug_assert_eq!(
-                xs.len(),
-                ys.len(),
-                "the values a merge joins share a tuple width"
-            );
-            Type::Tuple(
-                xs.iter()
-                    .zip(ys)
-                    .map(|(x, y)| join_value_tys(x, y))
-                    .collect(),
-            )
-        }
-        (Type::Record(xs), Type::Record(ys)) => {
-            debug_assert!(
-                xs.iter().map(|(l, _)| l).eq(ys.iter().map(|(l, _)| l)),
-                "the values a merge joins share a record's labels"
-            );
-            Type::Record(
-                xs.iter()
-                    .zip(ys)
-                    .map(|((l, x), (_, y))| (l.clone(), join_value_tys(x, y)))
-                    .collect(),
-            )
-        }
-        (base, _) => base.clone(),
-    };
-    Type::refined(base, shared)
+/// The type of a merge of `values`, the values a `Case` this pass builds leaves one variable
+/// holding, each closed over its arm's bindings: the type the `Case` rule gives that `Case`
+/// ([`crate::ccl::infer::case_result_ty`]). A refinement one value carries does not hold of
+/// the merge (`src/ccl/design/type-inference.md`, "An operator is refined by the operation it
+/// computes").
+fn joined_ty<'a>(values: impl IntoIterator<Item = &'a Type>) -> Type {
+    crate::ccl::infer::case_result_ty(values).unwrap_or_else(|e| {
+        panic!("the values a merge joins are values of one mutable variable: {e:?}")
+    })
 }
 
 /// `{ fire → feed; true → () }`: a feed that fires on a condition of its own within the
@@ -4549,14 +4513,16 @@ mod tests {
     fn int_refined(tag: &str) -> Type {
         Type::refined_one(
             Type::Base(BaseType::Int),
-            crate::ccl::Refinement::born(Rc::new(Expr::var(Name::from(tag)))),
+            crate::ccl::Refinement::born(Rc::new(
+                Expr::var(Name::from(tag)).with_ty(Type::Base(BaseType::Bool)),
+            )),
         )
     }
 
     /// The join keeps a refinement every incoming value carries at a component, at whatever depth
     /// of tuple or record it stands, and drops one the values disagree on.
     #[test]
-    fn join_value_tys_keeps_the_refinements_shared_at_each_component() {
+    fn joined_ty_keeps_the_refinements_shared_at_each_component() {
         let value = |first: &str, field: &str| {
             Type::refined_one(
                 Type::Tuple(vec![
@@ -4566,7 +4532,9 @@ mod tests {
                         ("b".into(), int_refined("shared")),
                     ]),
                 ]),
-                crate::ccl::Refinement::born(Rc::new(Expr::var(Name::from("outer")))),
+                crate::ccl::Refinement::born(Rc::new(
+                    Expr::var(Name::from("outer")).with_ty(Type::Base(BaseType::Bool)),
+                )),
             )
         };
         let expected = Type::refined_one(
@@ -4577,10 +4545,12 @@ mod tests {
                     ("b".into(), int_refined("shared")),
                 ]),
             ]),
-            crate::ccl::Refinement::born(Rc::new(Expr::var(Name::from("outer")))),
+            crate::ccl::Refinement::born(Rc::new(
+                Expr::var(Name::from("outer")).with_ty(Type::Base(BaseType::Bool)),
+            )),
         );
         assert_eq!(
-            join_value_tys(&value("one", "one"), &value("two", "two")),
+            joined_ty([&value("one", "one"), &value("two", "two")]),
             expected
         );
     }
