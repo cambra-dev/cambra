@@ -4587,10 +4587,8 @@ mod tests {
         );
     }
 
-    /// `Sum` with a non-function input → `TypeMismatch`.
-    ///
-    /// The input infers as `Int` (a bare literal), which has no codomain.
-    /// The aggregate arm expects a `Fun(_, _)`.
+    /// `Sum` with a non-function input → `ExpectedFunction`: `Sum` expects a collection
+    /// `𝛼 ⤇ Int`, and the input `42` is an `Int`.
     #[test]
     fn test_infer_aggregate_non_function_input_mismatch() {
         let mut ctx = TypeInferenceContext::new();
@@ -4630,8 +4628,9 @@ mod tests {
 
     /// `let total = λ xs → sum(xs) in total([1, 2, 3])` — aggregate in a let-bound function.
     ///
-    /// `xs` is still an unresolved variable when the `Aggregate` node is visited. The call
-    /// site bounds it below by the list's type `0..3 ⤇ Int`.
+    /// `total` is generalized, so the `Aggregate` arm meets `xs` as an unsolved variable and
+    /// bounds it from above by `Sum`'s input, a collection of `Int`. The use
+    /// `total([1, 2, 3])` instantiates `total` at the list's type `0..3 ⤇ Int`.
     #[test]
     fn test_infer_aggregate_input_type_inferred_from_call_site() {
         let mut ctx = TypeInferenceContext::new();
@@ -4695,10 +4694,11 @@ mod tests {
         }));
     }
 
-    /// `λ p → f(p._0) + g(p._0)` where f : Int → Int and g : String → String.
+    /// `λ p → f(p._0) and g(p._0)` where f : Int ⇒ Int and g : String ⇒ String.
     ///
-    /// Both usages constrain p._0. The second usage constrains p._0 as String while the
-    /// first established Int, causing a TypeMismatch.
+    /// Both projections bound `p._0` from above, by `Int` and by `String`. The asserted
+    /// `TypeMismatch` is the `and` rejecting its operand `f(p._0) : Int`, which is not
+    /// `Bool`; the test does not isolate the projection conflict.
     #[test]
     fn test_tuple_field_conflict_returns_mismatch() {
         let f = Expr::lambda(
@@ -4731,14 +4731,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Parameter types constrained from the call site
+    // Parameter types fixed by specialization at a use
     // -----------------------------------------------------------------------
 
-    /// `let g = λ x → x in let f = λ t → (t.0 ▸ g, t.2 ▸ g) in (0, 1, 2) ▸ f`
+    /// `let g = λ x → x in let f = λ t → (t.0 ▷ g, t.2 ▷ g) in (0, 1, 2) ▷ f`
     ///
-    /// `g`'s parameter type cannot be inferred from `g`'s own body, but usage
-    /// inside `f` constrains it to Int (via `t.0` and `t.2` when `f` is applied
-    /// to `(0, 1, 2)`). The whole expression infers as `(Int, Int)`.
+    /// `g` and `f` are generalized, and nothing in their bodies fixes their parameter types.
+    /// The use `(0, 1, 2) ▷ f` specializes `f` at that tuple, and each use of `g` inside it
+    /// at that tuple's element. The whole expression infers as `(Int, Int)`.
     #[test]
     fn test_lambda_type_inferred_from_call_site() {
         let mut ctx = TypeInferenceContext::new();
@@ -5283,7 +5283,7 @@ mod tests {
         assert_eq!(ty.to_string(), "{Int | __elem == 42 + 1}");
     }
 
-    /// All `Case` branches must agree on the result type; two `Int` branches give `Int`.
+    /// A `Case`'s type is the join of its branch types: branches `1` and `2` join to `Int`.
     #[test]
     fn test_infer_case_branches_unified() {
         let mut ctx = TypeInferenceContext::new();
@@ -5823,8 +5823,8 @@ mod tests {
         assert_eq!(typecheck(&expr), Ok(()));
     }
 
-    /// A lambda that applies two different projections to the same parameter infers a
-    /// tuple-typed domain.
+    /// A lambda that applies two different projections to the same parameter infers an open
+    /// tuple domain `(Int, ?b, ..)`: projections fix no width, and nothing applies the lambda.
     #[test]
     fn test_infer_lambda_two_proj_on_same_param() {
         let mut ctx = TypeInferenceContext::new();
