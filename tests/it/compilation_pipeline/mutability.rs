@@ -1257,7 +1257,7 @@ fn a_refinement_may_depend_on_a_read(#[case] code: &str, #[case] expected: Vec<i
         x := x ^+ n
         x
     "#},
-    "found {Int | __elem == x + n}"
+    "found {Int where _ == x + n}"
 )]
 #[case::a_filter_on_the_variable(
     indoc! {r#"
@@ -1296,7 +1296,7 @@ fn a_diagnostic_keeps_a_user_written_opaque_binder() {
         y
     "#});
     assert!(
-        rendered.contains("found {Int | __elem == x0 + n}"),
+        rendered.contains("found {Int where _ == x0 + n}"),
         "expected the user's own binder in:\n{rendered}"
     );
 }
@@ -2026,8 +2026,8 @@ fn a_curried_parameter_annotation_may_name_a_parameter_to_its_left() {
         Value::Int(5),
     );
     // The same call with the refinement violated. `Int@1` entails neither
-    // `__elem >= 5` structurally nor semantically, and the diagnostic names the
-    // refinement rather than the binder it mentions.
+    // `__elem >= 5` structurally nor semantically, and the diagnostic states the
+    // refinement at the call, with `a` discharged to its argument.
     check_compile_error(
         indoc! {r#"
             def f(a: Int, c: {Int where _ >= a}, m: Mut(Int)):
@@ -2037,7 +2037,7 @@ fn a_curried_parameter_annotation_may_name_a_parameter_to_its_left() {
             f(5, 1, total)
             total
         "#},
-        "expected {Int | __elem >= a}",
+        "expected {Int where _ >= 5}, found {Int where _ == 1}",
     );
     check_compile_error(
         indoc! {r#"
@@ -3054,7 +3054,7 @@ fn checking_writes_only_assumes_annotation_refinement() {
 x : Mut({Int where _ <= 5}) := 0;
 x := x ^+ 1
 "#},
-        "Type mismatch for write to mutable variable `x`: expected {Int | __elem <= 5}, found {Int | __elem == x + 1}",
+        "Type mismatch for write to mutable variable `x`: expected {Int where _ <= 5}, found {Int where _ == x + 1}",
     )
 }
 

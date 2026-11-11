@@ -301,14 +301,16 @@ pub(super) fn uncurry_params(
         });
     }
 
-    // Mint the tuple name after `body_expr` is lowered so that inner
-    // multi-arg lambdas (which bump the counter during body lowering)
-    // receive strictly smaller ids than the outer lambda. Together with
-    // the reserved `__arg_tuple_` prefix (user code cannot bind
-    // double-underscore names here), this guarantees the outer
-    // substitution's inserted `Var(outer_name)` never collides with an
-    // inner binder.
-    let tuple_name = ctx.fresh_tuple_arg();
+    // Mint the tuple binder here so it carries the parameters' spellings for diagnostics.
+    // Its unique id separates nested tuple binders; the counter in the reserved
+    // `__arg_tuple_` spelling only keeps their printed base names distinct.
+    let tuple_name = Name::fresh_tuple(
+        ctx.fresh_tuple_arg(),
+        params
+            .iter()
+            .map(|p| SmolStr::from(p.name.as_str()))
+            .collect(),
+    );
     let up = "lower.param_proj";
     let body_with_subs = params.iter().enumerate().fold(body_expr, |acc, (i, arg)| {
         // The projection plumbing is manufactured per *occurrence*: the
@@ -334,7 +336,7 @@ pub(super) fn uncurry_params(
         // only channel that can name its site — see `src/ccl/design/ir.md`,
         // "Source locations on substituted parameter projections".
         let site = arg.name_span;
-        let var = ctx.tag_machinery(Expr::var(&tuple_name), site, up);
+        let var = ctx.tag_machinery(Expr::var(tuple_name.clone()), site, up);
         let idx = ctx.tag_machinery(Expr::proj_index(i), site, up);
         let proj = ctx.tag_machinery(Expr::apply(var, idx), site, up);
         let name = Name::raw(arg.name.as_str());
@@ -365,7 +367,7 @@ pub(super) fn uncurry_params(
     // lowering's own: no one place in the source writes it, so it records where the function
     // is tagged.
     let arity = Type::Tuple(vec![Type::Hole; params.len()]);
-    let mut lam = Expr::lambda(&tuple_name, Occurrence::mint(), arity, body_with_subs);
+    let mut lam = Expr::lambda(tuple_name, Occurrence::mint(), arity, body_with_subs);
     if elem_anns.iter().any(|t| !matches!(t, Type::Hole))
         && let TypedExprNode::Lambda { param, .. } = &mut lam.node
     {
@@ -426,11 +428,8 @@ pub(super) fn lower_lambda(
 /// mirroring the template's machinery attribution — so every substituted node
 /// stays covered by the lowering fold.
 ///
-/// Capture is structurally impossible at this (pre-uniquify, raw-name) call
-/// site: the replacement's `Var` uses the reserved `__arg_tuple_` prefix
-/// that user code cannot bind, with a fresh unique id per multi-arg lambda
-/// ([`LoweringContext::fresh_tuple_arg`]), so the engine's no-capture assert
-/// cannot fire.
+/// The replacement names a tuple binder minted by `uncurry_params`. Its unique id keeps
+/// it distinct from every binder in the body before `uniquify` runs.
 ///
 /// `label` names the lowering rule the copies are recorded under.
 pub(super) fn substitute_param_in_body(

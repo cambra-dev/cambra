@@ -515,7 +515,7 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             // them unequal ([`ConstrainError::DataDomainMismatch`]'s `cause`, whose doc
             // says why it is carried): its own sides differ structurally, so
             // [`identical_rendering_hint`] can quote the divergence.
-            if found.to_string() == expected.to_string() {
+            if crate::ccl::chl_print::renders_alike(&found, &expected) {
                 return map_constrain_err(*cause, ctx_label);
             }
             InferError::TypeMismatch {

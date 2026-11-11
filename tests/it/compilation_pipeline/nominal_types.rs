@@ -235,7 +235,7 @@ fn a_nominal_value_has_no_fields() {
 
             Price::new(amount=3).amount
         "#},
-        "expected {amount: ?",
+        "expected {amount: ‹?",
     );
 }
 
@@ -288,7 +288,7 @@ fn a_covariant_parameter_refuses_a_narrower_argument() {
 
             narrow(Box::boxed((a=1)))
         "#},
-        "No field .b for Apply: {a: Int@1} has no such field",
+        "No field .b for Apply: {a: {Int where _ == 1}} has no such field",
     );
 }
 
@@ -558,7 +558,7 @@ fn a_constructor_discharges_its_refinement() {
 
             Price::new(-3)
         "#},
-        "expected {Int | __elem >= 0}, found Int@-3",
+        "expected {Int where _ >= 0}, found {Int where _ == -3}",
     );
 }
 

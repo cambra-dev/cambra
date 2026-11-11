@@ -121,6 +121,22 @@ fn a_collection_is_written_in_chl(#[case] binding: &str, #[case] inferred: &str)
     );
 }
 
+#[test]
+fn a_group_key_is_distinct_from_a_tuple_parameters_name() {
+    let code = indoc! {"
+        def f(k: Int, n: Int):
+            xs = [1, 2, 3]
+            g = groupby(xs, \\x -> x + k)
+            z: Int = g
+            n
+        f(1, 2)
+    "};
+    check_compile_error(
+        code,
+        "(k1: {Int where _ in [x + k for x in xs]}) |=> {UInt where _ < 3 and xs[_]! + k == k1} |=> Int",
+    );
+}
+
 /// A predicate's operators and an inference variable, written in CHL.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
@@ -159,4 +175,19 @@ fn an_inference_variable_keeps_its_identity() {
         .unwrap_or_else(|| panic!("a function; got: {inferred}"));
     assert!(domain.starts_with("‹?"), "a variable; got: {inferred}");
     assert_eq!(domain, codomain);
+}
+
+/// A sum's witness read outside the sum is the keys of the value it is projected through,
+/// written as the program wrote that value: a loop source's `elements` call is the
+/// collection it iterates.
+#[test]
+fn a_projected_witness_names_the_collection_it_reads() {
+    check_compile_error(
+        indoc! {"
+            c = sum([1]) > 0
+            ys = [x for x in box([1, 2])] if c else [x for x in box([1, 2, 3])]
+            sum(ys)
+        "},
+        "Conflicting Domains: ‹the keys of box([1, 2])› vs ‹the keys of box([1, 2, 3])›",
+    );
 }

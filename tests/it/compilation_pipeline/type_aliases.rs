@@ -161,7 +161,7 @@ fn alias_of_a_refinement_type_rejects_a_violating_argument() {
 
             refined_div(2, 0)
         "#},
-        "expected {Int | __elem != 0}",
+        "expected {Int where _ != 0}",
     );
 }
 

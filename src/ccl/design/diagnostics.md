@@ -6,13 +6,16 @@ How an inference diagnostic writes the types it reports, and the source position
 
 ## How a diagnostic writes a type
 
-An annotation mismatch writes both types in CHL with `chl_print::chl_type`: the annotation as
-written, a bounded one as `<: T`, and the inferred type as the annotation that would state it. A
-`requires` clause lowering refuses (`lower_named_requirements` and `expand_requirement` in
-`lower/stmts.rs`) writes the types it names the same way, and so do a value applied where a
-function is expected (`InferError::ExpectedFunction`) and a nominal type with no method of the
-called name (`InferError::UnresolvedMethod`). Every other diagnostic writes types with
-`Display for Type`.
+A diagnostic writes every type in CHL with `chl_print::chl_type`. An annotation mismatch writes
+the annotation as written, a bounded one as `<: T`, and the inferred type as the annotation that
+would state it. A report of a compiler bug, such as `InferError::ScopeViolation` or a type that
+survived a pass that erases it, writes `Display for Type`: its reader is the compiler's
+developer.
+
+`chl_print::renders_alike` compares the text a diagnostic writes, including descriptions that
+hide structural differences. A mismatch whose sides read alike reports the hidden difference;
+a data-domain mismatch instead reports the sub-comparison that rejected it. Neither use decides
+type equality.
 
 A family applied at a binder the compiler minted, outside the family that binds it, is written at
 the spelling an unnamed binder of the text would take: `V(k)`.
@@ -49,19 +52,39 @@ holds.
   where `𝑇` reads no binder, which is the constant family the annotation `𝑇` lowers to.
 - **A read of a collection is a proven lookup, `xs[_]!`; any other application is a call, `f(x)`.**
   The two differ only in the function's kind, so the types inside a predicate are resolved when the
-  error is raised (`coalesce_for_error`), while their variables still hold their bounds. A function
-  whose type names no kind is marked.
+  error is raised (`coalesce_for_error`), while their variables still hold their bounds. An
+  application of a function whose type names no kind is `‹not printable yet›`.
 - **A sum over named alternatives is a `Box`** of each alternative, as `box` built it
   ([chl-spec.md, "7.4 `box`"](../../../docs/chl-spec.md#74-box)).
 - **A refinement is written with `where`**, its predicate in CHL. A literal's type is its
   singleton, `{Int where _ == 5}`. Two refinements of one type are two `where`s, since a refinement
   holding `p and q` is a different refinement from the two.
-- **What CHL cannot write is marked, never dropped.** A part with no CHL spelling is written with
-  `Display for Type` between `‹…›`: an inference variable (`‹?7›`, whose occurrences are one type)
-  and the operators `nand`, `nor` and `xnor` among them.
+- **A point-free predicate is read at its argument.** `λ` elimination writes `_ == 1` as
+  `__elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)`, and `Printer::point` reads the combinators back to
+  `_ == 1`. `nand`, `nor` and `xnor` are written as negations, `not (p and q)`, and
+  `int_eq_uint((x, _))`, which relates an `Int` and a `UInt`, as `x == _`.
+- **A `def`'s parameter is written by its name.** A `def` of several parameters binds them as
+  one tuple (`uncurry_params` in `lower/functions.rs`), whose binder records the parameters'
+  spellings (`Name::positions`), so `__arg_tuple_0.0` is written `a`.
+- **What CHL cannot write is described, never dropped and never spelled with a name the program
+  did not write.**
+
+  | Part | Written |
+  | --- | --- |
+  | an inference variable, whose occurrences are one type | `‹?7›` |
+  | a reference to a function parameter or collection key bound outside the written type | `‹outer argument›` |
+  | a sum's witness read inside the sum's values | `‹outer keys›` |
+  | the witness projected through a value `c` | `‹the keys of c›` |
+  | a dependent tuple's read of an earlier component | `‹position 0›`, inside the tuple `{𝐴, 𝐵}` |
+  | a demand admitting arms it does not list | ``{`a{Int} \| ‹more arms›}`` |
+  | anything else: a channel domain, a positional variant, a sum of several witnesses | `‹not printable yet›` |
+
+  The solver's binder for an application's expected function (`SyntheticKind::SolverArg`) is
+  written `‹outer argument›` too: a type reading it is that function's result.
 
 `a_written_type_prints_as_an_annotation_that_lowers_back` (`ccl/chl_print.rs`) checks the rows
-marked "yes", and `tests/it/compilation_pipeline/chl_types.rs` checks each row end to end.
+marked "yes", and `tests/it/compilation_pipeline/chl_types.rs` checks the first table's rows
+end to end.
 
 ---
 

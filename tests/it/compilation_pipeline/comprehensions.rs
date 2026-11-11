@@ -945,8 +945,8 @@ fn a_dependent_and_a_product_comprehension_do_not_join(#[case] condition: &str) 
 }
 
 /// A mismatch between dependent tuples names their components as the program reads them: a
-/// component nothing reads is unnamed, a key binder the compiler minted is written `k`, and the
-/// differing widths get the tuple-width hint.
+/// component a later one reads is written by its position, never by a binder the compiler
+/// minted, and the differing widths get the tuple-width hint.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn a_mismatch_between_dependent_tuples_names_no_minted_binder() {
@@ -959,11 +959,15 @@ fn a_mismatch_between_dependent_tuples_names_no_minted_binder() {
     "#});
     assert!(!message.contains("__uncurry"), "{message}");
     assert!(
-        message.contains("expected (k : 0..2) × σ₁(k ▷ "),
+        message.contains(
+            "expected {{UInt where _ < 2}, ‹the keys of [box([1, 2]), box([3])][‹position 0›]!›}"
+        ),
         "{message}"
     );
     assert!(
-        message.contains("found (k : 0..2) × (k1 : σ₁(k ▷ "),
+        message.contains(
+            "found {{UInt where _ < 2}, ‹the keys of [box([box([1, 2]), box([3])]), box([box([4])])][‹position 0›]!›, ‹the keys of"
+        ),
         "{message}"
     );
     assert!(

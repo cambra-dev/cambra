@@ -1556,21 +1556,28 @@ fn test_one_arm_variant_type_rejections(#[case] code: &str) {
 /// The `Openness` marker is inference-internal, but a diagnostic naming the
 /// demand is the one place it has to be *visible*: an arm set the scrutinee
 /// merely failed to be a subtype of reads very differently from one it failed to
-/// match exactly, and only the trailing `| …` distinguishes them. The rendering
+/// match exactly, and the trailing `| ‹more arms›` distinguishes them. The rendering
 /// exists on `Type` either way; what this pins is that openness survives the
 /// compact/coalesce round-trip every reported type goes through, which is the
 /// step that would silently close it.
 #[test]
-fn test_open_demand_renders_its_ellipsis_in_a_diagnostic() {
+fn test_open_demand_describes_further_arms_in_a_diagnostic() {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let code = "x = True\nmatch x:\n    case `a(v):\n        v\n    case _:\n        99";
+    let code = indoc! {"
+        x = True
+        match x:
+            case `a(v):
+                v
+            case _:
+                99
+    "};
     let Err(errs) = compile_program(&mut ctx, &LoadedProgram::test(code), consumer) else {
         panic!("a Bool is not a variant, so the scrutinee constraint must fail");
     };
     let err = format!("{errs:?}");
     assert!(
-        err.contains("| …"),
+        err.contains("| ‹more arms›}"),
         "the demand admits tags it does not list, and should render as a partial \
          arm set; got: {err}"
     );

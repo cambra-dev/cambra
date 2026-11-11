@@ -1,7 +1,7 @@
 //! α-uniquification at lowering: the minting pass of the Barendregt
 //! convention.
 //!
-//! Lowering builds the tree with **raw** names — spellings straight from the
+//! Lowering builds most of the tree with raw names — spellings straight from the
 //! source program, where two distinct binders can share one spelling (Python
 //! reassignment lowers to a shadowing `let`). This pass walks the lowered
 //! tree once, mints a fresh [`Name`] uid at every binding site, and rewrites
@@ -79,7 +79,8 @@
 //! makes the pass idempotent. A uid may legitimately occur at several binding
 //! sites — a predicate shared by `Rc` is rebuilt once, and a later copy
 //! preserves uids — so the checked invariant is "every binding site is
-//! minted", not global binder uniqueness.
+//! minted", not global binder uniqueness. `uncurry_params` in `lower/functions.rs` also
+//! pre-mints tuple binders to carry the parameter spellings diagnostics need.
 
 use std::collections::HashMap;
 
