@@ -1073,7 +1073,14 @@ records one and the only site a `Transact` reaches"
                 if correspondent.is_none() {
                     self.rebuilt.insert(name.clone());
                 }
-                build_transact_store(keys, writers, domain, &paths, self)?
+                build_transact_store(
+                    keys,
+                    writers,
+                    domain,
+                    &key_value_types(bound_expr),
+                    &paths,
+                    self,
+                )?
             }
         };
         let info = StoreReadInfo {
@@ -3847,13 +3854,14 @@ fn build_transact_store(
     keys: &[TransactKey],
     writers: &[WriterSite],
     domain: &Type,
+    value_tys: &HashMap<Label, Type>,
     paths: &[VarPath],
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
     if !matches!(domain, Type::Txn) {
-        return build_induction_store(keys, writers, domain, paths, ctx);
+        return build_induction_store(keys, writers, domain, value_tys, paths, ctx);
     }
-    build_commit_store(keys, writers, paths, ctx)
+    build_commit_store(keys, writers, value_tys, paths, ctx)
 }
 
 /// The reply taps on a writer body's `` {`commit{writes, __to_<defer>*} | `abort} ``
@@ -3887,6 +3895,37 @@ fn body_tap_fields(body_ty: &Type) -> Vec<(Label, Type)> {
         .into_iter()
         // `writes` is the decision core; every other field is a tap.
         .filter(|(f, _)| f != F_WRITES)
+        .collect()
+}
+
+/// Each key's value type as a `Transact` states it: the codomain of the key's history in the
+/// node's history record, which is under the enclosing parameter for a nested one. Letrec
+/// recognition builds that record from the variable's declared type, the join of its seed and
+/// every write, so it is what a key's extent is read off. The seed is one value of that type,
+/// and its own type may lack a tag a later write carries.
+fn key_value_types(transact: &Expr) -> HashMap<Label, Type> {
+    let stated = transact.ty.peel_refinements();
+    let record = match stated {
+        Type::Record(_) => stated.clone(),
+        _ => stated
+            .codomain()
+            .unwrap_or_else(|| panic!("a `Transact` is a history record, got {}", transact.ty))
+            .peel_refinements()
+            .clone(),
+    };
+    let Type::Record(fields) = record else {
+        panic!("a `Transact` is a history record, got {}", transact.ty)
+    };
+    fields
+        .iter()
+        .map(|(field, history)| {
+            let value_ty = history.codomain().unwrap_or_else(|| {
+                panic!(
+                    "every key of a `Transact` has an overwrite history, but `{field}` has {history}"
+                )
+            });
+            (field.clone(), value_ty)
+        })
         .collect()
 }
 
@@ -3950,6 +3989,7 @@ fn store_key_extent(arms: Vec<(Label, Extent)>) -> Extent {
 fn build_commit_store(
     keys: &[TransactKey],
     writers: &[WriterSite],
+    value_tys: &HashMap<Label, Type>,
     paths: &[VarPath],
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
@@ -3992,7 +4032,8 @@ fn build_commit_store(
     for (i, k) in keys.iter().enumerate() {
         let field = k.name.field_key();
         let runtime_key = store_key(&field);
-        let key_value_extent = ctx.extent_of(&k.init.ty)?;
+        let value_ty = &value_tys[&field];
+        let key_value_extent = ctx.extent_of(value_ty)?;
         if !value_extents.contains(&key_value_extent) {
             value_extents.push(key_value_extent.clone());
         }
@@ -4018,7 +4059,7 @@ fn build_commit_store(
                 carried: Some(paths[i].clone()),
                 runtime_key,
                 value_extent: key_value_extent,
-                holds_nominal: k.init.ty.mentions_nominal(),
+                holds_nominal: value_ty.mentions_nominal(),
             },
         );
         debug_assert!(
@@ -4449,6 +4490,8 @@ pub fn nodes_reaching<const N: usize>(
 struct MutableVariable<'e> {
     path: VarPath,
     key: &'e TransactKey,
+    /// The variable's value type as its `Transact` states it ([`key_value_types`]).
+    value_ty: Type,
     /// The `Transact` node declaring it, so conversion can ask for the identities
     /// of the store it is building.
     declared_by: NodeId,
@@ -4577,6 +4620,7 @@ fn state_identities(expr: &Expr) -> StateIdentities<'_> {
             // One hash per `Transact`, shared by every key it declares: the site
             // is the node, not the key.
             let site = content_hash(e);
+            let value_tys = key_value_types(e);
             for k in keys {
                 let name = k.name.field_key().to_string();
                 let index = w.counts.entry((w.chain.clone(), name.clone())).or_insert(0);
@@ -4587,6 +4631,7 @@ fn state_identities(expr: &Expr) -> StateIdentities<'_> {
                         index: *index,
                     },
                     key: k,
+                    value_ty: value_tys[&k.name.field_key()].clone(),
                     declared_by: e.node_id(),
                     site,
                 });
@@ -4698,7 +4743,7 @@ impl<'e> StateIdentities<'e> {
                 (
                     v.path.clone(),
                     DeclaredVariable {
-                        ty: v.key.init.ty.clone(),
+                        ty: v.value_ty.clone(),
                         site: v.site,
                     },
                 )
@@ -4923,6 +4968,7 @@ fn build_induction_store(
     keys: &[TransactKey],
     writers: &[WriterSite],
     domain: &Type,
+    value_tys: &HashMap<Label, Type>,
     paths: &[VarPath],
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
@@ -4954,7 +5000,7 @@ fn build_induction_store(
         w.write_keys.len(),
         "the induction writer writes every accumulator key"
     );
-    build_induction_store_single(keys, w, domain, paths, ctx)
+    build_induction_store_single(keys, w, domain, value_tys, paths, ctx)
 }
 
 /// The parts of an induction store that its depth does not change: the read keys' extents,
@@ -5166,17 +5212,12 @@ fn build_nested_induction_store(
     // A seed is a morphism of the enclosing parameter, one per enclosing position, so it is
     // converted at the enclosing body's own iteration and reads its bindings as they are.
     let seeds = convert_nested_seeds(keys, &enclosing_fan, ctx);
+    let value_tys = key_value_types(bound_expr);
     for (k, seed) in keys.iter().zip(seeds?) {
         let field = k.name.field_key();
         let rk = store_key(&field);
-        // A nested seed is `ᴘ ⇒ V`, so the accumulator's own type is its codomain.
-        let value_ty = k.init.ty.codomain().ok_or_else(|| {
-            ConversionError::TypeError(format!(
-                "a nested `Transact`'s seed is a morphism of the enclosing parameter, got {}",
-                k.init.ty
-            ))
-        })?;
-        let value_extent = ctx.extent_of(&value_ty)?;
+        let value_ty = &value_tys[&field];
+        let value_extent = ctx.extent_of(value_ty)?;
         // Fanned, because a nested `Transact`'s seed has two readers: the driver snapshots
         // the body with it at an enclosing boundary, and the store folds a carry to it at
         // a position that writes nothing. One reader would leave the other disagreeing —
@@ -5291,6 +5332,7 @@ fn build_induction_store_single(
     keys: &[TransactKey],
     w: &WriterSite,
     domain: &Type,
+    value_tys: &HashMap<Label, Type>,
     paths: &[VarPath],
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
@@ -5308,7 +5350,8 @@ fn build_induction_store_single(
     for (i, k) in keys.iter().enumerate() {
         let field = k.name.field_key();
         let rk = store_key(&field);
-        let value_extent = ctx.extent_of(&k.init.ty)?;
+        let value_ty = &value_tys[&field];
+        let value_extent = ctx.extent_of(value_ty)?;
         // A variable the replaced version was carrying resumes from the value it
         // held; one this version introduces starts from the init it declares.
         // Rebuilding a store therefore changes what the loop does next without
@@ -5336,7 +5379,7 @@ fn build_induction_store_single(
                 carried: Some(paths[i].clone()),
                 runtime_key: rk,
                 value_extent,
-                holds_nominal: k.init.ty.mentions_nominal(),
+                holds_nominal: value_ty.mentions_nominal(),
             },
         );
         debug_assert!(
