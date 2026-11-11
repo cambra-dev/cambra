@@ -4,8 +4,8 @@ description: >-
   cache, and the z3 binary refinement subtyping shells out to.
 
 inputs:
-  z3-only:
-    description: Set up Z3 for a job that runs prebuilt test binaries.
+  shared-tests:
+    description: Configure optimized tests and source timestamps for a shared Cargo build.
     default: "false"
   cache-key:
     description: Override the job-based Cargo cache key.
@@ -16,7 +16,6 @@ runs:
   using: composite
   steps:
     - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable as of 2026-02-05
-      if: inputs.z3-only != 'true'
       with:
         components: rustfmt, clippy
 
@@ -28,13 +27,24 @@ runs:
     # dependencies recompiles them on each push — the cost of one gate's
     # rebuild against a cache that stays warm for every other branch.
     - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      if: inputs.z3-only != 'true'
       with:
         # An empty `shared-key` is falsy to the action, which then keys on the
         # job name. A non-empty one replaces that name rather than extending it,
         # so two jobs naming the same key read and write one entry.
         shared-key: ${{ inputs.cache-key }}
         save-if: ${{ github.ref == 'refs/heads/main' }}
+
+    - name: Configure shared tests
+      if: inputs.shared-tests == 'true'
+      shell: bash
+      run: |
+        # The build and its consumers check out the same commit. Matching source
+        # timestamps lets Cargo reuse the restored fingerprints on each runner.
+        source_epoch=$(git show -s --format=%ct HEAD)
+        git ls-files -z | xargs -0 touch -h --date="@$source_epoch"
+        for package in cambra chl-parser chl-interp cambra-lsp; do
+          printf '[profile.test.package.%s]\nopt-level = 1\n' "$package"
+        done > "$RUNNER_TEMP/cambra-test-profile.toml"
 
     # The refinement-entailment fallback shells out to a `z3` subprocess
     # (`easy_smt::ContextBuilder::with_z3_defaults` in
