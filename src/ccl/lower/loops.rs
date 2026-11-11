@@ -48,8 +48,10 @@ pub(super) fn for_body_has_feed(stmts: &[Spanned<ChlStmt>]) -> bool {
 
 /// Whether `p` holds of a statement in `stmts` or of one beneath it: in a `for` body or one of
 /// a statement's [`branch_blocks`](ChlStmt::branch_blocks) (an `if` branch or its `else`, a
-/// `match` arm, a `try` block or an `except` clause). The search enters neither a `with` body
-/// nor a block right-hand side ([`block_value_stmt`]).
+/// `match` arm, a `try` block or an `except` clause). The search enters nothing else: not a
+/// `def` body, a `with` body, an `impl` or instance block, the statement under `pub`, or any
+/// expression, so it misses an `if` or `match` in value position ([`ChlExpr::Block`],
+/// [`block_value_stmt`]).
 fn any_stmt_beneath(stmts: &[Spanned<ChlStmt>], p: &dyn Fn(&Spanned<ChlStmt>) -> bool) -> bool {
     stmts.iter().any(|stmt| {
         p(stmt)
