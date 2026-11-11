@@ -4,11 +4,11 @@ description: >-
   cache, and the z3 binary refinement subtyping shells out to.
 
 inputs:
+  shared-tests:
+    description: Configure optimized tests and source timestamps for a shared Cargo build.
+    default: "false"
   cache-key:
-    description: >-
-      A `rust-cache` key to share with another job, for a job whose Cargo build
-      is identical to that one's. Empty (the default) keys the cache on this
-      job's own name, which is what a gate with a build of its own wants.
+    description: Override the job-based Cargo cache key.
     required: false
     default: ""
 
@@ -33,6 +33,18 @@ runs:
         # so two jobs naming the same key read and write one entry.
         shared-key: ${{ inputs.cache-key }}
         save-if: ${{ github.ref == 'refs/heads/main' }}
+
+    - name: Configure shared tests
+      if: inputs.shared-tests == 'true'
+      shell: bash
+      run: |
+        # The build and its consumers check out the same commit. Matching source
+        # timestamps lets Cargo reuse the restored fingerprints on each runner.
+        source_epoch=$(git show -s --format=%ct HEAD)
+        git ls-files -z | xargs -0 touch -h --date="@$source_epoch"
+        for package in cambra chl-parser chl-interp cambra-lsp; do
+          printf '[profile.test.package.%s]\nopt-level = 1\n' "$package"
+        done > "$RUNNER_TEMP/cambra-test-profile.toml"
 
     # The refinement-entailment fallback shells out to a `z3` subprocess
     # (`easy_smt::ContextBuilder::with_z3_defaults` in
