@@ -3235,3 +3235,31 @@ fn an_inner_list_literal_reading_the_enclosing_binder_is_refused() {
         "a list element must be a constant",
     );
 }
+
+/// Rule 2 checks a binder's own type, not only the type of the node it binds: the `f = …`
+/// binding carries its own diagnostic. A `Let` forwards its tail, so its node-type check
+/// is skipped, and the binder slot's diagnostic is labelled with the binder's base name
+/// rather than a rendered term. That base name is `__mono`: coalesce rebuilds the
+/// generalized `f` as its per-use specialization. The `f` read on line 3 renders `__mono`
+/// too, so the test pairs the label with the binding's own span (`2:1`). The program is
+/// the one in `rule2_function_returning_mut_is_rejected`; this test pins where the
+/// binder's diagnostic lands.
+#[test]
+fn rule2_reports_at_the_binder_slot() {
+    let rendered = compile_errors(indoc! {r#"
+        x := 0
+        f = \z -> x
+        f
+    "#});
+    let at_binder = rendered.split("Error:").any(|report| {
+        report.contains("<compile-error-test>:2:1]")
+            && report.contains("Mut second-class rule 2")
+            && report
+                .lines()
+                .any(|line| line.trim_end().ends_with(" at __mono"))
+    });
+    assert!(
+        at_binder,
+        "expected a rule-2 diagnostic labelled `at __mono` at the `f` binding in:\n{rendered}"
+    );
+}

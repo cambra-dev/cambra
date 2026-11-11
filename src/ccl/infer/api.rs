@@ -2982,9 +2982,9 @@ fn check_no_nested_mut(
     }
 }
 
-/// Rule 2 (no nested `Mut`) on a single binder slot. `For`, `Case`-pattern,
-/// `LetRec`, `Lambda`, `MutDecl`, and `Let` binder types are unreachable by
-/// `walk_children`, so the caller invokes this on each explicitly.
+/// Rule 2 (no nested `Mut`) on a single binder slot. Binder slots are unreachable by
+/// `walk_children`; the caller enumerates them with
+/// [`TypedExpr::walk_binders`](crate::ccl::TypedExpr::walk_binders).
 ///
 /// There is no longer a rule about an *undeclared* binder holding a `Mut`: only
 /// [`TypedExprNode::MutDecl`] and a pass-by-reference `Lambda` param can bind a
@@ -3117,26 +3117,7 @@ fn check_mut_discipline_go(
     }
 
     // Rule 2 on the binder slots `walk_children` does not reach.
-    match &expr.node {
-        TypedExprNode::Let { binding, .. } | TypedExprNode::MutDecl { binding, .. } => {
-            check_binder(binding, &mut here)
-        }
-        TypedExprNode::Lambda { param, .. } => check_binder(param, &mut here),
-        TypedExprNode::For { target, .. } => check_binder(target, &mut here),
-        TypedExprNode::LetRec { bindings, .. } => {
-            for (b, _) in bindings {
-                check_binder(b, &mut here);
-            }
-        }
-        TypedExprNode::Case { branches, .. } => {
-            for b in branches {
-                if let Some(p) = &b.pattern {
-                    check_binder(&p.binding, &mut here);
-                }
-            }
-        }
-        _ => {}
-    }
+    expr.walk_binders(|b| check_binder(b, &mut here));
 
     errors.extend(
         here.into_iter()
@@ -3190,38 +3171,17 @@ fn binder_is_mut(b: &TypedBinding) -> bool {
     b.ty.mut_value_type().is_some()
 }
 
-/// Record every binder's `name → is-a-mut`. Binder-typed slots are unreachable
-/// by `walk_children` (mirroring [`check_binder`]'s call sites), so each binder
-/// node is handled explicitly before recursing into children.
+/// Record every binder's `name → is-a-mut`. Binder slots are unreachable by
+/// `walk_children`, so each node's binders come from [`crate::ccl::TypedExpr::walk_binders`]
+/// before recursing into children.
 ///
-/// "Every" is load-bearing now that absence is itself an error: a binding node missing
-/// from this match makes its binder look like it does not exist, which would reject
-/// every write to it.
+/// "Every" is load-bearing now that absence is itself an error: a binding node
+/// `walk_binders` missed would make its binder look like it does not exist, which would
+/// reject every write to it. `walk_binders` matches every node kind without a wildcard.
 fn collect_mut_binders(expr: &Expr, out: &mut HashMap<Name, bool>) {
-    match &expr.node {
-        TypedExprNode::Let { binding, .. } | TypedExprNode::MutDecl { binding, .. } => {
-            out.insert(binding.name.clone(), binder_is_mut(binding));
-        }
-        TypedExprNode::Lambda { param, .. } => {
-            out.insert(param.name.clone(), binder_is_mut(param));
-        }
-        TypedExprNode::For { target, .. } => {
-            out.insert(target.name.clone(), binder_is_mut(target));
-        }
-        TypedExprNode::LetRec { bindings, .. } => {
-            for (b, _) in bindings {
-                out.insert(b.name.clone(), binder_is_mut(b));
-            }
-        }
-        TypedExprNode::Case { branches, .. } => {
-            for br in branches {
-                if let Some(p) = &br.pattern {
-                    out.insert(p.binding.name.clone(), binder_is_mut(&p.binding));
-                }
-            }
-        }
-        _ => {}
-    }
+    expr.walk_binders(|b| {
+        out.insert(b.name.clone(), binder_is_mut(b));
+    });
     expr.walk_children(|c| collect_mut_binders(c, out));
 }
 

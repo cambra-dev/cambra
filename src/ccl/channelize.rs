@@ -1624,28 +1624,9 @@ fn check_unrouted_feeds(
 
 /// Every name a binder in `expr` binds, of any kind.
 fn all_binders(expr: &Expr, out: &mut HashSet<Name>) {
-    match &expr.node {
-        TypedExprNode::Let { binding, .. } | TypedExprNode::MutDecl { binding, .. } => {
-            out.insert(binding.name.clone());
-        }
-        TypedExprNode::Lambda { param, .. } => {
-            out.insert(param.name.clone());
-        }
-        TypedExprNode::For { target, .. } => {
-            out.insert(target.name.clone());
-        }
-        TypedExprNode::LetRec { bindings, .. } => {
-            out.extend(bindings.iter().map(|(b, _)| b.name.clone()));
-        }
-        TypedExprNode::Case { branches, .. } => {
-            out.extend(
-                branches
-                    .iter()
-                    .filter_map(|br| br.pattern.as_ref().map(|p| p.binding.name.clone())),
-            );
-        }
-        _ => {}
-    }
+    expr.walk_binders(|b| {
+        out.insert(b.name.clone());
+    });
     expr.walk_children(|child| all_binders(child, out));
 }
 
