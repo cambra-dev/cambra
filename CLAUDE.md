@@ -115,19 +115,29 @@ keeping the reader company, admiring the design.
 - **A design doc records a decision rather than arguing for it.** Prose answering an objection
   nobody raised is argument; state the invariant instead.
 - **One claim per sentence, with the claim in the main clause.** Content stacked into em-dash asides
-  makes the reader reassemble it from fragments; asides are for genuine parentheticals.
-- **One name per concept.** Use the name the codebase already gives it rather than coining a second
-  one or reaching for a synonym to avoid repetition; where nothing names it, describe the mechanism.
+  makes the reader reassemble it from fragments; asides are for genuine parentheticals. Keep a
+  necessary condition with its claim rather than splitting it into an unconditional statement.
+- **Use linear sentence structure.** Keep each clause's subject and predicate together. Do not
+  interrupt them with another clause or a long aside, or nest relative clauses inside one another.
+  Move restrictions into an initial condition, a separate sentence, or a short modifier. Preserve
+  every actor, quantifier, exception, and causal relationship. Do not replace clauses with opaque
+  noun stacks or split already-clear sentences merely to make them shorter.
+  Add `that` when it clarifies a relative-clause boundary; do not add it mechanically to short,
+  unambiguous phrases. An explicit relative pronoun does not repair a delayed main predicate.
+- **One name per concept.** If the codebase already names the concept, use that name rather than
+  coining a second name or substituting a synonym to avoid repetition. If it has no name, describe
+  the mechanism.
   A coined term spreads into other files, and then into identifiers, before anything defines it.
-  Coinage you find already spread is a finding to report, not a decision to make: raise it in the
-  session where you find it, convert what the change touches, and leave the rest to the author.
+  Report existing coined vocabulary in the session before deciding whether to change it. Convert
+  the affected passage within the change's scope, and leave the rest to the author.
 - **Every claim is checkable.** Name the code, test, or doc heading that makes it so, or label the
   conjecture.
 
-Length follows from these rules rather than being a separate target. `docs/operational-semantics/`
-is written this way and is the exemplar to imitate; the dense design docs under `src/ccl/design/`
-are not, so take facts from them and not sentence shape. When editing a passage written in the older
-style, convert it rather than matching it.
+Length follows from these rules rather than being a separate target. The
+[prose skill](.claude/skills/spec-prose/SKILL.md#imitate-these-not-the-nearest-paragraph) selects
+exemplar passages; it does not endorse every sentence in those documents. Take facts from the
+surrounding reference material, not sentence shape. Convert older-style prose within the affected
+passage rather than matching it.
 
 None of this is mechanically checkable, and a word-level gate would report dash counts as if they
 were quality. Before writing or revising a doc section or a comment, load the `spec-prose` skill

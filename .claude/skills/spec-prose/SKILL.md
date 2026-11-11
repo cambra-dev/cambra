@@ -16,10 +16,11 @@ document is not conforming for containing no banned words.
 
 ## Imitate these, not the nearest paragraph
 
-An agent writing in `src/ccl/` has thousands of tokens of essayistic prose in front of it, and
-imitation beats instruction. Counter it deliberately: `docs/operational-semantics/semantics.md` and
-`docs/operational-semantics/lowering.md` are written in the target style. Read a page of one before
-writing a doc section.
+Before writing a doc section, read the scalar and function paragraphs under
+[Instances](../../../docs/operational-semantics/semantics.md#instances). They introduce each
+representation, define combination, and state completion conditions. Use the examples under
+[Linear sentence structure](#linear-sentence-structure) for sentence shape. These selections do
+not endorse the surrounding documents as uniformly good style.
 
 The dense design docs carry the content you need but not the form:
 `src/ccl/design/type-inference.md`, `mutability.md`, `provenance.md`. Take facts from them, not
@@ -95,9 +96,9 @@ so `./ci.sh doc_refs` validates references, then use that one spelling everywher
 
 ### Finding it already spread
 
-Coined vocabulary you did not introduce is a **finding to report, not a decision to make**. Whether
-it gets fixed in the current change or a follow-up depends on how far it reaches and what else is in
-flight, which is the author's call. Worst to best:
+Report existing coined vocabulary before deciding whether to change it. The author decides
+whether the correction belongs in the current change or a follow-up, based on its reach and other
+work in flight. Worst to best:
 
 1. **Silently keeping the redundant term** — the spread continues, and the change endorses it.
 2. **Silently converting it** — the vocabulary improves, and a rename the author did not ask for
@@ -106,13 +107,43 @@ flight, which is the author's call. Worst to best:
    how many sites, whether identifiers are involved, and what a full pass would touch. Then convert
    what the change already touches and leave the rest.
 
-The session is the channel that works. A note in a commit message or a PR body is read late or
-never, and a request for a decision that arrives after the change has landed has been decided by
-default. Flag it while the author can still answer.
+Report it in the session while the author can still respond. Commit messages and PR descriptions
+may be read too late or not at all. Asking after the change has landed leaves the decision already
+made.
 
 Converting only part of a passage manufactures the two-names-one-concept problem, so extend to the
 enclosing passage — the section, the doc comment, the blockquote — even when the change did not
 otherwise touch all of it. Stop at the file boundary, and stop before identifiers.
+
+## Linear sentence structure
+
+Find each clause's subject and predicate. If another clause or a long aside separates them,
+move that material before or after the main assertion. Do not fix a nested relative by adding
+more relative pronouns: the reader would still have to hold several incomplete clauses open.
+
+For example, the dependency-order restriction in
+[The fold is order-free](../../../src/ccl/design/provenance.md#the-fold-is-order-free):
+
+> Before: A dependency whose upstream ID also has a selected row must have a smaller ID than its
+> product.
+
+> After: If a dependency's upstream ID also has a selected row, that ID must be smaller than the
+> product's ID.
+
+The restriction applies only when the upstream ID has a selected row. Pre-seeded input IDs are
+exempt in both versions. Splitting this into "A dependency has an upstream ID. That ID must be
+smaller than the product's ID" would remove the condition and change the contract. Preserve
+restrictions and exceptions when moving them; do not add an unstated converse.
+
+An omitted object relative pronoun is a separate question. Both `the level they name` and
+`the level that they name` can be clear. Add the pronoun if it makes a boundary easier to recognize,
+but do not insert `that` mechanically. Likewise, `the node that the pass creates contains ...`
+still interrupts `the node ... contains`: restoring the marker alone has not made it linear.
+
+Keep short modifiers such as `a stateless producer`. There is no requirement to turn them into
+conditionals. A sentence can also retain a contrast: `The grammar consumes those tokens rather
+than computing indentation` need not become two sentences. Repeat a technical noun when a pronoun
+would obscure its referent, not merely to avoid all pronouns.
 
 ## The transformation
 
@@ -148,9 +179,9 @@ length exercise.
 
 The rules in
 [Prose style: specifications, not blog posts](../../../CLAUDE.md#prose-style-specifications-not-blog-posts)
-are the checklist; re-read against them rather than against a restatement here. Two questions are
-not on that list, because no rule encodes them, and they decide whether a passage reads as
-specification:
+are the checklist; re-read against them rather than against a restatement here. Check sentence
+structure as a separate pass: locate subjects and predicates, remove intervening clauses, and
+confirm that the same conditions and exceptions still apply. Then ask:
 
 - **Does this repeat what the document already said?** Repetition across sections is the largest
   source of length here, and the hardest thing to see while writing.
@@ -177,7 +208,6 @@ already shipped a doc claim that a `Σ` reconciles arms at differing domains whe
 them, and the cleanup that fixed the staleness around it carried the wrong claim forward one
 revision further. Check the claim against the mechanism, not against the sentence.
 
-Convert a passage you touch; do not match it. This follows the repo's rule that a doc defect found
-while working gets fixed in the same change. The corpus is what the next agent imitates, so
-old-style prose left in a file you are already editing preserves the thing the rules exist to
-remove. Converting a whole document you were not otherwise changing is a separate change.
+Convert older-style prose in the affected passage; do not imitate it. Fix documentation defects
+found during the work in the same change. Otherwise later agents can copy the old sentence
+structures from that passage. Rewriting an unrelated document remains a separate change.
