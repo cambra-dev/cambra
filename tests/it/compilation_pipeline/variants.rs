@@ -55,9 +55,10 @@ fn union(tag: &str, inner: Value) -> Value {
 #[case("`none()", union("none", Value::Unit))]
 // The payload is an arbitrary expression, not just a literal.
 #[case(
-    r"
-a: Int = 20
-`some(a + 1)",
+    indoc::indoc! {r#"
+
+        a: Int = 20
+        `some(a + 1)"#},
     union("some", Value::Int(21))
 )]
 // Tags are structural and undeclared, so any spelling constructs.
@@ -88,25 +89,28 @@ fn test_variant_construction(#[case] code: &str, #[case] expected: Value) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
-    r"
-x = `none
-x",
+    indoc::indoc! {r#"
+
+        x = `none
+        x"#},
     union("none", Value::Unit)
 )]
 // The payload-carrying sibling, whose payload column is canonical either way —
 // the control that shows the shape above is specific to the `Unit` payload.
 #[case(
-    r"
-x = `some(1)
-x",
+    indoc::indoc! {r#"
+
+        x = `some(1)
+        x"#},
     union("some", Value::Int(1))
 )]
 // Two hops of let-binding, so the value is memoised more than once.
 #[case(
-    r"
-x = `none
-y = x
-y",
+    indoc::indoc! {r#"
+
+        x = `none
+        y = x
+        y"#},
     union("none", Value::Unit)
 )]
 fn test_let_bound_variant_payload_column(#[case] code: &str, #[case] expected: Value) {
@@ -123,29 +127,33 @@ fn test_let_bound_variant_payload_column(#[case] code: &str, #[case] expected: V
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
-    r"
-c: Bool = True
-`some(1) if c else `some(2)",
+    indoc::indoc! {r#"
+
+        c: Bool = True
+        `some(1) if c else `some(2)"#},
     union("some", Value::Int(1))
 )]
 #[case(
-    r"
-c: Bool = False
-`some(1) if c else `some(2)",
+    indoc::indoc! {r#"
+
+        c: Bool = False
+        `some(1) if c else `some(2)"#},
     union("some", Value::Int(2))
 )]
 // A `Unit` payload in the same position — both column holes at once.
 #[case(
-    r"
-c: Bool = True
-`none if c else `none",
+    indoc::indoc! {r#"
+
+        c: Bool = True
+        `none if c else `none"#},
     union("none", Value::Unit)
 )]
 // A computed guard rather than a bound boolean.
 #[case(
-    r"
-n: Int = 5
-`some(n) if n > 1 else `some(0)",
+    indoc::indoc! {r#"
+
+        n: Int = 5
+        `some(n) if n > 1 else `some(0)"#},
     union("some", Value::Int(5))
 )]
 fn test_conditional_variant_arms(#[case] code: &str, #[case] expected: Value) {
@@ -192,113 +200,123 @@ fn test_a_match_as_a_conditional_s_guard(#[case] value: &str, #[case] expected: 
 #[timeout(Duration::from_secs(10))]
 // The payload binder is in scope for the arm's body.
 #[case(
-    r"
-x = `some(7)
-match x:
-    case `some(v):
-        v + 1
-    case `none:
-        0",
+    indoc::indoc! {r#"
+
+        x = `some(7)
+        match x:
+            case `some(v):
+                v + 1
+            case `none:
+                0"#},
     Value::Int(8)
 )]
 // The other tag selects the other arm, and a binder-less `case` still matches.
 #[case(
-    r"
-x = `none
-match x:
-    case `some(v):
-        v + 1
-    case `none:
-        0",
+    indoc::indoc! {r#"
+
+        x = `none
+        match x:
+            case `some(v):
+                v + 1
+            case `none:
+                0"#},
     Value::Int(0)
 )]
 // Arm order does not matter: the arms are tag-disjoint.
 #[case(
-    r"
-x = `some(7)
-match x:
-    case `none:
-        0
-    case `some(v):
-        v + 1",
+    indoc::indoc! {r#"
+
+        x = `some(7)
+        match x:
+            case `none:
+                0
+            case `some(v):
+                v + 1"#},
     Value::Int(8)
 )]
 // A single-arm `match` — the degenerate partition needs no union at all.
 #[case(
-    r"
-x = `some(3)
-match x:
-    case `some(v):
-        v * 10",
+    indoc::indoc! {r#"
+
+        x = `some(3)
+        match x:
+            case `some(v):
+                v * 10"#},
     Value::Int(30)
 )]
 // The arm body is a block, not just a trailing expression: a `let` then a value.
 #[case(
-    r"
-x = `some(4)
-match x:
-    case `some(v):
-        d = v * 2
-        d + 1
-    case `none:
-        0",
+    indoc::indoc! {r#"
+
+        x = `some(4)
+        match x:
+            case `some(v):
+                d = v * 2
+                d + 1
+            case `none:
+                0"#},
     Value::Int(9)
 )]
 // The scrutinee is an expression, not a bound name.
 #[case(
-    r"
-match `some(5):
-    case `some(v):
-        v - 1
-    case `none:
-        0",
+    indoc::indoc! {r#"
+
+        match `some(5):
+            case `some(v):
+                v - 1
+            case `none:
+                0"#},
     Value::Int(4)
 )]
 // `_` over a payload-carrying tag: there *is* a payload and the arm declines to read
 // it. The payload-less spelling `` case `some: `` is a different claim and is rejected
 // here — see `test_a_named_payload_is_not_optional`.
 #[case(
-    r"
-x = `some(9)
-match x:
-    case `some(_):
-        1
-    case `none:
-        0",
+    indoc::indoc! {r#"
+
+        x = `some(9)
+        match x:
+            case `some(_):
+                1
+            case `none:
+                0"#},
     Value::Int(1)
 )]
 // The arm body reads an outer binding alongside its payload.
 #[case(
-    r"
-k: Int = 100
-x = `some(7)
-match x:
-    case `some(v):
-        v + k
-    case `none:
-        k",
+    indoc::indoc! {r#"
+
+        k: Int = 100
+        x = `some(7)
+        match x:
+            case `some(v):
+                v + k
+            case `none:
+                k"#},
     Value::Int(107)
 )]
 // A non-`Int` arm result — tag dispatch is value-agnostic.
 #[case(
-    r#"
-x = `some(1)
-match x:
-    case `some(v):
-        "yes"
-    case `none:
-        "no""#,
+    indoc::indoc! {r#"
+
+        x = `some(1)
+        match x:
+            case `some(v):
+                "yes"
+            case `none:
+                "no""#},
     Value::String("yes".into())
 )]
 // The arm value is itself a variant, so the result is a union column.
 #[case(
-    r"
-x = `some(2)
-match x:
-    case `some(v):
-        `some(v * 3)
-    case `none:
-        `some(0)",
+    indoc::indoc! {r#"
+
+        x = `some(2)
+        match x:
+            case `some(v):
+                `some(v * 3)
+            case `none:
+                `some(0)"#},
     union("some", Value::Int(6))
 )]
 fn test_match_scalar(#[case] code: &str, #[case] expected: Value) {
@@ -358,23 +376,25 @@ fn test_match_as_an_assigned_value(#[case] code: &str, #[case] expected: Value) 
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
-    r"
-x: Option(Int) = Option::some(7)
-match x:
-    case Option::some(v):
-        v + 1
-    case Option::none:
-        0",
+    indoc::indoc! {r#"
+
+        x: Option(Int) = Option::some(7)
+        match x:
+            case Option::some(v):
+                v + 1
+            case Option::none:
+                0"#},
     Value::Int(8)
 )]
 #[case(
-    r"
-x: Option(Int) = Option::none
-match x:
-    case Option::some(v):
-        v + 1
-    case Option::none:
-        0",
+    indoc::indoc! {r#"
+
+        x: Option(Int) = Option::none
+        match x:
+            case Option::some(v):
+                v + 1
+            case Option::none:
+                0"#},
     Value::Int(0)
 )]
 fn test_match_annotated_option(#[case] code: &str, #[case] expected: Value) {
@@ -395,62 +415,67 @@ fn test_match_annotated_option(#[case] code: &str, #[case] expected: Value) {
 #[timeout(Duration::from_secs(10))]
 // `x` is `some(Int)`, so the `none` arm is unreachable — and kept, inert.
 #[case(
-    r"
-x = `some(1)
-match x:
-    case `some(v):
-        v
-    case `none:
-        0",
+    indoc::indoc! {r#"
+
+        x = `some(1)
+        match x:
+            case `some(v):
+                v
+            case `none:
+                0"#},
     Value::Int(1)
 )]
 // Several unreachable arms, including ones whose payload is never mentioned.
 #[case(
-    r"
-x = `none
-match x:
-    case `some(v):
-        v
-    case `other(w):
-        1
-    case `none:
-        2",
+    indoc::indoc! {r#"
+
+        x = `none
+        match x:
+            case `some(v):
+                v
+            case `other(w):
+                1
+            case `none:
+                2"#},
     Value::Int(2)
 )]
 // An unreachable arm that **reads** its binder. Nothing can reach the arm, so no
 // value ever flows through `v` — but the read still states what it needs of it,
 // and the payload is typed to satisfy that rather than to `Unit`.
 #[case(
-    r"
-x = `none
-match x:
-    case `some(v):
-        v + v
-    case `none:
-        7",
+    indoc::indoc! {r#"
+
+        x = `none
+        match x:
+            case `some(v):
+                v + v
+            case `none:
+                7"#},
     Value::Int(7)
 )]
 // The same, drawing on a different requirement: `*` has no `String` row where `+`
 // does, so the choice cannot be coming from a fixed default.
 #[case(
-    r"
-x = `none
-match x:
-    case `some(v):
-        v * v
-    case `none:
-        8",
+    indoc::indoc! {r#"
+
+        x = `none
+        match x:
+            case `some(v):
+                v * v
+            case `none:
+                8"#},
     Value::Int(8)
 )]
 // A unary read, whose single row forces the choice with nothing else to go on.
 #[case(
-    r"
-x = `none
-match x:
-    case `some(v):
-        -v
-    case `none:
-        9",
+    indoc::indoc! {r#"
+
+        x = `none
+        match x:
+            case `some(v):
+                -v
+            case `none:
+                9"#},
     Value::Int(9)
 )]
 fn test_match_keeps_unreachable_arms(#[case] code: &str, #[case] expected: Value) {
@@ -493,7 +518,15 @@ fn an_unreachable_arm_payload_takes_its_type_from_the_join() {
     make_tuple(&[union("dot", Value::Unit), Value::Int(3)])
 )]
 fn a_product_of_variants_joins(#[case] join: &str, #[case] expected: Value) {
-    check_scalar(&format!("c = 1 > 0\n{join}\n"), expected);
+    check_scalar(
+        &indoc::formatdoc!(
+            r#"
+        c = 1 > 0
+        {join}
+        "#
+        ),
+        expected,
+    );
 }
 
 /// A join that gives an unreachable payload a type its own reads reject is a type error.
@@ -512,7 +545,11 @@ fn an_unreachable_arm_payload_its_reads_reject_is_a_type_error(#[case] payload: 
                 `p(w) if w + w == w else `q(1)
     "};
     check_compile_error(
-        &format!("x = `a({payload})\n{program}"),
+        &indoc::formatdoc!(
+            r#"
+            x = `a({payload})
+            {program}"#
+        ),
         "The values that meet here have no common type",
     );
 }
@@ -532,50 +569,54 @@ fn an_unreachable_arm_payload_its_reads_reject_is_a_type_error(#[case] payload: 
 #[timeout(Duration::from_secs(10))]
 // A tagged arm matches: the default is not reached.
 #[case(
-    r"
-x = `some(7)
-match x:
-    case `some(v):
-        v + 1
-    case _:
-        0",
+    indoc::indoc! {r#"
+
+        x = `some(7)
+        match x:
+            case `some(v):
+                v + 1
+            case _:
+                0"#},
     Value::Int(8)
 )]
 // No tagged arm matches — the scrutinee's tag is one no arm names, which is the
 // case `the default arm exists for and the one the subset rule used to reject.
 #[case(
-    r"
-x = `other(5)
-match x:
-    case `some(v):
-        v + 1
-    case _:
-        99",
+    indoc::indoc! {r#"
+
+        x = `other(5)
+        match x:
+            case `some(v):
+                v + 1
+            case _:
+                99"#},
     Value::Int(99)
 )]
 // The default arm reads an outer binding rather than a payload (it binds none).
 #[case(
-    r"
-k: Int = 42
-x = `other(5)
-match x:
-    case `some(v):
-        v
-    case _:
-        k",
+    indoc::indoc! {r#"
+
+        k: Int = 42
+        x = `other(5)
+        match x:
+            case `some(v):
+                v
+            case _:
+                k"#},
     Value::Int(42)
 )]
 // Several tagged arms plus a default; a tagged one still wins.
 #[case(
-    r"
-x = `b(2)
-match x:
-    case `a(v):
-        v + 10
-    case `b(w):
-        w + 20
-    case _:
-        0",
+    indoc::indoc! {r#"
+
+        x = `b(2)
+        match x:
+            case `a(v):
+                v + 10
+            case `b(w):
+                w + 20
+            case _:
+                0"#},
     Value::Int(22)
 )]
 // The arm body is the **bare payload binder**. This is the shape that pins the
@@ -585,63 +626,68 @@ match x:
 // other case `in this list happens to widen the binder through its own use (`v + 1`
 // forces an `Int`), which is why they passed while this did not.
 #[case(
-    r"
-x = `a(1)
-match x:
-    case `a(v):
-        v
-    case _:
-        0",
+    indoc::indoc! {r#"
+
+        x = `a(1)
+        match x:
+            case `a(v):
+                v
+            case _:
+                0"#},
     Value::Int(1)
 )]
 // The same shape at a non-`Int` payload, so nothing about it is arithmetic-specific.
 #[case(
-    r#"
-x = `a("hi")
-match x:
-    case `a(v):
-        v
-    case _:
-        "no""#,
+    indoc::indoc! {r#"
+
+        x = `a("hi")
+        match x:
+            case `a(v):
+                v
+            case _:
+                "no""#},
     Value::String("hi".into())
 )]
 // An `_` payload beside a default arm: the ignored binder is still typed from the
 // scrutinee, and must not be resolved from the default arm either.
 #[case(
-    r"
-x = `a(1)
-match x:
-    case `a(_):
-        7
-    case _:
-        0",
+    indoc::indoc! {r#"
+
+        x = `a(1)
+        match x:
+            case `a(_):
+                7
+            case _:
+                0"#},
     Value::Int(7)
 )]
 // A default arm on a `match` over a **function parameter**, where the scrutinee is
 // still an inference variable when the arms' variant is demanded of it — so the
 // openness has to ride the recorded bound rather than being decomposed eagerly.
 #[case(
-    r"
-def pick(x):
-    match x:
-        case `a(v):
-            v
-        case _:
-            0
-pick(`a(1))",
+    indoc::indoc! {r#"
+
+        def pick(x):
+            match x:
+                case `a(v):
+                    v
+                case _:
+                    0
+        pick(`a(1))"#},
     Value::Int(1)
 )]
 // A variant payload matched again inside the arm, both levels with a default.
 #[case(
-    r"
-x = `a(`b(3))
-match x:
-    case `a(inner):
-        match inner:
-            case `b(v):
-                v + 1
-    case _:
-        0",
+    indoc::indoc! {r#"
+
+        x = `a(`b(3))
+        match x:
+            case `a(inner):
+                match inner:
+                    case `b(v):
+                        v + 1
+            case _:
+                0"#},
     Value::Int(4)
 )]
 fn test_match_default_arm(#[case] code: &str, #[case] expected: Value) {
@@ -665,29 +711,32 @@ fn test_match_default_arm(#[case] code: &str, #[case] expected: Value) {
 #[timeout(Duration::from_secs(10))]
 // A variant scrutinee, whose tag no arm names.
 #[case(
-    r"
-x = `some(1)
-match x:
-    case _:
-        7",
+    indoc::indoc! {r#"
+
+        x = `some(1)
+        match x:
+            case _:
+                7"#},
     Value::Int(7)
 )]
 // A non-variant scrutinee. No arm names a tag, so nothing demands one.
 #[case(
-    r"
-x = 5
-match x:
-    case _:
-        7",
+    indoc::indoc! {r#"
+
+        x = 5
+        match x:
+            case _:
+                7"#},
     Value::Int(7)
 )]
 // The arm reads an outer binding; the scrutinee decides nothing.
 #[case(
-    r"
-k: Int = 3
-match `a(99):
-    case _:
-        k + 4",
+    indoc::indoc! {r#"
+
+        k: Int = 3
+        match `a(99):
+            case _:
+                k + 4"#},
     Value::Int(7)
 )]
 fn test_match_with_only_a_default_arm(#[case] code: &str, #[case] expected: Value) {
@@ -702,7 +751,10 @@ fn test_default_only_match_still_types_its_scrutinee() {
     assert!(
         compile_program(
             &mut ctx,
-            &LoadedProgram::test("match nope:\n    case _:\n        0"),
+            &LoadedProgram::test(indoc::indoc! {r#"
+                match nope:
+                    case _:
+                        0"#}),
             consumer
         )
         .is_err(),
@@ -722,39 +774,42 @@ fn test_default_only_match_still_types_its_scrutinee() {
 #[timeout(Duration::from_secs(10))]
 // One call site.
 #[case(
-    r"
-def pick(x):
-    match x:
-        case `a(v):
-            v
-        case `b(w):
-            w + 100
-pick(`a(1))",
+    indoc::indoc! {r#"
+
+        def pick(x):
+            match x:
+                case `a(v):
+                    v
+                case `b(w):
+                    w + 100
+        pick(`a(1))"#},
     Value::Int(1)
 )]
 // **Two call sites with different tags** — each arm is selected by a different
 // caller, so this is the N-arm fan-out actually dispatching: 1 + (2 + 100).
 #[case(
-    r"
-def pick(x):
-    match x:
-        case `a(v):
-            v
-        case `b(w):
-            w + 100
-pick(`a(1)) + pick(`b(2))",
+    indoc::indoc! {r#"
+
+        def pick(x):
+            match x:
+                case `a(v):
+                    v
+                case `b(w):
+                    w + 100
+        pick(`a(1)) + pick(`b(2))"#},
     Value::Int(103)
 )]
 // A non-`Int` payload, to pin that nothing here is arithmetic-specific.
 #[case(
-    r#"
-def pick(x):
-    match x:
-        case `a(v):
-            v
-        case `b(w):
-            w
-pick(`a("hello"))"#,
+    indoc::indoc! {r#"
+
+        def pick(x):
+            match x:
+                case `a(v):
+                    v
+                case `b(w):
+                    w
+        pick(`a("hello"))"#},
     Value::String("hello".into())
 )]
 fn test_match_on_parameter(#[case] code: &str, #[case] expected: Value) {
@@ -917,39 +972,44 @@ fn test_default_arm_under_a_record_field(#[case] code: &str, #[case] expected: V
 #[timeout(Duration::from_secs(10))]
 // A payload arm and a nullary arm, against the value each admits.
 #[case(
-    r"
-n: Int = 1
-x: {`some{Int} | `none} = `some(n)
-x",
+    indoc::indoc! {r#"
+
+        n: Int = 1
+        x: {`some{Int} | `none} = `some(n)
+        x"#},
     union("some", Value::Int(1))
 )]
 #[case(
-    r"
-x: {`some{Int} | `none} = `none
-x",
+    indoc::indoc! {r#"
+
+        x: {`some{Int} | `none} = `none
+        x"#},
     union("none", Value::Unit)
 )]
 // Arm order is not part of the type: the tags canonicalize by name.
 #[case(
-    r"
-n: Int = 1
-x: {`none | `some{Int}} = `some(n)
-x",
+    indoc::indoc! {r#"
+
+        n: Int = 1
+        x: {`none | `some{Int}} = `some(n)
+        x"#},
     union("some", Value::Int(1))
 )]
 // More than two arms, with distinct payload types.
 #[case(
-    r#"
-x: {`a{Int} | `b{String} | `c} = `b("s")
-x"#,
+    indoc::indoc! {r#"
+
+        x: {`a{Int} | `b{String} | `c} = `b("s")
+        x"#},
     union("b", Value::String("s".into()))
 )]
 // A payload that is itself a variant type.
 #[case(
-    r"
-n: Int = 1
-x: {`outer{`some{Int} | `none} | `done} = `outer(`some(n))
-x",
+    indoc::indoc! {r#"
+
+        n: Int = 1
+        x: {`outer{`some{Int} | `none} | `done} = `outer(`some(n))
+        x"#},
     union("outer", union("some", Value::Int(1)))
 )]
 fn test_variant_type_annotation(#[case] code: &str, #[case] expected: Value) {
@@ -962,24 +1022,26 @@ fn test_variant_type_annotation(#[case] code: &str, #[case] expected: Value) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
-    r"
-n: Int = 1
-x: {`some{Int} | `none} = `some(n)
-match x:
-    case `some(v):
-        v
-    case `none:
-        0",
+    indoc::indoc! {r#"
+
+        n: Int = 1
+        x: {`some{Int} | `none} = `some(n)
+        match x:
+            case `some(v):
+                v
+            case `none:
+                0"#},
     Value::Int(1)
 )]
 #[case(
-    r"
-x: {`some{Int} | `none} = `none
-match x:
-    case `some(v):
-        v
-    case `none:
-        0",
+    indoc::indoc! {r#"
+
+        x: {`some{Int} | `none} = `none
+        match x:
+            case `some(v):
+                v
+            case `none:
+                0"#},
     Value::Int(0)
 )]
 fn test_variant_type_dispatches_like_option(#[case] code: &str, #[case] expected: Value) {
@@ -1000,41 +1062,45 @@ fn test_variant_type_dispatches_like_option(#[case] code: &str, #[case] expected
 // The bound is a *bound*: the value still has to be admitted by it, so the same
 // payload and tag checks apply. What it does not do is replace the value's type.
 #[case(
-    r"
-x <: {`some{Int} | `none} = `some(1)
-x",
+    indoc::indoc! {r#"
+
+        x <: {`some{Int} | `none} = `some(1)
+        x"#},
     union("some", Value::Int(1))
 )]
 // One arm suffices, because `x` carries one tag. The exact form of the same program
 // is a rejection — see `test_variant_type_rejections`.
 #[case(
-    r"
-x <: {`some{Int} | `none} = `some(1)
-match x:
-    case `some(v):
-        v",
+    indoc::indoc! {r#"
+
+        x <: {`some{Int} | `none} = `some(1)
+        match x:
+            case `some(v):
+                v"#},
     Value::Int(1)
 )]
 // Handling more tags than the value carries stays legal under either form: the extra
 // arm is unreachable and kept.
 #[case(
-    r"
-x <: {`some{Int} | `none} = `none
-match x:
-    case `some(v):
-        v
-    case `none:
-        0",
+    indoc::indoc! {r#"
+
+        x <: {`some{Int} | `none} = `none
+        match x:
+            case `some(v):
+                v
+            case `none:
+                0"#},
     Value::Int(0)
 )]
 // At a parameter, where the same asymmetry motivated the split.
 #[case(
-    r"
-def f(v <: {`some{Int} | `none}):
-    match v:
-        case `some(w):
-            w + 1
-f(`some(1))",
+    indoc::indoc! {r#"
+
+        def f(v <: {`some{Int} | `none}):
+            match v:
+                case `some(w):
+                    w + 1
+        f(`some(1))"#},
     Value::Int(2)
 )]
 fn test_bounded_variant_annotation(#[case] code: &str, #[case] expected: Value) {
@@ -1046,57 +1112,65 @@ fn test_bounded_variant_annotation(#[case] code: &str, #[case] expected: Value) 
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
-    r#"
-x: {`some{Int} | `none} = `some("s")
-x"#
+    indoc::indoc! {r#"
+
+        x: {`some{Int} | `none} = `some("s")
+        x"#}
 )]
 #[case(
-    r"
-x: {`some{Int} | `none} = `other(1)
-x"
+    indoc::indoc! {r#"
+
+        x: {`some{Int} | `none} = `other(1)
+        x"#}
 )]
 // Tags are compared as written, so a differently-cased tag is a *different*
 // tag, not the same one spelled wrong.
 #[case(
-    r"
-x: {`Some{Int} | `none} = `some(1)
-x"
+    indoc::indoc! {r#"
+
+        x: {`Some{Int} | `none} = `some(1)
+        x"#}
 )]
 // A tag names one payload type, so an arm set that repeats a tag has no
 // meaning to lower to.
 #[case(
-    r"
-x: {`some{Int} | `some{String}} = `some(1)
-x"
+    indoc::indoc! {r#"
+
+        x: {`some{Int} | `some{String}} = `some(1)
+        x"#}
 )]
 // A multi-field arm stores a tuple; a bare `Int` is not one.
 #[case(
-    r"
-x: {`some{Int, String} | `none} = `some(1)
-x"
+    indoc::indoc! {r#"
+
+        x: {`some{Int, String} | `none} = `some(1)
+        x"#}
 )]
 // The **bounded** form bounds rather than replaces, and a bound is still checked: a
 // tag the type does not name, or the wrong payload for one it does, fails exactly as
 // under the exact form.
 #[case(
-    r"
-x <: {`some{Int} | `none} = `other(1)
-x"
+    indoc::indoc! {r#"
+
+        x <: {`some{Int} | `none} = `other(1)
+        x"#}
 )]
 #[case(
-    r#"
-x <: {`some{Int} | `none} = `some("s")
-x"#
+    indoc::indoc! {r#"
+
+        x <: {`some{Int} | `none} = `some("s")
+        x"#}
 )]
 // The other direction of the contrast in `test_bounded_variant_annotation`: an
 // **exact** annotation makes the binder the two-arm type, so a `match` handling only
 // `` `some `` leaves `` `none `` unhandled — the same program is accepted with `<:`.
 #[case(
-    r"
-x: {`some{Int} | `none} = `some(1)
-match x:
-    case `some(v):
-        v"
+    indoc::indoc! {r#"
+
+        x: {`some{Int} | `none} = `some(1)
+        match x:
+            case `some(v):
+                v"#}
 )]
 fn test_variant_type_rejections(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
@@ -1120,33 +1194,36 @@ fn test_variant_type_rejections(#[case] code: &str) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::informative_payload(
-    r"
-x = `some(9)
-match x:
-    case `some:
-        1
-    case `none:
-        0"
+    indoc::indoc! {r#"
+
+        x = `some(9)
+        match x:
+            case `some:
+                1
+            case `none:
+                0"#}
 )]
 // Also when the tag comes from an annotation rather than from a constructed value.
 #[case::annotated_informative_payload(
-    r"
-x: {`some{Int} | `none} = `none
-match x:
-    case `some:
-        1
-    case `none:
-        0"
+    indoc::indoc! {r#"
+
+        x: {`some{Int} | `none} = `none
+        match x:
+            case `some:
+                1
+            case `none:
+                0"#}
 )]
 // `_` is not a name: an arm that declines to read its payload cannot then read it.
 #[case::underscore_is_not_readable(
-    r"
-x = `some(9)
-match x:
-    case `some(_):
-        _ + 1
-    case `none:
-        0"
+    indoc::indoc! {r#"
+
+        x = `some(9)
+        match x:
+            case `some(_):
+                _ + 1
+            case `none:
+                0"#}
 )]
 fn test_a_named_payload_is_not_optional(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
@@ -1162,23 +1239,25 @@ fn test_a_named_payload_is_not_optional(#[case] code: &str) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
-    r"
-x = `none
-match x:
-    case `some(v):
-        v
-    case `none:
-        0",
+    indoc::indoc! {r#"
+
+        x = `none
+        match x:
+            case `some(v):
+                v
+            case `none:
+                0"#},
     Value::Int(0)
 )]
 #[case(
-    r"
-x = `none
-match x:
-    case `some(v):
-        v
-    case `none(_):
-        0",
+    indoc::indoc! {r#"
+
+        x = `none
+        match x:
+            case `some(v):
+                v
+            case `none(_):
+                0"#},
     Value::Int(0)
 )]
 fn test_empty_payload_arm_matches_a_payload_less_tag(#[case] code: &str, #[case] expected: Value) {
@@ -1199,31 +1278,34 @@ fn test_empty_payload_arm_matches_a_payload_less_tag(#[case] code: &str, #[case]
 #[timeout(Duration::from_secs(10))]
 // A `String` payload used arithmetically, with a default arm.
 #[case(
-    r#"
-x = `a("hi")
-match x:
-    case `a(v):
-        v + 1
-    case _:
-        0"#
+    indoc::indoc! {r#"
+
+        x = `a("hi")
+        match x:
+            case `a(v):
+                v + 1
+            case _:
+                0"#}
 )]
 // The control: the same misuse with no default arm, which was always rejected.
 #[case(
-    r#"
-x = `a("hi")
-match x:
-    case `a(v):
-        v + 1"#
+    indoc::indoc! {r#"
+
+        x = `a("hi")
+        match x:
+            case `a(v):
+                v + 1"#}
 )]
 // The mirror — an `Int` payload used as a string, with a default arm.
 #[case(
-    r#"
-x = `a(1)
-match x:
-    case `a(v):
-        v + "s"
-    case _:
-        "z""#
+    indoc::indoc! {r#"
+
+        x = `a(1)
+        match x:
+            case `a(v):
+                v + "s"
+            case _:
+                "z""#}
 )]
 fn test_match_arm_payload_misuse_is_rejected(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
@@ -1239,17 +1321,19 @@ fn test_match_arm_payload_misuse_is_rejected(#[case] code: &str) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
-    r"
-a: Bool = True
-b: Bool = False
-(a | b)",
+    indoc::indoc! {r#"
+
+        a: Bool = True
+        b: Bool = False
+        (a | b)"#},
     Value::Bool(true)
 )]
 #[case(
-    r"
-a: Bool = False
-b: Bool = False
-(a | b)",
+    indoc::indoc! {r#"
+
+        a: Bool = False
+        b: Bool = False
+        (a | b)"#},
     Value::Bool(false)
 )]
 fn test_pipe_is_still_logical_or(#[case] code: &str, #[case] expected: Value) {
@@ -1275,59 +1359,65 @@ fn test_pipe_is_still_logical_or(#[case] code: &str, #[case] expected: Value) {
 #[timeout(Duration::from_secs(10))]
 // Same tag on the seed and on every write: the arm set never grows.
 #[case(
-    r"
-acc: Mut({`some{Int} | `none}) := `some(0)
-for i in [1, 2, 3]:
-    acc := `some(i)
-acc",
+    indoc::indoc! {r#"
+
+        acc: Mut({`some{Int} | `none}) := `some(0)
+        for i in [1, 2, 3]:
+            acc := `some(i)
+        acc"#},
     union("some", Value::Int(3))
 )]
 // A `` `none `` seed with `` `some `` writes — the seed is the *other* arm, so the value
 // space is the join and the emitted column has to carry both tags.
 #[case(
-    r"
-acc: Mut({`some{Int} | `none}) := `none
-for i in [1, 2, 3]:
-    acc := `some(i)
-acc",
+    indoc::indoc! {r#"
+
+        acc: Mut({`some{Int} | `none}) := `none
+        for i in [1, 2, 3]:
+            acc := `some(i)
+        acc"#},
     union("some", Value::Int(3))
 )]
 // A conditional write choosing between the two tags per iteration.
 #[case(
-    r"
-acc: Mut({`some{Int} | `none}) := `none
-for i in [1, 2, 3]:
-    acc := `some(i) if i > 2 else `none
-acc",
+    indoc::indoc! {r#"
+
+        acc: Mut({`some{Int} | `none}) := `none
+        for i in [1, 2, 3]:
+            acc := `some(i) if i > 2 else `none
+        acc"#},
     union("some", Value::Int(3))
 )]
 // The last write takes the *other* tag, so the surviving value is the seed's arm
 // rather than the one the writes mostly used.
 #[case(
-    r"
-acc: Mut({`some{Int} | `none}) := `some(0)
-for i in [1, 2, 3]:
-    acc := `some(i) if i < 3 else `none
-acc",
+    indoc::indoc! {r#"
+
+        acc: Mut({`some{Int} | `none}) := `some(0)
+        for i in [1, 2, 3]:
+            acc := `some(i) if i < 3 else `none
+        acc"#},
     union("none", Value::Unit)
 )]
 // No annotation: the variable's variant type is inferred from seed and writes.
 #[case(
-    r"
-acc := `some(0)
-for i in [1, 2, 3]:
-    acc := `some(i)
-acc",
+    indoc::indoc! {r#"
+
+        acc := `some(0)
+        for i in [1, 2, 3]:
+            acc := `some(i)
+        acc"#},
     union("some", Value::Int(3))
 )]
 // A nominal `Option` held in a mutable variable is one type, whatever its seed and
 // writes build, and is held as the same union.
 #[case(
-    r"
-acc: Mut(Option(Int)) := Option::none
-for i in [1, 2, 3]:
-    acc := Option::some(i) if i > 2 else Option::none
-acc",
+    indoc::indoc! {r#"
+
+        acc: Mut(Option(Int)) := Option::none
+        for i in [1, 2, 3]:
+            acc := Option::some(i) if i > 2 else Option::none
+        acc"#},
     union("some", Value::Int(3))
 )]
 fn test_variant_valued_mut_var(#[case] code: &str, #[case] expected: Value) {
@@ -1358,16 +1448,17 @@ fn test_variant_valued_mut_var(#[case] code: &str, #[case] expected: Value) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_match_over_conditional_collection() {
-    let code = r"
-def unwrap(m):
-    match m:
-        case `a(v):
-            v
-        case `b(w):
-            w + 100
-xs = [1, 2]
-ys = [`a(v) if v > 1 else `a(0) for v in xs]
-sum([unwrap(m) for m in ys])";
+    let code = indoc::indoc! {r#"
+
+        def unwrap(m):
+            match m:
+                case `a(v):
+                    v
+                case `b(w):
+                    w + 100
+        xs = [1, 2]
+        ys = [`a(v) if v > 1 else `a(0) for v in xs]
+        sum([unwrap(m) for m in ys])"#};
     check_scalar(code, Value::Int(2));
 }
 
@@ -1377,16 +1468,17 @@ sum([unwrap(m) for m in ys])";
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_multi_arm_match_over_plain_collection() {
-    let code = r"
-def unwrap(m):
-    match m:
-        case `a(v):
-            v
-        case `b(w):
-            w + 100
-xs = [1, 2]
-ys = [`a(v) for v in xs]
-sum([unwrap(m) for m in ys])";
+    let code = indoc::indoc! {r#"
+
+        def unwrap(m):
+            match m:
+                case `a(v):
+                    v
+                case `b(w):
+                    w + 100
+        xs = [1, 2]
+        ys = [`a(v) for v in xs]
+        sum([unwrap(m) for m in ys])"#};
     check_scalar(code, Value::Int(3));
 }
 
@@ -1402,68 +1494,73 @@ sum([unwrap(m) for m in ys])";
 #[timeout(Duration::from_secs(10))]
 // One tag throughout.
 #[case(
-    r"
-def unwrap(m):
-    match m:
-        case `a(v):
-            v
-xs = [`a(1), `a(2)]
-sum([unwrap(m) for m in xs])",
+    indoc::indoc! {r#"
+
+        def unwrap(m):
+            match m:
+                case `a(v):
+                    v
+        xs = [`a(1), `a(2)]
+        sum([unwrap(m) for m in xs])"#},
     Value::Int(3)
 )]
 // **Mixed tags in one literal** — the case `a per-element extent cannot describe.
 #[case(
-    r"
-def unwrap(m):
-    match m:
-        case `a(v):
-            v
-        case `b(w):
-            w + 100
-xs = [`a(1), `b(2)]
-sum([unwrap(m) for m in xs])",
+    indoc::indoc! {r#"
+
+        def unwrap(m):
+            match m:
+                case `a(v):
+                    v
+                case `b(w):
+                    w + 100
+        xs = [`a(1), `b(2)]
+        sum([unwrap(m) for m in xs])"#},
     Value::Int(103)
 )]
 // A `Unit`-payload arm alongside a payload-carrying one.
 #[case(
-    r"
-def unwrap(m):
-    match m:
-        case `a(v):
-            v
-        case `none:
-            7
-xs = [`a(1), `none]
-sum([unwrap(m) for m in xs])",
+    indoc::indoc! {r#"
+
+        def unwrap(m):
+            match m:
+                case `a(v):
+                    v
+                case `none:
+                    7
+        xs = [`a(1), `none]
+        sum([unwrap(m) for m in xs])"#},
     Value::Int(8)
 )]
 // A nested variant payload, so the constant recursion is exercised.
 #[case(
-    r"
-def unwrap(m):
-    match m:
-        case `a(i):
-            match i:
-                case `b(v):
-                    v
-xs = [`a(`b(4))]
-sum([unwrap(m) for m in xs])",
+    indoc::indoc! {r#"
+
+        def unwrap(m):
+            match m:
+                case `a(i):
+                    match i:
+                        case `b(v):
+                            v
+        xs = [`a(`b(4))]
+        sum([unwrap(m) for m in xs])"#},
     Value::Int(4)
 )]
 // Two levels of nesting: A-normalization names each payload, so the element holds
 // a chain of two bindings and the flattening has to reach both.
 #[case(
-    r"
-def unwrap(m):
-    match m:
-        case `a(i):
-            match i:
-                case `b(j):
-                    match j:
-                        case `c(v):
-                            v
-xs = [`a(`b(`c(4)))]
-sum([unwrap(m) for m in xs])",
+    indoc::indoc! {r#"
+
+        def unwrap(m):
+            match m:
+                case `a(i):
+                    match i:
+                        case `b(j):
+                            match j:
+                                case `c(v):
+                                    v
+        xs = [`a(`b(`c(4)))]
+        sum([unwrap(m) for m in xs])"#},
     Value::Int(4)
 )]
 fn test_list_literal_of_variants(#[case] code: &str, #[case] expected: Value) {
@@ -1477,26 +1574,35 @@ fn test_list_literal_of_variants(#[case] code: &str, #[case] expected: Value) {
 /// disambiguating comma, unlike the one-*tuple* type it shares a bracket with.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case("x: {`a{Int}} = `a(1)\nx", union("a", Value::Int(1)))]
+#[case(indoc::indoc! {r#"
+    x: {`a{Int}} = `a(1)
+    x"#}, union("a", Value::Int(1)))]
 // The nullary arm both ways: bare, and with its unit payload written out. Those
 // agree because the empty product *is* unit, so the two spell one type.
-#[case("x: {`a} = `a\nx", union("a", Value::Unit))]
-#[case("x: {`a{}} = `a\nx", union("a", Value::Unit))]
+#[case(indoc::indoc! {r#"
+    x: {`a} = `a
+    x"#}, union("a", Value::Unit))]
+#[case(indoc::indoc! {r#"
+    x: {`a{}} = `a
+    x"#}, union("a", Value::Unit))]
 // A one-arm variant inside `Mut(…)`, which reaches the annotation reader by a
 // different path than a plain binding.
 #[case(
-    r"
-acc: Mut({`a{Int}}) := `a(0)
-for i in [1, 2]:
-    acc := `a(i)
-acc",
+    indoc::indoc! {r#"
+
+        acc: Mut({`a{Int}}) := `a(0)
+        for i in [1, 2]:
+            acc := `a(i)
+        acc"#},
     union("a", Value::Int(2))
 )]
 // A `|`-chain nested as a one-arm variant's payload. The inner variant reuses
 // the arm's braces rather than doubling them — the form `Type`'s `Display`
 // emits, so a printed type reads back.
 #[case(
-    "x: {`a{`some{Int} | `none}} = `a(`some(1))\nx",
+    indoc::indoc! {r#"
+        x: {`a{`some{Int} | `none}} = `a(`some(1))
+        x"#},
     union("a", union("some", Value::Int(1)))
 )]
 // A tag's braces are the payload type's own, elided, so the one-tuple's comma is
@@ -1504,16 +1610,22 @@ acc",
 // The distinction is carried by the same comma at both levels: the payload term
 // takes it too.
 #[case(
-    "x: {`a{Int,}} = `a((1,))\nx",
+    indoc::indoc! {r#"
+        x: {`a{Int,}} = `a((1,))
+        x"#},
     union("a", make_tuple(&[Value::Int(1)]))
 )]
 #[case(
-    "x: {`a{Int,}} = `a(1,)\nx",
+    indoc::indoc! {r#"
+        x: {`a{Int,}} = `a(1,)
+        x"#},
     union("a", make_tuple(&[Value::Int(1)]))
 )]
 // The tag's parens are the product term's, so a constructor reads like a call:
 // several values need no second bracket, and a record payload is written once.
-#[case("x: {`a{Int, Bool}} = `a(1, True)\nx", union("a", make_tuple(&[Value::Int(1), Value::Bool(true)])))]
+#[case(indoc::indoc! {r#"
+    x: {`a{Int, Bool}} = `a(1, True)
+    x"#}, union("a", make_tuple(&[Value::Int(1), Value::Bool(true)])))]
 fn test_one_arm_variant_type(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -1524,24 +1636,40 @@ fn test_one_arm_variant_type(#[case] code: &str, #[case] expected: Value) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // The value carries a tag the one-arm type does not name.
-#[case("x: {`a{Int}} = `b(1)\nx")]
+#[case(indoc::indoc! {r#"
+    x: {`a{Int}} = `b(1)
+    x"#})]
 // The right tag, the wrong payload.
 #[case(r#"x: {`a{Int}} = `a("s")"#)]
 // An unknown name in type position is an unknown type, whatever its case — the
 // backtick, not the capitalisation, is what would have made it a tag.
-#[case("x: Itn = 5\nx")]
-#[case("x: itn = 5\nx")]
+#[case(indoc::indoc! {r#"
+    x: Itn = 5
+    x"#})]
+#[case(indoc::indoc! {r#"
+    x: itn = 5
+    x"#})]
 // A variant type is delimited: without the braces there is nothing to say where
 // the `|`-chain ends, so a bare arm is not a type.
-#[case("x: `a = `a\nx")]
-#[case("x: `some{Int} | `none = `none\nx")]
+#[case(indoc::indoc! {r#"
+    x: `a = `a
+    x"#})]
+#[case(indoc::indoc! {r#"
+    x: `some{Int} | `none = `none
+    x"#})]
 // Arms are `|`-separated. A comma makes this a *tuple* of variant types, which
 // is a different type and is rejected rather than quietly accepted.
-#[case("x: {`a{Int}, `b} = `a(1)\nx")]
+#[case(indoc::indoc! {r#"
+    x: {`a{Int}, `b} = `a(1)
+    x"#})]
 // Braces after a tag are its field list, and parens carry a value: neither form
 // works in the other's position.
-#[case("x: {`a(Int)} = `a(1)\nx")]
-#[case("x = `a{Int}\nx")]
+#[case(indoc::indoc! {r#"
+    x: {`a(Int)} = `a(1)
+    x"#})]
+#[case(indoc::indoc! {r#"
+    x = `a{Int}
+    x"#})]
 fn test_one_arm_variant_type_rejections(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -1606,16 +1734,17 @@ fn test_open_demand_describes_further_arms_in_a_diagnostic() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_two_call_sites_of_a_match_udf() {
-    let code = r#"
-def unwrap(m):
-    match m:
-        case `a(v):
-            v
-        case `b(w):
-            w
-p = unwrap(`a(1))
-q = unwrap(`a(2))
-p + q"#;
+    let code = indoc::indoc! {r#"
+
+        def unwrap(m):
+            match m:
+                case `a(v):
+                    v
+                case `b(w):
+                    w
+        p = unwrap(`a(1))
+        q = unwrap(`a(2))
+        p + q"#};
     check_scalar(code, Value::Int(3));
 }
 
@@ -1626,14 +1755,15 @@ p + q"#;
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_single_arm_match_udf_takes_two_call_sites() {
-    let code = r#"
-def unwrap(m):
-    match m:
-        case `a(v):
-            v
-p = unwrap(`a(1))
-q = unwrap(`a("s"))
-p"#;
+    let code = indoc::indoc! {r#"
+
+        def unwrap(m):
+            match m:
+                case `a(v):
+                    v
+        p = unwrap(`a(1))
+        q = unwrap(`a("s"))
+        p"#};
     check_scalar(code, Value::Int(1));
 }
 

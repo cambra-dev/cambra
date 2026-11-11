@@ -4239,7 +4239,10 @@ mod tests {
     #[test]
     fn a_walk_carries_no_entry_the_names_below_do_not_read() {
         const DEPTH: usize = 8;
-        let mut program = String::from("type One(T) = T\nc0 = 1\n");
+        let mut program = String::from(indoc::indoc! {r#"
+            type One(T) = T
+            c0 = 1
+            "#});
         for i in 1..=DEPTH {
             program.push_str(&format!("c{i} = One::new(c{})\n", i - 1));
         }

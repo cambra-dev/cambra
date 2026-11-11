@@ -3310,7 +3310,10 @@ mod tests {
     /// A trait's associated type is a type, so it is capitalized.
     #[test]
     fn a_lowercase_associated_type_is_refused() {
-        let result = parse_mod("trait T(C):\n    elem\n");
+        let result = parse_mod(indoc::indoc! {r#"
+            trait T(C):
+                elem
+            "#});
         let errors = result.into_result().expect_err("refused");
         assert!(
             errors.iter().any(|e| e
@@ -3323,7 +3326,11 @@ mod tests {
     /// `pub` stands on each `def` in an `impl` block, not on the block.
     #[test]
     fn pub_on_an_impl_block_is_refused() {
-        let result = parse_mod("pub impl Price:\n    def f(self) => Int:\n        1\n");
+        let result = parse_mod(indoc::indoc! {r#"
+            pub impl Price:
+                def f(self) => Int:
+                    1
+            "#});
         assert!(
             result
                 .errors
@@ -3369,9 +3376,13 @@ mod tests {
     #[test]
     fn a_constructor_line_takes_no_empty_parentheses() {
         assert!(
-            !parse_mod("type Option(T):\n    some(T)\n    none()\n")
-                .errors
-                .is_empty()
+            !parse_mod(indoc::indoc! {r#"
+                type Option(T):
+                    some(T)
+                    none()
+                "#})
+            .errors
+            .is_empty()
         );
     }
 
@@ -3467,7 +3478,13 @@ mod tests {
             ("type price = Int\n", "type name `price`"),
             ("type Box(t) = t\n", "type parameter `t`"),
             ("type Box(t: Type) = Int\n", "type parameter `t`"),
-            ("type Shape:\n    Circle(Int)\n", "constructor `Circle`"),
+            (
+                indoc::indoc! {r#"
+                type Shape:
+                    Circle(Int)
+                "#},
+                "constructor `Circle`",
+            ),
         ] {
             let result = parse_mod(src);
             assert!(
@@ -3774,7 +3791,10 @@ mod tests {
     fn function_def_return_annotation_may_be_a_function_type() {
         // The `def`'s structural `=>` is consumed before the return type is
         // parsed, so the return type may itself be a function type.
-        let m = parse_m("def f(x: Int) => (Int => Bool):\n    x\n");
+        let m = parse_m(indoc::indoc! {r#"
+            def f(x: Int) => (Int => Bool):
+                x
+            "#});
         match &m.body[0].node {
             Stmt::FunctionDef { output, .. } => {
                 let output = output.as_ref().expect("expected an output annotation");
@@ -4272,13 +4292,22 @@ mod tests {
     /// folds a run of them into one `Newline`, so the statement is unaffected.
     #[test]
     fn a_blank_line_between_the_decorator_and_its_declaration_is_ignored() {
-        let m = parse_m("@LoadFrom(qty)\n\nheld: Int\nheld\n");
+        let m = parse_m(indoc::indoc! {r#"
+            @LoadFrom(qty)
+
+            held: Int
+            held
+            "#});
         assert!(matches!(&m.body[0].node, Stmt::LoadFrom { .. }));
     }
 
     #[test]
     fn load_from_declaration() {
-        let m = parse_m("@LoadFrom(qty)\nheld: Int\nheld\n");
+        let m = parse_m(indoc::indoc! {r#"
+            @LoadFrom(qty)
+            held: Int
+            held
+            "#});
         let Stmt::LoadFrom {
             target,
             annotation,
@@ -4296,7 +4325,11 @@ mod tests {
     /// this version then iterates is written with.
     #[test]
     fn load_from_declaration_bounded() {
-        let m = parse_m("@LoadFrom(qty)\nheld <: Map(String, Int)\nheld\n");
+        let m = parse_m(indoc::indoc! {r#"
+            @LoadFrom(qty)
+            held <: Map(String, Int)
+            held
+            "#});
         let Stmt::LoadFrom { annotation, .. } = &m.body[0].node else {
             panic!("expected a LoadFrom statement");
         };
@@ -4306,7 +4339,10 @@ mod tests {
     /// An annotation with no value is a declaration, exact or bounded.
     #[test]
     fn a_bare_annotation_is_a_declaration() {
-        let m = parse_m("out: Feed(Int)\nout <: Feed(_)\n");
+        let m = parse_m(indoc::indoc! {r#"
+            out: Feed(Int)
+            out <: Feed(_)
+            "#});
         let [first, second] = m.body.as_slice() else {
             panic!("expected two statements");
         };
@@ -4407,7 +4443,14 @@ mod tests {
 
     #[test]
     fn if_elif_else() {
-        let m = parse_m("if x:\n    y\nelif z:\n    w\nelse:\n    q\n");
+        let m = parse_m(indoc::indoc! {r#"
+            if x:
+                y
+            elif z:
+                w
+            else:
+                q
+            "#});
         match &m.body[0].node {
             Stmt::If {
                 branches,
@@ -4422,13 +4465,19 @@ mod tests {
 
     #[test]
     fn for_loop() {
-        let m = parse_m("for x in [1, 2, 3]:\n    y\n");
+        let m = parse_m(indoc::indoc! {r#"
+            for x in [1, 2, 3]:
+                y
+            "#});
         assert!(matches!(m.body[0].node, Stmt::For { .. }));
     }
 
     #[test]
     fn function_def() {
-        let m = parse_m("def f(x, y):\n    x + y\n");
+        let m = parse_m(indoc::indoc! {r#"
+            def f(x, y):
+                x + y
+            "#});
         match &m.body[0].node {
             Stmt::FunctionDef {
                 name,
@@ -4478,7 +4527,10 @@ mod tests {
 
     #[test]
     fn function_def_output_annotation_base() {
-        let m = parse_m("def f(x: Int) => Int:\n    x\n");
+        let m = parse_m(indoc::indoc! {r#"
+            def f(x: Int) => Int:
+                x
+            "#});
         match &m.body[0].node {
             Stmt::FunctionDef { output, .. } => {
                 let output = output.as_ref().expect("expected an output annotation");
@@ -4490,7 +4542,10 @@ mod tests {
 
     #[test]
     fn function_def_output_annotation_refinement() {
-        let m = parse_m("def f(x: Int) => {Int where _ > 0}:\n    x\n");
+        let m = parse_m(indoc::indoc! {r#"
+            def f(x: Int) => {Int where _ > 0}:
+                x
+            "#});
         match &m.body[0].node {
             Stmt::FunctionDef { output, .. } => {
                 let output = output.as_ref().expect("expected an output annotation");
@@ -4505,7 +4560,11 @@ mod tests {
 
     #[test]
     fn nested_function_with_for_and_yield() {
-        let src = "def doubles(xs):\n    for x in xs:\n        yield x * 2\n";
+        let src = indoc::indoc! {r#"
+            def doubles(xs):
+                for x in xs:
+                    yield x * 2
+            "#};
         let m = parse_m(src);
         assert_eq!(m.body.len(), 1);
     }
@@ -4596,7 +4655,13 @@ mod tests {
 
     #[test]
     fn match_arms_bind_payloads() {
-        let m = parse_m("match x:\n    case `some(v):\n        v\n    case `none:\n        0\n");
+        let m = parse_m(indoc::indoc! {r#"
+            match x:
+                case `some(v):
+                    v
+                case `none:
+                    0
+            "#});
         match &m.body[0].node {
             Stmt::Match { scrutinee, arms } => {
                 assert!(matches!(scrutinee.node, Expr::Name(_)));
@@ -4623,7 +4688,12 @@ mod tests {
     /// The scrutinee is a full expression and each arm body is a full block.
     #[test]
     fn match_scrutinee_expression_and_block_arms() {
-        let m = parse_m("match f(y)[0]!:\n    case `ok(v):\n        d = v\n        d + 1\n");
+        let m = parse_m(indoc::indoc! {r#"
+            match f(y)[0]!:
+                case `ok(v):
+                    d = v
+                    d + 1
+            "#});
         match &m.body[0].node {
             Stmt::Match { scrutinee, arms } => {
                 assert!(matches!(scrutinee.node, Expr::Subscript { .. }));
@@ -4927,7 +4997,13 @@ mod tests {
     /// identifier, so without the special case it would parse as an unmatchable tag.
     #[test]
     fn default_arm_is_not_a_tag_named_underscore() {
-        let m = parse_m("match x:\n    case `some(v):\n        v\n    case _:\n        0\n");
+        let m = parse_m(indoc::indoc! {r#"
+            match x:
+                case `some(v):
+                    v
+                case _:
+                    0
+            "#});
         match &m.body[0].node {
             Stmt::Match { arms, .. } => {
                 assert_eq!(arms.len(), 2);

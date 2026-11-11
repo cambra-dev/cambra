@@ -284,7 +284,10 @@ fn a_use_name_spelled_like_a_source_is_refused() {
         ),
     )));
     let program = program(
-        "import catalog use double as orders\n1\n",
+        indoc::indoc! {r#"
+            import catalog use double as orders
+            1
+            "#},
         &[("catalog", CATALOG)],
     );
     let result = panic::catch_unwind(AssertUnwindSafe(|| {

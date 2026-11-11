@@ -17,11 +17,12 @@ use super::helpers::*;
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
-    r#"
-x := 0
-for i in [1, 2, 3]:
-    x += i
-x"#,
+    indoc::indoc! {r#"
+
+        x := 0
+        for i in [1, 2, 3]:
+            x += i
+        x"#},
     Tile::Scalar(ColumnValue::Ints(vec![6]))
 )]
 // A mutable variable seeded from a **computed** expression rather than a literal.
@@ -33,22 +34,24 @@ x"#,
 // — the intersection over every contribution — so the refinement drops out here and the
 // mutable variable types as `Mut(Int)`.
 #[case(
-    r#"
-r = (a=0, b=9)
-x := r.a
-for i in [1, 2, 3]:
-    x += i
-x"#,
+    indoc::indoc! {r#"
+
+        r = (a=0, b=9)
+        x := r.a
+        for i in [1, 2, 3]:
+            x += i
+        x"#},
     Tile::Scalar(ColumnValue::Ints(vec![6]))
 )]
 // The same seed with **no writes at all**. The join has one member, so the mutable variable
 // keeps its seed's refinement — and that is correct, since it really does hold that
 // value at every position. Nothing pre-emptively widens it.
 #[case(
-    r#"
-r = (a=7, b=9)
-x := r.a
-x"#,
+    indoc::indoc! {r#"
+
+        r = (a=7, b=9)
+        x := r.a
+        x"#},
     Tile::Scalar(ColumnValue::Ints(vec![7]))
 )]
 // A mutable variable whose only write goes **through a `Mut` parameter**. The write is not
@@ -62,13 +65,14 @@ x"#,
 // an `Infer` and takes the deliberate deref arm, which is right for a bare read
 // (`cnt + 1`) and drops the handle here.
 #[case(
-    r#"
-def fw(c: Mut(Int)):
-  c += 1
-x := 0
-for i in [1, 2, 3]:
-  fw(x)
-x"#,
+    indoc::indoc! {r#"
+
+        def fw(c: Mut(Int)):
+          c += 1
+        x := 0
+        for i in [1, 2, 3]:
+          fw(x)
+        x"#},
     Tile::Scalar(ColumnValue::Ints(vec![3]))
 )]
 // The same contribution at an argument position that is **not the first**. A call is
@@ -78,26 +82,28 @@ x"#,
 // instead covers `fw(x, n)` and silently skips this, which then fails the invariance
 // check against `Mut(Int)` because the mutable variable still claims its seed.
 #[case(
-    r#"
-def fw(n: Int, c: Mut(Int)):
-  c += n
-x := 0
-for i in [1, 2, 3]:
-  fw(2, x)
-x"#,
+    indoc::indoc! {r#"
+
+        def fw(n: Int, c: Mut(Int)):
+          c += n
+        x := 0
+        for i in [1, 2, 3]:
+          fw(2, x)
+        x"#},
     Tile::Scalar(ColumnValue::Ints(vec![6]))
 )]
 // Two mutable variables in one call: every argument position is walked, not just one.
 #[case(
-    r#"
-def fw(a: Mut(Int), b: Mut(Int)):
-  a += 1
-  b += 2
-x := 0
-y := 0
-for i in [1, 2, 3]:
-  fw(x, y)
-(x, y)"#,
+    indoc::indoc! {r#"
+
+        def fw(a: Mut(Int), b: Mut(Int)):
+          a += 1
+          b += 2
+        x := 0
+        y := 0
+        for i in [1, 2, 3]:
+          fw(x, y)
+        (x, y)"#},
     Tile::record(HashMap::from([
         ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![3]))),
         ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![6]))),
@@ -107,75 +113,82 @@ for i in [1, 2, 3]:
 // `Mut(Int)`'s value against the outer parameter's, so the mutable variable's join closes over
 // the whole forwarding chain rather than just the frame it was named in.
 #[case(
-    r#"
-def inner(c: Mut(Int)):
-  c += 1
-def outer(n: Int, c: Mut(Int)):
-  inner(c)
-x := 0
-for i in [1, 2, 3]:
-  outer(7, x)
-x"#,
+    indoc::indoc! {r#"
+
+        def inner(c: Mut(Int)):
+          c += 1
+        def outer(n: Int, c: Mut(Int)):
+          inner(c)
+        x := 0
+        for i in [1, 2, 3]:
+          outer(7, x)
+        x"#},
     Tile::Scalar(ColumnValue::Ints(vec![3]))
 )]
 // The `:=` operator marks mutability syntactically — a bare `x := 0` induction
 // accumulator (no `Mut(…)` annotation) written with `x := x + i`.
 #[case(
-    r#"
-x := 0
-for i in [1, 2, 3]:
-    x := x + i
-x"#,
+    indoc::indoc! {r#"
+
+        x := 0
+        for i in [1, 2, 3]:
+            x := x + i
+        x"#},
     Tile::Scalar(ColumnValue::Ints(vec![6]))
 )]
 // The accumulator's value type can be spelled concretely: `Mut(Int)`
 // annotates the binding at `Int` (checked against init and updates).
 #[case(
-    r#"
-x: Mut(Int) := 0
-for i in [1, 2, 3]:
-    x += i
-x"#,
+    indoc::indoc! {r#"
+
+        x: Mut(Int) := 0
+        for i in [1, 2, 3]:
+            x += i
+        x"#},
     Tile::Scalar(ColumnValue::Ints(vec![6]))
 )]
 #[case(
-    r#"
-x := 0
-for i in []:
-    x += 1
-x"#,
+    indoc::indoc! {r#"
+
+        x := 0
+        for i in []:
+            x += 1
+        x"#},
     Tile::Scalar(ColumnValue::Ints(vec![0]))
 )]
 #[case(
-    r#"
-x := 0
-for i in [1, 2, 3]:
-    x := x + i + 1
-x"#,
+    indoc::indoc! {r#"
+
+        x := 0
+        for i in [1, 2, 3]:
+            x := x + i + 1
+        x"#},
     Tile::Scalar(ColumnValue::Ints(vec![9]))
 )]
 #[case(
-    r#"
-x := 0
-o: Feed(_)
-for i in [1, 2, 3]:
-    x := x + i
-    o << x
-o"#,
+    indoc::indoc! {r#"
+
+        x := 0
+        o: Feed(_)
+        for i in [1, 2, 3]:
+            x := x + i
+            o << x
+        o"#},
     make_int_list(&[1,3,6])
 )]
 #[case(
-    r#"
-x := 0
-o: Feed(_)
-o << x
-for i in [1, 2, 3]:
-    x := x + i
-    o << x
-for j in [4, 5]:
-    x := x + j
-    o << x
-o"#,
+    indoc::indoc! {r#"
+
+        x := 0
+        o: Feed(_)
+        o << x
+        for i in [1, 2, 3]:
+            x := x + i
+            o << x
+        for j in [4, 5]:
+            x := x + j
+            o << x
+        o"#},
     Tile::data_function(
         // Tags map each domain entry to its source variant: index 0 (pre-loop
         // feed of `x = 0`) → variant 0; indices 1-3 (loop1 running sums) →
@@ -194,12 +207,13 @@ o"#,
 // on `i`).  This exercises the const-of-function shortcut in op-conversion
 // — without it, op-conversion tries to const-lift a function-tiled value.
 #[case(
-    r#"
-x := 0
-for i in [1, 2, 3]:
-    y = x + 1
-    x := y * 2
-x"#,
+    indoc::indoc! {r#"
+
+        x := 0
+        for i in [1, 2, 3]:
+            y = x + 1
+            x := y * 2
+        x"#},
     Tile::Scalar(ColumnValue::Ints(vec![14]))
 )]
 // As above, but `y` depends on `i` so the source list survives.  This
@@ -208,22 +222,24 @@ x"#,
 // captures both the cyclic accumulator (function-tiled) and the per-i
 // stream.
 #[case(
-    r#"
-x := 0
-for i in [1, 2, 3]:
-    y = x + i
-    x := y * 2
-x"#,
+    indoc::indoc! {r#"
+
+        x := 0
+        for i in [1, 2, 3]:
+            y = x + i
+            x := y * 2
+        x"#},
     Tile::Scalar(ColumnValue::Ints(vec![22]))
 )]
 #[case(
-    r#"
-x := 1
-y := 0
-for i in [1, 2, 3]:
-    y := y + i
-    x := x * i
-(x, y, x + y)"#,
+    indoc::indoc! {r#"
+
+        x := 1
+        y := 0
+        for i in [1, 2, 3]:
+            y := y + i
+            x := x * i
+        (x, y, x + y)"#},
     Tile::record(HashMap::from([
         ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![6]))),
         ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![6]))),
@@ -235,15 +251,16 @@ for i in [1, 2, 3]:
 //   iter 1 (i=2): y=1+2=3, x=1*2=2, feed: 2+3=5
 //   iter 2 (i=3): y=3+3=6, x=2*3=6, feed: 6+6=12
 #[case(
-    r#"
-x := 1
-y := 0
-o: Feed(_)
-for i in [1, 2, 3]:
-    y := y + i
-    x := x * i
-    o << x + y
-o"#,
+    indoc::indoc! {r#"
+
+        x := 1
+        y := 0
+        o: Feed(_)
+        for i in [1, 2, 3]:
+            y := y + i
+            x := x * i
+            o << x + y
+        o"#},
     make_int_list(&[2, 5, 12])
 )]
 // Multi-accumulator loop with a pre-mutation feed that observes both
@@ -252,15 +269,16 @@ o"#,
 //   iter 1 (i=2): feed prev: 2+10=12; x=2+2=4, y=10*2=20
 //   iter 2 (i=3): feed prev: 4+20=24; x=4+3=7, y=20*3=60
 #[case(
-    r#"
-x := 1
-y := 10
-o: Feed(_)
-for i in [1, 2, 3]:
-    o << x + y
-    x := x + i
-    y := y * i
-o"#,
+    indoc::indoc! {r#"
+
+        x := 1
+        y := 10
+        o: Feed(_)
+        for i in [1, 2, 3]:
+            o << x + y
+            x := x + i
+            y := y * i
+        o"#},
     make_int_list(&[11, 12, 24])
 )]
 // Two feeds to the same defer within a single mutation loop — exercises
@@ -272,14 +290,15 @@ o"#,
 //   iter 2: x = 3+3 = 6, feeds: 6, 106
 // The two feeds form variants 0 and 1 of the resulting union.
 #[case(
-    r#"
-x := 0
-o: Feed(_)
-for i in [1, 2, 3]:
-    x := x + i
-    o << x
-    o << x + 100
-o"#,
+    indoc::indoc! {r#"
+
+        x := 0
+        o: Feed(_)
+        for i in [1, 2, 3]:
+            x := x + i
+            o << x
+            o << x + 100
+        o"#},
     Tile::data_function(channel_union(&["o<<", "o<<#1"], &[0, 0, 0, 1, 1, 1], vec![
                 ColumnValue::UInts(vec![0, 1, 2]),
                 ColumnValue::UInts(vec![0, 1, 2]),
@@ -293,15 +312,16 @@ o"#,
 //   iter 1 (i=2): prev_x=1 → feed_pre=1; x=1+2=3; feed_post=3*10=30
 //   iter 2 (i=3): prev_x=3 → feed_pre=3; x=3+3=6; feed_post=6*10=60
 #[case(
-    r#"
-x := 0
-o: Feed(_)
-o << x
-for i in [1, 2, 3]:
-    o << x
-    x := x + i
-    o << x * 10
-o"#,
+    indoc::indoc! {r#"
+
+        x := 0
+        o: Feed(_)
+        o << x
+        for i in [1, 2, 3]:
+            o << x
+            x := x + i
+            o << x * 10
+        o"#},
     Tile::data_function(channel_union(&["o<<", "o<<#1", "o<<#2"], &[0, 1, 1, 1, 2, 2, 2], vec![
                 ColumnValue::Units(1),
                 ColumnValue::UInts(vec![0, 1, 2]),
@@ -313,24 +333,26 @@ o"#,
 // cnt + 1)`, and the letrec phase reads the hidden write off the `For` marker
 // as an accumulator recurrence: 0 → 1 → 2 → 3 over [1, 2, 3].
 #[case(
-    r#"
-def bump(c: Mut(Int)):
-    c += 1
-cnt: Mut(Int) := 0
-for x in [1, 2, 3]:
-    bump(cnt)
-cnt"#,
+    indoc::indoc! {r#"
+
+        def bump(c: Mut(Int)):
+            c += 1
+        cnt: Mut(Int) := 0
+        for x in [1, 2, 3]:
+            bump(cnt)
+        cnt"#},
     Tile::Scalar(ColumnValue::Ints(vec![3]))
 )]
 // The same pass-by-ref writer applied once, outside any loop: the inlined
 // `MutWrite(cnt, cnt + 1)` normalizes to a shadowing `let`, so `cnt` reads 1.
 #[case(
-    r#"
-def bump(c: Mut(Int)):
-    c += 1
-cnt: Mut(Int) := 0
-bump(cnt)
-cnt"#,
+    indoc::indoc! {r#"
+
+        def bump(c: Mut(Int)):
+            c += 1
+        cnt: Mut(Int) := 0
+        bump(cnt)
+        cnt"#},
     Tile::Scalar(ColumnValue::Ints(vec![1]))
 )]
 // Two independent mutation loops of *different* domain lengths, both read in
@@ -339,14 +361,15 @@ cnt"#,
 // *both* loops to converge — the shorter loop (`a`) converging first must not
 // declare the whole result terminal and read `b` as an empty (→ 0) arm.
 #[case(
-    r#"
-a := 0
-b := 100
-for x in [1, 2]:
-    a += 1
-for x in [1, 2, 3]:
-    b += 1
-a * 1000 + b"#,
+    indoc::indoc! {r#"
+
+        a := 0
+        b := 100
+        for x in [1, 2]:
+            a += 1
+        for x in [1, 2, 3]:
+            b += 1
+        a * 1000 + b"#},
     Tile::Scalar(ColumnValue::Ints(vec![2103]))
 )]
 // As above, but the longer loop reads the shorter loop's final mutable-variable value:
@@ -354,71 +377,77 @@ a * 1000 + b"#,
 // Broadcasting the not-yet-converged `a` must yield an empty (non-terminal)
 // contribution, not panic on a `repeat`-of-empty.
 #[case(
-    r#"
-a := 0
-b := 100
-for x in [1, 2]:
-    a += 1
-for x in [1, 2, 3]:
-    b += a
-a * 1000 + b"#,
+    indoc::indoc! {r#"
+
+        a := 0
+        b := 100
+        for x in [1, 2]:
+            a += 1
+        for x in [1, 2, 3]:
+            b += a
+        a * 1000 + b"#},
     Tile::Scalar(ColumnValue::Ints(vec![2106]))
 )]
 // A pass-by-ref writer whose body is *two* statements, applied once outside a
 // loop. Inlining splices `ExprStmt(ExprStmt(cnt := cnt+1, cnt := cnt+2), cnt)`;
 // flat-spine normalization un-nests it so both writes land on the spine.
 #[case(
-    r#"
-def bump2(c: Mut(Int)):
-    c += 1
-    c += 2
-cnt: Mut(Int) := 0
-bump2(cnt)
-cnt"#,
+    indoc::indoc! {r#"
+
+        def bump2(c: Mut(Int)):
+            c += 1
+            c += 2
+        cnt: Mut(Int) := 0
+        bump2(cnt)
+        cnt"#},
     Tile::Scalar(ColumnValue::Ints(vec![3]))
 )]
 // A pass-by-ref writer applied in *value* position (`y = bump(cnt)`). Inlining
 // binds `y` to a bare `MutWrite`; flat-spine normalization hoists the write onto
 // the spine (its value is `unit`), so the mutable-variable advance reaches the trailing read.
 #[case(
-    r#"
-def bump(c: Mut(Int)):
-    c += 1
-cnt: Mut(Int) := 0
-y = bump(cnt)
-cnt"#,
+    indoc::indoc! {r#"
+
+        def bump(c: Mut(Int)):
+            c += 1
+        cnt: Mut(Int) := 0
+        y = bump(cnt)
+        cnt"#},
     Tile::Scalar(ColumnValue::Ints(vec![1]))
 )]
 // A top-level mutable write followed by a read: the terminal-write path shadows
 // `cnt` so the read observes the advanced value.
 #[case(
-    r#"
-cnt := 0
-cnt += 1
-cnt"#,
+    indoc::indoc! {r#"
+
+        cnt := 0
+        cnt += 1
+        cnt"#},
     Tile::Scalar(ColumnValue::Ints(vec![1]))
 )]
 // I1(b): a non-`Mut` annotated local (`y: Int = …`) inside a mutation-loop
 // body lowers as an ordinary per-iteration annotated `let`, not rejected.
 // Per iter: y = 2·i; acc += y over [1,2,3] → 2+4+6 = 12.
 #[case(
-    r#"
-acc := 0
-for i in [1, 2, 3]:
-    y: Int = i * 2
-    acc += y
-acc"#,
+    indoc::indoc! {r#"
+
+        acc := 0
+        for i in [1, 2, 3]:
+            y: Int = i * 2
+            acc += y
+        acc"#},
     Tile::Scalar(ColumnValue::Ints(vec![12]))
 )]
 // A nested loop's accumulator is carried through both levels, so the overwrite reads what
 // the position before it left whichever level that position sat at: 0 →11→32→44→66.
 #[case(
-    r#"
-x := 0
-for i in [1, 2]:
-    for j in [10, 20]:
-        x := x + i + j
-x"#,
+    indoc::indoc! {r#"
+
+        x := 0
+        for i in [1, 2]:
+            for j in [10, 20]:
+                x := x + i + j
+        x"#},
     Tile::Scalar(ColumnValue::Ints(vec![66]))
 )]
 // A **conditional feed** riding an accumulator loop: the `o << i` fires only on
@@ -428,14 +457,15 @@ x"#,
 // `InductionStore` omits the tap from a non-firing position's delta, and
 // `StoreDenseRead` (non-carry) reads only fired positions.
 #[case(
-    r#"
-o: Feed(_)
-cnt := 0
-for i in [10, 20, 30]:
-    cnt := cnt + 1
-    if i > 15:
-        o << i
-o"#,
+    indoc::indoc! {r#"
+
+        o: Feed(_)
+        cnt := 0
+        for i in [10, 20, 30]:
+            cnt := cnt + 1
+            if i > 15:
+                o << i
+        o"#},
     Tile::data_function(ColumnValue::from_uints(vec![1, 2]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![20, 30]))), Predicate::True, BitSet::new())
 )]
 // A **conditional write** with an unconditional feed after it: `cnt` increments
@@ -443,30 +473,32 @@ o"#,
 // reads the merged `cnt` on the loop spine, so the tap is one route over every
 // position: 0 ↦ 0, 1 ↦ 1, 2 ↦ 2.
 #[case(
-    r#"
-o: Feed(_)
-cnt := 0
-for i in [10, 20, 30]:
-    if i > 15:
-        cnt := cnt + 1
-    o << cnt
-o"#,
+    indoc::indoc! {r#"
+
+        o: Feed(_)
+        cnt := 0
+        for i in [10, 20, 30]:
+            if i > 15:
+                cnt := cnt + 1
+            o << cnt
+        o"#},
     Tile::data_function(ColumnValue::from_uints(vec![0, 1, 2]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 2]))), Predicate::True, BitSet::new())
 )]
 // A full `if/else` write with a trailing feed: each position takes exactly one
 // arm (`i < 2` → `x += i`, else `x += 100`) and feeds the merged `x` on the loop
 // spine: 0 ↦ 0, 1 ↦ 1, 2 ↦ 101, 3 ↦ 201.
 #[case(
-    r#"
-o: Feed(_)
-x := 0
-for i in [0, 1, 2, 3]:
-    if i < 2:
-        x := x + i
-    else:
-        x := x + 100
-    o << x
-o"#,
+    indoc::indoc! {r#"
+
+        o: Feed(_)
+        x := 0
+        for i in [0, 1, 2, 3]:
+            if i < 2:
+                x := x + i
+            else:
+                x := x + 100
+            o << x
+        o"#},
     Tile::data_function(ColumnValue::from_uints(vec![0, 1, 2, 3]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 101, 201]))), Predicate::True, BitSet::new())
 )]
 // A `mut` accumulator over a **filtered** source. `restrict` keeps an element at
@@ -538,14 +570,15 @@ o"#,
 // the channel is keyed by the **position pair** the nest names — one value per innermost
 // position rather than one per outer group.
 #[case(
-    r#"
-x := 0
-o: Feed(_)
-for i in [1, 2]:
-    for j in [10, 20]:
-        x := x + i + j
-        o << x
-o"#,
+    indoc::indoc! {r#"
+
+        x := 0
+        o: Feed(_)
+        for i in [1, 2]:
+            for j in [10, 20]:
+                x := x + i + j
+                o << x
+        o"#},
     Tile::data_function(
         ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::from_uints(vec![0, 0, 1, 1])),
@@ -705,7 +738,13 @@ fn expect_compile_error(code: &str, needle: &str) {
 /// [`write_of_the_wrong_type_is_rejected_against_the_mut_vars_value_type`].
 #[test]
 fn augmented_assignment_to_non_mutable_rejected() {
-    expect_mut_discipline_error("x = 0\nx += 1\nx", "not a mutable variable");
+    expect_mut_discipline_error(
+        indoc::indoc! {r#"
+        x = 0
+        x += 1
+        x"#},
+        "not a mutable variable",
+    );
 }
 
 /// The same rejection when the target's binder is **gone by the time the check runs**.
@@ -754,7 +793,9 @@ fn write_of_the_wrong_type_is_rejected_against_the_mut_vars_value_type() {
 #[test]
 fn mut_annotation_with_too_many_arguments_rejected() {
     expect_compile_error(
-        "x: Mut(Int, Txn, Int) := 0\nx",
+        indoc::indoc! {r#"
+            x: Mut(Int, Txn, Int) := 0
+            x"#},
         "takes one or two arguments",
     );
 }
@@ -765,7 +806,9 @@ fn mut_annotation_with_too_many_arguments_rejected() {
 #[test]
 fn mut_annotation_with_non_txn_domain_rejected() {
     expect_compile_error(
-        "x: Mut(Int, Foo) := 0\nx",
+        indoc::indoc! {r#"
+            x: Mut(Int, Foo) := 0
+            x"#},
         "only explicit `Mut` sequencing domain is `Txn`",
     );
 }
@@ -961,10 +1004,18 @@ fn a_nested_loop_neither_feeding_nor_writing_outside_it_is_rejected(#[case] code
 /// claims nothing `:` does not: `Type::History` is invariant in both payloads, so
 /// the only type below `Mut(V, D)` is `Mut(V, D)` itself.
 #[rstest]
-#[case::bare_value_exact("y: Int := 0\ny")]
-#[case::bare_value_bounded("y <: Int := 0\ny")]
-#[case::mut_bounded("y <: Mut(Int) := 0\ny")]
-#[case::mut_txn_bounded("y <: Mut(Int, Txn) := 0\ny")]
+#[case::bare_value_exact(indoc::indoc! {r#"
+    y: Int := 0
+    y"#})]
+#[case::bare_value_bounded(indoc::indoc! {r#"
+    y <: Int := 0
+    y"#})]
+#[case::mut_bounded(indoc::indoc! {r#"
+    y <: Mut(Int) := 0
+    y"#})]
+#[case::mut_txn_bounded(indoc::indoc! {r#"
+    y <: Mut(Int, Txn) := 0
+    y"#})]
 fn mut_decl_annotation_is_exact_and_is_a_mut(#[case] code: &str) {
     expect_compile_error(code, "is not a valid mutable-variable annotation");
 }
@@ -1062,7 +1113,12 @@ fn per_iteration_value_binding_inside_a_loop_is_allowed() {
 /// at `:=`.
 #[test]
 fn mut_annotation_with_plain_equals_is_rejected() {
-    expect_compile_error("x: Mut(Int) = 0\nx", "use `:=` instead");
+    expect_compile_error(
+        indoc::indoc! {r#"
+        x: Mut(Int) = 0
+        x"#},
+        "use `:=` instead",
+    );
 }
 
 /// A plain `=` to a mutable variable bound outside a loop is a mistaken accumulator: `=`
@@ -1072,7 +1128,11 @@ fn mut_annotation_with_plain_equals_is_rejected() {
 /// compiled to a silent no-op).
 #[test]
 fn plain_equals_to_outer_mutable_in_final_loop_is_rejected() {
-    let code = "cnt := 0\nfor i in [1, 2, 3]:\n    cnt = cnt + 1\n    i";
+    let code = indoc::indoc! {r#"
+        cnt := 0
+        for i in [1, 2, 3]:
+            cnt = cnt + 1
+            i"#};
     expect_compile_error(code, "binds immutably");
 }
 
@@ -1081,7 +1141,12 @@ fn plain_equals_to_outer_mutable_in_final_loop_is_rejected() {
 /// than looped on.
 #[test]
 fn cross_channel_cycle_is_rejected() {
-    let code = "x: Feed(_)\ny: Feed(_)\nx <<= y\ny <<= x\nx";
+    let code = indoc::indoc! {r#"
+        x: Feed(_)
+        y: Feed(_)
+        x <<= y
+        y <<= x
+        x"#};
     expect_compile_error(code, "mutually recursive cycle");
 }
 
@@ -1305,7 +1370,13 @@ fn a_diagnostic_keeps_a_user_written_opaque_binder() {
 /// escape where its writer set is no longer statically known.
 #[test]
 fn rule2_function_returning_mut_is_rejected() {
-    expect_mut_discipline_error("x := 0\nf = \\z -> x\nf", "cannot be part of another type");
+    expect_mut_discipline_error(
+        indoc::indoc! {r#"
+        x := 0
+        f = \z -> x
+        f"#},
+        "cannot be part of another type",
+    );
 }
 
 /// The escape is rejected **however many tail positions sit between the function
@@ -1385,7 +1456,13 @@ fn a_programs_tail_read_of_its_accumulator_is_a_value() {
 #[test]
 fn rule1_selected_mut_argument_is_rejected() {
     expect_mut_discipline_error(
-        "def bump(c: Mut(Int)):\n    c += 1\nx := 0\ny := 1\nbump(x if True else y)\nx",
+        indoc::indoc! {r#"
+            def bump(c: Mut(Int)):
+                c += 1
+            x := 0
+            y := 1
+            bump(x if True else y)
+            x"#},
         "must be a mutable variable named where it is used",
     );
 }
@@ -1397,7 +1474,13 @@ fn rule1_selected_mut_argument_is_rejected() {
 /// itself does not reject it.)
 #[test]
 fn tuple_of_mut_reads_compiles_as_values() {
-    let code = "x := 1\ny := 0\nfor i in [1, 2, 3]:\n    y := y + i\n    x := x * i\n(x, y)";
+    let code = indoc::indoc! {r#"
+        x := 1
+        y := 0
+        for i in [1, 2, 3]:
+            y := y + i
+            x := x * i
+        (x, y)"#};
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::from_text("<tuple-mut-reads>", code);
     compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
@@ -1410,7 +1493,9 @@ fn tuple_of_mut_reads_compiles_as_values() {
 /// strict-typecheck wall the raw bare-final write used to hit.
 #[test]
 fn final_mutable_write_with_no_read_compiles_as_unit() {
-    let code = "cnt := 0\ncnt += 1";
+    let code = indoc::indoc! {r#"
+        cnt := 0
+        cnt += 1"#};
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::from_text("<final-mutable-write>", code);
     compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
@@ -1424,7 +1509,10 @@ fn final_mutable_write_with_no_read_compiles_as_unit() {
 /// unobserved (`Unit`), so the program compiles.
 #[test]
 fn final_mutation_loop_with_no_read_compiles_as_unit() {
-    let code = "total := 0\nfor i in [1, 2, 3]:\n    total += i";
+    let code = indoc::indoc! {r#"
+        total := 0
+        for i in [1, 2, 3]:
+            total += i"#};
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::from_text("<final-mutation-loop>", code);
     compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
@@ -1434,14 +1522,24 @@ fn final_mutation_loop_with_no_read_compiles_as_unit() {
 #[test]
 fn mut_registry_does_not_leak_into_a_shadowing_param() {
     check_scalar(
-        "n: Mut(Int) := 0\ndef h(n: Int):\n    n = n + 1\n    n\nh(10)",
+        indoc::indoc! {r#"
+            n: Mut(Int) := 0
+            def h(n: Int):
+                n = n + 1
+                n
+            h(10)"#},
         cambra::interpreter::Value::Int(11),
     );
 }
 #[test]
 fn mut_collection_as_for_source_derefs() {
     check_scalar(
-        "xs := [1, 2, 3]\ntotal := 0\nfor i in xs:\n    total := total + i\ntotal",
+        indoc::indoc! {r#"
+            xs := [1, 2, 3]
+            total := 0
+            for i in xs:
+                total := total + i
+            total"#},
         cambra::interpreter::Value::Int(6),
     );
 }
@@ -1452,21 +1550,36 @@ fn mut_collection_as_for_source_derefs() {
 #[test]
 fn multi_param_pass_by_ref_assign_works() {
     check_scalar(
-        "def add_to(c: Mut(Int), amt: Int):\n    c := c + amt\ncnt: Mut(Int) := 0\nadd_to(cnt, 5)\ncnt",
+        indoc::indoc! {r#"
+            def add_to(c: Mut(Int), amt: Int):
+                c := c + amt
+            cnt: Mut(Int) := 0
+            add_to(cnt, 5)
+            cnt"#},
         cambra::interpreter::Value::Int(5),
     );
 }
 #[test]
 fn multi_param_pass_by_ref_augassign_works() {
     check_scalar(
-        "def f(c: Mut(Int), d: Int):\n    c += d\ncnt: Mut(Int) := 0\nf(cnt, 7)\ncnt",
+        indoc::indoc! {r#"
+            def f(c: Mut(Int), d: Int):
+                c += d
+            cnt: Mut(Int) := 0
+            f(cnt, 7)
+            cnt"#},
         cambra::interpreter::Value::Int(7),
     );
 }
 #[test]
 fn mut_arg_must_be_a_mutable_not_a_plain_value() {
     expect_mut_discipline_error(
-        "x = 7\ndef bump(c: Mut(Int)):\n    c := c + 1\nbump(x)\nx",
+        indoc::indoc! {r#"
+            x = 7
+            def bump(c: Mut(Int)):
+                c := c + 1
+            bump(x)
+            x"#},
         "mutable variable",
     );
 }
@@ -1477,7 +1590,11 @@ fn mut_arg_must_be_a_mutable_not_a_plain_value() {
 #[test]
 fn nonmut_param_reads_mut_arg_current_value() {
     check_scalar(
-        "cnt: Mut(Int) := 5\ndef g(a: Int):\n    a + 1\ng(cnt)",
+        indoc::indoc! {r#"
+            cnt: Mut(Int) := 5
+            def g(a: Int):
+                a + 1
+            g(cnt)"#},
         cambra::interpreter::Value::Int(6),
     );
 }
@@ -1488,7 +1605,11 @@ fn nonmut_param_reads_mut_arg_current_value() {
 #[test]
 fn nonmut_param_annotation_enforced_against_mut_arg() {
     expect_compile_error(
-        "cnt: Mut(Int) := 0\ndef g(a: String):\n    a\ng(cnt)",
+        indoc::indoc! {r#"
+            cnt: Mut(Int) := 0
+            def g(a: String):
+                a
+            g(cnt)"#},
         "mismatch",
     );
 }
@@ -1500,14 +1621,24 @@ fn nonmut_param_annotation_enforced_against_mut_arg() {
 #[test]
 fn mut_param_value_type_must_match_mut_arg() {
     expect_compile_error(
-        "cnt: Mut(Int) := 0\ndef g(c: Mut(String)):\n    c := \"x\"\ng(cnt)\ncnt",
+        indoc::indoc! {r#"
+            cnt: Mut(Int) := 0
+            def g(c: Mut(String)):
+                c := "x"
+            g(cnt)
+            cnt"#},
         "mismatch",
     );
 }
 #[test]
 fn single_param_pass_by_ref_still_works() {
     check_scalar(
-        "cnt: Mut(Int) := 0\ndef bump(c: Mut(Int)):\n    c := c + 1\nbump(cnt)\ncnt",
+        indoc::indoc! {r#"
+            cnt: Mut(Int) := 0
+            def bump(c: Mut(Int)):
+                c := c + 1
+            bump(cnt)
+            cnt"#},
         cambra::interpreter::Value::Int(1),
     );
 }
@@ -1520,14 +1651,27 @@ fn single_param_pass_by_ref_still_works() {
 #[test]
 fn pass_by_ref_writer_with_intermediate_value_position() {
     check_scalar(
-        "def f(c: Mut(Int)):\n    tmp = c + 1\n    c := tmp\ncnt: Mut(Int) := 0\ny = f(cnt)\ncnt",
+        indoc::indoc! {r#"
+            def f(c: Mut(Int)):
+                tmp = c + 1
+                c := tmp
+            cnt: Mut(Int) := 0
+            y = f(cnt)
+            cnt"#},
         cambra::interpreter::Value::Int(1),
     );
 }
 #[test]
 fn pass_by_ref_writer_with_intermediate_in_loop() {
     check_scalar(
-        "def f(c: Mut(Int)):\n    tmp = c + 1\n    c := tmp\ncnt: Mut(Int) := 0\nfor i in [1, 2, 3]:\n    y = f(cnt)\ncnt",
+        indoc::indoc! {r#"
+            def f(c: Mut(Int)):
+                tmp = c + 1
+                c := tmp
+            cnt: Mut(Int) := 0
+            for i in [1, 2, 3]:
+                y = f(cnt)
+            cnt"#},
         cambra::interpreter::Value::Int(3),
     );
 }
@@ -1537,7 +1681,15 @@ fn pass_by_ref_writer_with_intermediate_in_loop() {
 #[test]
 fn pass_by_ref_writer_with_intermediates_bare_statement_loop() {
     check_scalar(
-        "def f(c: Mut(Int)):\n    a = c + 1\n    b = a + 10\n    c := b\ncnt: Mut(Int) := 0\nfor i in [1, 2, 3]:\n    f(cnt)\ncnt",
+        indoc::indoc! {r#"
+            def f(c: Mut(Int)):
+                a = c + 1
+                b = a + 10
+                c := b
+            cnt: Mut(Int) := 0
+            for i in [1, 2, 3]:
+                f(cnt)
+            cnt"#},
         cambra::interpreter::Value::Int(33),
     );
 }
@@ -1569,7 +1721,10 @@ fn wildcard_annotated_copy_of_a_mutable_is_a_value_read() {
 #[test]
 fn typed_deref_copy_of_mut_still_works() {
     check_scalar(
-        "a: Mut(Int) := 5\nb: Int = a\nb",
+        indoc::indoc! {r#"
+            a: Mut(Int) := 5
+            b: Int = a
+            b"#},
         cambra::interpreter::Value::Int(5),
     );
 }
@@ -1585,7 +1740,11 @@ fn typed_deref_copy_of_mut_still_works() {
 #[test]
 fn deref_copy_snapshots_the_value_at_its_position() {
     check_scalar(
-        "x: Mut(Int) := 1\ny: Int = x\nx += 4\ny",
+        indoc::indoc! {r#"
+            x: Mut(Int) := 1
+            y: Int = x
+            x += 4
+            y"#},
         cambra::interpreter::Value::Int(1),
     );
 }
@@ -1596,11 +1755,19 @@ fn deref_copy_snapshots_the_value_at_its_position() {
 #[test]
 fn mutable_reads_are_positional() {
     check_scalar(
-        "x: Mut(Int) := 1\nx += 4\ny: Int = x\ny",
+        indoc::indoc! {r#"
+            x: Mut(Int) := 1
+            x += 4
+            y: Int = x
+            y"#},
         cambra::interpreter::Value::Int(5),
     );
     check_scalar(
-        "x: Mut(Int) := 1\ny: Int = x\nx += 4\nx",
+        indoc::indoc! {r#"
+            x: Mut(Int) := 1
+            y: Int = x
+            x += 4
+            x"#},
         cambra::interpreter::Value::Int(5),
     );
 }
@@ -1613,7 +1780,11 @@ fn mutable_reads_are_positional() {
 #[test]
 fn deref_copy_is_a_value_not_a_mutable_alias() {
     check_scalar(
-        "x: Mut(Int) := 1\ny: Int = x\nz = y\nz",
+        indoc::indoc! {r#"
+            x: Mut(Int) := 1
+            y: Int = x
+            z = y
+            z"#},
         cambra::interpreter::Value::Int(1),
     );
 }
@@ -1692,7 +1863,11 @@ fn a_mut_var_read_through_a_udf_inside_its_own_loop() {
 #[test]
 fn write_to_deref_copy_rejected() {
     expect_mut_discipline_error(
-        "x: Mut(Int) := 1\ny: Int = x\ny += 1\ny",
+        indoc::indoc! {r#"
+            x: Mut(Int) := 1
+            y: Int = x
+            y += 1
+            y"#},
         "not a mutable variable",
     );
 }
@@ -1700,7 +1875,11 @@ fn write_to_deref_copy_rejected() {
 #[test]
 fn genuine_mutable_still_accumulates() {
     check_scalar(
-        "x: Mut(Int) := 0\nfor i in [1, 2, 3]:\n    x += i\nx",
+        indoc::indoc! {r#"
+            x: Mut(Int) := 0
+            for i in [1, 2, 3]:
+                x += i
+            x"#},
         cambra::interpreter::Value::Int(6),
     );
 }
@@ -1720,7 +1899,12 @@ fn genuine_mutable_still_accumulates() {
 #[test]
 fn non_mut_redef_shadows_mut_param_fn_lowers_tupled() {
     check_scalar(
-        "def f(c: Mut(Int)):\n    c += 1\ndef f(a, b):\n    a + b\nf(10, 20)",
+        indoc::indoc! {r#"
+            def f(c: Mut(Int)):
+                c += 1
+            def f(a, b):
+                a + b
+            f(10, 20)"#},
         cambra::interpreter::Value::Int(30),
     );
 }
@@ -1735,7 +1919,17 @@ fn non_mut_redef_shadows_mut_param_fn_lowers_tupled() {
 #[test]
 fn nested_mut_param_fn_does_not_leak_to_outer_same_named_call() {
     check_scalar(
-        "def bump(a, b):\n    a + b\nr = bump(3, 4)\ndef outer(z):\n    def bump(c: Mut(Int)):\n        c += 1\n    y: Mut(Int) := 0\n    bump(y)\n    y + z\nr + outer(100)",
+        indoc::indoc! {r#"
+            def bump(a, b):
+                a + b
+            r = bump(3, 4)
+            def outer(z):
+                def bump(c: Mut(Int)):
+                    c += 1
+                y: Mut(Int) := 0
+                bump(y)
+                y + z
+            r + outer(100)"#},
         cambra::interpreter::Value::Int(108),
     );
 }
@@ -1746,7 +1940,12 @@ fn nested_mut_param_fn_does_not_leak_to_outer_same_named_call() {
 /// fallback and rejected it with "must end in a yield/feed".
 #[test]
 fn trailing_hidden_writer_loop_compiles() {
-    let code = "def bump(c: Mut(Int)):\n    c += 1\ncnt: Mut(Int) := 0\nfor x in [1, 2, 3]:\n    bump(cnt)";
+    let code = indoc::indoc! {r#"
+        def bump(c: Mut(Int)):
+            c += 1
+        cnt: Mut(Int) := 0
+        for x in [1, 2, 3]:
+            bump(cnt)"#};
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
@@ -1776,58 +1975,66 @@ fn trailing_hidden_writer_loop_compiles() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // Unconditional: the whole tuple is overwritten each step → final write (3, 3).
-#[case(r"
-acc := (0, 0)
-for i in [1, 2, 3]:
-    acc := (i, i)
-acc", make_tuple(&[Value::Int(3), Value::Int(3)]))]
+#[case(indoc::indoc! {r#"
+
+    acc := (0, 0)
+    for i in [1, 2, 3]:
+        acc := (i, i)
+    acc"#}, make_tuple(&[Value::Int(3), Value::Int(3)]))]
 // Read-your-writes across both fields: acc.0 = 0+1+2+3 = 6, acc.1 = 10+1+2+3 = 16.
-#[case(r"
-acc := (0, 10)
-for i in [1, 2, 3]:
-    acc := (acc.0 + i, acc.1 + i)
-acc", make_tuple(&[Value::Int(6), Value::Int(16)]))]
+#[case(indoc::indoc! {r#"
+
+    acc := (0, 10)
+    for i in [1, 2, 3]:
+        acc := (acc.0 + i, acc.1 + i)
+    acc"#}, make_tuple(&[Value::Int(6), Value::Int(16)]))]
 // Single-arm conditional write to a tuple: fires at i>1 → final (3, 3).
-#[case(r"
-acc := (0, 0)
-for i in [1, 2, 3]:
-    if i > 1:
-        acc := (i, i)
-acc", make_tuple(&[Value::Int(3), Value::Int(3)]))]
+#[case(indoc::indoc! {r#"
+
+    acc := (0, 0)
+    for i in [1, 2, 3]:
+        if i > 1:
+            acc := (i, i)
+    acc"#}, make_tuple(&[Value::Int(3), Value::Int(3)]))]
 // if/else both arms write different tuples: i=3 → i>2 arm → (3, 30).
-#[case(r"
-acc := (0, 0)
-for i in [1, 2, 3]:
-    if i > 2:
-        acc := (i, i * 10)
-    else:
-        acc := (i, i)
-acc", make_tuple(&[Value::Int(3), Value::Int(30)]))]
+#[case(indoc::indoc! {r#"
+
+    acc := (0, 0)
+    for i in [1, 2, 3]:
+        if i > 2:
+            acc := (i, i * 10)
+        else:
+            acc := (i, i)
+    acc"#}, make_tuple(&[Value::Int(3), Value::Int(30)]))]
 // Trailing carries: writes at i<3 (1,2), carries at 3,4,5 → final (2, 2).
-#[case(r"
-acc := (0, 0)
-for i in [1, 2, 3, 4, 5]:
-    if i < 3:
-        acc := (i, i)
-acc", make_tuple(&[Value::Int(2), Value::Int(2)]))]
+#[case(indoc::indoc! {r#"
+
+    acc := (0, 0)
+    for i in [1, 2, 3, 4, 5]:
+        if i < 3:
+            acc := (i, i)
+    acc"#}, make_tuple(&[Value::Int(2), Value::Int(2)]))]
 // Heterogeneous tuple (Int, String).
-#[case(r#"
-acc := (0, "a")
-for i in [1, 2]:
-    acc := (i, "b")
-acc"#, make_tuple(&[Value::Int(2), Value::String("b".into())]))]
+#[case(indoc::indoc! {r#"
+
+    acc := (0, "a")
+    for i in [1, 2]:
+        acc := (i, "b")
+    acc"#}, make_tuple(&[Value::Int(2), Value::String("b".into())]))]
 // Three-tuple.
-#[case(r"
-acc := (0, 0, 0)
-for i in [1, 2, 3]:
-    acc := (i, i * 2, i * 3)
-acc", make_tuple(&[Value::Int(3), Value::Int(6), Value::Int(9)]))]
+#[case(indoc::indoc! {r#"
+
+    acc := (0, 0, 0)
+    for i in [1, 2, 3]:
+        acc := (i, i * 2, i * 3)
+    acc"#}, make_tuple(&[Value::Int(3), Value::Int(6), Value::Int(9)]))]
 // Named record mutable variable.
-#[case(r"
-acc := (x=0, y=0)
-for i in [1, 2, 3]:
-    acc := (x=i, y=i + i)
-acc", make_record(&[("x", Value::Int(3)), ("y", Value::Int(6))]))]
+#[case(indoc::indoc! {r#"
+
+    acc := (x=0, y=0)
+    for i in [1, 2, 3]:
+        acc := (x=i, y=i + i)
+    acc"#}, make_record(&[("x", Value::Int(3)), ("y", Value::Int(6))]))]
 fn test_compound_mut_var(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -1836,11 +2043,12 @@ fn test_compound_mut_var(#[case] code: &str, #[case] expected: Value) {
 #[test]
 fn test_compound_mut_var_field_read() {
     check_scalar(
-        r"
-acc := (0, 0)
-for i in [1, 2, 3]:
-    acc := (acc.0 + i, acc.1)
-acc.0",
+        indoc::indoc! {r#"
+
+            acc := (0, 0)
+            for i in [1, 2, 3]:
+                acc := (acc.0 + i, acc.1)
+            acc.0"#},
         Value::Int(6),
     );
 }
@@ -1850,11 +2058,12 @@ acc.0",
 #[test]
 fn test_compound_mut_var_nested() {
     check_scalar(
-        r"
-acc := ((0, 0), 0)
-for i in [1, 2]:
-    acc := ((i, i), i)
-acc",
+        indoc::indoc! {r#"
+
+            acc := ((0, 0), 0)
+            for i in [1, 2]:
+                acc := ((i, i), i)
+            acc"#},
         make_tuple(&[make_tuple(&[Value::Int(2), Value::Int(2)]), Value::Int(2)]),
     );
 }

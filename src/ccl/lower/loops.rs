@@ -2038,138 +2038,138 @@ mod tests {
     #[rstest]
     // Simple generator: map pattern.
     #[case(
-        "\
-def doubles(xs):
-    for x in xs:
-        yield x * 2
-doubles",
-        "\
-let doubles : (_ ⇒ _) = λ xs → let __result_0 = defer
-in xs ▷ Iterable::elements ▷ unbox ≫ (λ x → feed(__result_0, x * 2)); __result_0
-in doubles"
+        indoc::indoc! {r#"
+            def doubles(xs):
+                for x in xs:
+                    yield x * 2
+            doubles"#},
+        indoc::indoc! {r#"
+            let doubles : (_ ⇒ _) = λ xs → let __result_0 = defer
+            in xs ▷ Iterable::elements ▷ unbox ≫ (λ x → feed(__result_0, x * 2)); __result_0
+            in doubles"#}
     )]
     // Multi-param generator: captures outer parameter. Uncurried params
     // appear as projections of the synthetic `__arg_tuple_0`.
     #[case(
-        "\
-def add_to(xs, n):
-    for x in xs:
-        yield x + n
-add_to",
-        "\
-let add_to : ((_, _) ⇒ _) = λ __arg_tuple_1 : (_, _) → let __result_0 = defer
-in __arg_tuple_1.0 ▷ Iterable::elements ▷ unbox ≫ (λ x → feed(__result_0, x + __arg_tuple_1.1)); __result_0
-in add_to"
+        indoc::indoc! {r#"
+            def add_to(xs, n):
+                for x in xs:
+                    yield x + n
+            add_to"#},
+        indoc::indoc! {r#"
+            let add_to : ((_, _) ⇒ _) = λ __arg_tuple_1 : (_, _) → let __result_0 = defer
+            in __arg_tuple_1.0 ▷ Iterable::elements ▷ unbox ≫ (λ x → feed(__result_0, x + __arg_tuple_1.1)); __result_0
+            in add_to"#}
     )]
     // Generator with if-guard: guard becomes a Case in the For body.
     #[case(
-        "\
-def positives(xs):
-    for x in xs:
-        if x > 0:
-            yield x
-positives",
-        "\
-let positives : (_ ⇒ _) = λ xs → let __result_0 = defer
-in xs ▷ Iterable::elements ▷ unbox ≫ (λ x → { x > 0 → feed(__result_0, x); true → unit }); __result_0
-in positives"
+        indoc::indoc! {r#"
+            def positives(xs):
+                for x in xs:
+                    if x > 0:
+                        yield x
+            positives"#},
+        indoc::indoc! {r#"
+            let positives : (_ ⇒ _) = λ xs → let __result_0 = defer
+            in xs ▷ Iterable::elements ▷ unbox ≫ (λ x → { x > 0 → feed(__result_0, x); true → unit }); __result_0
+            in positives"#}
     )]
     // Nested for-loops: inner iter independent of outer loop variable.
     #[case(
-        "\
-def cross(xs, ys):
-    for x in xs:
-        for y in ys:
-            yield x + y
-cross",
-        "\
-let cross : ((_, _) ⇒ _) = λ __arg_tuple_1 : (_, _) → let __result_0 = defer
-in __arg_tuple_1.0 ▷ Iterable::elements ▷ unbox ≫ (λ x → __arg_tuple_1.1 ▷ Iterable::elements ▷ unbox ≫ (λ y → feed(__result_0, x + y))); __result_0
-in cross"
+        indoc::indoc! {r#"
+            def cross(xs, ys):
+                for x in xs:
+                    for y in ys:
+                        yield x + y
+            cross"#},
+        indoc::indoc! {r#"
+            let cross : ((_, _) ⇒ _) = λ __arg_tuple_1 : (_, _) → let __result_0 = defer
+            in __arg_tuple_1.0 ▷ Iterable::elements ▷ unbox ≫ (λ x → __arg_tuple_1.1 ▷ Iterable::elements ▷ unbox ≫ (λ y → feed(__result_0, x + y))); __result_0
+            in cross"#}
     )]
     // Three-level nested for.
     #[case(
-        "\
-def triple(xs, ys, zs):
-    for x in xs:
-        for y in ys:
-            for z in zs:
-                yield x + y + z
-triple",
-        "\
-let triple : ((_, _, _) ⇒ _) = λ __arg_tuple_1 : (_, _, _) → let __result_0 = defer
-in __arg_tuple_1.0 ▷ Iterable::elements ▷ unbox ≫ (λ x → __arg_tuple_1.1 ▷ Iterable::elements ▷ unbox ≫ (λ y → __arg_tuple_1.2 ▷ Iterable::elements ▷ unbox ≫ (λ z → feed(__result_0, x + y + z)))); __result_0
-in triple"
+        indoc::indoc! {r#"
+            def triple(xs, ys, zs):
+                for x in xs:
+                    for y in ys:
+                        for z in zs:
+                            yield x + y + z
+            triple"#},
+        indoc::indoc! {r#"
+            let triple : ((_, _, _) ⇒ _) = λ __arg_tuple_1 : (_, _, _) → let __result_0 = defer
+            in __arg_tuple_1.0 ▷ Iterable::elements ▷ unbox ≫ (λ x → __arg_tuple_1.1 ▷ Iterable::elements ▷ unbox ≫ (λ y → __arg_tuple_1.2 ▷ Iterable::elements ▷ unbox ≫ (λ z → feed(__result_0, x + y + z)))); __result_0
+            in triple"#}
     )]
     // Guard before inner for: Case wraps the nested For node.
     #[case(
-        "\
-def cross_filtered(xs, ys):
-    for x in xs:
-        if x > 0:
-            for y in ys:
-                yield y
-cross_filtered",
-        "\
-let cross_filtered : ((_, _) ⇒ _) = λ __arg_tuple_1 : (_, _) → let __result_0 = defer
-in __arg_tuple_1.0 ▷ Iterable::elements ▷ unbox ≫ (λ x → { x > 0 → __arg_tuple_1.1 ▷ Iterable::elements ▷ unbox ≫ (λ y → feed(__result_0, y)); true → unit }); __result_0
-in cross_filtered"
+        indoc::indoc! {r#"
+            def cross_filtered(xs, ys):
+                for x in xs:
+                    if x > 0:
+                        for y in ys:
+                            yield y
+            cross_filtered"#},
+        indoc::indoc! {r#"
+            let cross_filtered : ((_, _) ⇒ _) = λ __arg_tuple_1 : (_, _) → let __result_0 = defer
+            in __arg_tuple_1.0 ▷ Iterable::elements ▷ unbox ≫ (λ x → { x > 0 → __arg_tuple_1.1 ▷ Iterable::elements ▷ unbox ≫ (λ y → feed(__result_0, y)); true → unit }); __result_0
+            in cross_filtered"#}
     )]
     // Let-binding in generator body: y is a fresh local per iteration.
     #[case(
-        "\
-def with_let(xs):
-    for x in xs:
-        y = x + 1
-        yield y * 2
-with_let",
-        "\
-let with_let : (_ ⇒ _) = λ xs → let __result_0 = defer
-in xs ▷ Iterable::elements ▷ unbox ≫ (λ x → let y = x + 1
-in feed(__result_0, y * 2)); __result_0
-in with_let"
+        indoc::indoc! {r#"
+            def with_let(xs):
+                for x in xs:
+                    y = x + 1
+                    yield y * 2
+            with_let"#},
+        indoc::indoc! {r#"
+            let with_let : (_ ⇒ _) = λ xs → let __result_0 = defer
+            in xs ▷ Iterable::elements ▷ unbox ≫ (λ x → let y = x + 1
+            in feed(__result_0, y * 2)); __result_0
+            in with_let"#}
     )]
     // Iter-var shadowing: x = x + 1 re-binds x as a let inside the For body.
     #[case(
-        "\
-def shadow(xs):
-    for x in xs:
-        x = x + 1
-        yield x
-shadow",
-        "\
-let shadow : (_ ⇒ _) = λ xs → let __result_0 = defer
-in xs ▷ Iterable::elements ▷ unbox ≫ (λ x → let x = x + 1
-in feed(__result_0, x)); __result_0
-in shadow"
+        indoc::indoc! {r#"
+            def shadow(xs):
+                for x in xs:
+                    x = x + 1
+                    yield x
+            shadow"#},
+        indoc::indoc! {r#"
+            let shadow : (_ ⇒ _) = λ xs → let __result_0 = defer
+            in xs ▷ Iterable::elements ▷ unbox ≫ (λ x → let x = x + 1
+            in feed(__result_0, x)); __result_0
+            in shadow"#}
     )]
     // Dependent inner iter: inner source references the outer iter var.
     #[case(
-        "\
-def dep(xss):
-    for xs in xss:
-        for x in xs:
-            yield x
-dep",
-        "\
-let dep : (_ ⇒ _) = λ xss → let __result_0 = defer
-in xss ▷ Iterable::elements ▷ unbox ≫ (λ xs → xs ▷ Iterable::elements ▷ unbox ≫ (λ x → feed(__result_0, x))); __result_0
-in dep"
+        indoc::indoc! {r#"
+            def dep(xss):
+                for xs in xss:
+                    for x in xs:
+                        yield x
+            dep"#},
+        indoc::indoc! {r#"
+            let dep : (_ ⇒ _) = λ xss → let __result_0 = defer
+            in xss ▷ Iterable::elements ▷ unbox ≫ (λ xs → xs ▷ Iterable::elements ▷ unbox ≫ (λ x → feed(__result_0, x))); __result_0
+            in dep"#}
     )]
     // Let inside an if-guard body.
     #[case(
-        "\
-def guarded_let(xs):
-    for x in xs:
-        if x > 0:
-            y = x * 2
-            yield y
-guarded_let",
-        "\
-let guarded_let : (_ ⇒ _) = λ xs → let __result_0 = defer
-in xs ▷ Iterable::elements ▷ unbox ≫ (λ x → { x > 0 → let y = x * 2
-in feed(__result_0, y); true → unit }); __result_0
-in guarded_let"
+        indoc::indoc! {r#"
+            def guarded_let(xs):
+                for x in xs:
+                    if x > 0:
+                        y = x * 2
+                        yield y
+            guarded_let"#},
+        indoc::indoc! {r#"
+            let guarded_let : (_ ⇒ _) = λ xs → let __result_0 = defer
+            in xs ▷ Iterable::elements ▷ unbox ≫ (λ x → { x > 0 → let y = x * 2
+            in feed(__result_0, y); true → unit }); __result_0
+            in guarded_let"#}
     )]
     fn test_lower_generator_fn(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
@@ -2190,9 +2190,20 @@ in guarded_let"
     #[test]
     fn test_with_begin_requires_effect() {
         for code in [
-            "with begin():\n    x = 1\nx",
-            "with begin():\n    x = 1\ny = 2\ny",
-            "for r in [1]:\n    with begin():\n        x = 1\nx",
+            indoc::indoc! {r#"
+                with begin():
+                    x = 1
+                x"#},
+            indoc::indoc! {r#"
+                with begin():
+                    x = 1
+                y = 2
+                y"#},
+            indoc::indoc! {r#"
+                for r in [1]:
+                    with begin():
+                        x = 1
+                x"#},
         ] {
             let stmts = parse_module(code);
             let err = expect_one_lowering_error(&stmts);
@@ -2333,14 +2344,14 @@ in guarded_let"
     /// internal error.
     #[test]
     fn a_yield_from_a_feed_only_loop_in_a_mutation_loop() {
-        let code = "\
-def g(xs):
-    t := 0
-    for i in xs:
-        t += i
-        for j in [10, 20]:
-            yield j
-g";
+        let code = indoc::indoc! {r#"
+            def g(xs):
+                t := 0
+                for i in xs:
+                    t += i
+                    for j in [10, 20]:
+                        yield j
+            g"#};
         let err = expect_one_lowering_error(&parse_module(code));
         let LoweringError::Internal { message, .. } = &err else {
             panic!("expected an internal error, got {err:?}")
@@ -2353,7 +2364,9 @@ g";
     /// transactional mutable variable may be read only inside a `with begin():` block.
     #[test]
     fn test_mut_txn_bare_read_rejected() {
-        let stmts = parse_module("store: Mut(Int, Txn) := 0\nstore");
+        let stmts = parse_module(indoc::indoc! {r#"
+            store: Mut(Int, Txn) := 0
+            store"#});
         let err = expect_one_lowering_error(&stmts);
         let LoweringError::Unsupported { message: msg, .. } = &err else {
             panic!("expected an unsupported error, got {err:?}")
@@ -2369,11 +2382,11 @@ g";
     /// which is not a yield, so this should still be rejected.
     #[test]
     fn test_generator_aug_assign_no_yield_rejected() {
-        let code = "\
-def bad(xs):
-    for x in xs:
-        x += 1
-bad";
+        let code = indoc::indoc! {r#"
+            def bad(xs):
+                for x in xs:
+                    x += 1
+            bad"#};
         let stmts = parse_module(code);
         let err = expect_one_lowering_error(&stmts);
         assert!(matches!(err, LoweringError::Unsupported { .. }));
@@ -2387,13 +2400,13 @@ bad";
     /// before inference.
     #[test]
     fn test_generator_with_loop_carried_mutation_lowers() {
-        let code = "\
-def running_totals(items):
-    total := 0
-    for item in items:
-        total += item
-        yield total
-running_totals";
+        let code = indoc::indoc! {r#"
+            def running_totals(items):
+                total := 0
+                for item in items:
+                    total += item
+                    yield total
+            running_totals"#};
         let stmts = parse_module(code);
         let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
             .into_result()
@@ -2426,12 +2439,12 @@ running_totals";
     /// iterations. The error points at `:=` (introduce a mutable variable to mutate).
     #[test]
     fn test_generator_mutation_of_arg_rejected() {
-        let code = "\
-def bad(xs, n):
-    for x in xs:
-        n = n + 1
-        yield n
-bad";
+        let code = indoc::indoc! {r#"
+            def bad(xs, n):
+                for x in xs:
+                    n = n + 1
+                    yield n
+            bad"#};
         let stmts = parse_module(code);
         let err = expect_one_lowering_error(&stmts);
         let LoweringError::Unsupported { message: msg, .. } = &err else {
@@ -2450,14 +2463,14 @@ bad";
     /// the inner for's own frame and rejects it.
     #[test]
     fn test_generator_mutation_across_nested_for_rejected() {
-        let code = "\
-def bad(xs, ys):
-    for x in xs:
-        y = 0
-        for z in ys:
-            y = y + z
-            yield y
-bad";
+        let code = indoc::indoc! {r#"
+            def bad(xs, ys):
+                for x in xs:
+                    y = 0
+                    for z in ys:
+                        y = y + z
+                        yield y
+            bad"#};
         let stmts = parse_module(code);
         let err = expect_one_lowering_error(&stmts);
         let LoweringError::Unsupported { message: msg, .. } = &err else {
@@ -2474,11 +2487,11 @@ bad";
     /// `=` binds immutably. The error points at `:=` — accumulators are opt-in.
     #[test]
     fn test_plain_accumulator_requires_mut() {
-        let code = "\
-x = 0
-for i in [1, 2, 3]:
-    x = x + i
-x";
+        let code = indoc::indoc! {r#"
+            x = 0
+            for i in [1, 2, 3]:
+                x = x + i
+            x"#};
         let stmts = parse_module(code);
         let err = expect_one_lowering_error(&stmts);
         let LoweringError::Unsupported { message: msg, .. } = &err else {
@@ -2500,14 +2513,14 @@ x";
         // write — no longer rejected. Both legs become branches of the
         // statement-position filter-`Case`, which `mut_elim::WriterWalk`
         // merges into one writer decision with a per-accumulator value-`Case`.
-        let code = "\
-x := 0
-for i in [1, 2]:
-    if i > 0:
-        x := x + i
-    else:
-        x := x - i
-x";
+        let code = indoc::indoc! {r#"
+            x := 0
+            for i in [1, 2]:
+                if i > 0:
+                    x := x + i
+                else:
+                    x := x - i
+            x"#};
         let stmts = parse_module(code);
         let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
             .into_result()
@@ -2515,9 +2528,9 @@ x";
         let s = symbolic(&ccl);
         assert_eq!(
             s,
-            "x : Mut(_, _) := 0\n\
-             in for i in [1, 2] ▷ Iterable::elements do { i > 0 → x := x + i; unit; \
-             true → x := x - i; unit }; unit; x",
+            indoc::indoc! {r#"
+                x : Mut(_, _) := 0
+                in for i in [1, 2] ▷ Iterable::elements do { i > 0 → x := x + i; unit; true → x := x - i; unit }; unit; x"#},
             "if/else conditional write lowers to a two-branch filter-Case, each \
              leg carrying its own MutWrite: {s}"
         );
@@ -2528,14 +2541,14 @@ x";
     /// which `channelize` fans out as its own feeding channel.
     #[test]
     fn test_generator_if_else_in_body_lowers() {
-        let code = "\
-def bad(xs):
-    for x in xs:
-        if x > 0:
-            yield x
-        else:
-            yield 0
-bad";
+        let code = indoc::indoc! {r#"
+            def bad(xs):
+                for x in xs:
+                    if x > 0:
+                        yield x
+                    else:
+                        yield 0
+            bad"#};
         let stmts = parse_module(code);
         lower_stmts(&stmts, &mut LoweringContext::default())
             .into_result()
@@ -2546,12 +2559,12 @@ bad";
     /// lets wrap the generator expression.
     #[test]
     fn test_generator_with_preloop_let() {
-        let code = "\
-def f(xs):
-    a = 5
-    for x in xs:
-        yield x + a
-f";
+        let code = indoc::indoc! {r#"
+            def f(xs):
+                a = 5
+                for x in xs:
+                    yield x + a
+            f"#};
         let stmts = parse_module(code);
         let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
             .into_result()
@@ -2570,12 +2583,12 @@ f";
     /// merges these branches into one writer decision with a per-accumulator value-`Case`.
     #[test]
     fn test_lower_conditional_induction_write() {
-        let code = "\
-x := 0
-for i in [1, 2, 3]:
-    if i > 1:
-        x += i
-x";
+        let code = indoc::indoc! {r#"
+            x := 0
+            for i in [1, 2, 3]:
+                if i > 1:
+                    x += i
+            x"#};
         let stmts = parse_module(code);
         let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
             .into_result()
@@ -2583,9 +2596,9 @@ x";
         let s = symbolic(&ccl);
         assert_eq!(
             s,
-            "x : Mut(_, _) := 0\n\
-             in for i in [1, 2, 3] ▷ Iterable::elements do { i > 1 → x := x + i; unit; \
-             true → unit }; unit; x",
+            indoc::indoc! {r#"
+                x : Mut(_, _) := 0
+                in for i in [1, 2, 3] ▷ Iterable::elements do { i > 1 → x := x + i; unit; true → unit }; unit; x"#},
             "conditional write lowers to a statement-position filter-Case with the \
              MutWrite in the guarded leg and a `true → unit` carry-forward complement"
         );

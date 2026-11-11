@@ -276,7 +276,9 @@ fn a_sum_reading_an_earlier_sum_of_the_loop_body() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_udf_used_inside_filter_predicate() {
-    let code = "f = \\x -> x > 1\n[x for x in [1, 2, 3] if f(x)]";
+    let code = indoc::indoc! {r#"
+        f = \x -> x > 1
+        [x for x in [1, 2, 3] if f(x)]"#};
     check_tile(
         code,
         Tile::data_function(
@@ -295,7 +297,9 @@ fn test_udf_used_inside_filter_predicate() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_udf_containing_filter() {
-    let code = "f = \\xs -> [x for x in xs if x > 1]\nf([1, 2, 3])";
+    let code = indoc::indoc! {r#"
+        f = \xs -> [x for x in xs if x > 1]
+        f([1, 2, 3])"#};
     check_tile(
         code,
         Tile::data_function(
@@ -1011,7 +1015,12 @@ fn three_generators_under_an_outer_comprehension_flatten_per_row(
     #[case] expected: &str,
 ) {
     check_sink(
-        &format!("out = test_sink()\nout << {program}\n"),
+        &indoc::formatdoc!(
+            r#"
+            out = test_sink()
+            out << {program}
+            "#
+        ),
         &format!("[() -> {expected}]"),
     );
 }

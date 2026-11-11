@@ -451,7 +451,14 @@ fn builtin_type_names_are_refused() {
             "`{name}` is listed here but not refused by `is_builtin_type_name`"
         );
         check_compile_error(
-            &format!("{name} = Int\n\nx: Int = 1\nx\n"),
+            &indoc::formatdoc!(
+                r#"
+                {name} = Int
+
+                x: Int = 1
+                x
+                "#
+            ),
             &format!("`{name}` is a built-in type and cannot be given another meaning"),
         );
     }

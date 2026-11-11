@@ -114,7 +114,14 @@ use super::panic_message::panic_message;
 fn a_collection_is_written_in_chl(#[case] binding: &str, #[case] inferred: &str) {
     let last = binding.trim_end().lines().last().expect("a binding");
     let name = last.split([' ', ':', '=']).next().expect("a name");
-    let code = format!("{}\nz: Int = {name}\n1\n", binding.trim_end());
+    let code = indoc::formatdoc!(
+        r#"
+        {}
+        z: Int = {name}
+        1
+        "#,
+        binding.trim_end()
+    );
     check_compile_error(
         &code,
         &format!("annotated as Int, but inferred as {inferred}"),

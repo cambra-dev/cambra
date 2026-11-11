@@ -39,14 +39,15 @@ fn refinement() {
 #[test]
 fn output_annotation_base() {
     check_scalar(
-        "
-def foo(a: Int, b: Int) => Int:
-    a + b
+        indoc::indoc! {r#"
 
-x = (4,-1)
+            def foo(a: Int, b: Int) => Int:
+                a + b
 
-foo(x)
-",
+            x = (4,-1)
+
+            foo(x)
+            "#},
         Value::Int(3),
     )
 }
@@ -54,12 +55,13 @@ foo(x)
 #[test]
 fn output_annotation_base_neg() {
     check_compile_error(
-        "
-def itsa_five(a) => String:
-    5
+        indoc::indoc! {r#"
 
-itsa_five(\"dummy_arg\")
-",
+            def itsa_five(a) => String:
+                5
+
+            itsa_five("dummy_arg")
+            "#},
         "Annotation mismatch: annotated as String, but inferred as {Int where _ == 5}",
     )
 }
@@ -79,12 +81,13 @@ fn a_bounded_annotation_mismatch_writes_the_bound() {
 #[test]
 fn output_annotation_singleton_matches_the_literal() {
     check_scalar(
-        "
-def itsa_nine(a) => {Int where _ == 9}:
-    9
+        indoc::indoc! {r#"
 
-itsa_nine(\"dummy_arg\")
-",
+            def itsa_nine(a) => {Int where _ == 9}:
+                9
+
+            itsa_nine("dummy_arg")
+            "#},
         Value::Int(9),
     )
 }
@@ -92,12 +95,13 @@ itsa_nine(\"dummy_arg\")
 #[test]
 fn output_annotation_singleton_rejects_another_literal() {
     check_compile_error(
-        "
-def itsa_nine(a) => {Int where _ == 9}:
-    8
+        indoc::indoc! {r#"
 
-itsa_nine(\"dummy_arg\")
-",
+            def itsa_nine(a) => {Int where _ == 9}:
+                8
+
+            itsa_nine("dummy_arg")
+            "#},
         "Annotation mismatch: annotated as {Int where _ == 9}, but inferred as {Int where _ == 8}",
     )
 }
@@ -107,10 +111,11 @@ fn function_type_annotation() {
     // A binding annotated with a function type `(Int => Int)` checks against the
     // lambda it binds (a lambda is a compute function, the kind `=>` denotes).
     check_scalar(
-        "
-f: (Int => Int) = \\x -> x + 1
-f(4)
-",
+        indoc::indoc! {r#"
+
+            f: (Int => Int) = \x -> x + 1
+            f(4)
+            "#},
         Value::Int(5),
     )
 }
@@ -121,10 +126,11 @@ fn function_type_annotation_refined_codomain() {
     // through `Type::Fun` like any other annotation refinement. The body `9` is
     // `Int@9`, which discharges `{Int where _ == 9}`.
     check_scalar(
-        "
-f: (Int => {Int where _ == 9}) = \\x -> 9
-f(4)
-",
+        indoc::indoc! {r#"
+
+            f: (Int => {Int where _ == 9}) = \x -> 9
+            f(4)
+            "#},
         Value::Int(9),
     )
 }
@@ -134,10 +140,11 @@ fn function_type_annotation_refined_codomain_neg() {
     // The codomain refinement is enforced: a body of `8` does not satisfy
     // `{Int where _ == 9}`.
     check_compile_error(
-        "
-f: (Int => {Int where _ == 9}) = \\x -> 8
-f(4)
-",
+        indoc::indoc! {r#"
+
+            f: (Int => {Int where _ == 9}) = \x -> 8
+            f(4)
+            "#},
         "Annotation mismatch",
     )
 }
@@ -180,10 +187,11 @@ fn a_pair_arrow_in_a_def_return_annotation_is_a_parse_error() {
 fn function_type_in_value_position_is_rejected() {
     // `T => U` names a type; it is annotation-only, not a value.
     check_compile_error(
-        "
-x = Int => Int
-x
-",
+        indoc::indoc! {r#"
+
+            x = Int => Int
+            x
+            "#},
         "is a function *type*",
     )
 }
@@ -194,14 +202,15 @@ x
 #[test]
 fn output_annotation_naming_a_parameter_not_entailed() {
     check_compile_error(
-        "
-def sum_up(a: Int, b: {Int where _ >= 0}) => {Int where _ >= a}:
-    a + b
+        indoc::indoc! {r#"
 
-x = (3,-1)
+            def sum_up(a: Int, b: {Int where _ >= 0}) => {Int where _ >= a}:
+                a + b
 
-sum_up(x)
-",
+            x = (3,-1)
+
+            sum_up(x)
+            "#},
         "Annotation mismatch: annotated as {Int where _ >= a}, but inferred as Int",
     )
 }
@@ -214,12 +223,13 @@ sum_up(x)
 #[test]
 fn pi_type_scope() {
     check_compile_error(
-        "
-def test(x: Int) => {Int where _ > x}:
-    x + 1
+        indoc::indoc! {r#"
 
-()
-",
+            def test(x: Int) => {Int where _ > x}:
+                x + 1
+
+            ()
+            "#},
         "Annotation mismatch: annotated as {Int where _ > x}, but inferred as Int",
     )
 }
@@ -229,12 +239,13 @@ def test(x: Int) => {Int where _ > x}:
 #[test]
 fn type_scope_neg() {
     check_compile_error(
-        "
-def test(x: Int) => {Int where _ > y}:
-    x + 1
+        indoc::indoc! {r#"
 
-()
-",
+            def test(x: Int) => {Int where _ > y}:
+                x + 1
+
+            ()
+            "#},
         "Unbound variable: 'y'",
     )
 }
@@ -249,14 +260,15 @@ def test(x: Int) => {Int where _ > y}:
 #[test]
 fn type_scope_outer() {
     check_compile_error(
-        "
-y = 3
+        indoc::indoc! {r#"
 
-def test(x: {{Int where _ != y + y} where _ != y}) => {Int where _ > y + x}:
-    x + 3
+            y = 3
 
-()
-",
+            def test(x: {{Int where _ != y + y} where _ != y}) => {Int where _ > y + x}:
+                x + 3
+
+            ()
+            "#},
         "Annotation mismatch: annotated as {Int where _ > y + x}, but inferred as Int",
     )
 }
@@ -264,11 +276,12 @@ def test(x: {{Int where _ != y + y} where _ != y}) => {Int where _ > y + x}:
 #[test]
 fn type_refined_input_only_true() {
     check_scalar(
-        "
-def f(x: {Int where True}) => Int:
-    x
-()
-",
+        indoc::indoc! {r#"
+
+            def f(x: {Int where True}) => Int:
+                x
+            ()
+            "#},
         Value::Unit,
     )
 }
@@ -276,11 +289,12 @@ def f(x: {Int where True}) => Int:
 #[test]
 fn type_refined_input_only_self_comparison() {
     check_scalar(
-        "
-def f(x: {Int where _ >= _}) => Int:
-    x
-()
-",
+        indoc::indoc! {r#"
+
+            def f(x: {Int where _ >= _}) => Int:
+                x
+            ()
+            "#},
         Value::Unit,
     )
 }
@@ -288,11 +302,12 @@ def f(x: {Int where _ >= _}) => Int:
 #[test]
 fn type_refined_input_only_self_equality_after_a_parameter() {
     check_scalar(
-        "
-def f(y: Int, x: {Int where _ == _}):
-    x
-()
-",
+        indoc::indoc! {r#"
+
+            def f(y: Int, x: {Int where _ == _}):
+                x
+            ()
+            "#},
         Value::Unit,
     )
 }
@@ -300,11 +315,12 @@ def f(y: Int, x: {Int where _ == _}):
 #[test]
 fn type_refined_input_only_self_equality() {
     check_scalar(
-        "
-def f(x: {Int where _ == _}):
-    x
-()
-",
+        indoc::indoc! {r#"
+
+            def f(x: {Int where _ == _}):
+                x
+            ()
+            "#},
         Value::Unit,
     )
 }
@@ -314,11 +330,12 @@ def f(x: {Int where _ == _}):
 #[test]
 fn type_refined_input_output() {
     check_compile_error(
-        "
-def f(x: {Int where _ == _}) => {Int where _ == x}:
-    x
-()
-",
+        indoc::indoc! {r#"
+
+            def f(x: {Int where _ == _}) => {Int where _ == x}:
+                x
+            ()
+            "#},
         "Annotation mismatch: annotated as {Int where _ == x}, but inferred as {Int where _ == _}",
     )
 }
@@ -328,11 +345,12 @@ def f(x: {Int where _ == _}) => {Int where _ == x}:
 #[test]
 fn type_refined_output() {
     check_compile_error(
-        "
-def f(x: Int) => {Int where _ == x}:
-    x
-()
-",
+        indoc::indoc! {r#"
+
+            def f(x: Int) => {Int where _ == x}:
+                x
+            ()
+            "#},
         "Annotation mismatch: annotated as {Int where _ == x}, but inferred as Int",
     )
 }
@@ -342,12 +360,13 @@ def f(x: Int) => {Int where _ == x}:
 #[test]
 fn type_scope_self() {
     check_compile_error(
-        "
-def test(x: {Int where x >= 1}) => Int:
-    x + 1
+        indoc::indoc! {r#"
 
-()
-",
+            def test(x: {Int where x >= 1}) => Int:
+                x + 1
+
+            ()
+            "#},
         "Unbound variable: 'x'",
     )
 }
@@ -357,14 +376,15 @@ def test(x: {Int where x >= 1}) => Int:
 #[test]
 fn type_scope_outer_shadow() {
     check_compile_error(
-        "
-x = \"Hello\"
+        indoc::indoc! {r#"
 
-def test(x: {Int where _ >= x}) => Int:
-    x + 1
+            x = "Hello"
 
-()
-",
+            def test(x: {Int where _ >= x}) => Int:
+                x + 1
+
+            ()
+            "#},
         "No Orderable instance for `>=`: operand 2 is String",
     )
 }
@@ -372,12 +392,13 @@ def test(x: {Int where _ >= x}) => Int:
 #[test]
 fn type_binop_mismatch() {
     check_compile_error(
-        "
-def test(a: String, b: Int):
-    a + b
+        indoc::indoc! {r#"
 
-()
-",
+            def test(a: String, b: Int):
+                a + b
+
+            ()
+            "#},
         "No Addable instance for `+`: operand 2 is Int, but the only type accepted there is String",
     )
 }
@@ -393,17 +414,42 @@ def test(a: String, b: Int):
 /// a name-based rejection there reports the wrong cause for the shadowing case
 /// (`type_scope_outer_shadow`).
 #[rstest]
-#[case::sibling("def f(a: Int, c: {Int where _ >= a}):\n    c\n\nf\n", "a")]
-#[case::sibling_reversed("def f(c: {Int where _ >= a}, a: Int):\n    c\n\nf\n", "a")]
-#[case::sibling_of_three("def f(a: Int, b: Int, c: {Int where _ >= b}):\n    c\n\nf\n", "b")]
-#[case::own_binder("def f(a: {Int where _ >= a}):\n    a\n\nf\n", "a")]
+#[case::sibling(indoc::indoc! {r#"
+    def f(a: Int, c: {Int where _ >= a}):
+        c
+
+    f
+    "#}, "a")]
+#[case::sibling_reversed(indoc::indoc! {r#"
+    def f(c: {Int where _ >= a}, a: Int):
+        c
+
+    f
+    "#}, "a")]
+#[case::sibling_of_three(indoc::indoc! {r#"
+    def f(a: Int, b: Int, c: {Int where _ >= b}):
+        c
+
+    f
+    "#}, "b")]
+#[case::own_binder(indoc::indoc! {r#"
+    def f(a: {Int where _ >= a}):
+        a
+
+    f
+    "#}, "a")]
 fn type_annotation_naming_a_parameter_is_unbound(#[case] code: &str, #[case] name: &str) {
     check_compile_error(code, &format!("Unbound variable: '{name}'"));
 }
 
 #[test]
 fn refined_add() {
-    check_scalar("z: {Int where _ == 1 + 3} = 1 ^+ 3\n()", Value::Unit)
+    check_scalar(
+        indoc::indoc! {r#"
+        z: {Int where _ == 1 + 3} = 1 ^+ 3
+        ()"#},
+        Value::Unit,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -803,10 +849,11 @@ fn a_record_equality_in_a_refinement_predicate_is_not_discharged() {
 #[test]
 fn a_refined_map_key_no_key_satisfies() {
     check_compile_error(
-        r#"
-m: Map({String where _ != ""}, Int) = map([("a", 1), ("z", 2)])
-m
-"#,
+        indoc::indoc! {r#"
+
+            m: Map({String where _ != ""}, Int) = map([("a", 1), ("z", 2)])
+            m
+            "#},
         r#"Annotation mismatch: annotated as Map({String where _ != ""}, Int), but inferred as {String where _ in ["a", "z"]} |=> Int"#,
     )
 }
@@ -814,10 +861,11 @@ m
 #[test]
 fn a_refined_map_key_in_a_mut_annotation_is_reported() {
     check_compile_error(
-        r#"
-m: Mut(Map({String where _ != ""}, Int)) := box(map([("a", 1), ("z", 2)]))
-m
-"#,
+        indoc::indoc! {r#"
+
+            m: Mut(Map({String where _ != ""}, Int)) := box(map([("a", 1), ("z", 2)]))
+            m
+            "#},
         r#"Type mismatch for collection annotation: expected Map({String where _ != ""}, _), found {String where _ in ["a", "z"]}"#,
     )
 }
@@ -2062,8 +2110,12 @@ i = f(1)
 /// A data-function type whose domain is a bare `_` admits a plain collection and a sum alike
 /// (`docs/chl-spec.md`, "6.3 Direction: collection types [Decided]").
 #[rstest]
-#[case::a_plain_collection("xs: _ |=> Int = [1, 2, 3]\nsum(xs)", 6)]
-#[case::a_sum("xs: _ |=> Int = box([1, 2, 3])\nsum([x for x in xs])", 6)]
+#[case::a_plain_collection(indoc::indoc! {r#"
+    xs: _ |=> Int = [1, 2, 3]
+    sum(xs)"#}, 6)]
+#[case::a_sum(indoc::indoc! {r#"
+    xs: _ |=> Int = box([1, 2, 3])
+    sum([x for x in xs])"#}, 6)]
 #[case::a_parameter(
     indoc! {"
         def total(xs: _ |=> Int) => Int:
@@ -2118,7 +2170,9 @@ i = f(1)
     "},
     10
 )]
-#[case::a_codomain("f: Int => _ |=> Int = \\n -> [n, n]\nsum(f(3))", 6)]
+#[case::a_codomain(indoc::indoc! {r#"
+    f: Int => _ |=> Int = \n -> [n, n]
+    sum(f(3))"#}, 6)]
 // A group-by's codomain reads its key, and a hole in the annotation's codomain is filled under
 // the annotation's binder.
 #[case::a_group_by(
@@ -2145,7 +2199,9 @@ fn a_data_function_type_admits_both_collections(#[case] code: &str, #[case] expe
     10
 )]
 #[case::a_polymorphic_annotation(
-    "f: forall (D) (D |=> Int) => Int = \\xs -> sum(xs)\nf([1, 2]) + f([3])",
+    indoc::indoc! {r#"
+        f: forall (D) (D |=> Int) => Int = \xs -> sum(xs)
+        f([1, 2]) + f([3])"#},
     6
 )]
 #[case::a_shared_domain_over_one_plain_domain(
@@ -2180,7 +2236,9 @@ fn a_written_domain_admits_a_plain_collection(#[case] code: &str, #[case] expect
 /// several, and two plain domains a type parameter names are one.
 #[rstest]
 #[case::a_written_type(
-    "xs: Int |=> Int = box([1, 2])\nsum(xs)",
+    indoc::indoc! {r#"
+        xs: Int |=> Int = box([1, 2])
+        sum(xs)"#},
     "annotated as Int |=> Int, but inferred as Box(Array(2, Int))"
 )]
 #[case::a_type_parameter(
@@ -2192,7 +2250,9 @@ fn a_written_domain_admits_a_plain_collection(#[case] code: &str, #[case] expect
     SUM_REACHED_PLAIN
 )]
 #[case::a_polymorphic_annotation(
-    "f: forall (D) (D |=> Int) => Int = \\xs -> sum(xs)\nf(box([1, 2]))",
+    indoc::indoc! {r#"
+        f: forall (D) (D |=> Int) => Int = \xs -> sum(xs)
+        f(box([1, 2]))"#},
     SUM_REACHED_PLAIN
 )]
 #[case::two_sums(
@@ -2236,5 +2296,10 @@ const SUM_REACHED_PLAIN: &str = "a sum reached a plain collection";
 /// A data-function type is written in annotation position, as `T => U` is.
 #[test]
 fn a_data_function_type_is_no_value() {
-    check_compile_error("x = Int |=> Int\n1", "`T |=> U` is a data-function *type*");
+    check_compile_error(
+        indoc::indoc! {r#"
+        x = Int |=> Int
+        1"#},
+        "`T |=> U` is a data-function *type*",
+    );
 }

@@ -2660,7 +2660,14 @@ fn option_declares_is_none() {
     Value::Int(104)
 )]
 fn is_none_as_a_condition(#[case] tail: &str, #[case] expected: Value) {
-    check_scalar(&format!("m = map([(1, 10), (3, 30)])\n{tail}"), expected);
+    check_scalar(
+        &indoc::formatdoc!(
+            r#"
+        m = map([(1, 10), (3, 30)])
+        {tail}"#
+        ),
+        expected,
+    );
 }
 
 /// A type declaring its own `is_none` keeps it beside `Option`'s: each `.is_none()` call

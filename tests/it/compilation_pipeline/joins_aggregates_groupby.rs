@@ -76,10 +76,11 @@ use super::helpers::*;
     ColumnValue::strings(&["b", "b"])
 )]
 #[case(
-    "[a + b
-        for a in [c + d for c in ['a'] for d in ['b', 'c'] if c < d]
-        for b in [e + f for e in ['d', 'e'] for f in ['f'] if e < f]
-    if a != b]",
+    indoc::indoc! {r#"
+        [a + b
+                for a in [c + d for c in ['a'] for d in ['b', 'c'] if c < d]
+                for b in [e + f for e in ['d', 'e'] for f in ['f'] if e < f]
+            if a != b]"#},
     ColumnValue::strings(&["abdf", "abef", "acdf", "acef"])
 )]
 #[case(
@@ -360,12 +361,16 @@ fn a_bare_groupby_tail_is_driven() {
 )]
 #[case(
     "x = [1,2,3]; x",
-    "let x : (0..3 ⤇ Int) = iterate ≫ [1, 2, 3]\nin x:(0..3 ⤇ Int)",
+    indoc::indoc! {r#"
+        let x : (0..3 ⤇ Int) = iterate ≫ [1, 2, 3]
+        in x:(0..3 ⤇ Int)"#},
     make_int_list(&[1,2,3])
 )]
 #[case(
     "x = [1,2,3]; [y + 10 for y in x]",
-    "let x : (0..3 ⤇ Int) = iterate ≫ [1, 2, 3]\nin x ≫ (id, 10 ▷ const) ▷ zip ≫ add:(0..3 ⤇ Int)",
+    indoc::indoc! {r#"
+        let x : (0..3 ⤇ Int) = iterate ≫ [1, 2, 3]
+        in x ≫ (id, 10 ▷ const) ▷ zip ≫ add:(0..3 ⤇ Int)"#},
     make_int_list(&[11,12,13])
 )]
 #[case(
@@ -377,7 +382,9 @@ fn a_bare_groupby_tail_is_driven() {
 // nothing eliminating a `let` whose body no longer reads it.
 #[case(
     "y = 10; [x + y for x in [1,2,3]]",
-    "let y : Int = 10\nin iterate ≫ [1, 2, 3] ≫ (id, 10 ▷ const) ▷ zip ≫ add:(0..3 ⤇ Int)",
+    indoc::indoc! {r#"
+        let y : Int = 10
+        in iterate ≫ [1, 2, 3] ≫ (id, 10 ▷ const) ▷ zip ≫ add:(0..3 ⤇ Int)"#},
     make_int_list(&[11,12,13])
 )]
 #[case(
@@ -458,7 +465,9 @@ fn a_bare_groupby_tail_is_driven() {
 )]
 #[case(
     "[x for x in [y for y in [1,2,3] if y < 3] if x < 2]",
-    "let __anf : ({0..3 | __elem ▷ ([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt)} ⤇ Int) = iterate ▷ (([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast([1, 2, 3])\nin iterate ▷ (([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt) ▷ restrict) ▷ ((__anf ≫ (id, 2 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast(__anf):({0..3 | __elem ▷ ([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt), __elem ▷ (cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt)} ⤇ Int)",
+    indoc::indoc! {r#"
+        let __anf : ({0..3 | __elem ▷ ([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt)} ⤇ Int) = iterate ▷ (([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast([1, 2, 3])
+        in iterate ▷ (([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt) ▷ restrict) ▷ ((__anf ≫ (id, 2 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast(__anf):({0..3 | __elem ▷ ([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt), __elem ▷ (cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt)} ⤇ Int)"#},
     make_int_list(&[1])
 )]
 #[case(
@@ -569,7 +578,9 @@ fn a_bare_groupby_tail_is_driven() {
 )]
 #[case(
     "[x + y for x in [2] for y in [a + b for a in [1, 2] for b in [1, 2, 3] if a == b] if x == y]",
-    "let __anf : ({(0..2, 0..3) | __elem ▷ ((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ eq)} ⤇ Int) = (iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)\nin (iterate ≫ [2] ≫ ((iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ __anf) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [2], .1 ≫ __anf) ▷ zip ≫ add):({(0..1, {(0..2, 0..3) | __elem ▷ ((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ eq)}) | __elem ▷ ((.0 ≫ [2], .1 ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ zip ≫ eq)} ⤇ Int)",
+    indoc::indoc! {r#"
+        let __anf : ({(0..2, 0..3) | __elem ▷ ((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ eq)} ⤇ Int) = (iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)
+        in (iterate ≫ [2] ≫ ((iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ __anf) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [2], .1 ≫ __anf) ▷ zip ≫ add):({(0..1, {(0..2, 0..3) | __elem ▷ ((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ eq)}) | __elem ▷ ((.0 ≫ [2], .1 ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ zip ≫ eq)} ⤇ Int)"#},
     Tile::data_function(ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0])),
             ("_1".into(), ColumnValue::Records(HashMap::from([
@@ -681,12 +692,16 @@ fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expe
 #[timeout(Duration::from_secs(10))]
 // Two iterations of one grouping, aggregating differently.
 #[case(
-    "g = groupby([1,2,3,4], \\y -> y // 2)\nsum([sum(x) for x in g]) + sum([max(x) for x in g])",
+    indoc::indoc! {r#"
+        g = groupby([1,2,3,4], \y -> y // 2)
+        sum([sum(x) for x in g]) + sum([max(x) for x in g])"#},
     Value::Int(18)
 )]
 // Three, including a repeat of the first.
 #[case(
-    "g = groupby([1,2,3,4], \\y -> y // 2)\nsum([sum(x) for x in g]) + sum([max(x) for x in g]) + sum([sum(x) for x in g])",
+    indoc::indoc! {r#"
+        g = groupby([1,2,3,4], \y -> y // 2)
+        sum([sum(x) for x in g]) + sum([max(x) for x in g]) + sum([sum(x) for x in g])"#},
     Value::Int(28)
 )]
 fn test_shared_grouping(#[case] code: &str, #[case] expected: Value) {
@@ -712,15 +727,21 @@ fn test_shared_grouping(#[case] code: &str, #[case] expected: Value) {
 #[timeout(Duration::from_secs(10))]
 // Two uses.
 #[case(
-    "g = groupby([1,2,3,4], \\y -> y // 2)\nsum([sum(x) for x in g]) + sum([max(x) for x in g])"
+    indoc::indoc! {r#"
+        g = groupby([1,2,3,4], \y -> y // 2)
+        sum([sum(x) for x in g]) + sum([max(x) for x in g])"#}
 )]
 // Three, including a repeat of the first, so a second bucketize would show as a second
 // `converse` whether or not the extra use aggregates differently.
 #[case(
-    "g = groupby([1,2,3,4], \\y -> y // 2)\nsum([sum(x) for x in g]) + sum([max(x) for x in g]) + sum([sum(x) for x in g])"
+    indoc::indoc! {r#"
+        g = groupby([1,2,3,4], \y -> y // 2)
+        sum([sum(x) for x in g]) + sum([max(x) for x in g]) + sum([sum(x) for x in g])"#}
 )]
 // A grouping whose keys are its own elements, the shape the lookup spellings used.
-#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum([sum(x) for x in g]) + sum([max(x) for x in g])")]
+#[case(indoc::indoc! {r#"
+    g = groupby([1,1,2,2,3], \x -> x)
+    sum([sum(x) for x in g]) + sum([max(x) for x in g])"#})]
 fn test_grouping_built_once(#[case] code: &str) {
     use cambra::ccl::symbolic::symbolic;
 
@@ -963,7 +984,14 @@ fn a_surplus_column_does_not_reach_the_comparison(#[case] comparison: &str) {
 #[case::nested("(1, (2, \"a\")) == (1, (2, \"a\"))", Value::Int(1))]
 #[case::not_equals("(1, 2) != (1, 9)", Value::Int(1))]
 fn products_compare_componentwise(#[case] comparison: &str, #[case] expected: Value) {
-    check_scalar(&format!("x = {comparison}\n1 if x else 0"), expected);
+    check_scalar(
+        &indoc::formatdoc!(
+            r#"
+        x = {comparison}
+        1 if x else 0"#
+        ),
+        expected,
+    );
 }
 
 /// Two spellings of one record type, fields written in different orders, compare as one
@@ -1074,24 +1102,34 @@ fn checked_lookup_over_a_key_stream(#[case] tail: &str, #[case] expected: Value)
 #[rstest]
 #[timeout(Duration::from_secs(30))]
 #[case(
-    "g: FullMap(_, _) = groupby([1,2], \\v -> v)\nsum([sum(v) for v in g])",
+    indoc::indoc! {r#"
+        g: FullMap(_, _) = groupby([1,2], \v -> v)
+        sum([sum(v) for v in g])"#},
     Value::Int(3)
 )]
 #[case(
-    "g: FullMap(_, _) = groupby([1,2,3,4], \\v -> v // 2)\nsum([sum(v) for v in g])",
+    indoc::indoc! {r#"
+        g: FullMap(_, _) = groupby([1,2,3,4], \v -> v // 2)
+        sum([sum(v) for v in g])"#},
     Value::Int(10)
 )]
 // Bounded: `g` keeps the group-by's own type, binder included.
 #[case(
-    "g <: FullMap(_, _) = groupby([1,2], \\v -> v)\nsum([sum(v) for v in g])",
+    indoc::indoc! {r#"
+        g <: FullMap(_, _) = groupby([1,2], \v -> v)
+        sum([sum(v) for v in g])"#},
     Value::Int(3)
 )]
 #[case(
-    "g <: FullMap(_, _) = groupby([1,2,3,4], \\v -> v // 2)\nsum([sum(v) for v in g])",
+    indoc::indoc! {r#"
+        g <: FullMap(_, _) = groupby([1,2,3,4], \v -> v // 2)
+        sum([sum(v) for v in g])"#},
     Value::Int(10)
 )]
 #[case(
-    "g: Map(_, _) = box(groupby([1,2,3], \\x -> x))\nsum([sum(v) for v in g])",
+    indoc::indoc! {r#"
+        g: Map(_, _) = box(groupby([1,2,3], \x -> x))
+        sum([sum(v) for v in g])"#},
     Value::Int(6)
 )]
 fn a_keyed_annotation_compiles_and_runs(#[case] code: &str, #[case] expected: Value) {
@@ -1282,7 +1320,12 @@ fn a_filtered_comprehension_beside_another_over_each_row_keeps_its_filter(
     #[case] expected: &str,
 ) {
     check_sink(
-        &format!("out = test_sink()\nout << [{row} for g in [[1, 2, 3], [4, 5, 6]]]\n"),
+        &indoc::formatdoc!(
+            r#"
+            out = test_sink()
+            out << [{row} for g in [[1, 2, 3], [4, 5, 6]]]
+            "#
+        ),
         expected,
     );
 }
@@ -1402,7 +1445,15 @@ fn a_group_by_in_a_guard(#[case] program: &str) {
     "[() -> [[2, 4], [3, 6], [3, 6]]]"
 )]
 fn a_comprehension_over_each_group_of_a_group_by(#[case] row: &str, #[case] expected: &str) {
-    check_sink(&format!("out = test_sink()\n{row}\n"), expected);
+    check_sink(
+        &indoc::formatdoc!(
+            r#"
+        out = test_sink()
+        {row}
+        "#
+        ),
+        expected,
+    );
 }
 
 /// An inner comprehension reading only the outer element, one level further in. The enclosing
@@ -1595,7 +1646,10 @@ fn a_nested_for_over_a_groups_rows() {
     ));
     std::fs::write(
         &path,
-        "xs = [1, 2]\n[r for g in groupby(xs, \\s -> s) for r in g]\n",
+        indoc::indoc! {r#"
+            xs = [1, 2]
+            [r for g in groupby(xs, \s -> s) for r in g]
+            "#},
     )
     .expect("the program file is written");
     let mut child = std::process::Command::new("sh")

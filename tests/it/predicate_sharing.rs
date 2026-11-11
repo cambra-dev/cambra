@@ -158,12 +158,11 @@ fn a_cast_target_does_not_carry_its_value_s_refinements() {
 /// predicate as one `Rc`, at both depths.
 #[test]
 fn nested_comprehension_shares_predicate_rcs() {
-    assert_no_split(
-        "[a + b
-            for a in [c + d for c in ['a'] for d in ['b', 'c'] if c < d]
-            for b in [e + f for e in ['d', 'e'] for f in ['f'] if e < f]
-        if a != b]",
-    );
+    assert_no_split(indoc::indoc! {r#"
+            [a + b
+                        for a in [c + d for c in ['a'] for d in ['b', 'c'] if c < d]
+                        for b in [e + f for e in ['d', 'e'] for f in ['f'] if e < f]
+                    if a != b]"#});
 }
 
 /// A filtered collection read under a binder keeps its filter predicate as one `Rc`, whether

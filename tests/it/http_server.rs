@@ -130,10 +130,12 @@ fn drive_until<T>(ctx: &mut GlobalContext, rx: &mpsc::Receiver<T>, timeout: Dura
 #[rstest]
 fn test_http_serve_echo() {
     let port = reserve_test_port();
-    let code = format!(
-        "requests, responses = http_serve(\"{port}\", \"POST\", \"/echo\")\n\
-         for req in requests:\n\
-         \tresponses << \"Received: \" + req\n"
+    let code = indoc::formatdoc!(
+        r#"
+            requests, responses = http_serve("{port}", "POST", "/echo")
+            for req in requests:
+            	responses << "Received: " + req
+            "#
     );
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -157,10 +159,12 @@ fn test_http_serve_echo() {
 #[rstest]
 fn test_http_serve_const() {
     let port = reserve_test_port();
-    let code = format!(
-        "requests, responses = http_serve(\"{port}\", \"GET\", \"/static\")\n\
-         for req in requests:\n\
-         \tresponses << \"Hello, world!\"\n"
+    let code = indoc::formatdoc!(
+        r#"
+            requests, responses = http_serve("{port}", "GET", "/static")
+            for req in requests:
+            	responses << "Hello, world!"
+            "#
     );
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -186,10 +190,12 @@ fn test_http_serve_const() {
 #[rstest]
 fn test_http_serve_two_sequential_requests() {
     let port = reserve_test_port();
-    let code = format!(
-        "requests, responses = http_serve(\"{port}\", \"POST\", \"/echo\")\n\
-         for req in requests:\n\
-         \tresponses << \"OK: \" + req\n"
+    let code = indoc::formatdoc!(
+        r#"
+            requests, responses = http_serve("{port}", "POST", "/echo")
+            for req in requests:
+            	responses << "OK: " + req
+            "#
     );
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -219,13 +225,15 @@ fn test_http_serve_two_sequential_requests() {
 #[rstest]
 fn test_http_serve_two_paths() {
     let port1 = reserve_test_port();
-    let code = format!(
-        "reqs1, resps1 = http_serve(\"{port1}\", \"GET\", \"/greet\")\n\
-         for req in reqs1:\n\
-         \tresps1 << \"hello\"\n\
-        reqs2, resps2 = http_serve(\"{port1}\", \"POST\", \"/echo\")\n\
-         for req in reqs2:\n\
-         \tresps2 << \"echo: \" + req\n"
+    let code = indoc::formatdoc!(
+        r#"
+            reqs1, resps1 = http_serve("{port1}", "GET", "/greet")
+            for req in reqs1:
+            	resps1 << "hello"
+            reqs2, resps2 = http_serve("{port1}", "POST", "/echo")
+            for req in reqs2:
+            	resps2 << "echo: " + req
+            "#
     );
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -255,14 +263,16 @@ fn test_http_serve_two_paths() {
 #[rstest]
 fn test_http_serve_two_paths_shared_outer_let() {
     let port = reserve_test_port();
-    let code = format!(
-        "prefix = \"greeting: \"\n\
-         reqs1, resps1 = http_serve(\"{port}\", \"POST\", \"/a\")\n\
-         reqs2, resps2 = http_serve(\"{port}\", \"POST\", \"/b\")\n\
-         for req in reqs1:\n\
-         \tresps1 << prefix + \"alice\"\n\
-         for req in reqs2:\n\
-         \tresps2 << prefix + req\n"
+    let code = indoc::formatdoc!(
+        r#"
+            prefix = "greeting: "
+            reqs1, resps1 = http_serve("{port}", "POST", "/a")
+            reqs2, resps2 = http_serve("{port}", "POST", "/b")
+            for req in reqs1:
+            	resps1 << prefix + "alice"
+            for req in reqs2:
+            	resps2 << prefix + req
+            "#
     );
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -288,11 +298,13 @@ fn test_http_serve_two_paths_shared_outer_let() {
 #[rstest]
 fn test_http_serve_echo_with_outer_let() {
     let port = reserve_test_port();
-    let code = format!(
-        "prefix = \"Echo: \"\n\
-         requests, responses = http_serve(\"{port}\", \"POST\", \"/echo\")\n\
-         for req in requests:\n\
-         \tresponses << prefix + req\n"
+    let code = indoc::formatdoc!(
+        r#"
+            prefix = "Echo: "
+            requests, responses = http_serve("{port}", "POST", "/echo")
+            for req in requests:
+            	responses << prefix + req
+            "#
     );
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -458,11 +470,13 @@ fn test_http_serve_inside_an_expression_is_error() {
 #[test]
 fn test_http_serve_in_if_branch_is_error() {
     let port = reserve_test_port();
-    let code = format!(
-        "if True:\n\
-         \trequests, responses = http_serve(\"{port}\", \"POST\", \"/echo\")\n\
-         \tfor req in requests:\n\
-         \t\tresponses << req\n"
+    let code = indoc::formatdoc!(
+        r#"
+            if True:
+            	requests, responses = http_serve("{port}", "POST", "/echo")
+            	for req in requests:
+            		responses << req
+            "#
     );
     let mut ctx = LoweringContext::default();
     let module = chl_parser::parse_module(FileId::ROOT, &code)
@@ -483,12 +497,14 @@ fn test_http_serve_in_if_branch_is_error() {
 #[test]
 fn test_http_serve_in_function_body_is_error() {
     let port = reserve_test_port();
-    let code = format!(
-        "def handler():\n\
-         \trequests, responses = http_serve(\"{port}\", \"POST\", \"/echo\")\n\
-         \tfor req in requests:\n\
-         \t\tresponses << req\n\
-         handler()\n"
+    let code = indoc::formatdoc!(
+        r#"
+            def handler():
+            	requests, responses = http_serve("{port}", "POST", "/echo")
+            	for req in requests:
+            		responses << req
+            handler()
+            "#
     );
     let mut ctx = LoweringContext::default();
     let module = chl_parser::parse_module(FileId::ROOT, &code)
@@ -553,10 +569,12 @@ fn test_http_serve_in_with_block_is_error() {
 #[rstest]
 fn test_http_serve_wrong_path_gets_404() {
     let port = reserve_test_port();
-    let code = format!(
-        "requests, responses = http_serve(\"{port}\", \"POST\", \"/echo\")\n\
-         for req in requests:\n\
-         \tresponses << req\n"
+    let code = indoc::formatdoc!(
+        r#"
+            requests, responses = http_serve("{port}", "POST", "/echo")
+            for req in requests:
+            	responses << req
+            "#
     );
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});

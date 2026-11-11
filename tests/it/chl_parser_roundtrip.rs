@@ -625,7 +625,10 @@ fn error_messages_use_readable_symbols_not_debug_names() {
     let cases: &[(&str, &[&str], &[&str])] = &[
         // source, must_contain, must_not_contain
         (
-            "def 1(x):\n    body\n",
+            indoc::indoc! {r#"
+                def 1(x):
+                    body
+                "#},
             &["function name", "'integer literal'"],
             &["Ident", "Token::"],
         ),
@@ -634,7 +637,15 @@ fn error_messages_use_readable_symbols_not_debug_names() {
             &["')'", "expression"],
             &["RParen", "LParen", "Token::"],
         ),
-        ("if 1 + 2:\n    pass\n=\n", &["'='"], &["Eq(", "Token::"]),
+        (
+            indoc::indoc! {r#"
+            if 1 + 2:
+                pass
+            =
+            "#},
+            &["'='"],
+            &["Eq(", "Token::"],
+        ),
     ];
     for (src, must_contain, must_not_contain) in cases {
         let r = parse_mod(src);
@@ -673,7 +684,10 @@ fn expected_lists_are_collapsed_to_categories() {
     // ("binary operator", "comparison operator", "boolean operator",
     // "postfix operation") and the genuinely-distinct alternatives
     // (`<<`, `if`, `:`) — about 7 items total, not 22.
-    let r = parse_mod("if x\n    y\n");
+    let r = parse_mod(indoc::indoc! {r#"
+        if x
+            y
+        "#});
     assert_eq!(r.errors.len(), 1, "{:#?}", r.errors);
     let msg = format!("{}", r.errors[0]);
     for needle in &[
@@ -707,7 +721,10 @@ fn ariadne_render_includes_source_context_and_secondary_labels() {
     //       should mention "while parsing expression" and/or "while
     //       parsing statement" pointing back at the in-progress
     //       production.
-    let src = "if x\n    y\n";
+    let src = indoc::indoc! {r#"
+        if x
+            y
+        "#};
     let sources = SourceMap::single("if-test", src);
     let r = parse_module(sources.root(), src);
     let rendered = r.render_errors(&sources);
@@ -728,17 +745,34 @@ fn ariadne_render_includes_source_context_and_secondary_labels() {
 fn with_begin_transaction_block_parses() {
     // The transaction surface parses (lowering is a separate, later concern):
     // a standalone block, a handle-bound block, and one as a loop body.
-    must_parse_module("with begin():\n    x = 1\nx\n");
-    must_parse_module("with t = begin():\n    x = 1\nx\n");
-    must_parse_module("for r in [1]:\n    with begin():\n        x = 1\nx\n");
+    must_parse_module(indoc::indoc! {r#"
+        with begin():
+            x = 1
+        x
+        "#});
+    must_parse_module(indoc::indoc! {r#"
+        with t = begin():
+            x = 1
+        x
+        "#});
+    must_parse_module(indoc::indoc! {r#"
+        for r in [1]:
+            with begin():
+                x = 1
+        x
+        "#});
 }
 
 #[test]
 fn with_begin_binds_handle() {
     // `with t = begin():` records the optional handle binding.
-    let m = parse_mod("with t = begin():\n    x = 1\nx\n")
-        .value
-        .expect("parses");
+    let m = parse_mod(indoc::indoc! {r#"
+        with t = begin():
+            x = 1
+        x
+        "#})
+    .value
+    .expect("parses");
     let Stmt::With { binding, .. } = &m.body[0].node else {
         panic!("expected a With statement, got {:?}", m.body[0].node);
     };
@@ -749,9 +783,12 @@ fn with_begin_binds_handle() {
 fn mut_txn_annotation_parses_as_type_application() {
     // `Mut(V, Txn)` — the two-argument (value, domain) annotation form —
     // parses as type application: a call with a `Mut` head and two arguments.
-    let m = parse_mod("store: Mut(Int, Txn) = 0\nstore\n")
-        .value
-        .expect("parses");
+    let m = parse_mod(indoc::indoc! {r#"
+        store: Mut(Int, Txn) = 0
+        store
+        "#})
+    .value
+    .expect("parses");
     let Stmt::AnnAssign { annotation, .. } = &m.body[0].node else {
         panic!("expected an AnnAssign, got {:?}", m.body[0].node);
     };

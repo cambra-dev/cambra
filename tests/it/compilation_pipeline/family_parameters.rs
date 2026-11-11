@@ -299,8 +299,10 @@ fn an_annotation_mismatch_writes_the_inferred_family() {
         .flat_map(|a| [(a, "1"), (a, "sum([sum(grp) for grp in gs.extract()])")])
     {
         check_compile_error(
-            &format!(
-                "{GROUPS}gs: {annotation} = Groups::new(groupby([1, 2, 3], \\x -> x > 1))\n{then}"
+            &indoc::formatdoc!(
+                r#"
+                    {GROUPS}gs: {annotation} = Groups::new(groupby([1, 2, 3], \x -> x > 1))
+                    {then}"#
             ),
             "inferred as Groups({Bool where _ in [1 > 1, 2 > 1, 3 > 1]}, \\k: {Bool where _ in \
              [1 > 1, 2 > 1, 3 > 1]} -> {UInt where _ < 3 and ([1, 2, 3][_]! > 1) == k} |=> Int)",
@@ -312,71 +314,111 @@ fn an_annotation_mismatch_writes_the_inferred_family() {
 fn family_parameter_errors_name_what_is_wrong() {
     for (program, message) in [
         (
-            "type Bad(K, V: K => Type) = K |=> V\n1",
+            indoc::indoc! {r#"
+                type Bad(K, V: K => Type) = K |=> V
+                1"#},
             "`V` is a family parameter, a type for each value it ranges over",
         ),
         (
-            "type Bad(K, V: K => Type) = (k: K) |=> V(j)\n1",
+            indoc::indoc! {r#"
+                type Bad(K, V: K => Type) = (k: K) |=> V(j)
+                1"#},
             "`j` is not a binder of a type around this application",
         ),
         (
-            "type Bad(K, V: K => Type) = (k: K) |=> V(k + 1)\n1",
+            indoc::indoc! {r#"
+                type Bad(K, V: K => Type) = (k: K) |=> V(k + 1)
+                1"#},
             "`V` is applied to a binder of a type around it",
         ),
         (
-            "type Bad(K, V: {K, K} => Type) = (k: K) |=> V(k, k)\n1",
+            indoc::indoc! {r#"
+                type Bad(K, V: {K, K} => Type) = (k: K) |=> V(k, k)
+                1"#},
             "`V` is applied to `k` twice",
         ),
         (
-            "type Bad(K, V: {K, K} => Type) = (k: K) |=> V(k)\n1",
+            indoc::indoc! {r#"
+                type Bad(K, V: {K, K} => Type) = (k: K) |=> V(k)
+                1"#},
             "`V` is a family over 2 values, applied here to 1",
         ),
         (
-            "type Bad(K, V: Type => Type) = (k: K) |=> V(k)\n1",
+            indoc::indoc! {r#"
+                type Bad(K, V: Type => Type) = (k: K) |=> V(k)
+                1"#},
             "`V` is indexed by values, so its kind's domain is a type",
         ),
         (
-            "type Bad(K, V: (K: K) => Type) = (k: K) |=> V(k)\n1",
+            indoc::indoc! {r#"
+                type Bad(K, V: (K: K) => Type) = (k: K) |=> V(k)
+                1"#},
             "`K` is capitalized, so it names a type; `(K: K)` binds a value of `K`",
         ),
         (
-            "type Bad(K, V: K |=> Type) = (k: K) |=> V(k)\n1",
+            indoc::indoc! {r#"
+                type Bad(K, V: K |=> Type) = (k: K) |=> V(k)
+                1"#},
             "the kind arrow is `=>`: `V: K => Type`",
         ),
         (
-            "type Bad(K, V: K => K => Type) = (k: K) |=> V(k)\n1",
+            indoc::indoc! {r#"
+                type Bad(K, V: K => K => Type) = (k: K) |=> V(k)
+                1"#},
             "a family over two values is `V: {A, B} => Type`, applied as `V(a, b)`",
         ),
         (
-            "type Bad(K, V <: K => Type) = (k: K) |=> V(k)\n1",
+            indoc::indoc! {r#"
+                type Bad(K, V <: K => Type) = (k: K) |=> V(k)
+                1"#},
             "a type declaration's parameter takes a kind, `V: Type`, and no bound",
         ),
         (
-            "type Bad(V: String => Type) = (k: Bool) |=> V(k)\n1",
+            indoc::indoc! {r#"
+                type Bad(V: String => Type) = (k: Bool) |=> V(k)
+                1"#},
             "`k` ranges over `Bool`, and `V` is a family over `String`",
         ),
         (
-            "type Bad(K, V: Int) = (k: K) |=> V\n1",
+            indoc::indoc! {r#"
+                type Bad(K, V: Int) = (k: K) |=> V
+                1"#},
             "the kind of `V` is `Type`, or `K => Type` for a type for each value of `K`",
         ),
         (
-            "x: \\k: Int -> Int = 1\n1",
+            indoc::indoc! {r#"
+                x: \k: Int -> Int = 1
+                1"#},
             "a family, `\\k: K -> V`, is written as the argument of a family parameter",
         ),
         (
-            "x: forall (k: Int) Int = 1\n1",
+            indoc::indoc! {r#"
+                x: forall (k: Int) Int = 1
+                1"#},
             "a family over the values `k` ranges over is a lambda, `\\k: K -> T`",
         ),
         (
-            &format!("{GROUPS}g: Groups(_, \\a, b -> Int) = Groups::new([1])\n1"),
+            &indoc::formatdoc!(
+                r#"
+                {GROUPS}g: Groups(_, \a, b -> Int) = Groups::new([1])
+                1"#
+            ),
             "`V`'s family ranges over 1 value, and this family binds 2",
         ),
         (
-            &format!("{GROUPS}g: Groups(Int, \\k: Bool -> Int) = Groups::new([1])\n1"),
+            &indoc::formatdoc!(
+                r#"
+                {GROUPS}g: Groups(Int, \k: Bool -> Int) = Groups::new([1])
+                1"#
+            ),
             "`k` ranges over `Bool`, and `V`'s family ranges over `Int`",
         ),
         (
-            &format!("{GROUPS}g: Groups(_, \\k <: Bool -> Int) = Groups::new([1])\n1"),
+            &indoc::formatdoc!(
+                r#"
+                {GROUPS}g: Groups(_, \k <: Bool -> Int) = Groups::new([1])
+                1"#
+            ),
             "a family's binder states the type it ranges over, `k: K`, not a bound",
         ),
     ] {
@@ -391,21 +433,36 @@ fn family_parameter_errors_name_what_is_wrong() {
 fn a_value_binder_s_annotation_is_a_type() {
     const KIND: &str = "is lowercase, so it binds a value, and its annotation is a kind";
     for program in [
-        "g = \\t: Type -> 1\n1".to_string(),
+        indoc::indoc! {r#"
+            g = \t: Type -> 1
+            1"#}
+        .to_string(),
         indoc! {"
             def f(t: Type) => Int:
                 1
             f(1)
         "}
         .to_string(),
-        "x: (k: Type) |=> Int = [1]\n1".to_string(),
-        "type Bad(K, V: (k: Type) => Type) = (k: K) |=> V(k)\n1".to_string(),
-        format!("{GROUPS}g: Groups(_, \\k: Type -> Int) = Groups::new([1])\n1"),
+        indoc::indoc! {r#"
+            x: (k: Type) |=> Int = [1]
+            1"#}
+        .to_string(),
+        indoc::indoc! {r#"
+            type Bad(K, V: (k: Type) => Type) = (k: K) |=> V(k)
+            1"#}
+        .to_string(),
+        indoc::formatdoc!(
+            r#"
+            {GROUPS}g: Groups(_, \k: Type -> Int) = Groups::new([1])
+            1"#
+        ),
     ] {
         check_compile_error(&program, KIND);
     }
     check_compile_error(
-        "x: (K: Int) |=> Int = [1]\n1",
+        indoc::indoc! {r#"
+            x: (K: Int) |=> Int = [1]
+            1"#},
         "`K` is capitalized, so it names a type; `(K: K)` binds a value of `K`",
     );
 }
@@ -682,21 +739,36 @@ fn a_family_parameter_ends_with_its_function() {
 fn a_functions_family_parameter_errors_name_what_is_wrong() {
     /// A `def` over a family `V` of `K` and a type parameter `T`, ending in `requires {clause}`.
     fn with_requires(clause: &str) -> String {
-        format!(
-            "def f(K, T, V: K => Type, g: FullMap(K, V), t: T) => Int requires {clause}:\n    0\n1"
+        indoc::formatdoc!(
+            r#"
+                def f(K, T, V: K => Type, g: FullMap(K, V), t: T) => Int requires {clause}:
+                    0
+                1"#
         )
     }
     for (program, message) in [
         (
-            "def f(K, V: {K, K} => Type, g: FullMap(K, V)) => Int:\n    0\n1".to_string(),
+            indoc::indoc! {r#"
+                def f(K, V: {K, K} => Type, g: FullMap(K, V)) => Int:
+                    0
+                1"#}
+            .to_string(),
             "`V` is a family over 2 values, where one over 1 is taken",
         ),
         (
-            "def f(K, v: K => Type, g: FullMap(K, v)) => Int:\n    0\n1".to_string(),
+            indoc::indoc! {r#"
+                def f(K, v: K => Type, g: FullMap(K, v)) => Int:
+                    0
+                1"#}
+            .to_string(),
             "`v` is lowercase, so it binds a value, and its annotation is a kind",
         ),
         (
-            "def f(K, V: K => Int, g: FullMap(K, V)) => Int:\n    0\n1".to_string(),
+            indoc::indoc! {r#"
+                def f(K, V: K => Int, g: FullMap(K, V)) => Int:
+                    0
+                1"#}
+            .to_string(),
             "the kind of `V` is `Type`, `SubtypesOf(U)`, also written `V <: U`, or a family's \
              `K => Type`",
         ),
@@ -721,7 +793,11 @@ fn a_functions_family_parameter_errors_name_what_is_wrong() {
             "`k` ranges over `K`, and `V` is a family over `String`",
         ),
         (
-            "def f(K, V: K => Type, x: V) => Int:\n    0\n1".to_string(),
+            indoc::indoc! {r#"
+                def f(K, V: K => Type, x: V) => Int:
+                    0
+                1"#}
+            .to_string(),
             "`V` is a family parameter, a type for each value it ranges over",
         ),
         // A bound on a family's values is a `forall` requirement, over the family's index.

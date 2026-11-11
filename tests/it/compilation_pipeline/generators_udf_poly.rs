@@ -21,8 +21,14 @@ use super::helpers::*;
 // uncurried definition/call shape and the inline pass for scalar UDFs.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case("def inc(x):\n    x + 1\ninc(4)", Value::Int(5))]
-#[case("def add(x, y):\n    x + y\nadd(3, 4)", Value::Int(7))]
+#[case(indoc::indoc! {r#"
+    def inc(x):
+        x + 1
+    inc(4)"#}, Value::Int(5))]
+#[case(indoc::indoc! {r#"
+    def add(x, y):
+        x + y
+    add(3, 4)"#}, Value::Int(7))]
 fn test_function_def_scalar(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -203,7 +209,9 @@ fn a_call_to_a_function_chosen_at_run_time_is_refused(#[case] code: &str, #[case
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_function_def_polymorphic_used_at_two_types() {
-    let code = "f = \\x -> x == x\nf(1) and f(\"foo\")";
+    let code = indoc::indoc! {r#"
+        f = \x -> x == x
+        f(1) and f("foo")"#};
     check_scalar(code, Value::Bool(true));
 }
 
@@ -228,18 +236,28 @@ fn test_function_def_polymorphic_used_at_two_types() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // Differs only in the second argument — the position the old key could not see.
-#[case("h = \\a, b -> a + b\nh(1, 2) + h(1, 5)", Value::Int(9))]
+#[case(indoc::indoc! {r#"
+    h = \a, b -> a + b
+    h(1, 2) + h(1, 5)"#}, Value::Int(9))]
 // Differs in the first argument: keyed apart even before the fix.
-#[case("h = \\a, b -> a + b\nh(2, 1) + h(5, 1)", Value::Int(9))]
+#[case(indoc::indoc! {r#"
+    h = \a, b -> a + b
+    h(2, 1) + h(5, 1)"#}, Value::Int(9))]
 // Three call sites, two of them differing only in an invisible position.
-#[case("h = \\a, b -> a + b\nh(1, 2) + h(1, 5) + h(1, 9)", Value::Int(19))]
+#[case(indoc::indoc! {r#"
+    h = \a, b -> a + b
+    h(1, 2) + h(1, 5) + h(1, 9)"#}, Value::Int(19))]
 // Identical calls: one specialization, shared.
-#[case("h = \\a, b -> a + b\nh(1, 2) + h(1, 2)", Value::Int(6))]
+#[case(indoc::indoc! {r#"
+    h = \a, b -> a + b
+    h(1, 2) + h(1, 2)"#}, Value::Int(6))]
 // A single-argument UDF, where the shared clone's body carried the first call's
 // singleton on its parameter reference (`λ x : Int → x:<1> + 1`). That happened
 // to compile to the right answer, so this case pins the *result* while the
 // unit-level `SpecKey` tests pin the keying.
-#[case("f = \\x -> x + 1\nf(1) + f(2)", Value::Int(5))]
+#[case(indoc::indoc! {r#"
+    f = \x -> x + 1
+    f(1) + f(2)"#}, Value::Int(5))]
 fn test_polymorphic_udf_calls_differing_only_in_a_literal(
     #[case] code: &str,
     #[case] expected: Value,
@@ -260,7 +278,11 @@ fn test_polymorphic_udf_calls_differing_only_in_a_literal(
 #[timeout(Duration::from_secs(10))]
 // Simple map: yield x * 2
 #[case(
-    "def doubles(xs):\n    for x in xs:\n        yield x * 2\ndoubles([1, 2, 3])",
+    indoc::indoc! {r#"
+        def doubles(xs):
+            for x in xs:
+                yield x * 2
+        doubles([1, 2, 3])"#},
     make_int_list(&[2, 4, 6])
 )]
 // Same generator, but its result is *bound* to a variable before use
@@ -270,7 +292,12 @@ fn test_polymorphic_udf_calls_differing_only_in_a_literal(
 // feeds land on `y`. The inline form above never reaches that path, so this
 // case is its regression guard.
 #[case(
-    "def doubles(xs):\n    for x in xs:\n        yield x * 2\ny = doubles([1, 2, 3])\ny",
+    indoc::indoc! {r#"
+        def doubles(xs):
+            for x in xs:
+                yield x * 2
+        y = doubles([1, 2, 3])
+        y"#},
     make_int_list(&[2, 4, 6])
 )]
 // A UDF that binds another generator's result to a local and returns it
@@ -280,12 +307,24 @@ fn test_polymorphic_udf_calls_differing_only_in_a_literal(
 // `channelize`'s defer-returning-let *collapse* fires (surfacing the inner
 // defer for a subsequent `lift_defer`). Regression guard for that path.
 #[case(
-    "def doubles(xs):\n    for x in xs:\n        yield x * 2\ndef wrap(xs):\n    z = doubles(xs)\n    z\ny = wrap([1, 2, 3])\ny",
+    indoc::indoc! {r#"
+        def doubles(xs):
+            for x in xs:
+                yield x * 2
+        def wrap(xs):
+            z = doubles(xs)
+            z
+        y = wrap([1, 2, 3])
+        y"#},
     make_int_list(&[2, 4, 6])
 )]
 // Map with captured parameter
 #[case(
-    "def add_to(xs, n):\n    for x in xs:\n        yield x + n\nadd_to([1, 2, 3], 10)",
+    indoc::indoc! {r#"
+        def add_to(xs, n):
+            for x in xs:
+                yield x + n
+        add_to([1, 2, 3], 10)"#},
     make_int_list(&[11, 12, 13])
 )]
 // A list-returning UDF over a *literal* argument, with a body that imposes
@@ -301,7 +340,11 @@ fn test_polymorphic_udf_calls_differing_only_in_a_literal(
 // precondition instead of dropping it. Contrast `add_to` above, where
 // `x + n` forces `n` to plain `Int` and the parameter is unrefined.
 #[case(
-    "def rep(k):\n    for x in [1, 2, 3]:\n        yield k\nrep(10)",
+    indoc::indoc! {r#"
+        def rep(k):
+            for x in [1, 2, 3]:
+                yield k
+        rep(10)"#},
     make_int_list(&[10, 10, 10])
 )]
 // Filter via if-guard. The generator body's filter-feed lowers to a
@@ -310,13 +353,14 @@ fn test_polymorphic_udf_calls_differing_only_in_a_literal(
 // builds), so planning reifies it into an `IterateExtent` + `Restrict` and
 // only guard-passing elements are yielded.
 #[case(
-    r#"
-def positives(xs):
-    n = 0
-    for x in xs:
-        if x > n:
-            yield x
-positives([-1, 2, -3, 4])"#,
+    indoc::indoc! {r#"
+
+        def positives(xs):
+            n = 0
+            for x in xs:
+                if x > n:
+                    yield x
+        positives([-1, 2, -3, 4])"#},
     Tile::data_function(ColumnValue::UInts(vec![1, 3]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 4]))), Predicate::True, BitSet::new())
 )]
 fn test_generator_function(#[case] code: &str, #[case] expected: Tile) {
@@ -332,13 +376,14 @@ fn test_generator_function(#[case] code: &str, #[case] expected: Tile) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
-    r#"
-def running_totals(items):
-    total := 0
-    for item in items:
-        total += item
-        yield total
-running_totals([1, 2, 3, 4])"#,
+    indoc::indoc! {r#"
+
+        def running_totals(items):
+            total := 0
+            for item in items:
+                total += item
+                yield total
+        running_totals([1, 2, 3, 4])"#},
     make_int_list(&[1, 3, 6, 10])
 )]
 fn test_generator_with_loop_carried_mutation(#[case] code: &str, #[case] expected: Tile) {
@@ -349,7 +394,11 @@ fn test_generator_with_loop_carried_mutation(#[case] code: &str, #[case] expecte
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
-    "def doubles(xs):\n    for x in xs:\n        yield x * 2\nsum(doubles([1, 2, 3]))",
+    indoc::indoc! {r#"
+        def doubles(xs):
+            for x in xs:
+                yield x * 2
+        sum(doubles([1, 2, 3]))"#},
     Value::Int(12)
 )]
 fn test_generator_function_with_aggregate(#[case] code: &str, #[case] expected: Value) {
@@ -368,7 +417,11 @@ fn test_generator_function_with_aggregate(#[case] code: &str, #[case] expected: 
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_generator_polymorphic_over_element_type() {
-    let code = "def ones(xs):\n    for x in xs:\n        yield 1\nsum(ones([1, 2, 3])) + sum(ones([\"a\", \"b\"]))";
+    let code = indoc::indoc! {r#"
+        def ones(xs):
+            for x in xs:
+                yield 1
+        sum(ones([1, 2, 3])) + sum(ones(["a", "b"]))"#};
     check_scalar(code, Value::Int(5));
 }
 
@@ -386,7 +439,10 @@ fn test_generator_polymorphic_over_element_type() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_poly_calls_poly_at_two_types() {
-    let code = "f = \\x -> x == x\ng = \\y -> f(y)\ng(1) and g(\"foo\")";
+    let code = indoc::indoc! {r#"
+        f = \x -> x == x
+        g = \y -> f(y)
+        g(1) and g("foo")"#};
     check_scalar(code, Value::Bool(true));
 }
 
@@ -545,7 +601,10 @@ fn test_poly_calls_poly_list_body() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_collection_udf_through_poly_wrapper() {
-    let code = "f = \\xs -> [x for x in xs]\ng = \\ys -> f(ys)\ng([1, 2, 3])";
+    let code = indoc::indoc! {r#"
+        f = \xs -> [x for x in xs]
+        g = \ys -> f(ys)
+        g([1, 2, 3])"#};
     check_tile(code, make_int_list(&[1, 2, 3]));
 }
 
@@ -554,7 +613,10 @@ fn test_collection_udf_through_poly_wrapper() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_collection_udf_through_poly_wrapper_two_element_types() {
-    let code = "f = \\xs -> [1 for x in xs]\ng = \\ys -> f(ys)\nsum(g([1, 2, 3])) + sum(g([\"a\", \"b\"]))";
+    let code = indoc::indoc! {r#"
+        f = \xs -> [1 for x in xs]
+        g = \ys -> f(ys)
+        sum(g([1, 2, 3])) + sum(g(["a", "b"]))"#};
     check_scalar(code, Value::Int(5));
 }
 
@@ -568,7 +630,12 @@ fn test_collection_udf_through_poly_wrapper_two_element_types() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_generator_def_through_poly_wrapper_two_element_types() {
-    let code = "def ones(xs):\n    for x in xs:\n        yield 1\nwrap = \\ys -> ones(ys)\nsum(wrap([1, 2, 3])) + sum(wrap([\"a\", \"b\"]))";
+    let code = indoc::indoc! {r#"
+        def ones(xs):
+            for x in xs:
+                yield 1
+        wrap = \ys -> ones(ys)
+        sum(wrap([1, 2, 3])) + sum(wrap(["a", "b"]))"#};
     check_scalar(code, Value::Int(5));
 }
 
@@ -576,8 +643,11 @@ fn test_generator_def_through_poly_wrapper_two_element_types() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_triple_poly_chain_collection() {
-    let code =
-        "f = \\xs -> [x for x in xs]\ng = \\ys -> f(ys)\nh = \\zs -> g(zs)\nsum(h([1, 2, 3]))";
+    let code = indoc::indoc! {r#"
+            f = \xs -> [x for x in xs]
+            g = \ys -> f(ys)
+            h = \zs -> g(zs)
+            sum(h([1, 2, 3]))"#};
     check_scalar(code, Value::Int(6));
 }
 
@@ -585,7 +655,11 @@ fn test_triple_poly_chain_collection() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_triple_poly_chain_at_two_types() {
-    let code = "f = \\x -> x == x\ng = \\y -> f(y)\nh = \\z -> g(z)\nh(1) and h(\"foo\")";
+    let code = indoc::indoc! {r#"
+        f = \x -> x == x
+        g = \y -> f(y)
+        h = \z -> g(z)
+        h(1) and h("foo")"#};
     check_scalar(code, Value::Bool(true));
 }
 
@@ -595,7 +669,11 @@ fn test_triple_poly_chain_at_two_types() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_poly_diamond() {
-    let code = "f = \\x -> x == x\ng = \\y -> f(y)\nh = \\z -> f(z)\ng(1) and h(\"foo\")";
+    let code = indoc::indoc! {r#"
+        f = \x -> x == x
+        g = \y -> f(y)
+        h = \z -> f(z)
+        g(1) and h("foo")"#};
     check_scalar(code, Value::Bool(true));
 }
 
@@ -604,7 +682,10 @@ fn test_poly_diamond() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_poly_used_directly_and_through_wrapper() {
-    let code = "f = \\x -> x == x\ng = \\y -> f(y)\nf(1) and g(\"foo\")";
+    let code = indoc::indoc! {r#"
+        f = \x -> x == x
+        g = \y -> f(y)
+        f(1) and g("foo")"#};
     check_scalar(code, Value::Bool(true));
 }
 
@@ -614,7 +695,10 @@ fn test_poly_used_directly_and_through_wrapper() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_poly_fanout_inside_wrapper() {
-    let code = "f = \\x -> x == x\ng = \\y -> f(y) and f(\"z\")\ng(1) and g(\"foo\")";
+    let code = indoc::indoc! {r#"
+        f = \x -> x == x
+        g = \y -> f(y) and f("z")
+        g(1) and g("foo")"#};
     check_scalar(code, Value::Bool(true));
 }
 
@@ -625,7 +709,10 @@ fn test_poly_fanout_inside_wrapper() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_filter_udf_through_poly_wrapper() {
-    let code = "f = \\xs -> [x for x in xs if x > 1]\ng = \\ys -> f(ys)\ng([1, 2, 3])";
+    let code = indoc::indoc! {r#"
+        f = \xs -> [x for x in xs if x > 1]
+        g = \ys -> f(ys)
+        g([1, 2, 3])"#};
     check_tile(
         code,
         Tile::data_function(
@@ -644,7 +731,10 @@ fn test_filter_udf_through_poly_wrapper() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_predicate_udf_used_inside_poly_wrapper_filter() {
-    let code = "p = \\x -> x > 1\ng = \\ys -> [y for y in ys if p(y)]\ng([1, 2, 3])";
+    let code = indoc::indoc! {r#"
+        p = \x -> x > 1
+        g = \ys -> [y for y in ys if p(y)]
+        g([1, 2, 3])"#};
     check_tile(
         code,
         Tile::data_function(
@@ -661,7 +751,10 @@ fn test_predicate_udf_used_inside_poly_wrapper_filter() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_poly_chain_with_extra_param() {
-    let code = "f = \\xs -> [x for x in xs]\ng = \\ys, n -> sum(f(ys)) + n\ng([1, 2], 10)";
+    let code = indoc::indoc! {r#"
+        f = \xs -> [x for x in xs]
+        g = \ys, n -> sum(f(ys)) + n
+        g([1, 2], 10)"#};
     check_scalar(code, Value::Int(13));
 }
 
@@ -696,24 +789,26 @@ fn test_unexercised_generic_definition_is_an_error_not_a_panic() {
 #[timeout(Duration::from_secs(10))]
 // doubles(add_one([1,2,3])) == [4, 6, 8]
 #[case(
-    r#"def add_one(xs):
-    for x in xs:
-        yield x + 1
-def doubles(xs):
-    for x in xs:
-        yield x * 2
-doubles(add_one([1, 2, 3]))"#,
+    indoc::indoc! {r#"
+        def add_one(xs):
+            for x in xs:
+                yield x + 1
+        def doubles(xs):
+            for x in xs:
+                yield x * 2
+        doubles(add_one([1, 2, 3]))"#},
     Tile::data_function(ColumnValue::UInts(vec![0, 1, 2]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![4, 6, 8]))), Predicate::True, BitSet::new())
 )]
 // sum(doubles(add_one([1,2,3]))) == 18
 #[case(
-    r#"def add_one(xs):
-    for x in xs:
-        yield x + 1
-def doubles(xs):
-    for x in xs:
-        yield x * 2
-sum(doubles(add_one([1, 2, 3])))"#,
+    indoc::indoc! {r#"
+        def add_one(xs):
+            for x in xs:
+                yield x + 1
+        def doubles(xs):
+            for x in xs:
+                yield x * 2
+        sum(doubles(add_one([1, 2, 3])))"#},
     Tile::Scalar(ColumnValue::Ints(vec![18]))
 )]
 fn test_nested_generator_functions(#[case] code: &str, #[case] expected: Tile) {
@@ -771,7 +866,9 @@ fn a_generator_called_in_a_predicate(#[case] source: &str, #[case] expected: &st
 #[timeout(Duration::from_secs(10))]
 fn a_parameter_iterated_as_a_collection_resolves_data() {
     check_tile(
-        "f = \\xs -> [x for x in xs if x > 1]\nf([1, 2, 3])",
+        indoc::indoc! {r#"
+            f = \xs -> [x for x in xs if x > 1]
+            f([1, 2, 3])"#},
         Tile::data_function(
             ColumnValue::UInts(vec![1, 2]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
@@ -1015,7 +1112,12 @@ fn a_definition_applied_to_each_group(
     #[case] expected: &str,
 ) {
     check_sink(
-        &format!("{definitions}out = test_sink()\nout << {row}\n"),
+        &indoc::formatdoc!(
+            r#"
+            {definitions}out = test_sink()
+            out << {row}
+            "#
+        ),
         expected,
     );
 }

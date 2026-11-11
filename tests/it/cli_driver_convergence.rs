@@ -95,7 +95,11 @@ fn drive_scalar_int(code: &str) -> i64 {
 #[test]
 fn accumulator_converges_via_notification_gated_driver() {
     assert_eq!(
-        drive_scalar_int("x := 0\nfor i in [1, 2, 3, 4, 5]:\n    x += 1\nx"),
+        drive_scalar_int(indoc::indoc! {r#"
+            x := 0
+            for i in [1, 2, 3, 4, 5]:
+                x += 1
+            x"#}),
         5
     );
 }
@@ -105,7 +109,11 @@ fn accumulator_converges_via_notification_gated_driver() {
 #[test]
 fn loop_carried_sum_converges() {
     assert_eq!(
-        drive_scalar_int("x := 0\nfor i in [1, 2, 3, 4, 5]:\n    x += i\nx"),
+        drive_scalar_int(indoc::indoc! {r#"
+            x := 0
+            for i in [1, 2, 3, 4, 5]:
+                x += i
+            x"#}),
         15
     );
 }
@@ -115,7 +123,14 @@ fn loop_carried_sum_converges() {
 /// without stalling.
 #[test]
 fn empty_loop_returns_init() {
-    assert_eq!(drive_scalar_int("x := 7\nfor i in []:\n    x += 1\nx"), 7);
+    assert_eq!(
+        drive_scalar_int(indoc::indoc! {r#"
+        x := 7
+        for i in []:
+            x += 1
+        x"#}),
+        7
+    );
 }
 
 /// Control: an aggregate converges in a single pull (no cycle), so it must keep
@@ -151,9 +166,16 @@ fn drive_single_int(code: &str) -> i64 {
 #[test]
 fn leading_deny_converges_no_stall() {
     // r=0 denies (guard `r != 0` false); r=1 commits q:=2; r=2 commits q:=3.
-    let v = drive_single_int(
-        "out: Feed(_)\nq: Mut(Int, Txn) := 0\nfor r in [0, 1, 2]:\n    with begin():\n        if r != 0:\n            q := r + 1\nwith begin():\n    out << q\nout",
-    );
+    let v = drive_single_int(indoc::indoc! {r#"
+            out: Feed(_)
+            q: Mut(Int, Txn) := 0
+            for r in [0, 1, 2]:
+                with begin():
+                    if r != 0:
+                        q := r + 1
+            with begin():
+                out << q
+            out"#});
     assert!(
         [0, 2, 3].contains(&v),
         "trailing as-of read {v} must be a member of the as-of set {{0, 2, 3}}"
@@ -165,9 +187,16 @@ fn leading_deny_converges_no_stall() {
 /// commits q:=3. The store must still step past the interior deny to terminal.
 #[test]
 fn middle_deny_converges_no_stall() {
-    let v = drive_single_int(
-        "out: Feed(_)\nq: Mut(Int, Txn) := 0\nfor r in [1, 0, 2]:\n    with begin():\n        if r != 0:\n            q := r + 1\nwith begin():\n    out << q\nout",
-    );
+    let v = drive_single_int(indoc::indoc! {r#"
+            out: Feed(_)
+            q: Mut(Int, Txn) := 0
+            for r in [1, 0, 2]:
+                with begin():
+                    if r != 0:
+                        q := r + 1
+            with begin():
+                out << q
+            out"#});
     assert!(
         [0, 2, 3].contains(&v),
         "trailing as-of read {v} must be a member of the as-of set {{0, 2, 3}}"

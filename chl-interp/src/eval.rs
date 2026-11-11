@@ -3936,11 +3936,20 @@ mod tests {
     #[test]
     fn a_pattern_binding_a_name_twice_is_refused() {
         for body in [
-            "a, a = (1, 2)\nout << a",
-            "for a, a in [(1, 2)]:\n    out << a",
+            indoc::indoc! {r#"
+                a, a = (1, 2)
+                out << a"#},
+            indoc::indoc! {r#"
+                for a, a in [(1, 2)]:
+                    out << a"#},
             "out << sum([a for a, a in [(1, 2)]])",
         ] {
-            let e = refused(&format!("out = test_sink()\n{body}\n"));
+            let e = refused(&indoc::formatdoc!(
+                r#"
+                out = test_sink()
+                {body}
+                "#
+            ));
             assert!(e.contains("`a` is bound twice"), "{body}: {e}");
         }
     }
@@ -4497,11 +4506,21 @@ mod tests {
     #[test]
     fn an_associated_function_with_a_mut_parameter_is_refused() {
         for decl in [
-            "def Price::add(self, total: Mut(Int)) => Int:\n    1",
-            "impl Price:\n    def add(self, total: Mut(Int)) => Int:\n        1",
+            indoc::indoc! {r#"
+                def Price::add(self, total: Mut(Int)) => Int:
+                    1"#},
+            indoc::indoc! {r#"
+                impl Price:
+                    def add(self, total: Mut(Int)) => Int:
+                        1"#},
         ] {
-            let e = refused(&format!(
-                "type Price = Int\n{decl}\nout = test_sink()\nout << 1\n"
+            let e = refused(&indoc::formatdoc!(
+                r#"
+                    type Price = Int
+                    {decl}
+                    out = test_sink()
+                    out << 1
+                    "#
             ));
             assert!(e.contains("takes a `Mut` parameter `total`"), "{e}");
         }

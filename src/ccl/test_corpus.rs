@@ -54,15 +54,17 @@ pub(crate) fn pipeline_corpus() -> Vec<(&'static str, String)> {
         ),
         (
             "transaction",
-            "out: Feed(_)\n\
-             pool: Mut(Int, Txn) := 100\n\
-             for r in [10, 20, 30]:\n\
-             \x20   with begin():\n\
-             \x20       pool := pool - r\n\
-             with begin():\n\
-             \x20   out << pool\n\
-             out\n"
-                .to_string(),
+            indoc::indoc! {r#"
+                out: Feed(_)
+                pool: Mut(Int, Txn) := 100
+                for r in [10, 20, 30]:
+                    with begin():
+                        pool := pool - r
+                with begin():
+                    out << pool
+                out
+                "#}
+            .to_string(),
         ),
         (
             "group_by",
@@ -71,13 +73,25 @@ pub(crate) fn pipeline_corpus() -> Vec<(&'static str, String)> {
         ),
         (
             "udf_chain",
-            "def double(x):\n    x * 2\ndef bump(x):\n    double(x) + 1\n\
-             xs = [1, 2, 3]\n[bump(x) for x in xs]\n"
-                .to_string(),
+            indoc::indoc! {r#"
+                def double(x):
+                    x * 2
+                def bump(x):
+                    double(x) + 1
+                xs = [1, 2, 3]
+                [bump(x) for x in xs]
+                "#}
+            .to_string(),
         ),
         (
             "feed_loop",
-            "out: Feed(_)\nfor x in [1, 2, 3]:\n    out << x * 2\nout\n".to_string(),
+            indoc::indoc! {r#"
+                out: Feed(_)
+                for x in [1, 2, 3]:
+                    out << x * 2
+                out
+                "#}
+            .to_string(),
         ),
     ];
     corpus

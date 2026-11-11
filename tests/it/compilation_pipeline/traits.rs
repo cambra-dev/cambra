@@ -2043,7 +2043,9 @@ fn a_loop_walks_its_sources_elements(#[case] code: &str, #[case] expected: i64) 
         total += x
     total
 "})]
-#[case::a_nominal_type_without_an_instance("type Box = Int\nsum([x for x in Box::new(3)])")]
+#[case::a_nominal_type_without_an_instance(indoc::indoc! {r#"
+    type Box = Int
+    sum([x for x in Box::new(3)])"#})]
 fn a_loop_over_a_type_without_an_iterable_instance(#[case] code: &str) {
     check_compile_error(
         code,

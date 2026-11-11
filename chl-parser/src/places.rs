@@ -528,8 +528,14 @@ mod tests {
 
     #[test]
     fn a_new_place_moves_no_place_of_another_binding_or_spelling() {
-        let before = spelled("a = f(1)\nb = f(2)\n");
-        let after = spelled("a = f(0) + f(1) + g(2)\nb = f(2)\n");
+        let before = spelled(indoc::indoc! {r#"
+            a = f(1)
+            b = f(2)
+            "#});
+        let after = spelled(indoc::indoc! {r#"
+            a = f(0) + f(1) + g(2)
+            b = f(2)
+            "#});
         assert_eq!(before, ["a.f()", "b.f()"]);
         assert_eq!(after, ["a.f()", "a.f()#1", "a.g()", "b.f()"]);
     }

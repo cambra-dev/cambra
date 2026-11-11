@@ -5054,147 +5054,147 @@ mod tests {
 
     #[rstest]
     #[case(
-        "\
-x = 2
-x",
-        "\
-let x = 2
-in x"
+        indoc::indoc! {r#"
+            x = 2
+            x"#},
+        indoc::indoc! {r#"
+            let x = 2
+            in x"#}
     )]
     #[case(
-        "\
-x = 2
-y = x
-y",
-        "\
-let x = 2
-in let y = x
-in y"
+        indoc::indoc! {r#"
+            x = 2
+            y = x
+            y"#},
+        indoc::indoc! {r#"
+            let x = 2
+            in let y = x
+            in y"#}
     )]
     #[case(
-        "\
-x = 2 + 3
-y = x * 4
-y",
-        "\
-let x = 2 + 3
-in let y = x * 4
-in y"
+        indoc::indoc! {r#"
+            x = 2 + 3
+            y = x * 4
+            y"#},
+        indoc::indoc! {r#"
+            let x = 2 + 3
+            in let y = x * 4
+            in y"#}
     )]
     // Note: SSA and ANF disallow this sort of redefinition; our less-normalised
     // representation allows shadowing the same binding name.
     #[case(
-        "\
-x = 2 + 3
-x = x * 4
-x",
-        "\
-let x = 2 + 3
-in let x = x * 4
-in x"
+        indoc::indoc! {r#"
+            x = 2 + 3
+            x = x * 4
+            x"#},
+        indoc::indoc! {r#"
+            let x = 2 + 3
+            in let x = x * 4
+            in x"#}
     )]
     // Augmented assignment: `x op= e` is a mutable write (`MutWrite`) — the target
     // must be introduced mutable with `:=`.
     #[case(
-        "\
-x := 0
-x += 1
-x",
-        "\
-x : Mut(_, _) := 0
-in x := x + 1; x"
+        indoc::indoc! {r#"
+            x := 0
+            x += 1
+            x"#},
+        indoc::indoc! {r#"
+            x : Mut(_, _) := 0
+            in x := x + 1; x"#}
     )]
     #[case(
-        "\
-x := 10
-x -= 3
-x",
-        "\
-x : Mut(_, _) := 10
-in x := x - 3; x"
+        indoc::indoc! {r#"
+            x := 10
+            x -= 3
+            x"#},
+        indoc::indoc! {r#"
+            x : Mut(_, _) := 10
+            in x := x - 3; x"#}
     )]
     #[case(
-        "\
-x := 2
-x *= 5
-x",
-        "\
-x : Mut(_, _) := 2
-in x := x * 5; x"
+        indoc::indoc! {r#"
+            x := 2
+            x *= 5
+            x"#},
+        indoc::indoc! {r#"
+            x : Mut(_, _) := 2
+            in x := x * 5; x"#}
     )]
     #[case(
-        "\
-x := 7
-x //= 2
-x",
-        "\
-x : Mut(_, _) := 7
-in x := x // 2; x"
+        indoc::indoc! {r#"
+            x := 7
+            x //= 2
+            x"#},
+        indoc::indoc! {r#"
+            x : Mut(_, _) := 7
+            in x := x // 2; x"#}
     )]
     // Chained augmented assignments are a sequence of mutable writes.
     #[case(
-        "\
-x := 0
-x += 1
-x += 2
-x",
-        "\
-x : Mut(_, _) := 0
-in x := x + 1; x := x + 2; x"
+        indoc::indoc! {r#"
+            x := 0
+            x += 1
+            x += 2
+            x"#},
+        indoc::indoc! {r#"
+            x : Mut(_, _) := 0
+            in x := x + 1; x := x + 2; x"#}
     )]
     // A feed declaration introduces a Defer node.
     #[case(
-        "\
-x: Feed(_)
-x",
-        "\
-let x = defer
-in x"
+        indoc::indoc! {r#"
+            x: Feed(_)
+            x"#},
+        indoc::indoc! {r#"
+            let x = defer
+            in x"#}
     )]
     // x <<= expr (AugAssign LShift) lowers to ExprStmt(Define(x, expr), body).
     #[case(
-        "\
-x: Feed(_)
-x <<= 1
-x",
-        "\
-let x = defer
-in define(x, 1); x"
+        indoc::indoc! {r#"
+            x: Feed(_)
+            x <<= 1
+            x"#},
+        indoc::indoc! {r#"
+            let x = defer
+            in define(x, 1); x"#}
     )]
     // x << expr as a middle statement lowers to ExprStmt(Feed(x, expr), body).
     #[case(
-        "\
-x: Feed(_)
-x << 1
-x",
-        "\
-let x = defer
-in feed(x, 1); x"
+        indoc::indoc! {r#"
+            x: Feed(_)
+            x << 1
+            x"#},
+        indoc::indoc! {r#"
+            let x = defer
+            in feed(x, 1); x"#}
     )]
     // defer with an intervening let binding before the define.
     #[case(
-        "\
-x: Feed(_)
-y = 5
-x <<= y + 1
-x",
-        "\
-let x = defer
-in let y = 5
-in define(x, y + 1); x"
+        indoc::indoc! {r#"
+            x: Feed(_)
+            y = 5
+            x <<= y + 1
+            x"#},
+        indoc::indoc! {r#"
+            let x = defer
+            in let y = 5
+            in define(x, y + 1); x"#}
     )]
     // Two independent defers each get their own Let/Defer node.
     #[case(
-        "\
-x: Feed(_)
-y: Feed(_)
-x <<= 1
-y <<= 2
-x",
-        "\
-let x = defer
-in let y = defer
-in define(x, 1); define(y, 2); x"
+        indoc::indoc! {r#"
+            x: Feed(_)
+            y: Feed(_)
+            x <<= 1
+            y <<= 2
+            x"#},
+        indoc::indoc! {r#"
+            let x = defer
+            in let y = defer
+            in define(x, 1); define(y, 2); x"#}
     )]
     fn test_lower_stmts(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
@@ -5223,14 +5223,14 @@ in define(x, 1); define(y, 2); x"
     #[ignore = "if/else as a non-final statement (assignment-binding desugaring) is not yet \
                 implemented; if/else as a final value-returning statement is now supported"]
     fn test_lower_if_else_branch_locals() {
-        let code = "\
-if cond:
-    tmp = 1
-    result = tmp + 1
-else:
-    tmp = 2
-    result = tmp + 2
-result";
+        let code = indoc::indoc! {r#"
+            if cond:
+                tmp = 1
+                result = tmp + 1
+            else:
+                tmp = 2
+                result = tmp + 2
+            result"#};
         let stmts = parse_module(code);
         let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
             .into_result()
@@ -5251,9 +5251,9 @@ result";
     #[test]
     #[ignore = "walrus operator (:=) not yet in the CHL grammar"]
     fn test_lower_walrus_let_in_value_position() {
-        let code = "\
-x = (y := 5) + 1
-x";
+        let code = indoc::indoc! {r#"
+            x = (y := 5) + 1
+            x"#};
         let stmts = parse_module(code);
         let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
             .into_result()
@@ -5275,22 +5275,46 @@ x";
 
     #[rstest]
     // Simple if/else as the final statement.
-    #[case("if x:\n    1\nelse:\n    0", "{ x → 1; true → 0 }")]
+    #[case(indoc::indoc! {r#"
+        if x:
+            1
+        else:
+            0"#}, "{ x → 1; true → 0 }")]
     // Scrutinee from an outer let binding.
     #[case(
-        "x = 5\nif x > 3:\n    10\nelse:\n    0",
-        "let x = 5\nin { x > 3 → 10; true → 0 }"
+        indoc::indoc! {r#"
+            x = 5
+            if x > 3:
+                10
+            else:
+                0"#},
+        indoc::indoc! {r#"
+            let x = 5
+            in { x > 3 → 10; true → 0 }"#}
     )]
     // elif chain: CHL's flat `Stmt::If { branches, else_body }` lowers to a single Case
     // with one branch per `if`/`elif` plus a true-guard for the `else`.
     #[case(
-        "if c1:\n    1\nelif c2:\n    2\nelse:\n    3",
+        indoc::indoc! {r#"
+            if c1:
+                1
+            elif c2:
+                2
+            else:
+                3"#},
         "{ c1 → 1; c2 → 2; true → 3 }"
     )]
     // Multi-statement arm body: last stmt must be a bare expression.
     #[case(
-        "if x:\n    a = 1\n    a\nelse:\n    0",
-        "{ x → let a = 1\nin a; true → 0 }"
+        indoc::indoc! {r#"
+            if x:
+                a = 1
+                a
+            else:
+                0"#},
+        indoc::indoc! {r#"
+            { x → let a = 1
+            in a; true → 0 }"#}
     )]
     fn test_lower_if(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
@@ -5307,7 +5331,12 @@ x";
     #[test]
     #[ignore = "non-tail if/else requires a statement-level IR pass (not yet implemented)"]
     fn test_lower_non_tail_if() {
-        let code = "x = 1\nif x > 0:\n    x = x + 1\nresult = x\nresult";
+        let code = indoc::indoc! {r#"
+            x = 1
+            if x > 0:
+                x = x + 1
+            result = x
+            result"#};
         let stmts = parse_module(code);
         let _ccl = lower_stmts(&stmts, &mut LoweringContext::default())
             .into_result()
@@ -5318,7 +5347,9 @@ x";
 
     #[test]
     fn test_lower_if_without_else_rejected() {
-        let stmts = parse_module("if x:\n    1");
+        let stmts = parse_module(indoc::indoc! {r#"
+            if x:
+                1"#});
         let err = expect_one_lowering_error(&stmts);
         assert!(matches!(err, LoweringError::Unsupported { .. }));
     }
@@ -5616,7 +5647,10 @@ x";
         // `x = 1` is the first statement (spans bytes 0..5); `x + 2` is the
         // final bare expression (spans bytes 6..11). The source-byte offsets are
         // load-bearing: the test asserts the exact origin span of each node.
-        let src = "x = 1\nx + 2\n";
+        let src = indoc::indoc! {r#"
+            x = 1
+            x + 2
+            "#};
         let module = parse_module(src);
         assert_eq!(
             module.body[0].span,

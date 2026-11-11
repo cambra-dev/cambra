@@ -2214,13 +2214,30 @@ mod tests {
     fn parser_rejects_constructs_outside_chl_grammar() {
         let cases: &[&str] = &[
             // Bare `yield` (no value).
-            "def bad(xs):\n    for x in xs:\n        yield\nbad",
+            indoc::indoc! {r#"
+                def bad(xs):
+                    for x in xs:
+                        yield
+                bad"#},
             // Function decorators.
-            "@some_decorator\ndef f(x):\n    x + 1\nf",
+            indoc::indoc! {r#"
+                @some_decorator
+                def f(x):
+                    x + 1
+                f"#},
             // `for/else`.
-            "def bad(xs):\n    for x in xs:\n        yield x\n    else:\n        pass\nbad",
+            indoc::indoc! {r#"
+                def bad(xs):
+                    for x in xs:
+                        yield x
+                    else:
+                        pass
+                bad"#},
             // Attribute augmented-assignment target.
-            "x = 0\nx.field += 1\nx",
+            indoc::indoc! {r#"
+                x = 0
+                x.field += 1
+                x"#},
         ];
         for code in cases {
             let result = super::test_helpers::parse_module_result(code);
@@ -2237,7 +2254,16 @@ mod tests {
     /// has no keyed read-modify-write.
     #[test]
     fn a_subscript_target_is_rejected_by_every_form_but_mut_assign() {
-        for code in ["x = [1]\nx[0] += 1\nx", "x = [1]\nx[0] = 1\nx"] {
+        for code in [
+            indoc::indoc! {r#"
+            x = [1]
+            x[0] += 1
+            x"#},
+            indoc::indoc! {r#"
+            x = [1]
+            x[0] = 1
+            x"#},
+        ] {
             let module = super::test_helpers::parse_module(code);
             let mut ctx = super::LoweringContext::default();
             let errs = super::lower_stmts(&module, &mut ctx)
@@ -2264,10 +2290,17 @@ mod tests {
             e.fold_children((), |(), c| option_bindings(c, out));
         }
         for (code, bound) in [
-            ("m = map([(1, 10)])\nm[1]", &[][..]),
+            (
+                indoc::indoc! {r#"
+                m = map([(1, 10)])
+                m[1]"#},
+                &[][..],
+            ),
             ("Option::some(1)", &["Option::some"][..]),
             (
-                "m = map([(1, 10)])\nm[1].is_none()",
+                indoc::indoc! {r#"
+                    m = map([(1, 10)])
+                    m[1].is_none()"#},
                 &["Option::is_none"][..],
             ),
         ] {

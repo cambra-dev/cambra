@@ -419,7 +419,11 @@ mod tests {
     /// of them and not the other.
     #[test]
     fn a_shadowed_use_resolves_to_the_innermost_binder() {
-        let code = "x = 1\nx = x + 1\nx\n";
+        let code = indoc::indoc! {r#"
+            x = 1
+            x = x + 1
+            x
+            "#};
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
         let compiled = compile_program(&mut ctx, &LoadedProgram::test(code), consumer)
