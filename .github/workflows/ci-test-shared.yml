@@ -1,0 +1,108 @@
+name: Shared Rust test build benchmark
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build test binaries
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ./.github/actions/rust
+        with:
+          cache-key: test
+
+      - name: Build
+        env:
+          TEST_PROFILE: ${{ inputs.profile }}
+        run: |
+          options=()
+          if [[ "$TEST_PROFILE" == opt1 ]]; then
+            for package in cambra chl-parser chl-interp cambra-lsp; do
+              options+=(--config "profile.test.package.$package.opt-level=1")
+            done
+          fi
+          cargo "${options[@]}" test -p cambra -p chl-parser -p chl-interp -p cambra-lsp \
+            --no-run --message-format=json > "$RUNNER_TEMP/cargo-test.jsonl"
+          for option in "${options[@]}"; do
+            printf '%s\n' "$option"
+          done > "$RUNNER_TEMP/cargo-test-options"
+
+      - name: Pack test binaries
+        run: |
+          mapfile -t options < "$RUNNER_TEMP/cargo-test-options"
+          cargo "${options[@]}" test -p cambra -p chl-parser -p chl-interp -p cambra-lsp \
+            --no-run --color never 2> "$RUNNER_TEMP/cargo-test-order"
+          python3 .github/scripts/ci-test-bundle.py bundle "$RUNNER_TEMP/cargo-test.jsonl" \
+            "$RUNNER_TEMP/cargo-test-order" > "$RUNNER_TEMP/test-files.txt"
+          tar --use-compress-program='zstd -T0 -1' -cf "$RUNNER_TEMP/test-binaries.tar.zst" \
+            -T "$RUNNER_TEMP/test-files.txt"
+
+      - name: Upload test binaries
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-binaries-${{ inputs.profile }}
+          path: ${{ runner.temp }}/test-binaries.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 2
+
+      - name: Normal doctests
+        run: |
+          mapfile -t options < "$RUNNER_TEMP/cargo-test-options"
+          CAMBRA_PROVENANCE_GATE=1 cargo "${options[@]}" test \
+            -p cambra -p chl-parser -p chl-interp -p cambra-lsp --doc -q --no-fail-fast
+
+      - name: Reversed doctests
+        if: ${{ !cancelled() && steps.upload.outcome == 'success' }}
+        run: |
+          mapfile -t options < "$RUNNER_TEMP/cargo-test-options"
+          CAMBRA_REFINEMENT_ORDER=reverse cargo "${options[@]}" test \
+            -p cambra -p chl-parser -p chl-interp -p cambra-lsp --doc -q --no-fail-fast
+
+  test:
+    name: Tests (${{ matrix.order }})
+    needs: build
+    if: ${{ !cancelled() && needs.build.outputs.artifact-id != '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        order: [normal, reversed]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ./.github/actions/rust
+        with:
+          z3-only: "true"
+
+      - name: Download test binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: test-binaries-${{ inputs.profile }}
+          path: ${{ runner.temp }}
+
+      - name: Unpack test binaries
+        run: tar --zstd -xf "$RUNNER_TEMP/test-binaries.tar.zst"
+
+      - name: Test
+        env:
+          TEST_ORDER: ${{ matrix.order }}
+        run: |
+          if [[ "$TEST_ORDER" == normal ]]; then
+            export CAMBRA_PROVENANCE_GATE=1
+          else
+            export CAMBRA_REFINEMENT_ORDER=reverse
+          fi
+          python3 .github/scripts/ci-test-bundle.py run

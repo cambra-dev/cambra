@@ -231,6 +231,20 @@ jobs:
       - name: Test (reversed refinement order)
         run: CAMBRA_REFINEMENT_ORDER=reverse ./ci.sh test
 
+  test_shared_current:
+    needs: repo_checks
+    if: ${{ !cancelled() && github.ref == 'refs/heads/dmills/ci-test-benchmark' && needs.repo_checks.outputs.is_code_change == 'true' }}
+    uses: ./.github/workflows/ci-test-shared.yml
+    with:
+      profile: current
+
+  test_shared_optimized:
+    needs: repo_checks
+    if: ${{ !cancelled() && github.ref == 'refs/heads/dmills/ci-test-benchmark' && needs.repo_checks.outputs.is_code_change == 'true' }}
+    uses: ./.github/workflows/ci-test-shared.yml
+    with:
+      profile: opt1
+
   # The Lean model: `lake build` elaborates every theorem and evaluates every
   # `#guard`, then the differential tests diff the model's verdicts against the
   # solver's. Those tests skip themselves when the oracle binary is absent, so
@@ -363,3 +377,23 @@ jobs:
               --arg channel "$SLACK_CHANNEL" \
               --arg text ":red_circle: CI failed on main — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>" \
               '{channel: $channel, text: $text}')"
+
+  check_shared_current:
+    needs: [repo_checks, lint, clippy, clippy_release, test_shared_current, test_no_assertions, formal, fixtures, web, editors]
+    if: ${{ always() && github.ref == 'refs/heads/dmills/ci-test-benchmark' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect gate results
+        env:
+          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: test "$FAILED" = false
+
+  check_shared_optimized:
+    needs: [repo_checks, lint, clippy, clippy_release, test_shared_optimized, test_no_assertions, formal, fixtures, web, editors]
+    if: ${{ always() && github.ref == 'refs/heads/dmills/ci-test-benchmark' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect gate results
+        env:
+          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: test "$FAILED" = false
