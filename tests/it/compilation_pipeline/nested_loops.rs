@@ -1764,3 +1764,86 @@ fn a_constant_guard_operand_leaves_the_sum_unchanged(#[case] guard: &str, #[case
         Value::Int(expected),
     );
 }
+
+// ---------------------------------------------------------------------------
+// Statements beneath a branch of an inner loop's body
+// ---------------------------------------------------------------------------
+//
+// Lowering asks of an inner loop's body whether a `with` block, a bare call or a `match` sits
+// anywhere beneath it. These place each under a branch or an arm rather than at the body's top
+// level.
+
+/// A transaction under a branch or an arm of an inner loop's body is refused as one at the
+/// body's top level is.
+#[rstest]
+#[case::under_an_if(indoc! {r"
+    t: Mut(Int, Txn) := 0
+    for x in [1, 2]:
+        for y in [10, 20]:
+            if y > 10:
+                with begin():
+                    t := t + y
+    await_final(t)
+"})]
+#[case::under_a_match_arm(indoc! {r"
+    t: Mut(Int, Txn) := 0
+    for x in [1, 2]:
+        for y in [10, 20]:
+            match `some(y):
+                case `some(v):
+                    with begin():
+                        t := t + v
+                case `none:
+                    pass
+    await_final(t)
+"})]
+fn a_transaction_beneath_a_branch_of_a_nested_loop_is_refused(#[case] program: &str) {
+    check_compile_error(
+        program,
+        "a `with begin():` transaction inside a nested `for` is not supported",
+    );
+}
+
+/// A writer call under an `if` in an inner loop's body is a write the inner loop folds, as one
+/// at the body's top level is: `y` ends each row one past `i`.
+#[test]
+fn a_writer_call_under_a_branch_of_an_inner_loop_runs() {
+    check_scalar(
+        indoc! {r"
+            def bump(c: Mut(Int)):
+                c += 1
+            t := 0
+            for i in [1, 2]:
+                y := i
+                for k in [10, 20]:
+                    if k > 10:
+                        bump(y)
+                t += y
+            t
+        "},
+        Value::Int(5),
+    );
+}
+
+/// A `match` under an `if` in a feed-only loop nested in a mutation loop is the same gap as one
+/// at the loop body's top level.
+#[test]
+fn a_match_under_a_branch_of_a_feed_only_loop_in_a_mutation_loop_is_a_gap() {
+    check_compile_error(
+        indoc! {r"
+            t := 0
+            out: Feed(_)
+            for i in [1, 2]:
+                t += i
+                for j in [10, 20]:
+                    if j > 10:
+                        match `some(j):
+                            case `some(v):
+                                out << v
+                            case `none:
+                                out << 0
+            sum([v for v in out])
+        "},
+        "a `match` in a feed-only loop nested in a mutation loop is not compiled yet",
+    );
+}
