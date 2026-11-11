@@ -1775,8 +1775,8 @@ fn restrict_to_path(
 }
 
 /// `source` kept at the positions where `condition` holds of the item `target` binds, over its
-/// unrefined domain: `source ≫ (λ target → {condition → `fired(target); true → `idle}) ≫
-/// variant_project(`fired)`.
+/// unrefined domain: `source ≫ (λ target → {condition → `fired(target); true → `idle} ▷
+/// variant_project(`fired))`.
 ///
 /// The form [`restrict_to_path`] gives a site in a branch. A refinement of the source's domain
 /// would state the condition in the site's type, which every type its store exports carries:

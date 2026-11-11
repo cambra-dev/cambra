@@ -102,18 +102,11 @@ impl FragmentChecker {
     }
 }
 
-// Preserve the `crate::ccl::planning::…` paths that other modules' doc-comments
-// and prose reference (design docs link `insert_iterate_markers`; `ccl_utils` /
-// `simplify` / `lambda_elim` mention `compile_refinement_predicates` and
-// `fn_of_bare_predicate`). `run` calls the first two through these re-exports;
-// `fn_of_bare_predicate` is only reached from `iterate`/`predicates`'s own
-// imports today, so its re-export exists purely to keep the documented path
-// resolvable — hence the `allow`.
+// Preserve the `crate::ccl::planning::…` paths used by callers and documentation.
 pub(crate) use const_fold::eval_binop;
 pub(crate) use iterate::insert_iterate_markers;
 pub(crate) use loops::plan_loops;
 pub(crate) use predicates::compile_refinement_predicates;
-#[allow(unused_imports)]
 pub(crate) use predicates::fn_of_bare_predicate;
 
 /// Materialize every iteration site in the post-lambda-elim CCL, choosing

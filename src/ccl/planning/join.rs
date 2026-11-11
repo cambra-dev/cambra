@@ -6,7 +6,6 @@
 //! ([`plan_loop_join`] / [`convert_loop_join`]) and emits a [`JoinPlan`] tree
 //! ([`join_plan_to_expr`]) whose leaves are iteration-bearing.
 
-use crate::ccl::Occurrence;
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::mem::take;
@@ -73,14 +72,7 @@ fn split_join_conditions(refinement: &Expr, rec_ty: &Type) -> (Vec<(Expr, Expr)>
         env.push((param.name.clone(), (**argument).clone()));
         cur = inner.as_ref();
     }
-    decompose_join_bool(
-        cur,
-        &env,
-        &Name::elem(),
-        rec_ty,
-        &mut eq_conds,
-        &mut other_preds,
-    );
+    decompose_join_bool(cur, &env, rec_ty, &mut eq_conds, &mut other_preds);
     (eq_conds, other_preds)
 }
 
@@ -154,7 +146,6 @@ fn filter_nest_levels(predicate: &Expr) -> Option<(Vec<(Name, &Expr)>, &Expr)> {
 fn decompose_join_bool(
     e: &Expr,
     env: &[(Name, Expr)],
-    rec_name: &Name,
     rec_ty: &Type,
     eq_conds: &mut Vec<(Expr, Expr)>,
     other_preds: &mut Vec<Expr>,
@@ -163,32 +154,28 @@ fn decompose_join_bool(
         TypedExprNode::BinOp { left, op, right }
             if op.unrefined() == BinOpKind::BoolLogic(LogicKind::And) =>
         {
-            decompose_join_bool(left, env, rec_name, rec_ty, eq_conds, other_preds);
-            decompose_join_bool(right, env, rec_name, rec_ty, eq_conds, other_preds);
+            decompose_join_bool(left, env, rec_ty, eq_conds, other_preds);
+            decompose_join_bool(right, env, rec_ty, eq_conds, other_preds);
         }
         TypedExprNode::BinOp { left, op, right }
             if op.unrefined() == BinOpKind::Compare(CompareKind::Equals) =>
         {
-            let ka = compile_join_side(left, env, rec_name, rec_ty);
-            let kb = compile_join_side(right, env, rec_name, rec_ty);
+            let ka = compile_join_side(left, env, rec_ty);
+            let kb = compile_join_side(right, env, rec_ty);
             eq_conds.push((ka, kb));
         }
-        _ => other_preds.push(compile_join_side(e, env, rec_name, rec_ty)),
+        _ => other_preds.push(compile_join_side(e, env, rec_ty)),
     }
 }
 
-/// Substitute the element-binder environment into `side` (an expression over
-/// the element binders) and lambda-eliminate `λ rec → side` to the point-free
-/// morphism over the tuple domain.
-fn compile_join_side(side: &Expr, env: &[(Name, Expr)], rec_name: &Name, rec_ty: &Type) -> Expr {
+/// Substitute the element-binder environment into `side`, then compile the bare predicate
+/// as a morphism over the tuple domain through [`predicates::fn_of_bare_predicate`].
+fn compile_join_side(side: &Expr, env: &[(Name, Expr)], rec_ty: &Type) -> Expr {
     let mut body = side.clone();
     for (var, morph) in env {
         body = lambda_elim::substitute(body, var, morph);
     }
-    let side_ty = body.ty.clone();
-    let lam = Expr::lambda(rec_name, Occurrence::mint(), rec_ty.clone(), body)
-        .with_ty(Type::fun(rec_ty.clone(), side_ty));
-    predicates::eliminate_lifted(lam).expect("lambda-elim of join-condition side")
+    fn_of_bare_predicate(rec_ty, &body, &[])
 }
 
 /// Collects the original arm indices accessed by `expr` at domain-accessing positions.
@@ -1351,6 +1338,7 @@ mod tests {
 
     use super::super::test_helpers::*;
     use super::*;
+    use crate::ccl::Occurrence;
     use crate::ccl::symbolic::symbolic;
     // `super::*` also glob-imports `lambda_elim::compose`; name the test-helper
     // `compose` (`Expr::compose`) explicitly so it wins over the glob.
@@ -1970,6 +1958,37 @@ mod tests {
     // probe — and the multi-arm AND/residual/permute cases in
     // `test_new_compile`), which run it on real inferred predicates rather than
     // hand-built combinator ASTs.
+
+    #[test]
+    fn a_join_side_binds_the_element_its_result_type_reads() {
+        use crate::ccl::{BaseType, Refinement};
+        use std::rc::Rc;
+
+        let scalar = int_ty();
+        let tuple = tuple_ty(vec![scalar.clone(), scalar.clone()]);
+        let project = |name| {
+            Expr::apply(
+                Expr::var(name).with_ty(tuple.clone()),
+                Expr::proj_index(0).with_ty(Type::fun(tuple.clone(), scalar.clone())),
+            )
+            .with_ty(scalar.clone())
+        };
+        let result = Type::refined_one(
+            scalar.clone(),
+            Refinement::born(Rc::new(
+                Expr::binop(
+                    Expr::var(Name::elem()).with_ty(scalar.clone()),
+                    BinOpKind::Compare(CompareKind::Equals),
+                    project(Name::elem_at(1)),
+                )
+                .with_ty(Type::Base(BaseType::Bool)),
+            )),
+        );
+        let side = project(Name::elem()).with_ty(result);
+        let compiled = compile_join_side(&side, &[], &tuple);
+        assert_eq!(compiled.ty.domain(), Some(tuple));
+        assert!(crate::ccl::subst::free_elem_indices(&compiled).is_empty());
+    }
 
     // --- collect_arms_used ---
 

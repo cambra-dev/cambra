@@ -1209,6 +1209,30 @@ fn refine_filtering_casts(param: &Name, expr: &mut Expr) -> bool {
     rewrote
 }
 
+/// A component of `pair`, with a dependent projection where its type reads the earlier component.
+fn pair_projection(pair: &Name, pair_ty: &Type, index: usize) -> Expr {
+    let at = |name: &Name| {
+        pair_ty
+            .component_type(index, |earlier, ty| {
+                debug_assert_eq!(earlier, 0, "a pair has only one earlier component");
+                Expr::apply(
+                    Expr::var(name).with_ty(pair_ty.clone()),
+                    Expr::proj_index(earlier).with_ty(Type::fun(pair_ty.clone(), ty.clone())),
+                )
+                .with_ty(ty.clone())
+            })
+            .expect("a pair projection names one of its two components")
+    };
+    let own = Name::fresh("__pair");
+    let projection_ty =
+        Type::pi_if_dependent(own.clone(), pair_ty.clone(), at(&own), FunKind::Compute);
+    Expr::apply(
+        Expr::var(pair).with_ty(pair_ty.clone()),
+        Expr::proj_index(index).with_ty(projection_ty),
+    )
+    .with_ty(at(pair))
+}
+
 /// `λ 𝑦 → 𝑦 ▷ 𝑣`, the collection `𝑣` as the lambda reading it at each element.
 fn eta_expanded(v: Expr) -> Expr {
     let _g = provenance::enter(
@@ -1220,6 +1244,11 @@ fn eta_expanded(v: Expr) -> Expr {
     let codomain = v.ty.codomain().unwrap_or(Type::Hole);
     let fun_kind = v.ty.fun_kind().cloned().unwrap_or(FunKind::Data(None));
     let y = Name::fresh("__elem_at");
+    let source_binder = match v.ty.peel_refinements() {
+        Type::Fun { name, .. } => name.as_ref(),
+        _ => None,
+    };
+    let codomain = crate::ccl::subst::codomain_renamed(source_binder, &y, &codomain);
     let body = Expr::apply(Expr::var(&y).with_ty(domain.clone()), v).with_ty(codomain.clone());
     let mut binding =
         crate::ccl::expr::TypedBinding::new_unannotated(y.clone(), Occurrence::mint());
@@ -1228,13 +1257,7 @@ fn eta_expanded(v: Expr) -> Expr {
         param: binding,
         body: Box::new(body),
     })
-    .with_ty(Type::Fun {
-        name: None,
-        fun_kind,
-        domain: Box::new(domain),
-        codomain: Box::new(codomain),
-        capabilities: crate::ccl::capabilities::Capabilities::none(),
-    })
+    .with_ty(Type::pi_if_dependent(y, domain, codomain, fun_kind))
 }
 
 /// The lambda a cast-wrapped lambda denotes: `cast(λ 𝑦 : {𝐷 | 𝑟} → body, {𝐷 | 𝑝} ⤇ 𝑉)` is
@@ -1480,26 +1503,22 @@ fn elim_lambda_impl(
                 (Some(param.clone()), param_ty.clone()),
                 (Some(y.clone()), y_ty.clone()),
             ]);
-            let dependent = matches!(bare_pair, Type::DepTuple(_));
             let pair_ty = {
                 let onto_pair = |predicate: &Rc<TypedExpr>| {
-                    let at = |index: usize, ty: &Type| {
-                        Expr::apply(
-                            Expr::var(Name::elem()).with_ty(bare_pair.clone()),
-                            Expr::proj_index(index)
-                                .with_ty(Type::fun(bare_pair.clone(), ty.clone())),
-                        )
-                        .with_ty(ty.clone())
-                    };
                     // Innermost first: the element read introduces `__elem`, and the
                     // `param` read must not then be rewritten as one of its occurrences. A
                     // nested refinement reading `param` reads `__elem^1.0`
                     // (`src/ccl/design/type-inference.md`, "Lifting a filter onto the pair").
-                    let on_element =
-                        crate::ccl::subst::Subst::discharge(Name::elem(), at(1, &y_ty))
-                            .apply_expr(predicate);
-                    crate::ccl::subst::Subst::discharge(param.clone(), at(0, param_ty))
-                        .apply_expr(&on_element)
+                    let on_element = crate::ccl::subst::Subst::discharge(
+                        Name::elem(),
+                        pair_projection(&Name::elem(), &bare_pair, 1),
+                    )
+                    .apply_expr(predicate);
+                    crate::ccl::subst::Subst::discharge(
+                        param.clone(),
+                        pair_projection(&Name::elem(), &bare_pair, 0),
+                    )
+                    .apply_expr(&on_element)
                 };
                 let key = (param.clone(), bare_pair.clone());
                 let lifted: Vec<Refinement> = lifting
@@ -1524,38 +1543,8 @@ fn elim_lambda_impl(
             // downstream type computations (e.g. zip_pair_ty) can see the domain.
             // Also annotate the pair variable itself so that the identity rule in
             // the recursive call can produce a typed `id` morphism.
-            let proj0_ty = Type::fun(pair_ty.clone(), param_ty.clone());
-            let sub_x = Expr::apply(
-                Expr::var(&pair).with_ty(pair_ty.clone()),
-                Expr::proj_index(0).with_ty(proj0_ty.clone()),
-            )
-            .with_ty(param_ty.clone());
-            // `.1` out of a dependent tuple is a Pi: its type is the second component
-            // opened at the pair's first.
-            let (y_at_pair, proj1_ty) = if dependent {
-                let at = |p: &Name| {
-                    let first = Expr::apply(
-                        Expr::var(p).with_ty(pair_ty.clone()),
-                        Expr::proj_index(0).with_ty(proj0_ty.clone()),
-                    )
-                    .with_ty(param_ty.clone());
-                    crate::ccl::subst::Subst::discharge(param.clone(), first).apply_type(&y_ty)
-                };
-                // The projection's own binder is for its own codomain alone, so no name binds
-                // two positions of a chain (`src/ccl/design/type-inference.md`, "A chain names
-                // each position").
-                let y_at_pair = at(&pair);
-                let own = Name::fresh("__pair");
-                let proj1_ty = Type::pi(own.clone(), pair_ty.clone(), at(&own));
-                (y_at_pair, proj1_ty)
-            } else {
-                (y_ty.clone(), Type::fun(pair_ty.clone(), y_ty.clone()))
-            };
-            let sub_y = Expr::apply(
-                Expr::var(&pair).with_ty(pair_ty.clone()),
-                Expr::proj_index(1).with_ty(proj1_ty.clone()),
-            )
-            .with_ty(y_at_pair);
+            let sub_x = pair_projection(&pair, &pair_ty, 0);
+            let sub_y = pair_projection(&pair, &pair_ty, 1);
             let merged = substitute(substitute(*inner_body, &y, &sub_y), param, &sub_x);
 
             // The merged pair morphism is the uncurried form of the same nested
