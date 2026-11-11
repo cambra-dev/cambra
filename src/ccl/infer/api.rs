@@ -1143,15 +1143,15 @@ fn without_node_ids(debug: &str) -> String {
     out
 }
 
-fn identical_rendering_hint(type_a: &Type, type_b: &Type) -> Option<String> {
-    if !crate::ccl::chl_print::renders_alike(type_a, type_b) {
+fn identical_rendering_hint(expected: &Type, found: &Type) -> Option<String> {
+    if !crate::ccl::chl_print::renders_alike(expected, found) {
         return None;
     }
     // A predicate's node ids name where its nodes came from, not what the type says, so the
     // comparison skips them.
     let (a, b) = (
-        without_node_ids(&format!("{type_a:?}")),
-        without_node_ids(&format!("{type_b:?}")),
+        without_node_ids(&format!("{expected:?}")),
+        without_node_ids(&format!("{found:?}")),
     );
     let Some(at) = a
         .char_indices()
@@ -1348,7 +1348,7 @@ impl std::fmt::Debug for InferError {
                     }
                     // Last: it fires only when the two render identically, which the
                     // hints above have already had their chance to explain.
-                    if let Some(hint) = identical_rendering_hint(found, expected) {
+                    if let Some(hint) = identical_rendering_hint(expected, found) {
                         write!(f, "\n  {hint}")?;
                     }
                     Ok(())
@@ -6002,5 +6002,47 @@ mod tests {
             "a `let` recording `{{Int | __elem == 2}}` over a body closing to \
              `{{Int | __elem == 1}}` passed the check"
         );
+    }
+    #[test]
+    fn identical_type_hint_keeps_expected_and_found_sides() {
+        use crate::ccl::infer_var::fresh_witness_binder_id;
+        use crate::ccl::ty::{TypeKind, Witness};
+        let sum = || {
+            let witness = Witness::bound_to(
+                fresh_witness_binder_id(),
+                TypeKind::Enumerated(vec![Type::UIntRange(2)]),
+            );
+            let marker = format!("{:?}", witness.id());
+            let occurrence = Type::WitnessRef(*witness.id());
+            (
+                Type::sum_binding(
+                    witness,
+                    Type::data_fun(occurrence, Type::Base(BaseType::Int)),
+                ),
+                marker,
+            )
+        };
+        let ((found, found_marker), (expected, expected_marker)) = (sum(), sum());
+        let rendered = format!(
+            "{:?}",
+            InferError::TypeMismatch {
+                ctx: "this call".into(),
+                found: Box::new(found),
+                expected: Some(Box::new(expected)),
+            }
+        );
+        let expected_line = rendered
+            .lines()
+            .find(|line| line.trim_start().starts_with("expected:"))
+            .unwrap_or_else(|| panic!("missing expected excerpt: {rendered}"));
+        let found_line = rendered
+            .lines()
+            .find(|line| line.trim_start().starts_with("found:"))
+            .unwrap_or_else(|| panic!("missing found excerpt: {rendered}"));
+        assert!(
+            expected_line.contains(&expected_marker),
+            "expected excerpt must contain {expected_marker}, found excerpt must contain {found_marker}: {rendered}"
+        );
+        assert!(found_line.contains(&found_marker), "{rendered}");
     }
 }
