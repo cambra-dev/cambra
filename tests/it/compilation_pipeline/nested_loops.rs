@@ -505,7 +505,7 @@ fn a_collection_valued_field_of_differing_lengths_is_refused() {
                     total += x * r.n
             total
         "},
-        "collection domains have no common answer",
+        "Collection domains have no common answer",
     );
 }
 

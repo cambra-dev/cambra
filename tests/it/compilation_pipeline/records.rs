@@ -194,7 +194,7 @@ fn a_mut_parameter_function_called_through_a_field_is_refused() {
                 (r.f)(cnt, x)
             cnt
         "},
-        "Type mismatch for Apply",
+        "Type mismatch for this call",
     );
 }
 

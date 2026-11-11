@@ -32,37 +32,11 @@ use crate::ccl::{
 use super::context::should_generalize;
 use super::{LocatedInferError, map_coalesce_err, map_constrain_err};
 
-/// Returns `true` for expression labels that are structurally significant
-/// (let bindings, lambdas, comprehensions) and worth showing as error context.
-/// Filters out bare variable names and simple expressions that add noise.
-///
-/// TODO(structured-context): this filter decides "worth showing" by
-/// substring-matching pretty-printed CCL, because when it was written an error
-/// had no way to point at a node. Half of that is now fixed — a
-/// `LocatedInferError` carries the node its rule raised it at — but the
-/// *contributing sites* of a merged `IncompatibleBounds` are still labels:
-/// `origin: String` plus `context: Vec<String>` on the variant.
-///
-/// The remaining work, and why it is worth doing for this error kind
-/// specifically: a bounds conflict has no single blame site by nature (the same
-/// variable was constrained in several places, and the error *is* the
-/// collision), so one underline understates it. Threading a `NodeId` into the
-/// merge path — `context: Vec<NodeId>` instead of `Vec<String>` — lets the
-/// renderer emit a primary label at the origin plus a secondary label per
-/// contributing site, which is exactly the shape `ParseErrorInfo` already ships
-/// (`context: Vec<(String, Span)>`, rendered by `ParseError::to_report`). This
-/// filter then matches on node *kind* (`Let`/`Lambda`/`For`) rather than on
-/// whether a rendering contains `"let "`.
-fn is_significant_context(label: &str) -> bool {
-    label.contains("let ") || label.contains("λ ") || label.contains('\n')
-}
-
 /// Push `new_err` onto `errors`, deduplicating [`InferError::IncompatibleBounds`],
 /// [`InferError::OpaqueEscape`] and [`InferError::NoJoinOverBinder`].
 ///
-/// If an existing error has the same `(polarity, conflicting)` key, `label` is
-/// appended to its context vec (when it passes [`is_significant_context`])
-/// instead of pushing a duplicate. An `OpaqueEscape` naming the same binders as an
+/// If an existing error has the same `(polarity, conflicting)` key, `blame` joins its
+/// [`LocatedInferError::also`] instead of pushing a duplicate. An `OpaqueEscape` naming the same binders as an
 /// existing one is dropped: each specialization of a function copies its barrier
 /// variable, and every copy reports it. A `NoJoinOverBinder` is one fact about one
 /// contribution, which every node whose type reaches the target's variable meets
@@ -72,18 +46,10 @@ fn is_significant_context(label: &str) -> bool {
 /// `blame` is the node whose rule raised `new_err`. A merged
 /// `IncompatibleBounds` keeps the *first* contributing node: a bounds conflict
 /// has no single site by nature — the same variable was constrained in several
-/// places — so the blame is the site where the conflict was first detected, the
-/// later sites' labels land in `context`, and their nodes in
-/// [`LocatedInferError::also`], so each copy of a run's code that raised it is
-/// labelled at its run. (Turning `context` itself into node ids, so a report can
-/// underline every contributing site, is the follow-up the `is_significant_context`
-/// note above describes.)
-fn push_coalesce_err(
-    errors: &mut Vec<LocatedInferError>,
-    new_err: InferError,
-    label: String,
-    blame: NodeId,
-) {
+/// places — so the blame is the site where the conflict was first detected, and the
+/// later sites' nodes land in [`LocatedInferError::also`], so each copy of a run's code
+/// that raised it is labelled at its run.
+fn push_coalesce_err(errors: &mut Vec<LocatedInferError>, new_err: InferError, blame: NodeId) {
     if let InferError::OpaqueEscape { names, .. } = &new_err
         && errors.iter().any(
             |e| matches!(&e.error, InferError::OpaqueEscape { names: seen, .. } if seen == names),
@@ -116,20 +82,16 @@ fn push_coalesce_err(
             if let InferError::IncompatibleBounds {
                 polarity,
                 conflicting,
-                context,
                 ..
-            } = &mut e.error
+            } = &e.error
                 && *polarity == key.0
                 && conflicting == &key.1
             {
-                return Some((context, e.node_id, &mut e.also));
+                return Some((e.node_id, &mut e.also));
             }
             None
         });
-        if let Some((ctx_vec, first, also)) = existing {
-            if is_significant_context(&label) {
-                ctx_vec.push(label);
-            }
+        if let Some((first, also)) = existing {
             if blame != first && !also.contains(&blame) {
                 *also = also.iter().copied().chain([blame]).collect();
             }
@@ -279,18 +241,18 @@ pub(super) struct CoalesceCtx {
 impl CoalesceCtx {
     /// Record `error`, blamed on the node whose rule is running — the coalesce
     /// counterpart of [`Typing::raise`](super::typing::Typing::raise).
-    fn push_error(&mut self, error: InferError, label: String) {
-        push_coalesce_err(&mut self.errors, error, label, self.current_node);
+    fn push_error(&mut self, error: InferError) {
+        push_coalesce_err(&mut self.errors, error, self.current_node);
     }
 
     /// [`push_error`](Self::push_error) for a failure to resolve `ty`, recording the
     /// variables `ty` reaches against the node ([`CoalesceCtx::failed_type_vars`]).
-    fn push_type_error(&mut self, ty: &Type, error: InferError, label: String) {
+    fn push_type_error(&mut self, ty: &Type, error: InferError) {
         self.failed_type_vars
             .entry(self.current_node)
             .or_default()
             .extend(reachable_vars(ty));
-        self.push_error(error, label);
+        self.push_error(error);
     }
 
     /// Whether `name` is an enclosing **lambda parameter**. Only that binder's slot is
@@ -990,8 +952,8 @@ fn pin_empty_list_element(list_ty: &Type, ctx: &mut CoalesceCtx) {
     // `xs = []` read at `Int` and at `String` fails here
     // (`an_empty_literal_read_at_two_types_is_a_type_error`).
     if let Err(err) = pinned {
-        let label = format!("empty collection literal pinned to `{chosen}`");
-        ctx.push_error(map_constrain_err(err, &label), label);
+        let label = "this empty collection".to_string();
+        ctx.push_error(map_constrain_err(err, &label));
     }
 }
 
@@ -1054,8 +1016,8 @@ fn pin_unobservable_param(lambda_ty: &Type, ctx: &mut CoalesceCtx) {
         return;
     };
     if let Err(err) = pin_both_ways(&chosen, domain) {
-        let label = format!("lambda parameter pinned to `{chosen}`");
-        ctx.push_error(map_constrain_err(err, &label), label);
+        let label = "this parameter".to_string();
+        ctx.push_error(map_constrain_err(err, &label));
     }
 }
 
@@ -1079,8 +1041,8 @@ fn pin_unobservable_ctor_args(value_ty: &Type, ctx: &mut CoalesceCtx) {
             continue;
         };
         if let Err(err) = pin_both_ways(&chosen, arg) {
-            let label = format!("an argument of `{}` pinned to `{chosen}`", decl.name);
-            ctx.push_error(map_constrain_err(err, &label), label);
+            let label = format!("an argument of `{}`", decl.name);
+            ctx.push_error(map_constrain_err(err, &label));
         }
     }
 }
@@ -1576,12 +1538,12 @@ fn obligation_choices(v: &crate::ccl::infer_var::InferVar) -> Option<Vec<crate::
 /// bound written in a polymorphic type or recorded with no origin.
 ///
 /// A failed upper bound raises the error its edge's caller gave it
-/// ([`EdgeReport`]). One with none is a mismatch labeled by `label`, which renders the
-/// blamed node.
+/// ([`EdgeReport`]). One with none is a mismatch labeled `label`, a phrase for what the
+/// blamed node is.
 pub(super) fn push_barrier_failures(
     errors: &mut Vec<LocatedInferError>,
     fallback: NodeId,
-    label: impl Fn(NodeId) -> String,
+    label: &str,
 ) {
     use crate::ccl::infer::solver::barrier::{BarrierFailure, solve_barrier_vars};
     use crate::ccl::infer_var::Origin;
@@ -1600,7 +1562,7 @@ pub(super) fn push_barrier_failures(
                     names,
                     ty: Box::new(resolved),
                 };
-                push_coalesce_err(errors, error, String::new(), blame(origin));
+                push_coalesce_err(errors, error, blame(origin));
             }
             BarrierFailure::Upper {
                 error,
@@ -1612,7 +1574,7 @@ pub(super) fn push_barrier_failures(
                 let error = match report.as_deref() {
                     Some(EdgeReport::Fixed(error)) => error.clone(),
                     Some(EdgeReport::Labeled(at)) => map_constrain_err(error, at),
-                    None => map_constrain_err(error, &label(node)),
+                    None => map_constrain_err(error, label),
                 };
                 errors.push(
                     LocatedInferError {
@@ -1950,7 +1912,7 @@ fn resolve_binder_slot(
     match resolved {
         Ok(ty) => *slot = ty,
         Err(err) => {
-            ctx.push_type_error(slot, map_coalesce_err(err, &label), label.clone());
+            ctx.push_type_error(slot, map_coalesce_err(err, &label));
         }
     }
     coalesce_type_predicates(slot, level, ctx);
@@ -1978,7 +1940,7 @@ fn decide_memberships(
                 resolved: Box::new(m.found.clone()),
                 type_kind: m.kind,
             };
-            ctx.push_type_error(&m.found, map_coalesce_err(err, label), label.to_string());
+            ctx.push_type_error(&m.found, map_coalesce_err(err, label));
         }
     }
 }
@@ -2005,7 +1967,7 @@ fn decide_suspended_memberships(root: NodeId, ctx: &mut CoalesceCtx) {
         let mut sum = match resolved {
             Ok(sum) => sum,
             Err(err) => {
-                ctx.push_type_error(&sum, map_coalesce_err(err, &label), label);
+                ctx.push_type_error(&sum, map_coalesce_err(err, &label));
                 continue;
             }
         };
@@ -2033,7 +1995,7 @@ fn decide_suspended_memberships(root: NodeId, ctx: &mut CoalesceCtx) {
             resolved: Box::new(resolved.clone()),
             type_kind: m.kind,
         };
-        ctx.push_type_error(&resolved, map_coalesce_err(err, &label), label);
+        ctx.push_type_error(&resolved, map_coalesce_err(err, &label));
     }
 }
 
@@ -2101,8 +2063,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     if matches!(expr.node, TypedExprNode::TraitFn { .. }) && !ctx.discarding {
         match matching_instance(expr, ctx) {
             Err(error) => {
-                let label = symbolic(expr);
-                ctx.push_error(error, label);
+                ctx.push_error(error);
                 return;
             }
             Ok(Some(instance)) => {
@@ -2594,7 +2555,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         }
         Err(err) => {
             let ty = expr.ty.clone();
-            ctx.push_type_error(&ty, map_coalesce_err(err, &label), label.clone())
+            ctx.push_type_error(&ty, map_coalesce_err(err, &label))
         }
     }
 
@@ -3048,8 +3009,7 @@ fn use_instance_function(expr: &mut Expr, instance: &TraitInstance, ctx: &mut Co
         } else {
             InferError::InstanceAfterUse { function, instance }
         };
-        let label = symbolic(expr);
-        ctx.push_error(error, label);
+        ctx.push_error(error);
         return false;
     }
     expr.node = TypedExprNode::Var(binding);
@@ -3346,7 +3306,7 @@ fn argument_reads(ty: &Type) -> std::collections::BTreeSet<Name> {
 }
 
 /// What a failed specialization pin reports its edge as.
-const PIN_LABEL: &str = "monomorphization specialization";
+const PIN_LABEL: &str = "this use";
 
 /// The types of a specialization's named arguments.
 fn types_of(arguments: &[(smol_str::SmolStr, Type)]) -> Vec<Type> {
@@ -3385,7 +3345,7 @@ pub(super) fn specialize_use(
             };
             frame.failed_uses.push((error.clone(), carried));
             frame.failed_use_nodes.insert(node);
-            ctx.push_error(error, label);
+            ctx.push_error(error);
             return;
         }
     };
@@ -3583,8 +3543,7 @@ pub(super) fn specialize_use(
                 })
         };
         if let Some(error) = error {
-            let label = symbolic(use_expr);
-            ctx.push_error(error, label);
+            ctx.push_error(error);
             return;
         }
         arguments
@@ -3810,8 +3769,7 @@ pub(super) fn specialize_use(
     // The pin added bounds to the clone's copies of the definition's barrier variables,
     // and the walk below compacts them, so they are checked first.
     if pinned.is_ok() {
-        let label = symbolic(use_expr);
-        push_barrier_failures(&mut ctx.errors, use_expr.node_id(), |_| label.clone());
+        push_barrier_failures(&mut ctx.errors, use_expr.node_id(), PIN_LABEL);
     }
     if let Err(e) = &pinned {
         let e = e.clone();
@@ -4326,6 +4284,23 @@ fn typecheck_discarded_definition(
     coalesce_node(def, level + 1, ctx);
     ctx.assumptions.truncate(depth);
     ctx.discarding = was_discarding;
+    // A message names the binder an A-normalization temp or a mutable variable's read was
+    // given rather than the term or the variable it stands for, and the caller respells it
+    // against the tree inference leaves, which this definition is dropped from. Respelled
+    // here, against the definition, while it holds those bindings. The respelling's terms
+    // only reach messages, so they keep the identities they copy.
+    if ctx.errors.len() > before {
+        let respelling = {
+            let _preserving = crate::ccl::provenance::preserve_ids();
+            crate::ccl::subst::Subst::then(
+                &crate::ccl::anf::temp_respelling(def),
+                &crate::ccl::mut_read::read_respelling(def),
+            )
+        };
+        for error in &mut ctx.errors[before..] {
+            error.error.respell(&respelling);
+        }
+    }
     let raised = ctx.errors[before..]
         .iter()
         .map(|e| (e.node_id, e.error.clone()))

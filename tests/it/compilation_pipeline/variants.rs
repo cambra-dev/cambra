@@ -513,7 +513,7 @@ fn an_unreachable_arm_payload_its_reads_reject_is_a_type_error(#[case] payload: 
     "};
     check_compile_error(
         &format!("x = `a({payload})\n{program}"),
-        "Incompatible lower bounds",
+        "The values that meet here have no common type",
     );
 }
 

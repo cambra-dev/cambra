@@ -940,7 +940,7 @@ fn a_dependent_and_a_product_comprehension_do_not_join(#[case] condition: &str) 
             d = a if c else b
             sum(d)
         "#},
-        "won't infer an untagged sum from a collision",
+        "The values that meet here have no common type",
     );
 }
 

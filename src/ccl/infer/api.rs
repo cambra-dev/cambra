@@ -274,9 +274,23 @@ pub struct StatedRequirement {
 /// Omitted for a unary trait, which has no beside.
 impl std::fmt::Display for StatedRequirement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        fn or_list(types: &[Type]) -> String {
-            types.iter().map(chl_type).collect::<Vec<_>>().join(" or ")
-        }
+        self.fmt_with(f, &crate::ccl::chl_print::Writer::default())
+    }
+}
+
+impl StatedRequirement {
+    fn fmt_with(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        w: &crate::ccl::chl_print::Writer,
+    ) -> std::fmt::Result {
+        let or_list = |types: &[Type]| {
+            types
+                .iter()
+                .map(|ty| w.ty(ty))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        };
         write!(
             f,
             "{} accepts only {} as its operand {}",
@@ -298,19 +312,14 @@ impl std::fmt::Display for StatedRequirement {
 
 /// Errors that can occur during limited type inference.
 ///
-/// # The `at` / `ctx` / `origin` label fields are for *display*, not location
+/// # Labels: a role is printed, a site is not
 ///
-/// Several variants carry a rendered symbolic label (`at`, `ctx`, `origin`,
-/// `context`) naming the offending expression. Those are message text — they end
-/// up verbatim in this type's hand-written `Debug`, which is the human-facing
-/// message — and they predate the compiler having any way to point at a node.
-/// They are **not** the authoritative location: that is
-/// [`LocatedInferError::node_id`], which every error raised by inference now
-/// carries, and which `compile_program` resolves to a source span. A consumer
-/// that wants to *locate* an error reads the node; a consumer that wants to
-/// *print* it reads these. The labels are consequently redundant with the node
-/// for anything but rendering, and are kept only because the message text is
-/// built from them.
+/// Labels hold a role in the program, an operator name, or an expression written in CCL.
+/// Each field documents its form and whether the message prints it. Unprinted labels
+/// distinguish otherwise equal errors in [`Self::same_defect`]. A compiler-bug report
+/// (`ScopeViolation` or the consistency check) can print CCL.
+/// The location is [`LocatedInferError::node_id`], resolved to a source span by
+/// `compile_program`.
 #[derive(Clone, PartialEq)]
 pub enum InferError {
     /// A variable was referenced but not bound in the current scope.
@@ -333,6 +342,8 @@ pub enum InferError {
         /// field, an unaccepted variant tag): there is no second type to print, and
         /// inventing one is how the message came to read backwards.
         expected: Option<Box<Type>>,
+        /// The failing value's role, printed in the message. The consistency check
+        /// supplies `type of` followed by the expression written in CCL.
         ctx: String,
     },
     /// A product type lacked a field a structural edge required — the violation of
@@ -356,7 +367,8 @@ pub enum InferError {
         key: FieldKey,
         /// The product that should have carried `key`.
         found: Box<Type>,
-        /// Display label for the message (see the type docs — not the location).
+        /// The field access's role, or the CCL expression requiring the field. Omitted
+        /// from the message; retained for [`Self::same_defect`].
         at: String,
     },
     /// A [`Type::Fun`] was required — e.g. in a function-application or
@@ -364,7 +376,8 @@ pub enum InferError {
     ExpectedFunction {
         /// The actual type of the non-function expression.
         found: Type,
-        /// Display label for the message (see the type docs — not the location).
+        /// The required function's role, or a label from the consistency check. Omitted
+        /// from the message; retained for [`Self::same_defect`].
         at: String,
     },
     /// A user-written annotation on a binding site conflicts with the inferred type.
@@ -408,11 +421,8 @@ pub enum InferError {
     DomainJoinConflict {
         /// The domains that have no common answer, in the order they were met.
         domains: Vec<Type>,
-        /// The expression whose type carries the conflict, rendered symbolically.
-        ///
-        /// A field rather than part of the message: the report's span already underlines
-        /// this expression, so writing it into the text says the same thing twice, once in
-        /// source and once in CCL. A caller that has no span can still reach it.
+        /// A role from constraint emission, or the expression written in CCL at coalesce.
+        /// Omitted from the message; retained for [`Self::same_defect`].
         origin: String,
     },
     /// Two closed tuples of different widths met at one position: neither is a subtype of
@@ -420,8 +430,8 @@ pub enum InferError {
     TupleWidthConflict {
         /// The widths that have no merge, as `a 2-tuple and a 3-tuple`.
         widths: String,
-        /// The expression whose type carries the conflict, rendered symbolically. The
-        /// report's span underlines it, as for [`DomainJoinConflict`](Self::DomainJoinConflict).
+        /// A role from constraint emission, or the expression written in CCL at coalesce.
+        /// Omitted from the message; retained for [`Self::same_defect`].
         origin: String,
     },
     /// A feed or a mutable variable receives a value whose collection keys or function
@@ -455,12 +465,14 @@ pub enum InferError {
     /// Lowering never produces a 0-branch `Case`; this indicates a malformed
     /// AST constructed outside the normal lowering path.
     EmptyCase {
-        /// Display label for the message (see the type docs — not the location).
+        /// The empty case expression written in CCL. Omitted from the message; retained
+        /// for [`Self::same_defect`].
         at: String,
     },
     /// A [`Type::Hole`] placeholder survived past inference.
     UnresolvedHole {
-        /// Display label for the message (see the type docs — not the location).
+        /// The enclosing expression or binder written in CCL. Omitted from the message;
+        /// retained for [`Self::same_defect`].
         at: String,
     },
     /// A [`Type::BoundedHole`] bounded-annotation marker survived past inference.
@@ -469,14 +481,16 @@ pub enum InferError {
     /// user-facing error: `normalize_annotation` erases every `BoundedHole` it is handed,
     /// so a survivor means a slot inference never normalized.
     UnresolvedBoundedHole {
-        /// Display label for the message (see the type docs — not the location).
+        /// The enclosing expression or binder written in CCL. Omitted from the message;
+        /// retained for [`Self::same_defect`].
         at: String,
     },
     /// An unresolved [`Type::Infer`] variable survived past inference.
     UnresolvedInfer {
         /// The unresolved variable's id.
         id: InferVarId,
-        /// Display label for the message (see the type docs — not the location).
+        /// The enclosing expression or binder written in CCL. Omitted from the message;
+        /// retained for [`Self::same_defect`].
         at: String,
     },
     /// A binding annotated with a polymorphic type whose right-hand side is not
@@ -587,7 +601,8 @@ pub enum InferError {
         param: String,
         /// What the value reaches, where the typing rule knows it.
         target: Option<EscapeTarget>,
-        /// Display label for the message (see the type docs — not the location).
+        /// The escaping value's role. Omitted from the message; retained for
+        /// [`Self::same_defect`].
         at: String,
     },
     /// An operator applied to a value of a type parameter's type, with no
@@ -599,7 +614,7 @@ pub enum InferError {
         position: u8,
         /// The parameter's spelling.
         param: String,
-        /// Display label for the message (see the type docs — not the location).
+        /// The operator or trait function that needs the requirement, printed in the message.
         at: String,
     },
     /// An operator was used at operand types no instance of its trait
@@ -622,7 +637,7 @@ pub enum InferError {
         /// What that position could still have accepted, given what was already
         /// known about the other operand.
         accepted: Vec<Type>,
-        /// Display label for the message (see the type docs — not the location).
+        /// The operator or trait function with no applicable instance, printed in the message.
         at: String,
     },
     /// One value carries two or more trait requirements that no type satisfies at
@@ -652,11 +667,12 @@ pub enum InferError {
         /// The type the value already has.
         found: Box<Type>,
     },
-    /// A partial tuple or partial record was not resolved to a concrete type.
+    /// A value read both by position and by field name, which no tuple or record is.
     UnresolvedPartial {
-        /// Display string of the partial type.
-        kind: String,
-        /// Display label for the message (see the type docs — not the location).
+        /// The keys it is read at, written `.0`, `.foo`.
+        keys: String,
+        /// A role from constraint emission, or the expression written in CCL at coalesce.
+        /// Omitted from the message; retained for [`Self::same_defect`].
         at: String,
     },
     /// A node or binder's tuple stayed open: the program reads positions of it and
@@ -664,7 +680,8 @@ pub enum InferError {
     UnresolvedTupleWidth {
         /// The open tuple, rendered.
         open: String,
-        /// Display label for the message (see the type docs — not the location).
+        /// The enclosing expression or binder written in CCL. Omitted from the message;
+        /// retained for [`Self::same_defect`].
         at: String,
     },
     /// A node's coalesced type references a term binder that is not in scope
@@ -673,7 +690,7 @@ pub enum InferError {
     /// (a substitution that failed to discharge a binder), not a user-facing
     /// error: user scoping mistakes are rejected earlier with source context.
     ScopeViolation {
-        /// Display label for the message (see the type docs — not the location).
+        /// The expression written in CCL, printed in this compiler-bug report.
         at: String,
         /// The ill-scoped type. Boxed, as `TypeMismatch`'s types are, to keep
         /// [`LocatedInferError`] under `clippy::result_large_err`'s threshold.
@@ -700,12 +717,9 @@ pub enum InferError {
         polarity: bool,
         /// Display string of the conflicting types, e.g. `"handle(0) | handle(1)"`.
         conflicting: String,
-        /// UIDs of the inference variables whose bounds conflicted.
-        vars: Vec<InferVarId>,
-        /// The innermost expression label where the conflict was first detected.
+        /// A role from constraint emission, or the expression written in CCL at coalesce.
+        /// Omitted from the message; retained for [`Self::same_defect`].
         origin: String,
-        /// Enclosing expression labels, innermost-first.
-        context: Vec<String>,
     },
     /// A [`Type::History`]-typed expression appears in a value position but is not
     /// a bare variable reference — the second-class discipline's rule 1 (see
@@ -714,7 +728,8 @@ pub enum InferError {
     /// expression of `Mut` type (or a non-variable argument to a `Mut`
     /// parameter) is rejected. Reported by [`check_mut_discipline`].
     MutNotBareVariable {
-        /// Display label for the message (see the type docs — not the location).
+        /// The expression written in CCL. Omitted from the message; retained for
+        /// [`Self::same_defect`].
         at: String,
     },
     /// A [`Type::History`] appears nested inside a composite type — the
@@ -725,7 +740,8 @@ pub enum InferError {
     /// child of another `Mut` breaks the "writer set is statically known"
     /// guarantee. Reported by [`check_mut_discipline`].
     MutInCompositeType {
-        /// Display label for the message (see the type docs — not the location).
+        /// The expression written in CCL. Omitted from the message; retained for
+        /// [`Self::same_defect`].
         at: String,
         /// The composite type that illegally contains a `Mut`.
         ty: Type,
@@ -738,7 +754,8 @@ pub enum InferError {
     /// D)`) and be silently mutated in name only. Reported by
     /// [`check_mut_discipline`].
     MutArgNotMutable {
-        /// Display label for the message (see the type docs — not the location).
+        /// The argument written in CCL. Omitted from the message; retained for
+        /// [`Self::same_defect`].
         at: String,
     },
     /// A `MutWrite` (`:=` / `+=`) targets a binding whose resolved type is not
@@ -759,10 +776,8 @@ impl InferError {
     pub fn same_defect(&self, other: &InferError) -> bool {
         fn anonymous(e: &InferError) -> InferError {
             let mut e = e.clone();
-            match &mut e {
-                InferError::IncompatibleBounds { vars, .. } => vars.clear(),
-                InferError::UnresolvedInfer { id, .. } => *id = InferVarId(0),
-                _ => {}
+            if let InferError::UnresolvedInfer { id, .. } = &mut e {
+                *id = InferVarId(0);
             }
             e
         }
@@ -1106,29 +1121,6 @@ impl LocatedInferError {
     }
 }
 
-/// The hint for a mismatch between a [`Type::Record`] and a [`Type::Tuple`].
-///
-/// The two are the same thing — a product — keyed differently, by field *name* and by
-/// *position*, so a mismatch between them is never about depth: it is always that one
-/// keying was used where the other applies, which the bare shapes do not say. It is the
-/// failure `r.0` and `t.name` produce, and the required side of such an edge is a
-/// projection's *partial* shape (`(?31)` names only the position it reads), so the raw
-/// message reads as internal machinery rather than as the mistake.
-///
-/// Both messages are facts about the *pair*, true whichever side the solver reports as
-/// "expected" — an application's domain can be raised from either side of its edge.
-/// Where two types that **render identically** actually differ.
-///
-/// A type written in CHL (`chl_print::chl_type`) is lossy: a refinement writes its
-/// predicate without the types of its terms, and a sum writes no binder, so two types that
-/// differ only there print the same. A mismatch between them reads as
-/// "expected 𝑇, found 𝑇" — a message that states the types agree while reporting that they
-/// do not, which sends a reader looking for the bug anywhere but where it is.
-///
-/// So when the rendered forms agree, fall through to the structural form and quote the first
-/// place it diverges. Only ever computed on this path: `Debug` of a type carrying a compiled
-/// predicate runs to a hundred kilobytes, which is exactly why the excerpt is a window and
-/// not the whole thing.
 /// `debug` with every `node_id: NodeId(…)` field removed.
 fn without_node_ids(debug: &str) -> String {
     const FIELD: &str = "node_id: NodeId(";
@@ -1143,8 +1135,17 @@ fn without_node_ids(debug: &str) -> String {
     out
 }
 
-fn identical_rendering_hint(expected: &Type, found: &Type) -> Option<String> {
-    if !crate::ccl::chl_print::renders_alike(expected, found) {
+/// The hidden structural difference between types whose text in the message is identical.
+/// `written_expected` and `written_found` come from the message's
+/// [`crate::ccl::chl_print::Writer`]. Predicate node ids carry provenance and are excluded
+/// from the structural comparison.
+fn identical_rendering_hint(
+    expected: &Type,
+    found: &Type,
+    written_expected: &str,
+    written_found: &str,
+) -> Option<String> {
+    if written_expected != written_found {
         return None;
     }
     // A predicate's node ids name where its nodes came from, not what the type says, so the
@@ -1234,6 +1235,17 @@ fn tuple_width(ty: &Type) -> Option<usize> {
 
 /// The hint for a product `found` where the product `expected` is required. A type
 /// parameter found is read as its bound, which is what the definition knows of it.
+/// The hint for a mismatch between a [`Type::Record`] and a [`Type::Tuple`].
+///
+/// The two are the same thing — a product — keyed differently, by field *name* and by
+/// *position*, so a mismatch between them is never about depth: it is always that one
+/// keying was used where the other applies, which the bare shapes do not say. It is the
+/// failure `r.0` and `t.name` produce, and the required side of such an edge is a
+/// projection's *partial* shape (`(?31)` names only the position it reads), so the raw
+/// message reads as internal machinery rather than as the mistake.
+///
+/// Both messages are facts about the *pair*, true whichever side the solver reports as
+/// "expected" — an application's domain can be raised from either side of its edge.
 fn product_keying_hint(expected: &Type, found: &Type) -> Option<&'static str> {
     let found = match found {
         Type::Param(p) => p.bound.as_ref().unwrap_or(found),
@@ -1277,7 +1289,11 @@ fn product_keying_hint(expected: &Type, found: &Type) -> Option<&'static str> {
 /// The proven/checked operator pair this points at is specified in `docs/chl-spec.md`,
 /// "3.9 Subscript and attribute access"; the discharge it rests on is
 /// `src/ccl/design/collections.md`, "Lookup: membership discharge".
-fn undischarged_index_hint(type_a: &Type, type_b: &Type) -> Option<String> {
+fn undischarged_index_hint(
+    type_a: &Type,
+    type_b: &Type,
+    w: &crate::ccl::chl_print::Writer,
+) -> Option<String> {
     /// A **present-key domain** — `{𝐾 | __elem ▷ (𝑚 ▷ collection_contains)}`, how a keyed
     /// collection states which keys it holds. Its sole producer is `present_key_domain` in
     /// `src/ccl/lower/exprs.rs`, and the test is the shape that function builds.
@@ -1315,13 +1331,15 @@ fn undischarged_index_hint(type_a: &Type, type_b: &Type) -> Option<String> {
          not provably total. A proven lookup needs an index whose type carries that proof \
          (one drawn from the collection itself); write `c[k]` for the checked form, which \
          answers `some(v)`/`none` for any key.",
-        chl_type(index),
-        chl_type(domain)
+        w.ty(index),
+        w.ty(domain)
     ))
 }
 
 impl std::fmt::Debug for InferError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // One numbering of inference variables for every type the message writes.
+        let w = crate::ccl::chl_print::Writer::default();
         match self {
             InferError::UnboundVariable(name) => write!(f, "Unbound variable: '{}'", name),
             InferError::TypeMismatch {
@@ -1331,11 +1349,11 @@ impl std::fmt::Debug for InferError {
             } => match expected {
                 // Both sides known: name the demand, then the value that failed it.
                 Some(expected) => {
+                    let expected_text = w.ty(expected);
+                    let found_text = w.ty(found);
                     write!(
                         f,
-                        "Type mismatch for {ctx}: expected {}, found {}",
-                        chl_type(expected),
-                        chl_type(found)
+                        "Type mismatch for {ctx}: expected {expected_text}, found {found_text}"
                     )?;
                     if let Some(hint) = product_keying_hint(expected, found) {
                         write!(f, "\n  {hint}")?;
@@ -1343,19 +1361,21 @@ impl std::fmt::Debug for InferError {
                     if let Some(hint) = option_variant_hint(expected, found) {
                         write!(f, "\n  {hint}")?;
                     }
-                    if let Some(hint) = undischarged_index_hint(found, expected) {
+                    if let Some(hint) = undischarged_index_hint(found, expected, &w) {
                         write!(f, "\n  {hint}")?;
                     }
                     // Last: it fires only when the two render identically, which the
                     // hints above have already had their chance to explain.
-                    if let Some(hint) = identical_rendering_hint(expected, found) {
+                    if let Some(hint) =
+                        identical_rendering_hint(expected, found, &expected_text, &found_text)
+                    {
                         write!(f, "\n  {hint}")?;
                     }
                     Ok(())
                 }
                 // A one-sided violation (`ExtraTag`): the `ctx` says what is wrong and
                 // there is no second type the demand could be.
-                None => write!(f, "Type mismatch for {ctx}: found {}", chl_type(found)),
+                None => write!(f, "Type mismatch for {ctx}: found {}", w.ty(found)),
             },
             InferError::NoTraitInstance {
                 trait_,
@@ -1366,7 +1386,7 @@ impl std::fmt::Debug for InferError {
             } => {
                 // A trait with no instance accepting anything at the position, as one a
                 // module declares no instance of, has no type to list.
-                let found = chl_type(found);
+                let found = w.ty(found);
                 if accepted.is_empty() {
                     return write!(
                         f,
@@ -1377,7 +1397,7 @@ impl std::fmt::Debug for InferError {
                 }
                 let accepted = accepted
                     .iter()
-                    .map(chl_type)
+                    .map(|t| w.ty(t))
                     .collect::<Vec<_>>()
                     .join(" or ");
                 write!(
@@ -1419,9 +1439,9 @@ impl std::fmt::Debug for InferError {
                     ts.iter()
                         .map(|(name, t)| {
                             if name.is_empty() {
-                                format!("`{}`", chl_type(t))
+                                format!("`{}`", w.ty(t))
                             } else {
-                                format!("`{name} = {}`", chl_type(t))
+                                format!("`{name} = {}`", w.ty(t))
                             }
                         })
                         .collect::<Vec<_>>()
@@ -1485,7 +1505,7 @@ impl std::fmt::Debug for InferError {
             InferError::UnresolvedMethod {
                 method,
                 receiver: Some(ty @ Type::Nominal(..)),
-            } => write!(f, "`{}` has no method `{method}`", chl_type(ty)),
+            } => write!(f, "`{}` has no method `{method}`", w.ty(ty)),
             InferError::UnresolvedMethod {
                 method,
                 receiver: Some(ty),
@@ -1493,7 +1513,7 @@ impl std::fmt::Debug for InferError {
                 f,
                 "`.{method}(…)` calls a method, and `{}` is not a nominal type, so it has no \
                  methods; the function a field holds is called as `(r.{method})(…)`",
-                chl_type(ty)
+                w.ty(ty)
             ),
             InferError::ParamReadsBinder { param, binder } => match binder {
                 Some(binder) => write!(
@@ -1523,7 +1543,7 @@ impl std::fmt::Debug for InferError {
                      family as a lambda that names the key"
                 ),
             },
-            InferError::TypeParamEscapes { param, target, at } => match target {
+            InferError::TypeParamEscapes { param, target, .. } => match target {
                 Some(EscapeTarget::Argument { function }) => write!(
                     f,
                     "cannot pass a value of type parameter `{param}` to `{function}`: \
@@ -1539,7 +1559,7 @@ impl std::fmt::Debug for InferError {
                 None => write!(
                     f,
                     "a value of type parameter `{param}` reaches a type fixed outside \
-                     `{param}`'s definition at {at}, so that type cannot depend on `{param}`"
+                     `{param}`'s definition, so that type cannot depend on `{param}`"
                 ),
             },
             InferError::MissingRequirement {
@@ -1549,8 +1569,8 @@ impl std::fmt::Debug for InferError {
                 at,
             } => write!(
                 f,
-                "No requirement states that `{param}` is {trait_} at {at}: operand {} is the \
-                 type parameter `{param}`, which supports only what its bound and \
+                "No requirement states that `{param}` is {trait_}, which {at} needs: operand {} \
+                 is the type parameter `{param}`, which supports only what its bound and \
                  `requires` clause state",
                 position + 1,
             ),
@@ -1561,7 +1581,9 @@ impl std::fmt::Debug for InferError {
                      can never be called:"
                 )?;
                 for r in requirements {
-                    writeln!(f, "  {r}")?;
+                    write!(f, "  ")?;
+                    r.fmt_with(f, &w)?;
+                    writeln!(f)?;
                 }
                 Ok(())
             }
@@ -1574,43 +1596,37 @@ impl std::fmt::Debug for InferError {
                     f,
                     "This value is already {}, but it is required to be {}, so it can never \
                      be called:",
-                    chl_type(found),
-                    chl_type(required)
+                    w.ty(found),
+                    w.ty(required)
                 )?;
                 for r in requirements {
-                    writeln!(f, "  {r}")?;
+                    write!(f, "  ")?;
+                    r.fmt_with(f, &w)?;
+                    writeln!(f)?;
                 }
                 Ok(())
             }
-            InferError::MissingField { key, found, at } => match (key, &**found) {
+            InferError::MissingField { key, found, .. } => match (key, &**found) {
                 // A tuple's positions are its width, so that is the fact to state: the
                 // projection asked for a position past the end.
                 (FieldKey::Index(i), Type::Tuple(elems)) => write!(
                     f,
-                    "No position .{i} for {at}: {} is a tuple with {} position{}",
-                    chl_type(found),
+                    "No position .{i}: {} is a tuple with {} position{}",
+                    w.ty(found),
                     elems.len(),
                     if elems.len() == 1 { "" } else { "s" },
                 ),
                 // A written record already lists its fields, so naming the absent
                 // one against it is the whole message.
                 (FieldKey::Name(name), _) => {
-                    write!(
-                        f,
-                        "No field .{name} for {at}: {} has no such field",
-                        chl_type(found)
-                    )
+                    write!(f, "No field .{name}: {} has no such field", w.ty(found))
                 }
                 // `found` degraded to a shape whose keying the message cannot lean on
                 // (`coalesce_for_error` falls back to `Type::Hole`).
-                _ => write!(f, "No field .{key} for {at}: {}", chl_type(found)),
+                _ => write!(f, "No field .{key}: {}", w.ty(found)),
             },
-            InferError::ExpectedFunction { found, at } => {
-                write!(
-                    f,
-                    "Expected function type at {at}, found {}",
-                    chl_type(found)
-                )?;
+            InferError::ExpectedFunction { found, .. } => {
+                write!(f, "Expected a function, found {}", w.ty(found))?;
                 if matches!(found, Type::Tuple(_) | Type::Record(_)) {
                     write!(
                         f,
@@ -1631,8 +1647,8 @@ impl std::fmt::Debug for InferError {
                 write!(
                     f,
                     "Annotation mismatch: annotated as {}, but inferred as {}",
-                    chl_type(annotation),
-                    chl_type(inferred)
+                    w.ty(annotation),
+                    w.ty(inferred)
                 )?;
                 if let Some(hint) = product_keying_hint(annotation, inferred) {
                     write!(f, "\n  {hint}")?;
@@ -1653,7 +1669,7 @@ impl std::fmt::Debug for InferError {
                 )?;
                 match &**inferred {
                     Type::Tuple(found) => write!(f, "a {}-tuple", found.len())?,
-                    found => write!(f, "{}", chl_type(found))?,
+                    found => write!(f, "{}", w.ty(found))?,
                 }
                 let pattern = Type::Tuple(vec![Type::Hole; *positions]);
                 if let Some(hint) = product_keying_hint(&pattern, inferred) {
@@ -1668,29 +1684,34 @@ impl std::fmt::Debug for InferError {
                 write!(
                     f,
                     "Annotation mismatch: annotated as {}, but inferred as {}",
-                    chl_type(annotation),
-                    crate::ccl::chl_print::chl_inferred_poly(inferred)
+                    w.ty(annotation),
+                    w.inferred_poly(inferred)
                 )
             }
             InferError::Unsupported(msg) => write!(f, "Unsupported: {}", msg),
-            InferError::EmptyCase { at } => {
-                write!(f, "Case expression must have at least one branch (at {at})")
+            InferError::EmptyCase { .. } => {
+                write!(f, "A `match` must have at least one `case`")
             }
-            InferError::UnresolvedHole { at } => {
-                write!(f, "Unresolved type hole in expression: {at}")
+            InferError::UnresolvedHole { .. } => {
+                write!(f, "Nothing determines the type this `_` stands for")
             }
-            InferError::UnresolvedBoundedHole { at } => {
-                write!(f, "Unresolved bounded annotation `<:` in expression: {at}")
+            InferError::UnresolvedBoundedHole { .. } => {
+                write!(
+                    f,
+                    "Nothing determines the type this `<:` annotation stands for"
+                )
             }
-            InferError::UnresolvedInfer { id, at } => {
-                write!(f, "Unresolved inference variable {id} in expression: {at}")
+            InferError::UnresolvedInfer { .. } => {
+                write!(f, "Nothing determines the type of this expression")
             }
-            InferError::UnresolvedPartial { kind, at } => {
-                write!(f, "Unresolved partial {kind} in expression: {at}")
-            }
-            InferError::UnresolvedTupleWidth { open, at } => write!(
+            InferError::UnresolvedPartial { keys, .. } => write!(
                 f,
-                "The width of the tuple {open} is never fixed in {at}: the program reads its \
+                "This value is read both by position and by field name ({keys}), so it is \
+                 neither a tuple nor a record"
+            ),
+            InferError::UnresolvedTupleWidth { open, .. } => write!(
+                f,
+                "The width of the tuple {open} is never fixed: the program reads its \
                  positions, and nothing gives it a width\n  hint: a tuple value has one \
                  width; pass this a tuple, or annotate it with a tuple type"
             ),
@@ -1705,7 +1726,7 @@ impl std::fmt::Debug for InferError {
                     "this function's result type {} refines a parameter by {names}, which \
                      the function body binds opaquely; annotate the function's result type \
                      with a type that does not name {names}",
-                    chl_type(ty)
+                    w.ty(ty)
                 )
             }
             InferError::ScopeViolation { at, ty, unbound } => {
@@ -1715,32 +1736,19 @@ impl std::fmt::Debug for InferError {
                      references out-of-scope binder(s) {unbound:?}"
                 )
             }
+            // Values flowing together form a join, demands a meet; neither exists here, and a
+            // join of unrelated types is not taken as their untagged sum.
             InferError::IncompatibleBounds {
                 polarity,
                 conflicting,
-                vars,
-                origin,
-                context,
+                ..
             } => {
-                let bound_kind = if *polarity { "lower" } else { "upper" };
-                let aligned_origin = origin.replace('\n', "\n  ");
-                let var_ids: Vec<_> = vars.iter().map(|v| v.0).collect();
-                write!(
-                    f,
-                    "Type Inference Error: Incompatible {bound_kind} bounds\nRejected by: structural inference (won't infer an untagged sum from a collision)\nConflicting Types: {conflicting}\nVariables: {var_ids:?}\n\nError originated at:\n  {aligned_origin}"
-                )?;
-                if !context.is_empty() {
-                    write!(f, "\n\nIn context of:")?;
-                    for (i, ctx) in context.iter().enumerate() {
-                        // "  N. " prefix; continuation lines must align with the
-                        // first character of content (i.e. same width of spaces).
-                        let prefix = format!("  {}. ", i + 1);
-                        let cont_indent = " ".repeat(prefix.len());
-                        let aligned = ctx.replace('\n', &format!("\n{cont_indent}"));
-                        write!(f, "\n{prefix}{aligned}")?;
-                    }
-                }
-                Ok(())
+                let what = if *polarity {
+                    "The values that meet here have no common type"
+                } else {
+                    "No type meets every requirement on this value"
+                };
+                write!(f, "{what}\nConflicting Types: {conflicting}")
             }
             InferError::TupleWidthConflict { widths, origin: _ } => {
                 write!(
@@ -1752,10 +1760,10 @@ impl std::fmt::Debug for InferError {
                 // Joined with `vs`, not commas: a domain is often a tuple and renders with
                 // commas of its own, so a comma-separated list of them reads as one long
                 // tuple.
-                let listed: Vec<String> = domains.iter().map(chl_type).collect();
+                let listed: Vec<String> = domains.iter().map(|t| w.ty(t)).collect();
                 write!(
                     f,
-                    "Type Inference Error: collection domains have no common answer\n\
+                    "Collection domains have no common answer\n\
                      Conflicting Domains: {}\n\
                      A collection's domain is its data, so a join may not narrow it. Wrap each \
                      arm in `box` to keep them.",
@@ -1790,7 +1798,7 @@ impl std::fmt::Debug for InferError {
                 match position {
                     JoinedPosition::Keys => write!(
                         f,
-                        "Type Inference Error: the keys of a collection written to a feed or \
+                        "The keys of a collection written to a feed or \
                          mutable variable depend on {depends}\n\
                          Keys: {predicate}\n\
                          The target's type is the join of every value written to it, and \
@@ -1798,7 +1806,7 @@ impl std::fmt::Debug for InferError {
                     )?,
                     JoinedPosition::Parameter => write!(
                         f,
-                        "Type Inference Error: the parameter of a function written to a feed or \
+                        "The parameter of a function written to a feed or \
                          mutable variable depends on {depends}\n\
                          Parameter: {predicate}\n\
                          The target's type is the join of every value written to it, and the \
@@ -1816,26 +1824,26 @@ impl std::fmt::Debug for InferError {
                 }
                 Ok(())
             }
-            InferError::MutNotBareVariable { at } => {
+            InferError::MutNotBareVariable { .. } => {
                 write!(
                     f,
-                    "a mutable-reference value must be a bare variable reference \
-                     (Mut second-class rule 1): {at}"
+                    "a value of a `Mut(…)` type must be a mutable variable named where it is \
+                     used, not a computed expression"
                 )
             }
-            InferError::MutInCompositeType { at, ty } => {
+            InferError::MutInCompositeType { ty, .. } => {
                 write!(
                     f,
-                    "a mutable-reference type may not appear inside a composite type \
-                     (Mut second-class rule 2): {} at {at}",
-                    chl_type(ty)
+                    "a `Mut(…)` type cannot be part of another type, such as a tuple, a \
+                     record, a feed's values or a function's result: {}",
+                    w.ty(ty)
                 )
             }
-            InferError::MutArgNotMutable { at } => {
+            InferError::MutArgNotMutable { .. } => {
                 write!(
                     f,
                     "argument to a `Mut` parameter must be a mutable variable, not a \
-                     plain value (Mut second-class rule 1): {at}"
+                     plain value"
                 )
             }
             InferError::MutWriteToNonMutable { name } => {
@@ -3259,6 +3267,7 @@ fn check_mut_write_targets_go(
 mod tests {
     use super::*;
     use crate::ccl::Annotation;
+
     use crate::ccl::BaseType;
     use crate::ccl::Occurrence;
     use crate::ccl::RecordEntry;
@@ -3269,6 +3278,68 @@ mod tests {
         Lit, LogicKind, Type, TypedBinding, TypedExpr, TypedExprNode,
     };
 
+    #[test]
+    fn a_mismatch_between_two_variables_is_not_called_identical() {
+        let rendered = format!(
+            "{:?}",
+            InferError::TypeMismatch {
+                ctx: "this call".to_string(),
+                found: Box::new(Type::Infer(crate::ccl::InferVar::fresh(0))),
+                expected: Some(Box::new(Type::Infer(crate::ccl::InferVar::fresh(0)))),
+            }
+        );
+        assert_eq!(
+            rendered,
+            "Type mismatch for this call: expected ‹?1›, found ‹?2›"
+        );
+    }
+
+    #[test]
+    fn requirement_lines_share_the_headers_variable_numbering() {
+        let a = Type::Infer(crate::ccl::InferVar::fresh(0));
+        let b = Type::Infer(crate::ccl::InferVar::fresh(0));
+        let rendered = format!(
+            "{:?}",
+            InferError::RequirementContradictsBound {
+                found: Box::new(a.clone()),
+                required: Box::new(b.clone()),
+                requirements: vec![StatedRequirement {
+                    trait_: "Addable".into(),
+                    position: 0,
+                    accepted: vec![b],
+                    siblings: vec![(1, vec![a])],
+                }],
+            }
+        );
+        assert!(
+            rendered.starts_with("This value is already ‹?1›, but it is required to be ‹?2›"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Addable accepts only ‹?2› as its operand 1 (its operand 2 is ‹?1›)"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn independent_requirements_keep_their_variables_distinct() {
+        let a = Type::Infer(crate::ccl::InferVar::fresh(0));
+        let b = Type::Infer(crate::ccl::InferVar::fresh(0));
+        let requirements = [a, b].map(|ty| StatedRequirement {
+            trait_: "Addable".into(),
+            position: 0,
+            accepted: vec![ty],
+            siblings: Vec::new(),
+        });
+        let rendered = format!(
+            "{:?}",
+            InferError::UnsatisfiableOperand {
+                requirements: requirements.into(),
+            }
+        );
+        assert!(rendered.contains("Addable accepts only ‹?1› as its operand 1"));
+        assert!(rendered.contains("Addable accepts only ‹?2› as its operand 1"));
+    }
     /// [`infer`] with the blame nodes stripped, for the assertions that compare
     /// error *payloads*.
     ///
@@ -5886,8 +5957,9 @@ mod tests {
                 morphism,
             ))),
         );
-        let hint = undischarged_index_hint(&key_domain, &Type::Base(BaseType::Int))
-            .expect("a bare index against a present-key domain is an undischarged lookup");
+        let hint =
+            undischarged_index_hint(&key_domain, &Type::Base(BaseType::Int), &Default::default())
+                .expect("a bare index against a present-key domain is an undischarged lookup");
         assert!(
             hint.contains("write `c[k]` for the checked"),
             "the hint names the checked form: {hint}"
@@ -5895,11 +5967,19 @@ mod tests {
 
         // A literal on one side of an ordinary mismatch is not a lookup.
         assert_eq!(
-            undischarged_index_hint(&int_lit_ty(7), &Type::Base(BaseType::String)),
+            undischarged_index_hint(
+                &int_lit_ty(7),
+                &Type::Base(BaseType::String),
+                &Default::default()
+            ),
             None
         );
         assert_eq!(
-            undischarged_index_hint(&str_lit_ty("nope"), &Type::Base(BaseType::Int)),
+            undischarged_index_hint(
+                &str_lit_ty("nope"),
+                &Type::Base(BaseType::Int),
+                &Default::default()
+            ),
             None
         );
     }

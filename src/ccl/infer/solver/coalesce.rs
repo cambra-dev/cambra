@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::ccl::chl_print::chl_type;
+use crate::ccl::chl_print::Writer;
 use crate::ccl::{HistoryKind, InferVar, InferVarId, Type};
 
 use super::compact::{CompactGraph, CompactType, CompactVariant};
@@ -783,14 +783,15 @@ fn coalesce_compact_go(
     }
     // Two applications whose arguments at an invariant parameter differ have no join.
     if let Some((decl, a, b)) = &ct.nominal_conflict {
+        let w = Writer::default();
         return Err(CoalesceError::IncompatibleBounds {
             polarity,
             vars: ct.vars.iter().copied().collect(),
             details: format!(
                 "two `{}` values at different arguments of an invariant parameter: {} and {}",
                 decl.name,
-                chl_type(&coalesce_compact_go(a, polarity, scope)?),
-                chl_type(&coalesce_compact_go(b, polarity, scope)?),
+                w.ty(&coalesce_compact_go(a, polarity, scope)?),
+                w.ty(&coalesce_compact_go(b, polarity, scope)?),
             ),
         });
     }
@@ -850,7 +851,8 @@ fn coalesce_compact_go(
             // bounds so the union is rejected at *their* site; that is deferred
             // past the conditional-collection foundation. Collection arms still join losslessly — that happens in
             // the `fun` slot above (`CompactFun::merge`), not through atoms.
-            let pretty = all.iter().map(chl_type).collect::<Vec<_>>().join(" | ");
+            let w = Writer::default();
+            let pretty = all.iter().map(|t| w.ty(t)).collect::<Vec<_>>().join(" | ");
             let vars: Vec<InferVarId> = ct.vars.iter().copied().collect();
             return Err(CoalesceError::IncompatibleBounds {
                 polarity,
@@ -1054,10 +1056,11 @@ fn materialize_record(
     } else {
         Err(CoalesceError::UnresolvedPartial {
             kind: PartialKind::Record,
-            details: format!(
-                "mixed Index/Name keys: {:?}",
-                rec.keys().collect::<Vec<_>>()
-            ),
+            details: rec
+                .keys()
+                .map(|k| format!("`.{k}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
         })
     }
 }

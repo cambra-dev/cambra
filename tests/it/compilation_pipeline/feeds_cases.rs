@@ -1099,7 +1099,7 @@ fn a_defer_error_in_a_predicate_is_a_compile_error(
 #[rstest]
 #[case::a_collection(
     "x = [1, 2, 3]\nx << 4\nsum(x)\n",
-    "feed target of feed(x, 4) must be a feed handle (a feed handle is required here, but the \
+    "Type mismatch for the target of a feed to `x` (a feed handle is required here, but the \
      value is not one)"
 )]
 #[case::a_collection_annotated_as_a_feed(
@@ -1479,7 +1479,15 @@ fn defer_names_the_declaration_that_replaces_it() {
 fn a_declared_feed_takes_its_value_type() {
     check_compile_error(
         "out: Feed(String); out << 1; out",
-        "Type mismatch for contribution to feed(out, 1)",
+        "Type mismatch for a feed to `out`",
+    );
+}
+
+#[test]
+fn a_definition_is_named_when_its_element_type_fails() {
+    check_compile_error(
+        "out: Feed(String); out <<= [1]; out",
+        "Type mismatch for a definition of `out`",
     );
 }
 
@@ -1794,7 +1802,7 @@ fn functions_whose_parameter_varies_with_a_binder_have_no_join() {
                 o << (\i -> xs[i]!)
             o
         "#},
-        "the parameter of a function written to a feed or mutable variable depends on `r`",
+        "The parameter of a function written to a feed or mutable variable depends on `r`",
     );
 }
 
@@ -1816,7 +1824,7 @@ fn a_contribution_with_no_join_is_reported_once() {
     };
     let rendered = render_errors(&errs, loaded.sources());
     assert_eq!(
-        rendered.matches("the keys of a collection").count(),
+        rendered.matches("The keys of a collection").count(),
         1,
         "{rendered}"
     );
