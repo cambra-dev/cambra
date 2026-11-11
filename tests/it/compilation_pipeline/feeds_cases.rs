@@ -1483,6 +1483,14 @@ fn a_declared_feed_takes_its_value_type() {
     );
 }
 
+#[test]
+fn a_definition_is_named_when_its_element_type_fails() {
+    check_compile_error(
+        "out: Feed(String); out <<= [1]; out",
+        "Type mismatch for a definition of `out`",
+    );
+}
+
 /// A `Feed(…)` annotation states a feed wherever a binder takes one: a parameter of a
 /// function of one or several parameters, and an annotated binding.
 #[rstest]

@@ -1010,6 +1010,25 @@ mod tests {
     use crate::ccl::{BindingTransparency, TypedBinding, TypedExpr, TypedExprNode};
 
     #[test]
+    fn distinct_domain_variables_keep_the_domain_mismatch() {
+        let error = map_constrain_err(
+            ConstrainError::DataDomainMismatch {
+                lhs: Box::new(Type::Infer(crate::ccl::InferVar::fresh(0))),
+                rhs: Box::new(Type::Infer(crate::ccl::InferVar::fresh(0))),
+                cause: Box::new(ConstrainError::Mismatch {
+                    lhs: Box::new(Type::Base(BaseType::Int)),
+                    rhs: Box::new(Type::Base(BaseType::String)),
+                }),
+            },
+            "this call",
+        );
+        assert!(
+            matches!(&error, InferError::TypeMismatch { ctx, .. } if ctx.starts_with("collection domain")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
     fn smoke_lambda_identity_inferred_int() {
         // λx. x applied to 42 → Int
         let lam = TypedExpr::new(TypedExprNode::Lambda {

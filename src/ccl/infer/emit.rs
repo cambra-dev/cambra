@@ -374,7 +374,11 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             value,
         } => {
             let target_ty = ctx.instantiate_binding(name)?;
-            emit_define(name, &target_ty, value, &feed_role(name), ctx)?
+            let label = match name.source_spelling() {
+                Some(name) => format!("a definition of `{name}`"),
+                None => "this definition".to_string(),
+            };
+            emit_define(name, &target_ty, value, &label, ctx)?
         }
 
         TypedExprNode::Copair(exprs) => emit_copair(exprs, &recorded_ty, ctx)?,
@@ -1853,6 +1857,15 @@ fn emit_value_read<C: Typing>(e: &mut Expr, ctx: &mut C) -> Result<Type, Located
     Ok(read_through(&ctx.subexpr(e)?))
 }
 
+/// A feed into `target` as a diagnostic names it: by the target's name, or as
+/// `this feed` for a target the compiler minted, a generator's result.
+fn feed_role(target: &Name) -> String {
+    match target.source_spelling() {
+        Some(name) => format!("a feed to `{name}`"),
+        None => "this feed".to_string(),
+    }
+}
+
 /// Type a `Feed { name, value }`: the fed value contributes one element to
 /// the target handle's channel; the feed expression itself is `Unit` (it is
 /// statement-positioned — channelize extracts the value into a channel and
@@ -1863,15 +1876,6 @@ fn emit_value_read<C: Typing>(e: &mut Expr, ctx: &mut C) -> Result<Type, Located
 /// rather than a free `Infer`, and `channelize` erases `ChanDom(d)` to the
 /// concrete channel domain (a source domain, or a `Variant` union of feed
 /// sites) by substitution.
-/// A feed or define into `target` as a diagnostic names it: by the target's name, or as
-/// `this feed` for a target the compiler minted, a generator's result.
-fn feed_role(target: &Name) -> String {
-    match target.source_spelling() {
-        Some(name) => format!("a feed to `{name}`"),
-        None => "this feed".to_string(),
-    }
-}
-
 pub(super) fn emit_feed(
     target: &Name,
     target_ty: &Type,
@@ -2978,6 +2982,11 @@ fn proj_requirement<C: Typing>(key: &ProjKey, field_ty: Type, ctx: &mut C) -> Ty
     }
 }
 
+/// A projection as a diagnostic names it.
+fn projection(key: &ProjKey) -> String {
+    format!("projection `.{key}`")
+}
+
 /// `Proj(k) : ∀α. {k: α, …} ⇒ α`. The node's own type *is* that function, so
 /// we decompose it into `(domain, codomain)` and require the domain to carry
 /// field `k` typed at the codomain.
@@ -2992,11 +3001,6 @@ fn proj_requirement<C: Typing>(key: &ProjKey, field_ty: Type, ctx: &mut C) -> Ty
 /// mentions the projected pair. The comparison below puts that codomain beside the
 /// domain it was read off, which is the domain's coordinate, so it is opened first —
 /// the same reading [`compose_chain`] takes on a chain adjacency.
-/// A projection as a diagnostic names it.
-fn projection(key: &ProjKey) -> String {
-    format!("projection `.{key}`")
-}
-
 pub(super) fn emit_proj<C: Typing>(
     key: &ProjKey,
     node_ty: &Type,

@@ -39,7 +39,8 @@ pub const OUTER_ARGUMENT: &str = "‹outer argument›";
 /// The key type of a collection outside the written type.
 pub const OUTER_KEYS: &str = "‹outer keys›";
 
-/// `ty` written in CHL.
+/// `ty` written in CHL, numbering inference variables from 1 on each call. A message
+/// writing several types uses one [`Writer`] to keep their numbering consistent.
 pub fn chl_type(ty: &Type) -> String {
     Writer::default().ty(ty)
 }
@@ -96,7 +97,8 @@ pub fn chl_operator(op: &BinOpKind) -> String {
 /// Whether two types have the same diagnostic text, including any descriptions that hide
 /// structural differences. This compares what the reader sees, not type equality.
 pub fn renders_alike(a: &Type, b: &Type) -> bool {
-    chl_type(a) == chl_type(b)
+    let w = Writer::default();
+    w.ty(a) == w.ty(b)
 }
 
 /// A refinement predicate written in CHL, `_` for the refined value.

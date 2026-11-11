@@ -13,7 +13,8 @@ A message names what failed by its role in the program, and its span says where.
   `` `+` ``, never the name of a node or the expression written in CCL.
 - **A trait failure names the operator or function**: ``No Addable instance for `+` ``, or
   `Iterable::elements` for a function a construct calls.
-- **No message prints an expression.** The error's node is its location
+- **No message about the program prints an expression.** `ScopeViolation` and the consistency
+  check (`infer/check.rs`) report compiler bugs and print CCL. The error's node is its location
   (`LocatedInferError::node_id`), which `compile_program` resolves to a span.
 
 ---
