@@ -476,12 +476,14 @@ fn statement_recovery_collects_multiple_errors_in_one_pass() {
 fn statement_recovery_reads_the_binders_of_the_head() {
     let cases: &[(&str, &[&str], bool)] = &[
         ("x = 1 +* 2\n", &["x"], false),
+        ("x ^= 1 +* 2\n", &["x"], false),
         ("a, b = 1 +* 2\n", &["a", "b"], false),
         ("x: Int = 1 +* 2\n", &["x"], false),
         ("x := 1 +* 2\n", &["x"], true),
         ("def f(a:\n    a\n", &["f"], false),
         ("pub y = 1 +* 2\n", &["y"], false),
         ("param p: Int = 1 +* 2\n", &["p"], false),
+        ("const param p: Int = 1 +* 2\n", &["p"], false),
         ("1 +* 2\n", &[], false),
     ];
     for (src, binds, mut_assign) in cases {

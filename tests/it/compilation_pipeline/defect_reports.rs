@@ -659,6 +659,40 @@ fn a_lowering_failure_respects_a_stop_before_inference(#[case] stop: cambra::ccl
     );
 }
 
+/// An unreadable sub-expression fails its statement before inference reads its values.
+#[rstest]
+#[case::joined_comprehension(indoc! {r#"
+    users = [(id=1, name="alice"), (id=, name="bob")]
+    orders = [(user_id=1, amount=50)]
+    [(customer=u.name, total=o.amount) for u in users for o in orders if u.id == o.user_id]
+"#})]
+#[case::groupby(indoc! {r#"
+    users = [(id=1, name="alice"), (id=, name="bob")]
+    groupby(users, \u -> u.id)
+"#})]
+fn an_unreadable_list_element_reports_only_its_parse_error(#[case] code: &str) {
+    let phases: Vec<_> = underlined_by_phase(code)
+        .into_iter()
+        .map(|(phase, _)| phase)
+        .collect();
+    assert_eq!(phases, ["parse"]);
+}
+
+#[test]
+fn an_unreadable_list_element_hides_no_independent_join() {
+    let got = underlined_by_phase(indoc! {r#"
+        users = [(id=1, name="alice"), (id=, name="bob")]
+        bad = [1, "s"]
+        bad
+    "#});
+    assert!(got.iter().any(|(phase, _)| *phase == "parse"), "{got:?}");
+    assert!(
+        got.iter()
+            .any(|(phase, span)| *phase == "infer" && span == r#"[1, "s"]"#),
+        "{got:?}"
+    );
+}
+
 /// The mutability rules are inference's, so a type error elsewhere hides none of them
 /// (`src/ccl/design/mutability.md`, "No aliasing: `Mut` values are second-class
 /// (downward-only)").

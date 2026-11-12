@@ -68,6 +68,7 @@ pub(super) fn lower_chain_recovering(
         .map(DeclaredSink::binding)
         .collect();
     errors.extend(sink_rebindings(stmts, &declared));
+    let body = bind_unreached_uses(body, ctx);
     let body = nominal::bind_constructors(body, ctx);
     let (associated, reaches) = nominal::associated_reach(&body, ctx);
     nominal::settle_implicit(&reaches.associated, ctx);

@@ -1678,27 +1678,34 @@ pub(super) fn check_scope_valid(
     scope: &BTreeSet<Name>,
     errors: &mut Vec<LocatedInferError>,
 ) {
-    // An opaque binder's name is not discharged when a type leaves its scope
-    // (`Typing::close_let_type`), so it stands in the types of nodes above its
-    // `let`, starting with the `let` node itself. Seeding the root scope with
-    // every such name is what admits those types. The seed admits more than
-    // those nodes: the name is already out of its lexical scope at the first
-    // node that carries it, so the walk has no position from which to rule a
-    // later one out.
+    // Opaque and failed definitions have no value to discharge (ScopeExit::Keep), so
+    // their names can occur in types above their lets. A failed definition is present
+    // only in an error-bearing tree; admitting its name does not admit a successful
+    // transparent definition whose name escaped substitution.
     let mut scope = scope.clone();
-    collect_opaque_binders(expr, &mut scope);
+    collect_kept_let_binders(expr, &mut scope);
     check_scope_valid_go(expr, &scope, errors)
 }
 
-/// Every [opaque](crate::ccl::BindingTransparency::Opaque) `let` binder in the
-/// tree.
-fn collect_opaque_binders(expr: &Expr, out: &mut BTreeSet<Name>) {
-    if let TypedExprNode::Let { binding, .. } = &expr.node
-        && binding.transparency == BindingTransparency::Opaque
+/// Record let binders whose definitions cannot be discharged and return whether the subtree
+/// holds a recovery placeholder. One postorder walk supplies both facts.
+fn collect_kept_let_binders(expr: &Expr, out: &mut BTreeSet<Name>) -> bool {
+    if let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = &expr.node
     {
-        out.insert(binding.name.clone());
+        let failed = collect_kept_let_binders(bound_expr, out);
+        let body_failed = collect_kept_let_binders(body, out);
+        if binding.transparency == BindingTransparency::Opaque || failed {
+            out.insert(binding.name.clone());
+        }
+        return failed || body_failed;
     }
-    expr.walk_children(|c| collect_opaque_binders(c, out));
+    let mut failed = matches!(expr.node, TypedExprNode::Error);
+    expr.walk_children(|child| failed |= collect_kept_let_binders(child, out));
+    failed
 }
 
 fn check_scope_valid_go(expr: &Expr, scope: &BTreeSet<Name>, errors: &mut Vec<LocatedInferError>) {

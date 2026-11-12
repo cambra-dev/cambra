@@ -357,11 +357,13 @@ Lowering stands the same placeholder in for a top-level statement it fails in, i
 survives a failed initializer; an annotation that itself fails to lower establishes no type.
 Names without a usable declaration bind at a poison, and a statement introducing nothing is an
 expression statement of the placeholder. A statement the parser could not read introduces the
-names its head binds in the same way. An expression it could not read is the placeholder where it
-stands ([parser recovery](../../../chl-parser/design-chl-parser.md#threading-partial-asts-through-to-lowering)).
+names its head binds in the same way. An unreadable sub-expression fails its enclosing statement
+with `ParseHole`, and the statement stands in whole. This prevents a partially read value from
+contributing constraints ([parser recovery](../../../chl-parser/design-chl-parser.md#threading-partial-asts-through-to-lowering)).
 A failed last statement leaves the placeholder as the block's value, which emission types as a
-fresh variable. Each contained error carries its own placeholder mark, retained through copying
-and diagnostic merging. When every lowering error is marked, the passes reach the earlier of the
+fresh variable. The scope check admits names retained by failed definitions, as it admits
+opaque binders: neither has a usable definition to discharge (`ScopeExit::Keep`). Each contained
+error carries its own placeholder mark, retained through copying and diagnostic merging. When every lowering error is marked, the passes reach the earlier of the
 requested output and inference past parse and lowering errors, and inference's errors are added
 to theirs. An undetermined type is not reported, as in a run that starts over.
 

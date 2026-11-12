@@ -313,10 +313,11 @@ placeholder carries the names the head binds: `x = …`, `a, b = …`, `x: …`,
 marked, since it writes a name already in scope rather than introducing it. An `import` or `run`
 head binds its module name, its `as` name or its path's last segment, and the names of its `use`
 clause; one cut off after its `as` binds a module name no one can read, and lowering then reads a
-qualifier that names no module as one it may be. A head that reads as none of these binds nothing. The program below the statement reads the names as bound, so a use
-of one is not reported as unbound (see [Threading partial ASTs through to
-lowering](#threading-partial-asts-through-to-lowering)). `statement_recovery_reads_the_binders_of_the_head`
-in `tests/it/chl_parser_roundtrip.rs` covers each head.
+qualifier that names no module as one it may be. A head that reads as none of these binds nothing.
+The program below the statement reads the names as bound, so a use of one is not reported as
+unbound (see [Threading partial ASTs through to lowering](#threading-partial-asts-through-to-lowering)).
+`statement_recovery_reads_the_binders_of_the_head` in `tests/it/chl_parser_roundtrip.rs` covers each
+head.
 
 A semicolon terminates a valid simple statement, but is not a synchronization token for this
 recovery parser. Recovery can therefore discard later semicolon-separated text on the same
@@ -599,14 +600,15 @@ included, allowing independent lowering errors to appear in the same response. L
 token stream [Lexer recovery](#lexer-recovery) leaves, so a call the lexer closed with a
 zero-width closer lowers as an ordinary call.
 
-Lowering maps recovered error nodes to `TypedExprNode::Error` without reporting the same
-parse failure again. An `Expr::Error` is the placeholder where it stands. A `Stmt::Error` binds each
-name its head binds at the placeholder, as a statement lowering fails in does
-(`stand_in_for_failed`), so a use of one reads a poison and reports nothing. Where lowering cannot
-give a hole a meaning, a type a declaration states in full, a statement in a loop's or a
-transaction's block, or a name whose declaration it cannot see, such as the operand of
-`await_final`, it fails the construct with `LoweringError::ParseHole`, which the frontend does not
-report: the parse error does. `LoweringResult` also carries an optional value and errors.
+Lowering replaces recovered statement errors with `TypedExprNode::Error` without duplicating
+their parse diagnostics. An `Expr::Error` fails its enclosing statement with
+`LoweringError::ParseHole`. Statement recovery replaces the whole statement with a placeholder
+and preserves usable annotations and mutable histories. A `Stmt::Error` binds each name its head
+binds at the placeholder (`stand_in_for_failed`), so its uses read a poison and report nothing.
+An unreadable type, a statement in a loop or transaction block, or a name whose declaration is
+unavailable, such as an `await_final` operand, also fails its construct with `ParseHole`. The
+frontend suppresses these lowering diagnostics because the parser reports the cause.
+`LoweringResult` retains its optional value and errors.
 
 The frontend appends lowering errors and returns if no CCL value is available. Past parse and
 lowering errors alone, when every lowering error is one a placeholder stands for, it runs the

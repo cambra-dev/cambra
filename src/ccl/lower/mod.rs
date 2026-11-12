@@ -1820,13 +1820,9 @@ fn lower_expr_inner(
             expr.span,
             "yield outside a generator for-loop context",
         )),
-        // Parse-recovery placeholder: silently substitute a CCL placeholder so
-        // we keep lowering the rest of the tree. The parse error itself has
-        // already been reported via [`crate::chl_parser::ParseResult::errors`];
-        // adding a redundant lowering error would just clutter the diagnostic
-        // output. [`crate::ccl::context::compile_program`] guards against this
-        // placeholder ever reaching inference.
-        ChlExpr::Error => Ok(Expr::error()),
+        // An unreadable sub-expression fails its enclosing statement. Its parse error
+        // reports the failure, and statement recovery preserves usable declarations.
+        ChlExpr::Error => Err(LoweringError::parse_hole(expr.span)),
     }
 }
 
