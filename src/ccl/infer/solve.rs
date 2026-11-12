@@ -1778,7 +1778,7 @@ pub(crate) fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
     }
     let compacted = compact_type(ty);
     crate::ccl::infer::solver::coalesce::refuse_param_joined_with_outer_variable(&compacted)?;
-    let resolved = coalesce_compact(&simplify_type(compacted))?;
+    let resolved = coalesce_compact(&simplify_type::simplify_type_for_resolution(compacted))?;
     #[cfg(debug_assertions)]
     if let Type::Infer(v) = ty {
         assert_resolves_in_scope(v, &resolved);
@@ -4553,6 +4553,21 @@ fn collect_param_spelling(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unresolved_materialization_preserves_variable_identity() {
+        let _arena = crate::ccl::infer::InferArena::new();
+        let first = crate::ccl::infer::solver::fresh_var(0);
+        let second = crate::ccl::infer::solver::fresh_var(0);
+        let resolve = |ty: &Type| {
+            let Type::Infer(var) = super::resolve_var_type(ty).unwrap() else {
+                panic!("an unconstrained variable must remain undetermined")
+            };
+            var.uid
+        };
+        assert_eq!(resolve(&first), resolve(&first));
+        assert_ne!(resolve(&first), resolve(&second));
+    }
+
     use super::super::test_helpers::*;
     use crate::ccl::infer::{int_lit_ty, str_lit_ty};
     use crate::ccl::symbolic::symbolic;

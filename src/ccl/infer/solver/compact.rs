@@ -1214,6 +1214,62 @@ pub struct CompactType {
     pub origins: ContributionOrigins,
 }
 
+/// Call `f` on every position directly under `ct`, with its polarity: fields and
+/// payloads as `ct`, a function's domain and its binders' kinds opposite, its codomain
+/// as `ct`, a history's parts as `ct` (the polarities [`super::simplify_type`] reads).
+/// Stops at the first `None`.
+pub(super) fn for_each_child(
+    ct: &mut CompactType,
+    pol: bool,
+    f: &mut impl FnMut(&mut CompactType, bool) -> Option<()>,
+) -> Option<()> {
+    for child in ct.rec.iter_mut().flat_map(|r| r.values_mut()) {
+        f(child, pol)?;
+    }
+    for child in ct.var.iter_mut().flat_map(|v| v.tags.values_mut()) {
+        f(child, pol)?;
+    }
+    for child in ct
+        .dep_tuple
+        .iter_mut()
+        .flat_map(|d| d.components.iter_mut())
+    {
+        f(child, pol)?;
+    }
+    if let Some(family) = &mut ct.family {
+        for child in family.domains.iter_mut() {
+            f(child, pol)?;
+        }
+        f(&mut family.body, pol)?;
+    }
+    if let Some(cf) = &mut ct.fun {
+        for w in &mut cf.binders {
+            match &mut w.type_kind {
+                CompactTypeKind::Enumerated(candidates) => {
+                    for c in candidates {
+                        f(c, !pol)?;
+                    }
+                }
+                CompactTypeKind::SubtypesOf(bound) => f(bound, !pol)?,
+                CompactTypeKind::UIntRanges | CompactTypeKind::Type => {}
+            }
+        }
+        f(&mut cf.domain, !pol)?;
+        f(&mut cf.codomain, pol)?;
+    }
+    if let Some(history) = &mut ct.history_slot {
+        f(&mut history.value, pol)?;
+        f(&mut history.domain, pol)?;
+    }
+    for (decl, args) in ct.nominal.iter_mut() {
+        for (arg, v) in args.iter_mut().zip(decl.sided_variances()) {
+            let pol = v.polarity(pol);
+            f(arg, pol)?;
+        }
+    }
+    Some(())
+}
+
 /// How many positions a tuple contribution has: exactly its listed ones (a [`Type::Tuple`]),
 /// or at least them (a [`Type::OpenTuple`]). See `docs/chl-spec.md`, "Tuple width".
 ///

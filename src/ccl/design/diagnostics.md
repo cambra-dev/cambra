@@ -39,8 +39,11 @@ a generic definition whose instantiation fails it. `defect_reports.rs` checks ea
 - **A copy is not a site.** A dead definition nested in a generic one is walked once in each
   specialization of the enclosing definition. An error such a walk raises at a copy of a node an
   earlier walk raised the same error at is dropped (`typecheck_discarded_definition`).
-- **The checks after coalescing report once per value.** An unfixed tuple width, an undetermined
-  type and a `Mut` inside another type reach every node holding the value. `one_per_value` keeps
+- **An undetermined variable reports once.** `one_per_variable` keeps the innermost report of
+  each variable, including independent variables held in the same node's type. Materialization
+  pins variables at positions with no concrete contribution so each read retains that identity.
+- **An unfixed tuple width or a nested `Mut` reports once per value.** These defects reach every
+  node holding the value. `one_per_value` keeps
   the innermost reports and groups them by the value the tree shows them holding: a variable holds
   its binder's, a `let` binder its bound expression's, an application its function's or
   argument's.

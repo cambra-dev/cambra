@@ -3718,6 +3718,14 @@ Error: lowering error
         "x: Feed(_)",
         0
     )]
+    #[case::two_undetermined_parameters(
+        indoc::indoc! {r"
+            f = \x -> \y -> (x, y)
+            f
+        "},
+        "y",
+        1
+    )]
     fn a_rejection_after_lowering_points_at_its_source(
         #[case] code: &str,
         #[case] expected: &str,

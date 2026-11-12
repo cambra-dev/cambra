@@ -41,6 +41,28 @@ pub fn simplify_type(cty: CompactGraph) -> CompactGraph {
     simplify_type_pinning(cty, &BTreeSet::new())
 }
 
+/// Simplify a type being materialized, retaining variable identity where no concrete type
+/// reached a position. Dropping every variable there would make coalescing mint an unrelated
+/// placeholder at each read, so the annotation check could not recognize one undetermined
+/// variable across its uses.
+pub fn simplify_type_for_resolution(mut cty: CompactGraph) -> CompactGraph {
+    fn collect(ct: &mut CompactType, pinned: &mut BTreeSet<InferVarId>) {
+        if ct.refinements.is_none() {
+            pinned.extend(ct.vars.iter().copied());
+        }
+        super::compact::for_each_child(ct, true, &mut |child, _| {
+            collect(child, pinned);
+            Some(())
+        });
+    }
+    let mut pinned = BTreeSet::new();
+    collect(&mut cty.term, &mut pinned);
+    for bound in cty.rec_vars.values_mut() {
+        collect(bound, &mut pinned);
+    }
+    simplify_type_pinning(cty, &pinned)
+}
+
 /// [`simplify_type`], keeping every variable in `pinned`: neither polar-only
 /// elimination nor atomic absorption drops one, though another variable may still
 /// merge into it.

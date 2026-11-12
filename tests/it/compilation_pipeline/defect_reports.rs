@@ -196,6 +196,13 @@ fn underlined(code: &str) -> Vec<String> {
     "},
     &["x"],
 )]
+#[case::two_undetermined_parameters(
+    indoc! {r"
+        f = \x -> \y -> (x, y)
+        f
+    "},
+    &["x", "y"],
+)]
 #[case::a_function_returning_a_mutable_variable(
     indoc! {r"
         x := 0

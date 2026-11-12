@@ -773,6 +773,10 @@ impl InferError {
     /// Whether `self` and `other` report one defect: equal but for the inference
     /// variables they name, which differ between a definition and a specialization's
     /// copy of it.
+    // TODO(error-identity): define whether binder spelling and the site label belong to a
+    // defect, then use that comparison in dead-definition deduplication, coalescing,
+    // generalized-binding cascade checks and Blame::infer. Predicate binder spelling
+    // currently makes structural equality disagree with diagnostic-text equality.
     pub fn same_defect(&self, other: &InferError) -> bool {
         fn anonymous(e: &InferError) -> InferError {
             let mut e = e.clone();
@@ -2240,8 +2244,8 @@ fn check_annotated(expr: &Expr, strictness: Strictness) -> Result<(), Vec<Locate
     let mut errors = Vec::new();
     let mut seen: HashSet<crate::ccl::PredicateId> = HashSet::new();
     collect_expr_errors(expr, strictness, &mut errors, &mut seen);
-    // An unfixed width or an undetermined type reaches every node and binder its value's
-    // type does, so it is reported once per value.
+    // An unfixed width reaches every node holding its value. An undetermined variable
+    // can occur beside independent variables in the same value.
     let (open, errors): (Vec<_>, Vec<_>) = errors
         .into_iter()
         .partition(|e| matches!(e.error, InferError::UnresolvedTupleWidth { .. }));
@@ -2252,7 +2256,7 @@ fn check_annotated(expr: &Expr, strictness: Strictness) -> Result<(), Vec<Locate
     // to holds one too. Those are the width's consequences, so they are not reported beside
     // it: a variable that stays unresolved once the widths are fixed is reported then.
     if open.is_empty() {
-        errors.extend(one_per_value(expr, undetermined));
+        errors.extend(one_per_variable(expr, undetermined));
     }
     errors.extend(one_per_value(expr, open));
     if errors.is_empty() {
@@ -2262,9 +2266,29 @@ fn check_annotated(expr: &Expr, strictness: Strictness) -> Result<(), Vec<Locate
     }
 }
 
+/// Keep the innermost report of each undetermined inference variable. Postorder puts a
+/// node after its descendants and keeps the first use among independent subtrees.
+fn one_per_variable(expr: &Expr, mut raised: Vec<LocatedInferError>) -> Vec<LocatedInferError> {
+    fn order(e: &Expr, positions: &mut HashMap<NodeId, usize>) {
+        e.walk_children(|child| order(child, positions));
+        positions.insert(e.node_id(), positions.len());
+    }
+    let mut positions = HashMap::new();
+    order(expr, &mut positions);
+    raised.sort_by_key(|e| positions.get(&e.node_id).copied().unwrap_or(usize::MAX));
+    let mut seen = HashSet::new();
+    raised.retain(|e| {
+        let InferError::UnresolvedInfer { id, .. } = e.error else {
+            unreachable!("one_per_variable receives only undetermined-variable reports")
+        };
+        seen.insert(id)
+    });
+    raised
+}
+
 /// The reports of `raised`, errors of one kind raised at nodes and binders of `expr` for a
 /// value whose type every node holding the value carries, one per value: an unfixed tuple
-/// width, an undetermined type, a `Mut` inside a composite type.
+/// width or a `Mut` inside a composite type.
 ///
 /// The defect reaches every node and binder that holds the value, so a report is a
 /// candidate only at the innermost: a node whose subtree raises no other. A projection's
