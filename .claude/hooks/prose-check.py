@@ -26,8 +26,10 @@ MIN_WORDS = 25
 REMINDER = (
     "This edit added prose to {path}. Design docs and comments here are "
     "specification prose: the conclusion first, one claim per sentence in the "
-    "main clause, no stress italics, no coined vocabulary, and no arguing for "
-    "the design. Load the `spec-prose` skill before writing more, and convert "
+    "main clause, subjects and predicates kept together, no stress italics, "
+    "no coined vocabulary, and no arguing for the design. Move embedded clauses "
+    "without losing conditions or exceptions; do not add `that` or split sentences "
+    "mechanically. Load the `spec-prose` skill before writing more, and convert "
     "any older-style passage you touch rather than matching it."
 )
 
