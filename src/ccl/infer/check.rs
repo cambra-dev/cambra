@@ -256,7 +256,6 @@ impl Typing for CheckCtx {
         &mut self,
         error: LocatedInferError,
         _reads_before: usize,
-        _statement: NodeId,
     ) -> Result<(), LocatedInferError> {
         Err(error)
     }

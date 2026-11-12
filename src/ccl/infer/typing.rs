@@ -73,6 +73,12 @@ pub(super) trait Typing {
     /// on entry to a node's rule and restore it on exit, error path included.
     fn current_node(&self) -> NodeId;
 
+    /// Emit one statement's definition or initializer under its ownership. Check retains
+    /// the already typed tree and does not collect recovery ownership.
+    fn in_statement<R>(&mut self, _statement: NodeId, f: impl FnOnce(&mut Self) -> R) -> R {
+        f(self)
+    }
+
     /// Raise `error`, blamed on the node whose rule is running.
     ///
     /// Inference's way to build a [`LocatedInferError`], which has no unlocated
@@ -107,13 +113,12 @@ pub(super) trait Typing {
     /// Emit drops the error of a statement that has read a
     /// [poisoned](LetScheme::Poisoned) binding since: such a statement fails
     /// because the binding's definition did, which has already been reported.
-    /// `statement` is the statement's expression, which emit records either way, for a run
-    /// that starts over without it ([`super::run_with_params`]).
+    /// Emit records the failure node even when its diagnostic is suppressed. Its owner
+    /// is the statement being emitted when that node was visited or the error recovered.
     fn recover(
         &mut self,
         error: LocatedInferError,
         reads_before: usize,
-        statement: NodeId,
     ) -> Result<(), LocatedInferError>;
 
     /// Record what the A-normalization temp `temp` names ([`super::emit::written_variable`]),

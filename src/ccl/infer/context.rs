@@ -252,9 +252,11 @@ pub(super) struct InferCtx {
     pub(super) trait_calls: HashMap<NodeId, (Rc<TraitObligation>, smol_str::SmolStr, Vec<Type>)>,
     /// How many errors emission has recovered from ([`Typing::recoveries`]).
     recoveries: usize,
-    /// The expression of the statement each recovery was made at, in the order emission
-    /// made them ([`Typing::recover`]).
-    pub(super) recovered: Vec<NodeId>,
+    /// Failure nodes, including suppressed cascades, whose statements a restart omits.
+    failed_nodes: Vec<NodeId>,
+    /// The innermost statement owning each emitted node, including annotation copies.
+    statement_owners: HashMap<NodeId, NodeId>,
+    current_statement: Option<NodeId>,
     /// What each A-normalization temp emitted so far names ([`Typing::note_temp`]).
     temps_written: HashMap<Name, TempNames>,
     /// How a type leaves the scope of each binder in scope ([`ScopeExit`]), read by
@@ -483,7 +485,9 @@ impl InferCtx {
             groups: Vec::new(),
             trait_calls: HashMap::new(),
             recoveries: 0,
-            recovered: Vec::new(),
+            failed_nodes: Vec::new(),
+            statement_owners: HashMap::new(),
+            current_statement: None,
             temps_written: HashMap::new(),
             method_calls: vec![Vec::new()],
             selected_methods: Rc::default(),
@@ -676,7 +680,28 @@ impl InferCtx {
     /// Enter `node`'s rule, returning the previous node for the caller to
     /// restore. Only [`emit_node`](super::emit::emit_node) calls this.
     pub(super) fn enter_node(&mut self, node: NodeId) -> NodeId {
+        self.own_node(node);
         std::mem::replace(&mut self.current_node_id, node)
+    }
+
+    fn own_node(&mut self, node: NodeId) {
+        if let Some(statement) = self.current_statement {
+            self.statement_owners.insert(node, statement);
+        }
+    }
+
+    /// Every pre-coalesce failure uses the ownership recorded during emission.
+    pub(super) fn failure(&self, errors: Vec<LocatedInferError>) -> super::RunFailure {
+        let mut seen = HashSet::new();
+        let recovered = self
+            .failed_nodes
+            .iter()
+            .copied()
+            .chain(errors.iter().map(|e| e.node_id))
+            .filter_map(|node| self.statement_owners.get(&node).copied())
+            .filter(|statement| seen.insert(*statement))
+            .collect();
+        super::RunFailure { errors, recovered }
     }
 
     /// Restore the node whose rule is running, on both exit paths.
@@ -722,6 +747,7 @@ impl InferCtx {
         receiver: &Type,
         node: NodeId,
     ) -> Result<Rc<TraitObligation>, LocatedInferError> {
+        self.own_node(node);
         let call = MethodCall {
             at: RefCell::new((self.level, self.telescope.clone())),
             rows,
@@ -1886,14 +1912,28 @@ impl Typing for InferCtx {
         self.current_node_id
     }
 
+    fn in_statement<R>(&mut self, statement: NodeId, f: impl FnOnce(&mut Self) -> R) -> R {
+        let previous = self.current_statement.replace(statement);
+        self.own_node(self.current_node_id);
+        self.own_node(statement);
+        let result = f(self);
+        self.current_statement = previous;
+        result
+    }
+
     fn recover(
         &mut self,
         error: LocatedInferError,
         reads_before: usize,
-        statement: NodeId,
     ) -> Result<(), LocatedInferError> {
         self.recoveries += 1;
-        self.recovered.push(statement);
+        let statement = self
+            .current_statement
+            .expect("recovery runs inside a statement definition");
+        self.statement_owners
+            .entry(error.node_id)
+            .or_insert(statement);
+        self.failed_nodes.push(error.node_id);
         if self.poisoned_reads == reads_before {
             self.errors.push(error);
         }

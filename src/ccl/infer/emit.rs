@@ -1760,23 +1760,26 @@ pub(super) fn emit_expr_stmt<C: Typing>(
     body: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    // A failed statement is recovered from: its value is discarded either way, and the
-    // method calls it deferred report nothing.
-    let reads_before = ctx.poisoned_reads();
-    if matches!(e.node, TypedExprNode::Error) {
-        ctx.stand_in();
-    } else {
-        ctx.open_method_calls();
-        let emitted = ctx.subexpr(e);
-        ctx.close_method_calls(if emitted.is_ok() {
-            MethodCallsEnd::Monomorphic
+    ctx.in_statement(e.node_id(), |ctx| {
+        // A failed statement is recovered from: its value is discarded either way, and the
+        // method calls it deferred report nothing.
+        let reads_before = ctx.poisoned_reads();
+        if matches!(e.node, TypedExprNode::Error) {
+            ctx.stand_in();
         } else {
-            MethodCallsEnd::Failed
-        });
-        if let Err(error) = emitted {
-            ctx.recover(error, reads_before, e.node_id())?;
+            ctx.open_method_calls();
+            let emitted = ctx.subexpr(e);
+            ctx.close_method_calls(if emitted.is_ok() {
+                MethodCallsEnd::Monomorphic
+            } else {
+                MethodCallsEnd::Failed
+            });
+            if let Err(error) = emitted {
+                ctx.recover(error, reads_before)?;
+            }
         }
-    }
+        Ok(())
+    })?;
     // The continuation's value is passed along: a mutable variable reads, and a feed stays
     // the handle a function hands back (`x: Feed(_); x << n; x`).
     Ok(read_mut(&ctx.subexpr(body)?))
@@ -2226,6 +2229,17 @@ fn emit_let_definition<C: Typing>(
     body: Option<&Expr>,
     ctx: &mut C,
 ) -> Result<(LetScheme, bool), LocatedInferError> {
+    ctx.in_statement(bound_expr.node_id(), |ctx| {
+        emit_let_definition_inner(binding, bound_expr, body, ctx)
+    })
+}
+
+fn emit_let_definition_inner<C: Typing>(
+    binding: &mut TypedBinding,
+    bound_expr: &mut Expr,
+    body: Option<&Expr>,
+    ctx: &mut C,
+) -> Result<(LetScheme, bool), LocatedInferError> {
     let reads_before = ctx.poisoned_reads();
     // Emit the RHS at a deeper level so its locally-minted variables can be
     // generalized at the binding site (`scoped_let`). A polymorphic annotation is
@@ -2295,7 +2309,7 @@ fn emit_let_definition<C: Typing>(
         (true, false) => MethodCallsEnd::Monomorphic,
     };
     for error in ctx.close_method_calls(end) {
-        ctx.recover(error, reads_before, bound_expr.node_id())?;
+        ctx.recover(error, reads_before)?;
         poisoned = true;
     }
     // Lowering refuses a polymorphic annotation on a call or a collection; a name
@@ -2305,7 +2319,7 @@ fn emit_let_definition<C: Typing>(
         let error = ctx.raise(InferError::MonomorphicPolyBinding {
             name: binding.name.base().to_string(),
         });
-        ctx.recover(error, reads_before, bound_expr.node_id())?;
+        ctx.recover(error, reads_before)?;
         poisoned = true;
     }
     let scheme = if poisoned {
@@ -2558,7 +2572,7 @@ fn emit_let_bound<C: Typing>(
     let (rhs, opened) = match opening {
         Ok(emitted) => emitted,
         Err(error) => {
-            ctx.recover(error, reads_before, bound_expr.node_id())?;
+            ctx.recover(error, reads_before)?;
             return Ok(LetBound {
                 ty: poison(ctx),
                 at_annotation: false,
@@ -2573,7 +2587,7 @@ fn emit_let_bound<C: Typing>(
         Ok(ty) => ty,
         Err(error) => {
             match error {
-                Some(error) => ctx.recover(error, reads_before, bound_expr.node_id())?,
+                Some(error) => ctx.recover(error, reads_before)?,
                 None => ctx.stand_in(),
             }
             defined = false;
@@ -2646,7 +2660,7 @@ fn emit_let_bound<C: Typing>(
     if let Some(ann) = &mut binding.user_annotation
         && let Err(error) = emit_annotation_predicates(&mut ann.ty, ctx)
     {
-        ctx.recover(error, reads_before, bound_expr.node_id())?;
+        ctx.recover(error, reads_before)?;
         annotation_typed = false;
     }
     // Whether the variable is bound at a poison rather than at a type the program
@@ -2705,11 +2719,7 @@ fn emit_let_bound<C: Typing>(
             match ctx.in_let_rhs(|ctx| ctx.bind_poly_annotation(&bound_ty, &declared, &shown)) {
                 Ok(ty) => ty,
                 Err(error) => {
-                    ctx.recover(
-                        error.at_annotation(annotation),
-                        reads_before,
-                        bound_expr.node_id(),
-                    )?;
+                    ctx.recover(error.at_annotation(annotation), reads_before)?;
                     poisoned = true;
                     poison(ctx)
                 }
@@ -2738,11 +2748,7 @@ fn emit_let_bound<C: Typing>(
             match ctx.bind_annotation(&bound_ty, &declared) {
                 Ok(ty) => ty,
                 Err(error) => {
-                    ctx.recover(
-                        error.at_annotation(annotation),
-                        reads_before,
-                        bound_expr.node_id(),
-                    )?;
+                    ctx.recover(error.at_annotation(annotation), reads_before)?;
                     poisoned = true;
                     poison(ctx)
                 }
@@ -2900,58 +2906,61 @@ pub(super) fn emit_mut_decl<C: Typing>(
     body: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    // A failed initializer is recovered from: the variable is bound at its
-    // declared history all the same, so its writes still constrain one value type,
-    // and only the seed's contribution is missing.
-    let reads_before = ctx.poisoned_reads();
-    let init_ty = if matches!(init.node, TypedExprNode::Error) {
-        ctx.stand_in();
-        None
-    } else {
-        ctx.open_method_calls();
-        let init_ty = ctx.in_let_rhs(|ctx| emit_value_read(init, ctx));
-        ctx.close_method_calls(if init_ty.is_ok() {
-            MethodCallsEnd::Monomorphic
+    let history = ctx.in_statement(init.node_id(), |ctx| {
+        // A failed initializer is recovered from: the variable is bound at its
+        // declared history all the same, so its writes still constrain one value type,
+        // and only the seed's contribution is missing.
+        let reads_before = ctx.poisoned_reads();
+        let init_ty = if matches!(init.node, TypedExprNode::Error) {
+            ctx.stand_in();
+            None
         } else {
-            MethodCallsEnd::Failed
-        });
-        match init_ty {
-            Ok(ty) => Some(ty),
-            Err(error) => {
-                ctx.recover(error, reads_before, init.node_id())?;
-                None
+            ctx.open_method_calls();
+            let init_ty = ctx.in_let_rhs(|ctx| emit_value_read(init, ctx));
+            ctx.close_method_calls(if init_ty.is_ok() {
+                MethodCallsEnd::Monomorphic
+            } else {
+                MethodCallsEnd::Failed
+            });
+            match init_ty {
+                Ok(ty) => Some(ty),
+                Err(error) => {
+                    ctx.recover(error, reads_before)?;
+                    None
+                }
+            }
+        };
+        let mut history = ctx.normalize(&binding.ty);
+        // The declared value type's predicates are terms, and the binder's slot is what
+        // carries them to the post-inference wall — an untyped one surfaces there as
+        // `UnresolvedInfer` on the predicate's own nodes (see
+        // `emit_annotation_predicates`). A mutable variable declares its refinement on the
+        // binder rather than in a `user_annotation`, so this is the only place that types it.
+        // Routed through the mode for the reason `emit_lambda`'s call is: Check trusts a
+        // resolved predicate.
+        if let Err(error) = ctx.type_annotation_predicates(&mut history) {
+            ctx.recover(error, reads_before)?;
+        }
+        debug_assert!(
+            history.mut_value_type().is_some(),
+            "a MutDecl binder must be an Overwrite history, got {history}"
+        );
+        if let Some(init_ty) = init_ty
+            && let Some(value) = history.mut_value_type()
+            && !matches!(value, Type::Hole)
+        {
+            let value_ty = value.clone();
+            let label = binding.name.clone();
+            let seeded = ctx.require_sub(&init_ty, &value_ty, &|| {
+                format!("initializer of mutable `{label}`")
+            });
+            if let Err(error) = seeded {
+                ctx.recover(error, reads_before)?;
             }
         }
-    };
-    let mut history = ctx.normalize(&binding.ty);
-    // The declared value type's predicates are terms, and the binder's slot is what
-    // carries them to the post-inference wall — an untyped one surfaces there as
-    // `UnresolvedInfer` on the predicate's own nodes (see
-    // `emit_annotation_predicates`). A mutable variable declares its refinement on the
-    // binder rather than in a `user_annotation`, so this is the only place that types it.
-    // Routed through the mode for the reason `emit_lambda`'s call is: Check trusts a
-    // resolved predicate.
-    if let Err(error) = ctx.type_annotation_predicates(&mut history) {
-        ctx.recover(error, reads_before, init.node_id())?;
-    }
-    debug_assert!(
-        history.mut_value_type().is_some(),
-        "a MutDecl binder must be an Overwrite history, got {history}"
-    );
-    if let Some(init_ty) = init_ty
-        && let Some(value) = history.mut_value_type()
-        && !matches!(value, Type::Hole)
-    {
-        let value_ty = value.clone();
-        let label = binding.name.clone();
-        let seeded = ctx.require_sub(&init_ty, &value_ty, &|| {
-            format!("initializer of mutable `{label}`")
-        });
-        if let Err(error) = seeded {
-            ctx.recover(error, reads_before, init.node_id())?;
-        }
-    }
-    binding.ty = history.clone();
+        binding.ty = history.clone();
+        Ok(history)
+    })?;
     // Monomorphic, like every other non-`let` binder: a mutable variable is a single
     // object with one writer set, so there is nothing to generalize and
     // specializing it would duplicate the mutable variable.

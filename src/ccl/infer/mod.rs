@@ -747,7 +747,7 @@ pub(crate) struct RunOutcome {
 /// starts over in `arena`, restarted, on a copy of `expr` as it was, with the expression of
 /// each statement recovered from replaced by the [`Error`](crate::ccl::TypedExprNode::Error)
 /// stand-in. A run the barrier check or the requirement sweep stops starts over the same
-/// way, without the statements enclosing their failures ([`failed_in_statements`]). The
+/// way, without the statements enclosing their failures ([`context::InferCtx::failure`]). The
 /// statements left in are then solved over a graph holding exactly their constraints, and
 /// what that run reports is added, but for a value it leaves undetermined
 /// ([`InferError::is_undetermined`]): the missing statements' constraints may be what
@@ -799,7 +799,7 @@ pub(crate) fn run_with_params(
     let mut stood_in: HashMap<NodeId, StandIn> = HashMap::new();
     let mut typed = None;
     if recover_all && recovered.is_empty() {
-        recovered = failed_in_statements(&pristine, errors.clone()).recovered;
+        recovered = failed_after_coalesce(&pristine, errors.clone()).recovered;
     }
     loop {
         // A statement recovered from stands in; one that is recovered from as a stand-in
@@ -836,7 +836,7 @@ pub(crate) fn run_with_params(
         // Restart copies preserve node identities. Equal messages at different nodes can
         // report independent defects, so only a repeat at the same node is dropped.
         recovered = if recover_all && failure.recovered.is_empty() {
-            failed_in_statements(&pristine, failure.errors.clone()).recovered
+            failed_after_coalesce(&pristine, failure.errors.clone()).recovered
         } else {
             failure.recovered
         };
@@ -1011,17 +1011,12 @@ fn holds_stand_in(expr: &Expr) -> bool {
 }
 
 /// Why one run of inference ([`run_once`]) failed.
-// TODO(recovery-attribution): unify pre-coalesce statement attribution after establishing
-// whether emission can blame a node outside the statement it stops. Emission currently
-// supplies the statement to Typing::recover; deferred calls and whole-graph checks find it
-// with failed_in_statements. Coalesce recovery is a separate policy.
 struct RunFailure {
     /// What it reports.
     errors: Vec<LocatedInferError>,
     /// The expression of each statement a run that starts over leaves out: one emission
-    /// recovered from ([`typing::Typing::recover`]), when emission reached the end of the
-    /// tree, or one enclosing a failure of a check of the whole graph
-    /// ([`failed_in_statements`]). Empty when coalesce or a later pass failed, since those
+    /// owned during emission, including deferred calls and whole-graph failures
+    /// ([`context::InferCtx::failure`]). Empty when coalesce or a later pass failed, since those
     /// report every failing node already.
     recovered: Vec<NodeId>,
 }
@@ -1114,12 +1109,9 @@ pub(crate) fn stand_in_for_recovered(
     expr.walk_children_mut(|child| stand_in_for_recovered(child, stood_in, keep_signature));
 }
 
-/// A run's failure in a check of the whole graph, the barrier check or the requirement
-/// sweep, which stops it before coalesce: `errors`, and the expression of the innermost
-/// statement enclosing each error's node, which a run that starts over leaves out as it
-/// leaves out a statement emission recovered from. An error no statement encloses names
-/// none.
-fn failed_in_statements(expr: &Expr, errors: Vec<LocatedInferError>) -> RunFailure {
+/// Locate post-coalesce failures in the original tree for partial module contracts.
+/// Pre-coalesce failures use the ownership recorded while emitting each statement.
+fn failed_after_coalesce(expr: &Expr, errors: Vec<LocatedInferError>) -> RunFailure {
     use crate::ccl::TypedExprNode;
     fn go(e: &Expr, within: Option<NodeId>, nodes: &HashSet<NodeId>, out: &mut Vec<NodeId>) {
         let expression = match &e.node {
@@ -1202,35 +1194,28 @@ fn run_once(
         let [calls] = std::mem::take(&mut sub_ctx.method_calls)
             .try_into()
             .unwrap_or_else(|_| panic!("every definition closes the method calls it opens"));
-        let failure = failed_in_statements(
-            expr,
+        errors.extend(
             calls
                 .iter()
                 .filter(|call| call.obligation.is_waiting())
-                .map(|call| call.unresolved())
-                .collect(),
+                .map(|call| call.unresolved()),
         );
-        errors.extend(failure.errors);
-        sub_ctx.recovered.extend(failure.recovered);
     }
-    let recovered = if emitted.is_ok() {
-        std::mem::take(&mut sub_ctx.recovered)
-    } else {
-        Vec::new()
-    };
     if let Err(e) = emitted {
         errors.push(e);
     }
-    if !errors.is_empty() {
-        return Err(RunFailure { errors, recovered });
+    let failure = sub_ctx.failure(errors);
+    if !failure.errors.is_empty() || !failure.recovered.is_empty() {
+        return Err(failure);
     }
+    let mut errors = Vec::new();
 
     // Check each barrier variable's upper bounds against its resolution. The checks add
     // bounds, so they run before anything reads the graph: compaction reads a barrier
     // variable's lower bounds and nothing else (`solver::barrier`).
     push_barrier_failures(&mut errors, expr.node_id(), "this value");
     if !errors.is_empty() {
-        return Err(failed_in_statements(expr, errors));
+        return Err(sub_ctx.failure(errors));
     }
 
     // The graph is complete here and nothing has been materialized yet — the one
@@ -1318,7 +1303,7 @@ fn run_once(
                 .filter(|(_, known)| *known)
                 .map(|(e, _)| e.clone())
                 .collect();
-            let mut failure = failed_in_statements(expr, attributed);
+            let mut failure = sub_ctx.failure(attributed);
             failure.errors = located.into_iter().map(|(error, _)| error).collect();
             return Err(failure);
         }

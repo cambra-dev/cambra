@@ -346,8 +346,11 @@ typed.
 The two checks that read the whole graph before coalesce stop a run too, each after reporting every
 failure it finds: the barrier check and the [operand-requirement
 sweep](#requirements-are-read-together-once). Inference starts over the same way, leaving out the
-innermost statement enclosing each failure's node (`failed_in_statements`). A failure no statement
-encloses leaves nothing out.
+statement owning each failure's node. Emission records that ownership while typing each definition
+or initializer, including copied annotation predicates and deferred method placeholders. Every
+pre-coalesce failure uses this record, including suppressed cascades. Each statement is selected
+once per run, so repeated failures cannot skip expression recovery and discard its declaration.
+A failure outside every statement leaves nothing out.
 
 A statement recovered from again as a stand-in stands in **bare** in the next run: its declared
 type is left out too, so the `let` binds at a poison and the `:=` at a history whose value type is
