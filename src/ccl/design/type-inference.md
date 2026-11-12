@@ -356,9 +356,9 @@ Each later run's errors are added to the earlier runs', but for those saying the
 determine a type (`InferError::is_undetermined`): an unresolved variable or tuple width, or a
 method call with no receiver type. The constraints a stand-in removed may be what determines such a
 value, and they can raise nothing else, since removing constraints removes conflicts and adds none.
-An error with an earlier run's message at the same node is not added. Restart copies preserve node
-identities. Equal messages at different nodes remain separate reports: a later run can uncover an
-independent failure at another site.
+An error matching an earlier run's `InferError::same_defect` at the same node is not added. Restart
+copies preserve node identities. Equal messages at different nodes remain separate reports: a later
+run can uncover an independent failure at another site.
 
 Check mode shares the rules and does not recover at statements: its rules record a failed
 constraint and continue, and an error a rule returns ends the walk.

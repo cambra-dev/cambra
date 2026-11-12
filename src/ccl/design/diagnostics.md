@@ -57,6 +57,7 @@ separately. `defect_reports.rs` checks each rule below.
   reported as having no common type, `x + 1` over the elements of `[1, "a"]` failing at `"a"`, is
   that join met where its values are used, and fixing the join fixes it. Such an error is dropped
   (`drop_met_downstream`), read by the node its "the value comes from here" label names.
+  A statement's continuation is outside that join, so defects in later statements remain.
 - **One span and one defect are one diagnostic.** `compile_program` merges inference errors
   that underline one span and satisfy `InferError::same_defect`, keeping the secondary labels
   of each (`Blame::infer`).

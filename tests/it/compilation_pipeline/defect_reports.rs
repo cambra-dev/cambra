@@ -349,8 +349,14 @@ fn a_carrier_of_two_conflicts_keeps_both_original_defects() {
         1
     "#},
     &[
-        "def f(a):\n    (a + 1, a + \"s\")\n",
-        "def g(b):\n    (b + 1, b + \"s\")\n",
+        indoc! {r#"
+            def f(a):
+                (a + 1, a + "s")
+        "#},
+        indoc! {r#"
+            def g(b):
+                (b + 1, b + "s")
+        "#},
     ],
 )]
 // A barrier check's failure leaves its statement out as an emission error does.
@@ -470,4 +476,46 @@ fn a_carrier_of_two_conflicts_keeps_both_original_defects() {
 )]
 fn each_defect_is_reported_past_a_failed_statement(#[case] code: &str, #[case] expected: &[&str]) {
     assert_eq!(underlined(code), expected);
+}
+
+#[test]
+fn an_independent_defect_after_a_join_blamed_at_its_statement_is_reported() {
+    let got = underlined(indoc! {r#"
+        xs = [(1, 2), ("a", 2)]
+        def id(v):
+            v
+        x = id((sku=1))
+        y = x.at
+        (xs, y)
+    "#});
+    assert!(got.iter().any(|u| u == "x.at"), "{got:?}");
+}
+
+#[test]
+fn an_unresolved_method_call_hides_no_later_join() {
+    let got = underlined(indoc! {r#"
+        type Price = Int
+        def Price::cents(self) => Int:
+            Price::extract(self)
+        p = nope
+        q = p.cents()
+        w = [1, "a"]
+        w
+    "#});
+    assert!(got.iter().any(|u| u == "nope"), "{got:?}");
+    assert!(got.iter().any(|u| u == r#"[1, "a"]"#), "{got:?}");
+}
+
+#[test]
+fn an_unresolved_method_call_hides_no_operand_conflict() {
+    let got = underlined(indoc! {r#"
+        type Price = Int
+        def Price::cents(self) => Int:
+            Price::extract(self)
+        def bad(x):
+            (Price::new(1), x + 1, x + "s")
+        q = bad(2).0.cents()
+        q
+    "#});
+    assert!(got.iter().any(|u| u.starts_with("def bad(x):")), "{got:?}");
 }

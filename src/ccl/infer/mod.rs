@@ -121,9 +121,9 @@ pub(super) fn variant_type(tags: BTreeMap<FieldKey, Type>) -> Type {
 
 /// The first node whose type names a variable of a failing operand place.
 /// Equivalent requirement copies are grouped before this walk, so an arena-only copy
-/// contributes the live variables of the same conflict. No match is an attribution bug:
-/// the program root can belong to an unrelated statement and is no fallback for recovery.
-fn blame_node_for_place(expr: &Expr, uids: &[crate::ccl::InferVarId]) -> NodeId {
+/// contributes the live variables of the same conflict. An attribution miss reports at
+/// the root and leaves no statement out of recovery, since the root may be unrelated.
+fn blame_node_for_place(expr: &Expr, uids: &[crate::ccl::InferVarId]) -> Option<NodeId> {
     /// Structural only — deliberately does **not** follow a variable's bounds. The
     /// question is which node's type *is written in terms of* this variable, and
     /// chasing bounds would answer a different one (nearly every node, transitively).
@@ -196,9 +196,12 @@ fn blame_node_for_place(expr: &Expr, uids: &[crate::ccl::InferVarId]) -> NodeId 
         });
         found
     }
-    uids.iter().find_map(|uid| go(expr, *uid)).expect(
+    let node = uids.iter().find_map(|uid| go(expr, *uid));
+    debug_assert!(
+        node.is_some(),
         "a failing operand place is named by the emitted tree after equivalent copies are grouped",
-    )
+    );
+    node
 }
 
 /// Why two functions' kinds do not relate, read off what each side's kind settled to.
@@ -747,6 +750,10 @@ pub(crate) fn run_with_params(
     // Emission rewrites the tree it types, so a run that starts over needs it as it was: a
     // snapshot, at the same identities, since the statements recovered from are named by
     // node. Neither copy joins the tree `expr` is.
+    // TODO(recovery-snapshot): measure snapshot and restart costs on editor-sized programs
+    // before adding inference to the language server, which currently parses only. A
+    // successful run copies the entire tree once; each restart copies it again. Retaining
+    // statement expressions at emission recovery could avoid the successful-run copy.
     let pristine = expr.clone_preserving_ids();
     let RunFailure {
         mut errors,
@@ -780,13 +787,15 @@ pub(crate) fn run_with_params(
         };
         // Restart copies preserve node identities. Equal messages at different nodes can
         // report independent defects, so only a repeat at the same node is dropped.
-        let said: HashSet<(NodeId, String)> = errors
-            .iter()
-            .map(|e| (e.node_id, format!("{:?}", e.error)))
-            .collect();
-        errors.extend(failure.errors.into_iter().filter(|e| {
-            !e.error.is_undetermined() && !said.contains(&(e.node_id, format!("{:?}", e.error)))
-        }));
+        for error in failure.errors {
+            if !error.error.is_undetermined()
+                && !errors.iter().any(|said| {
+                    said.node_id == error.node_id && said.error.same_defect(&error.error)
+                })
+            {
+                errors.push(error);
+            }
+        }
         recovered = failure.recovered;
     }
     drop_met_downstream(&pristine, &mut errors);
@@ -811,9 +820,23 @@ fn drop_met_downstream(tree: &Expr, errors: &mut Vec<LocatedInferError>) {
         found
     }
     fn collect(e: &Expr, out: &mut HashSet<NodeId>) {
+        use crate::ccl::TypedExprNode;
+        // A statement's type is its continuation's value. A failure at the statement
+        // therefore identifies neither its initializer nor later statements as join
+        // contributors. The expression forming the join supplies its own report.
+        if matches!(
+            e.node,
+            TypedExprNode::Let { .. }
+                | TypedExprNode::MutDecl { .. }
+                | TypedExprNode::ExprStmt { .. }
+                | TypedExprNode::DefGroup { .. }
+        ) {
+            return;
+        }
         out.insert(e.node_id());
-        e.walk_children(|c| collect(c, out));
+        e.walk_children(|child| collect(child, out));
     }
+
     let mut joined: HashSet<NodeId> = HashSet::new();
     for error in errors.iter() {
         if let InferError::IncompatibleBounds { polarity: true, .. } = error.error
@@ -838,6 +861,10 @@ fn drop_met_downstream(tree: &Expr, errors: &mut Vec<LocatedInferError>) {
 }
 
 /// Why one run of inference ([`run_once`]) failed.
+// TODO(recovery-attribution): unify pre-coalesce statement attribution after establishing
+// whether emission can blame a node outside the statement it stops. Emission currently
+// supplies the statement to Typing::recover; deferred calls and whole-graph checks find it
+// with failed_in_statements. Coalesce recovery is a separate policy.
 struct RunFailure {
     /// What it reports.
     errors: Vec<LocatedInferError>,
@@ -997,12 +1024,16 @@ fn run_once(
         let [calls] = std::mem::take(&mut sub_ctx.method_calls)
             .try_into()
             .unwrap_or_else(|_| panic!("every definition closes the method calls it opens"));
-        errors.extend(
+        let failure = failed_in_statements(
+            expr,
             calls
                 .iter()
                 .filter(|call| call.obligation.is_waiting())
-                .map(|call| call.unresolved()),
+                .map(|call| call.unresolved())
+                .collect(),
         );
+        errors.extend(failure.errors);
+        sub_ctx.recovered.extend(failure.recovered);
     }
     let recovered = if emitted.is_ok() {
         std::mem::take(&mut sub_ctx.recovered)
@@ -1093,14 +1124,25 @@ fn run_once(
                 ),
             };
             let node_id = match origins.0 {
-                Some(crate::ccl::infer_var::Origin::Node(node)) => node,
+                Some(crate::ccl::infer_var::Origin::Node(node)) => Some(node),
                 _ => blame_node_for_place(expr, &blame_vars),
             };
-            LocatedInferError::new(error, node_id).with_failure(origins)
+            (
+                LocatedInferError::new(error, node_id.unwrap_or(expr.node_id()))
+                    .with_failure(origins),
+                node_id.is_some(),
+            )
         });
-        let errors: Vec<_> = located.collect();
-        if !errors.is_empty() {
-            return Err(failed_in_statements(expr, errors));
+        let located: Vec<_> = located.collect();
+        if !located.is_empty() {
+            let attributed = located
+                .iter()
+                .filter(|(_, known)| *known)
+                .map(|(e, _)| e.clone())
+                .collect();
+            let mut failure = failed_in_statements(expr, attributed);
+            failure.errors = located.into_iter().map(|(error, _)| error).collect();
+            return Err(failure);
         }
     }
     // Sealed *after* the requirement sweep, not before: the sweep itself narrows, and
