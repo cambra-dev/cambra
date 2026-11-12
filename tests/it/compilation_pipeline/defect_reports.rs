@@ -532,11 +532,14 @@ fn underlined_by_phase(code: &str) -> Vec<(&'static str, String)> {
     errs.iter()
         .map(|e| {
             let phase = match e {
+                CompileError::Parse(_) => "parse",
                 CompileError::Lower(_) => "lower",
                 CompileError::Infer { .. } => "infer",
-                _ => panic!("expected only lowering and inference errors, got {errs:?}"),
+                _ => panic!("expected only parse, lowering and inference errors, got {errs:?}"),
             };
-            let span = e.span().expect("a lowering or inference error has a span");
+            let span = e
+                .span()
+                .expect("a parse, lowering or inference error has a span");
             (phase, code[span.start..span.end].to_string())
         })
         .collect()
@@ -656,6 +659,40 @@ fn a_lowering_failure_respects_a_stop_before_inference(#[case] stop: cambra::ccl
     );
 }
 
+/// An unreadable sub-expression fails its statement before inference reads its values.
+#[rstest]
+#[case::joined_comprehension(indoc! {r#"
+    users = [(id=1, name="alice"), (id=, name="bob")]
+    orders = [(user_id=1, amount=50)]
+    [(customer=u.name, total=o.amount) for u in users for o in orders if u.id == o.user_id]
+"#})]
+#[case::groupby(indoc! {r#"
+    users = [(id=1, name="alice"), (id=, name="bob")]
+    groupby(users, \u -> u.id)
+"#})]
+fn an_unreadable_list_element_reports_only_its_parse_error(#[case] code: &str) {
+    let phases: Vec<_> = underlined_by_phase(code)
+        .into_iter()
+        .map(|(phase, _)| phase)
+        .collect();
+    assert_eq!(phases, ["parse"]);
+}
+
+#[test]
+fn an_unreadable_list_element_hides_no_independent_join() {
+    let got = underlined_by_phase(indoc! {r#"
+        users = [(id=1, name="alice"), (id=, name="bob")]
+        bad = [1, "s"]
+        bad
+    "#});
+    assert!(got.iter().any(|(phase, _)| *phase == "parse"), "{got:?}");
+    assert!(
+        got.iter()
+            .any(|(phase, span)| *phase == "infer" && span == r#"[1, "s"]"#),
+        "{got:?}"
+    );
+}
+
 /// The mutability rules are inference's, so a type error elsewhere hides none of them
 /// (`src/ccl/design/mutability.md`, "No aliasing: `Mut` values are second-class
 /// (downward-only)").
@@ -692,4 +729,118 @@ fn a_lowering_failure_respects_a_stop_before_inference(#[case] stop: cambra::ccl
 )]
 fn a_mutability_error_is_reported_with_type_errors(#[case] code: &str, #[case] expected: &[&str]) {
     assert_eq!(underlined(code), expected);
+}
+
+/// A statement the parser could not read hides no inference error elsewhere: it binds the
+/// names its head does, as a poison, and nothing reports it again
+/// (`chl-parser/design-chl-parser.md`, "Threading partial ASTs through to lowering").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_join_past_a_broken_binding(
+    indoc! {r#"
+        x = 1 +* 2
+        z = x + 1
+        w = [1, "a"]
+        (z, w)
+    "#},
+    &[("parse", "*"), ("infer", r#"[1, "a"]"#)],
+)]
+#[case::a_join_past_a_broken_function_header(
+    indoc! {r#"
+        def f(a:
+            a
+        w = [1, "a"]
+        (f(1), w)
+    "#},
+    &[("parse", "("), ("infer", r#"[1, "a"]"#)],
+)]
+#[case::a_join_past_a_broken_bracket(
+    indoc! {r#"
+        x = (1 + ]
+        y = x + 1
+        w = [1, "a"]
+        (y, w)
+    "#},
+    &[("parse", "]"), ("infer", r#"[1, "a"]"#)],
+)]
+// A declaration states its types in full, so one it cannot read fails it, and only the
+// lexer reports it.
+#[case::a_declaration_with_a_broken_type(
+    indoc! {"
+        type Price = {Int where _ >
+        p = Price::new(3)
+        p
+    "},
+    &[("parse", "{")],
+)]
+#[case::a_loop_with_a_broken_statement(
+    indoc! {r#"
+        total := 0
+        for x in [1, 2]:
+            total +=
+        w = [1, "a"]
+        (total, w)
+    "#},
+    &[("parse", "\n"), ("infer", r#"[1, "a"]"#)],
+)]
+// A `run` cut off after its `as` binds a module name no one can read, which a qualifier
+// may be.
+#[case::a_join_past_a_run_cut_off_before_its_name(
+    indoc! {r#"
+        run nothere as
+        z = a::x + 1
+        w = [1, "a"]
+        (z, w)
+    "#},
+    &[("parse", "\n"), ("infer", r#"[1, "a"]"#)],
+)]
+#[case::an_await_of_a_broken_declaration(
+    indoc! {"
+        pool: M$ut(Int, Txn) := 100
+        await_final(pool)
+    "},
+    &[("parse", "$")],
+)]
+fn inference_runs_past_a_statement_the_parser_could_not_read(
+    #[case] code: &str,
+    #[case] expected: &[(&str, &str)],
+) {
+    let expected: Vec<(&str, String)> = expected.iter().map(|(p, s)| (*p, s.to_string())).collect();
+    assert_eq!(underlined_by_phase(code), expected);
+}
+
+#[test]
+fn unreadable_names_do_not_escape_their_block() {
+    let code = indoc! {"
+        def first(x: Int):
+            await_final(x)
+        def second(dummy):
+            x = 1 +* 2
+            1
+        1
+    "};
+    let reports = underlined_by_phase(code);
+    assert_eq!(
+        reports.iter().map(|(phase, _)| *phase).collect::<Vec<_>>(),
+        ["parse", "lower"],
+        "{reports:?}"
+    );
+}
+
+#[test]
+fn an_unreadable_module_alias_does_not_escape_its_block() {
+    let code = indoc! {"
+        def first(dummy):
+            absent::value
+        def second(dummy):
+            run absent as
+            1
+        1
+    "};
+    let reports = underlined_by_phase(code);
+    assert_eq!(
+        reports.iter().map(|(phase, _)| *phase).collect::<Vec<_>>(),
+        ["parse", "lower"],
+        "{reports:?}"
+    );
 }

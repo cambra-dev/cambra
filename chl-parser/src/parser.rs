@@ -46,7 +46,7 @@ pub fn parse_module(file: FileId, source: &str) -> ParseResult<Module> {
     let (out, errs) = module_parser().parse(input).into_output_errors();
     ParseResult {
         value: out.map(|body| Module { file, body }),
-        errors: lex_then_grammar_errors(errors, errs),
+        errors: lex_then_grammar_errors(errors, errs, &tokens, source),
     }
 }
 
@@ -67,7 +67,7 @@ pub fn parse_expression(file: FileId, source: &str) -> ParseResult<Spanned<Expr>
     let (out, errs) = parser.parse(input).into_output_errors();
     ParseResult {
         value: out,
-        errors: lex_then_grammar_errors(errors, errs),
+        errors: lex_then_grammar_errors(errors, errs, &tokens, source),
     }
 }
 
@@ -2353,12 +2353,88 @@ where
         let skip_chain = choice((just(Token::Elif), just(Token::Else)))
             .then(skip_line_and_block.clone())
             .repeated();
-        let stmt_recovery = choice((
-            skip_block_value,
-            skip_indented_block,
-            skip_line_and_block.then(skip_chain).ignored(),
-        ))
-        .map_with(|_, e| Spanned::new(e.span(), Stmt::Error));
+        // TODO(statement-expression-recovery): recover within each statement's expression
+        // parser rather than restating its binding grammar in `head` and `module_head`.
+        // First verify that expression recovery preserves the one-error-per-statement
+        // behavior of nested_block_recovery_reports_one_error_per_mistake.
+        // What the skipped statement binds, read off its head without consuming it, so
+        // the program below it reads the names as bound (`Stmt::Error`).
+        let name = select! { Token::Ident(s) => s };
+        let assigned = name
+            .separated_by(just(Token::Comma))
+            .at_least(1)
+            .collect::<Vec<_>>()
+            .then(choice((
+                just(Token::ColonEq).to(true),
+                one_of([Token::Eq, Token::CaretEq, Token::Colon]).to(false),
+            )));
+        let defined = just(Token::Def)
+            .ignore_then(name)
+            .map(|name| (vec![name], false));
+        let declared = just(Token::Const)
+            .or_not()
+            .ignore_then(just(Token::Param))
+            .ignore_then(name)
+            .map(|name| (vec![name], false));
+        let head = just(Token::BlockValueIndent)
+            .or_not()
+            .ignore_then(just(Token::Pub).or_not())
+            .ignore_then(choice((defined, declared, assigned)))
+            .rewind()
+            .or_not();
+        // An `import` or `run` head: the module name it binds, `None` when it is cut off after
+        // its `as`, and the names its `use` clause binds as far as it reads.
+        let module_head = one_of([Token::Import, Token::Run])
+            .ignore_then(
+                name.separated_by(just(Token::ColonColon))
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )
+            .then_ignore(nested_delimiters(Token::LParen, Token::RParen, [], |_span| ()).or_not())
+            .then(just(Token::As).ignore_then(name.or_not()).or_not())
+            .then(
+                just(Token::Use)
+                    .ignore_then(name.separated_by(just(Token::Comma)).collect::<Vec<_>>())
+                    .or_not(),
+            )
+            .map(|((path, alias), used)| {
+                let module = match alias {
+                    Some(alias) => alias,
+                    None => path.last().cloned(),
+                };
+                (module, used.unwrap_or_default())
+            })
+            .rewind()
+            .or_not();
+        let stmt_recovery = head
+            .then(module_head)
+            .then_ignore(choice((
+                skip_block_value,
+                skip_indented_block,
+                skip_line_and_block.then(skip_chain).ignored(),
+            )))
+            .map_with(|(head, module_head), e| {
+                let (mut binds, mut_assign) = head.unwrap_or_default();
+                let (modules, unknown_module) = match module_head {
+                    Some((module, used)) => {
+                        binds.extend(used);
+                        match module {
+                            Some(module) => (vec![module], false),
+                            None => (Vec::new(), true),
+                        }
+                    }
+                    None => (Vec::new(), false),
+                };
+                Spanned::new(
+                    e.span(),
+                    Stmt::Error {
+                        binds,
+                        mut_assign,
+                        modules,
+                        unknown_module,
+                    },
+                )
+            });
 
         choice((
             if_stmt,
@@ -2408,7 +2484,7 @@ where
 /// on, or `None` for a recovered [`Stmt::Error`], whose own parse error already reports it.
 fn const_refusal(stmt: &Stmt) -> Option<&'static str> {
     Some(match stmt {
-        Stmt::Error => return None,
+        Stmt::Error { .. } => return None,
         Stmt::Param { .. } => "`const` is written once",
         Stmt::Assign { .. } | Stmt::AnnAssign { .. } | Stmt::Pub { .. } => {
             "`const` marks a parameter, `const param x: T`; a binding is a constant when its \
@@ -2432,7 +2508,7 @@ fn pub_refusal(stmt: &Stmt) -> Option<&'static str> {
         | Stmt::FunctionDef { .. }
         | Stmt::TypeDecl(_)
         | Stmt::TraitDecl(_)
-        | Stmt::Error => return None,
+        | Stmt::Error { .. } => return None,
         Stmt::Import { .. } => {
             "`pub` is refused on an `import`: a module exports only what it declares"
         }

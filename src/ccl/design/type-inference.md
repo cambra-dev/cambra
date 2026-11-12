@@ -352,19 +352,24 @@ undeclared. That is a statement whose annotation fails on its own, `def f(x) => 
 with no `r` in scope. Each statement goes the two steps at most, and a run that recovers from no
 statement an earlier run did not, or recovers only from bare ones, is the last.
 
-Lowering stands the same placeholder in for a top-level statement it fails in
+Lowering stands the same placeholder in for a top-level statement it fails in, in any module
 (`stand_in_for_failed` in `lower/stmts.rs`). A usable annotation or declared mutable history
 survives a failed initializer; an annotation that itself fails to lower establishes no type.
 Names without a usable declaration bind at a poison, and a statement introducing nothing is an
-expression statement of the placeholder. A failed last statement leaves the placeholder as the
-block's value, which emission types as a fresh variable. Each contained error carries its own
-placeholder mark, retained through copying and diagnostic merging. When every lowering error is
-marked, the passes reach the earlier of the requested output and inference, and inference's errors
-are added to lowering's. An undetermined type is not reported, as in a run that starts over.
+expression statement of the placeholder. A statement the parser could not read introduces the
+names its head binds in the same way. An unreadable sub-expression fails its enclosing statement
+with `ParseHole`, and the statement stands in whole. This prevents a partially read value from
+contributing constraints ([parser recovery](../../../chl-parser/design-chl-parser.md#threading-partial-asts-through-to-lowering)).
+A failed last statement leaves the placeholder as the block's value, which emission types as a
+fresh variable. The scope check admits names retained by failed definitions, as it admits
+opaque binders: neither has a usable definition to discharge (`ScopeExit::Keep`). Each contained
+error carries its own placeholder mark, retained through copying and diagnostic merging. When every lowering error is marked, the passes reach the earlier of the
+requested output and inference past parse and lowering errors, and inference's errors are added
+to theirs. An undetermined type is not reported, as in a run that starts over.
 
 A module with lowering errors has no interface or linked chain and is not inferred. A reference
-into it lowers to the placeholder. A parse or load error, or a lowering error without a
-placeholder, stops the compile after lowering: the tree can be inconsistent outside a placeholder.
+into it lowers to the placeholder. A load error or a lowering error without a placeholder stops
+the compile after lowering: the tree can be inconsistent outside a placeholder.
 
 Each later run's errors are added to the earlier runs', but for those saying the program does not
 determine a type (`InferError::is_undetermined`): an unresolved variable or tuple width, or a

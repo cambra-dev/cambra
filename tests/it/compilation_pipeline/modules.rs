@@ -1068,6 +1068,25 @@ fn a_reference_into_a_module_with_errors_adds_no_error(#[case] root: &str) {
     assert!(!errors.contains("missing"), "{errors}");
 }
 
+/// Unavailable `use` names are bound at placeholders in imported modules as in the root.
+#[rstest]
+#[case::parse("pub x = = 1")]
+#[case::lower("pub x: Mut(Int) = 3")]
+#[timeout(Duration::from_secs(10))]
+fn a_use_of_a_module_with_errors_adds_no_error_below_the_root(#[case] lib: &str) {
+    let mid = indoc! {"
+        import lib use missing
+        pub v = missing + 1
+    "};
+    let root = indoc! {"
+        import mid
+        mid::v
+    "};
+    let errors = compile_errors(&program(root, &[("mid", mid), ("lib", lib)]));
+    assert!(!errors.contains("Unbound variable"), "{errors}");
+    assert_eq!(report_count(&errors), 1, "{errors}");
+}
+
 /// A reference into a module lowering failed in hides no root inference error. The module
 /// has no interface or linked chain, and the reference lowers to a placeholder
 /// (`src/ccl/design/type-inference.md`, "An error stops its statement, not the pass").

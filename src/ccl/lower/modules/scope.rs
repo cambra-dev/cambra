@@ -167,6 +167,8 @@ impl LoweringContext {
         self.module = scope;
         self.io_site = None;
         self.transactional_vars.clear();
+        self.unreadable.clear();
+        self.unreadable_module = false;
         self.in_tx_body = false;
         self.type_params_in_scope.clear();
         self.shadow_depth.clear();
@@ -478,6 +480,11 @@ impl LoweringContext {
         span: Span,
     ) -> Result<&Qualifier, LoweringError> {
         let Some(qualifier) = self.module.qualifiers.get(name.node.as_str()) else {
+            // A module name a statement the parser could not read binds, or may: its parse
+            // error reports it.
+            if self.unreadable_module || self.unreadable.contains(name.node.as_str()) {
+                return Err(LoweringError::parse_hole(name.span));
+            }
             return Err(LoweringError::unsupported(
                 name.span,
                 format!(

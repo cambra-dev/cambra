@@ -244,6 +244,9 @@ pub(super) fn lower_call(
                 ));
             };
             let name = id.as_str();
+            if ctx.unreadable.contains(name) && !ctx.is_transactional_mut_var(name) {
+                return Err(LoweringError::parse_hole(arg.span));
+            }
             if !ctx.is_transactional_mut_var(name) || ctx.is_shadowed(name) {
                 return Err(LoweringError::unsupported(
                     arg.span,

@@ -465,9 +465,82 @@ fn statement_recovery_collects_multiple_errors_in_one_pass() {
         "expected 3 stmts (Error, Assign, Error), got {:#?}",
         m.body
     );
-    assert!(matches!(m.body[0].node, Stmt::Error));
+    assert!(matches!(m.body[0].node, Stmt::Error { .. }));
     assert!(matches!(m.body[1].node, Stmt::Assign { .. }));
-    assert!(matches!(m.body[2].node, Stmt::Error));
+    assert!(matches!(m.body[2].node, Stmt::Error { .. }));
+}
+
+/// A statement recovery skips still binds what its head does, so the program below it reads
+/// the names as bound (`chl-parser/design-chl-parser.md`, "Statement-level recovery").
+#[test]
+fn statement_recovery_reads_the_binders_of_the_head() {
+    let cases: &[(&str, &[&str], bool)] = &[
+        ("x = 1 +* 2\n", &["x"], false),
+        ("x ^= 1 +* 2\n", &["x"], false),
+        ("a, b = 1 +* 2\n", &["a", "b"], false),
+        ("x: Int = 1 +* 2\n", &["x"], false),
+        ("x := 1 +* 2\n", &["x"], true),
+        ("def f(a:\n    a\n", &["f"], false),
+        ("pub y = 1 +* 2\n", &["y"], false),
+        ("param p: Int = 1 +* 2\n", &["p"], false),
+        ("const param p: Int = 1 +* 2\n", &["p"], false),
+        ("1 +* 2\n", &[], false),
+    ];
+    for (src, binds, mut_assign) in cases {
+        let result = parse_mod(src);
+        assert!(!result.errors.is_empty(), "{src:?} should fail to parse");
+        let m = result.value.expect("recovery should still produce an AST");
+        // `pub` parses the statement after it, with that statement's own recovery.
+        let stmt = match &m.body[0].node {
+            Stmt::Pub { stmt, .. } => &stmt.node,
+            stmt => stmt,
+        };
+        let Stmt::Error {
+            binds: got,
+            mut_assign: got_mut,
+            ..
+        } = stmt
+        else {
+            panic!(
+                "{src:?} should recover as a statement placeholder, got {:#?}",
+                m.body[0]
+            );
+        };
+        assert_eq!(got.as_slice(), *binds, "{src:?}");
+        assert_eq!(got_mut, mut_assign, "{src:?}");
+    }
+}
+
+/// An `import` or `run` recovery skips binds its module name, or a name no one can read when
+/// it is cut off after its `as`, and the names its `use` clause reads.
+#[test]
+fn statement_recovery_reads_the_module_a_head_binds() {
+    let cases: &[(&str, &[&str], &[&str], bool)] = &[
+        ("import lib as l use f +\n", &["l"], &["f"], false),
+        ("import shop::cart +\n", &["cart"], &[], false),
+        ("run lib(x=1) as a +\n", &["a"], &[], false),
+        ("run lib as\n", &[], &[], true),
+    ];
+    for (src, modules, binds, unknown_module) in cases {
+        let result = parse_mod(src);
+        assert!(!result.errors.is_empty(), "{src:?} should fail to parse");
+        let m = result.value.expect("recovery should still produce an AST");
+        let Stmt::Error {
+            binds: got_binds,
+            modules: got_modules,
+            unknown_module: got_unknown,
+            ..
+        } = &m.body[0].node
+        else {
+            panic!(
+                "{src:?} should recover as a statement placeholder, got {:#?}",
+                m.body[0]
+            );
+        };
+        assert_eq!(got_modules.as_slice(), *modules, "{src:?}");
+        assert_eq!(got_binds.as_slice(), *binds, "{src:?}");
+        assert_eq!(got_unknown, unknown_module, "{src:?}");
+    }
 }
 
 #[test]
@@ -503,7 +576,7 @@ fn bad_def_header_does_not_swallow_following_top_level_stmts() {
     assert!(!result.errors.is_empty(), "expected at least one error");
     let m = result.value.expect("recovery should still produce an AST");
     assert_eq!(m.body.len(), 2);
-    assert!(matches!(m.body[0].node, Stmt::Error));
+    assert!(matches!(m.body[0].node, Stmt::Error { .. }));
     assert!(matches!(m.body[1].node, Stmt::Assign { .. }));
 }
 

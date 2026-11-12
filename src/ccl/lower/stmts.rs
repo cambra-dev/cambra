@@ -7,6 +7,7 @@ use crate::ccl::RecordEntry;
 use crate::ccl::module_type::{AliasType, ModuleEntry, ModuleType, TypeEntry, TypeEntryForm};
 use std::{collections::HashSet, rc::Rc};
 
+use super::modules::Reached;
 use super::modules::module_body;
 use super::*;
 use crate::{
@@ -67,6 +68,7 @@ pub(super) fn lower_chain_recovering(
         .map(DeclaredSink::binding)
         .collect();
     errors.extend(sink_rebindings(stmts, &declared));
+    let body = bind_unreached_uses(body, ctx);
     let body = nominal::bind_constructors(body, ctx);
     let (associated, reaches) = nominal::associated_reach(&body, ctx);
     nominal::settle_implicit(&reaches.associated, ctx);
@@ -248,6 +250,7 @@ pub(super) fn lower_stmts_recovering(
                 }
             }
         });
+    let body = bind_unreached_uses(body, ctx);
     let body = nominal::bind_constructors(body, ctx);
     let (associated, reaches) = nominal::associated_reach(&body, ctx);
     nominal::settle_implicit(&reaches.associated, ctx);
@@ -428,12 +431,13 @@ pub(super) fn lower_stmts_inner(
         return Err(nominal::refuse_nested(last.span, decl));
     }
 
-    // Restore transactional declarations and `Mut`- and `Feed`-parameter call shapes on both
-    // success and error, so local declarations can shadow without leaking into sibling or
-    // outer blocks. Induction mutability has no lowering registry; its history type is
-    // checked later.
+    // These registries use pre-uniquify names. Local declarations and unreadable heads
+    // must stop affecting those names when the block exits, on success and error alike.
+    // Induction mutability has no lowering registry; its history type is checked later.
     let snapshot = ctx.snapshot_transactional();
     let saved_history_param_fns = ctx.history_param_fns.clone();
+    let saved_unreadable = ctx.unreadable.clone();
+    let saved_unreadable_module = ctx.unreadable_module;
 
     // Lower the terminal before wrapping preceding statements, innermost first.
     // Alias registration must precede any annotation read by transaction registration.
@@ -449,6 +453,8 @@ pub(super) fn lower_stmts_inner(
     });
     ctx.restore_transactional(snapshot);
     ctx.history_param_fns = saved_history_param_fns;
+    ctx.unreadable = saved_unreadable;
+    ctx.unreadable_module = saved_unreadable_module;
     result
 }
 
@@ -636,7 +642,7 @@ pub(super) fn lower_final_stmt(
             lower_middle_stmt(last, preceding, unit, outer_bindings, ctx, true)
         }
         // Parse-recovery placeholder: silently substitute. See `ChlExpr::Error`.
-        ChlStmt::Error => Ok(Expr::error()),
+        ChlStmt::Error { .. } => Ok(ctx.tag_image(Expr::error(), last.span)),
         // A `type` inside a block is refused before this ([`lower_stmts_inner`]), so one
         // here ends the module.
         ChlStmt::TypeDecl(decl) => Err(LoweringError::unsupported(
@@ -1298,9 +1304,15 @@ pub(super) fn lower_middle_stmt(
             };
             Ok(ctx.tag_image(bound, stmt.span))
         }
-        // Parse-recovery placeholder: silently drop the broken statement and
-        // pass the continuation through. See `ChlExpr::Error`.
-        ChlStmt::Error => Ok(body),
+        // Parse-recovery placeholder: the statement stands in as one lowering failed in
+        // does, binding the names its head does. Its parse error reports it.
+        ChlStmt::Error { .. } => Ok(stand_in_for_failed(
+            stmt,
+            preceding,
+            outer_bindings,
+            body,
+            ctx,
+        )),
         _ => Err(LoweringError::unsupported(
             stmt.span,
             "only assignment and function definition statements are supported \
@@ -1309,9 +1321,11 @@ pub(super) fn lower_middle_stmt(
     }
 }
 
-/// The statement `stmt` stands for when its lowering failed, over its continuation `body`:
-/// each name it introduces bound at the [`Error`](crate::ccl::TypedExprNode::Error)
-/// placeholder, or, when it introduces none, the placeholder as an expression statement.
+/// The statement `stmt` stands for when its lowering failed, or the parser could not read
+/// it, over its continuation `body`: each name it introduces bound at the
+/// [`Error`](crate::ccl::TypedExprNode::Error) placeholder, or, when it introduces none, the
+/// placeholder as an expression statement. A statement the parser could not read introduces
+/// what its head binds ([`ChlStmt::Error`]).
 ///
 /// The continuation was lowered first and names what `stmt` binds, so inference, which runs
 /// on a tree lowering failed in, keeps a usable annotation or declared history and otherwise
@@ -1332,6 +1346,9 @@ fn stand_in_for_failed(
         ChlStmt::AugAssign { .. } => true,
         ChlStmt::MutAssign {
             annotation: None, ..
+        }
+        | ChlStmt::Error {
+            mut_assign: true, ..
         } => {
             let mut scope = outer_bindings.clone();
             collect_stmt_names(preceding, &mut scope);
@@ -1422,12 +1439,37 @@ fn stand_in_for_failed(
     })
 }
 
+/// `body` with each value `use` name of an import that reaches nothing, its module having
+/// errors of its own, bound at the [`Error`](crate::ccl::TypedExprNode::Error) placeholder:
+/// as a statement that failed binds its names, so the uses of one report nothing, and the
+/// module's errors account for it.
+fn bind_unreached_uses(body: Expr, ctx: &mut LoweringContext) -> Expr {
+    let mut unreached: Vec<(SmolStr, Span)> = ctx
+        .module
+        .uses
+        .iter()
+        .filter(|(_, used)| used.run.is_none() && matches!(used.reached, Reached::Value(None)))
+        .map(|(name, used)| (name.clone(), used.item))
+        .collect();
+    // Sorted, so the tree does not depend on the map's order.
+    unreached.sort_by(|(a, _), (b, _)| a.cmp(b));
+    unreached.into_iter().fold(body, |body, (name, item)| {
+        let failed = ctx.tag_image(Expr::error(), item);
+        ctx.tag_machinery(
+            Expr::let_bind(name.as_str(), Occurrence::mint(), failed, body),
+            item,
+            "lower.failed_stmt",
+        )
+    })
+}
+
 /// Collect the names assignment and function-def statements bind into `names`, every name
 /// a destructuring pattern binds included. Used to build `outer_bindings` for mutation
 /// checks.
 ///
 /// A type alias binds no value and so contributes no name: nothing a mutation
-/// check asks about can be answered by a type.
+/// check asks about can be answered by a type. A statement the parser could not read binds
+/// what its head does ([`ChlStmt::Error`]).
 pub(super) fn collect_stmt_names(stmts: &[Spanned<ChlStmt>], names: &mut HashSet<String>) {
     for stmt in stmts {
         match &stmt.node {
@@ -1443,6 +1485,9 @@ pub(super) fn collect_stmt_names(stmts: &[Spanned<ChlStmt>], names: &mut HashSet
             }
             ChlStmt::FunctionDef { name, .. } => {
                 names.insert(name.node.as_str().to_string());
+            }
+            ChlStmt::Error { binds, .. } => {
+                names.extend(binds.iter().map(|n| n.to_string()));
             }
             _ => {}
         }
@@ -2039,6 +2084,19 @@ pub(super) fn mut_annotation_parts(
 pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut LoweringContext) {
     for stmt in stmts {
         match &stmt.node {
+            // A statement the parser could not read may have declared a transactional
+            // variable among the names it binds.
+            ChlStmt::Error {
+                binds,
+                modules,
+                unknown_module,
+                ..
+            } => {
+                ctx.unreadable.extend(binds.iter().map(ToString::to_string));
+                ctx.unreadable
+                    .extend(modules.iter().map(ToString::to_string));
+                ctx.unreadable_module |= unknown_module;
+            }
             // `x: Mut(V, Txn) := e` — a transactional-variable introduction.
             // Register `x` so a following loop's `with begin(): x := …` write is
             // recognised as a commit and a bare read of `x` is gated. A bare
@@ -3614,6 +3672,8 @@ pub(super) fn lower_type_expr_or_poly(
             ctx.restore_type_aliases(snapshot);
             poly
         }
+        // A type the parser could not read, which its parse error reports.
+        ChlExpr::Error => Err(LoweringError::parse_hole(annotation.span)),
         other => Err(LoweringError::unsupported(
             annotation.span,
             format!("{} is not a type", describe_type_form(other)),

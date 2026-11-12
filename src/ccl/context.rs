@@ -2032,22 +2032,32 @@ fn run_frontend(
     let run_sites = std::mem::take(&mut ctx.lowering_ctx().run_sites);
     let resolved_names = ctx.lowering_ctx().take_resolved_names();
     let contained = lower_result.errors.iter().all(LoweringError::has_stand_in);
-    errors.extend(lower_result.errors.into_iter().map(CompileError::Lower));
+    errors.extend(
+        lower_result
+            .errors
+            .into_iter()
+            .filter(|e| !e.is_parse_hole())
+            .map(CompileError::Lower),
+    );
     let Some(mut expr) = lower_result.value else {
         return Err(errors);
     };
 
-    // A statement lowering failed in is the `TypedExprNode::Error` placeholder, binding
-    // the names it introduces (`lower::stmts::stand_in_for_failed`), which the passes up
-    // to and including inference read as a statement that failed. A statement the parser
-    // could not read names nothing it binds, a module that did not load nothing it
-    // declares, and a lowering error no placeholder stands for, such as a run missing a
-    // type argument, can leave the tree inconsistent where it is read: past any of those,
-    // bail here.
-    if !contained || errors.iter().any(|e| !matches!(e, CompileError::Lower(_))) {
+    // A statement lowering failed in, or the parser could not read, is the
+    // `TypedExprNode::Error` placeholder, binding the names it introduces
+    // (`lower::stmts::stand_in_for_failed`), which the passes up to and including
+    // inference read as a statement that failed; so is an expression the parser could not
+    // read. A module that did not load names nothing it declares, and a lowering error no
+    // placeholder stands for, such as a run missing a type argument, can leave the tree
+    // inconsistent where it is read: past either, bail here.
+    if !contained
+        || errors
+            .iter()
+            .any(|e| !matches!(e, CompileError::Lower(_) | CompileError::Parse(_)))
+    {
         return Err(errors);
     }
-    let lowering_errors = errors;
+    let stood_in_for = errors;
 
     // Fold anything this pass opened into the source/sink registry before the
     // per-compilation registries are drained, so the next version inherits it.
@@ -2083,8 +2093,8 @@ fn run_frontend(
 
     let mut panes = BTreeMap::new();
     if at_phase_output(Phase::Lower, &expr, stop, capture, &mut panes) {
-        if !lowering_errors.is_empty() {
-            return Err(lowering_errors);
+        if !stood_in_for.is_empty() {
+            return Err(stood_in_for);
         }
         return Ok(Frontend {
             expr,
@@ -2104,8 +2114,8 @@ fn run_frontend(
     expr = uniquify::run(expr);
 
     let blame = Blame::new(&lowering_projection, sources).with_runs(&run_sites);
-    // Lowering errors cap the requested output at inference; earlier stops still apply.
-    let lowering_failed = !lowering_errors.is_empty();
+    // Parse and lowering errors cap the requested output at inference; earlier stops still apply.
+    let lowering_failed = !stood_in_for.is_empty();
     let inferred = run_passes(
         ctx,
         expr,
@@ -2122,7 +2132,7 @@ fn run_frontend(
         lowering_failed,
     );
     if lowering_failed {
-        let mut errors = lowering_errors;
+        let mut errors = stood_in_for;
         errors.extend(inferred.err().unwrap_or_default());
         return Err(merged_copies(errors));
     }
@@ -2442,7 +2452,13 @@ pub fn check_program(
     }
     let lowering_session = LoweringSession::install();
     let lowered = lower_for_check(program, ctx.lowering_ctx());
-    errors.extend(lowered.into_iter().map(CompileError::Lower));
+    // A part the parser could not read is reported by its parse error.
+    errors.extend(
+        lowered
+            .into_iter()
+            .filter(|e| !e.is_parse_hole())
+            .map(CompileError::Lower),
+    );
     let checks = std::mem::take(&mut ctx.lowering_ctx().module_checks);
     if !errors.is_empty() {
         return Err(errors);
@@ -2485,8 +2501,9 @@ pub fn check_program(
 /// Split out of [`run_frontend`] only so each phase boundary can `return` the
 /// tree; the two are one pipeline. Every phase ends with one
 /// [`at_phase_output`] call, which is both where a pane is taken and where a
-/// stop happens. With `lowering_failed`, the tree holds statements lowering failed in,
-/// and the sequence stops once inference has run, before any check of its result.
+/// stop happens. With `holds_stand_ins`, the tree holds statements the parser or lowering
+/// failed in, and the sequence stops once inference has run, before any check of its
+/// result.
 #[allow(clippy::too_many_arguments)]
 fn run_passes(
     ctx: &mut GlobalContext,
@@ -2497,7 +2514,7 @@ fn run_passes(
     record: bool,
     mut blame: Blame<'_>,
     panes: &mut BTreeMap<Phase, Expr>,
-    lowering_failed: bool,
+    holds_stand_ins: bool,
 ) -> Result<Expr, Vec<CompileError>> {
     // Phase recording for the rows the pane-pair folds read. One scope per
     // phase, opened and closed in place: a phase scope is per-thread and
@@ -2636,8 +2653,9 @@ fn run_passes(
             .collect();
         return Err(blame.infer(errors, &expr));
     }
-    // The checks below read a tree that typed, which a statement lowering failed in is not.
-    if lowering_failed {
+    // The checks below read a tree that typed, which a statement the parser or lowering
+    // failed in is not.
+    if holds_stand_ins {
         return Ok(expr);
     }
     // Inference mints predicates (`lit_singleton`) and clones a definition per

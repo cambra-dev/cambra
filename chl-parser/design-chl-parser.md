@@ -307,6 +307,18 @@ least one token. This prevents a zero-progress success inside `repeated()` and l
 block consume its own closer without an additional diagnostic.
 `nested_block_recovery_reports_one_error_per_mistake` covers that boundary behavior.
 
+Before skipping, recovery reads the statement's head without consuming it (`rewind`), and the
+placeholder carries the names the head binds: `x = …`, `a, b = …`, `x: …`, `x ^= …`,
+`x := …`, `def f…` or `param x…`, after an optional `BlockValueIndent` and `pub`. A `:=` head is
+marked, since it writes a name already in scope rather than introducing it. An `import` or `run`
+head binds its module name, its `as` name or its path's last segment, and the names of its `use`
+clause; one cut off after its `as` binds a module name no one can read, and lowering then reads a
+qualifier that names no module as one it may be. A head that reads as none of these binds nothing.
+The program below the statement reads the names as bound, so a use of one is not reported as
+unbound (see [Threading partial ASTs through to lowering](#threading-partial-asts-through-to-lowering)).
+`statement_recovery_reads_the_binders_of_the_head` in `tests/it/chl_parser_roundtrip.rs` covers each
+head.
+
 A semicolon terminates a valid simple statement, but is not a synchronization token for this
 recovery parser. Recovery can therefore discard later semicolon-separated text on the same
 logical line. It does not promise one error per source-level mistake.
@@ -503,6 +515,14 @@ grammar error whose found token is a `Token::Error` or a zero-width closer is dr
 result, because the lexical error at that place already reports it. Each zero-width closer comes
 with exactly one `UnclosedBracket` or `MismatchedClose`, which `tokenize` asserts in debug builds.
 
+Two more grammar errors are dropped because the zero-width closer's place is the lexer's guess
+(`lex_then_grammar_errors`). One stands at the token after a zero-width closer: `def f(x:` reads
+as `def f(x:)`, so the parser meets the line's end where a `:` or `=>` belongs. The other stands
+inside a bracket a zero-width closer closes, on a line after the bracket's: the lexer kept that
+line inside the bracket by indentation alone ([Later: parser-driven recovery for unclosed
+brackets](#later-parser-driven-recovery-for-unclosed-brackets)). An error inside the bracket on its
+own line is kept, since the line the bracket opens on is the source's, `f(1 +* 2` included.
+
 The dropped error can be a second mistake at the same place. In `x = f(a if`, the parser expects
 an expression at the zero-width `)`, and only the `UnclosedBracket` is reported.
 
@@ -544,9 +564,10 @@ closed" at that bracket. Here the analogue drops a grammar error that falls betw
 `UnclosedBracket` and its zero-width closer, on a later line than the bracket. In the example
 above it removes the error at `return`, and `return x` stays inside `f`'s parameter list.
 
-None is implemented. A recovery corpus case where the second layout pass closes a bracket at the
-wrong line is the evidence for the first two. A grammar error inside an unclosed bracket that a
-corpus golden reports is the evidence for the third.
+The third is implemented ([One diagnostic per lexical error](#one-diagnostic-per-lexical-error)),
+which leaves `return x` inside `f`'s parameter list but reports only the unclosed bracket. A
+recovery corpus case where the second layout pass closes a bracket at the wrong line is the
+evidence for the first two.
 
 ### Recovery API
 
@@ -579,11 +600,29 @@ included, allowing independent lowering errors to appear in the same response. L
 token stream [Lexer recovery](#lexer-recovery) leaves, so a call the lexer closed with a
 zero-width closer lowers as an ordinary call.
 
-Lowering maps recovered error nodes to `TypedExprNode::Error` without reporting the same
-parse failure again. `LoweringResult` also carries an optional value and errors.
-The frontend appends lowering errors and returns if no CCL value is available or if either
-stage reported an error. Inference and later phases do not run on that result.
-This guard applies to diagnostics from validation as well as explicit AST holes.
+Lowering replaces recovered statement errors with `TypedExprNode::Error` without duplicating
+their parse diagnostics. An `Expr::Error` fails its enclosing statement with
+`LoweringError::ParseHole`. Statement recovery replaces the whole statement with a placeholder
+and preserves usable annotations and mutable histories. A `Stmt::Error` binds each name its head
+binds at the placeholder (`stand_in_for_failed`), so its uses read a poison and report nothing.
+An unreadable type, a statement in a loop or transaction block, or a name whose declaration is
+unavailable, such as an `await_final` operand, also fails its construct with `ParseHole`. The
+frontend suppresses these lowering diagnostics because the parser reports the cause.
+Unreadable binding and module names are scoped to their statement block. Leaving a block
+restores the outer names on both success and error, so a malformed declaration hides no
+independent error in a sibling block.
+`LoweringResult` retains its optional value and errors.
+
+The frontend appends lowering errors and returns if no CCL value is available. Past parse and
+lowering errors alone, when every lowering error is one a placeholder stands for, it runs the
+passes up to and including inference, adds inference's errors, and stops: no later phase runs on
+the result. Inference reports no undetermined type in such a tree, which the left-out statements
+may be what determines (`src/ccl/design/type-inference.md`, "An error stops its statement, not
+the pass"). A loading error stops the frontend after lowering, as does a lowering error no
+placeholder stands for. Bracket recovery can still change a statement's shape, which lowering then
+reports: the lexer closes an unclosed bracket where the statement ends ([Unclosed
+brackets](#unclosed-brackets)), so in a list written one record per line, a record missing its
+`)` is called with the record on the next line.
 
 The returned `Vec<CompileError>` contains stage-tagged errors, not an assertion that all
 possible errors were discovered. Regressions include `multiple_parse_errors_all_surface`,
