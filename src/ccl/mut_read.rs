@@ -233,9 +233,10 @@ fn spine(expr: Expr, muts: &Muts, open: &mut Open) -> Expr {
             }
             // `await_final(x)` reads `x`, so its binding is sealed for the reason a read's
             // is: a transparent binder reads `x` back into a type lifted out of its scope.
-            // It opens no segment. Its value is the one the writes settle to, not the one
-            // this point of the block holds.
-            if binding.name.is_anf_temp() && is_await_final_of_mut(&bound_expr, muts) {
+            // The bound expression decides this, so a source-written binding is sealed as an
+            // A-normalization temp is. It opens no segment. Its value is the one the writes
+            // settle to, not the one this point of the block holds.
+            if is_await_final_of_mut(&bound_expr, muts) {
                 binding.transparency = BindingTransparency::Opaque;
                 let body = spine(*body, muts, open);
                 return rebuild(TypedExprNode::Let {

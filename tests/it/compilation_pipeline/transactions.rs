@@ -1323,6 +1323,24 @@ fn await_final_bound_then_computed_with() {
     );
 }
 
+/// A refined operation over `await_final`: its result type reads the awaited value, so that
+/// value is bound opaquely and the type names the binder rather than the mutable variable.
+#[rstest]
+#[case::inline("await_final(a) ^+ 1")]
+#[case::named("final = await_final(a)\nfinal ^+ 1")]
+fn refined_op_over_await_final(#[case] tail: &str) {
+    let code = indoc! {r#"
+        a: Mut(Int, Txn) := 0
+        for x in [1, 2]:
+            with begin():
+                a := a ^+ x
+    "#};
+    check_tile(
+        &format!("{code}{tail}\n"),
+        Tile::Scalar(ColumnValue::Ints(vec![4])),
+    );
+}
+
 /// Every transaction denies, so nothing is ever committed and the final value is
 /// the seed — `final_or_default`'s default, which is what the CHL spec means by
 /// "or the initializer if it was never committed".
