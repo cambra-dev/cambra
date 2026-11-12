@@ -164,6 +164,8 @@ pub enum LoweringError {
         /// Other positions the message names, each with its label: the first declaration
         /// of a name declared twice.
         related: Vec<(Span, String)>,
+        /// Whether a recovery placeholder contains this failure.
+        stood_in: bool,
     },
     /// A program the language accepts and the compiler cannot compile yet, refused here
     /// rather than left to fail in a later phase: a compiler gap to fix, not a mistake in
@@ -175,6 +177,8 @@ pub enum LoweringError {
         message: String,
         /// Other positions the message names, each with its label, as for `Unsupported`.
         related: Vec<(Span, String)>,
+        /// Whether a recovery placeholder contains this failure.
+        stood_in: bool,
     },
 }
 
@@ -201,6 +205,7 @@ impl LoweringError {
             span,
             message: message.into(),
             related: Vec::new(),
+            stood_in: false,
         }
     }
 
@@ -216,6 +221,26 @@ impl LoweringError {
             span,
             message: message.into(),
             related: Vec::new(),
+            stood_in: false,
+        }
+    }
+
+    /// This error contained by the recovery placeholder of its failed statement.
+    fn with_stand_in(mut self) -> Self {
+        *self.stand_in_mut() = true;
+        self
+    }
+
+    /// Whether a recovery placeholder contains this failure.
+    pub(crate) fn has_stand_in(&self) -> bool {
+        match self {
+            Self::Unsupported { stood_in, .. } | Self::Internal { stood_in, .. } => *stood_in,
+        }
+    }
+
+    fn stand_in_mut(&mut self) -> &mut bool {
+        match self {
+            Self::Unsupported { stood_in, .. } | Self::Internal { stood_in, .. } => stood_in,
         }
     }
 
@@ -266,22 +291,18 @@ impl LoweringError {
     }
 }
 
-/// Output of [`lower_stmts`].
-///
-/// Mirrors the shape of [`crate::chl_parser::parser::ParseResult`]: a (possibly
-/// partial) lowered expression is returned alongside every error encountered,
-/// so callers can surface every diagnostic in one pass.  Failed sub-trees are
-/// filled with [`TypedExprNode::Error`] placeholders — these are only valid
-/// while `errors` is non-empty; callers must check `errors` before passing the
-/// tree to inference or any downstream stage.
+/// Output of [`lower_stmts`]: a partial tree beside its errors. Inference can read it when
+/// every error has a recovery placeholder ([`LoweringError::has_stand_in`]); other errors
+/// can leave the tree inconsistent outside a placeholder. No later pass reads a tree with
+/// lowering errors.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoweringResult {
     /// The lowered expression. `Some` even on error if recovery produced
     /// anything usable; `None` only when there is nothing structural to
     /// return at all (e.g. an empty top-level statement list).
     pub value: Option<Expr>,
-    /// Errors collected during lowering.  Non-empty implies `value` (if
-    /// `Some`) contains [`TypedExprNode::Error`] placeholders.
+    /// Failures collected during lowering, each marked when a recovery placeholder
+    /// contains it ([`LoweringError::has_stand_in`]).
     pub errors: Vec<LoweringError>,
 }
 
@@ -678,10 +699,6 @@ pub struct LoweringContext {
     /// ([`ResolvedName`]). Behind a cell because the lookups that resolve them borrow
     /// the context immutably.
     resolved_names: RefCell<Vec<ResolvedName>>,
-    /// How many errors lowering reported at a statement it stood the placeholder in for
-    /// (`stmts::stand_in_for_failed`). The tree lowering returns is one inference can read
-    /// when these are all its errors; another error can leave it inconsistent elsewhere.
-    pub(crate) stood_in: usize,
     /// Every binder the module being lowered writes, with its span, for the rule
     /// that none takes a name that denotes a module ([`module_name_binders`]).
     pub(super) module_binders: Vec<(SmolStr, Span)>,

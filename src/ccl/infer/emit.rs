@@ -477,9 +477,9 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             Type::Base(BaseType::Unit)
         }
 
-        // A block's last statement, which lowering failed in: its value is one nothing
-        // states, and a statement rule meets the placeholder anywhere else
-        // (`Typing::stand_in`).
+        // A statement lowering failed in, or a reference into a module that failed
+        // lowering: a value nothing states. A statement rule keeps declared constraints
+        // over the placeholder (`Typing::stand_in`).
         TypedExprNode::Error => ctx.fresh(),
     };
 

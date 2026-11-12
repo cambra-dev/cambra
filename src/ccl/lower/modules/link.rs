@@ -429,6 +429,10 @@ pub(super) fn in_source_order(errors: Vec<LoweringError>) -> Vec<LoweringError> 
     for error in errors {
         match merged.iter_mut().find(|e| e.differs_only_in_labels(&error)) {
             Some(into) => {
+                // Every occurrence must be contained, including errors merged by labels.
+                if !error.has_stand_in() {
+                    *into.stand_in_mut() = false;
+                }
                 for label in error.related() {
                     if !into.related().contains(label) {
                         into.related_mut().push(label.clone());
@@ -1869,4 +1873,32 @@ pub(super) fn use_names(
         }
     }
     names
+}
+
+#[cfg(test)]
+mod recovery_mark_tests {
+    use super::*;
+
+    #[test]
+    fn merged_diagnostics_keep_a_placeholder_only_when_every_occurrence_has_one() {
+        let span = Span::new(FileId::ROOT, 0, 1);
+        for first in [false, true] {
+            for second in [false, true] {
+                let marked = |contained| {
+                    let error = LoweringError::unsupported(span, "same failure");
+                    if contained {
+                        error.with_stand_in()
+                    } else {
+                        error
+                    }
+                };
+                let got = in_source_order(vec![
+                    marked(first),
+                    marked(second).with_related(span, "copy"),
+                ]);
+                assert_eq!(got.len(), 1);
+                assert_eq!(got[0].has_stand_in(), first && second);
+            }
+        }
+    }
 }

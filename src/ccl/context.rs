@@ -2052,8 +2052,7 @@ fn run_frontend(
     let checks = std::mem::take(&mut ctx.lowering_ctx().module_checks);
     let run_sites = std::mem::take(&mut ctx.lowering_ctx().run_sites);
     let resolved_names = ctx.lowering_ctx().take_resolved_names();
-    let stood_in = std::mem::take(&mut ctx.lowering_ctx().stood_in);
-    let contained = lower_result.errors.len() == stood_in;
+    let contained = lower_result.errors.iter().all(LoweringError::has_stand_in);
     errors.extend(lower_result.errors.into_iter().map(CompileError::Lower));
     let Some(mut expr) = lower_result.value else {
         return Err(errors);
@@ -2126,28 +2125,29 @@ fn run_frontend(
     expr = uniquify::run(expr);
 
     let blame = Blame::new(&lowering_projection, sources).with_runs(&run_sites);
-    // Past a lowering error, the passes run to inference and no further: what inference
-    // reports is added to lowering's.
-    if !lowering_errors.is_empty() {
+    // Lowering errors cap the requested output at inference; earlier stops still apply.
+    let lowering_failed = !lowering_errors.is_empty();
+    let inferred = run_passes(
+        ctx,
+        expr,
+        checks,
+        if lowering_failed {
+            stop.min(Phase::Infer)
+        } else {
+            stop
+        },
+        capture,
+        record,
+        blame,
+        &mut panes,
+        lowering_failed,
+    );
+    if lowering_failed {
         let mut errors = lowering_errors;
-        let inferred = run_passes(
-            ctx,
-            expr,
-            checks,
-            Phase::Infer,
-            &[],
-            record,
-            blame,
-            &mut panes,
-            true,
-        );
         errors.extend(inferred.err().unwrap_or_default());
         return Err(merged_copies(errors));
     }
-    let expr = run_passes(
-        ctx, expr, checks, stop, capture, record, blame, &mut panes, false,
-    )
-    .map_err(merged_copies)?;
+    let expr = inferred.map_err(merged_copies)?;
     Ok(Frontend {
         expr,
         panes,

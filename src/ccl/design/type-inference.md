@@ -353,15 +353,18 @@ with no `r` in scope. Each statement goes the two steps at most, and a run that 
 statement an earlier run did not, or recovers only from bare ones, is the last.
 
 Lowering stands the same placeholder in for a top-level statement it fails in
-(`stand_in_for_failed` in `lower/stmts.rs`): each name the statement introduces is a `let` of the
-placeholder, so the uses below it, which lowering lowered first, read a poison, and a statement that
-introduces nothing is an expression statement of it. A failed last statement leaves the placeholder
-as the block's value, which emission types as a fresh variable. When every lowering error is one
-such placeholder stands for, the passes run on to inference and stop after it, and what inference
-reports is added to lowering's; an undetermined type is not reported, as in a run that starts over.
-A parse or load error, or a lowering error no placeholder stands for, such as a `run` missing a type
-argument, stops the compile after lowering as before: the tree can be inconsistent where nothing
-marks it, and a statement the parser could not read names nothing it binds.
+(`stand_in_for_failed` in `lower/stmts.rs`). A usable annotation or declared mutable history
+survives a failed initializer; an annotation that itself fails to lower establishes no type.
+Names without a usable declaration bind at a poison, and a statement introducing nothing is an
+expression statement of the placeholder. A failed last statement leaves the placeholder as the
+block's value, which emission types as a fresh variable. Each contained error carries its own
+placeholder mark, retained through copying and diagnostic merging. When every lowering error is
+marked, the passes reach the earlier of the requested output and inference, and inference's errors
+are added to lowering's. An undetermined type is not reported, as in a run that starts over.
+
+A module with lowering errors has no interface or linked chain and is not inferred. A reference
+into it lowers to the placeholder. A parse or load error, or a lowering error without a
+placeholder, stops the compile after lowering: the tree can be inconsistent outside a placeholder.
 
 Each later run's errors are added to the earlier runs', but for those saying the program does not
 determine a type (`InferError::is_undetermined`): an unresolved variable or tuple width, or a

@@ -1068,12 +1068,12 @@ fn a_reference_into_a_module_with_errors_adds_no_error(#[case] root: &str) {
     assert!(!errors.contains("missing"), "{errors}");
 }
 
-/// A statement lowering fails in, in a module the root imports, hides no inference error:
-/// the statement stands in, its names are poisons, and a reference to one reports nothing
+/// A reference into a module lowering failed in hides no root inference error. The module
+/// has no interface or linked chain, and the reference lowers to a placeholder
 /// (`src/ccl/design/type-inference.md`, "An error stops its statement, not the pass").
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-fn a_failed_statement_of_an_imported_module_hides_no_inference_error() {
+fn a_reference_into_a_module_lowering_failed_in_hides_no_root_inference_error() {
     let root = indoc! {r#"
         import lib
         z = [1, "a"]
@@ -1081,7 +1081,13 @@ fn a_failed_statement_of_an_imported_module_hides_no_inference_error() {
     "#};
     let errors = compile_errors(&program(
         root,
-        &[("lib", "pub x: Mut(Int) = 3\npub y = x + 1\n")],
+        &[(
+            "lib",
+            indoc! {"
+            pub x: Mut(Int) = 3
+            pub y = x + 1
+        "},
+        )],
     ));
     assert!(
         errors.contains("introduces a mutable with the immutable"),

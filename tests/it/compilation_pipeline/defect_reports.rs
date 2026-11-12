@@ -579,3 +579,79 @@ fn inference_runs_past_a_statement_lowering_failed_in(
     let expected: Vec<(&str, String)> = expected.iter().map(|(p, s)| (*p, s.to_string())).collect();
     assert_eq!(underlined_by_phase(code), expected);
 }
+
+#[rstest]
+#[case::exact(indoc! {r#"
+    x: Int = m::y
+    w = x + "s"
+    (w, 1)
+"#}, &[r#"x + "s""#])]
+#[case::bounded(indoc! {r#"
+    x <: Int = m::y
+    w = x + "s"
+    (w, 1)
+"#}, &["x", r#"x + "s""#])]
+#[case::partial(indoc! {r#"
+    x: {Int, _} = m::y
+    w = x.0 + "s"
+    (w, 1)
+"#}, &[r#"x.0 + "s""#])]
+#[case::mutable(indoc! {r#"
+    x: Mut(Int) := m::y
+    x := "s"
+    x
+"#}, &[r#"x := "s""#])]
+fn a_lowering_failure_preserves_declared_constraints(
+    #[case] code: &str,
+    #[case] expected: &[&str],
+) {
+    let got = underlined_by_phase(code);
+    assert!(got.iter().any(|(phase, _)| *phase == "lower"), "{got:?}");
+    assert!(
+        got.iter()
+            .any(|(phase, span)| *phase == "infer" && expected.contains(&span.as_str())),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn an_annotation_lowering_cannot_read_establishes_no_constraint() {
+    let got = underlined_by_phase(indoc! {r#"
+        x: Nope = 3
+        w = x + "s"
+        z = [1, "a"]
+        (w, z)
+    "#});
+    let inferred: Vec<_> = got
+        .iter()
+        .filter(|(phase, _)| *phase == "infer")
+        .map(|(_, span)| span.as_str())
+        .collect();
+    assert_eq!(inferred, vec![r#"[1, "a"]"#], "{got:?}");
+    assert!(got.iter().any(|(phase, _)| *phase == "lower"), "{got:?}");
+}
+
+#[rstest]
+#[case(cambra::ccl::context::Phase::Anf)]
+#[case(cambra::ccl::context::Phase::MutRead)]
+#[case(cambra::ccl::context::Phase::Comprehension)]
+#[case(cambra::ccl::context::Phase::OpaqueOutput)]
+fn a_lowering_failure_respects_a_stop_before_inference(#[case] stop: cambra::ccl::context::Phase) {
+    let program = LoadedProgram::test(indoc! {r#"
+        x: Int = m::y
+        w = [1, "a"]
+        w
+    "#});
+    let got = GlobalContext::default()
+        .sources_and_sinks()
+        .compile_to(&program, stop)
+        .unwrap_err();
+    assert!(
+        got.iter().any(|e| matches!(e, CompileError::Lower(_))),
+        "{got:?}"
+    );
+    assert!(
+        !got.iter().any(|e| matches!(e, CompileError::Infer { .. })),
+        "{got:?}"
+    );
+}
