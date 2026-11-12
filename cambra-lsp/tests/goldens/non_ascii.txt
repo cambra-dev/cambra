@@ -6,6 +6,7 @@ diagnostics:
     13:8-13:9 this bracket is never closed
 symbols:
   variable greeting 4:1-4:25 (name 4:1-4:9)
+  variable price 5:1-5:16 (name 5:1-5:6)
   function shout 6:1-7:23 (name 6:5-6:10)
   function tag 8:1-10:19 (name 8:5-8:8)
   variable pairs 11:1-12:16 (name 11:1-11:6)
@@ -25,6 +26,7 @@ diagnostics:
     13:8-13:9 this bracket is never closed
 symbols:
   variable greeting 4:1-4:22 (name 4:1-4:9)
+  variable price 5:1-5:14 (name 5:1-5:6)
   function shout 6:1-7:20 (name 6:5-6:10)
   function tag 8:1-10:17 (name 8:5-8:8)
   variable pairs 11:1-12:14 (name 11:1-11:6)
