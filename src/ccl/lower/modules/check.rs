@@ -202,12 +202,7 @@ impl<'a> ProgramLowering<'a> {
     /// statements raise is raised here, and no other module's check raises it
     /// ([`ProgramLowering::nested`]).
     pub(super) fn check(&mut self, file: FileId, ctx: &mut LoweringContext) -> Option<ModuleCheck> {
-        let lowered = self
-            .lowered
-            .get(&file)
-            .cloned()
-            .flatten()
-            .or_else(|| self.with_errors.get(&file).cloned())?;
+        let lowered = self.lowered.get(&file).cloned().flatten()?;
         // The shared imports it reaches, each after the ones it reaches.
         let mut reached = HashSet::new();
         let mut pending: Vec<SharedImport> = self.program.ast(file).map_or_else(Vec::new, |ast| {

@@ -349,8 +349,9 @@ entries a module seeds from interfaces and from its parameters' Module types, `T
 spelling. The out-of-block read gate and the `MutWrite` shape then apply to `eu::stock` and
 `audit::stock` exactly as they apply to `stock` inside its own module.
 
-A module whose own errors stop it from lowering has no interface, and a reference or a `use` item
-into it adds no error: that module's own errors account for it.
+A module with no syntax tree or an uncontained lowering error has no usable interface. A
+reference or a `use` item into it adds no error: that module's errors account for it. Contained
+errors retain the module's usable declarations for its importers.
 
 A `use` item whose module has no usable interface records an unavailable member with its original
 module and spelling. Its use as a value or type recovers through the existing placeholders.
@@ -513,7 +514,7 @@ parameter on checks the next run's Module type against the parameter's view. A p
 with a Module type must be passed a module, and a module must be passed to one. Creating the run
 binds each entry's `let` to the argument's member, imaged at the argument, so a member whose type
 does not fit is the argument's error (`ProgramLowering::bind_module_parameter`). An argument whose
-module has errors of its own binds nothing and adds no error, as a reference into it adds none. The
+module has no usable lowering binds nothing and adds no error, as a reference into it adds none. The
 argument's members are those of the run or shared import it names, or, for a parameter passed on,
 those of that parameter's argument (`module_names`). A default names an import, checked while the
 module lowers and taken by a run that passes no argument.
@@ -720,13 +721,15 @@ specialization can reject a use in ways their signatures do not express. A diagn
 label in a broken module suppresses nothing: the
 label can name a valid requirement that the caller violates.
 
-A module with lowering errors of its own is not linked, and a reference into it reaches nothing.
-When each of those errors is a statement's the placeholder stands in for
-(`src/ccl/design/type-inference.md`, "An error stops its statement, not the pass"), the module is
-checked all the same, on the statements that lowered (`ProgramLowering::with_errors`), and its type
-errors are reported with its lowering errors. A module is checked against its dependencies' bodies,
-so each check infers them again; keeping each module's inferred schemes for its users would remove
-that cost.
+A module whose lowering errors all have placeholders retains one interface and chain for its
+own check and its importers. Healthy exports and explicit constraints remain available to
+importer diagnostics. Failed functions retain their usable parameter and result declarations;
+unknown portions establish no inferred guarantee. A partial parse does not establish that an
+unrecorded member is absent. Known private members remain private.
+
+Each module check infers its dependencies' bodies again; keeping each module's inferred schemes
+for its users would remove that cost. Parse and lowering errors still stop compilation after
+inference, so a linked placeholder chain never reaches execution.
 
 `cambra check lib.cambra` checks a file on its own (`check_program`). It lowers the file as a module
 rather than as a root (`lower_for_check`), so its parameters need no defaults, and links nothing: it

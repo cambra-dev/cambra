@@ -457,9 +457,9 @@ pub(super) fn in_source_order(errors: Vec<LoweringError>) -> Vec<LoweringError> 
 /// before it, and the root lowers last. Linking then creates each imported
 /// module's shared import, in link order, and the root's run, which creates each
 /// run it declares in turn. The shared imports' chains wrap the root's, the first
-/// in link order outermost. A module whose own errors stop it from lowering has
-/// no interface, and a reference into it lowers to an error placeholder without
-/// an error of its own.
+/// in link order outermost. Contained errors retain their module's interface and chain.
+/// A module without usable lowering has no interface; its references become placeholders
+/// without adding errors.
 ///
 /// An imported module that performs IO or declares state has no shared import,
 /// and each `import` of it is the error.
@@ -711,18 +711,8 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
 pub(super) struct ProgramLowering<'a> {
     pub(super) program: &'a LoadedProgram,
     /// Each module other than the root, lowered, by file, or `None` when it has
-    /// no syntax tree or has errors of its own.
+    /// no syntax tree or has uncontained lowering errors.
     pub(super) lowered: HashMap<FileId, Option<Rc<LoweredModule>>>,
-    /// Each module with errors of its own whose lowering errors are all a statement's it
-    /// stood the placeholder in for (`stmts::stand_in_for_failed`), lowered. Its check
-    /// reads it, and nothing else does: a reference into the module reaches nothing, as
-    /// one into any module with errors of its own does.
-    // TODO(lowered-module-interface-recovery): retain usable partial interfaces for
-    // importers after a module's lowering errors. Only its own check reads this chain;
-    // importer references still lower to placeholders. Establish whether incomplete
-    // chains may be linked and how module checks and run checks consume them. Declared
-    // constraints must survive each placeholder before exposing its interface.
-    pub(super) with_errors: HashMap<FileId, Rc<LoweredModule>>,
     /// What each `import` statement reaches, by the statement. An import whose
     /// arguments are in error reaches nothing.
     pub(super) imports: HashMap<Span, Imported>,
@@ -969,7 +959,6 @@ impl<'a> ProgramLowering<'a> {
         ProgramLowering {
             program,
             lowered: HashMap::new(),
-            with_errors: HashMap::new(),
             imports: HashMap::new(),
             check_sites: RunSites::default(),
             type_keys: TypeKeys::default(),
@@ -1069,7 +1058,7 @@ impl<'a> ProgramLowering<'a> {
     }
 
     /// Lower the module in `file` once, recording it, or `None` when it has no
-    /// syntax tree or has errors of its own.
+    /// syntax tree or has uncontained lowering errors.
     pub(super) fn lower(&mut self, file: FileId, ctx: &mut LoweringContext) {
         let lowered = self.lower_once(file, ctx).map(Rc::new);
         self.lowered.insert(file, lowered);
@@ -1101,13 +1090,12 @@ impl<'a> ProgramLowering<'a> {
             .map(Unimportable::Io)
             .or_else(|| state_site(ast).map(Unimportable::State))
             .or(ctx.io_site.map(Unimportable::Io));
-        let clean = lowered.errors.is_empty() && self.program.parsed_cleanly(file);
         // Every lowering error a statement's the placeholder stands in for, so the chain is
         // one inference reads (`compile_program`).
         let stood_in_for_all = lowered.errors.iter().all(LoweringError::has_stand_in);
         self.errors.extend(lowered.errors);
-        let chain = lowered.value.filter(|_| clean || stood_in_for_all)?;
-        let interface = Interface::of_lowered(
+        let chain = lowered.value.filter(|_| stood_in_for_all)?;
+        let mut interface = Interface::of_lowered(
             module,
             ast,
             &chain,
@@ -1115,6 +1103,7 @@ impl<'a> ProgramLowering<'a> {
             ctx,
             unimportable,
         );
+        interface.incomplete = !self.program.parsed_cleanly(file);
         ctx.reached_methods.extend(interface.public_methods());
         let lowered = LoweredModule {
             chain,
@@ -1124,10 +1113,6 @@ impl<'a> ProgramLowering<'a> {
             run_checks,
             as_root: false,
         };
-        if !clean {
-            self.with_errors.insert(file, Rc::new(lowered));
-            return None;
-        }
         Some(lowered)
     }
 
@@ -1151,7 +1136,7 @@ impl<'a> ProgramLowering<'a> {
     }
 
     /// The interface an import of the module in `file` reaches, or `None` when
-    /// the module has errors of its own or an import may not hold its statements.
+    /// the module has no usable lowering or an import may not hold its statements.
     pub(super) fn import_interface(&mut self, file: FileId) -> Option<Rc<Interface>> {
         // A module that performs IO or declares state is refused at each import
         // of it, for that reason alone (`module_scope`), whether or not it has
@@ -1382,9 +1367,8 @@ impl<'a> ProgramLowering<'a> {
                     ))
                 });
                 if let Some((names, span)) = argument {
-                    // An argument whose module has errors of its own binds
-                    // nothing, and reports nothing more: its errors account for
-                    // the run.
+                    // An argument without usable lowering binds nothing. Its existing
+                    // errors account for the unavailable members.
                     let Some(names) = names else {
                         continue;
                     };
@@ -1648,7 +1632,8 @@ impl<'a> ProgramLowering<'a> {
     /// `chain`, a copy of a module's chain, with each `let` the Module-typed
     /// parameter `parameter` of type `ty` binds bound to its member among
     /// `names`, what the module passed at `at.0` reaches. A member it lacks is an
-    /// error at the argument, with a note at the parameter, `at.1`.
+    /// placeholder when parsing could have omitted it. Known missing members are
+    /// refused before creating the run.
     pub(super) fn bind_module_parameter(
         &mut self,
         mut chain: Expr,
@@ -1658,7 +1643,7 @@ impl<'a> ProgramLowering<'a> {
         at: (Span, Span),
         ctx: &mut LoweringContext,
     ) -> Expr {
-        let (span, declared) = at;
+        let (span, _) = at;
         let parameter = QualifiedName::new(parameter);
         let mut lets = Vec::new();
         ModuleView::of(&parameter, ty, &mut lets);
@@ -1668,16 +1653,12 @@ impl<'a> ProgramLowering<'a> {
                 .expect("a parameter's entries are spelled under it");
             match names.get(&entry) {
                 Some(member) => rebind_entry(&mut chain, &binder, member.clone(), span, ctx),
-                None => self.errors.push(
-                    LoweringError::unsupported(
-                        span,
-                        format!(
-                            "this module does not fit the parameter's Module type: it has no \
-                             public member `{entry}`"
-                        ),
-                    )
-                    .with_related(declared, "the parameter"),
-                ),
+                // `uncovered` rejects known missing members before creation. An
+                // unparsed entry retains the parameter's declaration over a placeholder.
+                None => {
+                    let value = ctx.tag_image(Expr::error(), span);
+                    read_argument(&mut chain, &binder.to_string(), value);
+                }
             }
         }
         chain

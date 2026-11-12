@@ -73,7 +73,7 @@ pub struct Qualifier {
     /// The statement that binds the name.
     pub statement: Span,
     /// What the module declares. `None` when the module has no file or has
-    /// errors of its own, which are reported where they stand, and for a
+    /// no usable lowering, whose errors are reported where they stand, and for a
     /// Module-typed parameter, which reaches what its view names.
     pub interface: Option<Rc<Interface>>,
     pub kind: QualifierKind,
@@ -163,7 +163,7 @@ impl LoweringContext {
         self.run_const_arguments.clear();
         self.run_type_checks.clear();
         // A `use` type name is in scope throughout its module. One whose module
-        // has errors of its own names no type, and stands for any. A `use` name
+        // has no usable lowering names no type, and stands for any. A `use` name
         // for a function with a `Mut` or `Feed` parameter takes the curried call shape
         // the function was lowered with.
         for (name, used) in &scope.uses {
@@ -414,7 +414,7 @@ impl LoweringContext {
     }
 
     /// The member the value reference `q` names, or `None` when `q`'s module has
-    /// errors of its own, which already fail the compilation.
+    /// no usable lowering or the member's declaration was not parsed.
     pub(in crate::ccl::lower) fn member(
         &self,
         q: &ParserQualifiedName,
@@ -428,7 +428,7 @@ impl LoweringContext {
     }
 
     /// The type or Module type the type reference `q` names, or `None` when
-    /// `q`'s module has errors of its own, which already fail the compilation.
+    /// `q`'s module has no usable lowering or the member's declaration was not parsed.
     pub(in crate::ccl::lower) fn type_member(
         &self,
         q: &ParserQualifiedName,
@@ -553,7 +553,7 @@ pub(super) fn uncovered(
             })
             .collect(),
         (None, Some(interface)) => interface.missing(ty),
-        // A module with errors of its own reaches nothing, as its references do.
+        // A module with no usable lowering reaches nothing, as its references do.
         (None, None) => Vec::new(),
     };
     missing
@@ -654,6 +654,9 @@ impl Qualifier {
             return Err(is_module(name, member));
         }
         let Some(found) = interface.members.get(member) else {
+            if interface.may_be_unparsed(member) {
+                return Ok(None);
+            }
             return Err(LoweringError::unsupported(
                 span,
                 format!("module `{module}` has no member `{member}`"),
@@ -725,6 +728,9 @@ impl Qualifier {
             ))));
         }
         let Some(found) = interface.types.get(member) else {
+            if interface.may_be_unparsed(member) {
+                return Ok(None);
+            }
             return Err(LoweringError::unsupported(
                 span,
                 format!("module `{module}` has no type member `{member}`"),
@@ -744,7 +750,7 @@ impl Qualifier {
 
     /// Where the module this reaches writes the name of its type alias `member`, or
     /// `None` when it has none to reach: through a Module type, whose type members
-    /// no module declares, or when the module has errors of its own.
+    /// no module declares, or when the module has no usable lowering.
     pub(super) fn type_member_span(&self, member: &str) -> Option<Span> {
         if self.view.is_some() {
             return None;
@@ -755,7 +761,7 @@ impl Qualifier {
     /// The type this module, passed at `span` as the argument for `parameter`,
     /// gives `member`, an abstract type member of the parameter's Module type
     /// spelled under it: `payments::Receipt` takes this module's `Receipt`.
-    /// `None` when this module has errors of its own. A member this module
+    /// `None` when this module has no usable lowering. A member this module
     /// lacks, or has as a Module type, is an error.
     pub(super) fn argument_type_member(
         &self,
@@ -790,7 +796,7 @@ impl Qualifier {
     }
 
     /// The public trait `member` of the module this reaches through the qualifier `name`, or
-    /// `None` when the module has errors of its own, which are reported where they stand.
+    /// `None` when the module has no usable lowering, which are reported where they stand.
     pub(in crate::ccl::lower) fn reach_trait(
         &self,
         name: &QualifiedName,
@@ -810,6 +816,9 @@ impl Qualifier {
             return Ok(None);
         };
         let Some(found) = interface.traits.get(member) else {
+            if interface.may_be_unparsed(member) {
+                return Ok(None);
+            }
             return Err(LoweringError::unsupported(
                 span,
                 format!("module `{}` declares no trait `{member}`", interface.module),
@@ -835,7 +844,7 @@ impl Qualifier {
     }
 
     /// The public nominal type `member` of the module this reaches through the qualifier
-    /// `name`, or `None` when the module has errors of its own, which are reported where
+    /// `name`, or `None` when the module has no usable lowering, which are reported where
     /// they stand.
     pub(in crate::ccl::lower) fn reach_nominal(
         &self,
@@ -856,6 +865,9 @@ impl Qualifier {
             return Ok(None);
         };
         let Some(found) = interface.nominal.get(member) else {
+            if interface.may_be_unparsed(member) {
+                return Ok(None);
+            }
             return Err(LoweringError::unsupported(
                 span,
                 format!(
@@ -919,8 +931,7 @@ impl Qualifier {
 
     /// The public member `segment` bound to a module, reached through the
     /// qualifier `name`: `audit` in `shop::audit::events`. Through a module
-    /// with errors of its own it is a module with no interface, as that
-    /// module's other members are `None`.
+    /// without usable lowering, or for an unparsed member, it has no interface.
     pub(super) fn module_member(
         &self,
         name: &QualifiedName,
@@ -951,6 +962,12 @@ impl Qualifier {
         };
         let module = &interface.module;
         let Some(found) = interface.modules.get(member) else {
+            if interface.may_be_unparsed(member) {
+                return Ok(Qualifier {
+                    interface: None,
+                    ..self.clone()
+                });
+            }
             return Err(LoweringError::unsupported(
                 segment.span,
                 format!("module `{module}` has no member `{member}` bound to a module"),
@@ -1007,7 +1024,7 @@ impl Qualifier {
     }
 
     /// The interface whose members a reference reaches, or `None` when the module
-    /// has errors of its own or performs IO, each reported where it stands.
+    /// has no usable lowering or cannot be imported because it performs IO.
     pub(in crate::ccl::lower) fn reachable(&self) -> Option<&Interface> {
         self.interface.as_deref().filter(|interface| {
             interface.unimportable.is_none() || self.kind != QualifierKind::Import

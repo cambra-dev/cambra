@@ -1072,22 +1072,8 @@ pub(super) fn lower_middle_stmt(
                 fn_body,
                 ctx,
             )?;
-            let occurrence = ctx.occurrence_at(name.span);
-            let name = name.node.as_str().to_string();
-            // A `def`'s polymorphic annotation is built from its signature rather than
-            // written as one type, so its occurrence records at the statement.
-            Ok(ctx.tag_image(
-                match annotation {
-                    Some(poly) => Expr::let_bind_annotated(
-                        name,
-                        occurrence,
-                        func_expr,
-                        body,
-                        Annotation::new(poly, Occurrence::mint()),
-                    ),
-                    None => Expr::let_bind(name, occurrence, func_expr, body),
-                },
-                stmt.span,
+            Ok(bind_lowered_function(
+                name, func_expr, annotation, body, stmt.span, ctx,
             ))
         }
         // For a for-loop in the middle of a block, check whether it is a mutation
@@ -1361,6 +1347,36 @@ fn stand_in_for_failed(
     // A failed right-hand side leaves explicit constraints usable. If the declaration
     // itself fails to lower, the unannotated placeholder below states no type.
     match &stmt.node {
+        ChlStmt::FunctionDef {
+            owner: None,
+            name,
+            type_params,
+            params,
+            output,
+            requires,
+            ..
+        } => {
+            let omitted = [Spanned::new(
+                stmt.span,
+                ChlStmt::Error {
+                    binds: Vec::new(),
+                    mut_assign: false,
+                    modules: Vec::new(),
+                    unknown_module: false,
+                },
+            )];
+            if let Ok((function, annotation)) = lower_def(
+                stmt.span,
+                type_params,
+                params,
+                output.as_ref(),
+                requires,
+                &omitted,
+                ctx,
+            ) {
+                return bind_lowered_function(name, function, annotation, body, stmt.span, ctx);
+            }
+        }
         ChlStmt::AnnAssign {
             target,
             annotation,
@@ -1437,6 +1453,29 @@ fn stand_in_for_failed(
             "lower.failed_stmt",
         )
     })
+}
+
+fn bind_lowered_function(
+    name: &Spanned<SmolStr>,
+    function: Expr,
+    annotation: Option<Type>,
+    body: Expr,
+    span: Span,
+    ctx: &mut LoweringContext,
+) -> Expr {
+    let occurrence = ctx.occurrence_at(name.span);
+    // A polymorphic def annotation describes its signature rather than one written type.
+    let binding = match annotation {
+        Some(poly) => Expr::let_bind_annotated(
+            name.node.as_str(),
+            occurrence,
+            function,
+            body,
+            Annotation::new(poly, ctx.occurrence_at(span)),
+        ),
+        None => Expr::let_bind(name.node.as_str(), occurrence, function, body),
+    };
+    ctx.tag_image(binding, span)
 }
 
 /// `body` with each value `use` name of an import that reaches nothing, its module having
@@ -2100,6 +2139,21 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
                 ctx.unreadable
                     .extend(modules.iter().map(ToString::to_string));
                 ctx.unreadable_module |= unknown_module;
+            }
+            ChlStmt::AnnAssign {
+                target, annotation, ..
+            }
+            | ChlStmt::MutAssign {
+                target,
+                annotation: Some(annotation),
+                ..
+            }
+            | ChlStmt::Declare { target, annotation }
+                if matches!(annotation.ty.node, ChlExpr::Error) =>
+            {
+                if let AssignTarget::Name(name) = &target.node {
+                    ctx.unreadable.insert(name.to_string());
+                }
             }
             // `x: Mut(V, Txn) := e` — a transactional-variable introduction.
             // Register `x` so a following loop's `with begin(): x := …` write is
