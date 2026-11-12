@@ -608,6 +608,9 @@ binds at the placeholder (`stand_in_for_failed`), so its uses read a poison and 
 An unreadable type, a statement in a loop or transaction block, or a name whose declaration is
 unavailable, such as an `await_final` operand, also fails its construct with `ParseHole`. The
 frontend suppresses these lowering diagnostics because the parser reports the cause.
+Unreadable binding and module names are scoped to their statement block. Leaving a block
+restores the outer names on both success and error, so a malformed declaration hides no
+independent error in a sibling block.
 `LoweringResult` retains its optional value and errors.
 
 The frontend appends lowering errors and returns if no CCL value is available. Past parse and

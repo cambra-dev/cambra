@@ -431,12 +431,13 @@ pub(super) fn lower_stmts_inner(
         return Err(nominal::refuse_nested(last.span, decl));
     }
 
-    // Restore transactional declarations and `Mut`- and `Feed`-parameter call shapes on both
-    // success and error, so local declarations can shadow without leaking into sibling or
-    // outer blocks. Induction mutability has no lowering registry; its history type is
-    // checked later.
+    // These registries use pre-uniquify names. Local declarations and unreadable heads
+    // must stop affecting those names when the block exits, on success and error alike.
+    // Induction mutability has no lowering registry; its history type is checked later.
     let snapshot = ctx.snapshot_transactional();
     let saved_history_param_fns = ctx.history_param_fns.clone();
+    let saved_unreadable = ctx.unreadable.clone();
+    let saved_unreadable_module = ctx.unreadable_module;
 
     // Lower the terminal before wrapping preceding statements, innermost first.
     // Alias registration must precede any annotation read by transaction registration.
@@ -452,6 +453,8 @@ pub(super) fn lower_stmts_inner(
     });
     ctx.restore_transactional(snapshot);
     ctx.history_param_fns = saved_history_param_fns;
+    ctx.unreadable = saved_unreadable;
+    ctx.unreadable_module = saved_unreadable_module;
     result
 }
 

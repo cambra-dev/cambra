@@ -2356,8 +2356,7 @@ where
         // TODO(statement-expression-recovery): recover within each statement's expression
         // parser rather than restating its binding grammar in `head` and `module_head`.
         // First verify that expression recovery preserves the one-error-per-statement
-        // behavior of nested_block_recovery_reports_one_error_per_mistake. Lowering's
-        // unreadable-name state is module-wide; its block scoping must be established too.
+        // behavior of nested_block_recovery_reports_one_error_per_mistake.
         // What the skipped statement binds, read off its head without consuming it, so
         // the program below it reads the names as bound (`Stmt::Error`).
         let name = select! { Token::Ident(s) => s };

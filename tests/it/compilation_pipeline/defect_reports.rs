@@ -808,3 +808,39 @@ fn inference_runs_past_a_statement_the_parser_could_not_read(
     let expected: Vec<(&str, String)> = expected.iter().map(|(p, s)| (*p, s.to_string())).collect();
     assert_eq!(underlined_by_phase(code), expected);
 }
+
+#[test]
+fn unreadable_names_do_not_escape_their_block() {
+    let code = indoc! {"
+        def first(x: Int):
+            await_final(x)
+        def second(dummy):
+            x = 1 +* 2
+            1
+        1
+    "};
+    let reports = underlined_by_phase(code);
+    assert_eq!(
+        reports.iter().map(|(phase, _)| *phase).collect::<Vec<_>>(),
+        ["parse", "lower"],
+        "{reports:?}"
+    );
+}
+
+#[test]
+fn an_unreadable_module_alias_does_not_escape_its_block() {
+    let code = indoc! {"
+        def first(dummy):
+            absent::value
+        def second(dummy):
+            run absent as
+            1
+        1
+    "};
+    let reports = underlined_by_phase(code);
+    assert_eq!(
+        reports.iter().map(|(phase, _)| *phase).collect::<Vec<_>>(),
+        ["parse", "lower"],
+        "{reports:?}"
+    );
+}
