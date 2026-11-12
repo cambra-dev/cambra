@@ -21,7 +21,7 @@ use crate::ccl::{
 
 use super::context::InferCtx;
 use super::schemes::{OpSignature, OperatorResult};
-use super::typing::{LetScheme, MethodCallsEnd, Typing};
+use super::typing::{LetScheme, MethodCallsEnd, TempNames, Typing};
 use super::{product, variant_type};
 use crate::ccl::infer::solver::traits::{
     Assoc, MethodRow, MethodTarget, Signature, Trait, function_over, replace_params,
@@ -461,7 +461,6 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             // value variable, and a positive-position read intersects refinement sets.
             // Across the values one write takes — a write in a loop, once per iteration —
             // the edge joins over the binders it crosses (`require_contribution`).
-            //
             match key {
                 None => ctx.require_contribution(name, &value_ty, mut_val, &|| {
                     format!("write to mutable variable `{write_label}`")
@@ -1262,13 +1261,15 @@ pub(super) fn emit_apply<C: Typing>(
         .is_some_and(|param| param.mut_value_type().is_some())
     {
         let refused = match written_variable(argument, ctx) {
-            None => Some(InferError::MutNotBareVariable {
+            TempNames::Computed => Some(InferError::MutNotBareVariable {
                 at: symbolic(argument),
             }),
-            Some(ty) if ty.mut_value_type().is_none() => Some(InferError::MutArgNotMutable {
-                at: symbolic(argument),
-            }),
-            Some(_) => None,
+            TempNames::Variable(ty) if ty.mut_value_type().is_none() => {
+                Some(InferError::MutArgNotMutable {
+                    at: symbolic(argument),
+                })
+            }
+            TempNames::Variable(_) => None,
         };
         if let Some(error) = refused {
             return Err(LocatedInferError::new(error, argument.node_id()));
@@ -1783,14 +1784,14 @@ pub(super) fn emit_expr_stmt<C: Typing>(
 /// The type of the variable `argument` is as the program wrote it, read through the
 /// A-normalization temps naming it ([`Typing::note_temp`]): a temp bound to a mutable
 /// variable holds that variable's value, and the variable is what the program passed.
-/// `None` for a computed argument.
-pub(super) fn written_variable<C: Typing>(argument: &Expr, ctx: &C) -> Option<Type> {
+/// [`TempNames::Computed`] for a computed argument.
+pub(super) fn written_variable<C: Typing>(argument: &Expr, ctx: &C) -> TempNames {
     match &argument.node {
         TypedExprNode::Var(name) if name.is_anf_temp() => ctx
             .temp_written(name)
-            .unwrap_or_else(|| Some(argument.ty.clone())),
-        TypedExprNode::Var(_) => Some(argument.ty.clone()),
-        _ => None,
+            .expect("an A-normalization temp is recorded by its let before its body is emitted"),
+        TypedExprNode::Var(_) => TempNames::Variable(argument.ty.clone()),
+        _ => TempNames::Computed,
     }
 }
 

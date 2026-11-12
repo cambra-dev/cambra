@@ -28,7 +28,7 @@ use crate::util::ScopeStack;
 use super::emit::emit_node;
 use super::schemes::OperatorSchemes;
 use super::solve::value_type;
-use super::typing::{LetScheme, MethodCallsEnd, Typing};
+use super::typing::{LetScheme, MethodCallsEnd, TempNames, Typing};
 use super::{coalesce_for_error, map_constrain_err};
 use crate::ccl::infer::solver::traits::{
     Assoc, InstanceTable, MethodCall, MethodRow, Trait, TraitObligation,
@@ -256,7 +256,7 @@ pub(super) struct InferCtx {
     /// made them ([`Typing::recover`]).
     pub(super) recovered: Vec<NodeId>,
     /// What each A-normalization temp emitted so far names ([`Typing::note_temp`]).
-    temps_written: HashMap<Name, Option<Type>>,
+    temps_written: HashMap<Name, TempNames>,
     /// How a type leaves the scope of each binder in scope ([`ScopeExit`]), read by
     /// [`Self::require_contribution`] and [`Typing::close_let_type`]: one per binder of the
     /// name, innermost last, pushed where the binder is entered and popped where its scope
@@ -1838,11 +1838,11 @@ impl Typing for InferCtx {
         self.recoveries += 1;
     }
 
-    fn note_temp(&mut self, temp: &Name, written: Option<Type>) {
+    fn note_temp(&mut self, temp: &Name, written: TempNames) {
         self.temps_written.insert(temp.clone(), written);
     }
 
-    fn temp_written(&self, temp: &Name) -> Option<Option<Type>> {
+    fn temp_written(&self, temp: &Name) -> Option<TempNames> {
         self.temps_written.get(temp).cloned()
     }
 
