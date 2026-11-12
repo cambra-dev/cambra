@@ -4281,7 +4281,7 @@ fn plan_store(
             // The tap is the commit log read through the field, so it is a collection at
             // the log's kind — and `recognize_txn_group` takes the history record's tap
             // field type straight off this binding.
-            let tap_value_ty = crate::ccl::ccl_utils::tap_variant_ty(f.ty.clone());
+            let tap_value_ty = crate::ccl::ccl_utils::tap_variant_ty(f.value.row.clone());
             let value = value.as_ref().filter(|v| v.defer == f.defer);
             let records = tvar(&commits[j], commits_ty.clone());
             let tap_ty = Type::fun_like(&commits_ty, dom.clone(), tap_value_ty.clone());
@@ -4300,7 +4300,7 @@ fn plan_store(
             );
             tap_bindings.push((binding(tap_name.clone(), tap_ty.clone()), tap_expr));
             if let Some(value) = value {
-                let (bound, read) = block_values(value, &tap_name, &tap_ty, &f.ty);
+                let (bound, read) = block_values(value, &tap_name, &tap_ty, &f.value.row);
                 own_values.push((bound.name.clone(), read.clone_preserving_ids()));
                 values.push((bound, read));
                 continue;
@@ -4309,7 +4309,7 @@ fn plan_store(
                 defer: f.defer,
                 tap: tap_name,
                 tap_ty,
-                value_ty: f.ty.clone(),
+                value_ty: f.value.row.clone(),
                 fed_at: f.fed_at,
             });
         }
@@ -4539,21 +4539,23 @@ impl StorePlan {
             .map(|f| {
                 // The channel carries the fed value at the positions the tap
                 // fired, so the hoist eliminates `` `fired `` off the raw tap.
-                let view = crate::ccl::ccl_utils::chain_typed(
-                    vec![
-                        tvar(&f.tap, f.tap_ty.clone()),
-                        crate::ccl::ccl_utils::fired_project(f.value_ty.clone()),
-                    ],
+                let steps = vec![
+                    tvar(&f.tap, f.tap_ty.clone()),
+                    crate::ccl::ccl_utils::fired_project(f.value_ty.clone()),
+                ];
+                let row = crate::ccl::ccl_utils::chain_type_of(
+                    &steps,
                     Type::fun_like(
                         &f.tap_ty,
-                        f.tap_ty.domain().unwrap_or(Type::Hole),
+                        f.tap_ty.domain().expect("a tap is a collection"),
                         f.value_ty.clone(),
                     ),
                 );
+                let view = Expr::compose(steps).with_ty(row.clone());
                 // One value per item: the tap is keyed by the item its transaction ran for.
                 LoopFeed {
                     defer: f.defer.clone(),
-                    view,
+                    view: crate::ccl::feed_nest::FeedValue::new(view, row),
                     levels: 1,
                     site: f.fed_at.clone(),
                 }
@@ -4739,7 +4741,7 @@ fn cross_level(cross: &CrossDomain, stores: &[StorePlan], carried: &[Vec<Expr>])
         .iter()
         .chain(cross.reads.iter())
         .map(|(_, e)| e)
-        .chain(cross.feeds.iter().map(|f| &f.view))
+        .chain(cross.feeds.iter().map(|f| &f.view.value))
         .filter_map(|e| level_of(e, stores, carried))
         .max()
 }
