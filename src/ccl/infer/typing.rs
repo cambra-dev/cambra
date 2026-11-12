@@ -45,6 +45,15 @@ pub(super) enum MethodCallsEnd {
     Failed,
 }
 
+/// The written argument an A-normalization temp names, before reading mutable variables.
+#[derive(Clone)]
+pub(super) enum TempNames {
+    /// A source variable, at its own type rather than the type of its read value.
+    Variable(Type),
+    /// A computed expression, which supplies no variable to pass by reference.
+    Computed,
+}
+
 /// The operations a typing rule needs from its surrounding pass.
 ///
 /// Each per-node rule (`emit_apply`, `emit_let`, …) is written once against
@@ -106,6 +115,15 @@ pub(super) trait Typing {
         reads_before: usize,
         statement: NodeId,
     ) -> Result<(), LocatedInferError>;
+
+    /// Record what the A-normalization temp `temp` names ([`super::emit::written_variable`]),
+    /// for a pass-by-reference argument the temp is.
+    fn note_temp(&mut self, temp: &Name, written: TempNames);
+
+    /// What [`Self::note_temp`] recorded for `temp`. Every A-normalization temp is recorded
+    /// by its `let` before its body is emitted, in both Emit and Check mode. A missing
+    /// record violates that ordering invariant.
+    fn temp_written(&self, temp: &Name) -> Option<TempNames>;
 
     /// Pass over a statement whose expression is the [`Error`](crate::ccl::TypedExprNode::Error)
     /// stand-in for one that failed in an earlier run ([`super::run_with_params`]): it is

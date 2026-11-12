@@ -502,18 +502,21 @@ introduction every write targets. The discipline:
    pass-by-reference `Mut` parameter — both declarations by construction. Pinned
    by `infer::api::debug_assert_no_mut_var_let`.
 
-One structural check after inference enforces the two rules. The real fault line is the **merge law**,
-not `Feed`-vs-`Mut`. *Append-only* mutability merges commutatively — a feed by `++`, and (at
-runtime) a `Txn` mutable variable by the commit operator's timestamped merge — so multiple writers are
-already the semantics and aliasing is benign; that is why a feed handle may be aliased and
-returned (`http_serve` returns one in its tuple). *Last-write-wins* mutability instead needs a **resolvable
-writer set** — but that requirement is fundamental only for an **induction** accumulator, which
-compiles to a single-writer `InductionStore` changelog. A `Txn` mutable variable already tolerates an open writer set (its
-sites merge their commit streams by time), so applying the uniform second-class discipline to it is
-a conservative stopgap, not a necessity. (Future work splits the same way: the induction aliasing
-rule is a blunt approximation of **affine typing** — a use-at-most-once handle keeps the writer
-unique by construction while lifting downward-only — and first-class `Txn` needs only a runtime
-mutable variable key into the already-keyed MVCC store, not the full sigma/index-types generality.)
+Inference enforces these rules. Emission reads pass-by-reference arguments through their
+A-normalization temps and refuses an argument that is not a bare variable of `Mut` type (rule 1).
+It refuses a write whose target is not a mutable variable (rule 3). Rule 2 and rule 1's
+computed-expression check need resolved types. `check_mut_discipline` checks them over the
+coalesced tree as the last step of each run and reports its errors with coalesce's.
+
+The **merge law** determines the writer restrictions. Feeds combine by `++`, and transactional
+mutable variables combine through the commit operator's timestamped merge. Both merge operations
+permit multiple writers. Feed handles may be aliased and returned (`http_serve` returns one in
+its tuple). An induction accumulator instead compiles to a single-writer `InductionStore`
+changelog and requires a resolvable writer set. A `Txn` mutable variable supports an open writer
+set because its sites merge their commits by time; the uniform second-class discipline restricts
+it conservatively. Planned affine typing expresses induction handles that may be used at most
+once, keeping writers unique while relaxing the downward-only rule. First-class `Txn` requires
+a runtime mutable variable key into the keyed MVCC store.
 
 `Mut`-parameter functions must reach their call sites, so they must be inlineable — the stance the
 pipeline already takes for writers and `Feed`-mediating UDFs. (When general recursion lands,

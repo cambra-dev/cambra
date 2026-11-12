@@ -26,7 +26,7 @@ use super::emit::{
     emit_unary, emit_variant_ctor, paths_are_canonical, projected_source_type,
 };
 use super::schemes::OperatorSchemes;
-use super::typing::{LetScheme, Typing};
+use super::typing::{LetScheme, TempNames, Typing};
 use super::{lit_base, map_constrain_err};
 use crate::ccl::infer::solver::traits::{
     Assoc, InstanceHead, InstanceTable, Trait, compares_by_value, offered_head,
@@ -82,6 +82,8 @@ pub(super) struct CheckCtx {
     /// reason [`Typing::raise`] attributes at the raise site.
     errors: Vec<LocatedInferError>,
     pred_memo: TermMemo,
+    /// What each A-normalization temp walked so far names ([`Typing::note_temp`]).
+    temps_written: HashMap<Name, TempNames>,
     /// **Γ — what the witnesses in scope range over** at the current position
     /// (`src/ccl/design/type-inference.md`, "The witness context").
     ///
@@ -200,6 +202,7 @@ impl CheckCtx {
             level: 0,
             errors: Vec::new(),
             pred_memo: Default::default(),
+            temps_written: HashMap::new(),
             witness_ctx: Default::default(),
             current_node: root,
             telescope: Telescope::empty(),
@@ -260,6 +263,14 @@ impl Typing for CheckCtx {
 
     fn stand_in(&mut self) {
         crate::unexpected_error_node!()
+    }
+
+    fn note_temp(&mut self, temp: &Name, written: TempNames) {
+        self.temps_written.insert(temp.clone(), written);
+    }
+
+    fn temp_written(&self, temp: &Name) -> Option<TempNames> {
+        self.temps_written.get(temp).cloned()
     }
 
     fn poisoned_reads(&self) -> usize {
