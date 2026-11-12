@@ -31,6 +31,30 @@ fn underlined(code: &str) -> Vec<String> {
         .collect()
 }
 
+#[test]
+fn a_join_labels_the_types_of_its_contributing_values() {
+    let code = r#"[1, "a"]"#;
+    let mut ctx = GlobalContext::default();
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let errors = compile_program(&mut ctx, &LoadedProgram::test(code), consumer)
+        .err()
+        .unwrap();
+    let [CompileError::Infer { related, .. }] = errors.as_slice() else {
+        panic!("{errors:?}")
+    };
+    let labels: Vec<_> = related
+        .iter()
+        .map(|(at, label)| (&code[at.start..at.end], label.as_str()))
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            ("1", "contributes {Int where _ == 1}"),
+            (r#""a""#, r#"contributes {String where _ == "a"}"#)
+        ]
+    );
+}
+
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // The binding, each use and the tuple read the literal's failing position.

@@ -523,6 +523,24 @@ impl<'a> Blame<'a> {
                     related.push((at, r.role.label().to_string()));
                 }
             }
+            for contribution in located.related.contributions() {
+                let at = match contribution.origin {
+                    crate::ccl::infer_var::Origin::Node(id) => self.traced(id, Some(tree)),
+                    crate::ccl::infer_var::Origin::Written(at) => Some(at),
+                };
+                if let Some(at) = at {
+                    let label = (
+                        at,
+                        format!(
+                            "contributes {}",
+                            crate::ccl::chl_print::chl_type(&contribution.ty)
+                        ),
+                    );
+                    if !related.contains(&label) {
+                        related.push(label);
+                    }
+                }
+            }
             // Each copy that raised the error is labelled at its run, those of the
             // errors inference merged into it included.
             for node in std::iter::once(located.node_id).chain(located.also) {
@@ -2197,7 +2215,7 @@ fn check_modules(
         let errors = errors
             .into_iter()
             .map(|mut located| {
-                located.error.respell(&respelling);
+                located.respell(&respelling);
                 located
             })
             .collect();
@@ -2609,7 +2627,7 @@ fn run_passes(
         let errors = errors
             .into_iter()
             .map(|mut located| {
-                located.error.respell(&respelling);
+                located.respell(&respelling);
                 located
             })
             .collect();

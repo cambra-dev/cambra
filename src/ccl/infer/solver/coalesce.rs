@@ -152,11 +152,6 @@ pub enum CoalesceError {
 #[derive(Debug, Clone)]
 pub struct FailedPosition {
     pub vars: Vec<InferVarId>,
-    // TODO(bound-contribution-labels): render each BornAt in ContributionOrigins::known()
-    // as a secondary label naming the bound it contributed. Bounds-conflict reports
-    // currently underline only the innermost node; `also` holds carriers, not births.
-    // RelatedPositions holds one position per RelatedRole, so contributions need their
-    // own collection rather than another role in that map.
     pub origins: super::compact::ContributionOrigins,
 }
 

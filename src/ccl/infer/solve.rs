@@ -256,11 +256,21 @@ impl CoalesceCtx {
             }
             return;
         }
+        let contributions: Vec<_> = position
+            .origins
+            .contributions()
+            .map(|(at, ty)| (at, super::coalesce_for_error(ty)))
+            .collect();
         self.reported_at
             .entry(node)
             .or_default()
             .push((position, error.clone()));
         self.push_error(error);
+        if let Some(located) = self.errors.last_mut() {
+            for (at, ty) in contributions {
+                located.related.add_contribution(at, ty);
+            }
+        }
     }
 
     /// Whether `name` is an enclosing **lambda parameter**. Only that binder's slot is
@@ -1815,7 +1825,7 @@ fn meets_reported(reported: &FailedPosition, later: &FailedPosition) -> bool {
             .origins
             .known()
             .zip(later.origins.known())
-            .is_some_and(|(a, b)| nested(a, b))
+            .is_some_and(|(a, b)| nested(&a, &b))
 }
 
 /// Hold a variable to the invariant every vacuity test relies on: it resolves to a type naming

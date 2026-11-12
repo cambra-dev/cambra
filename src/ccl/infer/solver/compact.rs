@@ -1036,7 +1036,7 @@ impl CompactFun {
 /// their contributions' births, so the field changes no comparison compaction makes.
 #[derive(Debug, Clone, Default)]
 pub struct ContributionOrigins {
-    born: BTreeSet<BornAt>,
+    born: BTreeMap<BornAt, Vec<Type>>,
     unknown: bool,
 }
 
@@ -1058,20 +1058,23 @@ impl ContributionOrigins {
     /// A contribution compacted from a type no bound holds.
     fn unknown() -> Self {
         ContributionOrigins {
-            born: BTreeSet::new(),
+            born: BTreeMap::new(),
             unknown: true,
         }
     }
 
     /// A contribution a bound recorded at `origin`.
-    fn born_at(origin: Option<crate::ccl::infer_var::Origin>) -> Self {
+    fn born_at(origin: Option<crate::ccl::infer_var::Origin>, ty: &Type) -> Self {
         match origin {
             Some(crate::ccl::infer_var::Origin::Node(node)) => ContributionOrigins {
-                born: BTreeSet::from([BornAt::Node(node)]),
+                born: BTreeMap::from([(BornAt::Node(node), vec![ty.clone()])]),
                 unknown: false,
             },
             Some(crate::ccl::infer_var::Origin::Written(at)) => ContributionOrigins {
-                born: BTreeSet::from([BornAt::Written(at.file, at.start, at.end)]),
+                born: BTreeMap::from([(
+                    BornAt::Written(at.file, at.start, at.end),
+                    vec![ty.clone()],
+                )]),
                 unknown: false,
             },
             None => Self::unknown(),
@@ -1079,14 +1082,35 @@ impl ContributionOrigins {
     }
 
     fn union(mut self, other: Self) -> Self {
-        self.born.extend(other.born);
+        for (at, types) in other.born {
+            let held = self.born.entry(at).or_default();
+            for ty in types {
+                if !held.contains(&ty) {
+                    held.push(ty);
+                }
+            }
+        }
         self.unknown |= other.unknown;
         self
     }
 
     /// The births, or `None` where some contribution's is unknown or there is none.
-    pub fn known(&self) -> Option<&BTreeSet<BornAt>> {
-        (!self.unknown && !self.born.is_empty()).then_some(&self.born)
+    pub fn known(&self) -> Option<BTreeSet<BornAt>> {
+        (!self.unknown && !self.born.is_empty()).then(|| self.born.keys().copied().collect())
+    }
+
+    /// Each known birth and the bound recorded there, including known births of a
+    /// position whose other contributions have no origin.
+    pub fn contributions(&self) -> impl Iterator<Item = (crate::ccl::infer_var::Origin, &Type)> {
+        self.born.iter().flat_map(|(at, types)| {
+            let origin = match *at {
+                BornAt::Node(node) => crate::ccl::infer_var::Origin::Node(node),
+                BornAt::Written(file, start, end) => crate::ccl::infer_var::Origin::Written(
+                    chl_parser::ast::Span::new(file, start, end),
+                ),
+            };
+            types.iter().map(move |ty| (origin, ty))
+        })
     }
 }
 
@@ -4111,7 +4135,7 @@ fn compact_go_inner(
                 let inner_acc = Subst::then(&b.render_subst(), subst_acc);
                 let mut bc = compact_bound(&b.ty, pol, &inner_acc, pos.under(&new_parents), st);
                 if !stands_for_a_variable(&b.ty) {
-                    bc.origins = ContributionOrigins::born_at(b.origin);
+                    bc.origins = ContributionOrigins::born_at(b.origin, &b.ty);
                 }
                 bound = CompactType::merge(pol, bound, bc);
             }
@@ -4203,7 +4227,7 @@ fn compact_go_inner(
                     let mut bc =
                         compact_bound(&b.ty, !pol, &inner_acc, pos.under(&new_parents), st);
                     if !stands_for_a_variable(&b.ty) {
-                        bc.origins = ContributionOrigins::born_at(b.origin);
+                        bc.origins = ContributionOrigins::born_at(b.origin, &b.ty);
                     }
                     recovered = Some(match recovered {
                         None => bc,

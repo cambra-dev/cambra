@@ -23,7 +23,10 @@ A message names what failed by its role in the program, and its span says where.
 ## One report per defect
 
 A defect is reported once per site: at the first node inference meets it at, and at each use of
-a generic definition whose instantiation fails it. `defect_reports.rs` checks each rule below.
+a generic definition whose instantiation fails it. `InferError::same_defect` compares the variant
+and semantic payload. It ignores source labels, bound-binder names and bound-witness identities;
+free identities and witness kinds remain distinct. Each caller compares sites or graph positions
+separately. `defect_reports.rs` checks each rule below.
 
 - **Carriers report nothing.** Every node whose type reads a failing position meets the failure
   again: the literal `[1, "a"]`, the binding holding it, each use of it. A failure with a reported
@@ -50,9 +53,9 @@ a generic definition whose instantiation fails it. `defect_reports.rs` checks ea
 - **A module sound at its parameters' types reports nothing a run raises in it.** A run whose
   argument does not fit its parameter reports the argument; an error that run's copy of the module
   raises is dropped (`check_modules`).
-- **One span and one message are one diagnostic.** `compile_program` merges inference errors
-  that underline one span with one message, keeping the secondary labels of each
-  (`Blame::infer`).
+- **One span and one defect are one diagnostic.** `compile_program` merges inference errors
+  that underline one span and satisfy `InferError::same_defect`, keeping the secondary labels
+  of each (`Blame::infer`).
 
 ---
 
@@ -166,6 +169,11 @@ edge involves is a secondary label (`LocatedInferError::related`): `x = id((sku=
 - **Rendering.** `compile_program` resolves a node through the lowering projection and keeps a
   label whose span lies outside the primary span, reading "required here" or "the value comes
   from here".
+- **Conflicting contributions.** A failed coalesce position retains each concrete bound and
+  its birth in `ContributionOrigins`. `RelatedPositions` stores these in a separate collection
+  from its edge roles. Each known birth gets a "contributes T" label, including births inside
+  the primary span. A list element records its own node as the value origin, so a heterogeneous
+  list labels each conflicting element.
 
 Not covered:
 
@@ -175,9 +183,9 @@ Not covered:
 - An obligation does not record which contribution narrowed its candidates, so a conflict between
   two operands labels only the later operand's source: `a = id("s")`, `b = id(1)`, then `a + b`
   labels `id(1)` and not `id("s")`.
-- An error raised at coalesce, such as an incompatible join or a use whose instantiation does not
-  resolve, has no edge and so no label. The exception is an error a specialization raises that is
-  the use's
+- A coalesce error has no edge labels. Its known concrete contributions have birth labels;
+  a use whose instantiation does not resolve can have no known birth. An error a specialization
+  raises that is the use's
   ([type-inference.md, "Checking a definition alone"](type-inference.md#checking-a-definition-alone)):
   it is reported at the use, labelled "required here" where the body failed.
 - The inspector's diagnostic carries one span (`inspector_model::wire::Diagnostic`), so it shows

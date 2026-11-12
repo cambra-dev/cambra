@@ -1055,16 +1055,43 @@ pub struct LocatedInferError {
 }
 
 /// The positions an error involves besides its own node: at most one per
-/// [`RelatedRole`], behind one thin pointer. Every inference rule returns a
+/// [`RelatedRole`] and a collection of bound contributions, behind one thin pointer.
+/// Every inference rule returns a
 /// [`LocatedInferError`], so it stays under `clippy::result_large_err`'s threshold, and
 /// an error rarely has any.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct RelatedPositions(Option<Box<[Option<Related>; 3]>>);
+pub struct RelatedPositions(Option<Box<RelatedData>>);
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct RelatedData {
+    roles: [Option<Related>; 3],
+    contributions: Vec<BoundContribution>,
+}
+
+/// A concrete bound contributing to a position that failed to coalesce.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundContribution {
+    pub origin: crate::ccl::infer_var::Origin,
+    pub ty: Type,
+}
 
 impl RelatedPositions {
     /// Each position: the value's, the demand's, then another place feeding the target.
     pub fn iter(&self) -> impl Iterator<Item = &Related> {
-        self.0.iter().flat_map(|slots| slots.iter().flatten())
+        self.0.iter().flat_map(|slots| slots.roles.iter().flatten())
+    }
+
+    /// Each concrete contribution, kept separately from the one position per role.
+    pub fn contributions(&self) -> impl Iterator<Item = &BoundContribution> {
+        self.0.iter().flat_map(|data| data.contributions.iter())
+    }
+
+    pub(crate) fn add_contribution(&mut self, origin: crate::ccl::infer_var::Origin, ty: Type) {
+        let data = self.0.get_or_insert_with(Box::default);
+        let contribution = BoundContribution { origin, ty };
+        if !data.contributions.contains(&contribution) {
+            data.contributions.push(contribution);
+        }
     }
 
     /// Record `related` in its role's slot.
@@ -1074,7 +1101,7 @@ impl RelatedPositions {
             RelatedRole::Demand => 1,
             RelatedRole::OtherFeed => 2,
         };
-        self.0.get_or_insert_with(Box::default)[slot] = Some(related);
+        self.0.get_or_insert_with(Box::default).roles[slot] = Some(related);
     }
 }
 
@@ -1155,6 +1182,16 @@ impl LocatedInferError {
                 origin: crate::ccl::infer_var::Origin::Node(other),
                 role: RelatedRole::OtherFeed,
             });
+        }
+    }
+
+    /// Respell the types in the diagnostic and its contribution labels together.
+    pub(crate) fn respell(&mut self, rename: &Subst) {
+        self.error.respell(rename);
+        if let Some(data) = &mut self.related.0 {
+            for contribution in &mut data.contributions {
+                contribution.ty = rename.apply_type(&contribution.ty);
+            }
         }
     }
 

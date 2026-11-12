@@ -128,7 +128,11 @@ fn labels(code: &str) -> (String, Vec<(String, String)>) {
         f(True, 2)
     "#},
     "f",
-    &[("a if c else \"s\"", "required here")],
+    &[
+        (r#"a if c else "s""#, "required here"),
+        ("f(True, 2)", "contributes {Int where _ == 2}"),
+        (r#"a if c else "s""#, r#"contributes {String where _ == "s"}"#),
+    ],
 )]
 #[case::the_resolution_of_a_function_result_barrier(
     indoc! {"

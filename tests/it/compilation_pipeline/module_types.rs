@@ -913,7 +913,7 @@ fn a_module_typed_parameter_takes_its_arguments_type_members(
         run exact(n=p) as e
         1
     "},
-    "annotated as Int => Int, but inferred as {Int where _ > 0} => {Int where _ > 0}"
+    "annotated as {Int where _ > 0}, but inferred as Int"
 )]
 #[case::a_missing_type_member(
     indoc! {"
