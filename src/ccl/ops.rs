@@ -702,9 +702,9 @@ pub enum Builtin {
     /// `begin_<site>` is injective over iterations; the engine allocates no tick for it. The
     /// tap's ``variant_project(`commit)`` drops it.
     ///
-    /// Heads each in-block reply tap [`crate::ccl::transact_phase`] binds, which types a reply
-    /// `Txn ⤇ 𝑉`, keyed as the store serves it. Minted after inference with its type stamped,
-    /// like [`Self::BeginTxn`], and consumed with the tap binding by
+    /// Heads each tap [`crate::ccl::transact_phase`] binds for a reply inside a transaction,
+    /// which types a reply `Txn ⤇ 𝑉`, keyed as the store serves it. Minted after inference
+    /// with its type stamped, like [`Self::BeginTxn`], and consumed with the tap binding by
     /// [`crate::ccl::planning::plan_loops`], so its op-conversion arm is a deliberate error.
     ByCommitTime,
 

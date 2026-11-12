@@ -991,7 +991,7 @@ fn peel(mut e: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
 /// a bare reference to a `Mut` parameter, and an application's function, which
 /// is where a proven keyed read `m[k]!` puts the collection. A feed's value is the
 /// third — `transact_phase::rewrite_as_of_reads` turns a history read fed out
-/// of a read-only block into an as-of join, and it is the bare reference that
+/// of a read-only transaction into an as-of join, and it is the bare reference that
 /// says so. Naming any of them leaves the recognizer a `Var` it cannot read
 /// through, so each keeps whatever ordering it had.
 ///

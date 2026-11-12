@@ -250,7 +250,7 @@ fn a_chain_of_writing_if_values_stays_linear() {
 }
 
 #[test]
-fn a_chain_of_writing_if_values_in_a_writing_block_stays_linear() {
+fn a_chain_of_writing_if_values_in_a_writing_transaction_stays_linear() {
     assert_linear_in_chain_length("writing `if` values in a `with begin():` block", |d| {
         loop_with_chain_of(
             "a0 = i + 1",
@@ -344,7 +344,7 @@ fn a_chain_of_declarations_stays_linear() {
 }
 
 #[test]
-fn a_chain_in_a_read_only_block_stays_linear() {
+fn a_chain_in_a_read_only_transaction_stays_linear() {
     // The accumulator-free path: each feed leaves the chain for a map of its own
     // (`transform_feed_only_loop`), taking its bindings with it.
     assert_linear_in_chain_length("read-only `with begin():` block", |d| {
@@ -366,7 +366,7 @@ fn a_chain_in_a_read_only_block_stays_linear() {
 }
 
 #[test]
-fn a_chain_in_a_writing_block_stays_linear() {
+fn a_chain_in_a_writing_transaction_stays_linear() {
     assert_linear_in_chain_length("writing `with begin():` block", |d| {
         loop_with_chain(
             d,
@@ -385,7 +385,7 @@ fn a_chain_in_a_writing_block_stays_linear() {
 }
 
 #[test]
-fn a_chain_read_under_a_guard_in_a_writing_block_stays_linear() {
+fn a_chain_read_under_a_guard_in_a_writing_transaction_stays_linear() {
     // The guard reaches the commit gate, the guarded write a value-`Case` arm, and
     // the feed a tap: three regions, each given the bindings it reads.
     assert_linear_in_chain_length("guarded writing `with begin():` block", |d| {
@@ -409,7 +409,7 @@ fn a_chain_read_under_a_guard_in_a_writing_block_stays_linear() {
 }
 
 #[test]
-fn a_chain_inside_a_guard_in_a_writing_block_stays_linear() {
+fn a_chain_inside_a_guard_in_a_writing_transaction_stays_linear() {
     // The arm's bindings stay apart from the block's and travel with each value
     // leaving the arm.
     assert_linear_in_chain_length("chain in a guarded writing `with begin():` arm", |d| {
@@ -583,7 +583,7 @@ fn copies_of(marker: i64, code: &str) -> usize {
         zs << t
     sum(ys) + sum(zs)
 "})]
-#[case::in_a_writing_block(indoc::indoc! {"
+#[case::in_a_writing_transaction(indoc::indoc! {"
     t: Mut(Int, Txn) := 0
     ys: Feed(_)
     zs: Feed(_)

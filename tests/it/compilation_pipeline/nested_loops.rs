@@ -628,7 +628,7 @@ fn a_statement_may_follow_the_inner_loop() {
     );
 }
 
-/// The commit store meeting an induction accumulator inside one nest: the block reads
+/// The commit store meeting an induction accumulator inside one nest: the transaction reads
 /// `cnt`, which advances at the outer level, so the decision needs a cross-domain read
 /// at a position the nest names rather than a single loop's. Refused with the rest of
 /// the transactional nest cases; the value is what it should answer — 100 − (10+20)·1 −

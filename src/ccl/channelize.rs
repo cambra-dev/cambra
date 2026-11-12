@@ -3704,8 +3704,8 @@ fn extract_for_defer_impl(
         },
         // Recognition runs after lambda_elim, so a
         // causal `LetRec` reaches feed extraction. Walk its binding bodies
-        // and continuation generically — the phase hoists every in-loop /
-        // in-block feed to the letrec *body* (`for x in tap: defer << x` ExprStmts),
+        // and continuation generically — the phase hoists every feed inside a loop
+        // or a transaction to the letrec *body* (`for x in tap: defer << x` ExprStmts),
         // so extraction finds them there; binding bodies carry no feeds but
         // are walked for totality. Binder shadowing of `defer_name` is
         // impossible post-uniquify.

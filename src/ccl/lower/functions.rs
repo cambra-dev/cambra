@@ -397,7 +397,7 @@ pub(super) fn lower_lambda(
     // `uncurry_params`), checked post-inference — there is no induction registry
     // to mask here. But a plain parameter spelled like an outer transactional
     // mutable variable is a genuine local, so SHADOW every parameter over the body
-    // (popped on exit) to skip the out-of-block read gate for it — mirroring how
+    // (popped on exit) to skip the gate on reads outside a transaction for it — mirroring how
     // `uniquify` threads its env stack so a shadowed name reverts to its outer
     // meaning. The shadow set is keyed by pre-uniquify base name.
     let param_names: Vec<String> = params.iter().map(|p| p.name.as_str().to_string()).collect();
@@ -725,11 +725,10 @@ pub(super) fn lower_function_body(
         }
     }
 
-    // Shadow only the *non*-`Mut` parameters over the body: a plain param
-    // spelled like an outer transactional mutable variable is a genuine local, so the
-    // out-of-block read gate must skip it. A `Mut` param is a mutable variable in its own
-    // right, so it keeps its gate — reading a `Mut(_, Txn)` param outside a `with
-    // begin():` block in the body is still an error.
+    // Shadow only the *non*-`Mut` parameters over the body: a plain param spelled like an outer
+    // transactional mutable variable is a genuine local, so the gate on reads outside a transaction
+    // must skip it. A `Mut` param is a mutable variable in its own right, so it keeps its gate —
+    // reading a `Mut(_, Txn)` param outside a `with begin():` block in the body is still an error.
     let shadowed_params: Vec<String> = outer_bindings
         .iter()
         .filter(|n| !mut_param_names.contains(n.as_str()))

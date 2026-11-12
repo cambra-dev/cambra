@@ -343,11 +343,11 @@ registered in `history_param_fns` when its module begins lowering.
 
 Each module is lowered with fresh block state. Every spelling-keyed map in `LoweringContext`
 (`transactional_vars`, `type_aliases`, `history_param_fns`, `shadow_depth`, `nominal_types`,
-`associated_functions`, `used_nominal`, `traits`) covers one module. The
-entries a module seeds from interfaces and from its parameters' Module types, `Txn` members in
-`transactional_vars` and `Mut`- and `Feed`-parameter functions in `history_param_fns`, are keyed by qualified
-spelling. The out-of-block read gate and the `MutWrite` shape then apply to `eu::stock` and
-`audit::stock` exactly as they apply to `stock` inside its own module.
+`associated_functions`, `used_nominal`, `traits`) covers one module. The entries a module seeds from
+interfaces and from its parameters' Module types, `Txn` members in `transactional_vars` and `Mut`-
+and `Feed`-parameter functions in `history_param_fns`, are keyed by qualified spelling. The gate on
+reads outside a transaction and the `MutWrite` shape then apply to `eu::stock` and `audit::stock`
+exactly as they apply to `stock` inside its own module.
 
 A module with no syntax tree or an uncontained lowering error has no usable interface. A
 reference or a `use` item into it adds no error: that module's errors account for it. Contained
@@ -624,18 +624,17 @@ a tuple, a record or a list to a `const` parameter a predicate reads is an error
 the run, since a predicate holds no such value yet (`compound_const_reads`).
 
 **The per-module check runs parsing, lowering, uniquification, and inference** (`Phase::Lower`,
-`Phase::Uniquify`, `Phase::Infer` in `src/ccl/context.rs`), plus the run-site checks of the
-module's own `run` and `import` statements ([Checking a module on its
-own](#checking-a-module-on-its-own)). Lowering's own refusals are part of it: the
-mutation-statement rules, the out-of-block `Txn` read gate, visibility, and a duplicate literal
-route within the module.
+`Phase::Uniquify`, `Phase::Infer` in `src/ccl/context.rs`), plus the run-site checks of the module's
+own `run` and `import` statements ([Checking a module on its own](#checking-a-module-on-its-own)).
+Lowering's own refusals are part of it: the mutation-statement rules, the gate on `Txn` reads
+outside a transaction, visibility, and a duplicate literal route within the module.
 
 **Every later pass runs only on the linked tree**, because it needs the bodies of called functions
 inlined or the run tree assembled:
 
 | Pass | What it can refuse |
 | --- | --- |
-| inlining (`Phase::Inline`), then `check_transact_rejections` | the mutable-variable checks: a nested transaction, a block that writes only induction variables, an induction variable written under a branch in a block, a reference after `await_final` |
+| inlining (`Phase::Inline`), then `check_transact_rejections` | the mutable-variable checks: a nested transaction, a transaction that writes only induction variables, an induction variable written under a branch inside a transaction, a reference after `await_final` |
 | the transaction phase (`Phase::Transact`) and `mut_elim` (`Phase::Letrec`) | recurrence shapes they do not support |
 | channelization (`Phase::Channelize`) | a feed whose contributions do not route |
 | the as-of-read rewrite, lambda elimination, planning | shapes the planner cannot emit dataflow for |

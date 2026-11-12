@@ -113,7 +113,7 @@
 //!
 //! **A bare read fed to a deferred output.** `out << x` reaches
 //! `transact_phase::rewrite_as_of_reads`, which turns a history read fed out of
-//! a read-only block into an as-of join by reading the term. A computed feed
+//! a read-only transaction into an as-of join by reading the term. A computed feed
 //! value is an ordinary operand.
 //!
 //! **A refined cast's value.** A cast target that refines its domain holds a

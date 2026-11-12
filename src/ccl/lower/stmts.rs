@@ -986,7 +986,7 @@ pub(super) fn lower_middle_stmt(
         ChlStmt::AugAssign { target, op, value } => {
             let name = extract_name_target(target, "augmented assignment")?;
             // A `+=` to a transactional mutable variable outside a `with begin():` block
-            // is rejected here (a mutable variable write must commit inside a block);
+            // is rejected here (a mutable variable write must commit inside a transaction);
             // otherwise it is a bare mutable write whose target-is-a-mutable check
             // runs post-inference.
             check_mut_write_context(&name, stmt.span, ctx)?;
@@ -1940,9 +1940,9 @@ pub(super) fn name_target_as_name(target: &Spanned<AssignTarget>) -> Option<&str
 }
 
 /// Reject a `Mut(V, Txn)` **mutable variable** write that lands *outside* a `with
-/// begin():` block — the write-side mirror of the out-of-block read gate in
+/// begin():` block — the write-side mirror of the gate on reads outside a transaction in
 /// [`super::lower_expr`]. A mutable variable's history is the commit order, so a bare
-/// write outside a block would become a plain sequential `let` shadow that
+/// write outside a transaction would become a plain sequential `let` shadow that
 /// silently hides every committed value from subsequent reads; require the
 /// write to sit inside a block.
 ///

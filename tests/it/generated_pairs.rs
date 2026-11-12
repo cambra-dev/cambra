@@ -765,7 +765,7 @@ fn skeletons() -> Vec<Skeleton> {
         "#}},
 
         // Terminal reads. Every other transactional skeleton reads the store in context, inside
-        // the block that writes it; `await_final` waits for the whole commit history.
+        // the transaction that writes it; `await_final` waits for the whole commit history.
         Skeleton { name: "terminal_read", hole: Ty::Int, scope: &[("pool", Ty::TxnStore)], body: indoc! {r#"
             out = test_sink()
             pool: Mut(Int, Txn) := 100

@@ -1213,7 +1213,7 @@ fn test_a_source_growing_under_a_running_transaction_driver_is_read_again() {
 }
 
 /// A transaction loop over a live source filtered to nothing releases every row it reads
-/// past. No block runs, so no commit acknowledges a row, and a row the filter removes is
+/// past. No transaction runs, so no commit acknowledges a row, and a row the filter removes is
 /// consumed when the drive reads past it, once the source calls it complete.
 #[test_log::test]
 fn test_filtered_rows_of_a_live_transaction_source_are_released() {
@@ -1251,7 +1251,7 @@ fn test_filtered_rows_of_a_live_transaction_source_are_released() {
         "both filtered rows are released while the source is live"
     );
 
-    // No block ran, so the store still holds its seed.
+    // No transaction ran, so the store still holds its seed.
     test_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);

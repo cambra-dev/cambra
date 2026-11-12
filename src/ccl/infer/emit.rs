@@ -3032,7 +3032,7 @@ pub(super) fn emit_for<C: Typing>(
 
 /// Type a `Begin { body }` transaction-block marker: emit the per-transaction
 /// body chain and give the block itself type `Unit`. The block introduces no
-/// binder or scope — in-block mutable variable reads/writes/feeds are typed by their own
+/// binder or scope — the mutable variable reads/writes/feeds inside it are typed by their own
 /// `Var`/`MutWrite`/`Feed` rules. Shared by Emit and Check via [`Typing`], like
 /// [`emit_for`].
 pub(super) fn emit_begin<C: Typing>(

@@ -12,7 +12,7 @@ fn every_guarded_write_commits() {
     // 100 − 10 − 20 − 30, every guard passing over the snapshot it reads.
     //
     // The program observes `pool` through `await_final` because that is the only
-    // terminal read of a mutable variable: a read fed out of a block that does
+    // terminal read of a mutable variable: a read fed out of a transaction that does
     // not write `pool` is an as-of read at an arbitrary commit position
     // (`docs/chl-spec.md`, "8.3 Reads"), which the seed satisfies as well as the
     // folded value.

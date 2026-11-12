@@ -119,7 +119,11 @@ cnt: Mut(Int) := 0             # optional annotation; value type inferred if omi
 balance: Mut(Int, Txn) := 0    # transactional variable over the commit order — Txn is never inferred
 ```
 
-`:=` is imperative assignment (in the Algol tradition); plain `=` is an immutable binding and never mutates. Transactions are `with begin():` blocks: writes to `Txn`-domain variables are legal only inside one, all writes in a block commit atomically on exit, and reads inside a block see one snapshot-consistent view. Sharing state across concurrent writers is a semantic commitment the program must spell (`Mut(V, Txn)`). It's never inferred.
+`:=` is imperative assignment (in the Algol tradition); plain `=` is an immutable binding and never
+mutates. Transactions are `with begin():` blocks: writes to `Txn`-domain variables are legal only
+inside one, all writes in a transaction commit atomically on exit, and reads inside a transaction
+see one snapshot-consistent view. Sharing state across concurrent writers is a semantic commitment
+the program must spell (`Mut(V, Txn)`). It's never inferred.
 
 Mutability is still being implemented. See the [not-yet-implemented list](../src/ccl/design/mutability.md#not-yet-implemented) for the authoritative list.
 

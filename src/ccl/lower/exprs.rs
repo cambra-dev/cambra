@@ -220,8 +220,8 @@ pub(super) fn lower_call(
         // The argument is resolved **by name**, like a write's target and unlike an
         // ordinary call argument: `await_final` reduces the mutable variable's history rather
         // than consuming a value, so the operand is a handle position and never goes
-        // through the value-reading `lower_expr` (whose out-of-block read gate would
-        // reject the very read this is).
+        // through the value-reading `lower_expr` (whose gate on reads outside a
+        // transaction would reject the very read this is).
         Some(SurfaceBuiltin::AwaitFinal) => {
             // The slice pattern below states await_final's arity.
             const _: () = assert!(matches!(
@@ -257,16 +257,17 @@ pub(super) fn lower_call(
                     ),
                 ));
             }
-            // Inside a block the await would be a read of the very history that
-            // block extends — a transaction waiting on its own completion. The
-            // snapshot read (a bare `x`) is the only mutable variable read a block has.
+            // Inside a `with begin():` block the await would be a read of the very
+            // history that transaction extends — a transaction waiting on its own
+            // completion. The snapshot read (a bare `x`) is the only mutable variable read a
+            // transaction has.
             if ctx.in_tx_body {
                 return Err(LoweringError::unsupported(
                     func.span,
                     format!(
                         "await_final(`{name}`) inside a `with begin():` block would wait on the \
-                         commit history that block extends; a block reads `{name}` bare, as a \
-                         snapshot"
+                         commit history that transaction extends; a transaction reads `{name}` \
+                         bare, as a snapshot"
                     ),
                 ));
             }
@@ -508,8 +509,8 @@ fn lower_expression_call(
 /// The tupled form pairs with the uncurried multi-arg lambda lowering in
 /// [`lower_lambda`], so syntactic multi-arg functions compile without any
 /// `curry` combinator appearing in the tree. Every argument is an ordinary
-/// value, so it lowers through `lower_expr`, where the out-of-block
-/// transactional read gate applies. (Only a `Mut`-param callee, applied by
+/// value, so it lowers through `lower_expr`, where the gate on transactional reads
+/// outside a transaction applies. (Only a `Mut`-param callee, applied by
 /// [`lower_curried_call`], accepts a bare mutable variable and bypasses the gate.)
 fn apply_to_args(
     args: &[Spanned<ChlExpr>],
@@ -759,7 +760,7 @@ pub(super) fn lower_subscript(
 /// shape a pass-by-reference `Mut` parameter accepts (design doc
 /// `src/ccl/design/mutability.md`, rule 1: "a `Mut`-typed value must be a bare
 /// variable reference"), so it is lowered directly to a `Var` — bypassing the
-/// out-of-block transactional read gate in [`super::lower_expr`]. Whether it is
+/// gate on transactional reads outside a transaction in [`super::lower_expr`]. Whether it is
 /// a by-reference mutable-variable pass (e.g. `transfer(a, b, amt)` for
 /// `a: Mut(_, Txn)`) or an ordinary value read is decided downstream by the
 /// callee's inferred parameter type; lowering cannot know the signature (it runs

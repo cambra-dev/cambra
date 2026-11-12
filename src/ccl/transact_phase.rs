@@ -6,7 +6,7 @@
 //! This unifies the transaction path with the induction path (`For`/`MutWrite`
 //! → a `get_prev_seq` `LetRec` → recognition → `Transact` → engine).
 //!
-//! **A program gets one store per set of mutable variables a block relates**, not one for
+//! **A program gets one store per set of mutable variables a transaction relates**, not one for
 //! the whole program — the same shape the induction path has, where
 //! `mut_elim::transform_loop` emits one letrec per loop. [`partition_keys`] states
 //! the rule and why; [`plan_store`] plans each partition, and [`splice_stores`]
@@ -24,9 +24,9 @@
 //! 1. **strips** every such `For` site, building one [`WriterSite`] per site
 //!    (its read/write footprint, its loop source, and a
 //!    `` {`commit{writes, __to_<defer>*} | `abort} `` decision lambda built from the
-//!    block by threading read-your-writes ([`WriterWalk`]) — each in-block `<<` feed
-//!    rides the `` `commit `` payload as a `__to_<defer>` tap). This is the **same** writer/key
-//!    building the direct fold used; only the assembly below differs.
+//!    block by threading read-your-writes ([`WriterWalk`]) — each `<<` feed inside the
+//!    transaction rides the `` `commit `` payload as a `__to_<defer>` tap). This is the
+//!    **same** writer/key building the direct fold used; only the assembly below differs.
 //! 2. **partitions** the keys into commit stores ([`partition_keys`]) and
 //!    **assembles** one `LetRec` per store (see [`plan_store`]): one **history** binding
 //!    `hist_k : Txn ⇒ V = λ t → get_prev_txn(view, t, init)` per key — reading
@@ -39,17 +39,17 @@
 //! 3. **places** the stores ([`splice_stores`]), rebinding each key variable still
 //!    named in the continuation from `let x = init` to `let x = as_of_read(hist_x)` over
 //!    its history binding — an as-of read of it, at a position nothing has supplied yet.
-//!    A read fed out of a block that does not write `x` is broadcast over the reading
+//!    A read fed out of a transaction that does not write `x` is broadcast over the reading
 //!    loop and, after `channelize`, joined with that loop into an `AsOf` by
 //!    [`rewrite_as_of_reads`] (this module, pre-lambda-elim), which is where the
 //!    position comes from; and
-//!    **hoists** each in-block feed to
+//!    **hoists** each feed inside a transaction to
 //!    `Feed(defer, tap)` over its tap binding, for `channelize` to route as an
 //!    ordinary channel contribution.
 //!
 //! Recognition rebuilds the `Transact{domain: Txn}` node that op-conversion's
 //! `build_commit_store` compiles to the commit engine (`CommitOperator` + fused
-//! `TransactWriter`s in a cyclic `FanOut`). A read fed *out* of a block is
+//! `TransactWriter`s in a cyclic `FanOut`). A read fed *out* of a transaction is
 //! rewritten to an `AsOf` (an as-of read at an arbitrary commit position) by
 //! [`rewrite_as_of_reads`] below — every such read, regardless of the reading
 //! loop's domain. The one **terminal** mutable variable read is the surface
@@ -58,7 +58,7 @@
 //! terms** over the same history — [`Builtin::AsOfRead`] and [`Builtin::FinalRead`] — so
 //! neither pass can claim the other's read whatever the tree around it looks like. Each
 //! `__to_<defer>` tap compiles to a per-commit value-stream (`body_tap_fields`).
-//! The in-block feed mirrors the induction phase's in-loop feeds
+//! A feed inside a transaction mirrors the induction phase's in-loop feeds
 //! ([`crate::ccl::mut_elim`]).
 //!
 //! **Being a transactional variable is the `Mut(_, Txn)` type; a variable's identity
@@ -567,7 +567,7 @@ pub fn collect_txn_mut_vars(expr: &Expr) -> HashSet<Name> {
 }
 
 /// The value type `V` of a mutable variable reference. A transactional mutable variable's binding and
-/// its in-block references are `Mut(V, Txn)`-typed after inference, but the
+/// its references inside a transaction are `Mut(V, Txn)`-typed after inference, but the
 /// histories and commit records this phase emits — and the `final_or_default`
 /// reads it rebinds — are over `V`. Peel a `Mut` wrapper (through transparent
 /// outer refinements) to its value type; leave a non-`Mut` type untouched.
@@ -635,7 +635,7 @@ struct RawSite {
     enclosing_writes: HashSet<Name>,
 }
 
-/// One commit store's writer sites and their in-block feeds, as [`run`] collects
+/// One commit store's writer sites and the feeds inside their transactions, as [`run`] collects
 /// them before the store is planned.
 ///
 /// Each writer travels with the [`NodeId`] of the `with begin():` statement its
@@ -657,8 +657,8 @@ type StoreWriters = (Vec<(NodeId, WriterSite)>, Vec<Vec<FeedSite>>);
 /// base name) makes the fold immune to an unrelated local variable merely
 /// *spelled* like a mutable variable.
 pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<String>> {
-    // Strip whenever a `with begin():` block is present. A block need not write a
-    // transactional mutable variable — a read-only block (`out << balance`) has no write
+    // Strip whenever a `with begin():` block is present. A transaction need not write a
+    // transactional mutable variable — a read-only transaction (`out << balance`) has no write
     // yet must still be unwrapped off the loop spine — so we cannot short-circuit
     // on `txn_mut_vars` alone; but with neither a mutable variable nor a block there is
     // nothing to do.
@@ -681,8 +681,8 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<Str
     let stripped = strip(expr, txn_mut_vars, None, &mut harvest);
     // Post-strip invariants (release asserts, like the letrec-phase
     // post-conditions): every `Begin` was consumed (stripped into a site or
-    // unwrapped), and no transactional write survives outside a block — a
-    // survivor is a mutable variable write outside a block that the lowering write gate
+    // unwrapped), and no transactional write survives outside a transaction — a
+    // survivor is a mutable variable write outside a transaction that the lowering write gate
     // (`check_mut_write_context`) should have rejected, and must never
     // silently become a shadowing `let` that hides committed values.
     assert!(
@@ -691,8 +691,9 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<Str
     );
     assert!(
         !writes_any(&stripped, txn_mut_vars),
-        "transact_phase: a `MutWrite` to a transactional mutable variable survived stripping — an \
-         out-of-block mutable variable write the lowering write gate should have rejected"
+        "transact_phase: a `MutWrite` to a transactional mutable variable survived stripping — a \
+         mutable variable write outside any transaction, which the lowering write gate should \
+         have rejected"
     );
     let Stripped {
         sites,
@@ -708,7 +709,7 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<Str
             }
         }
     }
-    // One commit store per set of keys some block relates (see [`partition_keys`]),
+    // One commit store per set of keys some transaction relates (see [`partition_keys`]),
     // matching the induction path's one-letrec-per-loop.
     let groups = partition_keys(&key_names, &sites, &read_only_footprints);
 
@@ -719,8 +720,8 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<Str
     // no-site early return below safe: `await_final(pool)` with no `with begin():`
     // anywhere is that same program with `sites` empty.
     let mut stripped = stripped;
-    // Gated on the **write** footprints, not on `key_names`: a key some block only
-    // reads is a footprint key (`{reads ∪ writes}` is one store) yet nothing can write
+    // Gated on the **write** footprints, not on `key_names`: a key some transaction
+    // only reads is a footprint key (`{reads ∪ writes}` is one store) yet nothing can write
     // it, so its final value is statically its seed just as an untouched variable's is.
     let written_keys: Vec<Name> = sites
         .iter()
@@ -872,9 +873,9 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<Str
 /// Partition the mutable variable keys into **commit stores**: one store per set of keys
 /// that must commit and be sampled together.
 ///
-/// A `with begin():` **block** is the unit that forces keys together, through its
-/// footprint: a writing block's `{reads ∪ writes}` advance at one commit tick and are
-/// read at one snapshot (atomicity), and a read-only block's reads are latched at one
+/// A **transaction** is the unit that forces keys together, through its footprint: a
+/// writing transaction's `{reads ∪ writes}` advance at one commit tick and are read at
+/// one snapshot (atomicity), and a read-only transaction's reads are latched at one
 /// frontier (snapshot consistency). Nothing else forces sharing. The argument is in
 /// `src/ccl/design/mutability.md`, "How many commit stores a program has".
 ///
@@ -915,13 +916,13 @@ fn partition_keys(
             }),
         );
     }
-    // A read-only footprint may name a mutable variable **no block writes**. Such a mutable variable
-    // is not a store key: nothing can advance it (the write gate admits a mutable variable
-    // write only inside a block, and a block write would put it in a write set), so
-    // its history is constant at its seed and every read of it is that seed. It keeps
-    // its `MutDecl` on the spine and relates nothing — reading it at a frontier would
-    // cost a store key to learn what the declaration already says. Only the keys some
-    // writer does touch are unioned.
+    // A read-only footprint may name a mutable variable **no transaction writes**. Such a
+    // mutable variable is not a store key: nothing can advance it (the write gate admits a
+    // mutable variable write only inside a transaction, and a write inside a transaction
+    // would put it in a write set), so its history is constant at its seed and every read
+    // of it is that seed. It keeps its `MutDecl` on the spine and relates nothing — reading
+    // it at a frontier would cost a store key to learn what the declaration already says.
+    // Only the keys some writer does touch are unioned.
     for f in read_only_footprints {
         union_all(&mut parent, &mut f.iter().filter_map(&index_of));
     }
@@ -981,7 +982,7 @@ struct CrossAcc {
     final_var: Name,
 }
 
-/// Every `Var` a commit-decision block reads that is not a transactional variable — the
+/// Every `Var` a writing transaction reads that is not a transactional variable — the
 /// candidate induction accumulators. [`fold_cross_domain_loops`] confirms each by
 /// intersecting with the actual loop-`MutWrite` targets (names are α-unique, so a
 /// match is the same variable).
@@ -1127,15 +1128,16 @@ fn contains_begin(expr: &Expr) -> bool {
 }
 
 /// What [`strip`] harvests off the spine: one [`RawSite`] per writing `with
-/// begin():` block, and the mutable variable footprint of every **read-only** block.
+/// begin():` block, and the mutable variable footprint of every **read-only** transaction.
 ///
-/// A block's footprint is what decides its keys' store ([`partition_keys`]). A writing
-/// block's rides its `RawSite`; a read-only block is unwrapped onto the spine and leaves
+/// A transaction's footprint is what decides its keys' store ([`partition_keys`]). A
+/// writing transaction's rides its `RawSite`; a read-only transaction is unwrapped onto
+/// the spine and leaves
 /// no site, so its footprint is collected here or lost.
 #[derive(Default)]
 struct Stripped {
     sites: Vec<RawSite>,
-    /// One entry per read-only block: the mutable variable keys it reads together.
+    /// One entry per read-only transaction: the mutable variable keys it reads together.
     read_only_footprints: Vec<Vec<Name>>,
 }
 
@@ -1177,8 +1179,8 @@ fn strip(
         // ([`statement_tag_cases_to_guards`](crate::ccl::ccl_utils::statement_tag_cases_to_guards)).
         let block = {
             // The rewrite duplicates the scrutinee once per arm, so it needs a
-            // recording of its own: it runs before either block path opens one,
-            // and it applies to both (a writing block and a read-only one may each
+            // recording of its own: it runs before either strip path opens one,
+            // and it applies to both (a writing transaction and a read-only one may each
             // dispatch on a tag).
             let g = provenance::enter(
                 stmt_id,
@@ -1189,7 +1191,7 @@ fn strip(
             Box::new(crate::ccl::ccl_utils::statement_tag_cases_to_guards(*block))
         };
         if writes_any(&block, txn_mut_vars) {
-            // A writing block → a commit-record site keyed on the *enclosing*
+            // A writing transaction → a commit-record site keyed on the *enclosing*
             // loop. Partition it by mutable variable domain: the transactional remainder is
             // the commit decision; each induction `MutWrite` is lifted onto the
             // loop body as a sibling (after the stripped block, same iteration
@@ -1197,18 +1199,18 @@ fn strip(
             // The two domains stay independent — an induction accumulator is
             // never in the atomic commit.
             let (target, source, enclosing_writes) = enclosing.expect(
-                "a writing `with begin():` block must be inside a loop (lowering wraps a \
-                 standalone block in a singleton `For`)",
+                "a writing transaction must be inside a loop (lowering wraps a standalone \
+                 transaction in a singleton `For`)",
             );
             let new_rest = {
                 // Recorded here: the source copy the site takes, the statement
                 // wrappers `prepend_effects` mints for the lifted induction
-                // writes, and whatever `partition_block` rebuilds. The block
+                // writes, and whatever `partition_txn_by_domain` rebuilds. The block
                 // itself is *not* consumed here — it travels on the site and is
                 // disassembled by `build_writer` under this same parent.
                 let g = provenance::enter(stmt_id, "transact.strip", provenance::Nature::Expansion);
                 g.blame(&[begin_id]);
-                let (txn_block, lifted) = partition_block(*block, txn_mut_vars);
+                let (txn_block, lifted) = partition_txn_by_domain(*block, txn_mut_vars);
                 let (read_keys, write_keys) = collect_footprint(&txn_block, txn_mut_vars);
                 out.sites.push(RawSite {
                     parent: stmt_id,
@@ -1226,7 +1228,7 @@ fn strip(
             };
             return strip(new_rest, txn_mut_vars, enclosing, out);
         }
-        // A read-only block (feeds a mutable variable read, no txn write) → unwrap it onto
+        // A read-only transaction (feeds a mutable variable read, no txn write) → unwrap it onto
         // the loop spine. The fed mutable variable read then flows to `mut_elim`'s
         // live/terminal as-of path unchanged (the shape a get-loop had before).
         // Its footprint is kept even though the block is not: the mutable variables it reads
@@ -1236,18 +1238,18 @@ fn strip(
             out.read_only_footprints.push(reads);
         }
         let spliced = {
-            // `splice_block` re-types the spine as it re-points each statement's
+            // `splice_txn_body` re-types the spine as it re-points each statement's
             // continuation, but preserves every id, so this recording usually
             // captures nothing and writes nothing. It is here because the arm is a
             // rewrite: if a re-typed rebuild ever starts minting, the node lands
             // on the statement it belongs to instead of becoming a leak.
             let g = provenance::enter(
                 stmt_id,
-                "transact.unwrap_block",
+                "transact.unwrap_txn",
                 provenance::Nature::Machinery,
             );
             g.blame(&[begin_id]);
-            splice_block(*block, *rest)
+            splice_txn_body(*block, *rest)
         };
         return strip(spliced, txn_mut_vars, enclosing, out);
     }
@@ -1301,16 +1303,16 @@ fn strip(
     expr
 }
 
-/// Splice a `with begin():` block's statement chain onto an enclosing spine by
-/// replacing the block's terminal `Unit` with `rest`. Used to unwrap a
-/// read-only block (its feeds/local `let`s become ordinary loop-body
+/// Splice a transaction's body, the statement chain of its `with begin():` block, onto
+/// an enclosing spine by replacing the body's terminal `Unit` with `rest`. Used to unwrap
+/// a read-only transaction (its feeds/local `let`s become ordinary loop-body
 /// statements). Each rebuilt node's type follows its new continuation.
-fn splice_block(block: Expr, rest: Expr) -> Expr {
+fn splice_txn_body(block: Expr, rest: Expr) -> Expr {
     match block.node {
         TypedExprNode::Lit(Lit::Unit) => rest,
         TypedExprNode::ExprStmt { expr, body } => {
             let node_id = block.node_id;
-            let body = splice_block(*body, rest);
+            let body = splice_txn_body(*body, rest);
             let ty = body.ty.clone();
             Expr {
                 node: TypedExprNode::ExprStmt {
@@ -1329,7 +1331,7 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
             body,
         } => {
             let node_id = block.node_id;
-            let body = splice_block(*body, rest);
+            let body = splice_txn_body(*body, rest);
             let ty = body.ty.clone();
             Expr {
                 node: TypedExprNode::Let {
@@ -1350,10 +1352,10 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
         // `Let` arm above does — written as a `todo!` rather than that one-liner so
         // the first tree that reaches it is loud instead of silently plausible.
         TypedExprNode::MutDecl { .. } => todo!(
-            "splice_block: a mutable variable declared inside a `with begin():` block — \
+            "splice_txn_body: a mutable variable declared inside a `with begin():` block — \
              lowering cannot produce one yet"
         ),
-        // A read-only block is a `Let`/`ExprStmt`(feed) chain ending in `Unit`;
+        // A read-only transaction's body is a `Let`/`ExprStmt`(feed) chain ending in `Unit`;
         // any other terminal is unexpected — sequence it defensively before rest.
         _ => {
             let ty = rest.ty.clone();
@@ -1367,17 +1369,17 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
     }
 }
 
-/// Partition a writing block by mutable variable domain: remove each induction `MutWrite`
-/// (a target *not* in `txn_mut_vars`) from the block spine and return it in the
-/// `Vec`, leaving the transactional remainder (mutable variable writes/reads, local
-/// `let`s, feeds) as the block returned. The lifted induction writes become
+/// Partition a writing transaction by mutable variable domain: remove each induction
+/// `MutWrite` (a target *not* in `txn_mut_vars`) from the spine of its body and return it
+/// in the `Vec`, leaving the transactional remainder (mutable variable writes/reads, local
+/// `let`s, feeds) as the body returned. The lifted induction writes become
 /// siblings on the enclosing loop body (see [`strip`]), keeping the induction
 /// accumulator out of the atomic commit. A bare top-level spine induction write is
-/// therefore exactly the out-of-block form (block placement is inert for it). Only
+/// therefore exactly the form outside a transaction (its placement inside one is inert). Only
 /// top-level spine writes are lifted; a *guarded* induction write is rejected
-/// up front by [`check_no_guarded_induction_write_in_block`] (it would need commit-gated
+/// up front by [`check_no_guarded_induction_write_in_txn`] (it would need commit-gated
 /// carry-forward), so it never reaches here.
-fn partition_block(block: Expr, txn_mut_vars: &HashSet<Name>) -> (Expr, Vec<Expr>) {
+fn partition_txn_by_domain(block: Expr, txn_mut_vars: &HashSet<Name>) -> (Expr, Vec<Expr>) {
     let mut lifted = Vec::new();
     let mut env = HashMap::new();
     let txn_block = partition_spine(block, txn_mut_vars, &mut lifted, &mut env);
@@ -1401,10 +1403,10 @@ fn partition_block(block: Expr, txn_mut_vars: &HashSet<Name>) -> (Expr, Vec<Expr
 /// phase runs, which is what leaves this arm free to discharge unconditionally.
 ///
 /// **A binding the lift leaves with no consumer is dropped.** The transactional
-/// remainder is what states the block's footprint ([`collect_footprint`]) and
+/// remainder is what states the transaction's footprint ([`collect_footprint`]) and
 /// which induction accumulators the commit decision reads
 /// ([`cross_domain_reads`]), so a read-binding left behind by the write that
-/// consumed it claims a read the block no longer makes. For `cnt := cnt + 1`
+/// consumed it claims a read the transaction no longer makes. For `cnt := cnt + 1`
 /// that claim is `cnt`, and [`fold_cross_domain_loops`] then folds every loop
 /// writing `cnt` into a cross-domain letrec for an accumulator no decision
 /// reads.
@@ -1455,7 +1457,7 @@ fn partition_spine(
             let body = partition_spine(*body, txn_mut_vars, lifted, env);
             // A binding the remainder does not name is one the lift took the last
             // consumer of. Dropping it is what keeps the remainder's reads the
-            // block's reads. A type naming it counts: a filter reading a mutable
+            // transaction's reads. A type naming it counts: a filter reading a mutable
             // variable puts the read's binder in the type of the collection it
             // filters, and dropping the binding would leave that type naming nothing.
             if !is_free(&binding.name, &body) {
@@ -1473,7 +1475,7 @@ fn partition_spine(
                 site,
             }
         }
-        // Unreachable for the same reason as in `splice_block`: this walks a
+        // Unreachable for the same reason as in `splice_txn_body`: this walks a
         // *block's* spine, and a mutable variable cannot be declared inside a block.
         // A top-level mutable variable introduction is not this spine — it is above the
         // block, where `walk_spine` handles it.
@@ -1509,7 +1511,7 @@ fn prepend_effects(effects: Vec<Expr>, rest: Expr) -> Expr {
 ///
 /// Lowering's nested-`with` check is textual — it catches a literal `with`
 /// inside a `with`, but not a by-reference transactional writer
-/// (`def do_it(p: Mut(_, Txn)): with begin(): p -= 1`) *called* inside a block.
+/// (`def do_it(p: Mut(_, Txn)): with begin(): p -= 1`) *called* inside a transaction.
 /// After inlining, that callee's own `Begin` lands inside the outer block, where
 /// stripping would fold the inner site incorrectly. Detect it here, on the
 /// inlined tree, *before* [`run`]'s [`strip`] consumes the blocks: a `Begin` may
@@ -1541,10 +1543,10 @@ pub fn check_no_nested_transactions(
 /// Reject an **induction-only transaction**: a `with begin():` block that writes
 /// an induction accumulator (`Mut(…)`, non-`Txn`) but no transactional mutable variable.
 ///
-/// Such a block provides no atomicity — its only effect is an induction write
-/// that would be lifted onto the enclosing loop anyway (see [`partition_block`]),
+/// Such a transaction provides no atomicity — its only effect is an induction write
+/// that would be lifted onto the enclosing loop anyway (see [`partition_txn_by_domain`]),
 /// so the `with begin():` is either a misuse (the user believes the mutable variable is
-/// transactional) or dead syntax. An induction write is legal inside a block
+/// transactional) or dead syntax. An induction write is legal inside a transaction
 /// *only alongside* a mutable variable write (the mixed loop), where it rides its own
 /// domain. Mutability is a type, so this cannot be caught at lowering; it is
 /// caught here, on the inlined, typed tree.
@@ -1558,14 +1560,15 @@ pub fn check_no_induction_only_transactions(
     {
         // `name` is any non-transactional `MutWrite` target — an induction
         // accumulator, or a plain non-`Mut` binding (itself a type error caught
-        // by the later `MutWrite`-target check). Either way the block commits no
+        // by the later `MutWrite`-target check). Either way the transaction commits no
         // mutable variable, so keep the message neutral on which it is.
         return Err(Located::new(
             format!(
-                "`{name}` is written inside a `with begin():` block that commits no transactional \
-             mutable variable, so the block provides no atomicity. If `{name}` is an induction \
-             accumulator, move its write outside the block; if it should be a transactional \
-             mutable variable, declare it `Mut(…, Txn)` and write it alongside a mutable variable in the block"
+                "`{name}` is written inside a `with begin():` block whose transaction commits no \
+             transactional mutable variable, so the transaction provides no atomicity. If \
+             `{name}` is an induction accumulator, move its write outside the block; if it should \
+             be a transactional mutable variable, declare it `Mut(…, Txn)` and write it alongside \
+             a mutable variable in the block"
             ),
             expr.node_id(),
         ));
@@ -1590,7 +1593,7 @@ pub fn check_no_induction_only_transactions(
 /// **silently dropped** from the decision record — the worst failure for a DB
 /// substrate, and one a `debug_assert` alone would let through in release. Catch
 /// it here as a user-facing error before the phase runs.
-pub fn check_no_guarded_induction_write_in_block(
+pub fn check_no_guarded_induction_write_in_txn(
     expr: &Expr,
     txn_mut_vars: &HashSet<Name>,
 ) -> Result<(), Located<String>> {
@@ -1600,7 +1603,7 @@ pub fn check_no_guarded_induction_write_in_block(
         return Err(Located::new(
             format!(
                 "`{name}` is written under an `if` or a `match` arm inside a `with begin():` \
-             block. A branch-guarded induction write in a transaction block is not supported \
+             block. A branch-guarded induction write inside a transaction is not supported \
              — move the write outside the block, or (if it should be shared across the \
              transaction) declare it `Mut(…, Txn)` and write it directly, not under a branch"
             ),
@@ -1610,7 +1613,7 @@ pub fn check_no_guarded_induction_write_in_block(
     let mut result = Ok(());
     expr.walk_children(|c| {
         if result.is_ok() {
-            result = check_no_guarded_induction_write_in_block(c, txn_mut_vars);
+            result = check_no_guarded_induction_write_in_txn(c, txn_mut_vars);
         }
     });
     result
@@ -1623,7 +1626,7 @@ pub fn check_no_guarded_induction_write_in_block(
 /// [`partition_spine`] lifts an induction write onto the enclosing loop and
 /// discharges the block's `let` definientia into it, so the write leaves holding
 /// the values it reads rather than binders it is moving away from. A read inlined
-/// that way is evaluated at the lift destination, past every write the block makes
+/// that way is evaluated at the lift destination, past every write the transaction makes
 /// between the binding and the write carrying it, and reports the crossed write's
 /// value rather than the one the binding took. `inline.rs`'s
 /// `reads_a_variable_written_in` refuses the same move over the same hazard.
@@ -1723,7 +1726,7 @@ fn induction_write_reading_past_a_write(
                 }
                 // Both kinds of write invalidate: a lifted one moves out from under the
                 // bindings made before it, and a transactional one takes its variable to
-                // a value only the block sees.
+                // a value only the transaction sees.
                 let mut targets = HashSet::new();
                 collect_write_targets(effect, &mut targets);
                 let crossed: Vec<(Name, Name)> = reads
@@ -1763,8 +1766,9 @@ fn collect_write_targets(expr: &Expr, out: &mut HashSet<Name>) {
 /// One occurrence check covers every route, because a mention is always a `Var` or a
 /// `MutWrite` target:
 ///
-/// - A **write** inside a later block is a `MutWrite` targeting `x`; a **read** inside one
-///   is a bare `Var(x)` in the writer body. Outside a block both are already rejected at
+/// - A **write** inside a later transaction is a `MutWrite` targeting `x`; a **read** inside
+///   one is a bare `Var(x)` in the writer body. Outside a transaction both are already
+///   rejected at
 ///   lowering (`lower_expr`'s read gate, `check_mut_write_context`).
 /// - A **pass-by-reference argument** is the one mention lowering lets through — a
 ///   `Mut`-typed argument is a bare `Var` by rule, so `lower_call_arg` bypasses the
@@ -1782,8 +1786,8 @@ fn collect_write_targets(expr: &Expr, out: &mut HashSet<Name>) {
 ///   conservative: an await under a guard does not close the writer set the way an
 ///   unconditional one does.
 ///
-/// A block after an await is accepted here: a block committing some other
-/// mutable variable is a separate store, unordered against this one. A block that reaches
+/// A transaction after an await is accepted here: a transaction committing some other
+/// mutable variable is a separate store, unordered against this one. A transaction that reaches
 /// back into the awaited mutable variable's own store is what [`check_store_acyclicity`]
 /// rejects, and only through a store-mate, since this rule already forbids naming the
 /// awaited mutable variable itself.
@@ -1847,8 +1851,8 @@ pub fn check_await_final_linearity(expr: &Expr) -> Result<(), Located<String>> {
 /// depend on it. Three positions do, each of them read by the store's own letrec
 /// bindings:
 ///
-/// - a **writer's iteration source** — the block's extent would depend on the completion
-///   of a store that cannot complete until that block has committed;
+/// - a **writer's iteration source** — the transaction's extent would depend on the
+///   completion of a store that cannot complete until that transaction has committed;
 /// - a **writer's decision body** — the same cycle through the value rather than the
 ///   extent. Always by *taint*, since lowering rejects an `await_final` written inside a
 ///   block outright;
@@ -1857,9 +1861,9 @@ pub fn check_await_final_linearity(expr: &Expr) -> Result<(), Located<String>> {
 ///
 /// Every reachable instance reaches the store through a **store-mate** of the awaited
 /// key, never through the key itself: [`check_await_final_linearity`] already rejects a
-/// later write or read of `k`, so a block that commits into `k`'s store after the await
-/// gets there by writing some other key that block relates to `k`. `f =
-/// await_final(a)` followed by `with begin(): b := b + f`, where an earlier block writes
+/// later write or read of `k`, so a transaction that commits into `k`'s store after the
+/// await gets there by writing some other key that transaction relates to `k`. `f =
+/// await_final(a)` followed by `with begin(): b := b + f`, where an earlier transaction writes
 /// both `a` and `b`, is the shape — one per position, in
 /// `writer_body_depending_on_its_own_store_s_await_rejected` and its two siblings.
 ///
@@ -1868,7 +1872,7 @@ pub fn check_await_final_linearity(expr: &Expr) -> Result<(), Located<String>> {
 /// [`check_letrec_causal`](crate::ccl::letrec::check_letrec_causal) permits since it
 /// forbids only cycles. That is what makes **phase separation** compile; the CHL spec,
 /// [`await_final`](../../../docs/chl-spec.md#86-await_final), gives the program.
-/// Everything outside a store's own bindings is likewise fine: a block may follow an
+/// Everything outside a store's own bindings is likewise fine: a transaction may follow an
 /// await, an await may be bound and used (`f = await_final(pool)`), and an **induction**
 /// accumulator may be seeded from one (`x := await_final(pool)`) — a different
 /// recurrence, so no cycle to have.
@@ -1960,9 +1964,9 @@ fn check_store_acyclicity(
         awaited.iter().find(|k| store_of(k) == Some(store)).cloned()
     };
 
-    // Seeds before sites: a block reading a mutable variable whose *seed* awaits is derivatively
-    // in the cycle too, and the seed is the root cause — reporting the block instead
-    // would point at the statement that merely inherits the problem.
+    // Seeds before sites: a transaction reading a mutable variable whose *seed* awaits is
+    // derivatively in the cycle too, and the seed is the root cause — reporting the
+    // transaction instead would point at the statement that merely inherits the problem.
     // In key order — `groups` is built in `key_names` order — rather than `key_init`'s
     // hash order, so a program with two clashing seeds names the same one every run.
     for k in groups.iter().flatten() {
@@ -1973,7 +1977,7 @@ fn check_store_acyclicity(
                  two share a commit store — `{}`'s value at commit tick 0 would await that \
                  store's own completion. (An induction accumulator may be seeded from an await: \
                  it is a different recurrence. Two transactional mutable variables land in one store \
-                 only when some `with begin():` block mentions them together.)",
+                 only when some transaction mentions them together.)",
                     k.base(),
                     j.base(),
                     k.base()
@@ -1992,11 +1996,11 @@ fn check_store_acyclicity(
             if let Some(k) = clash(&awaited_in(e, &marked), store) {
                 return Err(Located::new(
                     format!(
-                        "a `with begin():` block's {what} depends on `await_final({0})`, and the \
-                     block commits into `{0}`'s own store — one store is one recurrence, so a \
-                     value read out of it cannot feed a writer back into it. (Two transactional \
-                     mutable variables land in one store only when some `with begin():` block \
-                     mentions them together, reads included.)",
+                        "a transaction's {what} depends on `await_final({0})`, and the \
+                     transaction commits into `{0}`'s own store — one store is one recurrence, so \
+                     a value read out of it cannot feed a writer back into it. (Two transactional \
+                     mutable variables land in one store only when some transaction mentions \
+                     them together, reads included.)",
                         k.base()
                     ),
                     s.parent,
@@ -2012,7 +2016,7 @@ fn check_store_acyclicity(
 ///
 /// Such a mutable variable's write history is statically empty, so its final value is its
 /// seed and no runtime completion has to be waited on. Two shapes reach here. One no site
-/// mentions at all is not a footprint key and gets no history binding. One a block only
+/// mentions at all is not a footprint key and gets no history binding. One a transaction only
 /// *reads* is a footprint key — `{reads ∪ writes}` is one store, which is why the `limit` a
 /// guard consults sits beside the `total` it guards — and its history binding simply goes
 /// unread by the await. The `MutDecl` itself is left in place either way, and `mut_elim`
@@ -2118,7 +2122,7 @@ fn first_non_txn_write(block: &Expr, txn_mut_vars: &HashSet<Name>) -> Option<Nam
     found
 }
 
-/// The block's transactional footprint: mutable variable keys read (snapshot) and written,
+/// A transaction's footprint: mutable variable keys read (snapshot) and written,
 /// each in first-occurrence order. Reads are bare `Var`s of a transactional
 /// mutable variable; writes are `MutWrite` targets.
 ///
@@ -2222,7 +2226,7 @@ fn build_writer(
         .codomain()
         .expect("transact_phase: writer source must have function type");
 
-    // Partition the induction accumulators this block reads:
+    // Partition the induction accumulators this transaction reads:
     //
     //  - **Co-indexed** (`site_accs`) — written by this site's *own* loop, so the
     //    read is request-indexed. Threaded through the writer *source*: it becomes
@@ -2239,7 +2243,7 @@ fn build_writer(
     let mut site_accs: Vec<(Name, Expr, Type)> = Vec::new();
     let mut broadcasts: Vec<(Name, Name, Type)> = Vec::new();
     for (n, info) in acc_views {
-        if !block_reads_var(&site.block, n) {
+        if !txn_reads_var(&site.block, n) {
             continue;
         }
         if site.enclosing_writes.contains(n) {
@@ -2291,7 +2295,7 @@ fn build_writer(
     // write beside a guard commits unconditionally (the guard scopes only its own arm's
     // writes) — the path-scoped deny semantics.
     //
-    // The legal `MutWrite` targets inside this block: exactly the site's write
+    // The legal `MutWrite` targets inside this transaction: exactly the site's write
     // keys (transactional mutable variables `collect_footprint` recorded), the only
     // ones the decision's write set holds.
     let allowed_writes: HashSet<Name> = site.write_keys.iter().cloned().collect();
@@ -2306,7 +2310,7 @@ fn build_writer(
 
     // The decision variant over `{commit, writes, __to_<defer>*}`, keyed by the variables
     // written: the whole-transaction grant/deny is the tag, the (dense) payload rides
-    // `commit`. An empty block commits. The in-block feeds ride as `__to_<defer>` taps,
+    // `commit`. An empty transaction commits. The feeds inside it ride as `__to_<defer>` taps,
     // each `` `fired `` on the positions its own path admits.
     let (body, feeds) = walk.body(kept, param, true);
 
@@ -2321,14 +2325,14 @@ fn build_writer(
     )
 }
 
-/// Whether a `with begin():` block reads `name` (a `Var` occurrence).
-fn block_reads_var(block: &Expr, name: &Name) -> bool {
+/// Whether a transaction reads `name` (a `Var` occurrence in its body).
+fn txn_reads_var(block: &Expr, name: &Name) -> bool {
     if let TypedExprNode::Var(n) = &block.node
         && n == name
     {
         return true;
     }
-    block.any_child(|c| block_reads_var(c, name))
+    block.any_child(|c| txn_reads_var(c, name))
 }
 
 /// `item ▷ .i : elt_ty` — project a slot off the writer item tuple.
@@ -2524,8 +2528,8 @@ fn per_key_view(
         p.ty = Type::fun(from.clone(), to.clone());
         p
     };
-    // The commit log is a collection: one decision record per position of the block's
-    // extent, stored by the engine and read at positions.
+    // The commit log is a collection: one decision record per position of the
+    // transaction's extent, stored by the engine and read at positions.
     let commits_ty = Type::data_fun(dom.clone(), rec_ty.clone());
     let payload_ty = crate::ccl::ccl_utils::commit_payload_ty(decision_ty);
     let writes_ty = record_field_ty(&payload_ty, &F_WRITES);
@@ -2591,8 +2595,9 @@ fn record_field_ty(ty: &Type, field: &Label) -> Type {
     }
 }
 
-/// A hoisted in-block feed: the target defer and the tap binding (``Txn ⤇ {`fired{𝑉} |
-/// `idle}``, its site's commit records keyed by commit time) whose per-commit values feed it.
+/// A hoisted feed from inside a transaction: the target defer and the tap binding
+/// (``Txn ⤇ {`fired{𝑉} | `idle}``, its site's commit records keyed by commit time) whose
+/// per-commit values feed it.
 /// `recognize` maps a read of `tap` to the history record's tap field.
 struct HoistedFeed {
     defer: Name,
@@ -2619,12 +2624,13 @@ struct HoistedFeed {
 ///   (verbatim) applied to the mutable variable snapshot `(hist_rk(begin(r)) …,
 ///   source(r))` at the site's commit time, and whose `write_targets` names the
 ///   write-set keys' histories so recognition recovers the writer's write-set;
-/// - one **tap** binding per in-block feed — ``(commits_j ▷ by_commit_time) ≫ .decision ≫
-///   variant_project(`commit) ≫ .field``, keyed by commit time.
+/// - one **tap** binding per feed inside a transaction —
+///   ``(commits_j ▷ by_commit_time) ≫ .decision ≫ variant_project(`commit) ≫ .field``, keyed
+///   by commit time.
 ///
 /// The continuation rebinds each key variable's `let x = init` to a
 /// `final_or_default(hist_x, init)` read over its history and hoists each
-/// in-block feed to `Feed(defer, tap)`. `recognize` inverts this straight into
+/// feed inside a transaction to `Feed(defer, tap)`. `recognize` inverts this straight into
 /// the `Transact{keys, writers, domain: Txn}` node.
 ///
 /// **Inverse pair:** the per-writer commit-record shape this emits — the
@@ -2764,7 +2770,7 @@ fn plan_store(
             commit_lambda,
         ));
 
-        // One tap binding per in-block feed:
+        // One tap binding per feed inside a transaction:
         // `(commits_j ▷ by_commit_time) ≫ .decision ≫ variant_project(`commit) ≫ .field`,
         // the per-commit tap stream. `by_commit_time` keys the site's commit records by
         // the commit time each carries, which is the key the store serves a reply under.
@@ -2934,7 +2940,7 @@ fn plan_store(
 }
 
 /// One commit store, planned but not yet placed: the keys it holds, their history
-/// bindings, the letrec bindings that realize it, and the in-block feeds to hoist
+/// bindings, the letrec bindings that realize it, and the feeds inside its transactions to hoist
 /// over its body.
 ///
 /// Planning is separate from placement so a program can have more than one store:
@@ -2947,14 +2953,15 @@ struct StorePlan {
     hist: HashMap<Name, Name>,
     /// History, commit-record and tap bindings — the letrec group.
     bindings: Vec<(TypedBinding, Expr)>,
-    /// In-block feeds, to hoist over this store's body in source order.
+    /// Feeds inside its transactions, to hoist over this store's body in source order.
     hoisted: Vec<HoistedFeed>,
 }
 
 impl StorePlan {
     /// Whether `e` reads this store — that is, whether it names anything this store's
     /// body binds: a key (the trailing read's binder), a history binding directly, or
-    /// an in-block feed's defer ([`StorePlan::feed_views`] rebinds it to the tap).
+    /// the defer of a feed inside a transaction ([`StorePlan::feed_views`] rebinds it to the
+    /// tap).
     ///
     /// The defer has no other binding to fall back on: a key still has its seed
     /// `MutDecl` further out, whereas a defer fed *inside* this store exists nowhere
@@ -2969,7 +2976,7 @@ impl StorePlan {
     /// The **as-of reads** to bind over `body`: one `let x = as_of_read(⟨history⟩)` per key
     /// still *named* there.
     ///
-    /// Every read that reaches here is fed out of a block, so every one of them is an
+    /// Every read that reaches here is fed out of a transaction, so every one of them is an
     /// as-of sample; [`rewrite_as_of_reads`] pairs each with the reading loop that indexes
     /// it and builds the `AsOf` join. The term is [`Builtin::AsOfRead`] rather than the
     /// `final_or_default` an induction accumulator's trailing read gets, because a `Txn`
@@ -3076,7 +3083,7 @@ impl StorePlan {
 /// reordered past one it depends on.
 ///
 /// A statement cannot read two stores at once, which is what makes a single level
-/// well-defined: reading two mutable variables together is a `with begin():` block, and
+/// well-defined: reading two mutable variables together is a transaction, and
 /// [`partition_keys`] put those keys in one store so that the read has one
 /// snapshot to come from.
 ///
@@ -3249,8 +3256,8 @@ fn level_of(e: &Expr, stores: &[StorePlan], carried: &[Vec<Expr>]) -> Option<usi
 /// The names a carried spine node makes a later statement depend on it: a `let` or
 /// mutable variable introduction's binder, and every defer an effect statement feeds.
 ///
-/// An effect statement binds no name but still provides its defers. A read-only `with
-/// begin():` block is unwrapped onto the spine, so `out << a` survives as an effect
+/// An effect statement binds no name but still provides its defers. A read-only
+/// transaction is unwrapped onto the spine, so `out << a` survives as an effect
 /// statement and is carried into the store it reads; `channelize` collects a defer's
 /// contributions from wherever they sit, so a consumer of `out` left above the letrec
 /// would read a defer whose only contribution is bound below it. Defers are collected
@@ -3484,7 +3491,7 @@ mod tests {
             .collect()
     }
 
-    /// Two mutable variables written by **separate blocks** have no operation relating
+    /// Two mutable variables written by **separate transactions** have no operation relating
     /// them, so they get separate stores.
     #[test]
     fn disjoint_writers_get_separate_stores() {
@@ -3497,10 +3504,10 @@ mod tests {
         );
     }
 
-    /// One block writing both keys is the atomicity case: they advance at one commit
+    /// One transaction writing both keys is the atomicity case: they advance at one commit
     /// tick, so they are one store.
     #[test]
-    fn keys_written_in_one_block_share_a_store() {
+    fn keys_written_in_one_transaction_share_a_store() {
         let (a, b) = (Name::fresh("a"), Name::fresh("b"));
         let keys = vec![a.clone(), b.clone()];
         let sites = [footprint_site(&[&a, &b], &[&a, &b])];
@@ -3510,10 +3517,10 @@ mod tests {
         );
     }
 
-    /// A block that *reads* `b` to decide a write to `a` reads it at that commit's
+    /// A transaction that *reads* `b` to decide a write to `a` reads it at that commit's
     /// snapshot, so the read alone forces the shared store.
     #[test]
-    fn a_read_in_a_writing_block_shares_the_store() {
+    fn a_read_in_a_writing_transaction_shares_the_store() {
         let (a, b) = (Name::fresh("a"), Name::fresh("b"));
         let keys = vec![a.clone(), b.clone()];
         let sites = [
@@ -3526,9 +3533,9 @@ mod tests {
         );
     }
 
-    /// Snapshot consistency: a **read-only** block reading two mutable variables latches them
-    /// at one frontier, so they share a store even though no block writes both. The
-    /// block leaves no `RawSite`, which is why [`strip`] keeps its footprint.
+    /// Snapshot consistency: a **read-only** transaction reading two mutable variables latches
+    /// them at one frontier, so they share a store even though no transaction writes both.
+    /// The transaction leaves no `RawSite`, which is why [`strip`] keeps its footprint.
     #[test]
     fn keys_read_together_share_a_store() {
         let (a, b) = (Name::fresh("a"), Name::fresh("b"));
@@ -3552,7 +3559,7 @@ mod tests {
             Name::fresh("d"),
         );
         let keys = vec![a.clone(), b.clone(), c.clone(), d.clone()];
-        // a–c share a block, c–b share another: all three are one store. `d` stands
+        // a–c share a transaction, c–b share another: all three are one store. `d` stands
         // alone, and sorts last because it is mentioned last.
         let sites = [
             footprint_site(&[], &[&a, &c]),
@@ -3682,13 +3689,13 @@ mod tests {
     }
 
     #[test]
-    fn splice_block_unexpected_terminal_keeps_its_node() {
+    fn splice_txn_body_unexpected_terminal_keeps_its_node() {
         let int = Type::Base(BaseType::Int);
         let terminal = Expr::new(TypedExprNode::Lit(Lit::Int(1))).with_ty(int.clone());
         let id = terminal.node_id();
-        let out = splice_block(terminal, Expr::new(TypedExprNode::Lit(Lit::Unit)));
+        let out = splice_txn_body(terminal, Expr::new(TypedExprNode::Lit(Lit::Unit)));
         let TypedExprNode::ExprStmt { expr, .. } = out.node else {
-            panic!("splice_block sequences an unexpected terminal before `rest`")
+            panic!("splice_txn_body sequences an unexpected terminal before `rest`")
         };
         assert_eq!((expr.node_id(), expr.ty), (id, int));
     }
