@@ -1910,6 +1910,7 @@ impl Subst {
                 name_occurrence,
                 name,
                 value,
+                row,
                 site,
             } => {
                 let (name, value) = self.apply_handle_use(name, value);
@@ -1917,6 +1918,7 @@ impl Subst {
                     name_occurrence: name_occurrence.clone(),
                     name,
                     value,
+                    row: self.apply_type(row),
                     site: site.clone(),
                 }
             }
@@ -2164,6 +2166,20 @@ impl Subst {
             .collect();
         Subst::of_binders(live).rewrite_expr(&mut e);
         e
+    }
+
+    /// Substitute into `ty`, a type standing where `env`'s names are in scope. Include only
+    /// environment keys free in it.
+    pub fn discharge_env_in_type(ty: &Type, env: &HashMap<Name, TypedExpr>) -> Type {
+        let live: BTreeMap<Binder, Mapping> = env
+            .iter()
+            .filter(|(name, _)| is_free_in_type(name, ty))
+            .map(|(name, term)| (name.clone(), Mapping::Discharge(Rc::new(term.clone()))))
+            .collect();
+        if live.is_empty() {
+            return ty.clone();
+        }
+        Subst::of_binders(live).apply_type(ty)
     }
 
     /// Substitute into a detached binding's declared type and optional annotation.
@@ -4798,6 +4814,31 @@ mod tests {
         );
     }
 
+    // A `Feed`'s row is a type slot `map_children` cannot reach, so the transport
+    // path rewrites it alongside the handle.
+    #[test]
+    fn apply_expr_renames_in_the_feed_row() {
+        let row = Type::refined_one(
+            Type::Base(crate::ccl::BaseType::Int),
+            Refinement::born(Rc::new(gt(var("i"), var("k")))),
+        );
+        let e = TypedExpr::new(TypedExprNode::Feed {
+            name_occurrence: Occurrence::mint(),
+            name: Name::raw("d"),
+            value: Box::new(int(1)),
+            row,
+            site: None,
+        });
+        let out = Subst::rename("k", "j").apply_expr(&e);
+        let TypedExprNode::Feed { row, .. } = &out.node else {
+            panic!("feed preserved");
+        };
+        let [r] = row.refinements() else {
+            panic!("expected a refined row");
+        };
+        assert_eq!(*r.predicate, gt(var("i"), var("j")));
+    }
+
     #[test]
     fn apply_type_discharges_refinement_predicate() {
         let r = Refinement::born(Rc::new(gt(var("i"), var("k"))));
@@ -5496,6 +5537,7 @@ mod rewrite_tests {
                 name_occurrence: Occurrence::mint(),
                 name: Name::raw("h"),
                 value: Box::new(int(1)),
+                row: Type::Hole,
                 site: None,
             }),
             TypedExpr::new(TypedExprNode::Define {

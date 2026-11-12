@@ -317,6 +317,7 @@ impl Uniquifier {
                 name_occurrence: _,
                 name,
                 value,
+                row: _,
                 site: _,
             }
             | TypedExprNode::Define {

@@ -646,12 +646,7 @@ mod tests {
         assert_disjoint(&images);
     }
 
-    // TODO: pinned on `^+`: `mut_elim` refuses a feed whose rows' type now reads the loop's
-    // accumulator.
     #[test]
-    #[should_panic(
-        expected = "a feed whose rows depend on a mutable variable its loop writes is not supported yet"
-    )]
     fn a_loop_body_statement_reaches_its_own_products_with_caret_operators() {
         with_caret_operators(a_loop_body_statement_reaches_its_own_products);
     }
@@ -686,12 +681,7 @@ mod tests {
         assert_disjoint(&images);
     }
 
-    // TODO: pinned on `^+`: `mut_elim` refuses a feed whose rows' type now reads the loop's
-    // accumulator.
     #[test]
-    #[should_panic(
-        expected = "a feed whose rows depend on a mutable variable its loop writes is not supported yet"
-    )]
     fn each_accumulator_reaches_the_statement_that_writes_it_with_caret_operators() {
         with_caret_operators(each_accumulator_reaches_the_statement_that_writes_it);
     }
@@ -1887,11 +1877,6 @@ mod tests {
     #[case::uncond_before(conditional_induction::UNCOND_BEFORE)]
     #[case::uncond_after(conditional_induction::UNCOND_AFTER)]
     #[case::if_else(conditional_induction::IF_ELSE)]
-    // TODO: pinned on `^` operators: the loop's exit rejects a value typed
-    // `{Int | __elem == __anf + __anf}` as holding a collection over a domain the loop determines.
-    #[should_panic(
-        expected = "a value crossing a loop's exit holds a collection over a domain the loop determines"
-    )]
     #[case::two_accumulators(conditional_induction::TWO_ACCUMULATORS)]
     #[case::sibling_ifs(conditional_induction::SIBLING_IFS)]
     fn conditional_induction_panes_are_leak_free_with_caret_operators(#[case] code: &str) {

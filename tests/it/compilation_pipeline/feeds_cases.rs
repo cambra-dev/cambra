@@ -1216,10 +1216,11 @@ fn a_feed_beside_a_list_literal_in_a_tuple_is_fed() {
     );
 }
 
-/// TODO: Support refined writes to vars used with feeds.
+/// A row fed after a refined write is typed by the feed's row, which keeps the variable's
+/// declared refinement and drops the fact that names the read the write follows.
 #[test]
 fn refined_write_used_with_feed() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
 x: Mut({Int where _ >= 0}) := 0
 o: Feed(_)
@@ -1229,14 +1230,14 @@ for p in [1,2,3]:
     o << x
 x
         "#},
-        "a feed whose rows depend on a mutable variable its loop writes is not supported yet",
+        Value::Int(3),
     )
 }
 
-/// TODO: Support mut reads in refined ops used with feeds.
+/// A row computed by a refined operation over a read of an accumulator the loop writes.
 #[test]
 fn refined_read_used_with_feed() {
-    check_compile_error(
+    check_tile(
         indoc! {r#"
 x := 0
 o: Feed(_)
@@ -1246,7 +1247,12 @@ for p in [1, 2, 3]:
     x += 1
 o
         "#},
-        "a feed whose rows depend on a mutable variable its loop writes is not supported yet",
+        Tile::data_function(
+            ColumnValue::UInts(vec![0, 1, 2]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+            Predicate::True,
+            BitSet::new(),
+        ),
     )
 }
 
@@ -2447,4 +2453,71 @@ fn a_feed_under_a_loop_writing_a_mutable_variable(#[case] source: &str, #[case] 
 "}, 33)]
 fn a_feed_in_a_writing_branch_shares_its_bindings(#[case] code: &str, #[case] expected: i64) {
     check_scalar(code, Value::Int(expected));
+}
+
+/// A row fed through a `Feed` parameter, computed by a refined operation over the read of an
+/// accumulator the caller's loop writes. The tap carries the row at the parameter's value type,
+/// which reads no argument of the call.
+///
+/// The unannotated variant is pinned on its failure as a known gap: the contribution's bound
+/// leaves the scope of the tuple parameter the parameters lower to. Under a loop of the `def`,
+/// the tap collection is typed from the feed's row lifted through that loop's level.
+#[rstest]
+#[case::annotated(indoc! {r#"
+    def emit(v: Int, out: Feed(Int)):
+        out << v ^+ 1
+"#})]
+#[should_panic(expected = "the bound left its binder's scope without a mediating discharge")]
+#[case::unannotated(indoc! {r#"
+    def emit(v, out):
+        out << v ^+ 1
+"#})]
+#[case::feed_first(indoc! {r#"
+    def emit(out: Feed(Int), v: Int):
+        out << v ^+ 1
+"#})]
+#[case::under_a_loop_of_the_def(indoc! {r#"
+    def emit(v: Int, out: Feed(Int)):
+        for j in [0]:
+            out << v ^+ 1 ^+ j
+"#})]
+fn refined_read_fed_through_a_feed_parameter(#[case] def: &str) {
+    let call = if def.contains("emit(out") {
+        "emit(out, x)"
+    } else {
+        "emit(x, out)"
+    };
+    let program = format!(
+        "{def}\n{}",
+        indoc! {r#"
+            x := 0
+            out: Feed(_)
+            for i in [1, 2, 3]:
+                CALL
+                x += 1
+            sum(out)
+        "#}
+        .replace("CALL", call),
+    );
+    check_tile(&program, Tile::Scalar(ColumnValue::Ints(vec![6])))
+}
+
+/// A row computed by a refined operation over the read of an accumulator, fed from a loop
+/// nested in the loop that writes the accumulator. The tap carries the feed's row, lifted
+/// through the nested loop's collection level, rather than the fed value's type, which reads
+/// the previous value of the accumulator.
+#[test]
+fn refined_read_fed_from_a_nested_loop() {
+    check_scalar(
+        indoc! {"
+            x := 0
+            out: Feed(_)
+            for i in [1, 2, 3]:
+                for j in [10, 20]:
+                    out << x ^+ j
+                x += 1
+            sum(out)
+        "},
+        Value::Int(96),
+    );
 }

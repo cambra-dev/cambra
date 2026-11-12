@@ -1391,12 +1391,16 @@ fn collect_mut_value_types(expr: &Expr, out: &mut HashMap<Name, Type>) {
     expr.walk_children(&mut |c| collect_mut_value_types(c, out));
 }
 
-/// The value a `Mut(𝑉, 𝐷)` binder holds, peeling refinements on either side.
+/// The value `𝑉` a `Mut(𝑉, 𝐷)` binder holds, peeling the refinements on the `Mut`. A
+/// refinement of `𝑉` stays: it holds of every value the variable takes, so the recurrence
+/// that carries the variable carries it too.
 fn value_type_of(ty: &Type) -> Type {
     match ty {
-        history @ Type::History { .. } => {
-            value_type_of(history.history_parts().expect("matched a history").1)
-        }
+        history @ Type::History { .. } => history
+            .history_parts()
+            .expect("matched a history")
+            .1
+            .clone(),
         Type::Refinement(inner, _) => value_type_of(inner),
         other => other.clone(),
     }
@@ -1746,6 +1750,14 @@ pub(crate) struct FeedSite {
     pub(crate) defer: Name,
     pub(crate) field: Label,
     pub(crate) value: Expr,
+    /// The type the tap carries `value` at, which `value` inhabits. A feed's own is the row
+    /// type inference recorded on it ([`TypedExprNode::Feed`]), which reads the loops around
+    /// the feed but no read of a mutable variable: the writer's snapshot replaces such a read
+    /// with the previous value the history holds, so a type reading it would read the history
+    /// that holds the row. An inner loop's tap collection is typed by that loop's fold, and a
+    /// feed-only inner loop's from each feed's row
+    /// ([`crate::ccl::channelize::loop_contributions`]).
+    pub(crate) ty: Type,
     /// The feed statement this tap is recorded against, so the view resolves to
     /// the `<<` the user wrote rather than to the enclosing loop.
     site: StmtSite,
@@ -2431,7 +2443,7 @@ pub(crate) fn fold_induction_loop(
             // view reads the field at that type and eliminates `` `fired ``:
             // the channel is the fired positions with their values
             // ([`fired_project`](crate::ccl::ccl_utils::fired_project)).
-            let value_ty = at_position(&f.value.ty);
+            let value_ty = at_position(&f.ty);
             let tap_ty = crate::ccl::ccl_utils::tap_variant_ty(value_ty.clone());
             let mut steps = hist_field_steps(&f.field, &tap_ty, &decision_ty);
             steps.push(crate::ccl::ccl_utils::fired_project(value_ty.clone()));
@@ -2566,6 +2578,7 @@ fn collect_feed_only(expr: Expr, prefix: &mut Vec<Kept>, feeds: &mut Vec<FedAt>)
                     name_occurrence,
                     name,
                     value,
+                    row: _,
                     site: fed_at,
                 } => {
                     feeds.push((
@@ -3196,10 +3209,12 @@ impl<'a> WriterWalk<'a> {
                         name_occurrence: _,
                         name,
                         value,
+                        row,
                         site: fed_at,
                     } => {
                         let value = Subst::discharge_env_in_place(*value, &self.env);
-                        self.feed(name, value, site, 0, fed_at);
+                        let row = Subst::discharge_env_in_type(&row, &self.env);
+                        self.feed(name, value, row, site, 0, fed_at);
                         self.walk_chain(*body, kept)
                     }
                     // A bare `unit` statement is a no-op. This is the discarded terminal
@@ -3251,7 +3266,8 @@ impl<'a> WriterWalk<'a> {
                         } in crate::ccl::channelize::loop_contributions(feed_loop)
                         {
                             let value = Subst::discharge_env_in_place(view, &self.env);
-                            self.feed(defer, value, site, levels, fed_at);
+                            let ty = value.ty.clone();
+                            self.feed(defer, value, ty, site, levels, fed_at);
                         }
                         self.walk_chain(*body, kept)
                     }
@@ -3325,7 +3341,8 @@ impl<'a> WriterWalk<'a> {
                             // was discharged into above, and its type can read this level's
                             // binders as well, a fed row filtered by this loop's variable say.
                             let view = Subst::discharge_env_in_place(view, &self.env);
-                            self.feed(defer, view, site, levels, fed_at);
+                            let ty = view.ty.clone();
+                            self.feed(defer, view, ty, site, levels, fed_at);
                         }
                         self.walk_chain(*body, kept)
                     }
@@ -3402,6 +3419,7 @@ impl<'a> WriterWalk<'a> {
         &mut self,
         defer: Name,
         value: Expr,
+        ty: Type,
         site: StmtSite,
         levels: usize,
         fed_at: Option<Rc<crate::ccl::site::Site>>,
@@ -3413,6 +3431,7 @@ impl<'a> WriterWalk<'a> {
             defer,
             field,
             value,
+            ty,
             fire: bool_lit(true),
             site,
             levels,
@@ -3597,11 +3616,10 @@ impl<'a> WriterWalk<'a> {
                 scrutinee: None,
                 branches,
             });
-            merged.ty = joined_ty(
-                merged_arms
-                    .iter()
-                    .map(|(_, env)| &env.get(name).unwrap_or(value_before).ty),
-            );
+            // The variable's value type, as the write set states it: a refinement every value
+            // of the variable carries holds of the merge, where the join of the arms' own
+            // types would drop it.
+            merged.ty = self.declared.value_ty(name).clone();
             let occurrence = self
                 .named_at
                 .get(name)
@@ -3689,14 +3707,27 @@ impl<'a> WriterWalk<'a> {
                         slots.push(crate::ccl::ccl_utils::tap_gated(
                             f.fire.clone(),
                             f.value.clone(),
+                            f.ty.clone(),
                         ));
                         slots.extend(fire.map(|_| f.fire.clone()));
                     } else {
-                        slots.push(crate::ccl::ccl_utils::tap_idle(f.value.ty.clone()));
+                        slots.push(crate::ccl::ccl_utils::tap_idle(f.ty.clone()));
                         slots.extend(fire.map(|_| bool_lit(false)));
                     }
                 }
-                let ty = Type::Tuple(slots.iter().map(|s| s.ty.clone()).collect());
+                // A variable's slot holds it at its value type, as the write set does: a
+                // refinement every value of the variable carries holds of the merge, where the
+                // join of the arms' own types would drop it.
+                let ty = Type::Tuple(
+                    slots
+                        .iter()
+                        .enumerate()
+                        .map(|(j, s)| match changed.get(j) {
+                            Some(name) => self.declared.value_ty(name).clone(),
+                            None => s.ty.clone(),
+                        })
+                        .collect(),
+                );
                 Branch {
                     pattern: None,
                     guard: arm.guard,
@@ -3730,7 +3761,7 @@ impl<'a> WriterWalk<'a> {
         ));
         for (owner, i, tap, fire) in feed_slots {
             let f = &mut self.feeds[i];
-            let value_ty = f.value.ty.clone();
+            let value_ty = f.ty.clone();
             f.value = Expr::apply(
                 proj_of(&name, &tuple_ty, tap, &slot_tys[tap]),
                 crate::ccl::ccl_utils::fired_project(value_ty.clone()),
@@ -3756,10 +3787,10 @@ impl<'a> WriterWalk<'a> {
     /// Whether the feed `f` the branch `arm` makes leaves it in a slot of the merged tuple
     /// ([`Self::merge_as_tuple`]) rather than taking the branch's bindings with it. A feed into
     /// a feed the block declares stays in that feed's binding ([`Self::walk_channel`]), so it
-    /// leaves the branch closed over its bindings. So does a feed whose value's type names a
+    /// leaves the branch closed over its bindings. So does a feed whose tap type names a
     /// binding of the branch, which a slot outside the branch could not state.
     fn leaves_in_a_slot(&self, f: &FeedSite, arm: &Arm) -> bool {
-        let names = crate::ccl::subst::type_free_vars(&f.value.ty);
+        let names = crate::ccl::subst::type_free_vars(&f.ty);
         !self.channels.contains(&f.defer)
             && !arm
                 .kept
@@ -3816,10 +3847,17 @@ impl<'a> WriterWalk<'a> {
             Expr::new(TypedExprNode::Record(RecordEntry::minted(fields))).with_ty(writes_ty);
         let commit =
             crate::ccl::ccl_utils::disjoin(self.commit_paths, empty, &Type::Base(BaseType::Bool));
-        let taps: Vec<(Label, Expr, Expr)> = self
+        let taps: Vec<(Label, Expr, Type, Expr)> = self
             .feeds
             .iter()
-            .map(|f| (f.field.clone(), f.value.clone(), f.fire.clone()))
+            .map(|f| {
+                (
+                    f.field.clone(),
+                    f.value.clone(),
+                    f.ty.clone(),
+                    f.fire.clone(),
+                )
+            })
             .collect();
         let mut decision = crate::ccl::ccl_utils::writer_decision_record(commit, writes, &taps);
         for entry in kept.into_iter().rev() {

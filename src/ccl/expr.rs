@@ -979,6 +979,11 @@ pub enum TypedExprNode {
         /// The applied occurrence of `name`.
         name_occurrence: Occurrence,
         value: Box<Expr>,
+        /// The type of the row this feed contributes, stated among the loops between the
+        /// channel and the feed: the value's type with every other binder between them exited
+        /// (`src/ccl/design/type-inference.md`, "A contribution crosses the binders after its
+        /// target"). A `Hole` before inference.
+        row: Type,
         /// Which place in the program this feed is ([`crate::ccl::site`]): the tag its
         /// contributions take in a channel fed from several places. A copy of the feed is
         /// the same place and keeps it.
@@ -1505,6 +1510,7 @@ impl TypedExpr {
             name: name.into(),
             name_occurrence,
             value: Box::new(value),
+            row: Type::Hole,
             site,
         })
     }
@@ -2562,7 +2568,9 @@ impl TypedExpr {
             f(annotation);
         }
         match &self.node {
-            TypedExprNode::Cast { target, .. } => f(target),
+            TypedExprNode::Cast { target, .. } | TypedExprNode::Feed { row: target, .. } => {
+                f(target)
+            }
             TypedExprNode::LetType { ty, .. } => ty.walk_types(&mut f),
             TypedExprNode::Run { types, .. } => types.iter().for_each(|(_, _, ty)| f(ty)),
             _ => {}
@@ -2604,7 +2612,9 @@ impl TypedExpr {
             f(annotation);
         }
         match &mut self.node {
-            TypedExprNode::Cast { target, .. } => f(target),
+            TypedExprNode::Cast { target, .. } | TypedExprNode::Feed { row: target, .. } => {
+                f(target)
+            }
             TypedExprNode::LetType { ty, .. } => ty.walk_types_mut(&mut f),
             TypedExprNode::Run { types, .. } => types.iter_mut().for_each(|(_, _, ty)| f(ty)),
             _ => {}

@@ -231,6 +231,20 @@ fn spine(expr: Expr, muts: &Muts, open: &mut Open) -> Expr {
                     body: Box::new(body),
                 });
             }
+            // `await_final(x)` reads `x`, so its binding is sealed for the reason a read's
+            // is: a transparent binder reads `x` back into a type lifted out of its scope.
+            // The bound expression decides this, so a source-written binding is sealed as an
+            // A-normalization temp is. It opens no segment. Its value is the one the writes
+            // settle to, not the one this point of the block holds.
+            if is_await_final_of_mut(&bound_expr, muts) {
+                binding.transparency = BindingTransparency::Opaque;
+                let body = spine(*body, muts, open);
+                return rebuild(TypedExprNode::Let {
+                    binding,
+                    bound_expr,
+                    body: Box::new(body),
+                });
+            }
             let mut minted = Minted::new();
             let bound_expr = operand(*bound_expr, muts, open, &mut minted);
             close_written(&bound_expr, open);
@@ -317,6 +331,13 @@ fn spine(expr: Expr, muts: &Muts, open: &mut Open) -> Expr {
             wrap(minted, out)
         }
     }
+}
+
+/// Whether `e` is `x ▷ await_final` for a mutable variable `x` in `muts`.
+fn is_await_final_of_mut(e: &Expr, muts: &Muts) -> bool {
+    matches!(&e.node, TypedExprNode::Apply { function, argument }
+        if matches!(function.node, TypedExprNode::Builtin(crate::ccl::Builtin::AwaitFinal))
+            && is_mut_var(argument, muts))
 }
 
 /// Rewrite an expression evaluated at one point of the enclosing block: replace
@@ -916,11 +937,17 @@ fn handles_restated(ty: &Type, channels: &HashMap<Name, Type>) -> Type {
 /// holding one by boxing each component where it sits. A tuple or record that is not a literal is
 /// spelled out by its projections first (`mut_elim::spell_out_product`).
 ///
+/// A `target` holding no sum is `value`'s type with facts dropped, which `value` already
+/// inhabits, so `value` is left as it is.
+///
 /// # Panics
 ///
 /// Where `target` is a list holding a sum and `value` is not a list literal: its elements cross
 /// the exit only inside the whole list here.
 fn box_at(value: &mut Expr, target: Type) {
+    if !holds_sum(&target) {
+        return;
+    }
     if target.peel_refinements().sum().is_some() {
         crate::ccl::mut_elim::view_at(value, target);
         return;
@@ -971,6 +998,15 @@ fn box_at(value: &mut Expr, target: Type) {
         ),
     }
     value.ty = target;
+}
+
+/// Whether `ty` is or contains a sum.
+fn holds_sum(ty: &Type) -> bool {
+    ty.peel_refinements().sum().is_some() || {
+        let mut found = false;
+        ty.walk_children(|c| found |= holds_sum(c));
+        found
+    }
 }
 
 /// `ty` as a value of it is seen outside the scope of the binders `out_of_scope` reports: a

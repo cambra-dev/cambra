@@ -358,10 +358,11 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             name_occurrence: _,
             name,
             value,
+            row,
             site: _,
         } => {
             let target_ty = ctx.instantiate_binding(name)?;
-            emit_feed(name, &target_ty, value, &feed_role(name), ctx).map_err(|e| {
+            emit_feed(name, &target_ty, value, row, &feed_role(name), ctx).map_err(|e| {
                 e.with_escape_target(EscapeTarget::Feed {
                     channel: name.to_string(),
                 })
@@ -1917,6 +1918,7 @@ pub(super) fn emit_feed(
     target: &Name,
     target_ty: &Type,
     value: &mut Expr,
+    row: &mut Type,
     label: &str,
     ctx: &mut InferCtx,
 ) -> Result<Type, LocatedInferError> {
@@ -1930,17 +1932,18 @@ pub(super) fn emit_feed(
     // is no demand for a handle to be reconciled against — an undereferenced
     // `Mut(V, D)` would simply collide with a plain-`V` feed to the same channel.
     let value_ty = emit_value_read(value, ctx)?;
+    let channel = feed_channel(target_ty, label, ctx)?;
+    *row = ctx.feed_row(target, &value_ty, &channel);
     // A lexically visible channel takes the value as one row of its collection, keyed
     // where the feed stands ([`InferCtx::require_feed`]).
     if target_ty.as_feed().is_some() {
-        let channel = target_ty.read_view().into_owned();
         ctx.require_feed(target, &value_ty, &channel, &|| label.to_string())?;
         return Ok(prim(BaseType::Unit));
     }
-    // A **data** function: the contribution is one row of the channel's collection,
-    // and the channel it flows into is that collection (`constrain_into_feed`).
+    // A **data** function: the contribution is one row of the channel's collection.
     let contribution = Type::data_fun(ctx.fresh(), value_ty);
-    constrain_into_feed(target, target_ty, &contribution, label, ctx)
+    ctx.require_contribution(target, &contribution, &channel, &|| label.to_string())?;
+    Ok(prim(BaseType::Unit))
 }
 
 /// Type a `Define { name, value }`: the defined value *is* the handle's
@@ -1959,16 +1962,6 @@ pub(super) fn emit_define(
 
 /// Land `payload_sub` inside the feed handle `target_ty`, returning `Unit`
 /// (the type of the feed/define expression itself).
-///
-/// When the target is structurally a feed handle — a lexically visible
-/// `let d = Defer` binding, possibly closure-captured — constrain straight
-/// into its payload. Otherwise the target is opaque (a lambda parameter
-/// receiving the handle: the ParamAsTarget pattern), so *demand* it be a
-/// feed via the upper bound `target <: Feed(ρf)` and constrain into that
-/// requirement's payload. The call-site argument edge `Feed(ρ_arg) <:
-/// param` then meets the upper bound, and the invariant Feed/Feed rule
-/// carries the contribution back into the caller's channel; a non-feed
-/// argument fails the same meeting with `NotAFeed`.
 fn constrain_into_feed(
     target: &Name,
     target_ty: &Type,
@@ -1976,30 +1969,35 @@ fn constrain_into_feed(
     label: &str,
     ctx: &mut InferCtx,
 ) -> Result<Type, LocatedInferError> {
-    match target_ty.as_feed() {
-        Some(_) => {
-            // The channel is the history's data function `domain ⤇ value`, its read
-            // view; the contribution flows into it (`Fun(δ, elem)` for a feed, the whole
-            // collection for a define). A **data** function, so a collection fed into it
-            // meets a collection.
-            let rho = target_ty.read_view().into_owned();
-            ctx.require_contribution(target, payload_sub, &rho, &|| label.to_string())?;
-        }
-        None => {
-            // Opaque target (a lambda parameter receiving the handle —
-            // ParamAsTarget): *demand* it be a feed channel, then constrain the
-            // contribution into that requirement's channel. The call-site
-            // argument edge meets the demand, and the invariant history/history
-            // rule carries the contribution back to the caller's channel.
-            let rho_value = ctx.fresh();
-            let rho_domain = ctx.fresh();
-            let required = Type::feed(rho_domain.clone(), rho_value.clone());
-            ctx.require_sub(target_ty, &required, &|| format!("the target of {label}"))?;
-            let rho = Type::data_fun(rho_domain, rho_value);
-            ctx.require_contribution(target, payload_sub, &rho, &|| label.to_string())?;
-        }
-    }
+    let channel = feed_channel(target_ty, label, ctx)?;
+    ctx.require_contribution(target, payload_sub, &channel, &|| label.to_string())?;
     Ok(prim(BaseType::Unit))
+}
+
+/// The channel a feed or define into a handle of type `target_ty` flows into: the history's
+/// data function `domain ⤇ value`, its read view. A **data** function, so a collection defined
+/// into it meets a collection.
+///
+/// A target that is structurally a feed handle, a lexically visible `let d = Defer` binding
+/// possibly closure-captured, has its read view as the channel. Any other target is opaque, a
+/// lambda parameter receiving the handle (the ParamAsTarget pattern). It is demanded to be a feed
+/// by the upper bound `target <: Feed(ρf)`, whose read view is the channel. The call-site
+/// argument edge `Feed(ρ_arg) <: param` meets that bound, and the invariant Feed/Feed rule carries
+/// the contribution back into the caller's channel. A non-feed argument fails the same meeting
+/// with `NotAFeed`.
+fn feed_channel(
+    target_ty: &Type,
+    label: &str,
+    ctx: &mut InferCtx,
+) -> Result<Type, LocatedInferError> {
+    if target_ty.as_feed().is_some() {
+        return Ok(target_ty.read_view().into_owned());
+    }
+    let rho_value = ctx.fresh();
+    let rho_domain = ctx.fresh();
+    let required = Type::feed(rho_domain.clone(), rho_value.clone());
+    ctx.require_sub(target_ty, &required, &|| format!("the target of {label}"))?;
+    Ok(Type::data_fun(rho_domain, rho_value))
 }
 
 pub(super) fn emit_copair<C: Typing>(
