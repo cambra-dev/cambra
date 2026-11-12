@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
+use crate::ccl::feed_nest::FeedValue;
 use crate::ccl::subst::Subst;
 use crate::ccl::{
     BaseType, BinOpKind, BindingTransparency, Branch, Builtin, Expr, F_WRITES, FieldKey, Lit,
@@ -163,10 +164,11 @@ pub(crate) fn tag_test(scrut: &Expr, tag: Label) -> Expr {
 /// same `body_decision_at` decoder, so the shape is built in exactly one place.
 ///
 /// `writes` are `(key, value, fire, declared)` in write-set order, each written at its variable's
-/// declared type, and `feeds` `(field, value, 𝑉, fire)` in tap order, each fed at its row type
-/// `𝑉`. Each entry holds `` {`fired{𝑉} | `idle} `` ([`V_FIRED`](crate::ccl::V_FIRED)): the value
-/// at the positions its `fire` path admits, and `` `idle `` elsewhere, so a write holds a value
-/// only where the decision writes it and a reply only where it is sent. A decision that fires
+/// declared type. `feeds` are `(field, value, fire)` in tap order, each fed at its
+/// [`FeedValue`]'s row type `𝑉`. Each entry holds `` {`fired{𝑉} | `idle} ``
+/// ([`V_FIRED`](crate::ccl::V_FIRED)): the value at the positions its `fire` path admits, and
+/// `` `idle `` elsewhere, so a write holds a value only where the decision writes it and a reply
+/// only where it is sent. A decision that fires
 /// nothing writes nothing: a transaction that denies, or an induction position that carries
 /// every accumulator. An empty write set is the empty product, `unit`.
 ///
@@ -174,9 +176,9 @@ pub(crate) fn tag_test(scrut: &Expr, tag: Label) -> Expr {
 /// beside a same-position value obliges the value to answer wherever the record exists, and
 /// an arm's `variant_project` answers only on its own arm's positions; under the tag, the
 /// non-firing positions are `` `idle `` and the value is asked for nowhere else.
-pub fn writer_decision(
+pub(crate) fn writer_decision(
     writes: &[(Label, Expr, Expr, Type)],
-    feeds: &[(Label, Expr, Type, Expr)],
+    feeds: &[(Label, FeedValue, Expr)],
 ) -> Expr {
     let written: Vec<(Label, Expr)> = writes
         .iter()
@@ -189,10 +191,10 @@ pub fn writer_decision(
         .collect();
     let fed: Vec<(Label, Expr)> = feeds
         .iter()
-        .map(|(field, value, value_ty, fire)| {
+        .map(|(field, value, fire)| {
             (
                 field.clone(),
-                tap_gated(fire.clone(), value.clone(), value_ty.clone()),
+                tap_gated(fire.clone(), value.value.clone(), value.row.clone()),
             )
         })
         .collect();
@@ -2016,15 +2018,7 @@ pub(crate) fn indexed_loop(position: Option<Name>, source: Expr, step: Expr) -> 
         source,
     )
     .with_ty(item);
-    let value = match step.ty.peel_refinements() {
-        Type::Fun {
-            name: Some(x),
-            codomain,
-            ..
-        } => crate::ccl::subst::discharge_codomain(x, &read, codomain),
-        Type::Fun { codomain, .. } => (**codomain).clone(),
-        other => panic!("a loop's step is a function, got {other}"),
-    };
+    let value = applied_type(&step.ty, &read);
     let ty = Type::fun_over(position.name.clone(), *domain, value.clone(), fun_kind);
     let body = Expr::apply(read, step).with_ty(value);
     let TypedExprNode::Lambda { param, body } =
@@ -2040,6 +2034,19 @@ pub(crate) fn indexed_loop(position: Option<Name>, source: Expr, step: Expr) -> 
         body,
     })
     .with_ty(ty)
+}
+
+/// The result of a function at `argument`, including its dependent codomain.
+pub(crate) fn applied_type(function: &Type, argument: &Expr) -> Type {
+    match function.read_view().peel_refinements() {
+        Type::Fun {
+            name: Some(x),
+            codomain,
+            ..
+        } => crate::ccl::subst::discharge_codomain(x, argument, codomain),
+        Type::Fun { codomain, .. } => (**codomain).clone(),
+        other => panic!("an applied value is a function, got {other}"),
+    }
 }
 
 /// The loop `e` ([`loop_parts`]) taken apart: its position binder, its source and its step,
@@ -2085,6 +2092,19 @@ pub(crate) fn chain_type_of(elts: &[Expr], stated: Type) -> Type {
         .iter()
         .map(|e| crate::ccl::generalize::opened(&e.ty).clone())
         .collect();
+    chain_type_at(elts, &types, stated)
+}
+
+/// The chain's type with its last morphism stated at `last_type`. A contribution's
+/// producer and storage row share the prefix but can state different codomains.
+pub(crate) fn chain_type_with_last(elts: &[Expr], last_type: &Type, stated: Type) -> Type {
+    let mut types: Vec<Type> = elts
+        .iter()
+        .map(|e| crate::ccl::generalize::opened(&e.ty).clone())
+        .collect();
+    if let Some(last) = types.last_mut() {
+        *last = crate::ccl::generalize::opened(last_type).clone();
+    }
     chain_type_at(elts, &types, stated)
 }
 

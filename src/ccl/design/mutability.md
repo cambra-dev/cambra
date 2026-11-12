@@ -981,6 +981,20 @@ feed's row, lifted through one collection level per loop between the feed and th
 (`channelize::loop_contributions`), so it holds no read of the writer's snapshot either
 (`refined_read_fed_from_a_nested_loop` in `tests/it/compilation_pipeline/feeds_cases.rs`).
 
+`FeedValue` (`feed_nest.rs`) carries a feed's producer and its row together through writer
+environments, branch merges, contribution extraction and nested-loop views. Each operation applies
+the same binders, substitutions and scope exits to both. A lambda or loop level lifts each type
+over the same binder. Closing over a scope keeps every binding that either reads
+(`mut_elim::close_in_place`). Indexing keeps the row's type, and flattening rebuilds the row's
+outer collection levels with the same keys as the producer's. The producer keeps its own type,
+including a payload collection's domain read from the bindings around the feed.
+
+A tap stores the row. The induction writer's tap field (`mut_elim::fold_induction_loop`) and the
+commit log's (`transact_phase::plan_store`) are typed from it, and so is the view each builds over
+its history, from the history's domain and the row. Channel assembly consumes the producer
+(`channelize::channelize_cluster`), and a feed hoisted back into the tree keeps both
+(`mut_elim::feed_each`). No pass derives a row from a producer's type.
+
 A `let` bound to an `if` or a `match` whose branches write is walked the same way, and the value
 it binds merges as a variable does: `Case[𝑔ᵢ → 𝑣ᵢ]` over the values the branches end in, each
 taking its branch's bindings. Nothing pushes such a binding, or the statements after a statement
