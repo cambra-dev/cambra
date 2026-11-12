@@ -2692,16 +2692,15 @@ pub fn check_program(
     );
     let checks = std::mem::take(&mut ctx.lowering_ctx().module_checks);
     // As in `run_frontend`: each module is checked past parse, load and lowering errors when
-    // every lowering error is a statement's the placeholder stands in for, and what the checks
-    // report is added to theirs.
-    if !contained
-        || errors.iter().any(|e| {
-            !matches!(
-                e,
-                CompileError::Lower(_) | CompileError::Parse(_) | CompileError::Load(_)
-            )
-        })
-    {
+    // a placeholder stands for every lowering error; what the checks report is added to theirs.
+    debug_assert!(
+        errors.iter().all(|e| matches!(
+            e,
+            CompileError::Parse(_) | CompileError::Load(_) | CompileError::Lower(_)
+        )),
+        "only parse, load and lowering errors precede inference"
+    );
+    if !contained {
         return Err(CheckErrors {
             interface: None,
             errors,
