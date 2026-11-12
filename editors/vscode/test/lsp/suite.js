@@ -89,7 +89,7 @@ async function run() {
   /** @type {vscode.DocumentSymbol[] | undefined} */
   const symbols = await vscode.commands.executeCommand("vscode.executeDocumentSymbolProvider", uri);
   const names = (symbols ?? []).map((s) => s.name);
-  check(JSON.stringify(names) === '["x","g"]', `the outline is not [x, g]: ${JSON.stringify(names)}`);
+  check(JSON.stringify(names) === '["x","y","g"]', `the outline is not [x, y, g]: ${JSON.stringify(names)}`);
   const g = (symbols ?? []).find((s) => s.name === "g");
   check(
     g !== undefined && show(g.selectionRange) === "2:4-2:5" && show(g.range) === "2:0-3:5",

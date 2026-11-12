@@ -108,7 +108,7 @@ local names = {}
 for _, symbol in ipairs((response and response[client.id] and response[client.id].result) or {}) do
   table.insert(names, symbol.name)
 end
-check(vim.deep_equal(names, { "x", "g" }), "the outline is not { x, g }: " .. vim.inspect(names))
+check(vim.deep_equal(names, { "x", "y", "g" }), "the outline is not { x, y, g }: " .. vim.inspect(names))
 
 -- The folds arrive after the first request for them; `foldclosed` reports
 -- the fold's first line once `zc` can close it.

@@ -733,23 +733,22 @@ inference, so a linked placeholder chain never reaches execution.
 
 `cambra check lib.cambra` checks a file on its own (`check_program`). It lowers the file as a module
 rather than as a root (`lower_for_check`), so its parameters need no defaults, and links nothing: it
-checks each module the file reaches and then the file. Each route a module declares is a source
-that opens nothing, so the check binds no port. Past parse and loading errors, and lowering errors
-that are each a statement's the placeholder stands in for, it checks all the same and reports what
-the checks find with them, as compiling a program does. It prints the file's interface
-(`Interface::written`): each parameter with its type, bound, or Module type, then each public member
-in the order declared. A failed check prints established contracts alongside its diagnostics and
-exits unsuccessfully. Values whose omitted definitions establish no complete contract are absent
-from this partial interface. A value's contract is its annotation or the type it infers, a
-generalized
-one's written as a diagnostic writes an inferred polymorphic type, joins and all. A `def` with a
-`Mut` parameter lowers curried and is written as its callers apply it, one function of the tuple of
-its parameters (`Contract::uncurried`). Inference notes a
-generalized member's scheme while it is live (`Typing::note_scheme`), and a monomorphic member's
-type is the one its uses settled. A type parameter with no kind written is one inference variable
-for the whole check, and a contract writes that variable as the parameter (`write_opened`), so
-`def wrap(x): id(x)` over `def id(x: T) => T` prints `wrap: T => T`. Lowering expands an alias
-where it is written, so a type prints expanded: `base: {Int where _ > 0}` for `base: Count`.
+checks each module the file reaches and then the file. Each route a module declares is a source that
+opens nothing, so the check binds no port. Past parse and loading errors, it checks all the same
+when recovery placeholders contain every lowering error, and reports what the checks find with them,
+as compiling a program does. It prints the file's interface (`Interface::written`): each parameter
+with its type, bound, or Module type, then each public member in the order declared. A failed check
+prints established contracts alongside its diagnostics and exits unsuccessfully. Values whose
+omitted definitions establish no complete contract are absent from this partial interface. A value's
+contract is its annotation or the type it infers, a generalized one's written as a diagnostic writes
+an inferred polymorphic type, joins and all. A `def` with a `Mut` parameter lowers curried and is
+written as its callers apply it, one function of the tuple of its parameters
+(`Contract::uncurried`). Inference notes a generalized member's scheme while it is live
+(`Typing::note_scheme`), and a monomorphic member's type is the one its uses settled. A type
+parameter with no kind written is one inference variable for the whole check, and a contract writes
+that variable as the parameter (`write_opened`), so `def wrap(x): id(x)` over `def id(x: T) => T`
+prints `wrap: T => T`. Lowering expands an alias where it is written, so a type prints expanded:
+`base: {Int where _ > 0}` for `base: Count`.
 
 ---
 

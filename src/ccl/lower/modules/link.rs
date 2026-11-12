@@ -513,8 +513,7 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
         }
     }
     let sinks = std::mem::take(&mut ctx.declared_sinks);
-    let mut errors = std::mem::take(&mut lowering.errors);
-    errors.extend(lowered.errors);
+    lowering.errors.extend(lowered.errors);
     let parameters: Vec<(SmolStr, Span, Rc<ModuleType>, QualifiedName)> = ctx
         .parameters
         .iter()
@@ -577,7 +576,7 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
     let root_lowered = lowered
         .value
         .as_ref()
-        .filter(|_| errors.is_empty())
+        .filter(|_| lowering.errors.iter().all(LoweringError::has_stand_in))
         .map(|chain| {
             let module = sources
                 .module(root)
@@ -654,7 +653,7 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
         lowering.errors.extend(refused);
         program
     });
-    errors.extend(std::mem::take(&mut lowering.errors));
+    let mut errors = std::mem::take(&mut lowering.errors);
     // Each `import` reaching a shared import brings its copy in.
     for (statement, imported) in &lowering.imports {
         let home = Home::Import(imported.shared.clone());
@@ -675,8 +674,8 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
                 .push((*statement, label));
         }
     }
-    // Each module is checked on its own, once linking has found nothing wrong but statements
-    // the placeholder stands in for, which a module's check reads as inference reads them.
+    // Recovery placeholders contain every lowering error, so each module's check can read
+    // its recovered chain as linked inference does.
     // The root's check is the linked program's inference, unless its parameters or the
     // arguments its own runs and imports pass need one of their own.
     if errors.iter().all(LoweringError::has_stand_in) && value.is_some() {
@@ -1090,8 +1089,8 @@ impl<'a> ProgramLowering<'a> {
             .map(Unimportable::Io)
             .or_else(|| state_site(ast).map(Unimportable::State))
             .or(ctx.io_site.map(Unimportable::Io));
-        // Every lowering error a statement's the placeholder stands in for, so the chain is
-        // one inference reads (`compile_program`).
+        // A recovery placeholder contains every lowering error (`LoweringError::has_stand_in`),
+        // so inference reads this chain as it reads the root's (`run_frontend`).
         let stood_in_for_all = lowered.errors.iter().all(LoweringError::has_stand_in);
         self.errors.extend(lowered.errors);
         let chain = lowered.value.filter(|_| stood_in_for_all)?;
@@ -1629,11 +1628,9 @@ impl<'a> ProgramLowering<'a> {
         })
     }
 
-    /// `chain`, a copy of a module's chain, with each `let` the Module-typed
-    /// parameter `parameter` of type `ty` binds bound to its member among
-    /// `names`, what the module passed at `at.0` reaches. A member it lacks is an
-    /// placeholder when parsing could have omitted it. Known missing members are
-    /// refused before creating the run.
+    /// Bind the `let`s of Module-typed `parameter` in `chain` to the argument's `names`.
+    /// A missing member is a placeholder under the parameter's declaration while
+    /// previously reported errors prevent execution.
     pub(super) fn bind_module_parameter(
         &mut self,
         mut chain: Expr,
@@ -1653,9 +1650,14 @@ impl<'a> ProgramLowering<'a> {
                 .expect("a parameter's entries are spelled under it");
             match names.get(&entry) {
                 Some(member) => rebind_entry(&mut chain, &binder, member.clone(), span, ctx),
-                // `uncovered` rejects known missing members before creation. An
-                // unparsed entry retains the parameter's declaration over a placeholder.
+                // `uncovered` reports known missing members, but creation can continue
+                // for diagnostics. Recovery entries retain their declared constraints;
+                // an earlier error must prevent this chain from reaching execution.
                 None => {
+                    debug_assert!(
+                        !self.errors.is_empty() || !self.program.compile_errors().is_empty(),
+                        "uncovered rejects known missing members; a recovery entry requires a reported load, parse or lowering error"
+                    );
                     let value = ctx.tag_image(Expr::error(), span);
                     read_argument(&mut chain, &binder.to_string(), value);
                 }

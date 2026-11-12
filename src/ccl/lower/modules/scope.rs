@@ -796,7 +796,7 @@ impl Qualifier {
     }
 
     /// The public trait `member` of the module this reaches through the qualifier `name`, or
-    /// `None` when the module has no usable lowering, which are reported where they stand.
+    /// `None` when the module has no usable lowering, whose errors are reported where they stand.
     pub(in crate::ccl::lower) fn reach_trait(
         &self,
         name: &QualifiedName,
@@ -844,8 +844,8 @@ impl Qualifier {
     }
 
     /// The public nominal type `member` of the module this reaches through the qualifier
-    /// `name`, or `None` when the module has no usable lowering, which are reported where
-    /// they stand.
+    /// `name`, or `None` when the module has no usable lowering, whose errors are reported
+    /// where they stand.
     pub(in crate::ccl::lower) fn reach_nominal(
         &self,
         name: &QualifiedName,

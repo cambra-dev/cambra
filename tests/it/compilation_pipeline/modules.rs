@@ -1877,3 +1877,22 @@ fn a_partial_module_argument_keeps_known_entries_and_stands_in_for_unknown_ones(
     assert!(errors.contains("No Addable instance"), "{errors}");
     assert_eq!(report_count(&errors), 2, "{errors}");
 }
+
+/// A root's parameters remain abstract in its own check after contained lowering errors.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_root_with_lowering_errors_checks_its_parameters() {
+    let root = indoc! {"
+        param T <: Int = Int
+        x: Mut(Int) = 3
+        def f(a: T) => T:
+            a + 1
+        f(1)
+    "};
+    let errors = compile_errors(&program(root, &[]));
+    assert!(errors.contains("introduces a mutable"), "{errors}");
+    assert!(
+        errors.contains("annotated as T, but inferred as Int"),
+        "{errors}"
+    );
+}

@@ -1994,6 +1994,19 @@ fn at_phase_output(
     phase >= stop
 }
 
+/// Whether recovery permits inference. `contained` also accounts for parse-hole errors
+/// that lowering filtered from the diagnostics because the parser already reported them.
+fn can_infer_after_lowering(errors: &[CompileError], contained: bool) -> bool {
+    debug_assert!(
+        errors.iter().all(|e| matches!(
+            e,
+            CompileError::Parse(_) | CompileError::Load(_) | CompileError::Lower(_)
+        )),
+        "only parse, load and lowering errors precede inference"
+    );
+    contained
+}
+
 /// The compiler frontend: source in, a CCL tree at `stop`'s output out.
 ///
 /// Owns the phase sequence and its checks. [`compile_program`] runs through
@@ -2071,14 +2084,7 @@ fn run_frontend(
     // reaches nothing through (`lower::modules::Qualifier::reachable`). A lowering error no
     // placeholder stands for, such as a run missing a type argument, can leave the tree
     // inconsistent where it is read: past one, bail here.
-    debug_assert!(
-        errors.iter().all(|e| matches!(
-            e,
-            CompileError::Parse(_) | CompileError::Load(_) | CompileError::Lower(_)
-        )),
-        "only parse, load and lowering errors precede inference"
-    );
-    if !contained {
+    if !can_infer_after_lowering(&errors, contained) {
         return Err(errors);
     }
     let stood_in_for = errors;
@@ -2693,14 +2699,7 @@ pub fn check_program(
     let checks = std::mem::take(&mut ctx.lowering_ctx().module_checks);
     // As in `run_frontend`: each module is checked past parse, load and lowering errors when
     // a placeholder stands for every lowering error; what the checks report is added to theirs.
-    debug_assert!(
-        errors.iter().all(|e| matches!(
-            e,
-            CompileError::Parse(_) | CompileError::Load(_) | CompileError::Lower(_)
-        )),
-        "only parse, load and lowering errors precede inference"
-    );
-    if !contained {
+    if !can_infer_after_lowering(&errors, contained) {
         return Err(CheckErrors {
             interface: None,
             errors,

@@ -841,14 +841,15 @@ fn an_error_at_a_node_a_module_check_minted_has_a_span() {
 /// module on its own").
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::a_lowering_error("pub x: Mut(Int) = 3\npub y = [1, \"a\"]\n", "introduces a mutable")]
-#[case::a_parse_error("pub a = 1 +* 2\npub y = [1, \"a\"]\n", "found '*'")]
-#[case::a_loading_error("import nothere\npub y = [1, \"a\"]\n", "no module `nothere`")]
+#[case::a_lowering_error("pub x: Mut(Int) = 3", "introduces a mutable")]
+#[case::a_parse_error("pub a = 1 +* 2", "found '*'")]
+#[case::a_loading_error("import nothere", "no module `nothere`")]
 fn checking_a_file_reports_its_type_errors_past_another_error(
-    #[case] root: &str,
+    #[case] first_line: &str,
     #[case] first: &str,
 ) {
-    let program = program(root, &[]);
+    let root = format!("{first_line}\npub y = [1, \"a\"]\n");
+    let program = program(&root, &[]);
     let Err(errors) = check_program(&mut GlobalContext::default(), &program) else {
         panic!("expected `{root}` not to check");
     };
