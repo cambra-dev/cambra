@@ -1910,6 +1910,7 @@ impl Subst {
                 name_occurrence,
                 name,
                 value,
+                row,
                 site,
             } => {
                 let (name, value) = self.apply_handle_use(name, value);
@@ -1917,6 +1918,7 @@ impl Subst {
                     name_occurrence: name_occurrence.clone(),
                     name,
                     value,
+                    row: row.clone(),
                     site: site.clone(),
                 }
             }
@@ -2164,6 +2166,20 @@ impl Subst {
             .collect();
         Subst::of_binders(live).rewrite_expr(&mut e);
         e
+    }
+
+    /// Substitute into `ty`, a type standing where `env`'s names are in scope. Include only
+    /// environment keys free in it.
+    pub fn discharge_env_in_type(ty: &Type, env: &HashMap<Name, TypedExpr>) -> Type {
+        let live: BTreeMap<Binder, Mapping> = env
+            .iter()
+            .filter(|(name, _)| is_free_in_type(name, ty))
+            .map(|(name, term)| (name.clone(), Mapping::Discharge(Rc::new(term.clone()))))
+            .collect();
+        if live.is_empty() {
+            return ty.clone();
+        }
+        Subst::of_binders(live).apply_type(ty)
     }
 
     /// Substitute into a detached binding's declared type and optional annotation.
@@ -5496,6 +5512,7 @@ mod rewrite_tests {
                 name_occurrence: Occurrence::mint(),
                 name: Name::raw("h"),
                 value: Box::new(int(1)),
+                row: Type::Hole,
                 site: None,
             }),
             TypedExpr::new(TypedExprNode::Define {

@@ -665,6 +665,7 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
             name_occurrence,
             name,
             value,
+            row,
             site,
         } => {
             let (binds, value) = atomize_handle(*value, muts);
@@ -674,6 +675,7 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
                     name_occurrence,
                     name,
                     value: Box::new(value),
+                    row,
                     site,
                 }),
             )
@@ -1128,6 +1130,7 @@ fn atomize_stmt_effect(expr: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, E
             name_occurrence,
             name,
             value,
+            row,
             site,
         } => {
             let (binds, value) = atomize_handle(*value, muts);
@@ -1137,6 +1140,7 @@ fn atomize_stmt_effect(expr: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, E
                     name_occurrence,
                     name,
                     value: Box::new(value),
+                    row,
                     site,
                 }),
             )

@@ -1395,6 +1395,45 @@ impl InferCtx {
         self.require_sub(&Type::Infer(crossing), history, at)
     }
 
+    /// The type of the row a feed of a value of type `value` into `target` contributes,
+    /// stated among the loops between `target` and the feed: `value` with every other binder
+    /// of that crossing exited as [`Self::require_contribution`] exits it. A loop's variable
+    /// and position stay, so the row reads the item a loop is at where `value` does. A read
+    /// of a mutable variable is such a binder, so the row reads none
+    /// (`src/ccl/design/mutability.md`, "A read is named while inference runs").
+    ///
+    /// The row is what a tap of the feed carries once mutability elimination folds the loops
+    /// into recurrences (`mut_elim::FeedSite`). The channel's own row type is no substitute:
+    /// a channel fed from one place reads the loops through its key, which the writer's
+    /// parameter does not hold.
+    pub(super) fn feed_row(&mut self, target: &Name, value: &Type) -> Type {
+        let Some((_, crossed)) = self.telescope.split_at(target) else {
+            return value.clone();
+        };
+        let loops = &self.loop_sources;
+        let is_loop =
+            |n: &Name| loops.contains_key(n) || loops.values().any(|l| l.position_binder == *n);
+        let exits = self.exits_but(&crossed, &[], &is_loop);
+        if exits.is_id() {
+            return value.clone();
+        }
+        let joined = self.joined_in_crossing(&crossed);
+        let left: HashSet<&Name> = crossed
+            .iter()
+            .zip(&joined)
+            .filter(|(n, joined)| {
+                !is_loop(n) && (**joined || matches!(self.exit_of(n), ScopeExit::Discharge(_)))
+            })
+            .map(|(n, _)| n)
+            .collect();
+        let scope = self.telescope.rescoped(|n| left.contains(n), []);
+        let row = InferVar::fresh_in(self.level, &scope);
+        let bound = Bound::with_subst(value.clone(), exits);
+        enforce_bound_scope(&row, "lower", &bound);
+        row.bounds.borrow_mut().lower_mut().push(bound);
+        Type::Infer(row)
+    }
+
     /// Record a feed of a value of type `value` into the channel `target`, whose read view
     /// is `channel`: one row of the channel's collection.
     ///
@@ -1581,6 +1620,17 @@ impl InferCtx {
     /// target"). A kept binder inside a joined one of the crossing is joined too: it holds one
     /// value per value of the binder around it ([`Self::joined_in_crossing`]).
     fn exits(&self, crossed: &[Name], at_key: &[(Name, Expr)]) -> Subst {
+        self.exits_but(crossed, at_key, &|_| false)
+    }
+
+    /// [`Self::exits`] without the exit of each binder `stays` names, which stays in scope.
+    /// Such a binder still joins the kept binders inside it.
+    fn exits_but(
+        &self,
+        crossed: &[Name],
+        at_key: &[(Name, Expr)],
+        stays: &dyn Fn(&Name) -> bool,
+    ) -> Subst {
         let joined = self.joined_in_crossing(crossed);
         // Composed from the outermost exit inward: `𝑒₀ ; (𝑒₁ ; (… ; 𝑒ₙ))`, which is the same
         // substitution as composing innermost first, since composition is associative. This
@@ -1594,6 +1644,9 @@ impl InferCtx {
             .enumerate()
             .rev()
             .fold(Subst::id(), |exits, (i, name)| {
+                if stays(name) {
+                    return exits;
+                }
                 let exit = match self.exit_of(name) {
                     ScopeExit::Discharge(definition) => {
                         Subst::discharge(name.clone(), Rc::clone(definition))

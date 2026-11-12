@@ -358,10 +358,11 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             name_occurrence: _,
             name,
             value,
+            row,
             site: _,
         } => {
             let target_ty = ctx.instantiate_binding(name)?;
-            emit_feed(name, &target_ty, value, &feed_role(name), ctx).map_err(|e| {
+            emit_feed(name, &target_ty, value, row, &feed_role(name), ctx).map_err(|e| {
                 e.with_escape_target(EscapeTarget::Feed {
                     channel: name.to_string(),
                 })
@@ -1880,6 +1881,7 @@ pub(super) fn emit_feed(
     target: &Name,
     target_ty: &Type,
     value: &mut Expr,
+    row: &mut Type,
     label: &str,
     ctx: &mut InferCtx,
 ) -> Result<Type, LocatedInferError> {
@@ -1893,6 +1895,7 @@ pub(super) fn emit_feed(
     // is no demand for a handle to be reconciled against — an undereferenced
     // `Mut(V, D)` would simply collide with a plain-`V` feed to the same channel.
     let value_ty = emit_value_read(value, ctx)?;
+    *row = ctx.feed_row(target, &value_ty);
     // A lexically visible channel takes the value as one row of its collection, keyed
     // where the feed stands ([`InferCtx::require_feed`]).
     if target_ty.as_feed().is_some() {

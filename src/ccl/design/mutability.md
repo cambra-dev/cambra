@@ -897,8 +897,21 @@ within the branch, and `` `idle `` in the others, which hold no value of the fed
 tuple takes the branch's bindings once, and each variable, the commit gate and the bound value read
 their slot. A feed reads its value off its tap through ``variant_project(`fired)``, and a feed under
 a condition of its own reads that condition from one more slot, `false` in the other arms. A feed
-into a feed the block declares stays in that feed's binding, and a feed whose value's type names a
+into a feed the block declares stays in that feed's binding, and a feed whose tap type names a
 binding of the branch cannot be stated outside it, so both take their own copies.
+
+A variable's merged value, in a `Case` or in a slot of `__merge`, is typed at the variable's value
+type, the `𝑉` of its `Mut(𝑉, 𝐷)` binder, refinements included. The write set and the snapshot slots
+of the writer's parameter are typed at it too. The join of the arms' own types drops a refinement
+that holds of every value the variable takes (`joined_ty`), which the write set states.
+
+A tap carries a feed's value at the feed's row, the type inference records on the `Feed`
+([A contribution crosses the binders after its target](type-inference.md#a-contribution-crosses-the-binders-after-its-target)).
+The row reads the loops around the feed and no read of a mutable variable, so it states the value
+without the snapshot the writer reads it through. A type reading the snapshot would read `__prev`,
+the write set the history holds before the position, once the decision is read at a position: the
+tap would then read the history that holds it, which `read_at_position` refuses. An inner loop's tap
+collection is typed by that loop's fold.
 
 A `let` bound to an `if` or a `match` whose branches write is walked the same way, and the value
 it binds merges as a variable does: `Case[𝑔ᵢ → 𝑣ᵢ]` over the values the branches end in, each

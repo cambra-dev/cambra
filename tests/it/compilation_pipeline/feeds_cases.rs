@@ -1149,8 +1149,8 @@ fn a_feed_beside_a_list_literal_in_a_tuple_is_fed() {
     );
 }
 
-/// A row fed after a refined write reads the accumulator's previous value, which the loop's
-/// history holds, so the row's type drops that fact.
+/// A row fed after a refined write is typed by the feed's row, which keeps the variable's
+/// declared refinement and drops the fact that names the read the write follows.
 #[test]
 fn refined_write_used_with_feed() {
     check_scalar(

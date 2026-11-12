@@ -731,6 +731,7 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             name_occurrence: _,
             name,
             value,
+            row: _,
             site: _,
         } => {
             let val_str = fmt(value, Precedence::Lowest, opts);

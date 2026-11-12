@@ -730,6 +730,7 @@ fn lift_defer(
                 name_occurrence,
                 name: _,
                 value,
+                row,
                 site: fed_at,
             } => TypedExpr {
                 ty: head.ty,
@@ -737,6 +738,7 @@ fn lift_defer(
                     name_occurrence,
                     name: binding_name.clone(),
                     value,
+                    row,
                     site: fed_at,
                 },
                 user_annotation: None,
@@ -961,6 +963,7 @@ fn contains_feed_or_define_for(expr: &Expr, name: &Name) -> bool {
             name_occurrence: _,
             name: t,
             value,
+            row: _,
             site: _,
         }
         | TypedExprNode::Define {
@@ -2439,6 +2442,7 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
                 name_occurrence: _,
                 name,
                 value,
+                row: _,
                 site: _,
             }
             | TypedExprNode::Define {
@@ -2807,6 +2811,7 @@ fn extract_for_defer_impl(
             name_occurrence: _,
             name,
             value,
+            row: _,
             site: fed_at,
         } if &name == defer_name => {
             // A feed outside any iteration contributes one element, keyed by the unit: its

@@ -2421,8 +2421,22 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         TypedExprNode::Defer => {}
         TypedExprNode::Abstract => {}
         // Feed/Define: recurse into the contributed value; the node's own `Unit` type
-        // needs no resolution.
-        TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => {
+        // needs no resolution. A feed's row resolves in place. It is the lower bound of the
+        // channel's contribution, so a row that does not resolve fails the contribution too,
+        // which reports it.
+        TypedExprNode::Feed { value, row, .. } => {
+            coalesce_node(value, level, ctx);
+            let (resolved, pending) =
+                crate::ccl::infer::solver::coalesce::collecting_memberships(|| {
+                    resolve_var_type(row)
+                });
+            if let Ok(ty) = resolved {
+                *row = ty;
+                coalesce_type_predicates(row, level, ctx);
+                decide_memberships(pending, level, ctx, "a feed's row");
+            }
+        }
+        TypedExprNode::Define { value, .. } => {
             coalesce_node(value, level, ctx);
         }
         // A write: the written value, and a keyed write's **key**. The key is a value

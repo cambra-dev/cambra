@@ -2780,7 +2780,7 @@ fn plan_store(
             // The tap is the commit log read through the field, so it is a collection at
             // the log's kind — and `recognize_txn_group` takes the history record's tap
             // field type straight off this binding.
-            let tap_value_ty = crate::ccl::ccl_utils::tap_variant_ty(f.value.ty.clone());
+            let tap_value_ty = crate::ccl::ccl_utils::tap_variant_ty(f.ty.clone());
             let tap_ty = Type::fun_like(&by_time_ty, Type::Txn, tap_value_ty.clone());
             let by_time = apply_ty(
                 tvar(&commits[j], commits_ty.clone()),
@@ -2809,7 +2809,7 @@ fn plan_store(
                 defer: f.defer,
                 tap: tap_name,
                 tap_ty,
-                value_ty: f.value.ty.clone(),
+                value_ty: f.ty.clone(),
                 fed_at: f.fed_at,
             });
         }

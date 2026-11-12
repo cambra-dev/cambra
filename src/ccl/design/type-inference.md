@@ -2689,6 +2689,14 @@ reads the same entry when it lifts a `let` body's type past its binding:
 A kept binder inside a joined binder of the crossing holds one value per value of the joined one,
 so it is joined over as well.
 
+A feed also records its **row** on the `Feed` node: the fed value's type with every binder of the
+crossing exited except the loops' (`InferCtx::feed_row`). A loop's variable and position stay in
+scope, and still join the kept binders inside them, so a read binder `mut_read` mints in a loop body
+is joined over. The row is what mutability elimination types a feed's tap at
+([Loop-body bindings](mutability.md#loop-body-bindings)). The channel's value type does not serve: it
+is the join over every place that feeds the channel, and a channel fed from one place reads its
+loops through its key, which a writer body does not hold.
+
 A history's type is the join of every value written to it (`docs/chl-spec.md`, "Joining the types
 of several values"). The contribution is joined over the values of each joined binder. A loop's or
 lambda's binder takes one per iteration or call; a pattern's binder takes one per evaluation of its
