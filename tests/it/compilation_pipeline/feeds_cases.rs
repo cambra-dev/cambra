@@ -26,39 +26,43 @@ use super::helpers::*;
 // into the double-underscore namespace user code cannot bind
 // (`Name::defer_tap_field`).
 #[case::accumulator_spelled_like_its_tap(
-r#"to_o_0 := 0
-o: Feed(_)
-for l in [1, 2, 3]:
-    to_o_0 := to_o_0 + l
-    o << l * 100
-to_o_0"#, Tile::Scalar(ColumnValue::Ints(vec![6])))]
+indoc::indoc! {r#"
+    to_o_0 := 0
+    o: Feed(_)
+    for l in [1, 2, 3]:
+        to_o_0 := to_o_0 + l
+        o << l * 100
+    to_o_0"#}, Tile::Scalar(ColumnValue::Ints(vec![6])))]
 // The same for a tap's `__fire` companion, which shares the record too.
 #[case::accumulator_spelled_like_its_taps_fire_gate(
-r#"to_o_0__fire := 0
-o: Feed(_)
-for l in [1, 2, 3]:
-    to_o_0__fire := to_o_0__fire + l
-    if l > 1:
-        o << l * 100
-to_o_0__fire"#, Tile::Scalar(ColumnValue::Ints(vec![6])))]
+indoc::indoc! {r#"
+    to_o_0__fire := 0
+    o: Feed(_)
+    for l in [1, 2, 3]:
+        to_o_0__fire := to_o_0__fire + l
+        if l > 1:
+            o << l * 100
+    to_o_0__fire"#}, Tile::Scalar(ColumnValue::Ints(vec![6])))]
 #[case::feed_in_comprehension("x: Feed(_); [x << i for i in [1,2,3]]; x", make_int_list(&[1, 2, 3]))]
 #[case::feed_in_for_loop(
-r#"x: Feed(_)
-for i in [1,2,3]:
-  x << i
-x"#, make_int_list(&[1, 2, 3]))]
+indoc::indoc! {r#"
+    x: Feed(_)
+    for i in [1,2,3]:
+      x << i
+    x"#}, make_int_list(&[1, 2, 3]))]
 // Two feeds inside one read-only `with begin():` block: the letrec phase's
 // feed-only path emits one `Feed` per feed, each mapping the same loop source, so
 // the source lands at two live positions and must be freshened per placement — a
 // bare clone trips the `post-letrec-run` id-uniqueness boundary.
 #[case::two_feeds_in_readonly_txn_loop(
-r#"x: Feed(_)
-y: Feed(_)
-for i in [1,2,3]:
-  with begin():
-    x << i
-    y << i
-x"#, make_int_list(&[1, 2, 3]))]
+indoc::indoc! {r#"
+    x: Feed(_)
+    y: Feed(_)
+    for i in [1,2,3]:
+      with begin():
+        x << i
+        y << i
+    x"#}, make_int_list(&[1, 2, 3]))]
 // Filter-feed inside a defer: `if cond: d << v` in a loop lowers to a
 // refined-source channel whose domain carries the bare predicate
 // `__elem ▷ source ▷ (λ p → guard)` (the same element form a filtered
@@ -66,68 +70,76 @@ x"#, make_int_list(&[1, 2, 3]))]
 // into an `IterateExtent` + `Restrict` and only guard-passing indices reach
 // the channel.
 #[case::feed_with_if(
-r#"x: Feed(_)
-for i in [0,1,2,3]:
-  if i // 2 == 0:
-    x << i
-x"#, make_int_list(&[0, 1]))]
+indoc::indoc! {r#"
+    x: Feed(_)
+    for i in [0,1,2,3]:
+      if i // 2 == 0:
+        x << i
+    x"#}, make_int_list(&[0, 1]))]
 #[case::chained_feeds_1(
-r#"x: Feed(_)
-y: Feed(_)
-x <<= y
-y <<= [0, 1]
-x"#, make_int_list(&[0, 1]))]
+indoc::indoc! {r#"
+    x: Feed(_)
+    y: Feed(_)
+    x <<= y
+    y <<= [0, 1]
+    x"#}, make_int_list(&[0, 1]))]
 #[case::chained_feeds_2(
-r#"x: Feed(_)
-y: Feed(_)
-x <<= [0, 1]
-y <<= x
-y"#, make_int_list(&[0, 1]))]
+indoc::indoc! {r#"
+    x: Feed(_)
+    y: Feed(_)
+    x <<= [0, 1]
+    y <<= x
+    y"#}, make_int_list(&[0, 1]))]
 // Cross-cluster defer reference: `y` and `x` are separated by an
 // intervening non-Defer `let some_var = 5`, and `y` depends on `x`
 // (via define).  The channelize pass must topologically order the defers
 // across the intervening let so `x` is bound before `y`.
 #[case(
-r#"x: Feed(_)
-some_var = 5
-y: Feed(_)
-x <<= [0, 1]
-y <<= x
-y"#, make_int_list(&[0, 1]))]
+indoc::indoc! {r#"
+    x: Feed(_)
+    some_var = 5
+    y: Feed(_)
+    x <<= [0, 1]
+    y <<= x
+    y"#}, make_int_list(&[0, 1]))]
 // Symmetric case: x depends on y across the intervening let.
 #[case(
-r#"x: Feed(_)
-some_var = 5
-y: Feed(_)
-x <<= y
-y <<= [0, 1]
-x"#, make_int_list(&[0, 1]))]
+indoc::indoc! {r#"
+    x: Feed(_)
+    some_var = 5
+    y: Feed(_)
+    x <<= y
+    y <<= [0, 1]
+    x"#}, make_int_list(&[0, 1]))]
 #[case::two_feeds(
-r#"x: Feed(_)
-x << 1
-x << 2
-x"#,
+indoc::indoc! {r#"
+    x: Feed(_)
+    x << 1
+    x << 2
+    x"#},
     Tile::data_function(channel_union(&["x<<", "x<<#1"], &[0, 1], vec![
                 ColumnValue::Units(1),
                 ColumnValue::Units(1),
             ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2]))), channel_predicate(&["x<<", "x<<#1"]), BitSet::new()))]
 #[case::scalar_and_loop_feeds(
-r#"x: Feed(_)
-x << 1
-for i in [1, 2, 3]:
-    x << i
-x"#,
+indoc::indoc! {r#"
+    x: Feed(_)
+    x << 1
+    for i in [1, 2, 3]:
+        x << i
+    x"#},
     Tile::data_function(channel_union(&["x<<", "x<<#1"], &[0, 1, 1, 1], vec![
                 ColumnValue::Units(1),
                 ColumnValue::UInts(vec![0, 1, 2])
             ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 1, 2, 3]))), channel_predicate(&["x<<", "x<<#1"]), BitSet::new()))]
 // Three feed sites: locks down N-ary union construction beyond N=2.
 #[case::three_feeds(
-r#"x: Feed(_)
-x << 1
-x << 2
-x << 3
-x"#,
+indoc::indoc! {r#"
+    x: Feed(_)
+    x << 1
+    x << 2
+    x << 3
+    x"#},
     Tile::data_function(channel_union(&["x<<", "x<<#1", "x<<#2"], &[0, 1, 2], vec![
                 ColumnValue::Units(1),
                 ColumnValue::Units(1),
@@ -135,97 +147,106 @@ x"#,
             ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))), channel_predicate(&["x<<", "x<<#1", "x<<#2"]), BitSet::new()))]
 // Identical feed values still produce distinct variant tags.
 #[case::identical_feeds(
-r#"x: Feed(_)
-x << 1
-x << 1
-x"#,
+indoc::indoc! {r#"
+    x: Feed(_)
+    x << 1
+    x << 1
+    x"#},
     Tile::data_function(channel_union(&["x<<", "x<<#1"], &[0, 1], vec![
                 ColumnValue::Units(1),
                 ColumnValue::Units(1),
             ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 1]))), channel_predicate(&["x<<", "x<<#1"]), BitSet::new()))]
 #[case::feed_via_alias(
-r#"
-x: Feed(_)
-y = x
-for i in [1,2,3]:
-  y << i
-y"#, make_int_list(&[1, 2, 3]))]
+indoc::indoc! {r#"
+
+    x: Feed(_)
+    y = x
+    for i in [1,2,3]:
+      y << i
+    y"#}, make_int_list(&[1, 2, 3]))]
 #[case::feed_via_double_alias(
-r#"
-x: Feed(_)
-y = x
-z = y
-for i in [1,2,3]:
-  z << i
-z"#, make_int_list(&[1, 2, 3]))]
+indoc::indoc! {r#"
+
+    x: Feed(_)
+    y = x
+    z = y
+    for i in [1,2,3]:
+      z << i
+    z"#}, make_int_list(&[1, 2, 3]))]
 #[case::return_defer_from_func(
-r#"
-def f(n):
-  x: Feed(_)
-  x
-y = f(10)
-for i in [1,2,3]:
-  y << i
-y"#, make_int_list(&[1, 2, 3]))]
+indoc::indoc! {r#"
+
+    def f(n):
+      x: Feed(_)
+      x
+    y = f(10)
+    for i in [1,2,3]:
+      y << i
+    y"#}, make_int_list(&[1, 2, 3]))]
 #[case::defer_through_identity_funcs(
-r#"
-def f(x):
-  x
-x: Feed(_)
-for i in [1,2,3]:
-  y = f(f(x))
-  y << i
-x"#, make_int_list(&[1, 2, 3]))]
+indoc::indoc! {r#"
+
+    def f(x):
+      x
+    x: Feed(_)
+    for i in [1,2,3]:
+      y = f(f(x))
+      y << i
+    x"#}, make_int_list(&[1, 2, 3]))]
 #[case::alias_inside_loop(
-r#"
-x: Feed(_)
-for i in [1,2,3]:
-  y = x
-  y << i
-x"#, make_int_list(&[1, 2, 3]))]
+indoc::indoc! {r#"
+
+    x: Feed(_)
+    for i in [1,2,3]:
+      y = x
+      y << i
+    x"#}, make_int_list(&[1, 2, 3]))]
 #[case::feed_internal_and_external(
-r#"
-def f(n):
-  x: Feed(_)
-  x << n
-  x
-y = f(10)
-for i in [1,2,3]:
-  y << i
-y"#, Tile::data_function(channel_union(&["y.f()/f.x<<", "y<<"], &[0, 1, 1, 1], vec![
+indoc::indoc! {r#"
+
+    def f(n):
+      x: Feed(_)
+      x << n
+      x
+    y = f(10)
+    for i in [1,2,3]:
+      y << i
+    y"#}, Tile::data_function(channel_union(&["y.f()/f.x<<", "y<<"], &[0, 1, 1, 1], vec![
                 ColumnValue::Units(1),
                 ColumnValue::UInts(vec![0, 1, 2])
             ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 1, 2, 3]))), channel_predicate(&["y.f()/f.x<<", "y<<"]), BitSet::new()))]
 #[case::multiple_func_feeds(
-r#"
-def f(n):
-  x: Feed(_)
-  x << n
-  x
-def g(c):
-  c << 100
-  c
-y = g(f(10))
-for i in [1,2,3]:
-  y << i
-y"#, Tile::data_function(channel_union(&["y.f()/f.x<<", "y.g()/g.c<<", "y<<"], &[0, 1, 2, 2, 2], vec![
+indoc::indoc! {r#"
+
+    def f(n):
+      x: Feed(_)
+      x << n
+      x
+    def g(c):
+      c << 100
+      c
+    y = g(f(10))
+    for i in [1,2,3]:
+      y << i
+    y"#}, Tile::data_function(channel_union(&["y.f()/f.x<<", "y.g()/g.c<<", "y<<"], &[0, 1, 2, 2, 2], vec![
                 ColumnValue::Units(1),
                 ColumnValue::Units(1),
                 ColumnValue::UInts(vec![0, 1, 2])
             ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 100, 1, 2, 3]))), channel_predicate(&["y.f()/f.x<<", "y.g()/g.c<<", "y<<"]), BitSet::new()))]
 #[case::union_of_complex_defers(
-r#"
-def f(n):
-  x: Feed(_)
-  x << n
-  x
-def g(c):
-  c << 100
-  c
-y = g(f(10))
-for i in [1,2,3]:
-  y << i
-y ++ y"#, Tile::data_function(ColumnValue::positional_union(&[0, 0, 0, 0, 0, 1, 1, 1, 1, 1], vec![
+indoc::indoc! {r#"
+
+    def f(n):
+      x: Feed(_)
+      x << n
+      x
+    def g(c):
+      c << 100
+      c
+    y = g(f(10))
+    for i in [1,2,3]:
+      y << i
+    y ++ y"#}, Tile::data_function(ColumnValue::positional_union(&[0, 0, 0, 0, 0, 1, 1, 1, 1, 1], vec![
                 channel_union(&["y.f()/f.x<<", "y.g()/g.c<<", "y<<"], &[0, 1, 2, 2, 2], vec![
                         ColumnValue::Units(1),
                         ColumnValue::Units(1),
@@ -244,14 +265,15 @@ y ++ y"#, Tile::data_function(ColumnValue::positional_union(&[0, 0, 0, 0, 0, 1, 
 // only the one grammar admits. `x = i` and `x = x + i` are per-iteration immutable
 // rebinds, so `x` is `i` at the first feed and `2i` at the second.
 #[case(
-    r#"
-o: Feed(_)
-for i in [1, 2, 3]:
-    x = i
-    o << x
-    x = x + i
-    o << x * 10
-o"#,
+    indoc::indoc! {r#"
+
+        o: Feed(_)
+        for i in [1, 2, 3]:
+            x = i
+            o << x
+            x = x + i
+            o << x * 10
+        o"#},
     Tile::data_function(channel_union(&["o<<", "o<<#1"], &[0, 0, 0, 1, 1, 1], vec![
                 ColumnValue::UInts(vec![0, 1, 2]),
                 ColumnValue::UInts(vec![0, 1, 2]),
@@ -263,15 +285,16 @@ o"#,
 // no-op units and reads `x` before each write, so the channel latches 0, 1, 2
 // (the pre-write values) over the three iterations.
 #[case::pbr_feed_before_write(
-r#"
-def fw(c: Mut(Int), o: Feed(Int)):
-  o << c
-  c += 1
-x := 0
-out: Feed(_)
-for i in [1, 2, 3]:
-  fw(x, out)
-out"#, make_int_list(&[0, 1, 2]))]
+indoc::indoc! {r#"
+
+    def fw(c: Mut(Int), o: Feed(Int)):
+      o << c
+      c += 1
+    x := 0
+    out: Feed(_)
+    for i in [1, 2, 3]:
+      fw(x, out)
+    out"#}, make_int_list(&[0, 1, 2]))]
 // The same writer with its parameters **swapped**, which is a different typing problem
 // rather than a different spelling. The mutable variable is now the second argument, and a call
 // is curried, so the applied function's type at that argument is the fresh variable
@@ -279,15 +302,16 @@ out"#, make_int_list(&[0, 1, 2]))]
 // the spine or it is never recorded, leaving `x` claiming its seed and failing the
 // invariance check against `Mut(Int)`.
 #[case::pbr_mut_var_after_feed(
-r#"
-def fw(o: Feed(Int), c: Mut(Int)):
-  o << c
-  c += 1
-x := 0
-out: Feed(_)
-for i in [1, 2, 3]:
-  fw(out, x)
-out"#, make_int_list(&[0, 1, 2]))]
+indoc::indoc! {r#"
+
+    def fw(o: Feed(Int), c: Mut(Int)):
+      o << c
+      c += 1
+    x := 0
+    out: Feed(_)
+    for i in [1, 2, 3]:
+      fw(out, x)
+    out"#}, make_int_list(&[0, 1, 2]))]
 fn test_feed_and_define_operators(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
@@ -393,13 +417,14 @@ fn feed_in_a_binding_in_an_accumulator_loop(#[case] code: &str, #[case] expected
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn multi_arm_if_elif_feeds_fan_out() {
-    let code = r#"d: Feed(_)
-for x in [1, 2, 3]:
-    if x == 1:
-        d << x * 10
-    elif x == 2:
-        d << x * 20
-d"#;
+    let code = indoc::indoc! {r#"
+        d: Feed(_)
+        for x in [1, 2, 3]:
+            if x == 1:
+                d << x * 10
+            elif x == 2:
+                d << x * 20
+        d"#};
     // Two feeding arms → two refined-source channels unioned via `++`: arm 0
     // (`x == 1`) restricts `[1,2,3]` to index {0} yielding `10`; arm 1
     // (`x == 2 ∧ ¬(x == 1)`) restricts to index {1} yielding `40`; `x == 3`
@@ -429,13 +454,14 @@ d"#;
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn if_else_both_feed_fan_out() {
-    let code = r#"o: Feed(_)
-for i in [0, 1, 2, 3]:
-    if i < 2:
-        o << i
-    else:
-        o << 100
-o"#;
+    let code = indoc::indoc! {r#"
+        o: Feed(_)
+        for i in [0, 1, 2, 3]:
+            if i < 2:
+                o << i
+            else:
+                o << 100
+        o"#};
     check_tile(
         code,
         Tile::data_function(
@@ -948,7 +974,10 @@ fn a_loop_body_ends_in_a_value() {
 #[rstest]
 #[timeout(Duration::from_secs(1))]
 fn scalar_define_into_defer_is_rejected() {
-    let code = "x: Feed(_)\nx <<= 1\nx";
+    let code = indoc::indoc! {r#"
+        x: Feed(_)
+        x <<= 1
+        x"#};
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let result = compile_program(&mut ctx, &LoadedProgram::test(code), consumer);
@@ -965,10 +994,11 @@ fn scalar_define_into_defer_is_rejected() {
 #[rstest]
 #[timeout(Duration::from_secs(1))]
 fn defer_type_errors_render_against_user_shape() {
-    let code = r#"x: Feed(_)
-x << 1
-x << "s"
-x"#;
+    let code = indoc::indoc! {r#"
+        x: Feed(_)
+        x << 1
+        x << "s"
+        x"#};
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::from_text("<defer-error-shape-test>", code);
@@ -1016,7 +1046,11 @@ fn expect_feed_error(code: &str, needle: &str) {
 #[test]
 fn multiple_defines_rejected() {
     expect_feed_error(
-        "x: Feed(_)\nx <<= [1]\nx <<= [2]\nx",
+        indoc::indoc! {r#"
+            x: Feed(_)
+            x <<= [1]
+            x <<= [2]
+            x"#},
         "multiple definitions",
     );
 }
@@ -1027,7 +1061,11 @@ fn multiple_defines_rejected() {
 #[test]
 fn feeds_and_define_mixed_rejected() {
     expect_feed_error(
-        "x: Feed(_)\nx << 1\nx <<= [2]\nx",
+        indoc::indoc! {r#"
+            x: Feed(_)
+            x << 1
+            x <<= [2]
+            x"#},
         "both feeds and a define",
     );
 }
@@ -1098,24 +1136,45 @@ fn a_defer_error_in_a_predicate_is_a_compile_error(
 /// fed or not.
 #[rstest]
 #[case::a_collection(
-    "x = [1, 2, 3]\nx << 4\nsum(x)\n",
+    indoc::indoc! {r#"
+        x = [1, 2, 3]
+        x << 4
+        sum(x)
+        "#},
     "Type mismatch for the target of a feed to `x` (a feed handle is required here, but the \
      value is not one)"
 )]
 #[case::a_collection_annotated_as_a_feed(
-    "x: Feed(Int) = [1, 2, 3]\nx << 4\nsum(x)\n",
+    indoc::indoc! {r#"
+        x: Feed(Int) = [1, 2, 3]
+        x << 4
+        sum(x)
+        "#},
     "annotated as Feed(Int), but inferred as Array(3, Int)"
 )]
 #[case::a_feed_binding_of_a_collection_never_fed(
-    "x: Feed(Int) = [1, 2, 3]\nsum(x)\n",
+    indoc::indoc! {r#"
+        x: Feed(Int) = [1, 2, 3]
+        sum(x)
+        "#},
     "annotated as Feed(Int), but inferred as Array(3, Int)"
 )]
 #[case::a_collection_passed_to_a_feed_parameter(
-    "def g(o: Feed(Int)):\n    o << 5\ng([1, 2])\n1\n",
+    indoc::indoc! {r#"
+        def g(o: Feed(Int)):
+            o << 5
+        g([1, 2])
+        1
+        "#},
     "a feed handle is required here, but the value is not one"
 )]
 #[case::a_collection_passed_to_an_unannotated_parameter(
-    "def g(o, x):\n    o << x\ng([1], 2)\n1\n",
+    indoc::indoc! {r#"
+        def g(o, x):
+            o << x
+        g([1], 2)
+        1
+        "#},
     "a feed handle is required here, but the value is not one"
 )]
 fn feeding_what_is_not_a_feed_is_a_type_error(#[case] code: &str, #[case] needle: &str) {
@@ -1129,7 +1188,15 @@ fn feeding_what_is_not_a_feed_is_a_type_error(#[case] code: &str, #[case] needle
 #[test]
 fn feeding_a_feed_out_of_a_data_structure_is_refused() {
     check_compile_error(
-        "xs = [1, 2]\nout: Feed(_)\nout << 1\nt = (sum(xs), out)\na, o = t\no << a\nsum(out)\n",
+        indoc::indoc! {r#"
+            xs = [1, 2]
+            out: Feed(_)
+            out << 1
+            t = (sum(xs), out)
+            a, o = t
+            o << a
+            sum(out)
+            "#},
         "this feeds a feed taken out of a data structure",
     );
 }
@@ -1469,7 +1536,11 @@ fn a_feed_a_loop_body_declares_fed_from_two_places_is_refused(#[case] code: &str
 #[test]
 fn defer_names_the_declaration_that_replaces_it() {
     check_compile_error(
-        "x = defer()\nx << 1\nsum(x)\n",
+        indoc::indoc! {r#"
+            x = defer()
+            x << 1
+            sum(x)
+            "#},
         "`defer()` no longer introduces a feed: declare one with no value, `x: Feed(T)`",
     );
 }

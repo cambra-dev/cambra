@@ -58,8 +58,20 @@ fn an_error_reading_a_member_is_reported_once(#[case] broken: &str) {
         "},
         &[
             ("broken", broken),
-            ("lib_a", "run broken as x\npub v = x::v\n"),
-            ("lib_b", "run broken as y\npub v = y::v\n"),
+            (
+                "lib_a",
+                indoc::indoc! {r#"
+                run broken as x
+                pub v = x::v
+                "#},
+            ),
+            (
+                "lib_b",
+                indoc::indoc! {r#"
+                run broken as y
+                pub v = y::v
+                "#},
+            ),
         ],
     ));
     assert!(errors.contains("broken.cambra"), "{errors}");

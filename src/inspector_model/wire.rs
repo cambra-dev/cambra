@@ -1932,7 +1932,12 @@ mod tests {
         let root = RootFile {
             path: "main.cambra".to_owned(),
             module: None,
-            text: "import lib\nx = = 1\n1\n".to_owned(),
+            text: indoc::indoc! {r#"
+                import lib
+                x = = 1
+                1
+                "#}
+            .to_owned(),
         };
         let program = LoadedProgram::load(root, &mut InMemory::default().with("lib", "y = = 2\n"));
         let Err(errors) = compile_program(
@@ -1964,12 +1969,12 @@ mod tests {
     /// clones), a genuine `u != d` identity change.
     #[test]
     fn mono_fanout_links_upstream_def_to_downstream_clones() {
-        let code = "\
-dup = \\x -> (x, x)
-a = dup(1)
-b = dup(2 == 2)
-a
-";
+        let code = indoc::indoc! {r#"
+            dup = \x -> (x, x)
+            a = dup(1)
+            b = dup(2 == 2)
+            a
+            "#};
         let prog = compile(code);
         let panes = prog.materialize_panes();
         let edges = dense_edges(&panes.pair("pre-inference → post-inference").map);
@@ -2031,12 +2036,12 @@ a
     /// post-inference node and downstream a post-channelize node.
     #[test]
     fn inline_fanout_links_post_inference_to_post_channelize_copies() {
-        let code = "\
-add1 = \\x -> x + 1
-a = add1(10)
-b = add1(20)
-a + b
-";
+        let code = indoc::indoc! {r#"
+            add1 = \x -> x + 1
+            a = add1(10)
+            b = add1(20)
+            a + b
+            "#};
         let prog = compile(code);
         let panes = prog.materialize_panes();
         let edges = dense_edges(&panes.pair("post-inference → post-channelize").map);
@@ -2066,10 +2071,10 @@ a + b
     /// the difference is predicate interiors and nothing else.
     #[test]
     fn a_monomorphic_program_changes_no_main_tree_identity_across_inference() {
-        let code = "\
-x = 1 + 2
-x
-";
+        let code = indoc::indoc! {r#"
+            x = 1 + 2
+            x
+            "#};
         let prog = compile(code);
         let panes = prog.materialize_panes();
         let edges = dense_edges(&panes.pair("pre-inference → post-inference").map);
@@ -2137,22 +2142,22 @@ x
     // rows and the shipped tree.
     // ------------------------------------------------------------------------
 
-    const GENERATOR_SRC: &str = "\
-def squared(xs):
-    for x in xs:
-        yield x * x
+    const GENERATOR_SRC: &str = indoc::indoc! {r#"
+        def squared(xs):
+            for x in xs:
+                yield x * x
 
-max(squared([1, 2, 3, 4]))
-";
+        max(squared([1, 2, 3, 4]))
+        "#};
 
-    const DEFER_SRC: &str = "\
-readings = [1, 2, 3, 4]
-totals: Feed(_)
-totals << sum(readings)
-for x in readings:
-    totals << x
-max(totals)
-";
+    const DEFER_SRC: &str = indoc::indoc! {r#"
+        readings = [1, 2, 3, 4]
+        totals: Feed(_)
+        totals << sum(readings)
+        for x in readings:
+            totals << x
+        max(totals)
+        "#};
 
     /// The labels of the nodes `pane_id` indexes at `span`: every `(span,
     /// nodeId)` row of that pane whose span covers the query, resolved to the

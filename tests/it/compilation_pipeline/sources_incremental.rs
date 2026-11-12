@@ -860,12 +860,12 @@ fn test_a_source_reads_the_nested_leaves_its_planned_chain_projects() {
 /// only 20 and 30 accumulate, so the final `x = 50` (a dropped guard would give 60).
 #[test_log::test]
 fn test_incremental_conditional_mutation_loop() {
-    let code = "\
-x := 0
-for i in source1():
-    if i > 15:
-        x := x + i
-x";
+    let code = indoc::indoc! {r#"
+        x := 0
+        for i in source1():
+            if i > 15:
+                x := x + i
+        x"#};
     let mut ctx = GlobalContext::default();
     let test_source = Rc::new(RefCell::new(TestDataSource::new(
         "source1",
@@ -907,13 +907,13 @@ x";
 /// feed maps `{0 ↦ 1, 1 ↦ 2, 2 ↦ 3}`.
 #[test_log::test]
 fn test_incremental_tap_loop() {
-    let code = "\
-o: Feed(_)
-cnt := 0
-for i in source1():
-    cnt := cnt + 1
-    o << cnt
-o";
+    let code = indoc::indoc! {r#"
+        o: Feed(_)
+        cnt := 0
+        for i in source1():
+            cnt := cnt + 1
+            o << cnt
+        o"#};
     let mut ctx = GlobalContext::default();
     let test_source = Rc::new(RefCell::new(TestDataSource::new(
         "source1",
@@ -960,11 +960,11 @@ o";
 ///   fully consumed.
 #[test_log::test]
 fn test_incremental_mutation_loop() {
-    let code = "\
-x := 0
-for i in source1():
-    x := x + i
-x";
+    let code = indoc::indoc! {r#"
+        x := 0
+        for i in source1():
+            x := x + i
+        x"#};
     let mut ctx = GlobalContext::default();
 
     let test_source = Rc::new(RefCell::new(TestDataSource::new(
@@ -1217,12 +1217,12 @@ fn test_a_source_growing_under_a_running_transaction_driver_is_read_again() {
 /// consumed when the drive reads past it, once the source calls it complete.
 #[test_log::test]
 fn test_filtered_rows_of_a_live_transaction_source_are_released() {
-    let code = "\
-pool: Mut(Int, Txn) := 100
-for r in [z for z in source1() if z > 99]:
-    with begin():
-        pool := 7
-await_final(pool)";
+    let code = indoc::indoc! {r#"
+        pool: Mut(Int, Txn) := 100
+        for r in [z for z in source1() if z > 99]:
+            with begin():
+                pool := 7
+        await_final(pool)"#};
     let mut ctx = GlobalContext::default();
     let test_source = Rc::new(RefCell::new(TestDataSource::new(
         "source1",
@@ -1268,11 +1268,11 @@ await_final(pool)";
 /// write, and releases every position.
 #[test_log::test]
 fn test_incremental_constant_mutation_loop() {
-    let code = "\
-x := 0
-for i in source1():
-    x := 7
-x";
+    let code = indoc::indoc! {r#"
+        x := 0
+        for i in source1():
+            x := 7
+        x"#};
     let mut ctx = GlobalContext::default();
     let test_source = Rc::new(RefCell::new(TestDataSource::new(
         "source1",
@@ -1315,11 +1315,11 @@ x";
 /// runs and the accumulator is its seed.
 #[test_log::test]
 fn test_incremental_constant_mutation_loop_over_nothing() {
-    let code = "\
-x := 0
-for i in source1():
-    x := 7
-x";
+    let code = indoc::indoc! {r#"
+        x := 0
+        for i in source1():
+            x := 7
+        x"#};
     let mut ctx = GlobalContext::default();
     let test_source = Rc::new(RefCell::new(TestDataSource::new(
         "source1",
@@ -1757,7 +1757,11 @@ fn run_in_batches_seeing(code: &str, batches: &[(&[(u64, i64)], u64)]) -> (Vec<T
 #[case::summed("sum([sum(r.xs) for x in source1() for r in rs])")]
 #[case::iterated("sum([sum([z for z in r.xs]) for x in source1() for r in rs])")]
 fn a_record_valued_lookup_is_restated_under_each_streamed_row(#[case] tail: &str) {
-    let code = format!("rs = [(n=1, xs=[7, 8])]\n{tail}");
+    let code = indoc::formatdoc!(
+        r#"
+        rs = [(n=1, xs=[7, 8])]
+        {tail}"#
+    );
     let tile = run_in_batches(&code, &[(&[(0, 1)], 0), (&[(1, 1)], 1)]);
     assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![30])));
 }

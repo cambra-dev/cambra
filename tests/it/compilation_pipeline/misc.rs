@@ -42,18 +42,30 @@ fn test_no_fan_outs(#[case] code: &str) {
 
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case("inc = \\x -> x + 1\ninc(4)", Value::Int(5))]
-#[case("double = \\x -> x * 2\ndouble(7)", Value::Int(14))]
-#[case("neg = \\x -> -x\nneg(3)", Value::Int(-3))]
-#[case("identity = \\x -> x\nidentity(42)", Value::Int(42))]
+#[case(indoc::indoc! {r#"
+    inc = \x -> x + 1
+    inc(4)"#}, Value::Int(5))]
+#[case(indoc::indoc! {r#"
+    double = \x -> x * 2
+    double(7)"#}, Value::Int(14))]
+#[case(indoc::indoc! {r#"
+    neg = \x -> -x
+    neg(3)"#}, Value::Int(-3))]
+#[case(indoc::indoc! {r#"
+    identity = \x -> x
+    identity(42)"#}, Value::Int(42))]
 fn test_scalar_udf(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case("is_pos = \\x -> x > 0\nis_pos(5)", Value::Bool(true))]
-#[case("is_pos = \\x -> x > 0\nis_pos(-1)", Value::Bool(false))]
+#[case(indoc::indoc! {r#"
+    is_pos = \x -> x > 0
+    is_pos(5)"#}, Value::Bool(true))]
+#[case(indoc::indoc! {r#"
+    is_pos = \x -> x > 0
+    is_pos(-1)"#}, Value::Bool(false))]
 fn test_udf_bool_codomain(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -61,7 +73,9 @@ fn test_udf_bool_codomain(#[case] code: &str, #[case] expected: Value) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // UDF called twice: body is duplicated at each call site (acceptable trade-off).
-#[case("f = \\x -> x + 1\nf(3) + f(4)", Value::Int(9))]
+#[case(indoc::indoc! {r#"
+    f = \x -> x + 1
+    f(3) + f(4)"#}, Value::Int(9))]
 fn test_udf_called_multiple_times(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -69,7 +83,9 @@ fn test_udf_called_multiple_times(#[case] code: &str, #[case] expected: Value) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // Nested call: f(f(3)) → f(6) → 12
-#[case("f = \\x -> x * 2\nf(f(3))", Value::Int(12))]
+#[case(indoc::indoc! {r#"
+    f = \x -> x * 2
+    f(f(3))"#}, Value::Int(12))]
 fn test_udf_nested_calls(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -78,14 +94,18 @@ fn test_udf_nested_calls(#[case] code: &str, #[case] expected: Value) {
 // inlining pass.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case("x = 4\nx + 1", Value::Int(5))]
+#[case(indoc::indoc! {r#"
+    x = 4
+    x + 1"#}, Value::Int(5))]
 fn test_scalar_let_unaffected(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case("xs = [1, 2, 3]\n[x * 2 for x in xs]", make_int_list(&[2, 4, 6]))]
+#[case(indoc::indoc! {r#"
+    xs = [1, 2, 3]
+    [x * 2 for x in xs]"#}, make_int_list(&[2, 4, 6]))]
 fn test_collection_let_unaffected(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
@@ -100,10 +120,18 @@ fn test_collection_let_unaffected(#[case] code: &str, #[case] expected: Tile) {
 // src/ccl/design/optimization.md "Limitations".
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case("add = \\x, y -> x + y\nadd(3, 4)", Value::Int(7))]
-#[case("combine = \\a, b -> a * b + 1\ncombine(3, 4)", Value::Int(13))]
-#[case("add3 = \\x, y, z -> x + y + z\nadd3(1, 2, 3)", Value::Int(6))]
-#[case("mix = \\x, y, z -> x * y - z\nmix(4, 5, 2)", Value::Int(18))]
+#[case(indoc::indoc! {r#"
+    add = \x, y -> x + y
+    add(3, 4)"#}, Value::Int(7))]
+#[case(indoc::indoc! {r#"
+    combine = \a, b -> a * b + 1
+    combine(3, 4)"#}, Value::Int(13))]
+#[case(indoc::indoc! {r#"
+    add3 = \x, y, z -> x + y + z
+    add3(1, 2, 3)"#}, Value::Int(6))]
+#[case(indoc::indoc! {r#"
+    mix = \x, y, z -> x * y - z
+    mix(4, 5, 2)"#}, Value::Int(18))]
 fn test_multi_arg_udf(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -116,9 +144,10 @@ fn test_multi_arg_udf(#[case] code: &str, #[case] expected: Value) {
 // `substitute_param_in_body`'s fail-loud guard).
 #[test]
 fn test_multi_arg_param_in_filter_predicate() {
-    let code = "data = [1, 2, 30]\n\
-                pick = \\lo, hi -> sum([x for x in data if x >= lo])\n\
-                pick(8, 0)";
+    let code = indoc::indoc! {r#"
+        data = [1, 2, 30]
+        pick = \lo, hi -> sum([x for x in data if x >= lo])
+        pick(8, 0)"#};
     check_scalar(code, Value::Int(30));
 }
 

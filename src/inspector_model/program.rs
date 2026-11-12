@@ -301,12 +301,12 @@ mod tests {
         // `dup` is generalized and applied at two distinct element types,
         // forcing monomorphization to synthesize a `__mono` wrapper `Let` per
         // use type.
-        let code = "\
-dup = \\x -> (x, x)
-a = dup(1)
-b = dup(2 == 2)
-a
-";
+        let code = indoc::indoc! {r#"
+            dup = \x -> (x, x)
+            a = dup(1)
+            b = dup(2 == 2)
+            a
+            "#};
         let prog = compile(code);
         let panes = prog.materialize_panes();
 
@@ -361,12 +361,12 @@ a
         // A let-polymorphic def (so the post-channelize tree still holds the
         // pre-mono original `dup`, which the post-inference tree replaces with
         // specialization clones).
-        let code = "\
-dup = \\x -> (x, x)
-a = dup(1)
-b = dup(2 == 2)
-a
-";
+        let code = indoc::indoc! {r#"
+            dup = \x -> (x, x)
+            a = dup(1)
+            b = dup(2 == 2)
+            a
+            "#};
         let prog = compile(code);
         let panes = prog.materialize_panes();
 

@@ -214,22 +214,48 @@ mod tests {
 
     #[test]
     fn a_statement_ends_before_its_trailing_comment() {
-        assert_eq!(first_statement_end("x = 1  # one\ny = 2\n"), "1:6");
+        assert_eq!(
+            first_statement_end(indoc::indoc! {r#"
+            x = 1  # one
+            y = 2
+            "#}),
+            "1:6"
+        );
     }
 
     /// The lexer drops a `]` that does not match the open `(`, and the statement's source
     /// still ends after it.
     #[test]
     fn a_dropped_close_bracket_stays_inside_its_statement() {
-        assert_eq!(first_statement_end("x = f(a]  # no\ny = 2\n"), "1:9");
+        assert_eq!(
+            first_statement_end(indoc::indoc! {r#"
+            x = f(a]  # no
+            y = 2
+            "#}),
+            "1:9"
+        );
     }
 
     #[test]
     fn edits_apply_in_order() {
-        let mut doc = Document::new("x = 1\ny = 2\n".to_owned(), 1, Encoding::Utf8);
+        let mut doc = Document::new(
+            indoc::indoc! {r#"
+            x = 1
+            y = 2
+            "#}
+            .to_owned(),
+            1,
+            Encoding::Utf8,
+        );
         doc.apply(edit((0, 4), (0, 5), "10")).unwrap();
         doc.apply(edit((1, 0), (1, 1), "z")).unwrap();
-        assert_eq!(doc.text(), "x = 10\nz = 2\n");
+        assert_eq!(
+            doc.text(),
+            indoc::indoc! {r#"
+            x = 10
+            z = 2
+            "#}
+        );
     }
 
     #[test]

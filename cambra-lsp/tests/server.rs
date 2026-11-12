@@ -253,7 +253,13 @@ fn an_unhandled_request_is_method_not_found() {
 fn an_incremental_edit_updates_the_diagnostics() {
     let mut server = TestServer::new();
     let uri = "file:///a.cambra";
-    server.open(uri, "x = f(1\ny = 2\n");
+    server.open(
+        uri,
+        indoc::indoc! {r#"
+        x = f(1
+        y = 2
+        "#},
+    );
     assert_eq!(server.diagnostics(uri, 1).as_array().map(Vec::len), Some(1));
     server.notify(
         "textDocument/didChange",

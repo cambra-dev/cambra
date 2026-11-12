@@ -31,11 +31,17 @@ fn test_literals(#[case] code: &str, #[case] expected: Value) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // Capitalized primitive.
-#[case("x: Int = 5\nx", Value::Int(5))]
+#[case(indoc::indoc! {r#"
+    x: Int = 5
+    x"#}, Value::Int(5))]
 // Record type `(name=T, …)`.
-#[case("p: {a: Int, b: Int} = (a=1, b=2)\np.a", Value::Int(1))]
+#[case(indoc::indoc! {r#"
+    p: {a: Int, b: Int} = (a=1, b=2)
+    p.a"#}, Value::Int(1))]
 // Tuple type `{T, U}` (colon-free brace group).
-#[case("t: {Int, Bool} = (1, True)\nt.0", Value::Int(1))]
+#[case(indoc::indoc! {r#"
+    t: {Int, Bool} = (1, True)
+    t.0"#}, Value::Int(1))]
 fn test_type_annotation_forms(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -52,23 +58,30 @@ fn test_type_annotation_forms(#[case] code: &str, #[case] expected: Value) {
 #[case("[1, 2]", make_int_list(&[1, 2]))]
 // A `List(_)` annotation lowers the wildcard to a `Hole` element type
 // (inferred), so the annotation is accepted and unifies with the list literal.
-#[case("x: List(_) = box([1, 2, 3])\nx", make_int_list(&[1, 2, 3]))]
+#[case(indoc::indoc! {r#"
+    x: List(_) = box([1, 2, 3])
+    x"#}, make_int_list(&[1, 2, 3]))]
 // The element type can also be spelled concretely: `List(Int)`.
-#[case("x: List(Int) = box([1, 2, 3])\nx", make_int_list(&[1, 2, 3]))]
+#[case(indoc::indoc! {r#"
+    x: List(Int) = box([1, 2, 3])
+    x"#}, make_int_list(&[1, 2, 3]))]
 // `Array(n, T)` = `0..n ⤇ T`: a static index range, so the length rides the
 // domain (`UIntRange(3)`) rather than being inferred.
-#[case(r"
-x: Array(3, Int) = [1, 2, 3]
-x", make_int_list(&[1, 2, 3]))]
+#[case(indoc::indoc! {r#"
+
+    x: Array(3, Int) = [1, 2, 3]
+    x"#}, make_int_list(&[1, 2, 3]))]
 // `Collection(T)` = `Σ (D: Any). D ⤇ T`, the whole-domain-witness sum — the ⊤ of the
 // kind order. The annotation is only the annotation: the value still runs as the
 // concrete list, because the witness is resolved statically before op-conversion.
-#[case(r"
-x: Collection(Int) = box([1, 2, 3])
-x", make_int_list(&[1, 2, 3]))]
-#[case(r"
-x: Collection(_) = box([1, 2, 3])
-x", make_int_list(&[1, 2, 3]))]
+#[case(indoc::indoc! {r#"
+
+    x: Collection(Int) = box([1, 2, 3])
+    x"#}, make_int_list(&[1, 2, 3]))]
+#[case(indoc::indoc! {r#"
+
+    x: Collection(_) = box([1, 2, 3])
+    x"#}, make_int_list(&[1, 2, 3]))]
 fn test_list_literals(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
@@ -157,7 +170,12 @@ fn an_empty_literal_in_a_definition_takes_each_joins_element_type(
         a = box([1]) if c else box(f(1))
     "#};
     check_scalar(
-        &format!("{program}b = {second}\n{result}\n"),
+        &indoc::formatdoc!(
+            r#"
+            {program}b = {second}
+            {result}
+            "#
+        ),
         Value::Int(expected),
     );
 }
@@ -226,7 +244,9 @@ fn an_empty_map_takes_its_types_from_the_annotation(#[case] code: &str) {
 #[timeout(Duration::from_secs(10))]
 fn an_empty_map_answers_a_set_annotation() {
     check_tile(
-        "s: Set(String) = empty_map()\ns",
+        indoc::indoc! {r#"
+            s: Set(String) = empty_map()
+            s"#},
         Tile::data_function(
             ColumnValue::Strings(vec![]),
             Box::new(Tile::Scalar(ColumnValue::Units(0))),
@@ -243,7 +263,9 @@ fn an_empty_map_answers_a_set_annotation() {
 #[timeout(Duration::from_secs(10))]
 fn an_empty_map_is_a_typed_empty_tile() {
     check_tile(
-        "m: Map(String, Int) = empty_map()\nm",
+        indoc::indoc! {r#"
+            m: Map(String, Int) = empty_map()
+            m"#},
         Tile::data_function(
             ColumnValue::Strings(vec![]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
@@ -276,7 +298,9 @@ fn a_checked_lookup_on_the_empty_map_is_none() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::bare("empty_map()")]
-#[case::let_bound("m = empty_map()\nm")]
+#[case::let_bound(indoc::indoc! {r#"
+    m = empty_map()
+    m"#})]
 fn an_unannotated_empty_map_is_rejected(#[case] code: &str) {
     check_compile_error(code, "Nothing determines the type of this expression");
 }
@@ -316,10 +340,14 @@ fn a_re_keying_constructor_rejects_an_empty_literal(#[case] code: &str, #[case] 
 #[timeout(Duration::from_secs(10))]
 #[case("sum([1 + 2, 3])", Value::Int(6))]
 #[case(
-    "one_dollar = 100000000\nsum([500 * one_dollar])",
+    indoc::indoc! {r#"
+        one_dollar = 100000000
+        sum([500 * one_dollar])"#},
     Value::Int(50_000_000_000)
 )]
-#[case("one = 100\nsum([one, 2])", Value::Int(102))]
+#[case(indoc::indoc! {r#"
+    one = 100
+    sum([one, 2])"#}, Value::Int(102))]
 #[case(indoc! {r"
     a = 2
     b = a * 3
@@ -327,7 +355,9 @@ fn a_re_keying_constructor_rejects_an_empty_literal(#[case] code: &str, #[case] 
     sum([c])"}, Value::Int(7))]
 // A shadowing binder hides the constant rather than substituting through it: `x` in the
 // comprehension body is the element, not the 100 the outer `let` binds.
-#[case("x = 100\nsum([x * 2 for x in [1, 2, 3]])", Value::Int(12))]
+#[case(indoc::indoc! {r#"
+    x = 100
+    sum([x * 2 for x in [1, 2, 3]])"#}, Value::Int(12))]
 fn test_folded_collection_elements(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -453,32 +483,36 @@ fn an_unrefined_downstream_sum_leaves_the_element_foldable() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
-    r"
-def f(c: Collection(Int)):
-    sum(c)
-f(box([1, 2, 3]))",
+    indoc::indoc! {r#"
+
+        def f(c: Collection(Int)):
+            sum(c)
+        f(box([1, 2, 3]))"#},
     Value::Int(6)
 )]
 #[case(
-    r"
-def f(c: Collection(Int)):
-    sum(c)
-f(box([10, 20]))",
+    indoc::indoc! {r#"
+
+        def f(c: Collection(Int)):
+            sum(c)
+        f(box([10, 20]))"#},
     Value::Int(30)
 )]
 // A `List(Int)` param — the `UIntRanges` kind — resolves the same way.
 #[case(
-    r"
-def f(c: List(Int)):
-    sum(c)
-f(box([1, 2, 3]))",
+    indoc::indoc! {r#"
+
+        def f(c: List(Int)):
+            sum(c)
+        f(box([1, 2, 3]))"#},
     Value::Int(6)
 )]
 #[case(
-    r"
-def f(c: List(Int)):
-    sum(c)
-f(box([10, 20, 30]))",
+    indoc::indoc! {r#"
+
+        def f(c: List(Int)):
+            sum(c)
+        f(box([10, 20, 30]))"#},
     Value::Int(60)
 )]
 fn test_collection_param_consumed(#[case] code: &str, #[case] expected: Value) {
@@ -750,18 +784,38 @@ fn test_let_bindings(#[case] code: &str, #[case] expected: Value) {
 #[timeout(Duration::from_secs(10))]
 // `+=` and friends are mutable writes: the target must be introduced mutable with
 // `:=` (a `+=` to a plain `=` binding is a "not a mutable" error, never a shadow).
-#[case("x := 0\nx += 1\nx", Value::Int(1))]
-#[case("x := 10\nx -= 3\nx", Value::Int(7))]
-#[case("x := 2\nx *= 5\nx", Value::Int(10))]
-#[case("x := 7\nx //= 2\nx", Value::Int(3))]
+#[case(indoc::indoc! {r#"
+    x := 0
+    x += 1
+    x"#}, Value::Int(1))]
+#[case(indoc::indoc! {r#"
+    x := 10
+    x -= 3
+    x"#}, Value::Int(7))]
+#[case(indoc::indoc! {r#"
+    x := 2
+    x *= 5
+    x"#}, Value::Int(10))]
+#[case(indoc::indoc! {r#"
+    x := 7
+    x //= 2
+    x"#}, Value::Int(3))]
 // Chained augmented assignments accumulate correctly.
-#[case("x := 0\nx += 1\nx += 2\nx", Value::Int(3))]
+#[case(indoc::indoc! {r#"
+    x := 0
+    x += 1
+    x += 2
+    x"#}, Value::Int(3))]
 // Mix of an immutable `=` binding and a mutable `+=`: the plain local `y` is read
 // into the mutable-variable update. (A pre-mutation *snapshot* of the mutable variable — `y: Int = x`
 // before `x += 4` — is deliberately not tested here: a top-level mutable read
 // currently resolves to the mutable variable's final value, so point-in-time snapshots are
 // a separate concern from this write-lowering path.)
-#[case("x := 0\ny = 10\nx += y\nx", Value::Int(10))]
+#[case(indoc::indoc! {r#"
+    x := 0
+    y = 10
+    x += y
+    x"#}, Value::Int(10))]
 fn test_augmented_assignment(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -880,9 +934,20 @@ fn test_tuple_patterns(#[case] code: &str, #[case] expected: Value) {
 /// (`docs/chl-spec.md`, "Tuple width").
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::a_wider_literal("a, b = (1, 2, 3)\na\n", 2, 3)]
-#[case::a_wider_value("t = (1, 2, 3)\na, b = t\na\n", 2, 3)]
-#[case::a_narrower_value("t = (1, 2)\na, b, c = t\na\n", 3, 2)]
+#[case::a_wider_literal(indoc::indoc! {r#"
+    a, b = (1, 2, 3)
+    a
+    "#}, 2, 3)]
+#[case::a_wider_value(indoc::indoc! {r#"
+    t = (1, 2, 3)
+    a, b = t
+    a
+    "#}, 2, 3)]
+#[case::a_narrower_value(indoc::indoc! {r#"
+    t = (1, 2)
+    a, b, c = t
+    a
+    "#}, 3, 2)]
 fn a_tuple_pattern_takes_apart_a_tuple_of_its_width(
     #[case] code: &str,
     #[case] pattern: usize,
@@ -902,7 +967,10 @@ fn a_tuple_pattern_takes_apart_a_tuple_of_its_width(
 #[test]
 fn a_tuple_pattern_over_a_scalar_names_the_tuple_it_takes_apart() {
     check_compile_error(
-        "a, b = 5\na\n",
+        indoc::indoc! {r#"
+            a, b = 5
+            a
+            "#},
         "A pattern of 2 positions takes apart a 2-tuple, but the value is {Int where _ == 5}",
     );
 }
@@ -976,10 +1044,18 @@ fn a_mutable_assignment_to_the_wildcard_declares_nothing() {
 
 /// A pattern binds each name once, at every binder.
 #[rstest]
-#[case::assignment("a, a = (1, 2)\na")]
-#[case::for_binder("total := 0\nfor a, a in [(1, 2)]:\n    total += a\ntotal")]
+#[case::assignment(indoc::indoc! {r#"
+    a, a = (1, 2)
+    a"#})]
+#[case::for_binder(indoc::indoc! {r#"
+    total := 0
+    for a, a in [(1, 2)]:
+        total += a
+    total"#})]
 #[case::comprehension("sum([a for a, a in [(1, 2)]])")]
-#[case::under_a_constructor("type P = Int\nsum([a for (a, P::new(a)) in [(1, P::new(2))]])")]
+#[case::under_a_constructor(indoc::indoc! {r#"
+    type P = Int
+    sum([a for (a, P::new(a)) in [(1, P::new(2))]])"#})]
 fn a_pattern_binding_a_name_twice_is_refused(#[case] code: &str) {
     check_compile_error(code, "`a` is bound twice in this pattern");
 }
@@ -1098,7 +1174,14 @@ fn test_binder_patterns(#[case] code: &str, #[case] expected: Value) {
 /// Compile `body` as the statements of a program feeding `out`, and answer its rendered
 /// compile errors, or `None` if it compiles.
 fn list_element_errors(body: &str) -> Option<String> {
-    let code = format!("out: Feed(_)\n{}\nout\n", body.trim_end());
+    let code = indoc::formatdoc!(
+        r#"
+        out: Feed(_)
+        {}
+        out
+        "#,
+        body.trim_end()
+    );
     let mut ctx = cambra::ccl::context::GlobalContext::default();
     let consumer: Box<dyn cambra::interpreter::Consumer> = Box::new(|| {});
     let loaded = cambra::ccl::load::LoadedProgram::test(&code);

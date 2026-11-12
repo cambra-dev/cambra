@@ -1793,16 +1793,26 @@ fn the_comparison_discriminates() {
 #[test]
 fn a_disagreement_is_keyed_by_its_structure_not_its_values() {
     let value = |source: &str| {
-        chl_interp::run(&format!("out = test_sink()\nout <<= {source}\n"))
-            .expect("the program runs")
-            .remove("out")
-            .expect("sink `out`")
+        chl_interp::run(&indoc::formatdoc!(
+            r#"
+            out = test_sink()
+            out <<= {source}
+            "#
+        ))
+        .expect("the program runs")
+        .remove("out")
+        .expect("sink `out`")
     };
     let nested = |source: &str| {
-        chl_interp::run(&format!("out = test_sink()\nout << {source}\n"))
-            .expect("the program runs")
-            .remove("out")
-            .expect("sink `out`")
+        chl_interp::run(&indoc::formatdoc!(
+            r#"
+            out = test_sink()
+            out << {source}
+            "#
+        ))
+        .expect("the program runs")
+        .remove("out")
+        .expect("sink `out`")
     };
     let key = |source: &str| difference_signature(&value(source), &nested(source));
     assert_eq!(key("[7]"), key("[1, 2, 3]"));

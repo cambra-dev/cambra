@@ -3326,7 +3326,13 @@ mod tests {
         use std::time::Instant;
         // A program exercising leaf recording (arithmetic/loop plumbing) plus a
         // copy frame (the chained comparison's shared operand).
-        let code = "x := 0\nfor i in [1, 2, 3]:\n    x += i\n1 < x < 3\nx\n";
+        let code = indoc::indoc! {r#"
+            x := 0
+            for i in [1, 2, 3]:
+                x += i
+            1 < x < 3
+            x
+            "#};
         let iters = 2_000u32;
         let start = Instant::now();
         for _ in 0..iters {
@@ -3342,11 +3348,11 @@ mod tests {
 
     #[test]
     fn rendered_errors_have_exact_format() {
-        let code = "\
-x = 1 +
-y = {a: 1}
-y
-";
+        let code = indoc::indoc! {r#"
+            x = 1 +
+            y = {a: 1}
+            y
+            "#};
         let loaded = LoadedProgram::test(code);
         let errs = compile_err(&loaded);
         let out = render_errors(&errs, loaded.sources());
@@ -3484,11 +3490,19 @@ Error: lowering error
     /// silently collapsed to the root would still look correct here.
     #[rstest]
     #[case::curried(
-        "g = 2\nf = \\a -> (a + 1, a + \"s\")\ng\n",
+        indoc::indoc! {r#"
+            g = 2
+            f = \a -> (a + 1, a + "s")
+            g
+            "#},
         "\\a -> (a + 1, a + \"s\")"
     )]
     #[case::uncurried(
-        "g = 2\nf = \\a, b -> (a + 1, a + \"s\")\ng\n",
+        indoc::indoc! {r#"
+            g = 2
+            f = \a, b -> (a + 1, a + "s")
+            g
+            "#},
         "\\a, b -> (a + 1, a + \"s\")"
     )]
     fn unsatisfiable_operand_carries_resolved_span(#[case] code: &str, #[case] expected: &str) {
@@ -3561,7 +3575,10 @@ Error: lowering error
     /// instead.
     #[test]
     fn an_inference_minted_blame_node_falls_back_to_its_enclosing_node_without_recording() {
-        let code = "xs = [1, 2]\n[x for x in xs if x > \"a\"]\n";
+        let code = indoc::indoc! {r#"
+            xs = [1, 2]
+            [x for x in xs if x > "a"]
+            "#};
         let program = LoadedProgram::test(code);
         let errs = GlobalContext::default()
             .sources_and_sinks()
@@ -3583,9 +3600,21 @@ Error: lowering error
     /// it rejects. Each case is one phase's check, and one of its errors' spans
     /// covers exactly the `nth` occurrence of `expected` in `code`.
     #[rstest]
-    #[case::write_to_an_immutable("x = 1\nx += 2\nx\n", "x += 2", 0)]
-    #[case::mut_rule_1("def g(n):\n    z := n\n    z\ng(5)\n", "g(5)", 0)]
-    #[case::ambiguous_program("f = \\x -> [x, x]\nf\n", "f = \\x -> [x, x]", 0)]
+    #[case::write_to_an_immutable(indoc::indoc! {r#"
+        x = 1
+        x += 2
+        x
+        "#}, "x += 2", 0)]
+    #[case::mut_rule_1(indoc::indoc! {r#"
+        def g(n):
+            z := n
+            z
+        g(5)
+        "#}, "g(5)", 0)]
+    #[case::ambiguous_program(indoc::indoc! {r#"
+        f = \x -> [x, x]
+        f
+        "#}, "f = \\x -> [x, x]", 0)]
     #[case::used_after_await_final(
         indoc::indoc! {"
             a: Mut(Int, Txn) := 0
@@ -3778,7 +3807,11 @@ Error: lowering error
     /// statements last to first.
     #[test]
     fn lowering_errors_report_in_source_order() {
-        let code = "a: Frob = 1\nb: Blarg = 2\na + b\n";
+        let code = indoc::indoc! {r#"
+            a: Frob = 1
+            b: Blarg = 2
+            a + b
+            "#};
         let loaded = LoadedProgram::test(code);
         let messages: Vec<String> = compile_err(&loaded)
             .iter()
@@ -3844,7 +3877,10 @@ Error: lowering error
     /// reading the offset as a character index would report column 12.
     #[test]
     fn a_diagnostic_after_a_multibyte_character_names_its_column() {
-        let code = "s = (\"é\", 1 and 2)\ns\n";
+        let code = indoc::indoc! {r#"
+            s = ("é", 1 and 2)
+            s
+            "#};
         let loaded = LoadedProgram::test(code);
         let out = render_errors(&compile_err(&loaded), loaded.sources());
         assert!(out.contains("<test>:1:11"), "{out}");
@@ -3875,11 +3911,11 @@ Error: lowering error
         // newline); statement 2 is a brace record in value position, which
         // parses but lowering rejects (braces are type syntax). We must see
         // both phases' errors in the result.
-        let code = "\
-x = (1 +)
-y = {a: 1}
-y
-";
+        let code = indoc::indoc! {r#"
+            x = (1 +)
+            y = {a: 1}
+            y
+            "#};
         let loaded = LoadedProgram::test(code);
         let errs = compile_err(&loaded);
         let has_parse = errs.iter().any(|e| matches!(e, CompileError::Parse(_)));
@@ -3894,11 +3930,11 @@ y
     /// `CompileError::Parse` per `ParseError`.
     #[test]
     fn multiple_parse_errors_all_surface() {
-        let code = "\
-x = 1 +
-y = 2 *
-1
-";
+        let code = indoc::indoc! {r#"
+            x = 1 +
+            y = 2 *
+            1
+            "#};
         let loaded = LoadedProgram::test(code);
         let errs = compile_err(&loaded);
         let parse_count = errs
@@ -3915,12 +3951,12 @@ y = 2 *
     /// line and the grammar error on the third both come back.
     #[test]
     fn lex_and_parse_errors_both_surface() {
-        let code = "\
-x = f(1, 2
-y = 2
-z = 3 +
-y
-";
+        let code = indoc::indoc! {r#"
+            x = f(1, 2
+            y = 2
+            z = 3 +
+            y
+            "#};
         let errs = compile_err(&LoadedProgram::test(code));
         let lex = errs
             .iter()
@@ -3938,11 +3974,11 @@ y
     /// back instead of just the first.
     #[test]
     fn multiple_lowering_errors_all_surface() {
-        let code = "\
-x = {a: 1}
-y = {b: 2}
-y
-";
+        let code = indoc::indoc! {r#"
+            x = {a: 1}
+            y = {b: 2}
+            y
+            "#};
         let loaded = LoadedProgram::test(code);
         let errs = compile_err(&loaded);
         let lower_count = errs
@@ -3960,10 +3996,10 @@ y
     /// recovery placeholder bubbling up.
     #[test]
     fn parse_recovery_placeholders_dont_produce_lowering_errors() {
-        let code = "\
-x = (1 +)
-1
-";
+        let code = indoc::indoc! {r#"
+            x = (1 +)
+            1
+            "#};
         let loaded = LoadedProgram::test(code);
         let errs = compile_err(&loaded);
         let lower_count = errs

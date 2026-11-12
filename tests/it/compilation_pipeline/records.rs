@@ -440,12 +440,22 @@ fn test_datasource_named_record_join() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // The wide arm is taken; the narrow arm's field set is what survives in the type.
-#[case("c = True\nr = (a=1, b=2) if c else (a=3)\nr.a", 1)]
+#[case(indoc::indoc! {r#"
+    c = True
+    r = (a=1, b=2) if c else (a=3)
+    r.a"#}, 1)]
 // The narrow arm is taken.
-#[case("c = False\nr = (a=1, b=2) if c else (a=3)\nr.a", 3)]
+#[case(indoc::indoc! {r#"
+    c = False
+    r = (a=1, b=2) if c else (a=3)
+    r.a"#}, 3)]
 // Three arms, narrowing twice.
 #[case(
-    "c = False\nd = True\nr = (a=1, b=2) if c else ((a=3, x=9) if d else (a=4))\nr.a",
+    indoc::indoc! {r#"
+        c = False
+        d = True
+        r = (a=1, b=2) if c else ((a=3, x=9) if d else (a=4))
+        r.a"#},
     3
 )]
 #[ignore = "UnionProducer cannot merge Tile::Record arms; needs record-width narrowing"]

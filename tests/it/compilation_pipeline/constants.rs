@@ -232,7 +232,11 @@ fn a_declaration_refines_by_a_constant(
         type Small = {Int where _ <= cfg::rate}
         Small::new(30).extract()
     "},
-    "pairs = (2, 5)\n(lo, hi) = pairs\npub rate = hi\n",
+    indoc::indoc! {r#"
+        pairs = (2, 5)
+        (lo, hi) = pairs
+        pub rate = hi
+        "#},
     "expected {Int where _ <= 5}"
 )]
 #[case::imported_not_a_constant(

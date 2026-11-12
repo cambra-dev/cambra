@@ -41,12 +41,19 @@ fn http_counter() {
 #[test]
 fn http_computed_live_read() {
     let port = reserve_test_port();
-    let source = format!(
-        "set_reqs, set_resps = http_serve(\"{port}\", \"POST\", \"/set\")\n\
-         get_reqs, get_resps = http_serve(\"{port}\", \"GET\", \"/get\")\n\
-         latest: Mut(String, Txn) := \"(none)\"\n\
-         for msg in set_reqs:\n    with begin():\n        latest := msg\n    set_resps << \"ok\\n\"\n\
-         for req in get_reqs:\n    with begin():\n        get_resps << latest + \"!\"\n"
+    let source = indoc::formatdoc!(
+        r#"
+            set_reqs, set_resps = http_serve("{port}", "POST", "/set")
+            get_reqs, get_resps = http_serve("{port}", "GET", "/get")
+            latest: Mut(String, Txn) := "(none)"
+            for msg in set_reqs:
+                with begin():
+                    latest := msg
+                set_resps << "ok\n"
+            for req in get_reqs:
+                with begin():
+                    get_resps << latest + "!"
+            "#
     );
     let mut ctx = compile_sink(&source);
 
@@ -68,13 +75,21 @@ fn http_computed_live_read() {
 #[test]
 fn http_multi_mut_var_live_read() {
     let port = reserve_test_port();
-    let source = format!(
-        "set_reqs, set_resps = http_serve(\"{port}\", \"POST\", \"/set\")\n\
-         get_reqs, get_resps = http_serve(\"{port}\", \"GET\", \"/get\")\n\
-         a: Mut(String, Txn) := \"a0\"\n\
-         b: Mut(String, Txn) := \"b0\"\n\
-         for msg in set_reqs:\n    with begin():\n        a := msg\n        b := msg\n    set_resps << \"ok\\n\"\n\
-         for req in get_reqs:\n    with begin():\n        get_resps << a + b\n"
+    let source = indoc::formatdoc!(
+        r#"
+            set_reqs, set_resps = http_serve("{port}", "POST", "/set")
+            get_reqs, get_resps = http_serve("{port}", "GET", "/get")
+            a: Mut(String, Txn) := "a0"
+            b: Mut(String, Txn) := "b0"
+            for msg in set_reqs:
+                with begin():
+                    a := msg
+                    b := msg
+                set_resps << "ok\n"
+            for req in get_reqs:
+                with begin():
+                    get_resps << a + b
+            "#
     );
     let mut ctx = compile_sink(&source);
 

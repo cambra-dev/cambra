@@ -74,105 +74,120 @@ fn codomain_ints(tile: &Tile) -> Vec<i64> {
 #[timeout(Duration::from_secs(10))]
 // Basic ternary, both branches.
 #[case(
-    r"
-c: Bool = True
-1 if c else 2",
+    indoc::indoc! {r#"
+
+        c: Bool = True
+        1 if c else 2"#},
     Value::Int(1)
 )]
 #[case(
-    r"
-c: Bool = False
-1 if c else 2",
+    indoc::indoc! {r#"
+
+        c: Bool = False
+        1 if c else 2"#},
     Value::Int(2)
 )]
 // Guard is a computed comparison, not a bare variable.
 #[case(
-    r"
-a: Int = 1
-b: Int = 2
-10 if a < b else 20",
+    indoc::indoc! {r#"
+
+        a: Int = 1
+        b: Int = 2
+        10 if a < b else 20"#},
     Value::Int(10)
 )]
 #[case(
-    r"
-a: Int = 5
-b: Int = 2
-10 if a < b else 20",
+    indoc::indoc! {r#"
+
+        a: Int = 5
+        b: Int = 2
+        10 if a < b else 20"#},
     Value::Int(20)
 )]
 // The selected value is itself a computed expression over outer bindings.
 #[case(
-    r"
-a: Int = 5
-c: Bool = True
-a * 2 if c else a - 1",
+    indoc::indoc! {r#"
+
+        a: Int = 5
+        c: Bool = True
+        a * 2 if c else a - 1"#},
     Value::Int(10)
 )]
 #[case(
-    r"
-a: Int = 5
-c: Bool = False
-a * 2 if c else a - 1",
+    indoc::indoc! {r#"
+
+        a: Int = 5
+        c: Bool = False
+        a * 2 if c else a - 1"#},
     Value::Int(4)
 )]
 // `elif` chain — first matching guard wins.
 #[case(
-    r"
-n: Int = 1
-100 if n == 1 else 200 if n == 2 else 300",
+    indoc::indoc! {r#"
+
+        n: Int = 1
+        100 if n == 1 else 200 if n == 2 else 300"#},
     Value::Int(100)
 )]
 #[case(
-    r"
-n: Int = 2
-100 if n == 1 else 200 if n == 2 else 300",
+    indoc::indoc! {r#"
+
+        n: Int = 2
+        100 if n == 1 else 200 if n == 2 else 300"#},
     Value::Int(200)
 )]
 #[case(
-    r"
-n: Int = 9
-100 if n == 1 else 200 if n == 2 else 300",
+    indoc::indoc! {r#"
+
+        n: Int = 9
+        100 if n == 1 else 200 if n == 2 else 300"#},
     Value::Int(300)
 )]
 // Ternary in an arithmetic context — the whole `Case` is a scalar `V`.
 #[case(
-    r"
-c: Bool = True
-(1 if c else 2) + 10",
+    indoc::indoc! {r#"
+
+        c: Bool = True
+        (1 if c else 2) + 10"#},
     Value::Int(11)
 )]
 // Nested ternary in an arm.
 #[case(
-    r"
-a: Int = 1
-b: Int = 1
-(100 if b == 1 else 101) if a == 1 else 200",
+    indoc::indoc! {r#"
+
+        a: Int = 1
+        b: Int = 1
+        (100 if b == 1 else 101) if a == 1 else 200"#},
     Value::Int(100)
 )]
 #[case(
-    r"
-a: Int = 1
-b: Int = 9
-(100 if b == 1 else 101) if a == 1 else 200",
+    indoc::indoc! {r#"
+
+        a: Int = 1
+        b: Int = 9
+        (100 if b == 1 else 101) if a == 1 else 200"#},
     Value::Int(101)
 )]
 #[case(
-    r"
-a: Int = 9
-b: Int = 1
-(100 if b == 1 else 101) if a == 1 else 200",
+    indoc::indoc! {r#"
+
+        a: Int = 9
+        b: Int = 1
+        (100 if b == 1 else 101) if a == 1 else 200"#},
     Value::Int(200)
 )]
 // Degenerate constant guard folds to the first arm.
 #[case("7 if True else 8", Value::Int(7))]
 // String and bool arms — the C-form is value-agnostic.
-#[case(r#"
-c: Bool = False
-"yes" if c else "no""#, Value::String("no".into()))]
+#[case(indoc::indoc! {r#"
+
+    c: Bool = False
+    "yes" if c else "no""#}, Value::String("no".into()))]
 #[case(
-    r"
-c: Bool = True
-False if c else True",
+    indoc::indoc! {r#"
+
+        c: Bool = True
+        False if c else True"#},
     Value::Bool(false)
 )]
 fn test_value_ternary_scalar(#[case] code: &str, #[case] expected: Value) {
@@ -269,30 +284,34 @@ fn test_block_if_chain_aligns_with_the_statement() {
 #[timeout(Duration::from_secs(10))]
 // Off-path partial arm: guard false → the `10 // b` arm is skipped, not faulted.
 #[case(
-    r"
-b: Int = 0
-0 if b == 0 else 10 // b",
+    indoc::indoc! {r#"
+
+        b: Int = 0
+        0 if b == 0 else 10 // b"#},
     Value::Int(0)
 )]
 // On-path partial arm still evaluates normally.
 #[case(
-    r"
-b: Int = 2
-10 // b if b != 0 else 0",
+    indoc::indoc! {r#"
+
+        b: Int = 2
+        10 // b if b != 0 else 0"#},
     Value::Int(5)
 )]
 // Guard true selects the safe arm; the partial `else` is skipped.
 #[case(
-    r"
-b: Int = 0
-99 if b == 0 else 10 // b",
+    indoc::indoc! {r#"
+
+        b: Int = 0
+        99 if b == 0 else 10 // b"#},
     Value::Int(99)
 )]
 // The partial arm is the (excluded) `else` of an explicit guard.
 #[case(
-    r"
-b: Int = 0
-10 // b if b != 0 else 42",
+    indoc::indoc! {r#"
+
+        b: Int = 0
+        10 // b if b != 0 else 42"#},
     Value::Int(42)
 )]
 fn test_value_ternary_skips_partial_off_path_arm(#[case] code: &str, #[case] expected: Value) {
@@ -316,48 +335,55 @@ fn test_value_ternary_skips_partial_off_path_arm(#[case] code: &str, #[case] exp
 #[timeout(Duration::from_secs(10))]
 // Distinct-domain arms — the `Case` types as a Σ; `sum`'s kind variable pins to it.
 #[case(
-    r"
-c: Bool = True
-sum(box([1, 2]) if c else box([1, 2, 3]))",
+    indoc::indoc! {r#"
+
+        c: Bool = True
+        sum(box([1, 2]) if c else box([1, 2, 3]))"#},
     Value::Int(3)
 )]
 #[case(
-    r"
-c: Bool = False
-sum(box([1, 2]) if c else box([1, 2, 3]))",
+    indoc::indoc! {r#"
+
+        c: Bool = False
+        sum(box([1, 2]) if c else box([1, 2, 3]))"#},
     Value::Int(6)
 )]
 // Same-domain boxed arms are realized; their one-candidate Σ remains on the assertion.
 #[case(
-    r"
-c: Bool = True
-sum(box([1, 2]) if c else box([3, 4]))",
+    indoc::indoc! {r#"
+
+        c: Bool = True
+        sum(box([1, 2]) if c else box([3, 4]))"#},
     Value::Int(3)
 )]
 #[case(
-    r"
-c: Bool = False
-sum(box([1, 2]) if c else box([3, 4]))",
+    indoc::indoc! {r#"
+
+        c: Bool = False
+        sum(box([1, 2]) if c else box([3, 4]))"#},
     Value::Int(7)
 )]
 // Guard is a computed comparison.
 #[case(
-    r"
-n: Int = 2
-sum(box([10, 20]) if n == 1 else box([1, 2, 3, 4]))",
+    indoc::indoc! {r#"
+
+        n: Int = 2
+        sum(box([10, 20]) if n == 1 else box([1, 2, 3, 4]))"#},
     Value::Int(10)
 )]
 // `elif` over collections — first matching arm's collection wins.
 #[case(
-    r"
-n: Int = 2
-sum(box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3]))",
+    indoc::indoc! {r#"
+
+        n: Int = 2
+        sum(box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3]))"#},
     Value::Int(4)
 )]
 #[case(
-    r"
-n: Int = 3
-sum(box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3]))",
+    indoc::indoc! {r#"
+
+        n: Int = 3
+        sum(box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3]))"#},
     Value::Int(9)
 )]
 // **Repeated domain across branches.** `[1]` and `[2]` share domain `0..1`, so
@@ -366,21 +392,24 @@ sum(box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3]))",
 // shared `0..1` candidate, their gates partitioning "branch a or b was taken".
 // A rule demanding one leg per candidate would reject it.
 #[case(
-    r"
-n: Int = 1
-sum(box([1]) if n == 1 else box([2]) if n == 2 else box([3, 3]))",
+    indoc::indoc! {r#"
+
+        n: Int = 1
+        sum(box([1]) if n == 1 else box([2]) if n == 2 else box([3, 3]))"#},
     Value::Int(1)
 )]
 #[case(
-    r"
-n: Int = 2
-sum(box([1]) if n == 1 else box([2]) if n == 2 else box([3, 3]))",
+    indoc::indoc! {r#"
+
+        n: Int = 2
+        sum(box([1]) if n == 1 else box([2]) if n == 2 else box([3, 3]))"#},
     Value::Int(2)
 )]
 #[case(
-    r"
-n: Int = 9
-sum(box([1]) if n == 1 else box([2]) if n == 2 else box([3, 3]))",
+    indoc::indoc! {r#"
+
+        n: Int = 9
+        sum(box([1]) if n == 1 else box([2]) if n == 2 else box([3, 3]))"#},
     Value::Int(6)
 )]
 fn test_value_case_collection_sum(#[case] code: &str, #[case] expected: Value) {
@@ -406,31 +435,35 @@ fn test_value_case_collection_sum(#[case] code: &str, #[case] expected: Value) {
 #[timeout(Duration::from_secs(10))]
 // Filtered arm first (`c` true → the filtered arm, `[2, 3]`).
 #[case(
-    r"
-c: Bool = True
-sum(box([x for x in [1, 2, 3] if x > 1]) if c else box([1, 2, 3]))",
+    indoc::indoc! {r#"
+
+        c: Bool = True
+        sum(box([x for x in [1, 2, 3] if x > 1]) if c else box([1, 2, 3]))"#},
     Value::Int(5)
 )]
 // The same program with the arms swapped (`c` true → the unfiltered arm).
 #[case(
-    r"
-c: Bool = True
-sum(box([1, 2, 3]) if c else box([x for x in [1, 2, 3] if x > 1]))",
+    indoc::indoc! {r#"
+
+        c: Bool = True
+        sum(box([1, 2, 3]) if c else box([x for x in [1, 2, 3] if x > 1]))"#},
     Value::Int(6)
 )]
 // Off-path selection through the shared base: `c` false takes the second arm.
 #[case(
-    r"
-c: Bool = False
-sum(box([x for x in [1, 2, 3] if x > 1]) if c else box([1, 2, 3]))",
+    indoc::indoc! {r#"
+
+        c: Bool = False
+        sum(box([x for x in [1, 2, 3] if x > 1]) if c else box([1, 2, 3]))"#},
     Value::Int(6)
 )]
 // Both arms filtered, by *different* predicates — two distinct refined
 // candidates over one base, so neither leg subtypes the other's candidate.
 #[case(
-    r"
-c: Bool = True
-sum(box([x for x in [1,2,3] if x > 1]) if c else box([y for y in [1,2,3] if y > 2]))",
+    indoc::indoc! {r#"
+
+        c: Bool = True
+        sum(box([x for x in [1,2,3] if x > 1]) if c else box([y for y in [1,2,3] if y > 2]))"#},
     Value::Int(5)
 )]
 fn test_value_case_arms_sharing_a_domain_base(#[case] code: &str, #[case] expected: Value) {
@@ -443,18 +476,16 @@ fn test_value_case_arms_sharing_a_domain_base(#[case] code: &str, #[case] expect
 #[timeout(Duration::from_secs(10))]
 fn test_value_case_collection_result() {
     // `True` arm: the surviving variant holds `[1, 2]`.
-    let result = run_pipeline(
-        r"
-c: Bool = True
-box([1, 2]) if c else box([1, 2, 3])",
-    );
+    let result = run_pipeline(indoc::indoc! {r#"
+
+            c: Bool = True
+            box([1, 2]) if c else box([1, 2, 3])"#});
     assert_eq!(codomain_ints(&result), vec![1, 2]);
     // `False` arm: the surviving variant holds `[1, 2, 3]`.
-    let result = run_pipeline(
-        r"
-c: Bool = False
-box([1, 2]) if c else box([1, 2, 3])",
-    );
+    let result = run_pipeline(indoc::indoc! {r#"
+
+            c: Bool = False
+            box([1, 2]) if c else box([1, 2, 3])"#});
     assert_eq!(codomain_ints(&result), vec![1, 2, 3]);
 }
 
@@ -465,17 +496,15 @@ box([1, 2]) if c else box([1, 2, 3])",
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_value_case_same_domain_collection_result() {
-    let result = run_pipeline(
-        r"
-c: Bool = True
-[1, 2] if c else [3, 4]",
-    );
+    let result = run_pipeline(indoc::indoc! {r#"
+
+            c: Bool = True
+            [1, 2] if c else [3, 4]"#});
     assert_eq!(codomain_ints(&result), vec![1, 2]);
-    let result = run_pipeline(
-        r"
-c: Bool = False
-[1, 2] if c else [3, 4]",
-    );
+    let result = run_pipeline(indoc::indoc! {r#"
+
+            c: Bool = False
+            [1, 2] if c else [3, 4]"#});
     assert_eq!(codomain_ints(&result), vec![3, 4]);
 }
 
@@ -557,60 +586,65 @@ fn a_conditional_chosen_per_row(#[case] source: &str, #[case] expected: &str) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // if/else — the selected arm's value is fed.
-#[case(r"
-c: Bool = True
-x: Feed(_)
-if c:
-    x << 1
-else:
-    x << 2
-x", vec![1])]
-#[case(r"
-c: Bool = False
-x: Feed(_)
-if c:
-    x << 1
-else:
-    x << 2
-x", vec![2])]
+#[case(indoc::indoc! {r#"
+
+    c: Bool = True
+    x: Feed(_)
+    if c:
+        x << 1
+    else:
+        x << 2
+    x"#}, vec![1])]
+#[case(indoc::indoc! {r#"
+
+    c: Bool = False
+    x: Feed(_)
+    if c:
+        x << 1
+    else:
+        x << 2
+    x"#}, vec![2])]
 // elif — first matching arm's value.
 #[case(
-    r"
-n: Int = 1
-x: Feed(_)
-if n == 1:
-    x << 10
-elif n == 2:
-    x << 20
-else:
-    x << 30
-x",
+    indoc::indoc! {r#"
+
+        n: Int = 1
+        x: Feed(_)
+        if n == 1:
+            x << 10
+        elif n == 2:
+            x << 20
+        else:
+            x << 30
+        x"#},
     vec![10]
 )]
 #[case(
-    r"
-n: Int = 2
-x: Feed(_)
-if n == 1:
-    x << 10
-elif n == 2:
-    x << 20
-else:
-    x << 30
-x",
+    indoc::indoc! {r#"
+
+        n: Int = 2
+        x: Feed(_)
+        if n == 1:
+            x << 10
+        elif n == 2:
+            x << 20
+        else:
+            x << 30
+        x"#},
     vec![20]
 )]
 #[case(
-    r"
-n: Int = 9
-x: Feed(_)
-if n == 1:
-    x << 10
-elif n == 2:
-    x << 20
-else:
-    x << 30
-x",
+    indoc::indoc! {r#"
+
+        n: Int = 9
+        x: Feed(_)
+        if n == 1:
+            x << 10
+        elif n == 2:
+            x << 20
+        else:
+            x << 30
+        x"#},
     vec![30]
 )]
 fn test_conditional_feed(#[case] code: &str, #[case] expected: Vec<i64>) {
@@ -630,23 +664,25 @@ fn test_conditional_feed(#[case] code: &str, #[case] expected: Vec<i64>) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // n=0 → else fires (42); the `100 // n` arm is not pulled.
-#[case(r"
-n: Int = 0
-x: Feed(_)
-if n != 0:
-    x << 100 // n
-else:
-    x << 42
-x", vec![42])]
+#[case(indoc::indoc! {r#"
+
+    n: Int = 0
+    x: Feed(_)
+    if n != 0:
+        x << 100 // n
+    else:
+        x << 42
+    x"#}, vec![42])]
 // n=5 → the partial arm fires and evaluates normally (100 // 5 = 20).
-#[case(r"
-n: Int = 5
-x: Feed(_)
-if n != 0:
-    x << 100 // n
-else:
-    x << 42
-x", vec![20])]
+#[case(indoc::indoc! {r#"
+
+    n: Int = 5
+    x: Feed(_)
+    if n != 0:
+        x << 100 // n
+    else:
+        x << 42
+    x"#}, vec![20])]
 fn test_conditional_feed_skips_partial_off_path_arm(
     #[case] code: &str,
     #[case] expected: Vec<i64>,
@@ -853,41 +889,47 @@ fn feed_from_a_match_arm(#[case] code: &str, #[case] expected: Value) {
 #[timeout(Duration::from_secs(10))]
 // Identity comprehension over a conditional collection.
 #[case(
-    r"
-c: Bool = True
-sum([x for x in (box([1, 2]) if c else box([1, 2, 3]))])",
+    indoc::indoc! {r#"
+
+        c: Bool = True
+        sum([x for x in (box([1, 2]) if c else box([1, 2, 3]))])"#},
     Value::Int(3)
 )]
 #[case(
-    r"
-c: Bool = False
-sum([x for x in (box([1, 2]) if c else box([1, 2, 3]))])",
+    indoc::indoc! {r#"
+
+        c: Bool = False
+        sum([x for x in (box([1, 2]) if c else box([1, 2, 3]))])"#},
     Value::Int(6)
 )]
 // Mapping comprehension over a conditional collection.
 #[case(
-    r"
-c: Bool = True
-sum([x * 10 for x in (box([1, 2]) if c else box([1, 2, 3]))])",
+    indoc::indoc! {r#"
+
+        c: Bool = True
+        sum([x * 10 for x in (box([1, 2]) if c else box([1, 2, 3]))])"#},
     Value::Int(30)
 )]
 #[case(
-    r"
-c: Bool = False
-sum([x * 10 for x in (box([1, 2]) if c else box([1, 2, 3]))])",
+    indoc::indoc! {r#"
+
+        c: Bool = False
+        sum([x * 10 for x in (box([1, 2]) if c else box([1, 2, 3]))])"#},
     Value::Int(60)
 )]
 // Nested conditional source: an `elif` in the iterable is one N-choice sum.
 #[case(
-    r"
-n: Int = 2
-sum([x for x in (box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3]))])",
+    indoc::indoc! {r#"
+
+        n: Int = 2
+        sum([x for x in (box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3]))])"#},
     Value::Int(4)
 )]
 #[case(
-    r"
-n: Int = 3
-sum([x for x in (box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3]))])",
+    indoc::indoc! {r#"
+
+        n: Int = 3
+        sum([x for x in (box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3]))])"#},
     Value::Int(9)
 )]
 fn test_comprehension_over_conditional(#[case] code: &str, #[case] expected: Value) {
@@ -947,26 +989,29 @@ fn a_conditional_between_comprehensions_over_boxes_is_refused(#[case] code: &str
 #[timeout(Duration::from_secs(30))]
 // Let-bound: the conditional is named, then iterated.
 #[case(
-    r"
-c: Bool = True
-x = box([1, 2]) if c else box([1, 2, 3])
-sum([y for y in x])",
+    indoc::indoc! {r#"
+
+        c: Bool = True
+        x = box([1, 2]) if c else box([1, 2, 3])
+        sum([y for y in x])"#},
     Value::Int(3)
 )]
 #[case(
-    r"
-c: Bool = False
-x = box([1, 2]) if c else box([1, 2, 3])
-sum([y * 10 for y in x])",
+    indoc::indoc! {r#"
+
+        c: Bool = False
+        x = box([1, 2]) if c else box([1, 2, 3])
+        sum([y * 10 for y in x])"#},
     Value::Int(60)
 )]
 // Through a UDF parameter: the sum arrives at the call, not the definition.
 #[case(
-    r"
-def f(xs):
-    sum([y for y in xs])
-c: Bool = True
-f(box([1, 2]) if c else box([1, 2, 3]))",
+    indoc::indoc! {r#"
+
+        def f(xs):
+            sum([y for y in xs])
+        c: Bool = True
+        f(box([1, 2]) if c else box([1, 2, 3]))"#},
     Value::Int(3)
 )]
 // **One collection, two consumers.** Both comprehensions range over whichever domain the
@@ -974,10 +1019,11 @@ f(box([1, 2]) if c else box([1, 2, 3]))",
 // `two_conditional_sources_keep_their_witnesses_apart` does not cover, since it is about
 // keeping *different* witnesses apart.
 #[case(
-    r"
-c: Bool = True
-x = box([1, 2]) if c else box([1, 2, 3])
-sum([y for y in x]) + sum([z for z in x])",
+    indoc::indoc! {r#"
+
+        c: Bool = True
+        x = box([1, 2]) if c else box([1, 2, 3])
+        sum([y for y in x]) + sum([z for z in x])"#},
     Value::Int(6)
 )]
 fn a_conditional_source_compiles_however_it_reaches_the_generator(
@@ -1012,31 +1058,35 @@ fn a_conditional_source_compiles_however_it_reaches_the_generator(
 // Both arms of the two-candidate sum. Only the `else` arm was pinned before, which cannot
 // distinguish a rule that reads the candidates positionally.
 #[case(
-    r"
-c: Bool = True
-sum([y for y in (box([1, 2]) if c else box([1, 2, 3])) if y > 1])",
+    indoc::indoc! {r#"
+
+        c: Bool = True
+        sum([y for y in (box([1, 2]) if c else box([1, 2, 3])) if y > 1])"#},
     Value::Int(2)
 )]
 #[case(
-    r"
-c: Bool = False
-sum([y for y in (box([1, 2]) if c else box([1, 2, 3])) if y > 1])",
+    indoc::indoc! {r#"
+
+        c: Bool = False
+        sum([y for y in (box([1, 2]) if c else box([1, 2, 3])) if y > 1])"#},
     Value::Int(5)
 )]
 // How the conditional reaches the generator — the same three routes
 // `a_conditional_source_compiles_however_it_reaches_the_generator` pins unfiltered.
 #[case(
-    r"
-def f(xs):
-    sum([y for y in xs if y > 1])
-c: Bool = False
-f(box([1, 2]) if c else box([1, 2, 3]))",
+    indoc::indoc! {r#"
+
+        def f(xs):
+            sum([y for y in xs if y > 1])
+        c: Bool = False
+        f(box([1, 2]) if c else box([1, 2, 3]))"#},
     Value::Int(5)
 )]
 #[case(
-    r"
-c: Bool = False
-sum([y for y in (box([x for x in [1, 2]]) if c else box([x for x in [1, 2, 3]])) if y > 1])",
+    indoc::indoc! {r#"
+
+        c: Bool = False
+        sum([y for y in (box([x for x in [1, 2]]) if c else box([x for x in [1, 2, 3]])) if y > 1])"#},
     Value::Int(5)
 )]
 // A **mapping** body. The identity comprehension above simplifies to a bare `cast`, so the
@@ -1044,29 +1094,33 @@ sum([y for y in (box([x for x in [1, 2]]) if c else box([x for x in [1, 2, 3]]))
 // opens the sum, leaving the `Case` typed by the body `σ ⤇ Int`. Both spellings name
 // the same witness and owe the same restriction.
 #[case(
-    r"
-c: Bool = False
-sum([y * 10 for y in (box([1, 2]) if c else box([1, 2, 3])) if y > 1])",
+    indoc::indoc! {r#"
+
+        c: Bool = False
+        sum([y * 10 for y in (box([1, 2]) if c else box([1, 2, 3])) if y > 1])"#},
     Value::Int(50)
 )]
 // Three arms: more legs than the two the union shape is usually reasoned about with.
 #[case(
-    r"
-n: Int = 2
-sum([y for y in (box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3])) if y > 1])",
+    indoc::indoc! {r#"
+
+        n: Int = 2
+        sum([y for y in (box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3])) if y > 1])"#},
     Value::Int(4)
 )]
 #[case(
-    r"
-n: Int = 3
-sum([y for y in (box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3])) if y > 1])",
+    indoc::indoc! {r#"
+
+        n: Int = 3
+        sum([y for y in (box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3])) if y > 1])"#},
     Value::Int(9)
 )]
 // ...including one whose selected arm the filter empties.
 #[case(
-    r"
-n: Int = 1
-sum([y for y in (box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3])) if y > 1])",
+    indoc::indoc! {r#"
+
+        n: Int = 1
+        sum([y for y in (box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3])) if y > 1])"#},
     Value::Int(0)
 )]
 // **Same-domain arms**: two legs, but the sum collapses to *one* candidate, so this sits
@@ -1074,55 +1128,62 @@ sum([y for y in (box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3
 // legs through a sum that no longer distinguishes them. Both predicates discriminate; an
 // unfiltered answer would be 6 and 7.
 #[case(
-    r"
-c: Bool = True
-sum([y for y in (box([1, 5]) if c else box([3, 4])) if y > 2])",
+    indoc::indoc! {r#"
+
+        c: Bool = True
+        sum([y for y in (box([1, 5]) if c else box([3, 4])) if y > 2])"#},
     Value::Int(5)
 )]
 #[case(
-    r"
-c: Bool = False
-sum([y for y in (box([1, 5]) if c else box([3, 4])) if y > 3])",
+    indoc::indoc! {r#"
+
+        c: Bool = False
+        sum([y for y in (box([1, 5]) if c else box([3, 4])) if y > 3])"#},
     Value::Int(4)
 )]
 // **Two consumers, each with its own conditional.** Spelled inline, each consumer has its own
 // `Case`. These and the `c: Bool = False` case of the pair that opens this test are the controls
 // for the let-bound cases below, which are the same three programs with one binding.
 #[case(
-    r"
-c: Bool = False
-sum([y for y in (box([1, 2]) if c else box([1, 2, 3])) if y > 1]) + sum([z for z in (box([1, 2]) if c else box([1, 2, 3])) if z > 2])",
+    indoc::indoc! {r#"
+
+        c: Bool = False
+        sum([y for y in (box([1, 2]) if c else box([1, 2, 3])) if y > 1]) + sum([z for z in (box([1, 2]) if c else box([1, 2, 3])) if z > 2])"#},
     Value::Int(8)
 )]
 // ...including one consumer that restricts nothing.
 #[case(
-    r"
-c: Bool = False
-sum([y for y in (box([1, 2]) if c else box([1, 2, 3]))]) + sum([z for z in (box([1, 2]) if c else box([1, 2, 3])) if z > 1])",
+    indoc::indoc! {r#"
+
+        c: Bool = False
+        sum([y for y in (box([1, 2]) if c else box([1, 2, 3]))]) + sum([z for z in (box([1, 2]) if c else box([1, 2, 3])) if z > 1])"#},
     Value::Int(11)
 )]
 // **Let-bound**, the same three programs with the conditional shared through a binding.
 // The conditional is realized once, in its binding, and its consumers share it
 // (`src/ccl/design/collections.md`, "Compiling a conditional collection").
 #[case(
-    r"
-c: Bool = False
-x = box([1, 2]) if c else box([1, 2, 3])
-sum([y for y in x if y > 1])",
+    indoc::indoc! {r#"
+
+        c: Bool = False
+        x = box([1, 2]) if c else box([1, 2, 3])
+        sum([y for y in x if y > 1])"#},
     Value::Int(5)
 )]
 #[case(
-    r"
-c: Bool = False
-x = box([1, 2]) if c else box([1, 2, 3])
-sum([y for y in x if y > 1]) + sum([z for z in x if z > 2])",
+    indoc::indoc! {r#"
+
+        c: Bool = False
+        x = box([1, 2]) if c else box([1, 2, 3])
+        sum([y for y in x if y > 1]) + sum([z for z in x if z > 2])"#},
     Value::Int(8)
 )]
 #[case(
-    r"
-c: Bool = False
-x = box([1, 2]) if c else box([1, 2, 3])
-sum([y for y in x]) + sum([z for z in x if z > 1])",
+    indoc::indoc! {r#"
+
+        c: Bool = False
+        x = box([1, 2]) if c else box([1, 2, 3])
+        sum([y for y in x]) + sum([z for z in x if z > 1])"#},
     Value::Int(11)
 )]
 fn a_filter_over_a_conditional_source_is_applied(#[case] code: &str, #[case] expected: Value) {
@@ -1138,21 +1199,24 @@ fn a_filter_over_a_conditional_source_is_applied(#[case] code: &str, #[case] exp
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
-    r"
-c: Bool = True
-sum(box([x for x in [1, 2]]) if c else box([y for y in [1, 2, 3]]))",
+    indoc::indoc! {r#"
+
+        c: Bool = True
+        sum(box([x for x in [1, 2]]) if c else box([y for y in [1, 2, 3]]))"#},
     Value::Int(3)
 )]
 #[case(
-    r"
-c: Bool = False
-sum(box([x for x in [1, 2]]) if c else box([y for y in [1, 2, 3]]))",
+    indoc::indoc! {r#"
+
+        c: Bool = False
+        sum(box([x for x in [1, 2]]) if c else box([y for y in [1, 2, 3]]))"#},
     Value::Int(6)
 )]
 #[case(
-    r"
-c: Bool = True
-sum(box([x * 10 for x in [1, 2]]) if c else box([y for y in [1, 2, 3]]))",
+    indoc::indoc! {r#"
+
+        c: Bool = True
+        sum(box([x * 10 for x in [1, 2]]) if c else box([y for y in [1, 2, 3]]))"#},
     Value::Int(30)
 )]
 fn test_conditional_between_comprehensions(#[case] code: &str, #[case] expected: Value) {
@@ -1241,42 +1305,46 @@ fn a_conditional_element_reading_an_enclosing_binder(#[case] source: &str, #[cas
 #[timeout(Duration::from_secs(10))]
 // Guard fires for 3, 4 → total = 3 + 4 = 7; positions 0, 1 carry.
 #[case(
-    r"
-total := 0
-for x in [1, 2, 3, 4]:
-    if x > 2:
-        total += x
-total",
+    indoc::indoc! {r#"
+
+        total := 0
+        for x in [1, 2, 3, 4]:
+            if x > 2:
+                total += x
+        total"#},
     7
 )]
 // Guard fires for none → total stays at its init.
 #[case(
-    r"
-total := 0
-for x in [1, 2, 3]:
-    if x > 10:
-        total += x
-total",
+    indoc::indoc! {r#"
+
+        total := 0
+        for x in [1, 2, 3]:
+            if x > 10:
+                total += x
+        total"#},
     0
 )]
 // Guard fires for all → same as an unconditional accumulate (1+2+3 = 6).
 #[case(
-    r"
-total := 0
-for x in [1, 2, 3]:
-    if x > 0:
-        total += x
-total",
+    indoc::indoc! {r#"
+
+        total := 0
+        for x in [1, 2, 3]:
+            if x > 0:
+                total += x
+        total"#},
     6
 )]
 // A non-zero init the leading carries fold to (only 3 fires → 100 + 3 = 103).
 #[case(
-    r"
-total := 100
-for x in [1, 2, 3]:
-    if x == 3:
-        total += x
-total",
+    indoc::indoc! {r#"
+
+        total := 100
+        for x in [1, 2, 3]:
+            if x == 3:
+                total += x
+        total"#},
     103
 )]
 // Fire early, then an **all-carry tail**: x=3 (position 0) writes +3; x=1
@@ -1285,12 +1353,13 @@ total",
 // carried tail, not stop at the latest change tick. Pins the terminality/watermark
 // decoupling (a sparse writer whose tail carries reads its true final value).
 #[case(
-    r"
-total := 0
-for x in [3, 1]:
-    if x > 2:
-        total += x
-total",
+    indoc::indoc! {r#"
+
+        total := 0
+        for x in [3, 1]:
+            if x > 2:
+                total += x
+        total"#},
     3
 )]
 // **Trailing carries**: writes then a carrying tail (`x < 3` fires at 1,2; the
@@ -1298,12 +1367,13 @@ total",
 // *written* value (1+2 = 3), not undercount because the changelog's latest change
 // tick sits below the position watermark — the terminality-vs-watermark fix.
 #[case(
-    r"
-total := 0
-for x in [1, 2, 3, 4, 5]:
-    if x < 3:
-        total += x
-total",
+    indoc::indoc! {r#"
+
+        total := 0
+        for x in [1, 2, 3, 4, 5]:
+            if x < 3:
+                total += x
+        total"#},
     3
 )]
 // A **partial op** (`//`) in the written value, guarded away from its bad input.
@@ -1311,12 +1381,13 @@ total",
 // `total // x` is evaluated only where `x != 0` — never at the `x == 0` position
 // it would fault on. x=2 → 100 // 2 = 50; x=0 → guard false, carry → 50.
 #[case(
-    r"
-total := 100
-for x in [2, 0]:
-    if x != 0:
-        total := total // x
-total",
+    indoc::indoc! {r#"
+
+        total := 100
+        for x in [2, 0]:
+            if x != 0:
+                total := total // x
+        total"#},
     50
 )]
 // An **absolute** conditional write (`total := 5`, a constant not reading the
@@ -1325,12 +1396,13 @@ total",
 // collapse `filter_values ≫ const` to a bare `const` (which would set 5 at every
 // position). x=1,2 carry init 9; x=3,4 set 5 → final 5.
 #[case(
-    r"
-total := 9
-for x in [1, 2, 3, 4]:
-    if x > 2:
-        total := 5
-total",
+    indoc::indoc! {r#"
+
+        total := 9
+        for x in [1, 2, 3, 4]:
+            if x > 2:
+                total := 5
+        total"#},
     5
 )]
 // An **unconditional** write *before* a conditional write on the same accumulator.
@@ -1339,25 +1411,27 @@ total",
 // +1 then +10 (=12); x=3 → +1 then +10 (=23). A commit gate that only fired on the
 // guard would drop the `+= 1` at x=1 (regressing to the prior value).
 #[case(
-    r"
-x := 0
-for i in [1, 2, 3]:
-    x := x + 1
-    if i > 1:
-        x := x + 10
-x",
+    indoc::indoc! {r#"
+
+        x := 0
+        for i in [1, 2, 3]:
+            x := x + 1
+            if i > 1:
+                x := x + 10
+        x"#},
     23
 )]
 // Same, with the unconditional write *after* the conditional (spliced into every
 // path). x=1 → +1 (=1); x=2 → +10 then +1 (=12); x=3 → +10 then +1 (=23).
 #[case(
-    r"
-x := 0
-for i in [1, 2, 3]:
-    if i > 1:
-        x := x + 10
-    x := x + 1
-x",
+    indoc::indoc! {r#"
+
+        x := 0
+        for i in [1, 2, 3]:
+            if i > 1:
+                x := x + 10
+            x := x + 1
+        x"#},
     23
 )]
 // **Sibling** `if`s (not `elif`) writing the *same* accumulator: the write set is
@@ -1365,14 +1439,15 @@ x",
 // from the entering value. i=1: +100 (=100); i=2: +2 then +100 (=202); i=3: +3
 // (=205). Final 205.
 #[case(
-    r"
-a := 0
-for i in [1, 2, 3]:
-    if i > 1:
-        a := a + i
-    if i < 3:
-        a := a + 100
-a",
+    indoc::indoc! {r#"
+
+        a := 0
+        for i in [1, 2, 3]:
+            if i > 1:
+                a := a + i
+            if i < 3:
+                a := a + 100
+        a"#},
     205
 )]
 fn test_conditional_induction_write(#[case] code: &str, #[case] expected: i64) {
@@ -1455,14 +1530,15 @@ fn a_branch_binding_two_writes_read_is_evaluated_only_in_the_branch() {
 #[timeout(Duration::from_secs(10))]
 fn test_conditional_induction_two_accumulators() {
     check_scalar(
-        r"
-cnt := 0
-total := 0
-for i in [1, 2, 3]:
-    cnt := cnt + 1
-    if i > 1:
-        total := total + i
-cnt * 10 + total",
+        indoc::indoc! {r#"
+
+            cnt := 0
+            total := 0
+            for i in [1, 2, 3]:
+                cnt := cnt + 1
+                if i > 1:
+                    total := total + i
+            cnt * 10 + total"#},
         Value::Int(35),
     );
 }
@@ -1476,28 +1552,30 @@ cnt * 10 + total",
 #[timeout(Duration::from_secs(10))]
 // x=1,2 → +1 (else); x=3,4 → +x. total = 1+1+3+4 = 9.
 #[case(
-    r"
-total := 0
-for x in [1, 2, 3, 4]:
-    if x > 2:
-        total += x
-    else:
-        total += 1
-total",
+    indoc::indoc! {r#"
+
+        total := 0
+        for x in [1, 2, 3, 4]:
+            if x > 2:
+                total += x
+            else:
+                total += 1
+        total"#},
     9
 )]
 // elif chain, all arms write. x=1→+10, x=2→+20, x=3→+30. total = 60.
 #[case(
-    r"
-total := 0
-for x in [1, 2, 3]:
-    if x == 1:
-        total += 10
-    elif x == 2:
-        total += 20
-    else:
-        total += 30
-total",
+    indoc::indoc! {r#"
+
+        total := 0
+        for x in [1, 2, 3]:
+            if x == 1:
+                total += 10
+            elif x == 2:
+                total += 20
+            else:
+                total += 30
+        total"#},
     60
 )]
 fn test_conditional_induction_if_else_both_write(#[case] code: &str, #[case] expected: i64) {
@@ -1513,15 +1591,21 @@ fn test_conditional_induction_if_else_both_write(#[case] code: &str, #[case] exp
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
-    "c: Bool = True\nsum(box([1, 2]) if c else box([1, 2, 3]))",
+    indoc::indoc! {r#"
+        c: Bool = True
+        sum(box([1, 2]) if c else box([1, 2, 3]))"#},
     Value::Int(3)
 )]
 #[case(
-    "c: Bool = False\nsum(box([1, 2]) if c else box([1, 2, 3]))",
+    indoc::indoc! {r#"
+        c: Bool = False
+        sum(box([1, 2]) if c else box([1, 2, 3]))"#},
     Value::Int(6)
 )]
 #[case(
-    "n: Int = 2\nsum(box([1]) if n == 1 else box([2]) if n == 2 else box([3, 3]))",
+    indoc::indoc! {r#"
+        n: Int = 2
+        sum(box([1]) if n == 1 else box([2]) if n == 2 else box([3, 3]))"#},
     Value::Int(2)
 )]
 fn test_boxed_conditional_collection(#[case] code: &str, #[case] expected: Value) {
@@ -1582,11 +1666,12 @@ fn a_boxed_conditional_keyed_by_its_arm(#[case] source: &str, #[case] expected: 
 #[case(false, true, 2 * 6 + 3 * 30)]
 #[case(false, false, 3 * 6 + 3 * 60)]
 fn two_conditional_sources_compile(#[case] c: bool, #[case] d: bool, #[case] expected: i64) {
-    let code = format!(
-        r"
-c: Bool = {}
-d: Bool = {}
-sum([x + y for x in (box([1, 2]) if c else box([1, 2, 3])) for y in (box([10, 20]) if d else box([10, 20, 30]))])",
+    let code = indoc::formatdoc!(
+        r#"
+
+            c: Bool = {}
+            d: Bool = {}
+            sum([x + y for x in (box([1, 2]) if c else box([1, 2, 3])) for y in (box([10, 20]) if d else box([10, 20, 30]))])"#,
         if c { "True" } else { "False" },
         if d { "True" } else { "False" },
     );
@@ -1613,11 +1698,12 @@ sum([x + y for x in (box([1, 2]) if c else box([1, 2, 3])) for y in (box([10, 20
 #[case(false, true, 2 * 5 + 2 * 30)]
 #[case(false, false, 3 * 5 + 2 * 60)]
 fn a_filter_over_two_conditional_sources(#[case] c: bool, #[case] d: bool, #[case] expected: i64) {
-    let code = format!(
-        r"
-c: Bool = {}
-d: Bool = {}
-sum([x + y for x in (box([1, 2]) if c else box([1, 2, 3])) if x > 1 for y in (box([10, 20]) if d else box([10, 20, 30]))])",
+    let code = indoc::formatdoc!(
+        r#"
+
+            c: Bool = {}
+            d: Bool = {}
+            sum([x + y for x in (box([1, 2]) if c else box([1, 2, 3])) if x > 1 for y in (box([10, 20]) if d else box([10, 20, 30]))])"#,
         if c { "True" } else { "False" },
         if d { "True" } else { "False" },
     );
@@ -1640,11 +1726,12 @@ fn a_filter_over_the_second_of_two_conditional_sources(
     #[case] d: bool,
     #[case] expected: i64,
 ) {
-    let code = format!(
-        r"
-c: Bool = {}
-d: Bool = {}
-sum([x + y for x in (box([1, 2]) if c else box([1, 2, 3])) for y in (box([10, 20]) if d else box([10, 20, 30])) if y > 10])",
+    let code = indoc::formatdoc!(
+        r#"
+
+            c: Bool = {}
+            d: Bool = {}
+            sum([x + y for x in (box([1, 2]) if c else box([1, 2, 3])) for y in (box([10, 20]) if d else box([10, 20, 30])) if y > 10])"#,
         if c { "True" } else { "False" },
         if d { "True" } else { "False" },
     );
@@ -1660,22 +1747,25 @@ sum([x + y for x in (box([1, 2]) if c else box([1, 2, 3])) for y in (box([10, 20
 #[rstest]
 #[timeout(Duration::from_secs(30))]
 #[case(
-    r"
-c: Bool = False
-sum([x + y for x in (box([1, 2]) if c else box([1, 2, 3])) for y in [10, 20]])",
+    indoc::indoc! {r#"
+
+        c: Bool = False
+        sum([x + y for x in (box([1, 2]) if c else box([1, 2, 3])) for y in [10, 20]])"#},
     Value::Int(3 * 30 + 2 * 6)
 )]
 #[case(
-    r"
-c: Bool = True
-sum([x + y for x in (box([1, 2]) if c else box([1, 2, 3])) for y in [10, 20]])",
+    indoc::indoc! {r#"
+
+        c: Bool = True
+        sum([x + y for x in (box([1, 2]) if c else box([1, 2, 3])) for y in [10, 20]])"#},
     Value::Int(2 * 30 + 2 * 3)
 )]
 // The conditional as the *second* generator.
 #[case(
-    r"
-c: Bool = False
-sum([x + y for x in [10, 20] for y in (box([1, 2]) if c else box([1, 2, 3]))])",
+    indoc::indoc! {r#"
+
+        c: Bool = False
+        sum([x + y for x in [10, 20] for y in (box([1, 2]) if c else box([1, 2, 3]))])"#},
     Value::Int(3 * 30 + 2 * 6)
 )]
 fn a_conditional_generator_beside_another(#[case] code: &str, #[case] expected: Value) {
@@ -1692,16 +1782,18 @@ fn a_conditional_generator_beside_another(#[case] code: &str, #[case] expected: 
 #[timeout(Duration::from_secs(30))]
 // The filter on the conditional generator.
 #[case(
-    r"
-c: Bool = False
-sum([x + y for x in (box([1, 2]) if c else box([1, 2, 3])) if x > 1 for y in [10, 20]])",
+    indoc::indoc! {r#"
+
+        c: Bool = False
+        sum([x + y for x in (box([1, 2]) if c else box([1, 2, 3])) if x > 1 for y in [10, 20]])"#},
     Value::Int(70)
 )]
 // ...and on the *other* generator, which the conditional never touches.
 #[case(
-    r"
-c: Bool = False
-sum([x + y for x in (box([1, 2]) if c else box([1, 2, 3])) for y in [10, 20] if y > 10])",
+    indoc::indoc! {r#"
+
+        c: Bool = False
+        sum([x + y for x in (box([1, 2]) if c else box([1, 2, 3])) for y in [10, 20] if y > 10])"#},
     Value::Int(66)
 )]
 fn a_filtered_conditional_generator_beside_another(#[case] code: &str, #[case] expected: Value) {

@@ -183,12 +183,12 @@ mod tests {
     )]
     // Outer capture: `y` comes from an enclosing let binding.
     #[case(
-        "\
-y = 5
-[x + y for x in [10, 20]]",
-        "\
-let y = 5
-in [x + y for x in [10, 20] ▷ Iterable::elements]"
+        indoc::indoc! {r#"
+            y = 5
+            [x + y for x in [10, 20]]"#},
+        indoc::indoc! {r#"
+            let y = 5
+            in [x + y for x in [10, 20] ▷ Iterable::elements]"#}
     )]
     // Nested comprehension: the inner one is the outer one's generator source.
     #[case(

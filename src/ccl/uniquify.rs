@@ -818,13 +818,13 @@ mod tests {
     // shadowing `let`) yields *distinct* refinements.
     #[test]
     fn shadowed_scope_twins_are_distinct_refinements() {
-        let expr = pipeline_front(
-            "k = 1\n\
-             a = [x for x in [1, 2, 3] if x > k]\n\
-             k = 2\n\
-             b = [x for x in [1, 2, 3] if x > k]\n\
-             (a, b)\n",
-        );
+        let expr = pipeline_front(indoc::indoc! {r#"
+                k = 1
+                a = [x for x in [1, 2, 3] if x > k]
+                k = 2
+                b = [x for x in [1, 2, 3] if x > k]
+                (a, b)
+                "#});
         let mut ks = Vec::new();
         let_binders(&expr, "k", &mut ks);
         assert_eq!(ks.len(), 2, "two shadowing k bindings");
@@ -873,7 +873,11 @@ mod tests {
 
     #[test]
     fn shadowing_resolves_to_innermost_binder() {
-        let expr = pipeline_front("k = 1\nk = 2\nk\n");
+        let expr = pipeline_front(indoc::indoc! {r#"
+            k = 1
+            k = 2
+            k
+            "#});
         let mut ks = Vec::new();
         let_binders(&expr, "k", &mut ks);
         assert_eq!(ks.len(), 2);
@@ -899,7 +903,10 @@ mod tests {
     // predicate's free program variables resolve to the enclosing binder.
     #[test]
     fn predicate_vars_resolve_at_their_anchor() {
-        let expr = pipeline_front("k = 1\n[x for x in [1, 2, 3] if x > k]\n");
+        let expr = pipeline_front(indoc::indoc! {r#"
+            k = 1
+            [x for x in [1, 2, 3] if x > k]
+            "#});
         let mut ks = Vec::new();
         let_binders(&expr, "k", &mut ks);
         assert_eq!(ks.len(), 1);
@@ -960,7 +967,10 @@ mod tests {
     // here an aggregate over a comprehension, which binds `x`.
     #[test]
     fn idempotent_on_minted_trees() {
-        let expr = run(lower_only("k = 1\n0 < sum([x + k for x in [1, 2]]) < 5\n"));
+        let expr = run(lower_only(indoc::indoc! {r#"
+            k = 1
+            0 < sum([x + k for x in [1, 2]]) < 5
+            "#}));
         // The second run must see the same nodes, not a freshened copy of them.
         let again = run(expr.clone_preserving_ids());
         assert_eq!(expr, again, "uniquify must be idempotent");
@@ -977,7 +987,11 @@ mod tests {
         // `let x = 1 in let x = x in x` — two shadowing `x` binders plus uses,
         // so the rename actually rewrites `Var` names. Lower *without*
         // uniquifying so we capture ids before the rename.
-        let expr = lower_only("x = 1\nx = x\nx\n");
+        let expr = lower_only(indoc::indoc! {r#"
+            x = 1
+            x = x
+            x
+            "#});
 
         let before: HashSet<NodeId> = collect_node_ids(&expr).into_iter().collect();
         // Pin a known structural position: the id of the root `Let` node.
@@ -1023,7 +1037,10 @@ mod tests {
             e.walk_children(|c| binder_predicate_ids(c, out));
         }
 
-        let expr = lower_only("x: {Int where _ > 0} = 5\nx\n");
+        let expr = lower_only(indoc::indoc! {r#"
+            x: {Int where _ > 0} = 5
+            x
+            "#});
         let mut predicate_ids = Vec::new();
         binder_predicate_ids(&expr, &mut predicate_ids);
         assert!(

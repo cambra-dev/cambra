@@ -22,16 +22,21 @@ use super::helpers::*;
 #[case("sum(box([1, 2, 3]))", Value::Int(6))]
 // Iterated: inline, let-bound, and through a UDF parameter.
 #[case("sum([y for y in box([1, 2, 3])])", Value::Int(6))]
-#[case("x = box([1, 2, 3])\nsum([y for y in x])", Value::Int(6))]
+#[case(indoc::indoc! {r#"
+    x = box([1, 2, 3])
+    sum([y for y in x])"#}, Value::Int(6))]
 #[case(
-    r"
-def f(xs):
-    sum([y for y in xs])
-f(box([1, 2, 3]))",
+    indoc::indoc! {r#"
+
+        def f(xs):
+            sum([y for y in xs])
+        f(box([1, 2, 3]))"#},
     Value::Int(6)
 )]
 // A mapping body, which composes onto the source rather than collapsing to it.
-#[case("x = box([1, 2, 3])\nsum([y * 10 for y in x])", Value::Int(60))]
+#[case(indoc::indoc! {r#"
+    x = box([1, 2, 3])
+    sum([y * 10 for y in x])"#}, Value::Int(60))]
 // The same mapping body over an **inline** box. Both halves are needed and neither
 // implies the other: the body is what puts the `box` inside a point-free chain, and
 // being inline is what leaves it there as an interior morphism — where `lambda_elim`
@@ -63,7 +68,9 @@ fn a_boxed_collection_is_consumed_like_the_collection_it_wraps(
     Value::Int(5)
 )]
 #[case(
-    "x = box([z for z in [1, 2, 3] if z > 1])\nsum([y for y in x])",
+    indoc::indoc! {r#"
+        x = box([z for z in [1, 2, 3] if z > 1])
+        sum([y for y in x])"#},
     Value::Int(5)
 )]
 fn a_filter_inside_the_box_is_already_compiled(#[case] code: &str, #[case] expected: Value) {
@@ -85,51 +92,73 @@ fn a_filter_inside_the_box_is_already_compiled(#[case] code: &str, #[case] expec
 #[timeout(Duration::from_secs(10))]
 // How the box reaches the generator: inline, let-bound, UDF parameter.
 #[case("sum([y for y in box([1, 2, 3]) if y > 1])", Value::Int(5))]
-#[case("x = box([1, 2, 3])\nsum([y for y in x if y > 1])", Value::Int(5))]
+#[case(indoc::indoc! {r#"
+    x = box([1, 2, 3])
+    sum([y for y in x if y > 1])"#}, Value::Int(5))]
 #[case(
-    r"
-def f(xs):
-    sum([y for y in xs if y > 1])
-f(box([1, 2, 3]))",
+    indoc::indoc! {r#"
+
+        def f(xs):
+            sum([y for y in xs if y > 1])
+        f(box([1, 2, 3]))"#},
     Value::Int(5)
 )]
 // A mapping body as well as the identity one: the identity comprehension
 // simplifies to a bare `cast`, so it alone would not exercise the composed form.
 #[case(
-    "x = box([1, 2, 3])\nsum([y * 10 for y in x if y > 1])",
+    indoc::indoc! {r#"
+        x = box([1, 2, 3])
+        sum([y * 10 for y in x if y > 1])"#},
     Value::Int(50)
 )]
 // Predicate shapes: an empty result, an outer binding, a conjunction. (An
 // always-true predicate cannot discriminate a dropped filter from a working
 // one, so it sits with the controls above.)
-#[case("x = box([1, 2, 3])\nsum([y for y in x if y > 100])", Value::Int(0))]
+#[case(indoc::indoc! {r#"
+    x = box([1, 2, 3])
+    sum([y for y in x if y > 100])"#}, Value::Int(0))]
 // A filter that admits *every* element. It cannot tell a working restrict from a
 // dropped one by its answer — but it belongs here rather than with the controls,
 // because planning refuses a site that still owes a restrict rather than dropping
 // it, and this owes one like any other.
-#[case("x = box([1, 2, 3])\nsum([y for y in x if y > 0])", Value::Int(6))]
+#[case(indoc::indoc! {r#"
+    x = box([1, 2, 3])
+    sum([y for y in x if y > 0])"#}, Value::Int(6))]
 #[case(
-    "k: Int = 1\nx = box([1, 2, 3])\nsum([y for y in x if y > k])",
+    indoc::indoc! {r#"
+        k: Int = 1
+        x = box([1, 2, 3])
+        sum([y for y in x if y > k])"#},
     Value::Int(5)
 )]
 #[case(
-    "x = box([1, 2, 3])\nsum([y for y in x if y > 1 and y < 3])",
+    indoc::indoc! {r#"
+        x = box([1, 2, 3])
+        sum([y for y in x if y > 1 and y < 3])"#},
     Value::Int(2)
 )]
 // A consumer other than `sum`. The predicate discriminates: unfiltered `max` is
 // 3, so a dropped filter is visible.
-#[case("x = box([1, 2, 3])\nmax([y for y in x if y < 3])", Value::Int(2))]
+#[case(indoc::indoc! {r#"
+    x = box([1, 2, 3])
+    max([y for y in x if y < 3])"#}, Value::Int(2))]
 // `min` under the same filter: unfiltered `min` is 1, so only a filter that drops 1 is visible.
-#[case("x = box([1, 2, 3])\nmin([y for y in x if y > 1])", Value::Int(2))]
+#[case(indoc::indoc! {r#"
+    x = box([1, 2, 3])
+    min([y for y in x if y > 1])"#}, Value::Int(2))]
 // Two consumers of one box, each with its own filter — the restrictions belong
 // to the sites, not to the boxed value they share.
 #[case(
-    "x = box([1, 2, 3])\nsum([y for y in x if y > 1]) + sum([z for z in x if z > 2])",
+    indoc::indoc! {r#"
+        x = box([1, 2, 3])
+        sum([y for y in x if y > 1]) + sum([z for z in x if z > 2])"#},
     Value::Int(8)
 )]
 // ...and one filtered consumer beside an unfiltered one.
 #[case(
-    "x = box([1, 2, 3])\nsum([y for y in x]) + sum([z for z in x if z > 1])",
+    indoc::indoc! {r#"
+        x = box([1, 2, 3])
+        sum([y for y in x]) + sum([z for z in x if z > 1])"#},
     Value::Int(11)
 )]
 fn a_filter_over_a_boxed_source_is_applied(#[case] code: &str, #[case] expected: Value) {
@@ -144,7 +173,9 @@ fn a_filter_over_a_boxed_source_is_applied(#[case] code: &str, #[case] expected:
 #[timeout(Duration::from_secs(10))]
 fn a_filter_over_a_box_that_already_carries_one() {
     check_scalar(
-        "x = box([z for z in [1, 2, 3] if z > 1])\nsum([y for y in x if y < 3])",
+        indoc::indoc! {r#"
+            x = box([z for z in [1, 2, 3] if z > 1])
+            sum([y for y in x if y < 3])"#},
         Value::Int(2),
     );
 }
@@ -285,7 +316,15 @@ fn a_jagged_nested_collection_is_consumed_at_each_rows_own_domain(
     "[() -> [[], [5, 0]]]"
 )]
 fn a_comprehension_over_each_jagged_row(#[case] row: &str, #[case] expected: &str) {
-    check_sink(&format!("out = test_sink()\n{row}\n"), expected);
+    check_sink(
+        &indoc::formatdoc!(
+            r#"
+        out = test_sink()
+        {row}
+        "#
+        ),
+        expected,
+    );
 }
 
 /// A collection per element of each jagged row, each holding the row's elements greater than

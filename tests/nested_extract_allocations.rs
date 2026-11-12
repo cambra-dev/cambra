@@ -29,7 +29,10 @@ use cambra::chl_parser::FileId;
 
 /// A value nested `depth` deep in `One`, then a `.extract()` per level.
 fn chain(depth: usize) -> String {
-    let mut s = String::from("type One(T) = T\nc0 = 1\n");
+    let mut s = String::from(indoc::indoc! {r#"
+        type One(T) = T
+        c0 = 1
+        "#});
     for i in 1..=depth {
         s.push_str(&format!("c{i} = One::new(c{})\n", i - 1));
     }

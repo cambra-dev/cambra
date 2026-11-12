@@ -284,7 +284,10 @@ fn shared_imports_at_different_types_order_by_their_types() {
     "};
     let order = |both: &str| {
         shared_import_order(&program(
-            "import both\nboth::t\n",
+            indoc::indoc! {r#"
+                import both
+                both::t
+                "#},
             &[("holder", holder), ("both", both)],
         ))
     };

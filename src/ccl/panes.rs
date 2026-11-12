@@ -1383,7 +1383,13 @@ mod tests {
         match shape {
             "arith" => {
                 let terms: Vec<String> = (1..=n).map(|i| format!("{i} * {}", i + 1)).collect();
-                format!("x = {}\nx\n", terms.join(" + "))
+                indoc::formatdoc!(
+                    r#"
+                    x = {}
+                    x
+                    "#,
+                    terms.join(" + ")
+                )
             }
             "comprehension" => {
                 // Independent comprehensions summed, rather than a chain: a
@@ -1393,12 +1399,24 @@ mod tests {
                 let parts: Vec<String> = (0..n)
                     .map(|i| format!("sum([y + {i} for y in xs if y > 0])"))
                     .collect();
-                format!("xs = [1, 2, 3, 4, 5]\nt = {}\nt\n", parts.join(" + "))
+                indoc::formatdoc!(
+                    r#"
+                    xs = [1, 2, 3, 4, 5]
+                    t = {}
+                    t
+                    "#,
+                    parts.join(" + ")
+                )
             }
             "udf" => {
                 let mut src = String::new();
                 for i in 0..n {
-                    src.push_str(&format!("def f{i}(x):\n    x + {i}\n"));
+                    src.push_str(&indoc::formatdoc!(
+                        r#"
+                        def f{i}(x):
+                            x + {i}
+                        "#
+                    ));
                 }
                 src.push_str("xs = [1, 2, 3, 4, 5]\n");
                 let calls: Vec<String> = (0..n).map(|i| format!("f{i}(y)")).collect();
@@ -1418,9 +1436,17 @@ mod tests {
                 src
             }
             "feed" => {
-                let mut src = String::from("out: Feed(_)\nxs = [1, 2, 3, 4, 5]\n");
+                let mut src = String::from(indoc::indoc! {r#"
+                    out: Feed(_)
+                    xs = [1, 2, 3, 4, 5]
+                    "#});
                 for i in 0..n {
-                    src.push_str(&format!("for v in xs:\n    out << v + {i}\n"));
+                    src.push_str(&indoc::formatdoc!(
+                        r#"
+                        for v in xs:
+                            out << v + {i}
+                        "#
+                    ));
                 }
                 src.push_str("out\n");
                 src

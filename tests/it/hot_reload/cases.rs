@@ -59,10 +59,11 @@ fn a_loop_added_over_a_folded_collection_reads_it_whole() {
         &mut ctx,
         MAIN_BRANCH,
         &fold(
-            "p := \"\"
-for y in items:
-    p := p + y
-",
+            indoc::indoc! {r#"
+                p := ""
+                for y in items:
+                    p := p + y
+                "#},
             "n + p",
         ),
         &no_main,
@@ -2129,11 +2130,17 @@ fn a_load_chains_across_successive_versions() {
     };
     let v1 = fold("a: Mut(Int, Txn) := 6", "a");
     let v2 = fold(
-        "@LoadFrom(a)\nheld: Int\nb: Mut(Int, Txn) := held * 10",
+        indoc::indoc! {r#"
+            @LoadFrom(a)
+            held: Int
+            b: Mut(Int, Txn) := held * 10"#},
         "b",
     );
     let v3 = fold(
-        "@LoadFrom(b)\nheld: Int\nc: Mut(Int, Txn) := held * 100",
+        indoc::indoc! {r#"
+            @LoadFrom(b)
+            held: Int
+            c: Mut(Int, Txn) := held * 100"#},
         "c",
     );
 
@@ -2750,18 +2757,18 @@ fn diffing_a_running_http_program_leaves_it_untouched() {
 /// two do not cross.
 #[test]
 fn two_instantiations_of_one_function_keep_their_accumulators_apart() {
-    let v1 = concat!(
-        "def count_by(src, step) => Int:\n",
-        "    total := 0\n",
-        "    for x in src:\n",
-        "        total := total + step\n",
-        "    total\n",
-        "\n",
-        "lines = stdin()\n",
-        "a = count_by(lines, 1)\n",
-        "b = count_by(lines, 10)\n",
-        "a * 1000 + b\n",
-    );
+    let v1 = indoc::indoc! {r#"
+        def count_by(src, step) => Int:
+            total := 0
+            for x in src:
+                total := total + step
+            total
+
+        lines = stdin()
+        a = count_by(lines, 1)
+        b = count_by(lines, 10)
+        a * 1000 + b
+        "#};
     let v2 = v1.replace("total + step", "total + step * 2");
     let (reply, out) = stdin_across_reload(v1, &v2, "m\nn", "o\np");
     assert!(

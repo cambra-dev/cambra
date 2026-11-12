@@ -1812,9 +1812,24 @@ mod tests {
     fn a_newline_inside_a_string_is_an_error() {
         let file = FileId::ROOT;
         for (source, text) in [
-            ("x = \"ab\ncd", "ab"),
-            ("x = 'ab\ncd", "ab"),
-            ("x = \"ab\\\ncd", "ab\\"),
+            (
+                indoc::indoc! {r#"
+                x = "ab
+                cd"#},
+                "ab",
+            ),
+            (
+                indoc::indoc! {r#"
+                x = 'ab
+                cd"#},
+                "ab",
+            ),
+            (
+                indoc::indoc! {r#"
+                x = "ab\
+                cd"#},
+                "ab\\",
+            ),
             ("x = \"ab", "ab"),
         ] {
             assert_eq!(
@@ -1847,7 +1862,12 @@ mod tests {
             ("x = ` foo", 4),
             ("x = `(1)", 4),
             ("x = `", 4),
-            ("x = `\nfoo", 4),
+            (
+                indoc::indoc! {r#"
+                x = `
+                foo"#},
+                4,
+            ),
             ("x = `if", 4),
         ] {
             assert_eq!(
@@ -1946,7 +1966,9 @@ mod tests {
     #[test]
     fn highlight_splits_escapes_and_recovers_comments() {
         use HighlightClass as C;
-        let source = "def f(x): # c\n    `t <- \"a\\nb\\d\"";
+        let source = indoc::indoc! {r#"
+            def f(x): # c
+                `t <- "a\nb\d""#};
         let spans = highlighted(source);
         assert_eq!(
             spans,
@@ -2014,7 +2036,9 @@ mod tests {
     fn highlight_marks_builtin_spellings() {
         use HighlightClass as C;
         assert_eq!(
-            highlighted("max = sum(xs)\ndef map(): `set"),
+            highlighted(indoc::indoc! {r#"
+                max = sum(xs)
+                def map(): `set"#}),
             vec![
                 (C::Builtin, "max"),
                 (C::Operator, "="),
@@ -2097,7 +2121,9 @@ mod tests {
     /// `highlight` as from `tokenize`, and is a string to the end of its line.
     #[test]
     fn highlight_reports_an_unterminated_string() {
-        let source = "x = 'ab\ncd";
+        let source = indoc::indoc! {r#"
+            x = 'ab
+            cd"#};
         let Highlighted { spans, errors } = highlight(FileId::ROOT, source);
         assert_eq!(errors, self::errors(source));
         assert_eq!(
@@ -2372,7 +2398,9 @@ mod tests {
 
     #[test]
     fn comments_are_skipped_but_newline_is_preserved() {
-        let toks = tokens("x # this is a comment\ny");
+        let toks = tokens(indoc::indoc! {r#"
+            x # this is a comment
+            y"#});
         assert_eq!(
             toks,
             vec![
@@ -2386,7 +2414,10 @@ mod tests {
 
     #[test]
     fn indent_dedent_basic_block() {
-        let src = "def f():\n    x\n";
+        let src = indoc::indoc! {r#"
+            def f():
+                x
+            "#};
         assert_eq!(
             tokens(src),
             vec![
@@ -2545,7 +2576,12 @@ mod tests {
 
     #[test]
     fn nested_blocks() {
-        let src = "def f():\n    if x:\n        y\n    z\n";
+        let src = indoc::indoc! {r#"
+            def f():
+                if x:
+                    y
+                z
+            "#};
         let toks = tokens(src);
         // Sanity check: one Indent at the function level, one at the if, two
         // Dedents at the end (closing the if and the function).
@@ -2559,7 +2595,13 @@ mod tests {
     fn newlines_suppressed_inside_brackets() {
         // A list literal split across lines should produce no Newline between
         // the bracketed tokens.
-        let toks = tokens("xs = [\n    1,\n    2,\n    3,\n]\n");
+        let toks = tokens(indoc::indoc! {r#"
+            xs = [
+                1,
+                2,
+                3,
+            ]
+            "#});
         let newlines_inside_brackets = toks
             .iter()
             .scan(0u32, |depth, t| {
@@ -2578,7 +2620,12 @@ mod tests {
 
     #[test]
     fn blank_lines_do_not_affect_indent() {
-        let src = "def f():\n    x\n\n    y\n";
+        let src = indoc::indoc! {r#"
+            def f():
+                x
+
+                y
+            "#};
         let toks = tokens(src);
         let indents = toks.iter().filter(|t| matches!(t, Token::Indent)).count();
         let dedents = toks.iter().filter(|t| matches!(t, Token::Dedent)).count();
@@ -2589,7 +2636,11 @@ mod tests {
     #[test]
     fn inconsistent_indent_is_an_error() {
         // Indent to 4, dedent to 2 (which is neither 4 nor 0) — error.
-        let src = "def f():\n    x\n  y\n";
+        let src = indoc::indoc! {r#"
+            def f():
+                x
+              y
+            "#};
         assert!(matches!(
             errors(src)[..],
             [LexError::InconsistentIndent { .. }]

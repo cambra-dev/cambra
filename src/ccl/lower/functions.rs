@@ -792,14 +792,32 @@ mod tests {
     #[rstest]
     // An enclosing `let` binding: in scope, and discharged to its definiens as
     // the type leaves that scope.
-    #[case::outer_let("n = 5\ndef f(a: Int, c: {Int where _ >= n}):\n    c\n\nf\n")]
+    #[case::outer_let(indoc::indoc! {r#"
+        n = 5
+        def f(a: Int, c: {Int where _ >= n}):
+            c
+
+        f
+        "#})]
     // The *output* annotation may name a parameter: it rides a `let` inside the
     // lambda, so uncurrying rewrites it to the tuple projection along with the
     // body.
-    #[case::output_annotation("def f(a: Int, b: Int) => {Int where _ >= a}:\n    a + b\n\nf\n")]
+    #[case::output_annotation(indoc::indoc! {r#"
+        def f(a: Int, b: Int) => {Int where _ >= a}:
+            a + b
+
+        f
+        "#})]
     // An enclosing `def`'s parameter: a curried binder, so the telescope is real.
     #[case::enclosing_param(
-        "def g(k: Int):\n    def h(x: {Int where _ >= k}):\n        x\n    h\n\ng\n"
+        indoc::indoc! {r#"
+            def g(k: Int):
+                def h(x: {Int where _ >= k}):
+                    x
+                h
+
+            g
+            "#}
     )]
     fn a_refinement_may_reference_a_binder_outside_the_parameter_list(#[case] code: &str) {
         let stmts = parse_module(code);
@@ -811,23 +829,23 @@ mod tests {
     #[rstest]
     // Simple function: body is a single expression.
     #[case(
-        "\
-def inc(x):
-    x + 1
-inc",
-        "\
-let inc : (_ ⇒ _) = λ x → x + 1
-in inc"
+        indoc::indoc! {r#"
+            def inc(x):
+                x + 1
+            inc"#},
+        indoc::indoc! {r#"
+            let inc : (_ ⇒ _) = λ x → x + 1
+            in inc"#}
     )]
     // Multi-param function: uncurried to a single tupled-parameter lambda.
     #[case(
-        "\
-def add(x, y):
-    x + y
-add",
-        "\
-let add : ((_, _) ⇒ _) = λ __arg_tuple_0 : (_, _) → __arg_tuple_0.0 + __arg_tuple_0.1
-in add"
+        indoc::indoc! {r#"
+            def add(x, y):
+                x + y
+            add"#},
+        indoc::indoc! {r#"
+            let add : ((_, _) ⇒ _) = λ __arg_tuple_0 : (_, _) → __arg_tuple_0.0 + __arg_tuple_0.1
+            in add"#}
     )]
     fn test_lower_function_def(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
@@ -856,7 +874,11 @@ in add"
 
         // `def add(a, b):` newline `    a + a + b` newline `add(1, 2)` newline.
         // The two `a` occurrences sit at distinct source spans; `b` at a third.
-        let src = "def add(a, b):\n    a + a + b\nadd(1, 2)\n";
+        let src = indoc::indoc! {r#"
+            def add(a, b):
+                a + a + b
+            add(1, 2)
+            "#};
         let module = parse_module(src);
         let a1 = Span::new(module.file, 19, 20);
         let a2 = Span::new(module.file, 23, 24);

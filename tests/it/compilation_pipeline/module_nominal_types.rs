@@ -608,7 +608,10 @@ fn an_associated_function_calls_a_run_s_type(#[case] body: &str) {
     "};
     check_program_scalar(
         &program(
-            "run shop as s\ns::Price::new(5).get()\n",
+            indoc::indoc! {r#"
+                run shop as s
+                s::Price::new(5).get()
+                "#},
             &[("shop", &shop), ("counted", COUNTED)],
         ),
         Value::Int(5),

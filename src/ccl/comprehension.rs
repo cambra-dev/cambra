@@ -571,27 +571,52 @@ mod tests {
     // source at the index position its parameter names.
     #[case(
         "[x for x in [10, 20]]",
-        "λ __iter_record → let __anf = [10, 20]\nin let __anf = __anf ▷ Iterable::elements\nin let __anf = __iter_record ▷ (__anf ▷ unbox)\nin __anf ▷ (λ x → x)"
+        indoc::indoc! {r#"
+            λ __iter_record → let __anf = [10, 20]
+            in let __anf = __anf ▷ Iterable::elements
+            in let __anf = __iter_record ▷ (__anf ▷ unbox)
+            in __anf ▷ (λ x → x)"#}
     )]
     // Constant element: the generator variable is unused.
     #[case(
         "[42 for x in [10, 20]]",
-        "λ __iter_record → let __anf = [10, 20]\nin let __anf = __anf ▷ Iterable::elements\nin let __anf = __iter_record ▷ (__anf ▷ unbox)\nin __anf ▷ (λ x → 42)"
+        indoc::indoc! {r#"
+            λ __iter_record → let __anf = [10, 20]
+            in let __anf = __anf ▷ Iterable::elements
+            in let __anf = __iter_record ▷ (__anf ▷ unbox)
+            in __anf ▷ (λ x → 42)"#}
     )]
     // BinOp element.
     #[case(
         "[x + 2 for x in [10, 20]]",
-        "λ __iter_record → let __anf = [10, 20]\nin let __anf = __anf ▷ Iterable::elements\nin let __anf = __iter_record ▷ (__anf ▷ unbox)\nin __anf ▷ (λ x → x + 2)"
+        indoc::indoc! {r#"
+            λ __iter_record → let __anf = [10, 20]
+            in let __anf = __anf ▷ Iterable::elements
+            in let __anf = __iter_record ▷ (__anf ▷ unbox)
+            in __anf ▷ (λ x → x + 2)"#}
     )]
     // Outer capture: `y` comes from an enclosing let binding.
     #[case(
-        "y = 5\n[x + y for x in [10, 20]]",
-        "let y = 5\nin λ __iter_record → let __anf = [10, 20]\nin let __anf = __anf ▷ Iterable::elements\nin let __anf = __iter_record ▷ (__anf ▷ unbox)\nin __anf ▷ (λ x → x + y)"
+        indoc::indoc! {r#"
+            y = 5
+            [x + y for x in [10, 20]]"#},
+        indoc::indoc! {r#"
+            let y = 5
+            in λ __iter_record → let __anf = [10, 20]
+            in let __anf = __anf ▷ Iterable::elements
+            in let __anf = __iter_record ▷ (__anf ▷ unbox)
+            in __anf ▷ (λ x → x + y)"#}
     )]
     // Nested: the inner comprehension is the outer one's source, encoded first.
     #[case(
         "[y for y in [x for x in [10, 20]]]",
-        "λ __iter_record → let __anf = (λ __iter_record → let __anf = [10, 20]\nin let __anf = __anf ▷ Iterable::elements\nin let __anf = __iter_record ▷ (__anf ▷ unbox)\nin __anf ▷ (λ x → x)) ▷ Iterable::elements\nin let __anf = __iter_record ▷ (__anf ▷ unbox)\nin __anf ▷ (λ y → y)"
+        indoc::indoc! {r#"
+            λ __iter_record → let __anf = (λ __iter_record → let __anf = [10, 20]
+            in let __anf = __anf ▷ Iterable::elements
+            in let __anf = __iter_record ▷ (__anf ▷ unbox)
+            in __anf ▷ (λ x → x)) ▷ Iterable::elements
+            in let __anf = __iter_record ▷ (__anf ▷ unbox)
+            in __anf ▷ (λ y → y)"#}
     )]
     // A guard puts the lambda under a `cast` whose target refines the domain by
     // the guard over the source — and nothing inside is hoisted, the two copies
@@ -606,19 +631,28 @@ mod tests {
     // join.
     #[case(
         "[x + y for x in [1, 2] for y in [3, 4] if x == y]",
-        "cast(({_ | __elem ▷ ((λ __iter_record → __iter_record ▷ ([1, 2] ▷ Iterable::elements ▷ unbox) ▷ (λ x → λ __iter_record → __iter_record ▷ ([3, 4] ▷ Iterable::elements ▷ unbox) ▷ (λ y → x == y))) ▷ uncurry)} ⤇ _), (λ __iter_record → __iter_record ▷ ([1, 2] ▷ Iterable::elements ▷ unbox) ▷ (λ x → let __anf = [3, 4] ▷ Iterable::elements\nin λ __iter_record → __iter_record ▷ (__anf ▷ unbox) ▷ (λ y → x + y))) ▷ uncurry)"
+        indoc::indoc! {r#"
+            cast(({_ | __elem ▷ ((λ __iter_record → __iter_record ▷ ([1, 2] ▷ Iterable::elements ▷ unbox) ▷ (λ x → λ __iter_record → __iter_record ▷ ([3, 4] ▷ Iterable::elements ▷ unbox) ▷ (λ y → x == y))) ▷ uncurry)} ⤇ _), (λ __iter_record → __iter_record ▷ ([1, 2] ▷ Iterable::elements ▷ unbox) ▷ (λ x → let __anf = [3, 4] ▷ Iterable::elements
+            in λ __iter_record → __iter_record ▷ (__anf ▷ unbox) ▷ (λ y → x + y))) ▷ uncurry)"#}
     )]
     // Three generators: three levels flattened by one `uncurry(3)` into the triples of
     // positions, the filter over all three.
     #[case(
         "[x + y + z for x in [1] for y in [2] for z in [3] if x < z]",
-        "cast(({_ | __elem ▷ ((λ __iter_record → __iter_record ▷ ([1] ▷ Iterable::elements ▷ unbox) ▷ (λ x → λ __iter_record → __iter_record ▷ ([2] ▷ Iterable::elements ▷ unbox) ▷ (λ y → λ __iter_record → __iter_record ▷ ([3] ▷ Iterable::elements ▷ unbox) ▷ (λ z → x < z)))) ▷ uncurry(3))} ⤇ _), (λ __iter_record → __iter_record ▷ ([1] ▷ Iterable::elements ▷ unbox) ▷ (λ x → let __anf = [2] ▷ Iterable::elements\nin λ __iter_record → __iter_record ▷ (__anf ▷ unbox) ▷ (λ y → let __anf = [3] ▷ Iterable::elements\nin λ __iter_record → __iter_record ▷ (__anf ▷ unbox) ▷ (λ z → x + y + z)))) ▷ uncurry(3))"
+        indoc::indoc! {r#"
+            cast(({_ | __elem ▷ ((λ __iter_record → __iter_record ▷ ([1] ▷ Iterable::elements ▷ unbox) ▷ (λ x → λ __iter_record → __iter_record ▷ ([2] ▷ Iterable::elements ▷ unbox) ▷ (λ y → λ __iter_record → __iter_record ▷ ([3] ▷ Iterable::elements ▷ unbox) ▷ (λ z → x < z)))) ▷ uncurry(3))} ⤇ _), (λ __iter_record → __iter_record ▷ ([1] ▷ Iterable::elements ▷ unbox) ▷ (λ x → let __anf = [2] ▷ Iterable::elements
+            in λ __iter_record → __iter_record ▷ (__anf ▷ unbox) ▷ (λ y → let __anf = [3] ▷ Iterable::elements
+            in λ __iter_record → __iter_record ▷ (__anf ▷ unbox) ▷ (λ z → x + y + z)))) ▷ uncurry(3))"#}
     )]
     // A per-element conditional stays a value `Case` in the per-element lambda,
     // which lambda elimination compiles over the element stream.
     #[case(
         "[x if x > 1 else 0 for x in [1, 2]]",
-        "λ __iter_record → let __anf = [1, 2]\nin let __anf = __anf ▷ Iterable::elements\nin let __anf = __iter_record ▷ (__anf ▷ unbox)\nin __anf ▷ (λ x → { x > 1 → x; true → 0 })"
+        indoc::indoc! {r#"
+            λ __iter_record → let __anf = [1, 2]
+            in let __anf = __anf ▷ Iterable::elements
+            in let __anf = __iter_record ▷ (__anf ▷ unbox)
+            in __anf ▷ (λ x → { x > 1 → x; true → 0 })"#}
     )]
     fn the_encoding(#[case] code: &str, #[case] expected: &str) {
         assert_eq!(encoded(code), expected);
@@ -644,7 +678,9 @@ mod tests {
     /// depth 0, so it is not normalized.
     #[rstest]
     #[case::comprehension_in_a_predicate(
-        "g = groupby([y + 10 for y in [2, 3, 4, 5, 6]], \\x -> x // 2)\ng"
+        indoc::indoc! {r#"
+            g = groupby([y + 10 for y in [2, 3, 4, 5, 6]], \x -> x // 2)
+            g"#}
     )]
     fn no_binding_stands_inside_a_predicate(#[case] code: &str) {
         let mut lctx = LoweringContext::default();

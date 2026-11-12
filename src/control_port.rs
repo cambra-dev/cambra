@@ -815,7 +815,10 @@ mod tests {
             let errors = compile_to(&posted, Phase::Lower).unwrap_err();
             posted_rejection(&ReloadError::Compile(errors), &posted)
         };
-        let reply = reject("import catalog\n1\n");
+        let reply = reject(indoc::indoc! {r#"
+            import catalog
+            1
+            "#});
         assert!(reply.contains("no module `catalog`"), "{reply}");
         assert!(reply.contains(note), "{reply}");
         let reply = reject("x = = 1\n");

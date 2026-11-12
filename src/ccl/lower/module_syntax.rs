@@ -604,7 +604,15 @@ mod tests {
         assert_eq!(messages[0], "`@RenamedFrom` is not supported yet");
         assert_eq!(messages[1], "`@Discard` is not supported yet");
         let spans: Vec<&str> = refused.iter().map(|(s, _)| s.trim_end()).collect();
-        assert_eq!(spans, ["old", "@Discard\nstock"]);
+        assert_eq!(
+            spans,
+            [
+                "old",
+                indoc::indoc! {r#"
+            @Discard
+            stock"#}
+            ]
+        );
     }
 
     /// `pub` on a mutable variable is refused at the keyword, and the
@@ -767,10 +775,19 @@ mod tests {
                     "`import` stands only at a module's top level"
                 ),
                 (
-                    "@Discard\n    run audit as old\n",
+                    indoc::indoc! {r#"
+                        @Discard
+                            run audit as old
+                        "#},
                     "`@Discard run` stands only at a module's top level"
                 ),
-                ("@Discard\n    stock\n", "`@Discard` is not supported yet"),
+                (
+                    indoc::indoc! {r#"
+                    @Discard
+                        stock
+                    "#},
+                    "`@Discard` is not supported yet"
+                ),
             ]
         );
     }

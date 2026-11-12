@@ -84,7 +84,18 @@ fn assert_linear_in_chain_length(shape: &str, build: impl Fn(usize) -> String) {
 #[test]
 fn a_chain_on_the_loop_spine_stays_linear() {
     assert_linear_in_chain_length("spine", |d| {
-        loop_with_chain(d, "  ", "x := 0\nfor i in [1, 2, 3]:\n", "x += {last}\nx\n")
+        loop_with_chain(
+            d,
+            "  ",
+            indoc::indoc! {r#"
+            x := 0
+            for i in [1, 2, 3]:
+            "#},
+            indoc::indoc! {r#"
+            x += {last}
+            x
+            "#},
+        )
     });
 }
 
@@ -96,8 +107,16 @@ fn a_chain_read_under_a_guard_stays_linear() {
         loop_with_chain(
             d,
             "  ",
-            "x := 0\nfor i in [1, 2, 3]:\n",
-            "if i > 1:\n    x += {last}\n  x += 1\nx\n",
+            indoc::indoc! {r#"
+                x := 0
+                for i in [1, 2, 3]:
+                "#},
+            indoc::indoc! {r#"
+                if i > 1:
+                    x += {last}
+                  x += 1
+                x
+                "#},
         )
     });
 }
@@ -108,8 +127,15 @@ fn a_chain_inside_a_guard_stays_linear() {
         loop_with_chain(
             d,
             "    ",
-            "x := 0\nfor i in [1, 2, 3]:\n  if i > 1:\n",
-            "x += {last}\nx\n",
+            indoc::indoc! {r#"
+                x := 0
+                for i in [1, 2, 3]:
+                  if i > 1:
+                "#},
+            indoc::indoc! {r#"
+                x += {last}
+                x
+                "#},
         )
     });
 }
@@ -120,8 +146,16 @@ fn a_chain_read_by_a_feed_stays_linear() {
         loop_with_chain(
             d,
             "  ",
-            "out: Feed(_)\nx := 0\nfor i in [1, 2, 3]:\n",
-            "out << {last}\n  x += {last}\nout\n",
+            indoc::indoc! {r#"
+                out: Feed(_)
+                x := 0
+                for i in [1, 2, 3]:
+                "#},
+            indoc::indoc! {r#"
+                out << {last}
+                  x += {last}
+                out
+                "#},
         )
     });
 }
@@ -133,8 +167,14 @@ fn a_chain_read_inside_a_comprehension_stays_linear() {
         loop_with_chain(
             d,
             "  ",
-            "x := 0\nfor i in [1, 2, 3]:\n",
-            "x += sum([z + {last} for z in [1, 2, 3]])\nx\n",
+            indoc::indoc! {r#"
+                x := 0
+                for i in [1, 2, 3]:
+                "#},
+            indoc::indoc! {r#"
+                x += sum([z + {last} for z in [1, 2, 3]])
+                x
+                "#},
         )
     });
 }
@@ -146,8 +186,16 @@ fn a_chain_seeding_an_inner_loop_stays_linear() {
         loop_with_chain(
             d,
             "  ",
-            "x := 0\nfor i in [1, 2, 3]:\n",
-            "x := {last}\n  for j in [1, 2]:\n    x += j\nx\n",
+            indoc::indoc! {r#"
+                x := 0
+                for i in [1, 2, 3]:
+                "#},
+            indoc::indoc! {r#"
+                x := {last}
+                  for j in [1, 2]:
+                    x += j
+                x
+                "#},
         )
     });
 }
@@ -161,8 +209,14 @@ fn a_chain_of_sums_stays_linear() {
             "a{k} = sum([z + a{p} + a{p} for z in [1, 2]])",
             d,
             "  ",
-            "x := 0\nfor i in [1, 2, 3]:\n",
-            "x += {last}\nx\n",
+            indoc::indoc! {r#"
+                x := 0
+                for i in [1, 2, 3]:
+                "#},
+            indoc::indoc! {r#"
+                x += {last}
+                x
+                "#},
         )
     });
 }
@@ -175,11 +229,22 @@ fn a_chain_of_writing_if_values_stays_linear() {
     assert_linear_in_chain_length("writing `if` values", |d| {
         loop_with_chain_of(
             "a0 = i + 1",
-            "a{k} = if i > 1:\n          acc += 1\n          a{p} + a{p}\n      else:\n          a{p}",
+            indoc::indoc! {r#"
+                a{k} = if i > 1:
+                          acc += 1
+                          a{p} + a{p}
+                      else:
+                          a{p}"#},
             d,
             "  ",
-            "acc := 0\nfor i in [1, 2, 3]:\n",
-            "acc += {last}\nacc\n",
+            indoc::indoc! {r#"
+                acc := 0
+                for i in [1, 2, 3]:
+                "#},
+            indoc::indoc! {r#"
+                acc += {last}
+                acc
+                "#},
         )
     });
 }
@@ -189,11 +254,23 @@ fn a_chain_of_writing_if_values_in_a_writing_block_stays_linear() {
     assert_linear_in_chain_length("writing `if` values in a `with begin():` block", |d| {
         loop_with_chain_of(
             "a0 = i + 1",
-            "a{k} = if i > 1:\n              acc := acc + 1\n              a{p} + a{p}\n          else:\n              a{p}",
+            indoc::indoc! {r#"
+                a{k} = if i > 1:
+                              acc := acc + 1
+                              a{p} + a{p}
+                          else:
+                              a{p}"#},
             d,
             "      ",
-            "acc: Mut(Int, Txn) := 0\nfor i in [1, 2, 3]:\n    with begin():\n",
-            "acc := acc + {last}\nawait_final(acc)\n",
+            indoc::indoc! {r#"
+                acc: Mut(Int, Txn) := 0
+                for i in [1, 2, 3]:
+                    with begin():
+                "#},
+            indoc::indoc! {r#"
+                acc := acc + {last}
+                await_final(acc)
+                "#},
         )
     });
 }
@@ -203,9 +280,19 @@ fn a_chain_of_top_level_writing_ifs_stays_linear() {
     // Outside a loop there is no writer walk: each `if` merges into one value whose
     // fields the statements after it read.
     assert_linear_in_chain_length("top-level writing `if`s", |d| {
-        format!(
-            "x := 1\ni = 3\n{}x\n",
-            "if i > 1:\n    x := x + x\nelse:\n    x := x + 1\n".repeat(d)
+        indoc::formatdoc!(
+            r#"
+                x := 1
+                i = 3
+                {}x
+                "#,
+            indoc::indoc! {r#"
+                if i > 1:
+                    x := x + x
+                else:
+                    x := x + 1
+                "#}
+            .repeat(d)
         )
     });
 }
@@ -215,11 +302,22 @@ fn a_chain_of_top_level_writing_if_values_stays_linear() {
     assert_linear_in_chain_length("top-level writing `if` values", |d| {
         loop_with_chain_of(
             "a0 = i + 1",
-            "a{k} = if i > 1:\n        acc += 1\n        a{p} + a{p}\n    else:\n        a{p}",
+            indoc::indoc! {r#"
+                a{k} = if i > 1:
+                        acc += 1
+                        a{p} + a{p}
+                    else:
+                        a{p}"#},
             d,
             "",
-            "acc := 0\ni = 3\n",
-            "acc += {last}\nacc\n",
+            indoc::indoc! {r#"
+                acc := 0
+                i = 3
+                "#},
+            indoc::indoc! {r#"
+                acc += {last}
+                acc
+                "#},
         )
     });
 }
@@ -233,8 +331,14 @@ fn a_chain_of_declarations_stays_linear() {
             "a{k} := a{p} + a{p}",
             d,
             "  ",
-            "x := 0\nfor i in [1, 2, 3]:\n",
-            "x += {last}\nx\n",
+            indoc::indoc! {r#"
+                x := 0
+                for i in [1, 2, 3]:
+                "#},
+            indoc::indoc! {r#"
+                x += {last}
+                x
+                "#},
         )
     });
 }
@@ -247,8 +351,16 @@ fn a_chain_in_a_read_only_block_stays_linear() {
         loop_with_chain(
             d,
             "        ",
-            "pool: Mut(Int, Txn) := 100\nout: Feed(_)\nfor i in [1, 2, 3]:\n    with begin():\n",
-            "out << {last} + pool\nout\n",
+            indoc::indoc! {r#"
+                pool: Mut(Int, Txn) := 100
+                out: Feed(_)
+                for i in [1, 2, 3]:
+                    with begin():
+                "#},
+            indoc::indoc! {r#"
+                out << {last} + pool
+                out
+                "#},
         )
     });
 }
@@ -259,8 +371,15 @@ fn a_chain_in_a_writing_block_stays_linear() {
         loop_with_chain(
             d,
             "        ",
-            "pool: Mut(Int, Txn) := 100\nfor i in [1, 2, 3]:\n    with begin():\n",
-            "pool := pool + {last}\nawait_final(pool)\n",
+            indoc::indoc! {r#"
+                pool: Mut(Int, Txn) := 100
+                for i in [1, 2, 3]:
+                    with begin():
+                "#},
+            indoc::indoc! {r#"
+                pool := pool + {last}
+                await_final(pool)
+                "#},
         )
     });
 }
@@ -273,8 +392,18 @@ fn a_chain_read_under_a_guard_in_a_writing_block_stays_linear() {
         loop_with_chain(
             d,
             "        ",
-            "pool: Mut(Int, Txn) := 100\nout: Feed(_)\nfor i in [1, 2, 3]:\n    with begin():\n",
-            "if {last} > 10:\n            pool := pool + {last}\n            out << {last}\nout\n",
+            indoc::indoc! {r#"
+                pool: Mut(Int, Txn) := 100
+                out: Feed(_)
+                for i in [1, 2, 3]:
+                    with begin():
+                "#},
+            indoc::indoc! {r#"
+                if {last} > 10:
+                            pool := pool + {last}
+                            out << {last}
+                out
+                "#},
         )
     });
 }
@@ -287,16 +416,29 @@ fn a_chain_inside_a_guard_in_a_writing_block_stays_linear() {
         loop_with_chain(
             d,
             "            ",
-            "pool: Mut(Int, Txn) := 100\nfor i in [1, 2, 3]:\n    with begin():\n        if i > 1:\n",
-            "pool := pool + {last}\nawait_final(pool)\n",
+            indoc::indoc! {r#"
+                pool: Mut(Int, Txn) := 100
+                for i in [1, 2, 3]:
+                    with begin():
+                        if i > 1:
+                "#},
+            indoc::indoc! {r#"
+                pool := pool + {last}
+                await_final(pool)
+                "#},
         )
     });
 }
 
 /// `{write}` repeated `depth` times in a writing `with begin():` block over `pool`.
 fn block_with_writes(depth: usize, write: &str) -> String {
-    format!(
-        "pool: Mut(Int, Txn) := 1\nfor i in [1, 2, 3]:\n    with begin():\n{}await_final(pool)\n",
+    indoc::formatdoc!(
+        r#"
+            pool: Mut(Int, Txn) := 1
+            for i in [1, 2, 3]:
+                with begin():
+            {}await_final(pool)
+            "#,
         write.repeat(depth)
     )
 }
@@ -312,13 +454,25 @@ fn writes_each_reading_the_last_twice_stay_linear() {
 fn guarded_writes_each_reading_the_last_twice_stay_linear() {
     // Each `if` rejoins `pool`, and the next one reads the rejoined value twice.
     assert_linear_in_chain_length("guarded writes in a `with begin():` block", |d| {
-        block_with_writes(d, "        if i > 1:\n            pool := pool + pool\n")
+        block_with_writes(
+            d,
+            r#"        if i > 1:
+            pool := pool + pool
+"#,
+        )
     });
 }
 
 /// `{write}` repeated `depth` times in the body of a loop over `x`.
 fn loop_with_writes(depth: usize, write: &str) -> String {
-    format!("x := 1\nfor i in [1, 2, 3]:\n{}x\n", write.repeat(depth))
+    indoc::formatdoc!(
+        r#"
+        x := 1
+        for i in [1, 2, 3]:
+        {}x
+        "#,
+        write.repeat(depth)
+    )
 }
 
 #[test]
@@ -333,7 +487,12 @@ fn loop_guarded_writes_each_reading_the_last_twice_stay_linear() {
     // Each `if` merges `x`, and the next one reads the merged value in both of its
     // arms.
     assert_linear_in_chain_length("guarded writes in a loop body", |d| {
-        loop_with_writes(d, "  if i > 1:\n    x := x + x\n")
+        loop_with_writes(
+            d,
+            r#"  if i > 1:
+    x := x + x
+"#,
+        )
     });
 }
 

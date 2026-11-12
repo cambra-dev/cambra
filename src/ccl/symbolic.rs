@@ -1166,7 +1166,9 @@ mod tests {
             Expr::var("x"),
             Expr::let_bind("f", Occurrence::mint(), Expr::var("g"), Expr::var("f")),
         ),
-        "x ▷ (let f = g\nin f)"
+        indoc::indoc! {r#"
+            x ▷ (let f = g
+            in f)"#}
     )]
     // Lambda (unannotated)
     #[case(
@@ -1190,16 +1192,16 @@ mod tests {
     // Let (unannotated — bound_expr.ty is Unknown so no annotation printed)
     #[case(
         Expr::let_bind("x", Occurrence::mint(), Expr::lit(Lit::Int(1)), Expr::var("x")),
-        "\
-let x = 1
-in x"
+        indoc::indoc! {r#"
+            let x = 1
+            in x"#}
     )]
     // Let (annotated — set bound_expr.ty to Bool so annotation is printed)
     #[case(
         Expr::let_bind("x", Occurrence::mint(), Expr::lit(Lit::Bool(true)).with_ty(Type::Base(BaseType::Bool)), Expr::var("x")),
-        "\
-let x : Bool = true
-in x"
+        indoc::indoc! {r#"
+            let x : Bool = true
+            in x"#}
     )]
     // List (empty and non-empty)
     #[case(Expr::list(vec![]), "[]")]
@@ -1328,9 +1330,9 @@ in x"
             ],
             Expr::var("y"),
         ),
-        "\
-letrec x = 0; y = x
-in y"
+        indoc::indoc! {r#"
+            letrec x = 0; y = x
+            in y"#}
     )]
     // LetRec with a resolved binding type: the binder carries ` : ty`
     #[case(
@@ -1346,9 +1348,9 @@ in y"
             )],
             Expr::var("x"),
         ),
-        "\
-letrec x : Int = 0
-in x"
+        indoc::indoc! {r#"
+            letrec x : Int = 0
+            in x"#}
     )]
     fn test_symbolic_expr(#[case] expr: Expr, #[case] expected: &str) {
         assert_eq!(symbolic(&expr), expected);
@@ -1421,9 +1423,9 @@ in x"
                 ),
             ),
         );
-        let expected = "\
-let x = not a or b
-in x ▷ (λ y → y + 1 * 2)";
+        let expected = indoc::indoc! {r#"
+            let x = not a or b
+            in x ▷ (λ y → y + 1 * 2)"#};
         assert_eq!(symbolic(&expr), expected);
     }
 }

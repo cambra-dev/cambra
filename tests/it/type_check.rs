@@ -375,7 +375,16 @@ fn a_binder_s_transparency_decides_what_its_uses_leave_in_a_type(
 #[test]
 fn an_opaque_binder_inherits_its_initializer_s_refinement() {
     // The singleton renders in its short form: `{Int | __elem == 5}` is `Int@5`.
-    assert_eq!(format!("{}", infer_program("y ^= 5\ny\n")), "Int@5");
+    assert_eq!(
+        format!(
+            "{}",
+            infer_program(indoc::indoc! {r#"
+        y ^= 5
+        y
+        "#})
+        ),
+        "Int@5"
+    );
 }
 
 /// A function's codomain drops a refinement naming an opaque binder its own body
@@ -637,7 +646,13 @@ fn misusing_an_operator_result_is_an_ordinary_diagnostic(#[case] code: &str) {
 fn a_generalized_function_instantiates_its_operator_requirements() {
     // One definition, three programs: only the uses differ, so only the uses are
     // written out.
-    let using = |uses: &str| format!("f = \\a, b -> a + b\n{uses}");
+    let using = |uses: &str| {
+        indoc::formatdoc!(
+            r#"
+        f = \a, b -> a + b
+        {uses}"#
+        )
+    };
     assert_eq!(infer_program(&using("f(1, 2)")), int());
     assert_eq!(infer_program(&using(r#"f("x", "y")"#)), string());
     assert_eq!(
@@ -1115,8 +1130,13 @@ fn a_generalized_function_rejects_a_use_its_trait_forbids() {
 /// makes `x` *the* `2`. The chain case shows the other half: `y + x` joins two
 /// singletons, and a join intersects refinements, so the sum is plain `Int`.
 #[rstest]
-#[case::simple("x = 2\nx", int_lit(2))]
-#[case::chain("x = 2\ny = x\ny + x", int())]
+#[case::simple(indoc::indoc! {r#"
+    x = 2
+    x"#}, int_lit(2))]
+#[case::chain(indoc::indoc! {r#"
+    x = 2
+    y = x
+    y + x"#}, int())]
 fn test_let(#[case] code: &str, #[case] expected: Type) {
     assert_eq!(infer_program(code), expected);
 }
@@ -1396,8 +1416,13 @@ fn a_definition_whose_use_failed_is_checked_alone_once() {
 /// types.
 #[rstest]
 #[case::one_enclosing_specialization("live1 = g(1)")]
-#[case::two_enclosing_specializations("live1 = g(1)\nlive2 = g(\"s\")")]
-#[case::three_enclosing_specializations("live1 = g(1)\nlive2 = g(\"s\")\nlive3 = g(True)")]
+#[case::two_enclosing_specializations(indoc::indoc! {r#"
+    live1 = g(1)
+    live2 = g("s")"#})]
+#[case::three_enclosing_specializations(indoc::indoc! {r#"
+    live1 = g(1)
+    live2 = g("s")
+    live3 = g(True)"#})]
 fn one_defect_does_not_multiply_by_the_enclosing_specialization_count(#[case] uses: &str) {
     let code = dead_code(&format!(
         "{}\n{uses}",
@@ -1586,7 +1611,12 @@ fn test_conditional_record_arms_join_by_field_intersection() {
 #[test]
 fn test_collection_consumed_at_concrete_domain_is_rejected() {
     // `f`'s `c` is genuinely `Collection(int)`; `g` demands `Array(3)`.
-    let base = "def g(a: Array(3, Int)):\n    sum(a)\ndef f(c: Collection(Int)):\n    g(c)\n";
+    let base = indoc::indoc! {r#"
+        def g(a: Array(3, Int)):
+            sum(a)
+        def f(c: Collection(Int)):
+            g(c)
+        "#};
     assert!(!infer_program_err(&format!("{base}f([1,2])")).is_empty());
     assert!(!infer_program_err(&format!("{base}f([1,2,3,4])")).is_empty());
 }
@@ -1598,7 +1628,10 @@ fn test_collection_consumed_at_concrete_domain_is_rejected() {
 fn test_conditional_collection_consumed_at_concrete_domain_is_rejected() {
     // Arms `{[0,1], [0,2]}` (2- and 3-element); a concrete `Array(N)` consumer is
     // rejected because some arm cannot supply domain N.
-    let base = "def g(a: Array(3, Int)):\n    sum(a)\n";
+    let base = indoc::indoc! {r#"
+        def g(a: Array(3, Int)):
+            sum(a)
+        "#};
     assert!(
         !infer_program_err(&format!("{base}g(box([1,2]) if True else box([3,4,5]))")).is_empty()
     );
@@ -1625,7 +1658,12 @@ fn conditional_collection_into_a_udf_param() {
     let c = "box([1, 2]) if True else box([1, 2, 3])";
     for param in ["c", "c: Collection(Int)", "c: List(Int)"] {
         assert_eq!(
-            infer_program(&format!("def f({param}):\n    sum(c)\nf({c})")),
+            infer_program(&indoc::formatdoc!(
+                r#"
+                def f({param}):
+                    sum(c)
+                f({c})"#
+            )),
             int(),
             "a conditional collection must reach `{param}`"
         );
@@ -1635,8 +1673,17 @@ fn conditional_collection_into_a_udf_param() {
     // because candidates cross a level boundary invariantly.
     let filtered = "box([x for x in [1, 2, 3] if x > 1]) if True else box([1, 2])";
     for program in [
-        format!("def f(c):\n    sum(c)\nf({filtered})"),
-        format!("x = {filtered}\nsum(x)"),
+        indoc::formatdoc!(
+            r#"
+            def f(c):
+                sum(c)
+            f({filtered})"#
+        ),
+        indoc::formatdoc!(
+            r#"
+            x = {filtered}
+            sum(x)"#
+        ),
     ] {
         assert_eq!(
             infer_program(&program),
@@ -1652,20 +1699,30 @@ fn conditional_collection_into_a_udf_param() {
 fn test_collection_uniform_consumers_accepted() {
     // Uniform (var-domain) consumers accept a `Collection` at any domain.
     assert_eq!(
-        infer_program("def f(c: Collection(Int)):\n    sum(c)\nf(box([1,2,3]))"),
+        infer_program(indoc::indoc! {r#"
+            def f(c: Collection(Int)):
+                sum(c)
+            f(box([1,2,3]))"#}),
         int()
     );
     // Identity round-trips the sum unchanged — the close re-pairs the domain the
     // annotation opened.
     assert_eq!(
-        infer_program("def f(c: Collection(Int)):\n    c\nf").to_string(),
+        infer_program(indoc::indoc! {r#"
+            def f(c: Collection(Int)):
+                c
+            f"#})
+        .to_string(),
         "(Σ (σ : Type). (σ ⤇ Int) ⇒ Σ (σ : Type). (σ ⤇ Int))"
     );
     // A comprehension over a `Collection` is keyed by its witness, `σ₁(c)`, which the call
     // discharges to the argument's: one candidate.
     assert_eq!(
-        infer_program("def f(c: Collection(Int)):\n    [x + 1 for x in c]\nf(box([1,2,3]))")
-            .to_string(),
+        infer_program(indoc::indoc! {r#"
+            def f(c: Collection(Int)):
+                [x + 1 for x in c]
+            f(box([1,2,3]))"#})
+        .to_string(),
         "(0..3 ⤇ Int)"
     );
 }
@@ -1677,18 +1734,29 @@ fn test_collection_uniform_consumers_accepted() {
 fn test_list_map_is_keyed_by_its_argument() {
     // Identity round-trips the sum (compaction re-pairs the opened domain).
     assert_eq!(
-        infer_program("def f(c: List(Int)):\n    c\nf").to_string(),
+        infer_program(indoc::indoc! {r#"
+            def f(c: List(Int)):
+                c
+            f"#})
+        .to_string(),
         "(Σ (σ : UIntRanges). (σ ⤇ Int) ⇒ Σ (σ : UIntRanges). (σ ⤇ Int))"
     );
     // `map` (domain-preserving) is keyed by the parameter's witness, `σ₁(c)`, which the call
     // discharges to the argument's: one candidate.
     assert_eq!(
-        infer_program("def f(c: List(Int)):\n    [x + 1 for x in c]\nf(box([1,2,3]))").to_string(),
+        infer_program(indoc::indoc! {r#"
+            def f(c: List(Int)):
+                [x + 1 for x in c]
+            f(box([1,2,3]))"#})
+        .to_string(),
         "(0..3 ⤇ Int)"
     );
     // `sum` (collapsing) → the scalar element type; the domain collapses away.
     assert_eq!(
-        infer_program("def f(c: List(Int)):\n    sum(c)\nf(box([1,2,3]))"),
+        infer_program(indoc::indoc! {r#"
+            def f(c: List(Int)):
+                sum(c)
+            f(box([1,2,3]))"#}),
         int()
     );
 }
@@ -1709,17 +1777,25 @@ fn test_list_map_is_keyed_by_its_argument() {
 #[test]
 fn test_a_map_widens_to_collection_interim() {
     assert_eq!(
-        infer_program(
-            "def f(c: Collection(Int)):\n    sum(c)\ndef g(m: Map(Int, Int)):\n    f(m)\ng"
-        )
+        infer_program(indoc::indoc! {r#"
+                def f(c: Collection(Int)):
+                    sum(c)
+                def g(m: Map(Int, Int)):
+                    f(m)
+                g"#})
         .to_string(),
         "(Σ (σ : SubtypesOf(Int)). (σ ⤇ Int) ⇒ Int)"
     );
     // A positional collection widens by the same arm, so the edge is kind-blind rather
     // than keyed-specific.
     assert_eq!(
-        infer_program("def f(c: Collection(Int)):\n    sum(c)\ndef g(l: List(Int)):\n    f(l)\ng")
-            .to_string(),
+        infer_program(indoc::indoc! {r#"
+            def f(c: Collection(Int)):
+                sum(c)
+            def g(l: List(Int)):
+                f(l)
+            g"#})
+        .to_string(),
         "(Σ (σ : UIntRanges). (σ ⤇ Int) ⇒ Int)"
     );
 }
@@ -1739,27 +1815,45 @@ fn test_a_map_widens_to_collection_interim() {
 fn full_map_lookup_needs_no_presence_proof() {
     let f = "def f(m: FullMap(Int, Int)):\n";
     assert_eq!(
-        infer_program(&format!("{f}    m\nf")).to_string(),
+        infer_program(&indoc::formatdoc!(
+            r#"
+            {f}    m
+            f"#
+        ))
+        .to_string(),
         "((Int ⤇ Int) ⇒ (Int ⤇ Int))",
         "the annotation is a data function, not a sum"
     );
     // The lookup yields the value type outright. An `Option` here would mean the
     // membership question was asked, which is exactly what totality removes.
     assert_eq!(
-        infer_program(&format!("{f}    m[1]!\nf")).to_string(),
+        infer_program(&indoc::formatdoc!(
+            r#"
+            {f}    m[1]!
+            f"#
+        ))
+        .to_string(),
         "((Int ⤇ Int) ⇒ Int)"
     );
     // Total does not mean unchecked: the key still has to be a key.
     assert!(
-        !infer_program_err(&format!("{f}    m[\"a\"]!\nf")).is_empty(),
+        !infer_program_err(&indoc::formatdoc!(
+            r#"
+            {f}    m["a"]!
+            f"#
+        ))
+        .is_empty(),
         "a String key must not reach an Int-keyed full map"
     );
     // The storefront shape — totality earned by refining the key type — keeps the
     // refinement on the domain rather than erasing it into a witness.
     assert!(
-        infer_program("def f(m: FullMap({Int where _ > 0}, Int)):\n    m\nf")
-            .to_string()
-            .contains("{Int | __elem > 0} ⤇ Int"),
+        infer_program(indoc::indoc! {r#"
+            def f(m: FullMap({Int where _ > 0}, Int)):
+                m
+            f"#})
+        .to_string()
+        .contains("{Int | __elem > 0} ⤇ Int"),
         "a refined key type is the domain"
     );
 }
@@ -1769,17 +1863,26 @@ fn full_map_lookup_needs_no_presence_proof() {
 #[test]
 fn full_map_annotations_are_satisfiable() {
     assert_eq!(
-        infer_program("x: FullMap(_, Int) = [1,2,3]\nx").to_string(),
+        infer_program(indoc::indoc! {r#"
+            x: FullMap(_, Int) = [1,2,3]
+            x"#})
+        .to_string(),
         "(0..3 ⤇ Int)",
         "a binding takes the producer's own domain"
     );
     assert_eq!(
-        infer_program("def f(m: FullMap(_, Int)):\n    sum(m)\nf([1,2,3])"),
+        infer_program(indoc::indoc! {r#"
+            def f(m: FullMap(_, Int)):
+                sum(m)
+            f([1,2,3])"#}),
         int(),
         "and so does a parameter, at a call site"
     );
     assert_eq!(
-        infer_program("def f(m: Array(3, Int)):\n    sum(m)\nf([1,2,3])"),
+        infer_program(indoc::indoc! {r#"
+            def f(m: Array(3, Int)):
+                sum(m)
+            f([1,2,3])"#}),
         int(),
         "control: Array is the same shape with the range written out"
     );
@@ -1792,9 +1895,19 @@ fn full_map_annotations_are_satisfiable() {
 #[test]
 fn a_key_from_the_source_does_not_yet_carry_its_key_domain() {
     for program in [
-        "c = [1,1,2]\ng = groupby(c, \\v -> v)\nsum([sum(g[x]!) for x in c])",
-        "k = \\v -> v\nc = [1,1,2]\ng = groupby(c, k)\nsum([sum(g[k(x)]!) for x in c])",
-        "c = [(a=1,b=2),(a=2,b=3)]\ng = groupby(c, \\r -> r.a)\nsum([sum([y.b for y in g[r.a]!]) for r in c])",
+        indoc::indoc! {r#"
+            c = [1,1,2]
+            g = groupby(c, \v -> v)
+            sum([sum(g[x]!) for x in c])"#},
+        indoc::indoc! {r#"
+            k = \v -> v
+            c = [1,1,2]
+            g = groupby(c, k)
+            sum([sum(g[k(x)]!) for x in c])"#},
+        indoc::indoc! {r#"
+            c = [(a=1,b=2),(a=2,b=3)]
+            g = groupby(c, \r -> r.a)
+            sum([sum([y.b for y in g[r.a]!]) for r in c])"#},
     ] {
         let errs = infer_program_err(program);
         assert!(
@@ -1815,12 +1928,25 @@ fn a_key_from_the_source_does_not_yet_carry_its_key_domain() {
 #[test]
 fn a_bare_key_lookup_on_a_groupby_is_refused() {
     for program in [
-        "g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1))",
-        "g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(9))",
-        "g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1)) + sum(g(2)) + sum(g(3))",
-        "g = groupby([1,1,2,2,3], \\x -> x)\nsum([sum(x) for x in g]) + sum(g(2))",
-        "groups = groupby([1, 2, 3], \\x -> x)\ngroups(0)",
-        "groups = groupby([1, 2, 3], \\x -> x)\napply0 = \\g -> g(0)\napply0(groups)",
+        indoc::indoc! {r#"
+            g = groupby([1,1,2,2,3], \x -> x)
+            sum(g(1))"#},
+        indoc::indoc! {r#"
+            g = groupby([1,1,2,2,3], \x -> x)
+            sum(g(9))"#},
+        indoc::indoc! {r#"
+            g = groupby([1,1,2,2,3], \x -> x)
+            sum(g(1)) + sum(g(2)) + sum(g(3))"#},
+        indoc::indoc! {r#"
+            g = groupby([1,1,2,2,3], \x -> x)
+            sum([sum(x) for x in g]) + sum(g(2))"#},
+        indoc::indoc! {r#"
+            groups = groupby([1, 2, 3], \x -> x)
+            groups(0)"#},
+        indoc::indoc! {r#"
+            groups = groupby([1, 2, 3], \x -> x)
+            apply0 = \g -> g(0)
+            apply0(groups)"#},
     ] {
         let errs = infer_program_err(program);
         assert!(
@@ -1840,27 +1966,44 @@ fn a_bare_key_lookup_on_a_groupby_is_refused() {
 fn a_groupby_is_a_full_map_at_either_strength() {
     let gb = "groupby([1,2], \\v -> v)";
     // Bounded: `g` keeps the initializer's type, so the group-by's own binder survives.
-    let bounded = infer_program(&format!("g <: FullMap(_, _) = {gb}\ng")).to_string();
+    let bounded = infer_program(&indoc::formatdoc!(
+        r#"
+        g <: FullMap(_, _) = {gb}
+        g"#
+    ))
+    .to_string();
     assert!(
         bounded.starts_with("((__gb_k: {Int | ") && bounded.contains("collection_contains"),
         "a group-by satisfies FullMap and keeps its present-key domain, got {bounded}"
     );
     // Exact: `g` binds at the annotation, whose binder the filled codomain names.
-    let exact = infer_program(&format!("g: FullMap(_, _) = {gb}\ng")).to_string();
+    let exact = infer_program(&indoc::formatdoc!(
+        r#"
+        g: FullMap(_, _) = {gb}
+        g"#
+    ))
+    .to_string();
     assert!(
         exact.starts_with("((__map_k: {Int | ") && exact.contains("== __map_k"),
         "the exact form binds at the annotation's binder, got {exact}"
     );
     // And it is usable, not merely inhabited: consuming the groups sums them.
     assert_eq!(
-        infer_program(&format!(
-            "g: FullMap(_, _) = {gb}\nsum([sum(v) for v in g])"
+        infer_program(&indoc::formatdoc!(
+            r#"
+                g: FullMap(_, _) = {gb}
+                sum([sum(v) for v in g])"#
         )),
         int(),
         "an exact keyed annotation is consumable"
     );
     assert!(
-        !infer_program_err(&format!("g <: FullMap(Int, _) = {gb}\ng")).is_empty(),
+        !infer_program_err(&indoc::formatdoc!(
+            r#"
+            g <: FullMap(Int, _) = {gb}
+            g"#
+        ))
+        .is_empty(),
         "the bare key type is not the present-key domain, so it must not match"
     );
 }
@@ -1886,7 +2029,12 @@ fn an_exact_keyed_annotation_aligns_the_filled_binder() {
         } else {
             "groupby([1,2,3], \\x -> x)"
         };
-        let ty = infer_program(&format!("g: {ann} = {gb}\ng")).to_string();
+        let ty = infer_program(&indoc::formatdoc!(
+            r#"
+            g: {ann} = {gb}
+            g"#
+        ))
+        .to_string();
         assert!(
             ty.contains("== __map_k"),
             "`{ann}` must fill its codomain at its own binder, got {ty}"
@@ -1911,7 +2059,12 @@ fn an_exact_keyed_annotation_aligns_the_filled_binder() {
 fn keyed_entry_checks_the_annotated_key_type() {
     let gb = "box(groupby([1,2,3], \\x -> x))";
     assert!(
-        !infer_program_err(&format!("g <: Map(String, Collection(Int)) = {gb}\ng")).is_empty(),
+        !infer_program_err(&indoc::formatdoc!(
+            r#"
+            g <: Map(String, Collection(Int)) = {gb}
+            g"#
+        ))
+        .is_empty(),
         "an Int-keyed group-by must not satisfy Map(String, _)"
     );
     // The same rejection with the value slot **elided**, which is the shape that reaches
@@ -1922,13 +2075,23 @@ fn keyed_entry_checks_the_annotated_key_type() {
     // with the morphism's codomain, `String` and `Int` would join instead of conflicting
     // and this annotation would be accepted.
     assert!(
-        !infer_program_err(&format!("g <: Map(String, _) = {gb}\ng")).is_empty(),
+        !infer_program_err(&indoc::formatdoc!(
+            r#"
+            g <: Map(String, _) = {gb}
+            g"#
+        ))
+        .is_empty(),
         "an Int-keyed group-by must not satisfy Map(String, _) with the value elided"
     );
     // Positive control: the right key type still reaches the annotation. The value type
     // is left elided — a group is a bare data function, and `Collection(Int)` is a sum
     // only a term can enter, so naming one there would be a second, unrelated rejection.
-    let ty = infer_program(&format!("g <: Map(Int, _) = {gb}\ng")).to_string();
+    let ty = infer_program(&indoc::formatdoc!(
+        r#"
+        g <: Map(Int, _) = {gb}
+        g"#
+    ))
+    .to_string();
     // The key type, not a binder spelling: a reference to the type's own function is
     // stored as an index and rendered at whichever binder the type carries
     // (`src/ccl/design/type-inference.md`, "A binder reference is stored in one of two
@@ -1949,23 +2112,42 @@ fn keyed_entry_checks_the_annotated_key_type() {
 /// shape: `Set(String)` and `Set(Int)` are different annotations.
 #[test]
 fn a_set_annotation_is_a_unit_valued_map() {
-    let int_keyed = infer_program("def f(s: Set(Int)):\n    s\nf").to_string();
+    let int_keyed = infer_program(indoc::indoc! {r#"
+        def f(s: Set(Int)):
+            s
+        f"#})
+    .to_string();
     assert!(
         int_keyed.contains("SubtypesOf(Int)") && int_keyed.contains("⤇ Unit"),
         "`Set(Int)` is a map over `Int` whose values are `unit`, got {int_keyed}"
     );
-    let str_keyed = infer_program("def f(s: Set(String)):\n    s\nf").to_string();
+    let str_keyed = infer_program(indoc::indoc! {r#"
+        def f(s: Set(String)):
+            s
+        f"#})
+    .to_string();
     assert!(
         str_keyed.contains("SubtypesOf(String)"),
         "`Set(String)` must carry its own key type, got {str_keyed}"
     );
-    let elided = infer_program("def f(s: Set(_)):\n    s\nf").to_string();
+    let elided = infer_program(indoc::indoc! {r#"
+        def f(s: Set(_)):
+            s
+        f"#})
+    .to_string();
     assert!(
         elided.contains("⤇ Unit"),
         "an elided key leaves the payload stated, got {elided}"
     );
     // A list is `Int`-valued, so it is no set of `Int`s at either annotation strength.
-    for code in ["s: Set(Int) = [1,2,3]\ns", "s <: Set(Int) = [1,2,3]\ns"] {
+    for code in [
+        indoc::indoc! {r#"
+        s: Set(Int) = [1,2,3]
+        s"#},
+        indoc::indoc! {r#"
+        s <: Set(Int) = [1,2,3]
+        s"#},
+    ] {
         assert!(
             !infer_program_err(code).is_empty(),
             "an `Int`-valued collection must not satisfy `Set(Int)`: {code}"
@@ -1991,7 +2173,11 @@ fn a_set_annotation_is_a_unit_valued_map() {
 #[test]
 fn test_map_consumption_is_kind_blind_interim() {
     assert_eq!(
-        infer_program("def g(m: Map(Int, Int)):\n    sum(m)\ng").to_string(),
+        infer_program(indoc::indoc! {r#"
+            def g(m: Map(Int, Int)):
+                sum(m)
+            g"#})
+        .to_string(),
         "(Σ (σ : SubtypesOf(Int)). (σ ⤇ Int) ⇒ Int)"
     );
 }
@@ -2005,11 +2191,10 @@ fn test_aggregate_over_scalar_lambda_is_rejected() {
     // in `constrain_fun_kind` (emission), never routed through a kind var.
     // Regression that a capability supplied where a collection is demanded is a
     // clean error, not a silent miskind or a debug panic.
-    let errs = infer_program_err(
-        r"
-f = \i -> i + 1
-sum(f)",
-    );
+    let errs = infer_program_err(indoc::indoc! {r#"
+
+            f = \i -> i + 1
+            sum(f)"#});
     assert!(
         errs.iter().any(|e| matches!(
             e,
@@ -2050,17 +2235,36 @@ fn test_def_param_annotation_enforced() {
     "#}),
         int_lit(1)
     );
-    assert!(!infer_program_err("def g(a: Int):\n    a\ng(\"x\")").is_empty());
+    assert!(
+        !infer_program_err(indoc::indoc! {r#"
+        def g(a: Int):
+            a
+        g("x")"#})
+        .is_empty()
+    );
     // A `List(Int)` annotation enforces the element type through the annotation.
     assert_eq!(
-        infer_program("def g(a: List(Int)):\n    sum(a)\ng(box([1, 2, 3]))"),
+        infer_program(indoc::indoc! {r#"
+            def g(a: List(Int)):
+                sum(a)
+            g(box([1, 2, 3]))"#}),
         int()
     );
     assert!(
-        !infer_program_err("def g(a: List(Int)):\n    sum(a)\ng(box([\"a\", \"b\"]))").is_empty()
+        !infer_program_err(indoc::indoc! {r#"
+            def g(a: List(Int)):
+                sum(a)
+            g(box(["a", "b"]))"#})
+        .is_empty()
     );
     // An unannotated param still infers purely from use.
-    assert_eq!(infer_program("def g(a):\n    a\ng(\"x\")"), str_lit("x"));
+    assert_eq!(
+        infer_program(indoc::indoc! {r#"
+        def g(a):
+            a
+        g("x")"#}),
+        str_lit("x")
+    );
 }
 
 /// A Σ-typed parameter in a **multi-parameter** function, consumed. This needs all
@@ -2072,23 +2276,21 @@ fn test_def_param_annotation_enforced() {
 #[test]
 fn sigma_param_in_a_multi_param_function_is_consumable() {
     assert_eq!(
-        infer_program(
-            r"
-def f(a: List(Int), b: Int):
-    sum(a) + b
-f(box([1,2]),3)"
-        ),
+        infer_program(indoc::indoc! {r#"
+
+                def f(a: List(Int), b: Int):
+                    sum(a) + b
+                f(box([1,2]),3)"#}),
         int()
     );
     // The single-Σ diagnosis, pinned so a future fix cannot pass for the wrong
     // reason: two Σ params must work too, and the controls must keep working.
     assert_eq!(
-        infer_program(
-            r"
-def f(a: List(Int), b: List(Int)):
-    sum(a) + sum(b)
-f(box([1,2]),box([3,4,5]))"
-        ),
+        infer_program(indoc::indoc! {r#"
+
+                def f(a: List(Int), b: List(Int)):
+                    sum(a) + sum(b)
+                f(box([1,2]),box([3,4,5]))"#}),
         int()
     );
 }
@@ -2101,23 +2303,21 @@ f(box([1,2]),box([3,4,5]))"
 #[test]
 fn list_param_under_a_domain_preserving_consumer() {
     assert_eq!(
-        infer_program(
-            r"
-def f(a: List(Int)):
-    [x + 1 for x in a]
-sum(f(box([1,2])))"
-        ),
+        infer_program(indoc::indoc! {r#"
+
+                def f(a: List(Int)):
+                    [x + 1 for x in a]
+                sum(f(box([1,2])))"#}),
         int()
     );
     // Two consumers of one `List` param — a uniform one and a domain-preserving
     // one — so the annotation's kind meets two separate demands.
     assert_eq!(
-        infer_program(
-            r"
-def f(a: List(Int)):
-    sum([x + 1 for x in a]) + sum(a)
-f(box([1,2]))"
-        ),
+        infer_program(indoc::indoc! {r#"
+
+                def f(a: List(Int)):
+                    sum([x + 1 for x in a]) + sum(a)
+                f(box([1,2]))"#}),
         int()
     );
 }
@@ -2128,32 +2328,29 @@ f(box([1,2]))"
 fn sigma_param_controls_single_and_unconsumed() {
     // Single Σ param, consumed.
     assert_eq!(
-        infer_program(
-            r"
-def f(a: List(Int)):
-    sum(a)
-f(box([1,2]))"
-        ),
+        infer_program(indoc::indoc! {r#"
+
+                def f(a: List(Int)):
+                    sum(a)
+                f(box([1,2]))"#}),
         int()
     );
     // Plain data function (not a Σ) alongside a scalar, consumed.
     assert_eq!(
-        infer_program(
-            r"
-def f(a: Array(2,Int), b: Int):
-    sum(a) + b
-f([1,2],3)"
-        ),
+        infer_program(indoc::indoc! {r#"
+
+                def f(a: Array(2,Int), b: Int):
+                    sum(a) + b
+                f([1,2],3)"#}),
         int()
     );
     // Σ present in a multi-param function but never consumed.
     assert_eq!(
-        infer_program(
-            r"
-def f(a: List(Int), b: Int):
-    b
-f(box([1,2]),3)"
-        ),
+        infer_program(indoc::indoc! {r#"
+
+                def f(a: List(Int), b: Int):
+                    b
+                f(box([1,2]),3)"#}),
         int()
     );
 }
@@ -2164,7 +2361,10 @@ fn test_multiarg_def_param_annotation_enforced() {
     // bounds its param rather than replacing it, so the caller's singleton
     // survives (see `test_def_param_annotation_enforced`).
     assert_eq!(
-        infer_program("def g(a: Int, b: String):\n    a\ng(1, \"x\")"),
+        infer_program(indoc::indoc! {r#"
+            def g(a: Int, b: String):
+                a
+            g(1, "x")"#}),
         int()
     );
     // Per-position modes inside the one tupled annotation: `a` exact, `b` bounded.
@@ -2177,11 +2377,29 @@ fn test_multiarg_def_param_annotation_enforced() {
         int_lit(1)
     );
     // Wrong type on `a` is rejected.
-    assert!(!infer_program_err("def g(a: Int, b: String):\n    a\ng(\"x\", \"y\")").is_empty());
+    assert!(
+        !infer_program_err(indoc::indoc! {r#"
+        def g(a: Int, b: String):
+            a
+        g("x", "y")"#})
+        .is_empty()
+    );
     // Wrong type on `b` is rejected.
-    assert!(!infer_program_err("def g(a: Int, b: String):\n    a\ng(1, 2)").is_empty());
+    assert!(
+        !infer_program_err(indoc::indoc! {r#"
+        def g(a: Int, b: String):
+            a
+        g(1, 2)"#})
+        .is_empty()
+    );
     // Fully unannotated params still infer from use.
-    assert_eq!(infer_program("def g(a, b):\n    a + b\ng(1, 2)"), int());
+    assert_eq!(
+        infer_program(indoc::indoc! {r#"
+        def g(a, b):
+            a + b
+        g(1, 2)"#}),
+        int()
+    );
 }
 
 #[test]
@@ -2295,38 +2513,43 @@ fn test_tuple_index() {
 /// what makes `x: _ = e` equivalent to `x = e`.
 #[rstest]
 #[case::literal(
-    r"
-x: Int = 2
-x
-",
+    indoc::indoc! {r#"
+
+        x: Int = 2
+        x
+        "#},
     int()
 )]
 #[case::bounded_literal(
-    r"
-x <: Int = 2
-x
-",
+    indoc::indoc! {r#"
+
+        x <: Int = 2
+        x
+        "#},
     int_lit(2)
 )]
 #[case::expr(
-    r"
-x: Int = 1 + 2
-x
-",
+    indoc::indoc! {r#"
+
+        x: Int = 1 + 2
+        x
+        "#},
     int()
 )]
 #[case::wildcard(
-    r"
-x: _ = 2
-x
-",
+    indoc::indoc! {r#"
+
+        x: _ = 2
+        x
+        "#},
     int_lit(2)
 )]
 #[case::wildcard_str(
-    r#"
-x: _ = "hi"
-x
-"#,
+    indoc::indoc! {r#"
+
+        x: _ = "hi"
+        x
+        "#},
     str_lit("hi")
 )]
 fn test_ann_assign_ok(#[case] code: &str, #[case] expected: Type) {
@@ -2337,10 +2560,11 @@ fn test_ann_assign_ok(#[case] code: &str, #[case] expected: Type) {
 fn test_ann_assign_mismatch() {
     // x: String = 2; x — mismatch: annotation says String but value is Int
     let err = infer_program_err(
-        r#"
-x: String = 2
-x
-"#
+        indoc::indoc! {r#"
+
+            x: String = 2
+            x
+            "#}
         .trim(),
     );
     assert!(
@@ -2380,11 +2604,10 @@ fn test_source_list_comp_element_type() {
 fn test_comprehension_enters_a_list_annotation() {
     // The comprehension's domain resolves to `0..3` — a range — which realizes
     // the length witness, so the deferred entry is discharged.
-    let ty = infer_program(
-        r"
-x: List(Int) = box([y + 1 for y in [1, 2, 3]])
-x",
-    );
+    let ty = infer_program(indoc::indoc! {r#"
+
+            x: List(Int) = box([y + 1 for y in [1, 2, 3]])
+            x"#});
     // Modulo binder identity: two derivations, so the binders differ by construction.
     assert_eq!(
         ty.without_witness_binders(),
@@ -2408,9 +2631,10 @@ x",
 #[test]
 fn test_source_comprehension_rejected_by_list_annotation() {
     let errs = infer_program_with_sources_err(
-        r"
-x: List(Int) = box([y + 1 for y in mysrc()])
-x",
+        indoc::indoc! {r#"
+
+            x: List(Int) = box([y + 1 for y in mysrc()])
+            x"#},
         &[("mysrc", int())],
     );
     // The rejection's variant depends on which edge sees the concrete domain
@@ -2656,7 +2880,11 @@ fn dependent_application_discharges_the_binder() {
 fn higher_order_dependent_application_discharges_the_binder() {
     let f = "f = \\k -> [x for x in [1,2,3] if x == k]\n";
     let direct = infer_program(&format!("{f}f(0)"));
-    let through = infer_program(&format!("{f}apply0 = \\g -> g(0)\napply0(f)"));
+    let through = infer_program(&indoc::formatdoc!(
+        r#"
+        {f}apply0 = \g -> g(0)
+        apply0(f)"#
+    ));
     assert_predicate_discharged(&through, "k");
     assert_eq!(
         through, direct,
@@ -2714,19 +2942,28 @@ fn set_injects_into_nominal_set_annotation() {
     // annotation instead and gives back the abstract `SubtypesOf` sum, as
     // [`map_injects_into_nominal_map_annotation`] shows.
     assert_eq!(
-        infer_program("x <: Set(Int) = box(set([1,2,3]))\nx").to_string(),
+        infer_program(indoc::indoc! {r#"
+            x <: Set(Int) = box(set([1,2,3]))
+            x"#})
+        .to_string(),
         "Σ (σ : [{Int | __elem ▷ ((λ __iter_record : 0..3 → __iter_record ▷ [1, 2, 3] ▷ (λ __set_key : Int → __set_key)) ▷ collection_contains)}]). (σ ⤇ Unit)"
     );
     // The **key type** flows too: it is a kind *parameter*, so the edge relates it
     // rather than ignoring it — and it survives the `box`, which reaches the annotation
     // by the cross-form width edge rather than the same-form one.
     assert!(
-        !infer_program_err("x <: Set(String) = box(set([1,2,3]))\nx").is_empty(),
+        !infer_program_err(indoc::indoc! {r#"
+            x <: Set(String) = box(set([1,2,3]))
+            x"#})
+        .is_empty(),
         "an Int-keyed set must not satisfy Set(String)"
     );
     // The codomain still flows: a `Set(Int)` is not a `Map(Int, Int)`.
     assert!(
-        !infer_program_err("x <: Map(Int, Int) = box(set([1,2,3]))\nx").is_empty(),
+        !infer_program_err(indoc::indoc! {r#"
+            x <: Map(Int, Int) = box(set([1,2,3]))
+            x"#})
+        .is_empty(),
         "a set's `unit` codomain must not satisfy Map(Int, Int)"
     );
 }
@@ -2750,15 +2987,24 @@ fn map_infers_a_key_domain_over_the_value() {
 #[test]
 fn map_injects_into_nominal_map_annotation() {
     assert_eq!(
-        infer_program("x: Map(Int, Int) = box(map([(1, 10), (2, 20)]))\nx").to_string(),
+        infer_program(indoc::indoc! {r#"
+            x: Map(Int, Int) = box(map([(1, 10), (2, 20)]))
+            x"#})
+        .to_string(),
         "Σ (σ : SubtypesOf(Int)). (σ ⤇ Int)"
     );
     assert!(
-        !infer_program_err("x <: Map(String, Int) = box(map([(1, 10), (2, 20)]))\nx").is_empty(),
+        !infer_program_err(indoc::indoc! {r#"
+            x <: Map(String, Int) = box(map([(1, 10), (2, 20)]))
+            x"#})
+        .is_empty(),
         "an Int-keyed map must not satisfy Map(String, Int)"
     );
     assert!(
-        !infer_program_err("x <: Set(Int) = box(map([(1, 10), (2, 20)]))\nx").is_empty(),
+        !infer_program_err(indoc::indoc! {r#"
+            x <: Set(Int) = box(map([(1, 10), (2, 20)]))
+            x"#})
+        .is_empty(),
         "a map's value codomain must not satisfy Set(Int)"
     );
 }
@@ -2828,42 +3074,46 @@ fn test_groupby_partition_stores_an_index_and_renders_the_binder() {
 
 #[rstest]
 #[case::int(
-    r"
-if True:
-    1
-else:
-    0
-",
+    indoc::indoc! {r#"
+
+        if True:
+            1
+        else:
+            0
+        "#},
     BaseType::Int
 )]
 #[case::string(
-    r#"
-if True:
-    "yes"
-else:
-    "no"
-"#,
+    indoc::indoc! {r#"
+
+        if True:
+            "yes"
+        else:
+            "no"
+        "#},
     BaseType::String
 )]
 #[case::with_let(
-    r"
-x = 5
-if x > 3:
-    10
-else:
-    0
-",
+    indoc::indoc! {r#"
+
+        x = 5
+        if x > 3:
+            10
+        else:
+            0
+        "#},
     BaseType::Int
 )]
 #[case::elif_chain(
-    r"
-if True:
-    1
-elif False:
-    2
-else:
-    3
-",
+    indoc::indoc! {r#"
+
+        if True:
+            1
+        elif False:
+            2
+        else:
+            3
+        "#},
     BaseType::Int
 )]
 fn test_if_else(#[case] code: &str, #[case] expected: BaseType) {
@@ -2886,12 +3136,13 @@ fn test_ternary(#[case] code: &str, #[case] expected: BaseType) {
 #[test]
 fn test_if_else_arm_type_mismatch() {
     let err = infer_program_err(
-        r#"
-if True:
-    1
-else:
-    "oops"
-"#
+        indoc::indoc! {r#"
+
+            if True:
+                1
+            else:
+                "oops"
+            "#}
         .trim(),
     );
     assert!(
@@ -2991,7 +3242,9 @@ fn an_undetermined_operand_stays_open() {
 fn test_generic_identity() {
     // f = \x -> x; f -> Fun(?a, ?b)
     // inference allows unconstrained parameters to remain unresolved.
-    let ty = infer_program("f = \\x -> x\nf");
+    let ty = infer_program(indoc::indoc! {r#"
+        f = \x -> x
+        f"#});
     if let Type::Fun {
         domain: dom,
         codomain: cod,
@@ -3023,7 +3276,9 @@ fn test_tuple_index_heterogeneous() {
 fn test_unconstrained_identity_applied_resolves() {
     // bind via Let so `f(5)` is a named call (lowering doesn't yet
     // support a lambda-literal in call position).
-    let ty = infer_program("f = \\x -> x\nf(5)");
+    let ty = infer_program(indoc::indoc! {r#"
+        f = \x -> x
+        f(5)"#});
     assert_eq!(ty, int_lit(5));
 }
 
@@ -3085,16 +3340,15 @@ fn infer_and_check(code: &str) -> Type {
 /// set and a `Data` domain then reports two domains that do not join.
 #[test]
 fn test_case_with_filtered_comprehension_arms_passes_consistency_wall() {
-    let ty = infer_and_check(
-        r"
-xs = [1, 2, 3]
-c = 1 > 0
-if c:
-    [x for x in xs if x > 1]
-else:
-    [x for x in xs if x > 1]
-",
-    );
+    let ty = infer_and_check(indoc::indoc! {r#"
+
+            xs = [1, 2, 3]
+            c = 1 > 0
+            if c:
+                [x for x in xs if x > 1]
+            else:
+                [x for x in xs if x > 1]
+            "#});
     let Type::Fun {
         domain, codomain, ..
     } = &ty
@@ -3116,12 +3370,11 @@ else:
 /// reach them.
 #[test]
 fn test_list_of_filtered_comprehensions_passes_consistency_wall() {
-    let ty = infer_and_check(
-        r"
-xs = [1, 2, 3]
-[[x for x in xs if x > 1]]
-",
-    );
+    let ty = infer_and_check(indoc::indoc! {r#"
+
+            xs = [1, 2, 3]
+            [[x for x in xs if x > 1]]
+            "#});
     let Type::Fun {
         domain, codomain, ..
     } = &ty
@@ -3143,11 +3396,19 @@ xs = [1, 2, 3]
 /// when every arm establishes it. Two arms that are the same literal *are* that
 /// literal; two different ones are only their base.
 #[rstest]
-#[case::same_literal("c = 1 > 0\n5 if c else 5", int_lit(5))]
-#[case::different_literals("c = 1 > 0\n1 if c else 2", int())]
-#[case::inside_a_tuple("c = 1 > 0\n(1, 2) if c else (3, 4)", Type::Tuple(vec![int(), int()]))]
+#[case::same_literal(indoc::indoc! {r#"
+    c = 1 > 0
+    5 if c else 5"#}, int_lit(5))]
+#[case::different_literals(indoc::indoc! {r#"
+    c = 1 > 0
+    1 if c else 2"#}, int())]
+#[case::inside_a_tuple(indoc::indoc! {r#"
+    c = 1 > 0
+    (1, 2) if c else (3, 4)"#}, Type::Tuple(vec![int(), int()]))]
 #[case::at_depth(
-    "c = 1 > 0\n((1, 2), 3) if c else ((4, 5), 6)",
+    indoc::indoc! {r#"
+        c = 1 > 0
+        ((1, 2), 3) if c else ((4, 5), 6)"#},
     Type::Tuple(vec![Type::Tuple(vec![int(), int()]), int()])
 )]
 fn test_case_arms_join(#[case] code: &str, #[case] expected: Type) {
@@ -3163,16 +3424,15 @@ fn test_case_arms_join(#[case] code: &str, #[case] expected: Type) {
 /// the same Σ formation as two structurally unrelated domains.
 #[test]
 fn test_case_arms_with_different_filters_become_sigma_candidates() {
-    let ty = infer_and_check(
-        r"
-xs = [1, 2, 3]
-c = 1 > 0
-if c:
-    box([x for x in xs if x > 1])
-else:
-    box([x for x in xs if x < 3])
-",
-    );
+    let ty = infer_and_check(indoc::indoc! {r#"
+
+            xs = [1, 2, 3]
+            c = 1 > 0
+            if c:
+                box([x for x in xs if x > 1])
+            else:
+                box([x for x in xs if x < 3])
+            "#});
     let Some([w]) = ty.sum() else {
         panic!("expected a conditional collection (a sum), got {ty}");
     };
@@ -3226,7 +3486,10 @@ fn feed_value(ty: &Type) -> &Type {
 fn test_defined_defer_is_feed_of_collection() {
     // `<<=` sets the whole channel; its RHS must be a collection (a `Fun`),
     // so the feed's element type is the collection's element.
-    let ty = infer_program("x: Feed(_)\nx <<= [1,2,3]\nx");
+    let ty = infer_program(indoc::indoc! {r#"
+        x: Feed(_)
+        x <<= [1,2,3]
+        x"#});
     assert_eq!(*feed_value(&ty), int());
 }
 
@@ -3234,7 +3497,10 @@ fn test_defined_defer_is_feed_of_collection() {
 fn test_scalar_define_is_rejected() {
     // A scalar `<<=` RHS is disallowed — `<<=` only accepts collections
     // (`Fun`s), so an `Int` fails to align with the channel's collection type.
-    let errs = infer_program_err("x: Feed(_)\nx <<= 1\nx");
+    let errs = infer_program_err(indoc::indoc! {r#"
+        x: Feed(_)
+        x <<= 1
+        x"#});
     assert!(
         !errs.is_empty(),
         "a scalar defined into a feed channel must be a type error"
@@ -3243,13 +3509,20 @@ fn test_scalar_define_is_rejected() {
 
 #[test]
 fn test_fed_defer_is_feed_of_channel() {
-    let ty = infer_program("x: Feed(_)\n[x << i for i in [1,2,3]]\nx");
+    let ty = infer_program(indoc::indoc! {r#"
+        x: Feed(_)
+        [x << i for i in [1,2,3]]
+        x"#});
     assert_eq!(*feed_value(&ty), int());
 }
 
 #[test]
 fn test_scalar_feeds_join_in_channel() {
-    let ty = infer_program("x: Feed(_)\nx << 1\nx << 2\nx");
+    let ty = infer_program(indoc::indoc! {r#"
+        x: Feed(_)
+        x << 1
+        x << 2
+        x"#});
     assert_eq!(*feed_value(&ty), int());
 }
 
@@ -3257,13 +3530,26 @@ fn test_scalar_feeds_join_in_channel() {
 fn test_defined_defer_reads_through_aggregate() {
     // A collection define sets the channel outright; `sum` reads the handle as
     // that collection and aggregates it to a scalar.
-    assert_eq!(infer_program("x: Feed(_)\nx <<= [1,2,3]\nsum(x)"), int());
+    assert_eq!(
+        infer_program(indoc::indoc! {r#"
+        x: Feed(_)
+        x <<= [1,2,3]
+        sum(x)"#}),
+        int()
+    );
 }
 
 #[test]
 fn test_fed_defer_reads_through_aggregate() {
     // `sum` consumes the feed handle as its read view `(α ⤇ γ)`.
-    assert_eq!(infer_program("x: Feed(_)\nx << 1\nx << 2\nsum(x)"), int());
+    assert_eq!(
+        infer_program(indoc::indoc! {r#"
+        x: Feed(_)
+        x << 1
+        x << 2
+        sum(x)"#}),
+        int()
+    );
 }
 
 #[test]
@@ -3271,13 +3557,22 @@ fn test_defer_chain_flattens_feeds() {
     // `x <<= y` sets x's channel to y's whole read view. A feed reads through to
     // that view, so x gets y's collection directly (a single feed layer, not
     // nested); channelize later binds x to y's channel.
-    let ty = infer_program("x: Feed(_)\ny: Feed(_)\nx <<= y\ny <<= [0, 1]\nx");
+    let ty = infer_program(indoc::indoc! {r#"
+        x: Feed(_)
+        y: Feed(_)
+        x <<= y
+        y <<= [0, 1]
+        x"#});
     assert_eq!(*feed_value(&ty), int());
 }
 
 #[test]
 fn test_heterogeneous_feeds_error() {
-    let errs = infer_program_err("x: Feed(_)\nx << 1\nx << \"s\"\nx");
+    let errs = infer_program_err(indoc::indoc! {r#"
+        x: Feed(_)
+        x << 1
+        x << "s"
+        x"#});
     assert!(
         !errs.is_empty(),
         "Int and String feeds into one defer must collide"
@@ -3290,16 +3585,15 @@ fn test_feed_through_param_flows_back_to_caller() {
     // `Feed(ρ_x) <: c` meets the feed's `c <: Feed(ρ_f)` upper bound,
     // and invariance carries g's contribution back into ρ_x — so the
     // String contribution collides with the direct Int feed.
-    let errs = infer_program_err(
-        r#"
-def g(c):
-  c << "s"
-  c
-x: Feed(_)
-g(x)
-x << 1
-x"#,
-    );
+    let errs = infer_program_err(indoc::indoc! {r#"
+
+            def g(c):
+              c << "s"
+              c
+            x: Feed(_)
+            g(x)
+            x << 1
+            x"#});
     assert!(
         !errs.is_empty(),
         "a String fed through g's parameter must collide with the Int fed directly"
@@ -3309,16 +3603,15 @@ x"#,
 #[test]
 fn test_feed_through_param_compatible_types_ok() {
     // Same shape with compatible contributions: both land in ρ_x as Int.
-    let ty = infer_program(
-        r#"
-def g(c):
-  c << 100
-  c
-x: Feed(_)
-g(x)
-x << 1
-x"#,
-    );
+    let ty = infer_program(indoc::indoc! {r#"
+
+            def g(c):
+              c << 100
+              c
+            x: Feed(_)
+            g(x)
+            x << 1
+            x"#});
     assert_eq!(*feed_value(&ty), int());
 }
 
@@ -3326,13 +3619,12 @@ x"#,
 fn test_plain_value_to_feeding_param_errors() {
     // `g(5)` where g feeds its parameter: the write capability cannot be
     // conjured from a plain value (`NotAFeed` at the call edge).
-    let errs = infer_program_err(
-        r#"
-def g(c):
-  c << 1
-  c
-g(5)"#,
-    );
+    let errs = infer_program_err(indoc::indoc! {r#"
+
+            def g(c):
+              c << 1
+              c
+            g(5)"#});
     assert!(
         !errs.is_empty(),
         "feeding through a non-feed argument must error"
@@ -3354,16 +3646,15 @@ fn test_generalized_defer_function_specializes_per_element_type() {
     // A defer minted inside a generalized function instantiates a fresh
     // feed handle (and element type) per call site — monomorphize then
     // specializes per resolved Feed type.
-    let ty = infer_program(
-        r#"
-def make(v):
-  x: Feed(_)
-  x << v
-  x
-a = make(1)
-b = make("s")
-(a, b)"#,
-    );
+    let ty = infer_program(indoc::indoc! {r#"
+
+            def make(v):
+              x: Feed(_)
+              x << v
+              x
+            a = make(1)
+            b = make("s")
+            (a, b)"#});
     let Type::Tuple(elems) = &ty else {
         panic!("expected a pair of feed handles, got {ty}");
     };
@@ -3385,13 +3676,36 @@ b = make("s")
 fn dot_projects_and_brackets_look_up() {
     // Both keyings project, on the shapes that have them. Projection *selects* an
     // element rather than computing one, so the element's own singleton survives.
-    assert_eq!(infer_program("t = (1, \"a\")\nt.0"), int_lit(1));
-    assert_eq!(infer_program("t = (1, \"a\")\nt.1"), str_lit("a"));
-    assert_eq!(infer_program("r = (a=1, b=2)\nr.b"), int_lit(2));
+    assert_eq!(
+        infer_program(indoc::indoc! {r#"
+        t = (1, "a")
+        t.0"#}),
+        int_lit(1)
+    );
+    assert_eq!(
+        infer_program(indoc::indoc! {r#"
+        t = (1, "a")
+        t.1"#}),
+        str_lit("a")
+    );
+    assert_eq!(
+        infer_program(indoc::indoc! {r#"
+        r = (a=1, b=2)
+        r.b"#}),
+        int_lit(2)
+    );
 
     // A tuple is a heterogeneous product, not a finite function, so it has no domain to
     // look up in — however the index is spelled, literal or not.
-    for program in ["t = (1, \"a\")\nt[0]!", "t = (1, 2)\ni = 0\nt[i]!"] {
+    for program in [
+        indoc::indoc! {r#"
+        t = (1, "a")
+        t[0]!"#},
+        indoc::indoc! {r#"
+        t = (1, 2)
+        i = 0
+        t[i]!"#},
+    ] {
         let errs = infer_program_err(program);
         assert!(
             errs.iter()
@@ -3409,9 +3723,24 @@ fn dot_projects_and_brackets_look_up() {
 /// in either order and to any depth.
 #[test]
 fn positional_and_named_projection_compose() {
-    assert_eq!(infer_program("r = (p=(1, \"a\"))\nr.p.1"), str_lit("a"));
-    assert_eq!(infer_program("t = ((a=1), 2)\nt.0.a"), int_lit(1));
-    assert_eq!(infer_program("t = ((1, 2), 3)\nt.0.1"), int_lit(2));
+    assert_eq!(
+        infer_program(indoc::indoc! {r#"
+        r = (p=(1, "a"))
+        r.p.1"#}),
+        str_lit("a")
+    );
+    assert_eq!(
+        infer_program(indoc::indoc! {r#"
+        t = ((a=1), 2)
+        t.0.a"#}),
+        int_lit(1)
+    );
+    assert_eq!(
+        infer_program(indoc::indoc! {r#"
+        t = ((1, 2), 3)
+        t.0.1"#}),
+        int_lit(2)
+    );
 }
 
 /// The brace *type* forms and `.` agree on keying: `{T, U}` is a tuple type, projected
@@ -3462,11 +3791,24 @@ fn brace_type_annotations_project_by_their_keying() {
 #[test]
 fn the_empty_product_is_unit() {
     let unit = Type::Base(BaseType::Unit);
-    assert_eq!(infer_program("x: {} = ()\nx"), unit);
-    assert_eq!(infer_program("x = ()\nx"), unit);
+    assert_eq!(
+        infer_program(indoc::indoc! {r#"
+        x: {} = ()
+        x"#}),
+        unit
+    );
+    assert_eq!(
+        infer_program(indoc::indoc! {r#"
+        x = ()
+        x"#}),
+        unit
+    );
     // `{}` really constrains: a non-unit value against it is an annotation error.
     assert!(
-        !infer_program_err("x: {} = 1\nx").is_empty(),
+        !infer_program_err(indoc::indoc! {r#"
+            x: {} = 1
+            x"#})
+        .is_empty(),
         "`{{}}` is the unit type, so an `Int` must not satisfy it"
     );
 }
@@ -3477,10 +3819,26 @@ fn the_empty_product_is_unit() {
 /// an argument with no such key is rejected there.
 #[test]
 fn projection_through_an_inferred_parameter() {
-    assert_eq!(infer_program("def f(x):\n    x.1\nf((1, 2))"), int_lit(2));
-    assert_eq!(infer_program("def f(r):\n    r.a\nf((a=7))"), int_lit(7));
+    assert_eq!(
+        infer_program(indoc::indoc! {r#"
+        def f(x):
+            x.1
+        f((1, 2))"#}),
+        int_lit(2)
+    );
+    assert_eq!(
+        infer_program(indoc::indoc! {r#"
+        def f(r):
+            r.a
+        f((a=7))"#}),
+        int_lit(7)
+    );
     assert!(
-        !infer_program_err("def f(x):\n    x.0\nf(1)").is_empty(),
+        !infer_program_err(indoc::indoc! {r#"
+            def f(x):
+                x.0
+            f(1)"#})
+        .is_empty(),
         "an `Int` has no positions to project"
     );
 }
@@ -3494,7 +3852,9 @@ fn projection_through_an_inferred_parameter() {
 #[test]
 fn projection_diagnostics_name_the_shape() {
     // Past the end of a tuple: the position asked for, and the width there is.
-    let errs = infer_program_err("t = (1, 2, 3)\nt.99");
+    let errs = infer_program_err(indoc::indoc! {r#"
+        t = (1, 2, 3)
+        t.99"#});
     let msg = format!("{:?}", errs[0]);
     assert!(
         msg.contains("No position .99") && msg.contains("3 positions"),
@@ -3503,7 +3863,14 @@ fn projection_diagnostics_name_the_shape() {
 
     // Wrong keying: a record has names and a tuple has positions, which is the whole
     // content of the failure and what the bare shapes do not say.
-    for program in ["r = (a=1)\nr.0", "t = (1, 2, 3)\nt.b"] {
+    for program in [
+        indoc::indoc! {r#"
+        r = (a=1)
+        r.0"#},
+        indoc::indoc! {r#"
+        t = (1, 2, 3)
+        t.b"#},
+    ] {
         let errs = infer_program_err(program);
         assert!(
             errs.iter()
@@ -3647,20 +4014,22 @@ fn conditional_collection_consumed_through_a_variable() {
     let c = "box([1, 2]) if True else box([1, 2, 3])";
     // Through a `let`.
     assert_eq!(
-        infer_program(&format!(
-            r"
-x = {c}
-sum(x)"
+        infer_program(&indoc::formatdoc!(
+            r#"
+
+                x = {c}
+                sum(x)"#
         )),
         int()
     );
     // Through a UDF parameter.
     assert_eq!(
-        infer_program(&format!(
-            r"
-def f(c):
-    sum(c)
-f({c})"
+        infer_program(&indoc::formatdoc!(
+            r#"
+
+                def f(c):
+                    sum(c)
+                f({c})"#
         )),
         int()
     );
@@ -3697,25 +4066,28 @@ fn domain_preserving_consumption_of_a_conditional_collection() {
         // Directly over the `Case`.
         format!("[y + 1 for y in {c}]"),
         // Through a `let` — candidates recorded before the demand.
-        format!(
-            r"
-x = {c}
-[y + 1 for y in x]"
+        indoc::formatdoc!(
+            r#"
+
+                x = {c}
+                [y + 1 for y in x]"#
         ),
         // Through a UDF parameter — demand recorded before the candidates.
-        format!(
-            r"
-def f(c):
-    [y + 1 for y in c]
-f({c})"
+        indoc::formatdoc!(
+            r#"
+
+                def f(c):
+                    [y + 1 for y in c]
+                f({c})"#
         ),
         // And with the argument itself `let`-bound, so the sum crosses two variables.
-        format!(
-            r"
-def f(c):
-    [y + 1 for y in c]
-x = {c}
-f(x)"
+        indoc::formatdoc!(
+            r#"
+
+                def f(c):
+                    [y + 1 for y in c]
+                x = {c}
+                f(x)"#
         ),
     ] {
         assert_eq!(
@@ -4557,9 +4929,16 @@ fn two_alpha_variant_dependent_refinements_share_a_position() {
 #[test]
 fn the_alpha_variant_join_is_arrival_order_independent() {
     let program = |arms: &str| {
-        format!(
-            "def f(k):\n    [y for y in [1, 2, 3] if y == k]\n\n\
-             def g(m):\n    [y for y in [1, 2, 3] if y == m]\n\n{arms}\n"
+        indoc::formatdoc!(
+            r#"
+                def f(k):
+                    [y for y in [1, 2, 3] if y == k]
+
+                def g(m):
+                    [y for y in [1, 2, 3] if y == m]
+
+                {arms}
+                "#
         )
     };
     assert_eq!(
@@ -4643,16 +5022,18 @@ fn an_arm_whose_domain_is_inferred_joins_like_a_written_one() {
         "box([q + 1 for q in [1, 2]]) if True else box([q + 1 for q in [1, 2, 3]])",
     ] {
         for shape in [
-            format!(
-                r"
-x = {arms}
-[y + 1 for y in x]"
+            indoc::formatdoc!(
+                r#"
+
+                    x = {arms}
+                    [y + 1 for y in x]"#
             ),
-            format!(
-                r"
-def f(c):
-    [y + 1 for y in c]
-f({arms})"
+            indoc::formatdoc!(
+                r#"
+
+                    def f(c):
+                        [y + 1 for y in c]
+                    f({arms})"#
             ),
         ] {
             assert_eq!(
@@ -4664,9 +5045,10 @@ f({arms})"
     }
     // A *filtered* arm is the same rule with a refinement riding the variable, and the
     // restriction stays on its own candidate.
-    let filtered = r"
-x = box([q for q in [1, 2, 3] if q > 1]) if True else box([1, 2])
-[y + 1 for y in x]";
+    let filtered = indoc::indoc! {r#"
+
+        x = box([q for q in [1, 2, 3] if q > 1]) if True else box([1, 2])
+        [y + 1 for y in x]"#};
     let ty = infer_program(filtered);
     let candidates = projected_candidates(&ty);
     assert_eq!(candidates.len(), 2, "expected both arms, got {ty}");
@@ -4682,10 +5064,10 @@ x = box([q for q in [1, 2, 3] if q > 1]) if True else box([1, 2])
     );
     // Nested conditionals over inferred domains flatten the same way.
     assert_eq!(
-        projected_candidates(&infer_program(
-            "d = 4 > 3\nx = box([q + 1 for q in [1, 2]]) if True else (box([1, 2, 3]) if d else box([1, 2, 3, 4]))\n\
-             [y + 1 for y in x]"
-        )),
+        projected_candidates(&infer_program(indoc::indoc! {r#"
+                d = 4 > 3
+                x = box([q + 1 for q in [1, 2]]) if True else (box([1, 2, 3]) if d else box([1, 2, 3, 4]))
+                [y + 1 for y in x]"#})),
         ranges(&[2, 3, 4])
     );
 }
@@ -4702,8 +5084,13 @@ x = box([q for q in [1, 2, 3] if q > 1]) if True else box([1, 2])
 /// position that has lost the contravariant-domain context its candidates are alternatives in.
 #[test]
 fn a_udf_call_arm_joins_through_the_bound_graph() {
-    let program = "def g(n):\n    [1,2]\ndef h(n):\n    [1,2,3]\n\
-                   x = box(g(0)) if True else box(h(0))\n[y + 1 for y in x]";
+    let program = indoc::indoc! {r#"
+        def g(n):
+            [1,2]
+        def h(n):
+            [1,2,3]
+        x = box(g(0)) if True else box(h(0))
+        [y + 1 for y in x]"#};
     assert_eq!(
         projected_candidates(&infer_program(program)),
         ranges(&[2, 3]),
@@ -4729,23 +5116,21 @@ fn a_lambda_param_use_falls_back_to_the_param_slot() {
     // The collection case: without the fallback this is `Conflicting Types: 0..2 | 0..3`
     // at the `__iter_record` use inside the comprehension.
     assert_eq!(
-        projected_candidates(&infer_program(
-            r"
-def f(c):
-    [y + 1 for y in c]
-f(box([1,2]) if True else box([1,2,3]))"
-        )),
+        projected_candidates(&infer_program(indoc::indoc! {r#"
+
+                def f(c):
+                    [y + 1 for y in c]
+                f(box([1,2]) if True else box([1,2,3]))"#})),
         ranges(&[2, 3])
     );
     // And the standalone read stays load-bearing: a projection's domain is recovered from a
     // record-typed parameter's uses, so those reads must still resolve.
     assert_eq!(
-        infer_program(
-            r"
-def f(r):
-    r.age + 1
-f((age=3, name=7))"
-        ),
+        infer_program(indoc::indoc! {r#"
+
+                def f(r):
+                    r.age + 1
+                f((age=3, name=7))"#}),
         int()
     );
 }
@@ -4761,10 +5146,11 @@ f((age=3, name=7))"
 /// has.
 #[test]
 fn a_conditional_collection_survives_every_shape_of_consumer() {
-    let c = r"
-c = 3 > 2
-x = box([1, 2]) if c else box([1, 2, 3])
-";
+    let c = indoc::indoc! {r#"
+
+        c = 3 > 2
+        x = box([1, 2]) if c else box([1, 2, 3])
+        "#};
     // One spelling, whichever way the sum was reached. `box` boxes a data function's
     // *domain*, so the join of two boxed arms lists domains, and a consumer that rebuilds
     // the sum from what it named lists the same ones.
@@ -4784,21 +5170,21 @@ x = box([1, 2]) if c else box([1, 2, 3])
     // so nothing is lost and there is no sum to introduce. This is the control for every
     // case above — `box` is required exactly where the domains differ.
     assert_eq!(
-        infer_program(
-            r"
-c = 3 > 2
-x = [1, 2] if c else [3, 4]
-[y + 1 for y in x]"
-        )
+        infer_program(indoc::indoc! {r#"
+
+                c = 3 > 2
+                x = [1, 2] if c else [3, 4]
+                [y + 1 for y in x]"#})
         .to_string(),
         "(0..2 ⤇ Int)"
     );
     // Nothing about the join is arity-two.
     assert_eq!(
-        projected_candidates(&infer_program(
-            "c = 3 > 2\nd = 4 > 3\nx = box([1, 2]) if c else (box([1, 2, 3]) if d else box([1, 2, 3, 4]))\n\
-             [y + 1 for y in x]"
-        )),
+        projected_candidates(&infer_program(indoc::indoc! {r#"
+                c = 3 > 2
+                d = 4 > 3
+                x = box([1, 2]) if c else (box([1, 2, 3]) if d else box([1, 2, 3, 4]))
+                [y + 1 for y in x]"#})),
         ranges(&[2, 3, 4])
     );
     // A filtered comprehension is domain-preserving too, and its restriction rides the
@@ -4834,10 +5220,11 @@ x = [1, 2] if c else [3, 4]
 /// property of the argument, not of the conditional.
 #[test]
 fn a_conditional_over_parameters_forms_its_sum_at_the_call_not_the_definition() {
-    let f = r"
-def f(a, b, d):
-    b if a else d
-";
+    let f = indoc::indoc! {r#"
+
+        def f(a, b, d):
+            b if a else d
+        "#};
     // Scalar arms: an ordinary join, no collection involved.
     assert_eq!(infer_program(&format!("{f}f(True, 1, 2)")), int());
     // Collection arms: the candidates come from the *arguments*.
@@ -4848,10 +5235,11 @@ def f(a, b, d):
     // And a domain-preserving consumer is keyed by its witness, exactly as over a
     // directly-bound one.
     assert_eq!(
-        projected_candidates(&infer_program(&format!(
-            r"
-{f}x = f(True, box([1,2]), box([1,2,3]))
-[y + 1 for y in x]"
+        projected_candidates(&infer_program(&indoc::formatdoc!(
+            r#"
+
+                {f}x = f(True, box([1,2]), box([1,2,3]))
+                [y + 1 for y in x]"#
         ))),
         ranges(&[2, 3])
     );
@@ -4876,15 +5264,14 @@ fn each_specialization_of_a_generic_conditional_gets_its_own_witness() {
     // definition-side binder for the copies to share. (`f(a, b, d) = b if a else d` forms
     // its sum at the call instead, so it has none.) Element types differ per call so the
     // two uses really are two specializations rather than one memoized copy.
-    let ty = infer_program(
-        r"
-def f(a, b):
-    box([b for z in [1, 2]]) if a else box([b for z in [1, 2, 3]])
-c = 3 > 2
-x = f(c, 1)
-y = f(c, True)
-(x, y)",
-    );
+    let ty = infer_program(indoc::indoc! {r#"
+
+            def f(a, b):
+                box([b for z in [1, 2]]) if a else box([b for z in [1, 2, 3]])
+            c = 3 > 2
+            x = f(c, 1)
+            y = f(c, True)
+            (x, y)"#});
     let Type::Tuple(parts) = &ty else {
         panic!("expected a pair of the two specializations' results, got {ty}")
     };
@@ -4910,14 +5297,13 @@ y = f(c, True)
 /// even under conflation, so they would not test it.
 #[test]
 fn two_conditional_sources_keep_their_witnesses_apart() {
-    let ty = infer_program(
-        r"
-c = 3 > 2
-d = 4 > 3
-a = box([1, 2]) if c else box([1, 2, 3])
-b = box([10, 20, 30, 40]) if d else box([10, 20, 30, 40, 50])
-[x + y for x in a for y in b]",
-    );
+    let ty = infer_program(indoc::indoc! {r#"
+
+            c = 3 > 2
+            d = 4 > 3
+            a = box([1, 2]) if c else box([1, 2, 3])
+            b = box([10, 20, 30, 40]) if d else box([10, 20, 30, 40, 50])
+            [x + y for x in a for y in b]"#});
     // Asserted structurally, not on the rendering: the index tuple's two components are
     // the two sources' witnesses, each ranging over its own source's domains.
     assert_eq!(
@@ -4937,12 +5323,11 @@ b = box([10, 20, 30, 40]) if d else box([10, 20, 30, 40, 50])
 /// binder is the source's.
 #[test]
 fn a_comprehension_is_keyed_by_its_sources_witness() {
-    let ty = infer_program(
-        r"
-c = 3 > 2
-x = box([1, 2]) if c else box([1, 2, 3])
-(x, [y + 1 for y in x])",
-    );
+    let ty = infer_program(indoc::indoc! {r#"
+
+            c = 3 > 2
+            x = box([1, 2]) if c else box([1, 2, 3])
+            (x, [y + 1 for y in x])"#});
     let Type::Tuple(parts) = &ty else {
         panic!("expected (source, comprehension), got {ty}")
     };
@@ -4965,12 +5350,11 @@ x = box([1, 2]) if c else box([1, 2, 3])
 /// `two_conditional_sources_keep_their_witnesses_apart` covers the separating half.
 #[test]
 fn one_collection_consumed_twice_is_one_collection() {
-    let ty = infer_program(
-        r"
-c = 3 > 2
-x = box([1, 2]) if c else box([1, 2, 3])
-([y for y in x], [z for z in x])",
-    );
+    let ty = infer_program(indoc::indoc! {r#"
+
+            c = 3 > 2
+            x = box([1, 2]) if c else box([1, 2, 3])
+            ([y for y in x], [z for z in x])"#});
     let Type::Tuple(parts) = &ty else {
         panic!("expected a pair of collections, got {ty}")
     };
@@ -4994,14 +5378,13 @@ x = box([1, 2]) if c else box([1, 2, 3])
 /// program names the binder the scheme was written with.
 #[test]
 fn independent_conditionals_at_equal_domains_stay_apart() {
-    let ty = infer_program(
-        r"
-c = 3 > 2
-d = 4 > 3
-a = box([1, 2]) if c else box([1, 2, 3])
-b = box([4, 5]) if d else box([4, 5, 6])
-(a, b)",
-    );
+    let ty = infer_program(indoc::indoc! {r#"
+
+            c = 3 > 2
+            d = 4 > 3
+            a = box([1, 2]) if c else box([1, 2, 3])
+            b = box([4, 5]) if d else box([4, 5, 6])
+            (a, b)"#});
     let Type::Tuple(parts) = &ty else {
         panic!("expected a pair, got {ty}")
     };
@@ -5029,10 +5412,11 @@ b = box([4, 5]) if d else box([4, 5, 6])
 /// solver refuses (see `coalesce`).
 #[test]
 fn conditional_collection_arms_must_share_an_element_type() {
-    let c = r#"
-c = 3 > 2
-x = [1, 2] if c else ["a", "b", "c"]
-"#;
+    let c = indoc::indoc! {r#"
+
+        c = 3 > 2
+        x = [1, 2] if c else ["a", "b", "c"]
+        "#};
     for tail in ["x", "sum(x)", "[y for y in x]"] {
         assert!(
             !infer_program_err(&format!("{c}{tail}")).is_empty(),
@@ -5053,11 +5437,12 @@ x = [1, 2] if c else ["a", "b", "c"]
 fn conditional_collection_into_a_list_annotated_param() {
     let c = "box([1, 2]) if True else box([1, 2, 3])";
     assert_eq!(
-        infer_program(&format!(
-            r"
-def f(c: List(Int)):
-    sum(c)
-f({c})"
+        infer_program(&indoc::formatdoc!(
+            r#"
+
+                def f(c: List(Int)):
+                    sum(c)
+                f({c})"#
         )),
         int()
     );
@@ -5117,11 +5502,12 @@ fn a_refinement_belongs_to_one_candidate_not_the_sum() {
 /// `src/ccl/design/type-inference.md`, "Membership is decided at materialization".
 #[test]
 fn test_kinding_constraint_survives_instantiation() {
-    let def = r"
-def make(s):
-    r: List(Int) = box([y + 1 for y in s])
-    r
-";
+    let def = indoc::indoc! {r#"
+
+        def make(s):
+            r: List(Int) = box([y + 1 for y in s])
+            r
+        "#};
     assert_eq!(
         infer_program(&format!("{def}make([1,2,3])")).to_string(),
         // The exact annotation is what `r` is bound at, so the use site's answer is
@@ -5160,11 +5546,10 @@ fn box_builds_the_singleton_sum_over_its_argument() {
 #[test]
 fn two_boxes_at_a_join_keep_both_candidates() {
     assert_eq!(
-        infer_program(
-            r"
-c: Bool = True
-box([1, 2]) if c else box([1, 2, 3])"
-        )
+        infer_program(indoc::indoc! {r#"
+
+                c: Bool = True
+                box([1, 2]) if c else box([1, 2, 3])"#})
         .to_string(),
         "Σ (σ : [0..2, 0..3]). (σ ⤇ Int)"
     );
@@ -5179,11 +5564,10 @@ box([1, 2]) if c else box([1, 2, 3])"
 /// without a `box` at all.
 #[test]
 fn box_rejects_a_scalar() {
-    let errs = infer_program_err(
-        r#"
-c: Bool = True
-box(1) if c else box("x")"#,
-    );
+    let errs = infer_program_err(indoc::indoc! {r#"
+
+            c: Bool = True
+            box(1) if c else box("x")"#});
     assert!(
         errs.iter()
             .any(|e| matches!(e, InferError::ExpectedFunction { .. })),
@@ -5198,12 +5582,11 @@ box(1) if c else box("x")"#,
 #[test]
 fn a_box_meeting_an_unboxed_arm_is_rejected() {
     assert!(
-        !infer_program_err(
-            r"
-c: Bool = True
-xs = [1, 2]
-box(xs) if c else xs"
-        )
+        !infer_program_err(indoc::indoc! {r#"
+
+                c: Bool = True
+                xs = [1, 2]
+                box(xs) if c else xs"#})
         .is_empty(),
         "a boxed arm joined with an unboxed one must not type"
     );
@@ -5229,22 +5612,20 @@ box(xs) if c else xs"
 #[test]
 fn a_comprehension_over_a_list_param_is_keyed_by_the_argument() {
     assert_eq!(
-        infer_program(
-            r"
-def f(a: List(Int)):
-    [x + 1 for x in a]
-f(box([1, 2, 3]))"
-        )
+        infer_program(indoc::indoc! {r#"
+
+                def f(a: List(Int)):
+                    [x + 1 for x in a]
+                f(box([1, 2, 3]))"#})
         .to_string(),
         "(0..3 ⤇ Int)"
     );
     assert_eq!(
-        infer_program(
-            r"
-def f(a: List(Int)):
-    a
-f(box([1, 2, 3]))"
-        )
+        infer_program(indoc::indoc! {r#"
+
+                def f(a: List(Int)):
+                    a
+                f(box([1, 2, 3]))"#})
         .to_string(),
         "Σ (σ : UIntRanges). (σ ⤇ Int)"
     );
@@ -5257,13 +5638,12 @@ f(box([1, 2, 3]))"
 #[test]
 fn a_conditional_collection_flows_into_a_list_param() {
     assert_eq!(
-        infer_program(
-            r"
-c: Bool = True
-def f(a: List(Int)):
-    sum(a)
-f(box([1, 2]) if c else box([1, 2, 3]))"
-        ),
+        infer_program(indoc::indoc! {r#"
+
+                c: Bool = True
+                def f(a: List(Int)):
+                    sum(a)
+                f(box([1, 2]) if c else box([1, 2, 3]))"#}),
         int()
     );
 }
@@ -5273,13 +5653,12 @@ f(box([1, 2]) if c else box([1, 2, 3]))"
 #[test]
 fn a_conditional_collection_flows_into_a_collection_param() {
     assert_eq!(
-        infer_program(
-            r"
-c: Bool = True
-def f(a: Collection(Int)):
-    sum(a)
-f(box([1, 2]) if c else box([1, 2, 3]))"
-        ),
+        infer_program(indoc::indoc! {r#"
+
+                c: Bool = True
+                def f(a: Collection(Int)):
+                    sum(a)
+                f(box([1, 2]) if c else box([1, 2, 3]))"#}),
         int()
     );
 }
@@ -5294,7 +5673,12 @@ f(box([1, 2]) if c else box([1, 2, 3]))"
 #[test]
 fn a_boxed_dependent_collection_declares_its_binder_on_the_witness() {
     let gb = "box(groupby([1,2,3], \\x -> x))";
-    let bare = infer_program(&format!("g = {gb}\ng")).to_string();
+    let bare = infer_program(&indoc::formatdoc!(
+        r#"
+        g = {gb}
+        g"#
+    ))
+    .to_string();
     // The candidate is the argument's domain *exactly* — the group-by's present-key
     // domain, refined — because `box`'s candidate position is invariant. What this pins is
     // one level up: the Pi binder is declared on the witness `σ`, not on that candidate.
@@ -5314,12 +5698,11 @@ fn a_boxed_dependent_collection_declares_its_binder_on_the_witness() {
 #[test]
 fn a_filtered_collection_is_not_a_list() {
     assert!(
-        !infer_program_err(
-            r"
-def f(a: List(Int)):
-    sum(a)
-f(box([x for x in [1, 2, 3] if x > 1]))"
-        )
+        !infer_program_err(indoc::indoc! {r#"
+
+                def f(a: List(Int)):
+                    sum(a)
+                f(box([x for x in [1, 2, 3] if x > 1]))"#})
         .is_empty()
     );
 }
@@ -5332,7 +5715,12 @@ f(box([x for x in [1, 2, 3] if x > 1]))"
 /// witness as the consumer's domain and flowing the element type through.
 #[test]
 fn a_boxed_collection_is_consumable() {
-    assert_eq!(infer_program("c: Bool = True\nsum(box([1, 2, 3]))"), int());
+    assert_eq!(
+        infer_program(indoc::indoc! {r#"
+        c: Bool = True
+        sum(box([1, 2, 3]))"#}),
+        int()
+    );
 }
 
 /// The case the whole `box` design exists for: two `box`ed arms join to one sum over both
@@ -5340,7 +5728,9 @@ fn a_boxed_collection_is_consumable() {
 #[test]
 fn a_boxed_conditional_collection_is_consumable() {
     assert_eq!(
-        infer_program("c: Bool = True\nsum(box([1]) if c else box([2, 3]))"),
+        infer_program(indoc::indoc! {r#"
+            c: Bool = True
+            sum(box([1]) if c else box([2, 3]))"#}),
         int()
     );
 }
@@ -5350,7 +5740,10 @@ fn a_boxed_conditional_collection_is_consumable() {
 #[test]
 fn a_boxed_conditional_keeps_both_candidates() {
     assert_eq!(
-        infer_program("c: Bool = True\nbox([1]) if c else box([2, 3])").to_string(),
+        infer_program(indoc::indoc! {r#"
+            c: Bool = True
+            box([1]) if c else box([2, 3])"#})
+        .to_string(),
         "Σ (σ : [0..1, 0..2]). (σ ⤇ Int)"
     );
 }
@@ -5362,8 +5755,12 @@ fn a_boxed_conditional_keeps_both_candidates() {
 #[case("List(Int)")]
 #[case("Collection(Int)")]
 fn a_boxed_conditional_collection_reaches_a_collection_annotation(#[case] annotation: &str) {
-    let program = format!(
-        "c: Bool = True\ndef g(a: {annotation}):\n    sum(a)\ng(box([1]) if c else box([2, 3]))"
+    let program = indoc::formatdoc!(
+        r#"
+            c: Bool = True
+            def g(a: {annotation}):
+                sum(a)
+            g(box([1]) if c else box([2, 3]))"#
     );
     assert_eq!(infer_program(&program), int(), "{program}");
 }
@@ -5374,13 +5771,12 @@ fn a_boxed_conditional_collection_reaches_a_collection_annotation(#[case] annota
 #[test]
 fn a_boxed_collection_joins_through_a_user_function() {
     assert_eq!(
-        infer_program(
-            r"
-c: Bool = True
-def f(xs):
-    box(xs)
-sum(f([1]) if c else f([2, 3]))"
-        ),
+        infer_program(indoc::indoc! {r#"
+
+                c: Bool = True
+                def f(xs):
+                    box(xs)
+                sum(f([1]) if c else f([2, 3]))"#}),
         int()
     );
 }
@@ -5401,15 +5797,14 @@ sum(f([1]) if c else f([2, 3]))"
 /// sharing is the only variable.
 #[test]
 fn a_source_shared_between_two_joins_keeps_the_joins_apart() {
-    let ty = infer_program(
-        r"
-c = 3 > 2
-d = 4 > 3
-a = box([1, 2])
-x = a if c else box([1, 2, 3])
-y = a if d else box([1, 2, 3, 4, 5])
-[p + q for p in x for q in y]",
-    );
+    let ty = infer_program(indoc::indoc! {r#"
+
+            c = 3 > 2
+            d = 4 > 3
+            a = box([1, 2])
+            x = a if c else box([1, 2, 3])
+            y = a if d else box([1, 2, 3, 4, 5])
+            [p + q for p in x for q in y]"#});
     // Two sources, two witnesses, each over its own candidates.
     assert_eq!(
         projected_kinds(&ty)
@@ -5433,14 +5828,13 @@ fn a_nested_sum_is_consumed_by_an_aggregate() {
     // Through `infer_and_check`: the rules that assumed one binder live at the
     // post-inference wall, where Check re-derives what Emit inferred, so inference alone
     // does not exercise them.
-    let ty = infer_and_check(
-        r"
-c = 3 > 2
-d = 4 > 3
-a = box([1, 2]) if c else box([1, 2, 3])
-b = box([10, 20]) if d else box([10, 20, 30])
-sum([x + y for x in a for y in b])",
-    );
+    let ty = infer_and_check(indoc::indoc! {r#"
+
+            c = 3 > 2
+            d = 4 > 3
+            a = box([1, 2]) if c else box([1, 2, 3])
+            b = box([10, 20]) if d else box([10, 20, 30])
+            sum([x + y for x in a for y in b])"#});
     assert_eq!(
         ty,
         Type::Base(cambra::ccl::BaseType::Int),
@@ -5492,13 +5886,14 @@ fn no_sum_quantifies_an_index() {
     let mut lctx = LoweringContext::default();
     let mut ictx = TypeInferenceContext::new();
     let stmts = parse_module(
-        r"
-c = 3 > 2
-d = 4 > 3
-a = box([1, 2]) if c else box([1, 2, 3])
-b = box([10, 20]) if d else box([10, 20, 30])
-sum([x + y for x in a for y in b])"
-            .trim(),
+        indoc::indoc! {r#"
+
+            c = 3 > 2
+            d = 4 > 3
+            a = box([1, 2]) if c else box([1, 2, 3])
+            b = box([10, 20]) if d else box([10, 20, 30])
+            sum([x + y for x in a for y in b])"#}
+        .trim(),
     );
     let mut expr = lower_uniquified(&stmts, &mut lctx);
     infer(&mut expr, &mut ictx).expect("inference failed");
@@ -5527,20 +5922,32 @@ sum([x + y for x in a for y in b])"
 #[test]
 fn option_is_a_nominal_type() {
     assert_eq!(
-        infer_program("x: Option(Int) = Option::some(1)\nx").to_string(),
+        infer_program(indoc::indoc! {r#"
+            x: Option(Int) = Option::some(1)
+            x"#})
+        .to_string(),
         "Option(Int)"
     );
     assert_eq!(
-        infer_program("x: Option(Int) = Option::none\nx").to_string(),
+        infer_program(indoc::indoc! {r#"
+            x: Option(Int) = Option::none
+            x"#})
+        .to_string(),
         "Option(Int)"
     );
     // The payload still flows: an `Option::some(String)` is not an `Option(Int)`.
     assert!(
-        !infer_program_err("x: Option(Int) = Option::some(\"a\")\nx").is_empty(),
+        !infer_program_err(indoc::indoc! {r#"
+            x: Option(Int) = Option::some("a")
+            x"#})
+        .is_empty(),
         "Option::some(String) must not satisfy Option(Int)"
     );
     assert!(
-        !infer_program_err("x: Option(Int) = `some(1)\nx").is_empty(),
+        !infer_program_err(indoc::indoc! {r#"
+            x: Option(Int) = `some(1)
+            x"#})
+        .is_empty(),
         "`some(1) must not satisfy Option(Int)"
     );
 }
@@ -5552,8 +5959,18 @@ fn option_is_a_nominal_type() {
 fn tuple_projection_keeps_the_elements_singleton() {
     // Projection selects an element rather than computing one, so the element's
     // own singleton survives the projection.
-    assert_eq!(infer_program("t = (1, \"a\")\nt.0"), int_lit(1));
-    assert_eq!(infer_program("t = (1, \"a\")\nt.1"), str_lit("a"));
+    assert_eq!(
+        infer_program(indoc::indoc! {r#"
+        t = (1, "a")
+        t.0"#}),
+        int_lit(1)
+    );
+    assert_eq!(
+        infer_program(indoc::indoc! {r#"
+        t = (1, "a")
+        t.1"#}),
+        str_lit("a")
+    );
 }
 
 /// A proven lookup `c[k]!` is **application**: subscript and call are one operation,
@@ -5570,9 +5987,15 @@ fn tuple_projection_keeps_the_elements_singleton() {
 fn total_subscript_demands_a_provable_index() {
     for program in [
         // A bare `Int` is not provably a member of `0..3`.
-        "def f(a: Array(3, Int), i: Int):\n    a[i]!\nf([1,2,3], 5)",
+        indoc::indoc! {r#"
+            def f(a: Array(3, Int), i: Int):
+                a[i]!
+            f([1,2,3], 5)"#},
         // Nor is a bare key provably present in a map's key domain.
-        "def f(m: Map(Int, Int), k: Int):\n    m[k]!\nf(groupby([1,2,3], \\x -> x), 5)",
+        indoc::indoc! {r#"
+            def f(m: Map(Int, Int), k: Int):
+                m[k]!
+            f(groupby([1,2,3], \x -> x), 5)"#},
     ] {
         assert!(
             !infer_program_err(program).is_empty(),
@@ -5593,26 +6016,49 @@ fn total_subscript_demands_a_provable_index() {
 #[test]
 fn subscript_is_lookup_and_dot_is_projection() {
     // Projection: both keys, on the shapes that have them.
-    assert_eq!(infer_program("t = (1, \"a\")\nt.0"), int_lit(1));
     assert_eq!(
-        infer_program("t = (1, \"a\")\nt.1").to_string(),
+        infer_program(indoc::indoc! {r#"
+        t = (1, "a")
+        t.0"#}),
+        int_lit(1)
+    );
+    assert_eq!(
+        infer_program(indoc::indoc! {r#"
+            t = (1, "a")
+            t.1"#})
+        .to_string(),
         "String@\"a\""
     );
-    assert_eq!(infer_program("r = (a=1, b=2)\nr.b"), int_lit(2));
+    assert_eq!(
+        infer_program(indoc::indoc! {r#"
+        r = (a=1, b=2)
+        r.b"#}),
+        int_lit(2)
+    );
 
     // Subscripting a tuple is *not* projection: a tuple is a heterogeneous product,
     // not a finite function.
     assert!(
-        !infer_program_err("t = (1, \"a\")\nt[0]!").is_empty(),
+        !infer_program_err(indoc::indoc! {r#"
+            t = (1, "a")
+            t[0]!"#})
+        .is_empty(),
         "a tuple has no domain to look up in"
     );
 
     // BUG: these valid lookups should have type Int and evaluate to 10. All three spellings
     // fail the same undischarged-membership edge. Replace rejection with success when fixed.
     for program in [
-        "xs = [10, 20, 30]\nxs[0]!",
-        "xs = [10, 20, 30]\ni = 0\nxs[i]!",
-        "xs = [10, 20, 30]\nxs(0)",
+        indoc::indoc! {r#"
+            xs = [10, 20, 30]
+            xs[0]!"#},
+        indoc::indoc! {r#"
+            xs = [10, 20, 30]
+            i = 0
+            xs[i]!"#},
+        indoc::indoc! {r#"
+            xs = [10, 20, 30]
+            xs(0)"#},
     ] {
         assert!(
             !infer_program_err(program).is_empty(),
@@ -5652,7 +6098,10 @@ fn a_checked_lookup_is_not_an_application() {
 #[test]
 fn a_key_dependent_lookup_discharges_the_key_binder() {
     assert_eq!(
-        infer_program("g = groupby([1, 2, 3], \\x -> x)\ng[1]").to_string(),
+        infer_program(indoc::indoc! {r#"
+            g = groupby([1, 2, 3], \x -> x)
+            g[1]"#})
+        .to_string(),
         "Option(({0..3 | __elem \u{25b7} [1, 2, 3] \u{25b7} (\u{3bb} x : Int \u{2192} x) == 1} \u{2907} Int))",
         "the group's predicate must name the key it was looked up at"
     );
@@ -5665,14 +6114,24 @@ fn a_key_dependent_lookup_discharges_the_key_binder() {
 fn checked_lookup_boundaries() {
     for (program, why) in [
         (
-            "xs = [10, 20, 30]\nxs[0]",
+            indoc::indoc! {r#"
+                xs = [10, 20, 30]
+                xs[0]"#},
             "a range domain has no membership refinement",
         ),
         (
-            "def f(m <: Map(Int, Int)):\n    m[1]\nf",
+            indoc::indoc! {r#"
+                def f(m <: Map(Int, Int)):
+                    m[1]
+                f"#},
             "a bounded parameter is unresolved where the relaxation runs",
         ),
-        ("t = (1, \"a\")\nt[0]", "a tuple is not a finite function"),
+        (
+            indoc::indoc! {r#"
+            t = (1, "a")
+            t[0]"#},
+            "a tuple is not a finite function",
+        ),
     ] {
         assert!(
             !infer_program_err(program).is_empty(),
@@ -5682,10 +6141,13 @@ fn checked_lookup_boundaries() {
     // The exact form binds `m` at `Map(Int, Int)` itself, so the relaxation has a domain
     // to strip the token from and the lookup answers `Option(Int)`.
     assert_eq!(
-        infer_program("def f(m: Map(Int, Int)):\n    m[1]\nf")
-            .codomain()
-            .expect("f is a function")
-            .to_string(),
+        infer_program(indoc::indoc! {r#"
+            def f(m: Map(Int, Int)):
+                m[1]
+            f"#})
+        .codomain()
+        .expect("f is a function")
+        .to_string(),
         "Option(Int)"
     );
 }
@@ -5696,11 +6158,17 @@ fn checked_lookup_boundaries() {
 #[test]
 fn checked_lookup_on_a_set_is_membership_as_a_value() {
     assert_eq!(
-        infer_program("s = set([1, 2, 3])\ns[1]").to_string(),
+        infer_program(indoc::indoc! {r#"
+            s = set([1, 2, 3])
+            s[1]"#})
+        .to_string(),
         "Option(Unit)"
     );
     assert!(
-        !infer_program_err("s = set([1, 2, 3])\ns[\"nope\"]").is_empty(),
+        !infer_program_err(indoc::indoc! {r#"
+            s = set([1, 2, 3])
+            s["nope"]"#})
+        .is_empty(),
         "a String key must not reach an Int-keyed set"
     );
 }
@@ -5765,11 +6233,17 @@ fn a_product_keys_a_collection() {
 #[test]
 fn checked_lookup_on_a_map_answers_an_option_of_the_value() {
     assert_eq!(
-        infer_program("m = map([(1, 10), (2, 20)])\nm[1]").to_string(),
+        infer_program(indoc::indoc! {r#"
+            m = map([(1, 10), (2, 20)])
+            m[1]"#})
+        .to_string(),
         "Option(Int)"
     );
     assert!(
-        !infer_program_err("m = map([(1, 10), (2, 20)])\nm[\"nope\"]").is_empty(),
+        !infer_program_err(indoc::indoc! {r#"
+            m = map([(1, 10), (2, 20)])
+            m["nope"]"#})
+        .is_empty(),
         "a String key must not reach an Int-keyed map"
     );
 }
@@ -5807,9 +6281,14 @@ fn a_keyed_write_types_against_the_collection(#[case] code: &str) {
 #[case::wrong_key("m[7] := 3", "keyed write key of `m`")]
 #[case::wrong_value("m[\"c\"] := \"nope\"", "keyed write to mutable variable `m`")]
 fn a_keyed_write_checks_key_and_value_separately(#[case] write: &str, #[case] expected: &str) {
-    let code = format!(
-        "m: Mut(Map(String, Int), Txn) := box(map([(\"a\", 1), (\"b\", 2)]))\n\
-         for r in [1, 2, 3]:\n    with begin():\n        {write}\n0\n"
+    let code = indoc::formatdoc!(
+        r#"
+            m: Mut(Map(String, Int), Txn) := box(map([("a", 1), ("b", 2)]))
+            for r in [1, 2, 3]:
+                with begin():
+                    {write}
+            0
+            "#
     );
     let errs = infer_program_err(&code);
     assert!(
