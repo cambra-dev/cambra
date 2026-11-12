@@ -1754,7 +1754,9 @@ pub(crate) struct FeedSite {
     /// type inference recorded on it ([`TypedExprNode::Feed`]), which reads the loops around
     /// the feed but no read of a mutable variable: the writer's snapshot replaces such a read
     /// with the previous value the history holds, so a type reading it would read the history
-    /// that holds the row. An inner loop's tap collection is typed by that loop's fold.
+    /// that holds the row. An inner loop's tap collection is typed by that loop's fold, and a
+    /// feed-only inner loop's from each feed's row
+    /// ([`crate::ccl::channelize::loop_contributions`]).
     pub(crate) ty: Type,
     /// The feed statement this tap is recorded against, so the view resolves to
     /// the `<<` the user wrote rather than to the enclosing loop.

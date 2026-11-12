@@ -1918,7 +1918,7 @@ impl Subst {
                     name_occurrence: name_occurrence.clone(),
                     name,
                     value,
-                    row: row.clone(),
+                    row: self.apply_type(row),
                     site: site.clone(),
                 }
             }
@@ -4812,6 +4812,31 @@ mod tests {
             Type::Base(crate::ccl::BaseType::Int),
             "a renamed occurrence keeps its type"
         );
+    }
+
+    // A `Feed`'s row is a type slot `map_children` cannot reach, so the transport
+    // path rewrites it alongside the handle.
+    #[test]
+    fn apply_expr_renames_in_the_feed_row() {
+        let row = Type::refined_one(
+            Type::Base(crate::ccl::BaseType::Int),
+            Refinement::born(Rc::new(gt(var("i"), var("k")))),
+        );
+        let e = TypedExpr::new(TypedExprNode::Feed {
+            name_occurrence: Occurrence::mint(),
+            name: Name::raw("d"),
+            value: Box::new(int(1)),
+            row,
+            site: None,
+        });
+        let out = Subst::rename("k", "j").apply_expr(&e);
+        let TypedExprNode::Feed { row, .. } = &out.node else {
+            panic!("feed preserved");
+        };
+        let [r] = row.refinements() else {
+            panic!("expected a refined row");
+        };
+        assert_eq!(*r.predicate, gt(var("i"), var("j")));
     }
 
     #[test]

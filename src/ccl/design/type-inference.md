@@ -2697,6 +2697,14 @@ is joined over. The row is what mutability elimination types a feed's tap at
 is the join over every place that feeds the channel, and a channel fed from one place reads its
 loops through its key, which a writer body does not hold.
 
+A feed into a joined binder, a `def`'s parameter or a pattern's binder, records the binder's channel
+value type as its row. The channel arrives through the binder, so the binders in scope at it take
+one value per call rather than one value where the channel is declared. A row stated among them
+reads a call's argument, and after the call is inlined that argument is the caller's expression: a
+read of a mutable variable the caller's loop writes, say. The channel value type is the contract
+the contribution is checked against, and the call's argument edge carries it to the caller's
+channel, so it reads no argument the parameter does not.
+
 A history's type is the join of every value written to it (`docs/chl-spec.md`, "Joining the types
 of several values"). The contribution is joined over the values of each joined binder. A loop's or
 lambda's binder takes one per iteration or call; a pattern's binder takes one per evaluation of its

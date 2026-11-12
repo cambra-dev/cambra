@@ -885,7 +885,11 @@ struct Contribution {
 ///
 /// `feed_loop` is a loop, `λ 𝑟 → (𝑟 ▷ 𝑠) ▷ (λ 𝑥 → body)`, with no mutable variable written in
 /// `body`.
-pub(crate) fn loop_contributions(feed_loop: Expr) -> Vec<LoopFeed> {
+///
+/// Each contribution is typed from its feed's row rather than from the fed value's type
+/// ([`at_rows`]).
+pub(crate) fn loop_contributions(mut feed_loop: Expr) -> Vec<LoopFeed> {
+    at_rows(&mut feed_loop);
     let mut contributions = Vec::new();
     let mut rest = feed_loop;
     for defer in collect_feed_target_names(&rest) {
@@ -913,6 +917,24 @@ pub(crate) fn loop_contributions(feed_loop: Expr) -> Vec<LoopFeed> {
         }
     }
     contributions
+}
+
+/// Type each fed value in `expr` at its feed's row, which the value inhabits. Inside a
+/// recurrence the fed value reads the writer's snapshot of a mutable variable, so its own type
+/// can read `__prev` once the decision is read at a position. The row reads only the loops
+/// around the feed (`src/ccl/design/type-inference.md`, "A contribution crosses the binders
+/// after its target"). Every level extraction wraps around the value, a lambda over a loop's
+/// variable or a loop indexed by its position, states its type from the value's, so typing the
+/// value at the row lifts the row through each level.
+fn at_rows(expr: &mut Expr) {
+    if let TypedExprNode::Feed { value, row, .. } = &mut expr.node {
+        assert!(
+            !matches!(row, Type::Hole),
+            "a feed reaching mutability elimination carries the row inference recorded"
+        );
+        value.ty = row.clone();
+    }
+    expr.walk_children_mut(at_rows);
 }
 
 /// `e` indexed by its position where it is the chain `source ≫ (λ 𝑥 → body)` a loop's

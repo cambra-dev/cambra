@@ -2383,3 +2383,70 @@ fn a_feed_under_a_loop_writing_a_mutable_variable(#[case] source: &str, #[case] 
 fn a_feed_in_a_writing_branch_shares_its_bindings(#[case] code: &str, #[case] expected: i64) {
     check_scalar(code, Value::Int(expected));
 }
+
+/// A row fed through a `Feed` parameter, computed by a refined operation over the read of an
+/// accumulator the caller's loop writes. The tap carries the row at the parameter's value type,
+/// which reads no argument of the call.
+///
+/// The unannotated variant is pinned on its failure as a known gap: the contribution's bound
+/// leaves the scope of the tuple parameter the parameters lower to. Under a loop of the `def`,
+/// the tap collection is typed from the feed's row lifted through that loop's level.
+#[rstest]
+#[case::annotated(indoc! {r#"
+    def emit(v: Int, out: Feed(Int)):
+        out << v ^+ 1
+"#})]
+#[should_panic(expected = "the bound left its binder's scope without a mediating discharge")]
+#[case::unannotated(indoc! {r#"
+    def emit(v, out):
+        out << v ^+ 1
+"#})]
+#[case::feed_first(indoc! {r#"
+    def emit(out: Feed(Int), v: Int):
+        out << v ^+ 1
+"#})]
+#[case::under_a_loop_of_the_def(indoc! {r#"
+    def emit(v: Int, out: Feed(Int)):
+        for j in [0]:
+            out << v ^+ 1 ^+ j
+"#})]
+fn refined_read_fed_through_a_feed_parameter(#[case] def: &str) {
+    let call = if def.contains("emit(out") {
+        "emit(out, x)"
+    } else {
+        "emit(x, out)"
+    };
+    let program = format!(
+        "{def}\n{}",
+        indoc! {r#"
+            x := 0
+            out: Feed(_)
+            for i in [1, 2, 3]:
+                CALL
+                x += 1
+            sum(out)
+        "#}
+        .replace("CALL", call),
+    );
+    check_tile(&program, Tile::Scalar(ColumnValue::Ints(vec![6])))
+}
+
+/// A row computed by a refined operation over the read of an accumulator, fed from a loop
+/// nested in the loop that writes the accumulator. The tap carries the feed's row, lifted
+/// through the nested loop's collection level, rather than the fed value's type, which reads
+/// the previous value of the accumulator.
+#[test]
+fn refined_read_fed_from_a_nested_loop() {
+    check_scalar(
+        indoc! {"
+            x := 0
+            out: Feed(_)
+            for i in [1, 2, 3]:
+                for j in [10, 20]:
+                    out << x ^+ j
+                x += 1
+            sum(out)
+        "},
+        Value::Int(96),
+    );
+}

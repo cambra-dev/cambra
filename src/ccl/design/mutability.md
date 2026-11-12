@@ -911,7 +911,10 @@ The row reads the loops around the feed and no read of a mutable variable, so it
 without the snapshot the writer reads it through. A type reading the snapshot would read `__prev`,
 the write set the history holds before the position, once the decision is read at a position: the
 tap would then read the history that holds it, which `read_at_position` refuses. An inner loop's tap
-collection is typed by that loop's fold.
+collection is typed by that loop's fold. A feed-only inner loop's collection is typed from each
+feed's row, lifted through one collection level per loop between the feed and the writer
+(`channelize::loop_contributions`), so it holds no read of the writer's snapshot either
+(`refined_read_fed_from_a_nested_loop` in `tests/it/compilation_pipeline/feeds_cases.rs`).
 
 A `let` bound to an `if` or a `match` whose branches write is walked the same way, and the value
 it binds merges as a variable does: `Case[𝑔ᵢ → 𝑣ᵢ]` over the values the branches end in, each

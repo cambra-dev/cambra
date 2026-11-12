@@ -1406,7 +1406,20 @@ impl InferCtx {
     /// into recurrences (`mut_elim::FeedSite`). The channel's own row type is no substitute:
     /// a channel fed from one place reads the loops through its key, which the writer's
     /// parameter does not hold.
-    pub(super) fn feed_row(&mut self, target: &Name, value: &Type) -> Type {
+    ///
+    /// A `target` bound by a joined binder, a `def`'s parameter or a pattern's binder, holds a
+    /// channel that arrives through the binder. The row is then `channel`'s value type, the
+    /// contract the call's argument edge carries to the caller
+    /// (`src/ccl/design/type-inference.md`, "A contribution crosses the binders after its target").
+    pub(super) fn feed_row(&mut self, target: &Name, value: &Type, channel: &Type) -> Type {
+        if matches!(self.exit_of(target), ScopeExit::Join) {
+            let Type::Fun { codomain, .. } = channel.peel_refinements() else {
+                unreachable!(
+                    "a feed's channel is the data function `domain ⤇ value`, got {channel}"
+                )
+            };
+            return (**codomain).clone();
+        }
         let Some((_, crossed)) = self.telescope.split_at(target) else {
             return value.clone();
         };
