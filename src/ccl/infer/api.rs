@@ -316,7 +316,7 @@ impl StatedRequirement {
 ///
 /// Labels hold a role in the program, an operator name, or an expression written in CCL.
 /// Each field documents its form and whether the message prints it. Unprinted labels
-/// distinguish otherwise equal errors in [`Self::same_defect`]. A compiler-bug report
+/// do not distinguish defects in [`Self::same_defect`]. A compiler-bug report
 /// (`ScopeViolation` or the consistency check) can print CCL.
 /// The location is [`LocatedInferError::node_id`], resolved to a source span by
 /// `compile_program`.
@@ -368,7 +368,7 @@ pub enum InferError {
         /// The product that should have carried `key`.
         found: Box<Type>,
         /// The field access's role, or the CCL expression requiring the field. Omitted
-        /// from the message; retained for [`Self::same_defect`].
+        /// from the message; excluded by [`Self::same_defect`].
         at: String,
     },
     /// A [`Type::Fun`] was required — e.g. in a function-application or
@@ -377,7 +377,7 @@ pub enum InferError {
         /// The actual type of the non-function expression.
         found: Type,
         /// The required function's role, or a label from the consistency check. Omitted
-        /// from the message; retained for [`Self::same_defect`].
+        /// from the message; excluded by [`Self::same_defect`].
         at: String,
     },
     /// A user-written annotation on a binding site conflicts with the inferred type.
@@ -422,7 +422,7 @@ pub enum InferError {
         /// The domains that have no common answer, in the order they were met.
         domains: Vec<Type>,
         /// A role from constraint emission, or the expression written in CCL at coalesce.
-        /// Omitted from the message; retained for [`Self::same_defect`].
+        /// Omitted from the message; excluded by [`Self::same_defect`].
         origin: String,
     },
     /// Two closed tuples of different widths met at one position: neither is a subtype of
@@ -431,7 +431,7 @@ pub enum InferError {
         /// The widths that have no merge, as `a 2-tuple and a 3-tuple`.
         widths: String,
         /// A role from constraint emission, or the expression written in CCL at coalesce.
-        /// Omitted from the message; retained for [`Self::same_defect`].
+        /// Omitted from the message; excluded by [`Self::same_defect`].
         origin: String,
     },
     /// A feed or a mutable variable receives a value whose collection keys or function
@@ -466,13 +466,13 @@ pub enum InferError {
     /// AST constructed outside the normal lowering path.
     EmptyCase {
         /// The empty case expression written in CCL. Omitted from the message; retained
-        /// for [`Self::same_defect`].
+        /// excluded by [`Self::same_defect`].
         at: String,
     },
     /// A [`Type::Hole`] placeholder survived past inference.
     UnresolvedHole {
         /// The enclosing expression or binder written in CCL. Omitted from the message;
-        /// retained for [`Self::same_defect`].
+        /// excluded by [`Self::same_defect`].
         at: String,
     },
     /// A [`Type::BoundedHole`] bounded-annotation marker survived past inference.
@@ -482,7 +482,7 @@ pub enum InferError {
     /// so a survivor means a slot inference never normalized.
     UnresolvedBoundedHole {
         /// The enclosing expression or binder written in CCL. Omitted from the message;
-        /// retained for [`Self::same_defect`].
+        /// excluded by [`Self::same_defect`].
         at: String,
     },
     /// An unresolved [`Type::Infer`] variable survived past inference.
@@ -490,7 +490,7 @@ pub enum InferError {
         /// The unresolved variable's id.
         id: InferVarId,
         /// The enclosing expression or binder written in CCL. Omitted from the message;
-        /// retained for [`Self::same_defect`].
+        /// excluded by [`Self::same_defect`].
         at: String,
     },
     /// A binding annotated with a polymorphic type whose right-hand side is not
@@ -601,7 +601,7 @@ pub enum InferError {
         param: String,
         /// What the value reaches, where the typing rule knows it.
         target: Option<EscapeTarget>,
-        /// The escaping value's role. Omitted from the message; retained for
+        /// The escaping value's role. Omitted from the message; excluded by
         /// [`Self::same_defect`].
         at: String,
     },
@@ -672,7 +672,7 @@ pub enum InferError {
         /// The keys it is read at, written `.0`, `.foo`.
         keys: String,
         /// A role from constraint emission, or the expression written in CCL at coalesce.
-        /// Omitted from the message; retained for [`Self::same_defect`].
+        /// Omitted from the message; excluded by [`Self::same_defect`].
         at: String,
     },
     /// A node or binder's tuple stayed open: the program reads positions of it and
@@ -681,7 +681,7 @@ pub enum InferError {
         /// The open tuple, rendered.
         open: String,
         /// The enclosing expression or binder written in CCL. Omitted from the message;
-        /// retained for [`Self::same_defect`].
+        /// excluded by [`Self::same_defect`].
         at: String,
     },
     /// A node's coalesced type references a term binder that is not in scope
@@ -718,7 +718,7 @@ pub enum InferError {
         /// Display string of the conflicting types, e.g. `"handle(0) | handle(1)"`.
         conflicting: String,
         /// A role from constraint emission, or the expression written in CCL at coalesce.
-        /// Omitted from the message; retained for [`Self::same_defect`].
+        /// Omitted from the message; excluded by [`Self::same_defect`].
         origin: String,
     },
     /// A [`Type::History`]-typed expression appears in a value position but is not
@@ -728,7 +728,7 @@ pub enum InferError {
     /// expression of `Mut` type (or a non-variable argument to a `Mut`
     /// parameter) is rejected. Reported by [`check_mut_discipline`].
     MutNotBareVariable {
-        /// The expression written in CCL. Omitted from the message; retained for
+        /// The expression written in CCL. Omitted from the message; excluded by
         /// [`Self::same_defect`].
         at: String,
     },
@@ -740,7 +740,7 @@ pub enum InferError {
     /// child of another `Mut` breaks the "writer set is statically known"
     /// guarantee. Reported by [`check_mut_discipline`].
     MutInCompositeType {
-        /// The expression written in CCL. Omitted from the message; retained for
+        /// The expression written in CCL. Omitted from the message; excluded by
         /// [`Self::same_defect`].
         at: String,
         /// The composite type that illegally contains a `Mut`.
@@ -754,7 +754,7 @@ pub enum InferError {
     /// D)`) and be silently mutated in name only. Reported by
     /// [`check_mut_discipline`].
     MutArgNotMutable {
-        /// The argument written in CCL. Omitted from the message; retained for
+        /// The argument written in CCL. Omitted from the message; excluded by
         /// [`Self::same_defect`].
         at: String,
     },
@@ -770,42 +770,127 @@ pub enum InferError {
 }
 
 impl InferError {
-    /// Whether `self` and `other` report one defect: equal but for the inference
-    /// variables they name, which differ between a definition and a specialization's
-    /// copy of it.
-    // TODO(error-identity): define whether binder spelling and the site label belong to a
-    // defect, then use that comparison in dead-definition deduplication, coalescing,
-    // generalized-binding cascade checks and Blame::infer. Predicate binder spelling
-    // currently makes structural equality disagree with diagnostic-text equality.
+    /// Whether the errors describe the same failure. Source labels and bound-binder
+    /// spellings are presentation; the variant, semantic payload, and free identities
+    /// distinguish failures. Callers compare source nodes or failing graph positions
+    /// separately, so independent sites remain independent.
     pub fn same_defect(&self, other: &InferError) -> bool {
-        fn anonymous(e: &InferError) -> InferError {
-            let mut e = e.clone();
-            if let InferError::UnresolvedInfer { id, .. } = &mut e {
-                *id = InferVarId(0);
-            }
-            e
-        }
-        anonymous(self) == anonymous(other)
-    }
-
-    /// Whether `self` and `other` report one defect at possibly different sites:
-    /// [`same_defect`](Self::same_defect) once the expression each names as its site is
-    /// also dropped. Two nodes whose types carry one conflicting set of bounds raise
-    /// errors equal in all but that label.
-    pub fn same_defect_at_any_site(&self, other: &InferError) -> bool {
-        fn unsited(e: &InferError) -> InferError {
-            let mut e = e.clone();
-            match &mut e {
+        fn identity(error: &InferError) -> (InferError, Vec<Type>) {
+            let mut error = error.clone();
+            match &mut error {
+                InferError::UnresolvedInfer { id, at } => {
+                    *id = InferVarId(0);
+                    at.clear();
+                }
                 InferError::IncompatibleBounds { origin, .. }
                 | InferError::DomainJoinConflict { origin, .. }
                 | InferError::TupleWidthConflict { origin, .. } => origin.clear(),
-                InferError::UnresolvedPartial { at, .. }
-                | InferError::UnresolvedTupleWidth { at, .. } => at.clear(),
+                InferError::MissingField { at, .. }
+                | InferError::ExpectedFunction { at, .. }
+                | InferError::EmptyCase { at }
+                | InferError::UnresolvedHole { at }
+                | InferError::UnresolvedBoundedHole { at }
+                | InferError::UnresolvedPartial { at, .. }
+                | InferError::UnresolvedTupleWidth { at, .. }
+                | InferError::TypeParamEscapes { at, .. }
+                | InferError::MutNotBareVariable { at }
+                | InferError::MutArgNotMutable { at }
+                | InferError::MutInCompositeType { at, .. } => at.clear(),
                 _ => {}
             }
-            e
+            let types = std::cell::RefCell::new(Vec::new());
+            error.map_types(&|ty| {
+                fn erase_binder_spelling(ty: &mut Type) {
+                    ty.walk_children_mut(erase_binder_spelling);
+                    match ty {
+                        Type::Fun { name, .. } => *name = None,
+                        Type::DepTuple(components) => {
+                            components.iter_mut().for_each(|(name, _)| *name = None);
+                        }
+                        Type::Family { binders, .. } => {
+                            binders.iter_mut().for_each(|(name, _)| *name = None);
+                        }
+                        _ => {}
+                    }
+                }
+                let mut ty = ty.canonical();
+                erase_binder_spelling(&mut ty);
+                types.borrow_mut().push(ty);
+                Type::Hole
+            });
+            (error, types.into_inner())
         }
-        unsited(self).same_defect(&unsited(other))
+        fn same_type(a: &Type, b: &Type) -> bool {
+            use crate::ccl::ty::{TypeKind, WitnessId, WitnessRenaming, free_witness_refs};
+            fn bindings(ty: &Type, out: &mut Vec<(WitnessId, TypeKind)>) {
+                if let Type::Fun { fun_kind, .. } = ty {
+                    out.extend(
+                        fun_kind
+                            .witnesses()
+                            .iter()
+                            .map(|w| (*w.id(), w.type_kind())),
+                    );
+                }
+                ty.walk_children(|child| bindings(child, out));
+            }
+            let free = |ty: &Type| {
+                free_witness_refs(ty, &[])
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            if free(a) != free(b) {
+                return false;
+            }
+            let (mut left, mut right) = (Vec::new(), Vec::new());
+            bindings(a, &mut left);
+            bindings(b, &mut right);
+            if left.len() != right.len() {
+                return false;
+            }
+            let renaming: WitnessRenaming = right
+                .iter()
+                .zip(&left)
+                .map(|((b, _), (a, _))| (*b, *a))
+                .collect();
+            let b = b.rename_witnesses(&renaming);
+            let mut kinds = Vec::new();
+            bindings(&b, &mut kinds);
+            a == &b && left.iter().zip(kinds).all(|((_, a), (_, b))| *a == b)
+        }
+        let ((left, left_types), (right, right_types)) = (identity(self), identity(other));
+        if left_types.len() != right_types.len()
+            || !left_types
+                .iter()
+                .zip(&right_types)
+                .all(|(a, b)| same_type(a, b))
+        {
+            return false;
+        }
+        match (&left, &right) {
+            (
+                InferError::NoJoinOverBinder {
+                    binders: a,
+                    reads: ar,
+                    predicate: ap,
+                    position: ax,
+                    fed_elsewhere: af,
+                },
+                InferError::NoJoinOverBinder {
+                    binders: b,
+                    reads: br,
+                    predicate: bp,
+                    position: bx,
+                    fed_elsewhere: bf,
+                },
+            ) => {
+                a == b
+                    && ar == br
+                    && ax == bx
+                    && af == bf
+                    && crate::ccl::ty::eq_term_modulo_ty_slots(ap, bp)
+            }
+            _ => left == right,
+        }
     }
 
     /// Rewrite every binder this error renders through `rename`: each type it
@@ -3326,6 +3411,84 @@ mod tests {
         AggregateKind, ArithmeticKind, BinOpKind, BindingTransparency, Branch, CompareKind, Expr,
         Lit, LogicKind, Type, TypedBinding, TypedExpr, TypedExprNode,
     };
+
+    #[test]
+    fn defect_identity_ignores_sites_and_bound_binder_spelling() {
+        let function = |name: &str| Type::Fun {
+            name: Some(name.into()),
+            fun_kind: crate::ccl::ty::FunKind::Compute,
+            domain: Box::new(Type::Base(BaseType::Int)),
+            codomain: Box::new(Type::Base(BaseType::String)),
+        };
+        let error = |name, at: &str| InferError::ExpectedFunction {
+            found: function(name),
+            at: at.into(),
+        };
+        assert!(error("x", "first use").same_defect(&error("y", "second use")));
+        assert!(
+            InferError::UnresolvedInfer {
+                id: InferVarId(1),
+                at: "x".into()
+            }
+            .same_defect(&InferError::UnresolvedInfer {
+                id: InferVarId(2),
+                at: "y".into()
+            })
+        );
+    }
+
+    #[test]
+    fn defect_identity_preserves_kinds_and_free_variables() {
+        let function = |kind| Type::Fun {
+            name: None,
+            fun_kind: kind,
+            domain: Box::new(Type::Base(BaseType::Int)),
+            codomain: Box::new(Type::Base(BaseType::Int)),
+        };
+        let error = |ty| InferError::ExpectedFunction {
+            found: ty,
+            at: String::new(),
+        };
+        let compute = error(function(crate::ccl::ty::FunKind::Compute));
+        let data = error(function(crate::ccl::ty::FunKind::Data(None)));
+        assert!(!compute.same_defect(&data));
+        let a = error(Type::Infer(crate::ccl::InferVar::fresh(0)));
+        let b = error(Type::Infer(crate::ccl::InferVar::fresh(0)));
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+        assert!(!a.same_defect(&b));
+    }
+
+    #[test]
+    fn defect_identity_compares_bound_witnesses_and_preserves_their_kinds() {
+        use crate::ccl::ty::TypeKind;
+        let error = |kind| InferError::ExpectedFunction {
+            found: Type::sum_over(kind, None, Type::Base(BaseType::Int)),
+            at: String::new(),
+        };
+        assert!(error(TypeKind::UIntRanges).same_defect(&error(TypeKind::UIntRanges)));
+        assert!(!error(TypeKind::UIntRanges).same_defect(&error(TypeKind::Type)));
+    }
+
+    #[test]
+    fn defect_identity_compares_predicates_modulo_bound_names() {
+        let error = |predicate| InferError::NoJoinOverBinder {
+            binders: vec![],
+            reads: vec![],
+            predicate: Rc::new(predicate),
+            position: JoinedPosition::Keys,
+            fed_elsewhere: false,
+        };
+        let predicate = |name: &str| {
+            Expr::lambda(
+                name,
+                Occurrence::mint(),
+                Type::Base(BaseType::Int),
+                Expr::var(name),
+            )
+        };
+        assert!(error(predicate("x")).same_defect(&error(predicate("y"))));
+        assert!(!error(Expr::var("x")).same_defect(&error(Expr::var("y"))));
+    }
 
     #[test]
     fn a_mismatch_between_two_variables_is_not_called_identical() {

@@ -502,7 +502,7 @@ impl<'a> Blame<'a> {
     /// and two positions can fail alike at one span, where a value reaches a position
     /// through a trait instance's types rather than through the variable that failed first.
     fn infer(&self, errors: Vec<LocatedInferError>, tree: &Expr) -> Vec<CompileError> {
-        let mut reported: Vec<(String, CompileError)> = Vec::new();
+        let mut reported: Vec<CompileError> = Vec::new();
         for located in errors {
             let span = self.span(located.node_id, Some(tree));
             // A related position is a secondary label only where it is not part of
@@ -533,11 +533,10 @@ impl<'a> Blame<'a> {
                 }
             }
             let error = self.as_pattern_mismatch(located.error, located.node_id);
-            let message = format!("{error:?}");
-            if let Some((_, CompileError::Infer { related: seen, .. })) =
-                reported.iter_mut().find(|(seen_message, seen)| {
-                    matches!(seen, CompileError::Infer { span: at, .. } if *at == span)
-                        && *seen_message == message
+            if let Some(CompileError::Infer { related: seen, .. }) =
+                reported.iter_mut().find(|seen| {
+                    matches!(seen, CompileError::Infer { span: at, error: earlier, .. }
+                        if *at == span && earlier.same_defect(&error))
                 })
             {
                 for label in related {
@@ -547,16 +546,13 @@ impl<'a> Blame<'a> {
                 }
                 continue;
             }
-            reported.push((
-                message,
-                CompileError::Infer {
-                    error,
-                    span,
-                    related,
-                },
-            ));
+            reported.push(CompileError::Infer {
+                error,
+                span,
+                related,
+            });
         }
-        reported.into_iter().map(|(_, error)| error).collect()
+        reported
     }
 
     /// `error`, reported as the pattern's where it is the width annotation lowering put on

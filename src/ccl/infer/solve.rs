@@ -123,7 +123,7 @@ pub(super) struct CoalesceCtx {
     failed_type_vars: HashMap<NodeId, std::collections::HashSet<InferVarId>>,
     /// For each node a failure to resolve a type was reported at, each failing position and
     /// the message reporting it ([`push_read_error`](Self::push_read_error)).
-    reported_at: HashMap<NodeId, Vec<(FailedPosition, String)>>,
+    reported_at: HashMap<NodeId, Vec<(FailedPosition, InferError)>>,
     /// For each error a walk of a discarded definition kept, the node of the source tree
     /// it was raised at ([`source_node`](Self::source_node)).
     discarded_sources: HashMap<NodeId, NodeId>,
@@ -243,15 +243,12 @@ impl CoalesceCtx {
             self.push_error(error);
             return;
         };
-        // Compared as a reader sees them: two nodes holding one type can spell its
-        // predicates' binders apart, and a message prints neither binder nor site.
-        let message = format!("{error:?}");
         let reported_at = &self.reported_at;
         let carried = self.errors.iter_mut().find(|e| {
             reported_at.get(&e.node_id).is_some_and(|seen| {
                 seen.iter()
-                    .any(|(seen, said)| *said == message && meets_reported(seen, &position))
-            }) && format!("{:?}", e.error) == message
+                    .any(|(seen, said)| said.same_defect(&error) && meets_reported(seen, &position))
+            }) && e.error.same_defect(&error)
         });
         if let Some(reported) = carried {
             if reported.node_id != node && !reported.also.contains(&node) {
@@ -262,7 +259,7 @@ impl CoalesceCtx {
         self.reported_at
             .entry(node)
             .or_default()
-            .push((position, message));
+            .push((position, error.clone()));
         self.push_error(error);
     }
 
@@ -4073,7 +4070,7 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
             failed_vars.is_some_and(|vars| !vars.is_disjoint(carried))
         };
         if frame.failed_uses.iter().any(|(e, carried)| {
-            e.same_defect_at_any_site(&error.error)
+            e.same_defect(&error.error)
                 && (frame.failed_use_nodes.contains(&error.node_id) || carries(carried))
         }) {
             cascade.push(ctx.errors.remove(i));
@@ -4096,11 +4093,11 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
     // A use whose instantiation failed reports the definition's defect again at every
     // node of the user that carries it. Where the definition alone raises the defect,
     // it is reported there, once.
-    ctx.errors.extend(cascade.into_iter().filter(|e| {
-        !raised
-            .iter()
-            .any(|(_, r)| r.same_defect_at_any_site(&e.error))
-    }));
+    ctx.errors.extend(
+        cascade
+            .into_iter()
+            .filter(|e| !raised.iter().any(|(_, r)| r.same_defect(&e.error))),
+    );
     // A held error is the definition's when the definition alone raises it too: of the
     // same kind at the node it was copied from, or the same defect, which a node a
     // nested specialization minted has no other way to show.
@@ -4367,7 +4364,7 @@ fn typecheck_discarded_definition(
         let source = ctx.source_node(ctx.errors[i].node_id);
         if ctx.errors[..before].iter().any(|seen| {
             ctx.discarded_sources.get(&seen.node_id) == Some(&source)
-                && seen.error == ctx.errors[i].error
+                && seen.error.same_defect(&ctx.errors[i].error)
         }) {
             ctx.errors.remove(i);
         } else {
