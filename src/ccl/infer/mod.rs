@@ -750,10 +750,6 @@ pub(crate) fn run_with_params(
     // Emission rewrites the tree it types, so a run that starts over needs it as it was: a
     // snapshot, at the same identities, since the statements recovered from are named by
     // node. Neither copy joins the tree `expr` is.
-    // TODO(recovery-snapshot): measure snapshot and restart costs on editor-sized programs
-    // before adding inference to the language server, which currently parses only. A
-    // successful run copies the entire tree once; each restart copies it again. Retaining
-    // statement expressions at emission recovery could avoid the successful-run copy.
     let pristine = expr.clone_preserving_ids();
     let RunFailure {
         mut errors,
