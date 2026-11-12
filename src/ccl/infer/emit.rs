@@ -477,7 +477,10 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             Type::Base(BaseType::Unit)
         }
 
-        TypedExprNode::Error => crate::unexpected_error_node!(),
+        // A statement lowering failed in, or a reference into a module that failed
+        // lowering: a value nothing states. A statement rule keeps declared constraints
+        // over the placeholder (`Typing::stand_in`).
+        TypedExprNode::Error => ctx.fresh(),
     };
 
     // User-annotation check: constrain_subtype the inferred type to the user's

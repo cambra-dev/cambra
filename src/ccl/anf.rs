@@ -488,7 +488,9 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
         | TypedExprNode::Builtin(_)
         | TypedExprNode::TraitFn { .. } => e,
 
-        TypedExprNode::Error => crate::unexpected_error_node!(),
+        // A statement lowering failed in, which inference reads as one
+        // (`TypedExprNode::Error`).
+        TypedExprNode::Error => e,
 
         TypedExprNode::Apply { .. } => {
             let (binds, spine) = normalize_apply_spine(e, muts);

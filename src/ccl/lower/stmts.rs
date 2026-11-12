@@ -53,10 +53,8 @@ pub(super) fn lower_chain_recovering(
             match lower_middle_stmt(stmt, &stmts[..i], acc, &outer_bindings, ctx, true) {
                 Ok(e) => e,
                 Err(e) => {
-                    errors.push(e);
-                    // As in `lower_stmts_recovering`: the partial tree is not consumed
-                    // past lowering, so the placeholder's role is structural.
-                    Expr::expr_stmt(Expr::error(), backup)
+                    errors.push(e.with_stand_in());
+                    stand_in_for_failed(stmt, &stmts[..i], &outer_bindings, backup, ctx)
                 }
             }
         });
@@ -159,8 +157,8 @@ fn declare_top_level_types(
 /// Differs from [`lower_stmts_inner`] (used by nested blocks) in that an error
 /// on any single statement is recorded into `errors`, a placeholder
 /// [`TypedExprNode::Error`] is substituted, and lowering continues on the
-/// remaining statements. The result is therefore a best-effort tree whose
-/// validity depends on `errors` being empty.
+/// remaining statements. Each failed statement is the placeholder
+/// [`stand_in_for_failed`] builds, and inference reads the result when every error has one.
 ///
 /// The sink-bindings record-wrap from the original `lower_stmts` is still
 /// applied around the recovered tree.
@@ -210,13 +208,15 @@ pub(super) fn lower_stmts_recovering(
         Some((_, last)) => match lower_final_stmt(last, rest, &outer_bindings, ctx) {
             Ok(e) => e,
             Err(e) => {
-                errors.push(e);
-                Expr::error()
+                errors.push(e.with_stand_in());
+                ctx.tag_image(Expr::error(), last.span)
             }
         },
         None => {
-            errors.push(block_contributes_nothing(stmts));
-            Expr::error()
+            let error = block_contributes_nothing(stmts);
+            let failed = ctx.tag_image(Expr::error(), error.span());
+            errors.push(error.with_stand_in());
+            failed
         }
     };
 
@@ -243,13 +243,8 @@ pub(super) fn lower_stmts_recovering(
             match lower_middle_stmt(stmt, &rest[..i], acc, &outer_bindings, ctx, true) {
                 Ok(e) => e,
                 Err(e) => {
-                    errors.push(e);
-                    // Wrap with a placeholder ExprStmt so the continuation
-                    // (`backup`) and any later siblings remain reachable in
-                    // the partial tree. The tree is not consumed past
-                    // lowering when errors are present, so the placeholder's
-                    // role is purely structural.
-                    Expr::expr_stmt(Expr::error(), backup)
+                    errors.push(e.with_stand_in());
+                    stand_in_for_failed(stmt, &rest[..i], &outer_bindings, backup, ctx)
                 }
             }
         });
@@ -1312,6 +1307,119 @@ pub(super) fn lower_middle_stmt(
              before the final expression",
         )),
     }
+}
+
+/// The statement `stmt` stands for when its lowering failed, over its continuation `body`:
+/// each name it introduces bound at the [`Error`](crate::ccl::TypedExprNode::Error)
+/// placeholder, or, when it introduces none, the placeholder as an expression statement.
+///
+/// The continuation was lowered first and names what `stmt` binds, so inference, which runs
+/// on a tree lowering failed in, keeps a usable annotation or declared history and otherwise
+/// binds each name at a poison, whose uses report nothing (`src/ccl/design/type-inference.md`, "An error stops its statement, not the
+/// pass"). A write, `+=` or a bare `:=` to a name in scope, introduces nothing.
+fn stand_in_for_failed(
+    stmt: &Spanned<ChlStmt>,
+    preceding: &[Spanned<ChlStmt>],
+    outer_bindings: &HashSet<String>,
+    body: Expr,
+    ctx: &mut LoweringContext,
+) -> Expr {
+    debug_assert!(
+        !matches!(stmt.node, ChlStmt::Pub { .. }),
+        "lower_module_body unwraps `pub` before lowering",
+    );
+    let writes = match &stmt.node {
+        ChlStmt::AugAssign { .. } => true,
+        ChlStmt::MutAssign {
+            annotation: None, ..
+        } => {
+            let mut scope = outer_bindings.clone();
+            collect_stmt_names(preceding, &mut scope);
+            let mut names = HashSet::new();
+            collect_stmt_names(std::slice::from_ref(stmt), &mut names);
+            names.iter().all(|name| scope.contains(name))
+        }
+        _ => false,
+    };
+    // A failed right-hand side leaves explicit constraints usable. If the declaration
+    // itself fails to lower, the unannotated placeholder below states no type.
+    match &stmt.node {
+        ChlStmt::AnnAssign {
+            target,
+            annotation,
+            value,
+        } => {
+            if let Ok(name) = extract_name_target(target, "annotated assignment")
+                && mut_annotation_parts(&annotation.ty, ctx).is_none()
+                && let Ok(ty) = lower_let_annotation(&name, annotation, value, ctx)
+            {
+                let annotation = Annotation::new(ty, ctx.occurrence_at(annotation.ty.span));
+                let failed = ctx.tag_image(Expr::error(), value.span);
+                let occurrence = ctx.occurrence_at(target.span);
+                return ctx.tag_image(
+                    Expr::let_bind_annotated(name, occurrence, failed, body, annotation),
+                    stmt.span,
+                );
+            }
+        }
+        ChlStmt::MutAssign {
+            target,
+            annotation,
+            value,
+        } if !writes => {
+            if let Ok(name) = extract_name_target(target, "mutable declaration") {
+                let declared = match annotation {
+                    Some(annotation) => {
+                        check_mut_decl_annotation(&name, annotation, stmt.span, ctx)
+                    }
+                    None => Ok((Type::Hole, false)),
+                };
+                if let Ok((value_ty, is_txn)) = declared {
+                    let domain = if is_txn {
+                        ctx.register_transactional(name.clone());
+                        Type::Txn
+                    } else {
+                        Type::Hole
+                    };
+                    let failed = ctx.tag_image(Expr::error(), value.span);
+                    let occurrence = ctx.occurrence_at(target.span);
+                    return ctx.tag_image(
+                        Expr::mut_decl(
+                            name,
+                            occurrence,
+                            Type::mutable(domain, value_ty),
+                            failed,
+                            body,
+                        ),
+                        stmt.span,
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut names = HashSet::new();
+    if !writes {
+        collect_stmt_names(std::slice::from_ref(stmt), &mut names);
+    }
+    if let ChlStmt::Param { name, .. } = &stmt.node {
+        names.insert(name.node.to_string());
+    }
+    if names.is_empty() {
+        let failed = ctx.tag_image(Expr::error(), stmt.span);
+        return ctx.tag_machinery(Expr::expr_stmt(failed, body), stmt.span, "lower.stmt_seq");
+    }
+    // Sorted, so the tree does not depend on the set's order.
+    let mut names: Vec<String> = names.into_iter().collect();
+    names.sort();
+    names.into_iter().fold(body, |body, name| {
+        let failed = ctx.tag_image(Expr::error(), stmt.span);
+        ctx.tag_machinery(
+            Expr::let_bind(name, Occurrence::mint(), failed, body),
+            stmt.span,
+            "lower.failed_stmt",
+        )
+    })
 }
 
 /// Collect the names assignment and function-def statements bind into `names`, every name
