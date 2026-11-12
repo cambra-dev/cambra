@@ -252,6 +252,9 @@ pub(super) struct InferCtx {
     pub(super) trait_calls: HashMap<NodeId, (Rc<TraitObligation>, smol_str::SmolStr, Vec<Type>)>,
     /// How many errors emission has recovered from ([`Typing::recoveries`]).
     recoveries: usize,
+    /// The expression of the statement each recovery was made at, in the order emission
+    /// made them ([`Typing::recover`]).
+    pub(super) recovered: Vec<NodeId>,
     /// How a type leaves the scope of each binder in scope ([`ScopeExit`]), read by
     /// [`Self::require_contribution`] and [`Typing::close_let_type`]: one per binder of the
     /// name, innermost last, pushed where the binder is entered and popped where its scope
@@ -478,6 +481,7 @@ impl InferCtx {
             groups: Vec::new(),
             trait_calls: HashMap::new(),
             recoveries: 0,
+            recovered: Vec::new(),
             method_calls: vec![Vec::new()],
             selected_methods: Rc::default(),
         }
@@ -1817,12 +1821,18 @@ impl Typing for InferCtx {
         &mut self,
         error: LocatedInferError,
         reads_before: usize,
+        statement: NodeId,
     ) -> Result<(), LocatedInferError> {
         self.recoveries += 1;
+        self.recovered.push(statement);
         if self.poisoned_reads == reads_before {
             self.errors.push(error);
         }
         Ok(())
+    }
+
+    fn stand_in(&mut self) {
+        self.recoveries += 1;
     }
 
     fn poisoned_reads(&self) -> usize {

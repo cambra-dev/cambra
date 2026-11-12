@@ -1026,17 +1026,18 @@ pub enum TypedExprNode {
     /// writes and feeds.
     Begin { body: Box<TypedExpr> },
 
-    /// Recovery placeholder inserted by lowering when a sub-expression or
-    /// statement could not be lowered (either because it came from a parser
-    /// recovery hole — [`crate::chl_parser::ast::Expr::Error`] /
-    /// [`crate::chl_parser::ast::Stmt::Error`] — or because lowering itself
-    /// failed with a [`crate::ccl::lower::LoweringError`]).
+    /// Placeholder for an expression with no well-typed content, inserted in two places:
     ///
-    /// **Contract.** This variant exists *only* while there are pending
-    /// [`crate::ccl::lower::LoweringError`]s in the `LoweringResult`. Callers
-    /// must inspect `errors` before consuming the lowered tree and abort the
-    /// pipeline (no inference, no operator conversion) if non-empty.
-    /// Downstream passes treat this variant as unreachable.
+    /// - Lowering inserts it for a sub-expression or statement it could not lower: a
+    ///   parser recovery hole ([`crate::chl_parser::ast::Expr::Error`] or
+    ///   [`crate::chl_parser::ast::Stmt::Error`]) or a [`crate::ccl::lower::LoweringError`].
+    ///   The lowering result retains the errors beside its partial tree.
+    /// - Inference inserts it in its own copy of the tree when restarting after a statement
+    ///   failed (`infer::run_with_params`). The statement's rule types the placeholder as a
+    ///   failed expression, retaining the statement's declared constraints.
+    ///
+    /// A successful lowering or inference result holds no placeholder. A compile with
+    /// errors stops before the passes after inference, which treat it as unreachable.
     Error,
 }
 

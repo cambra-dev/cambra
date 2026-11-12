@@ -1743,15 +1743,19 @@ pub(super) fn emit_expr_stmt<C: Typing>(
     // A failed statement is recovered from: its value is discarded either way, and the
     // method calls it deferred report nothing.
     let reads_before = ctx.poisoned_reads();
-    ctx.open_method_calls();
-    let emitted = ctx.subexpr(e);
-    ctx.close_method_calls(if emitted.is_ok() {
-        MethodCallsEnd::Monomorphic
+    if matches!(e.node, TypedExprNode::Error) {
+        ctx.stand_in();
     } else {
-        MethodCallsEnd::Failed
-    });
-    if let Err(error) = emitted {
-        ctx.recover(error, reads_before)?;
+        ctx.open_method_calls();
+        let emitted = ctx.subexpr(e);
+        ctx.close_method_calls(if emitted.is_ok() {
+            MethodCallsEnd::Monomorphic
+        } else {
+            MethodCallsEnd::Failed
+        });
+        if let Err(error) = emitted {
+            ctx.recover(error, reads_before, e.node_id())?;
+        }
     }
     // The continuation's value is passed along: a mutable variable reads, and a feed stays
     // the handle a function hands back (`x: Feed(_); x << n; x`).
@@ -2256,7 +2260,7 @@ fn emit_let_definition<C: Typing>(
         (true, false) => MethodCallsEnd::Monomorphic,
     };
     for error in ctx.close_method_calls(end) {
-        ctx.recover(error, reads_before)?;
+        ctx.recover(error, reads_before, bound_expr.node_id())?;
         poisoned = true;
     }
     // Lowering refuses a polymorphic annotation on a call or a collection; a name
@@ -2266,7 +2270,7 @@ fn emit_let_definition<C: Typing>(
         let error = ctx.raise(InferError::MonomorphicPolyBinding {
             name: binding.name.base().to_string(),
         });
-        ctx.recover(error, reads_before)?;
+        ctx.recover(error, reads_before, bound_expr.node_id())?;
         poisoned = true;
     }
     let scheme = if poisoned {
@@ -2507,13 +2511,18 @@ fn emit_let_bound<C: Typing>(
     let opening = ctx.in_let_rhs(|ctx| {
         let opened = poly.map(|poly| ctx.open_poly(poly)).transpose()?;
         let assumptions = opened.as_ref().map_or(&[][..], |o| o.requires.as_slice());
-        let rhs = ctx.with_assumptions(assumptions, |ctx| ctx.subexpr(bound_expr));
+        let rhs = if matches!(bound_expr.node, TypedExprNode::Error) {
+            Err(None)
+        } else {
+            ctx.with_assumptions(assumptions, |ctx| ctx.subexpr(bound_expr))
+                .map_err(Some)
+        };
         Ok((rhs, opened))
     });
     let (rhs, opened) = match opening {
         Ok(emitted) => emitted,
         Err(error) => {
-            ctx.recover(error, reads_before)?;
+            ctx.recover(error, reads_before, bound_expr.node_id())?;
             return Ok(LetBound {
                 ty: poison(ctx),
                 at_annotation: false,
@@ -2527,7 +2536,10 @@ fn emit_let_bound<C: Typing>(
     let bound_ty = match rhs {
         Ok(ty) => ty,
         Err(error) => {
-            ctx.recover(error, reads_before)?;
+            match error {
+                Some(error) => ctx.recover(error, reads_before, bound_expr.node_id())?,
+                None => ctx.stand_in(),
+            }
             defined = false;
             poison(ctx)
         }
@@ -2598,7 +2610,7 @@ fn emit_let_bound<C: Typing>(
     if let Some(ann) = &mut binding.user_annotation
         && let Err(error) = emit_annotation_predicates(&mut ann.ty, ctx)
     {
-        ctx.recover(error, reads_before)?;
+        ctx.recover(error, reads_before, bound_expr.node_id())?;
         annotation_typed = false;
     }
     // Whether the variable is bound at a poison rather than at a type the program
@@ -2657,7 +2669,11 @@ fn emit_let_bound<C: Typing>(
             match ctx.in_let_rhs(|ctx| ctx.bind_poly_annotation(&bound_ty, &declared, &shown)) {
                 Ok(ty) => ty,
                 Err(error) => {
-                    ctx.recover(error.at_annotation(annotation), reads_before)?;
+                    ctx.recover(
+                        error.at_annotation(annotation),
+                        reads_before,
+                        bound_expr.node_id(),
+                    )?;
                     poisoned = true;
                     poison(ctx)
                 }
@@ -2676,7 +2692,11 @@ fn emit_let_bound<C: Typing>(
             match ctx.bind_annotation(&bound_ty, &declared) {
                 Ok(ty) => ty,
                 Err(error) => {
-                    ctx.recover(error.at_annotation(annotation), reads_before)?;
+                    ctx.recover(
+                        error.at_annotation(annotation),
+                        reads_before,
+                        bound_expr.node_id(),
+                    )?;
                     poisoned = true;
                     poison(ctx)
                 }
@@ -2838,18 +2858,23 @@ pub(super) fn emit_mut_decl<C: Typing>(
     // declared history all the same, so its writes still constrain one value type,
     // and only the seed's contribution is missing.
     let reads_before = ctx.poisoned_reads();
-    ctx.open_method_calls();
-    let init_ty = ctx.in_let_rhs(|ctx| emit_value_read(init, ctx));
-    ctx.close_method_calls(if init_ty.is_ok() {
-        MethodCallsEnd::Monomorphic
+    let init_ty = if matches!(init.node, TypedExprNode::Error) {
+        ctx.stand_in();
+        None
     } else {
-        MethodCallsEnd::Failed
-    });
-    let init_ty = match init_ty {
-        Ok(ty) => Some(ty),
-        Err(error) => {
-            ctx.recover(error, reads_before)?;
-            None
+        ctx.open_method_calls();
+        let init_ty = ctx.in_let_rhs(|ctx| emit_value_read(init, ctx));
+        ctx.close_method_calls(if init_ty.is_ok() {
+            MethodCallsEnd::Monomorphic
+        } else {
+            MethodCallsEnd::Failed
+        });
+        match init_ty {
+            Ok(ty) => Some(ty),
+            Err(error) => {
+                ctx.recover(error, reads_before, init.node_id())?;
+                None
+            }
         }
     };
     let mut history = ctx.normalize(&binding.ty);
@@ -2861,7 +2886,7 @@ pub(super) fn emit_mut_decl<C: Typing>(
     // Routed through the mode for the reason `emit_lambda`'s call is: Check trusts a
     // resolved predicate.
     if let Err(error) = ctx.type_annotation_predicates(&mut history) {
-        ctx.recover(error, reads_before)?;
+        ctx.recover(error, reads_before, init.node_id())?;
     }
     debug_assert!(
         history.mut_value_type().is_some(),
@@ -2877,7 +2902,7 @@ pub(super) fn emit_mut_decl<C: Typing>(
             format!("initializer of mutable `{label}`")
         });
         if let Err(error) = seeded {
-            ctx.recover(error, reads_before)?;
+            ctx.recover(error, reads_before, init.node_id())?;
         }
     }
     binding.ty = history.clone();

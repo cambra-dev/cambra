@@ -235,6 +235,287 @@ fn a_join_labels_the_types_of_its_contributing_values() {
     "},
     &[r"\z -> x"],
 )]
+// A use failing at a value the join holds is the join's defect met downstream.
+#[case::a_join_and_a_use_failing_at_one_of_its_values(
+    indoc! {r#"
+        xs = [1, "a"]
+        ys = [x + 1 for x in xs]
+        ys
+    "#},
+    &[r#"[1, "a"]"#],
+)]
+#[case::a_join_and_two_uses_failing_at_its_values(
+    indoc! {r#"
+        xs = [1, "a"]
+        ys = [x ++ "b" for x in xs]
+        zs = [x + 1 for x in xs]
+        (ys, zs)
+    "#},
+    &[r#"[1, "a"]"#],
+)]
 fn a_defect_is_reported_once_per_site(#[case] code: &str, #[case] expected: &[&str]) {
     assert_eq!(underlined(code), expected);
+}
+
+#[test]
+fn long_copy_chains_keep_independently_narrowed_conflicts_distinct() {
+    let mut code = indoc! {r#"
+        def add(a, b):
+            a + b
+        alias0 = add
+    "#}
+    .to_owned();
+    for n in 1..=12 {
+        use std::fmt::Write;
+        writeln!(code, "alias{n} = alias{}", n - 1).unwrap();
+    }
+    code.push_str(indoc! {r#"
+        def left(x):
+            (alias12(x, 1), alias12(x, "s"))
+        def right(x):
+            (alias12(x, 2), alias12(x, "t"))
+        1
+    "#});
+    assert_eq!(
+        underlined(&code),
+        &[
+            indoc! {r#"
+            def left(x):
+                (alias12(x, 1), alias12(x, "s"))
+        "#},
+            indoc! {r#"
+            def right(x):
+                (alias12(x, 2), alias12(x, "t"))
+        "#},
+        ]
+    );
+}
+
+#[test]
+fn a_carrier_of_two_conflicts_keeps_both_original_defects() {
+    let code = indoc! {r#"
+        def left(x):
+            (x + 1, x + "s")
+        def right(x):
+            (x + 2, x + "t")
+        def carrier(x):
+            (left(x), right(x), x > 0)
+        alias = carrier
+        1
+    "#};
+    assert_eq!(
+        underlined(code),
+        &[
+            indoc! {r#"
+            def left(x):
+                (x + 1, x + "s")
+        "#},
+            indoc! {r#"
+            def right(x):
+                (x + 2, x + "t")
+        "#},
+        ]
+    );
+}
+
+/// A failed statement hides no defect elsewhere: inference starts over without it, and what
+/// that run finds is reported too, but for a type nothing determines
+/// (`src/ccl/design/type-inference.md`, "An error stops its statement, not the pass").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_join_past_an_unbound_name(
+    indoc! {r#"
+        x = undefined_name + 1
+        y = [1, "a"]
+        y
+    "#},
+    &["undefined_name", r#"[1, "a"]"#],
+)]
+// The list's element type is what the failed statement would have fixed.
+#[case::a_value_only_the_failed_statement_determines(
+    indoc! {"
+        xs = []
+        z = xs ++ nope
+        xs
+    "},
+    &["nope"],
+)]
+#[case::each_definition_no_type_satisfies(
+    indoc! {r#"
+        def f(a):
+            (a + 1, a + "s")
+        def g(b):
+            (b + 1, b + "s")
+        1
+    "#},
+    &[
+        indoc! {r#"
+            def f(a):
+                (a + 1, a + "s")
+        "#},
+        indoc! {r#"
+            def g(b):
+                (b + 1, b + "s")
+        "#},
+    ],
+)]
+// A barrier check's failure leaves its statement out as an emission error does.
+#[case::a_join_past_an_annotation_an_opaque_result_fails(
+    indoc! {r#"
+        def f(x: Int):
+            r ^= x;
+            r ^+ 0
+        a = f(1)
+        b: {Int where _ == a} = f(2)
+        y = [1, "a"]
+        (a == b, y)
+    "#},
+    &["b: {Int where _ == a} = f(2)", r#"[1, "a"]"#],
+)]
+// The binding keeps its declared type over a definition that failed.
+#[case::a_use_against_a_declared_type(
+    indoc! {r#"
+        w: Int = "s"
+        v = w + "t"
+        v
+    "#},
+    &["Int", r#"w + "t""#],
+)]
+#[case::equal_messages_at_different_sites_across_runs(
+    indoc! {r#"
+        x: Int = "s"
+        y = x + "t"
+        z = 1 + "u"
+        (y, z)
+    "#},
+    &["Int", r#"1 + "u""#, r#"x + "t""#],
+)]
+// The annotation fails without the definition too, so the second run leaves it out.
+#[case::a_join_past_a_result_annotation_that_fails(
+    indoc! {r#"
+        def f(x: Int) => {Int where _ == r}:
+            x
+        y = [1, "a"]
+        y
+    "#},
+    &["r", r#"[1, "a"]"#],
+)]
+// The function's result is the binding left out, which nothing determines.
+#[case::a_failed_binding_under_an_opaque_one(
+    indoc! {"
+        def f(x: Int):
+            r ^= x
+            def k(y: {Int where _ > 0 and r == r}):
+                nope
+            k
+        f1 = f(1)
+        f1(-5)
+    "},
+    &["nope"],
+)]
+#[case::a_broken_definition_its_aliases_carry(
+    indoc! {r#"
+        def healthy(x: Int) => Int:
+            x
+        def broken(x):
+            (x + 1, x + "s")
+        def indirect(x):
+            broken(x)
+        alias = indirect
+        1
+    "#},
+    &[indoc! {r#"
+        def broken(x):
+            (x + 1, x + "s")
+    "#}],
+)]
+#[case::copies_narrowed_in_different_definitions_are_different_defects(
+    indoc! {r#"
+        def add(a, b):
+            a + b
+        def g(x):
+            (add(x, 1), add(x, "s"))
+        def h(x):
+            (add(x, 2), add(x, "t"))
+        1
+    "#},
+    &[
+        indoc! {r#"
+            def g(x):
+                (add(x, 1), add(x, "s"))
+        "#},
+        indoc! {r#"
+            def h(x):
+                (add(x, 2), add(x, "t"))
+        "#},
+    ],
+)]
+#[case::a_carrier_adds_a_requirement_beside_an_existing_conflict(
+    indoc! {r#"
+        def broken(x):
+            (x + 1, x + "s")
+        def indirect(x):
+            (broken(x), x > 0)
+        1
+    "#},
+    &[indoc! {r#"
+        def broken(x):
+            (x + 1, x + "s")
+    "#}],
+)]
+#[case::a_transitive_key_conflict_names_the_lookup(
+    indoc! {r#"
+        def healthy(x: Int) => Int:
+            x
+        m = map([(1, 10), (2, 20)])
+        answer = m["nope"]
+        y = [1, "a"]
+        y
+    "#},
+    &[r#"m["nope"]"#, r#"[1, "a"]"#],
+)]
+fn each_defect_is_reported_past_a_failed_statement(#[case] code: &str, #[case] expected: &[&str]) {
+    assert_eq!(underlined(code), expected);
+}
+
+#[test]
+fn an_independent_defect_after_a_join_blamed_at_its_statement_is_reported() {
+    let got = underlined(indoc! {r#"
+        xs = [(1, 2), ("a", 2)]
+        def id(v):
+            v
+        x = id((sku=1))
+        y = x.at
+        (xs, y)
+    "#});
+    assert!(got.iter().any(|u| u == "x.at"), "{got:?}");
+}
+
+#[test]
+fn an_unresolved_method_call_hides_no_later_join() {
+    let got = underlined(indoc! {r#"
+        type Price = Int
+        def Price::cents(self) => Int:
+            Price::extract(self)
+        p = nope
+        q = p.cents()
+        w = [1, "a"]
+        w
+    "#});
+    assert!(got.iter().any(|u| u == "nope"), "{got:?}");
+    assert!(got.iter().any(|u| u == r#"[1, "a"]"#), "{got:?}");
+}
+
+#[test]
+fn an_unresolved_method_call_hides_no_operand_conflict() {
+    let got = underlined(indoc! {r#"
+        type Price = Int
+        def Price::cents(self) => Int:
+            Price::extract(self)
+        def bad(x):
+            (Price::new(1), x + 1, x + "s")
+        q = bad(2).0.cents()
+        q
+    "#});
+    assert!(got.iter().any(|u| u.starts_with("def bad(x):")), "{got:?}");
 }
