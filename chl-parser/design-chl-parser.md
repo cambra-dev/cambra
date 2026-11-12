@@ -613,16 +613,15 @@ restores the outer names on both success and error, so a malformed declaration h
 independent error in a sibling block.
 `LoweringResult` retains its optional value and errors.
 
-The frontend appends lowering errors and returns if no CCL value is available. Past parse and
-lowering errors alone, when every lowering error is one a placeholder stands for, it runs the
-passes up to and including inference, adds inference's errors, and stops: no later phase runs on
-the result. Inference reports no undetermined type in such a tree, which the left-out statements
-may be what determines (`src/ccl/design/type-inference.md`, "An error stops its statement, not
-the pass"). A loading error does not stop it either. A lowering error no placeholder stands for
-stops the frontend after lowering. Bracket recovery can still change a statement's shape, which lowering then
-reports: the lexer closes an unclosed bracket where the statement ends ([Unclosed
-brackets](#unclosed-brackets)), so in a list written one record per line, a record missing its
-`)` is called with the record on the next line.
+The frontend appends lowering errors and returns if no CCL value is available. Past parse, loading
+and lowering errors, when every lowering error is one a placeholder stands for, it runs the passes
+up to and including inference, adds inference's errors, and stops: no later phase runs on the
+result. Inference reports no undetermined type in such a tree, which the left-out statements may be
+what determines (`src/ccl/design/type-inference.md`, "An error stops its statement, not the pass").
+A lowering error no placeholder stands for stops the frontend after lowering. Bracket recovery can
+still change a statement's shape, which lowering then reports: the lexer closes an unclosed bracket
+where the statement ends ([Unclosed brackets](#unclosed-brackets)), so in a list written one record
+per line, a record missing its `)` is called with the record on the next line.
 
 The returned `Vec<CompileError>` contains stage-tagged errors, not an assertion that all
 possible errors were discovered. Regressions include `multiple_parse_errors_all_surface`,

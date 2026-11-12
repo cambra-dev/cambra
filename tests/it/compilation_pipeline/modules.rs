@@ -1146,6 +1146,57 @@ fn a_module_whose_check_fails_hides_no_error_of_the_root() {
     assert_eq!(report_count(&errors), 2, "{errors}");
 }
 
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_import_cycle_keeps_root_inference_without_lowering_dependencies() {
+    let root = indoc! {r#"
+        import a
+        import c
+        missing = c::nope
+        v = [1, "a"]
+        (missing, v)
+    "#};
+    let a = indoc! {"
+        import b
+        pub v = b::u
+    "};
+    let b = indoc! {"
+        import a
+        pub u = 1
+    "};
+    let errors = compile_errors(&program(
+        root,
+        &[("a", a), ("b", b), ("c", r#"pub bad = [1, "a"]"#)],
+    ));
+    assert!(errors.contains("cycle"), "{errors}");
+    assert!(
+        errors.contains("The values that meet here have no common type"),
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_root_error_after_a_clean_run_has_no_copy_failure_label() {
+    let root = indoc! {r#"
+        run a
+        v = [1, "a"]
+        v
+    "#};
+    let a = indoc! {"
+        pub y = 1
+        visits := 0
+    "};
+    let errors = compile_errors(&program(root, &[("a", a)]));
+    assert_eq!(report_count(&errors), 1, "{errors}");
+    assert!(
+        errors.contains("The values that meet here have no common type"),
+        "{errors}"
+    );
+    assert!(!errors.contains("whose copy fails"), "{errors}");
+}
+
 /// A module that does not load hides no error of the root's: it is a module with errors of
 /// its own, so a reference into it, a value, a type or a constructor, reports nothing more.
 #[rstest]
@@ -1156,8 +1207,9 @@ fn a_module_that_does_not_load_hides_no_error_of_the_root() {
         import gone use f
         x: nothere::T = 3
         z = nothere::x + f(1)
+        s = nothere::Shape::circle(1)
         v = [1, "a"]
-        (x, z, v)
+        (x, z, s, v)
     "#};
     let errors = compile_errors(&program(root, &[]));
     assert!(errors.contains("no module `nothere`"), "{errors}");

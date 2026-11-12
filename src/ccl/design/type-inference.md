@@ -366,15 +366,21 @@ contributing constraints ([parser recovery](../../../chl-parser/design-chl-parse
 A failed last statement leaves the placeholder as the block's value, which emission types as a
 fresh variable. The scope check admits names retained by failed definitions, as it admits
 opaque binders: neither has a usable definition to discharge (`ScopeExit::Keep`). Each contained
-error carries its own placeholder mark, retained through copying and diagnostic merging. When every lowering error is marked, the passes reach the earlier of the
-requested output and inference past parse and lowering errors, and inference's errors are added
-to theirs. An undetermined type is not reported, as in a run that starts over.
+error carries its own placeholder mark, retained through copying and diagnostic merging. When every
+lowering error is marked, the passes reach the earlier of the requested output and inference past
+parse, loading and lowering errors, and inference's errors are added to theirs. An undetermined type
+is not reported, as in a run that starts over.
 
-A module with lowering errors has no interface or linked chain and is not inferred. A reference
-into it lowers to the placeholder. A module that did not load has errors of its own; a qualified
-reference or a `use` name into it also lowers to the placeholder, so inference continues past load
-errors. A lowering error without a placeholder stops the compile after lowering: the tree can be
-inconsistent outside a placeholder.
+A module with lowering errors has no interface or linked chain and is not inferred. A value
+reference into it lowers to a placeholder. A module that did not load supplies placeholders for
+value and type-alias references, including `use` names of those kinds, so inference continues past
+load errors. Trait references and nominal type qualifiers through `use` do not have this recovery. A
+lowering error without a placeholder stops compilation after lowering: the tree can be inconsistent
+outside a placeholder.
+
+An import cycle leaves no link order, so no dependency module is lowered, including modules outside
+the cycle. The root's own errors are still inferred, while dependency errors and missing dependency
+members remain unchecked.
 
 Each later run's errors are added to the earlier runs', but for those saying the program does not
 determine a type (`InferError::is_undetermined`): an unresolved variable or tuple width, or a

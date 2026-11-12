@@ -429,6 +429,13 @@ impl<'a> Blame<'a> {
         };
         homes
             .iter()
+            // A carrier can hold its continuation's failing result type. Label only
+            // errors sourced from the copy's own module.
+            .filter(|home| {
+                runs.by_file
+                    .get(&span.file)
+                    .is_some_and(|homes| homes.contains(home))
+            })
             .filter_map(|home| runs.statements.get(home))
             .flatten()
             .cloned()
@@ -2008,7 +2015,7 @@ fn run_frontend(
     // parser recovers from a syntax error it still produces a partial AST, which
     // lowering can run on and report its own errors against, so the user sees
     // everything at once. The tree is inferred past parse, load and lowering errors too
-    // when every lowering error is a statement's, and the compile stops after inference.
+    // when a placeholder stands for every lowering error; the compile stops after inference.
     let mut errors: Vec<CompileError> = Vec::new();
 
     // Keep the table across phase scopes and possible audits. Early returns drop
@@ -2064,14 +2071,14 @@ fn run_frontend(
     // reaches nothing through (`lower::modules::Qualifier::reachable`). A lowering error no
     // placeholder stands for, such as a run missing a type argument, can leave the tree
     // inconsistent where it is read: past one, bail here.
-    if !contained
-        || errors.iter().any(|e| {
-            !matches!(
-                e,
-                CompileError::Lower(_) | CompileError::Parse(_) | CompileError::Load(_)
-            )
-        })
-    {
+    debug_assert!(
+        errors.iter().all(|e| matches!(
+            e,
+            CompileError::Parse(_) | CompileError::Load(_) | CompileError::Lower(_)
+        )),
+        "only parse, load and lowering errors precede inference"
+    );
+    if !contained {
         return Err(errors);
     }
     let stood_in_for = errors;
@@ -2131,7 +2138,7 @@ fn run_frontend(
     expr = uniquify::run(expr);
 
     let blame = Blame::new(&lowering_projection, sources).with_runs(&run_sites);
-    // Parse and lowering errors cap the requested output at inference; earlier stops still apply.
+    // Parse, load and lowering errors cap the requested output at inference; earlier stops still apply.
     let lowering_failed = !stood_in_for.is_empty();
     let inferred = run_passes(
         ctx,
