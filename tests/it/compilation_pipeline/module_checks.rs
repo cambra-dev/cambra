@@ -820,3 +820,18 @@ fn cambra_check_prints_an_interface_or_errors() {
     assert_eq!(usage.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&usage.stderr).contains("Usage: cambra check"));
 }
+
+/// A module's check traces an error at a node that inference minted to the source.
+/// Inference raises at its copy of `sales`, which comprehension put in a group's predicate.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_error_at_a_node_a_module_check_minted_has_a_span() {
+    let library = "pub g = [sum([s.amount for s in g]) for g in groupby(sales, \\r -> r.region)]\n";
+    let root = indoc! {"
+        import lib
+        lib::g
+    "};
+    let errors = compile_errors(&program(root, &[("lib", library)]));
+    assert!(errors.contains("Unbound variable: 'sales'"), "{errors}");
+    assert!(errors.contains("lib.cambra:1:46"), "{errors}");
+}

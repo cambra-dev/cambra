@@ -882,6 +882,8 @@ they do not make release builds reject a missing record.
 A phase under `DerivationSession` appends closed recordings to a `DerivationLog`, independently
 of table capture. The comprehension phase uses it so errors on its generated nodes can resolve
 to source spans even when `compile_to` does not capture provenance rows.
+A module's check also runs inference under a derivation session. The check resolves errors
+against its tree before inference, which holds none of the nodes that inference mints.
 
 `fold_derivation(log, base, via)` processes closing order. It looks up an input in `base` first,
 then in the projection already built by this fold. A mint copies its named input's spans and
