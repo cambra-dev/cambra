@@ -40,21 +40,21 @@ use crate::ccl::{
 
 /// Wrap every lambda body that binds an opaque variable. See the module docs.
 pub fn run(expr: Expr) -> Expr {
-    // One recording covers every binding this pass mints: they are all the same
-    // rewrite, so nothing inside needs a narrower scope.
-    let root_id = expr.node_id();
-    let _g = provenance::enter(root_id, "opaque_output.bind", Nature::Machinery);
     rewrite(expr)
 }
 
 fn rewrite(mut expr: Expr) -> Expr {
     expr.map_children(rewrite);
+    let lambda = expr.node_id();
     if let TypedExprNode::Lambda { body, .. } = &mut expr.node
         && !has_concrete_result_annotation(body)
     {
         let mut opaque = Vec::new();
         opaque_binders(body, &mut opaque);
         if !opaque.is_empty() {
+            // Recorded on the lambda, so a diagnostic blamed on the binding this mints
+            // points at the function rather than at the program.
+            let _g = provenance::enter(lambda, "opaque_output.bind", Nature::Machinery);
             **body = wrap(std::mem::take(body), opaque.into());
         }
     }

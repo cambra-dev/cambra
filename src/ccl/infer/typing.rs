@@ -257,6 +257,13 @@ pub(super) trait Typing {
         f: impl FnOnce(&mut Self) -> R,
     ) -> R;
 
+    /// Run `f` with the value side of its edges attributed to `origin`.
+    fn with_value_at<R>(
+        &mut self,
+        origin: crate::ccl::infer_var::Origin,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R;
+
     /// Require `sub <: sup`. `at` lazily produces an error-context label,
     /// invoked only on failure.
     fn require_sub(

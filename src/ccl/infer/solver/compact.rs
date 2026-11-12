@@ -748,6 +748,7 @@ impl CompactType {
             family,
             nominal,
             nominal_conflict: _,
+            origins: _,
         } = self;
         Occupied {
             atoms: atoms.len(),
@@ -1022,6 +1023,97 @@ impl CompactFun {
     }
 }
 
+/// Where the concrete contributions at a position were born: the origin of each bound whose
+/// bounding side is a type rather than a variable ([`crate::ccl::infer_var::Bound::origin`]),
+/// unioned as positions merge.
+///
+/// Closing an edge over a stored bound keeps the bound's origin, so a contribution copied to
+/// another variable names where it was born. Two positions failing at one set of births meet
+/// one conflict, though no variable links them. A contribution compacted from a type no bound
+/// holds, or from a bound with no origin, leaves the births unknown.
+///
+/// Every two values are equal: positions holding the same types are one position whatever
+/// their contributions' births, so the field changes no comparison compaction makes.
+#[derive(Debug, Clone, Default)]
+pub struct ContributionOrigins {
+    born: BTreeMap<BornAt, Vec<Type>>,
+    unknown: bool,
+}
+
+/// One birth [`ContributionOrigins`] records: an expression, or a bound or requirement written
+/// in a polymorphic type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BornAt {
+    Node(crate::ccl::provenance::NodeId),
+    Written(chl_parser::source_map::FileId, usize, usize),
+}
+
+impl PartialEq for ContributionOrigins {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl ContributionOrigins {
+    /// A contribution compacted from a type no bound holds.
+    fn unknown() -> Self {
+        ContributionOrigins {
+            born: BTreeMap::new(),
+            unknown: true,
+        }
+    }
+
+    /// A contribution a bound recorded at `origin`.
+    fn born_at(origin: Option<crate::ccl::infer_var::Origin>, ty: &Type) -> Self {
+        match origin {
+            Some(crate::ccl::infer_var::Origin::Node(node)) => ContributionOrigins {
+                born: BTreeMap::from([(BornAt::Node(node), vec![ty.clone()])]),
+                unknown: false,
+            },
+            Some(crate::ccl::infer_var::Origin::Written(at)) => ContributionOrigins {
+                born: BTreeMap::from([(
+                    BornAt::Written(at.file, at.start, at.end),
+                    vec![ty.clone()],
+                )]),
+                unknown: false,
+            },
+            None => Self::unknown(),
+        }
+    }
+
+    fn union(mut self, other: Self) -> Self {
+        for (at, types) in other.born {
+            let held = self.born.entry(at).or_default();
+            for ty in types {
+                if !held.contains(&ty) {
+                    held.push(ty);
+                }
+            }
+        }
+        self.unknown |= other.unknown;
+        self
+    }
+
+    /// The births, or `None` where some contribution's is unknown or there is none.
+    pub fn known(&self) -> Option<BTreeSet<BornAt>> {
+        (!self.unknown && !self.born.is_empty()).then(|| self.born.keys().copied().collect())
+    }
+
+    /// Each known birth and the bound recorded there, including known births of a
+    /// position whose other contributions have no origin.
+    pub fn contributions(&self) -> impl Iterator<Item = (crate::ccl::infer_var::Origin, &Type)> {
+        self.born.iter().flat_map(|(at, types)| {
+            let origin = match *at {
+                BornAt::Node(node) => crate::ccl::infer_var::Origin::Node(node),
+                BornAt::Written(file, start, end) => crate::ccl::infer_var::Origin::Written(
+                    chl_parser::ast::Span::new(file, start, end),
+                ),
+            };
+            types.iter().map(move |ty| (origin, ty))
+        })
+    }
+}
+
 /// Flat per-position representation of a type.
 ///
 /// At positive position, this conceptually represents a *union* of the
@@ -1141,6 +1233,65 @@ pub struct CompactType {
     /// so "check it where the variable resolves" is a local question at coalesce
     /// rather than a list to be drained afterwards.
     pub kinds: Vec<crate::ccl::ty::TypeKind>,
+    /// Where the concrete contributions at this position were born. Identity only: it
+    /// changes no answer compaction gives.
+    pub origins: ContributionOrigins,
+}
+
+/// Call `f` on every position directly under `ct`, with its polarity: fields and
+/// payloads as `ct`, a function's domain and its binders' kinds opposite, its codomain
+/// as `ct`, a history's parts as `ct` (the polarities [`super::simplify_type`] reads).
+/// Stops at the first `None`.
+pub(super) fn for_each_child(
+    ct: &mut CompactType,
+    pol: bool,
+    f: &mut impl FnMut(&mut CompactType, bool) -> Option<()>,
+) -> Option<()> {
+    for child in ct.rec.iter_mut().flat_map(|r| r.values_mut()) {
+        f(child, pol)?;
+    }
+    for child in ct.var.iter_mut().flat_map(|v| v.tags.values_mut()) {
+        f(child, pol)?;
+    }
+    for child in ct
+        .dep_tuple
+        .iter_mut()
+        .flat_map(|d| d.components.iter_mut())
+    {
+        f(child, pol)?;
+    }
+    if let Some(family) = &mut ct.family {
+        for child in family.domains.iter_mut() {
+            f(child, pol)?;
+        }
+        f(&mut family.body, pol)?;
+    }
+    if let Some(cf) = &mut ct.fun {
+        for w in &mut cf.binders {
+            match &mut w.type_kind {
+                CompactTypeKind::Enumerated(candidates) => {
+                    for c in candidates {
+                        f(c, !pol)?;
+                    }
+                }
+                CompactTypeKind::SubtypesOf(bound) => f(bound, !pol)?,
+                CompactTypeKind::UIntRanges | CompactTypeKind::Type => {}
+            }
+        }
+        f(&mut cf.domain, !pol)?;
+        f(&mut cf.codomain, pol)?;
+    }
+    if let Some(history) = &mut ct.history_slot {
+        f(&mut history.value, pol)?;
+        f(&mut history.domain, pol)?;
+    }
+    for (decl, args) in ct.nominal.iter_mut() {
+        for (arg, v) in args.iter_mut().zip(decl.sided_variances()) {
+            let pol = v.polarity(pol);
+            f(arg, pol)?;
+        }
+    }
+    Some(())
 }
 
 /// How many positions a tuple contribution has: exactly its listed ones (a [`Type::Tuple`]),
@@ -1468,6 +1619,7 @@ impl CompactType {
             family,
             nominal,
             nominal_conflict: _,
+            origins: _,
         } = self;
         let is_witness = |a: &&AtomKey| matches!(a, AtomKey::Witness(_));
         atoms.iter().filter(|a| !is_witness(a)).count()
@@ -1609,6 +1761,7 @@ impl CompactType {
             family,
             nominal,
             nominal_conflict: _,
+            origins: _,
         } = self;
         // `atoms` and `refinements` hold no position, so structural equality on those is
         // already denotational — the first is a `BTreeSet` and the second a set of terms.
@@ -1726,6 +1879,7 @@ impl CompactType {
         // See `src/ccl/design/type-inference.md`, "How a sum flows through the solver".
         let mut vars = lhs.vars;
         vars.extend(rhs.vars);
+        let (lhs_origins, rhs_origins) = (lhs.origins, rhs.origins);
         #[allow(clippy::mutable_key_type)]
         // `AtomKey::Witness` holds a `RefCell` kind; ordering reads its `uid` alone.
         let mut atoms = lhs.atoms;
@@ -1881,6 +2035,7 @@ impl CompactType {
             family,
             nominal,
             nominal_conflict,
+            origins: lhs_origins.union(rhs_origins),
         }
     }
 
@@ -1910,6 +2065,7 @@ impl CompactType {
             kinds,
             nominal,
             nominal_conflict: _,
+            origins: _,
         } = self;
         atoms.is_empty()
             && rec.is_none()
@@ -1927,6 +2083,7 @@ impl CompactType {
     /// [`imposes_nothing`](Self::imposes_nothing), leaving everything else as-is.
     fn absorbing_vars_of(mut self, identity: CompactType) -> CompactType {
         self.vars.extend(identity.vars);
+        self.origins = self.origins.union(identity.origins);
         self
     }
     fn merge_refinements(pol: bool, lhs: RefinementSet, rhs: RefinementSet) -> RefinementSet {
@@ -3285,9 +3442,25 @@ fn compact_go(
     pos: Position<'_>,
     st: &mut CompactState,
 ) -> CompactType {
-    stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
+    let mut ct = stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
         compact_go_inner(ty, pol, subst_acc, pos, st)
-    })
+    });
+    // A type a variable's bound holds is born where the bound says; the variable's arm
+    // records it. Any other type contributes without a recorded birth.
+    if !stands_for_a_variable(ty) {
+        ct.origins = ct.origins.union(ContributionOrigins::unknown());
+    }
+    ct
+}
+
+/// Whether `ty` is a variable, refined or not: what it contributes is its bounds', whose births
+/// they record ([`ContributionOrigins`]).
+fn stands_for_a_variable(ty: &Type) -> bool {
+    match ty {
+        Type::Infer(_) => true,
+        Type::Refinement(base, _) => stands_for_a_variable(base),
+        _ => false,
+    }
 }
 
 /// The body of [`compact_go`].
@@ -3960,7 +4133,10 @@ fn compact_go_inner(
                 // arrives with every edge's morphism composed (design §3.6).
                 // Identity edges leave `subst_acc` unchanged (the common case).
                 let inner_acc = Subst::then(&b.render_subst(), subst_acc);
-                let bc = compact_bound(&b.ty, pol, &inner_acc, pos.under(&new_parents), st);
+                let mut bc = compact_bound(&b.ty, pol, &inner_acc, pos.under(&new_parents), st);
+                if !stands_for_a_variable(&b.ty) {
+                    bc.origins = ContributionOrigins::born_at(b.origin, &b.ty);
+                }
                 bound = CompactType::merge(pol, bound, bc);
             }
             // Whether the *shape* collapse fires: the primary walk produced no
@@ -3992,6 +4168,7 @@ fn compact_go_inner(
                     refinements: _,
                     kinds: _,
                     nominal_conflict: _,
+                    origins: _,
                 } = &bound;
                 // A variant shape counts as concrete only at a **positive**
                 // position, where it is the value's own tags — read off the lower
@@ -4047,7 +4224,11 @@ fn compact_go_inner(
             if read_opposite {
                 for b in opposite_bounds.iter().filter(|b| renders_as_own(b)) {
                     let inner_acc = Subst::then(&b.render_subst(), subst_acc);
-                    let bc = compact_bound(&b.ty, !pol, &inner_acc, pos.under(&new_parents), st);
+                    let mut bc =
+                        compact_bound(&b.ty, !pol, &inner_acc, pos.under(&new_parents), st);
+                    if !stands_for_a_variable(&b.ty) {
+                        bc.origins = ContributionOrigins::born_at(b.origin, &b.ty);
+                    }
                     recovered = Some(match recovered {
                         None => bc,
                         Some(acc) => CompactType::merge(!pol, acc, bc),

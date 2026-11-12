@@ -3090,7 +3090,9 @@ pub(super) fn emit_list<C: Typing>(
     let elem_ty = ctx.fresh();
     for elt in elts.iter_mut() {
         let t = emit_value_read(elt, ctx)?;
-        ctx.require_sub(&t, &elem_ty, &|| "a list element".to_string())?;
+        ctx.with_value_at(Origin::Node(elt.node_id()), |ctx| {
+            ctx.require_sub(&t, &elem_ty, &|| "a list element".to_string())
+        })?;
     }
     let n = elts.len();
     // Deref a bare mutable read to its value, as in `emit_tuple`: the list's

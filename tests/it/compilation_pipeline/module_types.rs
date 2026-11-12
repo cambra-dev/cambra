@@ -913,7 +913,7 @@ fn a_module_typed_parameter_takes_its_arguments_type_members(
         run exact(n=p) as e
         1
     "},
-    "annotated as Int => Int, but inferred as {Int where _ > 0} => {Int where _ > 0}"
+    "annotated as {Int where _ > 0}, but inferred as Int"
 )]
 #[case::a_missing_type_member(
     indoc! {"
@@ -1013,4 +1013,32 @@ fn a_misused_type_member_is_refused(#[case] root: &str, #[case] needle: &str) {
         ),
         needle,
     );
+}
+
+/// A module sound at its parameters' types reports nothing a run raises in its code:
+/// `bounded` checks at `Count <: Int`, and a run passing a module whose `Count` is `String` is
+/// reported at the argument alone (`docs/modules.md`, "Checking a module on its own").
+#[test]
+fn an_argument_outside_its_bound_is_reported_at_the_argument_alone() {
+    let errors = compile_errors(&program(
+        indoc! {"
+            run worded as w
+            run bounded(n=w) as b
+            1
+        "},
+        &[
+            ("bounded", BOUNDED),
+            (
+                "worded",
+                indoc! {r#"
+                    pub Count = String
+                    pub start: Count = "a"
+                    pub def keep(c: Count) => Count:
+                        c
+                "#},
+            ),
+        ],
+    ));
+    assert_eq!(report_count(&errors), 1, "{errors}");
+    assert!(errors.contains("run bounded(n=w) as b"), "{errors}");
 }

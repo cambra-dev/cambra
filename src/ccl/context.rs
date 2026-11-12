@@ -496,45 +496,81 @@ impl<'a> Blame<'a> {
         })
     }
 
+    /// The diagnostics `errors` render as. Two errors that underline one span with one
+    /// message are one diagnostic, with the secondary labels of both: nothing a reader sees
+    /// tells them apart. Inference reports a defect once per failing position of its graph,
+    /// and two positions can fail alike at one span, where a value reaches a position
+    /// through a trait instance's types rather than through the variable that failed first.
     fn infer(&self, errors: Vec<LocatedInferError>, tree: &Expr) -> Vec<CompileError> {
-        errors
-            .into_iter()
-            .map(|located| {
-                let span = self.span(located.node_id, Some(tree));
-                // A related position is a secondary label only where it is not part of
-                // what the primary one underlines.
-                let within = |inner: Span| {
-                    inner.file == span.file && span.start <= inner.start && inner.end <= span.end
+        let mut reported: Vec<CompileError> = Vec::new();
+        for located in errors {
+            let span = self.span(located.node_id, Some(tree));
+            // A related position is a secondary label only where it is not part of
+            // what the primary one underlines.
+            let within = |inner: Span| {
+                inner.file == span.file && span.start <= inner.start && inner.end <= span.end
+            };
+            let mut related: Vec<(Span, String)> = Vec::new();
+            for r in located.related.iter() {
+                let at = match r.origin {
+                    crate::ccl::infer_var::Origin::Node(id) => self.traced(id, Some(tree)),
+                    crate::ccl::infer_var::Origin::Written(at) => Some(at),
                 };
-                let mut related: Vec<(Span, String)> = Vec::new();
-                for r in located.related.iter() {
-                    let at = match r.origin {
-                        crate::ccl::infer_var::Origin::Node(id) => self.traced(id, Some(tree)),
-                        crate::ccl::infer_var::Origin::Written(at) => Some(at),
-                    };
-                    if let Some(at) = at
-                        && !within(at)
-                        && !related.iter().any(|(seen, _)| *seen == at)
-                    {
-                        related.push((at, r.role.label().to_string()));
+                if let Some(at) = at
+                    && !within(at)
+                    && !related.iter().any(|(seen, _)| *seen == at)
+                {
+                    related.push((at, r.role.label().to_string()));
+                }
+            }
+            for contribution in located.related.contributions() {
+                let at = match contribution.origin {
+                    crate::ccl::infer_var::Origin::Node(id) => self.traced(id, Some(tree)),
+                    crate::ccl::infer_var::Origin::Written(at) => Some(at),
+                };
+                if let Some(at) = at {
+                    let label = (
+                        at,
+                        format!(
+                            "contributes {}",
+                            crate::ccl::chl_print::chl_type(&contribution.ty)
+                        ),
+                    );
+                    if !related.contains(&label) {
+                        related.push(label);
                     }
                 }
-                // Each copy that raised the error is labelled at its run, those of the
-                // errors inference merged into it included.
-                for node in std::iter::once(located.node_id).chain(located.also) {
-                    for label in self.run_labels(node, span, Some(tree)) {
-                        if !related.contains(&label) {
-                            related.push(label);
-                        }
+            }
+            // Each copy that raised the error is labelled at its run, those of the
+            // errors inference merged into it included.
+            for node in std::iter::once(located.node_id).chain(located.also) {
+                for label in self.run_labels(node, span, Some(tree)) {
+                    if !related.contains(&label) {
+                        related.push(label);
                     }
                 }
-                CompileError::Infer {
-                    error: self.as_pattern_mismatch(located.error, located.node_id),
-                    span,
-                    related,
+            }
+            let error = self.as_pattern_mismatch(located.error, located.node_id);
+            if let Some(CompileError::Infer { related: seen, .. }) =
+                reported.iter_mut().find(|seen| {
+                    matches!(seen, CompileError::Infer { span: at, error: earlier, .. }
+                        if *at == span && earlier.same_defect(&error))
+                })
+            {
+                for label in related {
+                    if !seen.contains(&label) {
+                        seen.push(label);
+                    }
                 }
-            })
-            .collect()
+                continue;
+            }
+            reported.push(CompileError::Infer {
+                error,
+                span,
+                related,
+            });
+        }
+        reported
     }
 
     /// `error`, reported as the pattern's where it is the width annotation lowering put on
@@ -2179,11 +2215,19 @@ fn check_modules(
         let errors = errors
             .into_iter()
             .map(|mut located| {
-                located.error.respell(&respelling);
+                located.respell(&respelling);
                 located
             })
             .collect();
-        for mut error in blame.infer(errors, &tree) {
+        let errors = blame.infer(errors, &tree);
+        // The spans of the errors standing in the checked module's own code, which include
+        // each argument its runs and imports pass that does not fit its parameter.
+        let own_spans: Vec<Span> = errors
+            .iter()
+            .filter_map(CompileError::span)
+            .filter(|span| span.file == check.file)
+            .collect();
+        for mut error in errors {
             let CompileError::Infer {
                 error: infer_error,
                 span,
@@ -2201,6 +2245,15 @@ fn check_modules(
             {
                 continue;
             } else if let Some(statement) = check.reached_by.get(&span.file) {
+                // A module whose own check passed is sound at the types its parameters
+                // declare, so an error in its code that a run raises comes from an argument
+                // that does not fit them, which the run's statement reports.
+                if own_spans
+                    .iter()
+                    .any(|at| statement.start <= at.start && at.end <= statement.end)
+                {
+                    continue;
+                }
                 related.push((*statement, "brought in here".to_string()));
             }
             if !seen.contains(&key) {
@@ -2574,7 +2627,7 @@ fn run_passes(
         let errors = errors
             .into_iter()
             .map(|mut located| {
-                located.error.respell(&respelling);
+                located.respell(&respelling);
                 located
             })
             .collect();
@@ -3611,10 +3664,11 @@ Error: lowering error
             z
         g(5)
         "#}, "g(5)", 0)]
+    // An undetermined type is reported at the innermost node holding it, the first read of `x`.
     #[case::ambiguous_program(indoc::indoc! {r#"
         f = \x -> [x, x]
         f
-        "#}, "f = \\x -> [x, x]", 0)]
+        "#}, "x", 1)]
     #[case::used_after_await_final(
         indoc::indoc! {"
             a: Mut(Int, Txn) := 0
@@ -3677,6 +3731,14 @@ Error: lowering error
         "},
         "x: Feed(_)",
         0
+    )]
+    #[case::two_undetermined_parameters(
+        indoc::indoc! {r"
+            f = \x -> \y -> (x, y)
+            f
+        "},
+        "y",
+        1
     )]
     fn a_rejection_after_lowering_points_at_its_source(
         #[case] code: &str,

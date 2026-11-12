@@ -210,6 +210,7 @@ pub(super) struct InferCtx {
     /// under emission: a type parameter's bound or a requirement, written in a `Poly`
     /// and checked at a use ([`Typing::with_demand_at`]).
     demand_at: Option<Origin>,
+    value_at: Option<Origin>,
     /// The assumptions in scope at the current emission position: the `requires`
     /// clauses of the polymorphic annotations whose right-hand sides enclose it.
     /// Every obligation `require_trait` mints takes those about its trait
@@ -459,6 +460,7 @@ impl InferCtx {
             reported: HashSet::new(),
             schemes_noted: Vec::new(),
             demand_at: None,
+            value_at: None,
             assumptions: Vec::new(),
             telescope: Telescope::empty(),
             opaque_binders: HashMap::new(),
@@ -755,7 +757,10 @@ impl InferCtx {
         scheme: &PolyScheme,
     ) -> Result<(), LocatedInferError> {
         let at = || format!("the method `.{}(…)`", call.trait_.name());
-        self.cache.at(self.here(), self.demand_at.or(self.here()));
+        self.cache.at(
+            self.value_at.or(self.here()),
+            self.demand_at.or(self.here()),
+        );
         let result = call.instantiate_method(scheme, &mut self.cache);
         self.cache.report_recorded(|| EdgeReport::Labeled(at()));
         result.map_err(|e| {
@@ -852,7 +857,10 @@ impl InferCtx {
         // A trait whose instances already agree settles here, before any
         // operand is known — the ordinary "all candidates agree" rule reaching its
         // condition immediately, not a special case.
-        self.cache.at(self.here(), self.demand_at.or(self.here()));
+        self.cache.at(
+            self.value_at.or(self.here()),
+            self.demand_at.or(self.here()),
+        );
         let deposited = obligation.try_deposit(&mut self.cache);
         self.cache.report_recorded(|| EdgeReport::Labeled(at()));
         if let Err(e) = deposited {
@@ -2017,7 +2025,10 @@ impl Typing for InferCtx {
             opaque_binders: &self.opaque_binders,
             scope_exits: &self.scope_exits,
         };
-        self.cache.at(self.here(), self.demand_at.or(self.here()));
+        self.cache.at(
+            self.value_at.or(self.here()),
+            self.demand_at.or(self.here()),
+        );
         let result = constrain_subtype_in(sub, sup, &mut self.cache, &scope);
         self.cache.report_recorded(|| EdgeReport::Labeled(at()));
         match result {
@@ -2029,6 +2040,13 @@ impl Typing for InferCtx {
                     .with_failure(failure))
             }
         }
+    }
+
+    fn with_value_at<R>(&mut self, origin: Origin, f: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = self.value_at.replace(origin);
+        let out = f(self);
+        self.value_at = saved;
+        out
     }
 
     fn with_demand_at<R>(&mut self, origin: Option<Origin>, f: impl FnOnce(&mut Self) -> R) -> R {
