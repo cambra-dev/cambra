@@ -691,11 +691,13 @@ declarations (`ModuleCheckResult`). Recovery also continues after coalescing err
 recovery run supplies the remaining contracts and inferred parameter types; an omitted body with no
 complete declaration supplies no export contract.
 
-A rejected run or import declaration is recorded separately from defects in the module it reaches.
-The linked tree poisons the members of that instantiation (`recover_rejected_runs`), identified by
-their `Home` and the declaration in `RunSites`. Its invalid arguments establish no instance whose
-body can be checked. The module's own errors are retained from its independent check, and other
-instantiations remain checked.
+A run or import is rejected when an error of its declaring module's own check falls within the
+declaration's source span. `RunSites` records the nodes of each copy before linking appends its
+importer's continuation. Later checks and linked inference replace every statement of the rejected
+copy with a placeholder (`recover_rejected_runs`), including statements that bind no name and
+copies of runs nested within it. Invalid arguments establish no instance whose body can be checked.
+The module's independent check retains
+its own errors, and other instantiations and the importer's continuation remain checked.
 
 Statements rejected by a module's own check are omitted from later checks and the linked program's
 inference (`recover_checked_statements`). A statement's source span and declared binder identify it
@@ -706,26 +708,24 @@ An incorrect caller is checked against those constraints even when the implement
 A complete declaration depends on the names in its declared types; reading a broken definition in
 its body does not discard that contract. Unknown portions of a recovered signature establish no
 inferred export contract. Definitions not selected for recovery retain their bodies, since
-specialization can reject a use in ways their
-signatures do not express. A diagnostic's secondary label in a broken module suppresses nothing: the
+specialization can reject a use in ways their signatures do not express. A diagnostic's secondary
+label in a broken module suppresses nothing: the
 label can name a valid requirement that the caller violates.
 
-The operand-requirement sweep groups unchanged copies of conflicting requirements before
-attribution. The grouped failure retains the variables of its source and its carriers, so the
-attribution walk finds the owning definition without falling back to the program root. Recovery
-can then omit that definition while retaining unrelated exports.
-
-A module with lowering errors
-of its own has no check, and its code is not linked, so its type errors are not reported until its
-lowering errors are fixed. A module is checked against its dependencies' bodies, so each check infers them
-again; keeping each module's inferred schemes for its users would remove that cost.
+A module with lowering errors of its own has no check, and its code is not linked, so its type
+errors are not reported until its lowering errors are fixed. A module is checked against its
+dependencies' bodies, so each check infers them again; keeping each module's inferred schemes for
+its users would remove that cost.
 
 `cambra check lib.cambra` checks a file on its own (`check_program`). It lowers the file as a module
 rather than as a root (`lower_for_check`), so its parameters need no defaults, and links nothing: it
 checks each module the file reaches and then the file. Each route a module declares is a source
 that opens nothing, so the check binds no port. It prints the file's interface
 (`Interface::written`): each parameter with its type, bound, or Module type, then each public member
-in the order declared. A value's contract is its annotation or the type it infers, a generalized
+in the order declared. A failed check prints established contracts alongside its diagnostics and
+exits unsuccessfully. Values whose omitted definitions establish no complete contract are absent
+from this partial interface. A value's contract is its annotation or the type it infers, a
+generalized
 one's written as a diagnostic writes an inferred polymorphic type, joins and all. A `def` with a
 `Mut` parameter lowers curried and is written as its callers apply it, one function of the tuple of
 its parameters (`Contract::uncurried`). Inference notes a

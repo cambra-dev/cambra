@@ -440,8 +440,11 @@ fn main() {
         });
         match cambra::ccl::context::check_program(&mut GlobalContext::default(), &loaded) {
             Ok(interface) => print!("{interface}"),
-            Err(errors) => {
-                eprint_errors(&errors, loaded.sources());
+            Err(failed) => {
+                if let Some(interface) = failed.interface {
+                    print!("{interface}");
+                }
+                eprint_errors(&failed.errors, loaded.sources());
                 std::process::exit(1);
             }
         }

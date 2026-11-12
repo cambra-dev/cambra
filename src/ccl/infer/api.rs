@@ -2091,6 +2091,7 @@ pub fn check_module(
     );
     let Some((_, schemes, opened)) = outcome.typed else {
         return ModuleCheckResult {
+            before: outcome.before,
             contracts: HashMap::new(),
             has_typed_tree: false,
             errors: outcome.errors,
@@ -2127,6 +2128,7 @@ pub fn check_module(
         }
     }
     ModuleCheckResult {
+        before: outcome.before,
         contracts,
         has_typed_tree: true,
         errors: outcome.errors,
@@ -2136,6 +2138,7 @@ pub fn check_module(
 
 /// Contracts retained after checking a module, alongside its errors and omitted statements.
 pub struct ModuleCheckResult {
+    pub(crate) before: Expr,
     /// Contracts established by surviving definitions or complete declarations.
     pub contracts: HashMap<Name, Contract>,
     /// Errors from the module and every recovery run.

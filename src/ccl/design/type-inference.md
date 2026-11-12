@@ -383,8 +383,9 @@ copies preserve node identities. Equal messages at different nodes remain separa
 run can uncover an independent failure at another site.
 
 Module checks continue recovery after coalescing failures too. `RunOutcome` keeps the errors and
-the last successful run's result together. That run supplies partial contracts and its recovered
-tree. A failed function retains explicit parameter and result constraints for diagnosing callers,
+the last successful run's result together. It also returns the tree before emission for tracing
+earlier errors without retaining another snapshot. That run supplies partial contracts and its
+recovered tree. A failed function retains explicit parameter and result constraints for diagnosing callers,
 including bounded and partial annotations. Complete declarations depend on their declared types
 rather than their bodies. An omitted body with no complete declaration establishes no inferred
 export contract (`unavailable_contracts`); its explicit constraints still check callers. The module
@@ -4183,8 +4184,8 @@ A value that fails deposits nothing and the pass goes on, so each failing value 
 whichever variable the pass reaches it from and however many rounds it takes.
 
 An obligation records the obligation it copied (`TraitObligation::copied_from`). A copy with the
-same candidate rows carries the parent's requirement; narrowing those rows establishes a distinct
-requirement for that instantiation. The sweep identifies an unsatisfiable intersection by these
+same candidate rows carries the parent's requirement (`TraitObligation::requirement_source`);
+narrowing those rows establishes a distinct requirement for that instantiation. The sweep identifies an unsatisfiable intersection by these
 requirement identities and operand positions, combining the variables of its copies before finding
 the node that owns the failure. A conflict containing every requirement of another conflict is a
 carrier too. Smaller conflicting sets are grouped first, independently of arena traversal order.

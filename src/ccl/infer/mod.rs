@@ -730,6 +730,8 @@ pub(crate) type OpenedVars = HashMap<crate::ccl::InferVarId, Rc<crate::ccl::ty::
 
 /// A run's errors and the result of its last successful recovery run.
 pub(crate) struct RunOutcome {
+    /// The tree before emission, at the identities earlier errors can still name.
+    pub before: Expr,
     pub typed: Option<(Type, NotedSchemes, OpenedVars)>,
     pub errors: Vec<LocatedInferError>,
     pub recovered: HashMap<NodeId, StandIn>,
@@ -780,6 +782,7 @@ pub(crate) fn run_with_params(
     } = match run_once(expr, sources, instances, params, reported) {
         Ok(typed) => {
             return RunOutcome {
+                before: pristine,
                 typed: Some(typed),
                 errors: Vec::new(),
                 recovered: HashMap::new(),
@@ -849,6 +852,7 @@ pub(crate) fn run_with_params(
     }
     drop_met_downstream(&pristine, &mut errors);
     RunOutcome {
+        before: pristine,
         typed,
         errors,
         recovered: stood_in,

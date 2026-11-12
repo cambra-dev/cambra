@@ -4,6 +4,7 @@
 use super::*;
 use crate::ccl::Annotation;
 use crate::ccl::Occurrence;
+use crate::ccl::provenance::NodeId;
 use crate::ccl::{BaseType, BinOpKind, CompareKind, PredicateId, Refinement};
 
 /// The spelling of the placeholder a module's chain holds where the code below
@@ -25,7 +26,7 @@ pub fn is_module_body(expr: &Expr) -> bool {
 /// the body of a `let`, a mutable variable, a statement, a type alias, an `impl`
 /// or `instance` block's group of functions, or a `run`. A module's top level is
 /// the chain of these bodies from the root.
-pub(in crate::ccl::lower) fn spine_body(expr: &Expr) -> Option<&Expr> {
+pub(crate) fn spine_body(expr: &Expr) -> Option<&Expr> {
     match &expr.node {
         TypedExprNode::Let { body, .. }
         | TypedExprNode::MutDecl { body, .. }
@@ -893,6 +894,51 @@ pub struct RunSites {
     pub statements: HashMap<Home, Vec<(Span, String)>>,
     /// The runs and shared imports of each module, by its file.
     pub by_file: HashMap<FileId, Vec<Home>>,
+    /// The copy owning each node, recorded before its continuation is filled.
+    pub nodes: HashMap<NodeId, Home>,
+    /// The enclosing copy of each nested run, including runs within shared imports.
+    pub(crate) parents: HashMap<Home, Home>,
+}
+
+impl RunSites {
+    fn note_copy(&mut self, tree: &Expr, home: &Home) {
+        if is_module_body(tree) {
+            return;
+        }
+        tree.for_each_own_id(|id| {
+            if let Some(inner) = self.nodes.get(&id) {
+                if inner != home {
+                    self.parents
+                        .entry(inner.clone())
+                        .or_insert_with(|| home.clone());
+                }
+            } else {
+                self.nodes.insert(id, home.clone());
+            }
+        });
+        tree.walk_children(|child| self.note_copy(child, home));
+    }
+
+    /// Carry copy ownership through a shared chain's identity-changing clone.
+    pub(super) fn note_clone(&mut self, source: &Expr, copy: &Expr, original: &Self) {
+        fn ids(tree: &Expr, out: &mut Vec<NodeId>) {
+            tree.for_each_own_id(|id| out.push(id));
+            tree.walk_children(|child| ids(child, out));
+        }
+        let mut from = Vec::new();
+        let mut to = Vec::new();
+        ids(source, &mut from);
+        ids(copy, &mut to);
+        assert_eq!(from.len(), to.len(), "a chain's clone preserves its shape");
+        for (old, new) in from.into_iter().zip(to) {
+            if let Some(home) = original.nodes.get(&old) {
+                self.nodes.insert(new, home.clone());
+                if let Some(parent) = original.parents.get(home) {
+                    self.parents.insert(home.clone(), parent.clone());
+                }
+            }
+        }
+    }
 }
 
 /// One run of a module, created ([`ProgramLowering::create`]).
@@ -1526,6 +1572,14 @@ impl<'a> ProgramLowering<'a> {
         let scope = use_names(&lowered.scope, qualified);
         let mut uniquified = uniquify::run_in(chain, &raw_scope(&scope), home.clone());
         substitute_in(&mut uniquified, &arguments);
+        if let Some(home) = &home {
+            let sites = if self.checking {
+                &mut self.check_sites
+            } else {
+                &mut ctx.run_sites
+            };
+            sites.note_copy(&uniquified, home);
+        }
         let mut names = scope;
         let (spine, _) = spine(&uniquified);
         for name in spine {

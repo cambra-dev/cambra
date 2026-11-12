@@ -333,7 +333,9 @@ impl<'a> ProgramLowering<'a> {
             let _copy = crate::ccl::provenance::copy_frame("check.module");
             for (shared, chain) in self.shared_chains.iter().rev() {
                 if reached.contains(shared) {
-                    tree = fill_module_body(chain.clone(), tree);
+                    let copy = chain.clone();
+                    self.check_sites.note_clone(chain, &copy, &ctx.run_sites);
+                    tree = fill_module_body(copy, tree);
                 }
             }
         }

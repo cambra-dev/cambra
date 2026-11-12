@@ -683,7 +683,7 @@ fn a_def_with_a_mut_parameter_is_written_uncurried() {
     );
 }
 
-/// A file whose check fails reports its errors, and prints no interface.
+/// A file whose check fails reports its errors alongside its established interface.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn a_checked_module_reports_its_errors() {
@@ -694,7 +694,9 @@ fn a_checked_module_reports_its_errors() {
         "},
         &[],
     );
-    let errors = check_program(&mut GlobalContext::default(), &program).unwrap_err();
+    let errors = check_program(&mut GlobalContext::default(), &program)
+        .unwrap_err()
+        .errors;
     assert_eq!(errors.len(), 1, "{errors:?}");
 }
 
@@ -721,7 +723,9 @@ fn a_checked_module_reports_a_runs_missing_argument(#[case] file: &str) {
         pub w = counter::v
     "};
     let program = program(file, &[("counter", counter), ("outer", outer)]);
-    let errors = check_program(&mut GlobalContext::default(), &program).unwrap_err();
+    let errors = check_program(&mut GlobalContext::default(), &program)
+        .unwrap_err()
+        .errors;
     let messages: Vec<String> = errors.iter().map(|e| e.message()).collect();
     assert_eq!(
         messages,
@@ -760,7 +764,7 @@ fn a_runs_missing_argument_is_reported_once_however_often_it_is_copied() {
 
 /// The `cambra check` subcommand reads the file and the modules it reaches from
 /// disk, prints the file's interface and exits 0, prints a failing check's
-/// errors and exits 1, and refuses a missing file argument.
+/// errors alongside established contracts and exits 1, and refuses a missing file argument.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
 fn cambra_check_prints_an_interface_or_errors() {
@@ -775,7 +779,15 @@ fn cambra_check_prints_an_interface_or_errors() {
         "},
     )
     .expect("writing lib");
-    std::fs::write(dir.join("bad.cambra"), "pub v: String = 1\n").expect("writing bad");
+    std::fs::write(
+        dir.join("bad.cambra"),
+        indoc! {r#"
+        pub good = 1
+        pub declared: String = 1
+        pub missing = absent
+    "#},
+    )
+    .expect("writing bad");
     let check = |args: &[&std::path::Path]| {
         std::process::Command::new(env!("CARGO_BIN_EXE_cambra"))
             .arg("check")
@@ -798,8 +810,11 @@ fn cambra_check_prints_an_interface_or_errors() {
     let failed = check(&[&dir.join("bad.cambra")]);
     let stderr = String::from_utf8_lossy(&failed.stderr);
     assert_eq!(failed.status.code(), Some(1), "{stderr}");
-    assert!(failed.stdout.is_empty());
-    assert!(stderr.contains("bad.cambra:1:"), "{stderr}");
+    let stdout = String::from_utf8_lossy(&failed.stdout);
+    assert!(stdout.contains("pub good: {Int where _ == 1}"), "{stdout}");
+    assert!(stdout.contains("pub declared: String"), "{stdout}");
+    assert!(!stdout.contains("pub missing:"), "{stdout}");
+    assert!(stderr.contains("bad.cambra:"), "{stderr}");
 
     let usage = check(&[]);
     assert_eq!(usage.status.code(), Some(1));

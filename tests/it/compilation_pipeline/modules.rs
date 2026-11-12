@@ -1441,3 +1441,81 @@ fn a_failed_value_keeps_declared_components_and_freshens_unknown_ones(
     assert!(errors.contains("lib.cambra:"), "{errors}");
     assert_eq!(errors.contains("main.cambra:2:"), !valid, "{errors}");
 }
+
+#[rstest]
+#[case::only_rejected(false)]
+#[case::valid_sibling_remains_checked(true)]
+#[timeout(Duration::from_secs(20))]
+fn a_rejected_outer_run_omits_its_nested_copies(#[case] invalid_sibling_use: bool) {
+    let worker = indoc! {"
+        param T <: Int
+        param x: T
+        visits := x
+        visits := visits + 1
+        pub n = 1
+    "};
+    let mid = indoc! {"
+        param T <: Int
+        param x: T
+        run worker(T=T, x=x) as inner
+        pub n = inner::n
+    "};
+    let use_ = if invalid_sibling_use {
+        r#"good::n + "s""#
+    } else {
+        "1"
+    };
+    let root = formatdoc! {r#"
+        run mid(T=String, x="s") as bad
+        run mid(T=Int, x=1) as good
+        {use_}
+    "#};
+    let errors = compile_errors(&program(&root, &[("worker", worker), ("mid", mid)]));
+    assert_eq!(
+        report_count(&errors),
+        if invalid_sibling_use { 2 } else { 1 },
+        "{errors}"
+    );
+    assert!(!errors.contains("worker.cambra:"), "{errors}");
+}
+
+#[rstest]
+#[case::direct(false, false)]
+#[case::nested(true, false)]
+#[case::importer_stays_checked(false, true)]
+#[case::nested_importer_stays_checked(true, true)]
+#[timeout(Duration::from_secs(20))]
+fn a_rejected_run_reports_nothing_from_its_nonbinding_statements(
+    #[case] nested: bool,
+    #[case] invalid_importer: bool,
+) {
+    let worker = indoc! {"
+        param T <: Int
+        param x: T
+        visits := x
+        visits := visits + 1
+        x + 1
+        pub n = 1
+    "};
+    let mid = indoc! {r#"
+        run worker(T=String, x="s") as bad
+        pub n = 1
+    "#};
+    let declaration = if nested {
+        "run mid as bad"
+    } else {
+        r#"run worker(T=String, x="s") as bad"#
+    };
+    let use_ = if invalid_importer { r#"1 + "s""# } else { "1" };
+    let root = formatdoc! {"
+        {declaration}
+        {use_}
+    "};
+    let errors = compile_errors(&program(&root, &[("worker", worker), ("mid", mid)]));
+    assert_eq!(
+        report_count(&errors),
+        if invalid_importer { 2 } else { 1 },
+        "{errors}"
+    );
+    assert!(!errors.contains("worker.cambra:"), "{errors}");
+}
