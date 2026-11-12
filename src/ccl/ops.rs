@@ -7,6 +7,12 @@ use std::fmt;
 
 use crate::ccl::{AggregateKind, FieldKey, Label};
 
+/// Whether an operator with a `^` sibling refines its result as that sibling does: `+` by
+/// `__elem == 𝑎 + 𝑏`, `<` by `__elem == (𝑎 < 𝑏)`, `not` by `__elem == not 𝑎`
+/// (`refinement_of_binop` in `src/ccl/infer/schemes.rs`). The `^` siblings refine their
+/// result either way. The `refine-ops` feature turns it on.
+pub const REFINE_OPS: bool = cfg!(feature = "refine-ops");
+
 /// Primitive base types shared between the CCL type system and the interpreter.
 ///
 /// Defined here (in `ccl`) and re-exported by the interpreter so that
@@ -256,6 +262,30 @@ impl BinOpKind {
         }
     }
 
+    /// The `^` sibling of this operator: `^+` for `+`, `^<` for `<`, and `None` for an
+    /// operator with no sibling or one that is itself a sibling. The inverse of
+    /// [`unrefined`](Self::unrefined) where it answers.
+    pub fn refined(self) -> Option<Self> {
+        use ArithmeticKind as A;
+        use CompareKind as C;
+        use LogicKind as L;
+        let sibling = match self {
+            Self::Arithmetic(A::Add) => Self::Arithmetic(A::AddRefined),
+            Self::Arithmetic(A::Sub) => Self::Arithmetic(A::SubRefined),
+            Self::Arithmetic(A::Mul) => Self::Arithmetic(A::MulRefined),
+            Self::Compare(C::Equals) => Self::Compare(C::EqualsRefined),
+            Self::Compare(C::Less) => Self::Compare(C::LessRefined),
+            Self::Compare(C::LessOrEq) => Self::Compare(C::LessOrEqRefined),
+            Self::Compare(C::Greater) => Self::Compare(C::GreaterRefined),
+            Self::Compare(C::GreaterOrEq) => Self::Compare(C::GreaterOrEqRefined),
+            Self::BoolLogic(L::And) => Self::BoolLogic(L::AndRefined),
+            Self::BoolLogic(L::Or) => Self::BoolLogic(L::OrRefined),
+            _ => return None,
+        };
+        debug_assert_eq!(sibling.unrefined(), self, "`refined` inverts `unrefined`");
+        Some(sibling)
+    }
+
     /// Returns the canonical infix symbol for this operator (e.g. `"+"`, `"and"`, `"<="`).
     ///
     /// Used by formatters such as the symbolic printer and the pretty-tree
@@ -359,6 +389,14 @@ impl UnaryOpKind {
         match self {
             Self::NotRefined => Self::Not,
             op => op,
+        }
+    }
+
+    /// The `^` sibling of this operator: `NotRefined` for `Not`, `None` otherwise.
+    pub fn refined(self) -> Option<Self> {
+        match self {
+            Self::Not => Some(Self::NotRefined),
+            _ => None,
         }
     }
 }

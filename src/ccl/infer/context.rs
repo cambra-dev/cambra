@@ -4474,6 +4474,21 @@ impl Typing for InferCtx {
         lifted
     }
 
+    fn close_pattern_type(&mut self, binder: &Name, body_ty: Type) -> Type {
+        debug_assert!(
+            !self.telescope.contains(binder),
+            "a pattern binder `{binder}` is lifted past after its scope is restored"
+        );
+        let lifted = self.fresh();
+        let Type::Infer(v) = &lifted else {
+            unreachable!("fresh() yields a Type::Infer var");
+        };
+        let bound = Bound::with_subst(body_ty, Subst::join(binder.clone()));
+        enforce_bound_scope(v, "lower", &bound);
+        v.bounds.borrow_mut().lower_mut().push(bound);
+        lifted
+    }
+
     fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<Type, LocatedInferError> {
         // The inferred type is read before the edge, which a failure can leave bounding its
         // variables by the annotation too. The types inside its predicates are resolved

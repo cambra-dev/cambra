@@ -4913,6 +4913,9 @@ A structural match additionally carries a scrutinee and patterns:
 4. For a pattern that claims to have no payload, constrain its payload to `Unit`.
    Do this after the scrutinee constraint so a failure is attributed to that arm.
 5. Infer each guard and body with its pattern binding in scope.
+6. Lift each body's type past its pattern binding before it reaches the result variable, as
+   [Pattern-match arm binder referenced by the result type](#pattern-match-arm-binder-referenced-by-the-result-type)
+   describes.
 
 [The unified tagged sum](#the-unified-tagged-sum) defines the coverage
 relation. Placing the scrutinee and expected variant below a common fresh variable would
@@ -5089,8 +5092,18 @@ Neither choice would justify acquiring an arbitrary scalar refinement. Convertin
 
 ### Pattern-match arm binder referenced by the result type
 
-An arm-dependent result type cannot retain an arm-local binder after leaving that scope.
-The following program panics during constraint emission in every build:
+An arm's type leaves its pattern binder's scope as the join over every value the binder takes.
+`Typing::close_pattern_type` lifts the body's type onto a variable minted outside the binder, whose
+lower edge carries `Subst::join` of the binder; Check applies the same join to the reconstructed
+type. The binder is joined over as a contribution's crossed binders are
+([A contribution crosses the binders after its target](#a-contribution-crosses-the-binders-after-its-target)):
+a refinement naming the binder is dropped where it states a value, and is
+`InferError::NoJoinOverBinder` where it states a collection's keys or a function's parameter.
+
+An arm `case Shape::circle(r): r * r * 3` therefore types as `Int`: the refinement
+`__elem == r * r * 3` names `r` and states a value.
+
+A result whose collection keys depend on the binder has no join:
 
 ```python
 def filter_against(tagged):
@@ -5102,12 +5115,8 @@ def filter_against(tagged):
 filter_against(`pair((0, 1)))
 ```
 
-`enforce_bound_scope` rejects a lower bound carrying the first arm's free `p` when it is
-recorded on a variable whose telescope contains `tagged` but not `p`. Inference does not
-return a typed error or reach the post-inference scope check for this program.
-`arm_dependent_filter_result_panics_when_recording_an_escaping_bound` in
-`tests/it/type_check.rs` pins this outcome in debug and no-assertions builds. The result needs
-its dependency expressed in terms of values available outside the arm.
+The first arm's domain is refined by `p`, so inference reports `NoJoinOverBinder` naming `p`.
+Accepting it needs the dependency expressed in terms of values available outside the arm.
 
 One proposed construction is a result predicate that performs the same match. In
 pseudocode, a predicate local to each arm,

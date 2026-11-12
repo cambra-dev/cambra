@@ -84,7 +84,7 @@ fn ranges(lengths: &[u64]) -> Vec<Type> {
 }
 
 #[test]
-fn arm_dependent_filter_result_panics_when_recording_an_escaping_bound() {
+fn arm_dependent_filter_result_is_rejected_as_keyed_by_an_arm_binder() {
     let code = indoc! {r"
         def filter_against(tagged):
             match tagged:
@@ -94,72 +94,61 @@ fn arm_dependent_filter_result_panics_when_recording_an_escaping_bound() {
                     [x for x in [1, 2, 3] if x > s]
         filter_against(`pair((0, 1)))
     "};
-    let stmts = parse_module(code);
-    let mut expr = lower_uniquified(&stmts, &mut LoweringContext::default());
-    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        infer(&mut expr, &mut TypeInferenceContext::new())
-    }))
-    .expect_err("the arm-dependent result currently panics while recording its bound");
-    let message = panic
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| panic.downcast_ref::<&str>().copied())
-        .expect("scope assertion has a string panic payload");
-    assert!(message.contains("open bound recorded on"), "{message}");
-    assert!(message.contains("base: \"p\""), "{message}");
-    assert!(message.contains("free in the lower bound"), "{message}");
+    let errs = infer_program_err(code);
+    assert!(!errs.is_empty());
+    for e in &errs {
+        assert!(
+            matches!(
+                e,
+                InferError::NoJoinOverBinder { binders, reads, .. }
+                    if reads.is_empty() && binders.iter().map(|b| b.base()).eq(["p"])
+            ),
+            "expected the keys to join over `p`, got {e:?}"
+        );
+    }
 }
 
-/// `^*` states its product, so an arm computing `r ^* …` has a type naming its pattern binder
-/// `r`. Inference records that type, `r` still free, on the result variable outside the arm,
-/// and panics there. A refinement naming only an outer binder is recorded without one.
+/// An arm's type leaves its pattern binder's scope as the join over every value the binder
+/// takes. `^*` states its product, so the arm's refinement names whatever the operands name:
+/// one naming the arm's binder is dropped, and one naming only an outer binder stays
+/// (`src/ccl/design/type-inference.md`, "Pattern-match arm binder referenced by the result
+/// type").
 #[rstest]
-#[case::names_the_binder(indoc! {r"
-    def area(s):
-        match s:
-            case `circle(r):
-                r ^* 2
-    area(`circle(2))
-"})]
-#[case::every_arm_names_its_binder(indoc! {r"
-    def area(s):
-        match s:
-            case `circle(r):
-                r ^* r
-            case `square(w):
-                w ^* w
-    area(`circle(2))
-"})]
-fn a_match_arm_naming_its_pattern_binder_panics_when_recording_an_escaping_bound(
-    #[case] code: &str,
-) {
-    let stmts = parse_module(code);
-    let mut expr = lower_uniquified(&stmts, &mut LoweringContext::default());
-    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        infer(&mut expr, &mut TypeInferenceContext::new())
-    }))
-    .expect_err("an arm type naming its binder currently panics while recording its bound");
-    let message = panic
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| panic.downcast_ref::<&str>().copied())
-        .expect("scope assertion has a string panic payload");
-    assert!(message.contains("open bound recorded on"), "{message}");
-    assert!(message.contains("base: \"r\""), "{message}");
-    assert!(message.contains("free in the lower bound"), "{message}");
-}
-
-#[test]
-fn a_match_arm_s_type_keeps_a_refinement_naming_an_outer_binder() {
-    let code = indoc! {r"
+#[case::names_the_binder(
+    indoc! {r"
+        def area(s):
+            match s:
+                case `circle(r):
+                    r ^* 2
+        area(`circle(2))
+    "},
+    "Int"
+)]
+#[case::every_arm_names_its_binder(
+    indoc! {r"
+        def area(s):
+            match s:
+                case `circle(r):
+                    r ^* r
+                case `square(w):
+                    w ^* w
+        area(`circle(2))
+    "},
+    "Int"
+)]
+#[case::names_an_outer_binder(
+    indoc! {r"
         k ^= 3
         def area(s):
             match s:
                 case `circle(r):
                     k ^* 2
         area(`circle(2))
-    "};
-    assert_eq!(infer_program(code).to_string(), "{Int | __elem == k * 2}");
+    "},
+    "{Int | __elem == k * 2}"
+)]
+fn a_match_arm_s_type_joins_over_its_pattern_binder(#[case] code: &str, #[case] expected: &str) {
+    assert_eq!(infer_program(code).to_string(), expected);
 }
 
 // ---------------------------------------------------------------------------

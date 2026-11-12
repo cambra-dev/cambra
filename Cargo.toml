@@ -29,6 +29,9 @@ readme = "README.md"
 # link against the compiled library. Add `cambra = { features = ["test-helpers"] }`
 # to a crate's dev-dependencies to enable.
 test-helpers = []
+# Turn on `REFINE_OPS` (`src/ccl/ops.rs`): every operator with a `^` sibling refines its
+# result as that sibling does.
+refine-ops = []
 
 [dev-dependencies]
 # The differential interpreter, for the differential suite. A dev-dependency because only the
