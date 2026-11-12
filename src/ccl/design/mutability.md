@@ -919,6 +919,20 @@ feed's row, lifted through one collection level per loop between the feed and th
 (`channelize::loop_contributions`), so it holds no read of the writer's snapshot either
 (`refined_read_fed_from_a_nested_loop` in `tests/it/compilation_pipeline/feeds_cases.rs`).
 
+`FeedValue` carries the producer expression and its inferred row together through writer
+environments, branch merges, contribution extraction and nested-loop views. Application,
+composition and loop constructors lift each type independently with the same binders and source
+reads. Scope exit applies the same substitution to the producer and row, and retains bindings
+that either reads. Indexing preserves the row's type; flattening transforms its outer collection
+levels with the same key construction as the producer's. These operations preserve the producer's
+local type, including the binding references in a payload collection's domain.
+
+History taps use the carried row as their storage type. Channel assembly takes the producer
+expression after extraction. Generated feeds retain both views when they are hoisted back into
+the tree. Channelization realizes the outer contribution domain from the assembled loops and
+sites. Generated history views are typed from the history's component contracts and sequencing
+domain; extraction never reconstructs a row from a producer's local type.
+
 A `let` bound to an `if` or a `match` whose branches write is walked the same way, and the value
 it binds merges as a variable does: `Case[𝑔ᵢ → 𝑣ᵢ]` over the values the branches end in, each
 taking its branch's bindings. Nothing pushes such a binding, or the statements after a statement

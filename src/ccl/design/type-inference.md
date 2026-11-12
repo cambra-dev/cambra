@@ -2217,6 +2217,12 @@ in place. Both reach type slots and type-borne predicates, respect binders, and 
 An unchanged predicate can retain its allocation. A returned expression copy is not necessarily an
 allocation or `NodeId` no-op: expression-copy identity follows the provenance rules.
 
+Both modes enumerate carried types through `TypedExpr::walk_type_slots_mut`, including feed
+rows, cast targets, binder declarations, annotations and transaction parameters. Transport
+rebuilds child terms under their binder crossings before applying the substitution to the
+rebuilt node's slots. A slot is transported once; simultaneous renames are not composed by
+visiting it again.
+
 `Mapping::as_expr` gives a renamed variable the replaced occurrence's type and copies a discharge's
 typed argument. The in-place variant preserves the replacement root's occurrence identity.
 Substitution must not discard type information merely because it changes the referenced name.
@@ -2763,8 +2769,7 @@ since, so the contribution can name binders the history's type cannot, and no sc
 value path lies between them. `InferCtx::require_contribution` records the contribution on a
 variable minted in the target's scope, through a lower edge carrying one exit per crossed binder,
 innermost first. The crossed binders are the telescope entries entered after the target's own
-(`Telescope::split_at`); a handle has no surface syntax as a parameter, so a target is always in
-lexical scope at the write.
+(`Telescope::split_at`).
 
 Emission records each binder's exit as it enters the binder (`ScopeExit`), and `close_let_type`
 reads the same entry when it lifts a `let` body's type past its binding:

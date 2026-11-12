@@ -50,6 +50,7 @@
 use crate::ccl::Label;
 use crate::ccl::Occurrence;
 use crate::ccl::RecordEntry;
+use crate::ccl::feed_nest::FeedValue;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -1749,15 +1750,7 @@ pub(crate) fn loop_domain(iter: &Expr) -> Type {
 pub(crate) struct FeedSite {
     pub(crate) defer: Name,
     pub(crate) field: Label,
-    pub(crate) value: Expr,
-    /// The type the tap carries `value` at, which `value` inhabits. A feed's own is the row
-    /// type inference recorded on it ([`TypedExprNode::Feed`]), which reads the loops around
-    /// the feed but no read of a mutable variable: the writer's snapshot replaces such a read
-    /// with the previous value the history holds, so a type reading it would read the history
-    /// that holds the row. An inner loop's tap collection is typed by that loop's fold, and a
-    /// feed-only inner loop's from each feed's row
-    /// ([`crate::ccl::channelize::loop_contributions`]).
-    pub(crate) ty: Type,
+    pub(crate) value: FeedValue,
     /// The feed statement this tap is recorded against, so the view resolves to
     /// the `<<` the user wrote rather than to the enclosing loop.
     site: StmtSite,
@@ -1954,8 +1947,12 @@ pub(crate) fn hoist_feeds(mut body: Expr, feeds: Vec<LoopFeed>) -> Expr {
     {
         // The loop is what the view became, so it is recorded under the view, which is
         // itself recorded under the feed that rode the tap.
-        let g = provenance::enter(view.node_id(), FEED_LABEL, provenance::Nature::Expansion);
-        let view = crate::ccl::feed_nest::flatten_nested_contribution(view, levels);
+        let g = provenance::enter(
+            view.value.node_id(),
+            FEED_LABEL,
+            provenance::Nature::Expansion,
+        );
+        let view = view.flatten(levels);
         let each = feed_each(defer, view, site);
         drop(g);
         // `expr_stmt` carries the body's type itself — an `ExprStmt`'s type *is*
@@ -1969,34 +1966,25 @@ pub(crate) fn hoist_feeds(mut body: Expr, feeds: Vec<LoopFeed>) -> Expr {
 /// x))`, indexed by the collection's position as a comprehension's step is, so a fed item whose
 /// type reads the position reads the loop's binder. Its feed is at `site`, the site of the feed
 /// the values came from.
-fn feed_each(defer: Name, collection: Expr, site: Option<Rc<crate::ccl::site::Site>>) -> Expr {
-    let (domain_ty, item_ty) = fun_parts(&collection.ty);
+fn feed_each(defer: Name, collection: FeedValue, site: Option<Rc<crate::ccl::site::Site>>) -> Expr {
+    let domain_ty = collection
+        .value
+        .ty
+        .read_view()
+        .domain()
+        .expect("a fed collection has a domain");
+    let collection_ty = collection.value.ty.clone();
     let position = Name::fresh("__iter_record");
-    // The item read at the position is the collection's codomain opened there.
-    let named = match collection.ty.peel_refinements() {
-        Type::Fun {
-            fun_kind,
-            domain,
-            codomain,
-            ..
-        } => Type::Fun {
-            name: Some(position.clone()),
-            fun_kind: fun_kind.clone(),
-            domain: domain.clone(),
-            codomain: codomain.clone(),
-        },
-        other => panic!("a fed collection is a function, got {other}"),
-    };
-    let item_ty = crate::ccl::subst::open_codomain(&named, &item_ty);
+    let at = tvar(&position, domain_ty.clone());
+    let item_ty = crate::ccl::ccl_utils::applied_type(&collection_ty, &at);
+    let row = crate::ccl::ccl_utils::applied_type(&collection.row, &at);
     let x = Name::fresh("__fed");
-    let mut feed = Expr::feed_at(defer, Occurrence::mint(), tvar(&x, item_ty.clone()), site);
-    feed.ty = Type::Base(BaseType::Unit);
+    let feed =
+        FeedValue::new(tvar(&x, item_ty.clone()), row).into_feed(defer, Occurrence::mint(), site);
     let mut lambda = Expr::lambda(x, Occurrence::mint(), item_ty.clone(), feed);
     lambda.ty = Type::fun(item_ty.clone(), Type::Base(BaseType::Unit));
-    let collection_ty = collection.ty.clone();
-    let read = Expr::apply(tvar(&position, domain_ty.clone()), collection).with_ty(item_ty);
+    let read = Expr::apply(at, collection.value).with_ty(item_ty);
     let step = Expr::apply(read, lambda).with_ty(Type::Base(BaseType::Unit));
-    // A loop over the collection is a read of it, so it is whatever the collection is.
     Expr::lambda(position, Occurrence::mint(), domain_ty.clone(), step).with_ty(Type::fun_like(
         &collection_ty,
         domain_ty,
@@ -2443,15 +2431,21 @@ pub(crate) fn fold_induction_loop(
             // view reads the field at that type and eliminates `` `fired ``:
             // the channel is the fired positions with their values
             // ([`fired_project`](crate::ccl::ccl_utils::fired_project)).
-            let value_ty = at_position(&f.ty);
+            let value_ty = at_position(&f.value.row);
             let tap_ty = crate::ccl::ccl_utils::tap_variant_ty(value_ty.clone());
             let mut steps = hist_field_steps(&f.field, &tap_ty, &decision_ty);
             steps.push(crate::ccl::ccl_utils::fired_project(value_ty.clone()));
+            let row = Type::pi_if_dependent(
+                r.clone(),
+                domain_ty.clone(),
+                value_ty,
+                crate::ccl::FunKind::Data(None),
+            );
             let view = crate::ccl::ccl_utils::pointwise_view(tvar(&h, hist_ty.clone()), steps);
             // This loop's positions are one more level over what the feed held.
             LoopFeed {
                 defer: f.defer.clone(),
-                view,
+                view: FeedValue::new(view, row),
                 levels: 1 + f.levels,
                 site: f.fed_at.clone(),
             }
@@ -2521,8 +2515,7 @@ fn transform_feed_only_loop(
         // The feed is the source statement's, moved, and the lambda's binder stands for the
         // loop's target.
         let unit = Type::Base(BaseType::Unit);
-        let mut feed = Expr::feed_at(defer, defer_occurrence, value, fed_at);
-        feed.ty = unit.clone();
+        let feed = value.into_feed(defer, defer_occurrence, fed_at);
         let mut lambda = Expr::lambda(
             target.name.clone(),
             target.occurrence.clone(),
@@ -2555,7 +2548,7 @@ fn transform_feed_only_loop(
 type FedAt = (
     Name,
     Occurrence,
-    Expr,
+    FeedValue,
     StmtSite,
     Option<Rc<crate::ccl::site::Site>>,
 );
@@ -2578,16 +2571,12 @@ fn collect_feed_only(expr: Expr, prefix: &mut Vec<Kept>, feeds: &mut Vec<FedAt>)
                     name_occurrence,
                     name,
                     value,
-                    row: _,
+                    row,
                     site: fed_at,
                 } => {
-                    feeds.push((
-                        name,
-                        name_occurrence,
-                        close_over(*value, prefix),
-                        site,
-                        fed_at,
-                    ));
+                    let mut value = FeedValue::new(*value, row);
+                    close_feed_over(&mut value, prefix);
+                    feeds.push((name, name_occurrence, value, site, fed_at));
                 }
                 other => panic!(
                     "letrec phase: unexpected statement in read-only `with begin():` block: {}",
@@ -2908,12 +2897,61 @@ fn close_over(e: Expr, kept: &[Kept]) -> Expr {
     out
 }
 
+/// Close a contribution over the bindings read by its producer or storage row. The same
+/// discharge or fresh binder is used in both views.
+fn close_feed_over(value: &mut FeedValue, kept: &[Kept]) {
+    let needed = needed_by_reads(kept, |name| value.reads(name));
+    for (entry, _) in kept
+        .iter()
+        .zip(&needed)
+        .rev()
+        .filter(|(_, needed)| **needed)
+    {
+        match entry {
+            Kept::Let(_, binding, definition)
+                if crate::ccl::ccl_utils::count_free_in_value(&binding.name, &value.value) <= 1 =>
+            {
+                value.substitute(&Subst::discharge(binding.name.clone(), definition.clone()));
+            }
+            Kept::Let(_, binding, definition) => {
+                let mut binding = binding.clone();
+                let old = binding.name.clone();
+                binding.name = old.refreshed();
+                value.substitute(&Subst::discharge(
+                    old,
+                    tvar(&binding.name, binding.ty.clone()),
+                ));
+                value.bind_let(binding, definition.clone());
+            }
+            Kept::Group(bindings) => {
+                debug_assert!(
+                    {
+                        let row_reads = crate::ccl::subst::type_free_vars(&value.row);
+                        !bindings.iter().any(|(b, _)| row_reads.contains(&b.name))
+                    },
+                    "a contribution's storage row cannot escape a recursive binding it reads",
+                );
+                value.value = close_recurrence_group(
+                    bindings.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                    std::mem::take(&mut value.value),
+                );
+            }
+        }
+    }
+}
+
 /// Which entries of `kept` `e` reads, transitively: the ones [`close_over`] puts it under.
 fn needed_by(e: &Expr, kept: &[Kept]) -> Vec<bool> {
+    needed_by_reads(kept, |name| reads(name, e))
+}
+
+fn needed_by_reads(kept: &[Kept], reads: impl Fn(&Name) -> bool) -> Vec<bool> {
     let mut needed = vec![false; kept.len()];
     for i in (0..kept.len()).rev() {
         needed[i] = kept[i].binders().into_iter().any(|name| {
-            reads(name, e)
+            reads(name)
                 || kept[i + 1..]
                     .iter()
                     .zip(&needed[i + 1..])
@@ -3212,9 +3250,8 @@ impl<'a> WriterWalk<'a> {
                         row,
                         site: fed_at,
                     } => {
-                        let value = Subst::discharge_env_in_place(*value, &self.env);
-                        let row = Subst::discharge_env_in_type(&row, &self.env);
-                        self.feed(name, value, row, site, 0, fed_at);
+                        let value = FeedValue::new(*value, row).discharge_env(&self.env);
+                        self.feed(name, value, site, 0, fed_at);
                         self.walk_chain(*body, kept)
                     }
                     // A bare `unit` statement is a no-op. This is the discarded terminal
@@ -3265,9 +3302,8 @@ impl<'a> WriterWalk<'a> {
                             site: fed_at,
                         } in crate::ccl::channelize::loop_contributions(feed_loop)
                         {
-                            let value = Subst::discharge_env_in_place(view, &self.env);
-                            let ty = value.ty.clone();
-                            self.feed(defer, value, ty, site, levels, fed_at);
+                            let value = view.discharge_env(&self.env);
+                            self.feed(defer, value, site, levels, fed_at);
                         }
                         self.walk_chain(*body, kept)
                     }
@@ -3340,9 +3376,8 @@ impl<'a> WriterWalk<'a> {
                             // The view reads the inner history, whose binding the environment
                             // was discharged into above, and its type can read this level's
                             // binders as well, a fed row filtered by this loop's variable say.
-                            let view = Subst::discharge_env_in_place(view, &self.env);
-                            let ty = view.ty.clone();
-                            self.feed(defer, view, ty, site, levels, fed_at);
+                            let view = view.discharge_env(&self.env);
+                            self.feed(defer, view, site, levels, fed_at);
                         }
                         self.walk_chain(*body, kept)
                     }
@@ -3418,8 +3453,7 @@ impl<'a> WriterWalk<'a> {
     fn feed(
         &mut self,
         defer: Name,
-        value: Expr,
-        ty: Type,
+        value: FeedValue,
         site: StmtSite,
         levels: usize,
         fed_at: Option<Rc<crate::ccl::site::Site>>,
@@ -3431,7 +3465,6 @@ impl<'a> WriterWalk<'a> {
             defer,
             field,
             value,
-            ty,
             fire: bool_lit(true),
             site,
             levels,
@@ -3474,7 +3507,7 @@ impl<'a> WriterWalk<'a> {
         let own = own
             .into_iter()
             .map(|mut f| {
-                f.value = close_over(std::mem::take(&mut f.value), rest);
+                close_feed_over(&mut f.value, rest);
                 f.fire = close_over(std::mem::take(&mut f.fire), rest);
                 f
             })
@@ -3565,7 +3598,9 @@ impl<'a> WriterWalk<'a> {
             leaving.extend(&arm.end);
             for f in &self.feeds[arm.feeds.clone()] {
                 if self.leaves_in_a_slot(f, arm) {
-                    leaving.extend([&f.value, &f.fire]);
+                    // The row names no binding of this arm (leaves_in_a_slot), so only
+                    // the producer and fire path add captured bindings here.
+                    leaving.extend([&f.value.value, &f.fire]);
                 }
             }
             share_a_binding(&leaving, &arm.kept)
@@ -3707,11 +3742,10 @@ impl<'a> WriterWalk<'a> {
                         slots.push(crate::ccl::ccl_utils::tap_gated(
                             f.fire.clone(),
                             f.value.clone(),
-                            f.ty.clone(),
                         ));
                         slots.extend(fire.map(|_| f.fire.clone()));
                     } else {
-                        slots.push(crate::ccl::ccl_utils::tap_idle(f.ty.clone()));
+                        slots.push(crate::ccl::ccl_utils::tap_idle(f.value.row.clone()));
                         slots.extend(fire.map(|_| bool_lit(false)));
                     }
                 }
@@ -3761,8 +3795,8 @@ impl<'a> WriterWalk<'a> {
         ));
         for (owner, i, tap, fire) in feed_slots {
             let f = &mut self.feeds[i];
-            let value_ty = f.ty.clone();
-            f.value = Expr::apply(
+            let value_ty = f.value.row.clone();
+            f.value.value = Expr::apply(
                 proj_of(&name, &tuple_ty, tap, &slot_tys[tap]),
                 crate::ccl::ccl_utils::fired_project(value_ty.clone()),
             )
@@ -3790,7 +3824,7 @@ impl<'a> WriterWalk<'a> {
     /// leaves the branch closed over its bindings. So does a feed whose tap type names a
     /// binding of the branch, which a slot outside the branch could not state.
     fn leaves_in_a_slot(&self, f: &FeedSite, arm: &Arm) -> bool {
-        let names = crate::ccl::subst::type_free_vars(&f.ty);
+        let names = crate::ccl::subst::type_free_vars(&f.value.row);
         !self.channels.contains(&f.defer)
             && !arm
                 .kept
@@ -3807,7 +3841,7 @@ impl<'a> WriterWalk<'a> {
                 continue;
             }
             let f = &mut self.feeds[i];
-            f.value = close_over(std::mem::take(&mut f.value), &arm.kept);
+            close_feed_over(&mut f.value, &arm.kept);
             let fire = close_over(std::mem::take(&mut f.fire), &arm.kept);
             f.fire = conjoin_path(&arm.pi, &fire);
         }
@@ -3847,17 +3881,10 @@ impl<'a> WriterWalk<'a> {
             Expr::new(TypedExprNode::Record(RecordEntry::minted(fields))).with_ty(writes_ty);
         let commit =
             crate::ccl::ccl_utils::disjoin(self.commit_paths, empty, &Type::Base(BaseType::Bool));
-        let taps: Vec<(Label, Expr, Type, Expr)> = self
+        let taps: Vec<(Label, FeedValue, Expr)> = self
             .feeds
             .iter()
-            .map(|f| {
-                (
-                    f.field.clone(),
-                    f.value.clone(),
-                    f.ty.clone(),
-                    f.fire.clone(),
-                )
-            })
+            .map(|f| (f.field.clone(), f.value.clone(), f.fire.clone()))
             .collect();
         let mut decision = crate::ccl::ccl_utils::writer_decision_record(commit, writes, &taps);
         for entry in kept.into_iter().rev() {
@@ -3886,8 +3913,9 @@ fn iteration_channel(channel: &TypedBinding, defer: Expr, own: Vec<FeedSite>) ->
         let _g = f.site.enter(FEED_LABEL, provenance::Nature::Expansion);
         let conditional = !is_true_lit(&f.fire);
         let feed = if f.levels == 0 {
-            let mut feed = Expr::feed_at(inner.clone(), Occurrence::mint(), f.value, f.fed_at);
-            feed.ty = Type::Base(BaseType::Unit);
+            let feed = f
+                .value
+                .into_feed(inner.clone(), Occurrence::mint(), f.fed_at);
             if conditional {
                 gated_feed(f.fire, feed)
             } else {
@@ -3897,7 +3925,7 @@ fn iteration_channel(channel: &TypedBinding, defer: Expr, own: Vec<FeedSite>) ->
             // An inner loop's whole tap collection, the only feed into this channel
             // ([`check_iteration_channel_feeds`]), so it is the channel's value outright,
             // with the condition the loop runs under, if any, restricting its domain.
-            let mut view = crate::ccl::feed_nest::flatten_nested_contribution(f.value, f.levels);
+            let mut view = f.value.flatten(f.levels).value;
             if conditional {
                 crate::ccl::channelize::refine_source_domain(
                     &mut view,
@@ -4134,6 +4162,42 @@ mod tests {
     use super::*;
     use crate::ccl::BaseType;
     use crate::ccl::provenance::NodeId;
+
+    #[test]
+    fn closing_a_feed_transports_a_binding_read_only_by_its_row() {
+        let literal = |n| {
+            let mut value = Expr::lit(Lit::Int(n));
+            crate::ccl::infer::infer(
+                &mut value,
+                &mut crate::ccl::infer::TypeInferenceContext::new(),
+            )
+            .expect("type a literal");
+            value
+        };
+        let name = Name::fresh("bound");
+        let int = Type::Base(BaseType::Int);
+        let predicate = Expr::binop(
+            tvar(&Name::elem(), int.clone()),
+            crate::ccl::BinOpKind::Compare(crate::ccl::CompareKind::Greater),
+            tvar(&name, int.clone()),
+        )
+        .with_ty(Type::Base(BaseType::Bool));
+        let row = Type::refined_one(
+            int.clone(),
+            crate::ccl::Refinement::born(Rc::new(predicate)),
+        );
+        let producer = literal(9);
+        let producer_type = producer.ty.clone();
+        let mut value = FeedValue::new(producer, row);
+        close_feed_over(
+            &mut value,
+            &[Kept::Let(None, binding(name.clone(), int), literal(0))],
+        );
+        assert!(!crate::ccl::subst::type_free_vars(&value.row).contains(&name));
+        assert!(!value.row.refinements().is_empty());
+        assert_eq!(value.value.ty, producer_type);
+        assert_ne!(value.value.ty, value.row);
+    }
 
     /// Whether any *binder slot* still carries a mutable history.
     ///

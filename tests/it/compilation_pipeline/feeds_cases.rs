@@ -2521,3 +2521,81 @@ fn refined_read_fed_from_a_nested_loop() {
         Value::Int(96),
     );
 }
+
+#[test]
+fn inferred_feed_rows_survive_nested_branches_and_calls() {
+    check_scalar(
+        indoc! {r#"
+            def emit(v: Int, out: Feed(Int)):
+                out << v ^+ 1
+            x := 0
+            out: Feed(_)
+            for i in [1, 2, 3]:
+                emit(x, out)
+                for j in [10, 20]:
+                    if j > 10:
+                        out << x ^+ 1
+                    else:
+                        out << x ^+ j
+                x += 1
+            sum(out)
+        "#},
+        Value::Int(45),
+    );
+}
+
+#[test]
+fn inferred_feed_rows_keep_nested_payload_domains() {
+    check_scalar(
+        indoc! {r#"
+            x := 0
+            out: Feed(_)
+            for i in [1, 2, 3]:
+                for j in [0, 1]:
+                    out << [k for k in [1, 2, 3] if k > i]
+                x += 1
+            sum([sum(row) for row in out]) + x
+        "#},
+        Value::Int(19),
+    );
+}
+
+#[test]
+fn inferred_feed_rows_keep_a_shared_filtered_binding_in_a_branch() {
+    check_scalar(
+        indoc! {r#"
+            source = [1, 2, 3]
+            total := 0
+            out: Feed(_)
+            for i in [1, 2, 3]:
+                if i > 1:
+                    kept = [k for k in source if k > i]
+                    out << kept
+                    total += sum(kept)
+            sum([sum(row) for row in out]) + total
+        "#},
+        Value::Int(6),
+    );
+}
+
+/// Known compiler bug: the correlated keys and filtered payload survive history construction,
+/// then lambda elimination compares the payload's abstract domain with the literal's domain.
+#[test]
+#[should_panic(
+    expected = "post-lambda-elim produced an invalid tree: [Type mismatch for collection domain"
+)]
+fn correlated_inner_payload_reaches_the_existing_lambda_elim_domain_failure() {
+    check_scalar(
+        indoc! {r#"
+            source = [1, 2, 3]
+            x := 0
+            out: Feed(_)
+            for i in [1, 2, 3]:
+                for j in [k for k in source if k >= i]:
+                    out << [z for z in source if z > j]
+                x += 1
+            sum([sum(row) for row in out]) + x
+        "#},
+        Value::Int(14),
+    );
+}
