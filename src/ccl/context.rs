@@ -2382,7 +2382,13 @@ fn check_modules(
         let reads_named = mut_read::read_respelling(&tree);
         recover_checked_statements(&mut tree, &recovered, &blame);
         recover_rejected_runs(&mut tree, &check.instantiations, &rejected_runs);
+        // Inference can raise an error at a node it minted, such as a copied predicate.
+        // The snapshot returned as `before` predates inference, so this session traces the
+        // new node to its source. A module check is not a phase of the linked program;
+        // no phase scope records its tree in the program's panes.
+        let derivation = DerivationSession::install();
         let checked = check_module(&mut tree, ctx.inference_ctx(), &check.params, &wanted);
+        blame.derive(&derivation.into_log(), Phase::Infer);
         let before = &checked.before;
         statement_expressions(before, &mut |expr, binding, statement| {
             if let Some(how) = checked.recovered.get(&expr.node_id()) {
