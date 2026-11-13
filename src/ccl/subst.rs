@@ -1895,7 +1895,7 @@ impl Subst {
             // its refinement predicate is a primary anchor.
             Cast { value, target } => Cast {
                 value: Box::new(self.apply_expr(value)),
-                target: self.apply_type(target),
+                target: target.clone(),
             },
 
             // The target name is a *use* of the defer-handle binder (these
@@ -1918,7 +1918,7 @@ impl Subst {
                     name_occurrence: name_occurrence.clone(),
                     name,
                     value,
-                    row: self.apply_type(row),
+                    row: row.clone(),
                     site: site.clone(),
                 }
             }
@@ -1956,7 +1956,7 @@ impl Subst {
 
             Lambda { param, body } => {
                 // Domain refinements ride the param's *type* (a
-                // `Type::Refinement`); `apply_binder_types` rewrites that slot
+                // `Type::Refinement`); `apply_type_slots` rewrites that slot
                 // below, under the unrestricted substitution.
                 let inner = self.under_binder(&param.name, body);
                 let body = Box::new(inner.apply_expr(body));
@@ -2044,9 +2044,7 @@ impl Subst {
             _ => {
                 let mut child = e.clone();
                 child.map_children(|c| self.apply_expr(&c));
-                child.ty = self.apply_type(&e.ty);
-                child.user_annotation = e.user_annotation.as_ref().map(|t| self.apply_type(t));
-                self.apply_binder_types(&mut child);
+                self.apply_type_slots(&mut child);
                 return child;
             }
         };
@@ -2060,33 +2058,19 @@ impl Subst {
         // rebuild should be a preserve, this is `Expr::preserve(e.node_id, node)`
         // — but that changes id semantics for every dependent-refinement
         // transport, so it wants its own change.
-        let mut out = TypedExpr::new(node).with_ty(self.apply_type(&e.ty));
-        out.user_annotation = e.user_annotation.as_ref().map(|t| self.apply_type(t));
-        self.apply_binder_types(&mut out);
+        let mut out = TypedExpr::new(node).with_ty(e.ty.clone());
+        out.user_annotation = e.user_annotation.clone();
+        self.apply_type_slots(&mut out);
         out
     }
 
-    /// Rewrite every declared binder type `e` carries, under the **unrestricted**
-    /// substitution.
-    ///
-    /// A binder does not bind in its own type, so that slot reads the enclosing
-    /// scope and the binder crossings guarding the children do not apply to it.
-    /// It is a type slot of its own — a refinement there holds its own predicate
-    /// `Rc`, distinct from the one on the matching position of `e.ty` — so
-    /// rewriting only `e.ty` leaves a discharged binder free in a predicate that
-    /// is still reachable. The in-place mode reaches the same slots through
-    /// [`Expr::walk_type_slots_mut`]; this is transport mode's half of that
-    /// contract, and the two must stay in step.
-    fn apply_binder_types(&self, e: &mut TypedExpr) {
+    /// Transport every carried type slot through the same inventory as in-place rewriting.
+    /// Child terms have already been transported under their binder crossings.
+    fn apply_type_slots(&self, e: &mut TypedExpr) {
         if self.is_id() {
             return;
         }
-        e.walk_binders_mut(|b| {
-            b.ty = self.apply_type(&b.ty);
-            if let Some(annotation) = &mut b.user_annotation {
-                annotation.ty = self.apply_type(&annotation.ty);
-            }
-        });
+        e.walk_type_slots_mut(|ty| *ty = self.apply_type(ty));
     }
 
     /// Rewrite a `Feed`/`Define` handle use (see the `Feed` arm above for
@@ -4837,6 +4821,54 @@ mod tests {
             panic!("expected a refined row");
         };
         assert_eq!(*r.predicate, gt(var("i"), var("j")));
+    }
+
+    #[test]
+    fn transport_and_rewrite_visit_the_same_type_slots_once() {
+        use crate::ccl::infer::solver::traits::{Assoc, Trait};
+
+        let row = Type::refined_one(
+            Type::Base(crate::ccl::BaseType::Int),
+            Refinement::born(Rc::new(gt(var("i"), var("k")))),
+        );
+        let nodes = [
+            TypedExpr::cast(int(1), row.clone()),
+            TypedExpr::new(TypedExprNode::Feed {
+                name_occurrence: Occurrence::mint(),
+                name: Name::raw("d"),
+                value: Box::new(int(1)),
+                row: row.clone(),
+                site: None,
+            }),
+            TypedExpr::lambda("p", Occurrence::mint(), row.clone(), var("p")),
+            TypedExpr::new(TypedExprNode::Transact {
+                keys: Vec::new(),
+                writers: Vec::new(),
+                domain: row.clone(),
+                parameter: Some(row.clone()),
+            }),
+            TypedExpr::new(TypedExprNode::TraitFn {
+                trait_: Trait::addable(),
+                function: "add".into(),
+                operands: vec![row.clone()],
+                assoc: vec![(Assoc::Output, row.clone())],
+            }),
+        ];
+        // Simultaneous renames expose a slot visited twice: k must become j, not m.
+        let subst = Subst::of_binders(BTreeMap::from([
+            (Name::raw("k"), Mapping::Rename(Name::raw("j"))),
+            (Name::raw("j"), Mapping::Rename(Name::raw("m"))),
+        ]));
+        let expected = subst.apply_type(&row);
+        for mut node in nodes {
+            node.ty = row.clone();
+            node.user_annotation = Some(row.clone());
+            let transported = subst.apply_expr(&node);
+            subst.rewrite_expr(&mut node);
+            for result in [&transported, &node] {
+                result.walk_type_slots(|ty| assert_eq!(ty, &expected));
+            }
+        }
     }
 
     #[test]

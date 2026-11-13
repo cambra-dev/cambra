@@ -16,6 +16,7 @@
 //! indexed form builds a level at a time.
 
 use crate::ccl::Occurrence;
+use crate::ccl::subst::Subst;
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{
@@ -26,17 +27,180 @@ use crate::ccl::{
     TypedExprNode, provenance::NodeId,
 };
 
+/// A fed value and the type inference permits its contribution to carry. The producer's
+/// own type can name a sampled mutable value that is out of scope in the stored row.
+#[derive(Clone)]
+pub(crate) struct FeedValue {
+    pub value: Expr,
+    pub row: Type,
+}
+
+impl FeedValue {
+    pub(crate) fn new(value: Expr, row: Type) -> Self {
+        assert!(
+            !matches!(row, Type::Hole),
+            "a lowered feed has an inferred row"
+        );
+        Self { value, row }
+    }
+
+    pub(crate) fn into_feed(
+        self,
+        target: Name,
+        occurrence: Occurrence,
+        site: Option<Rc<crate::ccl::site::Site>>,
+    ) -> Expr {
+        let mut feed = Expr::feed_at(target, occurrence, self.value, site);
+        let TypedExprNode::Feed { row, .. } = &mut feed.node else {
+            unreachable!("constructed a feed")
+        };
+        *row = self.row;
+        feed.with_ty(Type::Base(crate::ccl::BaseType::Unit))
+    }
+
+    pub(crate) fn discharge_env(self, env: &std::collections::HashMap<Name, Expr>) -> Self {
+        Self::new(
+            Subst::discharge_env_in_place(self.value, env),
+            Subst::discharge_env_in_type(&self.row, env),
+        )
+    }
+
+    pub(crate) fn substitute(&mut self, subst: &Subst) {
+        subst.rewrite_expr(&mut self.value);
+        self.row = subst.apply_type(&self.row);
+    }
+
+    pub(crate) fn reads(&self, name: &Name) -> bool {
+        crate::ccl::ccl_utils::free_reads(&self.value).contains(name)
+            || crate::ccl::subst::type_free_vars(&self.row).contains(name)
+    }
+
+    pub(crate) fn bind_let(&mut self, binding: TypedBinding, definition: Expr) {
+        self.row = crate::ccl::ccl_utils::closed_let_type(&binding, &definition, self.row.clone());
+        self.value = Expr::let_in(binding, definition, std::mem::take(&mut self.value));
+    }
+
+    pub(crate) fn lambda(self, param: &TypedBinding, exemplar: Option<&Type>) -> Self {
+        let row = contribution_type(param, self.row, exemplar);
+        Self::new(contribution_lambda(param, self.value, exemplar), row)
+    }
+
+    pub(crate) fn apply_to(self, argument: Expr) -> Self {
+        let row = crate::ccl::ccl_utils::applied_type(&self.row, &argument);
+        let ty = crate::ccl::ccl_utils::applied_type(&self.value.ty, &argument);
+        Self::new(Expr::apply(argument, self.value).with_ty(ty), row)
+    }
+
+    pub(crate) fn after(self, mut prefix: Vec<Expr>) -> Self {
+        if prefix.is_empty() {
+            return self;
+        }
+        let domain = prefix[0]
+            .ty
+            .read_view()
+            .domain()
+            .expect("a chain's head is a function");
+        let codomain = self
+            .row
+            .read_view()
+            .codomain()
+            .expect("a chain's tail is a function");
+        let stated = Type::fun_like(&prefix[0].ty, domain, codomain);
+        prefix.push(self.value);
+        let row = crate::ccl::ccl_utils::chain_type_with_last(&prefix, &self.row, stated);
+        Self::new(compose_typed_or_hole(prefix), row)
+    }
+
+    pub(crate) fn one_row(self, domain: Type) -> Self {
+        let ty = Type::data_fun(domain.clone(), self.value.ty.clone());
+        let row = Type::data_fun(domain.clone(), self.row);
+        let value = Expr::lambda("__unused", Occurrence::mint(), domain, self.value).with_ty(ty);
+        Self::new(value, row)
+    }
+
+    /// Indexing changes the nest's expression representation and preserves its type.
+    pub(crate) fn indexed(self, levels: usize) -> Self {
+        Self::new(indexed_nest(self.value, levels), self.row)
+    }
+
+    pub(crate) fn flatten(self, levels: usize) -> Self {
+        let row = flattened_type(&self.row, levels);
+        Self::new(flatten_nested_contribution(self.value, levels), row)
+    }
+
+    pub(crate) fn index_chain(&mut self, position: &Name) {
+        if let Some(own) = index_chain(&mut self.value, position, false) {
+            self.bind_position(position, &own);
+        }
+    }
+
+    /// The extracted chain now binds its loop position as `position`. Close both the
+    /// chain's input and any reads of the original position over that binder.
+    fn bind_position(&mut self, original: &Name, position: &Name) {
+        let Type::Fun {
+            name,
+            fun_kind,
+            domain,
+            codomain,
+        } = &self.row
+        else {
+            unreachable!("an indexed contribution has a function type")
+        };
+        let codomain = crate::ccl::subst::codomain_renamed(name.as_ref(), position, codomain);
+        let codomain = Subst::rename(original.clone(), position.clone()).apply_type(&codomain);
+        self.row = Type::pi_if_dependent(
+            position.clone(),
+            (**domain).clone(),
+            codomain,
+            fun_kind.clone(),
+        );
+    }
+}
+
 /// A feed out of a loop, lifted out of the loop with the values it fed: `view` holds them,
 /// keyed by the positions of the `levels` loops around the feed, curried outermost first —
 /// for an induction loop, `__hist ▷ .__to_<feed>` (`mut_elim`'s `hist_field_view`); for a
 /// `with begin():` block, a commit-record tap binding.
 pub(crate) struct LoopFeed {
     pub defer: Name,
-    pub view: Expr,
+    pub view: FeedValue,
     pub levels: usize,
     /// The site of the feed the values came from, which the feed hoisted for them keeps
     /// ([`crate::ccl::site`]).
     pub site: Option<Rc<crate::ccl::site::Site>>,
+}
+
+/// `e` indexed by its position where it is the chain `source ≫ (λ 𝑥 → body)` a loop's
+/// extraction builds ([`crate::ccl::ccl_utils::indexed_loop`]), keeping `e`'s id. The step reads
+/// the position as `position`, which binds it where `same` holds and is renamed to a fresh
+/// binder otherwise.
+pub(crate) fn index_chain(e: &mut Expr, position: &Name, same: bool) -> Option<Name> {
+    let TypedExprNode::Compose(elts) = &e.node else {
+        return None;
+    };
+    if !(elts.len() == 2 && matches!(elts[1].node, TypedExprNode::Lambda { .. })) {
+        return None;
+    }
+    let id = e.node_id();
+    let TypedExprNode::Compose(mut elts) = std::mem::replace(&mut e.node, TypedExprNode::Defer)
+    else {
+        unreachable!("matched a Compose above")
+    };
+    let (Some(mut step), Some(source)) = (elts.pop(), elts.pop()) else {
+        unreachable!("matched two elements above")
+    };
+    let name = if same {
+        position.clone()
+    } else {
+        let fresh = position.refreshed();
+        let at = Expr::var(&fresh).with_ty(source.ty.read_view().domain().unwrap_or(Type::Hole));
+        Subst::discharge_in_place(&mut step, position, &at);
+        fresh
+    };
+    let indexed = crate::ccl::ccl_utils::indexed_loop(Some(name.clone()), source, step);
+    let ty = indexed.ty.clone();
+    *e = Expr::preserve(id, indexed.node).with_ty(ty);
+    Some(name)
 }
 
 /// `λ param → body`, a channel contribution built around a fed value, with the kind of
@@ -48,7 +212,17 @@ pub(crate) fn contribution_lambda(
     body: Expr,
     exemplar: Option<&Type>,
 ) -> Expr {
-    let codomain = body.ty.clone();
+    let ty = contribution_type(param, body.ty.clone(), exemplar);
+    Expr::lambda(
+        &param.name,
+        param.occurrence.clone(),
+        param.ty.clone(),
+        body,
+    )
+    .with_ty(ty)
+}
+
+fn contribution_type(param: &TypedBinding, codomain: Type, exemplar: Option<&Type>) -> Type {
     let fun_kind = exemplar
         .and_then(
             |t| match Type::fun_like(t, param.ty.clone(), codomain.clone()) {
@@ -57,14 +231,7 @@ pub(crate) fn contribution_lambda(
             },
         )
         .unwrap_or(FunKind::Compute);
-    let ty = Type::pi_if_dependent(param.name.clone(), param.ty.clone(), codomain, fun_kind);
-    Expr::lambda(
-        &param.name,
-        param.occurrence.clone(),
-        param.ty.clone(),
-        body,
-    )
-    .with_ty(ty)
+    Type::pi_if_dependent(param.name.clone(), param.ty.clone(), codomain, fun_kind)
 }
 
 /// A feed's contribution from under `levels` loops, keyed by the tuple of their positions:
@@ -100,9 +267,16 @@ pub(crate) fn flatten_nested_contribution(value: Expr, levels: usize) -> Expr {
     // under three loops is keyed by the three positions, not by a pair of a pair and a position
     // (`docs/chl-spec.md`, "8.4 Feeds are the second form of mutability"). A loop's own key
     // that is a tuple stays one component.
-    let (components, elem) = opened_levels(&value.ty, levels);
-    let flat = keyed_by(components, elem);
+    let flat = flattened_type(&value.ty, levels);
     apply_primitive(value, Builtin::Uncurry(levels), flat)
+}
+
+fn flattened_type(ty: &Type, levels: usize) -> Type {
+    if levels < 2 {
+        return ty.clone();
+    }
+    let (components, elem) = opened_levels(ty, levels);
+    keyed_by(components, elem)
 }
 
 /// The outer `levels` collection levels of a contribution, `(𝑘₀ : 𝐴₀) ⤇ … ⤇ (𝑘ₙ : 𝐴ₙ) ⤇ 𝐸`,
@@ -156,7 +330,7 @@ fn keyed_by(components: Vec<(Option<Name>, Type)>, elem: Type) -> Type {
             let component = tuple
                 .component_type(index, project)
                 .expect("a telescope has a component per name");
-            crate::ccl::subst::Subst::discharge(name, project(index, &component)).apply_type(&elem)
+            Subst::discharge(name, project(index, &component)).apply_type(&elem)
         });
     if crate::ccl::subst::codomain_depends_on(&key, &elem) {
         Type::pi_kinded(key, tuple, elem, FunKind::Data(None))
@@ -213,8 +387,7 @@ fn nest_as_product(contribution: Expr, generators: Vec<Generator>) -> Expr {
             }
         }
         for r in refinements.iter().filter(|r| !r.is_collection_membership()) {
-            let predicate = crate::ccl::subst::Subst::discharge(Name::elem(), at(index))
-                .apply_expr(&r.predicate);
+            let predicate = Subst::discharge(Name::elem(), at(index)).apply_expr(&r.predicate);
             debug_assert!(
                 generators[..index]
                     .iter()
@@ -345,7 +518,7 @@ pub(crate) fn lifted_past(binding: &TypedBinding, bound_expr: &Expr, ty: &Type) 
     {
         return ty.clone();
     }
-    crate::ccl::subst::Subst::discharge(
+    Subst::discharge(
         &binding.name,
         crate::ccl::ccl_utils::predicate_term(bound_expr),
     )
@@ -553,9 +726,9 @@ fn read_level(
     // A level that was a loop indexed by a position of its own reads it where its element's
     // type depends on it; that position is this one.
     if let Some(was) = was {
-        let at = crate::ccl::subst::Subst::discharge(was.clone(), position.clone_preserving_ids());
+        let at = Subst::discharge(was.clone(), position.clone_preserving_ids());
         param.ty = at.apply_type(&param.ty);
-        crate::ccl::subst::Subst::discharge_in_place(&mut inner, was, &position);
+        Subst::discharge_in_place(&mut inner, was, &position);
     }
     // A source whose values depend on their position holds, at this one, its codomain read
     // there.
@@ -570,7 +743,7 @@ fn read_level(
     let read = Expr::apply(position, source).with_ty(item);
     let row_reads = crate::ccl::subst::type_free_vars(&inner.ty);
     if nest_params.iter().any(|p| row_reads.contains(p)) {
-        return crate::ccl::subst::Subst::discharge(param.name, read).apply_expr(&inner);
+        return Subst::discharge(param.name, read).apply_expr(&inner);
     }
     let ty = inner.ty.clone();
     // The step's binder is the loop's, so it keeps the loop binder's occurrence

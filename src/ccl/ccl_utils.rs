@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
+use crate::ccl::feed_nest::FeedValue;
 use crate::ccl::subst::Subst;
 use crate::ccl::{
     BaseType, BinOpKind, BindingTransparency, Branch, Builtin, Expr, F_WRITES, FieldKey, Lit,
@@ -172,7 +173,8 @@ pub(crate) fn tag_test(scrut: &Expr, tag: Label) -> Expr {
 /// ([`crate::ccl::mut_elim`]). Both feed it to the interpreter through the same
 /// `body_decision_at` decoder, so the shape must be built in exactly one place.
 ///
-/// `feeds` are `(field, value, 𝑉, fire)` in tap order, `value` inhabiting `𝑉`. Each tap's field
+/// `feeds` are `(field, value, fire)` in tap order. Each `FeedValue` carries its producer and
+/// its inferred row `𝑉`. Each tap's field
 /// holds `` {`fired{𝑉} | `idle} `` ([`V_FIRED`](crate::ccl::V_FIRED)): the value at the
 /// positions its `fire` path admits, and `` `idle `` elsewhere. A tap whose `fire`
 /// is structurally the writer's `commit` — a spine or sole-committer feed that
@@ -190,23 +192,23 @@ pub(crate) fn tag_test(scrut: &Expr, tag: Label) -> Expr {
 /// feed's fire path, so a feed-only committing position appends a change carrying
 /// the tap (the caller folds fires into `commit` before calling; see
 /// `mut_elim::WriterWalk::body`, which disjoins every write's and feed's path).
-pub fn writer_decision_record(
+pub(crate) fn writer_decision_record(
     commit: Expr,
     writes: Expr,
-    feeds: &[(Label, Expr, Type, Expr)],
+    feeds: &[(Label, FeedValue, Expr)],
 ) -> Expr {
     let mut fields: Vec<(Label, Expr)> = Vec::with_capacity(2 + feeds.len() * 2);
     fields.push((COMMIT_SELECTOR, commit.clone()));
     fields.push((F_WRITES, writes));
-    for (field, value, value_ty, fire) in feeds {
+    for (field, value, fire) in feeds {
         // Wrap unconditionally iff the fire path *is* the commit — a structural
         // test (no Boolean simplification). Such a tap fires at every position the
         // record exists at, so the `` `idle `` arm would be unreachable; a narrower
         // fire keeps it as the arm the non-firing positions take.
         let tap = if *fire == commit {
-            tap_fired(value.clone(), value_ty.clone())
+            tap_fired(value.clone())
         } else {
-            tap_gated(fire.clone(), value.clone(), value_ty.clone())
+            tap_gated(fire.clone(), value.clone())
         };
         fields.push((field.clone(), tap));
     }
@@ -230,8 +232,12 @@ pub fn tap_variant_ty(value_ty: Type) -> Type {
     ])
 }
 
-/// `` `fired(value) `` — a tap carrying its fed value at `value_ty`, which `value` inhabits.
-pub fn tap_fired(value: Expr, value_ty: Type) -> Expr {
+/// `` `fired(value) `` — a tap carrying its fed value at its inferred row.
+pub(crate) fn tap_fired(value: FeedValue) -> Expr {
+    let FeedValue {
+        value,
+        row: value_ty,
+    } = value;
     let ty = tap_variant_ty(value_ty.clone());
     let wrap = Expr::builtin(Builtin::VariantWrap(FieldKey::Name(V_FIRED)))
         .with_ty(Type::fun(value_ty, ty.clone()));
@@ -247,18 +253,19 @@ pub fn tap_idle(value_ty: Type) -> Expr {
     Expr::apply(unit_expr(), wrap).with_ty(ty)
 }
 
-/// A tap at `value_ty` under a `fire` path narrower than the record's commit:
+/// A tap at the fed value's row under a `fire` path narrower than the record's commit:
 /// `` { fire → `fired(value); true → `idle } ``, or `` `fired(value) `` where `fire` is the
 /// literal `true`.
 ///
 /// A two-arm value-`Case`, the shape a conditional write already takes, so
 /// `lambda_elim`'s C-form compiles it with no new machinery — and the `` `idle ``
 /// arm is what re-totals the tap over the positions `value` does not answer at.
-pub(crate) fn tap_gated(fire: Expr, value: Expr, value_ty: Type) -> Expr {
+pub(crate) fn tap_gated(fire: Expr, value: FeedValue) -> Expr {
     if matches!(fire.node, TypedExprNode::Lit(Lit::Bool(true))) {
-        return tap_fired(value, value_ty);
+        return tap_fired(value);
     }
-    let fired = tap_fired(value, value_ty.clone());
+    let value_ty = value.row.clone();
+    let fired = tap_fired(value);
     let ty = fired.ty.clone();
     let mut t = Expr::new(TypedExprNode::Lit(Lit::Bool(true)));
     t.ty = Type::Base(BaseType::Bool);
@@ -1671,15 +1678,7 @@ pub(crate) fn indexed_loop(position: Option<Name>, source: Expr, step: Expr) -> 
         source,
     )
     .with_ty(item);
-    let value = match step.ty.peel_refinements() {
-        Type::Fun {
-            name: Some(x),
-            codomain,
-            ..
-        } => crate::ccl::subst::discharge_codomain(x, &read, codomain),
-        Type::Fun { codomain, .. } => (**codomain).clone(),
-        other => panic!("a loop's step is a function, got {other}"),
-    };
+    let value = applied_type(&step.ty, &read);
     let ty = Type::pi_if_dependent(position.name.clone(), *domain, value.clone(), fun_kind);
     let body = Expr::apply(read, step).with_ty(value);
     let TypedExprNode::Lambda { param, body } =
@@ -1695,6 +1694,19 @@ pub(crate) fn indexed_loop(position: Option<Name>, source: Expr, step: Expr) -> 
         body,
     })
     .with_ty(ty)
+}
+
+/// The result of a function at `argument`, including its dependent codomain.
+pub(crate) fn applied_type(function: &Type, argument: &Expr) -> Type {
+    match function.read_view().peel_refinements() {
+        Type::Fun {
+            name: Some(x),
+            codomain,
+            ..
+        } => crate::ccl::subst::discharge_codomain(x, argument, codomain),
+        Type::Fun { codomain, .. } => (**codomain).clone(),
+        other => panic!("an applied value is a function, got {other}"),
+    }
 }
 
 /// The loop `e` ([`loop_parts`]) taken apart: its position binder, its source and its step,
@@ -1739,6 +1751,15 @@ pub(crate) fn chain_type_of(elts: &[Expr], stated: Type) -> Type {
     let Some(last) = elts.last() else {
         return stated;
     };
+    chain_type_with_last(elts, &last.ty, stated)
+}
+
+/// The chain's type with its last morphism stated at `last_type`. A contribution's
+/// producer and storage row share the prefix but can state different codomains.
+pub(crate) fn chain_type_with_last(elts: &[Expr], last_type: &Type, stated: Type) -> Type {
+    let Some(last) = elts.last() else {
+        return stated;
+    };
     let (
         Type::Fun {
             name: stated_name,
@@ -1749,23 +1770,32 @@ pub(crate) fn chain_type_of(elts: &[Expr], stated: Type) -> Type {
         Some(last_cod),
     ) = (
         stated.peel_refinements(),
-        last.ty.peel_refinements().codomain(),
+        last_type.peel_refinements().codomain(),
     )
     else {
         return stated;
     };
     let named: Vec<Option<(Name, Type)>> = elts
         .iter()
-        .map(|e| match e.ty.peel_refinements() {
-            Type::Fun {
-                name: Some(b),
-                domain,
-                ..
-            } => Some((b.clone(), (**domain).clone())),
-            _ => None,
+        .enumerate()
+        .map(|(i, e)| {
+            match (if i + 1 == elts.len() {
+                last_type
+            } else {
+                &e.ty
+            })
+            .peel_refinements()
+            {
+                Type::Fun {
+                    name: Some(b),
+                    domain,
+                    ..
+                } => Some((b.clone(), (**domain).clone())),
+                _ => None,
+            }
         })
         .collect();
-    let opened = crate::ccl::subst::open_codomain(&last.ty, &last_cod);
+    let opened = crate::ccl::subst::open_codomain(last_type, &last_cod);
     let reads_a_position = named
         .iter()
         .flatten()
