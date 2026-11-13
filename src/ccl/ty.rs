@@ -4214,6 +4214,23 @@ impl Type {
         })
     }
 
+    /// Does this type hold, at any depth, a `Hole`, `SharedHole`, `BoundedHole`, `Infer` or
+    /// `BarrierVar`, the positions inference fills (see the transient-variant table on
+    /// [`Type`])? It differs from [`holds_an_unresolved_position`](Self::holds_an_unresolved_position)
+    /// only in not counting a refinement.
+    pub fn holds_an_inference_slot(&self) -> bool {
+        self.holds_type(&|ty| {
+            matches!(
+                ty,
+                Type::Infer(_)
+                    | Type::Hole
+                    | Type::SharedHole(_)
+                    | Type::BoundedHole(_)
+                    | Type::BarrierVar(_)
+            )
+        })
+    }
+
     /// Every term this type or any of its nested type children quotes, in pre-order: each
     /// refinement's predicate and each witness projection's sum ([`QuotedTerm`]), those at a
     /// level before that level's children.

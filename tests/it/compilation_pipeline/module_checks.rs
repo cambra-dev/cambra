@@ -904,3 +904,40 @@ fn checking_unavailable_use_members_preserves_only_established_contracts(
         assert!(!interface.contains(absent), "{interface}");
     }
 }
+
+/// An omitted definition whose declaration leaves a position for inference establishes no
+/// contract, while a healthy export beside it keeps its own.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_omitted_definition_with_a_partial_declaration_has_no_contract() {
+    let root = indoc! {r#"
+        pub def partial(x: Int, y: _) => Int:
+            1 + "s"
+        pub healthy = 7
+    "#};
+    let result = check_program(&mut GlobalContext::default(), &program(root, &[])).unwrap_err();
+    let interface = result
+        .interface
+        .expect("healthy export establishes a contract");
+    assert!(interface.contains("pub healthy:"), "{interface}");
+    assert!(!interface.contains("pub partial:"), "{interface}");
+}
+
+/// In a failed module, a monomorphic binding whose type is still an inference variable
+/// establishes no contract.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_binding_of_an_unresolved_parameter_type_has_no_contract_in_a_failed_module() {
+    let root = indoc! {r#"
+        param x: _
+        pub y = x
+        pub healthy = 7
+        pub bad = [1, "a"]
+    "#};
+    let result = check_program(&mut GlobalContext::default(), &program(root, &[])).unwrap_err();
+    let interface = result
+        .interface
+        .expect("healthy export establishes a contract");
+    assert!(interface.contains("pub healthy:"), "{interface}");
+    assert!(!interface.contains("pub y:"), "{interface}");
+}

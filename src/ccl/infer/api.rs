@@ -2111,16 +2111,7 @@ pub fn check_module(
         if reported.contains(&binding.name)
             && !outcome.unavailable.contains(&binding.name)
             && !contracts.contains_key(&binding.name)
-            && !binding.ty.holds_type(&|ty| {
-                matches!(
-                    ty,
-                    Type::Infer(_)
-                        | Type::Hole
-                        | Type::SharedHole(_)
-                        | Type::BoundedHole(_)
-                        | Type::BarrierVar(_)
-                )
-            })
+            && !binding.ty.holds_an_inference_slot()
         {
             let mut ty = binding.ty.clone();
             write_opened(&mut ty, &opened);
