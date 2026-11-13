@@ -9,9 +9,9 @@
 //! to the commit engine rather than the induction store. A standalone
 //! transaction is one commit over a synthesized singleton source. Writes and
 //! reads inside the block run with `in_tx_body = true`, so a bare mutable variable read is
-//! a snapshot (a bare mutable variable read *outside* a block is the rejected out-of-block
-//! read) and an assignment is a write; a nested `with begin():` is rejected. A
-//! read fed out of a block that does not write that mutable variable is a live as-of read;
+//! a snapshot and an assignment is a write; a bare mutable variable read outside a
+//! transaction is rejected, and so is a nested `with begin():`. A read fed out of a
+//! transaction that does not write that mutable variable is a live as-of read;
 //! trailing sibling `<<` feeds are request-indexed replies (see
 //! `lower_transaction_loop`).
 
@@ -156,7 +156,7 @@ fn lower_tx_block(
     // A transaction must *do* something observable: either write a transactional
     // mutable variable (a committing transaction — a commit-record footprint) or feed a read
     // (`out << balance`), a read-only transaction whose fed mutable variable read is a live
-    // as-of read indexed by the enclosing loop. A block that does neither has no
+    // as-of read indexed by the enclosing loop. A transaction that does neither has no
     // footprint at all (its local `let`s are discarded), so reject it — a truly
     // empty transaction is a program error, not a no-op to silently drop.
     if !contains_mut_write(&block) && !contains_feed(&block) {

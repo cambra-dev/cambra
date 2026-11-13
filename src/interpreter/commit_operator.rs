@@ -3002,7 +3002,7 @@ impl TileProducer for InductionStoreProducer {
 ///
 /// Two readers, fixed per key by its registration:
 ///
-/// - the **in-block reply tap** (`out << e` inside a block — `carry_forward:
+/// - the **reply tap inside a transaction** (`out << e` inside a block — `carry_forward:
 ///   false`), holding only the ticks that wrote it and closing as soon as its own
 ///   writers do ([`Tile::Store`]'s `closed_keys`);
 /// - the **read-your-writes mutable variable carry** (`carry_forward: true`, the
@@ -3010,7 +3010,7 @@ impl TileProducer for InductionStoreProducer {
 ///   closes only with the whole store.
 ///
 /// Two other reads of a transactional key do not come through here. A read fed
-/// *out* of a block folds the store as-of via [`AsOf`], sampling an arbitrary commit
+/// *out* of a transaction folds the store as-of via [`AsOf`], sampling an arbitrary commit
 /// position, and a surface `await_final(x)` is a [`StoreFinalRead`], sampling the key
 /// once its writers have drained. Which read a program gets is selected by the term
 /// it wrote, never inferred from the reading loop.

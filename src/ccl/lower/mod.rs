@@ -568,8 +568,8 @@ pub struct LoweringContext {
     /// shadows via `shadow_depth`).
     ///
     /// Base-name keyed, and used *only* at lowering time: it decides the `with
-    /// begin():` variable-write shape (a `MutWrite` marker) and the out-of-block
-    /// read diagnostic. Downstream mutable variable *identity* — which mutable variables
+    /// begin():` variable-write shape (a `MutWrite` marker) and the diagnostic for a
+    /// read outside a transaction. Downstream mutable variable *identity* — which mutable variables
     /// `transact_phase` folds — is instead the `Mut(_, Txn)` type on the
     /// α-unique binding (see [`crate::ccl::transact_phase::collect_txn_mut_vars`]),
     /// so this set is no longer handed to the phase.
@@ -687,7 +687,7 @@ pub struct LoweringContext {
     /// binders — loop targets, comprehension generators, lambda/`def` params —
     /// currently bind each name. The `transactional_vars` set is keyed by base
     /// name, so a local variable merely *spelled* like a mutable variable would wrongly
-    /// trip the out-of-block read gate (`for x in xs: … x …`); a name
+    /// trip the gate on reads outside a transaction (`for x in xs: … x …`); a name
     /// with a positive shadow depth is a genuine local, not the mutable variable, so the
     /// gate skips it. Mirrors `uniquify`'s env stack — push a binder's spelling
     /// on entering its body scope, pop on exit (see [`LoweringContext::with_shadowed`]).
@@ -1562,7 +1562,7 @@ fn lower_expr_inner(
             }
             // A transactional mutable variable may be read only inside a `with begin():`
             // block, which pins a snapshot-consistent view (all txn reads in one
-            // block observe one commit snapshot). Inside a transaction
+            // transaction observe one commit snapshot). Inside a transaction
             // (`in_tx_body`) a bare read is that snapshot and is fine; outside
             // one it is rejected with a hint to wrap the read in a block.
             //

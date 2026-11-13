@@ -1280,18 +1280,7 @@ element, and between steps 1 and 2 process memory holds the only copy
 ## Consequences for other documents
 
 These statements conflict with the model or depend on it. Of them, only
-[7.5 Time](chl-spec.md#75-time-decided) is edited here. One rename follows this document as its own
-change:
-
-- **"Block" for a transaction.**
-  [8. Mutability, transactions, and feeds](chl-spec.md#8-mutability-transactions-and-feeds),
-  [mutability.md](../src/ccl/design/mutability.md) and
-  [`mutability-walkthrough.md`](mutability-walkthrough.md) say "block" where they mean a
-  transaction ("read-only block", "in-block reply", "the writing block"), as do the identifiers
-  `splice_block`, `partition_block`, `check_no_guarded_induction_write_in_block` and
-  `block_reads_var` in `src/ccl/transact_phase.rs`. "Block" stays where it means the syntax of a
-  `with begin():` statement, and in `src/interpreter/scalar_expr.rs`, where a block is a chunk of a
-  column.
+[7.5 Time](chl-spec.md#75-time-decided) is edited here.
 
 The model's consequences:
 

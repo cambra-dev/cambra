@@ -2047,7 +2047,7 @@ fn transform_loop(
         // A loop with no accumulator. If its body feeds — a stateless generator,
         // or a `with begin():` read-only transaction (`for r in iter: with
         // begin(): out << balance` reads a mutable variable and feeds it, writing nothing) —
-        // it's the design's "plain map" path: each in-block feed becomes an
+        // it's the design's "plain map" path: each feed inside the transaction becomes an
         // ordinary map of the loop source. Otherwise the body inlined to neither
         // a write nor a feed (a `for x: pure_call()` whose call didn't mutate) —
         // observationally a no-op; drop the loop and keep the continuation.
@@ -2473,7 +2473,7 @@ pub(crate) fn fold_induction_loop(
 
 /// Rewrite an accumulator-free loop — a read-only `with begin():` transaction
 /// fed out (`for target in iter: out << value`) — to the plain-map form. Each
-/// in-block feed becomes a loop of its own, `iter ≫ (λ target → Feed(defer, value))`,
+/// feed inside the transaction becomes a loop of its own, `iter ≫ (λ target → Feed(defer, value))`,
 /// which `channelize` routes as an ordinary loop's feed: its channel is the loop
 /// source mapped through the fed value at each position. There is no history
 /// binding and no letrec.
@@ -2550,8 +2550,9 @@ fn transform_feed_only_loop(
 ///
 /// The site is the feed statement its map is recorded against, the same
 /// attribution the induction path's [`FeedSite`] carries.
-/// A feed a read-only block makes: its target and the target's occurrence, its value closed over
-/// the block's bindings, its statement, and its site ([`crate::ccl::site`]).
+/// A feed a read-only transaction makes: its target and the target's occurrence, its value closed
+/// over the bindings of its `with begin():` block, its statement, and its site
+/// ([`crate::ccl::site`]).
 type FedAt = (
     Name,
     Occurrence,

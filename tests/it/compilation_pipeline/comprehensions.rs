@@ -411,8 +411,8 @@ fn a_filtered_inner_comprehension_over_the_outer_row_keeps_its_filter(
 /// filter reads the row only through the projection, so the chain the curry reduces to,
 /// `.xs ≫ map(id)`, states the narrowing on `map` over the row carried through `.xs`, and
 /// planning materializes it as a per-group filter. Inside a `with begin():` block a mutable
-/// variable arrives as a projection of the block's snapshot tuple, so a filtered comprehension over
-/// a map-valued one is the same shape (`mut_var_in_block`).
+/// variable arrives as a projection of the transaction's snapshot tuple, so a filtered
+/// comprehension over a map-valued one is the same shape (`mut_var_in_block`).
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::bare_element(
@@ -532,7 +532,7 @@ fn a_value_binder_reads_a_transactional_map(#[case] rows: &str, #[case] total: i
     );
 }
 
-/// A transactional map read back after a keyed write in the same block: the comprehension's
+/// A transactional map read back after a keyed write in the same transaction: the comprehension's
 /// source is the `insert` result rather than a store read (`src/ccl/design/optimization.md`,
 /// "A generator over a sum composes with its source"). Each transaction writes `b := 10` and
 /// then sums `{a: 1, b: 10}`.

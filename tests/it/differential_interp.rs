@@ -962,12 +962,12 @@ fn a_filter_keeps_its_survivors_positions() {
 }
 
 // ---------------------------------------------------------------------------
-// Transactions. A block is one commit record, at the next commit time or none at all, and
+// Transactions. A transaction is one commit record, at the next commit time or none at all, and
 // a reply fed inside it is indexed by that commit time rather than by the iteration.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn an_in_block_reply_per_commit() {
+fn a_reply_inside_a_transaction_per_commit() {
     agree(indoc! {r#"
         out = test_sink()
         pool: Mut(Int, Txn) := 100
@@ -983,7 +983,7 @@ fn an_in_block_reply_per_commit() {
 /// Agreement compares commit times by rank, which cannot see a single reply's time, so the
 /// compiled side's raw time is pinned too.
 #[test]
-fn a_denied_block_takes_no_commit_time() {
+fn a_denied_transaction_takes_no_commit_time() {
     let source = indoc! {r#"
         out = test_sink()
         pool: Mut(Int, Txn) := 100
@@ -1130,7 +1130,7 @@ fn a_constant_overwrite_over_a_filtered_source_runs_once_per_survivor() {
 }
 
 /// The transactional half: a `with begin():` block whose write reads nothing, over a source
-/// filtered to nothing. No block runs, so no commit lands and the terminal read is the seed.
+/// filtered to nothing. No transaction runs, so no commit lands and the terminal read is the seed.
 #[test]
 fn a_constant_transactional_write_over_an_empty_filtered_source() {
     agree(indoc! {r#"
@@ -1187,9 +1187,9 @@ fn a_terminal_read_in_a_conditional_test_not_taken() {
     "#});
 }
 
-/// Read-your-writes: a read after a write in the same block sees it.
+/// Read-your-writes: a read after a write in the same transaction sees it.
 #[test]
-fn read_your_writes_within_a_block() {
+fn read_your_writes_within_a_transaction() {
     agree(indoc! {r#"
         out = test_sink()
         n: Mut(Int, Txn) := 1
@@ -1201,7 +1201,7 @@ fn read_your_writes_within_a_block() {
 }
 
 #[test]
-fn two_stores_written_in_one_block() {
+fn two_stores_written_in_one_transaction() {
     agree(indoc! {r#"
         out = test_sink()
         a: Mut(Int, Txn) := 0

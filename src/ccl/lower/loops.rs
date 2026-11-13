@@ -1529,7 +1529,7 @@ pub(super) fn lower_direct_mirror_loop(
     // Build the statement chain right-to-left, ending in Unit (the For's
     // body is a statement, not a value). The loop target is in scope over the
     // body — shadow it so a body read of a like-named transactional mutable variable is
-    // read as the loop local, not gated as an out-of-block mutable variable read.
+    // read as the loop local, not gated as a mutable variable read outside a transaction.
     let chain = ctx.with_shadowed([iter_var.clone()], |ctx| {
         lower_loop_body_chain(
             body_stmts,

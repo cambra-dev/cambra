@@ -60,9 +60,9 @@ fn check_compile_error(code: &str, needle: &str) {
 // leaves the order to the engine's serialization
 // (`drain_start`). The only context that pins commit order is a loop over a live
 // external stream (a `DataSource`), where real arrival order is a denotational
-// anchor. These blocks depend only on program start (no source arrival, no
+// anchor. These transactions depend only on program start (no source arrival, no
 // cross-transaction data dependence), and program start is a single event that
-// imposes no order *among* the blocks it triggers — so the event model *defines*
+// imposes no order *among* the transactions it triggers — so the event model *defines*
 // their commit order as mutually unordered, and the engine may serialize them any
 // way, correct under all of them. That is the contract, not a defect; see
 // `src/ccl/design/mutability.md` "Ordering and concurrency".
@@ -938,13 +938,13 @@ fn reply_feed_under_one_route_does_not_overfire() {
     );
 }
 
-/// **Both arms feed** in a *committing* block: each arm writes the mutable variable `a`
+/// **Both arms feed** in a *committing* transaction: each arm writes the mutable variable `a`
 /// and replies on `out`. Both taps ride the same commit but must fire only on
 /// their own route — each carries its own `__fire` gate. x=1 → else (a += 100,
 /// out << 0); x=2 → if (a += 2, out << 2); x=3 → if (a += 3, out << 3). Every
 /// position commits (both arms write), so `out` is [0, 2, 3] keyed by commit time.
 #[test]
-fn both_arms_feed_in_committing_block() {
+fn both_arms_feed_in_committing_transaction() {
     check_tile(
         indoc! {r#"
             a: Mut(Int, Txn) := 0
@@ -962,7 +962,7 @@ fn both_arms_feed_in_committing_block() {
         // Both taps fan out into a tagged-union channel (each fires on its own
         // route): arm `out<<` is the `if` arm (x=2,3 → 2,3), arm `out<<#1` the
         // `else` (x=1 → 0). Same union shape as the read-only both-arms reply, over the
-        // committing-block feed indexing (cf. `reply_feed_under_one_route`).
+        // feed indexing of a committing transaction (cf. `reply_feed_under_one_route`).
         Tile::data_function(
             channel_union(
                 &["out<<", "out<<#1"],
@@ -1003,15 +1003,15 @@ fn ryw_of_conditionally_written_key_after_case() {
     );
 }
 
-/// A **conditional feed in a read-only `with begin():` block** — a conditional
-/// reply that reads a mutable variable (`if r > 1: resp << pool`). The block commits no
+/// A **conditional feed in a read-only transaction** — a conditional
+/// reply that reads a mutable variable (`if r > 1: resp << pool`). The transaction commits no
 /// mutable variable, so the reply is a filtered as-of read: `channelize` fans the guard-
 /// `Case` out into a refined-source channel (the same path a non-transactional
 /// `if r > 1: resp << r` takes), rather than the feed-only hoist which handles
 /// only straight-line replies. `pool` is never written, so its as-of value is its
 /// init (100), replied at the guard-passing positions (r = 2, 3 → domain 1, 2).
 #[test]
-fn conditional_reply_in_readonly_block() {
+fn conditional_reply_in_readonly_transaction() {
     check_tile(
         indoc! {r#"
             resp: Feed(_)
@@ -1031,12 +1031,12 @@ fn conditional_reply_in_readonly_block() {
     );
 }
 
-/// An `if/else` conditional reply in a read-only `with begin():` block: both arms
+/// An `if/else` conditional reply in a read-only transaction: both arms
 /// feed, so the fan-out refines the source on each arm (the `else` with predicate
-/// `¬(r > 1)`) — the read-only-block counterpart of the pure-feed `if/else`
+/// `¬(r > 1)`) — the read-only-transaction counterpart of the pure-feed `if/else`
 /// fan-out. As a function: r=1 → 0 (else), r=2 → 2, r=3 → 3 (both variants).
 #[test]
-fn conditional_if_else_reply_in_readonly_block() {
+fn conditional_if_else_reply_in_readonly_transaction() {
     check_tile(
         indoc! {r#"
             resp: Feed(_)
@@ -1393,12 +1393,12 @@ fn await_final_mixes_a_writer_free_mut_var_with_a_written_one() {
     );
 }
 
-/// A later block that **writes the awaited mutable variable** extends a history the await
-/// already reduced. This is the linearity rule reaching a `MutWrite` target, not a
-/// blanket ban on blocks after an await — see
-/// `await_final_permits_a_later_block_on_another_mut_var` for the shape that is fine.
+/// A later transaction that **writes the awaited mutable variable** extends a history the
+/// await already reduced. This is the linearity rule reaching a `MutWrite` target, not a
+/// blanket ban on transactions after an await — see
+/// `await_final_permits_a_later_transaction_on_another_mut_var` for the shape that is fine.
 #[test]
-fn write_to_awaited_mut_var_in_a_later_block_rejected() {
+fn write_to_awaited_mut_var_in_a_later_transaction_rejected() {
     check_compile_error(
         indoc! {r#"
             pool: Mut(Int, Txn) := 100
@@ -1415,10 +1415,10 @@ fn write_to_awaited_mut_var_in_a_later_block_rejected() {
     );
 }
 
-/// A later block that **reads** the awaited mutable variable is the same violation reaching a
+/// A later transaction that **reads** the awaited mutable variable is the same violation reaching a
 /// `Var` in the writer body.
 #[test]
-fn read_of_awaited_mut_var_in_a_later_block_rejected() {
+fn read_of_awaited_mut_var_in_a_later_transaction_rejected() {
     check_compile_error(
         indoc! {r#"
             a: Mut(Int, Txn) := 100
@@ -1436,11 +1436,11 @@ fn read_of_awaited_mut_var_in_a_later_block_rejected() {
     );
 }
 
-/// **A block after an await is otherwise fine.** It commits another mutable variable, so
+/// **A transaction after an await is otherwise fine.** It commits another mutable variable, so
 /// it touches nothing the await consumed; it joins the same store, which the
 /// await was always going to wait for. `a` = 100 - 10 = 90, `b` = 5 -> 9005.
 #[test]
-fn await_final_permits_a_later_block_on_another_mut_var() {
+fn await_final_permits_a_later_transaction_on_another_mut_var() {
     check_tile(
         indoc! {r#"
             a: Mut(Int, Txn) := 100
@@ -1538,8 +1538,9 @@ fn by_ref_pass_after_await_final_rejected() {
     );
 }
 
-/// Inside a block, the await would wait on the very history that block extends. A
-/// block's mutable variable read is the bare snapshot, and that is its only read.
+/// Inside a `with begin():` block, the await would wait on the very history that transaction
+/// extends. A transaction's mutable variable read is the bare snapshot, and that is its only
+/// read.
 #[test]
 fn await_final_inside_a_block_rejected() {
     check_compile_error(
@@ -1553,7 +1554,7 @@ fn await_final_inside_a_block_rejected() {
                 out << await_final(pool)
             out
         "#},
-        "would wait on the commit history that block extends",
+        "would wait on the commit history that transaction extends",
     );
 }
 
@@ -1717,7 +1718,7 @@ fn load_from_without_a_predecessor_rejected() {
 /// **Phase separation** — drain one transaction, seed the next from its final value.
 /// The shape a single program-wide store made impossible: `b`'s seed names `a`'s
 /// completion, so with one store `b`'s tick-0 value would await the store `b` itself
-/// writes. No block mentions `a` and `b` together, so they partition into two stores
+/// writes. No transaction mentions `a` and `b` together, so they partition into two stores
 /// and the dependency is an ordinary one-way edge between two letrecs — `hist_a` bound
 /// outside, `hist_b`'s seed reading it. `a` reaches 1 + 1 = 2, seeding `b`, which
 /// reaches 3.
@@ -1762,16 +1763,16 @@ fn a_writer_source_computed_from_another_store_s_final_value() {
 }
 
 /// A refusal, and what reaching one takes: the await must reach a writer of its **own**
-/// store. The first block relates `a` and `b` (it writes both), so they share a store, and
-/// the second block commits into that same store while its decision depends on `a`'s
+/// store. The first transaction relates `a` and `b` (it writes both), so they share a store,
+/// and the second transaction commits into that same store while its decision depends on `a`'s
 /// completion. One store is one recurrence, so the value cannot re-enter it.
 ///
 /// Note the shape the sibling key is doing work for: `b := b + fa` cannot name `a`
 /// directly, because `await_final` consumes its mutable variable (`check_await_final_linearity`)
 /// and would reject the mention first. A store-mate is the only way to reach back in, which
 /// is why the check is wider than the rule it enforces —
-/// `a_block_writing_only_a_read_only_store_mate_of_an_await_rejected` is that width at its
-/// widest, with no block writing both variables at all.
+/// `a_transaction_writing_only_a_read_only_store_mate_of_an_await_rejected` is that width at its
+/// widest, with no transaction writing both variables at all.
 #[test]
 fn writer_body_depending_on_its_own_store_s_await_rejected() {
     check_compile_error(
@@ -1792,7 +1793,7 @@ fn writer_body_depending_on_its_own_store_s_await_rejected() {
     );
 }
 
-/// The same cycle through a writer's **iteration source** — the block's extent, rather
+/// The same cycle through a writer's **iteration source** — the transaction's extent, rather
 /// than its decision, would await the store it commits into.
 #[test]
 fn writer_source_depending_on_its_own_store_s_await_rejected() {
@@ -1815,7 +1816,7 @@ fn writer_source_depending_on_its_own_store_s_await_rejected() {
     );
 }
 
-/// And through a **seed**: `c` joins `a`'s store (its block reads store-mate `b`) while
+/// And through a **seed**: `c` joins `a`'s store (its transaction reads store-mate `b`) while
 /// its tick-0 value awaits that store's completion.
 #[test]
 fn a_seed_depending_on_its_own_store_s_await_rejected() {
@@ -1864,19 +1865,19 @@ fn writer_body_depending_on_an_await_laundered_through_an_accumulator_rejected()
     );
 }
 
-/// **The refusal is checked per store; the rule it enforces is stated per variable.**
-/// Nothing a writer of `a` needs may depend on `await_final(a)`; what is checked is that
-/// nothing a writer of `a`'s store needs does. No block here writes both variables. The
-/// one thing relating them is a block that reads `a` while writing `b`, the partition
-/// being over `reads ∪ writes`, and `a`'s only writer drains before the await, so per-key
-/// closure settles `await_final(a)` and the last block writes `b` alone. The per-variable
-/// rule permits this program; the check refuses it, because one store is one recurrence
-/// and a value read out of it cannot feed a writer back into it.
+/// **The refusal is checked per store; the rule it enforces is stated per variable.** Nothing a
+/// writer of `a` needs may depend on `await_final(a)`; what is checked is that nothing a writer of
+/// `a`'s store needs does. No transaction here writes both variables. The one thing relating them
+/// is a transaction that reads `a` while writing `b`, the partition being over `reads ∪ writes`,
+/// and `a`'s only writer drains before the await, so per-key closure settles `await_final(a)` and
+/// the last transaction writes `b` alone. The per-variable rule permits this program; the check
+/// refuses it, because one store is one recurrence and a value read out of it cannot feed a writer
+/// back into it.
 ///
 /// Splitting a store at a key's closure point would lift the refusal, so this test fails
 /// when it narrows. The mechanism is in `src/ccl/design/mutability.md`, "`await_final`".
 #[test]
-fn a_block_writing_only_a_read_only_store_mate_of_an_await_rejected() {
+fn a_transaction_writing_only_a_read_only_store_mate_of_an_await_rejected() {
     check_compile_error(
         indoc! {r#"
             a: Mut(Int, Txn) := 100
@@ -1900,8 +1901,8 @@ fn a_block_writing_only_a_read_only_store_mate_of_an_await_rejected() {
 // ---------------------------------------------------------------------------
 // Commit-store partitioning
 //
-// A program gets one commit store per set of mutable variables some `with begin():`
-// block relates — not one store for the whole program. These assert the
+// A program gets one commit store per set of mutable variables some transaction
+// relates — not one store for the whole program. These assert the
 // partition end to end, on the planned graph rather than only on values: two
 // programs can agree on every number and differ in how many stores they built.
 // ---------------------------------------------------------------------------
@@ -1934,11 +1935,11 @@ fn commit_stores(code: &str) -> Vec<String> {
     stores_in(&ast)
 }
 
-/// Two mutable variables written by separate blocks, with no block mentioning them
-/// together, have no operation relating them — so they get their own stores, and their
+/// Two mutable variables written by separate transactions, with no transaction mentioning
+/// them together, have no operation relating them — so they get their own stores, and their
 /// own commit clocks, and their own completion.
 /// `mut_vars_read_together_share_a_store` is this program plus the one thing that does
-/// relate them: a block reading both.
+/// relate them: a transaction reading both.
 #[test]
 fn unrelated_mut_vars_get_separate_stores() {
     let code = indoc! {r#"
@@ -1962,11 +1963,11 @@ fn unrelated_mut_vars_get_separate_stores() {
     );
 }
 
-/// **Atomicity holds the store together.** One block writing both keys means they
+/// **Atomicity holds the store together.** One transaction writing both keys means they
 /// advance at one commit tick, so they stay one store however the program is
 /// otherwise shaped.
 #[test]
-fn registers_written_in_one_block_share_a_store() {
+fn registers_written_in_one_transaction_share_a_store() {
     let code = indoc! {r#"
         a: Mut(Int, Txn) := 0
         b: Mut(Int, Txn) := 0
@@ -1981,7 +1982,7 @@ fn registers_written_in_one_block_share_a_store() {
 }
 
 /// **Snapshot consistency** holds a store together too, and writes alone do not show it:
-/// nothing writes both mutable variables, but one block reads both, latching them at a
+/// nothing writes both mutable variables, but one transaction reads both, latching them at a
 /// single frontier, so they must come from one history record. The writers are
 /// exactly those of `unrelated_mut_vars_get_separate_stores` — only this read is added.
 ///
@@ -2008,13 +2009,13 @@ fn mut_vars_read_together_share_a_store() {
     assert_eq!(commit_stores(code), vec!["Txn[a,b]"]);
 }
 
-/// A mutable variable a *writing* block reads to decide its commit is read at that commit's
+/// A mutable variable a *writing* transaction reads to decide its commit is read at that commit's
 /// snapshot, so the read alone pulls it into the store — no write to `limit` is
 /// needed. (`limit` is never written, so it is a read-only key of the store. The key
-/// order is the block's footprint order, which is where the guard reads them, not the
+/// order is the transaction's footprint order, which is where the guard reads them, not the
 /// declaration order.)
 #[test]
-fn a_mut_var_read_by_a_writing_block_joins_its_store() {
+fn a_mut_var_read_by_a_writing_transaction_joins_its_store() {
     let code = indoc! {r#"
         limit: Mut(Int, Txn) := 25
         total: Mut(Int, Txn) := 0
@@ -2028,19 +2029,19 @@ fn a_mut_var_read_by_a_writing_block_joins_its_store() {
     check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![10])));
 }
 
-/// A mutable variable **no block writes** is not a store key. Nothing can advance it, so its
+/// A mutable variable **no transaction writes** is not a store key. Nothing can advance it, so its
 /// history is constant at its seed and reading it costs a key to learn what the
 /// declaration already says — it keeps its introduction on the spine and relates
 /// nothing, which is why `lim` neither joins `tot`'s store nor forms one of its own.
-/// (Contrast `a_mut_var_read_by_a_writing_block_joins_its_store`, whose unwritten
-/// `limit` *is* a key: a **writing** block reads it, so it is read at that block's
-/// commit snapshot.)
+/// (Contrast `a_mut_var_read_by_a_writing_transaction_joins_its_store`, whose unwritten
+/// `limit` *is* a key: a **writing** transaction reads it, so it is read at that
+/// transaction's commit snapshot.)
 ///
-/// The read-only block is required — it is the only way an unwritten mutable variable reaches
+/// The read-only transaction is required — it is the only way an unwritten mutable variable reaches
 /// a footprint at all — so the fed value is an arbitrary as-of sample and is not
 /// asserted. The store list is what this test owns.
 #[test]
-fn a_mut_var_no_block_writes_is_not_a_store_key() {
+fn a_mut_var_no_transaction_writes_is_not_a_store_key() {
     let code = indoc! {r#"
         out: Feed(_)
         lim: Mut(Int, Txn) := 5
@@ -2075,7 +2076,7 @@ fn a_defer_fed_inside_a_store_is_consumed_inside_it() {
     check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![4])));
 }
 
-/// The same, for the feed of a **read-only** block. That block is unwrapped onto the
+/// The same, for the feed of a **read-only** transaction. That transaction is unwrapped onto the
 /// spine, so its feed survives as an effect statement and is carried into the store it
 /// reads — and an effect statement that feeds a defer is therefore something a later
 /// statement can depend on, even though it binds nothing.
@@ -2084,7 +2085,7 @@ fn a_defer_fed_inside_a_store_is_consumed_inside_it() {
 /// mutable variable read`), so compiling and evaluating is the assertion; the fed value is an
 /// arbitrary as-of sample and is not pinned.
 #[test]
-fn a_defer_fed_by_a_read_only_block_is_consumed_inside_its_store() {
+fn a_defer_fed_by_a_read_only_transaction_is_consumed_inside_its_store() {
     let code = indoc! {r#"
         out: Feed(_)
         a: Mut(Int, Txn) := 0
@@ -2154,7 +2155,7 @@ fn a_cross_domain_read_carries_across_the_positions_that_did_not_write_it() {
     check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![3])));
 }
 
-/// **Phase separation through a writer's iteration source.** The extent of `b`'s block
+/// **Phase separation through a writer's iteration source.** The extent of `b`'s transaction
 /// is computed from `a`'s final value, so the source binding is carried into `a`'s store
 /// and `b`'s letrec — nested inside it — reads it there. Legal, and the shape the
 /// nesting order exists for: `a`'s writers all precede the await, so `a`'s store is
@@ -2213,7 +2214,7 @@ fn a_cross_domain_accumulator_depending_on_an_await_nests_inside_that_store() {
 /// `b` is driven by a live source that never ends, so `await_final(b)` cannot resolve —
 /// correctly, since there is no final value to report. `a`'s writers are a finite loop,
 /// so its completion read resolves, unlike `b`'s. The companion
-/// `a_finite_mut_var_completes_despite_a_live_writer_it_shares_a_block_with` is the
+/// `a_finite_mut_var_completes_despite_a_live_writer_it_shares_a_transaction_with` is the
 /// same claim where the two are keys of one store, which is the harder half.
 ///
 /// The two halves of the reply are the assertion: one settles, the other stays
@@ -2266,7 +2267,7 @@ fn a_finite_mut_var_completes_despite_a_live_unrelated_writer() {
     );
 }
 
-/// The same claim where the two variables are **keys of one store**: a block writes both,
+/// The same claim where the two variables are **keys of one store**: a transaction writes both,
 /// so they share a commit clock, and `b` then gets a second writer off a live source.
 /// Nothing can write `a` after the finite loop drains, so `await_final(a)` settles —
 /// completion is a property of `a`'s own writers, not of every writer that commits
@@ -2277,7 +2278,7 @@ fn a_finite_mut_var_completes_despite_a_live_unrelated_writer() {
 /// store-count assertion is what pins the two variables together — without it the
 /// program could pass by being partitioned rather than by closing per key.
 #[test]
-fn a_finite_mut_var_completes_despite_a_live_writer_it_shares_a_block_with() {
+fn a_finite_mut_var_completes_despite_a_live_writer_it_shares_a_transaction_with() {
     let code = indoc! {r#"
         a: Mut(Int, Txn) := 0
         b: Mut(Int, Txn) := 0
@@ -2304,7 +2305,7 @@ fn a_finite_mut_var_completes_despite_a_live_writer_it_shares_a_block_with() {
     assert_eq!(
         stores_in(&compiled.ast),
         vec!["Txn[a,b]"],
-        "the shared block must put both keys in one store, or this tests nothing"
+        "the shared transaction must put both keys in one store, or this tests nothing"
     );
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
@@ -2328,7 +2329,7 @@ fn a_finite_mut_var_completes_despite_a_live_writer_it_shares_a_block_with() {
     );
 }
 
-/// A key a block only **reads** has a statically empty write history, so its terminal read
+/// A key a transaction only **reads** has a statically empty write history, so its terminal read
 /// is its seed — settled even while a live writer keeps that store open.
 ///
 /// `{reads ∪ writes}` is one store (`src/ccl/design/mutability.md`, "How many commit stores
@@ -2399,11 +2400,11 @@ fn bare_txn_read_outside_tx_rejected() {
 
 /// The gate follows a `Mut(_, Txn)` **parameter** into the callee: a by-reference pass is
 /// the one mention lowering lets through, and it hands the callee a mutable variable in
-/// its own right, so a read of it there obeys the same rule. Reading only inside a block
-/// is permanent (the CHL spec, "8.3 Reads"), so it holds through a function boundary as
+/// its own right, so a read of it there obeys the same rule. Reading only inside a
+/// transaction is permanent (the CHL spec, "8.3 Reads"), so it holds through a function boundary as
 /// well as at the top level.
 #[test]
-fn bare_read_of_a_mut_param_outside_a_block_rejected() {
+fn bare_read_of_a_mut_param_outside_a_transaction_rejected() {
     check_compile_error(
         indoc! {r#"
             def draw(p: Mut(Int, Txn), amt):
@@ -2584,7 +2585,7 @@ fn tx_if_else_routes_across_keys() {
 
 /// **Absolute** (non-RMW) conditional writes routing across keys: each arm sets
 /// its key outright (`a := 5`, not `a := a + x`), so neither key is read in the
-/// block. The key an arm does *not* write must still **carry** its prior
+/// transaction. The key an arm does *not* write must still **carry** its prior
 /// committed value — which is only expressible as that key's read snapshot, so
 /// `collect_footprint` finalizes each conditionally-written key into the read set
 /// (a plain write-only key would have no snapshot to carry). Over `[1, 2, 3]`:
@@ -2687,7 +2688,7 @@ fn txn_domain_never_inferred() {
                 x := x + 1
             x
         "#},
-        "`x` is written inside a `with begin():` block that commits no transactional mutable variable",
+        "`x` is written inside a `with begin():` block whose transaction commits no transactional mutable variable",
     );
 }
 
@@ -2704,15 +2705,15 @@ fn induction_write_inside_begin_block_rejected() {
                 cnt := cnt + 1
             cnt
         "#},
-        "`cnt` is written inside a `with begin():` block that commits no transactional mutable variable",
+        "`cnt` is written inside a `with begin():` block whose transaction commits no transactional mutable variable",
     );
 }
 
-/// A *guarded* induction write in a **mixed** block — one that *does* commit a
+/// A *guarded* induction write in a **mixed** block — one whose transaction *does* commit a
 /// transactional mutable variable — is rejected. `check_no_induction_only_transactions`
-/// passes (the block commits `total`), but the guarded `cnt += 1` is not liftable
+/// passes (the transaction commits `total`), but the guarded `cnt += 1` is not liftable
 /// by `partition_spine` and would be silently dropped from the decision record.
-/// A dedicated pre-check (`check_no_guarded_induction_write_in_block`) catches it.
+/// A dedicated pre-check (`check_no_guarded_induction_write_in_txn`) catches it.
 #[test]
 fn guarded_induction_write_in_mixed_block_rejected() {
     check_compile_error(
@@ -2726,7 +2727,7 @@ fn guarded_induction_write_in_mixed_block_rejected() {
                         cnt := cnt + 1
             cnt
         "#},
-        "guarded induction write in a transaction block is not supported",
+        "guarded induction write inside a transaction is not supported",
     );
 }
 
@@ -2781,7 +2782,7 @@ fn induction_keyed_write_reading_past_a_lifted_write_rejected() {
 /// is rejected (write-side mirror of the read gate). Otherwise it becomes a plain
 /// sequential `let` shadow that silently hides every committed value.
 #[test]
-fn out_of_block_txn_write_rejected() {
+fn txn_write_outside_a_transaction_rejected() {
     check_compile_error(
         indoc! {r#"
             store: Mut(Int, Txn) := 100
@@ -2814,7 +2815,7 @@ fn by_ref_txn_write_without_block_rejected() {
 /// absorb it. Rejected on the inlined tree (the textual nested-`with` check
 /// cannot see a transaction reached via a call).
 #[test]
-fn txn_writer_called_inside_block_rejected() {
+fn txn_writer_called_inside_a_transaction_rejected() {
     check_compile_error(
         indoc! {r#"
             out: Feed(_)
@@ -2868,10 +2869,10 @@ fn transaction_handle_binding_rejected() {
     );
 }
 
-/// C5: the out-of-block read gate applies to a bare mutable variable passed as an
+/// C5: the gate on reads outside a transaction applies to a bare mutable variable passed as an
 /// argument to an *ordinary* function (only a `Mut`-parameter callee accepts a
 /// bare mutable variable pass and bypasses the gate). `f(store)` reads the mutable variable
-/// outside a block, so it is rejected.
+/// outside a transaction, so it is rejected.
 #[test]
 fn bare_mut_var_arg_to_ordinary_fn_is_gated() {
     check_compile_error(
@@ -2913,8 +2914,8 @@ fn like_named_comprehension_var_does_not_panic() {
 }
 
 /// A2 regression (no false rejection): a loop target *spelled* like a mutable variable
-/// (`for store in [1, 2, 3]`) is a genuine local, not an out-of-block store
-/// read. Before the fix, the base-name read gate rejected `store` inside the
+/// (`for store in [1, 2, 3]`) is a genuine local, not a read of the store outside a
+/// transaction. Before the fix, the base-name read gate rejected `store` inside the
 /// loop even though no transaction is present. The loop feeds `store + 1` per
 /// iteration → `[2, 3, 4]` at loop positions `[0, 1, 2]`; the mutable variable itself is
 /// never written, so `transact_phase` is a no-op on it.
@@ -2978,7 +2979,7 @@ fn mixed_txn_and_induction_store_accumulates() {
 
 /// Stage-2 interop: the induction write sits *physically inside* the `with
 /// begin():` block (`store := store + r; cnt := cnt + 1`), the literal
-/// worked-example form. `transact_phase` partitions the block by mutable variable domain —
+/// worked-example form. `transact_phase` partitions the transaction by mutable variable domain —
 /// the mutable variable write forms the commit decision; the induction `cnt` write is
 /// lifted onto the enclosing loop as its own recurrence — so the result matches
 /// the sibling form: `resps << cnt` yields the request-indexed running total.
@@ -3019,14 +3020,13 @@ fn mixed_txn_and_induction_write_inside_block_store_accumulates() {
     );
 }
 
-/// The block that lifts `cnt := cnt + 1` keeps no read of `cnt`. A-normalization
-/// binds the read (`let __anf ^= cnt in cnt := __anf + 1`) and the lift carries
-/// that value out with the write, so leaving the binding behind would make the
-/// transactional remainder claim a read it no longer makes, and
-/// `fold_cross_domain_loops` would fold every loop writing `cnt` into a
-/// cross-domain letrec for an accumulator no commit decision reads.
-/// `partition_spine` drops the binding instead. `cnt` counts 2 in-block
-/// increments and 2 from the sibling loop.
+/// Lifting `cnt := cnt + 1` out of a transaction leaves the transaction no read of `cnt`.
+/// A-normalization binds the read (`let __anf ^= cnt in cnt := __anf + 1`) and the lift carries
+/// that value out with the write, so leaving the binding behind would make the transactional
+/// remainder claim a read it no longer makes, and `fold_cross_domain_loops` would fold every loop
+/// writing `cnt` into a cross-domain letrec for an accumulator no commit decision reads.
+/// `partition_spine` drops the binding instead. `cnt` counts 2 increments written inside the
+/// `with begin():` block and 2 from the sibling loop.
 #[test]
 fn induction_write_in_block_leaves_no_read_of_its_accumulator() {
     check_tile(
@@ -3046,7 +3046,7 @@ fn induction_write_in_block_leaves_no_read_of_its_accumulator() {
 }
 
 /// The same drop with the sibling loop's own `with begin():` block: each loop
-/// lifts a write to the shared `cnt`, and neither block reads it. Both folds
+/// lifts a write to the shared `cnt`, and neither transaction reads it. Both folds
 /// name the one accumulator, so a stale read-binding leaves `cnt` free at the
 /// top and `splice_stores`' escape check reports it. `store` accumulates
 /// 1 + 2 + 3 + 4 = 10.
@@ -3122,13 +3122,13 @@ fn commit_decision_reads_induction_accumulator() {
 /// `[1,2,3]` → 3; the txn loop over `[10,20]` reads it). Unlike the co-indexed
 /// case above (same loop → request-indexed `zip`), a different loop's accumulator
 /// has no per-request correspondence, so its final value is broadcast into every
-/// transaction. Observed via an **in-block** (commit-ordered) reply — not a
+/// transaction. Observed via a reply **inside the transaction** (commit-ordered) — not a
 /// trailing read, which is an arbitrary as-of sample — so the committed values
 /// are deterministic: `pool` draws down `100 → 97 → 94` over commit ticks 1, 2.
 /// Exercises the writer's deferred-wakeup convergence: the broadcast `cnt`'s
 /// `ExtractFinal` is empty until its loop's own cycle drains, so the writer
 /// re-arms itself on the wakeup queue each not-ready pull rather than deadlocking
-/// on the stalled commit frontier; the in-block reply demands each commit and
+/// on the stalled commit frontier; the reply inside the transaction demands each commit and
 /// drives that convergence.
 #[test]
 fn commit_decision_reads_cross_loop_accumulator_broadcast() {
@@ -3156,7 +3156,7 @@ fn commit_decision_reads_cross_loop_accumulator_broadcast() {
 /// body-input row was pushed at the pre-commit frontier, so on the advanced
 /// frontier the writer re-pushes at the new snapshot and the stale row is orphaned
 /// (compacted on commit) — the value read is the *current* snapshot, not the stale
-/// one. Observed via in-block replies (which serialization commits first is
+/// one. Observed via replies inside the transactions (which serialization commits first is
 /// arbitrary), so asserted as a valid drawdown: both draws — `cnt`(3) and 5 —
 /// commit exactly once, conserving the pool (final 92).
 #[test]
@@ -3183,8 +3183,8 @@ fn broadcast_read_races_a_second_writer() {
 /// Broadcast off a finite **async** (data-source) sibling loop. `cnt` counts a
 /// `TestDataSource`'s three elements — a loop that converges only as
 /// the source's data arrives (via scheduler notifications), not synchronously.
-/// The txn decision reads `cnt`'s value (broadcast, 3), observed via an in-block
-/// reply — one commit, `pool = 100 − 3 = 97` at commit tick 1. This is the case
+/// The txn decision reads `cnt`'s value (broadcast, 3), observed via a reply inside the
+/// transaction — one commit, `pool = 100 − 3 = 97` at commit tick 1. This is the case
 /// the old in-`get` pump could not handle (it spun without yielding to the
 /// scheduler); the deferred-wakeup path drives it — each not-ready pull re-arms
 /// the writer, and `check_for_notifications` delivers both the source's data and
@@ -3244,7 +3244,7 @@ fn broadcast_off_async_source_sibling_loop() {
 }
 
 /// Stage-3 cross-domain read, reply side: the same loop reads `cnt` in the commit
-/// decision *and* replies with it outside the block. The reply rides the induction
+/// decision *and* replies with it outside the transaction. The reply rides the induction
 /// domain (request-indexed → `[1,2,3]`) while the mutable variable accumulates to 6.
 #[test]
 fn commit_decision_reads_induction_accumulator_with_reply() {
@@ -3264,14 +3264,13 @@ fn commit_decision_reads_induction_accumulator_with_reply() {
     );
 }
 
-/// Stage-3 commit-ordered/gated reply (in-block feed): a reply *inside* the block
-/// rides the commit record as a tap (commit-tick-indexed, like `progress_feed_in_tx`),
-/// so it is sequenced after the commit and — the gating half — a *denied*
-/// transaction replies nothing. Here `pool` starts at 100 and `r = 70, 50, 20`
-/// draws down; `r = 50` fails `pool >= r` (pool is 30) so its transaction denies.
-/// The reply reads the induction counter `cnt` (a Stage-3 cross-domain read inside
-/// the tap): `cnt` advances 1,2,3 on the request loop regardless of commit, but
-/// only the two *committed* iterations reply — values `[1, 3]` at commit ticks 1,2.
+/// Stage-3 commit-ordered/gated reply (a feed inside the transaction): a reply *inside* the
+/// transaction rides the commit record as a tap (commit-tick-indexed, like `progress_feed_in_tx`),
+/// so it is sequenced after the commit and — the gating half — a *denied* transaction replies
+/// nothing. Here `pool` starts at 100 and `r = 70, 50, 20` draws down; `r = 50` fails `pool >= r`
+/// (pool is 30) so its transaction denies. The reply reads the induction counter `cnt` (a Stage-3
+/// cross-domain read inside the tap): `cnt` advances 1,2,3 on the request loop regardless of
+/// commit, but only the two *committed* iterations reply — values `[1, 3]` at commit ticks 1,2.
 #[test]
 fn commit_gated_reply_reading_induction_counter() {
     check_tile(
@@ -3291,7 +3290,7 @@ fn commit_gated_reply_reading_induction_counter() {
     );
 }
 
-/// Stage-3 commit-ordered reply that commits every iteration: the in-block reply
+/// Stage-3 commit-ordered reply that commits every iteration: the reply inside the transaction
 /// reads the induction counter `cnt` (cross-domain, via the writer co-iteration)
 /// and — since no transaction denies — every request replies, values `[1, 2, 3]`
 /// at commit ticks 1,2,3. The mutable variable accumulates alongside; this is the worked
@@ -3315,7 +3314,7 @@ fn commit_ordered_reply_reading_induction_counter() {
     );
 }
 
-/// In-block reply with an interspersed deny: the reply tap `resp << q` rides the
+/// A reply inside a transaction with an interspersed deny: the reply tap `resp << q` rides the
 /// writer *decision*, so a denied transaction (`r == 0`, guard false) contributes
 /// no tick and no reply, while each committing position emits its
 /// read-your-writes value densely. This is the exact reply-path contract (a
@@ -3323,7 +3322,7 @@ fn commit_ordered_reply_reading_induction_counter() {
 /// exactly under the consumer-driven store: r=0 denies, r=1 commits q:=2 (tick 1),
 /// r=2 commits q:=3 (tick 2) → `resp` = [2, 3] over commit ticks [1, 2].
 #[test]
-fn in_block_reply_with_deny_is_dense() {
+fn reply_inside_a_transaction_with_deny_is_dense() {
     check_tile(
         indoc! {r#"
             resp: Feed(_)
@@ -3460,7 +3459,7 @@ fn cross_function_transfer_conserves_total() {
 }
 
 // A heterogeneous multi-key mutable variable: a `Mut(String, Txn)` and a
-// `Mut(Int, Txn)` committed together in one block. Regression for the
+// `Mut(Int, Txn)` committed together in one transaction. Regression for the
 // variable-wide value extent (`build_commit_store`), which is the union of the
 // distinct per-key extents rather than whichever key was iterated last —
 // reading either key returns its own type. `label` is declared first, so a
@@ -3997,12 +3996,12 @@ fn a_keyed_write_commits_a_computed_value_at_a_computed_key() {
 }
 
 /// A checked lookup of a key the map-valued mutable variable does not hold answers `Option::none`
-/// inside a read-only block: key `2` is absent, and every position replies.
+/// inside a read-only transaction: key `2` is absent, and every position replies.
 ///
 /// `m` has no writer, so every transaction reads its seed and the replies are independent of
 /// commit order.
 #[test]
-fn a_checked_lookup_of_an_absent_key_in_a_read_only_block_answers_none() {
+fn a_checked_lookup_of_an_absent_key_in_a_read_only_transaction_answers_none() {
     check_scalar(
         indoc! {r#"
             m: Mut(Map(Int, Int), Txn) := box(map([(1, 10)]))
@@ -4018,19 +4017,19 @@ fn a_checked_lookup_of_an_absent_key_in_a_read_only_block_answers_none() {
     );
 }
 
-/// A checked lookup of an absent key inside a block that writes stalls: the program quiesces
+/// A checked lookup of an absent key inside a writing transaction stalls: the program quiesces
 /// without a final value of `n`, so `await_final(n)` never reaches a terminal tile.
 ///
-/// The block writes `n`, not `m`. The same lookup in a read-only block answers `Option::none`
-/// (the sibling above), and a lookup of a present key in a writing block commits
-/// (`a_keyed_read_at_the_loop_item_reads_the_snapshot`). Feeding the lookup out of the block
-/// instead of writing it stalls the same way: over a `[1, 2, 1]` loop with seed `{1: 10}`, the
-/// block replies at the first key and stops at the absent second one, and the `cambra` binary
-/// running that program does not exit. A key off a source, such as the storefront's
+/// The transaction writes `n`, not `m`. The same lookup in a read-only transaction answers
+/// `Option::none` (the sibling above), and a lookup of a present key in a writing transaction
+/// commits (`a_keyed_read_at_the_loop_item_reads_the_snapshot`). Feeding the lookup out of the
+/// transaction instead of writing it stalls the same way: over a `[1, 2, 1]` loop with seed
+/// `{1: 10}`, the transaction replies at the first key and stops at the absent second one, and the
+/// `cambra` binary running that program does not exit. A key off a source, such as the storefront's
 /// `inventory[req.body.sku]`, reaches the same stall.
 #[test]
 #[should_panic(expected = "producer stopped short of a terminal tile")]
-fn a_checked_lookup_of_an_absent_key_in_a_writing_block() {
+fn a_checked_lookup_of_an_absent_key_in_a_writing_transaction() {
     check_scalar(
         indoc! {r#"
             def or_zero(o: Option(Int)) => Int:
@@ -4070,8 +4069,8 @@ fn a_counter_over_an_induction_map_at_a_present_key() {
 }
 
 /// The same counter starting at a key the seed does not hold stalls: the loop produces no
-/// position of `m`. The absent-key stall of a writing `Txn` block
-/// (`a_checked_lookup_of_an_absent_key_in_a_writing_block`) on an induction map.
+/// position of `m`. The absent-key stall of a writing transaction
+/// (`a_checked_lookup_of_an_absent_key_in_a_writing_transaction`) on an induction map.
 #[test]
 #[should_panic(expected = "producer stopped short of a terminal tile")]
 fn a_counter_over_an_induction_map_at_an_absent_key() {
@@ -4091,7 +4090,7 @@ fn a_counter_over_an_induction_map_at_an_absent_key() {
 }
 
 /// A keyed write whose key is a mutable variable, `log[n] := 5` after `n := n + 1` in the same
-/// block, does not compile: the post-transact type check rejects the block's snapshot tuple,
+/// block, does not compile: the post-transact type check rejects the transaction's snapshot tuple,
 /// expecting `Mut(Int, Txn)` and finding `Int`. A `Map(Int, String)` panics the same way, and a
 /// key that is the loop item compiles (`a_keyed_write_commits_a_computed_value_at_a_computed_key`).
 /// Each transaction writes the key it has just counted to, so every commit order gives the same

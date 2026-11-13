@@ -714,10 +714,10 @@ fn reply_to(code: &str, request: impl FnOnce() -> String + Send + 'static) -> St
     drive_until(&mut ctx, &rx, Duration::from_secs(5))
 }
 
-/// A reply fed in the loop body, after a block that writes a mutable variable, answers each
+/// A reply fed in the loop body, after a transaction that writes a mutable variable, answers each
 /// request.
 #[test]
-fn a_reply_after_a_writing_block_answers_the_request() {
+fn a_reply_after_a_writing_transaction_answers_the_request() {
     let port = reserve_test_port();
     let code = formatdoc! {r#"
         reqs, resps = http_serve("{port}", "POST", "/hit")
@@ -733,10 +733,10 @@ fn a_reply_after_a_writing_block_answers_the_request() {
     );
 }
 
-/// A reply fed inside the block that writes a mutable variable never answers the request.
+/// A reply fed inside the transaction that writes a mutable variable never answers the request.
 ///
 /// `docs/chl-spec.md`, "8.4 Feeds are the second form of mutability" admits a reply inside a
-/// block, sequenced after the commit and indexed by commit tick. The same in-block feed over a
+/// transaction, sequenced after the commit and indexed by commit tick. The same feed over a
 /// `stdin()` loop into a declared feed replies (`progress_feed_inside_tx` in
 /// `tests/it/compilation_pipeline/transactions.rs` covers the literal-list loop), and the reply
 /// moved after the block answers (the sibling above).
@@ -746,7 +746,7 @@ fn a_reply_after_a_writing_block_answers_the_request() {
 // leave the driving thread running.
 #[test]
 #[should_panic(expected = "timed out after 5s waiting for HTTP response")]
-fn a_reply_inside_a_writing_block_answers_the_request() {
+fn a_reply_inside_a_writing_transaction_answers_the_request() {
     let port = reserve_test_port();
     let code = formatdoc! {r#"
         reqs, resps = http_serve("{port}", "POST", "/hit")

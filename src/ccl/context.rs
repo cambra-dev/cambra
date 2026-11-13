@@ -1920,12 +1920,13 @@ fn invalid_tree(ir: &Expr, boundary: &str, errs: &impl std::fmt::Debug) -> ! {
 ///
 /// - `check_no_nested_transactions` — a transactional writer reaching a `with
 ///   begin():` block via a function call. The callee's inlined `For` would
-///   otherwise be silently absorbed into the outer block's read-your-writes env,
+///   otherwise be silently absorbed into the outer transaction's read-your-writes env,
 ///   dropping its commit.
 /// - `check_no_induction_only_transactions` — an induction accumulator written
-///   inside a block with no mutable variable write is a no-atomicity transaction.
-/// - `check_no_guarded_induction_write_in_block` — a *guarded* induction write
-///   inside a committing block (`balance := …; if p: cnt += 1`) is not liftable
+///   inside a transaction that writes no transactional mutable variable gives that
+///   transaction no atomicity.
+/// - `check_no_guarded_induction_write_in_txn` — a *guarded* induction write
+///   inside a committing transaction (`balance := …; if p: cnt += 1`) is not liftable
 ///   and would be silently dropped from the decision record. A debug-only assert
 ///   would miss it in release.
 /// - `check_no_induction_write_reading_past_a_write` — an induction write whose
@@ -1944,8 +1945,7 @@ fn check_transact_rejections(
     let reject = |error: Located<String>| blame.unsupported(error, Some(expr));
     transact_phase::check_no_nested_transactions(expr, txn_mut_vars).map_err(reject)?;
     transact_phase::check_no_induction_only_transactions(expr, txn_mut_vars).map_err(reject)?;
-    transact_phase::check_no_guarded_induction_write_in_block(expr, txn_mut_vars)
-        .map_err(reject)?;
+    transact_phase::check_no_guarded_induction_write_in_txn(expr, txn_mut_vars).map_err(reject)?;
     transact_phase::check_no_induction_write_reading_past_a_write(expr, txn_mut_vars)
         .map_err(reject)?;
     transact_phase::check_await_final_linearity(expr).map_err(reject)
@@ -2993,7 +2993,7 @@ fn run_passes(
     let txn_mut_vars = transact_phase::collect_txn_mut_vars(&expr);
     // A transactional writer reaching a `with begin():` block via a function call
     // is a nested transaction — the callee's inlined `For` would otherwise be
-    // silently absorbed into the outer block's read-your-writes env, dropping its
+    // silently absorbed into the outer transaction's read-your-writes env, dropping its
     // commit. Reject it before the phase strips the sites.
     check_transact_rejections(&expr, &txn_mut_vars, &blame)?;
     mut_elim::check_iteration_channel_feeds(&expr)

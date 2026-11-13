@@ -4522,14 +4522,14 @@ for req in incr_reqs:
         balance += 1
 ```
 
-- `begin()` is the transaction marker. **All writes in one block commit
-  atomically** — the whole block's writes become visible together or not
+- `begin()` is the transaction marker. **All writes in one transaction commit
+  atomically** — the whole transaction's writes become visible together or not
   at all. There is no partially-visible commit.
 - Writes to a `Txn`-domain mutable variable are legal **only** inside a `with
   begin():` block; a write outside one is rejected (§8.3), as is a write
-  reached through a transactional-writer function *called* inside a block
+  reached through a transactional-writer function *called* inside a transaction
   (a disguised nested transaction).
-- **Nested transactions are rejected** — a block commits as one unit, so a
+- **Nested transactions are rejected** — a transaction commits as one unit, so a
   `with` inside it has no coherent meaning.
 - **Branch guards and tag dispatch.** A block may carry `if`/`elif`/`else`
   guards, more than one of them, and `match` dispatch. Each branch's
@@ -4560,26 +4560,26 @@ around `reserve` + `quote` + the feed).
 > the block's end. Nothing admits it today — §2.2 has `with_stmt` as a
 > compound statement and an `assign_stmt` right-hand side as an
 > `expression`, and the two never meet. **[Open]** is how §8.4's gating
-> rule reads against it: a reply fed *inside* a block rides the commit and
-> a denied transaction replies nothing, while a reply outside fires
+> rule reads against it: a reply fed *inside* a transaction rides the commit
+> and a denied transaction replies nothing, while a reply outside fires
 > regardless — and this shape puts the reply outside with a value that
 > came from inside, so which of the two it inherits has to be said.
 
 ### 8.3 Reads
 
-- **In-context** (inside the mutating loop or block) — a bare reference is
+- **In-context** (inside the mutating loop or transaction) — a bare reference is
   the value at the current position: the previous iteration's value, or,
-  after a write earlier in the same iteration/block, the just-written
+  after a write earlier in the same iteration or transaction, the just-written
   value (**read-your-writes**).
 - **Trailing induction read** — after a `for` loop, a bare reference to an
   induction accumulator is its final value (or the pre-loop value if the
   source was empty). The loop has ended, so "latest" is unambiguous.
 - **A `Txn` mutable variable is read only inside a `with begin():` block.** A
-  bare read outside one is an error, and stays one: the block is what pins a
+  bare read outside one is an error, and stays one: the transaction is what pins a
   **snapshot-consistent** view, so that several mutable variable reads in one
-  block see one commit snapshot. A read that wants no snapshot has the two terms
-  below instead — an as-of read fed out of a block, or `await_final`.
-- **As-of read.** A mutable variable read fed *out* of a block that does not
+  transaction see one commit snapshot. A read that wants no snapshot has the two
+  terms below instead — an as-of read fed out of a transaction, or `await_final`.
+- **As-of read.** A mutable variable read fed *out* of a transaction that does not
   itself write that mutable variable is an **as-of read at an arbitrary commit
   position** — the mutable variable's value as of wherever the reading transaction
   lands in the commit order, replied indexed by the *reading* loop. This
@@ -4602,13 +4602,13 @@ way `x := e` is; the two differ only in that merge law.
 Two feed shapes interact with transactions, and the difference is
 observable:
 
-- **Reply *inside* a block** (`out << e` within `with begin():`) rides the
+- **Reply *inside* a transaction** (`out << e` within `with begin():`) rides the
   commit: it is **sequenced after the commit** and **gated** — a denied
   transaction replies nothing — and is indexed by commit tick.
-- **Reply *outside* the block** rides its own loop's domain and fires every
+- **Reply *outside* the transaction** rides its own loop's domain and fires every
   iteration regardless of commit — request-indexed, value-correct, but not
   commit-ordered. **To gate or commit-order a reply, put it inside the
-  block.**
+  transaction.**
 
 ### 8.5 Ordering and concurrency
 
@@ -4630,7 +4630,7 @@ interleaved (or parallel) otherwise. The events:
   driven by a live stream commits in the stream's real arrival order.
 - **A data dependency forced by logic.** When logic reads a value another
   piece produces, the read depends on the write — read-your-writes in a
-  block, a commit decision reading a snapshot, a reply consuming its own
+  transaction, a commit decision reading a snapshot, a reply consuming its own
   commit record.
 - **`await_final`.** The **completion event** of a transactional mutable variable
   (§8.6): it is available only once every writer of the mutable variable has
@@ -4638,22 +4638,22 @@ interleaved (or parallel) otherwise. The events:
 
 Consequences a program may rely on:
 
-- **Commit order is not global.** Two `with begin():` blocks are ordered
-  relative to each other only if they mention a mutable variable in common —
-  a shared variable is what makes one block's commit visible to the other.
-  Blocks with no variable in common are **unordered**: nothing in the
-  language imposes an order between them, and their transactions interleave
-  freely. Two independent `for` loops relate their accumulators the same way.
+- **Commit order is not global.** Two transactions are ordered relative to each
+  other only if they mention a mutable variable in common — a shared variable is
+  what makes one transaction's commit visible to the other. Transactions with no
+  variable in common are **unordered**: nothing in the language imposes an order
+  between them, and they interleave freely. Two independent `for` loops relate
+  their accumulators the same way.
 - **Commit order is not lexical order.** Two `with begin():` blocks do
-  **not** commit in the order they appear in source; each block's position
+  **not** commit in the order they appear in source; each transaction's position
   is fixed by its trigger event (a source arrival, or the loop index for a
   batch writer). A programmer's default lexical-order assumption is wrong.
 - **A clock reading orders nothing** (**[Decided]**). A `time::now()` reading is not an event,
   and commit order never consults one. A row an alarm source releases is a source arrival
   ([7.5 Time [Decided]](#75-time-decided)).
-- **Read-your-writes** within a block or iteration.
+- **Read-your-writes** within a transaction or iteration.
 - **Reply-after-commit / cross-endpoint monotonicity.** A reply fed from
-  inside a block is sequenced after that commit; combined with arrival-order
+  inside a transaction is sequenced after that commit; combined with arrival-order
   monotonicity this gives external consistency — a client that sees `ok 2`
   then reads another endpoint observes `≥ 2`.
 - **Terminal vs. temporal reads.** `await_final` (and the trailing
@@ -4663,8 +4663,8 @@ Consequences a program may rely on:
 - **A shared program-start anchor gives no *relative* order — by design,
   not by omission.** A standalone `with begin():` or a literal-list loop
   depends on **program start** like everything else, but on nothing more.
-  Program start is a *single* event: it sequences each block after itself,
-  yet imposes no order *among* the blocks it triggers, so they are mutually
+  Program start is a *single* event: it sequences each transaction after itself,
+  yet imposes no order *among* the transactions it triggers, so they are mutually
   unordered — the engine may serialize them any way and the program is
   correct under all of them. (A live-stream writer differs because its
   successive arrivals are *distinct* events carrying a real order, which
@@ -4678,7 +4678,7 @@ Consequences a program may rely on:
 
 `await_final(x)` is a builtin call on a transactional mutable variable
 `x: Mut(V, Txn)`, an expression of type `V`: the mutable variable's **final
-committed value**, once every block that writes `x` has finished, or the
+committed value**, once every transaction that writes `x` has finished, or the
 initializer if it was never committed. It is the commit-domain counterpart of
 the trailing induction read (§8.3) and the completion event of the ordering
 model (§8.5) — the one read that waits for a `Txn` mutable variable's
@@ -4698,11 +4698,11 @@ error. That is what makes the completion event well-defined: the await closes
 `x`'s writer set at that point, so "final" names a fixed value. (A `for` loop's
 accumulator gets a terminal read for free because the loop has a lexical end; a
 mutable variable has none, so the barrier is drawn by consuming it.) The rule is
-about `x` alone — a later block that does not mention `x` is an ordinary
-transaction.
+about `x` alone — a later transaction that does not mention `x` is an
+ordinary one.
 
 **Nothing a writer of `x` needs may depend on `await_final(x)`**: the await
-completes only once every block writing `x` has finished, so such a dependency
+completes only once every transaction writing `x` has finished, so such a dependency
 is a cycle. Three positions are rejected — a writer's iteration source, a
 writer's decision body, and a transactional mutable variable's seed. Awaiting a
 mutable variable written *elsewhere* is an ordinary dependency between two
@@ -4724,21 +4724,21 @@ An **induction** accumulator may likewise be seeded from an await
 (`x := await_final(pool)`): a different recurrence, so there is no cycle.
 
 One restriction unrelated to cycles: `await_final` may not appear inside a `with
-begin():` block, which reads its mutable variables bare as a snapshot; awaiting
-there would wait on the history that block extends.
+begin():` block. The transaction reads its mutable variables bare as a snapshot, and
+an await there would wait on the history that transaction extends.
 
-**Completeness is per variable.** `await_final(x)` waits for every block that
-may write `x` and for nothing else, so a mutable variable whose writing blocks
-are all finite settles while other variables — including ones `x` shares a block
-with — are still being written by a live source. If no block writes `x` at all,
-or every transaction denies, the await is `x`'s initializer.
+**Completeness is per variable.** `await_final(x)` waits for every transaction
+that may write `x` and for nothing else, so a mutable variable written by finitely
+many transactions settles while other variables — including ones `x` shares a
+transaction with — are still being written by a live source. If no transaction
+writes `x` at all, or every transaction denies, the await is `x`'s initializer.
 
 > **Current limitation.** The *rejection* rule is enforced slightly wider than
-> it is stated: a block's dependency on an `await_final` is refused when the
-> awaited variable merely shares a block with one the dependent block writes,
-> not only when that block writes the awaited variable itself. Reaching a
-> wrongly-refused program takes a dependency that comes back into a related
-> variable, and the refusal is a compile error, never a wrong answer.
+> it is stated: a transaction's dependency on an `await_final` is refused when
+> the awaited variable merely shares a transaction with one the dependent
+> transaction writes, not only when that transaction writes the awaited variable
+> itself. Reaching a wrongly-refused program takes a dependency that comes back
+> into a related variable, and the refusal is a compile error, never a wrong answer.
 
 ### 8.7 Direction [Decided]: transactions as contextual parameters
 

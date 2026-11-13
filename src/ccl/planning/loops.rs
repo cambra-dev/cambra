@@ -637,7 +637,7 @@ fn hist_record(fields: Vec<(Label, Type)>) -> Type {
 /// group\'s bindings, by shape ([`classify_txn_binding`]): one **history** per
 /// key (its `init` off the guard\'s default slot), one **commit-record** per
 /// `with begin():` site ([`recover_writer`] — writer body verbatim), one
-/// **tap** per in-block feed. A read of a history / tap binding in the
+/// **tap** per feed inside a transaction. A read of a history / tap binding in the
 /// continuation becomes a history-record projection `__hist.field`.
 fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr {
     let mut keys: Vec<TransactKey> = Vec::new();
@@ -998,8 +998,8 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         _ => crate::ccl::ccl_utils::history_ty(&domain_ty, value),
     };
     // Op-conversion builds a commit store for a `Txn` domain and an induction store for any
-    // other, so an induction group over a `Txn` domain (e.g. a loop over an in-block reply
-    // channel) would be built as the wrong store.
+    // other, so an induction group over a `Txn` domain (e.g. a loop over the channel of a
+    // reply inside a transaction) would be built as the wrong store.
     assert!(
         !matches!(domain_ty, Type::Txn),
         "letrec recognition: an induction recurrence over the `Txn` domain would dispatch \

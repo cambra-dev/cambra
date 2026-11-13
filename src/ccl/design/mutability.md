@@ -286,9 +286,9 @@ subset of `0..4`.
 ## Surface language
 
 The surface syntax and the behaviour a programmer observes — `:=` mutation, `with begin():`
-transactions, the read rules (read-your-writes, the trailing induction read, the `Txn`
-block-read rule and as-of reads), feeds as the append-law sibling of mutation, `await_final`, and the
-ordering-and-concurrency contract — are specified in the
+transactions, the read rules (read-your-writes, the trailing induction read, reading a `Txn` mutable
+variable only inside a transaction, and as-of reads), feeds as the append-law sibling of mutation,
+`await_final`, and the ordering-and-concurrency contract — are specified in the
 [CHL spec, "Mutability, transactions, and feeds"](../../../docs/chl-spec.md#8-mutability-transactions-and-feeds).
 This document specifies the **realization**: how lowering, `mut_elim`, `channelize`, planning, and the
 runtime engines eliminate all of it into pure dataflow. The spec is the observable contract;
@@ -360,11 +360,12 @@ eliminator, stated by content rather than by a "mirrors CHL" adjective.)
   denotes, `m := insert(m, k, v)`, so every phase below sees one kind of `MutWrite` and none of them
   needs a key.
 - `Begin { body }` — one `with begin():` transaction block, made a *single* `Unit`-valued statement
-  (`ExprStmt(Begin{block}, rest)`) so a loop body may freely mix a per-iteration transaction, sibling
-  induction writes, and feeds. `body` is the per-transaction statement chain. The transaction phase
-  strips it: a block writing a `Mut(_, Txn)` mutable variable becomes a commit site (partitioned by mutable variable
-  domain — induction writes lifted onto the enclosing loop); a read-only block is unwrapped onto the
-  loop spine. A standalone block lowers to a singleton `For` wrapping a `Begin`.
+  (`ExprStmt(Begin{block}, rest)`) so a loop body may freely mix a per-iteration transaction,
+  sibling induction writes, and feeds. `body` is the per-transaction statement chain. The
+  transaction phase strips it: a transaction writing a `Mut(_, Txn)` mutable variable becomes a
+  commit site (partitioned by mutable variable domain — induction writes lifted onto the enclosing
+  loop); a read-only transaction is unwrapped onto the loop spine. A standalone transaction lowers
+  to a singleton `For` wrapping a `Begin`.
 - `Feed { name, value }` / `Defer` — a `<<` feed and its channel. These survive into inference (so
   a defer binding is typed, at `Feed(𝑉)`) and are eliminated by mut_elim (feeds via channelize).
 
@@ -616,7 +617,7 @@ Symbolic rendering: `letrec 𝑏₁ = 𝑒₁; …; 𝑏ₙ = 𝑒ₙ in body`.
 | `get_prev_seq` | `(𝐼 ⤇ 𝑉, 𝐼, 𝑉) ⇒ 𝑉` | history value at the predecessor of the given position; default at the first |
 | `get_prev_txn` | `(𝐼 ⤇ {time: Txn, write: 𝑉}, Txn, 𝑉) ⇒ 𝑉` | write of the latest commit strictly before the given time; default if none |
 | `begin_<site>` | `𝐼 ⇒ Txn` | the commit-time oracle for one `with begin():` site — where site `𝑠`'s iteration `𝑟` lands in the global commit order |
-| `by_commit_time` | `(𝐼 ⤇ {time: Txn, …}) ⇒ (Txn ⤇ {time: Txn, …})` | one site's commit records keyed by the commit time each carries. A denied iteration's record carries a time too in the model, where `begin_<site>` is injective over iterations; the engine allocates no tick for it. The tap's ``variant_project(`commit)`` drops it. Heads each in-block reply tap, so a reply's keys have type `Txn` |
+| `by_commit_time` | `(𝐼 ⤇ {time: Txn, …}) ⇒ (Txn ⤇ {time: Txn, …})` | one site's commit records keyed by the commit time each carries. A denied iteration's record carries a time too in the model, where `begin_<site>` is injective over iterations; the engine allocates no tick for it. The tap's ``variant_project(`commit)`` drops it. Heads each reply tap inside a transaction, so a reply's keys have type `Txn` |
 | `final_or_default` | `(𝐷 ⤇ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed stream; the default if the domain is empty. Compiles to `ExtractFinal`. A mutable variable's final value is `final_read`, a different term |
 | `final_read` | `(𝐷 ⤇ 𝑉) ⇒ 𝑉` | a mutable variable's value where its writers finish, sampled from the settled store, and its seed where they wrote nothing. `mut_elim` mints it for a loop's trailing read and `transact_phase` for `await_final`; it compiles to `StoreFinalRead`, one per enclosing position for an inner loop's |
 | `as_of_read` | `(Txn ⤇ 𝑉) ⇒ 𝑉` | a commit history read at an unspecified position — every fed-out mutable variable read. `rewrite_as_of_reads` pairs it with the reading loop that indexes it and builds the `AsOf` join; an unpaired one is a compile error, since nothing downstream supplies a position |
@@ -627,7 +628,7 @@ Symbolic rendering: `letrec 𝑏₁ = 𝑒₁; …; 𝑏ₙ = 𝑒ₙ in body`.
 gives cross-endpoint external consistency), with pairwise-disjoint ranges; the commit engine
 realizes them by tick allocation, not by computing anything.
 
-Multi-variable atomic blocks produce one shared record `{time, writes: {𝑘₁: 𝑉₁, …}}` per commit,
+Multi-variable transactions produce one shared record `{time, writes: {𝑘₁: 𝑉₁, …}}` per commit,
 and each variable's history reads it through a per-key view — atomicity by construction, since one
 record either exists or does not. There is no `commit: Bool` in the per-key view: the commit-record
 stream carries only committed transactions (allocate-on-commit — a denied decision proposes nothing,
@@ -697,7 +698,7 @@ CHL source
                         writer bodies decision-factored; eliminates For / MutWrite)
   → channelize         (append-mutability elimination: route feeds on the LetRec tree; erase ChanDom
                         by substitution; eliminates Feed / Defer)
-  → as-of-read rewrite (bare history reads fed out of read-only blocks → AsOf)
+  → as-of-read rewrite (bare history reads fed out of read-only transactions → AsOf)
   → lambda_elim        (the LetRec travels through — bodies point-freed, group intact)
   → typecheck          (strict, no relaxations)
   → plan_loops         (planning/loops.rs: point-free letrec patterns → `Transact`;
@@ -731,25 +732,24 @@ substituted wholesale.
 
 ### How many commit stores a program has
 
-**One per set of mutable variables a `with begin():` block relates** — not one per program, and
+**One per set of mutable variables a transaction relates** — not one per program, and
 not one per mutable variable. `transact_phase::partition_keys` computes the partition; each part
 becomes its own `LetRec`, its own `Transact{domain: Txn}`, and its own `CommitOperator`. The
 induction path partitions the same way: `mut_elim::transform_loop` emits one letrec per loop.
 
-A block is what forces mutable variables together, for two reasons that coincide on the block's
-footprint. The store is not a user-facing concept: the
-[CHL spec's ordering model](../../../docs/chl-spec.md#85-ordering-and-concurrency) says only that
-two blocks are ordered when they mention a mutable variable in common, and that blocks sharing no
-variable are unordered. The partition is how that is realized — a program never has to reason
-about it.
+A transaction is what forces mutable variables together, for two reasons that coincide on the
+transaction's footprint. The store is not a user-facing concept: the [CHL spec's ordering
+model](../../../docs/chl-spec.md#85-ordering-and-concurrency) says only that two transactions are
+ordered when they mention a mutable variable in common, and that transactions sharing no variable
+are unordered. The partition is how that is realized — a program never has to reason about it.
 
-- **Atomicity.** A writing block produces one commit record, so every key it *writes*
+- **Atomicity.** A writing transaction produces one commit record, so every key it *writes*
   advances at one tick, and every key it *reads* is read at that tick's snapshot.
   `{reads ∪ writes}` is therefore one store — which is why the `limit` a guard consults is
   in the same store as the `total` it guards, though nothing writes `limit`.
-- **Snapshot consistency.** A read-only block's reads are latched at one frontier, which
+- **Snapshot consistency.** A read-only transaction's reads are latched at one frontier, which
   `rewrite_as_of_reads`'s `build_snapshot` realizes by handing `AsOf` a single mutable variable
-  record. Keys read together must be in that record. Such a block is *unwrapped* onto the
+  record. Keys read together must be in that record. Such a transaction is *unwrapped* onto the
   spine and leaves no `WriterSite`, so `strip` keeps its footprint explicitly
   (`Stripped::read_only_footprints`).
 
@@ -762,12 +762,13 @@ Nothing else forces sharing. Two consequences are observable:
 - **Commit clocks.** Unrelated mutable variables share no commit order, so nothing imposes an
   interleaving between transactions that never interact.
 
-A mutable variable **no block writes at all** is not a key of any store, and relates nothing by
-being read. Nothing can advance it — the lowering write gate admits a mutable variable write only
-inside a block, and a block write would put it in a write set — so its history is constant at its
-seed and every read of it is that seed. It keeps its introduction on the spine. Only a read-only
-footprint reaches this case: `limit` above is unwritten too, but a *writing* block reads it, which
-makes its value a question about a commit snapshot rather than about a constant.
+A mutable variable **no transaction writes at all** is not a key of any store, and relates nothing
+by being read. Nothing can advance it — the lowering write gate admits a mutable variable write only
+inside a transaction, and a write inside a transaction would put it in a write set — so its history
+is constant at its seed and every read of it is that seed. It keeps its introduction on the spine.
+Only a read-only footprint reaches this case: `limit` above is unwritten too, but a *writing*
+transaction reads it, which makes its value a question about a commit snapshot rather than about a
+constant.
 
 **Placement.** `plan_store` plans each store (its keys' history bindings, its writers'
 commit records, its taps) and `splice_stores` places them in one spine walk. A store's
@@ -776,15 +777,15 @@ and above everything that reads its keys. Each spine statement gets a **level**:
 reads no store, else one past the last store it reads, transitively through statements
 already carried. Level 0 keeps its place above every letrec; the rest ride inside the
 store they read. A statement cannot read two stores at once, which is what makes the
-level well-defined — reading two mutable variables together is a block, and the partition put
+level well-defined — reading two mutable variables together is a transaction, and the partition put
 those keys in one store so the read has one snapshot to come from.
 
 "Reads a store" means *names anything that store's body binds*: a key, a history binding, or a
-**defer fed inside the store** — either an in-block feed, whose tap the store's body binds, or
-the feed of a read-only block, carried in as an effect statement. The defer has no fallback: a
-key left above the letrec would still find its seed introduction, whereas a defer fed only inside
-the store exists nowhere else. That is also why an effect statement counts for the transitive
-step — it binds no name, but it contributes to one.
+**defer fed inside the store** — either a feed inside a transaction, whose tap the store's body
+binds, or the feed of a read-only transaction, carried in as an effect statement. The defer has no
+fallback: a key left above the letrec would still find its seed introduction, whereas a defer fed
+only inside the store exists nowhere else. That is also why an effect statement counts for the
+transitive step — it binds no name, but it contributes to one.
 
 The folded cross-domain induction loops (`CrossDomain`) get a level of their own, by the
 same rule. Outermost is the usual answer and what the invariant demands — an accumulator a
@@ -860,13 +861,12 @@ Input: a typed, inlined, surface-CCL tree. Output: pure CCL (`let`/`letrec` alge
    whose rows read its loop's variable is keyed by the loop's position: the tap's history is a
    data function whose value reads the position, with the variable read as its source there
    (`type-inference.md`, "A history's value may depend on its position").
-5. **Routes loops and rewrites reads**: a `For` whose body writes a `Mut` variable bound outside it is
-   an accumulator recurrence (built in step 3); **any other `For` is rebuilt as its map shape** —
-   `λ position → (position ▷ iter) ▷ (λ target → body)`, with feeds/yields already routed in
-   step 4 — so a generator
-   or bare side-effect loop needs no letrec at all. Trailing induction reads →
-   `final_read(history)`; a `Txn` read fed out of a read-only block → a broadcast of the history
-   over the enclosing loop, which planning latches through the as-of read.
+5. **Routes loops and rewrites reads**: a `For` whose body writes a `Mut` variable bound outside it
+   is an accumulator recurrence (built in step 3); **any other `For` is rebuilt as its map shape** —
+   `λ position → (position ▷ iter) ▷ (λ target → body)`, with feeds/yields already routed in step 4
+   — so a generator or bare side-effect loop needs no letrec at all. Trailing induction reads →
+   `final_read(history)`; a `Txn` read fed out of a read-only transaction → a broadcast of the
+   history over the enclosing loop, which planning latches through the as-of read.
 
 Stateless programs never build a letrec — the phase degenerates to plain feed routing.
 
@@ -1002,30 +1002,32 @@ for req in get_reqs:
         get_resps << balance
 ```
 
-Note the mix: `balance` is transactional; `cnt` is a plain induction accumulator whose write here sits
-*inside* the transaction block. **In the model** this is legal — `cnt`'s writes sequence on the incr
-loop's induction domain, independent of the commit order, so `cnt` does not join `balance` in the
-atomic commit (it is absent from `incr_commits` below). Writing an induction accumulator inside a
-`with begin():` block **is implemented for a bare, top-level write**: the transaction phase partitions
-the block by mutable variable domain, lifting each top-level-spine induction `MutWrite` onto the enclosing loop
-as its own recurrence while the mutable variable writes form the commit decision. Because the write is lifted
-out entirely, block placement is *inert* for it — a bare in-block induction write is **exactly the
-out-of-block form** (it fires once per iteration unconditionally, independent of whether the co-located
-transaction commits). A **guarded** in-block induction write (`if q: cnt += 1`) is a different matter:
+Note the mix: `balance` is transactional; `cnt` is a plain induction accumulator whose write here
+sits *inside* the transaction block. **In the model** this is legal — `cnt`'s writes sequence on the
+incr loop's induction domain, independent of the commit order, so `cnt` does not join `balance` in
+the atomic commit (it is absent from `incr_commits` below). Writing an induction accumulator inside
+a `with begin():` block **is implemented for a bare, top-level write**: the transaction phase
+partitions the transaction by mutable variable domain, lifting each top-level-spine induction
+`MutWrite` onto the enclosing loop as its own recurrence while the mutable variable writes form the
+commit decision. Because the write is lifted out entirely, its placement inside a transaction is
+*inert* — a bare induction write inside a transaction is **exactly the form outside one** (it fires
+once per iteration unconditionally, independent of whether the co-located transaction commits). A
+**guarded** induction write inside a transaction (`if q: cnt += 1`) is a different matter:
 committing it only when the transaction commits needs commit-gated carry-forward (the value-`Case`
-machinery upstack), so today it is **rejected** (`check_no_guarded_induction_write_in_block`) rather than
-silently lifted with the wrong (unconditional) semantics. The lift also constrains where the written
-value is bound: it leaves the block carrying the block `let` definientia it names, so a definiens
-bound before a write the lift crosses would report that write's value rather than the one it took,
-and that block is rejected too (`check_no_induction_write_reading_past_a_write`). A value bound
-after the write it reads travels unchanged, since the lift preserves the relative order of the
-writes it moves. A binding the lift takes the last consumer of leaves with it: what stays behind
-is the block's footprint and the set of accumulators its decision reads, so a read-binding left
-standing would claim a read the block no longer makes. A commit *decision* that reads an induction
-accumulator (`balance += cnt`) **is also implemented** — the accumulator is threaded through the
-writer source and the commit engine co-iterates it (see [Reading an induction accumulator in a
-commit decision](#reading-an-induction-accumulator-in-a-commit-decision)). (A write to `balance`
-*outside* a `with begin():` block is rejected in both the model and the implementation.)
+machinery upstack), so today it is **rejected** (`check_no_guarded_induction_write_in_txn`) rather
+than silently lifted with the wrong (unconditional) semantics. The lift also constrains where the
+written value is bound: it leaves the block carrying the block `let` definientia it names, so a
+definiens bound before a write the lift crosses would report that write's value rather than the one
+it took, and that block is rejected too (`check_no_induction_write_reading_past_a_write`). A value
+bound after the write it reads travels unchanged, since the lift preserves the relative order of the
+writes it moves. A binding the lift takes the last consumer of leaves with it: what stays behind is
+the transaction's footprint and the set of accumulators its decision reads, so a read-binding left
+standing would claim a read the transaction no longer makes. A commit *decision* that reads an
+induction accumulator (`balance += cnt`) **is also implemented** — the accumulator is threaded
+through the writer source and the commit engine co-iterates it (see [Reading an induction
+accumulator in a commit decision](#reading-an-induction-accumulator-in-a-commit-decision)). (A write
+to `balance` *outside* a `with begin():` block is rejected in both the model and the
+implementation.)
 
 After mut_elim (with `IncrIdx`/`GetIdx` the two request-source domains):
 
@@ -1058,19 +1060,20 @@ Reading it off:
   `Txn`, because its annotation said so.
 - **`incr_resps`** — the reply for `𝑟` depends on `incr_commits(𝑟)` (then discards it): the reply is
   sequenced after the commit.
-- **`get_resps`** — the fed-out mutable variable read: `read_at_get` picks the GET's *observation time* (a `Txn`
-  position — wherever the read lands in the commit order) and `balance` is sampled there, replied
-  indexed by the GET request loop. This is the **same store-level-timestamp mechanism** the `AsOf`
-  sections describe as "a sample at an arbitrary observation-time position": the read takes a timestamp
-  at its observation point and returns the committed prefix as of that time — described uniformly here
-  and there, not as rival semantics. `read_at_get` is not a `begin_<site>` oracle: a
-  read-only block mints none — it commits nothing, produces no `{time, write}` record, and takes no
-  commit slot (`begin_<site>`/`BeginTxn` is the *writer* oracle only). It is pure composition, no
-  commit record, no write set. **External consistency** is a real property of this same mechanism (not
-  a competing guarantee): a GET issued once a POST's `ok`-reply has landed reads at an observation time ≥ that
-  POST's commit (arrival-order monotonicity), so a client that sees `ok 2` then GETs observes `≥ 2`;
-  a read with no such causal ordering samples an *arbitrary* position among concurrent commits — which
-  is all the "arbitrary as-of" of the `AsOf` sections means.
+- **`get_resps`** — the fed-out mutable variable read: `read_at_get` picks the GET's *observation
+  time* (a `Txn` position — wherever the read lands in the commit order) and `balance` is sampled
+  there, replied indexed by the GET request loop. This is the **same store-level-timestamp
+  mechanism** the `AsOf` sections describe as "a sample at an arbitrary observation-time position":
+  the read takes a timestamp at its observation point and returns the committed prefix as of that
+  time — described uniformly here and there, not as rival semantics. `read_at_get` is not a
+  `begin_<site>` oracle: a read-only transaction mints none — it commits nothing, produces no
+  `{time, write}` record, and takes no commit slot (`begin_<site>`/`BeginTxn` is the *writer* oracle
+  only). It is pure composition, no commit record, no write set. **External consistency** is a real
+  property of this same mechanism (not a competing guarantee): a GET issued once a POST's `ok`-reply
+  has landed reads at an observation time ≥ that POST's commit (arrival-order monotonicity), so a
+  client that sees `ok 2` then GETs observes `≥ 2`; a read with no such causal ordering samples an
+  *arbitrary* position among concurrent commits — which is all the "arbitrary as-of" of the `AsOf`
+  sections means.
 
 ## Semantics
 
@@ -1082,9 +1085,9 @@ this section states how the letrec model *delivers* them.
   total order, and each transaction reads exactly the prefix strictly before its own time.
   Optimistic concurrency — snapshots, backward validation, retry — is engine implementation,
   correct iff observationally equivalent to the serial denotation.
-- **Atomicity is representational**: one commit record per block. There is no partially visible
-  commit because no term denotes one.
-- **Read-your-writes** within a block is `let` shadowing inside the record body.
+- **Atomicity is representational**: one commit record per transaction. There is no partially
+  visible commit because no term denotes one.
+- **Read-your-writes** within a transaction is `let` shadowing inside the record body.
 - **Deny** (`if` around a write, no path taken) is the decision's **`` `abort ``** tag; `get_prev_txn`
   skips it. A denied transaction contributes no visible write and no reply. A *committing*
   transaction is **`` `commit(⟨writes, replies⟩) ``** — the (dense) write/reply payload rides the tag, so
@@ -1117,12 +1120,12 @@ is why dispatch on the sequencing domain is load-bearing (not an optimization):
   observationally equivalent to that denotation. Disjoint footprints commit concurrently.
 
 **How the program-start-anchored case is realized.** A standalone `with begin():` or a literal-list
-loop depends only on program start, which — being a single event — imposes no order among the blocks it
-triggers (the spec's ordering model), so their commit order is unconstrained. The engine realizes that
-freedom through its serialization choice (`drain_start`); any serialization the model admits is a
-correct outcome. This is why the batch programs in `tests/it/compilation_pipeline/transactions.rs`
-pass only because their bodies are commutative — they add no edge that distinguishes their commit
-order, so they are effectively engine tests.
+loop depends only on program start, which — being a single event — imposes no order among the
+transactions it triggers (the spec's ordering model), so their commit order is unconstrained. The
+engine realizes that freedom through its serialization choice (`drain_start`); any serialization the
+model admits is a correct outcome. This is why the batch programs in
+`tests/it/compilation_pipeline/transactions.rs` pass only because their bodies are commutative —
+they add no edge that distinguishes their commit order, so they are effectively engine tests.
 
 **Open / under-specified.** Two genuine model questions remain: the merge order of a feed `++`-union
 across multiple feeders (or several feeds in one body), and the multi-writer commit-stream merge order
@@ -1151,7 +1154,7 @@ causal matcher (`letrec::check_letrec_causal`).
 |---|---|
 | a binding referenced only via `get_prev_seq(𝑏, …)`, over a finite/stream induction domain | `InductionStore` — the position-driven changelog loop engine (read densely via `StoreDenseRead`) |
 | commit-record bindings + `begin_<site>` oracles + `Txn` histories read via `get_prev_txn` | the commit operator (`CommitOperator`, `TransactDriver`, `TransactWriter`, cyclic `FanOut`, `StoreValueStream`) |
-| a `Txn` history read out of a read-only block (any reading loop — a live request stream, a finite loop, or a standalone singleton) | the as-of read (`AsOf`), latching the store's value as of the reading transaction's position, indexed by the outer reading loop |
+| a `Txn` history read out of a read-only transaction (any reading loop — a live request stream, a finite loop, or a standalone singleton) | the as-of read (`AsOf`), latching the store's value as of the reading transaction's position, indexed by the outer reading loop |
 | a non-causal cycle, or a causal shape loop planning does not know | compile error (no silent fallback) |
 
 ### The runtime engines
@@ -1187,9 +1190,9 @@ causal matcher (`letrec::check_letrec_causal`).
   spells it [`await_final`](#await_final).
 - **`StoreValueStream`** — projects one key's commit-value stream, commit time ⇀ `V`, by folding the
   store changelog, on the axis the key's registration fixes: a mutable variable's **carry** stream
-  gains a position at every commit tick and is the fold `AsOf` samples; an **in-block reply tap**
-  (`out << e` inside a block) appears only at the ticks that wrote it. The terminal read
-  [`await_final`](#await_final) does not come through here: it is `final_read`, compiling to
+  gains a position at every commit tick and is the fold `AsOf` samples; a **reply tap inside a
+  transaction** (`out << e` inside a block) appears only at the ticks that wrote it. The terminal
+  read [`await_final`](#await_final) does not come through here: it is `final_read`, compiling to
   `StoreFinalRead`, which samples the key once its own writers have drained.
 
 The two loop engines are **not interchangeable**: the commit operator is built for an open commit
@@ -1297,10 +1300,11 @@ when its decision body is not ready, it re-arms itself on the scheduler's **defe
 reuses it (a re-push would duplicate a buffer position against the body's `Memo`). Each
 demand-driven re-pull advances the sibling loop one step until the decision is ready — no blocking
 loop inside `get`, and it composes with an async sibling source (the source's own notification
-drives the re-pulls). A fed-out read *of* the result mutable variable is an `AsOf` (an in-block
-reply tap, or a trailing standalone read), which demand-drives this convergence: each committed
-reply pulls the writer, which advances the sibling loop, exactly as an in-block reply drives the
-writer in the co-indexed case. The co-indexed and non-cross paths are untouched.
+drives the re-pulls). A fed-out read *of* the result mutable variable is an `AsOf` (a reply tap
+inside a transaction, or a trailing standalone read), which demand-drives this convergence: each
+committed reply pulls the writer, which advances the sibling loop, exactly as a reply inside a
+transaction drives the writer in the co-indexed case. The co-indexed and non-cross paths are
+untouched.
 
 (The asymmetry: the broadcast **source** — the sibling induction loop's accumulator — has a final,
 read via `StoreFinalRead`, because an induction loop terminates and its final value is denotable. A
@@ -1311,12 +1315,12 @@ read of the result **mutable variable** is an `AsOf` sample; its final exists on
 
 A `<<` reply takes one of two forms, by where it sits relative to the `with begin():` block.
 
-**As-of read (reply *of* a mutable variable, outside the writing block).** A read-only block
-`with begin(): resp << 𝑒` reading a `Txn` mutable variable replies the mutable variable as of the reading transaction's
-position. The pre-lambda-elim `rewrite_as_of_reads` turns it into an as-of join indexed by the reading
-loop, not the commit clock — uniformly, whether that loop is a live request stream, a finite loop, or
-a standalone singleton (the live cross-endpoint read is one instance, not a distinct compilation).
-Three shapes:
+**As-of read (reply *of* a mutable variable, outside the writing transaction).** A read-only
+transaction `with begin(): resp << 𝑒` reading a `Txn` mutable variable replies the mutable variable
+as of the reading transaction's position. The pre-lambda-elim `rewrite_as_of_reads` turns it into an
+as-of join indexed by the reading loop, not the commit clock — uniformly, whether that loop is a
+live request stream, a finite loop, or a standalone singleton (the live cross-endpoint read is one
+instance, not a distinct compilation). Three shapes:
 
 - **one mutable variable** — `as_of((trigger, balance.f)) ≫ (λ 𝑘 → 𝑒)` (`resp << balance`, `resp << balance + 1`);
 - **several at one snapshot** — `as_of((trigger, {fᵢ: histᵢ})) ≫ (λ snap → 𝑒[𝑘ᵢ ↦ snap.fᵢ])`
@@ -1326,14 +1330,15 @@ Three shapes:
   snapshot. The `as_of` arm is a leaf that op-conversion's `zip` co-iterates with the request stream
   (the same `is_leaf_zip_arm` path as the commit-decision read above) — no new operator.
 
-**commit-ordered / commit-gated reply (reply *inside* the writing block).** A `<<` inside the block
-rides the writer decision as a `__to_<defer>` tap, committed atomically with the mutable variable write and
-read back as a per-commit value-stream (commit-tick-indexed). So it is **sequenced after the commit**
-and **gated**: a denied transaction (`if 𝑝:` false) proposes no write and emits no tap, replying
-nothing. The tap may read an induction accumulator (`resp << cnt`), which composes with the
-commit-decision co-iteration above. Contrast a sibling reply *outside* the block (`resp << cnt`),
-which rides the induction domain and fires every iteration regardless of commit — value-correct,
-request-indexed, but not commit-ordered. To gate or commit-order a reply, put it in the block.
+**commit-ordered / commit-gated reply (reply *inside* the writing transaction).** A `<<` inside the
+transaction rides the writer decision as a `__to_<defer>` tap, committed atomically with the mutable
+variable write and read back as a per-commit value-stream (commit-tick-indexed). So it is
+**sequenced after the commit** and **gated**: a denied transaction (`if 𝑝:` false) proposes no write
+and emits no tap, replying nothing. The tap may read an induction accumulator (`resp << cnt`), which
+composes with the commit-decision co-iteration above. Contrast a sibling reply *outside* the
+transaction (`resp << cnt`), which rides the induction domain and fires every iteration regardless
+of commit — value-correct, request-indexed, but not commit-ordered. To gate or commit-order a reply,
+put it in the transaction.
 
 ### A reply's `Txn` domain overstates its keys [Interim]
 
@@ -1372,10 +1377,10 @@ write footprint contains it has drained — `Tile::Store`'s `closed_keys`, compu
 own keys from the per-writer write sets `CommitOperator` is built with. That is never later than the
 store's own `terminal`, which waits for every writer, and earlier whenever a writer that cannot
 write the key is still running. `StoreFinalRead`'s gate is that fact or the store's closure, so
-`await_final(𝑥)` settles while a variable `𝑥` shares a block with is still committing, which is
-what the contract asks for. The static footprint is the right input: a conditional write
-(`if 𝑝: 𝑥 := …`) keeps `𝑥` in its block's footprint, so a block that *might* write it keeps it
-open.
+`await_final(𝑥)` settles while a variable `𝑥` shares a transaction with is still committing, which
+is what the contract asks for. The static footprint is the right input: a conditional write
+(`if 𝑝: 𝑥 := …`) keeps `𝑥` in its transaction's footprint, so a transaction that *might* write it
+keeps it open.
 
 No projection reduces on that fact. Every projection of a key's history gains a position at a tick
 the store allocates, so nothing narrower than `terminal` says its positions are done. Per-key
@@ -1383,9 +1388,9 @@ closure is a statement about the key, which the terminal read consults directly 
 some stream's `domain_predicate`.
 
 A key **no writer site writes** never reaches the operator. `resolve_writer_free_awaits` replaces
-its await with its seed, its write history being statically empty. That covers a variable no block
-mentions and a variable some block only reads — a footprint key under `{reads ∪ writes}`, whose
-runtime completion would otherwise wait on writers that cannot write it
+its await with its seed, its write history being statically empty. That covers a variable no
+transaction mentions and a variable some transaction only reads — a footprint key under
+`{reads ∪ writes}`, whose runtime completion would otherwise wait on writers that cannot write it
 (`a_read_only_mentioned_key_completes_while_a_live_writer_runs`).
 
 `resolve_await_finals` mints the read at the await's own site, and placement then needs no
@@ -1407,7 +1412,7 @@ argument and a write target (["A mutable variable read is an explicit
 operation"](#a-mutable-variable-read-is-an-explicit-operation)). `Builtin::AwaitFinal`'s scheme
 `∀ν. Mut(ν, Txn) ⇒ ν` pins the domain, so awaiting an induction accumulator is a type error; and
 lowering resolves 𝑥 by name, as it does a write target, rather than through the value-reading path
-whose out-of-block gate would reject the very read this is.
+whose gate on reads outside a transaction would reject the very read this is.
 
 **Four rules, in three places.** Two are order-independent and belong at lowering: the operand must
 be a `Mut(_, Txn)` mutable variable named bare, and the await may not sit inside a `with begin():`
@@ -1423,17 +1428,17 @@ right-to-left, and a callee's mention becomes a read, a write, or a `Begin` only
   from its final value — compile.
 
 **That check is per store and the rule is per variable.** `await_final(𝑥)` completes on 𝑥's own
-writers, so a block writing only a store-mate of 𝑥 is well-founded and refused anyway: one store is
-one recurrence, and `final_read` is not a causal accessor into it. Reaching the stated rule through
-𝑥 itself is what `check_await_final_linearity` forbids first, so every program this check rejects is
-one the stated rule permits. Narrowing it means splitting a store at a key's closure point; until
-then the refusal is a compile error rather than a wrong answer
-(`a_block_writing_only_a_read_only_store_mate_of_an_await_rejected`).
+writers, so a transaction writing only a store-mate of 𝑥 is well-founded and refused anyway: one
+store is one recurrence, and `final_read` is not a causal accessor into it. Reaching the stated rule
+through 𝑥 itself is what `check_await_final_linearity` forbids first, so every program this check
+rejects is one the stated rule permits. Narrowing it means splitting a store at a key's closure
+point; until then the refusal is a compile error rather than a wrong answer
+(`a_transaction_writing_only_a_read_only_store_mate_of_an_await_rejected`).
 
-**A mutable variable no `with begin():` block mentions** is a key of no store, so it has no history
-binding to read and its await resolves to the seed directly (`resolve_writer_free_awaits`) — the
-empty-history case, known empty statically. An all-deny history is the other case: it does build a
-store, and its `final_read` reports the seed, since nothing was written over it.
+**A mutable variable no transaction mentions** is a key of no store, so it has no history binding to
+read and its await resolves to the seed directly (`resolve_writer_free_awaits`) — the empty-history
+case, known empty statically. An all-deny history is the other case: it does build a store, and its
+`final_read` reports the seed, since nothing was written over it.
 
 ## Not yet implemented
 
@@ -1585,8 +1590,8 @@ conditionals multiply, so a block with two independent `if`s has four paths. Eac
 carries a **path condition** — the conjunction of the guards it took, each `elif` guard first-match
 adjusted (`π̂ᵢ = 𝑔ᵢ ∧ ¬𝑔₀ ∧ … ∧ ¬𝑔ᵢ₋₁`). A path condition is a `Bool` expression over the
 transaction's *snapshot* alone — resolved through whatever the path has already written
-(read-your-writes), but never reading a later commit tick, which is what keeps the whole block one
-serialization point. The block's **spine** — the statements outside every
+(read-your-writes), but never reading a later commit tick, which is what keeps the whole transaction
+one serialization point. The block's **spine** — the statements outside every
 `if` — is the path condition `true`; descending into an arm narrows it to `path ∧ π̂`. The walk
 builds the conjunction from the inside out: a path `𝑝` within the arm leaves it as
 `Case[π̂ → 𝑝; true → false]`, so `𝑝` is evaluated only where `π̂` holds. Paths are
@@ -1596,10 +1601,9 @@ exhaustive: exactly one path runs per transaction.
 Paths are a *compile-time* enumeration, not a runtime branch: the walk visits every path and emits
 one decision variant, whose `` `commit ``/`` `abort `` tag is a path condition, whose per-tap
 `` `fired ``/`` `idle `` tag is that tap's own path condition, and whose per-key writes are `Case`s
-over the local branch guards — so every path is evaluated in
-one straight-line writer body and one transaction is still one decision. Walking a block threads
-the read-your-writes environment, each arm recording its paths relative to itself, and the block
-denotes
+over the local branch guards — so every path is evaluated in one straight-line writer body and one
+transaction is still one decision. Walking a transaction's body threads the read-your-writes
+environment, each arm recording its paths relative to itself, and the transaction denotes
 `` snapshot ⇒ {`commit{writes, __to_<defer>*} | `abort} `` — a decision **variant**
 (`ccl_utils::wrap_decision_variant`) where:
 
@@ -1618,10 +1622,10 @@ denotes
 The per-key merges are value-selecting `Case`s over the snapshot inside the writer lambda, compiled
 to the **value-preserving `filter_values` union-of-restricts** (`⧺ᵢ filter_values(π̂ᵢ) ≫ eᵢ`; the
 retired eager `FunctionDef::Select` is gone) — so a **partial op** (`//`, `%`) in a merge value is
-evaluated only where its guard holds, never at a rejected position. The block stays **one decision
-variant per transaction** — per-path writer sites are unsound (a path
-predicate reads the snapshot, which exists only at the commit tick; one `begin()` is one
-serialization point; multi-key read-your-writes needs one snapshot and one write-set).
+evaluated only where its guard holds, never at a rejected position. The walk emits **one decision
+variant per transaction** — per-path writer sites are unsound (a path predicate reads the snapshot,
+which exists only at the commit tick; one `begin()` is one serialization point; multi-key
+read-your-writes needs one snapshot and one write-set).
 
 A conditional feed under genuine cross-key *routing* fires only on its own route. A feed under one
 arm would otherwise ride the transaction's (broader) commit and over-fire on a sibling route's
@@ -1643,11 +1647,10 @@ finalized into the *read* set by `collect_footprint`, so it has a snapshot to **
 its arm does not fire; a read-modify-write already reads the key, and a purely spine (unconditional)
 write needs no carry and stays write-only.
 
-**A leading deny is ordinary.** A block that denies (matches no writing/feeding guard) at the first
-transaction leaves the store's first commit to a later position, which no read has to accommodate: a
+**A leading deny is ordinary.** When a site's first transaction denies (matches no writing/feeding
+guard), the store's first commit falls to a later position, which no read has to accommodate: a
 fed-out read samples at its own arrival and may see the seed at any position, and `await_final`
-reduces the whole history whatever order the commits land in
-(`tx_if_elif_leading_deny`).
+reduces the whole history whatever order the commits land in (`tx_if_elif_leading_deny`).
 
 **Not yet implemented**: `with t = begin():` (the handle) is still rejected.
 
@@ -1692,9 +1695,9 @@ shared store by the existing multi-writer commit-stream machinery. A standalone 
 `if 𝑝: with begin(): …` refines the `Units(1)` one-shot driver, so the transaction fires
 zero-or-one times.
 
-**Why this is sound where per-path writer sites *inside* one block are not** (contrast the "one
-decision record per transaction" verdict above): the guard `𝑝` is a **source-domain** predicate —
-evaluated on the request element ahead of the transaction, not on its snapshot — so it may
+**Why this is sound where per-path writer sites *inside* one transaction are not** (contrast the
+"one decision record per transaction" verdict above): the guard `𝑝` is a **source-domain** predicate
+— evaluated on the request element ahead of the transaction, not on its snapshot — so it may
 legitimately restrict the source; each branch's block is a **distinct transaction** with its own
 `begin_<site>`, so distinct serialization points are correct rather than a violation; and atomicity
 is intact — still one snapshot, one commit, one write-set per transaction. The whole difference is
@@ -1704,7 +1707,7 @@ is intact — still one snapshot, one commit, one write-set per transaction. The
 only (B) is a program:
 
 ```text
-if balance > 0: with begin(): balance -= req      # (A) rejected: `balance` is read outside a block
+if balance > 0: with begin(): balance -= req      # (A) rejected: `balance` is read outside a transaction
 with begin(): if balance > 0: balance -= req       # (B) atomic — checked in the snapshot
 ```
 
