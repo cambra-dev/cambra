@@ -22,8 +22,8 @@ use crate::ccl::ccl_utils::{
     apply_primitive, cast_target_refinement, compose_typed_or_hole, count_free,
 };
 use crate::ccl::{
-    BindingTransparency, Builtin, Expr, FunKind, Name, Refinement, Type, TypedBinding, TypedExpr,
-    TypedExprNode, provenance::NodeId,
+    BindingTransparency, Builtin, Expr, FunKind, Name, Refinement, RefinementSet, Type,
+    TypedBinding, TypedExpr, TypedExprNode, provenance::NodeId,
 };
 
 /// A feed out of a loop, lifted out of the loop with the values it fed: `view` holds them,
@@ -196,7 +196,7 @@ fn nest_as_product(contribution: Expr, generators: Vec<Generator>) -> Expr {
         )
         .with_ty(domains[index].clone())
     };
-    let mut lifted: Vec<Refinement> = Vec::new();
+    let mut lifted = RefinementSet::new();
     for (index, generator) in generators.iter().enumerate() {
         // The keys this loop ranges over: its source's own refinements and, where it filters,
         // the ones its `cast` states, which the keys satisfy together. A present-key
@@ -221,16 +221,10 @@ fn nest_as_product(contribution: Expr, generators: Vec<Generator>) -> Expr {
                     .all(|g| count_free(&g.param.name, &predicate) == 0),
                 "a product nest's filter reads no enclosing loop's variable ([`generator_nest`])"
             );
-            lifted.push(Refinement::born(Rc::new(predicate)));
+            lifted.insert(Refinement::born(Rc::new(predicate)));
         }
     }
-    let keys = if lifted.is_empty() {
-        bare
-    } else {
-        let mut set = crate::ccl::ty::RefinementSet::new();
-        set.extend(lifted);
-        Type::Refinement(Box::new(bare), set)
-    };
+    let keys = Type::refined(bare, lifted);
     let record = Name::fresh("__iter_record");
     let nest_params: Vec<Name> = generators.iter().map(|g| g.param.name.clone()).collect();
     around_lets(contribution, &mut |nest| {

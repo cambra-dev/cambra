@@ -4882,10 +4882,7 @@ impl RefinementTemplate {
     /// states nothing of it.
     pub fn refine(self, result: Type, operands: &[TypedExpr]) -> Type {
         match self.predicate(&result, operands) {
-            Some(predicate) => Type::Refinement(
-                Box::new(result),
-                RefinementSet::one(Refinement::born(Rc::new(predicate))),
-            ),
+            Some(predicate) => Type::refined_one(result, Refinement::born(Rc::new(predicate))),
             None => result,
         }
     }
