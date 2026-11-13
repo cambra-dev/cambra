@@ -436,8 +436,7 @@ The run's map is well-formed at every moment:
 
 - an arrival is taken before any observation keyed through its source position;
 - a writer decides one position before it drives the next;
-- the engine takes each clock's ticks in order;
-- a read-only transaction is decided at a tick already taken;
+- the engine takes each clock's ticks in order, a read-only transaction's included;
 - a reload's entry is taken at the swap, and its boundary guard at each term is the term's
   evaluation boundary there, from what the earlier version had computed.
 
@@ -921,9 +920,9 @@ holds each kept observation with its kept value.
 
 A producer checkpoints its state only once the observation log is durable through every entry
 appended before the state was computed, as an output escapes
-([The observation log](#the-observation-log)). This is the write-ahead rule. The observations the state was computed from are
-then in `𝑂ᵣ`, and because `𝐹` is monotone for a fixed reload history the recovered state stands for
-a tile below `𝐹(𝑂ᵣ)` at its term.
+([The observation log](#the-observation-log)). This is the write-ahead rule. The observations the
+state was computed from are then in `𝑂ᵣ`, and because `𝐹` is monotone for a fixed reload history
+the recovered state stands for a tile below `𝐹(𝑂ᵣ)` at its term.
 
 These rules establish the third condition of [the durability condition](#the-durability-condition).
 A recovered state stands for a tile below `𝐹(𝑂ᵣ)`, covers what its producer released, and comes from
@@ -1498,6 +1497,31 @@ The model's consequences:
   recovery replays them. Such a producer never releases a held row, so
   [Recovery catch-up](#recovery-catch-up) does not finish until each row it holds determines an
   output and the producer releases it.
+- **[Open] Persisting an observation only in its consumers' checkpoints.** The observation log holds
+  in full every input that no outside system keeps a copy of, such as an HTTP request body, a line
+  of standard input or the reply to a call made outside the program, and the input's consumers
+  checkpoint what they derive from it again. An entry is needed only until every consumer of its
+  observation point has released its key ([The observation log](#the-observation-log)). Suppose the
+  first consumers that hold state checkpoint it, and release the key, in the same write as the
+  entry. The entry can then leave out the observation's value, and those checkpoints are its only
+  record. For an HTTP request that commits a transaction, the decision's entry with its commit
+  record is then the only write. The compiler knows the dataflow graph, so for each observation
+  point it can choose consumers after the filters, projections and aggregates that shrink the data.
+  The model has to count such an observation as kept, because no write holds its value. The
+  implementation has to write an entry and several producers' checkpoints as one write, where
+  [Checkpoints](#checkpoints) writes each producer's checkpoint on its own schedule. Each
+  observation point already chooses what its entry holds, so neither changes an obligation.
+- **[Open] Outputs to sinks with no recipient after a crash.** An `http::serve` response has no
+  recipient after a crash ([HTTP requests](#http-requests)). An output that reaches only such sinks
+  then needs no support in `𝑂ᵣ`, and a read-only HTTP request would persist neither its body nor
+  the clock readings outside its transaction. This relaxes [obligation 3](#runtime-obligations),
+  that the durable observations hold a support for every escaped output, so it needs its own
+  decision before anything relies on it. The compiler can check which observation points reach
+  which sinks. A read-only transaction still takes a tick on
+  its store's clock, and a later commit on that clock is valid only once that tick is decided
+  ([Well-formed maps](#well-formed-maps)). Its decision, and every reading its body took, are kept
+  whenever a later commit on the clock is kept, unless the model lets a read-only transaction's tick
+  be dropped.
 - **[Open] Deleting a branch.** Recovery recovers
   [the branch table](../src/ccl/design/program-evolution.md#the-branch-table) from reload entries.
   Creating a branch is a reload
