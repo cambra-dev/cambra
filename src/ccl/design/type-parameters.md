@@ -504,6 +504,15 @@ two binders spelled alike is one part. A refinement reading the type's own binde
 of scope stays outside the parameter, around its occurrence. A binder spelled like a name the type
 also reads free is renamed apart first, so the two stay distinct.
 
+Constructor generalization uses the same handling of type binders, including data functions
+nested in variant payloads. Abstraction updates ordinary quoted type slots as their binders'
+types change. A quoted `Cast` transports its producer and the annotations in its filter predicates.
+Its target retains the filter, and both stored types are reconstructed from the transported
+producer by the same rule as cast canonicalization. Replacing the computed domain with a parameter
+would remove the filter. A domain that still names an escaping binder through that computation
+becomes a parameter or family whole. Traversals report annotation changes directly, since type
+equality ignores type annotations inside quoted terms.
+
 Check instantiates a generalized type where it is used: at a chain edge from the codomain before it,
 at a chain's head from the chain's input, and at an application from the argument
 (`generalize::instantiate`). It matches the type's domain against what it receives, with every

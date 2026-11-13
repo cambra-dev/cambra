@@ -2456,9 +2456,9 @@ pub fn canonicalize_cast_types(expr: &mut Expr) {
         TypedExprNode::Cast { .. } => {
             let view = expr.ty.clone();
             if let TypedExprNode::Cast { value, target } = &mut expr.node {
-                let born = std::mem::replace(target, Type::Hole);
-                *target = canonical_cast_ty(&born, None, view.clone());
-                expr.ty = canonical_cast_ty(&born, Some(&value.ty), view);
+                let (born, result) = canonical_cast_types(target, &value.ty, view);
+                *target = born;
+                expr.ty = result;
             }
         }
         // A chain's type is derived from its ends (`emit_compose`): the domain
@@ -2493,6 +2493,15 @@ pub fn canonicalize_cast_types(expr: &mut Expr) {
     }
 }
 
+/// A cast's target and result at `view`'s shape, with the target's own filter and the
+/// producer's preceding restrictions retained in their respective slots.
+pub(crate) fn canonical_cast_types(born: &Type, value: &Type, view: Type) -> (Type, Type) {
+    (
+        canonical_cast_ty(born, None, view.clone()),
+        canonical_cast_ty(born, Some(value), view),
+    )
+}
+
 /// The canonical type of a `Cast` node: the `view`'s shape and bases (the
 /// coalesced view at inference time; the rebuilt type after a rebuild pass),
 /// carrying the refinements the **term** determines — the value's own domain refinements
@@ -2503,7 +2512,7 @@ pub fn canonicalize_cast_types(expr: &mut Expr) {
 /// top of whatever its value already established, and both parts are fixed by
 /// the term — the born refinements when the cast was written (lowering's filter, a
 /// group-by's key equation), the value's refinements by the value's own type, which
-/// is already canonical by induction (both callers walk bottom-up). The graph
+/// is already canonical by induction (callers walk bottom-up). The graph
 /// view of the same position accumulates the same union on the ordinary route
 /// — `emit_cast` rebuilds the value's own domain, which is how the value's
 /// refinements flow in — but

@@ -898,14 +898,17 @@ fn constructor_generalized(
             body => requantify(&p.params, body),
         });
     }
-    let mut groups: Vec<Type> = Vec::new();
-    refined_parts_naming(ty, out_of_scope, &mut groups);
-    quantified(
-        ty,
-        groups,
-        out_of_scope,
-        "a builtin whose output its use states",
-    )
+    let free = crate::ccl::subst::type_free_vars(ty);
+    with_open_binders(ty, &free, out_of_scope, |opened, out_of_scope| {
+        let mut groups = Vec::new();
+        refined_parts_naming(opened, out_of_scope, &mut groups);
+        quantified(
+            opened,
+            groups,
+            out_of_scope,
+            "a builtin whose output its use states",
+        )
+    })
 }
 
 /// A type no generalizing makes well-scoped ([`generalized`]): it reads a binder no term binder
@@ -972,25 +975,28 @@ pub(crate) fn generalized(
         cache.insert(key, done.clone());
         return Ok(done);
     }
-    // Generalized with every Pi binder read by name: a part the type states under a binder
-    // of its own and again opened is then one part, spelled one way. A name such a binder
-    // binds is the type's own, not one out of scope. A binder spelled like a name the type
-    // reads outside it is renamed apart first: a part read under the binder depends on the
-    // value it binds, which a parameter quantified outside the binder cannot.
+    let done = with_open_binders(ty, &free, out_of_scope, |opened, out_of_scope| {
+        generalized_go(opened, out_of_scope, at, cache)
+    })?;
+    cache.insert(key, done.clone());
+    Ok(done)
+}
+
+/// Generalize with each type binder read by name, then close over it again. A binder's
+/// spelling can also occur free elsewhere in the type, so the two scopes are renamed apart.
+fn with_open_binders(
+    ty: &Type,
+    free: &std::collections::BTreeSet<crate::ccl::Name>,
+    out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool,
+    derive: impl FnOnce(&Type, &dyn Fn(&crate::ccl::Name) -> bool) -> Result<Type, Ungeneralizable>,
+) -> Result<Type, Ungeneralizable> {
     let mut renames = Vec::new();
-    let apart = renamed_apart(ty, &free, &mut renames);
+    let apart = renamed_apart(ty, free, &mut renames);
     let mut own = Vec::new();
     type_binders(&apart, &mut own);
     let out_of_scope_here = |n: &crate::ccl::Name| out_of_scope(n) && !own.contains(n);
-    let generalized = closed_deep(&generalized_go(
-        &opened_deep(&apart),
-        &out_of_scope_here,
-        at,
-        cache,
-    )?);
-    let done = restored_names(&generalized, &renames);
-    cache.insert(key, done.clone());
-    Ok(done)
+    let generalized = closed_deep(&derive(&opened_deep(&apart), &out_of_scope_here)?);
+    Ok(restored_names(&generalized, &renames))
 }
 
 /// `ty` with each Pi binder spelled like a name in `free` renamed to a fresh spelling, one per
@@ -1265,11 +1271,11 @@ fn quantified(
             Type::FamilyApp(crate::ccl::ty::FamilyApp::new(Rc::clone(&param), args))
         };
         let d = Type::refined(d, staying);
-        body = abstract_deep(&body, &group, &d, out_of_scope);
+        body = abstract_deep(&body, &group, &d);
         // A later part can hold this one inside the terms it quotes; it is matched as the
         // abstraction leaves it.
         for later in groups.iter_mut().skip(i + 1) {
-            *later = abstract_deep(later, &group, &d, out_of_scope);
+            *later = abstract_deep(later, &group, &d);
         }
         params.push(crate::ccl::ty::PolyParam {
             param,
@@ -1461,41 +1467,56 @@ fn refinements_in_scope(
 }
 
 /// `ty` with `group` replaced by `d`, and a refinement of `group`'s base that holds all of
-/// `group`'s refinements by `d` refined by the rest, in the terms it quotes as well.
+/// `group`'s refinements by `d` refined by the rest, in quoted annotations as well.
+/// Quoted `Cast` computations transport their producers and retain their filters.
 ///
 /// The generalized type is a new type beside the ones that keep the quoted terms as they were,
 /// so the terms it rewrites are derived ones, minted under the caller's recording.
-fn abstract_deep(
-    ty: &Type,
-    group: &Type,
-    d: &Type,
-    out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool,
-) -> Type {
-    let mut out = abstract_go(ty, group, d);
-    crate::ccl::ccl_utils::walk_quoted_terms_mut(
-        &mut out,
+fn abstract_deep(ty: &Type, group: &Type, d: &Type) -> Type {
+    let mut out = ty.clone();
+    abstract_type(&mut out, group, d);
+    out
+}
+
+fn abstract_type(ty: &mut Type, group: &Type, d: &Type) -> bool {
+    let next = abstract_go(ty, group, d);
+    let mut changed = next != *ty;
+    *ty = next;
+    // Type equality ignores annotations inside quotes; the traversal reports those changes.
+    changed |= crate::ccl::ccl_utils::walk_quoted_terms_mut(
+        ty,
         &crate::ccl::ccl_utils::PredMemo::default(),
         &(),
-        &mut |term, _| {
-            fn in_term(
-                e: &mut crate::ccl::Expr,
-                group: &Type,
-                d: &Type,
-                out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool,
-            ) -> bool {
-                let mut changed = false;
-                e.walk_type_slots_mut(|t| {
-                    let next = abstract_deep(t, group, d, out_of_scope);
-                    changed |= next != *t;
-                    *t = next;
-                });
-                e.walk_children_mut(|c| changed |= in_term(c, group, d, out_of_scope));
-                changed
-            }
-            in_term(term, group, d, out_of_scope)
-        },
+        &mut |term, _| abstract_quoted_term(term, group, d),
     );
-    out
+    changed
+}
+
+fn abstract_quoted_term(term: &mut crate::ccl::Expr, group: &Type, d: &Type) -> bool {
+    if let crate::ccl::TypedExprNode::Cast { value, target } = &mut term.node {
+        let mut changed = abstract_quoted_term(value, group, d);
+        // A target's predicates define its filter. Rewrite their annotations, then derive
+        // both stored types from the transported producer instead of abstracting the filter.
+        changed |= crate::ccl::ccl_utils::walk_quoted_terms_mut(
+            target,
+            &crate::ccl::ccl_utils::PredMemo::default(),
+            &(),
+            &mut |quoted, _| abstract_quoted_term(quoted, group, d),
+        );
+        let (born, result) =
+            crate::ccl::ccl_utils::canonical_cast_types(target, &value.ty, value.ty.clone());
+        changed |= term.ty != result || *target != born;
+        term.ty = result;
+        *target = born;
+        if let Some(annotation) = &mut term.user_annotation {
+            changed |= abstract_type(annotation, group, d);
+        }
+        return changed;
+    }
+    let mut changed = false;
+    term.walk_type_slots_mut(|ty| changed |= abstract_type(ty, group, d));
+    term.walk_children_mut(|child| changed |= abstract_quoted_term(child, group, d));
+    changed
 }
 
 fn abstract_go(ty: &Type, group: &Type, d: &Type) -> Type {
@@ -1748,6 +1769,67 @@ mod tests {
         BaseType, BinOpKind, CompareKind, Expr, FunKind, Lit, LogicKind, Name, Refinement,
     };
 
+    #[rstest::rstest]
+    #[case(1)]
+    #[case(2)]
+    fn a_quoted_cast_transports_its_producer_and_preserves_its_filter(#[case] filters: usize) {
+        let int = Type::Base(BaseType::Int);
+        let above_outer = Expr::binop(
+            Expr::var(Name::elem()).with_ty(int.clone()),
+            BinOpKind::Compare(CompareKind::Greater),
+            Expr::var("outer").with_ty(int.clone()),
+        )
+        .with_ty(Type::Base(BaseType::Bool));
+        let group = Type::refined_one(int.clone(), Refinement::born(Rc::new(above_outer)));
+        let source_ty = Type::data_fun(group.clone(), Type::Base(BaseType::Bool));
+        let mut value = Expr::var("g").with_ty(source_ty.clone());
+        for limit in 0..filters {
+            let predicate = Expr::binop(
+                Expr::var(Name::elem()).with_ty(value.ty.domain().unwrap()),
+                BinOpKind::Compare(CompareKind::Greater),
+                Expr::lit(Lit::Int(limit as i64)).with_ty(int.clone()),
+            )
+            .with_ty(Type::Base(BaseType::Bool));
+            let target = Type::data_fun(
+                Type::refined_one(int.clone(), Refinement::born(Rc::new(predicate))),
+                Type::Base(BaseType::Bool),
+            );
+            let result = crate::ccl::ccl_utils::canonical_cast_ty(
+                &target,
+                Some(&value.ty),
+                value.ty.clone(),
+            );
+            value = Expr::cast(value, target).with_ty(result);
+        }
+        let quoted = Expr::lambda("g", crate::ccl::Occurrence::mint(), source_ty, value);
+        crate::ccl::infer::check(&quoted).unwrap();
+        let mut ty = Type::FamilyApp(crate::ccl::ty::FamilyApp::new(
+            crate::ccl::ty::TypeParam::generalized_family("F".to_owned(), None, 1),
+            vec![Rc::new(quoted)],
+        ));
+        let d = Type::Param(crate::ccl::ty::TypeParam::generalized_family(
+            "D".to_owned(),
+            Some(int),
+            0,
+        ));
+        assert!(abstract_type(&mut ty, &group, &d));
+        assert!(!crate::ccl::subst::type_free_vars(&ty).contains(&Name::from("outer")));
+        let Type::FamilyApp(app) = &ty else {
+            unreachable!()
+        };
+        let quoted = &app.args[0].term;
+        let crate::ccl::TypedExprNode::Lambda { param, body } = &quoted.node else {
+            unreachable!()
+        };
+        let crate::ccl::TypedExprNode::Cast { target, .. } = &body.node else {
+            unreachable!()
+        };
+        assert_eq!(param.ty.domain().unwrap(), d);
+        assert_eq!(target.domain().unwrap().refinements().len(), 1);
+        assert_eq!(body.ty.domain().unwrap().refinements().len(), filters);
+        crate::ccl::infer::check(quoted).unwrap();
+    }
+
     /// A comprehension joins its guards into one conjunction, so a guard reading a binder out of
     /// scope leaves its siblings in the bound: `{Int | __elem < 4 and __elem > i}` with `i` out of
     /// scope is bounded by `{Int | __elem < 4}`.
@@ -1837,6 +1919,23 @@ mod tests {
             FunKind::Data(None),
         );
         Type::pi_kinded(Name::from("g"), curried, flat, FunKind::Compute)
+    }
+
+    #[test]
+    fn a_constructor_retains_the_family_between_nested_collection_domains() {
+        let rows = uncurry_over_rows_of("rows", "k").domain().unwrap();
+        let ty = Type::fun(
+            rows.clone(),
+            crate::ccl::ccl_utils::tap_variant_ty(rows.clone()),
+        );
+        let generic = constructor_generalized(&ty, &|n| *n == Name::from("rows")).unwrap();
+        let Type::Poly(poly) = &generic else {
+            panic!("the constructor's payload reads `rows`: {generic}")
+        };
+        let arities: Vec<_> = poly.params.iter().map(|p| p.param.arity).collect();
+        assert_eq!(arities, vec![0, 1], "{generic}");
+        assert!(crate::ccl::subst::type_free_vars(&generic).is_empty());
+        assert_eq!(instantiate(&generic, &rows), ty);
     }
 
     /// A part reading the type's own binder generalizes to a family applied to it, and a use
