@@ -3,7 +3,6 @@
 // ---------------------------------------------------------------------------
 
 use crate::ccl::ccl_utils::TermMemo;
-use crate::ccl::infer::api::RelatedPositions;
 use crate::ccl::infer::solver::PolyScheme;
 use crate::ccl::infer::solver::traits::{Assoc, Trait};
 use crate::ccl::infer::{InferError, LocatedInferError};
@@ -88,12 +87,7 @@ pub(super) trait Typing {
     /// being fail-fast — an accumulating pass gets the same per-error blame for
     /// free (this is how the coalesce walk and Check mode both get theirs).
     fn raise(&self, error: InferError) -> LocatedInferError {
-        LocatedInferError {
-            error,
-            node_id: self.current_node(),
-            also: Box::default(),
-            related: RelatedPositions::default(),
-        }
+        LocatedInferError::new(error, self.current_node())
     }
 
     /// Record `error` and continue past the statement that raised it, or return
