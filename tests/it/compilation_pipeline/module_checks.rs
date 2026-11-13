@@ -861,3 +861,46 @@ fn checking_a_file_reports_its_type_errors_past_another_error(
         "{messages:?}"
     );
 }
+
+#[rstest]
+#[case::missing(None)]
+#[case::partial(Some("pub broken = 1 +* 2"))]
+#[timeout(Duration::from_secs(10))]
+fn checking_unavailable_use_members_preserves_only_established_contracts(
+    #[case] library: Option<&str>,
+) {
+    let root = indoc! {r#"
+        import lib use Area, Shape, f, T
+        instance Area(Int):
+            def area(s):
+                1 + "skipped"
+        pub dependent = f(1)
+        pub constructed = Shape::circle(1)
+        pub typed: T = f(1)
+        pub healthy = 7
+        pub bad = [1, "a"]
+    "#};
+    let modules: Vec<_> = library.into_iter().map(|text| ("lib", text)).collect();
+    let result =
+        check_program(&mut GlobalContext::default(), &program(root, &modules)).unwrap_err();
+    let messages: Vec<_> = result.errors.iter().map(|error| error.message()).collect();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("The values that meet here have no common type")),
+        "{messages:?}"
+    );
+    let interface = result
+        .interface
+        .expect("healthy export establishes a contract");
+    assert!(interface.contains("pub healthy:"), "{interface}");
+    for absent in [
+        "pub dependent:",
+        "pub constructed:",
+        "pub typed:",
+        "pub bad:",
+    ] {
+        assert!(!interface.contains(absent), "{interface}");
+    }
+}

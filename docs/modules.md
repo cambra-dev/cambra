@@ -355,6 +355,8 @@ errors retain the module's usable declarations for its importers.
 
 A `use` item whose module has no usable interface records an unavailable member with its original
 module and spelling. Its use as a value or type recovers through the existing placeholders.
+A member omitted by an incomplete parse has the same unavailable state. Recovered declarations
+retain their category and visibility.
 A constructor pattern or trait requirement that needs its declaration fails its containing
 statement without another diagnostic. An instance whose trait is unavailable declares no instance
 and skips its function bodies without stopping the rest of the module's lowering. A member bound to

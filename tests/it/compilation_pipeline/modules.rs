@@ -1822,6 +1822,71 @@ fn a_partial_module_preserves_visibility_of_known_members() {
     assert_eq!(report_count(&errors), 2, "{errors}");
 }
 
+#[rstest]
+#[case::import("import lib use Area, Shape")]
+#[case::run("run lib use Area, Shape")]
+#[timeout(Duration::from_secs(10))]
+fn a_partial_interface_keeps_unknown_use_members_unavailable(#[case] statement: &str) {
+    let root = formatdoc! {r#"
+        {statement}
+        instance Area(Int):
+            def area(s):
+                1 + "skipped"
+        s = Shape::circle(1)
+        v = [1, "a"]
+        (s, v)
+    "#};
+    let errors = compile_errors(&program(&root, &[("lib", "pub broken = 1 +* 2")]));
+    assert!(errors.contains("found '*'"), "{errors}");
+    assert!(
+        errors.contains("The values that meet here have no common type"),
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
+#[rstest]
+#[case::alias(
+    "pub Shape = Int",
+    "Shape",
+    "Shape::circle(1)",
+    "is not a nominal type"
+)]
+#[case::known_trait(indoc! {"
+    pub trait Area(S):
+        def area(s: S) => Int
+"}, "Area", "Area::area(1)", "a trait's functions are read from an instance")]
+#[case::private_trait(indoc! {"
+    trait Area(S):
+        def area(s: S) => Int
+"}, "Area", "1", "private to module")]
+#[case::nominal(
+    "pub type Shape = Int",
+    "Shape",
+    "Shape::circle(1)",
+    "declares no constructor or function"
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_partial_interface_keeps_known_use_members_authoritative(
+    #[case] declaration: &str,
+    #[case] member: &str,
+    #[case] use_: &str,
+    #[case] expected: &str,
+) {
+    let library = formatdoc! {"
+        pub broken = 1 +* 2
+        {declaration}
+    "};
+    let root = formatdoc! {"
+        import lib use {member}
+        {use_}
+    "};
+    let errors = compile_errors(&program(&root, &[("lib", &library)]));
+    assert!(errors.contains("found '*'"), "{errors}");
+    assert!(errors.contains(expected), "{errors}");
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
 #[test]
 fn partial_interfaces_retain_constraints_through_diamond_imports() {
     let library = indoc! {"

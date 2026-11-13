@@ -1031,8 +1031,11 @@ impl Qualifier {
         })
     }
 
-    pub(in crate::ccl::lower) fn member_unavailable(&self, _member: &str) -> bool {
-        self.view.is_none() && self.reachable().is_none()
+    pub(in crate::ccl::lower) fn member_unavailable(&self, member: &str) -> bool {
+        self.view.is_none()
+            && self
+                .reachable()
+                .is_none_or(|interface| interface.may_be_unparsed(member))
     }
 }
 
