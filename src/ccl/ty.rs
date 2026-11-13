@@ -4214,10 +4214,10 @@ impl Type {
         })
     }
 
-    /// Does this type hold, at any depth, a `Hole`, `SharedHole`, `BoundedHole`, `Infer` or
-    /// `BarrierVar`, the positions inference fills (see the transient-variant table on
-    /// [`Type`])? It differs from [`holds_an_unresolved_position`](Self::holds_an_unresolved_position)
-    /// only in not counting a refinement.
+    /// Whether this type holds an inference slot at any depth: a `Hole`, `SharedHole`,
+    /// `BoundedHole`, `Infer` or `BarrierVar` (`src/ccl/design/ir.md`, "Transient types and
+    /// inference slots"). [`holds_an_unresolved_position`](Self::holds_an_unresolved_position)
+    /// also counts a refinement.
     pub fn holds_an_inference_slot(&self) -> bool {
         self.holds_type(&|ty| {
             matches!(
