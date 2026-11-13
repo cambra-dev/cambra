@@ -137,16 +137,22 @@ replaced by its definitions once those land on main.
   to ask for it again. Every operator is a producer to its consumers and a consumer of its inputs.
   A producer compacts a region once every consumer has released it
   ([Compaction](operational-semantics/semantics.md#compaction)). An operator releases a region of
-  its own input only once it has persisted what its future outputs need of it
-  ([Persisted producer state](#persisted-producer-state)). A source is a consumer of the system it
-  reads and releases to it the same way.
-- **Persisted producer state.** One producer's producer state and the guard it has released to
-  each of its inputs, persisted in one write before a release reaches its input
-  ([Persisted producer state](#persisted-producer-state)). Each producer persists its own, and no
-  two need to describe one moment of the run.
+  its own input only once what its future outputs need of it is durable, in its checkpoint or in
+  the observation log ([Checkpoints](#checkpoints)). A source is a consumer of the system it reads
+  and releases to it the same way.
+- **Checkpoint.** One write of a producer's producer state and the guard it has released to each of
+  its inputs ([Checkpoints](#checkpoints)). Each producer checkpoints on its own schedule while the
+  run continues, so checkpoints are fuzzy: no two need to describe one moment of the run.
+- **Write-ahead log.** A log of changes to state, durable before anything computed from those
+  changes is persisted or escapes. The observation log is the write-ahead log of the observation
+  points: each entry is one observation, the change to one observation point's tile. Every other
+  term is computed from observations, and its checkpoints wait for the entries they were computed
+  from. A commit clock's entry also holds the decision's commit record, a computed value, so that a
+  store recovers past its checkpoint without evaluating a body again
+  ([The observation log](#the-observation-log)).
 - **Recovery.** The start of a process after a crash. Each producer is **recovered** from its latest
-  persisted producer state, or starts from `⊥` where it has none, and each observation point is
-  recovered from its persisted observations.
+  checkpoint, or starts from `⊥` where it has none, and each observation point is recovered from
+  its persisted observations.
 - **Evaluation boundary.** The region of a term's tiling the run has decided at that term: what the
   term holds, together with what its consumers have released to it. It only grows while a process
   runs. A crash can shrink it, because a recovered producer holds only what it persisted, and
@@ -157,7 +163,7 @@ replaced by its definitions once those land on main.
   sink ([The durability condition](#the-durability-condition)).
 
 [The life of one arrival](#the-life-of-one-arrival) shows how the steps an arrival goes through,
-persisting it, escaping, persisting the producer states it fed, and releasing it, are ordered.
+persisting it, escaping, checkpointing the producers it fed, and releasing it, are ordered.
 
 ---
 
@@ -217,7 +223,8 @@ source's positions.
   - **The decision.** A transaction decides one of two values. `𝑔` is the generation of the clock
     the decision is taken on, and `𝑇` is a tick of it:
     - `` `commit(𝑔, 𝑇) ``: the attempt read the history through tick `𝑇−1` and committed at `𝑇`
-      one optional write per key and the rows its body feeds.
+      its **commit record**: one optional write per key of the store, and the rows its body
+      feeds.
     - `` `retry ``: the attempt failed the engine's validation and took no tick, and the
       transaction runs its next attempt.
 
@@ -506,7 +513,7 @@ An output **escapes** when it leaves the run and reaches the world, where the ru
 back: a row a sink takes, an HTTP response, or the request of a call made outside the program. A
 source's release to the system it reads is a release, not an escape: it withdraws a copy that no
 consumer will ask for again, under the rule every release follows
-([Persisted producer state](#persisted-producer-state)).
+([Checkpoints](#checkpoints)).
 
 A **support** for a set of outputs `𝐸` is a well-formed map `𝑂ₛ`, below the run's map, with
 `𝐸 ≤ Out(𝑂ₛ)` ([Well-formed maps](#well-formed-maps)): observations that determine every output in
@@ -630,8 +637,8 @@ attempt's writes and the rows its body fed are discarded, and nothing computed f
 leaves the run. A failed
 attempt's readings and its `` `retry `` entry are compacted with the transaction's other entries,
 once every consumer has released the transaction: the committing attempt is reached only through the
-`` `retry `` entries before it. Recovery recomputing a committed transaction reads the readings of
-the attempt that committed.
+`` `retry `` entries before it. Recovery applies the committed attempt's record and does not
+evaluate its body again ([The observation log](#the-observation-log)).
 
 **A transaction refuses `AffectWorld`.** An operation that changes state outside the run causes
 `AffectWorld`, whatever it returns, and the check follows the capability through calls as the
@@ -708,9 +715,10 @@ obligations. Each is a requirement on any implementation.
 
 5. **Recovered producer states meet the third condition of
    [the durability condition](#the-durability-condition).** A consumer releases a region of its
-   input only once it has persisted, in one write, the guard it releases and what its future outputs
-   need of the region, `compact(𝑜)` in [Compaction](operational-semantics/semantics.md#compaction).
-   It persists that only once the observations it was computed from are durable. A summary recovered
+   input only once what its future outputs need of the region is durable: persisted in one write
+   with the guard it releases, `compact(𝑜)` in
+   [Compaction](operational-semantics/semantics.md#compaction), or held in durable observations. It
+   persists that only once the observations it was computed from are durable. A summary recovered
    without its guard counts the region a second time when the consumer pulls it again. A guard
    recovered without its summary omits the region from every future output, because the consumer
    does not pull it again.
@@ -760,15 +768,21 @@ This design persists every observation point's observations in one observation l
 question on several processes describes persisting each observation point separately
 ([Open questions](#open-questions)).
 
-The design is uncoordinated checkpointing with log-based rollback recovery, in the terms of
-[A Survey of Rollback-Recovery Protocols in Message-Passing Systems](https://www.cs.utexas.edu/~lorenzo/papers/SurveyFinal.pdf).
-Each producer persists its own state with no coordination among producers, and the observation log
-records every value the run does not determine, so recomputation from the recovered states
-reproduces the run. Holding an output until the log is durable is that survey's output commit.
-Uncoordinated checkpointing alone is subject to the domino effect, in which recovering one producer
-from an older write forces its inputs back to older writes in turn. Log-based recovery avoids it
-where a recovered producer can answer a pull for every region its consumers have not released
-([Persisted producer state](#persisted-producer-state)).
+The design is fuzzy checkpointing with a write-ahead log. The observation log is the write-ahead
+log of the observation points ([Terms](#terms)). Every other producer checkpoints its state on its
+own schedule, with no coordination among producers, and only once the log is durable through the
+entries that state was computed from. Recovery only redoes: each observation point replays its
+entries, and every other producer starts from its latest checkpoint and recomputes forward from
+input its producers still hold unreleased. Nothing is undone, because no checkpoint holds state
+computed from an observation the log lost.
+
+In the terms of
+[A Survey of Rollback-Recovery Protocols in Message-Passing Systems](https://www.cs.utexas.edu/~lorenzo/papers/SurveyFinal.pdf),
+the design is uncoordinated checkpointing with log-based rollback recovery. Holding an output until
+the log is durable is that survey's output commit. Uncoordinated checkpointing alone is subject to
+the domino effect, in which recovering one producer from an older checkpoint forces its inputs back
+to older checkpoints in turn. Log-based recovery avoids it where a recovered producer can answer a
+pull for every region its consumers have not released ([Checkpoints](#checkpoints)).
 
 One process writes a run's stable storage at a time. A process takes an exclusive lock on the
 storage before recovery and holds it while it runs, so a process started while another is running
@@ -777,10 +791,18 @@ cannot persist state or release a source alongside it.
 ### The observation log
 
 The **observation log** holds every observation the run takes, as a sequence of entries in the
-order the run takes them, persisted in that order. It is distinct from a commit store's per-key
-changelogs. Each entry is a key and what its observation point needs to recover the observation at
-that key, which is the observation point's choice
-([Persisted producer state](#persisted-producer-state)).
+order the run takes them, persisted in that order. It is the write-ahead log of the observation
+points ([Terms](#terms)), and distinct from a commit store's per-key changelogs. Each entry is a key
+and what its observation point needs to recover the observation at that key, which is the
+observation point's choice ([Checkpoints](#checkpoints)).
+
+A commit clock's entry holds the decision and its commit record
+([Observations](#observations)). The record is computed, not observed, and the entry holds it so
+that a store recovers each tick past its checkpoint by applying the tick's record, without
+evaluating a body again. A transaction writes one store, because every mutable variable a
+`with begin():` block relates is in one store
+([How many commit stores a program has](../src/ccl/design/mutability.md#how-many-commit-stores-a-program-has)),
+so one record covers the transaction.
 
 An entry's **log sequence number** (LSN) is its number in the observation log: each entry's is one
 more than the entry's before it. An LSN is not a source position. The entry for position 7 of
@@ -792,11 +814,10 @@ position. Write `𝑂[<𝐿]` for the map held by the entries before LSN `𝐿`.
 
 **An observation is appended when it is taken, and it is taken when its observation point answers.**
 A source's arrival is taken when the source assigns its source position, a reading when its site is
-evaluated at a position, a decision when the commit engine decides a writer's proposal, decides a
-read-only transaction's tick, or the writer decides a position that writes nothing, and a reload
-when the runtime swaps versions. Taking and appending are one step, and no term computes from an
-observation before it. So everything the run holds at a moment, outputs and producer states alike,
-is computed from observations the observation log has already been given.
+evaluated at a position, a decision when the commit engine places a proposal at a tick or finds it
+stale, and a reload when the runtime swaps versions. Taking and appending are one step, and no term
+computes from an observation before it. So everything the run holds at a moment, outputs and
+producer states alike, is computed from observations the observation log has already been given.
 
 Every prefix of the observation log holds a well-formed map, because the run's map is well-formed
 at every moment ([Well-formed maps](#well-formed-maps)). The observation log is a chain of
@@ -841,7 +862,7 @@ iteration position
 ([Positions are absolute](../src/ccl/design/program-evolution.md#positions-are-absolute)), and a
 rebuilt term mints keys in a new generation. A key of a generation that a reload ended is reached
 only inside the reload's boundary guards, whose values the reload's write holds
-([Persisted producer state](#persisted-producer-state)). That write is therefore the old
+([Checkpoints](#checkpoints)). That write is therefore the old
 generation's release: once it is durable, nothing reads the old generation's entries or the old
 clock, and both are dropped.
 
@@ -850,7 +871,7 @@ from it as during the run:
 
 - **The entries not released** are pulled again. Consumers are recovered from writes made at
   different times, so they pull again from different source positions. Where a source's consumer `A`
-  has persisted producer state covering positions `0` through `9` and consumer `B` positions `0`
+  has a checkpoint covering positions `0` through `9` and consumer `B` positions `0`
   through `4`, `B` pulls the recovered source's positions from `5` on and `A` from `10` on.
 - **The summary** is what the observation point continues from: a source's next source position and
   a commit clock's latest committed tick. A reading's summary is empty.
@@ -861,18 +882,24 @@ was kept there, because an entry is dropped only once no consumer reaches its ke
 observation point answering a kept key from the observation map
 ([Runtime obligations](#runtime-obligations)) is this recovery.
 
-### Persisted producer state
+### Checkpoints
 
-A producer persists its producer state and the guard it has released to each of its inputs in one
-write, before a release reaches its input. A join holds one guard per input. A producer does not
-persist the guard its consumers have released to it: that guard is recovered from the consumers'
-own persisted guards. Each producer persists its own producer state when it releases, and no two
-producers' writes need to describe one moment of the run.
+A producer's **checkpoint** is one write of its producer state and the guard it has released to each
+of its inputs. A join holds one guard per input. A producer does not checkpoint the guard its
+consumers have released to it: that guard is recovered from the consumers' own checkpoints. Each
+producer checkpoints on its own schedule while the run continues, and no two producers' checkpoints
+need to describe one moment of the run.
 
-The write holds the producer's tile in the shape
+**A producer releases a region of its input only once what its future outputs need of the region is
+durable**, in a checkpoint written with the guard it releases, or, for an observation point, in its
+entries in the observation log. A source releases a position to the system it reads once its entry
+holds the element, and the commit operator acknowledges a commit once the decision's entry, which
+holds the commit record, is durable.
+
+A checkpoint holds the producer's tile in the shape
 [Compaction](operational-semantics/semantics.md#compaction) gives it: `compact(𝑜)` for the region
-`𝑜` every consumer has released, beside the tile `𝑟` no consumer has released yet. The write can
-leave out `𝑟`, or part of it, only where the producer can compute it again from input it has not
+`𝑜` every consumer has released, beside the tile `𝑟` no consumer has released yet. The checkpoint
+can leave out `𝑟`, or part of it, only where the producer can compute it again from input it has not
 released.
 
 **A recovered producer can answer a pull for every region its consumers have not released.** A
@@ -882,52 +909,53 @@ recovered producer's `𝑟`, or the producer computes it again from its input. A
 consumer has released positions `0` through `900` does not persist its sum through position `1000`
 and release its input through `1000`. After a crash the consumer would ask for position `901` again,
 and the recovered sum would hold only the total through `1000`. A runtime that recovered the sum
-from an older write instead would have to recover the sum's input from an older write too, and so on
-up the chain: the domino effect. The rule's cost is lag: a release reaches a source one persist per
-producer after the sink's release, so the lag of a source's release to the system it reads grows
+from an older checkpoint instead would have to recover the sum's input from an older checkpoint too,
+and so on
+up the chain: the domino effect. The rule's cost is lag: a release reaches a source one checkpoint
+per producer after the sink's release, so the lag of a source's release to the system it reads grows
 with the number of producers between the source and the sinks.
 
-A producer persists enough to recover its producer state after a crash, given what its inputs still
-hold unreleased. What it writes is its own choice. An observation point's recovered state holds
-each kept observation with its kept value.
+A checkpoint holds enough to recover its producer's state after a crash, given what its inputs still
+hold unreleased. What it holds is the producer's own choice. An observation point's recovered state
+holds each kept observation with its kept value.
 
-A producer persists its state only once the observation log is durable through every entry
+A producer checkpoints its state only once the observation log is durable through every entry
 appended before the state was computed, as an output escapes
-([The observation log](#the-observation-log)). The observations the state was computed from are
+([The observation log](#the-observation-log)). This is the write-ahead rule. The observations the state was computed from are
 then in `𝑂ᵣ`, and because `𝐹` is monotone for a fixed reload history the recovered state stands for
 a tile below `𝐹(𝑂ᵣ)` at its term.
 
 These rules establish the third condition of [the durability condition](#the-durability-condition).
 A recovered state stands for a tile below `𝐹(𝑂ᵣ)`, covers what its producer released, and comes from
-one write with its guard, and a summary covers only regions every consumer has released.
+one checkpoint with its guard, and a summary covers only regions every consumer has released.
 
-What the write holds depends on the producer:
+What a checkpoint holds depends on the producer:
 
 - **An observation point** writes its entries to the observation log. A source over a topic
   partition writes only that a position is taken, because the position is the offset and the
   partition holds the record. A standard-input source writes the line itself, because nothing
   upstream holds it ([Sources](#sources)). A random reading can write one random seed and derive
-  each reading from it and its key. A source releases a position to the system it reads once its
-  entry holds the element itself, or once every consumer of the source has released the position.
-- **A producer that compacts** persists nothing until it releases, and then its summary of the
-  regions every consumer has released: an aggregate's value, a store's seed, changelog and
-  frontier. A running average over released points
-  holds their count and their sum, because the count alone does not give the next average. A
-  `Memo` holds its cache, because it releases everything it merges
+  each reading from it and its key. A commit clock writes each decision with its commit record. A
+  source releases a position to the system it reads once its entry holds the element itself, or
+  once every consumer of the source has released the position.
+- **A producer that compacts** checkpoints its summary of the regions every consumer has
+  released: an aggregate's value, a store's seed, changelog and frontier. A running average over
+  released points holds their count and their sum, because the count alone does not give the next
+  average. A `Memo` holds its cache, because it releases everything it merges
   ([A `Memo` releases everything it takes](../src/interpreter/design-operators.md#a-memo-releases-everything-it-takes)).
 - **A producer that holds rows it has not released**, such as a join's open rows or the alarm pair's
-  held rows, persists them and then releases what they cover. Until it does, its inputs keep what
+  held rows, checkpoints them and then releases what they cover. Until it does, its inputs keep what
   the rows were computed from. A producer releases a region of its input only once it has produced
   every output that the region and the producer's internal state determine, so a row it holds
   determines no output it has not produced: a join holds an order until its customer arrives, and
   holds each customer for every later order that names it. A join that holds customer `1` produces
-  `(o1, 1)` before it releases an order `o1` that names customer `1`. Without the write, its input
-  would never release those rows, the observation log would keep their entries, and recovery would
-  replay them. Holding rows without persisting them is an open question
+  `(o1, 1)` before it releases an order `o1` that names customer `1`. Without the checkpoint, its
+  input would never release those rows, the observation log would keep their entries, and recovery
+  would replay them. Holding rows without persisting them is an open question
   ([Open questions](#open-questions)).
-- **A producer whose released region is obsolete** holds `⊥` for it and persists only the guard. A
-  sink is this case ([Sinks persist their release](#sinks-persist-their-release)).
-- **A producer with no state**, such as a `map`, a `filter` or a `FanOut`, persists nothing. Its
+- **A producer whose released region is obsolete** holds `⊥` for it and checkpoints only the
+  guard. A sink is this case ([Sinks persist their release](#sinks-persist-their-release)).
+- **A producer with no state**, such as a `map`, a `filter` or a `FanOut`, has no checkpoint. Its
   release is the one its consumers' releases permit, and a `FanOut`'s is the intersection of its
   slots' releases
   ([The release contract](../src/interpreter/design-operators.md#the-release-contract)).
@@ -939,19 +967,27 @@ predecessor's producer states through `OperatorMap::handover`, but the handover 
 producers. Persisting needs each producer state as data that can be written to stable storage and
 read back, which no producer defines today.
 
-A producer chooses when to persist. Persisting once the input it has taken since its last write
-passes a bound keeps what recovery recomputes for that producer below the bound, which persisting
-on a timer alone does not.
+A producer chooses when to checkpoint. Checkpointing once the input it has taken since its last
+checkpoint passes a bound keeps what recovery recomputes for that producer below the bound, which
+checkpointing on a timer alone does not. Until a producer checkpoints, its inputs keep every region
+it has not released, and the observation log keeps the entries those regions were computed from, so
+how often a producer checkpoints also bounds what the run retains.
 
 A store, its writers and its driver form a cycle, and two of the releases around it are
 acknowledgements: the commit operator's release to a writer acknowledges its commit
 ([The runtime engines](../src/ccl/design/mutability.md#the-runtime-engines)), and a writer's release
 to its driver finishes a position (`TransactWriterProducer` in
-`src/interpreter/commit_operator.rs`). Each is a release, so each is persisted before it goes out,
-which puts one write to stable storage in every commit. A transaction reads only earlier ticks, so
-recovering the cycle's producers in tick order has no domino effect. The induction loop,
-`InductionDriver` and `InductionStore` through a cyclic `FanOut`, is a cycle in the same way.
-Persisting a cycle as one unit is an open question ([Open questions](#open-questions)).
+`src/interpreter/commit_operator.rs`). The commit operator acknowledges a commit once the
+decision's entry is durable, because the entry holds the commit record, which is what the store's
+checkpoint would otherwise hold for that tick. The store checkpoints on its own schedule, as any
+producer does, and after a crash it applies the records of the ticks past its checkpoint. A driver
+recovered past the store's checkpoint does not drive those positions again, and a driver recovered
+before it drives positions the commit engine answers with their kept decisions
+([Runtime obligations](#runtime-obligations), the commit engine reuses a kept decision). A
+transaction reads only earlier ticks, so recovering the cycle's producers in tick order has no
+domino effect. The induction loop, `InductionDriver` and `InductionStore` through a cyclic
+`FanOut`, has no observation point to hold its steps, and checkpoints before each release inside
+the loop ([Open questions](#open-questions)).
 
 At a reload, the runtime appends the reload's entry to the observation log, and each term the reload
 pairs persists its state at its boundary guard, in the same write as the entry or before it. The
@@ -964,16 +1000,18 @@ operators. Without that write, a producer whose latest persisted state predates 
 need the retired version's operators to compute again what that version decided after the state was
 written.
 
-Recovery starts each producer from its latest persisted producer state, or from `⊥` where it has
-none, and each observation point from the observation log. Each recovered consumer issues its
+Recovery starts each producer from its latest checkpoint, or from `⊥` where it has none, and each
+observation point from the observation log. Each recovered consumer issues its
 persisted guard to its input as a release, and a producer with no state forwards it as during the
 run. Consumers then pull as during the run. A producer recovered from an older write than its
 latest in-memory state pulls again the regions it had not released, and its input still holds them
-because the release never went out.
+because the release never went out. A recovered producer pulls only outside the guards its
+checkpoint holds, so recovery never merges into a producer a region its checkpoint already
+covers.
 
 ### Sinks persist their release
 
-A sink persists the guard it releases upon each release, after sending the outputs in the
+A sink checkpoints the guard it releases upon each release, after sending the outputs in the
 region and before the release reaches the sink's input. A "client-like" sink making a call outside
 the program is a sink for its requests and an observation point for its replies, so it does not
 release a request until the reply's entry is durable
@@ -1006,12 +1044,12 @@ inputs:
 - **A consumer has caught up on an input** once the input has caught up and the consumer's release
   covers everything the input had produced at that moment.
 
-A caught-up sink's release covers its recovery set. A consumer releases a region only once its
-persisted state covers what its future outputs need, and a producer releases a region of its input
-only once it has produced every output that the region and the producer's internal state determine
-([Persisted producer state](#persisted-producer-state)). So a term that has caught up has produced
-`𝐹(𝑂ᵣ)` at its term, either released by its consumers or held unreleased, and the rows it holds
-determine no output in `𝐹(𝑂ᵣ)` that it has not produced.
+A caught-up sink's release covers its recovery set. A consumer releases a region only once what its
+future outputs need of it is durable, in its checkpoint or in the observation log, and a producer
+releases a region of its input only once it has produced every output that the region and the
+producer's internal state determine ([Checkpoints](#checkpoints)). So a term that has caught up has
+produced `𝐹(𝑂ᵣ)` at its term, either released by its consumers or held unreleased, and the rows it
+holds determine no output in `𝐹(𝑂ᵣ)` that it has not produced.
 
 For example, take a join of `orders` with `customers` on customer id, where `𝑂ᵣ` holds orders `o1`
 to `o4` and customers `1` to `4`, and `o4` names customer `5`. The join has caught up once it has
@@ -1023,9 +1061,9 @@ outputs its sink had not released before the crash has caught up when recovery s
 has caught up once it releases them.
 
 A cycle, such as a store with its writers and its driver, catches up as one term, on the edges that
-enter it. Its commit decisions are observations in `𝑂ᵣ`, and a writer releases its input only once
-its commit is acknowledged, so once the cycle has caught up on its inputs it has produced every tick
-`𝑂ᵣ` decides.
+enter it. A store has produced every tick `𝑂ᵣ` decides once it has applied the records of the ticks
+past its checkpoint ([The observation log](#the-observation-log)), so once the cycle has caught up
+on its inputs it has produced every tick `𝑂ᵣ` decides.
 
 Each term records in memory the guard of what it had produced when it caught up on its inputs.
 Intake and outputs continue during the check, and only a reload waits for it.
@@ -1036,9 +1074,8 @@ installs a fix. A reload therefore has a setting that replaces the recovering ve
 the reload waits. A reload with the setting takes as its boundary guard at each term the evaluation
 boundary recovery restored, and the new version computes everything outside it from `𝑂ᵣ`. Every
 observation in `𝑂ᵣ` keeps its key and its value, so immutable history holds. A store the reload
-rebuilds seeds at the last tick `𝑂ᵣ` decides on its clock, which the earlier version reaches by
-evaluating again the bodies of the kept decisions. Each of those bodies finished once from the same
-snapshot and readings, so it finishes again.
+rebuilds seeds at the last tick `𝑂ᵣ` decides on its clock, which the store reaches by applying the
+kept ticks' records.
 
 The cost falls on [Escape](#escape). A sink's outputs between its last persisted release and what it
 had sent before the crash are computed again by the new version wherever they pass through a term
@@ -1066,7 +1103,7 @@ position order and emits a position only once every earlier position is decided
 anything else, such as a message identity, leave the loop waiting on positions no element may take.
 
 **Keeping elements available.** Recovery needs an element only where an escaped output or a
-persisted producer state depends on it, and the runtime obligations make the element durable before
+checkpoint depends on it, and the runtime obligations make the element durable before
 either. What the source persists for it depends on what the system it reads gives back:
 
 | What the system it reads gives back                              | Example                                     | The source position an element takes                   | What the source persists   | A crash before the element's entry is persisted                              |
@@ -1083,7 +1120,7 @@ Two rules apply to every kind:
   and recovery then finds the element in its entry.
 - **A missing element fails recovery.** A source that finds an element it took and has not released
   missing from the system it reads stops recovery. It does not state `none` at that position,
-  because an escaped output or a persisted producer state may depend on the element.
+  because an escaped output or a checkpoint may depend on the element.
 
 None of these says anything about delivery to whoever produced an element, or about the order in
 which elements arrive beyond numbering them in it. A different element at a position whose entry was
@@ -1111,10 +1148,10 @@ retention has since removed, fails recovery under the rule above.
 ([`time::alarms()`](chl-spec.md#timealarms)). The program feeds alarm rows to `set_expiry`, and each
 row comes out of `expiries` once the clock reads at or after the row's `at` field. A row fed to the
 pair does not escape the run. The rows the pair holds, its pending alarms, are its producer state
-and are persisted as [Persisted producer state](#persisted-producer-state) describes. An alarm row
+and are checkpointed as [Checkpoints](#checkpoints) describes. An alarm row
 is persisted in one of two places:
 
-1. **In the pair's persisted producer state**, from the write after the row is fed to `set_expiry`
+1. **In the pair's checkpoint**, from the checkpoint after the row is fed to `set_expiry`
    until the row comes out of `expiries`.
 2. **In the observation log**, from when `expiries` takes the row.
 
@@ -1172,7 +1209,7 @@ idempotency key ([A call made outside the program](#a-call-made-outside-the-prog
 A call made outside the program is a sink for its requests and an observation point for its
 replies: the request and the reply share the call's key ([Outputs are keyed](#outputs-are-keyed)).
 Until the reply is kept, the call may have to send the request again, so it releases a request only
-once the reply's entry is durable ([Persisted producer state](#persisted-producer-state)). A crash
+once the reply's entry is durable ([Checkpoints](#checkpoints)). A crash
 before the reply's entry is durable leaves the request unreleased: recovery computes it again, and
 the call sends it again with the same key. A crash after it finds the reply in `𝑂ᵣ`, and the call
 sends nothing.
@@ -1202,16 +1239,15 @@ records that position 120 is taken; the partition holds the element.
 | 1. Arrival                 | The source receives the element at position 120. Its entry is appended to the observation log at LSN 1043, in process memory.                                                          | the partition; process memory                                                                     |
 | 2. Persist the entry       | The observation log is persisted through LSN 1043. Position 120 is kept.                                                                                                               | the partition; process memory                                                                     |
 | 3. Escape                  | Outputs computed from position 120 leave the run.                                                                                                                                      | unchanged                                                                                         |
-| 4. Persist producer states | Each consumer of the source persists its producer state covering position 120, then releases position 120.                                                                             | the partition; process memory; what position 120 fed, in each consumer's persisted producer state |
+| 4. Checkpoint              | Each consumer of the source checkpoints its state covering position 120, then releases position 120.                                                                                   | the partition; process memory; what position 120 fed, in each consumer's checkpoint               |
 | 5. The source's release    | Every consumer has released position 120. The source drops its buffered copy, commits its progress through offset 120 to the partition, and drops the entry at LSN 1043, in any order. | what position 120 fed; the partition, until its retention passes                                  |
 
 Three rules order the steps:
 
 - **Persisting the entry comes before escaping.** An output computed from position 120 leaves the
   run only once its entry is persisted (step 2 before step 3).
-- **Persisting the entry comes before persisting producer states.** A producer state computed from
-  position 120 stands for observations recovery keeps only once its entry is persisted (step 2
-  before step 4).
+- **Persisting the entry comes before checkpointing.** A checkpoint computed from position 120
+  stands for observations recovery keeps only once its entry is persisted (step 2 before step 4).
 - **A consumer persists before it releases.** Until every consumer has released position 120,
   recovery may recover one that pulls position 120 again, and the entry holds no element, so the
   partition still has to hold it (step 4 before step 5).
@@ -1230,10 +1266,10 @@ element, and between steps 1 and 2 process memory holds the only copy
 | A support for every escaped output is kept                          | Outputs wait for the observation log's durable prefix                                                                       |
 | An output is sent once, up to the limit                             | Each sink persists its release when it releases                                                                             |
 | `𝑂ᵣ` is well-formed and `𝑂ᵣ ≤ 𝑂₁`                                | `𝑂ᵣ` is the durable prefix                                                                                                 |
-| Recovered producer states stand for tiles below `𝐹(𝑂ᵣ)`           | A producer persists its state only once the observation log is durable through the entries it was computed from             |
-| A released region is not needed again                               | A consumer persists its producer state and its released guard in one write before it releases                               |
+| Recovered producer states stand for tiles below `𝐹(𝑂ᵣ)`           | A producer checkpoints only once the observation log is durable through the entries its state was computed from             |
+| A released region is not needed again                               | A consumer releases only once its checkpoint, or the observation log, holds what it needs of the region                     |
 | A reload's boundary is kept                                         | The reload's entry, and each paired term's state at its boundary, are persisted before an output of the new version escapes |
-| Determined values only are recomputed                               | Recovered producers pull from inputs recovered from persisted producer states and the observation log                       |
+| Determined values only are recomputed                               | Recovered producers pull from inputs recovered from checkpoints and the observation log                                     |
 | Outputs are recognizable when re-emitted                            | Sinks receive each output's key                                                                                             |
 | A kept key keeps its meaning across reloads                         | A rebuilt term mints its keys in a new generation, and a rebuilt store's clock is a new clock                               |
 | Every escaped output lies inside each later reload's boundary guard | After recovery, a reload waits for recovery catch-up unless set to replace the recovering version                            
@@ -1278,8 +1314,8 @@ The model's consequences:
 - **[What a producer holds](../src/interpreter/design-operators.md#what-a-producer-holds)** counts
   the values a producer retains, and `OperatorMap::handover` passes live producers. No producer
   defines its producer state as data that can be persisted and read back with the guard it has
-  released. Persisting producer state needs that for every stateful producer
-  ([Persisted producer state](#persisted-producer-state)), and recovery catch-up needs each
+  released. Checkpointing needs that for every stateful producer
+  ([Checkpoints](#checkpoints)), and recovery catch-up needs each
   producer to give the guard of what it has produced ([Recovery catch-up](#recovery-catch-up)).
 
 - **[How a reload works](../src/ccl/design/program-evolution.md#how-a-reload-works)** swaps versions
@@ -1296,11 +1332,10 @@ The model's consequences:
   The counter stays private and restartable.
 
 - **[A `Memo` releases everything it takes](../src/interpreter/design-operators.md#a-memo-releases-everything-it-takes)**
-  releases each region as it merges it. Under
-  [Persisted producer state](#persisted-producer-state) a consumer releases only once its producer
-  state is persisted, so a `Memo`'s release, and every compacting producer's, waits for a write to
-  stable storage. Compaction in memory does not wait: a crash before the write leaves the region
-  unreleased, and the recovered producer pulls it again.
+  releases each region as it merges it. Under [Checkpoints](#checkpoints) a consumer releases only
+  once its checkpoint holds what it needs, so a `Memo`'s release, and every compacting producer's,
+  waits for a checkpoint. Compaction in memory does not wait: a crash before the checkpoint leaves
+  the region unreleased, and the recovered producer pulls it again.
 
 - **Observations are taken in separate producers.** The source buffer assigns positions
   (`src/interpreter/stream_buffer.rs`), `CommitEngine::attempt` decides proposals, and
@@ -1442,8 +1477,8 @@ The model's consequences:
     the source's element at source position 7, or a commit whose writer's decision at an earlier
     position was lost. Recovery drops it and every entry that needs it, such as each later decision
     of its writer and each later commit on its clock, which leaves the largest well-formed sub-map
-    ([Well-formed maps](#well-formed-maps)). No escaped output or persisted producer state depends
-    on a dropped entry, because each waited for the entries it needs as well.
+    ([Well-formed maps](#well-formed-maps)). No escaped output or checkpoint depends on a dropped
+    entry, because each waited for the entries it needs as well.
   - **Each point uses its own storage.** A topic source can keep its entries in the topic's
     committed offsets, and a commit clock in its store's changelog. Each point drops its released
     entries from its own stream, where one log holds entries of mixed lifetimes.
@@ -1452,10 +1487,10 @@ The model's consequences:
   - **A reload is a cut.** A reload's entry has to be ordered against every observation point, so
     with separate logs a reload is a cut across them.
 
-  Persisted producer state needs no coordination across processes, because each producer persists
-  its own.
+  Checkpoints need no coordination across processes, because each producer checkpoints its own
+  state.
 - **[Open] Holding rows without persisting them.** A producer that holds rows persists them
-  ([Persisted producer state](#persisted-producer-state)). Keeping them only in memory and computing
+  ([Checkpoints](#checkpoints)). Keeping them only in memory and computing
   them again at recovery would save a write per bound. A streaming join is the first producer
   where the saving matters, because it holds every row of one input for as long as the other stays
   open ([Streaming Joins](../src/interpreter/design-operators.md#streaming-joins)). Its input then
@@ -1472,14 +1507,15 @@ The model's consequences:
   recovery brings a deleted branch back. A deletion needs an entry in the observation log. It frees
   the operators no other branch holds, which ends their generations, so the entry is also their
   release.
-- **[Open] Persisting a cycle as one unit.** [Persisted producer state](#persisted-producer-state)
-  persists before each release inside a cycle, which puts one write in every commit. Persisting the
-  cycle as one unit at the positions of the loop around it keeps the acknowledgements in memory, as
-  Falkirk Wheel persists a loop at its outer timestamps
-  ([Falkirk Wheel](https://icgog.github.io/data/papers/2021-socc-falkirk.pdf)). That needs a cut
-  that says what happens to the transactions in flight. Without one, a driver recovered as having
-  finished positions through `9` beside a store recovered at tick `5` never drives positions `6`
-  through `9` again, and the store cannot pass tick `5`.
+- **[Open] Checkpointing an induction loop as one unit.** An induction loop has no observation point
+  whose entries hold its steps, as a commit clock's records hold a store's ticks, so under
+  [Checkpoints](#checkpoints) its store checkpoints before each release to its driver, which puts
+  one write in every iteration. Checkpointing the loop as one unit at the positions of the loop
+  around it keeps the releases inside it in memory, as Falkirk Wheel persists a loop at its outer
+  timestamps ([Falkirk Wheel](https://icgog.github.io/data/papers/2021-socc-falkirk.pdf)). That
+  needs a cut that says what happens to the iterations in flight. Without one, a driver recovered as
+  having finished positions through `9` beside a store recovered at position `5` never drives
+  positions `6` through `9` again, and the store cannot pass position `5`.
 - **[Open] When a cycle reaches `𝐹(𝑂)`.** `𝐹(𝑂)` is the least program state that satisfies the
   equations of
   [The program state an observation map determines](#the-program-state-an-observation-map-determines).
