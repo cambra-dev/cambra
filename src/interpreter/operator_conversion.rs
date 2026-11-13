@@ -6682,6 +6682,7 @@ mod variant_ctor_tests {
             user_annotation: None,
             transparency: BindingTransparency::Transparent,
             site: None,
+            role: Default::default(),
         }
     }
 

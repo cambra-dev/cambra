@@ -201,6 +201,20 @@ pub(super) fn uncurry_params(
     fn_span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
+    let mut function = uncurry_params_inner(params, body_expr, fn_span, ctx)?;
+    let TypedExprNode::Lambda { param, .. } = &mut function.node else {
+        unreachable!("a source function lowers to a lambda")
+    };
+    param.role = crate::ccl::BindingRole::FunctionParameter;
+    Ok(function)
+}
+
+fn uncurry_params_inner(
+    params: &[Param],
+    body_expr: Expr,
+    fn_span: Span,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
     if params.len() == 1 {
         // A `Mut(…)`-annotated single parameter is a pass-by-reference mutable variable:
         // bind it at `Mut(V, D)` so body references carry `Mut` (reads deref, writes lower
@@ -257,6 +271,7 @@ pub(super) fn uncurry_params(
             let occurrence = ctx.occurrence_at(param.name_span);
             let mut lam = Expr::lambda(param.name.as_str(), occurrence, param_ty.clone(), acc);
             if let TypedExprNode::Lambda { param: p, .. } = &mut lam.node {
+                p.role = crate::ccl::BindingRole::Temporary;
                 match (history_ty, &param.annotation) {
                     // The carrier is both the binder type and its declaration.
                     (Some(_), Some(ann)) => {

@@ -64,6 +64,7 @@ fn arm(tag: &str, binding: &str, guard: Option<TypedExpr>, body: TypedExpr) -> B
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
+                role: Default::default(),
             },
             empty_payload: false,
         }),
@@ -178,6 +179,7 @@ fn variant_param_accepts_subtype() {
             user_annotation: Some(Annotation::new(param_ty.clone(), Occurrence::mint())),
             transparency: BindingTransparency::Transparent,
             site: None,
+            role: Default::default(),
         },
         body: Box::new(var("v")),
     });
@@ -200,6 +202,7 @@ fn variant_extra_tag_rejected() {
             user_annotation: Some(Annotation::new(param_ty, Occurrence::mint())),
             transparency: BindingTransparency::Transparent,
             site: None,
+            role: Default::default(),
         },
         body: Box::new(var("v")),
     });
@@ -286,6 +289,7 @@ fn value_ascription_accepts_widening() {
             )),
             transparency: BindingTransparency::Transparent,
             site: None,
+            role: Default::default(),
         },
         bound_expr: Box::new(TypedExpr::variant_ctor("A", Occurrence::mint(), lit_unit())),
         body: Box::new(var("x")),
@@ -472,6 +476,7 @@ fn lambda_returns_variant() {
             user_annotation: Some(Annotation::new(int(), Occurrence::mint())),
             transparency: BindingTransparency::Transparent,
             site: None,
+            role: Default::default(),
         },
         body: Box::new(TypedExpr::variant_ctor(
             "some",
@@ -537,6 +542,7 @@ fn payload_covariance_accept() {
             user_annotation: Some(Annotation::new(param_ty.clone(), Occurrence::mint())),
             transparency: BindingTransparency::Transparent,
             site: None,
+            role: Default::default(),
         },
         body: Box::new(var("v")),
     });
@@ -557,6 +563,7 @@ fn payload_mismatch_reject() {
             user_annotation: Some(Annotation::new(param_ty, Occurrence::mint())),
             transparency: BindingTransparency::Transparent,
             site: None,
+            role: Default::default(),
         },
         body: Box::new(var("v")),
     });

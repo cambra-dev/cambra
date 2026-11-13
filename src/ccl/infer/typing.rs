@@ -356,6 +356,20 @@ pub(super) trait Typing {
     /// no refinement answers it in place of a proof.
     fn refutes(&mut self, facts: Vec<Expr>, recorded: bool) -> bool;
 
+    /// Enter one source parameter. Currying preserves the common signature scope
+    /// for write contracts; ordinary lexical binders use `scoped` directly.
+    fn scoped_parameter<R>(
+        &mut self,
+        parameter: &TypedBinding,
+        ty: &Type,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R
+    where
+        Self: Sized,
+    {
+        self.scoped(&parameter.name, ty, f)
+    }
+
     /// `ty`, a morphism reached with an input of type `incoming`, instantiated for it where
     /// it is a generalized type (`src/ccl/design/type-parameters.md`, "Generalized types").
     /// Emission runs before any pass lifts a use, so it meets none.
