@@ -4335,11 +4335,9 @@ position in the commit order ([6. Types (informal sketch)](#6-types-informal-ske
 
 `time::now()` returns the runtime's clock reading as an `Instant`.
 
-- **A reading is the system clock, best effort.** It is the later of the system wall clock and the
-  latest reading the runtime has handed out, so readings never decrease within one process. A
-  reading taken after a restart can be earlier than one taken before it. The runtime does not
-  correct the system clock: a backward step holds readings at the latest one until the system clock
-  passes it, and a forward step is adopted at once.
+- **A reading is the system clock, best effort.** Readings carry no order: a reading can be
+  earlier than one taken before it, within one process or across a restart. The runtime does not
+  correct the system clock. A program that needs an order takes it from the transaction system.
 - **Each evaluation of a call reads the clock.** A call is evaluated once per iteration of each
   enclosing loop. Two calls can return different readings, including two calls in one transaction.
   A binding holds one reading: in `t = time::now()`, every use of `t` is the same instant.
@@ -4348,7 +4346,9 @@ position in the commit order ([6. Types (informal sketch)](#6-types-informal-ske
   new version starts.
 - **A reading orders nothing.** A reading is not an event and creates no dependency edge
   ([8.5 Ordering and concurrency](#85-ordering-and-concurrency)). Commit order never consults a
-  reading, so a transaction that commits after another can hold an earlier reading.
+  reading, so a transaction that commits after another can hold an earlier reading. Both rules
+  describe this clock, whose readings carry no order. A clock whose readings the commit engine
+  places in commit order would order them.
 - **A call is IO.** The compiler represents a call as a read of a clock source at the call's
   position, not as an expression it may merge or duplicate. A module whose top-level evaluation
   calls `time::now()`, directly or through a function, performs IO and is run
@@ -4404,10 +4404,9 @@ for e in expiries:
 - **Holding.** A row fed inside a `with begin():` block is held only if the transaction commits
   ([8.4 Feeds are the second form of mutability](#84-feeds-are-the-second-form-of-mutability)). A
   row whose `at` has passed when it is held comes out at once.
-- **Release.** The runtime releases a row at a reading of the clock `time::now()` reads, and that
-  reading is at or after the row's `at`. Every reading taken after the release in the same process
-  is at or after it, so a transaction handling a released row `e` reads
-  `time::now() >= e.time::at`.
+- **Release.** The runtime releases a row once its clock reads at or after the row's `at`. A
+  reading in the transaction handling the row has no order relative to the release and can be
+  earlier than `at`.
 - **Arrival.** A released row is an arrival on the source
   ([8.5 Ordering and concurrency](#85-ordering-and-concurrency)): every loop over the source
   receives it, and it orders what consumes it as any arrival does. Of two rows held at once, the
