@@ -11,6 +11,8 @@ use crate::ccl::lower::constants::Refused;
 #[derive(Debug)]
 pub struct Interface {
     pub module: ModulePath,
+    /// Parsing omitted declarations, so a missing entry does not establish absence.
+    pub(super) incomplete: bool,
     /// Every top-level binding, by spelling, public and private alike, so that a
     /// reference to a private member can say so.
     pub(super) members: HashMap<SmolStr, Member>,
@@ -204,7 +206,7 @@ pub struct ModuleBinding {
     pub declared: Span,
     /// The module it is bound to.
     pub module: ModulePath,
-    /// What that module declares, or `None` when it has errors of its own.
+    /// What that module declares, or `None` when it has no usable lowering.
     pub interface: Option<Rc<Interface>>,
     /// How its declaring module spells the module it is bound to: `a`, or
     /// `shop::audit`.
@@ -534,6 +536,16 @@ impl Interface {
         self.inferred_parameters().any(|p| p == parameter)
     }
 
+    /// Whether parsing may have omitted `name`, which no known declaration names.
+    pub(super) fn may_be_unparsed(&self, name: &str) -> bool {
+        self.incomplete
+            && !self.members.contains_key(name)
+            && !self.types.contains_key(name)
+            && !self.nominal.contains_key(name)
+            && !self.traits.contains_key(name)
+            && !self.modules.contains_key(name)
+    }
+
     /// Whether `name` is a public value member.
     pub fn is_public(&self, name: &str) -> bool {
         self.members.get(name).is_some_and(|member| member.public)
@@ -719,6 +731,7 @@ impl Interface {
     pub(super) fn unimportable(module: ModulePath, why: Unimportable) -> Self {
         Interface {
             module,
+            incomplete: false,
             members: HashMap::new(),
             types: HashMap::new(),
             nominal: HashMap::new(),
@@ -802,6 +815,7 @@ impl Interface {
             .collect();
         Interface {
             module,
+            incomplete: false,
             members,
             types,
             nominal: nominal_members(ast, ctx),
@@ -987,6 +1001,9 @@ pub fn top_level_bindings(stmts: &[Spanned<ChlStmt>]) -> Vec<TopLevelBinding> {
             ChlStmt::FunctionDef {
                 owner: None, name, ..
             } => bound.push((name.node.clone(), name.span)),
+            ChlStmt::Error { binds, .. } => {
+                bound.extend(binds.iter().map(|name| (name.clone(), stmt.span)))
+            }
             _ => {}
         }
         for (name, name_span) in bound {
@@ -1126,6 +1143,7 @@ impl Interface {
                 Some(_) => missing.push(format!(
                     "`{name}` is a Module type in module `{module}`, and the entry names a type"
                 )),
+                None if self.may_be_unparsed(name) => {}
                 None => missing.push(format!("module `{module}` has no type member `{name}`")),
             }
         }
@@ -1141,6 +1159,7 @@ impl Interface {
                          Module type does not reach one yet"
                     )),
                     Some(_) => {}
+                    None if self.may_be_unparsed(name) => {}
                     None => missing.push(format!("module `{module}` has no member `{name}`")),
                 },
                 AliasType::Module(inner) => match self.modules.get(name) {
@@ -1156,6 +1175,7 @@ impl Interface {
                         (None, Some(interface)) => missing.extend(interface.missing(inner)),
                         (None, None) => {}
                     },
+                    None if self.may_be_unparsed(name) => {}
                     None => missing.push(format!(
                         "module `{module}` has no member `{name}` bound to a module"
                     )),

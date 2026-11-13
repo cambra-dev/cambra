@@ -50,16 +50,16 @@ folds:
 == tests/programs/discount_contract/program.cambra
 diagnostics:
   10:12-10:17 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
-    10:5-10:11 while parsing statement
+    10:5-10:22 while parsing statement
     10:5-10:11 while parsing expression
   11:12-11:20 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
-    11:5-11:11 while parsing statement
+    11:5-11:25 while parsing statement
     11:5-11:11 while parsing expression
   12:12-12:20 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
-    12:5-12:11 while parsing statement
+    12:5-12:29 while parsing statement
     12:5-12:11 while parsing expression
   14:12-14:13 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
-    14:5-14:11 while parsing statement
+    14:5-14:18 while parsing statement
     14:5-14:11 while parsing expression
 symbols:
   function discounted 9:1-15:6 (name 9:5-9:15)
@@ -221,7 +221,7 @@ folds:
 == tests/programs/nonneg_inventory/program.cambra
 diagnostics:
   11:12-11:15 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
-    11:5-11:11 while parsing statement
+    11:5-11:19 while parsing statement
     11:5-11:11 while parsing expression
 symbols:
   variable inventory 8:1-8:69 (name 8:1-8:10)
@@ -252,7 +252,7 @@ folds:
 == tests/programs/reachability/program.cambra
 diagnostics:
   16:5-16:15 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
-    16:1-16:4 while parsing statement
+    16:1-21:3 while parsing statement
     16:1-16:4 while parsing expression
 symbols:
   variable edges 8:1-13:2 (name 8:1-8:6)
@@ -304,10 +304,10 @@ diagnostics:
     41:1-41:41 while parsing statement
     41:21-41:22 while parsing expression
   62:12-62:18 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
-    62:5-62:11 while parsing statement
+    62:5-62:39 while parsing statement
     62:5-62:11 while parsing expression
   76:14-76:18 found 'with', expected 'if', or 'match'
-    76:5-76:13 while parsing statement
+    76:5-83:5 while parsing statement
 symbols:
   variable Dollars 30:1-30:14 (name 30:1-30:8)
   variable Qty 31:1-31:25 (name 31:1-31:4)
@@ -353,10 +353,10 @@ diagnostics:
     38:1-38:41 while parsing statement
     38:21-38:22 while parsing expression
   75:12-75:18 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
-    75:5-75:11 while parsing statement
+    75:5-75:39 while parsing statement
     75:5-75:11 while parsing expression
   89:14-89:18 found 'with', expected 'if', or 'match'
-    89:5-89:13 while parsing statement
+    89:5-96:5 while parsing statement
 symbols:
   variable Dollars 27:1-27:14 (name 27:1-27:8)
   variable Qty 28:1-28:25 (name 28:1-28:4)
@@ -462,10 +462,10 @@ folds:
 == editors/sample-lexes-only.cambra
 diagnostics:
   5:5-5:6 found '>', expected expression, or '-'
-    5:1-5:5 while parsing statement
+    5:1-5:8 while parsing statement
     5:1-5:5 while parsing expression
   6:5-6:6 found '>', expected expression, or '-'
-    6:1-6:5 while parsing statement
+    6:1-6:8 while parsing statement
     6:1-6:5 while parsing expression
 symbols:
 folds:

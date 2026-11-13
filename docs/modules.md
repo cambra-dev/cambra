@@ -349,11 +349,14 @@ entries a module seeds from interfaces and from its parameters' Module types, `T
 spelling. The out-of-block read gate and the `MutWrite` shape then apply to `eu::stock` and
 `audit::stock` exactly as they apply to `stock` inside its own module.
 
-A module whose own errors stop it from lowering has no interface, and a reference or a `use` item
-into it adds no error: that module's own errors account for it.
+A module with no syntax tree or an uncontained lowering error has no usable interface. A
+reference or a `use` item into it adds no error: that module's errors account for it. Contained
+errors retain the module's usable declarations for its importers.
 
 A `use` item whose module has no usable interface records an unavailable member with its original
 module and spelling. Its use as a value or type recovers through the existing placeholders.
+A member omitted by an incomplete parse has the same unavailable state. Recovered declarations
+retain their category and visibility.
 A constructor pattern or trait requirement that needs its declaration fails its containing
 statement without another diagnostic. An instance whose trait is unavailable declares no instance
 and skips its function bodies without stopping the rest of the module's lowering. A member bound to
@@ -513,7 +516,7 @@ parameter on checks the next run's Module type against the parameter's view. A p
 with a Module type must be passed a module, and a module must be passed to one. Creating the run
 binds each entry's `let` to the argument's member, imaged at the argument, so a member whose type
 does not fit is the argument's error (`ProgramLowering::bind_module_parameter`). An argument whose
-module has errors of its own binds nothing and adds no error, as a reference into it adds none. The
+module has no usable lowering binds nothing and adds no error, as a reference into it adds none. The
 argument's members are those of the run or shared import it names, or, for a parameter passed on,
 those of that parameter's argument (`module_names`). A default names an import, checked while the
 module lowers and taken by a run that passes no argument.
@@ -720,28 +723,34 @@ specialization can reject a use in ways their signatures do not express. A diagn
 label in a broken module suppresses nothing: the
 label can name a valid requirement that the caller violates.
 
-A module with lowering errors of its own has no check, and its code is not linked, so its type
-errors are not reported until its lowering errors are fixed. A module is checked against its
-dependencies' bodies, so each check infers them again; keeping each module's inferred schemes for
-its users would remove that cost.
+A module whose lowering errors all have placeholders retains one interface and chain for its
+own check and its importers. Healthy exports and explicit constraints remain available to
+importer diagnostics. Failed functions retain their usable parameter and result declarations;
+unknown portions establish no inferred guarantee. A partial parse does not establish that an
+unrecorded member is absent. Known private members remain private.
+
+Each module check infers its dependencies' bodies again; keeping each module's inferred schemes
+for its users would remove that cost. Parse and lowering errors still stop compilation after
+inference, so a linked placeholder chain never reaches execution.
 
 `cambra check lib.cambra` checks a file on its own (`check_program`). It lowers the file as a module
 rather than as a root (`lower_for_check`), so its parameters need no defaults, and links nothing: it
-checks each module the file reaches and then the file. Each route a module declares is a source
-that opens nothing, so the check binds no port. It prints the file's interface
-(`Interface::written`): each parameter with its type, bound, or Module type, then each public member
-in the order declared. A failed check prints established contracts alongside its diagnostics and
-exits unsuccessfully. Values whose omitted definitions establish no complete contract are absent
-from this partial interface. A value's contract is its annotation or the type it infers, a
-generalized
-one's written as a diagnostic writes an inferred polymorphic type, joins and all. A `def` with a
-`Mut` parameter lowers curried and is written as its callers apply it, one function of the tuple of
-its parameters (`Contract::uncurried`). Inference notes a
-generalized member's scheme while it is live (`Typing::note_scheme`), and a monomorphic member's
-type is the one its uses settled. A type parameter with no kind written is one inference variable
-for the whole check, and a contract writes that variable as the parameter (`write_opened`), so
-`def wrap(x): id(x)` over `def id(x: T) => T` prints `wrap: T => T`. Lowering expands an alias
-where it is written, so a type prints expanded: `base: {Int where _ > 0}` for `base: Count`.
+checks each module the file reaches and then the file. Each route a module declares is a source that
+opens nothing, so the check binds no port. Past parse and loading errors, it checks all the same
+when recovery placeholders contain every lowering error, and reports what the checks find with them,
+as compiling a program does. It prints the file's interface (`Interface::written`): each parameter
+with its type, bound, or Module type, then each public member in the order declared. A failed check
+prints established contracts alongside its diagnostics and exits unsuccessfully. Values whose
+omitted definitions establish no complete contract are absent from this partial interface. A value's
+contract is its annotation or the type it infers, a generalized one's written as a diagnostic writes
+an inferred polymorphic type, joins and all. A `def` with a `Mut` parameter lowers curried and is
+written as its callers apply it, one function of the tuple of its parameters
+(`Contract::uncurried`). Inference notes a generalized member's scheme while it is live
+(`Typing::note_scheme`), and a monomorphic member's type is the one its uses settled. A type
+parameter with no kind written is one inference variable for the whole check, and a contract writes
+that variable as the parameter (`write_opened`), so `def wrap(x): id(x)` over `def id(x: T) => T`
+prints `wrap: T => T`. Lowering expands an alias where it is written, so a type prints expanded:
+`base: {Int where _ > 0}` for `base: Count`.
 
 ---
 

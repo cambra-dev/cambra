@@ -21,4 +21,4 @@ lex errors:
 parse errors:
   1:7-1:9 lex error: unrecognized token
   2:7-2:8 lex error: unrecognized token
-statements: Error, Error, Assign
+statements: Assign, Assign, Assign

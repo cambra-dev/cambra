@@ -196,7 +196,7 @@ fn two_runs_share_an_instance() {
     ],
     "`m` is a parameter of Module type, and a Module type names no trait"
 )]
-#[case::a_trait_of_a_module_with_errors(
+#[case::a_usable_trait_in_a_module_with_errors_still_needs_an_instance(
     indoc! {"
         import broken
         summon(broken::Area(_))::area(1)
@@ -207,7 +207,7 @@ fn two_runs_share_an_instance() {
         def g(x: Nope) => Int:
             1
     "})],
-    "unknown type annotation: Nope"
+    "no instance of `Area` accepts (_)"
 )]
 #[case::a_private_trait_s_function_read_from_the_trait(
     indoc! {"

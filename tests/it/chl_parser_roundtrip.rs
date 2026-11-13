@@ -7,7 +7,7 @@
 //! inside `chl_parser::parser`. These integration tests are guardrails:
 //! "is the surface syntax we already use still parseable?"
 
-use cambra::chl_parser::ast::{Expr, Spanned, Stmt};
+use cambra::chl_parser::ast::{AssignTarget, Expr, Spanned, Stmt};
 use cambra::chl_parser::parser::ParseResult;
 use cambra::chl_parser::{FileId, SourceMap, parse_expression, parse_module};
 use indoc::indoc;
@@ -480,6 +480,26 @@ fn statement_recovery_reads_the_binders_of_the_head() {
         ("a, b = 1 +* 2\n", &["a", "b"], false),
         ("x: Int = 1 +* 2\n", &["x"], false),
         ("x := 1 +* 2\n", &["x"], true),
+        (
+            indoc! {"
+            x = if c d:
+                    1
+                else:
+                    2
+        "},
+            &["x"],
+            false,
+        ),
+        (
+            indoc! {"
+            x := if c d:
+                    1
+                else:
+                    2
+        "},
+            &["x"],
+            true,
+        ),
         ("def f(a:\n    a\n", &["f"], false),
         ("pub y = 1 +* 2\n", &["y"], false),
         ("param p: Int = 1 +* 2\n", &["p"], false),
@@ -495,19 +515,37 @@ fn statement_recovery_reads_the_binders_of_the_head() {
             Stmt::Pub { stmt, .. } => &stmt.node,
             stmt => stmt,
         };
-        let Stmt::Error {
-            binds: got,
-            mut_assign: got_mut,
-            ..
-        } = stmt
-        else {
-            panic!(
-                "{src:?} should recover as a statement placeholder, got {:#?}",
-                m.body[0]
-            );
+        fn names(target: &AssignTarget, out: &mut Vec<String>) {
+            match target {
+                AssignTarget::Name(name) => out.push(name.to_string()),
+                AssignTarget::Tuple(parts) => parts.iter().for_each(|p| names(&p.node, out)),
+                _ => panic!("unexpected recovered target {target:?}"),
+            }
+        }
+        let (got, got_mut) = match stmt {
+            Stmt::Error {
+                binds, mut_assign, ..
+            } => (binds.iter().map(ToString::to_string).collect(), *mut_assign),
+            Stmt::Assign { target, value, .. }
+            | Stmt::AnnAssign { target, value, .. }
+            | Stmt::MutAssign { target, value, .. } => {
+                assert!(matches!(value.node, Expr::Error), "{src:?}: {value:?}");
+                let mut names_out = Vec::new();
+                names(&target.node, &mut names_out);
+                (names_out, matches!(stmt, Stmt::MutAssign { .. }))
+            }
+            Stmt::Param {
+                name,
+                default: Some(value),
+                ..
+            } => {
+                assert!(matches!(value.node, Expr::Error), "{src:?}: {value:?}");
+                (vec![name.node.to_string()], false)
+            }
+            _ => panic!("{src:?}: {stmt:#?}"),
         };
-        assert_eq!(got.as_slice(), *binds, "{src:?}");
-        assert_eq!(got_mut, mut_assign, "{src:?}");
+        assert_eq!(got, *binds, "{src:?}");
+        assert_eq!(got_mut, *mut_assign, "{src:?}");
     }
 }
 
@@ -517,6 +555,8 @@ fn statement_recovery_reads_the_binders_of_the_head() {
 fn statement_recovery_reads_the_module_a_head_binds() {
     let cases: &[(&str, &[&str], &[&str], bool)] = &[
         ("import lib as l use f +\n", &["l"], &["f"], false),
+        ("import lib as l use f as g +\n", &["l"], &["g"], false),
+        ("import lib(x=1 +* 2) as l use f +\n", &["l"], &["f"], false),
         ("import shop::cart +\n", &["cart"], &[], false),
         ("run lib(x=1) as a +\n", &["a"], &[], false),
         ("run lib as\n", &[], &[], true),

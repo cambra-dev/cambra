@@ -1075,8 +1075,8 @@ fn a_reference_into_a_module_with_errors_adds_no_error(#[case] root: &str) {
 #[timeout(Duration::from_secs(10))]
 fn a_use_of_a_module_with_errors_adds_no_error_below_the_root(#[case] lib: &str) {
     let mid = indoc! {"
-        import lib use missing
-        pub v = missing + 1
+        import lib use x
+        pub v = x + 1
     "};
     let root = indoc! {"
         import mid
@@ -1088,7 +1088,7 @@ fn a_use_of_a_module_with_errors_adds_no_error_below_the_root(#[case] lib: &str)
 }
 
 /// A reference into a module lowering failed in hides no root inference error. The module
-/// has no interface or linked chain, and the reference lowers to a placeholder
+/// retains its interface and linked chain, including placeholders for failed definitions
 /// (`src/ccl/design/type-inference.md`, "An error stops its statement, not the pass").
 #[rstest]
 #[timeout(Duration::from_secs(10))]
@@ -1365,6 +1365,38 @@ fn a_known_use_member_keeps_its_declaration_kind(#[case] use_: &str, #[case] exp
     let errors = compile_errors(&program(&root, &[("lib", "pub Shape = Int")]));
     assert!(errors.contains(expected), "{errors}");
     assert_eq!(report_count(&errors), 1, "{errors}");
+}
+
+/// A module with lowering errors of its own reports its type errors too: its check reads the
+/// remaining statements, and importers retain the module's declared constraints.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_module_with_lowering_errors_reports_its_type_errors() {
+    let library = indoc! {r#"
+        pub x: Mut(Int) = 3
+        pub def g(a: Int) => String:
+            a
+        pub w = [1, "c"]
+    "#};
+    let root = indoc! {r#"
+        import lib
+        z = [2, "b"]
+        (lib::g(1), z)
+    "#};
+    let errors = compile_errors(&program(root, &[("lib", library)]));
+    assert!(errors.contains("introduces a mutable"), "{errors}");
+    assert!(
+        errors.contains("annotated as String, but inferred as Int"),
+        "{errors}"
+    );
+    assert_eq!(
+        errors
+            .matches("The values that meet here have no common type")
+            .count(),
+        2,
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 4, "{errors}");
 }
 
 /// A module two others import is evaluated once: its bindings stand once in the
@@ -1739,4 +1771,193 @@ fn a_rejected_run_reports_nothing_from_its_nonbinding_statements(
         "{errors}"
     );
     assert!(!errors.contains("worker.cambra:"), "{errors}");
+}
+
+#[rstest]
+#[case::exact("pub broken: Int = absent::value", r#"lib::broken + "t""#)]
+#[case::bounded("pub broken <: Int = absent::value", r#"lib::broken + "t""#)]
+#[case::partial("pub broken: {Int, _} = absent::value", r#"lib::broken.0 + "t""#)]
+#[case::parse("pub broken: Int = 1 +* 2", r#"lib::broken + "t""#)]
+#[case::function(indoc! {"
+    pub def broken(a: Int) => String:
+        absent::value
+"}, r#"(lib::broken("t"), lib::broken(1) + 1)"#)]
+#[timeout(Duration::from_secs(10))]
+fn a_partial_module_preserves_usable_exports_and_declarations(
+    #[case] declaration: &str,
+    #[case] invalid_use: &str,
+) {
+    let library = formatdoc! {r#"
+        {declaration}
+        pub healthy = "s"
+    "#};
+    let root = formatdoc! {r#"
+        import lib
+        ({invalid_use}, lib::healthy + 1)
+    "#};
+    let errors = compile_errors(&program(&root, &[("lib", &library)]));
+    assert!(!errors.contains("Unbound variable"), "{errors}");
+    assert!(!errors.contains("has no member"), "{errors}");
+    let expected = if declaration.contains("def broken") {
+        4
+    } else {
+        3
+    };
+    assert_eq!(report_count(&errors), expected, "{errors}");
+    assert!(errors.contains("No Addable instance"), "{errors}");
+}
+
+#[test]
+fn a_partial_module_preserves_visibility_of_known_members() {
+    let library = indoc! {"
+        pub broken = 1 +* 2
+        hidden = 1
+    "};
+    let root = indoc! {"
+        import lib
+        lib::hidden
+    "};
+    let errors = compile_errors(&program(root, &[("lib", library)]));
+    assert!(errors.contains("private to module"), "{errors}");
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
+#[rstest]
+#[case::import("import lib use Area, Shape")]
+#[case::run("run lib use Area, Shape")]
+#[timeout(Duration::from_secs(10))]
+fn a_partial_interface_keeps_unknown_use_members_unavailable(#[case] statement: &str) {
+    let root = formatdoc! {r#"
+        {statement}
+        instance Area(Int):
+            def area(s):
+                1 + "skipped"
+        s = Shape::circle(1)
+        v = [1, "a"]
+        (s, v)
+    "#};
+    let errors = compile_errors(&program(&root, &[("lib", "pub broken = 1 +* 2")]));
+    assert!(errors.contains("found '*'"), "{errors}");
+    assert!(
+        errors.contains("The values that meet here have no common type"),
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
+#[rstest]
+#[case::alias(
+    "pub Shape = Int",
+    "Shape",
+    "Shape::circle(1)",
+    "is not a nominal type"
+)]
+#[case::known_trait(indoc! {"
+    pub trait Area(S):
+        def area(s: S) => Int
+"}, "Area", "Area::area(1)", "a trait's functions are read from an instance")]
+#[case::private_trait(indoc! {"
+    trait Area(S):
+        def area(s: S) => Int
+"}, "Area", "1", "private to module")]
+#[case::nominal(
+    "pub type Shape = Int",
+    "Shape",
+    "Shape::circle(1)",
+    "declares no constructor or function"
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_partial_interface_keeps_known_use_members_authoritative(
+    #[case] declaration: &str,
+    #[case] member: &str,
+    #[case] use_: &str,
+    #[case] expected: &str,
+) {
+    let library = formatdoc! {"
+        pub broken = 1 +* 2
+        {declaration}
+    "};
+    let root = formatdoc! {"
+        import lib use {member}
+        {use_}
+    "};
+    let errors = compile_errors(&program(&root, &[("lib", &library)]));
+    assert!(errors.contains("found '*'"), "{errors}");
+    assert!(errors.contains(expected), "{errors}");
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
+#[test]
+fn partial_interfaces_retain_constraints_through_diamond_imports() {
+    let library = indoc! {"
+        pub broken: Int = absent::value
+        pub healthy = 2
+    "};
+    let left = indoc! {"
+        import lib
+        pub value = lib::healthy
+    "};
+    let right = indoc! {"
+        import lib
+        pub value = lib::healthy
+    "};
+    let root = indoc! {r#"
+        import left
+        import right
+        a = left::value + "s"
+        b = right::value + "t"
+        (a, b)
+    "#};
+    let errors = compile_errors(&program(
+        root,
+        &[("lib", library), ("left", left), ("right", right)],
+    ));
+    assert_eq!(report_count(&errors), 3, "{errors}");
+    assert_eq!(errors.matches("No Addable instance").count(), 2, "{errors}");
+}
+
+#[rstest]
+#[case::value("Module{unknown: Int, healthy: Int}")]
+#[case::type_member("Module{Unknown <: Int, healthy: Int}")]
+#[case::nested_module("Module{unknown: Module{value: Int}, healthy: Int}")]
+fn a_partial_module_argument_keeps_known_entries_and_stands_in_for_unknown_ones(
+    #[case] module_type: &str,
+) {
+    let library = indoc! {"
+        pub broken = 1 +* 2
+        pub healthy = 2
+    "};
+    let client = formatdoc! {"
+        param m: {module_type}
+        pub value = m::healthy
+    "};
+    let root = indoc! {r#"
+        import lib
+        run client(m=lib) as c
+        c::value + "s"
+    "#};
+    let errors = compile_errors(&program(root, &[("lib", library), ("client", &client)]));
+    assert!(!errors.contains("has no member"), "{errors}");
+    assert!(!errors.contains("has no public member"), "{errors}");
+    assert!(errors.contains("No Addable instance"), "{errors}");
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
+/// A root's parameters remain abstract in its own check after contained lowering errors.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_root_with_lowering_errors_checks_its_parameters() {
+    let root = indoc! {"
+        param T <: Int = Int
+        x: Mut(Int) = 3
+        def f(a: T) => T:
+            a + 1
+        f(1)
+    "};
+    let errors = compile_errors(&program(root, &[]));
+    assert!(errors.contains("introduces a mutable"), "{errors}");
+    assert!(
+        errors.contains("annotated as T, but inferred as Int"),
+        "{errors}"
+    );
 }

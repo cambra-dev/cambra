@@ -1430,6 +1430,83 @@ where
     recursive(|stmt| {
         let expr = expression();
 
+        // Recovery skips a failed statement's whole extent, and every layout
+        // token in it in balanced pairs. A layout token left behind closes the
+        // enclosing block early, or at the top level matches nothing and fails
+        // the whole module; one taken without its partner does the same to the
+        // partner. See `chl-parser/design-chl-parser.md`, "Statement-level
+        // recovery".
+        //
+        // Recovery must also consume a token before succeeding. Otherwise
+        // repeated statements can make no progress.
+        let skip_indented_block = nested_delimiters(Token::Indent, Token::Dedent, [], |_span| ());
+        // `pub` is no part of this extent: `pub_stmt` parses the statement
+        // after it, whose own recovery starts at the `BlockValueIndent`.
+        let skip_block_value = nested_delimiters(
+            Token::BlockValueIndent,
+            Token::BlockValueDedent,
+            [],
+            |_span| (),
+        );
+        let line_token = none_of([
+            Token::Newline,
+            Token::Indent,
+            Token::Dedent,
+            Token::BlockValueIndent,
+            Token::BlockValueDedent,
+        ]);
+        let skip_to_newline = line_token
+            .clone()
+            .repeated()
+            .at_least(1)
+            .then_ignore(just(Token::Newline).or_not());
+        let skip_line_and_block = skip_to_newline.then(skip_indented_block.clone().or_not());
+        let skip_chain = choice((just(Token::Elif), just(Token::Else)))
+            .then(skip_line_and_block.clone())
+            .repeated();
+        let skip_statement = choice((
+            skip_block_value.clone(),
+            skip_indented_block.clone(),
+            skip_line_and_block.then(skip_chain).ignored(),
+        ));
+        // A production's head has already consumed input. Its tail may stop at a
+        // synchronization token without consuming it; the enclosing block owns its closer.
+        let skip_rhs = line_token.repeated().ignored();
+        let skip_tail = skip_rhs
+            .clone()
+            .then_ignore(just(Token::Newline).or_not())
+            .then_ignore(skip_indented_block.or_not());
+        let stmt_terminator = choice((
+            just(Token::Semi).then_ignore(just(Token::Newline).or_not()),
+            just(Token::Newline),
+        ));
+        let statement_end = stmt_terminator.clone().rewind();
+        let value_expr = expr
+            .clone()
+            .then_ignore(statement_end.clone())
+            .recover_with(via_parser(
+                skip_rhs
+                    .clone()
+                    .map_with(|_, e| Spanned::new(e.span(), Expr::Error)),
+            ));
+        let annotation_expr = expr
+            .clone()
+            .then_ignore(one_of([Token::Eq, Token::ColonEq, Token::Newline, Token::Semi]).rewind())
+            .recover_with(via_parser(
+                none_of([
+                    Token::Eq,
+                    Token::ColonEq,
+                    Token::Newline,
+                    Token::Semi,
+                    Token::Indent,
+                    Token::Dedent,
+                    Token::BlockValueIndent,
+                    Token::BlockValueDedent,
+                ])
+                .repeated()
+                .map_with(|_, e| Spanned::new(e.span(), Expr::Error)),
+            ));
+
         // A block is either:
         //   - NEWLINE INDENT stmt+ DEDENT     (Python-style indented body)
         //   - or a single simple statement on the same line: `if x: y`
@@ -1566,20 +1643,26 @@ where
         // ---- module statements: import, run, param ------------------
         // (`docs/chl-spec.md`, "9.2 Imports", "9.3 Runs", "9.4 Parameters")
         let binder = select! { Token::Ident(s) => s }.map_with(|s, e| Spanned::new(e.span(), s));
-        let module_alias = just(Token::As)
-            .ignore_then(binder.validate(|name, _, emitter| {
-                if is_type_name(&name.node) {
-                    emitter.emit(Rich::custom(
-                        name.span,
-                        format!(
-                            "`{}` is capitalized, which names a type; a module or run \
+        let alias_name = binder.validate(|name, _, emitter| {
+            if is_type_name(&name.node) {
+                emitter.emit(Rich::custom(
+                    name.span,
+                    format!(
+                        "`{}` is capitalized, which names a type; a module or run \
                              name begins with a lowercase letter",
-                            name.node
-                        ),
-                    ));
-                }
-                name
-            }))
+                        name.node
+                    ),
+                ));
+            }
+            name
+        });
+        let module_alias = just(Token::As).ignore_then(alias_name).or_not();
+        let recovered_alias = just(Token::As)
+            .ignore_then(
+                alias_name
+                    .map(Some)
+                    .recover_with(via_parser(skip_rhs.clone().to(None))),
+            )
             .or_not();
         let use_item = binder
             .then(just(Token::As).ignore_then(binder).or_not())
@@ -1624,43 +1707,75 @@ where
             .allow_trailing()
             .collect::<Vec<_>>()
             .delimited_by(just(Token::LParen), just(Token::RParen))
+            .map(Ok)
+            .recover_with(via_parser(nested_delimiters(
+                Token::LParen,
+                Token::RParen,
+                [],
+                |_| Err(()),
+            )))
             .or_not()
-            .map(Option::unwrap_or_default);
+            .map(|args| args.unwrap_or_else(|| Ok(Vec::new())));
 
-        let import_stmt = just(Token::Import)
-            .ignore_then(module_path())
-            .then(module_args.clone())
-            .then(module_alias.clone())
-            .then(use_clause.clone())
-            .map_with(|(((path, args), alias), uses), e| {
-                Spanned::new(
-                    e.span(),
+        let module_parts = module_path()
+            .then(module_args)
+            .then(recovered_alias)
+            .then(
+                use_clause
+                    .map(Some)
+                    .recover_with(via_parser(skip_rhs.clone().to(None))),
+            )
+            .then(
+                statement_end
+                    .clone()
+                    .to(true)
+                    .recover_with(via_parser(skip_rhs.clone().to(false))),
+            );
+        let module_stmt = one_of([Token::Import, Token::Run])
+            .then(module_parts)
+            .map_with(|(keyword, ((((path, args), alias), uses), ended)), e| {
+                let broken =
+                    args.is_err() || uses.is_none() || !ended || matches!(alias, Some(None));
+                let unknown_alias = matches!(alias, Some(None));
+                let alias = alias.flatten();
+                let stmt = if broken {
+                    let unknown = unknown_alias;
+                    let modules = if unknown {
+                        Vec::new()
+                    } else {
+                        alias
+                            .as_ref()
+                            .map(|a| a.node.clone())
+                            .or_else(|| path.segments.last().map(|s| s.node.clone()))
+                            .into_iter()
+                            .collect()
+                    };
+                    let binds = uses
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|u| u.alias.as_ref().unwrap_or(&u.name).node.clone())
+                        .collect();
+                    failed_statement(binds, false, modules, unknown)
+                } else if keyword == Token::Import {
                     Stmt::Import {
                         path,
-                        args,
+                        args: args.unwrap(),
                         alias,
-                        uses,
-                    },
-                )
-            });
-
-        let run_stmt = just(Token::Run)
-            .ignore_then(module_path())
-            .then(module_args)
-            .then(module_alias.clone())
-            .then(use_clause)
-            .map_with(|(((path, args), alias), uses), e| {
-                Spanned::new(
-                    e.span(),
+                        uses: uses.unwrap(),
+                    }
+                } else {
                     Stmt::Run {
                         path,
-                        args,
+                        args: args.unwrap(),
                         alias,
-                        uses,
+                        uses: uses.unwrap(),
                         renamed_from: None,
-                    },
-                )
+                    }
+                };
+                Spanned::new(e.span(), stmt)
             });
+
+        let run_stmt = just(Token::Run).rewind().ignore_then(module_stmt.clone());
 
         // A capitalized parameter is a type parameter, known through a bound
         // (`<:`); a lowercase one is a value, known through its exact type
@@ -1671,10 +1786,19 @@ where
                 annotation_mode()
                     .then(expr.clone())
                     .map(|(mode, ty)| TypeAnnotation { mode, ty })
-                    .or_not(),
+                    .or_not()
+                    .then(just(Token::Eq).ignore_then(value_expr.clone()).or_not())
+                    .then_ignore(statement_end.clone())
+                    .map(Some)
+                    .recover_with(via_parser(skip_rhs.clone().to(None))),
             )
-            .then(just(Token::Eq).ignore_then(expr.clone()).or_not())
-            .validate(|((name, annotation), default), e, emitter| {
+            .validate(|(name, tail), e, emitter| {
+                let Some((annotation, default)) = tail else {
+                    return Spanned::new(
+                        e.span(),
+                        failed_statement(vec![name.node], false, Vec::new(), false),
+                    );
+                };
                 let is_type = is_type_name(&name.node);
                 match annotation.as_ref().map(|a| a.mode) {
                     Some(AnnotationMode::Bounded) if !is_type => emitter.emit(Rich::custom(
@@ -1955,28 +2079,38 @@ where
                     .allow_trailing()
                     .collect::<Vec<_>>()
                     .try_map(|items, _| split_params(items))
-                    .delimited_by(just(Token::LParen), just(Token::RParen)),
+                    .delimited_by(just(Token::LParen), just(Token::RParen))
+                    .then(just(Token::DoubleArrow).ignore_then(expr.clone()).or_not())
+                    .then(requires_clause(expr.clone()).or_not())
+                    .then_ignore(just(Token::Colon))
+                    .then(block.clone())
+                    .map(Some)
+                    .recover_with(via_parser(skip_tail.clone().to(None))),
             )
-            .then(just(Token::DoubleArrow).ignore_then(expr.clone()).or_not())
-            .then(requires_clause(expr.clone()).or_not())
-            .then_ignore(just(Token::Colon))
-            .then(block.clone())
-            .map_with(
-                |(((((owner, name), (type_params, params)), output), requires), body), e| {
-                    Spanned::new(
+            .map_with(|((owner, name), tail), e| {
+                let Some(((((type_params, params), output), requires), body)) = tail else {
+                    let name = owner.map_or_else(
+                        || name.node.clone(),
+                        |owner| format!("{}::{}", owner.node, name.node).into(),
+                    );
+                    return Spanned::new(
                         e.span(),
-                        Stmt::FunctionDef {
-                            owner,
-                            name,
-                            type_params,
-                            params,
-                            output,
-                            requires: requires.unwrap_or_default(),
-                            body,
-                        },
-                    )
-                },
-            );
+                        failed_statement(vec![name], false, Vec::new(), false),
+                    );
+                };
+                Spanned::new(
+                    e.span(),
+                    Stmt::FunctionDef {
+                        owner,
+                        name,
+                        type_params,
+                        params,
+                        output,
+                        requires: requires.unwrap_or_default(),
+                        body,
+                    },
+                )
+            });
 
         // ---- impl N(P…): ( [pub] def … | A = T )+ ----------------------
         // (`docs/chl-spec.md`, "Associated functions and methods" and "Declaring an instance")
@@ -2227,9 +2361,11 @@ where
         let expr_or_assign = bare_tuple
             .clone()
             .then(
-                assign_tail(expr.clone(), expr.clone())
+                assign_tail(value_expr.clone(), annotation_expr)
                     .or(declared)
-                    .or(empty().to(AssignTail::None)),
+                    .or(empty().to(AssignTail::None))
+                    .then_ignore(statement_end.clone())
+                    .recover_with(via_parser(skip_rhs.clone().to(AssignTail::Broken))),
             )
             .try_map_with(|(target, tail), e| assign_stmt(target, tail, e.span()));
 
@@ -2253,12 +2389,21 @@ where
         // `BlockValueDedent`. Consuming the closer here ends the statement, and
         // it is what a chain written at the statement's own column fails on:
         // that spelling closes the level before the chain's first line.
+        let skip_block_tail = choice((
+            skip_block_value,
+            none_of([Token::BlockValueIndent, Token::BlockValueDedent]).ignored(),
+        ))
+        .repeated()
+        .then_ignore(just(Token::BlockValueDedent));
         let block_value = choice((if_stmt.clone(), match_stmt.clone()))
             .then_ignore(just(Token::BlockValueDedent))
             .map(|stmt: Spanned<Stmt>| {
                 let span = stmt.span;
                 Spanned::new(span, Expr::Block(Box::new(stmt)))
-            });
+            })
+            .recover_with(via_parser(
+                skip_block_tail.map_with(|_, e| Spanned::new(e.span(), Expr::Error)),
+            ));
         let block_assign = just(Token::BlockValueIndent)
             .ignore_then(bare_tuple.clone())
             .then(assign_tail(block_value, expr.clone()))
@@ -2268,15 +2413,10 @@ where
         // one-liners: `x = 1; y = 2`). A statement followed by `;` may also
         // be the last on its line, in which case both `;` and the trailing
         // `Newline` are consumed.
-        let stmt_terminator = choice((
-            just(Token::Semi).then_ignore(just(Token::Newline).or_not()),
-            just(Token::Newline),
-        ));
         let simple_stmt = choice((
             return_stmt,
             pass_stmt,
-            import_stmt,
-            run_stmt,
+            module_stmt,
             param_stmt,
             expr_or_assign,
         ))
@@ -2321,120 +2461,12 @@ where
                 Spanned::new(e.span(), inner.node)
             });
 
-        // Recovery skips a failed statement's whole extent, and every layout
-        // token in it in balanced pairs. A layout token left behind closes the
-        // enclosing block early, or at the top level matches nothing and fails
-        // the whole module; one taken without its partner does the same to the
-        // partner. See `chl-parser/design-chl-parser.md`, "Statement-level
-        // recovery".
-        //
-        // Recovery must also consume a token before succeeding. Otherwise
-        // repeated statements can make no progress.
-        let skip_indented_block = nested_delimiters(Token::Indent, Token::Dedent, [], |_span| ());
-        // `pub` is no part of this extent: `pub_stmt` parses the statement
-        // after it, whose own recovery starts at the `BlockValueIndent`.
-        let skip_block_value = nested_delimiters(
-            Token::BlockValueIndent,
-            Token::BlockValueDedent,
-            [],
-            |_span| (),
-        );
-        let skip_to_newline = none_of([
-            Token::Newline,
-            Token::Indent,
-            Token::Dedent,
-            Token::BlockValueIndent,
-            Token::BlockValueDedent,
-        ])
-        .repeated()
-        .at_least(1)
-        .then_ignore(just(Token::Newline).or_not());
-        let skip_line_and_block = skip_to_newline.then(skip_indented_block.clone().or_not());
-        let skip_chain = choice((just(Token::Elif), just(Token::Else)))
-            .then(skip_line_and_block.clone())
-            .repeated();
-        // TODO(statement-expression-recovery): recover within each statement's expression
-        // parser rather than restating its binding grammar in `head` and `module_head`.
-        // First verify that expression recovery preserves the one-error-per-statement
-        // behavior of nested_block_recovery_reports_one_error_per_mistake.
-        // What the skipped statement binds, read off its head without consuming it, so
-        // the program below it reads the names as bound (`Stmt::Error`).
-        let name = select! { Token::Ident(s) => s };
-        let assigned = name
-            .separated_by(just(Token::Comma))
-            .at_least(1)
-            .collect::<Vec<_>>()
-            .then(choice((
-                just(Token::ColonEq).to(true),
-                one_of([Token::Eq, Token::CaretEq, Token::Colon]).to(false),
-            )));
-        let defined = just(Token::Def)
-            .ignore_then(name)
-            .map(|name| (vec![name], false));
-        let declared = just(Token::Const)
-            .or_not()
-            .ignore_then(just(Token::Param))
-            .ignore_then(name)
-            .map(|name| (vec![name], false));
-        let head = just(Token::BlockValueIndent)
-            .or_not()
-            .ignore_then(just(Token::Pub).or_not())
-            .ignore_then(choice((defined, declared, assigned)))
-            .rewind()
-            .or_not();
-        // An `import` or `run` head: the module name it binds, `None` when it is cut off after
-        // its `as`, and the names its `use` clause binds as far as it reads.
-        let module_head = one_of([Token::Import, Token::Run])
-            .ignore_then(
-                name.separated_by(just(Token::ColonColon))
-                    .at_least(1)
-                    .collect::<Vec<_>>(),
+        let stmt_recovery = skip_statement.map_with(|_, e| {
+            Spanned::new(
+                e.span(),
+                failed_statement(Vec::new(), false, Vec::new(), false),
             )
-            .then_ignore(nested_delimiters(Token::LParen, Token::RParen, [], |_span| ()).or_not())
-            .then(just(Token::As).ignore_then(name.or_not()).or_not())
-            .then(
-                just(Token::Use)
-                    .ignore_then(name.separated_by(just(Token::Comma)).collect::<Vec<_>>())
-                    .or_not(),
-            )
-            .map(|((path, alias), used)| {
-                let module = match alias {
-                    Some(alias) => alias,
-                    None => path.last().cloned(),
-                };
-                (module, used.unwrap_or_default())
-            })
-            .rewind()
-            .or_not();
-        let stmt_recovery = head
-            .then(module_head)
-            .then_ignore(choice((
-                skip_block_value,
-                skip_indented_block,
-                skip_line_and_block.then(skip_chain).ignored(),
-            )))
-            .map_with(|(head, module_head), e| {
-                let (mut binds, mut_assign) = head.unwrap_or_default();
-                let (modules, unknown_module) = match module_head {
-                    Some((module, used)) => {
-                        binds.extend(used);
-                        match module {
-                            Some(module) => (vec![module], false),
-                            None => (Vec::new(), true),
-                        }
-                    }
-                    None => (Vec::new(), false),
-                };
-                Spanned::new(
-                    e.span(),
-                    Stmt::Error {
-                        binds,
-                        mut_assign,
-                        modules,
-                        unknown_module,
-                    },
-                )
-            });
+        });
 
         choice((
             if_stmt,
@@ -2481,10 +2513,17 @@ where
 }
 
 /// Why `const` cannot stand on `stmt`, which is not a `param` that `const` is not already
-/// on, or `None` for a recovered [`Stmt::Error`], whose own parse error already reports it.
+/// on, or `None` for a recovered statement or right-hand side whose parse error reports it.
 fn const_refusal(stmt: &Stmt) -> Option<&'static str> {
     Some(match stmt {
         Stmt::Error { .. } => return None,
+        Stmt::Assign { value, .. }
+        | Stmt::AnnAssign { value, .. }
+        | Stmt::MutAssign { value, .. }
+            if matches!(value.node, Expr::Error) =>
+        {
+            return None;
+        }
         Stmt::Param { .. } => "`const` is written once",
         Stmt::Assign { .. } | Stmt::AnnAssign { .. } | Stmt::Pub { .. } => {
             "`const` marks a parameter, `const param x: T`; a binding is a constant when its \
@@ -2548,6 +2587,20 @@ fn pub_refusal(stmt: &Stmt) -> Option<&'static str> {
     Some(what)
 }
 
+fn failed_statement(
+    binds: Vec<SmolStr>,
+    mut_assign: bool,
+    modules: Vec<SmolStr>,
+    unknown_module: bool,
+) -> Stmt {
+    Stmt::Error {
+        binds,
+        mut_assign,
+        modules,
+        unknown_module,
+    }
+}
+
 /// Intermediate type used inside the statement-level expression dispatch.
 #[derive(Clone)]
 enum AssignTail {
@@ -2565,6 +2618,7 @@ enum AssignTail {
     Define(Spanned<Expr>),
     /// `: ty` / `<: ty` with nothing after it — a declaration.
     Declared(TypeAnnotation),
+    Broken,
     None,
 }
 
@@ -2890,6 +2944,27 @@ fn assign_stmt<'src>(
             target: to_target(target)?,
             annotation,
         },
+        AssignTail::Broken => {
+            fn names(target: &AssignTarget, out: &mut Vec<SmolStr>) {
+                match target {
+                    AssignTarget::Name(name) => out.push(name.clone()),
+                    AssignTarget::Tuple(parts) => parts.iter().for_each(|p| names(&p.node, out)),
+                    AssignTarget::Constructor(pattern) => out.extend(
+                        pattern
+                            .binders
+                            .iter()
+                            .flatten()
+                            .filter_map(|n| n.node.clone()),
+                    ),
+                    AssignTarget::Subscript { .. } | AssignTarget::Qualified(_) => {}
+                }
+            }
+            let mut binds = Vec::new();
+            if let Ok(target) = expr_to_assign_target(target) {
+                names(&target.node, &mut binds);
+            }
+            failed_statement(binds, false, Vec::new(), false)
+        }
         AssignTail::None => Stmt::Expr(target),
     };
     Ok(Spanned::new(span, stmt))
@@ -5517,7 +5592,7 @@ mod tests {
                         out << result
                     after = 2
                 "},
-                &["For(Error, Expr)", "Assign"],
+                &["For(Assign, Expr)", "Assign"],
             ),
             (
                 "a `match` right-hand side whose arms fail",
@@ -5531,7 +5606,7 @@ mod tests {
                         out << resp
                     after = 2
                 "},
-                &["For(Error, Expr)", "Assign"],
+                &["For(Assign, Expr)", "Assign"],
             ),
             (
                 "a broken `if` right-hand side header with an `else` chain",
@@ -5542,7 +5617,7 @@ mod tests {
                             2
                     y = 3
                 "},
-                &["Error", "Assign"],
+                &["Assign", "Assign"],
             ),
             (
                 "a broken `pub` block right-hand side",
@@ -5565,7 +5640,7 @@ mod tests {
                                 2
                         y = 3
                 "},
-                &["FunctionDef(Error, Assign)"],
+                &["FunctionDef(Assign, Assign)"],
             ),
             (
                 "a line at the chain's column after the `else` block",
@@ -5577,7 +5652,7 @@ mod tests {
                         z
                     y = 3
                 "},
-                &["Error", "Assign"],
+                &["Assign", "Assign"],
             ),
             (
                 "a broken `if` header with an `elif`/`else` chain",

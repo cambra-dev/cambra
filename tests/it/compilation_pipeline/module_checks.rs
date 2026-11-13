@@ -835,3 +835,72 @@ fn an_error_at_a_node_a_module_check_minted_has_a_span() {
     assert!(errors.contains("Unbound variable: 'sales'"), "{errors}");
     assert!(errors.contains("lib.cambra:1:46"), "{errors}");
 }
+
+/// Checking a file on its own, as `cambra check` and an editor do, reports its type errors past
+/// a parse, load or lowering error a placeholder stands in for (`docs/modules.md`, "Checking a
+/// module on its own").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_lowering_error("pub x: Mut(Int) = 3", "introduces a mutable")]
+#[case::a_parse_error("pub a = 1 +* 2", "found '*'")]
+#[case::a_loading_error("import nothere", "no module `nothere`")]
+fn checking_a_file_reports_its_type_errors_past_another_error(
+    #[case] first_line: &str,
+    #[case] first: &str,
+) {
+    let root = format!("{first_line}\npub y = [1, \"a\"]\n");
+    let program = program(&root, &[]);
+    let Err(errors) = check_program(&mut GlobalContext::default(), &program) else {
+        panic!("expected `{root}` not to check");
+    };
+    let messages: Vec<String> = errors.errors.iter().map(|e| e.message()).collect();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert!(messages[0].contains(first), "{messages:?}");
+    assert!(
+        messages[1].contains("The values that meet here have no common type"),
+        "{messages:?}"
+    );
+}
+
+#[rstest]
+#[case::missing(None)]
+#[case::partial(Some("pub broken = 1 +* 2"))]
+#[timeout(Duration::from_secs(10))]
+fn checking_unavailable_use_members_preserves_only_established_contracts(
+    #[case] library: Option<&str>,
+) {
+    let root = indoc! {r#"
+        import lib use Area, Shape, f, T
+        instance Area(Int):
+            def area(s):
+                1 + "skipped"
+        pub dependent = f(1)
+        pub constructed = Shape::circle(1)
+        pub typed: T = f(1)
+        pub healthy = 7
+        pub bad = [1, "a"]
+    "#};
+    let modules: Vec<_> = library.into_iter().map(|text| ("lib", text)).collect();
+    let result =
+        check_program(&mut GlobalContext::default(), &program(root, &modules)).unwrap_err();
+    let messages: Vec<_> = result.errors.iter().map(|error| error.message()).collect();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("The values that meet here have no common type")),
+        "{messages:?}"
+    );
+    let interface = result
+        .interface
+        .expect("healthy export establishes a contract");
+    assert!(interface.contains("pub healthy:"), "{interface}");
+    for absent in [
+        "pub dependent:",
+        "pub constructed:",
+        "pub typed:",
+        "pub bad:",
+    ] {
+        assert!(!interface.contains(absent), "{interface}");
+    }
+}

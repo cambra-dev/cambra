@@ -125,7 +125,9 @@ pub fn lower_for_check(program: &LoadedProgram, ctx: &mut LoweringContext) -> Ve
     for lowered in lowering.lowered.values().flatten() {
         ctx.declare_unopened_routes(&lowered.sinks);
     }
-    if lowering.errors.is_empty() {
+    // As in `lower_program`: linking found nothing wrong but statements the placeholder
+    // stands in for.
+    if lowering.errors.iter().all(LoweringError::has_stand_in) {
         lowering.check_all(order, ctx);
     }
     in_source_order(lowering.errors)

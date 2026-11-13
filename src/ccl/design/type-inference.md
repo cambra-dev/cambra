@@ -346,8 +346,11 @@ typed.
 The two checks that read the whole graph before coalesce stop a run too, each after reporting every
 failure it finds: the barrier check and the [operand-requirement
 sweep](#requirements-are-read-together-once). Inference starts over the same way, leaving out the
-innermost statement enclosing each failure's node (`failed_in_statements`). A failure no statement
-encloses leaves nothing out.
+statement owning each failure's node. Emission records that ownership while typing each definition
+or initializer, including copied annotation predicates and deferred method placeholders. Every
+pre-coalesce failure uses this record, including suppressed cascades. Each statement is selected
+once per run, so repeated failures cannot skip expression recovery and discard its declaration.
+A failure outside every statement leaves nothing out.
 
 A statement recovered from again as a stand-in stands in **bare** in the next run: its declared
 type is left out too, so the `let` binds at a poison and the `:=` at a history whose value type is
@@ -371,9 +374,13 @@ lowering error is marked, the passes reach the earlier of the requested output a
 parse, loading and lowering errors, and inference's errors are added to theirs. An undetermined type
 is not reported, as in a run that starts over.
 
-A module with lowering errors has no interface or linked chain and is not inferred. A value
-reference into it lowers to a placeholder. A lowering error without a placeholder stops compilation
-after lowering: the tree can be inconsistent outside a placeholder.
+A module whose lowering errors all have placeholders retains its interface and chain. Its own check
+and its importers read the same recovered declarations. Healthy exports and declared constraints
+remain usable, including known positions of partial types and function signatures. A missing entry
+in a partially parsed interface supplies a placeholder, since the parser may have omitted its
+declaration. Known private entries still enforce visibility. A lowering error without a placeholder
+stops compilation after lowering. Any parse, load or lowering error stops compilation after
+inference; a recovered chain never reaches later phases or execution.
 
 A module that did not load supplies placeholders for value and type references. A `use` member
 records an unavailable state when its declaration category cannot be determined. Constructor

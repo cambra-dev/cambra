@@ -307,17 +307,23 @@ least one token. This prevents a zero-progress success inside `repeated()` and l
 block consume its own closer without an additional diagnostic.
 `nested_block_recovery_reports_one_error_per_mistake` covers that boundary behavior.
 
-Before skipping, recovery reads the statement's head without consuming it (`rewind`), and the
-placeholder carries the names the head binds: `x = …`, `a, b = …`, `x: …`, `x ^= …`,
-`x := …`, `def f…` or `param x…`, after an optional `BlockValueIndent` and `pub`. A `:=` head is
-marked, since it writes a name already in scope rather than introducing it. An `import` or `run`
-head binds its module name, its `as` name or its path's last segment, and the names of its `use`
-clause; one cut off after its `as` binds a module name no one can read, and lowering then reads a
-qualifier that names no module as one it may be. A head that reads as none of these binds nothing.
-The program below the statement reads the names as bound, so a use of one is not reported as
-unbound (see [Threading partial ASTs through to lowering](#threading-partial-asts-through-to-lowering)).
-`statement_recovery_reads_the_binders_of_the_head` in `tests/it/chl_parser_roundtrip.rs` covers each
-head.
+Each binding production recovers its tail after parsing its own head. Assignments and
+parameters retain their normal statement form when their right-hand side becomes `Expr::Error`;
+usable annotations remain available to lowering. An unreadable assignment tail retains the
+names of its parsed target. An unreadable function header retains its function name in
+`Stmt::Error`, without inventing a parameter list. Imports and runs retain the module name and
+`use` aliases that their own parsers read; an unreadable `as` name records an unknown module
+binding. No separate grammar re-parses binding heads for recovery.
+
+The outer recovery binds no names when no production could read a head. Recovery after a parsed
+head can stop at a synchronization token without consuming it: the head already guarantees
+progress, and the enclosing block consumes its closer. The program below a failed declaration
+reads its known names as bound
+([Threading partial ASTs through to lowering](#threading-partial-asts-through-to-lowering)).
+`statement_recovery_reads_the_binders_of_the_head`,
+`statement_recovery_reads_the_module_a_head_binds`, and
+`nested_block_recovery_reports_one_error_per_mistake` in `tests/it/chl_parser_roundtrip.rs` cover
+binding retention and block boundaries.
 
 A semicolon terminates a valid simple statement, but is not a synchronization token for this
 recovery parser. Recovery can therefore discard later semicolon-separated text on the same
