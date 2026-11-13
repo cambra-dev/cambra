@@ -7,7 +7,7 @@ use crate::ccl::infer::api::RelatedPositions;
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
-use crate::ccl::ccl_utils::{PredMemo, canonical_cast_ty};
+use crate::ccl::ccl_utils::{PredMemo, canonical_cast_types};
 use crate::ccl::infer::InferError;
 use crate::ccl::infer::emit::{read_mut, read_through};
 use crate::ccl::infer::solver::barrier::EdgeReport;
@@ -2215,7 +2215,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         // born target's domain base a hole, which is what
         // [`type_element_reads_from_base`](crate::ccl::ccl_utils::type_element_reads_from_base)
         // types a predicate's element reads from. So the first read has to be the one that has a
-        // base, which is the one after [`canonical_cast_ty`] has put the view's bases on
+        // base, which is the one after [`canonical_cast_types`] has put the view's bases on
         // both slots.
         TypedExprNode::Cast { value, .. } => {
             coalesce_node(value, level, ctx);
@@ -2724,26 +2724,16 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     refresh_param_references(expr);
     refresh_lambda_param_slot(expr);
 
-    // A `Cast`'s `target` and its `expr.ty` converge on the **canonical cast
-    // type**: the coalesced view's *shape and bases*, carrying the refinements the
-    // *term* determines — the value's own domain refinements plus the target's born
-    // refinements (see `canonical_cast_ty`). Both slots share one `Type`, so
-    // planning compiles one predicate term and the post-inference check
-    // reconstructs the cast from a `target` that matches the recorded type.
+    // A cast's target and result share the coalesced view's shape and bases. The target
+    // keeps its born refinements; the result also includes the producer's restrictions.
+    // Keeping the two distinct lets Check reconstruct the result without applying the
+    // producer's filters twice.
     if matches!(expr.node, TypedExprNode::Cast { .. }) {
         let view = expr.ty.clone();
         if let TypedExprNode::Cast { value, target } = &mut expr.node {
-            // The *target* keeps exactly its born refinements (the assertion); the
-            // node *type* is the value's refinements joined with them (what the
-            // assertion yields on this value). Keeping the two distinct is
-            // load-bearing for the post-inference check, which recomputes the
-            // type as value-refinements ∪ target-refinements: a target that also carried
-            // the value's refinements would double-book them, and any divergence
-            // between the value's copy and the target's copy of one refinement
-            // would surface as a duplicated refinement in the recomputation.
-            let born = std::mem::replace(target, Type::Hole);
-            *target = canonical_cast_ty(&born, None, view.clone());
-            expr.ty = canonical_cast_ty(&born, Some(&value.ty), view);
+            let (born, result) = canonical_cast_types(target, &value.ty, view);
+            *target = born;
+            expr.ty = result;
         }
         // **Both slots' predicates, here and nowhere else.** They carry the view's bases
         // now, which is what a predicate's index spelling is answered from, and the memo

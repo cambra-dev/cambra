@@ -2811,13 +2811,9 @@ fn inferred_feed_rows_keep_a_shared_filtered_binding_in_a_branch() {
     );
 }
 
-/// Known compiler bug: the correlated keys and filtered payload survive history construction,
-/// then lambda elimination compares the payload's abstract domain with the literal's domain.
+/// The inner generator and its payload both depend on the positions around them.
 #[test]
-#[should_panic(
-    expected = "post-lambda-elim produced an invalid tree: [Type mismatch for collection domain"
-)]
-fn correlated_inner_payload_reaches_the_existing_lambda_elim_domain_failure() {
+fn correlated_inner_payload_preserves_its_dependent_domains() {
     check_scalar(
         indoc! {r#"
             source = [1, 2, 3]
@@ -2831,4 +2827,43 @@ fn correlated_inner_payload_reaches_the_existing_lambda_elim_domain_failure() {
         "#},
         Value::Int(14),
     );
+}
+
+#[rstest]
+#[case::mapped_inner_source(indoc! {r#"
+    source = [1, 2, 3]
+    x := 0
+    out: Feed(_)
+    for i in [1, 2, 3]:
+        for j in [k + i for k in source if k >= i]:
+            out << [z for z in [1, 2, 3, 4, 5] if z > j]
+        x += 1
+    sum([sum(row) for row in out]) + x
+"#}, 34)]
+#[case::three_dependent_loops(indoc! {r#"
+    source = [1, 2, 3]
+    x := 0
+    out: Feed(_)
+    for i in [1, 2]:
+        for j in [k for k in source if k >= i]:
+            for h in [k for k in source if k > j]:
+                out << [z for z in source if z > h]
+        x += 1
+    sum([sum(row) for row in out]) + x
+"#}, 5)]
+#[case::empty_inner_sources(indoc! {r#"
+    source = [1, 2, 3]
+    x := 0
+    out: Feed(_)
+    for i in [4, 5]:
+        for j in [k for k in source if k >= i]:
+            out << [z for z in source if z > j]
+        x += 1
+    sum([sum(row) for row in out]) + x
+"#}, 2)]
+fn correlated_inner_payload_keeps_mapped_and_nested_domains(
+    #[case] program: &str,
+    #[case] expected: i64,
+) {
+    check_scalar(program, Value::Int(expected));
 }
