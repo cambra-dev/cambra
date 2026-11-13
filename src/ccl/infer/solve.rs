@@ -3,7 +3,6 @@
 // See `src/ccl/design/type-inference.md`, "Coalesce ordering and read stability".
 
 use crate::ccl::Label;
-use crate::ccl::infer::api::RelatedPositions;
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
@@ -54,12 +53,7 @@ fn push_coalesce_err(errors: &mut Vec<LocatedInferError>, new_err: InferError, b
     {
         return;
     }
-    errors.push(LocatedInferError {
-        error: new_err,
-        node_id: blame,
-        also: Box::default(),
-        related: RelatedPositions::default(),
-    });
+    errors.push(LocatedInferError::new(new_err, blame));
 }
 
 /// State for coalescing and in-walk specialization.
@@ -1591,15 +1585,7 @@ pub(super) fn push_barrier_failures(
                     Some(EdgeReport::Labeled(at)) => map_constrain_err(error, at),
                     None => map_constrain_err(error, label),
                 };
-                errors.push(
-                    LocatedInferError {
-                        error,
-                        node_id: node,
-                        also: Box::default(),
-                        related: RelatedPositions::default(),
-                    }
-                    .with_failure(failure),
-                );
+                errors.push(LocatedInferError::new(error, node).with_failure(failure));
             }
         }
     }
@@ -1726,30 +1712,26 @@ fn check_scope_valid_go(expr: &Expr, scope: &BTreeSet<Name>, errors: &mut Vec<Lo
     // only the witnesses its own sums bind. Checked on the complete tree, after coalescing has
     // settled every type.
     if crate::ccl::ty::has_free_witness_ref(&expr.ty, &[]) {
-        errors.push(LocatedInferError {
-            error: InferError::ScopeViolation {
+        errors.push(LocatedInferError::new(
+            InferError::ScopeViolation {
                 at: symbolic(expr),
                 ty: Box::new(expr.ty.clone()),
                 unbound: vec!["a witness reference free in its node's type".to_string()],
             },
-            node_id: expr.node_id(),
-            also: Box::default(),
-            related: RelatedPositions::default(),
-        });
+            expr.node_id(),
+        ));
     }
 
     let unbound = crate::ccl::subst::scope_gaps(&expr.ty, |n| scope.contains(n));
     if !unbound.is_empty() {
-        errors.push(LocatedInferError {
-            error: InferError::ScopeViolation {
+        errors.push(LocatedInferError::new(
+            InferError::ScopeViolation {
                 at: symbolic(expr),
                 ty: Box::new(expr.ty.clone()),
                 unbound: unbound.iter().map(|n| n.to_string()).collect(),
             },
-            node_id: expr.node_id(),
-            also: Box::default(),
-            related: RelatedPositions::default(),
-        });
+            expr.node_id(),
+        ));
     }
     // The binders are the ones `for_each_scoped_item` states for every node, so a node that
     // introduces one is checked under it without this walk restating which nodes bind. A
@@ -3858,13 +3840,8 @@ pub(super) fn specialize_use(
         // Blamed on the use site, which is the node whose demanded type the pin
         // failed to satisfy, and the node this specialization's recording names.
         ctx.errors.push(
-            LocatedInferError {
-                error: map_constrain_err(e, PIN_LABEL),
-                node_id: use_expr.node_id(),
-                also: Box::default(),
-                related: RelatedPositions::default(),
-            }
-            .with_failure(cache.take_failure()),
+            LocatedInferError::new(map_constrain_err(e, PIN_LABEL), use_expr.node_id())
+                .with_failure(cache.take_failure()),
         );
     }
 

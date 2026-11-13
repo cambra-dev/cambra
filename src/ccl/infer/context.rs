@@ -312,15 +312,13 @@ pub(super) struct DeferredMethod {
 impl DeferredMethod {
     /// The error for a call whose receiver's type never arrived.
     pub(super) fn unresolved(&self) -> LocatedInferError {
-        LocatedInferError {
-            error: InferError::UnresolvedMethod {
+        LocatedInferError::new(
+            InferError::UnresolvedMethod {
                 method: self.obligation.trait_.name().to_string(),
                 receiver: None,
             },
-            node_id: self.node,
-            also: Box::default(),
-            related: crate::ccl::infer::RelatedPositions::default(),
-        }
+            self.node,
+        )
     }
 }
 
@@ -2210,12 +2208,10 @@ impl Typing for InferCtx {
             return None;
         }
         let err = crate::ccl::infer::solve::resolve_var_type(&binding.scheme.body).err()?;
-        Some(LocatedInferError {
-            error: crate::ccl::infer::map_coalesce_err(err, name.base()),
-            node_id: binding.defined_at,
-            also: Box::default(),
-            related: crate::ccl::infer::RelatedPositions::default(),
-        })
+        Some(LocatedInferError::new(
+            crate::ccl::infer::map_coalesce_err(err, name.base()),
+            binding.defined_at,
+        ))
     }
 
     fn is_generalizable(&self, def: &Expr) -> bool {
