@@ -546,6 +546,9 @@ and binder `user_annotation` slots before downstream passes. No persistent `decl
 the binder's resolved `ty` is the type at which references are bound. See
 [the binder slot](type-inference.md#the-binder-slot-and-why-annotations-do-not-outlive-inference).
 
+`BindingRole` distinguishes a source function's outer parameter from generated curried
+continuations. Contribution inference uses these roles to retain the common signature scope.
+
 `NodeId` tracks provenance, not expression equality: `TypedExpr` comparison ignores it.
 `Clone` freshens node identities, while `clone_preserving_ids` and `preserve` are explicit paths
 for carrying an existing identity through a rebuild. A substitution's in-place replacement keeps

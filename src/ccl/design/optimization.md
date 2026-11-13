@@ -89,7 +89,7 @@ under the binders enclosing the call, a transparent `let` at its definition too
 ([The scope a query runs in](type-inference.md#the-scope-a-query-runs-in)): an argument naming a
 binder, `__anf + 2` where `__anf = 1 + 3`, is decided by what the binder is. For
 multi-argument UDFs lowered with a tuple parameter, substitution can leave
-`Apply(Tuple(...), Proj(Index(i)))`. A tuple that holds a function is folded here
+`Apply(Tuple(...), Proj(Index(i)))`. A tuple that holds a function or feed handle is folded here
 ([Functions held in products](#functions-held-in-products)), and
 `simplify::try_literal_tuple_projection` folds every other such shape later. Both folds read only a
 bare literal, so beta-reduction floats the `Let` chain wrapping an argument out around the reduced
@@ -133,23 +133,27 @@ domain mismatch.
 ### Functions held in products
 
 A tuple or record that holds a function has no tile, because a tile carries values and not
-functions. The inliner takes such a product apart until each function it holds sits in call
-position, where it inlines as a let-bound one does. A product **holds a compute function** when
-one of its components is a compute function or is itself a product holding one
-(`holds_compute_function`).
+functions. One that holds a feed handle hides the handle from `channelize`, which resolves a
+feed's target through `Var` aliases only. The inliner takes such a product apart until each
+function it holds sits in call position, where it inlines as a let-bound one does, and each handle
+it holds is an alias of its channel. A product **holds a function or feed handle** when one of its
+components is a compute function or a feed handle, or is itself a product holding one
+(`holds_function_or_feed`).
 
 Two rewrites do it:
 
 - **A projection of a literal is folded.** `(𝑎₀, …, 𝑎ₙ).𝑖` becomes `𝑎ᵢ`, and likewise a record
-  literal's field, when the literal holds a compute function (`fold_product_projection`). The
-  literal is folded whichever component is read: folding only the function components would leave
-  `(f=𝑔, k=1).k` with `𝑔` inside it. This is how a function passed to a multi-argument function
-  reaches its call, since the parameter is a component of the argument tuple.
+  literal's field, when the literal holds a function or feed handle (`fold_product_projection`).
+  The literal is folded whichever component is read: folding only the function and handle
+  components would leave `(f=𝑔, k=1).k` with `𝑔` inside it. This is how a function or handle
+  passed to a multi-argument function reaches its use, since the parameter is a component of the
+  argument tuple.
 - **A let-bound literal is split.** `let 𝑟 = (𝑘₀=𝑎₀, …) in body` becomes one `let` per component,
   with each `𝑟.𝑘ᵢ` in the body replaced by that component's binder (`split_product_let`). A
-  function component then inlines, and a collection component stays bound once, so nothing is
-  recomputed per use. The split applies only when every use of `𝑟` is a projection. A whole use,
-  such as `𝑟` placed in a list, leaves the binding as it is.
+  function component then inlines, a handle component is an alias of its channel, and a
+  collection component stays bound once, so nothing is recomputed per use. The split applies only
+  when every use of `𝑟` is a projection. A whole use, such as `𝑟` placed in a list, leaves the
+  binding as it is.
 
 A lambda that reaches call position through a fold, as in `use(\x -> x + 1, 1)`, is beta-reduced
 there (`beta_reduce_folded_call`). A lambda written in call position is not this case: lowering

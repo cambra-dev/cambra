@@ -804,6 +804,7 @@ fn reduce_application(
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
                     site: None,
+                    role: Default::default(),
                 };
                 Some(
                     Expr::throwaway(TypedExprNode::Lambda {
@@ -957,6 +958,7 @@ fn normal_lambda(name: Name, body: Expr, ty: &Type) -> Expr {
         user_annotation: None,
         transparency: BindingTransparency::Transparent,
         site: None,
+        role: Default::default(),
     };
     Expr::throwaway(TypedExprNode::Lambda {
         param,
@@ -1050,6 +1052,7 @@ fn read_eliminated_match(argument: &Expr, ty: &Type, fuel: &mut usize) -> Option
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
                     site: None,
+                    role: Default::default(),
                 },
                 empty_payload: false,
             }),
@@ -2004,6 +2007,7 @@ pub(crate) fn indexed_loop(position: Option<Name>, source: Expr, step: Expr) -> 
         user_annotation: None,
         transparency: BindingTransparency::Transparent,
         site: None,
+        role: Default::default(),
     };
     let named = Type::Fun {
         name: Some(position.name.clone()),
@@ -2980,6 +2984,74 @@ pub fn refine_with_bare(base: Type, bare_predicate: &Expr) -> Type {
 /// [`Expr::walk_type_slots`] does.
 pub fn count_free(name: &Name, expr: &Expr) -> usize {
     crate::ccl::free_names::count(name, expr, crate::ccl::free_names::EVERY_READ)
+}
+
+/// A named binding or an expression being followed through transparent products.
+#[derive(Clone, Copy)]
+pub(crate) enum ValueReference<'a> {
+    Name(&'a Name),
+    Expr(&'a Expr),
+}
+
+/// Follow aliases and select literal-product components. A whole product or a computed
+/// definition stays named; an unknown projection stops at the binding that supplies its value.
+pub(crate) fn resolve_product_reference<'a>(
+    mut value: ValueReference<'a>,
+    definition: impl Fn(&Name) -> Option<&'a Expr>,
+) -> ValueReference<'a> {
+    let mut path = Vec::new();
+    let mut local = HashMap::new();
+    loop {
+        match value {
+            ValueReference::Name(name) => {
+                let Some(expr) = local.get(name).copied().or_else(|| definition(name)) else {
+                    return value;
+                };
+                let follows = matches!(expr.node, TypedExprNode::Var(_))
+                    || matches!(&expr.node, TypedExprNode::Apply { function, .. }
+                        if matches!(function.node, TypedExprNode::Proj(_)))
+                    || (!path.is_empty()
+                        && matches!(
+                            expr.node,
+                            TypedExprNode::Tuple(_)
+                                | TypedExprNode::Record(_)
+                                | TypedExprNode::Let { .. }
+                                | TypedExprNode::ExprStmt { .. }
+                        ));
+                if !follows {
+                    return value;
+                }
+                value = ValueReference::Expr(expr);
+            }
+            ValueReference::Expr(expr) => match &expr.node {
+                TypedExprNode::Var(name) => value = ValueReference::Name(name),
+                TypedExprNode::Let {
+                    binding,
+                    bound_expr,
+                    body,
+                } => {
+                    if binding.transparency == BindingTransparency::Transparent {
+                        local.insert(&binding.name, bound_expr.as_ref());
+                    }
+                    value = ValueReference::Expr(body);
+                }
+                TypedExprNode::ExprStmt { body, .. } => value = ValueReference::Expr(body),
+                TypedExprNode::Apply { argument, function }
+                    if let TypedExprNode::Proj(key) = &function.node =>
+                {
+                    path.push(key);
+                    value = ValueReference::Expr(argument);
+                }
+                _ => {
+                    let Some(component) = path.pop().and_then(|key| expr.product_component(key))
+                    else {
+                        return value;
+                    };
+                    value = ValueReference::Expr(component);
+                }
+            },
+        }
+    }
 }
 
 /// Returns `true` if `name` appears free anywhere in `expr` — either in

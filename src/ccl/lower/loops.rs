@@ -1444,6 +1444,7 @@ fn lower_nested_loop(
                 transparency: BindingTransparency::Transparent,
                 // The loop's place, which names the stores of the variables it writes.
                 site: Some(ctx.places.site(target.span)),
+                role: Default::default(),
             },
             iter: Box::new(source),
             body: Box::new(chain),
@@ -1543,6 +1544,7 @@ pub(super) fn lower_direct_mirror_loop(
                 transparency: BindingTransparency::Transparent,
                 // The loop's place, which names the stores of the variables it writes.
                 site: Some(ctx.places.site(target.span)),
+                role: Default::default(),
             },
             iter: Box::new(source),
             body: Box::new(chain),

@@ -4002,6 +4002,7 @@ pub(super) fn lower_try_over(
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
+                role: Default::default(),
             },
             body: handler_body,
         });
@@ -6053,6 +6054,7 @@ pub(super) fn lower_match_over(
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
                     site: None,
+                    role: Default::default(),
                 },
                 empty_payload,
             }),

@@ -241,7 +241,7 @@ impl DeferError {
             DeferError::UnreachedFeedHandle(_) => "this feeds a feed taken out of a data \
                  structure, which this compiler does not follow back to the feed's \
                  declaration, so what it is fed would be lost; a feed reaches its declaration \
-                 out of a tuple literal whose every element is a literal, a source or a feed"
+                 out of a tuple or record literal that is used only through projections"
                 .into(),
             DeferError::GatedValueReadsItsIteration(_) => "a feed whose value's type depends \
                  on the iteration it is fed in, under a condition on a value the loop computes, \
@@ -2372,6 +2372,7 @@ fn channelize_cluster(
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
                     site: None,
+                    role: Default::default(),
                 },
                 channel,
             ));
