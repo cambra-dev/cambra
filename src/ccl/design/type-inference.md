@@ -316,9 +316,11 @@ initializer, or an expression statement. That statement's rule records the error
 continuation (`Typing::recover`), so emission reports at most one error per statement, in source
 order.
 
-A `let` whose definition failed binds its name at the type an exact annotation declares, when it
-has one and `bind_annotation` accepts it, so its uses are typed against what the program states.
-Otherwise it binds the name at a poison: a fresh variable minted one level inside the binding and
+A `let` whose definition failed retains the constraints its annotation declares, provided the
+annotation's predicates type. An exact annotation supplies its stated type, with fresh variables
+at holes. A bounded annotation supplies its upper bound: no initializer type remains to infer a
+narrower subtype. Neither is reconciled against the failed initializer's partial constraints.
+Otherwise the name binds at a poison: a fresh variable minted one level inside the binding and
 generalized. Each use of a poisoned binding instantiates its own copy, so uses that demand different
 types of the failed definition do not conflict. A rule that needs a value's shape as it emits, such
 as the checked lookup `m[k]`, still fails on the bare variable, so `Typing::recover` drops the
@@ -336,9 +338,10 @@ instead starts over (`run_with_params`), in a restarted arena, on a copy of the 
 before emission (`clone_preserving_ids`), in which the expression of each statement recovered from
 is the `Error` stand-in: a `let`'s right-hand side, an expression statement's expression, a `:=`'s
 initializer, a `def` group member's definition. A statement rule types a stand-in as it types a
-failed expression, without reporting it (`Typing::stand_in`): the `let` binds at its exact
-annotation or at a poison, and the `:=` at its declared history. Coalesce does not descend into a
-stand-in. The graph of the second run holds exactly the constraints of the statements that typed.
+failed expression, without reporting it (`Typing::stand_in`): the `let` retains its annotation's
+constraints or binds at a poison, and the `:=` at its declared history. Coalesce does not descend
+into a stand-in. The graph of the second run holds exactly the constraints of the statements that
+typed.
 
 The two checks that read the whole graph before coalesce stop a run too, each after reporting every
 failure it finds: the barrier check and the [operand-requirement
@@ -378,6 +381,17 @@ value, and they can raise nothing else, since removing constraints removes confl
 An error matching an earlier run's `InferError::same_defect` at the same node is not added. Restart
 copies preserve node identities. Equal messages at different nodes remain separate reports: a later
 run can uncover an independent failure at another site.
+
+Module checks continue recovery after coalescing failures too. `RunOutcome` keeps the errors and
+the last successful run's result together. It also returns the tree before emission for tracing
+earlier errors without retaining another snapshot. That run supplies partial contracts and its
+recovered tree. A failed function retains explicit parameter and result constraints for diagnosing
+callers,
+including bounded and partial annotations. Complete declarations depend on their declared types
+rather than their bodies. An omitted body with no complete declaration establishes no inferred
+export contract (`unavailable_contracts`); its explicit constraints still check callers. The module
+checker carries the omitted statements to later copies of the module's code; see
+[modules.md, "Checking a module on its own"](../../../docs/modules.md#checking-a-module-on-its-own).
 
 Check mode shares the rules and does not recover at statements: its rules record a failed
 constraint and continue, and an error a rule returns ends the walk.
@@ -4171,8 +4185,9 @@ A value that fails deposits nothing and the pass goes on, so each failing value 
 whichever variable the pass reaches it from and however many rounds it takes.
 
 An obligation records the obligation it copied (`TraitObligation::copied_from`). A copy with the
-same candidate rows carries the parent's requirement; narrowing those rows establishes a distinct
-requirement for that instantiation. The sweep identifies an unsatisfiable intersection by these
+same candidate rows carries the parent's requirement (`TraitObligation::requirement_source`);
+narrowing those rows establishes a distinct requirement for that instantiation. The sweep identifies
+an unsatisfiable intersection by these
 requirement identities and operand positions, combining the variables of its copies before finding
 the node that owns the failure. A conflict containing every requirement of another conflict is a
 carrier too. Smaller conflicting sets are grouped first, independently of arena traversal order.

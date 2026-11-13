@@ -2069,25 +2069,38 @@ pub fn infer(
 /// Check `expr`, the check tree of a module checked on its own, with the
 /// module's type parameters `params` open throughout it (`docs/modules.md`,
 /// "Checking a module on its own"), and return the contract of each binding in
-/// `reported`. The tree is discarded, and no pass after inference runs on it.
+/// `reported`, alongside its errors. A successful recovery run retains established
+/// contracts; an omitted definition with no complete declaration supplies none. The tree
+/// is discarded, and no pass after inference runs on it.
 pub fn check_module(
     expr: &mut Expr,
     ctx: &mut TypeInferenceContext,
     params: &[super::ModuleCheckParam],
     reported: &HashSet<Name>,
-) -> Result<HashMap<Name, Contract>, Vec<LocatedInferError>> {
+) -> ModuleCheckResult {
     // The arena tears down every variable the check mints, as for `infer`.
     let mut arena = InferArena::new();
-    let (_, schemes, opened) = super::run_with_params(
+    let outcome = super::run_with_params(
         &mut arena,
         expr,
         &ctx.source_types,
         &ctx.instances,
         params,
         reported,
-    )?;
+        true,
+    );
+    let Some((_, schemes, opened)) = outcome.typed else {
+        return ModuleCheckResult {
+            before: outcome.before,
+            contracts: HashMap::new(),
+            has_typed_tree: false,
+            errors: outcome.errors,
+            recovered: outcome.recovered,
+        };
+    };
     let mut contracts: HashMap<Name, Contract> = schemes
         .into_iter()
+        .filter(|(name, _)| !outcome.unavailable.contains(name))
         .map(|(name, mut scheme)| {
             scheme.map_types(&mut |ty| write_opened(ty, &opened));
             (name, Contract::Scheme(scheme))
@@ -2095,13 +2108,43 @@ pub fn check_module(
         .collect();
     // A monomorphic binding's type is the one its uses settled.
     for binding in expr.chain_binders() {
-        if reported.contains(&binding.name) && !contracts.contains_key(&binding.name) {
+        if reported.contains(&binding.name)
+            && !outcome.unavailable.contains(&binding.name)
+            && !contracts.contains_key(&binding.name)
+            && !binding.ty.holds_type(&|ty| {
+                matches!(
+                    ty,
+                    Type::Infer(_)
+                        | Type::Hole
+                        | Type::SharedHole(_)
+                        | Type::BoundedHole(_)
+                        | Type::BarrierVar(_)
+                )
+            })
+        {
             let mut ty = binding.ty.clone();
             write_opened(&mut ty, &opened);
             contracts.insert(binding.name.clone(), Contract::Type(ty));
         }
     }
-    Ok(contracts)
+    ModuleCheckResult {
+        before: outcome.before,
+        contracts,
+        has_typed_tree: true,
+        errors: outcome.errors,
+        recovered: outcome.recovered,
+    }
+}
+
+/// Contracts retained after checking a module, alongside its errors and omitted statements.
+pub struct ModuleCheckResult {
+    pub(crate) before: Expr,
+    /// Contracts established by surviving definitions or complete declarations.
+    pub contracts: HashMap<Name, Contract>,
+    /// Errors from the module and every recovery run.
+    pub errors: Vec<LocatedInferError>,
+    pub(crate) has_typed_tree: bool,
+    pub(crate) recovered: HashMap<NodeId, super::StandIn>,
 }
 
 /// The contract a module's check infers for one of its public members

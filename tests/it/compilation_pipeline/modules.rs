@@ -1119,6 +1119,33 @@ fn a_reference_into_a_module_lowering_failed_in_hides_no_root_inference_error() 
     assert_eq!(report_count(&errors), 2, "{errors}");
 }
 
+/// A module whose own check fails hides no error of the root's: the program is inferred all
+/// the same, and an error naming the module's code is left to its check
+/// (`docs/modules.md`, "Checking a module on its own").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_module_whose_check_fails_hides_no_error_of_the_root() {
+    let library = indoc! {r#"
+        pub def f(x):
+            (x + 1, x + "s")
+    "#};
+    let root = indoc! {r#"
+        import lib
+        z = [2, "b"]
+        (lib::f(1), z)
+    "#};
+    let errors = compile_errors(&program(root, &[("lib", library)]));
+    assert!(
+        errors.contains("No type satisfies every requirement"),
+        "{errors}"
+    );
+    assert!(
+        errors.contains("The values that meet here have no common type"),
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
 /// A module two others import is evaluated once: its bindings stand once in the
 /// linked tree, ahead of both importers' (`docs/chl-spec.md`, "9.7 Importing
 /// asserts no IO and no state").
@@ -1230,4 +1257,265 @@ fn the_inspector_refuses_a_program_of_several_modules() {
         payload.contains("a program of several modules is not supported yet"),
         "{payload}"
     );
+}
+
+#[rstest]
+#[case::an_unrelated_join(
+    indoc! {r#"
+        pub def f(x):
+            x + 1
+        pub bad = [1, "a"]
+    "#},
+    "The values that meet here have no common type",
+)]
+#[case::an_unrelated_unbound_name(
+    indoc! {"
+        pub def f(x):
+            x + 1
+        pub bad = nope
+    "},
+    "Unbound variable: 'nope'",
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_module_defect_and_a_bad_use_are_both_reported(#[case] library: &str, #[case] defect: &str) {
+    let root = indoc! {r#"
+        import lib
+        x = lib::f("s")
+        x
+    "#};
+    let errors = compile_errors(&program(root, &[("lib", library)]));
+    assert!(errors.contains(defect), "{errors}");
+    assert!(
+        errors.contains("No Addable instance for this call"),
+        "{errors}"
+    );
+    assert!(errors.contains("required here"), "{errors}");
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_broken_function_keeps_its_declared_contract_for_bad_uses() {
+    let library = indoc! {"
+        pub def f(x: Int) => String:
+            x
+    "};
+    let root = indoc! {"
+        import lib
+        lib::f(True)
+    "};
+    let errors = compile_errors(&program(root, &[("lib", library)]));
+    assert!(errors.contains("Annotation mismatch"), "{errors}");
+    assert!(errors.contains("expected Int, found Bool"), "{errors}");
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_module_defect_does_not_hide_a_failure_inside_a_specialized_body() {
+    let library = indoc! {r#"
+        pub def f(c, a):
+            a if c else "s"
+        pub bad = [1, "a"]
+    "#};
+    let root = indoc! {"
+        import lib
+        lib::f(True, 1)
+    "};
+    let errors = compile_errors(&program(root, &[("lib", library)]));
+    assert_eq!(report_count(&errors), 2, "{errors}");
+    assert!(errors.contains("main.cambra"), "{errors}");
+}
+
+#[rstest]
+#[case::bounded_parameter(
+    indoc! {r#"
+        pub def f(x <: Int):
+            [1, "a"]
+    "#},
+    "lib::f(True)",
+)]
+#[case::bounded_partial_parameters(
+    indoc! {r#"
+        pub def f(x <: {Int, ..}, y):
+            [1, "a"]
+    "#},
+    "lib::f((True, 1), 1)",
+)]
+#[case::bounded_type_parameter(
+    indoc! {r#"
+        pub def f(T <: Int, x: T):
+            [1, "a"]
+    "#},
+    "lib::f(True)",
+)]
+#[case::partial_parameters(
+    indoc! {r#"
+        pub def f(x: Int, y):
+            [1, "a"]
+    "#},
+    "lib::f(True, 1)",
+)]
+#[case::partial_nested_parameter(
+    indoc! {r#"
+        pub def f(x: {Int, _}):
+            [1, "a"]
+    "#},
+    "lib::f((True, 1))",
+)]
+#[case::result_only(
+    indoc! {r#"
+        pub def f(x) => Int:
+            [1, "a"]
+    "#},
+    "answer: String = lib::f(1)",
+)]
+#[case::bounded_value(
+    indoc! {r#"
+        pub f <: Int = [1, "a"]
+    "#},
+    "answer: String = lib::f",
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_broken_definition_keeps_its_explicit_constraints(
+    #[case] library: &str,
+    #[case] caller: &str,
+    #[values(false, true)] valid: bool,
+) {
+    let caller = if valid {
+        caller
+            .replace("True", "1")
+            .replace("answer: String", "answer: Int")
+    } else {
+        caller.to_owned()
+    };
+    let root = indoc::formatdoc! {"
+        import lib
+        {caller}
+        1
+    "};
+    let errors = compile_errors(&program(&root, &[("lib", library)]));
+    assert!(errors.contains("lib.cambra:"), "{errors}");
+    assert_eq!(report_count(&errors), if valid { 1 } else { 2 }, "{errors}");
+    assert_eq!(errors.contains("main.cambra:2:"), !valid, "{errors}");
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn recovery_does_not_invent_constraints_for_unannotated_positions() {
+    let library = indoc! {r#"
+        pub def f(x: Int, y):
+            [1, "a"]
+    "#};
+    let root = indoc! {r#"
+        import lib
+        a: String = lib::f(1, True)
+        b: Int = lib::f(1, "s")
+        1
+    "#};
+    let errors = compile_errors(&program(root, &[("lib", library)]));
+    assert_eq!(report_count(&errors), 1, "{errors}");
+    assert!(errors.contains("lib.cambra:"), "{errors}");
+}
+
+#[rstest]
+#[case::exact(":")]
+#[case::bounded("<:")]
+#[timeout(Duration::from_secs(10))]
+fn a_failed_value_keeps_declared_components_and_freshens_unknown_ones(
+    #[case] mode: &str,
+    #[values(false, true)] valid: bool,
+) {
+    let library = indoc::formatdoc! {r#"
+        pub f {mode} {{Int, _}} = [1, "a"]
+    "#};
+    let first = if valid { "Int" } else { "Bool" };
+    let root = indoc::formatdoc! {r#"
+        import lib
+        a: {{{first}, String}} = lib::f
+        b: {{Int, Bool}} = lib::f
+        1
+    "#};
+    let errors = compile_errors(&program(&root, &[("lib", &library)]));
+    assert_eq!(report_count(&errors), if valid { 1 } else { 2 }, "{errors}");
+    assert!(errors.contains("lib.cambra:"), "{errors}");
+    assert_eq!(errors.contains("main.cambra:2:"), !valid, "{errors}");
+}
+
+#[rstest]
+#[case::only_rejected(false)]
+#[case::valid_sibling_remains_checked(true)]
+#[timeout(Duration::from_secs(20))]
+fn a_rejected_outer_run_omits_its_nested_copies(#[case] invalid_sibling_use: bool) {
+    let worker = indoc! {"
+        param T <: Int
+        param x: T
+        visits := x
+        visits := visits + 1
+        pub n = 1
+    "};
+    let mid = indoc! {"
+        param T <: Int
+        param x: T
+        run worker(T=T, x=x) as inner
+        pub n = inner::n
+    "};
+    let use_ = if invalid_sibling_use {
+        r#"good::n + "s""#
+    } else {
+        "1"
+    };
+    let root = formatdoc! {r#"
+        run mid(T=String, x="s") as bad
+        run mid(T=Int, x=1) as good
+        {use_}
+    "#};
+    let errors = compile_errors(&program(&root, &[("worker", worker), ("mid", mid)]));
+    assert_eq!(
+        report_count(&errors),
+        if invalid_sibling_use { 2 } else { 1 },
+        "{errors}"
+    );
+    assert!(!errors.contains("worker.cambra:"), "{errors}");
+}
+
+#[rstest]
+#[case::direct(false, false)]
+#[case::nested(true, false)]
+#[case::importer_stays_checked(false, true)]
+#[case::nested_importer_stays_checked(true, true)]
+#[timeout(Duration::from_secs(20))]
+fn a_rejected_run_reports_nothing_from_its_nonbinding_statements(
+    #[case] nested: bool,
+    #[case] invalid_importer: bool,
+) {
+    let worker = indoc! {"
+        param T <: Int
+        param x: T
+        visits := x
+        visits := visits + 1
+        x + 1
+        pub n = 1
+    "};
+    let mid = indoc! {r#"
+        run worker(T=String, x="s") as bad
+        pub n = 1
+    "#};
+    let declaration = if nested {
+        "run mid as bad"
+    } else {
+        r#"run worker(T=String, x="s") as bad"#
+    };
+    let use_ = if invalid_importer { r#"1 + "s""# } else { "1" };
+    let root = formatdoc! {"
+        {declaration}
+        {use_}
+    "};
+    let errors = compile_errors(&program(&root, &[("worker", worker), ("mid", mid)]));
+    assert_eq!(
+        report_count(&errors),
+        if invalid_importer { 2 } else { 1 },
+        "{errors}"
+    );
+    assert!(!errors.contains("worker.cambra:"), "{errors}");
 }

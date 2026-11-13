@@ -5558,6 +5558,9 @@ An inferred contract changes when its body changes. Every user in the engine is 
 so a breaking change surfaces there. A library author sees it in the interface `cambra check`
 prints. An annotation is how an author fixes the contract.
 
+When a check reports errors, it also prints the export contracts it established and exits with a
+failure status. An omitted definition with no complete declaration supplies no export contract.
+
 ### 9.15 Module files
 
 - The **module root** is the directory containing the root file.

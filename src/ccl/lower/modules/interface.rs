@@ -605,6 +605,15 @@ impl Interface {
     /// If `contracts` lacks a public value member's or associated function's: every
     /// one is a binder of the module's check tree.
     pub fn written(&self, contracts: &HashMap<SmolStr, Contract>) -> String {
+        self.write_contracts(contracts, false)
+    }
+
+    /// Write a failed check's interface, omitting values with no established contract.
+    pub(crate) fn written_established(&self, contracts: &HashMap<SmolStr, Contract>) -> String {
+        self.write_contracts(contracts, true)
+    }
+
+    fn write_contracts(&self, contracts: &HashMap<SmolStr, Contract>, partial: bool) -> String {
         let mut lines = vec![format!("module {}", self.module)];
         for parameter in &self.parameters {
             let stated = match &parameter.kind {
@@ -633,12 +642,14 @@ impl Interface {
         let mut members: Vec<(Span, String)> = Vec::new();
         for (name, member) in &self.members {
             if member.public {
-                let contract = contracts.get(name).unwrap_or_else(|| {
-                    panic!(
+                let Some(contract) = contracts.get(name) else {
+                    assert!(
+                        partial,
                         "module `{}`'s check found the public member `{name}`",
                         self.module
-                    )
-                });
+                    );
+                    continue;
+                };
                 // A caller writes a curried `def`'s arguments as one call's.
                 let contract = match member.history_param {
                     Some(arity) => contract.uncurried(arity),
@@ -672,12 +683,14 @@ impl Interface {
             for (function_name, function) in &member.functions {
                 if function.public {
                     let binding = format!("{name}::{function_name}");
-                    let contract = contracts.get(binding.as_str()).unwrap_or_else(|| {
-                        panic!(
+                    let Some(contract) = contracts.get(binding.as_str()) else {
+                        assert!(
+                            partial,
                             "module `{}`'s check found the public `{binding}`",
                             self.module
-                        )
-                    });
+                        );
+                        continue;
+                    };
                     let line = format!(
                         "pub {binding}: {}",
                         contract.written(self.module.segments())

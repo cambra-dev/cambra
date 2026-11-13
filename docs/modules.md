@@ -684,19 +684,48 @@ written as its module spells it (`error_key`), since each check holds its own co
 its own inference variables and its own names for the module's members. A check's error in another
 module's code is that module's own when its own check raised it. Otherwise the checked module's use
 raised it, and it carries a secondary label at the module's `import` or `run` statement that brings
-that code in (`ModuleCheck::reached_by`). A module whose own check passed is sound at the types
-its parameters declare, so an error a run raises in its code comes from an argument that does not
-fit them; where the statement bringing the code in has an error of its own, the module's error is
-dropped. A module whose check fails stops the compile before
-linking's inference. A module is checked against its dependencies' bodies, so each check infers them
-again; keeping each module's inferred schemes for its users would remove that cost.
+that code in (`ModuleCheck::reached_by`). A module whose check fails does not stop linking's
+inference: the program is inferred all the same and the compile stops after it. A module check
+returns its errors alongside the contracts established by its surviving definitions and complete
+declarations (`ModuleCheckResult`). Recovery also continues after coalescing errors. A successful
+recovery run supplies the remaining contracts and inferred parameter types; an omitted body with no
+complete declaration supplies no export contract.
+
+A run or import is rejected when an error of its declaring module's own check falls within the
+declaration's source span. `RunSites` records the nodes of each copy before linking appends its
+importer's continuation. Later checks and linked inference replace every statement of the rejected
+copy with a placeholder (`recover_rejected_runs`), including statements that bind no name and
+copies of runs nested within it. Invalid arguments establish no instance whose body can be checked.
+The module's independent check retains
+its own errors, and other instantiations and the importer's continuation remain checked.
+
+Statements rejected by a module's own check are omitted from later checks and the linked program's
+inference (`recover_checked_statements`). A statement's source span and declared binder identify it
+across copies of the module's code. A generated caller expression can trace to the definition's
+span without declaring its binder, so that expression remains checked. A failed function retains
+all explicit parameter and result constraints, including upper bounds and annotations with holes.
+An incorrect caller is checked against those constraints even when the implementation is broken.
+A complete declaration depends on the names in its declared types; reading a broken definition in
+its body does not discard that contract. Unknown portions of a recovered signature establish no
+inferred export contract. Definitions not selected for recovery retain their bodies, since
+specialization can reject a use in ways their signatures do not express. A diagnostic's secondary
+label in a broken module suppresses nothing: the
+label can name a valid requirement that the caller violates.
+
+A module with lowering errors of its own has no check, and its code is not linked, so its type
+errors are not reported until its lowering errors are fixed. A module is checked against its
+dependencies' bodies, so each check infers them again; keeping each module's inferred schemes for
+its users would remove that cost.
 
 `cambra check lib.cambra` checks a file on its own (`check_program`). It lowers the file as a module
 rather than as a root (`lower_for_check`), so its parameters need no defaults, and links nothing: it
 checks each module the file reaches and then the file. Each route a module declares is a source
 that opens nothing, so the check binds no port. It prints the file's interface
 (`Interface::written`): each parameter with its type, bound, or Module type, then each public member
-in the order declared. A value's contract is its annotation or the type it infers, a generalized
+in the order declared. A failed check prints established contracts alongside its diagnostics and
+exits unsuccessfully. Values whose omitted definitions establish no complete contract are absent
+from this partial interface. A value's contract is its annotation or the type it infers, a
+generalized
 one's written as a diagnostic writes an inferred polymorphic type, joins and all. A `def` with a
 `Mut` parameter lowers curried and is written as its callers apply it, one function of the tuple of
 its parameters (`Contract::uncurried`). Inference notes a

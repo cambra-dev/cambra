@@ -17,6 +17,191 @@ const ADDER: &str = indoc! {"
     pub y = x + 1
 "};
 
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_module_defect_keeps_the_inferred_type_of_its_parameter() {
+    let worker = indoc! {r#"
+        param x: _
+        pub y = x + 1
+        pub bad = [1, "a"]
+    "#};
+    let root = indoc! {r#"
+        run worker(x="s") as w
+        w::y
+    "#};
+    let errors = compile_errors(&program(root, &[("worker", worker)]));
+    assert!(
+        errors.contains("The values that meet here have no common type"),
+        "{errors}"
+    );
+    assert!(
+        errors.contains("annotated as Int, but inferred as {String"),
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_module_defect_and_a_bad_type_argument_are_both_reported() {
+    let worker = indoc! {r#"
+        param T <: Int
+        param x: T
+        pub y = x + 1
+        pub bad = [1, "a"]
+    "#};
+    let root = indoc! {r#"
+        run worker(T=String, x="s") as w
+        w::y
+    "#};
+    let errors = compile_errors(&program(root, &[("worker", worker)]));
+    assert!(
+        errors.contains("The values that meet here have no common type"),
+        "{errors}"
+    );
+    assert!(
+        errors.contains("annotated as Int, but inferred as String"),
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
+#[rstest]
+#[case::rejected_first(true)]
+#[case::rejected_second(false)]
+#[timeout(Duration::from_secs(10))]
+fn rejecting_one_run_keeps_another_runs_call_checked(#[case] rejected_first: bool) {
+    let worker = indoc! {r#"
+        param T <: Int
+        pub def f(x):
+            x + 1
+        pub bad = [1, "a"]
+    "#};
+    let good = "run worker(T=Int) as good";
+    let bad = "run worker(T=String) as bad";
+    let (first, second) = if rejected_first {
+        (bad, good)
+    } else {
+        (good, bad)
+    };
+    let root = indoc::formatdoc! {r#"
+        {first}
+        {second}
+        good::f("s")
+    "#};
+    let errors = compile_errors(&program(&root, &[("worker", worker)]));
+    assert!(
+        errors.contains("No Addable instance for this call"),
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 3, "{errors}");
+}
+
+#[rstest]
+#[case::left_first(false)]
+#[case::right_first(true)]
+#[timeout(Duration::from_secs(10))]
+fn a_rejected_nested_run_keeps_the_other_side_of_a_diamond_checked(#[case] reverse: bool) {
+    let worker = indoc! {r#"
+        param T <: Int
+        pub def f(x):
+            x + 1
+        pub bad = [1, "a"]
+    "#};
+    let left = indoc! {r#"
+        run worker(T=String) as rejected
+        pub value = rejected::f(1)
+    "#};
+    let right = indoc! {r#"
+        run worker(T=Int) as accepted
+        pub def f(x):
+            accepted::f(x)
+    "#};
+    let (first, second) = if reverse {
+        ("right", "left")
+    } else {
+        ("left", "right")
+    };
+    let root = indoc::formatdoc! {r#"
+        run {first} as {first}
+        run {second} as {second}
+        right::f("s")
+    "#};
+    let errors = compile_errors(&program(
+        &root,
+        &[("worker", worker), ("left", left), ("right", right)],
+    ));
+    assert_eq!(report_count(&errors), 3, "{errors}");
+    assert!(
+        errors.contains("annotated as Int, but inferred as String"),
+        "{errors}"
+    );
+    assert!(
+        errors.contains("No Addable instance for this call"),
+        "{errors}"
+    );
+    assert!(errors.contains("main.cambra:3:"), "{errors}");
+}
+
+#[rstest]
+#[case::left_first(false)]
+#[case::right_first(true)]
+#[timeout(Duration::from_secs(10))]
+fn a_shared_broken_dependency_keeps_both_diamond_callers_checked(#[case] reverse: bool) {
+    let worker = indoc! {r#"
+        pub def f(x: Int) => Int:
+            x
+        pub bad = [1, "a"]
+    "#};
+    let wrapper = indoc! {r#"
+        import worker
+        pub def f(x):
+            worker::f(x)
+    "#};
+    let (first, second) = if reverse {
+        ("right", "left")
+    } else {
+        ("left", "right")
+    };
+    let root = indoc::formatdoc! {r#"
+        import {first}
+        import {second}
+        left::f(True)
+        right::f("s")
+    "#};
+    let errors = compile_errors(&program(
+        &root,
+        &[("worker", worker), ("left", wrapper), ("right", wrapper)],
+    ));
+    assert_eq!(report_count(&errors), 3, "{errors}");
+    assert!(errors.contains("main.cambra:3:"), "{errors}");
+    assert!(errors.contains("main.cambra:4:"), "{errors}");
+}
+
+#[rstest]
+#[case::self_reference(indoc! {r#"
+    pub def f(x: Int) => Int:
+        f(x)
+"#})]
+#[case::mutual_reference(indoc! {r#"
+    pub def f(x: Int) => Int:
+        g(x)
+    pub def g(x: Int) => Int:
+        f(x)
+"#})]
+#[timeout(Duration::from_secs(10))]
+fn unsupported_recursion_keeps_declared_inputs_checked(#[case] library: &str) {
+    let root = indoc! {r#"
+        import lib
+        lib::f(True)
+    "#};
+    let errors = compile_errors(&program(root, &[("lib", library)]));
+    assert_eq!(report_count(&errors), 2, "{errors}");
+    assert!(errors.contains("Unbound variable:"), "{errors}");
+    assert!(errors.contains("expected Int, found Bool"), "{errors}");
+    assert!(errors.contains("main.cambra:2:"), "{errors}");
+}
+
 /// A module with an error of its own is reported once, however many runs it has.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
@@ -498,7 +683,7 @@ fn a_def_with_a_mut_parameter_is_written_uncurried() {
     );
 }
 
-/// A file whose check fails reports its errors, and prints no interface.
+/// A file whose check fails reports its errors alongside its established interface.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn a_checked_module_reports_its_errors() {
@@ -509,7 +694,9 @@ fn a_checked_module_reports_its_errors() {
         "},
         &[],
     );
-    let errors = check_program(&mut GlobalContext::default(), &program).unwrap_err();
+    let errors = check_program(&mut GlobalContext::default(), &program)
+        .unwrap_err()
+        .errors;
     assert_eq!(errors.len(), 1, "{errors:?}");
 }
 
@@ -536,7 +723,9 @@ fn a_checked_module_reports_a_runs_missing_argument(#[case] file: &str) {
         pub w = counter::v
     "};
     let program = program(file, &[("counter", counter), ("outer", outer)]);
-    let errors = check_program(&mut GlobalContext::default(), &program).unwrap_err();
+    let errors = check_program(&mut GlobalContext::default(), &program)
+        .unwrap_err()
+        .errors;
     let messages: Vec<String> = errors.iter().map(|e| e.message()).collect();
     assert_eq!(
         messages,
@@ -575,7 +764,7 @@ fn a_runs_missing_argument_is_reported_once_however_often_it_is_copied() {
 
 /// The `cambra check` subcommand reads the file and the modules it reaches from
 /// disk, prints the file's interface and exits 0, prints a failing check's
-/// errors and exits 1, and refuses a missing file argument.
+/// errors alongside established contracts and exits 1, and refuses a missing file argument.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
 fn cambra_check_prints_an_interface_or_errors() {
@@ -590,7 +779,15 @@ fn cambra_check_prints_an_interface_or_errors() {
         "},
     )
     .expect("writing lib");
-    std::fs::write(dir.join("bad.cambra"), "pub v: String = 1\n").expect("writing bad");
+    std::fs::write(
+        dir.join("bad.cambra"),
+        indoc! {r#"
+        pub good = 1
+        pub declared: String = 1
+        pub missing = absent
+    "#},
+    )
+    .expect("writing bad");
     let check = |args: &[&std::path::Path]| {
         std::process::Command::new(env!("CARGO_BIN_EXE_cambra"))
             .arg("check")
@@ -613,8 +810,11 @@ fn cambra_check_prints_an_interface_or_errors() {
     let failed = check(&[&dir.join("bad.cambra")]);
     let stderr = String::from_utf8_lossy(&failed.stderr);
     assert_eq!(failed.status.code(), Some(1), "{stderr}");
-    assert!(failed.stdout.is_empty());
-    assert!(stderr.contains("bad.cambra:1:"), "{stderr}");
+    let stdout = String::from_utf8_lossy(&failed.stdout);
+    assert!(stdout.contains("pub good: {Int where _ == 1}"), "{stdout}");
+    assert!(stdout.contains("pub declared: String"), "{stdout}");
+    assert!(!stdout.contains("pub missing:"), "{stdout}");
+    assert!(stderr.contains("bad.cambra:"), "{stderr}");
 
     let usage = check(&[]);
     assert_eq!(usage.status.code(), Some(1));
