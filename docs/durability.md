@@ -22,13 +22,13 @@ depends on keeps its value, and recomputation answers it from the kept observati
 clock. The only readings a crash may replace are ones no output depends on yet. Nothing that saw the
 value left the run, so no outputs conflict with program state ([Escape](#escape)).
 
-The current `time::now()` is a **weak clock** ([Terms](#terms)): a reading taken after recovery can
-be earlier than one taken before the crash, as two readings within one process can be
-([7.5 Time](chl-spec.md#75-time-decided)). In `elapsed = time::now() - started`, where `started` is
-a kept reading of 10:05, a reading of 10:03 after recovery makes `elapsed` negative. The model also
-admits a transactional clock, whose readings the commit engine places in commit order, because each
-attempt of a transaction takes its own readings
-([Transactions are keyed](#transactions-are-keyed-by-their-site-and-position)).
+The current `time::now()` is a **weak clock** ([Terms](#terms)), which a follow-up renames
+`time::weak_now()`: a reading taken after recovery can be earlier than one taken before the crash,
+as two readings within one process can be ([7.5 Time](chl-spec.md#75-time-decided)). In
+`elapsed = time::now() - started`, where `started` is a kept reading of 10:05, a reading of 10:03
+after recovery makes `elapsed` negative. The model also admits a **transactional clock**, whose
+readings the commit engine places in commit order, because each attempt of a transaction takes its
+own readings ([Transactions are keyed](#transactions-are-keyed-by-their-site-and-position)).
 
 Two conditions follow:
 
@@ -64,8 +64,11 @@ replaced by its definitions once those land on main.
   of a `@Builtin` standard-library function whose value comes from outside the program, such as
   `std::time::clock`, which `time::now()` calls (#656).
 - **Weak clock.** A clock whose readings carry no order: a reading can be earlier than one taken
-  before it, and commit order never consults a reading. The current `time::now()` is a weak clock
-  ([7.5 Time](chl-spec.md#75-time-decided)).
+  before it, and commit order never consults a reading. The current `time::now()` is a weak clock,
+  and a follow-up renames it `time::weak_now()`
+  ([Consequences for other documents](#consequences-for-other-documents)).
+- **Transactional clock.** A clock whose readings the commit engine places in commit order. A
+  follow-up names it `time::now()`.
 - **Site.** Where an evaluation stands in the program: a place, the places of the calls that reached
   it, outermost first, and the run ([Sites](../src/ccl/design/sites.md#sites)). Inlining gives each
   call its own site, and every site is fixed when the program is compiled. On main a site (`Site`,
@@ -97,17 +100,21 @@ replaced by its definitions once those land on main.
   ([Vocabulary](../src/ccl/design/program-evolution.md#vocabulary)). A reload keeps a domain when it
   keeps the operator, and a source is kept by its module path and binding name. A loop over a
   source, or over a filter of one, is at a source position. A loop over another collection, such as
-  the keys of a `group_by`, is at that collection's key. Inside a transaction, the position ends
-  with the attempt index
+  the keys of a `group_by`, is at that collection's key. Inside a transaction's body, the position
+  of a reading or of the transaction's decision ends with the attempt index
   ([Transactions are keyed](#transactions-are-keyed-by-their-site-and-position)). An evaluation
   under no loop has the empty position. Examples write a component by its iteration position alone
   where no reload intervenes.
+- **Body.** The statements under a `with begin():` block. A transaction evaluates its body once
+  per attempt, at the attempt's snapshot, and the engine decides the attempt only once the body has
+  finished ([Observations](#observations)).
 - **Key.** A source's observations are keyed by source position, and a reload's by its index among
   its branch's versions. Every other observation is keyed by a site `𝑠` and a position `𝑝`,
   `(𝑠, 𝑝)` ([Observations](#observations)). A tick is the value of a decision and is not part of its
   key.
 - **Feed key.** The key of a row appended to a feed: the site of the `<<` and the position at which
-  it ran, `(𝑠, 𝑝)` ([Outputs are keyed](#outputs-are-keyed)).
+  it ran, `(𝑠, 𝑝)`. A row appended inside a transaction's body takes the transaction's position,
+  without the attempt index ([Outputs are keyed](#outputs-are-keyed)).
 - **Log sequence number (LSN).** An entry's number in the observation log: one more than the
   entry's before it ([The observation log](#the-observation-log)).
 - **Program state.** A tile for each term of a program version
@@ -143,9 +150,9 @@ replaced by its definitions once those land on main.
 - **Evaluation boundary.** The region of a term's tiling the run has decided at that term: what the
   term holds, together with what its consumers have released to it. It only grows while a process
   runs. A crash can shrink it, because a recovered producer holds only what it persisted, and
-  before any reload recovery catch-up grows it to cover each sink's recovery set
-  ([Recovery catch-up](#recovery-catch-up)). A reload's boundary guard at the
-  term is the evaluation boundary at the swap ([Across reloads](#across-reloads)).
+  recovery catch-up grows it to cover each sink's recovery set before a reload that waits for
+  catch-up ([Recovery catch-up](#recovery-catch-up)). A reload's boundary guard at the term is the
+  evaluation boundary at the swap ([Across reloads](#across-reloads)).
 - **Recovery set.** The outputs at a sink that the recovered map `𝑂ᵣ` determines, `Out(𝑂ᵣ)` at that
   sink ([The durability condition](#the-durability-condition)).
 
@@ -179,7 +186,7 @@ source's positions.
 | ------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------- | ---------------------- |
 | A reading: the clock, a random value, the reply to a call made outside the program                                 | the reading's site and position                            | the world              |
 | A source element: the element at a position, or `none` where no element will take it                               | the source and the source position                         | the world              |
-| A transaction's decision: `` `commit ``, `` `abort ``, `` `retry `` or `` `read ``                                 | the transaction's site and position, its attempt innermost | the commit engine      |
+| A transaction's decision: `` `commit `` or `` `retry ``                                                            | the transaction's site and position, its attempt innermost | the commit engine      |
 | A reload: the new version, the generations it starts and their seeds, and the boundary guard of each term it pairs | its index among its branch's versions                      | the runtime's schedule |
 
 - **A reading.** A reading has one value per position. Its site is the place of the `@Builtin`
@@ -193,7 +200,7 @@ source's positions.
   skips, such as an offset a compacted topic removed. An output can depend on a `none`: a `sum`
   over a source is final only once the source has ended.
 - **A transaction's decision.** `Txn` is a total order that no writer's domain supplies. The
-  per-site oracle `begin_<site> : 𝐼 ⇒ Txn` places iteration `𝑖` of a writing site in it
+  per-site oracle `begin_<site> : 𝐼 ⇒ Txn` places iteration `𝑖` of a site in it
   ([mutability.md](../src/ccl/design/mutability.md#the-model-histories-and-causal-recursion)), and
   each transaction reads the commit history strictly before its place
   ([Semantics](../src/ccl/design/mutability.md#semantics)). The engine realizes `Txn` as the commit
@@ -203,34 +210,26 @@ source's positions.
     holds a commit, or `none` where the engine states no commit will land. Tick `0` holds the
     generation's seed: the store's declared initializer in its first generation, and the reload's
     seed in a later one. One sequencer per store, as the engine has today, gives each commit the
-    next tick and states no `none`. A transaction that writes nothing takes no tick. Stores that
-    share no mutable variable share no clock. The decisions of every transaction on one store form
-    one observation point, the store's **commit clock**, because two of its writers must not commit
-    at one tick. The `Transact` node carries the clock, and `CommitOperator` realizes it.
-  - **The decision.** A transaction decides one of four values. `𝑔` is the generation of the clock
-    the decision is taken on, and `𝑇` and `𝑆` are ticks of it:
-    - `` `commit(𝑔, 𝑇) ``: the attempt read the history through tick `𝑇−1`, wrote, and committed
-      at `𝑇`.
-    - `` `abort(𝑔, 𝑆) ``: the attempt read the history through tick `𝑆` and wrote nothing. An abort
-      is a deny, which takes no writing path, or a grant whose write set is empty: it writes no
-      store key and fires no reply inside the transaction, and `TransactWriterProducer` finishes it
-      as it finishes a deny.
-    - `` `retry ``: the attempt failed the engine's validation, and the transaction runs its next
-      attempt.
-    - `` `read(𝑔, 𝑆) ``: a read-only transaction read the history through tick `𝑆` and delivers its
-      replies. It writes nothing.
+    next tick and states no `none`. Stores that share no mutable variable share no clock. The
+    decisions of every transaction on one store form one observation point, the store's **commit
+    clock**, because two of its transactions must not commit at one tick. The `Transact` node
+    carries the clock, and `CommitOperator` realizes it.
+  - **The decision.** A transaction decides one of two values. `𝑔` is the generation of the clock
+    the decision is taken on, and `𝑇` is a tick of it:
+    - `` `commit(𝑔, 𝑇) ``: the attempt read the history through tick `𝑇−1` and committed at `𝑇`
+      one optional write per key and the rows its body feeds.
+    - `` `retry ``: the attempt failed the engine's validation and took no tick, and the
+      transaction runs its next attempt.
 
-    The body computes the tag and the writes from what it read, and the engine's schedule chooses
-    the tick.
-  - **A read-only transaction.** `` `read(𝑔, 𝑆) `` is the observation, and the value read is a
-    lookup of the store's history at tick `𝑆` of generation `𝑔` (`CommitEngine::read_as_of`), which
-    is a function of the clock's entries. The `AsOf` operator today latches a store's value at the
-    store's frontier when a trigger position is first observed, and records nothing
-    ([The runtime engines](../src/ccl/design/mutability.md#the-runtime-engines)). Under the model
-    the commit engine chooses `𝑆` and `AsOf` performs only the lookup. The engine chooses `𝑆` no
-    lower than the store's frontier when the trigger position arrived; that floor is a rule of the
-    engine, and the model does not depend on it. A read-only transaction reads one store, because
-    reading two mutable variables together puts them in one store
+    The body computes the writes and the rows from what it read, and the engine's schedule chooses
+    the tick. Every attempt that does not retry takes a tick, whatever it writes (#810): a grant, a
+    grant whose writes are all `` `idle ``, a **deny**, whose guard takes no writing path, and an
+    **abort**, whose body an exception escapes. A deny and an abort write no store key and feed no
+    row.
+  - **A read-only transaction.** A `with begin():` block that reads a store and writes nothing is a
+    transaction on that store's clock and takes a tick (#811). It reads the history through
+    `𝑇−1` and feeds its rows at `𝑇`. A read-only transaction reads one store, because reading two
+    mutable variables together puts them in one store
     ([How many commit stores a program has](../src/ccl/design/mutability.md#how-many-commit-stores-a-program-has)).
 - **A reload.** A reload replaces the operators of one version of a branch with those of the next
   while the terms hold tiles ([4. Reload](operational-semantics/semantics.md#4-reload)). Its entry
@@ -266,7 +265,7 @@ progress order, as program states are ordered term by term
 | -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | A source whose elements have type `𝐸` | partial functions `ℕ ⇀ Option(𝐸)`: `some(𝑒)` where `𝑒` took the position, `none` where the source states no element will                                                                                                        |
 | A reading                              | partial functions from position to value                                                                                                                                                                                           |
-| A store's commit clock                 | partial functions from site and position to `` {`commit{(Gen, ℕ)} \| `abort{(Gen, ℕ)} \| `read{(Gen, ℕ)} \| `retry} ``, beside the ticks stated `none`, that commit no tick of a generation twice and commit no tick stated `none` |
+| A store's commit clock                 | partial functions from site and position to `` {`commit{(Gen, ℕ)} \| `retry} ``, beside the ticks stated `none`, that commit no tick of a generation twice and commit no tick stated `none` |                                       
 | A branch's reloads                     | partial functions from a reload's index among the branch's versions to its version, the generations it starts with their links and seeds, and its boundary guards                                                                  |
 
 `Gen` is the type of generation IDs ([Terms](#terms)). A source's tiling is the sparse function
@@ -347,12 +346,11 @@ earlier in dependency order.
 
 A store's commit clock supplies the oracles `begin_<site>` of the transactions on the store. A
 transaction's body at a decided position reads the store through its decision's snapshot in the
-decision's generation `𝑔`: tick `𝑇−1` for `` `commit(𝑔, 𝑇) ``, and tick `𝑆` for
-`` `abort(𝑔, 𝑆) `` and `` `read(𝑔, 𝑆) ``. The store holds the writes of `` `commit(𝑔, 𝑇) `` at tick
-`𝑇` of `𝑔`, and its value at `𝑇` is decided once every tick of `𝑔` from `1` through `𝑇` holds a
-commit or `none`. An operator that read a missing tick as one with no commit would decide a value at
-a later tick that the missing commit then changes, and would not be monotone.
-`CommitEngine::read_as_of` answers nothing past its watermark.
+decision's generation `𝑔`: tick `𝑇−1` for `` `commit(𝑔, 𝑇) ``. The store holds the writes of
+`` `commit(𝑔, 𝑇) `` at tick `𝑇` of `𝑔`, and its value at `𝑇` is decided once every tick of `𝑔` from
+`1` through `𝑇` holds a commit or `none`. An operator that read a missing tick as one with no commit
+would decide a value at a later tick that the missing commit then changes, and would not be
+monotone. `CommitEngine::read_as_of` answers nothing past its watermark.
 
 Two properties follow:
 
@@ -415,18 +413,15 @@ grows across reloads. [The durability condition](#the-durability-condition) reli
 - **Reached.** `𝐹(𝑂)` holds the entry at its observation point: its key is in the point's domain in
   `𝐹(𝑂)`.
 - **Valid.** A source's `some` or `none`, a reading and a `` `retry `` are valid wherever they are
-  reached. A `` `commit `` or `` `abort `` is valid when its snapshot is decided in `𝐹(𝑂)` and the
-  transaction's body, reading the store at that snapshot, computes it: `` `commit(𝑔, 𝑇) `` when the
-  body writes at snapshot `𝑇−1`, and `` `abort(𝑔, 𝑆) `` when the body writes nothing at snapshot
-  `𝑆`. A `` `read(𝑔, 𝑆) `` is valid when tick `𝑆` of `𝑔` is decided. A reload's entry is valid when
-  `𝐹_𝑣₁` decides, at each term the reload pairs, the tile inside the entry's boundary guard.
-- **Ordered.** A writer decides the positions of its domain in order
-  ([8.5 Ordering and concurrency](chl-spec.md#85-ordering-and-concurrency)). A `` `commit `` or
-  `` `abort `` at position `𝑝` is valid only when the writer's decision at every earlier position is
-  in `𝑂` and placed no later on the clock. A commit at `(𝑔, 𝑇)` is placed at tick `𝑇` of `𝑔`, and an
-  abort at `(𝑔, 𝑆)` just after tick `𝑆` of `𝑔`. Across a reload, the entry's link places tick
-  `𝑇_swap` of the old generation just before tick `0` of the new one. A `` `read `` is no writer's
-  decision and is not ordered.
+  reached. A `` `commit(𝑔, 𝑇) `` is valid when tick `𝑇−1` of `𝑔` is decided in `𝐹(𝑂)`, and its
+  record is what the transaction's body computes reading the store at that snapshot. A reload's
+  entry is valid when `𝐹_𝑣₁` decides, at each term the reload pairs, the tile inside the entry's
+  boundary guard.
+- **Ordered.** A site decides the positions of its domain in order
+  ([8.5 Ordering and concurrency](chl-spec.md#85-ordering-and-concurrency)). A `` `commit `` at
+  position `𝑝` is valid only when the site's decision at every earlier position is in `𝑂` and placed
+  earlier on the clock. A commit at `(𝑔, 𝑇)` is placed at tick `𝑇` of `𝑔`. Across a reload, the
+  entry's link places tick `𝑇_swap` of the old generation just before tick `0` of the new one.
 
 `𝐹(𝑂)` is the least solution, so no entry is reached only through itself.
 
@@ -459,18 +454,18 @@ Consequences of the definition:
 - **A reading under a condition needs the condition.** A reading inside `if r.ok:` is reached at
   position `7` only where `r.ok` holds there in `𝐹(𝑂)`. That needs the element at `7` and everything
   `r.ok` reads.
-- **A decision needs what its body reads.** A body that reads `time::now()` computes its tag only
+- **A decision needs what its body reads.** A body that reads `time::now()` computes its record only
   where the reading at its key is in `𝑂`. Without that reading, `` `commit(𝑔, 5) `` at position `7`
   is not valid.
 - **A key through a derived domain needs what formed it.** In `for g in group_by(orders, sku):`, a
   reading at iteration position `A` is reached only where `𝐹(𝑂)` holds group `A`. After the orders
   that formed `A` are lost, the reading is not reached.
-- **A writer's decisions are kept in order.** Suppose a withdrawal at position `𝑝` is denied with
-  `` `abort(𝑔, 4) `` and a deposit at `𝑝+1` commits at tick `5` of `𝑔`. If the abort is lost because
-  the reading its body took was not durable, and the commit is kept, recovery decides `𝑝` again at
-  snapshot `5` and grants the withdrawal. It then lands behind the deposit, an order no crash-free
-  run produces. The ordering condition makes `` `commit(𝑔, 5) `` invalid without the decision at
-  `𝑝`, so the largest well-formed sub-map drops both.
+- **A site's decisions are kept in order.** Suppose a withdrawal at position `𝑝` is denied at tick
+  `5` of `𝑔` and a deposit at `𝑝+1` commits at tick `6`. If the deny is lost because the reading its
+  body took was not durable, tick `5` is undecided, and `` `commit(𝑔, 6) `` is not valid either,
+  because a clock's commits are contiguous. The ordering condition covers a deposit committed while
+  `𝑝` has no decision: recovery would then decide `𝑝` after the deposit and grant the withdrawal, an
+  order no crash-free run produces. So a commit at `𝑝+1` is not valid without the decision at `𝑝`.
 - **Well-formed maps are not downward-closed.** Removing `` `commit(𝑔, 1) `` from a well-formed map
   leaves `` `commit(𝑔, 2) `` reading through an undecided tick, so no guard denotes the well-formed
   maps. Well-formedness says which maps the run can hold; the order between maps is the progress
@@ -567,11 +562,13 @@ holds in two cases:
   compute that part again with the new version's equations. Recovery catch-up holds every reload
   until each sink's release covers its recovery set, `Out(𝑂ᵣ)` at that sink
   ([Runtime obligations](#runtime-obligations)). From then on `Out(𝑂ᵣ)` lies inside every later
-  reload's boundary guard at the sink's input, and each reload keeps it.
+  reload's boundary guard at the sink's input, and each reload keeps it. A reload set to replace
+  the recovering version does not wait, and the outputs it computes again are the one exception
+  ([Recovery catch-up](#recovery-catch-up)).
 
-So all of the outputs are parts of the one answer `Out(𝑂)`. An observation in `𝑂₁` and not in
-`𝑂ᵣ` is an input the run lost, and since `𝑂ᵣ` accounts for every escaped output without it, losing
-it is indistinguishable from never having received it.
+So, apart from that exception, all of the outputs are parts of the one answer `Out(𝑂)`. An
+observation in `𝑂₁` and not in `𝑂ᵣ` is an input the run lost, and since `𝑂ᵣ` accounts for every
+escaped output without it, losing it is indistinguishable from never having received it.
 
 Conditions 1 and 2 alone do not give this. A `sum` over standard input that has released positions
 `0` through `900` to its source and is recovered at `⊥` meets both: `𝑂ᵣ` holds the lines, and every
@@ -605,8 +602,8 @@ duplicate ([Outputs are keyed](#outputs-are-keyed)).
 A transaction's identity is its site and the position of the iteration that runs it, `(𝑠, 𝑝)`. Each
 attempt's decision is the observation at `(𝑠, 𝑝)` extended by the attempt index
 ([Observations](#observations)), and at most one attempt decides something other than `` `retry ``.
-The commit record, `` `commit(⟨writes, replies⟩) `` or `` `abort ``, is a function of the commit
-history through the decision's snapshot, which is immutable.
+The commit record, one optional write per key and the rows the body feeds, is a function of the
+commit history through the decision's snapshot, which is immutable.
 
 So a transaction commits at most once at each key, in every program and not only in a workflow. A
 second commit at key `(𝑠, 𝑝)` would be a second value of its decision, which immutable history
@@ -617,11 +614,11 @@ has. A reload that rebuilds the term a transaction's loop iterates starts a new 
 transaction the rebuilt loop reaches at the same site has a new key and is a new transaction
 ([Immutable history](#immutable-history)).
 
-An abort is kept as a commit is. `await_final` reads a mutable variable once every writer of it has
-drained ([8.6 `await_final`](chl-spec.md#86-await_final)), so its value depends on each writer's
-aborts. An abort recomputed against a later snapshot can commit, and the run would then contradict
-an `await_final` that escaped. A `` `read `` is no writer's decision, and `await_final` does not
-wait for it.
+A transaction that writes nothing is kept as one that writes. `await_final` reads a mutable
+variable once every writer of it has drained ([8.6 `await_final`](chl-spec.md#86-await_final)), so
+its value depends on each writer's denies and aborts. A deny decided again at a later tick can
+grant, and the run would then contradict an `await_final` that escaped. A read-only transaction is
+no writer, and `await_final` does not wait for it.
 
 **The engine's retry is the loop over attempts inside the transaction**
 ([The program state an observation map determines](#the-program-state-an-observation-map-determines)).
@@ -629,7 +626,8 @@ The attempt index is the innermost component of the transaction's position, and 
 domain grows by one attempt at each `` `retry ``, so the reach rule orders the attempts. Each
 attempt takes its own readings, because its readings' keys hold the attempt. A reading taken before
 `with begin():` is keyed by the loop's iteration alone and is the same in every attempt. A failed
-attempt's writes are discarded and nothing computed from its readings leaves the run. A failed
+attempt's writes and the rows its body fed are discarded, and nothing computed from its readings
+leaves the run. A failed
 attempt's readings and its `` `retry `` entry are compacted with the transaction's other entries,
 once every consumer has released the transaction: the committing attempt is reached only through the
 `` `retry `` entries before it. Recovery recomputing a committed transaction reads the readings of
@@ -641,17 +639,16 @@ nested-transaction check does. Readings, which cause `ObserveWorld` alone, are a
 with their transaction. Work that has to happen after a commit goes through a feed
 ([Work after a commit](#work-after-a-commit)).
 
-A decision that writes nothing never reaches the engine's validation, which checks a proposal's read
-set against the commits after its snapshot. An abort counts only once its writer has decided every
-earlier position and no commit after its snapshot wrote a key it read; otherwise the attempt decides
-`` `retry ``. A writer with at most one position in flight meets this, as `TransactWriterProducer`
-does today: it drives a position only after the one before it is acknowledged. Without either, a
-withdrawal decided against a snapshot from before an earlier deposit's commit is denied for want of
-money that arrived first ([Well-formed maps](#well-formed-maps)). A writer's commits follow the same
-order: the engine commits a writer's proposal at position `𝑝+1` only once the writer's decision at
-`𝑝` is placed, so a pipelined `𝑝+1` cannot commit first and leave `𝑝` to retry against its writes.
-A read-only transaction needs no validation: it reads one store's history at a decided tick, and no
-later commit changes that history.
+Every proposal reaches the engine's validation, which checks its read set against the commits after
+its snapshot. A deny's proposal and a read-only transaction's are validated as a grant's is (#810,
+#811): a withdrawal decided against a snapshot from before an earlier deposit's commit would
+otherwise be denied for want of money that arrived first
+([Well-formed maps](#well-formed-maps)). A stale proposal takes no tick, and the attempt decides
+`` `retry ``. A site's commits follow its domain's order: the engine commits a site's proposal at
+position `𝑝+1` only once the site's decision at `𝑝` is placed, so a pipelined `𝑝+1` cannot commit
+first and leave `𝑝` to retry against its writes. A site with at most one position in flight meets
+this, as `TransactWriterProducer` does today: it drives a position only after the one before it is
+acknowledged.
 
 ### Outputs are keyed
 
@@ -659,10 +656,11 @@ A feed is a function over its domain
 ([8.4 Feeds are the second form of mutability](chl-spec.md#84-feeds-are-the-second-form-of-mutability)),
 so every row appended to a feed has a key, its **feed key**: the site of the `<<` and the position
 at which it ran, `(𝑠, 𝑝)`. The position is the full position, because a feed declared inside a loop
-is a new feed at each iteration. A reply inside a transaction is delivered only if the transaction
-commits, and is ordered by its commit's generation and tick. An output at a key has one value,
-determined by `𝑂ᵣ`. An output re-emitted after a crash is the same key with the same value, so a
-sink, or a remote that accepts an idempotency key, recognizes it.
+is a new feed at each iteration. A row fed inside a transaction's body leaves with the attempt that
+commits and with no other, so its position is the transaction's, without the attempt index (#809).
+A deny and an abort feed no row. An output at a key has one value, determined by `𝑂ᵣ`. An output
+re-emitted after a crash is the same key with the same value, so a sink, or a remote that accepts an
+idempotency key, recognizes it.
 
 A sink receives the key with the value, so a re-emitted output can be recognized. A sink releases an
 output only after sending it, so a crash may at worst repeat an output but never loses one. The key
@@ -731,7 +729,9 @@ obligations. Each is a requirement on any implementation.
    the evaluation boundary, and after a crash an output that escaped can lie outside it until the
    recovered run computes it again and the sink releases it
    ([The durability condition](#the-durability-condition)). Intake and outputs continue while the
-   reload waits ([Recovery catch-up](#recovery-catch-up)).
+   reload waits. Waiting is the default. A reload set to replace the recovering version does not
+   wait, and gives up this obligation for the outputs it computes again
+   ([Recovery catch-up](#recovery-catch-up)).
 
 Recomputation needs no obligation of its own. The operator contract makes an operator term's tile a
 function of its inputs, and enumerable observation points answering kept keys make the inputs the
@@ -1030,6 +1030,24 @@ its commit is acknowledged, so once the cycle has caught up on its inputs it has
 Each term records in memory the guard of what it had produced when it caught up on its inputs.
 Intake and outputs continue during the check, and only a reload waits for it.
 
+**A reload can replace the version catch-up runs under.** A version that crashes deterministically
+during catch-up crashes again after each recovery, so a reload that waits for catch-up never
+installs a fix. A reload therefore has a setting that replaces the recovering version; without it,
+the reload waits. A reload with the setting takes as its boundary guard at each term the evaluation
+boundary recovery restored, and the new version computes everything outside it from `𝑂ᵣ`. Every
+observation in `𝑂ᵣ` keeps its key and its value, so immutable history holds. A store the reload
+rebuilds seeds at the last tick `𝑂ᵣ` decides on its clock, which the earlier version reaches by
+evaluating again the bodies of the kept decisions. Each of those bodies finished once from the same
+snapshot and readings, so it finishes again.
+
+The cost falls on [Escape](#escape). A sink's outputs between its last persisted release and what it
+had sent before the crash are computed again by the new version wherever they pass through a term
+the reload rebuilds. Such an output keeps its key where the reload keeps its site and the domains of
+the loops around it, and takes a new key where the reload rebuilds one of those domains. A sink that
+drops a key it has delivered keeps the earlier value, and any other recipient receives both. An
+output whose computation crashed was never sent, so the value the new version computes for it
+contradicts nothing.
+
 ### Sources
 
 A source meets three runtime obligations through how it numbers its elements and how it keeps them
@@ -1218,7 +1236,7 @@ element, and between steps 1 and 2 process memory holds the only copy
 | Determined values only are recomputed                               | Recovered producers pull from inputs recovered from persisted producer states and the observation log                       |
 | Outputs are recognizable when re-emitted                            | Sinks receive each output's key                                                                                             |
 | A kept key keeps its meaning across reloads                         | A rebuilt term mints its keys in a new generation, and a rebuilt store's clock is a new clock                               |
-| Every escaped output lies inside each later reload's boundary guard | After recovery, a reload waits for recovery catch-up                                                                        |
+| Every escaped output lies inside each later reload's boundary guard | After recovery, a reload waits for recovery catch-up unless set to replace the recovering version                            
 | A row handed from a feed to a source arrives once                   | The source records the row's feed key, and recovery drops held rows whose feed key has an entry                             |
 | A call's reply is kept or its request is sent again                 | A call releases a request only once the reply's entry is durable                                                            |
 
@@ -1249,8 +1267,8 @@ The model's consequences:
 - **[The Operator Contract](operational-semantics/semantics.md#the-operator-contract)** makes an
   operator's output a function of its input tiles. `CommitOperator` realizes an observation point
   and breaks it, deciding ticks by the schedule, and the semantics has no term kind for it
-  ([Observations](#observations)). `AsOfProducer` breaks it today by latching by the schedule; under
-  the model it performs a lookup at a tick the commit engine decides.
+  ([Observations](#observations)). `AsOfProducer` breaks it today by latching by the schedule, and
+  #811 removes it.
 
 - **[What a reload computes](operational-semantics/semantics.md#what-a-reload-computes)** takes
   `y₁` to be what the term held at the swap. Under the model the boundary guard is the term's
@@ -1287,23 +1305,15 @@ The model's consequences:
 - **Observations are taken in separate producers.** The source buffer assigns positions
   (`src/interpreter/stream_buffer.rs`), `CommitEngine::attempt` decides proposals, and
   `AsOfProducer` latches values. None appends to a shared sequence, and the observation log needs
-  each to append at the moment it answers ([The observation log](#the-observation-log)). Three of
-  them do not see what the entry needs:
-  - An abort, and a grant that writes nothing, is decided in `TransactWriterProducer` and never
-    reaches the commit engine.
-  - A read-only transaction compiles to `AsOf`, and the commit engine does not place it on the
-    clock.
-  - `CommitEngine::attempt` sees a step local to the writer, not the transaction's site and
-    position, and a retry is not a decision it records.
+  each to append at the moment it answers ([The observation log](#the-observation-log)).
+  `CommitEngine::attempt` sees a step local to the writer, not the transaction's site and position,
+  and a retry is not a decision it records. On main two decisions also bypass the commit engine: a
+  deny or a grant that writes nothing is decided in `TransactWriterProducer`, which #810 changes,
+  and a read-only transaction compiles to `AsOf`, which #811 changes.
 
 - **[`mutability-walkthrough.md`](mutability-walkthrough.md)** calls a commit store's per-key
   changelogs "the commit log". The observation log is a different thing, and the two names differ
   only in their first word.
-
-- **[Builtins](../src/ccl/design/mutability.md#builtins)** says `begin_<site>` is injective over
-  iterations and that a denied iteration's record carries a time. On the commit clock a transaction
-  that writes nothing takes no tick, so its decision records the generation and the tick it read
-  through instead ([Observations](#observations)).
 
 - **[mutability.md](../src/ccl/design/mutability.md)** does not say whether a transaction may make a
   call outside the program. Under the model a transaction refuses `AffectWorld`, and the check
@@ -1312,9 +1322,8 @@ The model's consequences:
 
 - **[8.3 Reads](chl-spec.md#83-reads)** describes an as-of read at an arbitrary commit position,
   and [The runtime engines](../src/ccl/design/mutability.md#the-runtime-engines) has `AsOf` latch a
-  store's value when a trigger position is first observed. Under the model the commit engine
-  decides `` `read(𝑔, 𝑆) `` and the read is a lookup at that tick
-  ([Observations](#observations)).
+  store's value when a trigger position is first observed. Under the model a read-only transaction
+  takes a tick on its store's clock ([Observations](#observations)), as #811 makes it.
 
 - **[4.4 Define statement `<<=`](chl-spec.md#44-define-statement-)** gives a feed every row of a
   collection from one evaluation of one statement. The rows share one site and one position, and
@@ -1326,16 +1335,16 @@ The model's consequences:
 
 - **[8.4 Feeds are the second form of mutability](chl-spec.md#84-feeds-are-the-second-form-of-mutability)**
   indexes a reply inside a transaction by commit tick, and mutability.md's `by_commit_time` keys a
-  reply by `Txn`, so a loop over the feed iterates ticks. A tick is private to one generation of one
-  store. [Outputs are
-  keyed](#outputs-are-keyed) keys the reply by its feed key and orders it by generation and tick.
-  CHL has no syntax for a row's feed key, which a consumer needs as an idempotency key
+  reply by `Txn`. Under the model a reply's key is its feed key, the transaction's position without
+  the attempt index ([Outputs are keyed](#outputs-are-keyed)), as #809 keys it. CHL also has no
+  syntax for a row's feed key, which a consumer needs as an idempotency key
   ([Work after a commit](#work-after-a-commit)).
 
 - **[7.5 Time](chl-spec.md#75-time-decided)** is edited here: "A reading orders nothing" and
   "Commit order never consults a reading" describe the current `time::now()`, a weak clock. A
   transactional clock, whose readings the commit engine places in commit order, would order its
-  readings. Renaming the current call to say it is weak leaves `time::now()` for that clock. #585's
+  readings. A follow-up renames the current call `time::weak_now()` and keeps `time::now()` for the
+  transactional clock. #585's
   section 7.5 still carries a clock floor and needs to drop it.
 
 - **[`time::alarms()`](chl-spec.md#timealarms)** says a process exit discards held rows. Held rows
