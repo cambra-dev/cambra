@@ -308,6 +308,46 @@ delivered only on commit, which is the gating [spec
 8.4](../../../docs/chl-spec.md#84-feeds-are-the-second-form-of-mutability) states for a reply fed
 inside `with begin():`.
 
+### Transaction outcomes
+
+A `with begin():` block in value position yields its outcome, a variant. This resolves the spec's
+Direction "a block is also the value it computes"
+([spec 8.2](../../../docs/chl-spec.md#82-transactions-with-begin)):
+
+| Outcome | Cause | Writes | Determined by the snapshot |
+|---|---|---|---|
+| `` `commit(𝑣) `` | The block committed; `𝑣` is the value of its last statement | All of the block's | Yes |
+| `` `aborted(𝑒) `` | The block called `abort(𝑒)`, or a guard denied it (the deny idiom), with `𝑒 = unit` | None | Yes |
+| `` `gave_up `` | The transaction did not commit before the block's deadline | None | No: it depends on load and time |
+
+```python
+outcome = with begin(deadline=time::millis(50)):
+    reserve(sku, qty)
+match outcome:
+    case `commit(v):  http.ok(v)
+    case `aborted(e): http.conflict(e)
+    case `gave_up:    http.unavailable()
+```
+
+- **Conflict retries are internal to the engine.** A program observes one outcome per block and
+  never the attempts behind it.
+- **The engine guarantees progress.** After a bounded number of optimistic failures it runs the
+  transaction against its footprint, which is known before execution
+  ([Footprints and elision](#footprints-and-elision)), so the transaction cannot conflict again. No
+  program needs a retry limit to terminate.
+- **A deadline sheds load.** `with begin(deadline=𝑑):` yields `` `gave_up `` when the transaction
+  has not committed within `𝑑`. The limit is a duration, not an attempt count, because the number of
+  attempts depends on the engine's strategy.
+- **A block with a deadline requires `ObserveWorld`.** Its outcome depends on load and time, as a
+  read of the clock does, and the requirement shows that in its signature. This assumes the effects
+  stack's `ObserveWorld` covers it.
+- **No write survives an abort.** Writes to cells and to outer `Mut`s stay gated on commit. A retry
+  policy is ordinary code outside the block: it counts outcomes in its own `Mut` and passes the
+  attempt number into the body as an argument. A policy that needs data from a failed attempt gets
+  it from the payload of `abort(𝑒)`.
+- **Isolation is unchanged.** An aborted block and a block that gave up write nothing, so no other
+  transaction can tell them apart from a transaction that never ran.
+
 ### Realms
 
 A realm is a nominal type with an instance of the marker trait `std::txn::Realm`. A program that
@@ -1177,6 +1217,10 @@ Proposals for the owners of each part.
   `Ref`.
 - **[Spec 3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access), "Absence at a cut
   [Open]".** A transaction's version is the cut for a `Cell(Log(𝑇))` or `Cell(OnceMap(𝐾, 𝑉))`.
+- **[Spec 8.2](../../../docs/chl-spec.md#82-transactions-with-begin), "a block is also the value
+  it computes" [Tentative].** Decided: the block yields `` `commit(𝑣) ``, `` `aborted(𝑒) `` or
+  `` `gave_up ``. A reply fed outside the block fires for every outcome, with the outcome as its
+  value ([Transaction outcomes](#transaction-outcomes)).
 - **[Spec 8.5](../../../docs/chl-spec.md#85-ordering-and-concurrency).** "Nothing is ordered by its
   position in the source text" does not hold for two loops that write one `Mut`: the second loop
   continues the first's history in statement order (`src/ccl/design/mutability.md`, the
@@ -1198,7 +1242,8 @@ Candidates listed under a question are proposals with their costs, not decisions
    transaction, with the compiler splitting it where transaction chopping (Shasha et al., 1995)
    proves serializability preserved, and whether `Ref::new` is allowed outside a block, which needs
    a creation commit of its own. For now every transaction is an explicit `with begin():` block, and
-   `Ref::new` requires one ([Transaction boundaries](#transaction-boundaries)).
+   `Ref::new` requires one ([Transaction boundaries](#transaction-boundaries)). Also whether a realm
+   sets a default deadline for its transactions ([Transaction outcomes](#transaction-outcomes)).
 2. **`Pin` lifetime.** Explicit `unpin` only, or a time-to-live (`pin(r, ttl)`) for identities
    such as session cookies that expire.
 3. **User-defined projections.** `to_mut` is the only projection: an operation that yields a
