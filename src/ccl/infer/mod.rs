@@ -863,23 +863,11 @@ pub(crate) fn run_with_params(
 /// Bindings whose recovered definitions establish no complete contract. An unconstrained
 /// result of an omitted body is a poison for diagnosis, not a polymorphic export.
 fn unavailable_contracts(tree: &Expr) -> HashSet<Name> {
-    fn complete(ty: &Type) -> bool {
-        !ty.holds_type(&|ty| {
-            matches!(
-                ty,
-                Type::Hole
-                    | Type::Infer(_)
-                    | Type::BarrierVar(_)
-                    | Type::SharedHole(_)
-                    | Type::BoundedHole(_)
-            )
-        })
-    }
     fn declared_reads(expr: &Expr) -> Option<std::collections::BTreeSet<Name>> {
         match &expr.node {
             crate::ccl::TypedExprNode::Lambda { param, body } => {
                 let annotation = param.annotation_ty().unwrap_or(&param.ty);
-                if !complete(annotation) {
+                if annotation.holds_an_inference_slot() {
                     return None;
                 }
                 let mut reads = declared_reads(body)?;
@@ -892,7 +880,7 @@ fn unavailable_contracts(tree: &Expr) -> HashSet<Name> {
             {
                 binding
                     .annotation_ty()
-                    .filter(|ty| complete(ty))
+                    .filter(|ty| !ty.holds_an_inference_slot())
                     .map(crate::ccl::subst::type_free_vars)
             }
             _ => None,
@@ -911,7 +899,7 @@ fn unavailable_contracts(tree: &Expr) -> HashSet<Name> {
         {
             let declared = binding
                 .annotation_ty()
-                .filter(|ty| complete(ty))
+                .filter(|ty| !ty.holds_an_inference_slot())
                 .map(crate::ccl::subst::type_free_vars)
                 .or_else(|| declared_reads(bound_expr));
             if holds_stand_in(bound_expr) && declared.is_none() {
