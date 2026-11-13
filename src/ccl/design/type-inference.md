@@ -2784,6 +2784,20 @@ reads the same entry when it lifts a `let` body's type past its binding:
 A kept binder inside a joined binder of the crossing holds one value per value of the joined one,
 so it is joined over as well.
 
+A handle received through a joined binder contributes outside that binder. Transparent aliases
+and product projections retain that origin (`InferCtx::target_origin`). Inference follows each
+selected component through transparent product literals and aliases. For an unannotated
+`def emit(v, out)`, `out` is a projection of the argument tuple; the contribution crosses the
+tuple's binder as well as the bindings around the feed. Joining over that binder removes value
+facts about `v` and rejects a collection domain varying with `v` by the same rules as other joins.
+An alias of a handle received through a parameter does not introduce a new storage scope.
+The same identity determines the storage scope and feed-place count for a locally declared
+channel. A known storage binding supplies its inferred history contract, including the key
+binder that a projected receiver's fresh view does not hold. Every feed uses `require_feed`;
+an unknown incoming contract falls back to the ordinary contribution join there. Two aliases
+feeding one channel count as two places, while a call receiving only a computed sibling does
+not receive the handle.
+
 A feed also records its **row** on the `Feed` node: the fed value's type with every binder of the
 crossing exited except the loops' (`InferCtx::feed_row`). A loop's variable and position stay in
 scope, and still join the kept binders inside them, so a read binder `mut_read` mints in a loop body

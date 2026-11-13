@@ -1399,6 +1399,40 @@ impl InferCtx {
         r
     }
 
+    /// The binding a handle reaches through transparent aliases and product projections.
+    fn target_origin<'a>(&'a self, target: &'a Name) -> &'a Name {
+        use crate::ccl::ccl_utils::{ValueReference, resolve_product_reference};
+        match resolve_product_reference(ValueReference::Name(target), |name| {
+            match self.exit_of(name) {
+                ScopeExit::Discharge(definition) => Some(definition),
+                _ => None,
+            }
+        }) {
+            ValueReference::Name(origin) => origin,
+            ValueReference::Expr(_) => target,
+        }
+    }
+
+    /// The inferred contract at a handle's storage binding, when that binding is known.
+    pub(super) fn feed_contract(&self, target: &Name) -> Option<Type> {
+        let binding = self.scopes.lookup(self.target_origin(target))?;
+        binding.scheme.body.as_feed()?;
+        Some(binding.scheme.instantiate(self.level))
+    }
+
+    /// A handle received through a joined binder contributes to its incoming contract,
+    /// outside that binder. Its aliases do not introduce a new storage scope.
+    fn contribution_crossing(&self, target: &Name) -> Option<(Telescope, Vec<Name>)> {
+        let origin = self.target_origin(target);
+        if matches!(self.exit_of(origin), ScopeExit::Join) {
+            let (scope, mut crossed) = self.telescope.split_at(origin)?;
+            crossed.push(origin.clone());
+            Some((scope.rescoped(|n| n == origin, []), crossed))
+        } else {
+            self.telescope.split_at(origin)
+        }
+    }
+
     /// Record `contribution <: history`: a feed, define or write into the history `target`
     /// binds, made at the current position.
     ///
@@ -1417,7 +1451,7 @@ impl InferCtx {
         history: &Type,
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError> {
-        let Some((target_scope, crossed)) = self.telescope.split_at(target) else {
+        let Some((target_scope, crossed)) = self.contribution_crossing(target) else {
             return self.require_sub(contribution, history, at);
         };
         self.note_varying_binders(&crossed);
@@ -1453,7 +1487,7 @@ impl InferCtx {
     /// contract the call's argument edge carries to the caller
     /// (`src/ccl/design/type-inference.md`, "A contribution crosses the binders after its target").
     pub(super) fn feed_row(&mut self, target: &Name, value: &Type, channel: &Type) -> Type {
-        if matches!(self.exit_of(target), ScopeExit::Join) {
+        if matches!(self.exit_of(self.target_origin(target)), ScopeExit::Join) {
             let Type::Fun { codomain, .. } = channel.peel_refinements() else {
                 unreachable!(
                     "a feed's channel is the data function `domain ⤇ value`, got {channel}"
@@ -1461,7 +1495,7 @@ impl InferCtx {
             };
             return (**codomain).clone();
         }
-        let Some((_, crossed)) = self.telescope.split_at(target) else {
+        let Some((_, crossed)) = self.telescope.split_at(self.target_origin(target)) else {
             return value.clone();
         };
         let loops = &self.loop_sources;
@@ -1508,7 +1542,7 @@ impl InferCtx {
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError> {
         let row = |ctx: &mut Self| Type::data_fun(ctx.fresh(), value.clone());
-        let Some((target_scope, crossed)) = self.telescope.split_at(target) else {
+        let Some((target_scope, crossed)) = self.contribution_crossing(target) else {
             let contribution = row(self);
             return self.require_sub(&contribution, channel, at);
         };
@@ -1545,7 +1579,10 @@ impl InferCtx {
         });
         let keyable =
             keyed.is_some() && !loops.is_empty() && !in_transaction && only_lets_and_loops;
-        let places = self.feed_places.get(target).map_or(&[][..], Vec::as_slice);
+        let places = self
+            .feed_places
+            .get(self.target_origin(target))
+            .map_or(&[][..], Vec::as_slice);
         if keyable && let Some(&other) = places.iter().find(|&&p| p != self.current_node_id) {
             for x in &loops {
                 self.fed_elsewhere.insert(x.clone(), other);

@@ -1737,6 +1737,18 @@ impl TypedExpr {
         Self::new(TypedExprNode::Proj(ProjKey::Index(i)))
     }
 
+    /// The component of a tuple or record literal selected by `key`.
+    pub(crate) fn product_component(&self, key: &ProjKey) -> Option<&Self> {
+        match (&self.node, key) {
+            (TypedExprNode::Tuple(elts), ProjKey::Index(i)) => elts.get(*i),
+            (TypedExprNode::Record(fields), ProjKey::Field(label)) => fields
+                .iter()
+                .find(|entry| &entry.label == label)
+                .map(|entry| &entry.value),
+            _ => None,
+        }
+    }
+
     /// Construct a unary operation expression.
     pub fn unary(op: UnaryOpKind, operand: Self) -> Self {
         Self::new(TypedExprNode::UnaryOp(op, Box::new(operand)))

@@ -1935,17 +1935,9 @@ pub(super) fn emit_feed(
     // is no demand for a handle to be reconciled against — an undereferenced
     // `Mut(V, D)` would simply collide with a plain-`V` feed to the same channel.
     let value_ty = emit_value_read(value, ctx)?;
-    let channel = feed_channel(target_ty, label, ctx)?;
+    let channel = feed_channel(target, target_ty, label, ctx)?;
     *row = ctx.feed_row(target, &value_ty, &channel);
-    // A lexically visible channel takes the value as one row of its collection, keyed
-    // where the feed stands ([`InferCtx::require_feed`]).
-    if target_ty.as_feed().is_some() {
-        ctx.require_feed(target, &value_ty, &channel, &|| label.to_string())?;
-        return Ok(prim(BaseType::Unit));
-    }
-    // A **data** function: the contribution is one row of the channel's collection.
-    let contribution = Type::data_fun(ctx.fresh(), value_ty);
-    ctx.require_contribution(target, &contribution, &channel, &|| label.to_string())?;
+    ctx.require_feed(target, &value_ty, &channel, &|| label.to_string())?;
     Ok(prim(BaseType::Unit))
 }
 
@@ -1972,7 +1964,7 @@ fn constrain_into_feed(
     label: &str,
     ctx: &mut InferCtx,
 ) -> Result<Type, LocatedInferError> {
-    let channel = feed_channel(target_ty, label, ctx)?;
+    let channel = feed_channel(target, target_ty, label, ctx)?;
     ctx.require_contribution(target, payload_sub, &channel, &|| label.to_string())?;
     Ok(prim(BaseType::Unit))
 }
@@ -1981,18 +1973,22 @@ fn constrain_into_feed(
 /// data function `domain ⤇ value`, its read view. A **data** function, so a collection defined
 /// into it meets a collection.
 ///
-/// A target that is structurally a feed handle, a lexically visible `let d = Defer` binding
-/// possibly closure-captured, has its read view as the channel. Any other target is opaque, a
-/// lambda parameter receiving the handle (the ParamAsTarget pattern). It is demanded to be a feed
-/// by the upper bound `target <: Feed(ρf)`, whose read view is the channel. The call-site
+/// A known storage binding supplies its inferred contract, including its key binder. An alias
+/// or projection is checked against that same contract. A target whose storage is unknown is
+/// demanded to be a feed by `target <: Feed(ρf)`, whose read view is the channel. The call-site
 /// argument edge `Feed(ρ_arg) <: param` meets that bound, and the invariant Feed/Feed rule carries
 /// the contribution back into the caller's channel. A non-feed argument fails the same meeting
 /// with `NotAFeed`.
 fn feed_channel(
+    target: &Name,
     target_ty: &Type,
     label: &str,
     ctx: &mut InferCtx,
 ) -> Result<Type, LocatedInferError> {
+    if let Some(contract) = ctx.feed_contract(target) {
+        ctx.require_sub(target_ty, &contract, &|| format!("the target of {label}"))?;
+        return Ok(contract.read_view().into_owned());
+    }
     if target_ty.as_feed().is_some() {
         return Ok(target_ty.read_view().into_owned());
     }
@@ -2794,30 +2790,68 @@ fn scoped_group<C: Typing, R>(
     }
 }
 
-/// The places in `body` that feed the channel `defer`: each `<<` naming it, each `<<=`
-/// defining it, and each call it is passed to, which could feed it from another place.
+/// The places in `body` that feed `defer`, through aliases and static products too: each `<<`,
+/// each `<<=`, and each call receiving the handle. Computed data siblings carry no handle.
 fn feed_places(defer: &Name, body: &Expr) -> Vec<NodeId> {
-    fn walk(defer: &Name, e: &Expr, places: &mut Vec<NodeId>) {
+    use crate::ccl::ccl_utils::{ValueReference, resolve_product_reference};
+    fn carries(defer: &Name, e: &Expr, definitions: &HashMap<&Name, &Expr>) -> bool {
+        match resolve_product_reference(ValueReference::Expr(e), |name| {
+            definitions.get(name).copied()
+        }) {
+            ValueReference::Name(name) if name == defer => true,
+            ValueReference::Name(name) => definitions
+                .get(name)
+                .is_some_and(|value| carries(defer, value, definitions)),
+            ValueReference::Expr(value) => match &value.node {
+                TypedExprNode::Tuple(_) | TypedExprNode::Record(_) | TypedExprNode::List(_) => {
+                    value.any_child(|child| carries(defer, child, definitions))
+                }
+                TypedExprNode::Case { branches, .. } => branches
+                    .iter()
+                    .any(|branch| carries(defer, &branch.body, definitions)),
+                _ => false,
+            },
+        }
+    }
+    fn walk<'a>(
+        defer: &Name,
+        e: &'a Expr,
+        definitions: &mut HashMap<&'a Name, &'a Expr>,
+        places: &mut Vec<NodeId>,
+    ) {
+        if let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            ..
+        } = &e.node
+            && binding.transparency == crate::ccl::BindingTransparency::Transparent
+        {
+            definitions.insert(&binding.name, bound_expr);
+        }
         match &e.node {
             TypedExprNode::Feed { name, .. } | TypedExprNode::Define { name, .. }
-                if name == defer =>
+                if matches!(resolve_product_reference(ValueReference::Name(name), |name| {
+                    definitions.get(name).copied()
+                }), ValueReference::Name(origin) if origin == defer) =>
             {
                 places.push(e.node_id())
             }
-            // A loop reads its source through `Iterable::elements`, which feeds nothing.
+            // Reading a product component or Iterable::elements feeds nothing.
             TypedExprNode::Apply { argument, function }
-                if !matches!(function.node, TypedExprNode::Builtin(_))
-                    && !is_iterable_elements(function)
-                    && crate::ccl::ccl_utils::is_free(defer, argument) =>
+                if !matches!(
+                    function.node,
+                    TypedExprNode::Builtin(_) | TypedExprNode::Proj(_)
+                ) && !is_iterable_elements(function)
+                    && carries(defer, argument, definitions) =>
             {
                 places.push(e.node_id())
             }
             _ => {}
         }
-        e.walk_children(|c| walk(defer, c, places));
+        e.walk_children(|c| walk(defer, c, definitions, places));
     }
     let mut places = Vec::new();
-    walk(defer, body, &mut places);
+    walk(defer, body, &mut HashMap::new(), &mut places);
     places
 }
 

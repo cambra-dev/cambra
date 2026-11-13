@@ -51,14 +51,12 @@
 //! `const(x)` wrappers, which would otherwise require special
 //! recognition downstream.
 //!
-//! # Tuple projections
+//! # Products holding functions and feed handles
 //!
-//! A projection chain `𝑡.𝑖…` of a `let`-bound tuple literal whose elements are literals, sources,
-//! `Var`s bound to a `Defer`, or tuples of those is replaced by a copy of the element it lands
-//! on, and a tuple `let` that nothing reads afterwards is dropped. `channelize` resolves a feed handle
-//! through `Var` aliases only, and runs before [`crate::ccl::simplify`] folds literal
-//! projections, so this is what lets `o = t.1` over `t = (1, out)` feed `out`. A projection
-//! standing directly on a literal is left to `simplify`.
+//! A tuple or record literal holding a function or feed handle is split into one binding per
+//! component when every use projects it. Each computed component stays bound once, and an alias
+//! of a feed handle reaches its declaration. A projection directly on such a literal folds to
+//! the selected component. Both operations share the same product handling.
 //!
 //! This pass runs **before** [`crate::ccl::channelize`] (so the unified
 //! letrec phase can route an in-loop feed against inlined writers, and a
@@ -75,7 +73,8 @@
 //! [`Define`]: crate::ccl::TypedExprNode::Define
 
 use crate::ccl::{
-    BindingTransparency, Expr, Lit, Name, ProjKey, Refinement, Type, TypedBinding, TypedExprNode,
+    BindingTransparency, Expr, HistoryKind, Lit, Name, ProjKey, Refinement, Type, TypedBinding,
+    TypedExprNode,
     ccl_utils::{
         PredMemo, count_free, discharge_transparent_lets, free_names, free_names_in_value, is_free,
         refresh_let_binder, spelled_in_a_type, walk_quoted_terms_mut,
@@ -85,7 +84,6 @@ use crate::ccl::{
 };
 
 use crate::ccl::infer::solver::smt::{BinderScope, ScopeEnv, SmtError, smt_sub};
-use std::collections::HashSet;
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -101,12 +99,10 @@ use std::collections::HashSet;
 /// UDFs, list-producing UDFs, and curried functions all qualify. A collection is
 /// left intact.
 ///
-/// Literal tuple projections that arise from uncurried multi-arg call sites
-/// are folded here only when the tuple holds a capability
-/// ([`fold_product_projection`]); `crate::ccl::simplify` folds the rest as a
-/// general rule so it fires consistently throughout the tree.
+/// Literal product projections fold here when the product holds a function or feed handle
+/// ([`fold_product_projection`]); `crate::ccl::simplify` folds ordinary data tuples.
 pub fn inline_capability_lambdas(expr: Expr) -> Expr {
-    let expr = inline_impl(expr, &mut BinderScope::default(), &mut HashSet::new());
+    let expr = inline_impl(expr, &mut BinderScope::default());
     inline_list_element_reads(expr, &PredMemo::new()).0
 }
 
@@ -169,18 +165,18 @@ fn should_inline(bound_ty: &Type) -> bool {
 // Functions held in products
 // ---------------------------------------------------------------------------
 
-/// Whether a value of type `ty` holds a capability: it is one, or it is a tuple or
-/// record with a component that holds one.
-///
-/// A tile carries values, not closures, so a function held in a product has no
-/// runtime representation. The inliner takes such a product apart until each
-/// function it holds sits in call position (`src/ccl/design/optimization.md`,
+/// Whether `ty` contains a compute function or feed handle that must be resolved before
+/// operator conversion or channelization (`src/ccl/design/optimization.md`,
 /// "Functions held in products").
-fn holds_capability(ty: &Type) -> bool {
+fn holds_function_or_feed(ty: &Type) -> bool {
     match ty {
-        Type::Tuple(elts) => elts.iter().any(holds_capability),
-        Type::Record(fields) => fields.iter().any(|(_, t)| holds_capability(t)),
-        Type::Refinement(base, _) => holds_capability(base),
+        Type::Tuple(elts) => elts.iter().any(holds_function_or_feed),
+        Type::Record(fields) => fields.iter().any(|(_, t)| holds_function_or_feed(t)),
+        Type::Refinement(base, _) => holds_function_or_feed(base),
+        Type::History {
+            history_kind: HistoryKind::Append,
+            ..
+        } => true,
         ty => should_inline(ty),
     }
 }
@@ -205,12 +201,14 @@ fn product_components(expr: &Expr) -> Option<Vec<(ProjKey, &Expr)>> {
     }
 }
 
-/// Whether `expr` is a tuple or record literal with a component that holds a
-/// capability. The components' own types decide, since those are what each
-/// projection of the literal would carry.
-fn product_holds_capability(expr: &Expr) -> bool {
-    product_components(expr)
-        .is_some_and(|components| components.iter().any(|(_, e)| holds_capability(&e.ty)))
+/// Whether a tuple or record literal holds a function or feed handle, at the types its
+/// component values carry.
+fn product_holds_function_or_feed(expr: &Expr) -> bool {
+    product_components(expr).is_some_and(|components| {
+        components
+            .iter()
+            .any(|(_, e)| holds_function_or_feed(&e.ty))
+    })
 }
 
 /// Take `expr` apart into its components, in order.
@@ -233,10 +231,10 @@ fn into_product_components(expr: Expr) -> Vec<(ProjKey, Expr)> {
 }
 
 /// `(𝑎₀, …, 𝑎ₙ).𝑖 ⟹ 𝑎ᵢ`, and the same for a record literal's field, where the literal
-/// holds a capability.
+/// holds a function or feed handle.
 ///
 /// A literal is folded whichever component the projection reads. Folding only the
-/// components that hold a capability would leave `(f=𝑔, k=1).k` with the function
+/// function and handle components would leave `(f=𝑔, k=1).k` with the function
 /// `𝑔` still inside it. A literal holding only data is left for `simplify`'s
 /// `try_literal_tuple_projection`, which folds it after lambda elimination.
 ///
@@ -249,9 +247,7 @@ fn fold_product_projection(expr: Expr) -> Expr {
     let TypedExprNode::Proj(key) = &function.node else {
         return expr;
     };
-    if !product_holds_capability(argument)
-        || !product_components(argument).is_some_and(|cs| cs.iter().any(|(k, _)| k == key))
-    {
+    if !product_holds_function_or_feed(argument) || argument.product_component(key).is_none() {
         return expr;
     }
     let TypedExprNode::Apply { argument, function } = expr.node else {
@@ -337,7 +333,7 @@ fn only_projected(name: &Name, expr: &Expr) -> bool {
 }
 
 /// `let 𝑟 = (𝑘₀=𝑎₀, …) in body ⟹ let 𝑐₀ = 𝑎₀ in … body[𝑟.𝑘ᵢ ↦ 𝑐ᵢ]`, for a product that
-/// holds a capability and is used only through projections ([`only_projected`]).
+/// holds a function or feed handle and is used only through projections ([`only_projected`]).
 ///
 /// Each component is then a binding of its own type: a function inlines to its
 /// calls, and a collection stays bound once, so no component is recomputed per
@@ -855,23 +851,7 @@ fn anf_chain_builds_a_product(e: &Expr) -> bool {
 /// routes them through the defer-aware [`crate::ccl::subst::Subst`] engine,
 /// which renames a fed-to handle when a defer-mediating UDF is inlined. The
 /// defer-returning lift itself lives in `channelize::lift_defer`.
-///
-/// `channels` holds the names the walk has met bound to a `Defer`: the feed handles
-/// `channelize` resolves, which [`project_bound_tuple`] may copy out of a tuple. Names are
-/// unique by this pass, and a binder encloses every mention of its name, so the walk, which
-/// visits a node before its children, records a channel before reaching any tuple that holds
-/// it. A defer-mediating function's parameter is replaced by the caller's handle when the
-/// function is inlined, so the handles a tuple holds by then are channel names.
-fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>) -> Expr {
-    if let TypedExprNode::Let {
-        binding,
-        bound_expr,
-        ..
-    } = &expr.node
-        && matches!(bound_expr.node, TypedExprNode::Defer)
-    {
-        channels.insert(binding.name.clone());
-    }
+fn inline_impl(expr: Expr, scope: &mut BinderScope) -> Expr {
     // Carry `node_id` through every rebuild: reconstructing a node with
     // inlined children is a Preserve (the same node, same identity), so the
     // input id must flow onto the rebuilt `Expr` rather than being re-minted.
@@ -889,10 +869,8 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
             bound_expr,
             body,
         } => {
-            let bound_expr = inline_impl(*bound_expr, scope, channels);
-            let body = scope.under_let(&binding, &bound_expr, |scope| {
-                inline_impl(*body, scope, channels)
-            });
+            let bound_expr = inline_impl(*bound_expr, scope);
+            let body = scope.under_let(&binding, &bound_expr, |scope| inline_impl(*body, scope));
 
             // Alias: `let y = x` is pure α-renaming — substitute y → x in body
             // and drop the Let.  This must run before lambda_elim so that the
@@ -925,8 +903,8 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                 && (crate::ccl::subst::type_free_vars(&ty).contains(&binding.name)
                     || spelled_in_a_type(&body, &binding.name));
 
-            // A product holding a function is bound one component at a time, so each
-            // component inlines, or stays shared, on its own type.
+            // A product holding a function or feed handle is bound one component at a time,
+            // so each component inlines, aliases its channel, or stays shared on its own type.
             //
             // `inline.anf_product` below rewrites the same `let 𝑝 = (…) in … 𝑝.𝑘 …`
             // shape by copying the former into each use instead. The two differ in
@@ -939,7 +917,7 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
             // projection. Asked first, so a temp holding a function is split as well
             // when every use projects it.
             if !binder_spelled_in_a_type
-                && product_holds_capability(&bound_expr)
+                && product_holds_function_or_feed(&bound_expr)
                 && only_projected(&binding.name, &body)
             {
                 let split = {
@@ -947,7 +925,7 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                         provenance::enter(node_id, "inline.split", provenance::Nature::Machinery);
                     split_product_let(&binding, bound_expr, body)
                 };
-                return inline_impl(split, scope, channels);
+                return inline_impl(split, scope);
             }
 
             if !binder_spelled_in_a_type
@@ -958,8 +936,10 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                 // Alias collapse: the `Let` and its `Var` bound-expr die, the
                 // body is promoted. Nothing is minted, so the recording exists
                 // only to own the substitution's copies.
+                // Substitution can expose a literal product behind an alias; normalize
+                // the resulting body so its projections receive the same rewrites.
                 let _g = provenance::enter(node_id, "inline.alias", provenance::Nature::Machinery);
-                return substitute(body, &binding.name, &bound_expr);
+                return inline_impl(substitute(body, &binding.name, &bound_expr), scope);
             }
 
             // **An A-normalization temp naming a closed atom** is an alias as well. The pass
@@ -974,7 +954,7 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                 )
             {
                 let _g = provenance::enter(node_id, "inline.alias", provenance::Nature::Machinery);
-                return substitute(body, &binding.name, &bound_expr);
+                return inline_impl(substitute(body, &binding.name, &bound_expr), scope);
             }
 
             // **An A-normalization temp read once.** The temp exists to give
@@ -1009,7 +989,7 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                 // inside a refinement predicate, an `Rc` no term walk rebuilds.
                 // Leave the binding standing.
                 return match unplaced {
-                    None => inline_impl(body, scope, channels),
+                    None => inline_impl(body, scope),
                     Some(bound_expr) => Expr {
                         node_id,
                         site,
@@ -1058,7 +1038,7 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                 // the substitution and land between the projection and the
                 // former again, one level in.
                 let former = flatten_anf_bindings(bound_expr);
-                return inline_impl(substitute(body, &binding.name, &former), scope, channels);
+                return inline_impl(substitute(body, &binding.name, &former), scope);
             }
 
             if !binder_spelled_in_a_type && should_inline(&bound_expr.ty) {
@@ -1088,34 +1068,9 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                     // `Rc` to a different result.
                     &PredMemo::new(),
                 );
-                return inline_impl(reduced, scope, channels);
+                return inline_impl(reduced, scope);
             }
 
-            // **A projection of a bound tuple literal** reads the element it lands on, when
-            // that element is made of references and literals (`project_bound_tuple`). A
-            // tuple nothing reads afterwards goes with its last projection, and the pass runs
-            // over the body again to collapse the aliases the rewrite made.
-            let body = if let TypedExprNode::Tuple(_) = &bound_expr.node {
-                let _g = provenance::enter(
-                    node_id,
-                    "inline.tuple_projection",
-                    provenance::Nature::Machinery,
-                );
-                match project_bound_tuple(body, &binding.name, &bound_expr, channels) {
-                    (body, true)
-                        if count_free(&binding.name, &body) == 0
-                            && !crate::ccl::subst::type_free_vars(&ty).contains(&binding.name) =>
-                    {
-                        return inline_impl(body, scope, channels);
-                    }
-                    (body, true) => scope.under_let(&binding, &bound_expr, |scope| {
-                        inline_impl(body, scope, channels)
-                    }),
-                    (body, false) => body,
-                }
-            } else {
-                body
-            };
             TypedExprNode::Let {
                 binding,
                 bound_expr: Box::new(bound_expr),
@@ -1133,13 +1088,13 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
         TypedExprNode::Compose(terms) => TypedExprNode::Compose(
             terms
                 .into_iter()
-                .map(|term| inline_impl(term, scope, channels))
+                .map(|term| inline_impl(term, scope))
                 .collect(),
         ),
 
         TypedExprNode::Lambda { param, body } => {
             let body = scope.under(&param.name, param.ty.clone(), |scope| {
-                inline_impl(*body, scope, channels)
+                inline_impl(*body, scope)
             });
             TypedExprNode::Lambda {
                 param,
@@ -1163,30 +1118,9 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                 ty,
                 user_annotation,
             };
-            expr.map_children(|child| inline_impl(child, scope, channels));
-            // **A projection of a tuple literal holding a feed handle** is the element it
-            // lands on. Beta reduction leaves this shape where a function of several
-            // parameters is called with a handle: the parameter the body feeds is bound to a
-            // projection of the argument tuple (`uncurry_params`), which becomes the alias
-            // `channelize` follows, and a projection of another parameter would otherwise
-            // read the tuple, so a channel fed it would read itself. The element is moved
-            // rather than copied, so it is computed once either way.
-            if let Some(element) = projection_landing(&expr, |base| {
-                let mut held = Vec::new();
-                collect_var_elements(base, &mut held);
-                (matches!(base.node, TypedExprNode::Tuple(_))
-                    && held.iter().any(|n| channels.contains(n)))
-                .then_some(base)
-            }) {
-                let _g = provenance::enter(
-                    expr.node_id,
-                    "inline.tuple_projection",
-                    provenance::Nature::Machinery,
-                );
-                return element.clone();
-            }
+            expr.map_children(|child| inline_impl(child, scope));
             if calls_a_projection && calls_a_lambda(&expr) {
-                return inline_impl(beta_reduce_folded_call(expr, scope), scope, channels);
+                return inline_impl(beta_reduce_folded_call(expr, scope), scope);
             }
             return fold_product_projection(expr);
         }
@@ -1222,118 +1156,6 @@ fn is_shared_computation(argument: &Expr, param: &Name, body: &Expr) -> bool {
 fn bind_argument(mut param: TypedBinding, argument: Expr, body: Expr) -> Expr {
     let body = refresh_let_binder(&mut param, body);
     Expr::let_in(param, argument, body)
-}
-
-/// `body` with each projection chain `𝑡.𝑖…` of `name` that lands on a [copyable](is_copyable)
-/// element of `tuple` replaced by a copy of that element, and whether any was.
-///
-/// `channelize` resolves a feed handle through `Var` aliases only, so `o = t.1` over
-/// `t = (1, out)` has to become the alias `o = out`. The literals and sources beside a handle
-/// fold too, so that the tuple's `let` can go: a tuple holding a feed handle, read by a feed into
-/// that handle, reads to `channelize` as a channel depending on itself. A nested tuple landed on
-/// is bound by its own `let` in turn, which is how `(b, o) = t.1` reaches `o`.
-///
-/// Only a tuple whose every element is copyable, or a literal list of such, is projected: one
-/// holding a computed value stays bound, so a handle copied out of it would be fed through a tuple that holds it, and
-/// `channelize` would read the channel as depending on itself. Left projected, the handle is
-/// refused as a feed taken out of a data structure.
-///
-/// A channel name `body` rebinds is left projected, as the alias rule leaves such a `let`. A
-/// `body` that rebinds `name` itself is left whole.
-fn project_bound_tuple(
-    mut body: Expr,
-    name: &Name,
-    tuple: &Expr,
-    channels: &HashSet<Name>,
-) -> (Expr, bool) {
-    fn walk(e: &mut Expr, name: &Name, tuple: &Expr, readable: &HashSet<Name>) -> bool {
-        if let Some(element) = projection_landing(e, |base| {
-            matches!(&base.node, TypedExprNode::Var(n) if n == name).then_some(tuple)
-        }) && is_copyable(element, &|n| readable.contains(n))
-        {
-            *e = element.clone();
-            return true;
-        }
-        let mut changed = false;
-        e.walk_children_mut(|c| changed |= walk(c, name, tuple, readable));
-        changed
-    }
-    if is_let_bound(name, &body) {
-        return (body, false);
-    }
-    let mut elements = Vec::new();
-    collect_var_elements(tuple, &mut elements);
-    let readable: HashSet<Name> = elements
-        .into_iter()
-        .filter(|n| channels.contains(n) && !is_let_bound(n, &body))
-        .collect();
-    if !holds_no_computation(tuple, &readable) {
-        return (body, false);
-    }
-    let changed = walk(&mut body, name, tuple, &readable);
-    (body, changed)
-}
-
-/// The element a projection chain `𝑏.𝑖.𝑗…` lands on, where `tuple_of` answers the tuple literal
-/// the chain's base `𝑏` stands for.
-fn projection_landing<'a>(
-    e: &'a Expr,
-    tuple_of: impl FnOnce(&'a Expr) -> Option<&'a Expr>,
-) -> Option<&'a Expr> {
-    let mut path = Vec::new();
-    let mut cur = e;
-    while let TypedExprNode::Apply { argument, function } = &cur.node
-        && let TypedExprNode::Proj(ProjKey::Index(i)) = &function.node
-    {
-        path.push(*i);
-        cur = argument;
-    }
-    if path.is_empty() {
-        return None;
-    }
-    let mut element = tuple_of(cur)?;
-    for i in path.into_iter().rev() {
-        let TypedExprNode::Tuple(elts) = &element.node else {
-            return None;
-        };
-        element = elts.get(i)?;
-    }
-    Some(element)
-}
-
-/// Whether `e` is a literal, a source, a `Var` whose name `readable` accepts, or a tuple of such.
-///
-/// A copy of one denotes what the projection did and performs no computation. Any other `Var`
-/// stays projected: an A-normalization temp's readers decide whether the inline pass moves its
-/// definiens, and a tuple element reading a mutable variable is a read performed where it is
-/// written (`src/ccl/design/mutability.md`, "A read is performed where it is written").
-fn is_copyable(e: &Expr, readable: &dyn Fn(&Name) -> bool) -> bool {
-    match &e.node {
-        TypedExprNode::Lit(_) | TypedExprNode::Source(..) => true,
-        TypedExprNode::Var(n) => readable(n),
-        TypedExprNode::Tuple(elts) => elts.iter().all(|e| is_copyable(e, readable)),
-        _ => false,
-    }
-}
-
-/// Whether `e` is [copyable](is_copyable) or a list or tuple of such: a literal collection holds no
-/// computation either, though a handle copied out beside it is still fed through the tuple.
-fn holds_no_computation(e: &Expr, readable: &HashSet<Name>) -> bool {
-    match &e.node {
-        TypedExprNode::List(elts) | TypedExprNode::Tuple(elts) => {
-            elts.iter().all(|e| holds_no_computation(e, readable))
-        }
-        _ => is_copyable(e, &|n| readable.contains(n)),
-    }
-}
-
-/// Every name a `Var` element of `tuple` reads, nested tuples included.
-fn collect_var_elements(tuple: &Expr, out: &mut Vec<Name>) {
-    match &tuple.node {
-        TypedExprNode::Var(n) => out.push(n.clone()),
-        TypedExprNode::Tuple(elts) => elts.iter().for_each(|e| collect_var_elements(e, out)),
-        _ => {}
-    }
 }
 
 /// Substitute `lambda` at every free occurrence of `name` in `expr`, and
