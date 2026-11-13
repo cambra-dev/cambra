@@ -13,7 +13,7 @@
 
 use crate::ccl::Annotation;
 use crate::ccl::Occurrence;
-use crate::ccl::lower::modules::{Qualifier, Reached, top_level_nominal_types, top_level_traits};
+use crate::ccl::lower::modules::{Reached, top_level_nominal_types, top_level_traits};
 use crate::ccl::module_type::AliasType;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -690,6 +690,7 @@ pub(super) fn declare_instances(
                 ));
                 continue;
             }
+            Err(e) if e.is_unavailable_member() => continue,
             Err(e) => {
                 // A qualified head naming a type of its module is the type's own block, as
                 // an unqualified one is above.
@@ -1491,6 +1492,12 @@ pub(super) fn lower_instance(
     body: Expr,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
+    if ctx
+        .block_trait(block)
+        .is_err_and(|e| e.is_unavailable_member())
+    {
+        return Ok(body);
+    }
     let at = ctx
         .instance_blocks
         .iter()
@@ -1797,8 +1804,8 @@ impl LoweringContext {
     /// [`trait_named`](Self::trait_named) reads it, or through the modules `qualifier`
     /// names, `shapes::Area` (`docs/chl-spec.md`, "Traits and instances across modules
     /// \[Decided\]").
-    /// `Ok(None)` where an unqualified name names no trait. A qualified one names a trait or
-    /// is an error.
+    /// `Ok(None)` where an unqualified name names no trait. An unavailable member fails
+    /// with `LoweringError::UnavailableMember`, so its containing declaration can recover.
     pub(super) fn resolve_trait(
         &self,
         qualifier: &[Spanned<SmolStr>],
@@ -1806,13 +1813,19 @@ impl LoweringContext {
         span: Span,
     ) -> Result<Option<Trait>, LoweringError> {
         if qualifier.is_empty() {
+            if let Some((at, member)) = self.unavailable_use(&name.node, name.span)? {
+                return at
+                    .reach_trait(&at.name, member, name.span)?
+                    .map(Some)
+                    .ok_or_else(|| LoweringError::unavailable_member(name.span));
+            }
             if let Some(Reached::Trait(None)) = self
                 .module
                 .uses
                 .get(name.node.as_str())
                 .map(|used| &used.reached)
             {
-                return Err(Qualifier::no_trait(&name.node, name.span));
+                return Err(LoweringError::unavailable_member(name.span));
             }
             return Ok(self.trait_named(&name.node));
         }
@@ -1820,10 +1833,7 @@ impl LoweringContext {
         let spelled = crate::ccl::names::QualifiedName::of_segments(qualifier);
         match at.reach_trait(&spelled, &name.node, name.span)? {
             Some(trait_) => Ok(Some(trait_)),
-            None => Err(Qualifier::no_trait(
-                &spelled.child(name.node.clone()).to_string(),
-                name.span,
-            )),
+            None => Err(LoweringError::unavailable_member(name.span)),
         }
     }
 

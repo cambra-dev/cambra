@@ -2056,7 +2056,7 @@ fn run_frontend(
         lower_result
             .errors
             .into_iter()
-            .filter(|e| !e.is_parse_hole())
+            .filter(|e| !e.reported_elsewhere())
             .map(CompileError::Lower),
     );
     let Some(mut expr) = lower_result.value else {
@@ -2682,11 +2682,11 @@ pub fn check_program(
     }
     let lowering_session = LoweringSession::install();
     let lowered = lower_for_check(program, ctx.lowering_ctx());
-    // A part the parser could not read is reported by its parse error.
+    // Parse holes and unavailable members are reported by their earlier errors.
     errors.extend(
         lowered
             .into_iter()
-            .filter(|e| !e.is_parse_hole())
+            .filter(|e| !e.reported_elsewhere())
             .map(CompileError::Lower),
     );
     let checks = std::mem::take(&mut ctx.lowering_ctx().module_checks);

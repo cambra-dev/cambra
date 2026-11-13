@@ -1837,6 +1837,13 @@ pub(super) fn resolve_type(
 ) -> Result<Option<Named>, LoweringError> {
     let (ty, qualifier) = path.split_last().expect("a type path names its type");
     let Some(first) = qualifier.first() else {
+        if let Some((at, member)) = ctx.unavailable_use(&ty.node, ty.span)? {
+            assert!(
+                at.member_unavailable(member),
+                "an unavailable use has no usable declaration"
+            );
+            return Ok(None);
+        }
         if !ctx.nominal_types.iter().any(|d| d.name == ty.node)
             && let Some((found, qualifier)) = ctx.used_nominal.get(&ty.node)
         {
@@ -2109,13 +2116,7 @@ fn resolve_pattern_type(
         .last()
         .expect("a constructor pattern names its type");
     let Some(named) = resolve_type(&pattern.type_path, ctx)? else {
-        return Err(LoweringError::unsupported(
-            ty.span,
-            format!(
-                "`{}`'s module has errors of its own, so its constructors are unknown",
-                ty.node
-            ),
-        ));
+        return Err(LoweringError::unavailable_member(ty.span));
     };
     let decl = named.decl;
     if decl.ctor(&pattern.ctor.node).is_none() {

@@ -372,11 +372,14 @@ parse, loading and lowering errors, and inference's errors are added to theirs. 
 is not reported, as in a run that starts over.
 
 A module with lowering errors has no interface or linked chain and is not inferred. A value
-reference into it lowers to a placeholder. A module that did not load supplies placeholders for
-value and type-alias references, including `use` names of those kinds, so inference continues past
-load errors. Trait references and nominal type qualifiers through `use` do not have this recovery. A
-lowering error without a placeholder stops compilation after lowering: the tree can be inconsistent
-outside a placeholder.
+reference into it lowers to a placeholder. A lowering error without a placeholder stops compilation
+after lowering: the tree can be inconsistent outside a placeholder.
+
+A module that did not load supplies placeholders for value and type references. A `use` member
+records an unavailable state when its declaration category cannot be determined. Constructor
+patterns and trait requirements that need the declaration recover their containing statements
+without another diagnostic. An unavailable trait head skips its whole instance, including its
+function bodies.
 
 An import cycle leaves no link order, so no dependency module is lowered, including modules outside
 the cycle. The root's own errors are still inferred, while dependency errors and missing dependency

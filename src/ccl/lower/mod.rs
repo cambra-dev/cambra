@@ -193,6 +193,13 @@ pub enum LoweringError {
         /// Whether a recovery placeholder contains this failure.
         stood_in: bool,
     },
+    /// A member whose module has no usable declaration because of an earlier error.
+    /// The containing statement recovers, and the module's error reports the cause.
+    UnavailableMember {
+        span: Span,
+        related: Vec<(Span, String)>,
+        stood_in: bool,
+    },
 }
 
 impl std::fmt::Display for LoweringError {
@@ -204,6 +211,9 @@ impl std::fmt::Display for LoweringError {
             LoweringError::Unsupported { message, .. }
             | LoweringError::Internal { message, .. } => f.write_str(message),
             LoweringError::ParseHole { .. } => f.write_str("a part the parser could not read"),
+            LoweringError::UnavailableMember { .. } => {
+                f.write_str("a member unavailable because its module has errors")
+            }
         }
     }
 }
@@ -250,7 +260,8 @@ impl LoweringError {
         match self {
             Self::Unsupported { stood_in, .. }
             | Self::Internal { stood_in, .. }
-            | Self::ParseHole { stood_in, .. } => *stood_in,
+            | Self::ParseHole { stood_in, .. }
+            | Self::UnavailableMember { stood_in, .. } => *stood_in,
         }
     }
 
@@ -258,7 +269,8 @@ impl LoweringError {
         match self {
             Self::Unsupported { stood_in, .. }
             | Self::Internal { stood_in, .. }
-            | Self::ParseHole { stood_in, .. } => stood_in,
+            | Self::ParseHole { stood_in, .. }
+            | Self::UnavailableMember { stood_in, .. } => stood_in,
         }
     }
 
@@ -276,12 +288,30 @@ impl LoweringError {
         matches!(self, LoweringError::ParseHole { .. })
     }
 
+    fn unavailable_member(span: Span) -> Self {
+        Self::UnavailableMember {
+            span,
+            related: Vec::new(),
+            stood_in: false,
+        }
+    }
+
+    fn is_unavailable_member(&self) -> bool {
+        matches!(self, Self::UnavailableMember { .. })
+    }
+
+    /// Whether an earlier parse or module error reports the cause of this failure.
+    pub(crate) fn reported_elsewhere(&self) -> bool {
+        self.is_parse_hole() || self.is_unavailable_member()
+    }
+
     /// Primary source span of this error.
     pub fn span(&self) -> Span {
         match self {
             LoweringError::Unsupported { span, .. }
             | LoweringError::Internal { span, .. }
-            | LoweringError::ParseHole { span, .. } => *span,
+            | LoweringError::ParseHole { span, .. }
+            | LoweringError::UnavailableMember { span, .. } => *span,
         }
     }
 
@@ -290,7 +320,8 @@ impl LoweringError {
         match self {
             LoweringError::Unsupported { related, .. }
             | LoweringError::Internal { related, .. }
-            | LoweringError::ParseHole { related, .. } => related,
+            | LoweringError::ParseHole { related, .. }
+            | LoweringError::UnavailableMember { related, .. } => related,
         }
     }
 
@@ -299,7 +330,8 @@ impl LoweringError {
         match self {
             LoweringError::Unsupported { related, .. }
             | LoweringError::Internal { related, .. }
-            | LoweringError::ParseHole { related, .. } => related,
+            | LoweringError::ParseHole { related, .. }
+            | LoweringError::UnavailableMember { related, .. } => related,
         }
     }
 

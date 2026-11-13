@@ -518,6 +518,9 @@ impl LoweringContext {
         span: Span,
     ) -> Option<Result<ConstTerm, Refused>> {
         let used = self.module.uses.get(name)?;
+        if matches!(used.reached, super::modules::Reached::Unavailable { .. }) {
+            return Some(Err(Refused(None)));
+        }
         let super::modules::Reached::Value(reference) = &used.reached else {
             return None;
         };

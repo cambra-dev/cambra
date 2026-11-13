@@ -229,16 +229,21 @@ impl LoweringContext {
         arguments: RunArguments,
         body: Expr,
     ) -> Expr {
-        let mut used: Vec<(SmolStr, QualifiedName, Span)> = self
+        let mut used: Vec<(SmolStr, Option<QualifiedName>, Span)> = self
             .module
             .uses
             .iter()
             .filter(|(_, used)| used.run.as_deref() == Some(name))
             .filter_map(|(bound, used)| match &used.reached {
                 Reached::Value(Some(reference)) => {
-                    Some((bound.clone(), reference.name.clone(), used.item))
+                    Some((bound.clone(), Some(reference.name.clone()), used.item))
                 }
-                Reached::Value(None)
+                Reached::Unavailable { .. } if !chl_parser::ast::is_type_name(bound) => {
+                    Some((bound.clone(), None, used.item))
+                }
+                Reached::Unavailable { .. }
+                | Reached::Module
+                | Reached::Value(None)
                 | Reached::Type { .. }
                 | Reached::Nominal(_)
                 | Reached::Trait(_) => None,
@@ -251,7 +256,10 @@ impl LoweringContext {
             .into_iter()
             .rev()
             .fold(body, |body, (bound, member, item)| {
-                let member = self.tag_image(Expr::var(member.raw()), item);
+                let member = self.tag_image(
+                    member.map_or_else(Expr::error, |member| Expr::var(member.raw())),
+                    item,
+                );
                 let bound = Expr::let_bind(bound.as_str(), Occurrence::mint(), member, body);
                 self.tag_image(bound, item)
             });
@@ -545,6 +553,9 @@ impl LoweringContext {
         let qualifier = qualifier.clone();
         for item in uses {
             let bound = item.alias.as_ref().unwrap_or(&item.name);
+            if qualifier.member_unavailable(&item.name.node) {
+                continue;
+            }
             if qualifier.declares_trait(&item.name.node) {
                 // A refused `use` item has no `use` name.
                 if !self.module.uses.contains_key(&bound.node) {

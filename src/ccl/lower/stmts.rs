@@ -1448,7 +1448,11 @@ fn bind_unreached_uses(body: Expr, ctx: &mut LoweringContext) -> Expr {
         .module
         .uses
         .iter()
-        .filter(|(_, used)| used.run.is_none() && matches!(used.reached, Reached::Value(None)))
+        .filter(|(name, used)| {
+            used.run.is_none()
+                && (matches!(used.reached, Reached::Value(None))
+                    || (matches!(used.reached, Reached::Unavailable { .. }) && !is_type_name(name)))
+        })
         .map(|(name, used)| (name.clone(), used.item))
         .collect();
     // Sorted, so the tree does not depend on the map's order.
@@ -3349,6 +3353,9 @@ pub(super) fn lower_type_expr_or_poly(
             if let Some(ty) = name_type(id.as_str()) {
                 return Ok(ty);
             }
+            if ctx.unavailable_use(id, annotation.span)?.is_some() {
+                return Ok(Type::Hole);
+            }
             if ctx.family_params.iter().any(|(n, ..)| n == id) {
                 return Err(LoweringError::unsupported(
                     annotation.span,
@@ -3430,6 +3437,11 @@ pub(super) fn lower_type_expr_or_poly(
         // types. Application uses parentheses at both levels
         // (`docs/chl-spec.md`).
         ChlExpr::Call { func, args } => {
+            if let ChlExpr::Name(name) = &func.node
+                && ctx.unavailable_use(name, func.span)?.is_some()
+            {
+                return Ok(Type::Hole);
+            }
             if let ChlExpr::Qualified(q) = &func.node
                 && let Some(decl) = qualified_nominal(q, func.span, ctx)?
             {
