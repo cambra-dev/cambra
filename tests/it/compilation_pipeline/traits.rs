@@ -1214,6 +1214,38 @@ fn a_trait_requires_traits(#[case] code: &str, #[case] expected: i64) {
     check_scalar(&format!("{RANKED}\n{code}"), Value::Int(expected));
 }
 
+/// A trait's requirement may name its associated types, and holds at the type each instance
+/// chooses: `Boxed`'s `Same(Elem, Elem)` is `Same(M, M)` at an instance whose `Elem` is `M`.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::holds_at_the_choice(
+    indoc! {"
+        instance Same(M, M):
+            def same(a, other):
+                a.extract() == other.extract()
+    "},
+    None
+)]
+#[case::refuses_without_it("", Some("`instance Boxed(Two(M))` needs `Same(M, M)`"))]
+fn a_trait_requirement_reads_an_associated_type(#[case] same: &str, #[case] needle: Option<&str>) {
+    let code = formatdoc! {"
+        {RANKED}
+        trait Boxed(C) requires s: Same(Elem, Elem):
+            Elem
+            def first(c: C) => Elem
+        {same}
+        instance Boxed(Two(M)):
+            Elem = M
+            def first(c):
+                c.extract().0
+        summon(Boxed(_))::first(Two::new((M::new(4), M::new(5)))).extract()
+    "};
+    match needle {
+        None => check_scalar(&code, Value::Int(4)),
+        Some(needle) => check_compile_error(&code, needle),
+    }
+}
+
 /// A requirement states nothing of what its trait requires of every instance: under
 /// `requires r: Ranked(T, T)`, neither a summon of `Same(T, T)` nor `r::s` reaches `Same`.
 #[rstest]
