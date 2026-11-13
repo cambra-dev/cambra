@@ -671,7 +671,7 @@ fn coalesce_compact_go(
         let c = coalesce_compact_go(&cf.codomain, polarity, scope)?;
         // The domain, materialized contravariantly. At a `Data` position the atoms are
         // *alternatives* — one candidate each (see `denoted_domains`) — and a
-        // `DomainConflict` reads them the same way, since naming both is the whole content
+        // `DomainJoinConflict` reads them the same way, since naming both is the whole content
         // of its diagnostic. Everywhere else they are a collision, which
         // `coalesce_compact_go` reports.
         let candidates: Vec<Type> = if (cf.kind.is_data() || cf.domains_disagree)
@@ -971,8 +971,7 @@ fn dissolve_read_feeds(mut ct: CompactType, polarity: bool) -> CompactType {
             ..
         } = history;
         // The channel is the `domain ⤇ value` function; reconstruct it as a
-        // `fun`-slot CompactType (exactly what the old single-payload slot held)
-        // and merge it into the read view.
+        // `fun`-slot CompactType and merge it into the read view.
         //
         // Not [`CompactType::value`]: this re-expresses content already at this
         // position rather than arriving as a second bound, so it imposes no refinement
@@ -1532,8 +1531,8 @@ mod tests {
     fn var_constrained_to_refined_coalesces_refined() {
         // A fresh var equated to a refined type (both bounds) must coalesce
         // *carrying* the refinement, not drop it to the bare base. Solver-level
-        // property: equality bounds may still arise (e.g. `bind_annotation`,
-        // `require_eq` on list elements), so refinements must survive them.
+        // property: a refinement survives an equality bound, whichever caller
+        // constrains a variable from both sides.
         let p = 1;
         let v = fresh_var(0);
         let refined_int = refined(prim(BaseType::Int), p);

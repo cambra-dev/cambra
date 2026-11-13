@@ -3727,19 +3727,13 @@ mod tests {
         );
     }
 
-    /// `λ p → p._0` where `p : Tuple([Hole, Hole])`.
+    /// `λ p → p._0` where `p : (_, _)`.
     ///
-    /// `replace_holes` converts the param type to `Tuple([Infer(a), Infer(b)])`.
-    /// Body inference constrains `Infer(a)` via the index-0 projection but never
-    /// touches `Infer(b)`. A shallow check (`if let Type::Infer(id) = param.ty`)
-    /// would miss this because `param.ty` is a `Tuple`, not a top-level `Infer`.
-    /// `type_has_infer` catches it recursively.
+    /// The body constrains `p._0` and leaves `p._1` unconstrained, and inference returns a
+    /// `Fun` rather than refusing the partly inferred parameter.
     #[test]
     fn test_cannot_infer_nested_tuple_param() {
         let mut ctx = TypeInferenceContext::new();
-        // λ p → p._0  where p : (_, _)
-        // inference permits partially-inferred params; body constrains p._0 to Int
-        // but leaves p._1 unconstrained — returns a Fun rather than erroring.
         let body = Expr::apply(Expr::var("p"), Expr::proj_index(0));
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
@@ -4674,16 +4668,14 @@ mod tests {
         );
     }
 
-    /// `Sum` with a non-function input → `TypeMismatch`.
-    ///
-    /// The input infers as `Int` (a bare literal), which has no codomain.
-    /// The aggregate arm expects a `Fun(_, _)`.
+    /// `Sum` with a non-function input → `ExpectedFunction`: `Sum` expects a collection
+    /// `𝛼 ⤇ Int`, and the input `42` is an `Int`.
     #[test]
     fn test_infer_aggregate_non_function_input_mismatch() {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = Expr::aggregate(Expr::lit(Lit::Int(42)), AggregateKind::Sum);
-        // HM produces TypeMismatch; inference's map_constrain_err detects that the
-        // rhs is a Fun and lhs is not, promoting it to ExpectedFunction.
+        // `map_constrain_err` reports a non-function where a function is expected as
+        // `ExpectedFunction`.
         let errs =
             infer_bare(&mut expr, &mut ctx).expect_err("expected error for non-function input");
         assert!(
@@ -4717,19 +4709,9 @@ mod tests {
 
     /// `let total = λ xs → sum(xs) in total([1, 2, 3])` — aggregate in a let-bound function.
     ///
-    /// The lambda is bound in a `Let` rather than immediately applied, so
-    /// `infer_apply`'s eager-annotation path (which sets `param.ty` from the
-    /// argument before descending into the body) does not fire when the lambda
-    /// body is first inferred. `xs` is therefore still an unresolved `Infer`
-    /// variable when the `Aggregate` node is visited.
-    ///
-    /// The old `resolve_type` approach failed here: `resolve_type` on an unsolved
-    /// `Infer` var is a no-op, leaving `Infer(_)`, whose `codomain()` is `None`,
-    /// which produced a `TypeMismatch` error.
-    ///
-    /// The `constrain_equal` approach records `xs = Fun(_, output)` and lets
-    /// unification fill in the concrete types when the call site `total([1,2,3])`
-    /// constrains `xs = Fun(UIntRange(3), Int)`.
+    /// `total` is generalized, so the `Aggregate` arm meets `xs` as an unsolved variable and
+    /// bounds it from above by `Sum`'s input, a collection of `Int`. The use
+    /// `total([1, 2, 3])` instantiates `total` at the list's type `0..3 ⤇ Int`.
     #[test]
     fn test_infer_aggregate_input_type_inferred_from_call_site() {
         let mut ctx = TypeInferenceContext::new();
@@ -4793,11 +4775,11 @@ mod tests {
         }));
     }
 
-    /// `λ p → f(p._0) + g(p._0)` where f : Int → Int and g : String → String.
+    /// `λ p → f(p._0) and g(p._0)` where f : Int ⇒ Int and g : String ⇒ String.
     ///
-    /// Both usages constrain p._0 via the unification table. The second usage
-    /// constrains p._0 as String while the first established Int, causing a
-    /// TypeMismatch.
+    /// Both projections bound `p._0` from above, by `Int` and by `String`. The asserted
+    /// `TypeMismatch` is the `and` rejecting its operand `f(p._0) : Int`, which is not
+    /// `Bool`; the test does not isolate the projection conflict.
     #[test]
     fn test_tuple_field_conflict_returns_mismatch() {
         let f = Expr::lambda(
@@ -4830,15 +4812,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Deferred CannotInferParam: constraint comes from the call site
+    // Parameter types fixed by specialization at a use
     // -----------------------------------------------------------------------
 
-    /// `let g = λ x → x in let f = λ t → (t.0 ▸ g, t.2 ▸ g) in (0, 1, 2) ▸ f`
+    /// `let g = λ x → x in let f = λ t → (t.0 ▷ g, t.2 ▷ g) in (0, 1, 2) ▷ f`
     ///
-    /// `g`'s parameter type cannot be inferred from `g`'s own body, but usage
-    /// inside `f` constrains it to Int (via `t.0` and `t.2` when `f` is applied
-    /// to `(0, 1, 2)`). Unification should infer `g : Int ⇒ Int`,
-    /// `f : {Int, Int, Int} ⇒ {Int, Int}`, and the whole expression `{Int, Int}`.
+    /// `g` and `f` are generalized, and nothing in their bodies fixes their parameter types.
+    /// The use `(0, 1, 2) ▷ f` specializes `f` at that tuple, and each use of `g` inside it
+    /// at that tuple's element. The whole expression infers as `(Int, Int)`.
     #[test]
     fn test_lambda_type_inferred_from_call_site() {
         let mut ctx = TypeInferenceContext::new();
@@ -4941,8 +4922,7 @@ mod tests {
 
     /// `Apply(λ [x : annotated String] → x, 42)` — argument is Int but annotation says String.
     ///
-    /// HM: catches the conflict as `AnnotationMismatch` at the lambda-param annotation check.
-    /// the solver: the annotation pins the param to String; the Apply then fails to constrain
+    /// The annotation pins the param to String; the Apply then fails to constrain
     /// `Int ≤ String` and surfaces as `TypeMismatch{Apply, Int, String}`.
     #[test]
     fn test_infer_apply_annotation_mismatch() {
@@ -4963,8 +4943,6 @@ mod tests {
             })),
             argument: Box::new(Expr::lit(Lit::Int(42))),
         });
-        // the solver: the annotation pins the param to String; the Apply then fails to
-        // constrain Int ≤ String and surfaces as TypeMismatch.
         let errs = infer_bare(&mut expr, &mut ctx).expect_err("expected error under inference");
         assert!(
             errs.iter()
@@ -5386,8 +5364,7 @@ mod tests {
         assert_eq!(ty.to_string(), "{Int | __elem == 42 + 1}");
     }
 
-    /// All `Case` branches must agree on the result type; unification of
-    /// compatible types (both `Int`) succeeds and returns `Int`.
+    /// A `Case`'s type is the join of its branch types: branches `1` and `2` join to `Int`.
     #[test]
     fn test_infer_case_branches_unified() {
         let mut ctx = TypeInferenceContext::new();
@@ -5582,7 +5559,7 @@ mod tests {
         let var = crate::ccl::InferVar::fresh(0);
         let id = var.uid;
         // The lambda's own type is concrete, but the param still holds an Infer var.
-        // After removing CannotInferParam, collect_type_errors reports UnresolvedInfer.
+        // `collect_type_errors` reports it as `UnresolvedInfer`.
         let expr = Expr::new(TypedExprNode::Lambda {
             param: TypedBinding {
                 occurrence: Occurrence::mint(),
@@ -5606,7 +5583,7 @@ mod tests {
     }
 
     /// A `Type::Hole` nested inside a `Fun` type (not just at a node boundary)
-    /// is caught by the recursive `check_type` walk.
+    /// is caught by the recursive `collect_type_errors` walk.
     ///
     /// The context string is the symbolic form of the node whose type is malformed (`"1"`).
     #[test]
@@ -5629,9 +5606,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// `Proj(Index(2))` applied to a 3-tuple infers the third element type.
-    ///
-    /// This was the broken case under the old HM fallback, which produced
-    /// `Fun(?a, ?b)` for any index ≥ 2, losing all structural information.
     #[test]
     fn test_infer_proj_index_2_on_3_tuple() {
         let mut ctx = TypeInferenceContext::new();
@@ -5765,8 +5739,8 @@ mod tests {
     /// A rule that reports by **returning** `Err` rather than accumulating into the
     /// context must still surface. `check` runs most rules through `require_sub`,
     /// which records and keeps walking, but a few — `emit_case`'s `EmptyCase`,
-    /// `emit_node`'s `UnboundVariable` — can only propagate. Dropping that return
-    /// value, as the driver used to, made those rules report into the void.
+    /// `emit_node`'s `UnboundVariable` — can only propagate. A driver that drops that
+    /// return value loses those rules' reports.
     #[test]
     fn typecheck_surfaces_a_propagated_error() {
         let empty_case =
@@ -5930,8 +5904,8 @@ mod tests {
         assert_eq!(typecheck(&expr), Ok(()));
     }
 
-    /// A lambda that applies two different projections to the same parameter infers a
-    /// tuple-typed domain, after `set()` merging and `TupleField` constraint accumulation.
+    /// A lambda that applies two different projections to the same parameter infers an open
+    /// tuple domain `(Int, ?b, ..)`: projections fix no width, and nothing applies the lambda.
     #[test]
     fn test_infer_lambda_two_proj_on_same_param() {
         let mut ctx = TypeInferenceContext::new();
