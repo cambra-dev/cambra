@@ -135,9 +135,9 @@ is under, so `b, a = (a, b)` reads both old values.
 A tuple literal under a tuple pattern of the same length binds each element directly, at every
 depth of nesting, so the statement builds no tuple it only takes apart. Any other value is bound
 once to a minted name, and component `𝑖` reads its projection `.𝑖`. A feed handle projected out of
-a bound tuple literal whose every element is a literal, a source or a handle reaches `channelize`
-as an alias of its channel through the inline pass's tuple-projection rule (the module docs of
-`src/ccl/inline.rs`). A handle in any other tuple does not reach it
+a static tuple or record literal reaches `channelize` as an alias of its channel. The inline
+pass splits the product into component bindings, retaining computed siblings once (the module
+docs of `src/ccl/inline.rs`). A handle chosen from runtime data does not reach its declaration
 ([mutability.md, "`Feed` is a CCL type"](mutability.md#feed-is-a-ccl-type);
 [chl-spec.md, "A deferred collection inside a data structure [Open]"](../../../docs/chl-spec.md#a-deferred-collection-inside-a-data-structure-open)).
 
@@ -166,7 +166,7 @@ the two is an error. Feed and define expressions have type `Unit`.
 only a feed is introduced with no value. A feed or define in statement position is sequenced through
 `ExprStmt`. A function of several parameters substitutes a projection of its argument tuple for each
 parameter, but binds one its body feeds to that projection (`uncurry_params`), since a feed targets
-a name. Inlining folds a projection of a tuple literal holding a feed handle to its element, so the
+a name. Inlining folds a projection of a static tuple or record holding a feed handle, so the
 binding becomes an alias of the handle the caller passed. A top-level
 `𝑝 = http_serve(port, method, path)` binds `𝑝` to the tuple `(Source(requests), responses)`, where
 `responses` names a `Defer` that a `let` around the statement binds. Both names are minted from the
