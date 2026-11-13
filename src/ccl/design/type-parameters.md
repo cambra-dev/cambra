@@ -621,7 +621,7 @@ the joins and meets the notation cannot write recorded beside it. An annotation 
 `Poly` (`InferError::PolyAnnotationMismatch`) uses it for the right-hand side's type, with the
 cutoff at the binding's level, so `pick: forall (T) {T, T} => T = add` reports `add` as
 `forall (A, B) {A, B} => r::Output requires r: Addable(A, B)`, written in CHL by
-`chl_print::chl_inferred_poly`.
+`chl_print::Writer::inferred_poly`.
 
 - **One term.** The type is compacted together with the operands and associated types of every
   obligation watching a variable it reaches, and the positions of each conditional ordering
