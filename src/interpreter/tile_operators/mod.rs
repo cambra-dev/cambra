@@ -1129,7 +1129,9 @@ pub enum TilePathStep {
 
 #[cfg(test)]
 pub(crate) mod test_helpers {
-    use super::{InspectNode, ProducerBase, Tile, TileGuard, TileProducer, Tiling, VizOptions};
+    use super::{
+        InspectNode, ProducerBase, Tile, TileGuard, TileOperator, TileProducer, Tiling, VizOptions,
+    };
     use crate::interpreter::{ColumnValue, FunctionGuard, Predicate, Value};
     use bit_set::BitSet;
     use intervalsets::{Interval, IntervalSet};
@@ -1187,6 +1189,94 @@ pub(crate) mod test_helpers {
         entries
     }
 
+    /// `k ⤇ j ⤇ Int`: the keys 0 and 1, each holding the positions 0 to 2 valued `10k + j`, every
+    /// level stated complete, and its tiling. The input a test of a projection beneath the
+    /// outermost keys pulls.
+    pub(crate) fn two_levels_of_ints() -> (Tile, Tiling) {
+        use crate::interpreter::{BaseType, Extent};
+        let tiling = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::data_function(
+                Extent::uint_range(3),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        let tile = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                vec![0, 3],
+                ColumnValue::UInts(vec![0, 1, 2, 0, 1, 2]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 2, 10, 11, 12]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        (tile, tiling)
+    }
+
+    /// The guard naming the paths `(k, j)` of a two-level collection that `paths` admits, a
+    /// predicate over `j` qualified by `k`.
+    pub(crate) fn paths_guard(paths: Predicate) -> TileGuard {
+        TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+            FunctionGuard::Domain(paths),
+        ))))
+    }
+
+    /// Assert that the producer of each operator `make` builds, over two levels of keys, answers
+    /// a pull at a projection of paths as the whole of its answer cut to it
+    /// ([`assert_conforms`]): one path, and paths of two rows.
+    pub(crate) fn assert_conforms_beneath(make: impl Fn() -> Box<dyn TileOperator>) {
+        let point = |k: u64| Predicate::point(Value::UInt(k));
+        for paths in [
+            Predicate::qualified(point(0), point(1)),
+            Predicate::qualified(point(0), point(2))
+                .union(&Predicate::qualified(point(1), point(0))),
+        ] {
+            assert_conforms(
+                || {
+                    let mut op = make();
+                    let guard = op.tiling().universal_guard();
+                    op.subscribe(guard, Box::new(|| {}), &mut super::Scheduler::new())
+                },
+                paths_guard(paths),
+            );
+        }
+    }
+
+    /// Assert that a producer answers a projection as the whole of its answer cut to it. `make`
+    /// builds the same producer twice: one is pulled at `guard`, the other at the universal
+    /// guard, and the second's tile is cut to `guard` and compared. Both are compacted and
+    /// ordered by key where the keys are scalars, since a producer may order its rows as it likes.
+    pub(crate) fn assert_conforms(make: impl Fn() -> Box<dyn TileProducer>, guard: TileGuard) {
+        let normal = |mut tile: Tile| {
+            tile.compact();
+            // Pairs and other record keys keep the order the producer gave them.
+            match &tile {
+                Tile::DataFunction {
+                    domain: ColumnValue::Records(_),
+                    ..
+                } => tile,
+                _ => crate::interpreter::sort_function_by_domain(tile),
+            }
+        };
+        let mut projected = make();
+        let answer = normal(projected.get(guard.clone()));
+        let mut whole = make();
+        let mut expected = whole.get(whole.tiling().universal_guard());
+        expected.restrict_to(
+            &crate::interpreter::Projection::of(&guard)
+                .expect("assert_conforms takes a projection guard"),
+            whole.tiling(),
+        );
+        assert_eq!(
+            answer,
+            normal(expected),
+            "a pull at {guard:?} is the whole answer cut to it"
+        );
+    }
+
     /// A [`TileProducer`] that **conforms to projection**: it answers a fixed tile minus what
     /// has been released, cut to the projection guard it is pulled with. It logs every
     /// projection and every release it receives, which is how a test sees the guard an
@@ -1229,18 +1319,69 @@ pub(crate) mod test_helpers {
             node
         }
 
+        fn restates(&self) -> crate::interpreter::Restates {
+            crate::interpreter::Restates::Every
+        }
+
         fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
             self.pulled.borrow_mut().push(projection_guard.clone());
             let mut tile = self.tile.clone();
             tile.remove_guarded(self.obsolete_guard().clone());
             tile.compact();
-            let projection = projection_guard.projection("ProjectionSpy");
+            let projection = projection_guard.projection_for(self);
             tile.restrict_to(&projection, self.tiling());
             tile
         }
 
         fn release_impl(&mut self, obsolete_guard: TileGuard) {
             self.released.borrow_mut().push(obsolete_guard);
+        }
+    }
+
+    /// An operator over a fixed tile whose producers are [`ProjectionSpy`]s sharing one pair of
+    /// logs, so a test can build a fan-out or a memo over it and read what reaches the input.
+    pub(crate) struct ProjectionSpyOp {
+        tile: Tile,
+        tiling: Tiling,
+        pulled: GuardLog,
+        released: GuardLog,
+    }
+
+    impl ProjectionSpyOp {
+        pub(crate) fn new(tile: Tile, tiling: Tiling) -> (Self, GuardLog, GuardLog) {
+            let (pulled, released) = (GuardLog::default(), GuardLog::default());
+            (
+                Self {
+                    tile,
+                    tiling,
+                    pulled: pulled.clone(),
+                    released: released.clone(),
+                },
+                pulled,
+                released,
+            )
+        }
+    }
+
+    impl TileOperator for ProjectionSpyOp {
+        // A test double holds no operator, and no session walks one.
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(super::InputEdgeSpec<'_>)) {}
+
+        fn tiling(&self) -> &Tiling {
+            &self.tiling
+        }
+
+        fn subscribe(
+            &mut self,
+            _intent_guard: TileGuard,
+            mut consumer: Box<dyn super::Consumer>,
+            _scheduler: &mut super::Scheduler,
+        ) -> Box<dyn TileProducer> {
+            consumer.notify();
+            let (mut spy, _, _) = ProjectionSpy::new(self.tile.clone(), self.tiling.clone());
+            spy.pulled = self.pulled.clone();
+            spy.released = self.released.clone();
+            Box::new(spy)
         }
     }
 
