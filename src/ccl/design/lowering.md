@@ -423,6 +423,13 @@ module to nothing ([docs/modules.md, "A Module type is not a
 `Type`"](../../../docs/modules.md#a-module-type-is-not-a-type)). A sink is declared, and registered
 by each run of the module.
 
+An unavailable `use` member retains its module and original spelling rather than a guessed
+declaration category. A dependent constructor pattern or requirement fails with
+`LoweringError::UnavailableMember`, whose cause is the earlier module error. Statement recovery
+contains the failure, and compilation omits its duplicate diagnostic. An unavailable instance head
+skips the whole instance before its declaration or bodies are checked
+([docs/modules.md, "The module interface"](../../../docs/modules.md#the-module-interface)).
+
 The rest of the module syntax parses ([chl-spec.md](../../../docs/chl-spec.md), "9. Modules") and
 does not lower yet: `@RenamedFrom`, `@Discard`, `pub` on a mutable variable, and a write to another
 module's member. `refuse_module_syntax` (`ccl/lower/module_syntax.rs`) walks the whole module,

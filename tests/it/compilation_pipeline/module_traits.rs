@@ -207,7 +207,7 @@ fn two_runs_share_an_instance() {
         def g(x: Nope) => Int:
             1
     "})],
-    "`broken::Area` names no trait here: its module has errors of its own"
+    "unknown type annotation: Nope"
 )]
 #[case::a_private_trait_s_function_read_from_the_trait(
     indoc! {"

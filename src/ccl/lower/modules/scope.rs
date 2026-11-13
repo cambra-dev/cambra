@@ -31,10 +31,16 @@ pub struct Use {
     pub run: Option<SmolStr>,
 }
 
-/// The member a `use` item names: a value or a type alias, as the case of its
-/// spelling says. Each is `None` when its module has errors of its own.
+/// The member a `use` item names, with its declaration category when known.
 #[derive(Debug, Clone)]
 pub enum Reached {
+    /// A member whose declaration category is unknown because its module has errors.
+    Unavailable {
+        qualifier: Box<Qualifier>,
+        member: SmolStr,
+    },
+    /// A member bound to a module, recorded in the module's qualifier map.
+    Module,
     /// The member, as a reference through its qualifier.
     Value(Option<Reference>),
     /// The type or Module type the alias names, spelled through its qualifier
@@ -124,6 +130,22 @@ impl QualifierKind {
 }
 
 impl LoweringContext {
+    pub(in crate::ccl::lower) fn unavailable_use(
+        &self,
+        name: &str,
+        span: Span,
+    ) -> Result<Option<(&Qualifier, &str)>, LoweringError> {
+        let Some(Use {
+            reached: Reached::Unavailable { qualifier, member },
+            ..
+        }) = self.module.uses.get(name)
+        else {
+            return Ok(None);
+        };
+        qualifier.in_scope_at(name, span, span)?;
+        Ok(Some((qualifier, member)))
+    }
+
     /// Start lowering a module in `scope`, clearing the block state the module
     /// before it left: each module lowers with fresh block state
     /// (`docs/modules.md`, "The module interface").
@@ -158,7 +180,11 @@ impl LoweringContext {
                 Reached::Value(Some(reference)) if reference.history_param => {
                     self.register_history_param_fn(name.as_str());
                 }
-                Reached::Value(_) | Reached::Nominal(None) | Reached::Trait(_) => {}
+                Reached::Unavailable { .. }
+                | Reached::Module
+                | Reached::Value(_)
+                | Reached::Nominal(None)
+                | Reached::Trait(_) => {}
                 Reached::Nominal(Some(found)) => {
                     self.used_nominal.insert(name.clone(), found.clone());
                 }
@@ -480,6 +506,9 @@ impl LoweringContext {
         span: Span,
     ) -> Result<&Qualifier, LoweringError> {
         let Some(qualifier) = self.module.qualifiers.get(name.node.as_str()) else {
+            if self.unavailable_use(&name.node, span)?.is_some() {
+                return Err(LoweringError::unavailable_member(name.span));
+            }
             // A module name a statement the parser could not read binds, or may: its parse
             // error reports it.
             if self.unreadable_module || self.unreadable.contains(name.node.as_str()) {
@@ -796,15 +825,6 @@ impl Qualifier {
         Ok(Some(found.trait_.clone()))
     }
 
-    /// The error at `span` for `name`, a trait of a module with errors of its own, which
-    /// therefore names none.
-    pub(in crate::ccl::lower) fn no_trait(name: &str, span: Span) -> LoweringError {
-        LoweringError::unsupported(
-            span,
-            format!("`{name}` names no trait here: its module has errors of its own"),
-        )
-    }
-
     /// Whether the module this reaches declares a nominal type `member`. A module reached
     /// through a Module type declares none: its type members are abstract.
     pub(in crate::ccl::lower) fn declares_nominal(&self, member: &str) -> bool {
@@ -992,6 +1012,10 @@ impl Qualifier {
         self.interface.as_deref().filter(|interface| {
             interface.unimportable.is_none() || self.kind != QualifierKind::Import
         })
+    }
+
+    pub(in crate::ccl::lower) fn member_unavailable(&self, _member: &str) -> bool {
+        self.view.is_none() && self.reachable().is_none()
     }
 }
 
@@ -1194,7 +1218,12 @@ pub(super) fn module_scope(
             qualifier.used_module(&item.name.node)
         };
         let reached = if module.is_some() {
-            Ok(Reached::Value(None))
+            Ok(Reached::Module)
+        } else if qualifier.member_unavailable(&item.name.node) {
+            Ok(Reached::Unavailable {
+                qualifier: Box::new(qualifier.clone()),
+                member: item.name.node.clone(),
+            })
         } else if qualifier.declares_trait(&item.name.node) {
             qualifier
                 .reach_trait(
@@ -1305,7 +1334,6 @@ pub(super) fn module_scope(
                     ..module
                 },
             );
-            continue;
         }
         uses.insert(
             bound.node.clone(),

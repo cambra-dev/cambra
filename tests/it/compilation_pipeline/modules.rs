@@ -1146,6 +1146,227 @@ fn a_module_whose_check_fails_hides_no_error_of_the_root() {
     assert_eq!(report_count(&errors), 2, "{errors}");
 }
 
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_import_cycle_keeps_root_inference_without_lowering_dependencies() {
+    let root = indoc! {r#"
+        import a
+        import c
+        missing = c::nope
+        v = [1, "a"]
+        (missing, v)
+    "#};
+    let a = indoc! {"
+        import b
+        pub v = b::u
+    "};
+    let b = indoc! {"
+        import a
+        pub u = 1
+    "};
+    let errors = compile_errors(&program(
+        root,
+        &[("a", a), ("b", b), ("c", r#"pub bad = [1, "a"]"#)],
+    ));
+    assert!(errors.contains("cycle"), "{errors}");
+    assert!(
+        errors.contains("The values that meet here have no common type"),
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_root_error_after_a_clean_run_has_no_copy_failure_label() {
+    let root = indoc! {r#"
+        run a
+        v = [1, "a"]
+        v
+    "#};
+    let a = indoc! {"
+        pub y = 1
+        visits := 0
+    "};
+    let errors = compile_errors(&program(root, &[("a", a)]));
+    assert_eq!(report_count(&errors), 1, "{errors}");
+    assert!(
+        errors.contains("The values that meet here have no common type"),
+        "{errors}"
+    );
+    assert!(!errors.contains("whose copy fails"), "{errors}");
+}
+
+/// A module that does not load hides no error of the root's: it is a module with errors of
+/// its own, so a reference into it, a value, a type or a constructor, reports nothing more.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_module_that_does_not_load_hides_no_error_of_the_root() {
+    let root = indoc! {r#"
+        import nothere
+        import gone use f
+        x: nothere::T = 3
+        z = nothere::x + f(1)
+        s = nothere::Shape::circle(1)
+        v = [1, "a"]
+        (x, z, s, v)
+    "#};
+    let errors = compile_errors(&program(root, &[]));
+    assert!(errors.contains("no module `nothere`"), "{errors}");
+    assert!(errors.contains("no module `gone`"), "{errors}");
+    assert!(
+        errors.contains("The values that meet here have no common type"),
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 3, "{errors}");
+}
+
+#[rstest]
+#[case::import("import nothere use Shape as Form, T as Item, f as make, sub")]
+#[case::run("run nothere use Shape as Form, T as Item, f as make, sub")]
+#[timeout(Duration::from_secs(10))]
+fn unavailable_use_members_recover_without_guessing_their_kind(#[case] statement: &str) {
+    let root = formatdoc! {r#"
+        {statement}
+        x: Item = make(1)
+        y: Item(Int) = 2
+        s = Form::circle(1)
+        q = sub::f(1)
+        v = [1, "a"]
+        (x, y, s, q, v)
+    "#};
+    let errors = compile_errors(&program(&root, &[]));
+    assert!(errors.contains("no module `nothere`"), "{errors}");
+    assert!(
+        errors.contains("The values that meet here have no common type"),
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
+#[rstest]
+#[case::import("import nothere use Area as Measure", "Measure")]
+#[case::run("run nothere use Area as Measure", "Measure")]
+#[case::qualified("import nothere", "nothere::Area")]
+#[timeout(Duration::from_secs(10))]
+fn an_unavailable_trait_skips_its_instance_and_checks_the_rest_of_the_module(
+    #[case] statement: &str,
+    #[case] head: &str,
+) {
+    let root = formatdoc! {r#"
+        {statement}
+        instance {head}(Int):
+            def area(s):
+                1 + "skipped"
+        v = [1, "a"]
+        v
+    "#};
+    let errors = compile_errors(&program(&root, &[]));
+    assert!(errors.contains("no module `nothere`"), "{errors}");
+    assert!(
+        errors.contains("The values that meet here have no common type"),
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
+#[rstest]
+#[case::used("import nothere use Shape as Form", "Form")]
+#[case::qualified("import nothere", "nothere::Shape")]
+#[timeout(Duration::from_secs(10))]
+fn an_unavailable_constructor_pattern_recovers_its_statement(
+    #[case] statement: &str,
+    #[case] ty: &str,
+) {
+    let root = formatdoc! {r#"
+        {statement}
+        x = 1
+        match x:
+            case {ty}::circle(r):
+                r
+        v = [1, "a"]
+        v
+    "#};
+    let errors = compile_errors(&program(&root, &[]));
+    assert!(errors.contains("no module `nothere`"), "{errors}");
+    assert!(
+        errors.contains("The values that meet here have no common type"),
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
+#[test]
+fn an_unavailable_trait_requirement_recovers_its_function() {
+    let root = indoc! {r#"
+        import nothere use Area
+        def area(s: Int) requires Area(Int):
+            s
+        v = [1, "a"]
+        (area(1), v)
+    "#};
+    let errors = compile_errors(&program(root, &[]));
+    assert!(errors.contains("no module `nothere`"), "{errors}");
+    assert!(
+        errors.contains("The values that meet here have no common type"),
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 2, "{errors}");
+}
+
+#[rstest]
+#[case::lowering(indoc! {"
+    pub type Broken:
+        broken(x: Unknown)
+"}, "unknown type annotation", false)]
+#[case::cycle(indoc! {"
+    import lib
+    pub known = 1
+"}, "cycle", true)]
+#[timeout(Duration::from_secs(10))]
+fn use_members_of_a_module_with_no_usable_lowering_remain_unavailable(
+    #[case] library: &str,
+    #[case] cause: &str,
+    #[case] inferred: bool,
+) {
+    let root = indoc! {r#"
+        import lib use Area, Shape
+        instance Area(Int):
+            def area(s):
+                1 + "skipped"
+        s = Shape::circle(1)
+        v = [1, "a"]
+        (s, v)
+    "#};
+    let errors = compile_errors(&program(root, &[("lib", library)]));
+    assert!(errors.contains(cause), "{errors}");
+    assert_eq!(
+        errors.contains("The values that meet here have no common type"),
+        inferred,
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 1 + usize::from(inferred), "{errors}");
+}
+
+#[rstest]
+#[case::constructor("s = Shape::circle(1)", "is not a nominal type")]
+#[case::instance(indoc! {"
+    instance Shape(Int):
+        def area(s):
+            s
+"}, "names no trait")]
+#[timeout(Duration::from_secs(10))]
+fn a_known_use_member_keeps_its_declaration_kind(#[case] use_: &str, #[case] expected: &str) {
+    let root = formatdoc! {"
+        import lib use Shape
+        {use_}
+        1
+    "};
+    let errors = compile_errors(&program(&root, &[("lib", "pub Shape = Int")]));
+    assert!(errors.contains(expected), "{errors}");
+    assert_eq!(report_count(&errors), 1, "{errors}");
+}
+
 /// A module two others import is evaluated once: its bindings stand once in the
 /// linked tree, ahead of both importers' (`docs/chl-spec.md`, "9.7 Importing
 /// asserts no IO and no state").

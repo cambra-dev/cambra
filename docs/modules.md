@@ -352,6 +352,14 @@ spelling. The out-of-block read gate and the `MutWrite` shape then apply to `eu:
 A module whose own errors stop it from lowering has no interface, and a reference or a `use` item
 into it adds no error: that module's own errors account for it.
 
+A `use` item whose module has no usable interface records an unavailable member with its original
+module and spelling. Its use as a value or type recovers through the existing placeholders.
+A constructor pattern or trait requirement that needs its declaration fails its containing
+statement without another diagnostic. An instance whose trait is unavailable declares no instance
+and skips its function bodies without stopping the rest of the module's lowering. A member bound to
+a module has its own `Reached::Module` case. A Module-typed parameter reaches the members its view
+declares, even though it has no interface.
+
 ### Imported aliases are closed over their module
 
 An alias's predicate names resolve where the alias is declared, at its `LetType`
