@@ -69,7 +69,9 @@ impl Writer {
         .annotation(ty)
     }
 
-    /// An inferred polymorphic type written in CHL ([`chl_inferred_poly`]).
+    /// An inferred polymorphic type written in CHL: its `Poly`, or its body alone when it
+    /// has no parameters, with each join or meet the notation cannot write written as its
+    /// operands, `A ∨ Int`.
     pub fn inferred_poly(&self, inferred: &InferredPoly) -> String {
         self.inferred_poly_in(inferred, None)
     }
@@ -122,14 +124,7 @@ fn written_in(ty: &Type, home: Option<&[SmolStr]>) -> String {
     Writer::default().ty_in(ty, home)
 }
 
-/// An inferred polymorphic type written in CHL: its `Poly`, or its body alone when it
-/// has no parameters, with each join or meet the notation cannot write written as its
-/// operands, `A ∨ Int`.
-pub fn chl_inferred_poly(inferred: &InferredPoly) -> String {
-    chl_inferred_poly_in(inferred, None)
-}
-
-/// [`chl_inferred_poly`], written as the module at `home` writes it when there is one
+/// [`Writer::inferred_poly`], written as the module at `home` writes it when there is one
 /// ([`chl_type_in`]).
 pub fn chl_inferred_poly_in(inferred: &InferredPoly, home: Option<&[SmolStr]>) -> String {
     Writer::default().inferred_poly_in(inferred, home)
@@ -152,7 +147,7 @@ struct Printer {
     /// given one that no other name in the text reads as.
     taken: HashSet<String>,
     /// The text of each parameter that stands for a join or meet
-    /// ([`chl_inferred_poly`]).
+    /// ([`Writer::inferred_poly`]).
     joins: Vec<(TypeParamId, String)>,
     /// The path of the module the text is written in, whose own nominal types are written
     /// by their names alone ([`chl_type_in`]).
