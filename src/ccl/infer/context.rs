@@ -6,8 +6,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::capabilities::{
-    Blame, Bound as CapabilityBound, Capabilities, Capability, CapabilityVar, Effect, Every,
-    Filter, Repr, Requirement, ScopedCapability, Upper,
+    Blame, Bound as CapabilityBound, Capabilities, Capability, CapabilitySet, CapabilityVar,
+    Effect, Every, Filter, Repr, Requirement, ScopedCapability, Upper,
 };
 use crate::ccl::ccl_utils::TermMemo;
 use crate::ccl::infer::solver::barrier::EdgeReport;
@@ -249,6 +249,19 @@ pub(super) struct InferCtx {
     /// the obligation that decides which instance's, or which requirement's in scope, it is
     /// ([`InferCtx::settle_effect_links`]).
     effect_links: Vec<EffectLink>,
+    /// Each function body's result: a function the body returns may name no variable the body
+    /// binds ([`InferCtx::escaping_results`]).
+    results: Vec<Returned>,
+    /// What each function body under emission declares, innermost last, and what the last one
+    /// to finish did: a function whose type holds a top holding writes or reads names every
+    /// mutable variable, and one holding appends every feed, so it leaves no body declaring one.
+    body_binds: Vec<Declared>,
+    last_body_binds: Declared,
+    /// Each variable a write or an append hands a value to, the type it holds, the depth
+    /// from which a variable's scope ends before the target's, and the write or append: a
+    /// function the target holds may name no such variable
+    /// ([`InferCtx::escaping_results`]).
+    handed_out: Vec<HandedOut>,
     /// The generalized bindings whose schemes a module check reports, and the
     /// scheme each was bound at, written as an annotation would state it
     /// ([`Typing::note_scheme`]).
@@ -442,6 +455,9 @@ struct NodeCapabilities {
     own: Rc<CapabilityVar>,
     inflow: Inflow,
     body: Option<Rc<CapabilityVar>>,
+    /// The node a capability crossing into the parent's variable entered at, where it is not
+    /// this one's own: a statement's, or a `with begin():` block's.
+    at: Option<NodeId>,
 }
 
 /// A variable standing for an associated effect type, `Writes`, at a call of a trait's
@@ -452,6 +468,16 @@ struct EffectLink {
     /// The trait's parameter for the associated effect type.
     assoc: crate::ccl::ty::TypeParamId,
     target: Rc<CapabilityVar>,
+}
+
+/// A function body's result ([`InferCtx::escaping_results`]): its type, the depth of the body,
+/// the function's lambda, the value it returns, and what the body declares.
+struct Returned {
+    ty: Type,
+    depth: u32,
+    function: NodeId,
+    returned: NodeId,
+    binds: Declared,
 }
 
 /// A generalized `def` whose `requires` clause is an upper bound, which no trait requirement
@@ -496,6 +522,17 @@ struct CapabilityBinder {
     /// No scope's end discharges what is done to it: a public feed or a declared transactional
     /// variable, which belong to the run.
     escapes: bool,
+}
+
+/// A variable a write or an append hands a value to ([`InferCtx::handed_out`]).
+struct HandedOut {
+    target: Name,
+    ty: Type,
+    depth: u32,
+    appends: bool,
+    node: NodeId,
+    /// What the body handing it out declares ([`InferCtx::body_binds`]).
+    binds: Declared,
 }
 
 pub(super) struct OpenGroup {
@@ -642,6 +679,10 @@ impl InferCtx {
             opened_clause_params: HashMap::new(),
             instance_effects: Default::default(),
             effect_links: Vec::new(),
+            results: Vec::new(),
+            body_binds: Vec::new(),
+            last_body_binds: Declared::default(),
+            handed_out: Vec::new(),
             reported: HashSet::new(),
             public: HashSet::new(),
             schemes_noted: Vec::new(),
@@ -685,7 +726,7 @@ impl InferCtx {
 
     /// What the module's top level requires and causes, less what its scopes discharge
     /// (`docs/chl-spec.md`, "Shareable modules").
-    pub(super) fn top_level_capabilities(&self) -> crate::ccl::capabilities::CapabilitySet {
+    pub(super) fn top_level_capabilities(&self) -> CapabilitySet {
         let root = self
             .root_capabilities
             .as_ref()
@@ -722,6 +763,7 @@ impl InferCtx {
             own: Rc::clone(&own),
             inflow: Inflow::of(node),
             body: None,
+            at: None,
         });
         (Capabilities::var(var), Capabilities::var(own))
     }
@@ -739,11 +781,18 @@ impl InferCtx {
         };
         {
             match parent.inflow {
-                Inflow::All => parent.var.flows_from(&node.var, Filter::default()),
+                Inflow::All => parent.var.flows_from(
+                    &node.var,
+                    Filter {
+                        at: node.at,
+                        ..Filter::default()
+                    },
+                ),
                 Inflow::DischargesTransaction => parent.var.flows_from(
                     &node.var,
                     Filter {
                         discharges: [Requirement::transaction()].into_iter().collect(),
+                        at: node.at,
                         ..Filter::default()
                     },
                 ),
@@ -771,6 +820,13 @@ impl InferCtx {
                 && matches!(history_kind, crate::ccl::ty::HistoryKind::Overwrite)
                 && matches!(domain, Type::Txn);
             let depth = self.capability_frame().depth;
+            if declares && let Some(declared) = self.body_binds.last_mut() {
+                match history_kind {
+                    crate::ccl::ty::HistoryKind::Append => declared.feed = true,
+                    _ if !transactional => declared.variable = true,
+                    _ => {}
+                }
+            }
             debug_assert!(
                 !transactional || depth == 0,
                 "lowering refuses `{name}`, a transactional variable declared below a module's \
@@ -860,6 +916,56 @@ impl InferCtx {
             }
         }
         out
+    }
+
+    /// An error at each function body whose result is a function requiring or causing
+    /// something naming a variable the body binds, and at each write or append handing such a
+    /// function to a variable bound outside that variable's scope: the function would outlive
+    /// the variable (`docs/chl-spec.md`, "Discharging requirements and effects").
+    pub(super) fn escaping_results(&self) -> Vec<LocatedInferError> {
+        let beyond = |ty: &Type, depth, binds: Declared| {
+            type_capabilities(ty).into_iter().find(|l| {
+                matches!(l.bound, CapabilityBound::At(at) if at >= depth)
+                    || matches!(&l.item, Capability::Every(every) if binds.named_by(every))
+            })
+        };
+        let located = |error, node_id| LocatedInferError {
+            error,
+            node_id,
+            also: Box::default(),
+            related: crate::ccl::infer::api::RelatedPositions::default(),
+        };
+        // The error is at the value returned, with the function returning it beside it.
+        let returned = self.results.iter().filter_map(|r| {
+            let capability = beyond(&r.ty, r.depth, r.binds)?;
+            let mut error = located(
+                InferError::EscapesItsVariable {
+                    item: capability.item.to_string(),
+                    every: matches!(capability.item, Capability::Every(_)),
+                },
+                r.returned,
+            );
+            if r.returned != r.function {
+                error.related.set(crate::ccl::infer::api::Related {
+                    origin: Origin::Node(r.function),
+                    role: crate::ccl::infer::api::RelatedRole::Function,
+                });
+            }
+            Some(error)
+        });
+        let handed_out = self.handed_out.iter().filter_map(|h| {
+            let capability = beyond(&h.ty, h.depth, h.binds)?;
+            Some(located(
+                InferError::HandsOutItsVariable {
+                    item: capability.item.to_string(),
+                    every: matches!(capability.item, Capability::Every(_)),
+                    target: h.target.to_string(),
+                    appends: h.appends,
+                },
+                h.node,
+            ))
+        });
+        returned.chain(handed_out).collect()
     }
 
     /// An error at each `def` whose bounded `requires` clause a trait requirement inference
@@ -968,10 +1074,7 @@ impl InferCtx {
     }
 
     /// The capability variable each parameter `set` names opened to.
-    fn clause_param_vars(
-        &self,
-        set: &crate::ccl::capabilities::CapabilitySet,
-    ) -> Vec<Rc<CapabilityVar>> {
+    fn clause_param_vars(&self, set: &CapabilitySet) -> Vec<Rc<CapabilityVar>> {
         set.params
             .iter()
             .map(|p| {
@@ -999,7 +1102,7 @@ impl InferCtx {
                 .or_insert_with(|| {
                     let var = CapabilityVar::fresh(0);
                     if !param.param.clause_except.is_empty() {
-                        let mut set = crate::ccl::capabilities::CapabilitySet::default();
+                        let mut set = CapabilitySet::default();
                         set.add_every(
                             Every::of_direction(param.of_causes)
                                 .less(param.param.clause_except.clone()),
@@ -1008,6 +1111,7 @@ impl InferCtx {
                             set,
                             of_requires: !param.of_causes,
                             of_causes: param.of_causes,
+                            forbidden: Default::default(),
                             blame: Blame::Bound(
                                 param
                                     .param
@@ -1237,6 +1341,7 @@ impl InferCtx {
             set,
             of_requires: !open_requires,
             of_causes: !open_causes,
+            forbidden: std::collections::BTreeSet::new(),
             blame,
         });
     }
@@ -2952,7 +3057,7 @@ impl Typing for InferCtx {
                 // parameter holds none of what the bound takes away, and each use's copy of
                 // the variable keeps the bound (`freshen_capability_var`).
                 if !opened.clause_except.is_empty() {
-                    let mut set = crate::ccl::capabilities::CapabilitySet::default();
+                    let mut set = CapabilitySet::default();
                     set.add_every(
                         Every::of_direction(of_causes).less(opened.clause_except.clone()),
                     );
@@ -2960,6 +3065,7 @@ impl Typing for InferCtx {
                         set,
                         of_requires: !of_causes,
                         of_causes,
+                        forbidden: Default::default(),
                         blame: Blame::Bound(
                             p.bound_at.expect("a bound taking `except` is written"),
                         ),
@@ -3138,7 +3244,9 @@ impl Typing for InferCtx {
         }
         let depth = self.capability_frame().depth + 1;
         self.capability_frames.push(CapabilityFrame { depth });
+        self.body_binds.push(Declared::default());
         let r = f(self);
+        self.last_body_binds = self.body_binds.pop().unwrap_or_default();
         let frame = self.capability_frames.pop().expect("this body's frame");
         // What the body does reaches the function's type through the frame's filter: nothing
         // naming a variable the body binds, its parameter's included.
@@ -3203,6 +3311,40 @@ impl Typing for InferCtx {
             },
             at: clauses.at,
             node: definition.node_id(),
+        });
+    }
+
+    fn note_result(&mut self, ty: &Type, returned: NodeId) {
+        let depth = self.capability_frame().depth + 1;
+        self.results.push(Returned {
+            ty: ty.clone(),
+            depth,
+            function: self.current_node_id,
+            returned,
+            binds: self.last_body_binds,
+        });
+    }
+
+    fn note_handed_out(&mut self, target: &Name, ty: &Type, appends: bool) {
+        let Some(binder) = self.capability_binders.get(target) else {
+            return;
+        };
+        // The run's state outlives every scope, a parameter's argument the function's, and
+        // any other variable the bodies nested in its own.
+        let depth = if binder.escapes {
+            0
+        } else if binder.parameter {
+            binder.depth
+        } else {
+            binder.depth + 1
+        };
+        self.handed_out.push(HandedOut {
+            target: target.clone(),
+            ty: ty.clone(),
+            depth,
+            appends,
+            node: self.current_node_id,
+            binds: self.body_binds.last().copied().unwrap_or_default(),
         });
     }
 
@@ -3314,6 +3456,7 @@ impl Typing for InferCtx {
             own: Rc::clone(&var),
             inflow: Inflow::All,
             body: None,
+            at: Some(node),
         });
         let r = f(self);
         self.leave_node_capabilities();
@@ -3333,8 +3476,33 @@ impl Typing for InferCtx {
     }
 
     fn transaction_body<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        // The `Begin` node discharges `Transaction` from its body's capabilities ([`Inflow`]).
-        f(self)
+        // The body collects on a variable of its own, which no commit may reach, directly or
+        // through a call: transactions do not nest (`docs/chl-spec.md`, "8.2 Transactions:
+        // `with begin():`"). The bound is copied with the variable at each instantiation, so
+        // a call through a polymorphic definition's parameter is checked at each use. The
+        // `Begin` node lets it in less `Transaction`, which it supplies ([`Inflow`]).
+        let node = self.current_node_id;
+        let var = CapabilityVar::fresh(self.level);
+        var.bound_above(Upper {
+            set: CapabilitySet::default(),
+            of_requires: false,
+            of_causes: false,
+            forbidden: [Effect::RunTransaction].into_iter().collect(),
+            blame: Blame::NestedTransaction {
+                block: node,
+                used_at: None,
+            },
+        });
+        self.node_capabilities.push(NodeCapabilities {
+            own: Rc::clone(&var),
+            var,
+            inflow: Inflow::All,
+            body: None,
+            at: Some(node),
+        });
+        let r = f(self);
+        self.leave_node_capabilities();
+        r
     }
 
     fn in_let_rhs<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {

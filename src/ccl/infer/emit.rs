@@ -149,6 +149,11 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                     // capability variables (`capabilities::UseCapabilities`).
                     ctx.use_capabilities
                         .record_use(node_id, &instance.capability_copies);
+                    // A block's bound copied with the definition is failed by what this use
+                    // passes, so it is reported here.
+                    for copy in instance.capability_copies.values() {
+                        copy.note_use(node_id);
+                    }
                     for (instantiation, bound, bound_at) in instance.bounds {
                         let check = |ctx: &mut InferCtx| {
                             ctx.require_sub(&instantiation, &bound, &|| {
@@ -386,6 +391,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         } => {
             let target_ty = ctx.instantiate_binding(name)?;
             ctx.record_capability(Capability::Causes(Effect::Append(name.clone())));
+            ctx.note_handed_out(name, &target_ty, true);
             emit_feed(name, &target_ty, value, row, &feed_role(name), ctx).map_err(|e| {
                 e.with_escape_target(EscapeTarget::Feed {
                     channel: name.to_string(),
@@ -404,6 +410,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                 None => "this definition".to_string(),
             };
             ctx.record_capability(Capability::Causes(Effect::Append(name.clone())));
+            ctx.note_handed_out(name, &target_ty, true);
             emit_define(name, &target_ty, value, &label, ctx)?
         }
 
@@ -456,6 +463,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             let var_ty = ctx.instantiate_binding(name)?;
             ctx.record_capability(Capability::Causes(Effect::Write(name.clone())));
             ctx.record_transactional_access(name);
+            ctx.note_handed_out(name, &var_ty, false);
             // The written value flows into the mutable variable's *value* type, not
             // the `Mut` handle itself — which is what a write means: it updates `V`.
             // Nothing would deref it on the way in, since the relation holds no
@@ -1027,6 +1035,7 @@ pub(super) fn emit_lambda<C: Typing>(
         })
     });
     let body_ty = body_ty?;
+    ctx.note_result(&body_ty, returned_node(body));
 
     // Emit a *named* Pi: the parameter binds in the codomain, so a refinement
     // predicate nested in `body_ty` that closes over the parameter (the
@@ -4708,6 +4717,17 @@ fn field_of(ty: &Type, key: &ProjKey) -> Result<Type, (FieldKey, Type)> {
         };
         (key, ty.clone())
     })
+}
+
+/// The node a statement sequence ends in, which it returns: past each `let`, mutable variable
+/// declaration and statement.
+fn returned_node(e: &Expr) -> NodeId {
+    match &e.node {
+        TypedExprNode::Let { body, .. }
+        | TypedExprNode::MutDecl { body, .. }
+        | TypedExprNode::ExprStmt { body, .. } => returned_node(body),
+        _ => e.node_id(),
+    }
 }
 
 #[cfg(test)]

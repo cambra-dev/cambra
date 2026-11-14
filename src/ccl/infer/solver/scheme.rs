@@ -408,6 +408,11 @@ fn freshen_capability_var(
     // admits whatever the use passes there, and the definition was checked against it, less what
     // the clause takes from the parameter: the top of its direction less that.
     for mut upper in v.uppers() {
+        // The copy is noted by the use that makes it ([`CapabilityVar::note_use`]).
+        if let crate::ccl::capabilities::Blame::NestedTransaction { used_at, .. } = &mut upper.blame
+        {
+            *used_at = None;
+        }
         for param in std::mem::take(&mut upper.set.params) {
             if !param.except.is_empty() {
                 upper.set.add_every(
@@ -420,7 +425,7 @@ fn freshen_capability_var(
                 upper.of_requires = false;
             }
         }
-        if upper.of_requires || upper.of_causes {
+        if upper.of_requires || upper.of_causes || !upper.forbidden.is_empty() {
             f.bound_above(upper);
         }
     }

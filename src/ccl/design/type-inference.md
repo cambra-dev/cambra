@@ -4556,10 +4556,11 @@ of a variable by the top less its `except` (`bound_written`, `freshen_capability
 or a top taking away other than what the rest of its clause shares prints in parentheses
 (`capabilities::clauses`). A top holding writes or reads names every mutable variable, and one
 holding appends every feed (`Every::names_mutable_variables`, `Every::names_feeds`), so a function
-whose type holds one is no public member of a module whose top level binds what it names. A clause
-variable's bound, and an associated effect type's, may take capabilities away
-(`TypeParam::clause_except`): opening the parameter, or an instance's variable for the associated
-type, bounds it by `Effect` or `Context` less them, which each use's copy keeps (`Blame::Bound`).
+whose type holds one leaves no body that declares what it names (`InferCtx::body_binds`) and is no
+public member of a module whose top level binds one. A clause variable's bound, and an associated
+effect type's, may take capabilities away (`TypeParam::clause_except`): opening the parameter, or an
+instance's variable for the associated type, bounds it by `Effect` or `Context` less them, which
+each use's copy keeps (`Blame::Bound`).
 
 **Upper bounds are checked once emission is complete.** A variable's capabilities are known only
 then, so `capabilities::exceeded_uppers` reads each bounded variable's resolution after the barrier
@@ -4611,6 +4612,22 @@ of a bound open: it is what flows there.
 
 ### Checks that read a body's capabilities
 
+A `with begin():` body collects on a variable of its own (`Typing::transaction_body`), bounded by an
+upper bound that forbids `RunTransaction` (`Upper::forbidden`, `Blame::NestedTransaction`), so a
+commit reaching it, directly or through a call, is a nested transaction, reported with the block as
+a secondary label. The bound is copied at each instantiation, and the copy notes the use
+(`CapabilityVar::note_use`), so a call through a polymorphic definition's parameter is refused at
+each use that passes a committing function, with the call inside the definition as a secondary
+label. Each function body's result is noted with the value it returns (`Typing::note_result`), and a
+function in its type requiring or causing a capability bound at the body's depth or deeper is
+refused at that value, with the function as a secondary label (`InferCtx::escaping_results`,
+`InferError::EscapesItsVariable`): it would outlive the variable. So
+is one a write or an append hands a variable bound outside that capability's scope
+(`Typing::note_handed_out`, `InferError::HandsOutItsVariable`): the target's type, read through the
+lower bounds of the inference variables in it, may hold no function with a capability bound below
+the target's scope, which for the run's state is every scope and for a `Mut` or `Feed` parameter the
+function's own.
+
 **Statements.** An expression statement a program writes before its block's last statement gets a
 capability variable of its own around its expression's, which keeps every capability, the enclosing
 function's own variables' included, as every node's does (`Typing::statement`; lowering labels each
@@ -4622,9 +4639,10 @@ a parameter, which only each use determines (`InferCtx::inert_statements`). Infe
 inert statements, and the compile reports them only where inference reports no error: an argument
 passed wrongly by reference, which inference refuses, is the more precise diagnosis.
 
-**Public functions.** A public function's capabilities naming an induction variable of the top
-level, `Bound::At(0)`, are an error at its `let` (`InferError::VariablePastItsScope`). An append to
-a private feed instead joins the top level's capabilities, since other modules append to the feed
+**Public members.** Every function nested in a public member's type is checked, including functions
+in products and returned functions. Its capabilities naming an induction variable of the top level,
+`Bound::At(0)`, are an error at its `let` (`InferError::VariablePastItsScope`). An append to a
+private feed instead joins the top level's capabilities, since other modules append to the feed
 through the function (`InferCtx::exported_capabilities`).
 
 ### Polymorphism and materialization

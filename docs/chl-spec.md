@@ -3481,8 +3481,7 @@ is a trait's function, read from an instance, `summon(Area(_))::area(s)`
 
 ### 6.9 Capabilities
 
-**[Decided]** — refusing a function that outlives a variable it names, and a nested transaction, by
-their capabilities; `Transaction` in a function a block calls ([8.7 Transactions as contextual
+**[Decided]** — `Transaction` in a function a block calls ([8.7 Transactions as contextual
 parameters](#87-transactions-as-contextual-parameters)); readings ([Inputs from outside the
 program](#inputs-from-outside-the-program)); exceptions ([Exceptions](#exceptions)); naming another
 module's public transactional variable, `WriteTxn(inv::stock)`; sink functions and calls made

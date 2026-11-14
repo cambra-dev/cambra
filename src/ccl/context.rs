@@ -1918,13 +1918,11 @@ fn invalid_tree(ir: &Expr, boundary: &str, errs: &impl std::fmt::Debug) -> ! {
     panic!("{boundary} produced an invalid tree: {errs:?}")
 }
 
-/// The transact phase's five rejections, run on the inlined, typed tree before
-/// [`transact_phase::run`] strips the sites they inspect.
+/// The transact phase's four rejections, run on the inlined, typed tree before
+/// [`transact_phase::run`] strips the sites they inspect. Inference refuses a nested
+/// transaction, a commit reaching a `with begin():` body
+/// (`src/ccl/design/type-inference.md`, "Checks that read a body's capabilities").
 ///
-/// - `check_no_nested_transactions` — a transactional writer reaching a `with
-///   begin():` block via a function call. The callee's inlined `For` would
-///   otherwise be silently absorbed into the outer block's read-your-writes env,
-///   dropping its commit.
 /// - `check_no_induction_only_transactions` — an induction accumulator written
 ///   inside a block with no mutable variable write is a no-atomicity transaction.
 /// - `check_no_guarded_induction_write_in_block` — a *guarded* induction write
@@ -1945,7 +1943,6 @@ fn check_transact_rejections(
     blame: &Blame<'_>,
 ) -> Result<(), Vec<CompileError>> {
     let reject = |error: Located<String>| blame.unsupported(error, Some(expr));
-    transact_phase::check_no_nested_transactions(expr, txn_mut_vars).map_err(reject)?;
     transact_phase::check_no_induction_only_transactions(expr, txn_mut_vars).map_err(reject)?;
     transact_phase::check_no_guarded_induction_write_in_block(expr, txn_mut_vars)
         .map_err(reject)?;

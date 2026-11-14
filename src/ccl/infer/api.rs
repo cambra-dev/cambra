@@ -375,6 +375,26 @@ pub enum InferError {
     /// (`docs/chl-spec.md`, "Effects in traits"). `compiler` is set for a compiler trait's
     /// signature, which a program writes nowhere and which takes no associated type.
     CapabilityBeyondSignature { item: String, compiler: bool },
+    /// A commit inside a `with begin():` block's body, directly or through a call. `through_use`
+    /// is set where a use of a polymorphic definition passes what the definition calls in its
+    /// block, and `top` where what reaches the block is a top holding `RunTransaction`, such as
+    /// `Effect`, rather than a commit.
+    NestedTransaction {
+        through_use: bool,
+        top: Option<String>,
+    },
+    /// A function returning a function that has `item`, which names a variable the
+    /// returning function binds.
+    EscapesItsVariable { item: String, every: bool },
+    /// A write (or, with `appends`, an append) handing `target` a function that has `item`,
+    /// which names a variable whose scope ends before `target`'s.
+    HandsOutItsVariable {
+        item: String,
+        /// The function has `Effect` or `Context`, which names every variable.
+        every: bool,
+        target: String,
+        appends: bool,
+    },
     /// A written clause's `item` names no variable of the kind it takes in scope.
     ClauseNamesNoVariable {
         item: String,
@@ -1084,6 +1104,9 @@ impl InferError {
             | InferError::CapabilityBeyondClause { .. }
             | InferError::ClauseNamesNoVariable { .. }
             | InferError::CapabilityBeyondSignature { .. }
+            | InferError::NestedTransaction { .. }
+            | InferError::EscapesItsVariable { .. }
+            | InferError::HandsOutItsVariable { .. }
             | InferError::Unsupported(_)
             | InferError::EmptyCase { .. }
             | InferError::UnresolvedHole { .. }
@@ -1151,7 +1174,7 @@ pub struct RelatedPositions(Option<Box<RelatedData>>);
 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct RelatedData {
-    roles: [Option<Related>; 3],
+    roles: [Option<Related>; 6],
     contributions: Vec<BoundContribution>,
 }
 
@@ -1163,7 +1186,8 @@ pub struct BoundContribution {
 }
 
 impl RelatedPositions {
-    /// Each position: the value's, the demand's, then another place feeding the target.
+    /// Each position: the value's, the demand's, another place feeding the target, a nested
+    /// transaction's commit, its block, then the function returning the value.
     pub fn iter(&self) -> impl Iterator<Item = &Related> {
         self.0.iter().flat_map(|slots| slots.roles.iter().flatten())
     }
@@ -1182,11 +1206,14 @@ impl RelatedPositions {
     }
 
     /// Record `related` in its role's slot.
-    fn set(&mut self, related: Related) {
+    pub(crate) fn set(&mut self, related: Related) {
         let slot = match related.role {
             RelatedRole::Value => 0,
             RelatedRole::Demand => 1,
             RelatedRole::OtherFeed => 2,
+            RelatedRole::Commit => 3,
+            RelatedRole::Block => 4,
+            RelatedRole::Function => 5,
         };
         self.0.get_or_insert_with(Box::default).roles[slot] = Some(related);
     }
@@ -1210,6 +1237,12 @@ pub enum RelatedRole {
     Demand,
     /// The target of a feed the error is about is fed here as well.
     OtherFeed,
+    /// A nested transaction's commit, where a use of the definition holding it is the error's.
+    Commit,
+    /// The `with begin():` block a nested transaction is in.
+    Block,
+    /// The function returning the value the error is at.
+    Function,
 }
 
 impl RelatedRole {
@@ -1219,6 +1252,9 @@ impl RelatedRole {
             RelatedRole::Value => "the value comes from here",
             RelatedRole::Demand => "required here",
             RelatedRole::OtherFeed => "the target is also fed here",
+            RelatedRole::Commit => "this commits",
+            RelatedRole::Block => "inside this block",
+            RelatedRole::Function => "returned by this function",
         }
     }
 }
@@ -1574,6 +1610,53 @@ impl std::fmt::Debug for InferError {
                  take an induction variable, `WriteTxn` and `ReadTxn` a transactional one, and \
                  `Append` a feed"
             ),
+            InferError::EscapesItsVariable { item, every: false } => write!(
+                f,
+                "this returns a function that has `{item}`, whose variable this function binds; \
+                 the returned function would outlive it"
+            ),
+            InferError::EscapesItsVariable { item, every: true } => write!(
+                f,
+                "this returns a function that has `{item}`, which names every variable, a \
+                 variable this function binds among them; the returned function would outlive it"
+            ),
+            InferError::HandsOutItsVariable {
+                item,
+                every,
+                target,
+                appends,
+            } => write!(
+                f,
+                "this {} to `{target}` a function that has `{item}`, {} ends before `{target}` \
+                 does; `{target}` would hold the function past it",
+                if *appends { "appends" } else { "writes" },
+                if *every {
+                    "which names every variable, and one of them"
+                } else {
+                    "whose variable"
+                }
+            ),
+            InferError::NestedTransaction { through_use, top } => {
+                let what = match top {
+                    Some(top) => {
+                        format!("has `{top}`, which holds `RunTransaction`, so it may commit")
+                    }
+                    None => "commits a transaction".to_string(),
+                };
+                if *through_use {
+                    write!(
+                        f,
+                        "this passes a function that {what}, and the definition calls it inside a \
+                         `with begin():` block's body; transactions do not nest"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "this {what} inside a `with begin():` block's body, directly or through a \
+                         call; transactions do not nest"
+                    )
+                }
+            }
             // A compiler trait takes no associated type, so the hint is for a program's trait.
             InferError::CapabilityBeyondSignature { item, compiler } => {
                 write!(

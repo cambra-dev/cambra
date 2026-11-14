@@ -1303,12 +1303,27 @@ pub struct Upper {
     /// `only` on one clause and leave the other a lower bound.
     pub of_requires: bool,
     pub of_causes: bool,
+    /// Capabilities the variable may not hold whatever else the bound admits: `RunTransaction` inside a
+    /// `with begin():` body.
+    pub forbidden: BTreeSet<Effect>,
     pub blame: Blame,
 }
 
 impl Upper {
     /// Whether `item` is within this bound.
     pub fn admits(&self, item: &Capability) -> bool {
+        let forbidden = match item {
+            Capability::Causes(e) => self.forbidden.contains(e),
+            // A top holds what the bound forbids unless it takes it away.
+            Capability::Every(every) => self
+                .forbidden
+                .iter()
+                .any(|e| every.holds(&Capability::Causes(e.clone()))),
+            _ => false,
+        };
+        if forbidden {
+            return false;
+        }
         let of_causes = item.of_causes();
         let bounded = if of_causes {
             self.of_causes
@@ -1321,13 +1336,20 @@ impl Upper {
 
 /// Where a failed [`Upper`] is written. The first capability beyond it is reported at the node
 /// where it entered the variable, with this as the secondary label.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Blame {
     /// A `def`'s `only` clause.
     Clause(chl_parser::ast::Span),
     /// The trait's signature bounding an instance's function, where a program writes it: `None`
     /// for a compiler trait's.
     Signature(Option<chl_parser::ast::Span>),
+    /// A `with begin():` block, at its node `block`, whose body may not commit. In the copy a
+    /// use of a polymorphic definition makes, `used_at` is the use, which passes what the
+    /// definition calls in the block ([`CapabilityVar::note_use`]).
+    NestedTransaction {
+        block: NodeId,
+        used_at: Option<NodeId>,
+    },
     /// A written function type, whose clauses are exact.
     Written(chl_parser::ast::Span),
     /// A clause variable's bound, `E <: Effect except RunTransaction`, which each use's
@@ -1479,6 +1501,7 @@ impl CapabilityVar {
                     set,
                     of_requires,
                     of_causes,
+                    forbidden: upper.forbidden.clone(),
                     blame: Blame::Written(at),
                 });
             }
@@ -1493,6 +1516,7 @@ impl CapabilityVar {
             u.set == upper.set
                 && u.of_requires == upper.of_requires
                 && u.of_causes == upper.of_causes
+                && u.forbidden == upper.forbidden
         }) {
             return;
         }
@@ -1509,6 +1533,19 @@ impl CapabilityVar {
     /// The sets bounding this variable.
     pub fn uppers(&self) -> Vec<Upper> {
         self.uppers.borrow().clone()
+    }
+
+    /// Note that this variable is a copy the use at `at` made of a definition's: a block's
+    /// bound on it is failed by what the use passes, so it is reported there. A copy is noted by
+    /// the use that made it; a later instantiation reaching the same variable keeps that use.
+    pub fn note_use(&self, at: NodeId) {
+        for upper in self.uppers.borrow_mut().iter_mut() {
+            if let Blame::NestedTransaction { used_at, .. } = &mut upper.blame
+                && used_at.is_none()
+            {
+                *used_at = Some(at);
+            }
+        }
     }
 
     pub fn level(&self) -> Level {
