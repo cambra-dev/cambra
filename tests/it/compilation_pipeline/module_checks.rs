@@ -10,6 +10,15 @@ use rstest_log::rstest;
 
 use super::modules::{compile_errors, program, report_count};
 
+#[rstest]
+#[case::constructor("Option::some(1) == Option::none")]
+#[case::grouping_key(r"groupby([1, 2], \x -> Option::some(x))")]
+fn module_check_reaches_prelude_constructors(#[case] code: &str) {
+    let program = program(code, &[]);
+    let mut ctx = GlobalContext::default();
+    check_program(&mut ctx, &program).unwrap_or_else(|errors| panic!("{errors:?}"));
+}
+
 /// A module that adds an `Int` to a value of its type parameter's type.
 const ADDER: &str = indoc! {"
     param T

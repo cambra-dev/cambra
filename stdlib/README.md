@@ -1,21 +1,26 @@
 # The CHL standard library
 
 `src/` is the std root ([9.16 The std root](../docs/chl-spec.md#916-the-std-root)): the CHL source
-of the modules every program can reach under the `std` path. The std root is [Planned]: no module
-here compiles, and the compiler does not embed them. A module's `Status:` line gives the spec's
-status for it. `[proposed]` marks each construct a file uses that the compiler lacks, and the
-programs under `tests/` check that every module parses and loads ([Tests](#tests)).
+of the modules every program can reach under the `std` path. The compiler embeds each module that
+compiles (`STD_MODULES` in `src/ccl/load/mod.rs`), and a path naming another one names no module.
+A module's `Status:` line gives the spec's status for it. `[proposed]` marks each construct a file
+uses that the compiler lacks, and the programs under `tests/` check that every module parses and
+loads ([Tests](#tests)).
+
+`prelude.cambra` is the prelude: the `import` statements whose `use` items every module outside
+the std root names without an import. It is no module, so it stands outside `src/`.
 
 ## Layout
 
 A module's path is its file's path under `src/`, as a user module's is under the module root
-([9.15 Module files](../docs/chl-spec.md#915-module-files)): `src/std/time.cambra` is `std::time`.
-`std` alone names no module, so `src/` holds no `std.cambra`. `tests/` holds the programs that
-load the modules ([Tests](#tests)).
+([9.15 Module files](../docs/chl-spec.md#915-module-files)): `src/std/time.cambra` is `std::time`,
+and `src/std.cambra` is `std`, the core module. `tests/` holds the programs that load the modules
+([Tests](#tests)).
 
 
 | Module | File | Used by | Holds |
 | -- | -- | -- | -- |
+| `std` | [src/std.cambra](src/std.cambra) | the prelude | `Option`, its method `is_none`, and its instance of `Equatable` |
 | `std::random` | [src/std/random.cambra](src/std/random.cambra) | `import std::random` | `next()`, a random `Int` read once per position |
 | `std::time` | [src/std/time.cambra](src/std/time.cambra) | `import std::time` | `Instant`, `Duration`, `now()`, `alarms`, durations, and conversions to integer counts and Unix time |
 
@@ -25,8 +30,11 @@ load the modules ([Tests](#tests)).
   ([9.7 Importing asserts a shareable module](../docs/chl-spec.md#97-importing-asserts-a-shareable-module)).
   A function that performs IO when called, such as `time::now()` or `time::alarms()`, leaves its
   module importable: the IO belongs to the module whose top level calls it.
-- **One concept per module, named by a noun:** `time`, `http`. A module's members read qualified,
-  `time::now()`, so a member does not repeat the module's name: `time::alarms`, not
+- **The core module holds what every program names:** the types, traits and functions the
+  language's own constructs answer or require, such as `Option`. The prelude imports them, so they
+  read bare.
+- **Every other module holds one concept, named by a noun:** `time`, `http`. A module's members
+  read qualified, `time::now()`, so a member does not repeat the module's name: `time::alarms`, not
   `time::time_alarms`.
 - **Names follow the language.** Types are capitalized nouns (`Instant`, `Duration`), and
   functions, sources and parameters are lowercase with underscores (`now`, `as_seconds`). A type
@@ -42,6 +50,8 @@ load the modules ([Tests](#tests)).
 2. Write the file with the documentation below.
 3. Add its row to the layout table.
 4. Import or run it from a program under `tests/` ([Tests](#tests)).
+5. Once it compiles, add it to `STD_MODULES`. A module the prelude imports compiles, and a std
+   module reaches no prelude, so it imports each std module whose members it names.
 
 ## Documentation
 
@@ -96,9 +106,11 @@ no hedges. The repo's
 ## Tests
 
 `tests/` holds programs that import or run the std modules as a user program does.
-`tests/it/std_root.rs` loads each program against the sources under `src/` in place of the
-compiler's std root, which is empty. Each program, and every std module it reaches, must parse and
-resolve its module paths. A module that no program loads fails the test.
+`tests/it/std_root.rs` loads each program against every source under `src/` in place of the
+compiler's std root, which holds only the modules that compile, with the compiler's prelude. Each
+program, and every std module it reaches, must parse and resolve its module paths. A module that no
+program loads fails the test.
 
-The programs are not compiled until a std module compiles. The `[proposed]` lines are the record of
-what each module waits on.
+The programs are not compiled, since each reaches a module that does not compile. The `[proposed]`
+lines are the record of what each module waits on. The compiler's own tests compile the embedded
+modules through the prelude, `Option`'s in `tests/it/compilation_pipeline/nominal_types.rs`.

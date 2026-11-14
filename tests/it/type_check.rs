@@ -11,7 +11,6 @@
 //!   → Type          (test assertion here)
 //! ```
 
-use cambra::chl_parser::FileId;
 use std::collections::HashSet;
 use std::{cell::RefCell, rc::Rc};
 
@@ -23,10 +22,10 @@ use cambra::ccl::{
         InferError, LocatedInferError, TypeInferenceContext, check_pre_channelize, infer,
         lit_singleton,
     },
-    lower::{LoweringContext, lower_stmts},
+    load::LoadedProgram,
+    lower::{LoweringContext, modules::lower_program},
     mut_read, opaque_output, uniquify,
 };
-use cambra::chl_parser::{self, ast as chl_ast};
 use cambra::interpreter::{BaseType, Extent, TestDataSource};
 use indoc::indoc;
 use rstest::rstest;
@@ -94,8 +93,7 @@ fn arm_dependent_filter_result_panics_when_recording_an_escaping_bound() {
                     [x for x in [1, 2, 3] if x > s]
         filter_against(`pair((0, 1)))
     "};
-    let stmts = parse_module(code);
-    let mut expr = lower_uniquified(&stmts, &mut LoweringContext::default());
+    let mut expr = lower_uniquified(code, &mut LoweringContext::default());
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         infer(&mut expr, &mut TypeInferenceContext::new())
     }))
@@ -114,8 +112,8 @@ fn arm_dependent_filter_result_panics_when_recording_an_escaping_bound() {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Lower `stmts`, α-uniquify, A-normalize, name mutable reads, lower comprehensions, and
-/// bind opaque outputs — the pipeline's prefix to `infer`, in `ccl::context`'s order.
+/// Lower the program `code`, α-uniquify, A-normalize, name mutable reads, lower comprehensions,
+/// and bind opaque outputs — the pipeline's prefix to `infer`, in `ccl::context`'s order.
 ///
 /// A-normalization binds a comprehension's sources ahead of it, which its domain needs: the
 /// domain is the sources' projections, standing outside the comprehension's lambda.
@@ -131,8 +129,8 @@ fn arm_dependent_filter_result_panics_when_recording_an_escaping_bound() {
 /// the same uid. Inferring a source-spelled tree asks those rules a question the
 /// product never asks, and shadowing — which uniquify removes — is exactly what
 /// makes the answer differ.
-fn lower_uniquified(module: &chl_ast::Module, lctx: &mut LoweringContext) -> Expr {
-    let expr = lower_stmts(module, lctx)
+fn lower_uniquified(code: &str, lctx: &mut LoweringContext) -> Expr {
+    let expr = lower_program(&LoadedProgram::test(code), lctx)
         .into_result()
         .expect("lowering failed");
     let expr = mut_read::run(anf::run(uniquify::run(expr)));
@@ -165,8 +163,7 @@ fn infer_program_with_sources(code: &str, sources: &[(&str, Type)]) -> Type {
         // ⤇ elem_ty`, `Data`) is constructed inside `register_source_type`.
         ictx.register_source_type(name, elem_ty.clone());
     }
-    let stmts = parse_module(code);
-    let mut expr = lower_uniquified(&stmts, &mut lctx);
+    let mut expr = lower_uniquified(code, &mut lctx);
     let out = infer(&mut expr, &mut ictx);
     #[cfg(debug_assertions)]
     if std::env::var_os("DUMP_KINDS").is_some() {
@@ -179,8 +176,7 @@ fn infer_program_with_sources(code: &str, sources: &[(&str, Type)]) -> Type {
 fn infer_program_err(code: &str) -> Vec<InferError> {
     let mut lctx = LoweringContext::default();
     let mut ictx = TypeInferenceContext::new();
-    let stmts = parse_module(code);
-    let mut expr = lower_uniquified(&stmts, &mut lctx);
+    let mut expr = lower_uniquified(code, &mut lctx);
     infer(&mut expr, &mut ictx)
         .map_err(LocatedInferError::bare)
         .expect_err("expected inference error")
@@ -203,18 +199,10 @@ fn infer_program_with_sources_err(code: &str, sources: &[(&str, Type)]) -> Vec<I
         lctx.register_source(*name, stub);
         ictx.register_source_type(name, elem_ty.clone());
     }
-    let stmts = parse_module(code);
-    let mut expr = lower_uniquified(&stmts, &mut lctx);
+    let mut expr = lower_uniquified(code, &mut lctx);
     infer(&mut expr, &mut ictx)
         .map_err(LocatedInferError::bare)
         .expect_err("expected inference error")
-}
-
-/// Parse a CHL module string, the root of its own one-file map.
-fn parse_module(code: &str) -> chl_ast::Module {
-    chl_parser::parse_module(FileId::ROOT, code)
-        .into_result()
-        .expect("Failed to parse module")
 }
 
 /// Convenience alias for `Type::Base(BaseType::Int)`.
@@ -323,7 +311,7 @@ fn an_operator_result_carries_no_operand_refinement(#[case] code: &str) {
 
         f
     "#},
-    "((__arg_tuple_0: (Int, Int)) ⇒ {Int | __elem == __arg_tuple_0.0 + __arg_tuple_0.1})"
+    "((__arg_tuple_2: (Int, Int)) ⇒ {Int | __elem == __arg_tuple_2.0 + __arg_tuple_2.1})"
 )]
 fn refining_addition_records_the_sum(#[case] code: &str, #[case] expected: &str) {
     assert_eq!(format!("{}", infer_program(code)), expected);
@@ -1336,7 +1324,7 @@ fn a_live_use_sharing_a_dead_definitions_specialization_splices_it() {
     "#};
     let mut lctx = LoweringContext::default();
     let mut ictx = TypeInferenceContext::new();
-    let mut expr = lower_uniquified(&parse_module(code), &mut lctx);
+    let mut expr = lower_uniquified(code, &mut lctx);
     infer(&mut expr, &mut ictx).expect("inference failed");
     let mut bound = HashSet::new();
     let mut e = &expr;
@@ -3313,8 +3301,7 @@ fn test_filtered_comprehension_has_refinement_on_domain() {
 fn infer_and_check(code: &str) -> Type {
     let mut lctx = LoweringContext::default();
     let mut ictx = TypeInferenceContext::new();
-    let stmts = parse_module(code.trim());
-    let mut expr = lower_uniquified(&stmts, &mut lctx);
+    let mut expr = lower_uniquified(code.trim(), &mut lctx);
     let ty = infer(&mut expr, &mut ictx).expect("inference failed");
     check_pre_channelize(&expr)
         .expect("post-inference consistency wall must accept the inferred tree");
@@ -4188,8 +4175,7 @@ mod binder_slot_records_the_bound_at_type {
             expr.walk_children(|c| find(c, name, out));
         }
         let mut lctx = LoweringContext::default();
-        let stmts = parse_module(code);
-        let mut expr = lower_uniquified(&stmts, &mut lctx);
+        let mut expr = lower_uniquified(code, &mut lctx);
         infer(&mut expr, &mut TypeInferenceContext::new()).expect("inference failed");
         let mut out = None;
         find(&expr, name, &mut out);
@@ -4327,8 +4313,8 @@ mod binder_slot_records_the_bound_at_type {
         }
 
         let mut lctx = LoweringContext::default();
-        let stmts = parse_module("[sum(g) for g in groupby([1, 1, 2], \\x -> x)]");
-        let mut expr = lower_uniquified(&stmts, &mut lctx);
+        let mut expr =
+            lower_uniquified("[sum(g) for g in groupby([1, 1, 2], \\x -> x)]", &mut lctx);
         infer(&mut expr, &mut TypeInferenceContext::new()).expect("inference failed");
 
         let mut out = Vec::new();
@@ -4655,8 +4641,7 @@ mod annotation_kinds {
     fn exact_param_collapses_specializations() {
         fn clones(code: &str) -> usize {
             let mut lctx = LoweringContext::default();
-            let stmts = parse_module(code);
-            let mut expr = lower_uniquified(&stmts, &mut lctx);
+            let mut expr = lower_uniquified(code, &mut lctx);
             infer(&mut expr, &mut TypeInferenceContext::new()).expect("inference failed");
             symbolic(&expr).matches("let __mono").count()
         }
@@ -5950,7 +5935,7 @@ fn no_sum_quantifies_an_index() {
 
     let mut lctx = LoweringContext::default();
     let mut ictx = TypeInferenceContext::new();
-    let stmts = parse_module(
+    let mut expr = lower_uniquified(
         indoc::indoc! {r#"
 
             c = 3 > 2
@@ -5959,8 +5944,8 @@ fn no_sum_quantifies_an_index() {
             b = box([10, 20]) if d else box([10, 20, 30])
             sum([x + y for x in a for y in b])"#}
         .trim(),
+        &mut lctx,
     );
-    let mut expr = lower_uniquified(&stmts, &mut lctx);
     infer(&mut expr, &mut ictx).expect("inference failed");
     check_pre_channelize(&expr).expect("post-inference consistency wall must accept the tree");
 
@@ -5981,7 +5966,7 @@ fn no_sum_quantifies_an_index() {
 // Lookup: `Option`, its constructors, and the subscript pair
 // ---------------------------------------------------------------------------
 
-/// `Option(T)` is the compiler-provided nominal type, built by `Option::some` and
+/// `Option(T)` is the nominal type `std` declares, built by `Option::some` and
 /// `Option::none` (`docs/chl-spec.md`, "3.15 Variant constructors"). A structural variant
 /// with the same arms is a different type, so a backtick constructor does not build one.
 #[test]

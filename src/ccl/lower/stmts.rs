@@ -4774,8 +4774,7 @@ fn collect_variant_arms(
 /// The capitalized names the type language spells that are not base types: the
 /// constructors [`lower_type_application`] dispatches on, the two heads resolved
 /// ahead of it (`Mut` in [`mut_annotation_parts`], `Feed` on a `def` parameter),
-/// `Mut`'s sequencing domain `Txn`, and the compiler-provided nominal type `Option`
-/// ([`crate::ccl::nominal::builtin`]).
+/// and `Mut`'s sequencing domain `Txn`.
 ///
 /// A new type constructor is added here in the same change that teaches
 /// [`lower_type_application`] its head. `builtin_type_names_are_refused` iterates
@@ -4791,7 +4790,6 @@ pub const RESERVED_TYPE_NAMES: &[&str] = &[
     "List",
     "Map",
     "Mut",
-    "Option",
     "Set",
     "Txn",
 ];

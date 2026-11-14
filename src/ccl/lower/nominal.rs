@@ -31,7 +31,6 @@ use crate::ccl::{
     Expr, FieldKey, Lit, MethodCandidate, Name, Pattern, PatternHead, Type, TypedBinding,
     TypedExprNode,
 };
-use crate::ccl::{V_NONE, V_SOME};
 use crate::chl_parser::ast::{
     AnnotationMode, ArmPattern, Clause, ConstructorPattern, Expr as ChlExpr, ImplBlock,
     KindAnnotation, MatchArm, Param, QualifiedName, Requirement, Span, Spanned, Stmt as ChlStmt,
@@ -1498,16 +1497,6 @@ pub(super) fn bind_constructors(body: Expr, ctx: &mut LoweringContext) -> Expr {
     for (decl, _) in closed.iter().rev() {
         acc = bind_functions(decl, acc, ctx);
     }
-    // A compiler-provided declaration's members are bound only where the module names them
-    // (`LoweringContext::builtin_members_used`).
-    let used = std::mem::take(&mut ctx.builtin_members_used);
-    for (decl, name) in used.into_values().rev() {
-        acc = match decl.ctor(&name) {
-            Some(ctor) => bind_constructor(&decl, ctor, acc, ctx),
-            None if name == IS_NONE => bind_is_none(&decl, acc, ctx),
-            None => unreachable!("`{}` provides no function `{name}`", decl.name),
-        };
-    }
     acc
 }
 
@@ -1593,9 +1582,8 @@ fn bind_constructor(
     );
     let name = member_binding(decl, &ctor.name);
     // A constructor line writes its name at `ctor.span`. The single-constructor form's
-    // `new` is written nowhere, and its span is the declaration's name, as is a
-    // compiler-provided declaration's.
-    let binder = if decl.is_builtin() || decl.declares_extract {
+    // `new` is written nowhere, and its span is the declaration's name.
+    let binder = if decl.declares_extract {
         Occurrence::mint()
     } else {
         ctx.occurrence_at(ctor.span)
@@ -1612,69 +1600,6 @@ fn bind_constructor(
         label,
         ctx,
     )
-}
-
-/// The method `Option::is_none` that the compiler provides with `Option`.
-const IS_NONE: &str = "is_none";
-
-/// `Option::is_none`, the function `λ 𝑜 → match 𝑜 { Option::some(_) → false; Option::none →
-/// true }` (`docs/chl-spec.md`, "Subscript and unwrap syntax \[Decided\]"). The interpreter
-/// provides the same method (`BuiltinMethod::IsNone` in `chl-interp/src/eval.rs`).
-fn bind_is_none(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) -> Expr {
-    let label = "lower.option_is_none";
-    let span = decl.span;
-    let arg = "__is_none_arg";
-    let scrutinee = ctx.tag_machinery(Expr::var(arg), span, label);
-    let mut arms = Vec::new();
-    for (tag, empty_payload, answer) in [(V_SOME, false, false), (V_NONE, true, true)] {
-        let payload = ctx.fresh_ignored_payload();
-        arms.push(crate::ccl::Branch {
-            pattern: Some(Pattern {
-                head: PatternHead::Constructor {
-                    decl: Rc::clone(decl),
-                    ctor: tag.name().into(),
-                },
-                head_occurrence: Occurrence::mint(),
-                binding: TypedBinding::new_unannotated(payload, Occurrence::mint()),
-                empty_payload,
-            }),
-            guard: ctx.tag_machinery(Expr::lit(Lit::Bool(true)), span, label),
-            body: ctx.tag_machinery(Expr::lit(Lit::Bool(answer)), span, label),
-        });
-    }
-    let case = ctx.tag_machinery(Expr::match_expr(scrutinee, arms), span, label);
-    let name = member_binding(decl, IS_NONE);
-    let self_ty = decl
-        .applied_to_params(&mut |n, ty| ctx.tag_machinery(Expr::var(n).with_ty(ty), span, label));
-    let binder = Occurrence::mint();
-    bind_function(
-        decl, name, binder, arg, self_ty, case, acc, span, label, ctx,
-    )
-}
-
-/// The name a reference to `decl`'s member `name` reads, recording the member as used when
-/// the compiler provides `decl`.
-fn member_reference(decl: &Rc<NominalDecl>, name: &str, ctx: &mut LoweringContext) -> String {
-    let binding = member_binding(decl, name);
-    if decl.is_builtin() {
-        ctx.builtin_members_used
-            .entry(binding.clone())
-            .or_insert_with(|| (Rc::clone(decl), SmolStr::from(name)));
-    }
-    binding
-}
-
-/// The associated functions the compiler provides with its declarations.
-fn builtin_functions() -> [AssociatedFunction; 1] {
-    let option = crate::ccl::nominal::option();
-    let span = option.span;
-    [AssociatedFunction {
-        decl: option,
-        name: SmolStr::new_static(IS_NONE),
-        arity: 1,
-        is_method: true,
-        span,
-    }]
 }
 
 /// `N::extract`, the function `λ n → match n: case N::new(r): r` that the
@@ -1812,8 +1737,6 @@ fn member(decl: &NominalDecl, name: &str, ctx: &LoweringContext) -> Option<(Memb
     }
     ctx.associated_functions
         .iter()
-        .cloned()
-        .chain(builtin_functions())
         .find(|f| *f.decl == *decl && f.name == name)
         .map(|f| (Member::Associated { arity: f.arity }, f.span))
 }
@@ -1874,9 +1797,9 @@ impl Named {
 
     /// The name a reference to the member `name` reads: the binding its module's chain
     /// binds, spelled through the qualifier for another module's type.
-    fn reference(&self, name: &str, ctx: &mut LoweringContext) -> String {
+    fn reference(&self, name: &str) -> String {
         match &self.foreign {
-            None => member_reference(&self.decl, name, ctx),
+            None => member_binding(&self.decl, name),
             Some((qualifier, _)) => {
                 format!("{qualifier}::{}", member_binding(&self.decl, name))
             }
@@ -1884,8 +1807,8 @@ impl Named {
     }
 }
 
-/// The nominal type `path` names, `Shape` or `shop::Shape`: one the module declares or the
-/// compiler provides, or a public one of the module its qualifier names. `None` when that
+/// The nominal type `path` names, `Shape` or `shop::Shape`: one the module declares or a `use`
+/// name reaches, or a public one of the module its qualifier names. `None` when that
 /// module has errors of its own, which are reported where they stand.
 pub(super) fn resolve_type(
     path: &[Spanned<SmolStr>],
@@ -2045,7 +1968,7 @@ pub(super) fn lower_member(
             let unit = ctx.tag_machinery(Expr::lit(Lit::Unit), span, "lower.nominal_ctor_unit");
             Ok(Expr::nominal_ctor(named.decl, q.name.node.as_str(), unit))
         }
-        _ => Ok(Expr::var(named.reference(&q.name.node, ctx))),
+        _ => Ok(Expr::var(named.reference(&q.name.node))),
     }
 }
 
@@ -2080,7 +2003,7 @@ pub(super) fn lower_member_call(
             ),
         )),
         _ => {
-            let binding = named.reference(name, ctx);
+            let binding = named.reference(name);
             super::exprs::lower_application(Name::raw(&binding), span, args, ctx)
         }
     }
@@ -2469,7 +2392,15 @@ fn declare_one(def: &AssociatedDef, ctx: &mut LoweringContext) -> Result<(), Low
             ),
         ));
     }
-    let Some(decl) = ctx.nominal_type(&owner.node) else {
+    // Whether another module may declare a type's associated functions is open
+    // (`docs/chl-spec.md`, "Associated functions and methods"), so the owner is a type this
+    // module declares, not one a `use` name reaches.
+    let Some(decl) = ctx
+        .nominal_types
+        .iter()
+        .find(|decl| decl.name == owner.node)
+        .cloned()
+    else {
         return Err(LoweringError::unsupported(
             owner.span,
             format!(
@@ -2481,18 +2412,6 @@ fn declare_one(def: &AssociatedDef, ctx: &mut LoweringContext) -> Result<(), Low
             ),
         ));
     };
-    // Whether another module may declare a type's associated functions is open, and the
-    // compiler provides `Option` from no module (`docs/chl-spec.md`, "Associated functions
-    // and methods").
-    if decl.is_builtin() {
-        return Err(LoweringError::unsupported(
-            owner.span,
-            format!(
-                "`{}` is a built-in type, so this module declares no associated function of it",
-                decl.name
-            ),
-        ));
-    }
     if block.is_some() && def.block_params.len() != decl.params.len() {
         return Err(LoweringError::unsupported(
             owner.span,
@@ -2685,7 +2604,7 @@ pub(super) fn lower_associated_def(
         && first.name == "self"
         && first.annotation.is_none()
     {
-        let head = Spanned::new(first.name_span, ChlExpr::Name(decl.name.clone()));
+        let head = Spanned::new(def.owner.span, ChlExpr::Name(decl.name.clone()));
         let ty = if impl_params.is_empty() {
             head
         } else {
@@ -2694,7 +2613,7 @@ pub(super) fn lower_associated_def(
                 .map(|p| Spanned::new(p.span, ChlExpr::Name(p.node.clone())))
                 .collect();
             Spanned::new(
-                first.name_span,
+                def.owner.span,
                 ChlExpr::Call {
                     func: Box::new(head),
                     args,
@@ -2795,8 +2714,6 @@ pub(super) fn lower_method_call(
     let mut owners: Vec<(Rc<NominalDecl>, usize, Option<QualifiedNameOf>)> = ctx
         .associated_functions
         .iter()
-        .cloned()
-        .chain(builtin_functions())
         .filter(|f| f.is_method && f.name == method.node)
         .map(|f| (Rc::clone(&f.decl), f.arity - 1, None))
         .collect();
@@ -2829,7 +2746,7 @@ pub(super) fn lower_method_call(
         .into_iter()
         .map(|(decl, params, qualifier)| {
             let binding = match qualifier {
-                None => member_reference(&decl, &method.node, ctx),
+                None => member_binding(&decl, &method.node),
                 Some(qualifier) => {
                     format!("{qualifier}::{}", member_binding(&decl, &method.node))
                 }

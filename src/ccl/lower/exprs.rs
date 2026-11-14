@@ -750,8 +750,18 @@ pub(super) fn lower_subscript(
         // Pair collection and key so point-free conversion can treat lookup as a morphism
         // from a zip. Record both manufactured nodes; the caller tags the Apply root.
         // See `src/ccl/design/provenance.md`, "The recorder".
+        // The lookup answers `std`'s `Option`, which inference reads off the stamp
+        // (`emit_lookup_checked`). A module the prelude reaches lowers after `std`.
+        let option = ctx.std_option.clone().ok_or_else(|| {
+            LoweringError::internal(
+                span,
+                "a checked lookup answers `std`'s `Option`, and this module lowers \
+                 before `std`: a std module that writes `c[k]` imports `std`",
+            )
+        })?;
+        let answer = Type::fun(Type::Hole, Type::Nominal(option, vec![Type::Hole]));
         let op = ctx.tag_machinery(
-            Expr::builtin(Builtin::LookupChecked),
+            Expr::builtin(Builtin::LookupChecked).with_ty(answer),
             span,
             "lower.lookup_checked",
         );

@@ -2662,8 +2662,8 @@ pub enum TypeKind {
 /// The name of `Option`'s constructor of a present value, `Option::some`.
 ///
 /// Named here because the runtime builds the same tag when it answers a checked lookup
-/// (`some_of` in `src/interpreter/tile_operators/lookup.rs`), and the compiler-provided
-/// declaration ([`crate::ccl::nominal::option`]) declares it. One spelling, two builders.
+/// (`some_of` in `src/interpreter/tile_operators/lookup.rs`), and `std`'s declaration
+/// declares it, which lowering checks when that module lowers. One spelling, two builders.
 pub const V_SOME: Label = Label::fixed("some");
 /// The name of `Option`'s constructor of an absent value, `Option::none`. See [`V_SOME`].
 pub const V_NONE: Label = Label::fixed("none");
@@ -3611,10 +3611,12 @@ impl Type {
         }
     }
 
-    /// `Option(payload)`, the compiler-provided nominal type
-    /// ([`crate::ccl::nominal::option`]) that a checked lookup answers.
-    pub fn option_of(payload: Self) -> Self {
-        Type::Nominal(crate::ccl::nominal::option(), vec![payload])
+    /// `Option(payload)`, an application of `option`, `std`'s `Option`
+    /// ([`NominalDecl::is_option`](crate::ccl::nominal::NominalDecl::is_option)), which a
+    /// checked lookup answers.
+    pub fn option_of(option: &Rc<crate::ccl::nominal::NominalDecl>, payload: Self) -> Self {
+        debug_assert!(option.is_option(), "`{}` is not `Option`", option.spelled());
+        Type::Nominal(Rc::clone(option), vec![payload])
     }
 
     /// The payload of an [`option_of`](Self::option_of), or `None` for any other type.
@@ -3623,7 +3625,7 @@ impl Type {
     /// rather than recomputing it.
     pub fn option_payload(&self) -> Option<&Self> {
         match self {
-            Type::Nominal(decl, args) if **decl == *crate::ccl::nominal::option() => args.first(),
+            Type::Nominal(decl, args) if decl.is_option() => args.first(),
             _ => None,
         }
     }
