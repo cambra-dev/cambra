@@ -23,6 +23,7 @@ const COUNTER: &str = indoc! {"
     pub def item(p):
         (price=p, cost=1)
     pub Small = {Int where _ < limit}
+    visits: Mut(Int, Txn) := 0
 "};
 
 /// A module whose run folds a loop into an induction variable and publishes the
@@ -137,17 +138,22 @@ fn two_runs_of_a_module_have_their_own_state(
 }
 
 /// Two runs of a module whose code holds refinements each hold their own copy of them: a
-/// refined parameter type, and a nominal type's refined constructor.
+/// refined parameter type, and a nominal type's refined constructor. Each module holds state,
+/// so it is run.
 #[rstest]
 #[case::function(
     indoc! {"
         pub def f(x: {Int where _ > 0}) => Int:
             x
+        visits: Mut(Int, Txn) := 0
     "},
     "a::f(1) + b::f(2)"
 )]
 #[case::constructor(
-    "pub type P = {Int where _ > 0}\n",
+    indoc! {"
+        pub type P = {Int where _ > 0}
+        visits: Mut(Int, Txn) := 0
+    "},
     "a::P::new(1).extract() + b::P::new(2).extract()"
 )]
 #[timeout(Duration::from_secs(10))]
@@ -513,6 +519,7 @@ const STEPPER: &str = indoc! {"
     param base: Int
     param step: Int = 1
     pub total = base + step
+    visits: Mut(Int, Txn) := 0
 "};
 
 /// A run's parameters take its arguments, and a parameter without one takes
@@ -593,6 +600,7 @@ fn a_runs_parameters_take_its_arguments(#[case] root: &str, #[case] expected: i6
     &[("bump", indoc! {"
         param k: _
         pub v = k + 1
+        visits: Mut(Int, Txn) := 0
     "})],
     4
 )]
@@ -782,4 +790,76 @@ fn a_module_feeds_a_runs_feed(#[case] root: &str, #[case] expected: i64) {
         pub total = sum([e for e in events])
     "};
     check_program_scalar(&program(root, &[("audit", audit)]), Value::Int(expected));
+}
+
+/// A module whose top level requires and causes nothing is imported, so running it with
+/// arguments an import could pass is an error (`docs/chl-spec.md`, "Shareable modules").
+#[rstest]
+#[case::no_arguments(
+    indoc! {"
+        run pure as p
+        p::v
+    "},
+    "module `pure` is shareable, since its top level requires and causes nothing, so running it \
+     is an error: import it instead"
+)]
+#[case::constant_arguments(
+    indoc! {"
+        run scaled(k=2) as s
+        s::v
+    "},
+    "module `scaled` is shareable, since its top level requires and causes nothing, so running it \
+     is an error: import it instead"
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_run_of_a_module_an_import_could_share_is_refused(#[case] root: &str, #[case] needle: &str) {
+    assert_refused(
+        &program(
+            root,
+            &[
+                ("pure", "pub v = 1\n"),
+                (
+                    "scaled",
+                    indoc! {"
+                        param k: Int
+                        pub v = k * 2
+                    "},
+                ),
+            ],
+        ),
+        needle,
+    );
+}
+
+/// A run passing another run gives its module state an import cannot share, so it is run
+/// whatever its own top level does.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_run_given_a_run_is_run() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                run store as s
+                run reader(source=s) as r
+                r::v
+            "},
+            &[
+                (
+                    "store",
+                    indoc! {"
+                        pub v = 3
+                        visits: Mut(Int, Txn) := 0
+                    "},
+                ),
+                (
+                    "reader",
+                    indoc! {"
+                        param source: Module{v: Int}
+                        pub v = source::v + 1
+                    "},
+                ),
+            ],
+        ),
+        Value::Int(4),
+    );
 }

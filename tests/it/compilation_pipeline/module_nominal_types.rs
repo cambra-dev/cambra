@@ -587,7 +587,7 @@ fn an_associated_function_reaches_nothing_an_import_or_a_run_gives_its_module(
 
 /// A run's module with a public type, so a module runs it and names the type through it.
 const COUNTED: &str = indoc! {"
-    visits := 0
+    visits: Mut(Int, Txn) := 0
     pub type Tally = Int
 "};
 

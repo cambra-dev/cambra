@@ -2373,19 +2373,32 @@ fn check_modules(
     // parameters. The link order checks a module before every module that
     // passes it an argument.
     let mut inferred: HashMap<(ModulePath, SmolStr), Type> = HashMap::new();
+    // What each module's top level requires and causes, by its file, for the rule that
+    // decides whether it is imported or run, applied once every module is checked.
+    let mut shareability: HashMap<FileId, Shareability> = HashMap::new();
+    let mut statements: Vec<crate::ccl::lower::modules::ModuleStatement> =
+        std::mem::take(&mut ctx.lowering_ctx().root_statements);
     for check in checks {
         let mut blame = blame.fresh();
         let mut tree = uniquify::run(check.tree);
         annotate_arguments(&mut tree, &check.arguments, &inferred);
+        // The root's statements are already here when its file has a check of its own.
+        for statement in &check.statements {
+            if !statements.iter().any(|s| s.span == statement.span) {
+                statements.push(statement.clone());
+            }
+        }
         // The module's own public members head its check tree with no home,
         // below the shared imports it reaches. Their contracts are what `cambra check`
         // prints, and what names only public traits.
         let mut wanted = HashSet::new();
+        let mut public = HashSet::new();
         for binding in tree.chain_binders() {
             let base = binding.name.base();
             if binding.name.home().is_none()
                 && (check.interface.is_public(base) || check.interface.is_public_function(base))
             {
+                public.insert(binding.name.clone());
                 wanted.insert(binding.name.clone());
             }
         }
@@ -2404,7 +2417,13 @@ fn check_modules(
         // new node to its source. A module check is not a phase of the linked program;
         // no phase scope records its tree in the program's panes.
         let derivation = DerivationSession::install();
-        let checked = check_module(&mut tree, ctx.inference_ctx(), &check.params, &wanted);
+        let checked = check_module(
+            &mut tree,
+            ctx.inference_ctx(),
+            &check.params,
+            &wanted,
+            &public,
+        );
         blame.derive(&derivation.into_log(), Phase::Infer);
         let before = &checked.before;
         statement_expressions(before, &mut |expr, binding, statement| {
@@ -2429,6 +2448,20 @@ fn check_modules(
             &check.interface,
             &checked.contracts,
         ));
+        // A module whose own check failed has its errors reported already.
+        if let Some(top_level) = checked.top_level.clone()
+            && checked.errors.is_empty()
+        {
+            shareability.insert(
+                check.file,
+                Shareability {
+                    module: check.module.clone(),
+                    top_level,
+                    runs_another: check.statements.iter().any(|s| s.runs),
+                    importable: check.interface.unimportable.is_none(),
+                },
+            );
+        }
         if contracts_of == Some(check.file) {
             contracts.extend(
                 checked
@@ -2495,6 +2528,7 @@ fn check_modules(
             }
         }
     }
+    reported.extend(import_and_run_errors(&statements, &shareability));
     CheckedModules {
         errors: reported,
         recovered,
@@ -2541,6 +2575,74 @@ fn private_traits_in_contracts(
         }
     }
     errors
+}
+
+/// What decides whether a checked module is imported or run (`docs/chl-spec.md`, "Shareable
+/// modules").
+struct Shareability {
+    module: ModulePath,
+    /// What its top level requires and causes, less what its scopes discharge.
+    top_level: crate::ccl::capabilities::CapabilitySet,
+    /// Whether it runs another module, which is run, so it is run too.
+    runs_another: bool,
+    /// Whether lowering can import it. One it cannot is refused at each `import` already,
+    /// and so is never refused at a `run`.
+    importable: bool,
+}
+
+impl Shareability {
+    /// What makes the module's top level unshareable, as a phrase, or `None` when it is
+    /// shareable.
+    fn obstacle(&self) -> Option<String> {
+        if self.runs_another {
+            return Some("it runs another module".to_string());
+        }
+        let set = &self.top_level;
+        if let Some(r) = set.requires.iter().next() {
+            return Some(format!("its top level requires `{r}`"));
+        }
+        set.causes
+            .iter()
+            .next()
+            .map(|e| format!("its top level causes `{e}`"))
+    }
+}
+
+/// An error at each `import` of a module that is not shareable, and at each `run` of one
+/// that is (`docs/chl-spec.md`, "Shareable modules"). A module lowering cannot
+/// import is refused at its imports during lowering, and is run. Lowering refuses to import
+/// every module this rule would make a run, so the error at an `import` is reached only once
+/// lowering imports such modules.
+fn import_and_run_errors(
+    statements: &[crate::ccl::lower::modules::ModuleStatement],
+    shareability: &HashMap<FileId, Shareability>,
+) -> Vec<CompileError> {
+    statements
+        .iter()
+        .filter_map(|statement| {
+            // A module whose own check failed has its errors reported already.
+            let target = shareability.get(&statement.target)?;
+            if !target.importable || !statement.importable_arguments {
+                return None;
+            }
+            let module = &target.module;
+            let message = match (statement.runs, target.obstacle()) {
+                (true, None) => format!(
+                    "module `{module}` is shareable, since its top level requires and causes \
+                     nothing, so running it is an error: import it instead"
+                ),
+                (false, Some(obstacle)) => format!(
+                    "module `{module}` is run, since {obstacle}, so importing it is an error: \
+                     run it instead"
+                ),
+                (true, Some(_)) | (false, None) => return None,
+            };
+            Some(CompileError::Lower(LoweringError::unsupported(
+                statement.span,
+                message,
+            )))
+        })
+        .collect()
 }
 
 /// What makes two errors one error: its span, and the error as every copy of the code
