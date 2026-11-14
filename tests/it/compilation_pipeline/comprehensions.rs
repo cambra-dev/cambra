@@ -909,6 +909,29 @@ fn an_inner_generator_over_the_outer_element_keys_by_a_dependent_tuple(
     check_sink(source, expected);
 }
 
+/// Comprehensions over boxed rows nested with a generator over a plain list. A one-element list
+/// types its element as that element alone (`Int@10`), which the comprehension over it takes as
+/// its binder's type rather than as a filter.
+#[rstest]
+#[case::under_an_independent_generator(indoc! {r#"
+    out = test_sink()
+    out << sum([sum([sum([x * 10 + i for x in xs]) for xs in [box([1, 2]), box([3])]]) for i in [0, 1]])
+"#}, "[() -> 123]")]
+#[case::around_a_one_element_list(indoc! {r#"
+    out = test_sink()
+    out << sum([sum([sum([n + x for x in xs]) for n in [10]]) for xs in [box([1, 2]), box([3])]])
+"#}, "[() -> 36]")]
+#[case::around_a_one_element_list_kept(indoc! {r#"
+    out = test_sink()
+    out << [[[(n, x) for x in xs] for n in [10]] for xs in [box([1, 2]), box([3])]]
+"#}, "[() -> [[[(_0: 10, _1: 1), (_0: 10, _1: 2)]], [[(_0: 10, _1: 3)]]]]")]
+fn comprehensions_over_boxed_rows_beside_a_list_generator(
+    #[case] source: &str,
+    #[case] expected: &str,
+) {
+    check_sink(source, expected);
+}
+
 /// Dependent comprehensions that do not compile yet: each reads a row of boxed collections at
 /// its key, and the operator for that reading takes rows whose values are one column. Each case
 /// names the value it must answer.
