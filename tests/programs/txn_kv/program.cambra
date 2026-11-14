@@ -9,9 +9,9 @@
 # while the write count is a *declarative aggregate* over the request stream
 # itself — no mutable counter, no shared state to race on.
 #
-# `requires Transaction` makes the transaction a contextual parameter
-# (typeclass-solver-resolved, not an effect), summoned implicitly at the call
-# site.  A transaction commits on normal block exit; `abort()` rolls it back.
+# `requires Transaction` makes the transaction a contextual requirement, which
+# the block calling `put` supplies.  A transaction commits on normal block exit;
+# one that should not write is written with a guard that writes nothing.
 
 import std::http
 
@@ -30,7 +30,8 @@ for req in set_reqs:
         # two concurrent /set requests for the same key can't both observe it
         # missing and both insert — the read-modify-write is atomic.
         match store[req.body.key]:
-            case `some(_): abort()
+            case `some(_):
+                pass
             case `none:    put(req.body.key, req.body.value)
     set_resps[req.id] = "ok\n"
 
@@ -46,5 +47,5 @@ for req in get_reqs:
 # this counter.
 for req in stats_reqs:
     with txn = begin():
-        num_writes = count(set_reqs.restrict(\r -> r.time < txn.current_time()))
+        num_writes = count(set_reqs.restrict(\r -> r.time < txn::now()))
         stats_resps[req.id] = str(num_writes) + "\n"

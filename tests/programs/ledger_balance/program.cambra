@@ -21,6 +21,6 @@ for req in deposit_reqs:
 
 for req in balance_reqs:
     with txn = begin():
-        deposits = ledger.restrict(\e -> e.time < txn.current_time())
+        deposits = ledger.restrict(\e -> e.time < txn::now())
         balance = sum([e.amount for e in deposits])
     balance_resps[req.id] = balance

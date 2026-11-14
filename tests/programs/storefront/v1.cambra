@@ -57,9 +57,9 @@ stats_reqs,   stats_resps   = http.serve("8080", "GET", "/stats")
 # Naming the aggregate makes it a view: denotationally it is just this sum, but the
 # runtime is free to materialize it and maintain it incrementally as orders commit,
 # rather than rescanning order history on every quote.
-def is_promo_spent() => Bool requires Transaction:
+def is_promo_spent() => Bool requires txn: Transaction:
     promo_budget = 1000
-    now = summon(Transaction).current_time()
+    now = txn::now()
     past = orders.filter(\o -> o.time < now)
     promo_budget <= sum([o.discount for o in past])
 
@@ -115,7 +115,7 @@ for req in order_reqs:
                         qty = req.body.qty,
                         price = price,
                         discount = item.price * req.body.qty - price,
-                        time = txn.current_time(),
+                        time = txn::now(),
                     )
                     http.ok(str(price))
                 else:
@@ -126,7 +126,7 @@ for req in order_reqs:
 # Revenue per SKU, as of this request's own transaction time.
 for req in stats_reqs:
     with txn = begin():
-        paid = orders.filter(\o -> o.time < txn.current_time())
+        paid = orders.filter(\o -> o.time < txn::now())
         revenue = [key -> sum([o.price for o in g])
             for key -> g in groupby(paid, \o -> o.sku)]
 

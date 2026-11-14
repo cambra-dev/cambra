@@ -43,7 +43,7 @@ for o in orders:
 revenue_reqs, revenue_resps = http_serve("8080", "GET", "/revenue")
 for req in revenue_reqs:
     with txn = begin():
-        so_far = orders.restrict(lambda o: o.time < txn.current_time())
+        so_far = orders.restrict(lambda o: o.time < txn::now())
         revenue = sum([p.price * o.qty for p in products for o in so_far if p.sku == o.sku])
         revenue_resps[req.id] = str(revenue) + "\n"
 ```

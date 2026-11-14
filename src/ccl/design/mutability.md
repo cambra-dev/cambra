@@ -623,9 +623,11 @@ Symbolic rendering: `letrec 𝑏₁ = 𝑒₁; …; 𝑏ₙ = 𝑒ₙ in body`.
 | `await_final` | `Mut(𝑉, Txn) ⇒ 𝑉` | the terminal read of a transactional mutable variable — a surface marker `transact_phase` replaces with a `final_read` over the mutable variable's history binding, which compiles to `StoreFinalRead`. Its domain is the **handle**, not a value. See [`await_final`](#await_final) |
 
 `begin()` never reaches CCL — lowering records the block structure, and the phase mints one
-`begin_<site>` per site. The oracles are opaque, strictly monotone in arrival order (which is what
-gives cross-endpoint external consistency), with pairwise-disjoint ranges; the commit engine
-realizes them by tick allocation, not by computing anything.
+`begin_<site>` per site. The oracles are opaque, strictly monotone in arrival order, with
+pairwise-disjoint ranges; the commit engine realizes them by tick allocation, not by computing
+anything. Arrival order realizes the spec's edge from a commit to every arrival after its output
+was sent, which gives cross-endpoint external consistency ([8.5 Ordering and
+concurrency](../../../docs/chl-spec.md#85-ordering-and-concurrency)).
 
 Multi-variable atomic blocks produce one shared record `{time, writes: {𝑘₁: 𝑉₁, …}}` per commit,
 and each variable's history reads it through a per-key view — atomicity by construction, since one
@@ -1068,7 +1070,8 @@ Reading it off:
   commit slot (`begin_<site>`/`BeginTxn` is the *writer* oracle only). It is pure composition, no
   commit record, no write set. **External consistency** is a real property of this same mechanism (not
   a competing guarantee): a GET issued once a POST's `ok`-reply has landed reads at an observation time ≥ that
-  POST's commit (arrival-order monotonicity), so a client that sees `ok 2` then GETs observes `≥ 2`;
+  POST's commit (an arrival is ordered after every commit whose output was sent before it, which
+  arrival-order monotonicity realizes), so a client that sees `ok 2` then GETs observes `≥ 2`;
   a read with no such causal ordering samples an *arbitrary* position among concurrent commits — which
   is all the "arbitrary as-of" of the `AsOf` sections means.
 

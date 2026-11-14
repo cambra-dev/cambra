@@ -57,7 +57,21 @@ def repeat(n: Int, y: String) => String: # return type syntax is [Sketched]
   return z
 ```
 
-A `Mut(_)` parameter annotation gives pass-by-reference access to a caller's mutable variable, under a deliberately *second-class* discipline — mutables flow down into calls but are not returned or stored in data structures (see [src/ccl/design/mutability.md](../src/ccl/design/mutability.md)). Captures of ordinary bindings are read-only. Captures of transactional variables are **[Decided]** (§8 of the [spec](chl-spec.md)).
+A `Mut(_)` parameter gives a function access to its caller's mutable variable. Mutable variables
+flow into calls but cannot be returned or stored in data structures
+([mutability](../src/ccl/design/mutability.md)). A function may capture a transactional variable and
+write it inside a `with begin():` block, or require the transaction of its caller.
+
+### Function requirements and effects
+
+A function's type records what a call requires from its context and what it causes besides its
+result. `requires Transaction` permits a function to read or write transactional state in its
+caller's block. `causes WriteTxn(stock)` names a write to `stock`; `Raise(NotFound)` names an
+exception. Inference propagates these capabilities through calls and discharges them at the
+construct that supplies the context or handles the effect. They determine transaction footprints,
+whether a module can be imported, and whether loop iterations need an order. The [capability
+rules](chl-spec.md#69-capabilities) define written bounds and polymorphism over an argument's
+capabilities.
 
 ### Collections are unordered
 
@@ -139,7 +153,7 @@ Self-referential *collection* definitions solve an equation as a least fixpoint 
 
 ### Currently omitted
 
-`while` loops, floats, `%`/bit-shifts, classes, exceptions, imports (CHL is single-file today), identity (`is`), and membership operators are omitted while we focus on the areas of highest technical risk. The spec's [reserved-for-future-work section](chl-spec.md) is the authoritative list. CHL resembles Python; it does not promise Python.
+`while` loops, floats, `%`/bit-shifts, classes, exceptions, identity (`is`), and membership operators are omitted while we focus on the areas of highest technical risk. The spec's [reserved-for-future-work section](chl-spec.md) is the authoritative list. CHL resembles Python; it does not promise Python.
 
 ## Program Execution Pipeline
 
@@ -156,7 +170,8 @@ pipeline; individual pass contracts belong to the linked design documents.
 | Name mutable reads | `mut_read::run` gives mutable reads immutable names that refinements can reference. |
 | Lower comprehensions | `comprehension::run` lowers each comprehension to its `cast`/`λ`/`▷` encoding. |
 | Bind opaque outputs | `opaque_output::run` binds the body of each lambda that binds an opaque variable to `__output` under a barrier-variable annotation. |
-| Infer | Infer types, specialize uses and validate the typed tree; see [type inference](../src/ccl/design/type-inference.md). Each module's check tree is inferred first, alone, and a failed check stops the compile; see [checking a module on its own](modules.md#checking-a-module-on-its-own). Read naming is undone before the post-inference pane. || Inline | Inline capability bindings and beta-reduce calls; see [inlining](../src/ccl/design/optimization.md#inlining-pass-cclinliners). |
+| Infer | Infer types, specialize uses and validate the typed tree; see [type inference](../src/ccl/design/type-inference.md). Each module's check tree is inferred first, alone, and a failed check stops the compile; see [checking a module on its own](modules.md#checking-a-module-on-its-own). Read naming is undone before the post-inference pane. |
+| Inline | Inline capability bindings and beta-reduce calls; see [inlining](../src/ccl/design/optimization.md#inlining-pass-cclinliners). |
 | Eliminate transactions | `transact_phase::run` constructs transaction histories after keyed-write desugaring and value-type views. |
 | Eliminate induction mutation | `mut_elim::run` constructs induction histories. |
 | Erase refinements | `erase_refinements::run` drops every refinement except those on data function domains; see [refinement erasure](../src/ccl/design/optimization.md#refinement-erasure-cclerase_refinementsrs). |
@@ -213,16 +228,16 @@ The connections between the layers above and the capabilities Cambra claims:
 | Streaming sources and sinks (`stdin`, `http_serve`) | Implemented |
 | Generator functions | Implemented (single-`for` bodies; general shapes **[Planned]**) |
 | `:=` mutation and loop accumulators (induction histories) | Implemented |
-| Transactions: `with begin():` over `Mut(V, Txn)` variables | Implemented (single deny-guard conditionals only; handle form and `abort()` still landing) |
+| Transactions: `with begin():` over `Mut(V, Txn)` variables | Implemented (single deny-guard conditionals only); naming a transaction, `with txn = begin():`, **[Decided]** |
 | Aggregates | `sum`, `max`, `min` implemented; `count`/`avg`/`len` **[Planned]** |
 | Refinement typing | Machinery implemented (internal); surface syntax **[Decided]** |
 | Feed channels | `Feed(_)` declarations, `Feed(_)` parameters and `http_serve` implemented |
-| Contextual parameters (`requires` / `given` / `summon`) | **[Decided]** |
+| Function requirements and effects (`requires` / `causes`) | **[Decided]** |
 | `rec` fixpoint bindings | **[Decided]** |
 | Collections-as-functions model | **[Decided]** — one representation (the data function `D ⤇ V`), five surface kinds; `Array`/`List`/`Collection` types implemented, `Map`/`Set` types and the operation layer landing (see [src/ccl/design/collections.md](../src/ccl/design/collections.md)) |
 | `match` / `case` | Tag dispatch implemented; deeper patterns **[Tentative]** |
 | Hot reload of a running program (`--control`) | Implemented for logic, endpoint changes, and state resume; running two versions at once is **[Open]** |
-| `while`, floats, imports, classes, exceptions | Absent (see the spec) |
+| `while`, floats, classes, exceptions | Absent (see the spec) |
 
 The [spec](chl-spec.md) carries the authoritative per-construct markers; [demo-programs.md](demo-programs.md) maps them to runnable programs and their blockers.
 
