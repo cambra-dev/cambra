@@ -3956,7 +3956,9 @@ body that reads no element names no collection, and the site's own type does: it
 generalized parameter, is the domain of a collection the enclosing value holds, which
 `collection_typed_at` finds through the enclosing value's tuple components. A site whose inner
 domain is a generalized parameter that no such collection has is refused, since enumerating the
-parameter's bound would look each row up at keys it lacks.
+parameter's bound would look each row up at keys it lacks. An inner domain that is one membership
+refinement `{𝐾 | 𝑘 ∈ 𝑀}`, with `𝑀` reading nothing the row binds, is the same keys at every row:
+the image of `𝑀`, keyed by itself, as an iteration site's membership is (`membership_keys`).
 
 ### At run time
 

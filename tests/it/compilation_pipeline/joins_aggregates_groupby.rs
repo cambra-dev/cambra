@@ -744,6 +744,15 @@ fn a_conditional_between_groups_at_two_keys_has_no_join() {
     "},
     12
 )]
+// The inner comprehension reads no group of its own, so its keys are the grouping's.
+#[case::the_outer_group_over_an_inner_loop_reading_none(
+    "sum([sum([sum(g1) for g2 in g]) for g1 in g])",
+    12
+)]
+#[case::the_outer_group_s_maximum_over_an_inner_loop_reading_none(
+    "sum([sum([max(g1) for g2 in g]) for g1 in g])",
+    8
+)]
 fn groups_read_at_the_keys_of_nested_loops(#[case] body: &str, #[case] expected: i64) {
     check_scalar(
         &format!("g = groupby([1, 2, 3], \\x -> x > 1)\n{body}"),

@@ -1478,20 +1478,18 @@ fn a_correlated_filter_inside_a_transaction() {
     );
 }
 
-/// A correlated inner comprehension over a **map** whose body never reads the element is
-/// refused by name. Its body never applies the source, so planning has none to name, and the
-/// type gives the inner domain as a membership refinement over the whole key type, which
-/// nothing enumerates.
+/// A correlated inner comprehension over a **map** whose body never reads the element. Its body
+/// never applies the source, so the inner domain is the type's membership refinement, and its
+/// keys are the map's: `r` counted twice at each `r`.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-fn a_correlated_comprehension_over_an_unnamed_map_source_is_unsupported() {
-    check_compile_error(
+fn a_correlated_comprehension_over_an_unnamed_map_source_ranges_over_its_keys() {
+    check_scalar(
         indoc! {r#"
             c = map([("a", 1), ("b", 2)])
             sum([sum([r for v in c]) for r in [1, 2]])
         "#},
-        "a correlated inner comprehension over a collection its body never applies is not \
-         supported yet",
+        Value::Int(6),
     );
 }
 
