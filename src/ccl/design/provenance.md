@@ -425,7 +425,7 @@ check still reports it.
 
 A label occurrence and a tag's occurrence compare the `Label`'s name, and a head occurrence the
 tag's name or the constructor's name, at `pre-inference` only. A pass builds records and variants of
-its own, `writes`, `` `commit `` and one field per stored variable among them, and nothing marks a
+its own, `writes`, `` `fired `` and one field per stored variable among them, and nothing marks a
 label the compiler writes apart from a source label a pass re-minted; at `pre-inference` every label
 is lowering's. An annotation occurrence has no spelling to compare: lowering substitutes an alias by
 the type it names, so `Annotation.ty` does not render as the text the source wrote. At

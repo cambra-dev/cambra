@@ -10,26 +10,13 @@ use crate::ccl::subst::Subst;
 use crate::ccl::{
     BaseType, BinOpKind, BindingTransparency, Branch, Builtin, Expr, F_WRITES, FieldKey, Lit,
     LogicKind, Name, PredicateId, ProjKey, QuotedTerm, Refinement, RefinementSet, Type,
-    TypedBinding, TypedExprNode, UnaryOpKind, V_ABORT, V_COMMIT, V_FIRED, V_IDLE,
+    TypedBinding, TypedExprNode, UnaryOpKind, V_FIRED, V_IDLE,
 };
 
-/// The `commit` selector field of the **intermediate** decision record the two
-/// writer phases build (`{commit, writes, __to_<defer>*}`) *before*
-/// [`wrap_decision_variant`] folds it into the `` {`commit{𝑃} | `abort} `` variant.
-/// The whole-transaction grant/deny is no longer a decision-codomain field — it
-/// is the variant *tag* — so this constant is phase-internal plumbing, not part
-/// of the observable decision protocol (hence it lives here, beside the wrapper,
-/// rather than among the AST field constants in `expr.rs`).
-pub(crate) const COMMIT_SELECTOR: Label = Label::fixed("commit");
-
-/// Disjoin control-flow `paths` into one boolean commit gate — the writer
-/// decision's `commit` field, true exactly where some path commits. Short-circuits
-/// a literal `true` path (an unconditional commit) and skips a literal `false`,
-/// so a spine writer folds to `true` (not `true or true or …`) and the two phases
-/// build the same gate for the same shape. `empty` is the value of an empty
-/// disjunction: `true` for a transaction block (a bare `with begin():` always
-/// commits), `false` for an induction `Case` (no writing/feeding branch commits
-/// nothing — a pure carry).
+/// Disjoin control-flow `paths` into one boolean gate: where a write or a feed fires, true
+/// exactly where some path reaches it. Short-circuits a literal `true` path and skips a
+/// literal `false`, so a spine write folds to `true` (not `true or true or …`). `empty` is
+/// the value of an empty disjunction.
 pub fn disjoin(paths: impl IntoIterator<Item = Expr>, empty: bool, bool_ty: &Type) -> Expr {
     let lit = |b: bool| Expr::new(TypedExprNode::Lit(Lit::Bool(b))).with_ty(bool_ty.clone());
     let mut acc: Option<Expr> = None;
@@ -168,57 +155,87 @@ pub(crate) fn tag_test(scrut: &Expr, tag: Label) -> Expr {
     test
 }
 
-/// Assemble a writer **decision record** `{commit, writes, __to_<feed>, …}` — the
-/// single encoding of the tap protocol shared by the
-/// transaction writer ([`crate::ccl::transact_phase`]) and the induction writer
-/// ([`crate::ccl::mut_elim`]). Both feed it to the interpreter through the same
-/// `body_decision_at` decoder, so the shape must be built in exactly one place.
+/// Assemble a writer **decision**: the record `{writes: {𝑘: …}, __to_<feed>: …, …}` — the
+/// single encoding shared by the transaction writer ([`crate::ccl::transact_phase`]) and the
+/// induction writer ([`crate::ccl::mut_elim`]). Both feed it to the interpreter through the
+/// same `body_decision_at` decoder, so the shape is built in exactly one place.
 ///
-/// `feeds` are `(field, value, 𝑉, fire)` in tap order, `value` inhabiting `𝑉`. Each tap's field
-/// holds `` {`fired{𝑉} | `idle} `` ([`V_FIRED`](crate::ccl::V_FIRED)): the value at the
-/// positions its `fire` path admits, and `` `idle `` elsewhere. A tap whose `fire`
-/// is structurally the writer's `commit` — a spine or sole-committer feed that
-/// fires with every committing position — wraps unconditionally; a **narrower**
-/// `fire` becomes the guard of a two-arm value-`Case`, so a sibling route's commit
-/// leaves this tap `` `idle ``.
+/// `writes` are `(key, value, fire, declared)` in write-set order, each written at its variable's
+/// declared type, and `feeds` `(field, value, 𝑉, fire)` in tap order, each fed at its row type
+/// `𝑉`. Each entry holds `` {`fired{𝑉} | `idle} `` ([`V_FIRED`](crate::ccl::V_FIRED)): the value
+/// at the positions its `fire` path admits, and `` `idle `` elsewhere, so a write holds a value
+/// only where the decision writes it and a reply only where it is sent. A decision that fires
+/// nothing writes nothing: a transaction that denies, or an induction position that carries
+/// every accumulator. An empty write set is the empty product, `unit`.
 ///
-/// The tag rather than a companion `Bool` is what lets a tap value be
-/// domain-restricted. A gate beside a same-position value obliges the value to
-/// answer wherever the record commits, and an arm's `variant_project` answers only
-/// on its own arm's positions; under the tag, the non-firing positions are
-/// `` `idle `` and the value is asked for nowhere else.
-///
-/// `commit` must already be the writer's *final* commit gate — including every
-/// feed's fire path, so a feed-only committing position appends a change carrying
-/// the tap (the caller folds fires into `commit` before calling; see
-/// `mut_elim::WriterWalk::body`, which disjoins every write's and feed's path).
-pub fn writer_decision_record(
-    commit: Expr,
-    writes: Expr,
+/// The tag rather than a companion `Bool` is what lets a value be domain-restricted. A gate
+/// beside a same-position value obliges the value to answer wherever the record exists, and
+/// an arm's `variant_project` answers only on its own arm's positions; under the tag, the
+/// non-firing positions are `` `idle `` and the value is asked for nowhere else.
+pub fn writer_decision(
+    writes: &[(Label, Expr, Expr, Type)],
     feeds: &[(Label, Expr, Type, Expr)],
 ) -> Expr {
-    let mut fields: Vec<(Label, Expr)> = Vec::with_capacity(2 + feeds.len() * 2);
-    fields.push((COMMIT_SELECTOR, commit.clone()));
-    fields.push((F_WRITES, writes));
-    for (field, value, value_ty, fire) in feeds {
-        // Wrap unconditionally iff the fire path *is* the commit — a structural
-        // test (no Boolean simplification). Such a tap fires at every position the
-        // record exists at, so the `` `idle `` arm would be unreachable; a narrower
-        // fire keeps it as the arm the non-firing positions take.
-        let tap = if *fire == commit {
-            tap_fired(value.clone(), value_ty.clone())
-        } else {
-            tap_gated(fire.clone(), value.clone(), value_ty.clone())
-        };
-        fields.push((field.clone(), tap));
-    }
-    let ty = Type::Record(
-        fields
+    let written: Vec<(Label, Expr)> = writes
+        .iter()
+        .map(|(key, value, fire, declared)| {
+            (
+                key.clone(),
+                tap_gated(fire.clone(), value.clone(), declared.clone()),
+            )
+        })
+        .collect();
+    let fed: Vec<(Label, Expr)> = feeds
+        .iter()
+        .map(|(field, value, value_ty, fire)| {
+            (
+                field.clone(),
+                tap_gated(fire.clone(), value.clone(), value_ty.clone()),
+            )
+        })
+        .collect();
+    let record = |fields: Vec<(Label, Expr)>| {
+        if fields.is_empty() {
+            return unit_expr();
+        }
+        let ty = Type::record(
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), v.ty.clone()))
+                .collect(),
+        );
+        Expr::new(TypedExprNode::Record(RecordEntry::minted(fields))).with_ty(ty)
+    };
+    let mut fields = vec![(F_WRITES, record(written))];
+    fields.extend(fed);
+    record(fields)
+}
+
+/// The type of field `field` of a writer decision's record type `decision_ty`, peeling its
+/// refinements ([`writer_decision`]).
+pub fn decision_field_ty(decision_ty: &Type, field: &Label) -> Type {
+    match decision_ty.peel_refinements() {
+        Type::Record(fields) => fields
             .iter()
-            .map(|(k, v)| (k.clone(), v.ty.clone()))
-            .collect(),
-    );
-    Expr::new(TypedExprNode::Record(RecordEntry::minted(fields))).with_ty(ty)
+            .find(|(k, _)| k == field)
+            .unwrap_or_else(|| panic!("a writer decision lacks field `{field}`: {decision_ty}"))
+            .1
+            .clone(),
+        other => panic!("expected a writer decision record, got {other}"),
+    }
+}
+
+/// The steps of a view of key `key`'s writes out of a decision history:
+/// ``.writes ≫ .𝑘 ≫ variant_project(`fired)``, which holds the value at the positions that
+/// write the key and drops the rest ([`writer_decision`]).
+pub fn write_view_steps(decision_ty: &Type, key: &Label, value_ty: &Type) -> Vec<Expr> {
+    let writes_ty = decision_field_ty(decision_ty, &F_WRITES);
+    let tap_ty = tap_variant_ty(value_ty.clone());
+    vec![
+        Expr::proj_field(F_WRITES).with_ty(Type::fun(decision_ty.clone(), writes_ty.clone())),
+        Expr::proj_field(key.clone()).with_ty(Type::fun(writes_ty, tap_ty)),
+        fired_project(value_ty.clone()),
+    ]
 }
 
 /// The tap variant type `` {`fired{𝑉} | `idle} `` over a fed value type `𝑉`.
@@ -232,7 +249,9 @@ pub fn tap_variant_ty(value_ty: Type) -> Type {
     ])
 }
 
-/// `` `fired(value) `` — a tap carrying its fed value at `value_ty`, which `value` inhabits.
+/// `` `fired(value) `` — a tap carrying its fed value at `value_ty`, which `value` inhabits: a
+/// write states its variable's declared type and a feed its row type, either of which may be
+/// wider than the value's own type, refined by the values it was computed from.
 pub fn tap_fired(value: Expr, value_ty: Type) -> Expr {
     let ty = tap_variant_ty(value_ty.clone());
     let wrap = Expr::builtin(Builtin::VariantWrap(FieldKey::Name(V_FIRED)))
@@ -249,16 +268,17 @@ pub fn tap_idle(value_ty: Type) -> Expr {
     Expr::apply(unit_expr(), wrap).with_ty(ty)
 }
 
-/// A tap at `value_ty` under a `fire` path narrower than the record's commit:
-/// `` { fire → `fired(value); true → `idle } ``, or `` `fired(value) `` where `fire` is the
-/// literal `true`.
+/// A value at `value_ty` under a `fire` path: `` { fire → `fired(value); true → `idle } ``, or
+/// `` `fired(value) `` where `fire` is the literal `true` and `` `idle `` where it is `false`.
 ///
 /// A two-arm value-`Case`, the shape a conditional write already takes, so
 /// `lambda_elim`'s C-form compiles it with no new machinery — and the `` `idle ``
 /// arm is what re-totals the tap over the positions `value` does not answer at.
 pub(crate) fn tap_gated(fire: Expr, value: Expr, value_ty: Type) -> Expr {
-    if matches!(fire.node, TypedExprNode::Lit(Lit::Bool(true))) {
-        return tap_fired(value, value_ty);
+    match fire.node {
+        TypedExprNode::Lit(Lit::Bool(true)) => return tap_fired(value, value_ty),
+        TypedExprNode::Lit(Lit::Bool(false)) => return tap_idle(value_ty),
+        _ => {}
     }
     let fired = tap_fired(value, value_ty.clone());
     let ty = fired.ty.clone();
@@ -331,24 +351,13 @@ pub(crate) fn gate_values(
     )
 }
 
-/// The decision **variant** type `` {`commit{𝑃} | `abort} `` over a (dense) payload
-/// record type `𝑃` (`{writes, __to_<defer>*}`). Tag order is `commit`=0, `abort`=1
-/// — the positions [`wrap_decision_variant`] injects and `body_decision_at`
-/// decodes.
-pub fn decision_variant_ty(payload_ty: Type) -> Type {
-    Type::variant(vec![
-        (FieldKey::Name(V_COMMIT), payload_ty),
-        (FieldKey::Name(V_ABORT), Type::Base(BaseType::Unit)),
-    ])
-}
-
 /// The type of a **history**: the total function `𝐷 ⤇ 𝑉` a mutable variable, a feed
 /// channel, or a commit log denotes over its sequencing domain (`mutability.md`,
 /// "The model: histories and causal recursion").
 ///
 /// A collection, and so [`crate::ccl::ty::FunKind::Data`]: the engine stores one value per
 /// position of the domain — an induction store's changelog, a commit log — and every read is
-/// a read at a position (`get_prev_seq`, `get_prev_txn`, `final_or_default`, an `AsOf` join).
+/// a read at a position (`get_prev_seq`, `get_prev_txn`, `final_or_default`, `final_read`).
 /// A view of a history is a history too, but it is built by *carrying* the head's kind
 /// through the compose ([`Type::fun_like`]) rather than by restating this.
 ///
@@ -357,39 +366,6 @@ pub fn decision_variant_ty(payload_ty: Type) -> Type {
 /// this rather than each reaching for [`Type::fun`].
 pub fn history_ty(domain_ty: &Type, value_ty: &Type) -> Type {
     Type::data_fun(domain_ty.clone(), value_ty.clone())
-}
-
-/// The `commit` payload record type of a decision variant `` {`commit{𝑃} | `abort} ``
-/// (peeling outer refinements).
-pub fn commit_payload_ty(decision_ty: &Type) -> Type {
-    let mut t = decision_ty;
-    while let Type::Refinement(inner, _) = t {
-        t = inner;
-    }
-    match t {
-        Type::Variant(tags, _) => tags
-            .iter()
-            .find(|(k, _)| matches!(k, FieldKey::Name(n) if n == V_COMMIT))
-            .unwrap_or_else(|| panic!("decision variant lacks a `commit` tag: {decision_ty}"))
-            .1
-            .clone(),
-        other => panic!("expected a decision variant type, got {other}"),
-    }
-}
-
-/// The point-free one-arm eliminator ``variant_project(`commit) : 𝑑 ⇒ 𝑃`` reading a
-/// decision history's `commit` payload — inserted before a `.writes`/`.__to_<defer>`
-/// read so a `` Fun(D, {`commit{𝑃} | `abort}) `` history projects its committing
-/// payload. (`abort` positions carry no payload and drop out of the eliminated
-/// collection; a read is only meaningful at committing positions.)
-pub fn commit_project(decision_ty: &Type) -> Expr {
-    // The projection names the tag, so a decision variant materialized in any arm
-    // order reads the same — there is no position for the runtime decode to agree
-    // with, and `commit_payload_ty` below finds the payload by the same name.
-    Expr::builtin(Builtin::VariantProject(FieldKey::Name(V_COMMIT))).with_ty(Type::fun(
-        decision_ty.clone(),
-        commit_payload_ty(decision_ty),
-    ))
 }
 
 /// Rewrite every tag-dispatching `Case` in `expr` into the guard-`Case` its
@@ -436,103 +412,6 @@ pub fn fired_project(value_ty: Type) -> Expr {
     let tap_ty = tap_variant_ty(value_ty.clone());
     Expr::builtin(Builtin::VariantProject(FieldKey::Name(V_FIRED)))
         .with_ty(Type::fun(tap_ty, value_ty))
-}
-
-/// Wrap a writer **decision record** `{commit, writes, __to_<defer>*}` (the
-/// intermediate the two phases build via [`writer_decision_record`]) into the
-/// **decision variant** `Case[ commit → .commit(⟨writes, __to_<defer>*⟩) ; true →
-/// `abort(unit) ]``. The `commit` field becomes the value-`Case` **selector** (its
-/// disjunction of path conditions) rather than a stored field; the remaining
-/// fields are the (dense) `commit` payload. This is the single site both the
-/// transaction writer and the induction writer funnel through, so the variant is
-/// built in exactly one place and `body_decision_at` decodes one shape.
-///
-/// The decision may sit under read-your-writes `let`s (the induction writer's
-/// `let __v = … in {commit, writes}`); descend through them and rebuild the
-/// variant at the record, preserving the `let` scope.
-pub fn wrap_decision_variant(decision: Expr) -> Expr {
-    match decision.node {
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => {
-            let new_body = wrap_decision_variant(*body);
-            let ty = new_body.ty.clone();
-            let mut e = Expr::new(TypedExprNode::Let {
-                binding,
-                bound_expr,
-                body: Box::new(new_body),
-            });
-            e.ty = ty;
-            e
-        }
-        // A nested recurrence: an inner loop's history binds inside this decision, and
-        // the decision itself is the `letrec`'s body.
-        TypedExprNode::LetRec { bindings, body } => {
-            let new_body = wrap_decision_variant(*body);
-            let ty = new_body.ty.clone();
-            let mut e = Expr::new(TypedExprNode::LetRec {
-                bindings,
-                body: Box::new(new_body),
-            });
-            e.ty = ty;
-            e
-        }
-        TypedExprNode::Record(fields) => {
-            let bool_ty = Type::Base(BaseType::Bool);
-            let unit_ty = Type::Base(BaseType::Unit);
-            // Split the `commit` selector out from the payload fields (everything
-            // else — `writes` and the `__to_<defer>*` taps, in order).
-            let mut commit: Option<Expr> = None;
-            let mut payload_fields: Vec<RecordEntry> = Vec::with_capacity(fields.len());
-            for entry in fields {
-                if entry.label == COMMIT_SELECTOR {
-                    commit = Some(entry.value);
-                } else {
-                    payload_fields.push(entry);
-                }
-            }
-            let commit = commit.expect("a writer decision record carries a `commit` selector");
-            let payload_ty = Type::Record(
-                payload_fields
-                    .iter()
-                    .map(|entry| (entry.label.clone(), entry.value.ty.clone()))
-                    .collect(),
-            );
-            let payload =
-                Expr::new(TypedExprNode::Record(payload_fields)).with_ty(payload_ty.clone());
-            let variant_ty = decision_variant_ty(payload_ty);
-
-            let commit_ctor = Expr::variant_ctor(V_COMMIT, Occurrence::mint(), payload)
-                .with_ty(variant_ty.clone());
-            let unit = Expr::new(TypedExprNode::Lit(Lit::Unit)).with_ty(unit_ty.clone());
-            let abort_ctor =
-                Expr::variant_ctor(V_ABORT, Occurrence::mint(), unit).with_ty(variant_ty.clone());
-            let true_lit = Expr::new(TypedExprNode::Lit(Lit::Bool(true))).with_ty(bool_ty.clone());
-
-            let mut case = Expr::new(TypedExprNode::Case {
-                scrutinee: None,
-                branches: vec![
-                    Branch {
-                        pattern: None,
-                        guard: commit,
-                        body: commit_ctor,
-                    },
-                    Branch {
-                        pattern: None,
-                        guard: true_lit,
-                        body: abort_ctor,
-                    },
-                ],
-            });
-            case.ty = variant_ty;
-            case
-        }
-        other => panic!(
-            "wrap_decision_variant: a writer decision is `(let | letrec)* in {{commit, writes, …}}`, got {other:?}"
-        ),
-    }
 }
 
 /// Returns `true` if `expr` directly references the given built-in primitive.

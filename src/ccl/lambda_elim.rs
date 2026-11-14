@@ -2180,8 +2180,8 @@ fn elim_lambda_impl(
         // `variant_project(cᵢ)`. Elaborate to `eᵢ ≫ variant_wrap(cᵢ)` — a
         // composable morphism `param_ty ⇒ Union` that can sit as the RHS of a
         // `≫`, so the value-`Case`-in-lambda fan-out
-        // `⧺ᵢ (filter_values(π̂ᵢ) ≫ eᵢ)` accepts a variant-valued arm (the writer
-        // decision ``if p: acc := `commit(…) else: acc := `abort(unit)``). A
+        // `⧺ᵢ (filter_values(π̂ᵢ) ≫ eᵢ)` accepts a variant-valued arm (a conditional
+        // write ``if p: x := 𝑣``, which holds ``{p → `fired(𝑣); true → `idle}``). A
         // `VariantCtor` whose payload is *constant* in `param` never reaches here
         // — the `const` arm above lifts the whole scalar variant value with
         // ``const(`cᵢ(…))``, which op-conversion broadcasts.
@@ -2245,8 +2245,8 @@ fn elim_lambda_impl(
         //
         // **Outer-binder arms.** When `eᵢ` closes over the outer binder as well
         // as its payload (`eᵢ(param, wᵢ)` — e.g. a per-key view
-        // `λ __c → match __c.decision { commit(w) → (time: __c.time, write: w.i) }`
-        // reading both the record's sibling field and the commit payload), the
+        // `λ __c → match __c.write { fired(w) → (time: __c.time, value: w) }`
+        // reading both the record's sibling field and the fired payload), the
         // arm zips the outer element alongside the projected payload:
         //
         //   ⧺ᵢ ( ⟨id, scrut ≫ variant_project(cᵢ)⟩ ≫ (λ (param, wᵢ) → eᵢ) )
@@ -3462,11 +3462,11 @@ mod tests {
         Type::Base(BaseType::Unit)
     }
 
-    /// ``{`abort | `commit{Int}}``, the two-arm decision sum.
-    fn commit_abort_ty() -> Type {
+    /// ``{`idle | `fired{Int}}``, the two-arm sum a write holds.
+    fn fired_idle_ty() -> Type {
         Type::variant(vec![
-            (FieldKey::Name("commit".into()), int_ty()),
-            (FieldKey::Name("abort".into()), unit_ty()),
+            (FieldKey::Name("fired".into()), int_ty()),
+            (FieldKey::Name("idle".into()), unit_ty()),
         ])
     }
 
@@ -3516,7 +3516,7 @@ mod tests {
 
     /// The **payload-only** arm shape:
     ///
-    ///   λ x → match x { commit(w) → w + 1 ; abort(a) → 0 }
+    ///   λ x → match x { fired(w) → w + 1 ; idle(a) → 0 }
     ///     ⟹  ⧺ᵢ ( variant_project(cᵢ) ≫ (λ wᵢ → eᵢ) )
     ///
     /// Every element of an arm is a morphism out of the eliminated binder, so
@@ -3526,7 +3526,7 @@ mod tests {
     /// out of the chain, leaving the projection at the head.
     #[test]
     fn scrutinee_case_elaborates_to_a_composition_of_tag_restricts() {
-        let x_ty = commit_abort_ty();
+        let x_ty = fired_idle_ty();
         let w_plus_1 = Expr::binop(
             var("w").with_ty(int_ty()),
             BinOpKind::Arithmetic(ArithmeticKind::Add),
@@ -3536,16 +3536,16 @@ mod tests {
         let case = Expr::new(TypedExprNode::Case {
             scrutinee: Some(Box::new(var("x").with_ty(x_ty.clone()))),
             branches: vec![
-                arm("commit", "w", int_ty(), w_plus_1),
-                arm("abort", "a", unit_ty(), lit(0).with_ty(int_ty())),
+                arm("fired", "w", int_ty(), w_plus_1),
+                arm("idle", "a", unit_ty(), lit(0).with_ty(int_ty())),
             ],
         })
         .with_ty(int_ty());
 
         assert_eq!(
             elim_and_typecheck("x", x_ty, case),
-            "variant_project(`commit) ≫ (id, 1 ▷ const) ▷ zip ≫ add \
-             ⊔ variant_project(`abort) ≫ 0 ▷ const"
+            "variant_project(`fired) ≫ (id, 1 ▷ const) ▷ zip ≫ add \
+             ⊔ variant_project(`idle) ≫ 0 ▷ const"
         );
     }
 
@@ -3553,26 +3553,26 @@ mod tests {
     /// element as well as its payload zips the two, so the merged binder can
     /// project either half.
     ///
-    ///   λ c → match c.decision { commit(w) → (c.time, w) }
-    ///     ⟹  ⟨id, .decision ≫ variant_project(`commit)⟩ ≫ (λ pair → …)
+    ///   λ c → match c.write { fired(w) → (c.time, w) }
+    ///     ⟹  ⟨id, .write ≫ variant_project(`fired)⟩ ≫ (λ pair → …)
     ///
     /// `id` sits *beside* the projection chain rather than inside it: both
     /// components are morphisms out of the **outer** binder, and the left one
     /// must deliver the whole element `c`. Composing the pair after the
-    /// scrutinee instead — ``.decision ≫ ⟨id, variant_project(`commit)⟩`` — would
-    /// pair the decision with its own payload and lose `c.time` entirely.
+    /// scrutinee instead — ``.write ≫ ⟨id, variant_project(`fired)⟩`` — would
+    /// pair the write with its own payload and lose `c.time` entirely.
     #[test]
     fn outer_binder_arm_zips_the_element_beside_the_projection() {
-        let decision_ty = commit_abort_ty();
+        let write_ty = fired_idle_ty();
         let c_ty = Type::Record(vec![
-            ("decision".into(), decision_ty.clone()),
+            ("write".into(), write_ty.clone()),
             ("time".into(), int_ty()),
         ]);
-        let c_decision = Expr::apply(
+        let c_write = Expr::apply(
             var("c").with_ty(c_ty.clone()),
-            Expr::proj_field("decision").with_ty(fun_ty(c_ty.clone(), decision_ty.clone())),
+            Expr::proj_field("write").with_ty(fun_ty(c_ty.clone(), write_ty.clone())),
         )
-        .with_ty(decision_ty);
+        .with_ty(write_ty);
         let c_time = Expr::apply(
             var("c").with_ty(c_ty.clone()),
             Expr::proj_field("time").with_ty(fun_ty(c_ty.clone(), int_ty())),
@@ -3582,11 +3582,11 @@ mod tests {
         let pair_body = Expr::tuple(vec![c_time, var("w").with_ty(int_ty())]).with_ty(body_ty);
 
         let case = Expr::new(TypedExprNode::Case {
-            scrutinee: Some(Box::new(c_decision)),
+            scrutinee: Some(Box::new(c_write)),
             branches: vec![
-                arm("commit", "w", int_ty(), pair_body),
+                arm("fired", "w", int_ty(), pair_body),
                 arm(
-                    "abort",
+                    "idle",
                     "a",
                     unit_ty(),
                     Expr::tuple(vec![lit(0).with_ty(int_ty()), lit(0).with_ty(int_ty())])
@@ -3596,7 +3596,7 @@ mod tests {
         })
         .with_ty(Type::Tuple(vec![int_ty(), int_ty()]));
 
-        // The commit arm reads `c.time`, so it takes the zip path; the abort arm
+        // The fired arm reads `c.time`, so it takes the zip path; the idle arm
         // is constant in both binders, so it stays on the payload-only path.
         //
         // The left component reads `.time` off the first half of the pair, a
@@ -3605,9 +3605,9 @@ mod tests {
         // the `variant_project`, which narrows the keys (`simplify::narrows_keys`).
         assert_eq!(
             elim_and_typecheck("c", c_ty, case),
-            "((id, .decision ≫ variant_project(`commit)) ▷ zip ≫ .0 ≫ .time, \
-             .decision ≫ variant_project(`commit)) ▷ zip \
-             ⊔ .decision ≫ variant_project(`abort) ≫ (0, 0) ▷ const"
+            "((id, .write ≫ variant_project(`fired)) ▷ zip ≫ .0 ≫ .time, \
+             .write ≫ variant_project(`fired)) ▷ zip \
+             ⊔ .write ≫ variant_project(`idle) ≫ (0, 0) ▷ const"
         );
     }
 

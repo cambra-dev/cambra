@@ -47,7 +47,8 @@ because every recursive reference is **causal** — it consults only *strictly e
 of the domain, through one of two **causal accessor** builtins:
 
 - `get_prev_seq(ℎ, 𝑖, 𝑑)` — for an **induction domain** (a loop's iteration index): the value of
-  history `ℎ` at the predecessor of `𝑖`, or the default `𝑑` at the first position.
+  history `ℎ` at its latest position strictly before `𝑖`, or the default `𝑑` where it has none. An
+  accumulator's history is the view of its writes, which holds only the positions that write it.
 - `get_prev_txn(𝑤, 𝑡, 𝑑)` — for the **transaction domain** `Txn` (a total order of commit times):
   the value carried by the latest commit in collection `𝑤` at a time *strictly before* `𝑡`, or
   the default `𝑑` if there is none.
@@ -607,7 +608,7 @@ Symbolic rendering: `letrec 𝑏₁ = 𝑒₁; …; 𝑏ₙ = 𝑒ₙ in body`.
 
 | Builtin | Type | Meaning |
 |---|---|---|
-| `get_prev_seq` | `(𝐼 ⤇ 𝑉, 𝐼, 𝑉) ⇒ 𝑉` | history value at the predecessor of the given position; default at the first |
+| `get_prev_seq` | `(𝐼 ⤇ 𝑉, 𝐼, 𝑉) ⇒ 𝑉` | history value at its latest position strictly before the given one; the default where it has none |
 | `get_prev_txn` | `(𝐼 ⤇ {time: Txn, write: 𝑉}, Txn, 𝑉) ⇒ 𝑉` | write of the latest commit strictly before the given time; default if none |
 | `begin_<site>` | `𝐼 ⇒ Txn` | the commit-time oracle for one `with begin():` site — where site `𝑠`'s iteration `𝑟` lands in the global commit order |
 | `final_or_default` | `(𝐷 ⤇ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed stream; the default if the domain is empty. Compiles to `ExtractFinal`. A mutable variable's final value is `final_read`, a different term |
@@ -620,41 +621,42 @@ site. The opaque oracles have pairwise-disjoint ranges and preserve the program'
 ordering dependencies, an arrival's on every commit whose output was sent before it included
 ([8.5 Ordering and concurrency](../../../docs/chl-spec.md#85-ordering-and-concurrency)). A source's arrival order alone imposes no order on its transactions
 ([Ordered loops](../../../docs/chl-spec.md#ordered-loops)). The commit engine realizes the oracles
-by allocating a commit time to each successful transaction.
+by allocating a commit time to each transaction it validates ([Every transaction takes a
+tick](#every-transaction-takes-a-tick)).
 
 Multi-variable atomic blocks produce one shared record `{time, writes: {𝑘₁: 𝑉₁, …}}` per commit,
 and each variable's history reads it through a per-key view — atomicity by construction, since one
-record either exists or does not. There is no `commit: Bool` in the per-key view: the commit-record
-stream carries only committed transactions (allocate-on-commit — a denied decision proposes nothing,
-so the engine allocates no tick and appends no entry), so `get_prev_txn` searches the latest write
-`≤ t` with no filter, matching its declared `{time, write}` codomain. Multiple writer sites for one variable merge their commit
+record either exists or does not. Each key's write in that record is `` `fired(𝑣) `` where the
+transaction writes it and `` `idle `` where it does not, so the per-key view's
+``variant_project(`fired)`` keeps exactly the transactions that write the key, and
+`get_prev_txn` searches the latest write `≤ t` with no filter, matching its declared
+`{time, write}` codomain. Multiple writer sites for one variable merge their commit
 streams (ordered by time) before the search — the emitted term is spec-true: each key's history
 searches the `⧺`-union of its writing sites' per-key views
-`commits_j ≫ (λ 𝑐 → {time: 𝑐.time, write: 𝑐.decision.writes.𝑖})`, shapes the causality check
+``commits_j ≫ (λ 𝑐 → {time: 𝑐.time, write: 𝑐.decision.writes.𝑖 ▷ variant_project(`fired)})``,
+shapes the causality check
 admits (pointwise maps and unions of causal streams change *what* is read per position, never
 *which* positions the accessor consults).
 
 ### Tagged sums in a decision, and in a mutable variable
 
-A decision is a **choice**, and the two things it chooses between carry different data: a grant
-carries a write set, a denial carries nothing. Today that is encoded as a record with a `commit:
-Bool` beside a `writes` field that is meaningless when `commit` is false — a product standing in for
-a sum, so nothing stops a reader consulting `writes` on a denied decision. The direction is the sum
-itself, `` `commit(writes) `` / `` `abort(unit) ``, which makes the write set reachable on the
-granting path.
+A decision states, for each variable its writer may write and each reply it may send, whether
+it does, and the value where it does: the record `{writes: {𝑘: …}, __to_<defer>: …}`, each entry
+`` {`fired{𝑉} | `idle} `` ([`writer_decision`](../ccl_utils.rs)). An `` `idle `` entry carries
+no value, so nothing can read a write the transaction did not make, and a path that leaves a
+variable alone writes nothing to it rather than writing back the value it read.
 
-What exists today is the algebra that shape needs, in both directions:
+What builds and reads those sums is the algebra a tagged sum needs, in both directions:
 
-- **Introduction.** A writer decision is a value-`Case` inside the writer lambda, so a
-  variant-valued arm has to be a *composable morphism* `param_ty ⇒ Union` — the RHS of a `≫` in the
-  fan-out `⧺ᵢ (filter_values(π̂ᵢ) ≫ 𝑒ᵢ)`. That is `variant_wrap(𝑐ᵢ)`, and `lambda_elim` elaborates a
-  `VariantCtor` in a lambda to `𝑒ᵢ ≫ variant_wrap(𝑐ᵢ)` to produce it.
-- **Elimination.** Reading the decision back is a scrutinee-`Case`, compiled to the union of
-  tag-restricts `⧺ᵢ (𝑑 ≫ variant_project(𝑐ᵢ) ≫ (λ 𝑤ᵢ → 𝑒ᵢ))` — a `≫`-chain, since `𝑑` is the
-  eliminated scrutinee morphism and both elements after it are functions of its output. The per-key view is the shape that
-  needs the *outer-binder* form, because its arm reads both the record's sibling field and the
-  granted payload: ``λ 𝑐 → match 𝑐.decision { `commit(𝑤) → (time: 𝑐.time, write: 𝑤.𝑖) }``. There the
-  projection is zipped alongside the whole element so the two co-iterate by key.
+- **Introduction.** A conditional write is a value-`Case` inside the writer lambda, so a
+  variant-valued arm has to be a *composable morphism* `param_ty ⇒ Union` — the RHS of a `≫` in
+  the fan-out `⧺ᵢ (filter_values(π̂ᵢ) ≫ 𝑒ᵢ)`. That is `variant_wrap(𝑐ᵢ)`, and `lambda_elim`
+  elaborates a `VariantCtor` in a lambda to `𝑒ᵢ ≫ variant_wrap(𝑐ᵢ)` to produce it.
+- **Elimination.** Reading a write back is ``variant_project(`fired)``, which restricts the
+  history to the positions that write it: ``𝑐.decision.writes.𝑖 ▷ variant_project(`fired)``. A
+  scrutinee-`Case` in general compiles to the union of tag-restricts
+  `⧺ᵢ (𝑑 ≫ variant_project(𝑐ᵢ) ≫ (λ 𝑤ᵢ → 𝑒ᵢ))` — a `≫`-chain, since `𝑑` is the eliminated
+  scrutinee morphism and both elements after it are functions of its output.
 
 Both are specified in [design-operators.md](../../interpreter/design-operators.md#tile-operators) (the `VariantWrap` and `VariantProject` rows).
 
@@ -1147,10 +1149,10 @@ this section states how the letrec model *delivers* them.
 - **Atomicity is representational**: one commit record per block. There is no partially visible
   commit because no term denotes one.
 - **Read-your-writes** within a block is `let` shadowing inside the record body.
-- **Deny** (`if` around a write, no path taken) is the decision's **`` `abort ``** tag; `get_prev_txn`
-  skips it. A denied transaction contributes no visible write and no reply. A *committing*
-  transaction is **`` `commit(⟨writes, replies⟩) ``** — the (dense) write/reply payload rides the tag, so
-  an illegal "no-commit yet real writes" state is unrepresentable.
+- **Deny** (`if` around a write, no path taken) leaves every write of the decision `` `idle ``;
+  `get_prev_txn` skips it. A denied transaction takes a tick and contributes no visible write and
+  no reply. A write is `` `fired(𝑣) `` exactly where the transaction writes `𝑣`, so a write the
+  transaction did not make carries no value to read.
 - **Induction and transaction domains are independent.** In the worked example's model form `cnt`
   advances per request even though its write sits inside the block (a mix the current lowering
   rejects — see the caveat there); only `Txn`-domain variables participate in the atomic commit. A
@@ -1159,6 +1161,21 @@ this section states how the letrec model *delivers* them.
 - **Liveness.** Induction domains are finite or stream-complete; a `Txn` history completes when the
   writers of its key do. Only [`await_final`](#await_final) waits for that completion; every other
   read is an as-of sample.
+
+### Every transaction takes a tick
+
+Each transaction a site runs takes the next tick of its store's commit clock, whatever it writes: a
+grant, a deny, a grant that writes nothing, and a block an exception escapes. The transaction at
+tick `𝑇` read the store through `𝑇−1`. `begin_<site>` is injective over the site's iterations, and
+the engine realizes it by allocating each validated proposal a tick, so the place a transaction
+reads at is the engine's decision, keyed by the site and the iteration, and never a writer's pull
+timing.
+
+A transaction's decision depends on what it read, a deny's included, so every proposal carries its
+read set and the engine validates it before allocating the tick. A stale proposal takes no tick and
+retries at the moved frontier, where the body may decide otherwise. A tick whose write set is empty
+is one of the store's decided positions that no key's changelog holds, so every key's value carries
+across it.
 
 ## Ordering and concurrency
 
@@ -1209,6 +1226,16 @@ other planning-phase iteration recognizers (`plan_loop_join` for joins, group-by
 it sits beside them in `planning/`. Causality is re-checked at loop planning's wall by the point-free
 causal matcher (`letrec::check_letrec_causal`).
 
+The engine does not evaluate a causal accessor's history argument: a store reads each key's latest
+write itself. Recognition checks that the argument is that history, so the letrec states the
+recurrence the engine runs. An accumulator's guard reads its own writes,
+``__hist ≫ .writes ≫ .acc ≫ variant_project(`fired)``, which an inner loop's family reads at the
+enclosing position (`check_induction_view`). A transactional key's history unions the
+`{time, write}` views of exactly the sites whose `write_targets` hold it, each reading the key's
+writes off the site's decision, and a key no site writes reads its own history
+(`check_txn_view`). A view that reads another key, idle positions, or another set of sites stops
+recognition.
+
 | Letrec pattern | Engine |
 |---|---|
 | a binding referenced only via `get_prev_seq(𝑏, …)`, over a finite/stream induction domain | `InductionStore` — the position-driven changelog loop engine (read densely via `StoreDenseRead`) |
@@ -1220,11 +1247,11 @@ causal matcher (`letrec::check_letrec_causal`).
 
 - **`InductionDriver` + `InductionStore` (+ `StoreDenseRead`)** — the induction loop, as a cycle
   through a `FanOut::new_cyclic`. The store consumes the body's decisions into a `Tile::Store`
-  changelog (a `commit: false` position is a carry, holding the prior value, and the init is the
-  store's seed rather than a change); the driver reads the changelog back to produce the body's
-  `(prev…, item)` input, taking the next position from the decided frontier and the previous
-  accumulator from the value at it. The accumulator crosses between them as a tile, one position
-  per pull. `StoreDenseRead` folds the changelog at every decided position into the dense
+  changelog (a position whose writes are all `` `idle `` is a carry, holding the prior value, and
+  the init is the store's seed rather than a change); the driver reads the changelog back to produce
+  the body's `(prev…, item)` input, taking the next position from the decided frontier and the
+  previous accumulator from the value at it. The accumulator crosses between them as a tile, one
+  position per pull. `StoreDenseRead` folds the changelog at every decided position into the dense
   `𝐷 ⇀ 𝑉` history a co-iterated read consumes; the trailing read is `StoreFinalRead`, one per
   enclosing position under a nest. One writer, over a finite or async domain.
 - **The commit operator** — the concurrent generalization of the induction accumulator, for the `Txn` domain. The
@@ -1406,7 +1433,7 @@ an induction accumulator (`resp << cnt`), which composes with the commit-decisio
 above.
 
 A reply is keyed by the item its transaction ran for, the key the site's commit records carry:
-`plan_store` binds ``tap = commits_j ≫ .decision ≫ variant_project(`commit) ≫ .field : 𝐼 ⤇
+`plan_store` binds ``tap = commits_j ≫ .decision ≫ .field : 𝐼 ⤇
 {`fired{𝑉} | `idle}``, and `channelize` routes the fired values. A request's reply therefore answers
 that request, which is what an HTTP route's response sink dispatches on. The commit order decides
 what each transaction read, and the key says which iteration replied.
@@ -1563,14 +1590,11 @@ position](#a-block-in-value-position) describes, with the decision gated on the 
 
 - `committed = __v ▷ variant_is(`__ok)`, over the value the block feeds to its `__block_value`
   defer.
-- Each variable the block writes holds `{committed → 𝑤; true → 𝑠}`, its written value `𝑤` where
-  the block commits and its snapshot `𝑠` elsewhere. The block reads every variable it writes, so
-  each snapshot is a slot of the writer parameter.
+- Each write fires on `committed` and its own path, so an aborted block writes nothing.
 - Each tap other than the value's fires on `committed` and its own path, so an aborted block sends
   no output. The value's tap fires on every path, so the code after the block reads every outcome.
 
-An aborted block commits its snapshots, which leaves every variable as it was, and takes a commit
-time like any other proposal.
+An aborted block takes a tick like any other transaction, at which it writes nothing.
 
 In a loop, the block's outcome is a value the loop iterates, so a clause that feeds is a feed under
 a condition reading a block's value, whose channel gates its values as [A block in value
@@ -1714,19 +1738,18 @@ Every fan-out shares one first-match encoding, `πᵢ = 𝑔ᵢ ∧ ¬⋁ⱼ˂�
 `ccl_utils`, shared between channelize, the value fan-outs, and the transaction path walk).
 
 A **conditional induction write** takes a different, simpler route than the value fan-out: it rides
-the induction accumulator's own `` {`commit{writes} | `abort} `` **decision variant** rather than a
-union of restricted sources. `lower_loop_body_chain` lowers `if 𝑝: acc += e` to a statement-position
-`Case` (`[𝑝 → acc += e; true → unit]`), and the writer walk (`mut_elim::WriterWalk`, which builds a
-`with begin():` block's decision the same way) merges its branches into **one uniform,
-carry-complete writer decision over the full loop source**: a committing position is
-`` `commit(⟨writes⟩) `` and a full-carry (non-writing) position is `` `abort ``. The commit selector
-is the disjunction of the paths every write and feed is reached on
-(`ccl_utils::wrap_decision_variant` folds it into the tag), and each accumulator a branch writes
-merges to `Case[𝑔ⱼ → wⱼᵢ; …; true → 𝑣ᵢ]`, a value-`Case` whose trailing `true` arm is the
-**carry** (the accumulator's value before the `if`). `` `abort `` positions are dropped from the
+the induction accumulator's own **decision** rather than a union of restricted sources.
+`lower_loop_body_chain` lowers `if 𝑝: acc += e` to a statement-position `Case`
+(`[𝑝 → acc += e; true → unit]`), and the writer walk (`mut_elim::WriterWalk`, which builds a
+`with begin():` block's decision the same way) merges its branches into **one writer decision over
+the full loop source**: each accumulator's write is `` `fired(𝑣) `` on the disjunction of the paths
+that write it and `` `idle `` elsewhere (`ccl_utils::writer_decision`). The value it fires with
+merges to `Case[𝑔ⱼ → wⱼᵢ; …; true → 𝑣ᵢ]`, a value-`Case` whose trailing `true` arm is the value
+before the `if`, which later reads in the body see. An `` `idle `` write appends nothing to the
 changelog store (`InductionStore`, see `../../interpreter/design-operators.md`), so it is sparse,
-and the carry arm keeps the `` `commit `` payload **dense** (total at every committing position). So
-the `Overwrite`/`Feed` distinction and the carry-forward live *inside one decision on one writer* —
+and the recurrence reads each accumulator's previous value off its own writes,
+`get_prev_seq(__hist ≫ .writes ≫ .acc ≫ variant_project(`fired), 𝑟, init)`. So the
+`Overwrite`/`Feed` distinction and the carry-forward live *inside one decision on one writer* —
 no per-leg restricted source, no complement leg, and none of the cyclic-convergence hazard a
 restricted-source multi-leg realization carried. Recognition packages it as an ordinary
 single-writer `Transact`; op-conversion routes it to the changelog store, and reads fold the
@@ -1840,25 +1863,24 @@ mutually exclusive and, taken together with the implicit empty arm of a guard th
 exhaustive: exactly one path runs per transaction.
 
 Paths are a *compile-time* enumeration, not a runtime branch: the walk visits every path and emits
-one decision variant, whose `` `commit ``/`` `abort `` tag is a path condition, whose per-tap
-`` `fired ``/`` `idle `` tag is that tap's own path condition, and whose per-key writes are `Case`s
-over the local branch guards — so every path is evaluated in
-one straight-line writer body and one transaction is still one decision. Walking a block threads
-the read-your-writes environment, each arm recording its paths relative to itself, and the block
-denotes
-`` snapshot ⇒ {`commit{writes, __to_<defer>*} | `abort} `` — a decision **variant**
-(`ccl_utils::wrap_decision_variant`) where:
+one decision, whose per-key write and per-tap `` `fired ``/`` `idle `` tags are each that write's
+or tap's own path condition — so every path is evaluated in one straight-line writer body and one
+transaction is still one decision. Walking a block threads the read-your-writes environment, each
+arm recording its paths relative to itself, and the block denotes
+`snapshot ⇒ {writes: {𝑘: …}, __to_<defer>*}` (`ccl_utils::writer_decision`) where:
 
-- **the `` `commit ``/`` `abort `` tag is chosen by the disjunction of the path-conditions of every
-  mutable write and feed** (`ccl_utils::disjoin`; an empty taken path — a position matching no
-  guard, including a missing `else` — is `` `abort ``). A spine write's path is `true`, so a write
-  beside a guard commits unconditionally: **a guard scopes only its own arm's writes**, not the
-  whole transaction. (This subsumes the former single-deny: `if 𝑝: x := 𝑒` → one write at path `𝑝` →
-  `` `commit `` iff `𝑝`, observationally identical.) The whole-transaction grant/deny is the *tag*,
-  not a `commit` field — an illegal "denied yet real writes" state is unrepresentable.
-- **each written key is rejoined as a carry-forward `Case`** over the branch structure
-  (read-your-writes; a branch that does not write a key contributes its snapshot value). An
-  unconditional write never enters a `Case` (it stays a bare write); cross-key routing
+- **each written key fires on the disjunction of the path-conditions of its writes**
+  (`ccl_utils::disjoin`). A spine write's path is `true`, so a write beside a guard writes
+  unconditionally: **a guard scopes only its own arm's writes**, not the whole transaction. A
+  deny, `if 𝑝: x := 𝑒` with `𝑝` false, writes nothing, and takes its tick all the same
+  ([Every transaction takes a tick](#every-transaction-takes-a-tick)).
+- **each written key's value is rejoined as a `Case`** over the branch structure, for the reads
+  after it (read-your-writes; a branch that does not write a key contributes its snapshot value).
+  The write itself fires only on the paths that write the key, so a key a path leaves alone is
+  not written for it. A key the block never reads has no snapshot to contribute, and none is
+  needed: it is rejoined as its tap, `` `fired(𝑣) `` from a branch that writes `𝑣` and `` `idle ``
+  from one that does not (`WriterWalk::held_as_taps`), and the write reads its value off the tap.
+  An unconditional write never enters a `Case` (it stays a bare write); cross-key routing
   (`if 𝑝: a := … else: b := …`) routes each key per path.
 
 The per-key merges are value-selecting `Case`s over the snapshot inside the writer lambda, compiled
@@ -1884,13 +1906,14 @@ value reading the payload answers on its own arm's positions only. Under the tag
 `` `fired `` positions and the value is asked for nowhere else, so `` out << v `` inside
 `` case `data(v): `` compiles beside an accumulator the other arms write.
 
-A write key written conditionally and never read (an absolute `k := 𝑒` inside a `Case` arm), or
-written on no path at all (a write a clause declares), joins the *read* set
-(`transact_phase::block_keys`), so it has a snapshot to **carry** on the paths that leave it alone;
-a read-modify-write already reads the key through its type, and a purely spine (unconditional)
-write needs no carry and stays write-only. A keyed write `m[k] := 𝑣` joins it too: its desugared
+A write key joins the *read* set only where the block reads it (`transact_phase::block_keys`): a
+read-modify-write reads it through its type, a read after the block's own write reads it where a
+path left it alone, and a keyed write `m[k] := 𝑣` reads it too, since its desugared
 `m := insert(m, k, 𝑣)` commits the whole collection, whose other keys come from the snapshot,
-though its type writes `m` and reads none of it.
+though its type writes `m` and reads none of it. A key written conditionally and never read (an
+absolute `k := 𝑒` inside a `Case` arm), or written on no path at all (a write a clause declares),
+stays write-only: a path that leaves it alone writes nothing to it, so a commit to it by another
+transaction does not make this one stale.
 
 **A leading deny is ordinary.** A block that denies (matches no writing/feeding guard) at the first
 transaction leaves the store's first commit to a later position, which no read has to accommodate: a
@@ -1899,17 +1922,6 @@ reduces the whole history whatever order the commits land in
 (`tx_if_elif_leading_deny`).
 
 **Not yet implemented**: `with t = begin():` (the handle) is still rejected.
-
-**Future work (deferred optimization).** The `` `commit `` payload is **dense**: an unwritten key on
-a committing path carries its snapshot value, a no-op re-write.
-
-***Partial* writes** would materialize only the keys a committing path actually changed, encoding an
-absent key as carry directly rather than re-writing the snapshot. A naive sparse per-key column is
-silently dropped by the record `zip`'s inner-join — it deletes the committing positions where any
-conditionally-written key is absent — so the encoding has to keep a value at every committing
-position while saying which of them changed. The tap variant above is that encoding for a reply, and
-a per-write-key `` {`wrote{𝑉} | `carried} `` is the same shape: dense in the record, restricted at the
-read.
 
 **An off-path partial op cannot fault.** Both induction and transaction value-`Case`s compile through
 the lazy `filter_values` union-of-restricts, so a guard-protected `//`/`%` is never evaluated on the

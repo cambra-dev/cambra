@@ -902,7 +902,7 @@ mod tests {
                         return;
                     };
                     // A label, tag or head a pass builds is one the compiler writes:
-                    // `writes`, `commit`, a store's field per variable. Nothing tells
+                    // `writes`, `fired`, a store's field per variable. Nothing tells
                     // it from a source label copied wrongly, so those are checked
                     // where every one is lowering's.
                     if i != 0 && !matches!(kind, "binder" | "use") {

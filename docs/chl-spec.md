@@ -5121,11 +5121,11 @@ for req in incr_reqs:
   nothing, so the commits after it are ordered as if it had committed.
 - **Branch guards and tag dispatch.** A block may carry `if`/`elif`/`else`
   guards, more than one of them, and `match` dispatch. Each branch's
-  writes are scoped to its own path and the transaction commits on the
-  disjunction of the writing paths, so a write on the spine beside a
-  guard commits unconditionally. In a block in statement position, a bare `if p:` with no
-  `else` is the deny idiom: where `p` fails over the snapshot the transaction contributes no
-  write and no reply.
+  writes are scoped to its own path: a write commits on the paths that reach it, so a write on
+  the spine beside a guard commits unconditionally. A bare `if p:` with no `else` is the deny
+  idiom: where `p` fails over the snapshot the transaction writes nothing and replies nothing.
+  A deny is a transaction all the same: it takes its place in the commit order, and reads the
+  snapshot there as any transaction does.
 - **An induction accumulator may not be written under a branch inside a
   block** (rejected with a diagnostic). Write it after the block, or, if
   it should be shared across the transaction, declare it `Mut(…, Txn)`
@@ -5169,10 +5169,10 @@ for req in withdraw_reqs:
 
 - **The value is read in the block's snapshot,** after the writes its path made before it
   (read-your-writes, [8.3 Reads](#83-reads)).
-- **Every path of a block in value position commits.** In a block where some path writes, a path
-  that writes nothing commits its reads, which places its value at a commit time. There is no deny:
-  where the bare `if p:` above fails, the transaction commits no write and the code after the block
-  still runs, with the value that path computed.
+- **Every path of a block in value position commits.** A path that writes nothing takes its place
+  in the commit order as a deny does, which places its value there: where the bare `if p:` above
+  fails, the transaction writes nothing and the code after the block still runs, with the value
+  that path computed.
 - **The value is available once the block commits.** Inside a loop, each iteration binds its own
   block's value, so a reply after the block is indexed by the iteration, as any reply outside a
   block is ([8.4 Feeds are the second form of

@@ -98,11 +98,10 @@ fn path_levels(tiling: &Tiling) -> Vec<Extent> {
 /// A transaction proposal, evaluated against a snapshot.
 ///
 /// A writer produces one of these by reading some keys at a decided snapshot and
-/// deciding what to write. `reads`/`writes` are the read set and write set. A
-/// read-only transaction (a guard that denies, or a grant that writes nothing) is a
-/// *local* decision by the writer and never becomes a proposal, so `writes` is never
-/// empty: a tick appears in the changelog of each key it writes, and a tick writing
-/// nothing would be decided in the frontier and recorded nowhere.
+/// deciding what to write. `reads`/`writes` are the read set and write set. Every
+/// transaction proposes, a deny and a grant that writes nothing included, so `writes` may
+/// be empty: such a tick is a decided position no key's changelog holds
+/// (`src/ccl/design/mutability.md`, "Every transaction takes a tick").
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Proposal {
     /// The committed prefix the writer read — a decided timestamp.
@@ -113,7 +112,7 @@ pub struct Proposal {
     pub writes: HashMap<Value, Value>,
 }
 
-/// The outcome of a commit attempt under **allocate-on-commit**: a valid
+/// The outcome of a commit attempt under **allocate-on-validate**: a valid
 /// proposal consumes the next tick and writes; a stale one consumes nothing and
 /// the writer retries by re-reading and re-proposing.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,8 +123,8 @@ pub enum CommitOutcome {
 
 /// The pure serialization engine: no tiles, directly unit-testable.
 ///
-/// **Allocate-on-commit**: a tick is consumed only by a successful commit, so
-/// the timestamp domain is dense and a stale proposal leaves no trace. Validates
+/// **Allocate-on-validate**: a tick is consumed only by a valid proposal, whatever it
+/// writes, so the timestamp domain is dense and a stale proposal leaves no trace. Validates
 /// the read set with backward validation against each key's changelog.
 pub struct CommitEngine {
     /// The store's value before any change: every key's initial value. Held beside
@@ -341,16 +340,11 @@ impl CommitEngine {
         }
     }
 
-    /// Validate and (if valid) commit one proposal. Allocate-on-commit: a valid
+    /// Validate and (if valid) commit one proposal. Allocate-on-validate: a valid
     /// proposal consumes the next tick and applies its write set; a stale one
     /// consumes no tick and returns [`CommitOutcome::Stale`], leaving the writer
     /// to retry.
     pub fn attempt(&mut self, p: Proposal) -> CommitOutcome {
-        debug_assert!(
-            !p.writes.is_empty(),
-            "a proposal writes at least one key: a tick is recorded only in the changelogs of \
-             the keys it writes, so an empty write set would decide a tick no changelog holds"
-        );
         debug_assert!(
             p.snapshot <= *self.watermark(),
             "proposal snapshot {} is beyond the watermark {}",
@@ -373,7 +367,7 @@ impl CommitEngine {
         if stale {
             return CommitOutcome::Stale;
         }
-        // Allocate-on-commit on a dense clock: the watermark is the last allocated
+        // Allocate-on-validate on a dense clock: the watermark is the last allocated
         // tick, so the next one follows it.
         let c = next_commit_tick(self.watermark());
         self.decided = Some(c.clone());
@@ -1678,9 +1672,9 @@ fn changelog_value(values: &Tile, i: usize) -> Value {
 }
 
 /// Field names of the proposal-stream codomain record. `F_WRITES` is shared with
-/// the CCL side: it names the writer decision's `commit`-payload write tuple (the
-/// contract between the letrec phase, inference, and this engine) and is reused
-/// here for the proposal's write-set map.
+/// the CCL side: it names the writer decision's write set (the contract between the
+/// letrec phase, inference, and this engine) and is reused here for the proposal's
+/// write-set map.
 const F_SNAP: &str = "snap";
 const F_READS: &str = "reads";
 
@@ -1711,11 +1705,11 @@ pub fn proposal_stream_tiling(key_extent: &Extent, value_extent: &Extent) -> Til
 /// output, so it reads the store before proposing.
 ///
 /// On each `get` the operator drains every writer's new proposals in writer-index
-/// order. A valid proposal commits (allocate-on-commit) and the operator
+/// order. A valid proposal commits (allocate-on-validate) and the operator
 /// `release`s that step back to the writer — the writer reads the release as
 /// "your transaction committed; advance". A stale proposal consumes no tick and
-/// is not released; the writer re-reads the advanced store and retries (or, if
-/// it now denies, decides locally and never re-proposes). Disjoint write sets
+/// is not released; the writer re-reads the advanced store and retries, where it
+/// may decide otherwise. Disjoint write sets
 /// from different writers commit on consecutive ticks without conflict.
 pub struct CommitOperator {
     /// The concrete part of the tick-0 store state (the [`Self::new`] seed, used
@@ -2360,22 +2354,20 @@ pub fn nested_engines_tiling(
 /// [`Tile::Store`] changelog machinery as the concurrent [`CommitOperator`], but
 /// driven by *iteration position* rather than by concurrent proposals.
 ///
-/// There is exactly one writer, visiting each iteration position once in order:
-/// no proposals, no conflicts, no retries. The store is the *consuming* half of
-/// the recurrence — it reads the body's `` {`commit{writes} | `abort} ``
-/// decision ([`body_decision_at`] decodes the union tag) and
-/// [`step`](CommitEngine::step)s the engine, a `` `commit `` appending a change
-/// and an `` `abort `` (a failed guard) **carrying** (no change; the value
-/// inherits). Its cycle partner [`InductionDriver`] produces the body's
-/// `(prev…, item)` input from the changelog this store emits, read back through
-/// a `FanOut::new_cyclic` — so the accumulator crosses between them as a tile,
-/// like every other operator-to-operator value.
+/// There is exactly one writer, visiting each iteration position once in order: no proposals, no
+/// conflicts, no retries. The store is the *consuming* half of the recurrence — it reads the body's
+/// decision record `{writes, __to_<defer>*}` ([`decision_at_index`] decodes each write's `` `fired
+/// ``/`` `idle `` tag) and [`step`](CommitEngine::step)s the engine, appending a change of the
+/// writes that fire and **carrying** where none does (no change; each value inherits). Its cycle
+/// partner [`InductionDriver`] produces the body's `(prev…, item)` input from the changelog this
+/// store emits, read back through a `FanOut::new_cyclic` — so the accumulator crosses between them
+/// as a tile, like every other operator-to-operator value.
 ///
-/// A plain (unconditional) `mut` loop is the degenerate `` `commit ``-everywhere
-/// case (a dense changelog); a conditional write is sparse in position space
-/// (`` `abort `` positions append nothing) while the frontier still tracks the whole extent.
+/// A plain (unconditional) `mut` loop writes at every position (a dense changelog); a
+/// conditional write is sparse in position space (a position where it is idle appends
+/// nothing to its changelog) while the frontier still tracks the whole extent.
 pub struct InductionStore {
-    /// The writer body `` λ (prev…, item) → {`commit{writes(, __to_<defer>…)} | `abort} ``,
+    /// The writer body `` λ (prev…, item) → {writes(, __to_<defer>…)} ``,
     /// compiled around an [`InductionDriver`]. Filled after construction through
     /// [`body_input_setter`](Self::body_input_setter): the body reads the driver,
     /// which reads this store back through the cycle, so it cannot exist yet
@@ -2692,36 +2684,25 @@ impl InductionStoreProducer {
         seeds
     }
 
-    /// The delta a decision applies: every carry write, and only the taps that fired.
+    /// The delta a decision applies: the writes and the taps that fire.
     ///
-    /// A non-fired conditional feed is omitted, so its per-position read skips that
-    /// position; a carry appends nothing at all and the accumulator holds from the seed
-    /// or the latest earlier change.
-    fn write_set(
-        &self,
-        commit: bool,
-        writes: Vec<Value>,
-        tap_fired: Vec<bool>,
-    ) -> Option<HashMap<Value, Value>> {
-        if !commit {
-            return None;
-        }
+    /// An idle write or tap is omitted, so its per-position read skips that position; a
+    /// position that fires nothing appends nothing at all, and each accumulator holds from
+    /// the seed or its latest earlier change.
+    fn write_set(&self, writes: Vec<Option<Value>>) -> Option<HashMap<Value, Value>> {
         debug_assert_eq!(
             writes.len(),
             self.write_keys.len(),
             "the decision's write set aligns with the store's write keys"
         );
-        let n_carry = self.write_keys.len() - self.tap_fields.len();
-        Some(
-            self.write_keys
-                .iter()
-                .cloned()
-                .zip(writes)
-                .enumerate()
-                .filter(|(i, _)| *i < n_carry || tap_fired[*i - n_carry])
-                .map(|(_, kv)| kv)
-                .collect(),
-        )
+        let delta: HashMap<Value, Value> = self
+            .write_keys
+            .iter()
+            .cloned()
+            .zip(writes)
+            .filter_map(|(key, value)| value.map(|v| (key, v)))
+            .collect();
+        (!delta.is_empty()).then_some(delta)
     }
 
     /// This induction store's engines as a tile, each store `terminal` once the recurrence is final
@@ -2817,8 +2798,9 @@ impl TileProducer for InductionStoreProducer {
         // down the levels the recurrence is indexed by. An induction store with no rows above it
         // has paths of one component, which is the whole of that statement at depth zero:
         // one store, at the empty path.
-        let Tile::Scalar(union_col) = body_tile.deepest_values().clone() else {
-            return self.notifier.notify_if_changed(self.render_store());
+        let decisions = match body_tile.deepest_values() {
+            values @ (Tile::Scalar(_) | Tile::Record { .. }) => decision_column(values),
+            _ => return self.notifier.notify_if_changed(self.render_store()),
         };
         for (path, idx) in decided_paths(&body_tile) {
             let Some((rows, inner)) = path.split_position() else {
@@ -2834,14 +2816,11 @@ impl TileProducer for InductionStoreProducer {
                 continue;
             }
             // Carry writes lead, taps follow (the layout `build_induction_store_single`
-            // sets). A committing position applies every carry write but only the taps
-            // that *fired* on its route — a non-fired conditional feed is omitted from the
-            // delta, so its per-position read (`store_delta_at`) skips this position.
-            // `commit` is true whenever a tap fires (the letrec phase folds feed-fire paths
-            // into the commit gate), so a fired tap always rides an appended change. A
-            // carry appends nothing at all, whatever a tap's tag there says.
-            let Some((commit, writes, tap_fired)) =
-                decision_at_index(&union_col, idx, &self.write_keys, &self.tap_fields)
+            // sets). A position applies the writes and the taps that fire on its route; an
+            // idle one is omitted from the delta, so its per-position read (`store_delta_at`)
+            // skips this position. A position that fires nothing carries every accumulator.
+            let Some(writes) =
+                decision_at_index(&decisions, idx, &self.write_keys, &self.tap_fields)
             else {
                 break;
             };
@@ -2869,7 +2848,7 @@ impl TileProducer for InductionStoreProducer {
                 );
                 self.stepped_through = Some(path.clone());
             }
-            let write_set = self.write_set(commit, writes, tap_fired);
+            let write_set = self.write_set(writes);
             let engine = self.open_at(&row, &seed);
             engine.step(inner.clone(), write_set);
             debug_assert_eq!(
@@ -6246,15 +6225,8 @@ fn item_position_at(driver_tile: &Tile, pos: &Position) -> Value {
 /// not a tuple field, so no projection of the body's parameter reaches it.
 pub(crate) const F_ITEM_POSITION: &str = "item_position";
 
-/// The `commit` tag of the decision variant `` {`commit{𝑃} | `abort} ``. A union
-/// column keys its arms by name, so the decode matches the tag the CCL side
-/// built and neither end depends on the variant's arm order.
-fn is_commit_tag(tag: &crate::ccl::FieldKey) -> bool {
-    matches!(tag, crate::ccl::FieldKey::Name(n) if n == crate::ccl::V_COMMIT)
-}
-
-/// The `` `fired `` tag of a tap variant `` {`fired{𝑉} | `idle} ``. Matched by name
-/// for the reason [`is_commit_tag`] is.
+/// The `` `fired `` tag of a write's or a tap's `` {`fired{𝑉} | `idle} ``, matched by name
+/// so a variant materialized in any arm order reads the same.
 fn is_fired_tag(tag: &crate::ccl::FieldKey) -> bool {
     matches!(tag, crate::ccl::FieldKey::Name(n) if n == crate::ccl::V_FIRED)
 }
@@ -6381,40 +6353,46 @@ fn decided_paths(tile: &Tile) -> Vec<(Path, usize)> {
     out
 }
 
-/// Extract a writer body's grant/deny *decision* at position `pos` of its input.
+/// Extract a writer body's *decision* at position `pos` of its input.
 ///
-/// The body returns a **decision variant** `` {`commit{𝑃} | `abort} `` (see
-/// [`crate::ccl::V_COMMIT`]/[`crate::ccl::V_ABORT`]): the codomain is a
-/// `Scalar(Union)` column, one `Value::Union { tag, inner }` per position.
-/// `abort` (any tag but `commit` — see [`is_commit_tag`]) is a whole-transaction deny — no writes, no
-/// taps (carry / no proposal). `commit` carries the dense payload record `𝑃 =
-/// {writes: {k: new…}, __to_<defer>*}`, each tap holding `` {`fired{𝑉} | `idle} ``.
+/// The body returns a **decision record** `{writes: {𝑘: …}, __to_<defer>*}`
+/// ([`crate::ccl::ccl_utils::writer_decision`]), each write and each tap holding
+/// `` {`fired{𝑉} | `idle} ``: one record per position, as one column of records or a record
+/// of columns.
 ///
-/// Returns `(commit, writes, tap_fired)`: `commit` gates grant vs deny; `writes[j]`
-/// is the new value for `write_keys[j]` (carry writes then tap values, in that
-/// order); and `tap_fired[t]` says whether tap `tap_fields[t]` fires at this
-/// position (its `` `fired ``/`` `idle `` tag).
-/// A committing decision applies a carry write and a *fired* tap, but not a
-/// non-fired tap.
+/// Returns one entry per `write_keys` key, carry keys then taps: the value the decision
+/// writes there where it fires, and `None` where it is `` `idle ``. A carry key's entry is the
+/// written value, and a tap's is its whole `` `fired `` value, which the store holds tag and
+/// all: the IR reads a tap through ``variant_project(`fired)``, so the stream's restriction to
+/// fired positions happens there, on a value whose type says what it is. `None` where the
+/// body has not decided `pos`.
 fn body_decision_at(
     tile: &Tile,
     pos: &Position,
     write_keys: &[Value],
     tap_fields: &[SmolStr],
-) -> Option<(bool, Vec<Value>, Vec<bool>)> {
+) -> Option<Vec<Option<Value>>> {
     let Tile::DataFunction {
         domain, codomain, ..
     } = tile
     else {
         return None;
     };
-    let keys = &domain;
-    // The decision codomain is a `Scalar(Union)` — one tagged variant per row.
-    let Tile::Scalar(union_col) = codomain.as_ref() else {
-        return None;
-    };
-    let row = (0..keys.len()).find(|&i| &keys.index_at(i) == pos.value())?;
-    decision_at_index(union_col, row, write_keys, tap_fields)
+    let row = (0..domain.len()).find(|&i| &domain.index_at(i) == pos.value())?;
+    decision_at_index(&decision_column(codomain), row, write_keys, tap_fields)
+}
+
+/// The decisions a body tile holds at its deepest level, as one column of records: a body
+/// whose decision holds only scalars renders them as one, which this borrows, and one
+/// assembled field by field as a record of columns, which this pivots.
+fn decision_column(values: &Tile) -> std::borrow::Cow<'_, ColumnValue> {
+    match values {
+        Tile::Scalar(column) => std::borrow::Cow::Borrowed(column),
+        record @ Tile::Record { .. } => std::borrow::Cow::Owned(
+            crate::interpreter::tile_operators::scalar_tile_to_column_value(record.clone()),
+        ),
+        other => panic!("a writer body's decisions are records, got {other:?}"),
+    }
 }
 
 /// [`body_decision_at`] once the row is known. The induction store finds the row by walking
@@ -6422,33 +6400,20 @@ fn body_decision_at(
 /// an inner position repeats across enclosing positions, so only the path identifies a
 /// decision.
 fn decision_at_index(
-    union_col: &ColumnValue,
+    decisions: &ColumnValue,
     row: usize,
     write_keys: &[Value],
     tap_fields: &[SmolStr],
-) -> Option<(bool, Vec<Value>, Vec<bool>)> {
-    let Value::Union { tag, inner } = union_col.index_at(row) else {
+) -> Option<Vec<Option<Value>>> {
+    let Value::Record(decision) = decisions.index_at(row) else {
         return None;
     };
-    // `abort` — a whole-transaction deny: no proposal, no taps (carry).
-    if !is_commit_tag(&tag) {
-        return Some((false, Vec::new(), Vec::new()));
-    }
-    // `commit` — the payload record `{writes, __to_<defer>*}`. The union column
-    // already carried the values materialized at this row, so they are read
-    // straight off the record with no per-column extraction step.
-    let Value::Record(payload) = *inner else {
-        return None;
-    };
-    // The write set is keyed by the variable written, so it is read back by name,
-    // in `write_keys` order — the order the caller aligns with. A store key is the
-    // variable's name as a tag over the data key it holds (`store_key`), so the
-    // name is the tag; the write set never keys by the data key, because a keyed
-    // write commits the whole collection at `` `reg(unit) ``. The carry keys are
-    // the ones it holds: `write_keys` is carry keys ++ tap keys (the layout
-    // `build_induction_store_single` and `build_commit_store` both set), and a
-    // tap's value rides the payload beside `writes` rather than inside it. Each
-    // entry may itself be record-valued (a store holding a record).
+    // The write set is keyed by the variable written, so it is read back by name, in
+    // `write_keys` order — the order the caller aligns with. A store key is the variable's
+    // name as a tag over the data key it holds (`store_key`), so the name is the tag; the
+    // write set never keys by the data key, because a keyed write commits the whole
+    // collection at `` `reg(unit) ``. `write_keys` is carry keys ++ tap keys (the layout
+    // `build_induction_store_single` and `build_commit_store` both set).
     assert!(
         write_keys.len() >= tap_fields.len(),
         "write keys are the carry keys followed by one per tap: {} keys, {} taps",
@@ -6457,12 +6422,12 @@ fn decision_at_index(
     );
     let n_carry = write_keys.len() - tap_fields.len();
     let mut writes = Vec::with_capacity(write_keys.len());
-    match payload.get(&F_WRITES.runtime_key())? {
+    match decision.get(&F_WRITES.runtime_key())? {
         Value::Record(writes_rec) => {
             debug_assert_eq!(
                 writes_rec.len(),
                 n_carry,
-                "a decision writes every carry key of the store consuming it",
+                "a decision states every carry key of the store consuming it",
             );
             for key in &write_keys[..n_carry] {
                 let Value::Union {
@@ -6472,35 +6437,25 @@ fn decision_at_index(
                 else {
                     return None;
                 };
-                writes.push(writes_rec.get(&name.runtime_key())?.clone());
+                let Value::Union { tag, inner } = writes_rec.get(&name.runtime_key())?.clone()
+                else {
+                    return None;
+                };
+                writes.push(is_fired_tag(&tag).then_some(*inner));
             }
         }
-        // A read-only transaction's empty write set lowers to a unit value (not
-        // a record): zero carry writes, only taps contribute.
-        Value::Unit => {}
+        // A writer that only reads writes nothing: its write set is `unit`.
+        Value::Unit => debug_assert_eq!(n_carry, 0, "a `unit` write set states no key"),
         _ => return None,
     }
-    // Per tap, its value and whether it *fires* at this position. A tap holds
-    // `` {`fired{𝑉} | `idle} ``, so the tag answers both at once: `` `fired ``
-    // carries the fed value, and `` `idle `` is a position the tap's own route did
-    // not admit — a sibling route's commit, which must not over-fire this reply.
-    // An `` `idle `` position still occupies its slot in `writes`, because the
-    // caller indexes that vector by `write_keys` and drops the non-fired entries
-    // by `tap_fired`; `Unit` is the value nothing reads.
-    let mut tap_fired = Vec::with_capacity(tap_fields.len());
     for tap in tap_fields {
-        let value = payload.get(tap)?.clone();
+        let value = decision.get(tap)?.clone();
         let Value::Union { tag, .. } = &value else {
             return None;
         };
-        // The tag is the gate. The *value* goes to the store as it stands, tag and
-        // all: the IR reads a tap through ``variant_project(`fired)``, so the
-        // stream's restriction to fired positions happens there, on a value whose
-        // type says what it is.
-        tap_fired.push(is_fired_tag(tag));
-        writes.push(value);
+        writes.push(is_fired_tag(tag).then_some(value));
     }
-    Some((true, writes, tap_fired))
+    Some(writes)
 }
 
 /// A complete transaction writer over a multi-key [`CommitOperator`], fused into
@@ -6752,6 +6707,52 @@ impl TransactWriterProducer {
         self.body_producer.release(guard);
     }
 
+    /// The write set a decision at driver position `pos` proposes: each carry key and each
+    /// tap it fires, a tap paired with the item it answers. A decision that fires nothing, a
+    /// deny or a read that replies nothing, proposes an empty write set.
+    fn proposal_writes(
+        &self,
+        writes: Vec<Option<Value>>,
+        driver_tile: &Tile,
+        pos: &Position,
+    ) -> HashMap<Value, Value> {
+        // `write_keys` and the decision's writes are two views of the same store keys,
+        // aligned by position: carry keys, then tap keys (the layout `build_commit_store`
+        // sets). A length mismatch is a `transact_phase`/inference bug that `zip` would
+        // otherwise paper over by silently dropping the tail.
+        debug_assert_eq!(
+            self.write_keys.len(),
+            writes.len(),
+            "commit operator: decision write-set arity ({}) disagrees with write_keys ({}) — \
+             zip would silently drop the tail",
+            writes.len(),
+            self.write_keys.len()
+        );
+        let n_carry = self.write_keys.len() - self.tap_fields.len();
+        let item_position =
+            (!self.tap_fields.is_empty()).then(|| item_position_at(driver_tile, pos));
+        self.write_keys
+            .iter()
+            .cloned()
+            .zip(writes)
+            .enumerate()
+            .filter_map(|(i, (key, value))| {
+                let value = value?;
+                if i < n_carry {
+                    return Some((key, value));
+                }
+                let at = item_position
+                    .clone()
+                    .expect("a writer with a tap reads item positions");
+                let pair = Value::Record(HashMap::from([
+                    (tuple_field(0), at),
+                    (tuple_field(1), value),
+                ]));
+                Some((key, pair))
+            })
+            .collect()
+    }
+
     /// Drop the live window's superseded proposals, which deciding driver position
     /// `attempt` makes dead — keeping writer state O(1) under sustained contention.
     ///
@@ -6941,127 +6942,60 @@ impl TileProducer for TransactWriterProducer {
             && Some(&pos) != self.last_decided_pos.as_ref()
             && let Some(frontier) = snapshot
         {
-            match body_decision_at(&body_tile, &pos, &self.write_keys, &self.tap_fields) {
-                // Grant: propose the write set; the operator decides whether it
-                // commits — its ack releases the driver row, which is what advances
-                // the driver past this item — or is stale, leaving the item to be
-                // re-attempted at the moved frontier. The read set omits
-                // never-written keys (append → empty read).
-                Some((true, new, tap_fired)) => {
-                    let reads: HashMap<Value, Value> = self
-                        .read_keys
-                        .iter()
-                        .zip(&olds)
-                        .filter_map(|(k, o)| o.clone().map(|v| (k.clone(), v)))
-                        .collect();
-                    // `write_keys` and the decision's `new` write-set are two
-                    // views of the same store keys, aligned by position. A
-                    // length mismatch is a `transact_phase`/inference bug that
-                    // `zip` would otherwise paper over by silently dropping the
-                    // tail — committing a truncated write set. Assert the arity.
-                    debug_assert_eq!(
-                        self.write_keys.len(),
-                        new.len(),
-                        "commit operator: decision write-set arity ({}) disagrees with \
-                         write_keys ({}) — zip would silently drop the tail",
-                        new.len(),
-                        self.write_keys.len()
-                    );
-                    // Carry writes lead; taps follow (the layout `build_commit_store`
-                    // sets). A committed transaction applies every carry write but
-                    // only the taps that *fired* on its route — a non-fired tap under
-                    // cross-key routing is omitted from the delta, so it does not
-                    // over-fire on a sibling route's commit.
-                    // Layout invariant: `write_keys` = carry keys ++ tap keys, so
-                    // the subtraction never underflows. Assert it — a break would wrap
-                    // `n_carry` to a huge value in release and mis-index `tap_fired`.
-                    debug_assert!(
-                        self.write_keys.len() >= self.tap_fields.len(),
-                        "commit operator: tap fields ({}) exceed write keys ({})",
-                        self.tap_fields.len(),
-                        self.write_keys.len()
-                    );
-                    let n_carry = self.write_keys.len() - self.tap_fields.len();
-                    let item_position =
-                        (!self.tap_fields.is_empty()).then(|| item_position_at(&driver_tile, &pos));
-                    let writes: HashMap<Value, Value> = self
-                        .write_keys
-                        .iter()
-                        .cloned()
-                        .zip(new)
-                        .enumerate()
-                        .filter(|(i, _)| *i < n_carry || tap_fired[*i - n_carry])
-                        .map(|(i, (key, value))| {
-                            if i < n_carry {
-                                return (key, value);
-                            }
-                            let at = item_position
-                                .clone()
-                                .expect("a writer with a tap reads item positions");
-                            let pair = Value::Record(HashMap::from([
-                                (tuple_field(0), at),
-                                (tuple_field(1), value),
-                            ]));
-                            (key, pair)
-                        })
-                        .collect();
-                    // **A grant that writes nothing is read-only**, which is a local
-                    // decision and never a proposal ([`Proposal`]): with no carry key and
-                    // no tap fired, the filter above leaves nothing, and committing that
-                    // would consume a tick no key's changelog records. It finishes the item
-                    // as a deny does.
-                    // Re-proposing this item at a new frontier supersedes its
-                    // prior stale proposal(s); drop them so the window stays O(1).
-                    self.drop_superseded(&pos);
-                    self.last_decided_pos = Some(pos.clone());
-                    if writes.is_empty() {
-                        self.ack_through(&pos);
-                    } else {
-                        // The body-input row stays live until the commit-ack: it is
-                        // the attempt in flight, and releasing it now would tell the
-                        // driver this item is finished before it has committed.
-                        self.emitted.push(InFlightProposal {
-                            snapshot: frontier,
-                            reads,
-                            writes,
-                            attempt: pos,
-                        });
-                    }
-                }
-                // Deny: a purely local read-only decision (the body chose not to
-                // write at this snapshot — e.g. `if pool >= r`). No proposal, no
-                // tick consumed; advance past this item immediately, like the
-                // hand-written `TokenWriter`'s `pool < cost` branch. Drop any
-                // earlier grant-stale proposal for this item first (a grant→deny
-                // flip on retry) so it is not orphaned in the window.
-                Some((false, _, _)) => {
-                    self.drop_superseded(&pos);
-                    self.last_decided_pos = Some(pos.clone());
-                    // A deny finishes the item without proposing, so there is no
-                    // commit-ack to carry it: ack the attempt here, which is what
-                    // advances the driver past this item.
-                    self.ack_through(&pos);
-                }
-                None => {
-                    // No decision at `pos`. If the body is **terminal**, the
-                    // decision-body shape is genuinely unsupported (e.g. a reply
-                    // tap fed a list-/function-valued expression) — retrying would
-                    // re-read the same `None`, so fail loudly.
-                    if body_tile.is_terminal() {
-                        panic!(
-                            "commit operator: decision body produced no scalar/record \
+            // Every decision proposes, a deny and a grant that writes nothing included: a
+            // transaction takes a tick whatever it writes, so the engine, and not this
+            // writer's pull timing, places the snapshot it read
+            // (`src/ccl/design/mutability.md`, "Every transaction takes a tick"). The operator
+            // decides whether it commits — its ack releases the driver row, which is what
+            // advances the driver past this item — or is stale, leaving the item to be
+            // re-attempted at the moved frontier, where the body may decide otherwise.
+            let writes =
+                match body_decision_at(&body_tile, &pos, &self.write_keys, &self.tap_fields) {
+                    Some(writes) => Some(self.proposal_writes(writes, &driver_tile, &pos)),
+                    None => {
+                        // No decision at `pos`. If the body is **terminal**, the
+                        // decision-body shape is genuinely unsupported (e.g. a reply
+                        // tap fed a list-/function-valued expression) — retrying would
+                        // re-read the same `None`, so fail loudly.
+                        if body_tile.is_terminal() {
+                            panic!(
+                                "commit operator: decision body produced no scalar/record \
                              decision at position {pos} — unsupported decision-body tile shape"
-                        );
+                            );
+                        }
+                        // Otherwise the decision is **not ready**: it reads a broadcast
+                        // cross-loop accumulator final still converging — its
+                        // `ExtractFinal` is empty until the sibling loop's own cycle
+                        // drains, one position per body pull. Leaving `last_decided_pos`
+                        // unset is the whole handling: this position stays undecided, so
+                        // nothing acks the driver row, so the driver's item cursor does not
+                        // move and the driver keeps re-arming. Each re-pull advances the
+                        // sibling loop one step until the decision fills in.
+                        None
                     }
-                    // Otherwise the decision is **not ready**: it reads a broadcast
-                    // cross-loop accumulator final still converging — its
-                    // `ExtractFinal` is empty until the sibling loop's own cycle
-                    // drains, one position per body pull. Leaving `last_decided_pos`
-                    // unset is the whole handling: this position stays undecided, so
-                    // nothing acks the driver row, so the driver's item cursor does not
-                    // move and the driver keeps re-arming. Each re-pull advances the
-                    // sibling loop one step until the decision fills in.
-                }
+                };
+            if let Some(writes) = writes {
+                // The read set omits never-written keys (append → empty read).
+                let reads: HashMap<Value, Value> = self
+                    .read_keys
+                    .iter()
+                    .zip(&olds)
+                    .filter_map(|(k, o)| o.clone().map(|v| (k.clone(), v)))
+                    .collect();
+                // Re-proposing this item at a new frontier supersedes its prior stale
+                // proposal(s), whichever way they decided; drop them so the window stays
+                // O(1).
+                self.drop_superseded(&pos);
+                self.last_decided_pos = Some(pos.clone());
+                // The body-input row stays live until the commit-ack: it is the attempt in
+                // flight, and releasing it now would tell the driver this item is finished
+                // before it has committed.
+                self.emitted.push(InFlightProposal {
+                    snapshot: frontier,
+                    reads,
+                    writes,
+                    attempt: pos,
+                });
             }
         }
         self.debug_assert_position_invariant();
@@ -7160,7 +7094,7 @@ mod tests {
     use super::*;
     // The consumer helpers own shared-cell construction for the operators here; the
     // fixtures below build their own recording cells, hence the direct imports.
-    use crate::ccl::{FieldKey, TagMap, V_ABORT, V_COMMIT};
+    use crate::ccl::{FieldKey, TagMap, V_FIRED, V_IDLE};
     use crate::interpreter::scheduler::pull_laps;
     use crate::interpreter::tile_operators::{Constant, FanOut, Memo};
     use crate::interpreter::tiling::{one_row_decided, row_frontier};
@@ -7591,56 +7525,46 @@ mod tests {
         );
     }
 
-    /// The `commit` payload extent for a single-key writer: `{writes: {acc: value}}`.
+    /// The decision extent for a single-key writer, `{writes: {acc: {`fired{value} | `idle}}}`.
     ///
-    /// The write set is keyed by the variable written, so these fixtures name
-    /// the key the same way the CCL side does.
-    fn commit_payload_extent(key: &str) -> Extent {
+    /// The write set is keyed by the variable written, so these fixtures name the key the same
+    /// way the CCL side does, and the tags by name, so the order they are listed in is
+    /// immaterial.
+    fn decision_extent(key: &str) -> Extent {
+        let write = Extent::Union(TagMap::from_arms(vec![
+            (FieldKey::Name(V_FIRED), value_extent()),
+            (FieldKey::Name(V_IDLE), Extent::Base(BaseType::Unit)),
+        ]));
         Extent::Record(HashMap::from([(
             F_WRITES.runtime_key(),
-            Extent::Record(HashMap::from([(SmolStr::from(key), value_extent())])),
+            Extent::Record(HashMap::from([(SmolStr::from(key), write)])),
         )]))
     }
 
-    /// The decision variant extent `` {`commit{payload} | `abort} ``, keyed by tag —
-    /// so these fixtures name the same arms the CCL side builds, and the order they
-    /// are listed in is immaterial.
-    fn decision_union_extent(payload: Extent) -> Extent {
-        Extent::Union(TagMap::from_arms(vec![
-            (FieldKey::Name(V_COMMIT), payload),
-            (FieldKey::Name(V_ABORT), Extent::Base(BaseType::Unit)),
-        ]))
+    /// A decision value writing `write` to `key`, or nothing where `write` is `None`.
+    fn decision_value(key: &str, write: Option<Value>) -> Value {
+        let write = match write {
+            Some(v) => Value::Union {
+                tag: FieldKey::Name(V_FIRED),
+                inner: Box::new(v),
+            },
+            None => Value::Union {
+                tag: FieldKey::Name(V_IDLE),
+                inner: Box::new(Value::Unit),
+            },
+        };
+        Value::Record(HashMap::from([(
+            F_WRITES.runtime_key(),
+            Value::Record(HashMap::from([(SmolStr::from(key), write)])),
+        )]))
     }
 
-    /// A `` `commit({writes: {key: write}}) `` decision value. The write set is
-    /// keyed by the variable written, so a fixture names its key the same way
-    /// the writer consuming the decision does.
-    fn commit_value(key: &str, write: Value) -> Value {
-        let writes_rec = Value::Record(HashMap::from([(SmolStr::from(key), write)]));
-        Value::Union {
-            tag: FieldKey::Name(V_COMMIT),
-            inner: Box::new(Value::Record(HashMap::from([(
-                F_WRITES.runtime_key(),
-                writes_rec,
-            )]))),
-        }
-    }
-
-    /// A `` `abort `` decision value (a carry / no proposal).
-    fn abort_value() -> Value {
-        Value::Union {
-            tag: FieldKey::Name(V_ABORT),
-            inner: Box::new(Value::Unit),
-        }
-    }
-
-    /// A single-key decision body: over its `(read, item)` input (a driver's tile),
-    /// emits `` `commit({writes: {_0: read + item}}) `` where `item > threshold`,
-    /// else `` `abort ``.
+    /// A single-key decision body: over its `(read, item)` input (a driver's tile), writes
+    /// `read + item` where `item > threshold`, and nothing elsewhere.
     ///
     /// Serves both drivers, because the body shape is the same on both sides: for
-    /// induction it models `for i in xs: if guard(i): acc += i`, an `` `abort ``
-    /// being a carry the accumulator holds through; for a transaction it is a
+    /// induction it models `for i in xs: if guard(i): acc += i`, a position that writes
+    /// nothing being a carry the accumulator holds through; for a transaction it is a
     /// drawdown of a negative item against the read snapshot, with `i64::MIN`
     /// making every attempt a grant so contention is the only thing under test.
     struct AddIfBody {
@@ -7650,18 +7574,17 @@ mod tests {
         /// variable written, so a fixture has to name its key the same way the
         /// writer that consumes the decision does.
         key: String,
-        /// The guard threshold: `commit` iff `item > threshold` (`i64::MIN` ⇒ an
-        /// unconditional loop, `commit` everywhere).
+        /// The guard threshold: a write iff `item > threshold` (`i64::MIN` ⇒ an
+        /// unconditional loop, a write everywhere).
         threshold: i64,
     }
 
     impl AddIfBody {
         fn new(input: Box<dyn TileOperator>, threshold: i64, key: &str) -> Self {
-            // Decision variant `` {`commit{{writes: {_0}}} | `abort} `` — a
-            // `Scalar(Union)` codomain (commit=0, abort=1).
+            // The decision record, one column of records.
             let tiling = Tiling::data_function(
                 Extent::Base(BaseType::UInt),
-                Tiling::Scalar(decision_union_extent(commit_payload_extent(key))),
+                Tiling::Scalar(decision_extent(key)),
             );
             Self {
                 input,
@@ -7721,24 +7644,22 @@ mod tests {
             };
             let prev = record_field(&fields, &tuple_field(0));
             let item = record_field(&fields, &tuple_field(1));
-            // Per row: `item > threshold` → `` `commit({writes: {_0: prev + item}}) ``,
-            // else `` `abort `` (a carry). Builds the decision `Scalar(Union)` column.
+            // Per row: `item > threshold` → a write of `prev + item`, else nothing (a carry).
             let mut rows = Vec::with_capacity(domain.len());
             for j in 0..domain.len() {
                 let (Value::Int(p), Value::Int(i)) = (prev.index_at(j), item.index_at(j)) else {
                     panic!("AddIfBody prev/item are Ints");
                 };
-                rows.push(if i > self.threshold {
-                    commit_value(&self.key, int(p + i))
-                } else {
-                    abort_value()
-                });
+                rows.push(decision_value(
+                    &self.key,
+                    (i > self.threshold).then(|| int(p + i)),
+                ));
             }
             Tile::data_function(
                 domain,
                 Box::new(Tile::Scalar(ColumnValue::from_values(
                     rows,
-                    &decision_union_extent(commit_payload_extent(&self.key)),
+                    &decision_extent(&self.key),
                 ))),
                 // A per-position decision map: the decision stream is final
                 // exactly when its input is, as a compiled body's operator chain
@@ -7840,8 +7761,8 @@ mod tests {
         );
     }
 
-    /// A plain (unconditional) `mut` loop is the degenerate `commit`-everywhere
-    /// case: `acc := 10; for i in [1,2,3]: acc += i` → 16, a dense changelog.
+    /// A plain (unconditional) `mut` loop writes at every position: `acc := 10; for i in [1,2,3]:
+    /// acc += i` → 16, a dense changelog.
     #[test]
     fn induction_store_unconditional_write_e2e() {
         let tile = drive_induction(&[1, 2, 3], i64::MIN, 10);
@@ -8129,6 +8050,47 @@ mod tests {
         assert_eq!(e.read_as_of(&pos(1), &acct("alice")), Some(int(70)));
     }
 
+    /// A transaction that writes nothing, a deny or a read-only grant, takes a tick like any
+    /// other: the tick is decided and every key's value carries across it.
+    #[test]
+    fn an_empty_write_set_takes_a_tick() {
+        let mut e = CommitEngine::new(balances(&[("alice", 100)]));
+        assert_eq!(
+            e.attempt(Proposal {
+                snapshot: pos(0),
+                reads: balances(&[("alice", 100)]),
+                writes: HashMap::new(),
+            }),
+            CommitOutcome::Committed { ts: pos(1) }
+        );
+        assert_eq!(e.decided_watermark(), Some(&pos(1)));
+        assert_eq!(e.read_as_of(&pos(1), &acct("alice")), Some(int(100)));
+    }
+
+    /// A deny read what it decided on, so a commit to that key after its snapshot makes it
+    /// stale, and it retries as a grant does: at the moved frontier it may decide otherwise.
+    #[test]
+    fn a_deny_whose_read_moved_is_stale() {
+        let mut e = CommitEngine::new(balances(&[("alice", 100)]));
+        assert_eq!(
+            e.attempt(Proposal {
+                snapshot: pos(0),
+                reads: balances(&[("alice", 100)]),
+                writes: balances(&[("alice", 30)]),
+            }),
+            CommitOutcome::Committed { ts: pos(1) }
+        );
+        assert_eq!(
+            e.attempt(Proposal {
+                snapshot: pos(0),
+                reads: balances(&[("alice", 100)]),
+                writes: HashMap::new(),
+            }),
+            CommitOutcome::Stale
+        );
+        assert_eq!(e.decided_watermark(), Some(&pos(1)));
+    }
+
     /// Two writers touch *disjoint* keys from the same snapshot: both commit, no
     /// conflict — concurrency for free.
     #[test]
@@ -8275,7 +8237,7 @@ mod tests {
 
     /// Repeated writes to one key, each reading the prior commit: every attempt
     /// commits, so the timestamp domain stays dense — the uncontended degeneration
-    /// of allocate-on-commit, where the tick sequence has no gaps because nothing
+    /// of allocate-on-validate, where the tick sequence has no gaps because nothing
     /// ever goes stale.
     #[test]
     fn repeated_writes_to_one_key_are_dense() {
@@ -9129,12 +9091,13 @@ mod tests {
     }
 
     /// A test writer that processes a stream of token-pool requests (`costs`),
-    /// one at a time. Each pull, for the current request, it reads the store: if
-    /// `pool >= cost` it proposes a grant (`write = pool - cost`); if `pool < cost`
-    /// it denies *locally* (a read-only decision — no proposal) and advances to
-    /// the next request. A `release` from the operator means the current grant
-    /// committed, which also advances. Stale grants stay unreleased while it
-    /// retries the current request against the advancing store.
+    /// one at a time, as `TransactWriter` does. Each pull, for the current request, it reads
+    /// the store and proposes: a grant (`write = pool - cost`) where `pool >= cost`, and a
+    /// deny, which reads `pool` and writes nothing, where `pool < cost`. A `release` from the
+    /// operator means the current proposal committed, which advances to the next request.
+    /// Stale proposals, a deny's included, stay unreleased while it retries the current
+    /// request against the advancing store (`src/ccl/design/mutability.md`, "Every
+    /// transaction takes a tick").
     struct TokenWriter {
         tiling: Tiling,
         store_op: Box<dyn TileOperator>,
@@ -9204,23 +9167,25 @@ mod tests {
                     .get(self.store_producer.tiling().universal_guard());
                 if let Some((frontier, pool)) = store_at(&store, &self.key) {
                     let cost = self.costs[self.current];
-                    if pool < cost {
-                        self.current += 1; // deny — a local read-only decision
+                    // A grant reads pool and writes pool - cost; a deny reads pool and writes
+                    // nothing.
+                    let writes = if pool < cost {
+                        HashMap::new()
                     } else {
-                        // grant: read pool, write pool - cost
-                        self.window.push((
-                            frontier,
-                            HashMap::from([(self.key.clone(), int(pool))]),
-                            HashMap::from([(self.key.clone(), int(pool - cost))]),
-                        ));
-                    }
+                        HashMap::from([(self.key.clone(), int(pool - cost))])
+                    };
+                    self.window.push((
+                        frontier,
+                        HashMap::from([(self.key.clone(), int(pool))]),
+                        writes,
+                    ));
                 }
             }
             let done = self.current >= self.costs.len();
             self.window.tile(done)
         }
         fn release_impl(&mut self, obsolete_guard: TileGuard) {
-            // The operator released our outstanding grant → the current request
+            // The operator released our outstanding proposal → the current request
             // committed → advance to the next request, and drop the committed
             // proposal out of the live window.
             self.current += 1;
@@ -9231,7 +9196,8 @@ mod tests {
     /// Two concurrent writers draw from a shared pool of 100: A wants 70, B wants
     /// 50. They read the same snapshot and both propose grants; the operator
     /// commits A and finds B stale (no tick). B retries, now sees pool = 30 < 50,
-    /// and denies locally. The pool never goes negative: it ends at 30.
+    /// and proposes a deny, which takes the second tick. The pool never goes negative: it
+    /// ends at 30.
     #[test]
     fn token_pool_two_writers() {
         let pool_init = balances(&[("pool", 100)]);
@@ -9259,17 +9225,54 @@ mod tests {
         let mut sched = Scheduler::new();
         let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
 
-        let latest = pull_laps(&mut sched, &mut *producer, 7, |_| false);
-        // Exactly one draw commits: 100−70=30 < 50 and 100−50=50 < 70, so
+        let latest = pull_laps(&mut sched, &mut *producer, 9, |_| false);
+        // Exactly one draw writes: 100−70=30 < 50 and 100−50=50 < 70, so
         // whichever commits first, the other denies. The round-robin drain picks
         // the winner, so the resting value is schedule-dependent (30 or 50) but
-        // always a valid, non-negative outcome — exactly one commit either way.
+        // always a valid, non-negative outcome. The deny takes a tick too.
         let (frontier, pool) = store_at(&latest, &acct("pool")).expect("pool decided");
-        assert_eq!(frontier, pos(1), "exactly one commit");
+        assert_eq!(frontier, pos(2), "a grant and a deny, a tick each");
         assert!(
             pool == 30 || pool == 50,
             "one draw committed; pool = {pool}"
         );
+    }
+
+    /// A deny reads what it decided on, so a commit to that key ahead of it makes it stale,
+    /// and its retry decides again: A deposits 60 into a pool of 20 (a draw of −60) while B
+    /// draws 50. Both read the pool at 20, where B denies. The drain takes A's grant first
+    /// here, so B's deny is stale, and B grants at the moved frontier, ending at 30; a deny
+    /// decided at its snapshot and never validated would leave 80.
+    #[test]
+    fn a_stale_deny_retries_and_grants() {
+        let pool_init = balances(&[("pool", 20)]);
+        let commit = CommitOperator::new(
+            pool_init.clone(),
+            store_values(&["pool"]),
+            all_writers_write(&pool_init, 2),
+        );
+        let set_b = commit.writer_input_setter(0);
+        let set_a = commit.writer_input_setter(1);
+        let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
+        set_a(Box::new(TokenWriter::new(
+            store_fan.slot(),
+            acct("pool"),
+            vec![-60],
+        )));
+        set_b(Box::new(TokenWriter::new(
+            store_fan.slot(),
+            acct("pool"),
+            vec![50],
+        )));
+
+        let mut external = store_fan.slot();
+        let guard = external.tiling().universal_guard();
+        let mut sched = Scheduler::new();
+        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
+
+        let latest = pull_laps(&mut sched, &mut *producer, 9, |_| false);
+        let (frontier, pool) = store_at(&latest, &acct("pool")).expect("pool decided");
+        assert_eq!((frontier, pool), (pos(2), 30));
     }
 
     /// Two writers each handle a *stream* of requests against a shared pool of
@@ -9306,15 +9309,20 @@ mod tests {
         let mut sched = Scheduler::new();
         let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
 
-        let latest = pull_laps(&mut sched, &mut *producer, 11, |_| false);
+        let latest = pull_laps(&mut sched, &mut *producer, 15, |_| false);
         // Which draws fit (and in what order) is schedule-dependent under the
         // round-robin drain, but the token-pool safety invariant holds under every
         // serialization: the pool is never oversold (≥ 0) and never exceeds its
         // initial 100 — a draw commits only when it fits the pool it read.
-        let (_, pool) = store_at(&latest, &acct("pool")).expect("pool decided");
+        let (frontier, pool) = store_at(&latest, &acct("pool")).expect("pool decided");
         assert!(
             (0..=100).contains(&pool),
             "pool stays within [0, 100]; got {pool}"
+        );
+        assert_eq!(
+            frontier,
+            pos(4),
+            "every request takes a tick, grant or deny"
         );
     }
 

@@ -1083,6 +1083,19 @@ fn caught_inside_a_block(#[case] code: &str, #[case] expected: i64) {
             pass
     await_final(pool)
 "}, 85)]
+// A write on some paths of a block that never reads it holds no snapshot to keep elsewhere, and
+// the abort leaves it unwritten all the same: `20` raises, so only `5` writes.
+#[case::a_write_on_some_paths_the_block_never_reads(indoc! {"
+    for r in [10, 20, 5]:
+        try:
+            with begin():
+                if r != 10:
+                    pool := r
+                check(r)
+        except Int:
+            pass
+    await_final(pool)
+"}, 5)]
 // A block after it in the same `try`, writing the same variable, runs where the first one did
 // not raise: its source is gated on the first block's outcome, which their shared store computes.
 #[case::a_block_after_a_block_that_aborts(indoc! {"

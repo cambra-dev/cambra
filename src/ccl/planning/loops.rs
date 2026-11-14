@@ -14,11 +14,10 @@ use crate::ccl::RecordEntry;
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::{
-    Builtin, Expr, F_DECISION, F_WRITE_TARGETS, F_WRITES, Name, ProjKey, TransactKey, Type,
+    Builtin, Expr, F_DECISION, F_TIME, F_WRITE_TARGETS, F_WRITES, Name, ProjKey, TransactKey, Type,
     TypedBinding, TypedExprNode, WriterSite,
     ccl_utils::{
-        PredMemo, apply_primitive, commit_payload_ty, count_free, is_free_in_type,
-        walk_refined_predicates_mut,
+        PredMemo, apply_primitive, count_free, is_free_in_type, walk_refined_predicates_mut,
     },
     letrec::{check_letrec_causal, group_has_causal},
     mut_elim::{binding, fun_parts, tvar},
@@ -175,6 +174,18 @@ fn flatten_channel_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Exp
     out
 }
 
+/// The `𝑉` of a write's or a tap's `` {`fired{𝑉} | `idle} ``.
+fn fired_value_ty(ty: &Type) -> Type {
+    match ty.peel_refinements() {
+        Type::Variant(tags, _) => tags
+            .iter()
+            .find(|(k, _)| matches!(k, crate::ccl::FieldKey::Name(n) if n == crate::ccl::V_FIRED))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| panic!("letrec recognition: a write is fired or idle: {ty}")),
+        other => panic!("letrec recognition: a write is fired or idle: {other}"),
+    }
+}
+
 /// Unwrap the post-elim constant-function wrapper `x ▷ const`, returning `x`.
 fn unwrap_const(e: Expr) -> Expr {
     let TypedExprNode::Apply { argument, function } = e.node else {
@@ -187,34 +198,35 @@ fn unwrap_const(e: Expr) -> Expr {
     *argument
 }
 
-/// Unwrap a guard's seed slot to the record of per-key seeds it carries, and whether
-/// that record is **closed** in the writer's argument.
+/// Unwrap a guard's seed slot to the seed it carries, and whether that seed is **closed** in
+/// the writer's argument.
 ///
-/// Seeds that vary per enclosing position — the enclosing accumulators where an inner
-/// loop starts — are a record-valued morphism, the `zip` `⟨…⟩`, whose fields are already
-/// morphisms. Seeds closed in the argument are one `const` over the whole record,
-/// `(…) ▷ const`, whose fields are values: every top-level loop's seeds, and an inner
-/// loop's where the enclosing body introduced the mutable variable, so it starts at the
-/// same value at every enclosing position.
-fn unwrap_seed_record(e: Expr) -> (Expr, bool) {
-    let TypedExprNode::Apply { argument, function } = e.node else {
-        panic!("letrec recognition: expected `(seeds) ▷ const` or `⟨seeds⟩`");
-    };
-    let closed = match function.node {
-        TypedExprNode::Builtin(Builtin::Const) => true,
-        TypedExprNode::Builtin(Builtin::Zip) => false,
-        _ => panic!("letrec recognition: guard seeds are neither const-wrapped nor zipped"),
-    };
-    (*argument, closed)
+/// A seed that varies per enclosing position — an enclosing accumulator where an inner loop
+/// starts — is a morphism of the writer's argument, and stays one. A seed closed in the
+/// argument is `seed ▷ const`: every top-level loop's seeds, and an inner loop's where the
+/// enclosing body introduced the mutable variable, so it starts at the same value at every
+/// enclosing position.
+fn unwrap_seed(e: Expr) -> (Expr, bool) {
+    match e.node {
+        TypedExprNode::Apply { argument, function }
+            if matches!(function.node, TypedExprNode::Builtin(Builtin::Const)) =>
+        {
+            (*argument, true)
+        }
+        node => (Expr { node, ..e }, false),
+    }
 }
 
 /// Destructure the post-elim guard compose
 /// `(⟨view⟩ ▷ const, ⟨pos⟩, ⟨default⟩ ▷ const) ▷ zip ≫ get_prev_*`,
-/// returning the defaults record, whether it is closed in the writer's argument
-/// ([`unwrap_seed_record`]), and which guard. The view slot (the causal history
-/// read) is validated by `check_letrec_causal` and discarded here — the
-/// engine reconstructs every read from the history record itself.
-fn split_causal_compose(guard: Expr) -> (Expr, bool, Builtin) {
+/// returning the view, the default, whether the default is closed in the writer's argument
+/// ([`unwrap_seed`]), and which guard.
+///
+/// The view is the history the recurrence reads its previous value from. The engine reads a
+/// key's latest write itself rather than evaluating the view, so each recognizer checks the
+/// view is that one ([`check_induction_view`], [`check_txn_view`]): the letrec and the engine
+/// then mean the same recurrence. `check_letrec_causal` has checked it is causal.
+fn split_causal_compose(guard: Expr) -> (Expr, Expr, bool, Builtin) {
     let TypedExprNode::Compose(mut elts) = guard.node else {
         panic!("letrec recognition: guard is not a compose");
     };
@@ -243,8 +255,142 @@ fn split_causal_compose(guard: Expr) -> (Expr, bool, Builtin) {
         panic!("letrec recognition: guard zip takes a tuple");
     };
     assert_eq!(slots.len(), 3, "guard arity (history, position, default)");
-    let (default, closed) = unwrap_seed_record(slots.pop().expect("default slot"));
-    (default, closed, b)
+    let (default, closed) = unwrap_seed(slots.pop().expect("default slot"));
+    let (view, _) = unwrap_seed(slots.swap_remove(0));
+    (view, default, closed, b)
+}
+
+/// The steps `view` applies to the history `h`, in application order and flattened. A history
+/// that reads no parameter keeps the flat `h ≫ step₁ ≫ …`. An inner loop's history is a
+/// family, one recurrence per enclosing position, so its view selects the enclosing position
+/// first and maps the steps over the history there, `.0 ≫ h ≫ (step₁ ≫ …) ▷ map`. Other
+/// eliminated forms are [`peel_view_steps`]'s. `None` where `view` is no view of `h`.
+fn view_steps(view: &Expr, h: &Name) -> Option<Vec<Expr>> {
+    fn flatten(e: &Expr, out: &mut Vec<Expr>) {
+        match &e.node {
+            TypedExprNode::Compose(elts) => elts.iter().for_each(|e| flatten(e, out)),
+            // A pointwise map of steps over a family's history at one enclosing position.
+            TypedExprNode::Apply { argument, function }
+                if matches!(function.node, TypedExprNode::Builtin(Builtin::Map)) =>
+            {
+                flatten(argument, out)
+            }
+            _ => out.push(e.clone()),
+        }
+    }
+    let mut steps = Vec::new();
+    match &view.node {
+        TypedExprNode::Compose(elts) => {
+            let at = elts
+                .iter()
+                .position(|e| matches!(&e.node, TypedExprNode::Var(n) if n == h));
+            match at {
+                // Only a projection of the writer's argument, the enclosing position, may
+                // stand before the history.
+                Some(at)
+                    if elts[..at]
+                        .iter()
+                        .all(|e| matches!(e.node, TypedExprNode::Proj(_))) =>
+                {
+                    elts[at + 1..].iter().for_each(|e| flatten(e, &mut steps));
+                }
+                _ => peel_view_steps(view, h)?
+                    .iter()
+                    .for_each(|e| flatten(e, &mut steps)),
+            }
+        }
+        _ => peel_view_steps(view, h)?
+            .iter()
+            .for_each(|e| flatten(e, &mut steps)),
+    }
+    Some(steps)
+}
+
+/// Whether `steps` read key `key`'s writes off a decision, the positions that write it:
+/// ``.writes ≫ .key ≫ variant_project(`fired)`` (`ccl_utils::write_view_steps`).
+fn reads_writes_of(steps: &[Expr], key: &Label) -> bool {
+    let field = |e: &Expr, want: &Label| matches!(&e.node, TypedExprNode::Proj(ProjKey::Field(f)) if f == want);
+    matches!(steps, [writes, k, fired]
+        if field(writes, &F_WRITES)
+            && field(k, key)
+            && matches!(&fired.node, TypedExprNode::Builtin(Builtin::VariantProject(
+                crate::ccl::FieldKey::Name(tag),
+            )) if *tag == crate::ccl::V_FIRED))
+}
+
+/// Check that accumulator `acc`'s recurrence reads its previous value off its own writes,
+/// ``h ≫ .writes ≫ .acc ≫ variant_project(`fired)``: the changelog the induction store folds
+/// for it, which carries its latest write across the positions that leave it alone.
+fn check_induction_view(view: &Expr, h: &Name, acc: &Label) {
+    assert!(
+        view_steps(view, h).is_some_and(|steps| reads_writes_of(&steps, acc)),
+        "letrec recognition: accumulator `{acc}`'s recurrence reads {}, not its own writes \
+         `{h} ≫ .writes ≫ .{acc} ≫ variant_project(`fired)`, which the induction store folds",
+        symbolic(view)
+    );
+}
+
+/// Check that key `key`'s history, bound to `hist`, reads its previous value off the writes
+/// of exactly the sites the commit engine folds for it, `writing`, the commit-record bindings
+/// whose `write_targets` hold it: one `{time, write}` view per site,
+/// ``(time: 𝑐 ≫ .time, write: 𝑐 ≫ .decision ≫ .writes ≫ .key ≫ variant_project(`fired)) ▷ zip``,
+/// unioned. A key no site writes reads its own history, which holds its seed.
+fn check_txn_view(view: &Expr, hist: &Name, writing: &[&Name]) {
+    let key = hist.field_key();
+    let leg_site = |leg: &Expr| -> Option<Name> {
+        let TypedExprNode::Apply { argument, function } = &leg.node else {
+            return None;
+        };
+        if !matches!(function.node, TypedExprNode::Builtin(Builtin::Zip)) {
+            return None;
+        }
+        let TypedExprNode::Record(fields) = &argument.node else {
+            return None;
+        };
+        let [time, write] = fields.as_slice() else {
+            return None;
+        };
+        if time.label != F_TIME || write.label != crate::ccl::F_WRITE {
+            return None;
+        }
+        let TypedExprNode::Compose(time_steps) = &time.value.node else {
+            return None;
+        };
+        let [site, time_proj] = time_steps.as_slice() else {
+            return None;
+        };
+        let TypedExprNode::Var(site) = &site.node else {
+            return None;
+        };
+        let read = view_steps(&write.value, site)?;
+        let reads_time =
+            matches!(&time_proj.node, TypedExprNode::Proj(ProjKey::Field(f)) if *f == F_TIME);
+        let reads_writes = matches!(read.split_first(), Some((decision, rest))
+            if matches!(&decision.node, TypedExprNode::Proj(ProjKey::Field(f)) if *f == F_DECISION)
+                && reads_writes_of(rest, &key));
+        (reads_time && reads_writes).then(|| site.clone())
+    };
+    let ok = if writing.is_empty() {
+        matches!(&view.node, TypedExprNode::Var(n) if n == hist)
+    } else {
+        let legs: Vec<&Expr> = match &view.node {
+            TypedExprNode::Copair(legs) => legs.iter().collect(),
+            _ => vec![view],
+        };
+        let sites: Option<Vec<Name>> = legs.into_iter().map(leg_site).collect();
+        sites.is_some_and(|mut sites| {
+            let mut want: Vec<Name> = writing.iter().map(|n| (*n).clone()).collect();
+            sites.sort();
+            want.sort();
+            sites == want
+        })
+    };
+    assert!(
+        ok,
+        "letrec recognition: `{hist}`'s history reads {}, not the writes of the sites that \
+         write it, {writing:?}, which the commit engine folds",
+        symbolic(view)
+    );
 }
 
 /// Whether a writer's decision collapsed to a constant function `⟨record⟩ ▷ const`.
@@ -483,8 +629,8 @@ enum TxnBinding {
     History,
     /// `commits_j : 𝐼 ⇒ {time, write_targets, decision} = let __t = begin in ⟨record⟩`.
     Commit,
-    /// ``__to_<defer> : 𝐼 ⤇ {`fired{V} | `idle} = commits_j ≫ .decision ≫
-    /// variant_project(`commit) ≫ .field``, keyed by item ([`tap_field`]).
+    /// ``__to_<defer> : 𝐼 ⤇ {`fired{V} | `idle} = commits_j ≫ .decision ≫ .field``, keyed by
+    /// item ([`tap_field`]).
     Tap,
 }
 
@@ -593,8 +739,8 @@ fn recover_writer(site_dom: &Type, def: Expr) -> WriterSite {
 /// The history-record tap field a tap binding projects — its trailing field projection — and
 /// the commit-record binding it reads.
 ///
-/// A tap reads its site's commit records ``commits_j ≫ .decision ≫ variant_project(`commit) ≫
-/// .field``, keyed by the item each was committed for, as `commits_j` is.
+/// A tap reads its site's commit records `commits_j ≫ .decision ≫ .field`, keyed by the item
+/// each was committed for, as `commits_j` is.
 fn tap_field(def: &Expr) -> (Label, Name) {
     let TypedExprNode::Compose(elts) = &def.node else {
         panic!("letrec recognition: tap binding is not a composition");
@@ -649,12 +795,16 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
     let mut taps: Vec<(Name, Label, Type, Name)> = Vec::new();
     // Every binding name, to assert the continuation has no dangling references.
     let mut binding_names: Vec<Name> = Vec::with_capacity(bindings.len());
+    // Each key's history binding with the view its guard reads, checked once every site's
+    // write set is known.
+    let mut histories: Vec<(Name, Expr)> = Vec::new();
 
     for (b, def) in bindings {
         binding_names.push(b.name.clone());
         match classify_txn_binding(&def) {
             TxnBinding::History => {
-                let (init, _, which) = split_causal_compose(def);
+                let (view, init, _, which) = split_causal_compose(def);
+                histories.push((b.name.clone(), view));
                 assert!(
                     matches!(which, Builtin::GetPrevTxn),
                     "letrec recognition: transaction history guarded by get_prev_seq"
@@ -702,6 +852,15 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
                 taps.push((b.name.clone(), field, b.ty.clone(), commits));
             }
         }
+    }
+
+    for (hist, view) in &histories {
+        let writing: Vec<&Name> = writer_of
+            .iter()
+            .filter(|(_, w)| writers[**w].write_keys.contains(hist))
+            .map(|(commits, _)| commits)
+            .collect();
+        check_txn_view(view, hist, &writing);
     }
 
     // A writer's source reading an earlier writer's tap reads it as a name the writer binds in
@@ -1035,11 +1194,10 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
          to the commit store: {}",
         h.ty
     );
-    // The decision codomain is the variant `` {`commit{𝑃} | `abort} ``; the feed taps
-    // ride the (dense) `commit` payload record `𝑃` alongside `writes`.
-    let payload_ty = commit_payload_ty(&decision_ty);
+    // The decision is the record `{writes, __to_<feed>*}`: the feed taps ride beside `writes`.
+    let payload_ty = decision_ty.peel_refinements().clone();
     let Type::Record(payload_field_tys) = &payload_ty else {
-        panic!("letrec recognition: commit payload is not a record: {payload_ty}");
+        panic!("letrec recognition: a decision is a record: {payload_ty}");
     };
     let feed_fields: Vec<(Label, Type)> = payload_field_tys
         .iter()
@@ -1058,17 +1216,33 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
              shape"
         );
     };
-    let (defaults, seeds_closed, which) = split_causal_compose(*guard);
-    assert!(
-        matches!(which, Builtin::GetPrevSeq),
-        "letrec recognition: induction history causal by get_prev_txn"
-    );
-    let TypedExprNode::Record(inits) = defaults.node else {
-        panic!("letrec recognition: guard defaults are not the accumulators' inits record");
+    // The guard is one causal read per accumulator, `(acc: ⟨guard⟩, …) ▷ zip`: each
+    // accumulator's previous value comes from its own writes.
+    let TypedExprNode::Apply {
+        argument: guards,
+        function: zip,
+    } = guard.node
+    else {
+        panic!("letrec recognition: an induction guard is a record of per-accumulator guards");
     };
-    let inits: Vec<(Label, Expr)> = inits
+    assert!(
+        matches!(zip.node, TypedExprNode::Builtin(Builtin::Zip)),
+        "letrec recognition: an induction guard zips its per-accumulator guards"
+    );
+    let TypedExprNode::Record(guards) = guards.node else {
+        panic!("letrec recognition: an induction guard is a record of per-accumulator guards");
+    };
+    let inits: Vec<(Label, Expr, bool)> = guards
         .into_iter()
-        .map(|entry| (entry.label, entry.value))
+        .map(|entry| {
+            let (view, init, closed, which) = split_causal_compose(entry.value);
+            assert!(
+                matches!(which, Builtin::GetPrevSeq),
+                "letrec recognition: induction history causal by get_prev_txn"
+            );
+            check_induction_view(&view, &h.name, &entry.label);
+            (entry.label, init, closed)
+        })
         .collect();
 
     let (prev_slots, source, writer_body, parameter) =
@@ -1107,7 +1281,7 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     // names. The slots are what the body reads, in its parameter order, so they give the
     // writer's read keys: every accumulator for a decision that reads them all, none for a
     // constant one.
-    let labels: Vec<Label> = inits.iter().map(|(label, _)| label.clone()).collect();
+    let labels: Vec<Label> = inits.iter().map(|(label, _, _)| label.clone()).collect();
     let slot_accumulators: Vec<usize> = prev_slots
         .iter()
         .map(|slot| {
@@ -1125,11 +1299,16 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     let Some((_, Type::Record(write_field_tys))) =
         payload_field_tys.iter().find(|(n, _)| n == F_WRITES)
     else {
-        panic!("letrec recognition: commit payload carries a `writes` record: {payload_ty}");
+        panic!("letrec recognition: a decision carries a `writes` record: {payload_ty}");
     };
+    // Each write holds `` {`fired{𝑉} | `idle} ``, and the accumulator holds the `𝑉`.
+    let write_field_tys: Vec<(Label, Type)> = write_field_tys
+        .iter()
+        .map(|(label, ty)| (label.clone(), fired_value_ty(ty)))
+        .collect();
     let acc_tys: Vec<Type> = inits
         .iter()
-        .map(|(label, _)| {
+        .map(|(label, _, _)| {
             write_field_tys
                 .iter()
                 .find(|(n, _)| n == label)
@@ -1157,12 +1336,12 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     // resume an accumulator rather than guess by position.
     let keys: Vec<TransactKey> = inits
         .into_iter()
-        .map(|(label, init)| {
+        .map(|(label, init, closed)| {
             // A nested `Transact`'s seed is a morphism of the enclosing writer's parameter.
-            // A record of seeds closed in it rides under one `const`, which distributes
-            // over the fields — the shape a mutable variable the enclosing body
-            // introduces leaves, its seed being the same at every enclosing position.
-            let init = match (&enclosing, seeds_closed) {
+            // A seed closed in it rides under a `const` — the shape a mutable variable the
+            // enclosing body introduces leaves, its seed being the same at every enclosing
+            // position.
+            let init = match (&enclosing, closed) {
                 (Some(ctx_ty), true) => {
                     let init_ty = init.ty.clone();
                     apply_primitive(init, Builtin::Const, Type::fun(ctx_ty.clone(), init_ty))
@@ -1322,17 +1501,7 @@ fn rewrite_hist_reads(e: &mut Expr, h: &Name, reads: &HistReads<'_>) {
     let split = split_view_tail(e);
     let view: &Expr = split.as_ref().map_or(&*e, |(view, _)| view);
     if let Some(steps) = peel_view_steps(view, h)
-        // The decision's `` variant_project(`commit) `` step comes first, as on the flat
-        // path below; the payload-field reads follow it.
-        && matches!(
-            steps.first().map(|x| &x.node),
-            Some(TypedExprNode::Builtin(Builtin::VariantProject(_)))
-        )
-        && let Some((read, consumed)) = history_read_replacement(
-            steps.get(1).map(|x| &x.node),
-            steps.get(2).map(|x| &x.node),
-            reads,
-        )
+        && let Some((read, consumed)) = history_read_replacement(&steps, reads)
     {
         let _g = provenance::enter(
             e.node_id(),
@@ -1340,7 +1509,7 @@ fn rewrite_hist_reads(e: &mut Expr, h: &Name, reads: &HistReads<'_>) {
             provenance::Nature::Machinery,
         );
         let outer_ty = e.ty.clone();
-        let rest: Vec<Expr> = steps[1 + consumed..].to_vec();
+        let rest: Vec<Expr> = steps[consumed..].to_vec();
         let view_ty = view.ty.clone();
         let after = split.map(|(_, after)| after).unwrap_or_default();
         let rewritten = match reads.enclosing {
@@ -1363,14 +1532,6 @@ fn rewrite_hist_reads(e: &mut Expr, h: &Name, reads: &HistReads<'_>) {
     }
     if let TypedExprNode::Compose(elts) = &e.node
         && matches!(elts.first().map(|x| &x.node), Some(TypedExprNode::Var(n)) if n == h)
-        // A ``variant_project(`commit)`` step sits between the history var and the
-        // `.writes`/`.__to_<feed>` reads, eliminating the `` {`commit{𝑃} | `abort} ``
-        // decision to its dense payload. Skip it, then match the payload-field prefix
-        // (`elts[2]`/`elts[3]`).
-        && matches!(
-            elts.get(1).map(|x| &x.node),
-            Some(TypedExprNode::Builtin(Builtin::VariantProject(_)))
-        )
     {
         // The whole compose is what the recording names: the history-record read
         // replaces its matched prefix and, when a tail survives, the rebuilt
@@ -1382,13 +1543,9 @@ fn rewrite_hist_reads(e: &mut Expr, h: &Name, reads: &HistReads<'_>) {
             provenance::Nature::Machinery,
         );
         // The history-record read replacing the matched prefix, plus how many compose
-        // elements the prefix covered (the `variant_project` step included).
-        let replacement: Option<(Expr, usize)> = history_read_replacement(
-            elts.get(2).map(|x| &x.node),
-            elts.get(3).map(|x| &x.node),
-            reads,
-        )
-        .map(|(read, consumed)| (read, 2 + consumed));
+        // elements the prefix covered (the history var included).
+        let replacement: Option<(Expr, usize)> = history_read_replacement(&elts[1..], reads)
+            .map(|(read, consumed)| (read, 1 + consumed));
         if let Some((read, covered)) = replacement {
             let rest: Vec<Expr> = elts[covered..].to_vec();
             let outer_ty = e.ty.clone();
@@ -1585,36 +1742,38 @@ fn peel_view_steps(e: &Expr, h: &Name) -> Option<Vec<Expr>> {
     Some(steps)
 }
 
-/// The history-record read a `` variant_project(`commit) `` view resolves to, and how
-/// many of the steps after it the read consumes.
+/// The history-record read a view of the decision history resolves to, and how many of its
+/// `steps` the read consumes.
 ///
-/// `a` and `b` are the two steps following the projection. An accumulator read takes
-/// both (`.writes ≫ .acc`); a feed tap takes one (`.__to_<defer>`).
-fn history_read_replacement(
-    a: Option<&TypedExprNode>,
-    b: Option<&TypedExprNode>,
-    reads: &HistReads<'_>,
-) -> Option<(Expr, usize)> {
+/// An accumulator read takes three, `.writes ≫ .acc ≫ variant_project(`fired)`, and resolves
+/// to the accumulator's history, which holds its value at every position. A feed tap takes
+/// one, `.__to_<defer>`, and the steps after it read the tap as they did the decision's.
+fn history_read_replacement(steps: &[Expr], reads: &HistReads<'_>) -> Option<(Expr, usize)> {
     let hist_ty = reads.hist_ty;
-    match (a, b) {
-        // An accumulator read `` __hist ≫ variant_project(`commit) ≫ .writes ≫ .acc ``.
-        // Both projections are named now that the write set is keyed by accumulator,
-        // so `.writes` on the outer one is what tells this from a tap read.
-        (
-            Some(TypedExprNode::Proj(ProjKey::Field(f))),
-            Some(TypedExprNode::Proj(ProjKey::Field(acc))),
-        ) if f == F_WRITES => {
+    match steps {
+        [first, second, third, ..] if matches!(&first.node, TypedExprNode::Proj(ProjKey::Field(f)) if f == F_WRITES) =>
+        {
+            let TypedExprNode::Proj(ProjKey::Field(acc)) = &second.node else {
+                return None;
+            };
+            if !matches!(
+                &third.node,
+                TypedExprNode::Builtin(Builtin::VariantProject(_))
+            ) {
+                return None;
+            }
             let field_ty = hist_ty_field(hist_ty, acc);
-            Some((hist_field_read_of(reads, acc.clone(), field_ty), 2))
+            Some((hist_field_read_of(reads, acc.clone(), field_ty), 3))
         }
-        (Some(TypedExprNode::Proj(ProjKey::Field(f))), _) if f != F_WRITES => {
-            // A tap read ``__hist ≫ variant_project(`commit) ≫ .__to_<feed>``: its
-            // function type is the history record's field type.
-            let field = f.clone();
-            let field_ty = hist_ty_field(hist_ty, &field);
-            Some((hist_field_read_of(reads, field, field_ty), 1))
-        }
-        _ => None,
+        [first, ..] => match &first.node {
+            TypedExprNode::Proj(ProjKey::Field(f)) if f != F_WRITES => {
+                let field = f.clone();
+                let field_ty = hist_ty_field(hist_ty, &field);
+                Some((hist_field_read_of(reads, field, field_ty), 1))
+            }
+            _ => None,
+        },
+        [] => None,
     }
 }
 
@@ -1628,4 +1787,102 @@ fn hist_ty_field(hist_ty: &Type, field: &Label) -> Type {
         .unwrap_or_else(|| panic!("letrec recognition: history record lacks field `{field}`"))
         .1
         .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ccl::{FieldKey, V_FIRED, V_IDLE};
+
+    /// `steps` after `base`, composed.
+    fn view(base: &Name, steps: Vec<Expr>) -> Expr {
+        Expr::compose(
+            std::iter::once(Expr::var(base.clone()))
+                .chain(steps)
+                .collect(),
+        )
+    }
+
+    /// ``.writes ≫ .key ≫ variant_project(`tag)``.
+    fn writes_of(key: &str, tag: Label) -> Vec<Expr> {
+        vec![
+            Expr::proj_field(F_WRITES),
+            Expr::proj_field(key),
+            Expr::builtin(Builtin::VariantProject(FieldKey::Name(tag))),
+        ]
+    }
+
+    /// One site's `{time, write}` view of key `key`.
+    fn txn_leg(site: &Name, key: &str) -> Expr {
+        let time = view(site, vec![Expr::proj_field(F_TIME)]);
+        let write = view(
+            site,
+            std::iter::once(Expr::proj_field(F_DECISION))
+                .chain(writes_of(key, V_FIRED))
+                .collect(),
+        );
+        Expr::apply(
+            Expr::new(TypedExprNode::Record(RecordEntry::minted([
+                (F_TIME, time),
+                (crate::ccl::F_WRITE, write),
+            ]))),
+            Expr::builtin(Builtin::Zip),
+        )
+    }
+
+    /// An accumulator's recurrence reads its own writes, flat or as a family's.
+    #[test]
+    fn an_accumulator_reads_its_own_writes() {
+        let h = Name::fresh("__hist");
+        check_induction_view(&view(&h, writes_of("a", V_FIRED)), &h, &Label::from("a"));
+        let family = Expr::compose(vec![
+            Expr::proj_index(0),
+            Expr::var(h.clone()),
+            Expr::apply(
+                Expr::compose(writes_of("a", V_FIRED)),
+                Expr::builtin(Builtin::Map),
+            ),
+        ]);
+        check_induction_view(&family, &h, &Label::from("a"));
+    }
+
+    #[test]
+    #[should_panic(expected = "not its own writes")]
+    fn an_accumulator_reading_another_ones_writes_is_caught() {
+        let h = Name::fresh("__hist");
+        check_induction_view(&view(&h, writes_of("b", V_FIRED)), &h, &Label::from("a"));
+    }
+
+    #[test]
+    #[should_panic(expected = "not its own writes")]
+    fn an_accumulator_reading_idle_positions_is_caught() {
+        let h = Name::fresh("__hist");
+        check_induction_view(&view(&h, writes_of("a", V_IDLE)), &h, &Label::from("a"));
+    }
+
+    /// A key's history unions the views of exactly the sites that write it, in any order.
+    #[test]
+    fn a_key_reads_the_writes_of_the_sites_that_write_it() {
+        let (p, c1, c2) = (Name::fresh("p"), Name::fresh("c"), Name::fresh("c"));
+        let union = Expr::copair(vec![
+            txn_leg(&c2, p.field_key().name()),
+            txn_leg(&c1, p.field_key().name()),
+        ]);
+        check_txn_view(&union, &p, &[&c1, &c2]);
+        check_txn_view(&Expr::var(p.clone()), &p, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not the writes of the sites that write it")]
+    fn a_key_missing_a_writing_site_is_caught() {
+        let (p, c1, c2) = (Name::fresh("p"), Name::fresh("c"), Name::fresh("c"));
+        check_txn_view(&txn_leg(&c1, p.field_key().name()), &p, &[&c1, &c2]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not the writes of the sites that write it")]
+    fn a_key_reading_another_keys_writes_is_caught() {
+        let (p, c1) = (Name::fresh("p"), Name::fresh("c"));
+        check_txn_view(&txn_leg(&c1, "q"), &p, &[&c1]);
+    }
 }

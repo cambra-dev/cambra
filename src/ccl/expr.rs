@@ -14,36 +14,27 @@ use crate::ccl::{
 use crate::chl_parser::ModulePath;
 use crate::chl_parser::ast::Span;
 
-/// The `commit` tag of a writer **decision variant** —
-/// `` {`commit{𝑃} | `abort} ``. `𝑃` is the (dense) write/reply payload record
-/// (`{writes, __to_<defer>*}`); a committing position carries it. Both the
-/// transaction writer and the induction writer build the same variant through
-/// [`crate::ccl::ccl_utils::wrap_decision_variant`], and the runtime
-/// (`body_decision_at`) decodes the tag: `commit` proposes the payload's writes,
-/// `abort` denies (carry, no proposal).
-pub const V_COMMIT: Label = Label::fixed("commit");
-/// The `abort` tag of a writer **decision variant** — the nullary
-/// whole-transaction deny (nothing fired). See [`V_COMMIT`].
-pub const V_ABORT: Label = Label::fixed("abort");
-/// The `writes` field of a [`WriterSite`] decision record — the proposed new
-/// values keyed by the mutable variable each is for (`writes.k` for the key
-/// spelled `k`, via [`Name::field_key`](crate::ccl::Name::field_key)). A slot
-/// therefore carries which variable it belongs to, which is what lets a second
-/// compilation of one program match a store's contents back to its declarations.
+/// The `writes` field of a [`WriterSite`] decision record — each mutable variable the
+/// writer may write, keyed by the variable (`writes.k` for the key spelled `k`, via
+/// [`Name::field_key`](crate::ccl::Name::field_key)), holding its new value where the
+/// decision writes it. A slot therefore carries which variable it belongs to, which is what
+/// lets a second compilation of one program match a store's contents back to its
+/// declarations.
 pub const F_WRITES: Label = Label::fixed("writes");
-// Tags of a **reply tap** on a decision record. A tap `__to_<defer>_k` has a value
-// exactly at the positions it fires, and its type says so: `` {`fired{𝑉} | `idle}
-// ``. A feed under one arm of cross-key routing fires on its own route only, so a
-// sibling route's commit leaves the tap `` `idle `` rather than appending a value
-// the program never fed.
+// Tags of a **write** and of a **reply tap** on a decision record
+// ([`crate::ccl::ccl_utils::writer_decision`]). Each has a value exactly at the positions
+// it fires, and its type says so: `` {`fired{𝑉} | `idle} ``. A write under one arm of a
+// branch fires on that arm's path only, so a path that leaves the variable alone writes
+// nothing to it, and a feed under one arm leaves its tap `` `idle `` on a sibling arm rather
+// than appending a value the program never fed.
 //
 // The tag sits in the one place that cannot disagree with the value; see
-// `crate::ccl::ccl_utils::writer_decision_record` for why a companion `Bool` gate
-// cannot carry a domain-restricted feed value.
-/// The tag of a tap that fired at this position, carrying the fed value.
+// `crate::ccl::ccl_utils::writer_decision` for why a companion `Bool` gate cannot carry a
+// domain-restricted value.
+/// The tag of a write or a tap that fired at this position, carrying its value.
 pub const V_FIRED: Label = Label::fixed("fired");
-/// The tag of a tap that did not fire at this position. Nullary: a tap that did
-/// not fire has no value.
+/// The tag of a write or a tap that did not fire at this position. Nullary: it has no
+/// value.
 pub const V_IDLE: Label = Label::fixed("idle");
 
 // Field names of a **commit-record** binding — the intermediate representation
@@ -52,8 +43,8 @@ pub const V_IDLE: Label = Label::fixed("idle");
 // per `with begin():` site carries: the commit time `begin(r)` (`time`), the
 // history bindings of the write-set keys (`write_targets`, so recognition can
 // recover the writer's `write_keys` without a per-key merge), and the writer's
-// verbatim `` {`commit{writes, __to_<defer>*} | `abort} `` decision variant applied to
-// the mutable variable snapshot at that time (`decision`). Only `write_targets`/`decision`
+// verbatim `{writes, __to_<defer>*}` decision applied to the mutable variable snapshot at
+// that time (`decision`). Only `write_targets`/`decision`
 // reach recognition; `time` records the commit clock for the model's honesty.
 /// The `time` field of a commit-record binding — the transaction's commit time
 /// `begin(r)`, at which the writer's mutable variable snapshots are read.
@@ -63,15 +54,14 @@ pub const F_TIME: Label = Label::fixed("time");
 /// `write_keys[i]`), the encoding recognition reads a site's `write_keys` off.
 pub const F_WRITE_TARGETS: Label = Label::fixed("write_targets");
 /// The `decision` field of a commit-record binding — the writer's verbatim
-/// `` {`commit{writes, __to_<defer>*} | `abort} `` decision variant, applied to the
-/// mutable variable snapshot at the commit time. Recognition lifts the writer body out of it.
+/// `{writes, __to_<defer>*}` decision, applied to the mutable variable snapshot at the
+/// commit time. Recognition lifts the writer body out of it.
 pub const F_DECISION: Label = Label::fixed("decision");
-/// The `write` field of a **per-key commit view** — the single value a site's
-/// commit proposes for one mutable variable key (`decision ▷ variant_project(`commit) ▷
-/// .writes.k`, re-projected). A key's history binding searches the `⧺`-merged
-/// per-key views of every site writing it: `{time, write}` per *committing*
-/// transaction (the ``variant_project(`commit)`` eliminator drops `` `abort ``
-/// positions), the exact record shape the design doc gives `get_prev_txn`'s
+/// The `write` field of a **per-key commit view** — the value a site's transaction writes
+/// to one mutable variable key (``decision ▷ .writes ▷ .k ▷ variant_project(`fired)``). A
+/// key's history binding searches the `⧺`-merged per-key views of every site writing it:
+/// `{time, write}` per transaction that writes the key (the ``variant_project(`fired)``
+/// eliminator drops the rest), the exact record shape the design doc gives `get_prev_txn`'s
 /// history argument.
 pub const F_WRITE: Label = Label::fixed("write");
 
@@ -982,8 +972,8 @@ pub enum TypedExprNode {
     /// Born **post-inference**, by the `Case` fan-outs in
     /// [`crate::ccl::lambda_elim`]: the arms of one `Case` restrict the *same* fed
     /// domain — by a first-match guard, or by tag — so their results must land back
-    /// on it rather than on a coproduct. A writer decision, for instance, has to
-    /// co-iterate with the sibling `commit` field of its own record.
+    /// on it rather than on a coproduct. A conditional write in a writer decision, for
+    /// instance, has to co-iterate with the sibling fields of its own record.
     DisjointJoin(Vec<TypedExpr>),
 
     /// A conditional collection realized as the union of its gated legs, typed as the sum
@@ -2999,11 +2989,11 @@ pub struct WriterSite {
     /// whose codomain elements are passed to [`Self::body`]. Sits *outside* the
     /// snapshot-parameter scope.
     pub source: TypedExpr,
-    /// The per-position decision — ``Fun(Tuple(snap…, item), {`commit{writes: {k: new…}, __to_<defer>*} | `abort})``: reads the mutable variable snapshot and returns
-    /// a grant/deny variant — `` `commit `` carries the (dense) per-key write set and
-    /// any per-position `__to_<defer>` feed taps; `` `abort `` is the whole-transaction
-    /// deny (carry, no proposal). An induction (`mut`-loop) position `` `commit ``s
-    /// unless every branch carries (a full non-writing position `` `abort ``s).
+    /// The per-position decision — ``Fun(Tuple(snap…, item), {writes: {k: {`fired{new} |
+    /// `idle}…}, __to_<defer>*})``: reads the mutable variable snapshot and returns each
+    /// key's write and each feed's tap, `` `fired `` where its path reaches it. A
+    /// transaction that fires no write writes nothing at its tick, and an induction
+    /// position that fires none carries every accumulator.
     pub body: TypedExpr,
     /// The item taps of earlier writers of the same `Transact` that [`Self::source`] reads,
     /// each bound in `source` to its name here: a block whose source carries the value of an

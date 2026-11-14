@@ -7,7 +7,7 @@ use smol_str::SmolStr;
 use crate::{
     ccl::{
         AggregateKind, Builtin, Expr, F_WRITES, FieldKey, Lit, Name, ProjKey, Reading, TagMap,
-        TransactKey, Type, TypedExprNode, V_COMMIT, WriterSite,
+        TransactKey, Type, TypedExprNode, WriterSite,
         ccl_utils::strip_refinements,
         ccl_utils::{free_names, is_trivially_true_predicate},
         content_hash::{ContentHash, content_hash},
@@ -3943,12 +3943,11 @@ fn build_transact_store(
     build_commit_store(keys, writers, value_tys, paths, ctx)
 }
 
-/// The reply taps on a writer body's `` {`commit{writes, __to_<defer>*} | `abort} ``
-/// decision — every field of the (dense) `commit` payload record other than
-/// `writes`, with its per-commit value type. A tap is a reply (`out << e`) that
-/// channelize folded onto the writer body; for a commit store, op-conversion commits
-/// each tap as a write-only key so the reply rides the transaction's commit and is
-/// read back as a value-stream. Empty for a writer with no reply.
+/// The reply taps on a writer body's decision record `{writes, __to_<defer>*}` — every field
+/// other than `writes`, with its type. A tap is a reply (`out << e`) that channelize folded
+/// onto the writer body; for a commit store, op-conversion commits each tap as a write-only
+/// key so the reply rides the transaction's commit and is read back as a value-stream. Empty
+/// for a writer with no reply.
 ///
 /// The type is the tap's `` {`fired{𝑉} | `idle} ``
 /// ([`tap_variant_ty`](crate::ccl::ccl_utils::tap_variant_ty)) as the decision
@@ -3960,20 +3959,14 @@ fn body_tap_fields(body_ty: &Type) -> Vec<(Label, Type)> {
     let Some(codom) = body_ty.codomain() else {
         return Vec::new();
     };
-    // Peel the `commit` payload record out of the decision variant.
-    let Type::Variant(tags, _) = codom else {
-        return Vec::new();
-    };
-    let Some((_, Type::Record(fields))) = tags
-        .into_iter()
-        .find(|(k, _)| matches!(k, FieldKey::Name(n) if n == V_COMMIT))
-    else {
+    let Type::Record(fields) = codom.peel_refinements() else {
         return Vec::new();
     };
     fields
-        .into_iter()
+        .iter()
         // `writes` is the decision core; every other field is a tap.
         .filter(|(f, _)| f != F_WRITES)
+        .cloned()
         .collect()
 }
 
@@ -4079,14 +4072,14 @@ fn store_key_extent(arms: Vec<(Label, Extent)>) -> Extent {
     ))
 }
 
-/// Build a [`Type::Txn`] transactional store: a multi-key [`CommitOperator`]
-/// wired in a cyclic [`FanOut`], one *fused* [`CommitWriter`] per writer (a
-/// slot of the shared store output). Each fused writer reads the cyclic store,
-/// runs its body — the ``let k₀ = p.0 in … let item = p.r in {`commit{writes} | `abort}`` decision, whose input is the driver's tile — and either grants (appends
-/// a proposal) or denies. A single writer is the degenerate case (no conflicts →
-/// no retries); ≥2 writers serialize through the operator with conflict + retry.
-/// A *fused* writer (not fanned) is load-bearing: a stateful sequencing producer
-/// cannot be fanned without desyncing its append-only proposal positions.
+/// Build a [`Type::Txn`] transactional store: a multi-key [`CommitOperator`] wired in a cyclic
+/// [`FanOut`], one *fused* [`CommitWriter`] per writer (a slot of the shared store output). Each
+/// fused writer reads the cyclic store, runs its body — the ``let k₀ = p.0 in … let item = p.r in
+/// {writes, …}`` decision, whose input is the driver's tile — and appends a proposal of what it
+/// writes. A single writer is the degenerate case (no conflicts → no retries); ≥2 writers serialize
+/// through the operator with conflict + retry. A *fused* writer (not fanned) is load-bearing: a
+/// stateful sequencing producer cannot be fanned without desyncing its append-only proposal
+/// positions.
 fn build_commit_store(
     keys: &[TransactKey],
     writers: &[WriterSite],

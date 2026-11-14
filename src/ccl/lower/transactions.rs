@@ -270,7 +270,7 @@ fn lower_tx_block_scoped(
                 assignment.wrap(val, chain, stmt.span, ctx)
             }
             // `if cond: <writes>` — a conditional (deny) write. The no-else
-            // branch is the deny: `commit = false` for the whole transaction.
+            // branch is the deny: the transaction writes nothing there.
             ChlStmt::If {
                 branches,
                 else_body,
@@ -437,7 +437,7 @@ fn write_or_let(
 
 /// Lower an `if`/`elif`/`else` guard inside a transaction to a `Case`. A bare
 /// `if cond:` (no `else`) is the deny idiom — its implicit else branch is `Unit`
-/// (no writes), which `transact_phase` reads as `commit = false`. Where `valued`, the
+/// (no writes), where the transaction writes nothing. Where `valued`, the
 /// `if` ends a block in value position and each branch ends in its value.
 fn lower_tx_if(
     branches: &[IfBranch],

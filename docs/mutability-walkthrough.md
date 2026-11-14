@@ -211,9 +211,9 @@ they are the answers to the three questions people usually ask:
   denotes one.
 - **Multiple writers are fine.** Several sites writing one mutable variable merge their commit
   streams by time before the search. Nothing is single-writer here.
-- **A denial writes nothing at all.** Commit records exist only for committed
-  transactions (allocate-on-commit), so `get_prev_txn` searches with no `commit: Bool`
-  filter to apply.
+- **A denial writes nothing at all.** Each write in a commit record is `` `fired `` where the
+  transaction makes it and `` `idle `` elsewhere, and a key's view keeps only the fired ones,
+  so `get_prev_txn` searches with no filter to apply.
 
 ## 4. What a programmer writes
 
@@ -277,8 +277,8 @@ out
 ```
 
 `r = 70` commits (`pool` 100 → 30) and replies `30` at item 0. `r = 50` fails its
-guard `30 >= 50`, so that transaction denies: no tick, no write, **no reply**. `out` holds
-one element, not two.
+guard `30 >= 50`, so that transaction denies: it takes a tick, writes nothing and sends **no
+reply**. `out` holds one element, not two.
 
 **2. Outside any block, on the loop spine — iteration-indexed and ungated.** It fires
 every iteration regardless of what the transaction decided, riding the loop's own domain:
@@ -505,10 +505,10 @@ induction write inside a block — so nothing downstream has to represent those 
 than on syntax. Four steps:
 
 1. **strip** — consume every `Begin`, building one writer site per writing block: its
-   read/write footprint, its loop source, and a `` `commit ``/`` `abort `` decision lambda
-   built by threading read-your-writes, the block's bindings kept as bindings
+   read/write footprint, its loop source, and a decision lambda built by threading
+   read-your-writes, the block's bindings kept as bindings
    ([Loop-body bindings](../src/ccl/design/mutability.md#loop-body-bindings)). An in-block
-   `<<` becomes a `__to_<defer>` tap on the `` `commit `` payload. A *read-only* block leaves
+   `<<` becomes a `__to_<defer>` tap on the decision. A *read-only* block leaves
    no writer site, but its footprint is kept — it is a reason two variables share a store.
 2. **partition** — union-find over those footprints, so a program gets one store per set of
    variables some block actually relates, rather than one store overall. A block is the only
@@ -543,14 +543,14 @@ in for r in [10, 20, 30] do unit;
          ( (time: …, write: …) ▷ zip ⊎ (time: …, write: …) ▷ zip,   ← both sites, merged
            __t, 100 ) ▷ get_prev_txn
 
-     __commits : (0..3 ⤇ {…, decision: {`commit{writes: (Int), to_out_0: Int} | `abort}}) =
-       λ __r : 0..3 → … `commit((writes: (__txp.0 - __txp.1), to_out_0: __txp.0 - __txp.1)) …
+     __commits : (0..3 ⤇ {…, decision: {writes: {pool: {`fired{Int} | `idle}}, to_out_0: …}}) =
+       λ __r : 0..3 → … (writes: (pool: `fired(__txp.0 - __txp.1)), to_out_0: `fired(…)) …
 
-     __commits : (0..1 ⤇ {…, decision: {`commit{writes: (Int), to_out_1: Int} | `abort}}) =
-       λ __r : 0..1 → … `commit((writes: (__txp.0 - 5), to_out_1: __txp.0 - 5)) …
+     __commits : (0..1 ⤇ {…, decision: {writes: {pool: {`fired{Int} | `idle}}, to_out_1: …}}) =
+       λ __r : 0..1 → … (writes: (pool: `fired(__txp.0 - 5)), to_out_1: `fired(…)) …
 
-     to_out_0 : (0..3 ⤇ {`fired{Int} | `idle}) = __commits ≫ .decision ≫ variant_project(`commit) ≫ .to_out_0
-     to_out_1 : (0..1 ⤇ {`fired{Int} | `idle}) = __commits ≫ .decision ≫ variant_project(`commit) ≫ .to_out_1
+     to_out_0 : (0..3 ⤇ {`fired{Int} | `idle}) = __commits ≫ .decision ≫ .to_out_0
+     to_out_1 : (0..1 ⤇ {`fired{Int} | `idle}) = __commits ≫ .decision ≫ .to_out_1
    in feed(out, to_out_0); feed(out, to_out_1); pool ▷ final_read
 ```
 
@@ -565,11 +565,11 @@ Reading it off — exactly the shape §3 predicted, now with two writers:
   resolves to the latest commit *strictly before* `__t`, so it is not a self-reference at the
   same position. The `pool ↔ __commits` cycle crosses `get_prev_txn` exactly once, so it is
   well-founded.
-- **each `<<` became a tap on its own site's decision** — `to_out_0` beside `writes` in the
-  loop's `` `commit `` payload, `to_out_1` in the block's. A denied transaction carries
-  neither, which is placement 1 of §4 in the concrete: a reply is gated on the commit because
-  it *rides* the commit. A tap is keyed by the item its transaction ran for, as the site's
-  records are, so a reply answers the iteration that fed it.
+- **each `<<` became a tap on its own site's decision** — `to_out_0` beside `writes` in the loop's
+  decision, `to_out_1` in the block's. A denied transaction fires neither, which is placement 1 of
+  §4 in the concrete: a reply is gated on the commit because it *rides* the commit. A tap is keyed
+  by the item its transaction ran for, as the site's records are, so a reply answers the iteration
+  that fed it.
 - **the trailing read is `final_read`**, which is what `await_final` resolves to: a sample of
   `pool`'s carried value at the position its own writers finish. It takes no seed operand,
   the store carrying its own seed.
@@ -593,28 +593,28 @@ through silently.
 ```
 let x : Int = 0
 in letrec
-     __hist : (0..3 ⤇ {`commit{writes: (Int)} | `abort}) =
+     __hist : (0..3 ⤇ {writes: {x: {`fired{Int} | `idle}}}) =
        λ __pos : 0..3 →
-         let __prev : (Int) = (__hist ≫ variant_project(`commit) ≫ .writes, __pos, (x))
-                              ▷ get_prev_seq
-         in (__prev.0, __pos ▷ [1, 2, 3])
-            ▷ (λ __p : (Int, Int) → { true → `commit((writes: (__p.0 + __p.1)));
-                                      true → `abort(unit) })
-   in let x : Int = (__hist ≫ variant_project(`commit) ≫ .writes ≫ .0) ▷ final_read
+         let __prev : {x: Int} =
+               (x: (__hist ≫ .writes ≫ .x ≫ variant_project(`fired), __pos, x) ▷ get_prev_seq)
+         in (__prev.x, __pos ▷ [1, 2, 3])
+            ▷ (λ __p : (Int, Int) → (writes: (x: (__p.0 + __p.1) ▷ variant_wrap(`fired))))
+   in let x : Int = (__hist ≫ .writes ≫ .x ≫ variant_project(`fired)) ▷ final_read
    in x
 ```
 
 Four things to read off it:
 
-- The recurrence is exactly the model's `λ 𝑟 → get_prev_seq(cnt, 𝑟, 0) + 1`, with the seed
-  `x` as `get_prev_seq`'s default — that is where the initializer goes.
+- The recurrence is exactly the model's `λ 𝑟 → get_prev_seq(cnt, 𝑟, 0) + 1`, one
+  `get_prev_seq` per accumulator over its own writes, with the seed `x` as its default — that is
+  where the initializer goes.
 - The loop source is applied at the position: `__pos ▷ [1, 2, 3]` *is* `i`. A collection is
   a function, so "the element at this iteration" is a lookup.
-- **The writer body is a decision**, `` `commit(writes) `` or `` `abort ``, even though this
-  write is unconditional (both guards are `true`). That is not induction-specific
-  scaffolding — it is the *same* shape B's writer produced above, which is what lets one
-  node and one set of planning patterns serve both domains. The tagged sum is what makes
-  "no write" unable to carry a write set.
+- **The writer body is a decision**, each write `` `fired `` or `` `idle ``, even though this
+  write is unconditional. That is not induction-specific scaffolding — it is the *same* shape
+  B's writer produced above, which is what lets one node and one set of planning patterns
+  serve both domains. The tagged sum is what makes a write that did not happen unable to carry
+  a value.
 - The trailing `x` became `final_read(history)`: the value the store holds once the loop has
   run, which is the seed where it ran no position.
 
@@ -754,7 +754,7 @@ counter transactionally consistent declares it `Mut(Int, Txn)`.
 
 Induction and transactions dispatch to different operators, which makes it easy to assume
 two implementations of a store. There is one. Both run the same `CommitEngine` over the same
-`Tile::Store` changelog, consume the same `` `commit ``/`` `abort `` decision, and are read
+`Tile::Store` changelog, consume the same decision record, and are read
 the same way. `InductionStore` owns an engine per open store too, holding the accumulator's init
 as its seed. An induction store is the no-conflict dual of the commit store
 ([The store](../src/interpreter/design-operators.md#the-store)).
@@ -865,8 +865,8 @@ holds an input it barely reads.
 of its own, to read the frontier its proposal is built against.)
 
 **Validate-then-allocate is what makes the concurrency safe.** A stale proposal never
-consumes a tick, so the commit clock has no holes and a denied transaction leaves no trace —
-the engine-level reason `get_prev_txn` needs no `commit: Bool` filter.
+consumes a tick, so the commit clock has no holes, and a denied transaction takes a tick at
+which no key's changelog records anything.
 
 ### Operators
 

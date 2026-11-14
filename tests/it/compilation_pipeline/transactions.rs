@@ -1938,6 +1938,92 @@ fn commit_stores(code: &str) -> Vec<String> {
     stores_in(&ast)
 }
 
+/// Each `with begin():` writer's footprint in `code`, `reads⇒writes`, in the order the
+/// writers stand.
+fn writer_footprints(code: &str) -> Vec<String> {
+    fn names(keys: &[cambra::ccl::Name]) -> String {
+        keys.iter()
+            .map(|k| k.base().to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+    fn walk(e: &cambra::ccl::Expr, out: &mut Vec<String>) {
+        if let cambra::ccl::TypedExprNode::Transact { writers, .. } = &e.node {
+            out.extend(
+                writers
+                    .iter()
+                    .map(|w| format!("[{}]⇒[{}]", names(&w.read_keys), names(&w.write_keys))),
+            );
+        }
+        e.walk_children(|c| walk(c, out));
+    }
+    let mut ctx = GlobalContext::default();
+    let (ast, _) = run_pipeline_with_ctx(&mut ctx, code);
+    let mut out = Vec::new();
+    walk(&ast, &mut out);
+    out
+}
+
+/// A key a block writes on some paths and never reads is not in its read set: a path that
+/// leaves it alone writes nothing to it, so no snapshot stands in for it there, and a commit
+/// to it elsewhere does not make the transaction stale. Each case is the footprint and the
+/// final value.
+#[rstest]
+#[case::under_a_guard(indoc! {"
+    for r in [1, 2, 3]:
+        with begin():
+            if r == 2:
+                x := r * 10
+"}, "[]⇒[x]", 20)]
+#[case::in_nested_branches(indoc! {"
+    for r in [1, 2, 3]:
+        with begin():
+            if r > 1:
+                if r == 3:
+                    x := r * 10
+"}, "[]⇒[x]", 30)]
+#[case::routed_with_another_key(indoc! {"
+    for r in [1, 2, 3]:
+        with begin():
+            if r == 3:
+                x := r * 10
+            elif r == 2:
+                y := r
+"}, "[]⇒[x,y]", 30)]
+#[case::then_on_the_spine(indoc! {"
+    for r in [1, 2, 3]:
+        with begin():
+            if r == 2:
+                x := 5
+            x := 40
+"}, "[]⇒[x]", 40)]
+#[case::beside_a_feed_sharing_its_binding(indoc! {"
+    out: Feed(_)
+    for r in [1, 2, 3]:
+        with begin():
+            if r == 2:
+                t = r * 3
+                x := t
+                out << t
+"}, "[]⇒[x]", 6)]
+#[case::read_after_the_branch(indoc! {"
+    out: Feed(_)
+    for r in [1, 2, 3]:
+        with begin():
+            if r == 2:
+                x := 50
+            out << x
+"}, "[x]⇒[x]", 50)]
+fn a_key_written_on_some_paths_and_never_read_is_not_read(
+    #[case] body: &str,
+    #[case] footprint: &str,
+    #[case] expected: i64,
+) {
+    let code = format!("x: Mut(Int, Txn) := 0\ny: Mut(Int, Txn) := 0\n{body}\nawait_final(x)\n");
+    assert_eq!(writer_footprints(&code), vec![footprint]);
+    check_scalar(&code, Value::Int(expected));
+}
+
 /// Two mutable variables written by separate blocks, with no block mentioning them
 /// together, have no operation relating them — so they get their own stores, and their
 /// own commit clocks, and their own completion.

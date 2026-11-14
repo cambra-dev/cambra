@@ -705,6 +705,7 @@ impl TileOperator for MapResultToConst {
             constant: constant_producer,
             mode: self.mode,
             level: self.level,
+            constant_unread: false,
         })
     }
 }
@@ -715,6 +716,9 @@ struct MapResultToConstProducer {
     constant: Box<dyn TileProducer>,
     mode: MapResultToConstMode,
     level: CurryLevel,
+    /// Whether the last pull found no live row and so did not read the constant. The next
+    /// pull that finds one reads it, and only the input's notification brings that pull.
+    constant_unread: bool,
 }
 
 impl MapResultToConstProducer {
@@ -786,6 +790,10 @@ impl TileProducer for MapResultToConstProducer {
         visit("constant", &*self.constant);
     }
 
+    fn answered_without(&self, role: &str) -> bool {
+        role == "constant" && self.constant_unread
+    }
+
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let c_tiling = self.constant.tiling();
         assert!(
@@ -815,8 +823,10 @@ impl TileProducer for MapResultToConstProducer {
             if let Some(dropped) = input_tile.deleted_keys_guard() {
                 self.input.release(dropped);
             }
+            self.constant_unread = true;
             return self.empty_beneath_live_rows(&input_tile);
         }
+        self.constant_unread = false;
         let streams = c_tiling.is_data_function();
         let constant_guard = c_tiling.universal_guard();
         let constant_tile = self.constant.get(constant_guard);
@@ -1778,6 +1788,7 @@ mod tests {
             )),
             mode: MapResultToConstMode::Replace,
             level: CurryLevel::new(1),
+            constant_unread: false,
         };
         let out = producer.get(producer.tiling().universal_guard());
         assert_eq!(
@@ -1874,6 +1885,7 @@ mod tests {
             )),
             mode: MapResultToConstMode::Replace,
             level: CurryLevel::new(1),
+            constant_unread: false,
         };
         let first = producer.get(producer.tiling().universal_guard());
         assert_eq!(stated(&first), Predicate::at_or_below(Value::UInt(0)));
