@@ -75,6 +75,11 @@ pub(crate) fn fresh_infer_var_id() -> InferVarId {
     InferVarId(INFER_VAR_COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
+/// The id the next variable minted will take: every variable already minted has a smaller one.
+pub(crate) fn next_infer_var_id() -> InferVarId {
+    InferVarId(INFER_VAR_COUNTER.load(Ordering::Relaxed))
+}
+
 /// Reset the inference variable counter to zero.
 ///
 /// For use in tests that need predictable `InferVarId` values in output.
@@ -1120,6 +1125,52 @@ impl InferVar {
     }
 }
 
+/// One entry per field of an [`InferVar`], for a copy of a variable to name each field it carries
+/// or leaves, with why ([`InferVar::fields`]). A field added to the variable fails to compile in
+/// `fields`, and then at every copy that destructures this.
+pub(crate) struct InferVarFields {
+    pub(crate) uid: (),
+    pub(crate) level: (),
+    pub(crate) telescope: (),
+    pub(crate) bounds: (),
+    pub(crate) fun_kind: (),
+    pub(crate) watches: (),
+    pub(crate) suspensions: (),
+    pub(crate) named_domain: (),
+    pub(crate) stands_for: (),
+    pub(crate) witness_scopes: (),
+}
+
+impl InferVar {
+    /// [`InferVarFields`], listed by destructuring this variable exhaustively.
+    pub(crate) fn fields(&self) -> InferVarFields {
+        let InferVar {
+            uid: _,
+            level: _,
+            telescope: _,
+            bounds: _,
+            fun_kind: _,
+            watches: _,
+            suspensions: _,
+            named_domain: _,
+            stands_for: _,
+            witness_scopes: _,
+        } = self;
+        InferVarFields {
+            uid: (),
+            level: (),
+            telescope: (),
+            bounds: (),
+            fun_kind: (),
+            watches: (),
+            suspensions: (),
+            named_domain: (),
+            stands_for: (),
+            witness_scopes: (),
+        }
+    }
+}
+
 // Identity-based: two inference variables are equal iff they share a `uid`.
 // Borrow-free and cycle-free (never touches `bounds`), so it's safe to call
 // on a variable whose bound graph is cyclic or currently borrowed.
@@ -1160,10 +1211,24 @@ impl InferVar {
     /// `ty` is a part of that function, as built by a pass that copies such a function's type
     /// (an instantiation, an annotation's normalization).
     pub fn place_parts_under(ty: &Type, kind: &crate::ccl::ty::FunKind) {
+        Self::place_parts_under_where(ty, kind, &|_| true);
+    }
+
+    /// Place only variables accepted by `keep` under the function's witness scope. A copy
+    /// uses this to preserve captured variables' placement while assigning its fresh parts.
+    pub fn place_parts_under_where(
+        ty: &Type,
+        kind: &crate::ccl::ty::FunKind,
+        keep: &impl Fn(&InferVar) -> bool,
+    ) {
         let Some(scope) = WitnessScope::of_kind(kind) else {
             return;
         };
-        ty.walk_infer_vars(&mut |v| v.place_under(scope.clone()));
+        ty.walk_infer_vars(&mut |v| {
+            if keep(v) {
+                v.place_under(scope.clone());
+            }
+        });
     }
 
     /// Carry `original`'s placement onto `self`, a copy of it at the same position (a proxy,

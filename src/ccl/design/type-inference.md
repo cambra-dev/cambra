@@ -3662,6 +3662,29 @@ to the funkind variables the definition owns, the bound `_ |=> 𝑉` on an assoc
 them, and a specialization of the definition copies both sides with the correspondence between
 them.
 
+Each instantiation, and each specialization's clone, is checked in debug builds against what it
+copied (`PolyScheme::instantiate*`, `specialize_use`, `assert_copied_apart`): no variable or
+funkind variable that stood before it, above the cutoff, is reached from the instance or the
+clone's type slots, through their structure or the copies' bounds and funkind edges. Such a one
+would be shared between the scheme and every use, and would carry whatever one use records into the
+others.
+The audit enters quoted predicate, family-argument and projection terms, and follows copied
+variables' bounds and funkind edges. A function's own funkind is checked even when its domain
+and codomain contain no inference variables. Reaching an enclosing variable or funkind at or
+below the cutoff stops that path: its graph is shared by design.
+
+A copied function places only variables minted by that freshening under its witness scope.
+Captured variables retain their existing placement. Adding a new scope to a captured variable
+would change which substitutions act on it after earlier reads had already discarded them.
+
+
+Every copy of a variable or a funkind variable (freshening, and an extrusion's proxy) destructures
+`InferVar::fields` or `FunKindVar::fields`, which name each field, and states for each what the copy
+makes of it. A field added to either fails to compile at each copy until the copy says whether it
+carries it. The proxy an extrusion makes carries the original's named-domain mark, and its funkind
+variable is related to the original's as the link bound relates the two variables, as a bound the
+solver records between two variables relates theirs.
+
 ### Implementation limits
 
 - Enumerated membership has no disjunctive constraint representation. Unresolved candidate
