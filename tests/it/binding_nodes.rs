@@ -23,6 +23,7 @@ fn binding(name: &str, user_annotation: Option<Type>) -> TypedBinding {
         ty: Type::Hole,
         user_annotation: user_annotation.map(|ty| Annotation::new(ty, Occurrence::mint())),
         transparency: BindingTransparency::Transparent,
+        site: None,
     }
 }
 

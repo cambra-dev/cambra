@@ -1,5 +1,5 @@
-//! Places: where each feed and each named call is written, in terms two versions of a module
-//! agree on (`src/ccl/design/sites.md`).
+//! Places: where each feed, named call, loop and assignment is written, in terms two versions
+//! of a module agree on (`src/ccl/design/sites.md`).
 //!
 //! A [`Place`] names the module, the bindings the author wrote around the node, what the node
 //! is and its spelling, and its index among the places sharing all of those, counted in source
@@ -32,6 +32,11 @@ pub enum PlaceKind {
     /// The body the compiler supplies for a `@Builtin` function, spelled by the function's name
     /// (`docs/chl-spec.md`, "9.16 The std root").
     Builtin,
+    /// A `for` loop, spelled by its target: `for i in xs`.
+    For,
+    /// An assignment of a mutable variable, `x := v`, or a declaration `@LoadFrom` seeds,
+    /// spelled by the variable. The one that declares the variable names it.
+    Assign,
 }
 
 /// Where a feed or a named call is written.
@@ -47,7 +52,8 @@ pub struct Place {
 }
 
 /// `module::binding.binding.spelling<<#index`, with `()` in place of `<<` for a call, nothing
-/// for a `yield`, and no `#index` for the first.
+/// for a `yield`, `for spelling` for a loop, `:=` for an assignment, and no `#index` for the
+/// first.
 impl fmt::Display for Place {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for segment in self.module.iter() {
@@ -61,6 +67,8 @@ impl fmt::Display for Place {
             PlaceKind::Yield => write!(f, "{}", self.spelling)?,
             PlaceKind::Call => write!(f, "{}()", self.spelling)?,
             PlaceKind::Builtin => write!(f, "@Builtin {}", self.spelling)?,
+            PlaceKind::For => write!(f, "for {}", self.spelling)?,
+            PlaceKind::Assign => write!(f, "{}:=", self.spelling)?,
         }
         if self.index > 0 {
             write!(f, "#{}", self.index)?;
@@ -89,9 +97,10 @@ pub fn site_tag<'a>(
     tag.replace("::", ".")
 }
 
-/// The place of each feed, `yield` and named call in the module at `module` whose body is
-/// `body`, by span: a feed's target's, a `yield`'s own, a call's callee's, a method call's
-/// method name's, and a field callee's field name's, `f` in `(r.f)(x)`.
+/// The place of each feed, `yield`, named call, loop and assignment in the module at `module`
+/// whose body is `body`, by span: a feed's target's, a `yield`'s own, a call's callee's, a
+/// method call's method name's, a field callee's field name's (`f` in `(r.f)(x)`), and a loop's
+/// or an assignment's target's.
 ///
 /// The bindings that enclose a place are the names an assignment to a name binds (`x = …`,
 /// `x: T = …`, `x := …`, `x <<= …`) and each `def`'s name, under its owner type's name or its
@@ -179,6 +188,7 @@ impl Walk {
                 annotation,
                 value,
             } => {
+                self.assignment(target);
                 self.target(target);
                 if let Some(a) = annotation {
                     self.annotation(a);
@@ -189,10 +199,14 @@ impl Walk {
                 self.target(target);
                 self.expr(value);
             }
-            Stmt::Declare { target, annotation }
-            | Stmt::LoadFrom {
+            Stmt::Declare { target, annotation } => {
+                self.target(target);
+                self.annotation(annotation);
+            }
+            Stmt::LoadFrom {
                 target, annotation, ..
             } => {
+                self.assignment(target);
                 self.target(target);
                 self.annotation(annotation);
             }
@@ -213,6 +227,7 @@ impl Walk {
                 arms.iter().for_each(|a| self.stmts(&a.body));
             }
             Stmt::For { target, iter, body } => {
+                self.place(target.span, PlaceKind::For, target_spelling(&target.node));
                 self.target(target);
                 self.expr(iter);
                 self.stmts(body);
@@ -293,6 +308,13 @@ impl Walk {
             }
             Stmt::Pub { stmt, .. } => self.stmt(stmt),
             Stmt::Return(None) | Stmt::Discard(_) | Stmt::Pass | Stmt::Error { .. } => {}
+        }
+    }
+
+    /// The place of an assignment to `target`, where it names a variable.
+    fn assignment(&mut self, target: &Spanned<AssignTarget>) {
+        if let AssignTarget::Name(n) = &target.node {
+            self.place(target.span, PlaceKind::Assign, n.clone());
         }
     }
 
@@ -512,6 +534,19 @@ impl Walk {
     }
 }
 
+/// A loop target as written: a name, or a tuple of them, `(k, v)`.
+fn target_spelling(target: &AssignTarget) -> SmolStr {
+    match target {
+        AssignTarget::Name(n) => n.clone(),
+        AssignTarget::Tuple(parts) => {
+            let parts: Vec<SmolStr> = parts.iter().map(|p| target_spelling(&p.node)).collect();
+            SmolStr::new(format!("({})", parts.join(", ")))
+        }
+        AssignTarget::Qualified(q) => qualified(&q.qualifier, &q.name),
+        AssignTarget::Subscript { .. } | AssignTarget::Constructor(_) => SmolStr::new_static("_"),
+    }
+}
+
 /// `a::b::name`.
 fn qualified(qualifier: &[Spanned<SmolStr>], name: &Spanned<SmolStr>) -> SmolStr {
     let mut s = String::new();
@@ -574,6 +609,21 @@ mod tests {
             "#});
         assert_eq!(before, ["a.f()", "b.f()"]);
         assert_eq!(after, ["a.f()", "a.f()#1", "a.g()", "b.f()"]);
+    }
+
+    #[test]
+    fn loops_and_assignments_are_places_of_their_own() {
+        let source = indoc::indoc! {r#"
+            n := 0
+            for i in [1, 2]:
+                n := n + i
+            for i in [3]:
+                n := n + i
+        "#};
+        assert_eq!(
+            spelled(source),
+            ["n:=", "for i", "n:=#1", "for i#1", "n:=#2"]
+        );
     }
 
     #[test]

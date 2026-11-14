@@ -85,6 +85,16 @@ fn in_run(e: &mut Expr, run: &RunPath) {
         TypedExprNode::Reading(reading) if reading.site.run == RunPath::default() => {
             reading.site = reading.site.in_run(run)
         }
+        TypedExprNode::For {
+            target: binding, ..
+        }
+        | TypedExprNode::MutDecl { binding, .. } => {
+            if let Some(site) = &binding.site
+                && site.run == RunPath::default()
+            {
+                binding.site = Some(site.in_run(run));
+            }
+        }
         _ => {}
     }
     e.walk_children_mut(|child| in_run(child, run));

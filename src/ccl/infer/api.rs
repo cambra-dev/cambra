@@ -4224,6 +4224,7 @@ mod tests {
                 ty: Type::Tuple(vec![Type::Hole, Type::Hole]),
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
+                site: None,
             },
             body: Box::new(body),
         });
@@ -4430,6 +4431,7 @@ mod tests {
                     Occurrence::mint(),
                 )),
                 transparency: BindingTransparency::Transparent,
+                site: None,
             },
             body: Box::new(Expr::aggregate(Expr::var("xs"), AggregateKind::Sum)),
         });
@@ -4462,6 +4464,7 @@ mod tests {
                     Occurrence::mint(),
                 )),
                 transparency: BindingTransparency::Transparent,
+                site: None,
             },
             body: Box::new(Expr::let_bind_annotated(
                 "ys",
@@ -4485,6 +4488,7 @@ mod tests {
                     Occurrence::mint(),
                 )),
                 transparency: BindingTransparency::Transparent,
+                site: None,
             },
             body: Box::new(Expr::let_bind_annotated(
                 "ys",
@@ -4520,6 +4524,7 @@ mod tests {
                     Occurrence::mint(),
                 )),
                 transparency: BindingTransparency::Transparent,
+                site: None,
             },
             body: Box::new(Expr::var("xs")),
         });
@@ -4559,6 +4564,7 @@ mod tests {
                     ty: Type::infer(),
                     user_annotation: Some(Annotation::new(ann, Occurrence::mint())),
                     transparency: BindingTransparency::Transparent,
+                    site: None,
                 },
                 body: Box::new(Expr::var("m")),
             });
@@ -4622,6 +4628,7 @@ mod tests {
                     Occurrence::mint(),
                 )),
                 transparency: BindingTransparency::Transparent,
+                site: None,
             },
             body: Box::new(Expr::var("xs")),
         });
@@ -4646,6 +4653,7 @@ mod tests {
                     Occurrence::mint(),
                 )),
                 transparency: BindingTransparency::Transparent,
+                site: None,
             },
             body: Box::new(Expr::aggregate(Expr::var("xs"), AggregateKind::Sum)),
         });
@@ -4709,6 +4717,7 @@ mod tests {
                     Occurrence::mint(),
                 )),
                 transparency: BindingTransparency::Transparent,
+                site: None,
             },
             bound_expr: Box::new(Expr::lit(Lit::Int(42))),
             body: Box::new(Expr::var("x")),
@@ -5387,6 +5396,7 @@ mod tests {
                     ty: Type::infer(),
                     user_annotation: Some(Annotation::new(ann, Occurrence::mint())),
                     transparency: BindingTransparency::Transparent,
+                    site: None,
                 },
                 body: Box::new(Expr::apply(Expr::var("x"), inner)),
             });
@@ -5435,6 +5445,7 @@ mod tests {
                         Occurrence::mint(),
                     )),
                     transparency: BindingTransparency::Transparent,
+                    site: None,
                 },
                 body: Box::new(Expr::var("x")),
             })),
@@ -5470,6 +5481,7 @@ mod tests {
                     Occurrence::mint(),
                 )),
                 transparency: BindingTransparency::Transparent,
+                site: None,
             },
             body: Box::new(Expr::lit(Lit::Unit)),
         });
@@ -5930,6 +5942,7 @@ mod tests {
                 ty: Type::Base(BaseType::Int),
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
+                site: None,
             },
             body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
         })
@@ -6017,6 +6030,7 @@ mod tests {
                 ty: Type::Hole,
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
+                site: None,
             },
             body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
         })
@@ -6073,6 +6087,7 @@ mod tests {
                 ty: Type::Infer(var), // unsolved
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
+                site: None,
             },
             body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
         })
@@ -6373,6 +6388,7 @@ mod tests {
                 ty: Type::Base(BaseType::String),
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
+                site: None,
             },
             body: Box::new(Expr::var("x").with_ty(Type::Base(BaseType::String))),
         })
