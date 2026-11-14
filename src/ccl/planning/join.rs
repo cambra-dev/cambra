@@ -1160,16 +1160,13 @@ fn convert_loop_join(
     Ok(Some(result))
 }
 
-/// Compile **one** of a refined domain's refinements into a join, leaving the others
-/// as ordinary restrictions on the domain the join reads.
+/// Compile a refined domain's refinement into a join.
 ///
-/// Any refinement may be the join condition — the set is unordered, so there is no
-/// "the" predicate to read — and the first that [`convert_loop_join`] accepts
-/// wins. That also gives planning latitude it could not have while refinements were
-/// a chain: when several are joinable, which one becomes the join is a free
-/// choice a cost model may later make, and the rest remain filters either way.
-/// `None` for an unrefined domain or when no refinement forms a join, and an error for a join
-/// that cannot be planned ([`extent_iteration`]).
+/// A join reads the bare product of its arms ([`convert_loop_join`]), so only a domain with one
+/// refinement forms one: beside a second, the domain the join would read is still refined. Such
+/// a site iterates and restricts instead, in [`application_order`](crate::ccl::application_order).
+/// `None` for an unrefined domain, one with more than one refinement, or one whose refinement
+/// forms no join, and an error for a join that cannot be planned ([`extent_iteration`]).
 fn convert_refinement_to_join(
     domain_ty: &Type,
     checker: &FragmentChecker,
@@ -1178,24 +1175,13 @@ fn convert_refinement_to_join(
     let Type::Refinement(base, refinements) = domain_ty else {
         return Ok(None);
     };
+    let [refinement] = refinements.as_slice() else {
+        return Ok(None);
+    };
     trace!("Attempting loop join conversion inside iteration");
-    for (i, r) in refinements.iter().enumerate() {
-        let rest = Type::refined(
-            (**base).clone(),
-            refinements
-                .iter()
-                .enumerate()
-                .filter(|(j, _)| *j != i)
-                .map(|(_, c)| c.clone())
-                .collect(),
-        );
-        // `convert_loop_join` only reads the predicate (it builds a new expr),
-        // so borrow the immutable term rather than clone it.
-        if let Some(joined) = convert_loop_join(&rest, &r.predicate, checker, lifted)? {
-            return Ok(Some(joined));
-        }
-    }
-    Ok(None)
+    // `convert_loop_join` only reads the predicate (it builds a new expr),
+    // so borrow the immutable term rather than clone it.
+    convert_loop_join(base, &refinement.predicate, checker, lifted)
 }
 
 /// Try the hash-join rewrite at an iteration site whose domain is `domain_ty`.
@@ -1243,9 +1229,10 @@ pub(super) fn try_hash_join_rewrite(
     // `Expansion` because its bucketize chain is what `groupby` denotes.
     //
     // The domain's refinement predicates are blamed rather than consumed. They
-    // are the terms the plan is read out of — the accepted one decomposes into
-    // the join conditions, the rest ride into the plan's base type as leaf
-    // refinements and residual `restrict`s — and this rewrite leaves them alive:
+    // are the terms the plan is read out of — the domain's refinement decomposes
+    // into the join conditions and a residual `restrict`, and the arms' own
+    // refinements ride into the plan's base type as leaf refinements — and this
+    // rewrite leaves them alive:
     // the site's original value-producer is spliced into the compose below with
     // its id and its refined type intact, and `predicate.rebuild` consumes them
     // later in this same phase. Naming them parents here would have one node
@@ -1254,19 +1241,14 @@ pub(super) fn try_hash_join_rewrite(
     // and each clone carries the subterm it was freshened from; blame is the only
     // edge the scaffolding around those keys has to a predicate.
     //
-    // The recording spans the attempts, as simplify's rule combinator does:
-    // `convert_refinement_to_join` tries each refinement in turn, and both a
-    // rejected refinement and a wholly unmatched domain return through this one
-    // guard's `Drop`. What a half-built plan minted before bailing — the key
-    // copies `plan_loop_join` freshens before `spanning_tree_children` refuses
-    // the condition graph — composes away as a transient: a copy that never
-    // reaches the output tree is not `Unrecorded`, that class being found by
-    // walking that tree, and its parent is this site, so it is no
-    // `DanglingParent` either. How many transients a compile writes depends on
-    // the order the refinement set is iterated in, and stays unobservable for
-    // the same reason they compose away: the rejected attempts reach no pane,
-    // and the accepted plan is the same whichever refinement supplied it. Naming
-    // the firing instead would mean threading the site id down through
+    // The recording spans the attempt, as simplify's rule combinator does: a
+    // rejected refinement returns through this guard's `Drop`. What a half-built
+    // plan minted before bailing — the key copies `plan_loop_join` freshens
+    // before `spanning_tree_children` refuses the condition graph — composes away
+    // as a transient: a copy that never reaches the output tree is not
+    // `Unrecorded`, that class being found by walking that tree, and its parent
+    // is this site, so it is no `DanglingParent` either. Naming the firing
+    // instead would mean threading the site id down through
     // `convert_refinement_to_join` into `convert_loop_join`.
     let g = provenance::enter(
         expr.node_id(),
