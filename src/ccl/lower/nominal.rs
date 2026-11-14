@@ -602,6 +602,7 @@ fn lower_constructors(
                 ctors.push(NominalCtor {
                     name: SmolStr::new_static("new"),
                     span: decl.name.span,
+                    public: true,
                     orders: vec![written_order(ty, &lowered)],
                     params: vec![(None, lowered)],
                 })
@@ -637,6 +638,7 @@ fn lower_constructors(
                     ctors.push(NominalCtor {
                         name: line.name.node.clone(),
                         span: line.name.span,
+                        public: line.public.is_some(),
                         params,
                         orders,
                     });
@@ -1779,9 +1781,14 @@ impl Named {
                 Some(function) => Some(Member::Associated {
                     arity: function.arity,
                 }),
-                None => member(decl, name, ctx)
-                    .map(|(m, _)| m)
-                    .filter(|m| !matches!(m, Member::Associated { .. })),
+                None => {
+                    if let Some(ctor) = decl.ctor(name) {
+                        self.check_ctor_visible(ctor, span)?;
+                    }
+                    member(decl, name, ctx)
+                        .map(|(m, _)| m)
+                        .filter(|m| !matches!(m, Member::Associated { .. }))
+                }
             },
         };
         found.ok_or_else(|| {
@@ -1793,6 +1800,25 @@ impl Named {
                 ),
             )
         })
+    }
+
+    /// Refuse naming `ctor`, written at `at`, from another module than the type's when its line
+    /// has no `pub`: another module neither builds nor matches it (`docs/chl-spec.md`, "9.5
+    /// Visibility").
+    fn check_ctor_visible(&self, ctor: &NominalCtor, at: Span) -> Result<(), LoweringError> {
+        if self.foreign.is_none() || ctor.public {
+            return Ok(());
+        }
+        Err(LoweringError::unsupported(
+            at,
+            format!(
+                "the constructor `{}::{}` is private to module `{}`",
+                self.decl.name,
+                ctor.name,
+                self.decl.module.join("::")
+            ),
+        )
+        .with_related(ctor.span, "declared here without `pub`"))
     }
 
     /// The name a reference to the member `name` reads: the binding its module's chain
@@ -2097,17 +2123,17 @@ fn resolve_pattern_type(
     let Some(named) = resolve_type(&pattern.type_path, ctx)? else {
         return Err(LoweringError::unavailable_member(ty.span));
     };
-    let decl = named.decl;
-    if decl.ctor(&pattern.ctor.node).is_none() {
+    let Some(ctor) = named.decl.ctor(&pattern.ctor.node) else {
         return Err(LoweringError::unsupported(
             ty.span.join(pattern.ctor.span),
             format!(
                 "`{}` declares no constructor `{}`",
-                decl.name, pattern.ctor.node
+                named.decl.name, pattern.ctor.node
             ),
         ));
-    }
-    Ok(decl)
+    };
+    named.check_ctor_visible(ctor, ty.span.join(pattern.ctor.span))?;
+    Ok(named.decl)
 }
 
 /// A constructor pattern binds one name or `_` per declared parameter, and takes no

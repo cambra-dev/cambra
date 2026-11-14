@@ -350,7 +350,7 @@ top-level member, public and private, so that `m::hidden` can say the member is 
 | --- | --- |
 | value, `def`, mutable variable, feed | its visibility, its statement, and for a `def` whether it takes a `Mut` parameter |
 | type alias | its visibility, its statement, and its type as its module lowered it |
-| nominal type | its declaration, visibility and statement, and each associated function's visibility, statement and arity, and whether it is a method (`NominalMember`) |
+| nominal type | its declaration, whose constructors carry their own visibility (`NominalCtor::public`), its visibility and statement, and each associated function's visibility, statement and arity, and whether it is a method (`NominalMember`) |
 | trait | its declaration, visibility and statement (`TraitMember`) |
 | member bound to a module, `pub audit = a` | its visibility, its statement, and the module it is bound to, as its module spells it |
 | parameter | its annotation, Module type, or bound, and whether it has a default |

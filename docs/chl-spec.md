@@ -3091,7 +3091,7 @@ type_stmt   ::= "type" Ident [ "(" type_param ( "," type_param )* [ "," ] ")" ]
                 [ requires_clause ] "=" expression NEWLINE
 type_param  ::= Ident [ ":" expression ]   (* the expression is a kind *)
 ctor_line   ::= [ "@" "RenamedFrom" "(" ident ")" NEWLINE ]
-                ident [ "(" ctor_param ( "," ctor_param )* [ "," ] ")" ] NEWLINE
+                [ "pub" ] ident [ "(" ctor_param ( "," ctor_param )* [ "," ] ")" ] NEWLINE
 ctor_param  ::= [ ident ":" ] expression
 
 -- A type the version this source replaces held under another name or in another module.
@@ -3113,6 +3113,16 @@ renamed_type_stmt ::= "@" "RenamedFrom" "(" type_path ")" NEWLINE type_stmt
   documentation and diagnostics, and a call is positional: `Shape::circle(1)`. A call from another
   module therefore writes no qualified label
   ([9.12 Field labels and tags belong to a module](#912-field-labels-and-tags-belong-to-a-module)).
+- **A constructor line marked `pub` is exported with its type.** Another module builds and
+  matches only a `pub` type's `pub` constructors. One without `pub` is its module's alone, so the
+  module's own functions are the only way to build that value
+  ([9.5 Visibility](#95-visibility)):
+
+  ```python
+  pub type Token:
+      pub revoked
+      issued(Int)          # built only by Token::issue, which checks its argument
+  ```
 - **Constructors are lowercase and take no backtick.** They are declared names that belong to their
   type, reached as `Shape::circle`, or `shop::Shape::circle` from a module that imports `shop`.
 - **A parameter type may name the type being declared and the module's other types**, so recursive
@@ -5880,8 +5890,10 @@ pub held: Int
   `pub` would change the module's interface.
 - Private names keep the ordinary top-level shadowing of
   [5. Scoping and binding](#5-scoping-and-binding).
-- `pub` on a `type` declaration exports the nominal type with its constructors, and with `new` and
-  `extract` in the single-constructor form. `pub` on an associated function's `def`, including one
+- `pub` on a `type` declaration exports the nominal type, with each constructor line marked `pub`,
+  and with `new` and `extract` in the single-constructor form. A constructor without `pub` is
+  neither built nor matched outside its module, so a type whose constructors are all private is
+  abstract: other modules hold its values and reach them through its public functions. `pub` on an associated function's `def`, including one
   in an `impl` block, exports it, and one without `pub` is reached only from its own module, in
   either spelling
   ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). An associated
