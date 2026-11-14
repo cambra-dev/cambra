@@ -4865,9 +4865,19 @@ fn a_block_value_in_a_loop(#[case] code: &str, #[case] expected: &str) {
     check_sink(code, expected);
 }
 
-/// A feed whose positions depend on a block's value has no channel type the compiler can state
-/// outside the block's store, so it is refused: under a condition reading the value.
+/// A feed whose positions depend on a block's value: fed in a loop iterating a block's values,
+/// under a condition reading the value, or under any condition in such a loop. A condition
+/// reading a value the block's store computes, or a loop over the block's values, has no
+/// spelling where the channel is declared, so the channel gates its values instead of refining
+/// its domain. A read-only block's value outside a loop is read once before the condition.
 #[rstest]
+#[case::a_feed_of_the_value_in_a_loop(indoc! {"
+    for r in [1, 2, 3]:
+        x = with begin():
+            pool := pool - r
+            pool
+        out << x
+"}, "[99, 97, 94]")]
 #[case::a_condition_on_the_value_in_a_loop(indoc! {"
     for r in [1, 2, 3]:
         x = with begin():
@@ -4875,7 +4885,15 @@ fn a_block_value_in_a_loop(#[case] code: &str, #[case] expected: &str) {
             pool
         if x > 95:
             out << x
-"})]
+"}, "[99, 97]")]
+#[case::any_condition_in_a_loop_reading_a_value(indoc! {"
+    for r in [1, 2, 3]:
+        x = with begin():
+            pool := pool - r
+            pool
+        if r > 1:
+            out << r
+"}, "[1 -> 2, 2 -> 3]")]
 #[case::a_match_on_the_value(indoc! {"
     for r in [1, 2, 3]:
         x = with begin():
@@ -4886,14 +4904,14 @@ fn a_block_value_in_a_loop(#[case] code: &str, #[case] expected: &str) {
                 out << v
             case `b(w):
                 pass
-"})]
+"}, "[1 -> 2, 2 -> 3]")]
 #[case::a_read_only_value_in_a_loop(indoc! {"
     for r in [1, 2, 3]:
         x = with begin():
             pool
         if x > r * 40:
             out << r
-"})]
+"}, "[1, 2]")]
 #[case::a_condition_on_the_value_outside_a_loop(indoc! {"
     x = with begin():
         pool := pool - 1
@@ -4901,33 +4919,40 @@ fn a_block_value_in_a_loop(#[case] code: &str, #[case] expected: &str) {
     if x > 50:
         out << x
     out << 0
-"})]
-fn a_feed_depending_on_a_block_value_is_refused(#[case] code: &str) {
-    check_compile_error(
-        &format!("pool: Mut(Int, Txn) := 100\nout: Feed(_)\n{code}\nout\n"),
-        "a feed under a condition that reads the value of a `with begin():` block",
-    );
-}
-
-/// A feed of a block's value under no condition, a feed under a condition reading no value in a
-/// loop over a block's values, which the loop reads at its position, and a condition on a
-/// read-only block's value outside a loop, which is read once before it, compile.
-#[rstest]
-#[case::a_feed_of_the_value_in_a_loop(indoc! {"
+"}, "[`out<<(()) -> 99, `out<<#1(()) -> 0]")]
+#[case::an_elif_chain_on_the_value_in_a_loop(indoc! {"
     for r in [1, 2, 3]:
         x = with begin():
             pool := pool - r
             pool
-        out << x
-"}, "[99, 97, 94]")]
-#[case::any_condition_in_a_loop_reading_a_value(indoc! {"
-    for r in [1, 2, 3]:
-        x = with begin():
-            pool := pool - r
-            pool
-        if r > 1:
-            out << r
-"}, "[1 -> 2, 2 -> 3]")]
+        if x > 98:
+            out << 1
+        elif x > 96:
+            out << 2
+        else:
+            out << 3
+"}, "[`out<<(0) -> 1, `out<<#1(1) -> 2, `out<<#2(2) -> 3]")]
+#[case::an_elif_chain_on_the_value_outside_a_loop(indoc! {"
+    x = with begin():
+        pool := pool - 2
+        pool
+    if x > 98:
+        out << 1
+    elif x > 96:
+        out << 2
+    else:
+        out << 3
+"}, "[`out<<#1(()) -> 2]")]
+#[case::a_default_arm_on_the_value_outside_a_loop(indoc! {"
+    x = with begin():
+        pool := pool - 1
+        `a(pool) if pool > 200 else `b(pool)
+    match x:
+        case `a(v):
+            out << v
+        case _:
+            out << 0
+"}, "[`out<<#1(()) -> 0]")]
 #[case::a_condition_on_a_read_only_value_outside_a_loop(indoc! {"
     x = with begin():
         pool
@@ -4935,7 +4960,7 @@ fn a_feed_depending_on_a_block_value_is_refused(#[case] code: &str) {
         out << x
     out << 0
 "}, "[`out<<(()) -> 100, `out<<#1(()) -> 0]")]
-fn a_feed_beside_a_block_value(#[case] code: &str, #[case] expected: &str) {
+fn a_feed_depending_on_a_block_value(#[case] code: &str, #[case] expected: &str) {
     check_sink(
         &format!("pool: Mut(Int, Txn) := 100\nout = test_sink()\n{code}"),
         expected,
@@ -5650,5 +5675,25 @@ fn a_feed_after_the_loop_reads_the_accumulator_its_block_value_feeds() {
             out << total
         "},
         "[() -> 290]",
+    );
+}
+
+/// A feed under a condition reading a block's value in the block's loop: the value is the block's
+/// store's, so the channel gates its values rather than refining its domain
+/// (`src/ccl/design/mutability.md`, "A condition the channel's type cannot state").
+#[test]
+fn a_feed_under_a_condition_on_a_block_value() {
+    check_sink(
+        indoc! {"
+            pool: Mut(Int, Txn) := 100
+            out = test_sink()
+            for r in [10, 20]:
+                left = with begin():
+                    pool := pool - r
+                    pool
+                if left > 85:
+                    out << left
+        "},
+        "[90]",
     );
 }

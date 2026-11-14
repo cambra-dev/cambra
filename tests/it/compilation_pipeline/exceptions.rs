@@ -590,8 +590,7 @@ fn refused(#[case] code: &str, #[case] needle: &str) {
 }
 
 /// A shape exception elimination does not compile yet is refused at the source that wrote it: the
-/// `raise` in a function value, the feed after a block an exception escapes, and the block in a
-/// loop an exception escapes.
+/// `raise` in a function value, and the block in a loop an exception escapes.
 #[rstest]
 // A function value in a collection stays in the tree as a lambda that may raise, which
 // elimination does not rewrite yet.
@@ -608,25 +607,6 @@ fn refused(#[case] code: &str, #[case] needle: &str) {
     "},
     "an exception raised inside a Lambda",
     "raise x"
-)]
-// A feed after a block an exception escapes reads the outcome the block commits or aborts,
-// which no channel's positions state yet.
-#[case::a_feed_after_a_block_an_exception_escapes(
-    indoc! {"
-        out: Feed(_)
-        pool: Mut(Int, Txn) := 100
-        try:
-            with begin():
-                pool := pool - 5
-                if pool < 200:
-                    raise 7
-            out << 2
-        except Int as e:
-            out << e
-        out
-    "},
-    "a feed after a `with begin():` block that an exception escapes",
-    "out << 2"
 )]
 // Each iteration of a loop an exception escapes runs where no earlier one raised, which a
 // block's site cannot carry yet.
@@ -656,6 +636,27 @@ fn refused_at_its_source(#[case] code: &str, #[case] needle: &str, #[case] sourc
             && message.contains(source)
             && !message.contains("internal compiler error"),
         "{message}"
+    );
+}
+
+/// A feed after a block an exception escapes, in the same `try` block or in its `except` clause,
+/// runs on the path the block took: the clause's feed where the block aborted.
+#[test]
+fn a_feed_after_a_block_an_exception_escapes_runs_on_its_path() {
+    check_sink(
+        indoc! {"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 100
+            try:
+                with begin():
+                    pool := pool - 5
+                    if pool < 200:
+                        raise 7
+                out << 2
+            except Int as e:
+                out << e
+        "},
+        "[`out<<#1(()) -> 7]",
     );
 }
 
@@ -1145,17 +1146,6 @@ fn escaping_a_block(#[case] code: &str, #[case] expected: i64) {
             out << 0 - e
     out
 "}, "sends output and writes no transactional variable is not compiled yet")]
-#[case::a_clause_that_feeds_in_a_loop(indoc! {"
-    out: Feed(_)
-    for r in [10, 20, 5]:
-        try:
-            with begin():
-                pool := pool - r
-                check(r)
-        except Int as e:
-            out << e
-    out
-"}, "a feed after a `with begin():` block that an exception escapes")]
 fn escaping_a_block_refused(#[case] code: &str, #[case] needle: &str) {
     let defs = indoc! {"
         def check(v):
@@ -1194,6 +1184,42 @@ fn escaping_a_block_sends_no_output() {
         "[`got.d.out<<(t1) -> 90, `got.d.out<<(t3) -> 85, `out<<(0) -> 10, `out<<(1) -> -20, \
          `out<<(2) -> 5]",
     );
+}
+
+/// A clause after a block in a loop feeds where the exception it catches escaped the block: its
+/// condition reads the block's outcome, a value the block's store computes, so its feed's
+/// channel gates its values.
+#[rstest]
+#[case::a_clause_that_feeds(indoc! {"
+    for r in [10, 20, 5]:
+        try:
+            with begin():
+                pool := pool - r
+                check(r)
+        except Int as e:
+            out << e
+"}, "[1 -> 20]")]
+#[case::a_clause_and_the_value_both_feed(indoc! {"
+    for r in [10, 20, 5]:
+        try:
+            d = with begin():
+                pool := pool - r
+                check(r)
+                pool
+            out << d
+        except Int as e:
+            out << 0 - e
+"}, "[`out<<(0) -> 90, `out<<(2) -> 85, `out<<#1(1) -> -20]")]
+fn a_clause_after_a_block_in_a_loop_feeds(#[case] code: &str, #[case] expected: &str) {
+    let defs = indoc! {"
+        def check(v):
+            if v > 15:
+                raise v
+            v
+        pool: Mut(Int, Txn) := 100
+        out = test_sink()
+    "};
+    check_sink(&format!("{defs}{code}"), expected);
 }
 
 /// A clause inside a block feeds through the commit, as a feed on any path of the block does.

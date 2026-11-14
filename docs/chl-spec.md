@@ -5141,8 +5141,6 @@ around `reserve` + `quote` + the feed).
 
 > **[Interim]** The compiler refuses these blocks in value position:
 >
-> - a feed under a condition that reads the block's value, such as `if ok: out << r` after the
->   block;
 > - a block in a function that a loop calls, in a loop that only feeds or that holds another loop,
 >   or in an expression such as a feed's value;
 > - a block in a loop that reads a variable its loop accumulates into or a binding computed from

@@ -2338,6 +2338,107 @@ fn a_feed_under_a_loop_writing_a_mutable_variable(#[case] source: &str, #[case] 
     check_sink(source, expected);
 }
 
+/// A feed under a condition reading a mutable variable's final value, after the loop that
+/// writes it. The value is the loop's recurrence's, which the channel's type cannot state where
+/// the channel is declared, so the channel gates its values instead of refining its domain.
+#[rstest]
+#[case::outside_a_loop(indoc! {"
+    out = test_sink()
+    n := 0
+    for x in [1, 2, 3]:
+        n := n + x
+    if n > 5:
+        out << n
+    out << 0
+"}, "[`out<<(()) -> 6, `out<<#1(()) -> 0]")]
+#[case::in_a_later_loop(indoc! {"
+    out = test_sink()
+    n := 0
+    for x in [1, 2, 3]:
+        n := n + x
+    for r in [1, 2, 3]:
+        if r * n > 7:
+            out << r
+"}, "[1 -> 2, 2 -> 3]")]
+fn a_feed_under_a_condition_on_a_final_value(#[case] source: &str, #[case] expected: &str) {
+    check_sink(source, expected);
+}
+
+/// A feed whose value's type reads the iteration it is fed in, under a condition the channel's
+/// type cannot state, is not compiled yet: the gate's projection has no type for such a value.
+#[rstest]
+#[case::a_final_value(indoc! {"
+    out: Feed(_)
+    n := 0
+    for x in [1, 2, 3]:
+        n := n + x
+    for r in [1, 2, 3]:
+        if r * n > 7:
+            out << [y for y in [1, 2, 3] if y < r]
+    out
+"})]
+#[case::a_block_value(indoc! {"
+    pool: Mut(Int, Txn) := 100
+    out: Feed(_)
+    for r in [1, 2, 3]:
+        x = with begin():
+            pool := pool - r
+            pool
+        if x > 96:
+            out << [y for y in [1, 2, 3] if y < r]
+    out
+"})]
+fn a_feed_reading_its_iteration_under_a_gated_condition_is_refused(#[case] source: &str) {
+    check_compile_error(
+        source,
+        "a feed whose value's type depends on the iteration it is fed in, under a condition on a \
+         value the loop computes, is not compiled yet",
+    );
+}
+
+/// Which conditions a channel's type states: one reading a plain `let` declared after the
+/// channel keeps the refinement, its type lifted past the binder, and one reading a value a
+/// recursive group computes gates the fed values over the unrefined source
+/// (`src/ccl/design/mutability.md`, "A condition the channel's type cannot state").
+#[rstest]
+#[case::a_plain_let(indoc! {"
+    out: Feed(_)
+    t = sum([1, 2])
+    for x in [1, 2, 3, 4]:
+        if x > t:
+            out << x
+    out
+"}, "letrec out : ({0..4 | ", false)]
+#[case::a_final_value(indoc! {"
+    out: Feed(_)
+    n := 0
+    for x in [1, 2, 3]:
+        n := n + x
+    for r in [1, 2, 3]:
+        if r * n > 7:
+            out << r
+    out
+"}, "letrec out : (0..3 ⤇ Int)", true)]
+fn a_channel_states_a_condition_it_can(
+    #[case] source: &str,
+    #[case] channel: &str,
+    #[case] gated: bool,
+) {
+    use cambra::ccl::context::{Phase, compile_to};
+    use cambra::ccl::symbolic::symbolic;
+    let channelized = compile_to(&LoadedProgram::test(source), Phase::Channelize)
+        .unwrap_or_else(|errors| panic!("compiles: {errors:?}"));
+    let text = symbolic(&channelized);
+    let out = &text[text
+        .find(channel)
+        .unwrap_or_else(|| panic!("the channel is `{channel}…`:\n{text}"))..];
+    assert_eq!(
+        out.contains("≫ variant_project(`fired)"),
+        gated,
+        "the channel gates its values exactly when its condition reads a recursive value:\n{text}"
+    );
+}
+
 /// A feed in a branch that writes, reading a binding the branch's other values read as well:
 /// the branch leaves as one merged tuple holding the feed's tap beside them, so the feed reads
 /// the binding the variable does (`src/ccl/design/mutability.md`, "Loop-body bindings"). A
