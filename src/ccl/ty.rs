@@ -1876,6 +1876,11 @@ pub struct TraitRequirement {
     /// The associated types the clause names. One it leaves unnamed is absent, and
     /// leaves that position open.
     pub assoc: Vec<(crate::ccl::infer::solver::traits::Assoc, Type)>,
+    /// The values a `forall` around the requirement binds, each with the type it ranges over:
+    /// `k: K` in `forall (k: K) Iterable(V(k))`. The operands and associated types read them,
+    /// and the requirement holds at every value of them (`docs/chl-spec.md`, "Family
+    /// parameters"). Empty for a requirement no `forall` quantifies.
+    pub binders: Vec<(crate::ccl::Name, Type)>,
     /// Where the requirement was written, for the secondary label of a use that fails
     /// it; `None` for one no `requires` clause states.
     pub at: Option<chl_parser::ast::Span>,
@@ -1887,6 +1892,7 @@ impl PartialEq for TraitRequirement {
             && self.args == other.args
             && self.terms == other.terms
             && self.assoc == other.assoc
+            && self.binders == other.binders
     }
 }
 impl Eq for TraitRequirement {}
@@ -1896,11 +1902,12 @@ impl std::hash::Hash for TraitRequirement {
         self.args.hash(state);
         self.terms.hash(state);
         self.assoc.hash(state);
+        self.binders.hash(state);
     }
 }
 
 impl TraitRequirement {
-    /// This requirement with `f` applied to each operand and associated type.
+    /// This requirement with `f` applied to each operand, associated type and binder's type.
     pub fn map_types(&self, mut f: impl FnMut(&Type) -> Type) -> TraitRequirement {
         TraitRequirement {
             trait_: self.trait_.clone(),
@@ -1908,8 +1915,111 @@ impl TraitRequirement {
             terms: self.terms.clone(),
             effect_assoc: self.effect_assoc.clone(),
             assoc: self.assoc.iter().map(|(n, t)| (n.clone(), f(t))).collect(),
+            binders: self
+                .binders
+                .iter()
+                .map(|(n, t)| (n.clone(), f(t)))
+                .collect(),
             at: self.at,
         }
+    }
+
+    /// This requirement with its binders renamed to `names`, one each: a use proves a
+    /// quantified requirement at binders of its own, which nothing else reads.
+    pub fn with_binders_named(&self, names: &[crate::ccl::Name]) -> TraitRequirement {
+        debug_assert_eq!(names.len(), self.binders.len(), "one name per binder");
+        let terms: Vec<Rc<TypedExpr>> = names
+            .iter()
+            .zip(&self.binders)
+            .map(|(n, (_, t))| Rc::new(crate::ccl::Expr::var(n.clone()).with_ty(t.clone())))
+            .collect();
+        let binders = names
+            .iter()
+            .zip(&self.binders)
+            .map(|(n, (_, t))| (n.clone(), t.clone()))
+            .collect();
+        TraitRequirement {
+            binders,
+            ..self.discharged(&terms)
+        }
+    }
+
+    /// This requirement at the terms `terms`, one per binder, which it no longer binds: an
+    /// application `V(t)` reaching an obligation reads the assumption
+    /// `forall (k: K) Iterable(V(k))` at `t` ([`crate::ccl::subst::discharge_binders`]).
+    pub fn discharged(&self, terms: &[Rc<TypedExpr>]) -> TraitRequirement {
+        let names: Vec<crate::ccl::Name> = self.binders.iter().map(|(n, _)| n.clone()).collect();
+        let at = |t: &Type| crate::ccl::subst::discharge_binders(&names, t, terms);
+        TraitRequirement {
+            trait_: self.trait_.clone(),
+            args: self.args.iter().map(at).collect(),
+            terms: self.terms.clone(),
+            effect_assoc: self.effect_assoc.clone(),
+            assoc: self.assoc.iter().map(|(n, t)| (n.clone(), at(t))).collect(),
+            binders: Vec::new(),
+            at: self.at,
+        }
+    }
+
+    /// Read the binders determined by the family application at operand `pos`, retaining
+    /// those another operand must determine. Repeated arguments must agree, including terms
+    /// fixed by an earlier operand. Associated types are deposited only after no binder remains.
+    pub fn at_application(
+        &self,
+        path: &[u8],
+        contribution: &FamilyApp,
+    ) -> Option<TraitRequirement> {
+        let (pos, args) = path.split_first()?;
+        let mut operand = self.args.get(*pos as usize)?;
+        for index in args {
+            let Type::Nominal(_, components) = operand.peel_refinements() else {
+                return None;
+            };
+            operand = components.get(*index as usize)?;
+        }
+        let Type::FamilyApp(stated) = operand.peel_refinements() else {
+            return None;
+        };
+        if stated.param != contribution.param || stated.args.len() != contribution.args.len() {
+            return None;
+        }
+        let mut terms: Vec<Option<Rc<TypedExpr>>> = vec![None; self.binders.len()];
+        for (arg, given) in stated.args.iter().zip(&contribution.args) {
+            if let TypedExprNode::Var(n) = &arg.term.node
+                && let Some(i) = self.binders.iter().position(|(b, _)| b == n)
+            {
+                if let Some(first) = &terms[i]
+                    && !eq_term_modulo_ty_slots(first, &given.term)
+                {
+                    return None;
+                }
+                terms[i] = Some(Rc::clone(&given.term));
+            } else if !eq_term_modulo_ty_slots(&arg.term, &given.term) {
+                return None;
+            }
+        }
+        let (names, args): (Vec<_>, Vec<_>) = self
+            .binders
+            .iter()
+            .zip(&terms)
+            .filter_map(|((n, _), t)| t.as_ref().map(|t| (n.clone(), Rc::clone(t))))
+            .unzip();
+        let at = |t: &Type| crate::ccl::subst::discharge_binders(&names, t, &args);
+        Some(TraitRequirement {
+            binders: self
+                .binders
+                .iter()
+                .zip(&terms)
+                .filter(|(_, t)| t.is_none())
+                .map(|((n, t), _)| (n.clone(), at(t)))
+                .collect(),
+            args: self.args.iter().map(at).collect(),
+            terms: self.terms.clone(),
+            effect_assoc: self.effect_assoc.clone(),
+            assoc: self.assoc.iter().map(|(n, t)| (n.clone(), at(t))).collect(),
+            trait_: self.trait_.clone(),
+            at: self.at,
+        })
     }
 
     /// The type this requirement associates with `name`, if it names one.
@@ -1934,12 +2044,23 @@ impl TraitRequirement {
     }
 }
 
+/// The member parameter a requirement's associated type `ty` stands for: a type parameter, or a
+/// member family applied to a quantified requirement's binders.
+fn member_param(ty: &Type) -> Option<&Rc<TypeParam>> {
+    match ty {
+        Type::Param(p) => Some(p),
+        Type::FamilyApp(app) => Some(&app.param),
+        _ => None,
+    }
+}
+
 /// The type parameters `ty` is, or a nominal type in it is applied to, through any depth of
-/// nominal types.
+/// nominal types. A family parameter's application is an occurrence of it.
 fn params_at_or_below(ty: &Type) -> impl Iterator<Item = TypeParamId> {
     fn go(ty: &Type, out: &mut Vec<TypeParamId>) {
         match ty {
             Type::Param(p) => out.push(p.id),
+            Type::FamilyApp(app) => out.push(app.param.id),
             Type::Nominal(_, args) => args.iter().for_each(|a| go(a, out)),
             _ => {}
         }
@@ -1973,7 +2094,7 @@ impl PolyType {
             && self.requires.iter().any(|r| {
                 r.assoc
                     .iter()
-                    .any(|(_, t)| matches!(t, Type::Param(p) if p.id == param.id))
+                    .any(|(_, t)| member_param(t).is_some_and(|p| p.id == param.id))
                     || r.effect_assoc.iter().any(|(_, c)| c.param.id == param.id)
             })
     }
@@ -2001,10 +2122,7 @@ impl PolyType {
             let unnamed: Vec<&Rc<TypeParam>> = r
                 .assoc
                 .iter()
-                .filter_map(|(_, t)| match t {
-                    Type::Param(p) => Some(p),
-                    _ => None,
-                })
+                .filter_map(|(_, t)| member_param(t))
                 .chain(r.effect_assoc.iter().map(|(_, c)| &c.param))
                 .filter(|p| self.is_member(p) && p.spelling.starts_with("_::"))
                 .collect();
@@ -2024,9 +2142,14 @@ impl PolyType {
             };
             for p in unnamed {
                 let member = &p.spelling["_::".len()..];
+                let spelling = format!("{binder}::{member}");
                 renamed.insert(
                     p.id,
-                    TypeParam::declared(format!("{binder}::{member}").as_str()),
+                    if p.arity > 0 {
+                        TypeParam::declared_family(spelling.as_str(), p.arity)
+                    } else {
+                        TypeParam::declared(spelling.as_str())
+                    },
                 );
             }
         }
@@ -2047,6 +2170,11 @@ impl PolyType {
             if let Type::Fun { capabilities, .. } = &mut out {
                 *capabilities =
                     capabilities.with_params_respelled(&|p| renamed.get(&p.id).cloned());
+            }
+            if let Type::FamilyApp(app) = &mut out
+                && let Some(to) = renamed.get(&app.param.id)
+            {
+                app.param = Rc::clone(to);
             }
             out.walk_children_mut(|c| *c = respell(c, renamed));
             out
@@ -2085,10 +2213,7 @@ impl PolyType {
             let members = r
                 .assoc
                 .iter()
-                .filter_map(|(_, t)| match t {
-                    Type::Param(p) if self.is_member(p) => Some(p),
-                    _ => None,
-                })
+                .filter_map(|(_, t)| member_param(t).filter(|p| self.is_member(p)))
                 .chain(r.effect_assoc.iter().map(|(_, c)| &c.param));
             // An unnamed requirement's member is spelled `_::Name`, and printing names it.
             members
@@ -2115,26 +2240,61 @@ impl PolyType {
         };
         let mut items = Vec::new();
         for r in &self.requires {
+            // A quantified requirement is written under its `forall`, its binders spelled `k`,
+            // `k1`, …, and the bounds on its associated types in the same group.
+            let names: Vec<crate::ccl::Name> = (0..r.binders.len())
+                .map(|i| match i {
+                    0 => crate::ccl::Name::raw("k"),
+                    i => crate::ccl::Name::raw(format!("k{i}").as_str()),
+                })
+                .collect();
+            let r = &if r.binders.is_empty() {
+                (**r).clone()
+            } else {
+                r.with_binders_named(&names)
+            };
+            let mut group = Vec::new();
             let args: Vec<String> = r.args.iter().map(&mut write).collect();
             let binder = member_binder(r)
                 .or_else(|| (!r.assoc.is_empty() || !r.effect_assoc.is_empty()).then(&mut fresh));
-            items.push(match &binder {
+            group.push(match &binder {
                 Some(b) => format!("{b}: {}({})", r.trait_, args.join(", ")),
                 None => format!("{}({})", r.trait_, args.join(", ")),
             });
-            let Some(binder) = binder else { continue };
-            for (n, t) in &r.assoc {
-                let bound = match t {
-                    Type::Param(p) if self.is_member(p) => self
-                        .params
-                        .iter()
-                        .find(|d| d.param.id == p.id)
-                        .and_then(|d| d.bound().cloned()),
-                    other => Some(other.clone()),
-                };
-                if let Some(bound) = bound {
-                    items.push(format!("{binder}::{n} <: {}", write(&bound)));
+            if let Some(binder) = binder {
+                for (n, t) in &r.assoc {
+                    let bound = match (t, member_param(t)) {
+                        (Type::Param(_), Some(p)) if self.is_member(p) => self
+                            .params
+                            .iter()
+                            .find(|d| d.param.id == p.id)
+                            .and_then(|d| d.bound().cloned()),
+                        (Type::FamilyApp(_), Some(p)) if self.is_member(p) => self
+                            .params
+                            .iter()
+                            .find(|d| d.param.id == p.id)
+                            .and_then(|d| d.kind.family_bound())
+                            .map(|family| crate::ccl::subst::family_at_names(family, &names)),
+                        (other, _) => Some(other.clone()),
+                    };
+                    if let Some(bound) = bound {
+                        group.push(format!("{binder}::{n} <: {}", write(&bound)));
+                    }
                 }
+            }
+            if r.binders.is_empty() {
+                items.extend(group);
+            } else {
+                let binders: Vec<String> = names
+                    .iter()
+                    .zip(&r.binders)
+                    .map(|(n, (_, t))| format!("{n}: {}", write(t)))
+                    .collect();
+                let body = match group.as_slice() {
+                    [one] => one.clone(),
+                    many => format!("({})", many.join(", ")),
+                };
+                items.push(format!("forall ({}) {body}", binders.join(", ")));
             }
         }
         items

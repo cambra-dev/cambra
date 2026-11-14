@@ -192,6 +192,15 @@ pub enum ConstrainError {
         /// The domains that have no common answer.
         domains: Vec<Type>,
     },
+    /// Types met as lower bounds of one variable that have no join: a family parameter
+    /// applied at two different terms, which relate as two type parameters do
+    /// (`docs/chl-spec.md`, "Kinds and bounds"). The constraint-time face of coalesce's
+    /// [`IncompatibleBounds`](super::coalesce::CoalesceError::IncompatibleBounds), reached where
+    /// a trait obligation is offered both.
+    NoJoin {
+        /// The types with no common type, in the order they arrived.
+        types: Vec<Type>,
+    },
     /// An operand's type ruled out the last instance of a trait an operator
     /// requires — `1 > "a"`, or `\x -> x + 1` applied to a string.
     ///
@@ -1042,6 +1051,15 @@ fn joined_keys(domain: &Type, subst: &Subst) -> Option<(Vec<Name>, Refinement)> 
     None
 }
 
+/// The substitution taking the lower side of the edge `lhs‹sl› <: rhs‹sr›` into the frame `rhs`
+/// stands in: `sl`, then `sr` undone where it can be.
+fn edge_into_holder(sl: &Subst, sr: &Subst) -> Subst {
+    if sr.is_id() {
+        return sl.clone();
+    }
+    Subst::then(sl, &sr.invert().unwrap_or_else(Subst::id))
+}
+
 /// A bound that would put the binder of a function whose codomain edge the descent is inside
 /// outside its scope on `holder`: the holder is one type for every value of the binder, and the
 /// edge would bound it at each value, a meet or a join over the binder, which the solver does
@@ -1487,8 +1505,9 @@ fn eliminate_at(ty: &Type, s: &Subst) -> Option<(Type, Subst)> {
     use crate::ccl::ty::FunKind;
     let (term, rest) = s.top_elim()?;
     match ty {
-        // A parameter is eliminated as its bound is, once the parameter's arm reads it.
-        Type::Infer(_) | Type::Param(_) => None,
+        // A parameter is eliminated as its bound is, once the parameter's arm reads it, and a
+        // family application as the bound on its family's values is.
+        Type::Infer(_) | Type::Param(_) | Type::FamilyApp(_) => None,
         Type::Refinement(base, refinements) => {
             let (b2, s2) = eliminate_at(base, s)?;
             Some((Type::Refinement(Box::new(b2), refinements.clone()), s2))
@@ -2337,7 +2356,7 @@ fn constrain_go_impl(
             // closure below only re-offers `lv`'s lowers to `rhs` when the levels let
             // this arm run, which is precisely what a `let` RHS breaks.
             if let Type::Infer(rv) = rhs {
-                link_watches(lv, rv, cache)?;
+                link_watches(lv, rv, &edge_into_holder(sl, sr), cache)?;
             }
             for low in lows.iter() {
                 let Some((tau_l, tau_u)) = bridge_holder_gap(&low.self_subst, sl, Some(lv)) else {
@@ -2434,15 +2453,23 @@ fn constrain_go_impl(
             // land the concrete type here. The one path that bypasses the closure is
             // `extrude`, which seeds a proxy's bounds by direct writes; it copies the
             // watch list instead.
-            notify_lower(rv, lhs, cache)?;
+            // A family application's terms are read where the variable stands, so the edge's
+            // substitution on its side reaches them before it is delivered.
+            if let Type::FamilyApp(_) = lhs.peel_refinements() {
+                let into = edge_into_holder(sl, sr);
+                let at = crate::ccl::provenance::preserving_ids(|| into.apply_type(lhs));
+                notify_lower(rv, &at, cache)?;
+            } else {
+                notify_lower(rv, lhs, cache)?;
+            }
             match lhs {
-                Type::Infer(lv) => link_watches(lv, rv, cache)?,
+                Type::Infer(lv) => link_watches(lv, rv, &edge_into_holder(sl, sr), cache)?,
                 // A refinement offers what its base does, so the watch follows the edge down to
                 // a refined variable as to a bare one: a map loop's positions are its key
                 // variable refined by membership.
                 Type::Refinement(inner, _) => {
                     if let Type::Infer(lv) = &**inner {
-                        link_watches(lv, rv, cache)?;
+                        link_watches(lv, rv, &edge_into_holder(sl, sr), cache)?;
                     }
                 }
                 // A barrier variable's lowers are not closed against `rv`'s uppers, and
@@ -2778,9 +2805,13 @@ fn smt_undecided_is_mismatch(
 /// Copied unconditionally, at both polarities. The proxy and the original stay
 /// linked, so a fact can legitimately arrive at both — but narrowing is an
 /// idempotent set intersection, which makes the duplicate delivery a no-op rather
-/// than something to reason about per polarity.
+/// than something to reason about per polarity. The proxy stands where the original
+/// does, so each obligation reads it in the original's frame.
 fn copy_watches(from: &Rc<InferVar>, to: &Rc<InferVar>) {
     let watches = from.watches.borrow().clone();
+    for (obligation, pos) in &watches {
+        obligation.copy_frame(obligation, *pos, from.uid, to.uid);
+    }
     if !watches.is_empty() {
         to.watches.borrow_mut().extend(watches);
     }

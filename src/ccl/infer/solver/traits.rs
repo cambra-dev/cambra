@@ -72,7 +72,7 @@
 use crate::ccl::Occurrence;
 use crate::ccl::ty::TraitRequirement;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -409,6 +409,7 @@ impl CompilerTraits {
                         terms: Vec::new(),
                         assoc: Vec::new(),
                         effect_assoc: Vec::new(),
+                        binders: Vec::new(),
                         at: None,
                     })],
                     params: vec![t],
@@ -600,6 +601,7 @@ impl OperatorTrait<'_> {
                     terms: Vec::new(),
                     assoc: Vec::new(),
                     effect_assoc: Vec::new(),
+                    binders: Vec::new(),
                     at: None,
                 })
             })
@@ -1319,6 +1321,12 @@ fn match_pattern(pattern: &Type, ty: &Type, bound: &mut HashMap<TypeParamId, Typ
 /// whether some types are an instance of both. Two instance heads overlap exactly when they
 /// unify, and a requirement can be satisfied by an instance exactly when they do.
 pub fn unify_all(a: &[Type], b: &[Type]) -> bool {
+    unifier(a, b).is_some()
+}
+
+/// The most general substitution under which `a` and `b` are equal ([`unify_all`]), applied by
+/// [`apply_unifier`]: what an instance's head variables stand for at a requirement's operands.
+pub fn unifier(a: &[Type], b: &[Type]) -> Option<HashMap<TypeParamId, Type>> {
     fn walk<'t>(ty: &'t Type, subst: &'t HashMap<TypeParamId, Type>) -> &'t Type {
         let mut ty = ty.peel_refinements();
         while let Type::Param(p) = ty {
@@ -1356,7 +1364,20 @@ pub fn unify_all(a: &[Type], b: &[Type]) -> bool {
         }
     }
     let mut subst = HashMap::new();
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| unify(x, y, &mut subst))
+    (a.len() == b.len() && a.iter().zip(b).all(|(x, y)| unify(x, y, &mut subst))).then_some(subst)
+}
+
+/// `ty` with each type parameter `subst` binds replaced by what it stands for, through any
+/// chain of others ([`unifier`]). The occurs check there keeps every chain finite.
+pub fn apply_unifier(ty: &Type, subst: &HashMap<TypeParamId, Type>) -> Type {
+    if let Type::Param(p) = ty
+        && let Some(to) = subst.get(&p.id)
+    {
+        return apply_unifier(to, subst);
+    }
+    let mut out = ty.clone();
+    out.walk_children_mut(|c| *c = apply_unifier(c, subst));
+    out
 }
 
 /// Whether values of `ty` satisfy the comparison trait `trait_`, `Equatable` or `Orderable`,
@@ -1805,6 +1826,36 @@ pub struct TraitObligation {
     /// requirement its scheme states, `r::Writes`. Each use's copy of the obligation links its
     /// copies to what it selects (`docs/chl-spec.md`, "Effects in traits").
     effects: RefCell<Vec<(TypeParamId, Rc<crate::ccl::capabilities::CapabilityVar>)>>,
+    /// For each variable a watch was carried down to, at an operand position, the substitution
+    /// taking a type in that variable's frame to the frame of the operand's own variable: the
+    /// edges' substitutions composed on the way down ([`link_watches`]). A family application
+    /// offered there reads terms, which the obligation reads where the operand stands. A
+    /// variable missing here stands in the operand's frame.
+    frames: RefCell<HashMap<(u8, InferVarId), crate::ccl::subst::Subst>>,
+    /// What applications of a bounded family it has been offered, where a quantified
+    /// assumption answers them ([`narrow_family`](Self::narrow_family)).
+    held: RefCell<BTreeMap<u8, Held>>,
+}
+
+/// An obligation's answer from a quantified assumption about a bounded family, held until
+/// its operand is settled ([`TraitObligation::narrow_family`]).
+///
+/// Applications at one set of terms are one value, which the assumption answers there.
+/// Applications at two different terms are two values, whose join is the bound on the family's
+/// values, which the assumption does not describe. Which the operand holds is known only once
+/// every application has arrived, so the answer is deposited then ([`settle_held_answers`]).
+#[derive(Clone, Default)]
+enum Held {
+    /// No application of a bounded family that an assumption answers has arrived.
+    #[default]
+    Nothing,
+    /// Applications at one set of terms, answered after every contribution has arrived.
+    AtOneKey { app: crate::ccl::ty::FamilyApp },
+    /// The answer at `app`'s terms, deposited.
+    Settled { app: crate::ccl::ty::FamilyApp },
+    /// Applications at two different terms arrived, so the operand is the bound on the
+    /// family's values, which was offered in their place.
+    AtTheBound,
 }
 
 /// What a method call `𝑥.m(𝑎…)` reaches once its receiver's type is known
@@ -2054,6 +2105,8 @@ impl TraitObligation {
             operator_node_id,
             required_at,
             method,
+            frames: RefCell::new(HashMap::new()),
+            held: RefCell::new(BTreeMap::new()),
             trait_,
             effects: RefCell::default(),
         })
@@ -2075,7 +2128,7 @@ impl TraitObligation {
     pub(super) fn new_from(original: &Rc<TraitObligation>) -> Rc<TraitObligation> {
         // A provenance recording for the cloning of the refinement's operands into the copy.
         let _f = provenance::copy_frame("infer.freshen_obligation");
-        Rc::new(TraitObligation {
+        let copy = Rc::new(TraitObligation {
             uid: TraitObligationId(OBLIGATION_COUNTER.fetch_add(1, Ordering::Relaxed)),
             copied_from: Some(Rc::clone(original)),
             trait_: original.trait_.clone(),
@@ -2105,7 +2158,18 @@ impl TraitObligation {
             method: original.method.clone(),
             // Freshening sets the copy's own ([`Self::set_effects`]).
             effects: RefCell::default(),
-        })
+            frames: RefCell::new(HashMap::new()),
+            held: RefCell::new(original.held.borrow().clone()),
+        });
+        if copy
+            .held
+            .borrow()
+            .values()
+            .any(|h| matches!(h, Held::AtOneKey { .. }))
+        {
+            hold(&copy);
+        }
+        copy
     }
 
     /// Whether the operand sweep reads this position as a table requirement.
@@ -2350,6 +2414,7 @@ impl TraitObligation {
         for position in &self.assoc {
             position.deposited.set(false);
         }
+        self.held.borrow_mut().clear();
         true
     }
 
@@ -2369,16 +2434,27 @@ impl TraitObligation {
             let Some(Type::Infer(var)) = operand else {
                 continue;
             };
-            let mut stack = vec![Rc::clone(var)];
+            // Each edge's substitution is composed on the way down, so a family application
+            // is read in the operand's frame, its terms renamed as the edges rename them.
+            let mut stack = vec![(Rc::clone(var), crate::ccl::subst::Subst::id())];
             let mut seen = std::collections::HashSet::new();
             let mut contributions = Vec::new();
-            while let Some(v) = stack.pop() {
+            while let Some((v, frame)) = stack.pop() {
                 if !seen.insert(v.uid) {
                     continue;
                 }
                 for bound in v.bounds.borrow().lower().iter() {
                     match &bound.ty {
-                        Type::Infer(below) => stack.push(Rc::clone(below)),
+                        Type::Infer(below) => stack.push((
+                            Rc::clone(below),
+                            crate::ccl::subst::Subst::then(&bound.render_subst(), &frame),
+                        )),
+                        app @ Type::FamilyApp(_) => {
+                            let into =
+                                crate::ccl::subst::Subst::then(&bound.render_subst(), &frame);
+                            let at = provenance::preserving_ids(|| into.apply_type(app));
+                            contributions.push((at, bound.origin));
+                        }
                         other => contributions.push((other.clone(), bound.origin)),
                     }
                 }
@@ -2499,6 +2575,15 @@ impl TraitObligation {
         if matches!(offered(contribution), Offered::Unknown) {
             return Ok(());
         }
+        if let Offered::Family(app) = offered(contribution)
+            && self
+                .assumptions
+                .borrow()
+                .iter()
+                .any(|a| a.at_application(&self.path(pos), app).is_some())
+        {
+            return self.narrow_family(pos, app, cache);
+        }
         let path = self.path(pos);
         let head = offered_head(contribution);
         let (operand, around) = self.operand_around(pos, contribution);
@@ -2564,16 +2649,16 @@ impl TraitObligation {
                     let watched = Type::Infer(Rc::clone(var));
                     self.watch(&watched, slot);
                     // What the variable already carries arrived before the watch.
-                    let lower: Vec<Type> = var
+                    let lower: Vec<(Type, crate::ccl::subst::Subst)> = var
                         .bounds
                         .borrow()
                         .lower()
                         .iter()
-                        .map(|b| b.ty.clone())
+                        .map(|b| (b.ty.clone(), b.render_subst()))
                         .collect();
-                    for bound in lower {
+                    for (bound, into) in lower {
                         match &bound {
-                            Type::Infer(below) => link_watches(below, var, cache)?,
+                            Type::Infer(below) => link_watches(below, var, &into, cache)?,
                             other => deliver(self, slot, other, None, cache)?,
                         }
                     }
@@ -2631,6 +2716,188 @@ impl TraitObligation {
                 param: Rc::clone(param),
             }),
         }
+    }
+
+    /// Narrow by a family application `app` at `pos`, inside the definition declaring its
+    /// family.
+    ///
+    /// An assumption whose operand there is the family applied to its binders, as
+    /// `forall (k: K) Iterable(V(k))` states, answers it at the application's terms: the row is
+    /// replaced by the requirement read there, whose associated types are the member families
+    /// applied to those terms ([`TraitRequirement::at_application`]). The rows and the
+    /// product and collection rules then drop out, as for a type parameter an assumption names
+    /// ([`narrow_param`](Self::narrow_param)). With no such assumption, the application
+    /// offers the bound on the family's values at its terms, and a family with none supports
+    /// nothing.
+    ///
+    /// A family with a bound on its values holds the answer instead ([`Held`]): applications at
+    /// two different terms join at the bound, so the operand is the bound, which is offered in
+    /// their place, and the answer at the first terms is deposited only once no second has
+    /// arrived ([`settle_held_answers`]).
+    fn narrow_family(
+        self: &Rc<Self>,
+        pos: u8,
+        app: &crate::ccl::ty::FamilyApp,
+        cache: &mut ConstrainCache,
+    ) -> Result<(), ConstrainError> {
+        let bound = crate::ccl::subst::family_bound_at(app);
+        if bound.is_some() {
+            let held = self.held.borrow().get(&pos).cloned().unwrap_or_default();
+            match held {
+                Held::Nothing => {}
+                Held::AtOneKey { app: first, .. } if first == *app => return Ok(()),
+                Held::Settled { app: first } if first == *app => return Ok(()),
+                Held::AtOneKey { .. } => {
+                    self.held.borrow_mut().insert(pos, Held::AtTheBound);
+                    return self.offer_family_bound(pos, app, cache);
+                }
+                Held::AtTheBound => return self.offer_family_bound(pos, app, cache),
+                Held::Settled { app: first } => panic!(
+                    "an obligation answered at {} was offered {} after its answer was \
+                     settled: every application of a family reaches an obligation inside the \
+                     definition declaring it, which settles its answers when it closes",
+                    Type::FamilyApp(first),
+                    Type::FamilyApp(app.clone()),
+                ),
+            }
+        }
+        let answering: Vec<Rc<TraitRequirement>> = self
+            .assumptions
+            .borrow()
+            .iter()
+            .filter_map(|a| a.at_application(&self.path(pos), app).map(Rc::new))
+            .collect();
+        if !answering.is_empty() {
+            if bound.is_some() {
+                self.held
+                    .borrow_mut()
+                    .insert(pos, Held::AtOneKey { app: app.clone() });
+                hold(self);
+                return Ok(());
+            }
+            self.candidates.borrow_mut().clear();
+            self.rule_out_product_rule();
+            *self.assumptions.borrow_mut() = answering;
+            return self.try_deposit(cache);
+        }
+        // The rows already read a quantified assumption at the terms of an application that
+        // arrived first. One arriving at the same terms is answered there.
+        let quantified_answers = self.context.borrow().iter().any(|a| {
+            a.trait_ == self.trait_
+                && !a.binders.is_empty()
+                && a.at_application(&self.path(pos), app).is_some()
+        });
+        if quantified_answers
+            && self.candidates.borrow().is_empty()
+            && !self.assumptions.borrow().is_empty()
+        {
+            let first = self
+                .assumptions
+                .borrow()
+                .iter()
+                .filter_map(|answered| {
+                    let path = self.path(pos);
+                    type_at(answered.args.get(path[0] as usize)?, &path[1..])
+                })
+                .map(|t| t.peel_refinements().clone())
+                .find(|t| !matches!(t, Type::FamilyApp(first) if *first == *app));
+            let Some(first) = first else {
+                return Ok(());
+            };
+            // An application at other terms holds another value, and the operand the join of the
+            // two, which two applications of a family with no bound on its values do not have:
+            // the program is wrong. A bounded family's are held above.
+            return Err(ConstrainError::NoJoin {
+                types: vec![first, Type::FamilyApp(app.clone())],
+            });
+        }
+        self.offer_family_bound(pos, app, cache)
+    }
+
+    /// Offer the bound on the values of `app`'s family at its terms, in its place at `pos`; a
+    /// family with none supports nothing.
+    fn offer_family_bound(
+        self: &Rc<Self>,
+        pos: u8,
+        app: &crate::ccl::ty::FamilyApp,
+        cache: &mut ConstrainCache,
+    ) -> Result<(), ConstrainError> {
+        let missing = || ConstrainError::MissingRequirement {
+            trait_: self.trait_.clone(),
+            position: pos,
+            param: Rc::clone(&app.param),
+        };
+        match crate::ccl::subst::family_bound_at(app) {
+            // The operand is this application, so a requirement missing of its bound is
+            // missing of the family.
+            Some(bound) => deliver(self, pos, &bound, None, cache).map_err(|e| match e {
+                ConstrainError::MissingRequirement { .. } => missing(),
+                other => other,
+            }),
+            None => Err(missing()),
+        }
+    }
+
+    /// Deposit the answer held at one set of terms, which no application at other terms
+    /// followed ([`Held`]).
+    fn settle_held(self: &Rc<Self>, cache: &mut ConstrainCache) -> Result<(), ConstrainError> {
+        let held = self.held.borrow().clone();
+        for (pos, held) in held {
+            let Held::AtOneKey { app } = held else {
+                continue;
+            };
+            self.held
+                .borrow_mut()
+                .insert(pos, Held::Settled { app: app.clone() });
+            let answering: Vec<_> = self
+                .assumptions
+                .borrow()
+                .iter()
+                .filter_map(|a| a.at_application(&self.path(pos), &app).map(Rc::new))
+                .collect();
+            if answering.is_empty() {
+                self.offer_family_bound(pos, &app, cache)?;
+            } else {
+                self.candidates.borrow_mut().clear();
+                self.rule_out_product_rule();
+                *self.assumptions.borrow_mut() = answering;
+            }
+        }
+        self.try_deposit(cache)
+    }
+
+    /// Whether every held family's declaration is among `params`.
+    fn held_families_are(&self, params: &[TypeParamId]) -> bool {
+        self.held.borrow().values().all(|h| match h {
+            Held::AtOneKey { app } => params.contains(&app.param.id),
+            _ => true,
+        })
+    }
+
+    /// Read `to` at operand `pos` in the frame `original` reads `from` in ([`frames`](Self::frames)):
+    /// `to` stands for `from` with the same binders in scope, as an extrusion proxy or a
+    /// specialization's copy does, and `original` is this obligation or the one it copies.
+    pub(super) fn copy_frame(
+        &self,
+        original: &TraitObligation,
+        pos: u8,
+        from: InferVarId,
+        to: InferVarId,
+    ) {
+        let frame = original.frames.borrow().get(&(pos, from)).cloned();
+        if let Some(frame) = frame {
+            self.frames.borrow_mut().insert((pos, to), frame);
+        }
+    }
+
+    /// The substitution taking a type in `var`'s frame to the frame of the variable standing at
+    /// operand `pos` ([`frames`](Self::frames)).
+    fn frame_of(&self, pos: u8, var: &InferVar) -> crate::ccl::subst::Subst {
+        self.frames
+            .borrow()
+            .get(&(pos, var.uid))
+            .cloned()
+            .unwrap_or_else(crate::ccl::subst::Subst::id)
     }
 
     /// Rule the product rule out, unless it is absent or already applied, and the
@@ -2721,12 +2988,13 @@ impl TraitObligation {
             terms: Vec::new(),
             effect_assoc: Vec::new(),
             assoc,
+            binders: Vec::new(),
             at: None,
         })
     }
 
     /// The type standing at each operand and argument position, `None` where none is yet.
-    pub(super) fn operands(&self) -> Vec<Option<Type>> {
+    pub(crate) fn operands(&self) -> Vec<Option<Type>> {
         self.operands.borrow().clone()
     }
 
@@ -3427,7 +3695,13 @@ impl TraitObligation {
     fn agreed_assoc(&self, name: &Assoc) -> Option<Type> {
         // The collection rule is a candidate beside the rows, and what it associates is the
         // operand itself, which no row states.
-        if self.collection_rule.get() == CollectionRule::Open {
+        if self.collection_rule.get() == CollectionRule::Open
+            || self
+                .held
+                .borrow()
+                .values()
+                .any(|h| matches!(h, Held::AtOneKey { .. }))
+        {
             return None;
         }
         let mut settled: Option<Type> = None;
@@ -3450,6 +3724,9 @@ impl TraitObligation {
             }
         }
         for assumption in self.assumptions.borrow().iter() {
+            if !assumption.binders.is_empty() {
+                return None;
+            }
             let ty = assumption.assoc_ty(name)?;
             if !agree(ty.clone()) {
                 return None;
@@ -3497,6 +3774,53 @@ fn register_watch(obligation: &Rc<TraitObligation>, pos: u8, ty: &Type) {
         log.borrow_mut()
             .push((Rc::clone(obligation), pos, ty.clone()))
     });
+}
+
+thread_local! {
+    /// Every obligation holding an answer from a quantified assumption about a bounded family
+    /// ([`Held`]), which [`settle_held_answers`] deposits. Per inference run.
+    static HELD: RefCell<Vec<Rc<TraitObligation>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Record that `obligation` holds an answer for [`settle_held_answers`] to deposit.
+fn hold(obligation: &Rc<TraitObligation>) {
+    HELD.with(|held| held.borrow_mut().push(Rc::clone(obligation)));
+}
+
+/// Forget every held answer. Called when an inference run begins.
+pub fn clear_held_answers() {
+    HELD.with(|held| held.borrow_mut().clear());
+}
+
+pub(crate) fn discard_held_answers(params: &[TypeParamId]) {
+    HELD.with(|held| {
+        held.borrow_mut().retain(|o| !o.held_families_are(params));
+    });
+}
+
+/// Deposit every answer held at one set of terms of a family `params` names, or of any family
+/// where `params` is `None` ([`Held`]).
+///
+/// Every application of a family parameter reaches an obligation inside the definition
+/// declaring it, so the definition settles its families' answers when it closes, before the
+/// method calls it deferred are closed. What a specialization's copy holds after its pin is
+/// settled once it has been redelivered.
+pub fn settle_held_answers(
+    params: Option<&[TypeParamId]>,
+    cache: &mut ConstrainCache,
+) -> Result<(), ConstrainError> {
+    let settling: Vec<Rc<TraitObligation>> = HELD.with(|held| {
+        let mut held = held.borrow_mut();
+        let (settling, kept) = std::mem::take(&mut *held)
+            .into_iter()
+            .partition(|o| params.is_none_or(|ps| o.held_families_are(ps)));
+        *held = kept;
+        settling
+    });
+    for obligation in settling {
+        obligation.settle_held(cache)?;
+    }
+    Ok(())
 }
 
 /// Discard the audit trail. Called when an inference run begins, so one run's
@@ -3902,8 +4226,8 @@ fn peel_refinements(ty: &Type) -> &Type {
 /// inference (a self-call is an unbound variable) and `LetRec` is born after it — so
 /// this is a precondition to re-check when recursive definitions arrive, not a live
 /// hazard.
-fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Place> {
-    let mut out: std::collections::BTreeMap<StepPath, Place> = Default::default();
+fn places_under(root: &Rc<InferVar>) -> BTreeMap<StepPath, Place> {
+    let mut out: BTreeMap<StepPath, Place> = Default::default();
     let mut seen: std::collections::HashSet<(InferVarId, StepPath)> = Default::default();
     let mut frontier = vec![(Rc::clone(root), StepPath::new())];
     while let Some((var, path)) = frontier.pop() {
@@ -4335,6 +4659,11 @@ pub enum Offered<'a> {
     /// its bound supports, and nothing if it has none
     /// (`src/ccl/design/type-parameters.md`, "Obligations under assumptions").
     Param(&'a Rc<TypeParam>),
+    /// A family parameter applied to terms, `V(k)`, inside the definition that declares it. It
+    /// supports what a requirement under `forall` states of its values, read at its terms, and
+    /// otherwise what the bound on its values supports
+    /// (`src/ccl/design/type-parameters.md`, "Obligations under assumptions").
+    Family(&'a crate::ccl::ty::FamilyApp),
 }
 
 /// `product` with every component's refinements peeled, recursively through nested products.
@@ -4444,6 +4773,7 @@ pub fn offered(ty: &Type) -> Offered<'_> {
         // A nominal type satisfies the traits its module's instances name.
         Type::Nominal(decl, _) => Offered::Nominal(decl),
         Type::Param(param) => Offered::Param(param),
+        Type::FamilyApp(app) => Offered::Family(app),
         // Everything else is either a variable, a placeholder, or a carrier whose
         // payload reaches the watch by another route.
         _ => Offered::Unknown,
@@ -4463,7 +4793,11 @@ pub fn offered_head(ty: &Type) -> Option<InstanceHead> {
     match offered(ty) {
         Offered::Base(b) => Some(InstanceHead::Base(b.clone())),
         Offered::Nominal(decl) => Some(InstanceHead::Nominal(Rc::clone(decl))),
-        Offered::Unknown | Offered::Product(_) | Offered::NotABase | Offered::Param(_) => None,
+        Offered::Unknown
+        | Offered::Product(_)
+        | Offered::NotABase
+        | Offered::Param(_)
+        | Offered::Family(_) => None,
     }
 }
 
@@ -4490,9 +4824,13 @@ pub fn offered_head(ty: &Type) -> Option<InstanceHead> {
 /// Recursion is bounded by the watch set only ever growing: a variable that gains
 /// nothing new stops the walk, which is what makes this safe on the cyclic bound
 /// graph a recurrence produces.
+///
+/// `into` takes a type in `lower`'s frame to `upper`'s, the edge's substitution: a family
+/// application `lower` carries reads terms, which the obligation reads where `upper` stands.
 pub(super) fn link_watches(
     lower: &Rc<InferVar>,
     upper: &Rc<InferVar>,
+    into: &crate::ccl::subst::Subst,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
     let incoming = {
@@ -4518,6 +4856,15 @@ pub(super) fn link_watches(
     if added.is_empty() {
         return Ok(());
     }
+    for (obligation, pos) in &added {
+        let frame = crate::ccl::subst::Subst::then(into, &obligation.frame_of(*pos, upper));
+        if !frame.is_id() {
+            obligation
+                .frames
+                .borrow_mut()
+                .insert((*pos, lower.uid), frame);
+        }
+    }
 
     // Whatever `lower` already carries is information the obligation has not been
     // offered — it arrived before the edge existed. A type parameter is replayed
@@ -4534,8 +4881,16 @@ pub(super) fn link_watches(
         let params: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = bounds
             .lower()
             .iter()
-            .filter(|b| matches!(offered(&b.ty), Offered::Param(_)))
-            .map(|b| (b.ty.clone(), b.origin))
+            .filter(|b| matches!(offered(&b.ty), Offered::Param(_) | Offered::Family(_)))
+            // A family application reads terms, rendered where `lower` stands and read by each
+            // obligation in its operand's frame ([`deliver_in_frame`]).
+            .map(|b| match &b.ty {
+                Type::FamilyApp(_) => (
+                    provenance::preserving_ids(|| b.render_subst().apply_type(&b.ty)),
+                    b.origin,
+                ),
+                _ => (b.ty.clone(), b.origin),
+            })
             .collect();
         // A product no product rule reads is refused as it is when it arrives after the edge: a
         // record reaching `Orderable`, the keys of a map an ordered loop runs over.
@@ -4561,11 +4916,11 @@ pub(super) fn link_watches(
             .filter(|b| matches!(b.ty.peel_refinements(), Type::Nominal(..)))
             .map(|b| (b.ty.clone(), b.origin))
             .collect();
-        let below: Vec<Rc<InferVar>> = bounds
+        let below: Vec<(Rc<InferVar>, crate::ccl::subst::Subst)> = bounds
             .lower()
             .iter()
             .filter_map(|b| match &b.ty {
-                Type::Infer(v) => Some(Rc::clone(v)),
+                Type::Infer(v) => Some((Rc::clone(v), b.render_subst())),
                 _ => None,
             })
             .collect();
@@ -4592,7 +4947,7 @@ pub(super) fn link_watches(
             deliver(obligation, *pos, known, *origin, cache)?;
         }
         for (param, origin) in &params {
-            deliver(obligation, *pos, param, *origin, cache)?;
+            deliver_in_frame(obligation, *pos, lower, param, *origin, cache)?;
         }
         for (product, origin) in &products {
             if !obligation.trait_.admits_product(product) {
@@ -4611,8 +4966,8 @@ pub(super) fn link_watches(
         }
     }
     // Transitivity: anything flowing into `lower` flows into `upper` too.
-    for v in below {
-        link_watches(&v, lower, cache)?;
+    for (v, into) in below {
+        link_watches(&v, lower, &into, cache)?;
     }
     for barrier in barriers_below {
         link_barrier_watches(&barrier, lower, cache)?;
@@ -4700,9 +5055,30 @@ pub(super) fn notify_lower(
         watches.clone()
     };
     for (obligation, pos) in watches {
-        deliver(&obligation, pos, contribution, None, cache)?;
+        deliver_in_frame(&obligation, pos, var, contribution, None, cache)?;
     }
     Ok(())
+}
+
+/// [`deliver`] `contribution`, a type in `var`'s frame, read in the frame of the operand at
+/// `pos`: a family application's terms are renamed by the edges the watch was carried down
+/// ([`TraitObligation::frames`]). Every other contribution offers what it offers in any frame.
+fn deliver_in_frame(
+    obligation: &Rc<TraitObligation>,
+    pos: u8,
+    var: &InferVar,
+    contribution: &Type,
+    value: Option<crate::ccl::infer_var::Origin>,
+    cache: &mut ConstrainCache,
+) -> Result<(), ConstrainError> {
+    if let Type::FamilyApp(_) = contribution.peel_refinements() {
+        let frame = obligation.frame_of(pos, var);
+        if !frame.is_id() {
+            let at = provenance::preserving_ids(|| frame.apply_type(contribution));
+            return deliver(obligation, pos, &at, value, cache);
+        }
+    }
+    deliver(obligation, pos, contribution, value, cache)
 }
 
 /// Deliver an upper bound to every obligation watching `var` that reads it: one that reads
@@ -4779,7 +5155,7 @@ fn offer(
     }
     match offered(contribution) {
         // A type variable standing as a candidate's whole operand takes what no head names.
-        Offered::Product(_) | Offered::NotABase | Offered::Param(_)
+        Offered::Product(_) | Offered::NotABase | Offered::Param(_) | Offered::Family(_)
             if obligation.has_variable_at(pos) =>
         {
             obligation.narrow_to_variables(pos, contribution, cache)
@@ -4796,6 +5172,7 @@ fn offer(
         Offered::Product(product) => obligation.narrow_product(pos, product, cache),
         Offered::NotABase => obligation.reject(pos, contribution),
         Offered::Param(param) => obligation.narrow_param(pos, param, cache),
+        Offered::Family(app) => obligation.narrow_family(pos, app, cache),
         Offered::Unknown => Ok(()),
     }
 }
@@ -4885,6 +5262,7 @@ pub fn entailed(
                 terms: Vec::new(),
                 effect_assoc: Vec::new(),
                 assoc: Vec::new(),
+                binders: Vec::new(),
                 at: requirement.at,
             };
             entailed(&at_field, assumptions, table)

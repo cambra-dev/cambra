@@ -3947,6 +3947,35 @@ pub(super) fn specialize_use(
             }
         }
     });
+    // A family parameter of the binding's own is below the bound on its values, at the
+    // binders its variable stands under, as at an instantiation (`PolyScheme::
+    // instantiate_with_params`).
+    let pinned = pinned.and_then(|()| {
+        let ScopeEntry::Generalized(frame) = &ctx.scope[frame_idx] else {
+            unreachable!("lookup_generalized returns indices of Generalized entries only");
+        };
+        let own = Rc::clone(&frame.own_params);
+        let mut families: Vec<_> = fresh
+            .family_params
+            .values()
+            .filter(|(param, _, _)| own.contains(&param.id))
+            .cloned()
+            .collect();
+        families.sort_by(|a, b| a.0.cmp(&b.0));
+        for (param, names, var) in families {
+            if let Some(bound) = &param.bound {
+                let bound = freshen_above(cutoff, bound, target, &mut fresh);
+                let bound = crate::ccl::subst::family_at_names(&bound, &names);
+                constrain_subtype_in(
+                    &var,
+                    &bound,
+                    &mut cache,
+                    &crate::ccl::infer::solver::smt::NoScope,
+                )?;
+            }
+        }
+        Ok(())
+    });
     // An obligation the copy reset, having assumed one of the binding's own type
     // parameters, resolves against its trait's instances at the use's types, which
     // the pin has just delivered to its operands' variables
@@ -3963,7 +3992,8 @@ pub(super) fn specialize_use(
             });
             obligation.assume_more(&ctx.assumptions);
             obligation.redeliver(&mut cache)
-        })
+        })?;
+        crate::ccl::infer::solver::traits::settle_held_answers(None, &mut cache)
     });
     // A parameter standing for an associated type is the instance's type at the clone's
     // operands, which the pin has just delivered: it is defined there, not solved for, so

@@ -2372,6 +2372,7 @@ fn emit_let_definition_inner<C: Typing>(
     ctx: &mut C,
 ) -> Result<(LetScheme, bool), LocatedInferError> {
     let reads_before = ctx.poisoned_reads();
+    let recoveries_before = ctx.recoveries();
     // Emit the RHS at a deeper level so its locally-minted variables can be
     // generalized at the binding site (`scoped_let`). A polymorphic annotation is
     // opened at that level first, so its type parameters sit with the right-hand
@@ -2393,9 +2394,13 @@ fn emit_let_definition_inner<C: Typing>(
         reads_before,
         ctx,
     );
-    if let Some(poly) = &poly {
-        ctx.close_poly(poly);
-    }
+    let bound = if let Some(poly) = &poly {
+        let complete = bound.is_ok() && ctx.recoveries() == recoveries_before;
+        let closed = ctx.close_poly(poly, complete);
+        bound.and_then(|bound| closed.map(|()| bound))
+    } else {
+        bound
+    };
     let LetBound {
         ty: scheme_ty,
         at_annotation,
@@ -3691,6 +3696,26 @@ fn require_stated(
     at: &dyn Fn() -> String,
     ctx: &mut InferCtx,
 ) -> Result<std::rc::Rc<crate::ccl::infer::solver::traits::TraitObligation>, LocatedInferError> {
+    // A quantified requirement holds at every value of its binders, so the use proves it at
+    // binders of its own, which nothing it passes constrains (`docs/chl-spec.md`, "Family
+    // parameters").
+    if !r.binders.is_empty() {
+        let fresh: Vec<Name> = r.binders.iter().map(|(n, _)| Name::fresh_like(n)).collect();
+        let at_fresh = {
+            let _g = crate::ccl::provenance::enter(
+                node_id,
+                "infer.quantified_requirement",
+                crate::ccl::provenance::Nature::Machinery,
+            );
+            TraitRequirement {
+                binders: Vec::new(),
+                ..r.with_binders_named(&fresh)
+            }
+        };
+        return under_binders(&fresh, ctx, &mut |ctx: &mut InferCtx| {
+            require_stated(&at_fresh, node_id, at, ctx)
+        });
+    }
     let names: Vec<Assoc> = r.assoc.iter().map(|(n, _)| n.clone()).collect();
     let require = |ctx: &mut InferCtx| {
         ctx.require_trait_obligation(
@@ -3707,6 +3732,19 @@ fn require_stated(
         ctx.require_sub(settled, named, at)?;
     }
     Ok(obligation)
+}
+
+/// Run `f` with each of `names` entered, outermost first.
+fn under_binders<R>(
+    names: &[Name],
+    ctx: &mut InferCtx,
+    f: &mut dyn FnMut(&mut InferCtx) -> R,
+) -> R {
+    use crate::ccl::infer_var::TelescopeWalk;
+    match names.split_first() {
+        None => f(ctx),
+        Some((first, rest)) => ctx.under_binder(first, |ctx| under_binders(rest, ctx, f)),
+    }
 }
 
 /// Replace the `Method` placeholder `function` with the candidate its receiver's type names
