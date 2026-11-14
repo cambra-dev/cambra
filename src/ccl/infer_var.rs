@@ -170,6 +170,10 @@ pub struct Bound {
     /// it follows, once per walk, and composing it applies the holder side to every term the
     /// content side's range holds.
     pub rendered: RenderedSubst,
+    /// Whether the edge is one half of an **equation**: drawn by the invariant data-domain
+    /// path, which relates two domains in both directions (`src/ccl/design/type-inference.md`,
+    /// "Two equations meet without filtering").
+    pub equation: bool,
 }
 
 /// The memo of a [`Bound`]'s [`render_subst`](Bound::render_subst). A bound's two
@@ -201,6 +205,7 @@ impl Bound {
             ty,
             ty_subst: subst::Subst::id(),
             rendered: RenderedSubst::default(),
+            equation: false,
         }
     }
 
@@ -215,6 +220,7 @@ impl Bound {
             ty,
             ty_subst,
             rendered: RenderedSubst::default(),
+            equation: false,
         }
     }
 
@@ -228,6 +234,7 @@ impl Bound {
             ty: Type::Infer(Rc::clone(v)),
             ty_subst: s,
             rendered: RenderedSubst::default(),
+            equation: false,
         }
     }
 
@@ -240,12 +247,19 @@ impl Bound {
             ty,
             ty_subst,
             rendered: RenderedSubst::default(),
+            equation: false,
         }
     }
 
     /// This bound, recording where its bounding side came from.
     pub fn with_origin(mut self, origin: Option<Origin>) -> Self {
         self.origin = origin;
+        self
+    }
+
+    /// This bound, recording whether it is one half of an equation ([`Bound::equation`]).
+    pub fn in_equation(mut self, equation: bool) -> Self {
+        self.equation = equation;
         self
     }
 

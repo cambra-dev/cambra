@@ -296,7 +296,7 @@ fn a_family_applied_at_two_sites_over_two_domains_is_refused() {
             t = Two::new((g, h))
             1
         "#},
-        "Type mismatch for collection domain",
+        "Collection domains have no common answer",
     );
 }
 

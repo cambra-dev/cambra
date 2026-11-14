@@ -708,6 +708,21 @@ fn test_shared_grouping(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
+/// Groups at two keys are collections over two domains, each the rows its own key selects, so a
+/// conditional between them has no join (`src/ccl/design/type-inference.md`, "Two equations meet
+/// without filtering").
+#[test]
+fn a_conditional_between_groups_at_two_keys_has_no_join() {
+    check_compile_error(
+        indoc! {"
+            g = groupby([1, 2, 3], \\x -> x > 1)
+            c = 1 > 0
+            sum([sum([sum([x for x in (g1 if c else g2)]) for g2 in g]) for g1 in g])
+        "},
+        "Collection domains have no common answer",
+    );
+}
+
 /// The sharing [`test_shared_grouping`] *describes*, pinned.
 ///
 /// Those value assertions hold whether the partition is bucketized once or
