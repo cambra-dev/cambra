@@ -103,29 +103,6 @@ impl MapResult {
     }
 }
 
-/// The values an application yields, given the function's values and, per output row, the
-/// entries of the function that row's argument matched.
-///
-/// Applying at a key yields that key's values. Where those values are a level, the key's
-/// group becomes a level of the output and several matched entries run together; where they
-/// are a record over the function's own rows, the key names one row of it and there is
-/// nothing to group.
-fn gather_applied(values: &Tile, groups: &[Vec<usize>]) -> Tile {
-    if values.is_data_function() {
-        return values.regroup_rows(groups);
-    }
-    let rows: Vec<usize> = groups.iter().flatten().copied().collect();
-    // `MapResultProducer::get_impl` withholds every argument outside the function's
-    // `domain_predicate` before applying it. An argument inside the predicate that the
-    // function does not hold lies outside its domain, which the argument's type excludes.
-    assert_eq!(
-        rows.len(),
-        groups.len(),
-        "a function whose values are a record answers each argument with exactly one row"
-    );
-    values.select_rows(&rows)
-}
-
 /// The keys an application looks up that the function has not called complete, each with the
 /// complete input paths that look it up. `lookups` pairs each input path with the key it looks
 /// up; `complete` is the input's statement over whole paths.
@@ -174,15 +151,19 @@ fn restate_gathered(
     let looking_up_incomplete = incomplete
         .iter()
         .fold(Predicate::False, |all, (_, paths)| all.union(paths));
-    incomplete.iter().fold(
+    let reads: Vec<_> = incomplete
+        .iter()
+        .map(|(key, rows)| ValueRead {
+            from: vec![key.clone()],
+            rows: rows.clone(),
+            complete: false,
+        })
+        .collect();
+    restate_value_reads(
+        stated,
+        depth,
+        &reads,
         Predicate::True.qualified_by(&complete.minus(&looking_up_incomplete), depth),
-        |all, (key, paths)| {
-            all.union(
-                &stated
-                    .within(std::slice::from_ref(key), depth)
-                    .qualified_by(paths, depth),
-            )
-        },
     )
 }
 
@@ -354,9 +335,7 @@ impl MapResultProducer {
             // The function's levels below the one this application consumes become further
             // levels of the output, so the operand may be a keyed collection of any depth.
 
-            // A **scalar** input is a single-key lookup — `groupby(c, k)(v)`. It is the walk
-            // below at one key, yielding that key's subtree directly rather than a family of
-            // them keyed by the input's domain.
+            // A scalar argument has no enclosing level. Its result is the group itself.
             if let Tile::Scalar(key_col) = input_tile {
                 // A key absent from a **settled** grouping is a genuinely empty group; one
                 // absent from an unsettled grouping is simply not answered yet. Only
