@@ -315,8 +315,9 @@ intersection cannot read.
 ### Lowering requirements
 
 `lower_named_requirements` resolves each requirement against the trait table
-(`lower_trait_type`): the name (`Trait::compiler_named`, or a trait the module declares), the
-operand count, and each associated type by name (`Trait::assoc_named`). Refinements are stripped
+(`lower_trait_type`): the name (a trait the module declares, or one a `use` name reaches, the
+prelude's included), the operand count, and each associated type by name (`Trait::assoc_named`).
+Refinements are stripped
 from every operand, since an instance matches a base whatever its refinements. A requirement states
 nothing of what its trait requires of every instance, so a definition under
 `requires Ranked(T, T)` that uses `Same(T, T)` states it too. A named requirement, `a: Area(S)`, is

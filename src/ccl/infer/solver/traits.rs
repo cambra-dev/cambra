@@ -92,8 +92,8 @@ use super::constrain::{ConstrainCache, ConstrainError, constrain_subtype};
 /// A trait: a named requirement on types, together with any types it associates
 /// with them and the functions it declares.
 ///
-/// Every trait is a declaration ([`TraitDecl`]): the compiler builds its own here
-/// ([`Trait::addable`] and the rest), and lowering builds a module's. A program's instances of either are its [`InstanceTable`]'s.
+/// Every trait is a declaration ([`TraitDecl`]), which lowering builds, `std`'s included: the
+/// compiler's traits are `std`'s ([`StdTrait`]). A program's instances of either are its [`InstanceTable`]'s.
 ///
 /// Equality, ordering and hashing are the declaration's, by the module that declares it and
 /// its name, and a method's trait ([`Trait::method`]), which no module declares, is equal
@@ -113,8 +113,6 @@ pub struct Trait(Rc<TraitDecl>);
 /// output no one reads.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Assoc {
-    /// The type an operator's result takes.
-    Output,
     /// An associated type a declared trait names, `Elem` in `trait Container(C): Elem`.
     Declared(SmolStr),
     /// The function a method call reaches: the method its receiver's type declares, at the
@@ -123,10 +121,14 @@ pub enum Assoc {
 }
 
 impl Assoc {
+    /// An operator trait's `Output`, the type its operator's result takes ([`OUTPUT_ASSOC`]).
+    pub fn output() -> Assoc {
+        Assoc::Declared(SmolStr::new_static(OUTPUT_ASSOC))
+    }
+
     /// The name a program writes the associated type by.
     pub fn name(&self) -> &str {
         match self {
-            Assoc::Output => "Output",
             Assoc::Declared(name) => name,
             Assoc::Method => "method",
         }
@@ -268,31 +270,24 @@ impl fmt::Debug for TraitDecl {
     }
 }
 
-/// The module the compiler's traits belong to.
-const COMPILER_MODULE: &str = "std";
+/// The path of the module that declares the compiler's traits (`stdlib/src/std.cambra`).
+const STD_MODULE: &str = "std";
 
-/// The traits the compiler provides, built once per thread.
-struct CompilerTraits {
-    addable: Trait,
-    addable_refined: Trait,
-    subtractable: Trait,
-    multipliable: Trait,
-    divisible: Trait,
-    exponentiable: Trait,
-    equatable: Trait,
-    orderable: Trait,
-    negatable: Trait,
-    iterable: Trait,
+/// The context traits whose requirements lexical scopes and the run supply.
+struct ContextTraits {
     transaction: Trait,
     observe_world: Trait,
     read_txn: Trait,
     read: Trait,
-    /// Every instance of these, which every program has.
-    instances: Rc<InstanceTable>,
 }
 
 thread_local! {
-    static COMPILER_TRAITS: CompilerTraits = CompilerTraits::build();
+    static CONTEXT_TRAITS: ContextTraits = ContextTraits {
+        transaction: context_trait("Transaction", &[], Supplier::Transaction),
+        observe_world: context_trait("ObserveWorld", &[], Supplier::Run),
+        read_txn: context_trait("ReadTxn", &["x"], Supplier::Run),
+        read: context_trait("Read", &["x"], Supplier::Scope),
+    };
 }
 
 /// `Iterable`'s function, the collection a loop walks.
@@ -301,327 +296,113 @@ pub const ITERABLE_ELEMENTS: &str = "elements";
 /// `Iterable`'s associated type, the type of what [`ITERABLE_ELEMENTS`] returns.
 pub const ITERABLE_ELEMENTS_ASSOC: &str = "Elements";
 
-impl CompilerTraits {
-    fn build() -> CompilerTraits {
-        use BaseType::{Bool, Int, String, UInt};
-        let mut instances = InstanceTable {
-            run_modules: HashMap::new(),
-            instances: Vec::new(),
-        };
-        let binary = ["A", "B"];
-        let primitive = |op| Some(InstanceBody::Binary(op));
-        // The numeric rows every arithmetic trait has, `(Int, Int) ⇝ Int` and
-        // `(UInt, UInt) ⇝ UInt`, each running the primitive `kind`.
-        let numeric = |kind| {
-            let op = primitive(BinOpKind::Arithmetic(kind));
-            vec![
-                (vec![Int, Int], Some(Int), op),
-                (vec![UInt, UInt], Some(UInt), op),
-            ]
-        };
-        // Homogeneous comparison over every base the interpreter can compare, which is also
-        // every base `max` folds (`ccl/aggregate.rs`). It associates nothing: a comparison's
-        // `Bool` is fixed by the operator's signature, the same for every pair of types the
-        // trait accepts, so recording it as an associated type would state that the trait
-        // determines something it does not. It declares no function either, a comparison
-        // being by value.
-        let comparison = || {
-            vec![
-                (vec![Int, Int], None, None),
-                (vec![UInt, UInt], None, None),
-                (vec![String, String], None, None),
-                (vec![Bool, Bool], None, None),
-            ]
-        };
-        let arithmetic = |name, function| OperatorTrait {
-            name,
-            operands: &binary,
-            function,
-            output: true,
-            products: ProductReading::None,
-            requires: Vec::new(),
-        };
-        // `+`. The `(String, String) ⇝ String` row is why surface `+` on strings types
-        // through arithmetic; its `add` is `Concat`.
-        let addable = arithmetic("Addable", Some("add")).build(
-            {
-                let mut rows = numeric(ArithmeticKind::Add);
-                rows.push((
-                    vec![String, String],
-                    Some(String),
-                    primitive(BinOpKind::Concat),
-                ));
-                rows
-            },
-            &mut instances,
-        );
-        // `^+`, which computes what `+` computes on the numeric bases: its result's
-        // refinement is the operator's to state (`emit_binop`), not the trait's. It declares no
-        // function, `^+` being its one use.
-        let addable_refined = arithmetic("AddableRefined", None).build(
-            numeric(ArithmeticKind::AddRefined)
-                .into_iter()
-                .map(|(bases, output, _)| (bases, output, None))
-                .collect(),
-            &mut instances,
-        );
-        let subtractable = arithmetic("Subtractable", Some("sub"))
-            .build(numeric(ArithmeticKind::Sub), &mut instances);
-        let multipliable = arithmetic("Multipliable", Some("mul"))
-            .build(numeric(ArithmeticKind::Mul), &mut instances);
-        let divisible = arithmetic("Divisible", Some("div"))
-            .build(numeric(ArithmeticKind::FloorDiv), &mut instances);
-        // `**`, whose rows relate the two *bases*. That the exponent is non-negative is
-        // stated where it can be discharged, as a refinement on the exponent's own binding
-        // (`src/ccl/lower/exprs.rs`'s `pow_with_checked_exponent`), because a row admits a
-        // base and not a predicate over its values. The refinement names `Int`, so the
-        // `UInt` row is unreachable for `**` while that holds.
-        let exponentiable = arithmetic("Exponentiable", Some("pow"))
-            .build(numeric(ArithmeticKind::Pow), &mut instances);
-        let equatable = OperatorTrait {
-            name: "Equatable",
-            operands: &binary,
-            function: None,
-            output: false,
-            products: ProductReading::AnyProduct,
-            requires: Vec::new(),
-        }
-        .build(comparison(), &mut instances);
-        // `<`, `<=`, `>`, `>=`. `max` and `min` place it on their codomain twice, `(γ, γ)`: a
-        // pure requirement, since the aggregate's scheme already returns an element of what
-        // it consumes. What orders by value is equal by value, so it requires `Equatable`.
-        let orderable = OperatorTrait {
-            name: "Orderable",
-            operands: &binary,
-            function: None,
-            output: false,
-            products: ProductReading::Tuples,
-            requires: vec![equatable.clone()],
-        }
-        .build(comparison(), &mut instances);
-        // Unary `-`: one operand, and an `Output` that genuinely depends on it.
-        let negatable = OperatorTrait {
-            name: "Negatable",
-            operands: &["A"],
-            function: Some("neg"),
-            output: true,
-            products: ProductReading::None,
-            requires: Vec::new(),
-        }
-        .build(
-            vec![(
-                vec![Int],
-                Some(Int),
-                Some(InstanceBody::Unary(UnaryOpKind::Neg)),
-            )],
-            &mut instances,
-        );
-        // `for x in c` and a comprehension's `for` clause (`docs/chl-spec.md`, "4.6 `for` —
-        // iteration"): `elements` is the collection the loop walks, its `Elements`. A
-        // structural collection is answered by the collection reading and has no row; a
-        // nominal type's rows are its instances.
-        let iterable = {
-            let c = TypeParam::declared("C");
-            let elements = TypeParam::declared("Elements");
-            Trait::compiler(TraitDecl {
-                module: vec![SmolStr::new_static(COMPILER_MODULE)],
-                name: "Iterable".into(),
-                span: Span::new(chl_parser::FileId::ROOT, 0, 0),
-                operands: vec![Rc::clone(&c)],
-                term_params: Vec::new(),
-                supplied_by: Supplier::Instances,
-                effect_assocs: Vec::new(),
-                assocs: vec![(
-                    Assoc::Declared(ITERABLE_ELEMENTS_ASSOC.into()),
-                    Rc::clone(&elements),
-                )],
-                // `Elements <: _ |=> _`: a loop walks a collection.
-                assoc_bounds: vec![(
-                    Assoc::Declared(ITERABLE_ELEMENTS_ASSOC.into()),
-                    Type::Fun {
-                        name: None,
-                        fun_kind: crate::ccl::ty::FunKind::data_hole(),
-                        domain: Box::new(Type::Hole),
-                        codomain: Box::new(Type::Hole),
-                        capabilities: crate::ccl::capabilities::Capabilities::none(),
-                    },
-                )],
-                functions: vec![TraitFunction {
-                    name: ITERABLE_ELEMENTS.into(),
-                    signature: Signature {
-                        params: Vec::new(),
-                        inputs: vec![Type::Param(c)],
-                        output: Type::Param(elements),
-                        requires: Vec::new(),
-                        // Exact clauses listing nothing: walking a collection requires
-                        // nothing and causes nothing.
-                        capabilities: crate::ccl::capabilities::Capabilities::written(
-                            crate::ccl::capabilities::Written {
-                                set: crate::ccl::capabilities::CapabilitySet::default(),
-                                open_requires: false,
-                                open_causes: false,
-                                at: Span::new(chl_parser::FileId::ROOT, 0, 0),
-                                of_def: false,
-                                of_instance: None,
-                            },
-                        ),
-                    },
-                }],
-                requires: Vec::new(),
-                named: Vec::new(),
-                products: ProductReading::None,
-                reads_collections: true,
-                method: false,
-            })
-        };
-        CompilerTraits {
-            transaction: context_trait("Transaction", &[], Supplier::Transaction),
-            observe_world: context_trait("ObserveWorld", &[], Supplier::Run),
-            read_txn: context_trait("ReadTxn", &["x"], Supplier::Run),
-            read: context_trait("Read", &["x"], Supplier::Scope),
-            addable,
-            addable_refined,
-            subtractable,
-            multipliable,
-            divisible,
-            exponentiable,
-            equatable,
-            orderable,
-            negatable,
-            iterable,
-            instances: Rc::new(instances),
+/// An operator trait's associated type, the type its operator's result takes.
+pub const OUTPUT_ASSOC: &str = "Output";
+
+/// A trait the compiler names: one `std` declares (`stdlib/src/std.cambra`), which an
+/// operator, a loop or an aggregate requires. The compiler recognizes each by its path and
+/// name ([`Trait::is_std`]), and reaches a program's through its [`InstanceTable`]
+/// ([`InstanceTable::std_trait`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StdTrait {
+    /// `+`.
+    Addable,
+    /// `^+`, which computes what `+` computes on the numeric bases. `std` keeps it private,
+    /// so no program names it.
+    AddableRefined,
+    /// `-`.
+    Subtractable,
+    /// `*`.
+    Multipliable,
+    /// `//`.
+    Divisible,
+    /// `**`.
+    Exponentiable,
+    /// `==` and `!=`.
+    Equatable,
+    /// `<`, `<=`, `>`, `>=`, and `max`'s and `min`'s.
+    Orderable,
+    /// Unary `-`.
+    Negatable,
+    /// `for x in c` and a comprehension's `for` clause: `elements` is the collection the
+    /// loop walks, its `Elements`.
+    Iterable,
+}
+
+impl StdTrait {
+    pub const ALL: [StdTrait; 10] = [
+        StdTrait::Addable,
+        StdTrait::AddableRefined,
+        StdTrait::Subtractable,
+        StdTrait::Multipliable,
+        StdTrait::Divisible,
+        StdTrait::Exponentiable,
+        StdTrait::Equatable,
+        StdTrait::Orderable,
+        StdTrait::Negatable,
+        StdTrait::Iterable,
+    ];
+
+    /// The name `std` declares the trait by.
+    pub fn name(self) -> &'static str {
+        match self {
+            StdTrait::Addable => "Addable",
+            StdTrait::AddableRefined => "AddableRefined",
+            StdTrait::Subtractable => "Subtractable",
+            StdTrait::Multipliable => "Multipliable",
+            StdTrait::Divisible => "Divisible",
+            StdTrait::Exponentiable => "Exponentiable",
+            StdTrait::Equatable => "Equatable",
+            StdTrait::Orderable => "Orderable",
+            StdTrait::Negatable => "Negatable",
+            StdTrait::Iterable => "Iterable",
         }
     }
-}
 
-/// One instance of an operator's trait: the bases it accepts, the base it associates as
-/// `Output` where it associates one, and the primitive its function runs where the trait
-/// declares one.
-type OperatorRow = (Vec<BaseType>, Option<BaseType>, Option<InstanceBody>);
+    /// The trait `std` declares under `name`, if the compiler names it.
+    pub fn named(name: &str) -> Option<StdTrait> {
+        StdTrait::ALL.into_iter().find(|t| t.name() == name)
+    }
 
-/// An operator's trait, as the compiler declares it.
-struct OperatorTrait<'a> {
-    name: &'a str,
-    operands: &'a [&'a str],
-    /// The function its operator calls, over the trait's operands, whose result is `Output`.
-    function: Option<&'a str>,
-    /// Whether it associates `Output`.
-    output: bool,
-    products: ProductReading,
-    /// The traits it requires of its own operands.
-    requires: Vec<Trait>,
-}
-
-impl OperatorTrait<'_> {
-    /// The trait, with an instance in `instances` for each of `rows`. Every row has the
-    /// declaration's shape, and runs a primitive exactly where the trait declares a function.
-    fn build(self, rows: Vec<OperatorRow>, instances: &mut InstanceTable) -> Trait {
-        let name = self.name;
-        let operands: Vec<Rc<TypeParam>> = self
-            .operands
-            .iter()
-            .map(|n| TypeParam::declared(*n))
-            .collect();
-        let assocs = if self.output {
-            vec![(Assoc::Output, TypeParam::declared("Output"))]
-        } else {
-            Vec::new()
-        };
-        let operand_types: Vec<Type> = operands.iter().map(|p| Type::Param(Rc::clone(p))).collect();
-        let functions = self
-            .function
-            .map(|f| {
-                let (_, output) = assocs
-                    .first()
-                    .expect("an operator's function returns its trait's `Output`");
-                TraitFunction {
-                    name: f.into(),
-                    signature: Signature {
-                        params: Vec::new(),
-                        inputs: operand_types.clone(),
-                        output: Type::Param(Rc::clone(output)),
-                        requires: Vec::new(),
-                        // Exact clauses listing nothing: an operator's function requires
-                        // nothing and causes nothing.
-                        capabilities: crate::ccl::capabilities::Capabilities::written(
-                            crate::ccl::capabilities::Written {
-                                set: crate::ccl::capabilities::CapabilitySet::default(),
-                                open_requires: false,
-                                open_causes: false,
-                                at: Span::new(chl_parser::FileId::ROOT, 0, 0),
-                                of_def: false,
-                                of_instance: None,
-                            },
-                        ),
-                    },
-                }
-            })
-            .into_iter()
-            .collect();
-        let requires = self
-            .requires
-            .into_iter()
-            .map(|t| {
-                Rc::new(TraitRequirement {
-                    trait_: t,
-                    args: operand_types.clone(),
-                    terms: Vec::new(),
-                    assoc: Vec::new(),
-                    effect_assoc: Vec::new(),
-                    binders: Vec::new(),
-                    at: None,
-                })
-            })
-            .collect();
-        let trait_ = Trait::compiler(TraitDecl {
-            module: vec![SmolStr::new_static(COMPILER_MODULE)],
-            name: name.into(),
-            span: Span::new(chl_parser::FileId::ROOT, 0, 0),
-            operands,
-            term_params: Vec::new(),
-            supplied_by: Supplier::Instances,
-            effect_assocs: Vec::new(),
-            assocs,
-            functions,
-            requires,
-            named: Vec::new(),
-            products: self.products,
-            assoc_bounds: Vec::new(),
-            reads_collections: false,
-            method: false,
-        });
-        for (bases, associated, primitive) in rows {
-            assert!(
-                bases.len() == self.operands.len()
-                    && associated.is_some() == self.output
-                    && primitive.is_some() == self.function.is_some(),
-                "every instance of `{name}` has its declaration's shape"
-            );
-            let operands: Vec<Type> = bases.into_iter().map(Type::Base).collect();
-            instances.add(
-                trait_.clone(),
-                Rc::new(TraitInstance {
-                    params: Vec::new(),
-                    heads: operands.iter().map(InstanceHead::of_pattern).collect(),
-                    operands,
-                    assoc: associated
-                        .into_iter()
-                        .map(|b| (Assoc::Output, Type::Base(b)))
-                        .collect(),
-                    requires: Vec::new(),
-                    bounds: Vec::new(),
-                    functions: self
-                        .function
-                        .zip(primitive)
-                        .map(|(f, p)| (SmolStr::from(f), Implementation::Primitive(p)))
-                        .into_iter()
-                        .collect(),
-                    effect_assocs: Vec::new(),
-                    declared: None,
-                }),
-            );
+    /// What the compiler answers a `@Builtin` trait with beyond its instances: the products
+    /// that satisfy it when their components do, and whether a structural collection does
+    /// as itself. `None` for a trait the compiler answers by its instances alone, which is
+    /// not `@Builtin`.
+    pub fn builtin_reading(self) -> Option<(ProductReading, bool)> {
+        match self {
+            // Comparisons are by value, so a product compares by its components: any product
+            // for equality, and a tuple, lexicographically, for order.
+            StdTrait::Equatable => Some((ProductReading::AnyProduct, false)),
+            StdTrait::Orderable => Some((ProductReading::Tuples, false)),
+            // A collection iterates itself, so its `Elements` is the collection.
+            StdTrait::Iterable => Some((ProductReading::None, true)),
+            _ => None,
         }
-        trait_
+    }
+
+    /// The primitive a `@Builtin` instance of this trait runs for its function `function`
+    /// at the base types `bases`, or `None` where the compiler has none.
+    pub fn primitive(self, function: &str, bases: &[BaseType]) -> Option<InstanceBody> {
+        use BaseType::{Int, String, UInt};
+        let numeric = |kind| match bases {
+            [Int, Int] | [UInt, UInt] => Some(InstanceBody::Binary(BinOpKind::Arithmetic(kind))),
+            _ => None,
+        };
+        match (self, function) {
+            (StdTrait::Addable, "add") => match bases {
+                [String, String] => Some(InstanceBody::Binary(BinOpKind::Concat)),
+                _ => numeric(ArithmeticKind::Add),
+            },
+            (StdTrait::Subtractable, "sub") => numeric(ArithmeticKind::Sub),
+            (StdTrait::Multipliable, "mul") => numeric(ArithmeticKind::Mul),
+            (StdTrait::Divisible, "div") => numeric(ArithmeticKind::FloorDiv),
+            (StdTrait::Exponentiable, "pow") => numeric(ArithmeticKind::Pow),
+            (StdTrait::Negatable, "neg") => match bases {
+                [Int] => Some(InstanceBody::Unary(UnaryOpKind::Neg)),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 }
 
@@ -634,7 +415,7 @@ fn context_trait(name: &str, term_params: &[&str], supplied_by: Supplier) -> Tra
         "a context trait is supplied by its context"
     );
     Trait::compiler(TraitDecl {
-        module: vec![SmolStr::new_static(COMPILER_MODULE)],
+        module: vec![SmolStr::new_static(STD_MODULE)],
         name: name.into(),
         span: Span::new(chl_parser::FileId::ROOT, 0, 0),
         operands: Vec::new(),
@@ -662,51 +443,15 @@ impl Trait {
         Trait(Rc::new(decl))
     }
 
-    /// `+`'s trait.
-    pub fn addable() -> Trait {
-        COMPILER_TRAITS.with(|c| c.addable.clone())
-    }
-    /// `^+`'s trait, which no program names.
-    pub fn addable_refined() -> Trait {
-        COMPILER_TRAITS.with(|c| c.addable_refined.clone())
-    }
-    /// `-`'s trait.
-    pub fn subtractable() -> Trait {
-        COMPILER_TRAITS.with(|c| c.subtractable.clone())
-    }
-    /// `*`'s trait.
-    pub fn multipliable() -> Trait {
-        COMPILER_TRAITS.with(|c| c.multipliable.clone())
-    }
-    /// `//`'s trait.
-    pub fn divisible() -> Trait {
-        COMPILER_TRAITS.with(|c| c.divisible.clone())
-    }
-    /// `**`'s trait.
-    pub fn exponentiable() -> Trait {
-        COMPILER_TRAITS.with(|c| c.exponentiable.clone())
-    }
-    /// `==` and `!=`'s trait.
-    pub fn equatable() -> Trait {
-        COMPILER_TRAITS.with(|c| c.equatable.clone())
-    }
-    /// The orderings' trait, and `max`'s and `min`'s.
-    pub fn orderable() -> Trait {
-        COMPILER_TRAITS.with(|c| c.orderable.clone())
-    }
-
     /// Conditional ordering, answered by its position and effect operands rather than instances.
     pub fn orderable_if_required_by() -> Trait {
         context_trait("OrderableIfRequiredBy", &[], Supplier::Conditional)
     }
 
-    /// Unary `-`'s trait.
-    pub fn negatable() -> Trait {
-        COMPILER_TRAITS.with(|c| c.negatable.clone())
-    }
-    /// The trait a loop's source satisfies: `Iterable(C)`, whose `Elements` is what the loop walks.
-    pub fn iterable() -> Trait {
-        COMPILER_TRAITS.with(|c| c.iterable.clone())
+    /// Whether this is the trait `std` declares as `trait_` (`stdlib/src/std.cambra`), by
+    /// its identity: its module's path and its name.
+    pub fn is_std(&self, trait_: StdTrait) -> bool {
+        self.is_compiler() && self.name == trait_.name()
     }
 
     /// The trait a call of the method `name` requires of its receiver
@@ -775,41 +520,22 @@ impl Trait {
 
     /// The snapshot of a transaction, which a `with begin():` block supplies to its body.
     pub fn transaction() -> Trait {
-        COMPILER_TRAITS.with(|c| c.transaction.clone())
+        CONTEXT_TRAITS.with(|c| c.transaction.clone())
     }
     /// An input from outside the program, which the run supplies: opening a source, or a
     /// reading.
     pub fn observe_world() -> Trait {
-        COMPILER_TRAITS.with(|c| c.observe_world.clone())
+        CONTEXT_TRAITS.with(|c| c.observe_world.clone())
     }
     /// The history of a transactional variable, which a read of it reads and the run
     /// supplies.
     pub fn read_txn() -> Trait {
-        COMPILER_TRAITS.with(|c| c.read_txn.clone())
+        CONTEXT_TRAITS.with(|c| c.read_txn.clone())
     }
     /// A position in the history of an induction variable, which a read of it stands at. The
     /// scope binding the variable supplies one to every call inside it.
     pub fn read() -> Trait {
-        COMPILER_TRAITS.with(|c| c.read.clone())
-    }
-
-    /// Every trait the compiler provides that instance search answers, `AddableRefined`
-    /// included.
-    pub fn compiler_traits() -> Vec<Trait> {
-        COMPILER_TRAITS.with(|c| {
-            vec![
-                c.addable.clone(),
-                c.addable_refined.clone(),
-                c.subtractable.clone(),
-                c.multipliable.clone(),
-                c.divisible.clone(),
-                c.exponentiable.clone(),
-                c.equatable.clone(),
-                c.orderable.clone(),
-                c.negatable.clone(),
-                c.iterable.clone(),
-            ]
-        })
+        CONTEXT_TRAITS.with(|c| c.read.clone())
     }
 
     /// The context trait a clause names by `name`: `Transaction`, `ObserveWorld`, `ReadTxn` or
@@ -825,18 +551,10 @@ impl Trait {
         .find(|t| t.name == name)
     }
 
-    /// The compiler trait a `requires` clause names by `name`, or `None` for a name that
-    /// is none. `AddableRefined` has no surface name (`docs/chl-spec.md`, "Trait
-    /// requirements").
-    pub fn compiler_named(name: &str) -> Option<Trait> {
-        Trait::compiler_traits()
-            .into_iter()
-            .find(|t| t.name == name && *t != Trait::addable_refined())
-    }
-
-    /// Whether the compiler provides this trait.
+    /// Whether `std` declares this trait, as it declares the compiler's
+    /// ([`StdTrait`]).
     pub fn is_compiler(&self) -> bool {
-        self.module.len() == 1 && self.module[0] == COMPILER_MODULE
+        self.module.len() == 1 && self.module[0] == STD_MODULE
     }
 
     /// The functions this trait declares, in declaration order.
@@ -1024,8 +742,9 @@ impl fmt::Display for InstanceHead {
 /// requires of them, and the function it supplies for each of its trait's functions
 /// (`docs/chl-spec.md`, "Declaring an instance").
 ///
-/// The compiler's and a module's are the same data. A compiler instance's head names base
-/// types; a module's, `instance Container(Bag(T)) requires …:`, is built by lowering.
+/// The compiler's and a module's are the same data, and lowering builds both. An instance's
+/// functions are primitives where it is `@Builtin`, one of `std`'s over base types, and the
+/// bindings of its `def`s otherwise ([`TraitInstance::binds_functions`]).
 #[derive(Debug)]
 pub struct TraitInstance {
     /// The head's type variables, `T` in `Bag(T)`, declared ([`TypeParam::declared`]).
@@ -1051,7 +770,8 @@ pub struct TraitInstance {
     /// list, which inference collects on one variable per entry
     /// (`docs/chl-spec.md`, "Effects in traits").
     pub effect_assocs: Vec<(TypeParamId, crate::ccl::capabilities::ClauseParam)>,
-    /// Where a module declares it; `None` for the compiler's.
+    /// Where a module declares it, `std`'s included; `None` for a row inference builds, as a
+    /// method call's ([`TraitObligation::new_method`]).
     pub declared: Option<DeclaredAt>,
 }
 
@@ -1078,6 +798,23 @@ impl TraitInstance {
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, t)| t.clone())
+    }
+
+    /// Whether `def`s implement this instance's functions, which a call of one becomes a use
+    /// of, rather than primitives the compiler runs (`@Builtin`). An instance of a trait that
+    /// declares no function has neither.
+    pub fn binds_functions(&self) -> bool {
+        self.functions
+            .iter()
+            .any(|(_, f)| matches!(f, Implementation::Binding(_)))
+    }
+
+    /// Whether every operand of the head is a base type, so the instance states everything at
+    /// its operands.
+    fn is_over_bases(&self) -> bool {
+        self.heads
+            .iter()
+            .all(|h| matches!(h, InstanceHead::Base(_)))
     }
 
     /// Whether the types this instance states depend on its head's type variables, so that
@@ -1409,36 +1146,41 @@ impl OperatorCall {
         functions.first().map(|f| &f.name)
     }
 
-    /// The call a binary operator makes, or `None` for one with a fixed signature, a
+    /// The trait a binary operator requires, or `None` for one with a fixed signature, a
     /// boolean connective or `++`.
     ///
     /// A `^` sibling makes its operator's call, except `^+`, whose trait is
     /// `AddableRefined`.
-    pub fn of_binop(op: BinOpKind) -> Option<OperatorCall> {
+    pub fn trait_of_binop(op: BinOpKind) -> Option<StdTrait> {
         if op == BinOpKind::Arithmetic(ArithmeticKind::AddRefined) {
-            return Some(OperatorCall::new(Trait::addable_refined()));
+            return Some(StdTrait::AddableRefined);
         }
         Some(match op.unrefined() {
             BinOpKind::Arithmetic(kind) => match kind {
-                ArithmeticKind::Add => OperatorCall::new(Trait::addable()),
-                ArithmeticKind::Sub => OperatorCall::new(Trait::subtractable()),
-                ArithmeticKind::Mul => OperatorCall::new(Trait::multipliable()),
-                ArithmeticKind::FloorDiv => OperatorCall::new(Trait::divisible()),
-                ArithmeticKind::Pow => OperatorCall::new(Trait::exponentiable()),
+                ArithmeticKind::Add => StdTrait::Addable,
+                ArithmeticKind::Sub => StdTrait::Subtractable,
+                ArithmeticKind::Mul => StdTrait::Multipliable,
+                ArithmeticKind::FloorDiv => StdTrait::Divisible,
+                ArithmeticKind::Pow => StdTrait::Exponentiable,
                 refined => unreachable!("`unrefined` answers no `{refined:?}`"),
             },
-            BinOpKind::Compare(CompareKind::Equals | CompareKind::NotEquals) => {
-                OperatorCall::new(Trait::equatable())
-            }
-            BinOpKind::Compare(_) => OperatorCall::new(Trait::orderable()),
+            BinOpKind::Compare(CompareKind::Equals | CompareKind::NotEquals) => StdTrait::Equatable,
+            BinOpKind::Compare(_) => StdTrait::Orderable,
             BinOpKind::BoolLogic(_) | BinOpKind::Concat => return None,
         })
     }
 
-    /// The call a unary operator makes, or `None` for `not`, whose signature is fixed.
-    pub fn of_unary(op: UnaryOpKind) -> Option<OperatorCall> {
+    /// The call a binary operator makes in a program whose table is `table`, or `None` for
+    /// one with a fixed signature, a boolean connective or `++`.
+    pub fn of_binop(op: BinOpKind, table: &InstanceTable) -> Option<OperatorCall> {
+        Self::trait_of_binop(op).map(|t| OperatorCall::new(table.std_trait(t)))
+    }
+
+    /// The call a unary operator makes in a program whose table is `table`, or `None` for
+    /// `not`, whose signature is fixed.
+    pub fn of_unary(op: UnaryOpKind, table: &InstanceTable) -> Option<OperatorCall> {
         match op {
-            UnaryOpKind::Neg => Some(OperatorCall::new(Trait::negatable())),
+            UnaryOpKind::Neg => Some(OperatorCall::new(table.std_trait(StdTrait::Negatable))),
             UnaryOpKind::Not | UnaryOpKind::NotRefined => None,
         }
     }
@@ -1470,24 +1212,19 @@ pub struct Signature {
     pub capabilities: crate::ccl::capabilities::Capabilities,
 }
 
-/// A program's instances: the compiler's, which every program has, and the instances its
-/// modules declare, of the compiler's traits and of their own.
+/// A program's instances, which its modules declare, `std`'s among them, and the traits `std`
+/// declares that the compiler names ([`StdTrait`]).
 ///
 /// Inference reads it wherever an obligation is minted.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct InstanceTable {
     instances: Vec<(Trait, Rc<TraitInstance>)>,
+    /// The traits `std` declares that the compiler names, once `std` has lowered.
+    std_traits: HashMap<StdTrait, Trait>,
     /// The path of the module each run copies, by its run path: where a definition a run
     /// holds is declared, which a diagnostic compares with an instance's module
     /// ([`DeclaredAt::module`]).
     run_modules: HashMap<crate::ccl::RunPath, Vec<SmolStr>>,
-}
-
-/// A program's table before it declares anything: the compiler's instances.
-impl Default for InstanceTable {
-    fn default() -> Self {
-        (*InstanceTable::builtin()).clone()
-    }
 }
 
 /// Whether a function whose parameters are passed by reference where `by_reference` says so
@@ -1514,10 +1251,43 @@ pub fn function_over(inputs: &[Type], output: Type) -> Type {
     crate::ccl::infer::solver::fun(domain, output)
 }
 
+thread_local! {
+    /// [`InstanceTable::std`], built once per thread.
+    static STD_TABLE: Rc<InstanceTable> = Rc::new(crate::ccl::lower::std_instances());
+}
+
 impl InstanceTable {
-    /// The table of a program that declares no instance: the compiler's alone.
-    pub fn builtin() -> Rc<InstanceTable> {
-        COMPILER_TRAITS.with(|c| Rc::clone(&c.instances))
+    /// The table of a program that declares nothing of its own: `std`'s traits and
+    /// instances, which the prelude reaches. A pass over a tree no program lowered, as a
+    /// test builds, reads this one; a compilation reads its program's.
+    pub fn std() -> Rc<InstanceTable> {
+        STD_TABLE.with(Rc::clone)
+    }
+
+    /// Whether the table holds `std`'s traits: whether `std` has lowered into it.
+    pub fn has_std(&self) -> bool {
+        !self.std_traits.is_empty()
+    }
+
+    /// Record `trait_`, which `std` declares, as the trait the compiler names `named`.
+    pub fn declare_std(&mut self, named: StdTrait, trait_: Trait) {
+        debug_assert!(
+            trait_.is_std(named),
+            "`{trait_}` is not `std`'s `{}`",
+            named.name()
+        );
+        self.std_traits.insert(named, trait_);
+    }
+
+    /// The trait `std` declares as `named`. Every program holds each: the prelude imports
+    /// `std` into every module outside the std root.
+    pub fn std_trait(&self, named: StdTrait) -> Trait {
+        self.std_traits.get(&named).cloned().unwrap_or_else(|| {
+            panic!(
+                "`std` declares `{}`, and every program lowers `std` before it names one",
+                named.name()
+            )
+        })
     }
 
     /// Add an instance of `trait_`.
@@ -1525,11 +1295,11 @@ impl InstanceTable {
         self.instances.push((trait_, instance));
     }
 
-    /// Whether the program declares an instance of `trait_`.
-    pub fn declares(&self, trait_: &Trait) -> bool {
+    /// Whether `def`s implement some instance of `trait_` ([`TraitInstance::binds_functions`]).
+    pub fn binds_functions_of(&self, trait_: &Trait) -> bool {
         self.instances
             .iter()
-            .any(|(t, i)| t == trait_ && i.declared.is_some())
+            .any(|(t, i)| t == trait_ && i.binds_functions())
     }
 
     /// Record that the run at `run` copies the module at `module`.
@@ -1950,7 +1720,7 @@ impl TraitObligation {
         required_at: crate::ccl::infer_var::Origin,
     ) -> Rc<TraitObligation> {
         Self::new_in(
-            &InstanceTable::builtin(),
+            &InstanceTable::std(),
             trait_,
             assoc,
             operator_node_id,
@@ -3415,9 +3185,9 @@ impl TraitObligation {
             let [only] = candidates.as_slice() else {
                 return Ok(());
             };
-            // A compiler row over bases states everything at its operands, and the deposit
-            // settles what it associates; one over type variables is selected as a module's is.
-            if self.method.is_none() && only.declared.is_none() && !only.has_type_variables() {
+            // An instance over bases states everything at its operands, and the deposit settles
+            // what it associates; one over type variables or nominal types is selected.
+            if self.method.is_none() && only.is_over_bases() && !only.has_type_variables() {
                 return Ok(());
             }
             Rc::clone(only)
@@ -5266,6 +5036,11 @@ mod tests {
     use crate::ccl::Refinement;
     use crate::ccl::infer::solver::fresh_var;
 
+    /// The trait `std` declares as `named`, from the table of a program of `std` alone.
+    fn std_trait(named: StdTrait) -> Trait {
+        InstanceTable::std().std_trait(named)
+    }
+
     /// The operand expressions an obligation substitutes into an instance's
     /// refinement template.
     fn operands() -> Vec<TypedExpr> {
@@ -5283,8 +5058,8 @@ mod tests {
             let original_value = fresh_var(0);
             let copied_value = fresh_var(0);
             let original = TraitObligation::new(
-                Trait::addable(),
-                vec![(Assoc::Output, original_value.clone())],
+                std_trait(StdTrait::Addable),
+                vec![(Assoc::output(), original_value.clone())],
                 node,
                 crate::ccl::infer_var::Origin::Node(node),
             );
@@ -5310,8 +5085,8 @@ mod tests {
         let node_id = provenance::NodeId::fresh();
         let out = fresh_var(0);
         let ob = TraitObligation::new(
-            Trait::addable(),
-            vec![(Assoc::Output, out.clone())],
+            std_trait(StdTrait::Addable),
+            vec![(Assoc::output(), out.clone())],
             node_id,
             crate::ccl::infer_var::Origin::Node(node_id),
         );
@@ -5342,8 +5117,8 @@ mod tests {
         let node_id = provenance::NodeId::fresh();
         let out = fresh_var(0);
         let ob = TraitObligation::new(
-            Trait::addable(),
-            vec![(Assoc::Output, out.clone())],
+            std_trait(StdTrait::Addable),
+            vec![(Assoc::output(), out.clone())],
             node_id,
             crate::ccl::infer_var::Origin::Node(node_id),
         );
@@ -5354,7 +5129,7 @@ mod tests {
 
         assert!(
             matches!(
-                ob.agreed_assoc(&Assoc::Output),
+                ob.agreed_assoc(&Assoc::output()),
                 Some(Type::Base(BaseType::Int))
             ),
             "(Int, Int) ⇝ Int is the only row left, so its Output is settled, and \
@@ -5371,10 +5146,7 @@ mod tests {
                 InstanceHead::Base(BaseType::Int)
             ]
         );
-        assert!(matches!(
-            only.assoc.as_slice(),
-            [(Assoc::Output, Type::Base(BaseType::Int))]
-        ));
+        assert_eq!(only.assoc, [(Assoc::output(), Type::Base(BaseType::Int))]);
     }
 
     /// `^+`'s obligation deposits the sum on its output; `+`'s deposits a bare `Int`. The
@@ -5387,13 +5159,13 @@ mod tests {
             let out = fresh_var(0);
             let ob = TraitObligation::new(
                 trait_,
-                vec![(Assoc::Output, out.clone())],
+                vec![(Assoc::output(), out.clone())],
                 node_id,
                 crate::ccl::infer_var::Origin::Node(node_id),
             );
             if refined {
                 ob.refine_output(OutputRefinement {
-                    assoc: Assoc::Output,
+                    assoc: Assoc::output(),
                     template: crate::ccl::RefinementTemplate::BinOp(BinOpKind::Arithmetic(
                         ArithmeticKind::AddRefined,
                     )),
@@ -5415,9 +5187,9 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        assert_eq!(deposited(Trait::addable(), false), vec!["Int"]);
+        assert_eq!(deposited(std_trait(StdTrait::Addable), false), vec!["Int"]);
         assert_eq!(
-            deposited(Trait::addable_refined(), true),
+            deposited(std_trait(StdTrait::AddableRefined), true),
             vec!["{Int | __elem == 1 + 2}"],
         );
     }
@@ -5433,7 +5205,7 @@ mod tests {
     fn a_comparison_associates_nothing() {
         let node_id = provenance::NodeId::fresh();
         let ob = TraitObligation::new(
-            Trait::equatable(),
+            std_trait(StdTrait::Equatable),
             Vec::new(),
             node_id,
             crate::ccl::infer_var::Origin::Node(node_id),
@@ -5441,7 +5213,7 @@ mod tests {
         let mut cache = ConstrainCache::new();
 
         ob.try_deposit(&mut cache).expect("nothing to deposit");
-        assert_eq!(ob.agreed_assoc(&Assoc::Output), None);
+        assert_eq!(ob.agreed_assoc(&Assoc::output()), None);
 
         // The requirement half is untouched.
         ob.narrow(0, &InstanceHead::Base(BaseType::Int), &mut cache)
@@ -5460,8 +5232,8 @@ mod tests {
         let node_id = provenance::NodeId::fresh();
         let out = fresh_var(0);
         let ob = TraitObligation::new(
-            Trait::orderable(),
-            vec![(Assoc::Output, out)],
+            std_trait(StdTrait::Orderable),
+            vec![(Assoc::output(), out)],
             node_id,
             crate::ccl::infer_var::Origin::Node(node_id),
         );
@@ -5483,7 +5255,7 @@ mod tests {
         else {
             panic!("expected NoTraitInstance, got {err:?}");
         };
-        assert_eq!(trait_, Trait::orderable());
+        assert_eq!(trait_, std_trait(StdTrait::Orderable));
         assert_eq!(position, 1);
         assert_eq!(found, Type::Base(BaseType::String));
         assert_eq!(accepted, vec![Type::Base(BaseType::Int)]);
@@ -5497,7 +5269,7 @@ mod tests {
         use crate::ccl::infer::solver::constrain_subtype;
         let node_id = provenance::NodeId::fresh();
         let ob = TraitObligation::new(
-            Trait::equatable(),
+            std_trait(StdTrait::Equatable),
             Vec::new(),
             node_id,
             crate::ccl::infer_var::Origin::Node(node_id),
@@ -5577,7 +5349,7 @@ mod tests {
     fn a_base_and_a_product_exclude_each_other(#[case] base_first: bool) {
         let node_id = provenance::NodeId::fresh();
         let ob = TraitObligation::new(
-            Trait::equatable(),
+            std_trait(StdTrait::Equatable),
             Vec::new(),
             node_id,
             crate::ccl::infer_var::Origin::Node(node_id),
@@ -5602,14 +5374,13 @@ mod tests {
         );
     }
 
-    /// Every compiler instance of a trait agrees with its declaration's **shape** — how
-    /// many types it is over, and which types it associates — which building the compiler's
-    /// traits asserts row by row.
+    /// Every `std` instance of a compiler trait agrees with its declaration's **shape** — how
+    /// many types it is over, and which types it associates.
     #[test]
     fn every_trait_has_a_consistent_shape() {
-        for trait_ in Trait::compiler_traits() {
+        for trait_ in StdTrait::ALL.map(std_trait) {
             let (arity, assocs) = (trait_.arity(), trait_.assocs());
-            for row in &InstanceTable::builtin().instances(&trait_) {
+            for row in &InstanceTable::std().instances(&trait_) {
                 assert_eq!(
                     row.operands.len(),
                     arity,

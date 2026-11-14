@@ -115,7 +115,7 @@ pub(super) fn checked_by(
 /// is a source that opens nothing. Returns the errors found.
 pub fn lower_for_check(program: &LoadedProgram, ctx: &mut LoweringContext) -> Vec<LoweringError> {
     let mut lowering = ProgramLowering::new(program);
-    let order = program.link_order().unwrap_or_default();
+    let order = program.lowering_order();
     let mut sites = HashMap::new();
     for &file in order {
         lowering.import_keys(file, &mut sites, ctx);

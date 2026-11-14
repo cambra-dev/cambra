@@ -23,8 +23,8 @@ use smol_str::SmolStr;
 use super::*;
 use crate::ccl::infer::solver::traits::{
     Assoc, DeclaredAt, Implementation, InstanceHead, InstanceTable, ProductReading, Signature,
-    Supplier, Trait, TraitDecl, TraitFunction, TraitInstance, compares_by_value, entailed,
-    replace_params, unify_all,
+    StdTrait, Supplier, Trait, TraitDecl, TraitFunction, TraitInstance, compares_by_value,
+    entailed, replace_params, unify_all,
 };
 use crate::ccl::nominal::WrittenOrder;
 use crate::ccl::ty::{FieldKey, PolyParam, TraitRequirement, TypeKind, TypeParam, TypeParamId};
@@ -533,6 +533,7 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
         .labels
         .as_ref()
         .map_or_else(Vec::new, |path| path.segments().to_vec());
+    let (products, reads_collections) = builtin_trait_reading(decl, ctx)?;
     Ok(Trait::declared(TraitDecl {
         module,
         name: name.node.clone(),
@@ -546,8 +547,8 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
         functions,
         requires,
         named,
-        products: ProductReading::None,
-        reads_collections: false,
+        products,
+        reads_collections,
         method: false,
     }))
 }
@@ -584,6 +585,56 @@ fn clause_bound(bound: &Option<Spanned<ChlExpr>>) -> Option<bool> {
         ChlExpr::Name(n) if n == crate::ccl::nominal::EFFECT => Some(true),
         ChlExpr::Name(n) if n == crate::ccl::nominal::CONTEXT => Some(false),
         _ => None,
+    }
+}
+
+/// Whether the module being lowered is `std`, the one module that declares `@Builtin` members
+/// (`docs/chl-spec.md`, "9.16 The std root").
+fn lowering_std(ctx: &LoweringContext) -> bool {
+    ctx.module
+        .labels
+        .as_ref()
+        .is_some_and(|path| path.segments() == [chl_parser::module_path::STD_ROOT])
+}
+
+/// The refusal of `@Builtin` at `at` outside `std`.
+fn builtin_outside_std(at: Span) -> LoweringError {
+    LoweringError::unsupported(
+        at,
+        "`@Builtin` marks a declaration whose behaviour the compiler supplies, and only `std` \
+         declares one",
+    )
+}
+
+/// What the compiler answers the trait `decl` with beyond its instances: the products that
+/// satisfy it by their components and whether a structural collection does as itself. A
+/// trait does so exactly when it is `@Builtin` ([`StdTrait::builtin_reading`]).
+fn builtin_trait_reading(
+    decl: &ChlTraitDecl,
+    ctx: &LoweringContext,
+) -> Result<(ProductReading, bool), LoweringError> {
+    let named = lowering_std(ctx)
+        .then(|| StdTrait::named(&decl.name.node))
+        .flatten();
+    let reading = named.and_then(StdTrait::builtin_reading);
+    match (decl.builtin, reading) {
+        (None, None) => Ok((ProductReading::None, false)),
+        (Some(_), Some(reading)) => Ok(reading),
+        (Some(at), None) if !lowering_std(ctx) => Err(builtin_outside_std(at)),
+        (Some(at), None) => Err(LoweringError::internal(
+            at,
+            format!(
+                "the compiler answers `{}` by its instances alone, so it is not `@Builtin`",
+                decl.name.node
+            ),
+        )),
+        (None, Some(_)) => Err(LoweringError::internal(
+            decl.name.span,
+            format!(
+                "the compiler answers `{}` beyond its instances, so `std` marks it `@Builtin`",
+                decl.name.node
+            ),
+        )),
     }
 }
 
@@ -1009,26 +1060,13 @@ fn declare_instance(
         heads.push(InstanceHead::of_pattern(&ty));
         operands.push(ty);
     }
-    if !heads.iter().any(|h| matches!(h, InstanceHead::Nominal(_))) {
-        return Err(LoweringError::unsupported(
-            block.ty.span,
-            format!(
-                "`instance {}` names no nominal type; an instance is for a type the module \
-                 declares, so one of its operands names one",
-                head_spelling(&trait_, &operands)
-            ),
-        ));
-    }
     // An instance is declared in its trait's module or in the module of a type its head
     // names, and outside its trait's module no operand is a whole type variable
-    // (`docs/chl-spec.md`, "Traits and instances across modules [Decided]"). The compiler's
-    // traits belong to no module, so an instance of one is always outside it.
+    // (`docs/chl-spec.md`, "Traits and instances across modules [Decided]"). In its trait's
+    // module an instance may be for any types, base types included: no other module can
+    // declare one of that trait for types it does not declare, so none overlaps it.
     if !ctx.traits.contains(&trait_) {
-        let whose = if trait_.is_compiler() {
-            format!("`{trait_}` is the compiler's")
-        } else {
-            format!("`{trait_}` is module `{}`'s", trait_.module.join("::"))
-        };
+        let whose = format!("`{trait_}` is module `{}`'s", trait_.module.join("::"));
         let declares =
             |decl: &Rc<NominalDecl>| ctx.nominal_types.iter().any(|d| Rc::ptr_eq(d, decl));
         if !heads
@@ -1062,7 +1100,7 @@ fn declare_instance(
     }
     // A `**`'s exponent is a non-negative `Int` whichever instance answers it, so an instance
     // of `Exponentiable` takes `Int` there (`docs/chl-spec.md`, "Declaring an instance").
-    if trait_ == Trait::exponentiable()
+    if trait_.is_std(StdTrait::Exponentiable)
         && operands.get(1) != Some(&Type::Base(crate::ccl::BaseType::Int))
     {
         return Err(LoweringError::unsupported(
@@ -1134,7 +1172,7 @@ fn declare_instance(
         // A loop walks its source through one `elements` call to a structural collection,
         // so a nominal `Elements` would need a second instance's `elements` after it
         // (`docs/chl-spec.md`, "Trait requirements").
-        if trait_ == Trait::iterable() && matches!(ty, Type::Nominal(..)) {
+        if trait_.is_std(StdTrait::Iterable) && matches!(ty, Type::Nominal(..)) {
             return Err(LoweringError::unsupported(
                 a.value.span,
                 format!(
@@ -1219,7 +1257,7 @@ fn declare_instance(
         ));
     }
     check_conditions_end(&trait_, &operands, &requires, &head, block, ctx)?;
-    if trait_ == Trait::equatable() || trait_ == Trait::orderable() {
+    if trait_.is_std(StdTrait::Equatable) || trait_.is_std(StdTrait::Orderable) {
         check_comparison_instance(&trait_, &operands, &requires, &head, block, &ctx.instances)?;
     }
     // What the trait requires of every instance holds at this one's types, by the instances
@@ -1253,6 +1291,35 @@ fn declare_instance(
             Some(d) => error.with_related(d.span, "the other instance"),
             None => error,
         });
+    }
+    let declared = DeclaredAt {
+        module: ctx
+            .module
+            .labels
+            .as_ref()
+            .map_or_else(Vec::new, |path| path.segments().to_vec()),
+        head: head.clone(),
+        span: block.ty.span,
+    };
+    if let Some(at) = block.builtin {
+        let functions = builtin_instance_functions(&trait_, &operands, block, &head, at, ctx)?;
+        // Inference answers a call of a `@Builtin` instance's function by its primitive, and
+        // no `def` of it lowers.
+        ctx.instances.add(
+            trait_,
+            Rc::new(TraitInstance {
+                params: Vec::new(),
+                heads,
+                operands,
+                assoc,
+                requires,
+                bounds: Vec::new(),
+                functions,
+                effect_assocs: Vec::new(),
+                declared: Some(declared),
+            }),
+        );
+        return Ok(());
     }
     // The block defines each of the trait's functions, and nothing else.
     let mut functions: Vec<(SmolStr, Implementation)> = Vec::new();
@@ -1343,15 +1410,7 @@ fn declare_instance(
                 )
             })
             .collect(),
-        declared: Some(DeclaredAt {
-            module: ctx
-                .module
-                .labels
-                .as_ref()
-                .map_or_else(Vec::new, |path| path.segments().to_vec()),
-            head,
-            span: block.ty.span,
-        }),
+        declared: Some(declared),
     });
     ctx.instances.add(trait_.clone(), Rc::clone(&instance));
     ctx.instance_blocks.push(InstanceBlock {
@@ -1363,6 +1422,67 @@ fn declare_instance(
         members,
     });
     Ok(())
+}
+
+/// The functions of `@Builtin instance head`, the block `block` marked at `at`: the primitive
+/// the compiler runs for each function the trait declares, at the instance's base types
+/// ([`StdTrait::primitive`]). The block defines none of them.
+fn builtin_instance_functions(
+    trait_: &Trait,
+    operands: &[Type],
+    block: &ImplBlock,
+    head: &str,
+    at: Span,
+    ctx: &LoweringContext,
+) -> Result<Vec<(SmolStr, Implementation)>, LoweringError> {
+    if !lowering_std(ctx) {
+        return Err(builtin_outside_std(at));
+    }
+    let internal = |why: String| LoweringError::internal(block.ty.span, why);
+    let Some(named) = StdTrait::named(trait_.name()).filter(|t| trait_.is_std(*t)) else {
+        return Err(internal(format!(
+            "`@Builtin instance {head}` is an instance of `{trait_}`, which the compiler does not \
+             name"
+        )));
+    };
+    if let Some(def) = block.defs.first() {
+        return Err(LoweringError::unsupported(
+            def.span,
+            format!(
+                "the compiler supplies the functions of `@Builtin instance {head}`, so its block \
+                 defines none"
+            ),
+        ));
+    }
+    if trait_.functions().is_empty() {
+        return Err(internal(format!(
+            "`{trait_}` declares no function, so the compiler supplies nothing for `instance \
+             {head}`, which is not `@Builtin`"
+        )));
+    }
+    let bases: Option<Vec<crate::ccl::BaseType>> = operands
+        .iter()
+        .map(|t| match t {
+            Type::Base(b) => Some(b.clone()),
+            _ => None,
+        })
+        .collect();
+    let Some(bases) = bases else {
+        return Err(internal(format!(
+            "`@Builtin instance {head}` is for a type that is not a base type"
+        )));
+    };
+    trait_
+        .functions()
+        .iter()
+        .map(|f| match named.primitive(&f.name, &bases) {
+            Some(primitive) => Ok((f.name.clone(), Implementation::Primitive(primitive))),
+            None => Err(internal(format!(
+                "the compiler has no primitive for `{trait_}::{}` at `{head}`",
+                f.name
+            ))),
+        })
+        .collect()
 }
 
 /// Check that resolving an instance's conditions ends (`docs/chl-spec.md`, "Declaring an
@@ -1506,11 +1626,13 @@ fn check_comparison_instance(
              instance of `{trait_}` names one type twice"
         ));
     }
+    // A base value compares by value as the compiler compares it, and only `Equatable`'s and
+    // `Orderable`'s own module, `std`, declares an instance for one.
     let Type::Nominal(decl, args) = one else {
-        unreachable!("an instance's head names a nominal type, and this one names one type")
+        return Ok(());
     };
     let ctors = &decl.body().ctors;
-    let orderable = *trait_ == Trait::orderable();
+    let orderable = trait_.is_std(StdTrait::Orderable);
     if orderable && ctors.len() != 1 {
         return refuse(format!(
             "`instance {head}`: `{}` has {} constructors, which have no order; only a type with \
@@ -1701,6 +1823,10 @@ pub(super) fn lower_instance(
         .block_trait(block)
         .is_err_and(|e| e.is_unavailable_member())
     {
+        return Ok(body);
+    }
+    // A `@Builtin` instance's functions are the compiler's primitives, so no `def` binds one.
+    if block.builtin.is_some() {
         return Ok(body);
     }
     let at = ctx
@@ -2087,11 +2213,13 @@ fn signature_bound(
 }
 
 impl LoweringContext {
-    /// The trait `name` names: the compiler's, one the module declares, or one a `use` name
-    /// of the module reaches.
+    /// The trait `name` names: one the module declares, or one a `use` name of the module
+    /// reaches, the prelude's included.
     pub(super) fn trait_named(&self, name: &str) -> Option<Trait> {
-        Trait::compiler_named(name)
-            .or_else(|| self.traits.iter().find(|t| t.name() == name).cloned())
+        self.traits
+            .iter()
+            .find(|t| t.name() == name)
+            .cloned()
             .or_else(
                 || match self.module.uses.get(name).map(|used| &used.reached) {
                     Some(Reached::Trait(Some(trait_))) => Some(trait_.clone()),
@@ -2186,4 +2314,29 @@ impl LoweringContext {
     pub(crate) fn take_instances(&mut self) -> InstanceTable {
         std::mem::take(&mut self.instances)
     }
+
+    /// Record each trait `std` declares that the compiler names, once `std` has lowered: the
+    /// module's own traits are `ctx.traits` until the next module begins.
+    pub(super) fn declare_std_traits(&mut self) {
+        for named in StdTrait::ALL {
+            let trait_ = self
+                .traits
+                .iter()
+                .find(|t| t.is_std(named))
+                .cloned()
+                .unwrap_or_else(|| panic!("`std` declares `{}`", named.name()));
+            self.instances.declare_std(named, trait_);
+        }
+    }
+}
+
+/// The traits and instances of a program that declares nothing of its own: `std`'s, which
+/// the prelude reaches ([`InstanceTable::std`]).
+pub fn std_instances() -> InstanceTable {
+    let mut ctx = LoweringContext::default();
+    let program = crate::ccl::load::LoadedProgram::test("1");
+    modules::lower_program(&program, &mut ctx)
+        .into_result()
+        .unwrap_or_else(|errors| panic!("`std` and a program of one literal lower: {errors:?}"));
+    ctx.take_instances()
 }

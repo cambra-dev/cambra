@@ -29,7 +29,7 @@ use super::schemes::OperatorSchemes;
 use super::typing::{LetScheme, TempNames, Typing};
 use super::{lit_base, map_constrain_err};
 use crate::ccl::infer::solver::traits::{
-    Assoc, InstanceHead, InstanceTable, Trait, compares_by_value, offered_head,
+    Assoc, InstanceHead, InstanceTable, StdTrait, Trait, compares_by_value, offered_head,
 };
 use crate::util::ScopeStack;
 use std::collections::HashMap;
@@ -257,6 +257,10 @@ fn without_written_clauses(ty: &mut Type) {
 }
 
 impl Typing for CheckCtx {
+    fn std_trait(&self, named: StdTrait) -> Trait {
+        self.instances.std_trait(named)
+    }
+
     fn pred_memo(&self) -> TermMemo {
         self.pred_memo.clone()
     }
@@ -1477,7 +1481,7 @@ fn check_unbox(ty: &Type, label: &str, ctx: &mut CheckCtx) {
 pub fn check(expr: &Expr) -> Result<(), Vec<InferError>> {
     // Check-mode failures are compiler bugs (a pass produced an ill-typed tree), and
     // every caller of this entry `.expect()`s them, so the blame nodes go unread.
-    check_located(expr, &InstanceTable::builtin(), CheckMode::Full)
+    check_located(expr, &InstanceTable::std(), CheckMode::Full)
         .map_err(|errs| errs.into_iter().map(|e| e.error).collect())
 }
 
@@ -1695,7 +1699,7 @@ mod tests {
     #[test]
     fn a_refinement_blind_check_rejects_unequal_data_function_domains() {
         let check_in = |tree: &TypedExpr, mode| {
-            check_located(tree, &InstanceTable::builtin(), mode).map_err(|errs| errs.len())
+            check_located(tree, &InstanceTable::std(), mode).map_err(|errs| errs.len())
         };
         let data = applied_across_unequal_domains(Type::data_fun);
         assert!(check_in(&data, CheckMode::Full).is_err());
@@ -1732,7 +1736,7 @@ mod tests {
         let (a_id, b_id) = (bad_a.node_id(), bad_b.node_id());
         let mut tree = TypedExpr::tuple(vec![bad_a, bad_b]);
 
-        let mut ctx = CheckCtx::new(tree.node_id(), InstanceTable::builtin(), CheckMode::Full);
+        let mut ctx = CheckCtx::new(tree.node_id(), InstanceTable::std(), CheckMode::Full);
         let _ = check_node(&mut tree, &mut ctx);
 
         let blamed: Vec<_> = ctx.errors.iter().map(|e| e.node_id).collect();
@@ -1772,7 +1776,7 @@ mod tests {
         let errors_for = |result: Type| {
             let mut node = Expr::builtin(Builtin::StrengthOver)
                 .with_ty(Type::fun(operand.clone(), Type::fun(int.clone(), result)));
-            let mut ctx = CheckCtx::new(node.node_id(), InstanceTable::builtin(), CheckMode::Full);
+            let mut ctx = CheckCtx::new(node.node_id(), InstanceTable::std(), CheckMode::Full);
             let _ = check_node(&mut node, &mut ctx);
             ctx.errors
         };

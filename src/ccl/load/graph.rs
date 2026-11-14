@@ -86,8 +86,8 @@ pub(super) fn cycles(modules: &[LoadedModule], sources: &SourceMap) -> Vec<LoadE
         .collect()
 }
 
-/// Every module, each after every module it has an edge to, ties broken by
-/// module path. The graph must be acyclic.
+/// Every module outside a cycle and not reaching one, each after every module it has an
+/// edge to, ties broken by module path.
 pub(super) fn link_order(modules: &[LoadedModule], sources: &SourceMap) -> Vec<FileId> {
     let mut waiting: BTreeMap<FileId, BTreeSet<FileId>> = modules
         .iter()
@@ -116,10 +116,5 @@ pub(super) fn link_order(modules: &[LoadedModule], sources: &SourceMap) -> Vec<F
             }
         }
     }
-    assert_eq!(
-        order.len(),
-        modules.len(),
-        "an acyclic module graph orders every module"
-    );
     order
 }

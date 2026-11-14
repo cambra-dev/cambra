@@ -1058,7 +1058,7 @@ impl GlobalContext {
     pub fn new() -> Self {
         let mut result = Self {
             lowering: LoweringContext::default(),
-            inference: TypeInferenceContext::new(),
+            inference: TypeInferenceContext::for_program(),
             conversion: OpConversionContext::new(),
             scheduler: Scheduler::new(),
             sources_and_sinks: SourceSinkRegistry::default(),
@@ -1077,7 +1077,7 @@ impl GlobalContext {
     fn scratch(lowering: LoweringContext) -> Self {
         Self {
             lowering,
-            inference: TypeInferenceContext::new(),
+            inference: TypeInferenceContext::for_program(),
             conversion: OpConversionContext::new(),
             scheduler: Scheduler::new(),
             sources_and_sinks: SourceSinkRegistry::default(),
@@ -3799,6 +3799,7 @@ mod tests {
         let mut ctx = GlobalContext::default();
         let lowering = LoweringSession::install();
         assert!(lower_for_check(&program, ctx.lowering_ctx()).is_empty());
+        ctx.inference_ctx().instances = Rc::new(ctx.lowering_ctx().take_instances());
         let checks = std::mem::take(&mut ctx.lowering_ctx().module_checks);
         let ids = checks
             .iter()

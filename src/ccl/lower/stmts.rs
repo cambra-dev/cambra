@@ -4804,18 +4804,14 @@ pub fn is_builtin_type_name(name: &str) -> bool {
     BaseType::from_keyword(name).is_some() || RESERVED_TYPE_NAMES.contains(&name)
 }
 
-/// What a capitalized name the language already gives a meaning is, `"type"` or `"trait"`,
-/// for a declaration that would rebind it. A trait name is spelled in the type world too, in
-/// a `requires` clause and before `::`, so a type of the same name would make both ambiguous.
+/// What a capitalized name the language already gives a meaning is, `"type"`, for a
+/// declaration that would rebind it. The compiler's traits are `std`'s, and a module's own
+/// declaration of one's name shadows the prelude's (`docs/chl-spec.md`, "9.16 The std root").
 pub(super) fn reserved_name(name: &str) -> Option<&'static str> {
     if name == "OrderableIfRequiredBy" {
         Some("requirement")
-    } else if is_builtin_type_name(name) {
-        Some("type")
-    } else if crate::ccl::infer::solver::traits::Trait::compiler_named(name).is_some() {
-        Some("trait")
     } else {
-        None
+        is_builtin_type_name(name).then_some("type")
     }
 }
 

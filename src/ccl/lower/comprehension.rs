@@ -202,7 +202,7 @@ mod tests {
     )]
     fn test_lower_list_comp(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
-        let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
+        let ccl = lower_stmts(&stmts, &mut std_context())
             .into_result()
             .expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
@@ -217,14 +217,14 @@ mod tests {
     )]
     fn test_lower_generator_expr(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
-        let ccl = lower_expr(&expr, &mut LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_expr(&expr, &mut std_context()).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
     /// A source call nested inside a larger expression lowers correctly.
     #[test]
     fn test_lower_source_in_list_comp() {
-        let mut ctx = LoweringContext::default();
+        let mut ctx = std_context();
         ctx.register_source("src", stub_source("src"));
         let stmts = parse_module("[x for x in src()]");
         let ccl = lower_stmts(&stmts, &mut ctx)

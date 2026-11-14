@@ -516,9 +516,8 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
     let sources = program.sources();
     let root = sources.root();
     let mut lowering = ProgramLowering::new(program);
-    // With a cycle there is no link order, and the root lowers with no module to
-    // reach: loading has reported the cycle.
-    let order = program.link_order().unwrap_or_default();
+    // A cycle leaves user dependencies unavailable; std still supplies the root's operators.
+    let order = program.lowering_order();
     // Each import's shared import is decided once the module it imports has
     // lowered, and before its importer lowers, so the importer reaches the
     // types its arguments give.
@@ -1213,6 +1212,9 @@ impl<'a> ProgramLowering<'a> {
         ctx.root_value = None;
         if let Some(option) = ctx.nominal_types.iter().find(|decl| decl.is_option()) {
             ctx.std_option = Some(declared_option(option));
+        }
+        if module.segments() == [chl_parser::module_path::STD_ROOT] && lowered.errors.is_empty() {
+            ctx.declare_std_traits();
         }
         let sinks = std::mem::take(&mut ctx.declared_sinks);
         let run_checks = std::mem::take(&mut ctx.run_type_checks);
