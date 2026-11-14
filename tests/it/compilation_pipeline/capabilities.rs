@@ -415,6 +415,52 @@ fn a_feed_reached_through_another_name(
     "},
     "pub with_ctx: forall (R <: Context) {(Int => Int requires R), Int} => Int requires R"
 )]
+#[case::a_raised_nominal_type(
+    indoc! {"
+        pub type Negative = {qty: Int}
+        pub def checked(qty: Int):
+            if qty < 0:
+                raise Negative::new((qty=qty))
+            qty
+    "},
+    "pub checked: Int => Int causes Raise(main::Negative)"
+)]
+#[case::an_exception_the_definition_catches(
+    indoc! {"
+        pub def recover(E <: Effect, f: (Int => Int causes E, Raise(Int)), x: Int) => Int causes only E:
+            try:
+                f(x)
+            except Int as e:
+                e + 1
+    "},
+    "pub recover: forall (E <: Effect) {(Int => Int causes Raise(Int), E), Int} => Int causes E"
+)]
+#[case::a_raised_parameter(
+    indoc! {"
+        pub def f(x):
+            raise x
+    "},
+    "pub f: forall (A, B) A => B causes Raise(A)"
+)]
+#[case::a_type_parameter_caught_by_itself(
+    indoc! {"
+        pub def g(A, x: A) => Int:
+            try:
+                raise x
+            except A:
+                1
+    "},
+    "pub g: forall (A) A => Int"
+)]
+#[case::a_raised_collection(
+    indoc! {"
+        pub def h(x: Int) => Int:
+            if x > 1:
+                raise [x, x]
+            x
+    "},
+    "pub h: Int => Int causes Raise(Array(2, Int))"
+)]
 fn a_contract_names_the_effects_an_argument_brings(#[case] code: &str, #[case] line: &str) {
     let interface = interface_of(code);
     assert!(interface.lines().any(|l| l == line), "{interface}");
@@ -640,12 +686,12 @@ fn a_clause_naming_no_variable_is_reported_at_the_clause() {
 /// is refused where it is written.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::an_exception(
+#[case::an_exception_without_its_type(
     indoc! {"
-        def f(n: Int) causes Raise(Int):
+        def f(n: Int) causes Raise:
             n
     "},
-    "`Raise` is not supported yet"
+    "`Raise` takes one type"
 )]
 #[case::an_effect_variable(
     indoc! {"
@@ -1787,6 +1833,79 @@ fn a_runs_state_is_written_where_it_has_one(#[case] code: &str, #[case] needle: 
     "g: Int => Int requires Context except Transaction = \\x -> x\ny = g(1)\n",
     "run, since its top level requires `Context except Transaction`"
 )]
+#[case::every_raise(
+    "pub def apply(f: (Int => Int causes Raise(*)), x: Int) => Int:\n    f(x)\n",
+    "pub apply: {(Int => Int causes Raise(*)), Int} => Int causes Raise(*)"
+)]
+#[case::a_raise_within_every_raise(
+    "pub def apply(f: (Int => Int causes Raise(Int), Raise(*)), x: Int) => Int:\n    f(x)\n",
+    "pub apply: {(Int => Int causes Raise(*)), Int} => Int causes Raise(*)"
+)]
+#[case::a_raise_taken_from_every_raise(
+    "pub def apply(f: (Int => Int causes Write(*), Raise(*) except Raise(Int)), x: Int) => Int:\n    \
+     f(x)\n",
+    "pub apply: {(Int => Int causes Write(*), Raise(*) except Raise(Int)), Int} => Int causes \
+     Write(*), Raise(*) except Raise(Int)"
+)]
+#[case::a_variable_beside_a_raise_top_written_back(
+    indoc! {"
+        pub def both(E <: Effect, f: (Int => Int causes E), g: (Int => Int causes (Raise(*) except Raise(Int))), x: Int) => Int causes E, (Raise(*) except Raise(Int)):
+            f(x) + g(x)
+        pub h: forall (E <: Effect) {(Int => Int causes E), (Int => Int causes Raise(*) except Raise(Int)), Int} => Int causes E, (Raise(*) except Raise(Int)) = both
+    "},
+    "pub h: forall (E <: Effect) {(Int => Int causes E), (Int => Int causes Raise(*) except \
+     Raise(Int)), Int} => Int causes E, (Raise(*) except Raise(Int))"
+)]
+#[case::a_raise_held_by_a_wider_one(
+    indoc! {"
+        def thrower(x: Int) => Int:
+            raise 5
+        pub def both(E <: Effect, f: (Int => Int causes E), x: Int) => Int:
+            f(x) + thrower(x)
+        pub h: forall (E <: Effect) {(Int => Int causes E), Int} => Int causes E, Raise(Int) = both
+    "},
+    "pub h: forall (E <: Effect) {(Int => Int causes E), Int} => Int causes Raise(Int), E"
+)]
+#[case::raises_of_one_type_from_two_sites(
+    "g: Int => Int causes Raise(Int) = \\x -> x\npub h: Int => Int causes Raise(Int) = g\n",
+    "pub h: Int => Int causes Raise(Int)"
+)]
+#[case::raises_taken_from_effect_caught_by_type(
+    indoc! {"
+        pub def safe(f: (Int => Int causes Raise(Int), Effect except Raise(*)), x: Int) => Int:
+            try:
+                f(x)
+            except Int:
+                0
+    "},
+    "pub safe: {(Int => Int causes Raise(Int), Effect except Raise(*)), Int} => Int causes Effect \
+     except Raise(*)"
+)]
+#[case::a_loop_running_effect_but_writes_and_raises(
+    indoc! {"
+        def loop_over(f: (Int => Int causes Effect except (Write(*), Raise(*))), xs):
+            for x in xs:
+                f(x)
+            0
+        pub def go(a, b) => Int:
+            loop_over(\\y -> y, a ++ b)
+    "},
+    "pub go: forall (A, B) {A => Int, B => Int} => Int causes Effect except (Write(*), Raise(*))"
+)]
+#[case::returned_raising(
+    indoc! {"
+        pub def maker(f: (Int => Int causes Raise(*))) => Int => Int causes Raise(*):
+            c := 0
+            for x in [1, 2]:
+                c += x
+            \\x -> f(x) + 1
+    "},
+    "pub maker: (Int => Int causes Raise(*)) => Int => Int causes Raise(*)"
+)]
+#[case::public_raising_beside_an_induction_variable(
+    "cnt := 0\nfor x in [1, 2]:\n    cnt += x\npub g: Int => Int causes Raise(*) = \\x -> x\n",
+    "pub g: Int => Int causes Raise(*)"
+)]
 fn a_top_is_written(#[case] code: &str, #[case] line: &str) {
     let interface = interface_of(code);
     assert!(interface.lines().any(|l| l == line), "{interface}");
@@ -1958,6 +2077,30 @@ fn a_top_is_written(#[case] code: &str, #[case] line: &str) {
     "g: Int => Int requires Context = \\x -> x\ny = g(1)\n",
     "this requires `Transaction` outside a `with begin():` block"
 )]
+#[case::a_raise_the_type_takes_away(
+    indoc! {"
+        def thrower(x: Int) => Int:
+            raise 5
+        pub def apply(f: (Int => Int causes Effect except Raise(Int)), x: Int) => Int:
+            f(x)
+        pub def bad(x: Int) => Int:
+            apply(thrower, x)
+    "},
+    "this has `Raise({Int where _ == 5})`, which the function type it must have does not state"
+)]
+#[case::an_instance_beyond_its_associated_bound(
+    indoc! {"
+        trait Act(T):
+            Does <: Effect except Raise(*)
+            def act(t: T) => Int causes Does
+        type Box = Int
+        instance Act(Box):
+            def act(t):
+                raise 3
+    "},
+    "this has `Raise({Int where _ == 3})`, which the bound of the clause variable it reaches takes \
+     away"
+)]
 fn a_top_is_checked(#[case] code: &str, #[case] needle: &str) {
     let errors = errors_of(code);
     assert!(errors.contains(needle), "{errors}");
@@ -2091,6 +2234,7 @@ fn a_top_names_every_variable(#[case] code: &str, #[case] needle: &str) {
 #[rstest]
 #[case::effect("Effect")]
 #[case::every_write("Write(*)")]
+#[case::every_raise("Raise(*)")]
 fn a_top_orders_a_loop(#[case] top: &str) {
     let errors = errors_of(&format!(
         "def loop_over(f: (Int => Int causes {top}), xs):\n    for x in xs:\n        f(x)\n    \
@@ -2100,6 +2244,49 @@ fn a_top_orders_a_loop(#[case] top: &str) {
         errors.contains(&format!(
             "since its body causes `{top}`, but this source has the positions of a concatenation"
         )),
+        "{errors}"
+    );
+}
+
+/// A clause variable bounded by `Effect` may hold `Raise(*)`, so a `try` around a call causing it
+/// is refused as one around `Raise(*)` is, naming the variable, whatever a use passes
+/// (`docs/chl-spec.md`, "Exceptions").
+#[test]
+fn a_try_around_a_raising_clause_variable_names_it() {
+    let errors = errors_of(indoc! {"
+        def recover(E <: Effect, f: (Int => Int causes E), x: Int) => Int causes E:
+            try:
+                f(x)
+            except Int as e:
+                e + 1
+    "});
+    assert!(
+        errors.contains(
+            "this `except Int` is around a call that may cause `E`, whose bound holds `Raise(*)`"
+        ),
+        "{errors}"
+    );
+}
+
+/// `Effect` and `Raise(*)` raise every type: a `try` around either catches nothing, and a top
+/// level calling either raises past the program (`docs/chl-spec.md`, "Exceptions").
+#[rstest]
+#[case::effect("Effect")]
+#[case::every_raise("Raise(*)")]
+fn a_top_raises_every_type(#[case] top: &str) {
+    let errors = errors_of(&format!(
+        "pub def safe(f: (Int => Int causes {top}), x: Int) => Int:\n    try:\n        f(x)\n    \
+         except Int:\n        0\n"
+    ));
+    assert!(
+        errors.contains(&format!(
+            "this `except Int` is around a call that may cause `{top}`, which raises every type"
+        )),
+        "{errors}"
+    );
+    let errors = errors_of(&format!("g: Int => Int causes {top} = \\x -> x\ng(1)\n"));
+    assert!(
+        errors.contains(&format!("this raises `{top}`, which nothing catches")),
         "{errors}"
     );
 }

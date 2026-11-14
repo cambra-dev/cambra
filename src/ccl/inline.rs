@@ -1098,6 +1098,8 @@ fn inline_node(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                 && !writes_what_the_body_touches(&bound_expr, &body)
                 && !writes_a_variable_bound_outside(&bound_expr)
                 && !stands_in_a_value_former(&binding.name, &body)
+                && !may_raise(&bound_expr)
+                && !effect_past_a_raise(&bound_expr, &body)
             {
                 let _g =
                     provenance::enter(node_id, "inline.anf_temp", provenance::Nature::Machinery);
@@ -1158,6 +1160,8 @@ fn inline_node(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                 && !reads_a_variable_written_in(&bound_expr, &body)
                 && !writes_what_the_body_touches(&bound_expr, &body)
                 && !writes_a_variable_bound_outside(&bound_expr)
+                && !may_raise(&bound_expr)
+                && !effect_past_a_raise(&bound_expr, &body)
             {
                 let _g =
                     provenance::enter(node_id, "inline.anf_product", provenance::Nature::Machinery);
@@ -1312,6 +1316,26 @@ fn inline_node(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
         own_capabilities,
     }
     .absorbing_children_capabilities()
+}
+
+/// Whether evaluating `e` may raise an exception, so that a rewrite must neither drop it, copy
+/// it, nor move it to where it would be evaluated under a condition or in another order
+/// (`docs/chl-spec.md`, "Exceptions": an exception is raised whether its value is used or
+/// not, and the first in written order escapes).
+///
+/// `e`'s capabilities answer: a lambda raises where it is applied, so its body's `Raise` is not
+/// the lambda's, and a call holds what its function causes.
+fn may_raise(e: &Expr) -> bool {
+    e.capabilities.set().may_raise()
+}
+
+/// Whether moving `definiens`, which causes something, to its use in `body` could carry its
+/// effect past an exception `body` raises first: in `a = g(5, o); b = f(1); a + b`, `g`'s feed
+/// stands where `f` raises, and moved to `a + b` it would not (`docs/chl-spec.md`,
+/// "Exceptions": what runs before a raise takes effect). Conservative as
+/// [`writes_what_the_body_touches`] is: a raise anywhere in `body` blocks the move.
+fn effect_past_a_raise(definiens: &Expr, body: &Expr) -> bool {
+    !definiens.capabilities.set().causes_nothing() && may_raise(body)
 }
 
 /// Whether beta reduction should bind `argument` rather than substitute it for `param` in

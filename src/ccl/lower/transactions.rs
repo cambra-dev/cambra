@@ -298,6 +298,31 @@ fn lower_tx_block_scoped(
                 )?;
                 ctx.tag_machinery(Expr::expr_stmt(case, chain), stmt.span, "lower.stmt_seq")
             }
+            // `raise e` — the rest of the block runs only where it does not raise, which
+            // exception elimination decides.
+            ChlStmt::Raise(value) => {
+                let value = lower_expr(value, ctx)?;
+                let raise = ctx.tag_image(
+                    Expr::new(TypedExprNode::Raise {
+                        value: Box::new(value),
+                    }),
+                    stmt.span,
+                );
+                ctx.tag_machinery(Expr::expr_stmt(raise, chain), stmt.span, "lower.stmt_seq")
+            }
+            // `try: … except T as e: …` — its blocks are write paths of the transaction, as a
+            // `match`'s arms are.
+            ChlStmt::Try { body, handlers } => {
+                let attempt = lower_try_over(
+                    stmt.span,
+                    body,
+                    handlers,
+                    outer_bindings,
+                    ctx,
+                    |body, scope, ctx| lower_tx_block_inner(body, scope, stmt.span, ctx),
+                )?;
+                ctx.tag_machinery(Expr::expr_stmt(attempt, chain), stmt.span, "lower.stmt_seq")
+            }
             ChlStmt::With { .. } => {
                 return Err(LoweringError::unsupported(
                     stmt.span,
@@ -320,7 +345,7 @@ fn lower_tx_block_scoped(
                     stmt.span,
                     "a `with begin():` block supports mutable writes (`x := …`, `x += …`), \
                      local bindings (`x = …`), `if cond:` guards, `match` dispatch, \
-                     and feeds (`out << e`). A declaration goes above the block, \
+                     `raise` and `try`, and feeds (`out << e`). A declaration goes above the block, \
                      `@LoadFrom` included: its value is the predecessor's, read once \
                      at the swap",
                 ));

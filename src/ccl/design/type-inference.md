@@ -798,6 +798,7 @@ conditional's reading unchanged.
 | Unreachable `match` arm | ``x = `a(1)``; ``case `a(v): `p(v)``; ``case `b(w): `p(w)`` | `w : Int@1`, the `` `p `` payload of the join | the payload binder's type | no value reaches it | [An unobservable arm payload is pinned to what its uses require](#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require) |
 | Empty list literal | `box([1]) if c else box([])` | element `Int@1`, the other branch's element | the element type | no value reaches it | as an arm payload ([The empty literal names no element type](collections.md#the-empty-literal-names-no-element-type)) |
 | Lambda parameter | `(\x -> 1) if c else (\y -> y + 2)` | `x : Int`, the join's domain | the parameter's type | neither a value nor a demand reaches it | the variable remains, and the post-inference check reports `UnresolvedInfer` |
+| Call no value returns from | `def g(x): raise x`; `try: g(3) except Int as e: e + 1` | the call's result `Int`, the `try`'s join | the call's type | no value reaches it and the call may raise | as an arm payload |
 | Nominal constructor | `Opt::some(1) if c else Opt::none` | `T : Int@1`, the other branch's argument | each type argument of the value it builds, `T` in `Opt::none : Opt(T)` | neither the payload nor a demand reaches it | the variable remains, an unresolved type at the use (`docs/chl-spec.md`, "Type parameters") |
 
 ##### The type of a position
@@ -855,14 +856,15 @@ with none, from the site's fallback, and the pin is still checked by `constrain_
 
 An arm payload is pinned when the walk reaches its `Case`, before the scrutinee and branches. A
 lambda parameter is pinned when the walk reaches the lambda, before its body. Empty literals are
-pinned by `pin_empty_list_elements` before the walk starts, because `Apply` walks its function
-before its argument, so a comprehension's lambda reads the element of an inline `[]` before the walk
-reaches the literal.
+pinned by `pin_unreached_values` before the walk starts, because `Apply` walks its function before
+its argument, so a comprehension's lambda reads the element of an inline `[]` before the walk
+reaches the literal. Calls no value returns from are pinned in the same pre-pass, so the joins above
+them read the pinned result.
 
 Each walk pins its own tree: the program's walk, and the walk of each specialization clone, which
 runs after `specialize_use` has pinned the clone to its use
 ([Specialization scope and lifecycle](#specialization-scope-and-lifecycle)).
-`pin_empty_list_elements` skips the right-hand side of a generalized `let`, whose clones are walked,
+`pin_unreached_values` skips the right-hand side of a generalized `let`, whose clones are walked,
 and pinned, one per use. So `def f(x: Int): []` called at `List(Int)` and at `List(String)` gives
 each use's element the type that use requires. A use whose instantiation leaves a variable for the
 pins shares no clone, so two uses that only their joins tell apart get one clone each
@@ -4502,6 +4504,7 @@ frame's filter. Capabilities are recorded on the node that does them:
 | a value read of an induction variable 𝑥 | `Read(𝑥)` |
 | an `Apply` passing 𝑎 to a `Mut` parameter | `Read(𝑎)` and `Write(𝑎)`, or `ReadTxn(𝑎)` and `WriteTxn(𝑎)` when 𝑎 is transactional |
 | an `Apply` passing a feed 𝑎 to a `Feed` parameter | `Append(𝑎)` |
+| `Raise` of a value of type 𝐸 | `Raise(𝐸)`, identified by the `Raise` node and an instance each use's copy renews (`Raised`) |
 
 A value read is a mention whose handle becomes its value (`read_value` in `emit.rs`). A mention
 passed by reference, or to `await_final`, stays a handle and reads nothing. A parameter's history is
@@ -4553,8 +4556,10 @@ Lowering writes a function type's clauses as `Repr::Written`: the items, which c
 hole, and where the clauses are written (`lower/clauses.rs`). A function type with no clause is
 written too, with no item and neither clause open, since a written type's clauses are exact.
 `normalize_annotation` turns written clauses into a fresh variable holding the items, with an upper
-bound of the items over each clause without a hole (`InferCtx::normalize_capabilities`). `uniquify`
-resolves the variables a clause names in the scope the clause is written in, and
+bound of the items over each clause without a hole (`InferCtx::normalize_capabilities`). A stated
+`Raise(𝑇)` bounds by subtyping, since `Raise` is covariant: an upper bound admits a `Raise(𝑆)` with
+𝑆 a subtype of a 𝑇 it states (`Upper::admits`), checked once inference is done and the types
+resolve. `uniquify` resolves the variables a clause names in the scope the clause is written in, and
 `Typing::check_written` refuses one that names no variable of the kind its item takes
 (`InferError::ClauseNamesNoVariable`). The Check mode reads no capabilities, and normalizes a
 written clause to none.
@@ -4594,10 +4599,12 @@ or a top taking away other than what the rest of its clause shares prints in par
 (`capabilities::clauses`). A top holding writes or reads names every mutable variable, and one
 holding appends every feed (`Every::names_mutable_variables`, `Every::names_feeds`), so a function
 whose type holds one leaves no body that declares what it names (`InferCtx::body_binds`) and is no
-public member of a module whose top level binds one. A top holding writes orders a loop running it.
-A clause variable's bound, and an associated effect type's, may take capabilities away
-(`TypeParam::clause_except`): opening the parameter, or an instance's variable for the associated
-type, bounds it by `Effect` or `Context` less them, which each use's copy keeps (`Blame::Bound`).
+public member of a module whose top level binds one. A top holding writes or exceptions orders a
+loop running it, and one holding `Raise(*)` raises every type, so a `try` around it is refused
+(`InferError::ExceptAroundEveryRaise`, `Every::raises_anything`). A clause variable's bound, and an
+associated effect type's, may take capabilities away (`TypeParam::clause_except`): opening the
+parameter, or an instance's variable for the associated type, bounds it by `Effect` or `Context`
+less them, which each use's copy keeps (`Blame::Bound`).
 
 **Upper bounds are checked once emission is complete.** A variable's capabilities are known only
 then, so `capabilities::exceeded_uppers` reads each bounded variable's resolution after the barrier
@@ -4677,7 +4684,7 @@ one `lower::EXPRESSION_STATEMENT`, which `lower::marked_nodes` reads). A paramet
 `Bound::Parameter`: it reaches the statement's variable and no function body's type. A statement
 whose variable causes nothing is inert (`InferError::InertStatement`), unless it reaches a call
 variable with nothing flowing into it, the call of a function a polymorphic definition takes as a
-parameter, which only each use determines (`InferCtx::inert_statements`). Inference returns the
+parameter, which only each use determines (`InferCtx::does_nothing`). Inference returns the
 inert statements, and the compile reports them only where inference reports no error: an argument
 passed wrongly by reference, which inference refuses, is the more precise diagnosis.
 
@@ -4692,7 +4699,7 @@ through the function (`InferCtx::exported_capabilities`).
 Each loop records `OrderableIfRequiredBy(𝑃, 𝐸)` in its enclosing function's requirements
 ([Conditional ordering requirements](../../../docs/chl-spec.md#conditional-ordering-requirements)).
 `𝑃` is the source's position type. `𝐸` collects the body's capabilities after excluding writes to
-variables declared in the iteration. The requirement keeps its
+variables declared in the iteration and exceptions caught in the body. The requirement keeps its
 own capability variable, independently of the capabilities an enclosing scope discharges. An inner
 loop's source evaluates in the outer body, before the inner body's frame opens.
 
@@ -4700,7 +4707,7 @@ loop's source evaluates in the outer body, before the inner body's frame opens.
 instantiation copies both through the same `FreshenCache` as the function type, including its
 written upper bounds. The position variables retain their telescopes, and the requirement retains
 the trait assumptions available where it is used. A statement's frame passes the requirement
-outward even when its writes stop at a surrounding scope.
+outward even when its writes or exceptions stop at a surrounding scope.
 
 A requirement whose capabilities exclude ordering is discharged. Otherwise `check_loop_orders` uses
 the ordinary trait solver to require `Orderable(𝑃, 𝑃)`. An orderable position type also discharges a
@@ -4715,6 +4722,29 @@ solver. Establishing an order never sets a loop's ordering flag: the body's capa
 it. Contract rendering compacts a conditional requirement's position operands with the function's
 other types, pins their identities, and names its clause variables with the callback's clauses.
 
+
+### Exceptions
+
+**A `try` catches by type.** A `try` body collects on a frame of its own, and the edge out of it
+stops each `Raise(𝑆)` whose 𝑆 resolves to a subtype of a type a clause catches
+(`capabilities::Catch`). The first clause whose type does not exclude 𝑆 must cover it
+(`capabilities::sent`). Each edge out of a `try` body is registered with the variable collecting the
+body's capabilities, a use's copy included, and once the types settle `capabilities::partly_caught`
+reports a clause taking part of an 𝑆 (`InferError::ExceptTakesPart`). Every type may be raised; a
+type holding a function that is not a collection, which an exception's outcome cannot carry yet,
+is refused at the `raise`, in an `except` and in a clause as not compiled yet
+(`InferError::ExceptionHoldsAFunction`). The edge
+reads the type each time it is crossed, so an exception reaching the body through a function a use
+of the definition is passed is decided as one raised in it is. A type still open lets the exception
+through, and `InferCtx::settle_catches`, once emission is done, marks the types settled and refuses
+a clause that catches nothing (`InferError::ExceptCatchesNothing`). From then on a type still
+holding a variable, which generalizes into a type parameter, is decided as one: it overlaps every
+type, and only itself covers it (`Raised::decided_type`, `covers`). A `try` whose body reaches a
+call of a function no value of the definition flows into, such as an unannotated parameter's, raises
+what each use passes, so none of its clauses is refused at the definition: `Typing::apply` records
+each call whose callee is an inference variable, and the check skips a `try` reaching one whose
+variable receives no value. Each use of a polymorphic definition copies its `Raise` capabilities at
+its own instance of the types (`Raised::instantiated`).
 
 ### Polymorphism and materialization
 
@@ -4784,14 +4814,18 @@ value, and gives every node it rewrites what a term substituted below it does
 (`Subst::apply_capabilities`). A node built or rebuilt over children does what its own capabilities
 state and what its children do, and no more (`Expr::absorb_children_capabilities`,
 `capabilities::of_children`): what it held of code a pass moved out from under it, it no longer
-does. Inlining gives the body it puts in a call's place what the call did of its own beyond what the
-body does, which a clause can make more than the body does (`Expr::doing_of_its_own`). The passes
-that compile a capability away discharge it from every node and function type at their end
-(`capabilities::discharge`): `transact_phase` every `RunTransaction`, `WriteTxn`, `ReadTxn` and
+does. A `try` lets out of its body what its clauses do not catch. Inlining gives the body it puts in
+a call's place what the call did of its own beyond what the body does, which a clause can make more
+than the body does (`Expr::doing_of_its_own`). The passes that compile a capability away discharge
+it from every node and function type at their end (`capabilities::discharge`): exception elimination
+every `Raise`, rebuilding each node it keeps with that node's own capabilities
+(`Expr::with_own_capabilities`), `transact_phase` every `RunTransaction`, `WriteTxn`, `ReadTxn` and
 `Transaction`, `mut_elim` every `Write` and `Read`, and `channelize` every `Append`. The program
 `lambda_elim` receives is pure-functional, requiring at most the input a source opens
 (`capabilities::assert_discharged`), and in debug builds each pass's output is checked to state, at
-every node, what its children do and its own effect (`capabilities::assert_monotone`).
+every node, what it does of its own and what its children do, less what a block supplies or a `try`
+catches (`capabilities::assert_monotone`). An exception a node raises holds one of a subtype raised
+below it.
 
 ### Block footprints
 

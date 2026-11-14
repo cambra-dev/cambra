@@ -17,8 +17,8 @@ use super::stmts::lower_type_expr;
 use super::{LoweringContext, LoweringError};
 use crate::ccl::Name;
 use crate::ccl::capabilities::{
-    Capability, CapabilitySet, ClauseParam, Effect, Every, Family, Owner, Requirement, Written,
-    pruned,
+    Capability, CapabilitySet, ClauseParam, Effect, Every, Family, Owner, Raised, Requirement,
+    Written, pruned,
 };
 use crate::ccl::infer::solver::traits::Trait;
 use crate::ccl::provenance::NodeId;
@@ -679,7 +679,7 @@ fn context_requirement(
 /// The effect or the parameter `item` names.
 fn effect(
     item: &Spanned<TraitType>,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Lowered<Effect>, LoweringError> {
     let ty = &item.node;
     if let Some(param) = associated(ty, ctx)? {
@@ -697,6 +697,7 @@ fn effect(
             Ok(Lowered::Every(Family::WriteTxn.owned_top(owner)))
         }
         ("Append", [f]) if is_every(f) => Ok(Lowered::Every(Family::Append.top())),
+        ("Raise", [t]) if is_every(t) => Ok(Lowered::Every(Family::Raise.top())),
         ("Write", [x]) => Ok(Lowered::Capability(Effect::Write(variable(
             x, "Write", ctx,
         )?))),
@@ -708,20 +709,24 @@ fn effect(
         )?))),
         ("RunTransaction", []) => Ok(Lowered::Capability(Effect::RunTransaction)),
         ("AffectWorld", []) => Ok(Lowered::Capability(Effect::AffectWorld)),
-        ("Raise", _) => Err(LoweringError::unsupported(
-            ty.name_span,
-            "`Raise` is not supported yet: exceptions are not implemented",
-        )),
+        // The clause item stands for a `raise` the function may perform, so it is the site
+        // an exception it states is raised at.
+        ("Raise", [t]) => Ok(Lowered::Capability(Effect::Raise(Raised::at(
+            NodeId::fresh(),
+            lower_type_expr(t, ctx)?,
+        )))),
         (
-            "Write" | "WriteTxn" | "Append" | "RunTransaction" | "AffectWorld" | "Effect" | "_",
+            "Write" | "WriteTxn" | "Append" | "RunTransaction" | "AffectWorld" | "Raise" | "Effect"
+            | "_",
             _,
         ) => Err(arity(item.span, &ty.name)),
         (name, _) => Err(LoweringError::unsupported(
             ty.name_span,
             format!(
                 "`{name}` is not an effect; a `causes` clause lists `Write(x)`, `WriteTxn(x)`, \
-                 `Append(f)`, `RunTransaction`, `AffectWorld`, the tops `Effect`, `Write(*)`, \
-                 `WriteTxn(*)` and `Append(*)`, `_`, and a type parameter bounded by `Effect`"
+                 `Append(f)`, `RunTransaction`, `AffectWorld`, `Raise(T)`, the tops `Effect`, \
+                 `Write(*)`, `WriteTxn(*)`, `Append(*)` and `Raise(*)`, `_`, and a type \
+                 parameter bounded by `Effect`"
             ),
         )),
     }
@@ -817,6 +822,7 @@ fn arity(span: Span, name: &str) -> LoweringError {
         "_" | "ObserveWorld" | "RunTransaction" | "AffectWorld" | "Effect" | "Context" => {
             "no argument"
         }
+        "Raise" => "one type",
         _ => "one variable",
     };
     LoweringError::unsupported(span, format!("`{name}` takes {expected}"))

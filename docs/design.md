@@ -153,7 +153,7 @@ Self-referential *collection* definitions solve an equation as a least fixpoint 
 
 ### Currently omitted
 
-`while` loops, floats, `%`/bit-shifts, classes, exceptions, identity (`is`), and membership operators are omitted while we focus on the areas of highest technical risk. The spec's [reserved-for-future-work section](chl-spec.md) is the authoritative list. CHL resembles Python; it does not promise Python.
+`while` loops, floats, `%`/bit-shifts, classes, identity (`is`), and membership operators are omitted while we focus on the areas of highest technical risk. The spec's [reserved-for-future-work section](chl-spec.md) is the authoritative list. CHL resembles Python; it does not promise Python.
 
 ## Program Execution Pipeline
 
@@ -171,7 +171,7 @@ pipeline; individual pass contracts belong to the linked design documents.
 | Lower comprehensions | `comprehension::run` lowers each comprehension to its `cast`/`λ`/`▷` encoding. |
 | Bind opaque outputs | `opaque_output::run` binds the body of each lambda that binds an opaque variable to `__output` under a barrier-variable annotation, and gives a `=> T` result's binding the same binder. |
 | Infer | Infer types, specialize uses and validate the typed tree; see [type inference](../src/ccl/design/type-inference.md). Each module's check tree is inferred first, alone, and a failed check stops the compile; see [checking a module on its own](modules.md#checking-a-module-on-its-own). Every expression keeps its capabilities; read naming is undone before the post-inference pane. |
-| Inline | Inline compute-function bindings and beta-reduce calls; see [inlining](../src/ccl/design/optimization.md#inlining-pass-cclinliners). |
+| Inline | Inline compute-function bindings, beta-reduce calls, and eliminate `raise` and `try` into outcomes and matches; see [inlining](../src/ccl/design/optimization.md#inlining-pass-cclinliners). |
 | Eliminate transactions | `transact_phase::run` constructs transaction histories after keyed-write desugaring and value-type views. |
 | Eliminate induction mutation | `mut_elim::run` constructs induction histories. |
 | Erase refinements | `erase_refinements::run` drops every refinement except those on data function domains; see [refinement erasure](../src/ccl/design/optimization.md#refinement-erasure-cclerase_refinementsrs). |
@@ -232,12 +232,12 @@ The connections between the layers above and the capabilities Cambra claims:
 | Aggregates | `sum`, `max`, `min` implemented; `count`/`avg`/`len` **[Planned]** |
 | Refinement typing | Machinery implemented (internal); surface syntax **[Decided]** |
 | Feed channels | `Feed(_)` declarations, `Feed(_)` parameters and `http_serve` implemented |
-| Function requirements and effects (`requires` / `causes`) | Implemented; exceptions **[Decided]** |
+| Function requirements and effects (`requires` / `causes`) | Implemented |
 | `rec` fixpoint bindings | **[Decided]** |
 | Collections-as-functions model | **[Decided]** — one representation (the data function `D ⤇ V`), five surface kinds; `Array`/`List`/`Collection` types implemented, `Map`/`Set` types and the operation layer landing (see [src/ccl/design/collections.md](../src/ccl/design/collections.md)) |
 | `match` / `case` | Tag dispatch implemented; deeper patterns **[Tentative]** |
 | Hot reload of a running program (`--control`) | Implemented for logic, endpoint changes, and state resume; running two versions at once is **[Open]** |
-| `while`, floats, classes, exceptions | Absent (see the spec) |
+| `while`, floats, classes | Absent (see the spec) |
 
 The [spec](chl-spec.md) carries the authoritative per-construct markers; [demo-programs.md](demo-programs.md) maps them to runnable programs and their blockers.
 

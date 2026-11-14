@@ -17,6 +17,7 @@ pub mod content_hash;
 pub mod context;
 pub mod diff;
 pub mod erase_refinements;
+pub mod exceptions;
 pub mod feed_nest;
 pub(crate) mod free_names;
 pub(crate) mod generalize;

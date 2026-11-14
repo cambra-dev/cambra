@@ -333,6 +333,210 @@ pub enum Effect {
     RunTransaction,
     /// An output outside the program.
     AffectWorld,
+    /// An exception, raised at one site and of one type (`docs/chl-spec.md`, "Exceptions").
+    Raise(Raised),
+}
+
+/// The exception a `raise` makes: where it is raised, and its type.
+///
+/// Equality, ordering and hashing read the site and the instance alone. The type may still be
+/// an inference variable when the capability is recorded, and two capabilities from one site are
+/// two capabilities only where they are two instances: each use of a polymorphic function copies
+/// its capabilities, the type freshened with the rest of its type, and the copy is a new instance
+/// ([`Raised::instantiated`]).
+#[derive(Debug, Clone)]
+pub struct Raised {
+    pub site: NodeId,
+    pub instance: u32,
+    pub ty: crate::ccl::Type,
+}
+
+impl Raised {
+    /// The exception raised at `site`, of type `ty`, as the definition holding it records it.
+    pub fn at(site: NodeId, ty: crate::ccl::Type) -> Self {
+        Self {
+            site,
+            instance: 0,
+            ty,
+        }
+    }
+
+    /// This exception as one use of its definition raises it: at the freshened type `ty`, and
+    /// a capability of its own.
+    pub fn instantiated(&self, ty: crate::ccl::Type) -> Self {
+        thread_local! {
+            static NEXT: Cell<u32> = const { Cell::new(1) };
+        }
+        let instance = NEXT.with(|n| {
+            let i = n.get();
+            n.set(i + 1);
+            i
+        });
+        Self {
+            site: self.site,
+            instance,
+            ty,
+        }
+    }
+
+    fn key(&self) -> (NodeId, u32) {
+        (self.site, self.instance)
+    }
+
+    /// The type this exception is raised at, once emission has resolved it. `None` while it
+    /// does not resolve.
+    pub fn resolved(&self) -> Option<crate::ccl::Type> {
+        crate::ccl::infer::solve::resolve_var_type(&self.ty)
+            .ok()
+            .filter(|ty| !crate::ccl::subst::type_contains_infer(ty))
+    }
+
+    /// The type a `try` decides this exception by: its resolved type, and once the exceptions'
+    /// types are settled ([`exceptions_settled`]), one still holding a variable too. Such a
+    /// variable generalizes into a type parameter, so it is decided as one ([`covers`]).
+    /// `None` while the type may still resolve.
+    pub(crate) fn decided_type(&self) -> Option<crate::ccl::Type> {
+        if SETTLED.with(Cell::get) {
+            crate::ccl::infer::solve::resolve_var_type(&self.ty).ok()
+        } else {
+            self.resolved()
+        }
+    }
+}
+
+/// The part of `ty` the compiler cannot carry as an exception, or `None` where it can: a function
+/// that is not a collection (`docs/chl-spec.md`, "Exceptions"). Every type may be raised, and an
+/// exception travels to its handler in the outcome of each call and iteration it leaves, which
+/// holds data. A collection is data, a type parameter is whatever its instantiation is, and a
+/// variable still open is decided where its type is.
+pub fn uncompiled_exception_part(ty: &crate::ccl::Type) -> Option<&crate::ccl::Type> {
+    use crate::ccl::Type;
+    match ty {
+        Type::Refinement(base, _) => uncompiled_exception_part(base),
+        Type::Tuple(ts) | Type::Nominal(_, ts) => ts.iter().find_map(uncompiled_exception_part),
+        Type::Record(fs) => fs.iter().find_map(|(_, t)| uncompiled_exception_part(t)),
+        Type::Variant(tags, _) => tags.iter().find_map(|(_, t)| uncompiled_exception_part(t)),
+        Type::Fun {
+            domain, codomain, ..
+        } if ty.is_collection() => {
+            uncompiled_exception_part(domain).or_else(|| uncompiled_exception_part(codomain))
+        }
+        Type::Fun { .. } | Type::History { .. } => Some(ty),
+        _ => None,
+    }
+}
+
+/// Whether every exception of type `raised` is one of type `catches`: `raised <: catches`.
+/// A type holding an inference variable stands for a type parameter, which only itself
+/// covers; the subtype check would bound the variable instead.
+pub(crate) fn covers(raised: &crate::ccl::Type, catches: &crate::ccl::Type) -> bool {
+    if crate::ccl::subst::type_contains_infer(raised) {
+        return raised == catches;
+    }
+    crate::ccl::infer::solver::constrain::constrain_subtype_in(
+        raised,
+        catches,
+        &mut crate::ccl::infer::solver::constrain::ConstrainCache::new().without_capabilities(),
+        &crate::ccl::infer::solver::smt::NoScope,
+    )
+    .is_ok()
+}
+
+/// Whether no value has both type `a` and type `b`, by the rules of `docs/chl-spec.md`,
+/// "Exceptions". Two types they do not tell apart overlap: two records with no field in
+/// common, say, since a record with both fields has both types.
+pub(crate) fn excludes(a: &crate::ccl::Type, b: &crate::ccl::Type) -> bool {
+    use crate::ccl::{BaseType, Type};
+    // An index range is a refined `UInt`, and the empty tuple is the unit.
+    let unrefined = |ty: &Type| match ty.peel_refinements() {
+        Type::UIntRange(_) => Type::Base(BaseType::UInt),
+        Type::Tuple(ts) if ts.is_empty() => Type::Base(BaseType::Unit),
+        other => other.clone(),
+    };
+    match (unrefined(a), unrefined(b)) {
+        (Type::Base(x), Type::Base(y)) if x != y => true,
+        (base @ Type::Base(_), Type::Base(_)) => refinements_exclude(&base, a, b),
+        (Type::Tuple(xs), Type::Tuple(ys)) => {
+            xs.len() != ys.len() || xs.iter().zip(&ys).any(|(x, y)| excludes(x, y))
+        }
+        (Type::Record(xs), Type::Record(ys)) => xs
+            .iter()
+            .any(|(name, x)| ys.iter().any(|(n, y)| n == name && excludes(x, y))),
+        (Type::Variant(xs, _), Type::Variant(ys, _)) => xs
+            .iter()
+            .all(|(tag, x)| ys.iter().all(|(t, y)| t != tag || excludes(x, y))),
+        (Type::Nominal(x, _), Type::Nominal(y, _)) => x != y,
+        // Functions, collections among them, are a kind of their own: two of them overlap.
+        (x, y) => {
+            let kinded = |ty: &Type| {
+                matches!(
+                    ty,
+                    Type::Base(_)
+                        | Type::Tuple(_)
+                        | Type::Record(_)
+                        | Type::Variant(..)
+                        | Type::Nominal(..)
+                        | Type::Fun { .. }
+                )
+            };
+            kinded(&x) && kinded(&y) && std::mem::discriminant(&x) != std::mem::discriminant(&y)
+        }
+    }
+}
+
+/// Whether no value of `base` satisfies both `a`'s refinements and `b`'s.
+fn refinements_exclude(
+    base: &crate::ccl::Type,
+    a: &crate::ccl::Type,
+    b: &crate::ccl::Type,
+) -> bool {
+    use crate::ccl::infer::solver::smt::{NoScope, SmtError, smt_sub};
+    use crate::ccl::{BaseType, Expr, Lit, Type, TypedExprNode, ty::Refinement};
+    if a.refinements().is_empty() && b.refinements().is_empty() {
+        return false;
+    }
+    let both: Vec<Refinement> = a
+        .refinements()
+        .iter()
+        .chain(b.refinements())
+        .cloned()
+        .collect();
+    // Only the query reads the predicate, so it reaches no tree.
+    let never = Refinement::born(Rc::new(
+        Expr::throwaway(TypedExprNode::Lit(Lit::Bool(false))).with_ty(Type::Base(BaseType::Bool)),
+    ));
+    match smt_sub(base, &both, &[never], &NoScope) {
+        Ok(entailed) => entailed,
+        // A predicate the encoder cannot read leaves the two undecided, so they overlap.
+        Err(SmtError::Encoding { .. }) => false,
+        Err(error) => panic!("{error}"),
+    }
+}
+
+impl PartialEq for Raised {
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+
+impl Eq for Raised {}
+
+impl PartialOrd for Raised {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Raised {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key().cmp(&other.key())
+    }
+}
+
+impl Hash for Raised {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key().hash(state);
+    }
 }
 
 impl Effect {
@@ -340,7 +544,7 @@ impl Effect {
     pub fn variable(&self) -> Option<&Name> {
         match self {
             Effect::Write(x) | Effect::WriteTxn(x) | Effect::Append(x) => Some(x),
-            Effect::RunTransaction | Effect::AffectWorld => None,
+            Effect::RunTransaction | Effect::AffectWorld | Effect::Raise(_) => None,
         }
     }
 
@@ -350,7 +554,7 @@ impl Effect {
             Effect::Write(_) => Effect::Write(to),
             Effect::WriteTxn(_) => Effect::WriteTxn(to),
             Effect::Append(_) => Effect::Append(to),
-            Effect::RunTransaction | Effect::AffectWorld => {
+            Effect::RunTransaction | Effect::AffectWorld | Effect::Raise(_) => {
                 unreachable!("an effect naming no variable is not renamed")
             }
         }
@@ -395,8 +599,14 @@ pub fn discharge(expr: &mut crate::ccl::Expr, discharged: &impl Fn(&Capability) 
 /// Panic, naming the pass `after`, unless every node of `expr` requires and causes at least what
 /// it does of its own and what each of its children does, evaluating a node evaluating its
 /// children, and a write, a feed and a block each state their own effect. A lambda's body is
-/// latent in the lambda's type, and a `with begin():` block supplies `Transaction` to its body.
+/// latent in the lambda's type, a `with begin():` block supplies `Transaction` to its body, a
+/// `try` discharges what it catches, and an exception holds one of a subtype.
 /// A pass that builds a node states its capabilities; this catches one that does not.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "an `Item` reaches a `Type` only through an exception's type or a requirement's \
+              trait declaration, and both hash and order by what never changes"
+)]
 pub fn assert_monotone(expr: &crate::ccl::Expr, after: &str) {
     use crate::ccl::TypedExprNode as N;
     if matches!(expr.node, N::Lambda { .. }) {
@@ -422,8 +632,18 @@ pub fn assert_monotone(expr: &crate::ccl::Expr, after: &str) {
         "after {after}: `{}` does not state its own effect",
         crate::ccl::symbolic::symbolic(expr)
     );
-    // A top of the node's holds what it holds, which a normalized set keeps no copy of.
-    let held = |item: Capability| total.tops.iter().any(|top| top.holds(&item));
+    // A top of the node's holds what it holds, which a normalized set keeps no copy of, and an
+    // exception of the node's holds one of a subtype.
+    let raises: BTreeSet<Capability> = total
+        .causes
+        .iter()
+        .filter(|e| matches!(e, Effect::Raise(_)))
+        .map(|e| Capability::Causes(e.clone()))
+        .collect();
+    let held = |item: Capability| {
+        total.tops.iter().any(|top| top.holds(&item))
+            || (matches!(item, Capability::Causes(Effect::Raise(_))) && taken_away(&item, &raises))
+    };
     let check = |part: CapabilitySet, of: &dyn Fn() -> String| {
         let missing = CapabilitySet {
             requires: part
@@ -453,6 +673,11 @@ pub fn assert_monotone(expr: &crate::ccl::Expr, after: &str) {
         let mut theirs = child.capabilities.set();
         if matches!(expr.node, N::Begin { .. }) {
             theirs.requires.remove(&Requirement::transaction());
+        }
+        if let N::Try { body, handlers } = &expr.node
+            && std::ptr::eq(child, &**body)
+        {
+            theirs.causes.retain(|e| !caught_by(handlers, e));
         }
         check(theirs, &|| {
             format!("its child `{}`", crate::ccl::symbolic::symbolic(child))
@@ -556,6 +781,18 @@ impl Capabilities {
     }
 }
 
+/// Whether a `try` with `handlers` catches `effect`: an exception whose type, resolved, a clause
+/// takes, whole or, in error, in part ([`sent`]).
+fn caught_by(handlers: &[crate::ccl::expr::Handler], effect: &Effect) -> bool {
+    let Effect::Raise(raised) = effect else {
+        return false;
+    };
+    let clauses: Vec<crate::ccl::Type> = handlers.iter().map(|h| h.catches.clone()).collect();
+    raised
+        .resolved()
+        .is_some_and(|ty| sent(&clauses, &ty) != Sent::On)
+}
+
 /// What `expr` requires and causes for what its children do: all of it, but nothing for a
 /// lambda, whose body is latent in its type, and no `Transaction` for a `with begin():`
 /// block, which supplies it. A node with capabilities of its own, a read, a call, a write, a
@@ -567,12 +804,15 @@ pub fn of_children(expr: &crate::ccl::Expr) -> Capabilities {
     }
     let mut set = CapabilitySet::default();
     expr.walk_children(|child| {
-        if let Repr::Known(theirs) = child.capabilities.repr() {
-            if !theirs.is_empty() {
-                set = set.union(theirs);
-            }
-        } else {
-            set = set.union(&child.capabilities.set());
+        let mut theirs = child.capabilities.set();
+        // A `try` lets out of its body what its clauses do not catch.
+        if let N::Try { body, handlers } = &expr.node
+            && std::ptr::eq(child, &**body)
+        {
+            theirs.causes.retain(|e| !caught_by(handlers, e));
+        }
+        if !theirs.is_empty() {
+            set = set.union(&theirs);
         }
     });
     if matches!(expr.node, N::Begin { .. }) {
@@ -678,6 +918,43 @@ impl CapabilitySet {
             Capability::Every(_) => false,
         };
         listed || self.tops.iter().any(|top| top.holds(item))
+    }
+
+    /// Whether this causes nothing: it lists no effect, and holds no top or clause variable of
+    /// the `causes` clause, which stand for effects as a listed one does.
+    pub fn causes_nothing(&self) -> bool {
+        self.causes.is_empty()
+            && self.tops_of(true).next().is_none()
+            && !self.params.iter().any(|p| p.of_causes)
+    }
+
+    /// Whether this may raise: it lists a `Raise`, holds a top meeting `Raise(*)`, or holds a
+    /// clause variable of the `causes` clause whose bound does not take `Raise(*)` away.
+    pub fn may_raise(&self) -> bool {
+        let raise = Capability::Every(Family::Raise.top());
+        self.causes.iter().any(|e| matches!(e, Effect::Raise(_)))
+            || self.tops.iter().any(|top| top.overlaps(&raise))
+            || self.params.iter().any(|p| {
+                p.of_causes
+                    && !taken_away(&raise, &p.param.clause_except)
+                    && !taken_away(&raise, &p.except)
+            })
+    }
+
+    /// This set with each exception at the type its bounds resolve to, as a contract states it.
+    pub fn with_raises_resolved(mut self) -> CapabilitySet {
+        self.causes = std::mem::take(&mut self.causes)
+            .into_iter()
+            .map(|e| match e {
+                Effect::Raise(raised) => {
+                    let ty = crate::ccl::infer::solve::resolve_var_type(&raised.ty)
+                        .unwrap_or_else(|_| raised.ty.clone());
+                    Effect::Raise(Raised { ty, ..raised })
+                }
+                e => e,
+            })
+            .collect();
+        self
     }
 
     /// This set as a clause writes it: a capability it lists is not taken away from a top
@@ -894,6 +1171,8 @@ pub enum Family {
     WriteTxn,
     /// `Append(f)` for every feed `f`.
     Append,
+    /// `Raise(T)` for every type `T`.
+    Raise,
 }
 
 impl Family {
@@ -933,7 +1212,8 @@ impl Family {
             }
             (Family::Write, Capability::Causes(Effect::Write(_)))
             | (Family::WriteTxn, Capability::Causes(Effect::WriteTxn(_)))
-            | (Family::Append, Capability::Causes(Effect::Append(_))) => true,
+            | (Family::Append, Capability::Causes(Effect::Append(_)))
+            | (Family::Raise, Capability::Causes(Effect::Raise(_))) => true,
             _ => false,
         }
     }
@@ -948,6 +1228,7 @@ impl Family {
             Family::ReadTxn => "ReadTxn",
             Family::WriteTxn => "WriteTxn",
             Family::Append => "Append",
+            Family::Raise => "Raise",
         }
     }
 }
@@ -1106,6 +1387,11 @@ impl Every {
         self.overlaps(&Capability::Every(Family::Append.top()))
     }
 
+    /// Whether this raises every type: it holds `Raise(*)`.
+    pub fn raises_anything(&self) -> bool {
+        self.holds(&Capability::Every(Family::Raise.top()))
+    }
+
     /// This, taking away `except` instead, less what lies outside it.
     #[expect(
         clippy::mutable_key_type,
@@ -1224,8 +1510,9 @@ pub fn except_text(except: &BTreeSet<Capability>) -> String {
     }
 }
 
-/// Whether `except` takes `item` away: it lists it, or a top it lists holds it
-/// (`docs/chl-spec.md`, "Writing requirements and effects").
+/// Whether `except` takes `item` away: it lists it, or a top it lists holds it, or it lists a
+/// `Raise(T)` and the item raises a subtype of `T` (`docs/chl-spec.md`, "Writing requirements
+/// and effects").
 #[expect(
     clippy::mutable_key_type,
     reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
@@ -1243,6 +1530,9 @@ pub fn taken_away(item: &Capability, except: &BTreeSet<Capability>) -> bool {
                     .iter()
                     .all(|e| taken_away(e, &q.except) || taken_away(e, &q.param.clause_except))
         }
+        (Capability::Causes(Effect::Raise(t)), Capability::Causes(Effect::Raise(raised))) => raised
+            .resolved()
+            .is_some_and(|s| t.resolved().is_some_and(|t| covers(&s, &t))),
         _ => false,
     })
 }
@@ -1322,11 +1612,12 @@ impl Capability {
     }
 
     /// The families whose capabilities order a loop whose body causes one (`docs/chl-spec.md`,
-    /// "Ordered loops"). [`Self::orders_a_loop`] and [`Self::may_order_a_loop`] read it.
-    const ORDERING: [Family; 1] = [Family::Write];
+    /// "Ordered loops"): a write, and an exception escaping the iteration.
+    /// [`Self::orders_a_loop`] and [`Self::may_order_a_loop`] read it.
+    const ORDERING: [Family; 2] = [Family::Write, Family::Raise];
 
     /// Whether a loop whose body causes this is ordered by it: a write to an induction variable,
-    /// or a top holding one (`docs/chl-spec.md`, "Ordered loops"). A write orders the loop only
+    /// an exception, or a top holding either (`docs/chl-spec.md`, "Ordered loops"). A write orders the loop only
     /// where its variable is bound outside the iteration, which the caller decides. A clause
     /// parameter is not one: each use decides what it holds, through the loop's `OrderableIfRequiredBy`
     /// requirement.
@@ -1441,9 +1732,152 @@ pub struct Filter {
     /// The items a written clause states beside the parameter the edge leads to: the
     /// parameter stands for the rest of the clause, not for these.
     pub stated: BTreeSet<Capability>,
+    /// The exceptions a `try` catches, where the edge leaves a `try`'s body.
+    pub catches: Option<Rc<Catch>>,
     /// What a clause's `except` takes out of the clause variable the edge leaves
     /// (`docs/chl-spec.md`, "Writing requirements and effects").
     pub except: BTreeSet<Capability>,
+}
+
+/// The exceptions one `try` catches (`docs/chl-spec.md`, "Exceptions"): each whose type is a
+/// subtype of a type one of its clauses catches ([`sent`]).
+///
+/// It is decided by type rather than by capability, so an exception that reaches the `try` through
+/// a function an instance of its definition is passed is decided as one raised in its body
+/// is. The types resolve as emission constrains them, and an exception whose type does not
+/// resolve yet passes; [`exceptions_settled`] marks the point after which every one does.
+#[derive(Debug)]
+pub struct Catch {
+    /// The `try`.
+    node: NodeId,
+    clauses: Vec<crate::ccl::Type>,
+}
+
+impl PartialEq for Catch {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl Eq for Catch {}
+
+/// Mark the exceptions' types resolved: a resolution of a capability variable computed before
+/// now may have let through an exception a [`Catch`] stops.
+pub fn exceptions_settled() {
+    SETTLED.with(|settled| settled.set(true));
+    capability_fact_written();
+}
+
+impl Catch {
+    /// The catch of the `try` at `node`, whose clauses catch `clauses`.
+    pub fn new(node: NodeId, clauses: Vec<crate::ccl::Type>) -> Self {
+        Catch { node, clauses }
+    }
+
+    /// This catch at a use of the definition holding its `try`, its clauses' types `clauses`
+    /// instantiated as the use's copy of the definition instantiates its types.
+    pub fn instantiated(&self, clauses: Vec<crate::ccl::Type>) -> Self {
+        Catch {
+            node: self.node,
+            clauses,
+        }
+    }
+
+    /// The types the clauses catch.
+    pub fn clauses(&self) -> &[crate::ccl::Type] {
+        &self.clauses
+    }
+
+    /// Whether `raised`'s type is one a clause takes, whole or, in error, in part. One whose
+    /// type may still resolve passes ([`Raised::decided_type`]).
+    fn catches(&self, raised: &Raised) -> bool {
+        let clauses: Vec<crate::ccl::Type> = self
+            .clauses
+            .iter()
+            .map(|c| crate::ccl::infer::solve::resolve_var_type(c).unwrap_or_else(|_| c.clone()))
+            .collect();
+        raised
+            .decided_type()
+            .is_some_and(|ty| sent(&clauses, &ty) != Sent::On)
+    }
+}
+
+/// Where a `try` sends an exception of one type (`docs/chl-spec.md`, "Exceptions").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sent {
+    /// To the clause at this index, which covers the type.
+    To(usize),
+    /// On to the `try` around this one: every clause excludes the type.
+    On,
+    /// The clause at this index is the first not to exclude the type, and does not cover it:
+    /// an error ([`partly_caught`]). The exception counts as caught there, so nothing reports
+    /// it again outside the `try`.
+    Partly(usize),
+}
+
+/// Where a `try` whose clauses catch `clauses` sends an exception of type `raised`: to the
+/// first clause that does not exclude it, which must cover it.
+pub(crate) fn sent(clauses: &[crate::ccl::Type], raised: &crate::ccl::Type) -> Sent {
+    match clauses.iter().position(|c| !excludes(raised, c)) {
+        None => Sent::On,
+        Some(i) if covers(raised, &clauses[i]) => Sent::To(i),
+        Some(i) => Sent::Partly(i),
+    }
+}
+
+/// A `try` clause taking part of an exception's type ([`Sent::Partly`]).
+#[derive(Debug, Clone)]
+pub struct PartlyCaught {
+    /// The `try`.
+    pub node: NodeId,
+    /// The type the clause catches.
+    pub clause: crate::ccl::Type,
+    /// The exception's type.
+    pub raised: crate::ccl::Type,
+}
+
+/// An edge out of a `try` body, with the variable collecting the body's capabilities.
+type TryEdge = (Rc<Catch>, Rc<CapabilityVar>);
+
+thread_local! {
+    /// Each edge out of a `try` body in the active inference run: a definition's own, and each
+    /// use's copy. `None` outside a run.
+    static TRY_EDGES: RefCell<Option<Vec<TryEdge>>> = const { RefCell::new(None) };
+    /// What [`partly_caught`] has answered in the active run, so each is reported once.
+    static PARTLY_REPORTED: RefCell<HashSet<(NodeId, String, String)>> =
+        RefCell::new(HashSet::new());
+    /// Whether the active run's exceptions' types are settled ([`exceptions_settled`]).
+    static SETTLED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Each `try` clause of the active run taking part of the type of an exception its body
+/// raises, not answered before. Read once the exceptions' types are settled.
+pub(crate) fn partly_caught() -> Vec<PartlyCaught> {
+    let edges = TRY_EDGES.with(|slot| slot.borrow().clone().unwrap_or_default());
+    let mut out = Vec::new();
+    for (catch, body) in edges {
+        for capability in body.resolved() {
+            let Capability::Causes(Effect::Raise(raised)) = &capability.item else {
+                continue;
+            };
+            let Some(ty) = raised.decided_type() else {
+                continue;
+            };
+            let Sent::Partly(i) = sent(&catch.clauses, &ty) else {
+                continue;
+            };
+            let clause = catch.clauses[i].clone();
+            let key = (catch.node, clause.to_string(), ty.to_string());
+            if PARTLY_REPORTED.with(|reported| reported.borrow_mut().insert(key)) {
+                out.push(PartlyCaught {
+                    node: catch.node,
+                    clause,
+                    raised: ty,
+                });
+            }
+        }
+    }
+    out
 }
 
 impl Filter {
@@ -1514,6 +1948,12 @@ impl Filter {
             return false;
         }
         if taken_away(&capability.item, &self.except) {
+            return false;
+        }
+        if let (Capability::Causes(Effect::Raise(raised)), Some(catch)) =
+            (&capability.item, &self.catches)
+            && catch.catches(raised)
+        {
             return false;
         }
         match (self.below, capability.bound) {
@@ -1604,7 +2044,33 @@ impl Upper {
         } else {
             self.of_requires
         };
-        !bounded || self.set.states(item)
+        !bounded || self.set.states(item) || self.states_a_wider_raise(item)
+    }
+
+    /// Whether `item` raises an exception whose type is a subtype of one this bound's
+    /// `Raise(T)` states: `Raise` is covariant (`docs/chl-spec.md`, "Exceptions"). Read once
+    /// inference is done, when the types resolve.
+    fn states_a_wider_raise(&self, item: &Capability) -> bool {
+        let Capability::Causes(Effect::Raise(raised)) = item else {
+            return false;
+        };
+        let resolve = |ty: &crate::ccl::Type| {
+            crate::ccl::infer::solve::resolve_var_type(ty).unwrap_or_else(|_| ty.clone())
+        };
+        let raised = resolve(&raised.ty);
+        self.set.causes.iter().any(|e| {
+            let Effect::Raise(stated) = e else {
+                return false;
+            };
+            crate::ccl::infer::solver::constrain::constrain_subtype_in(
+                &raised,
+                &resolve(&stated.ty),
+                &mut crate::ccl::infer::solver::constrain::ConstrainCache::new()
+                    .without_capabilities(),
+                &crate::ccl::infer::solver::smt::NoScope,
+            )
+            .is_ok()
+        })
     }
 }
 
@@ -1646,15 +2112,22 @@ thread_local! {
     static UPPER_ARENA: RefCell<Option<Vec<Rc<CapabilityVar>>>> = const { RefCell::new(None) };
 }
 
-/// Begin collecting the capability variables given an upper bound.
+/// Begin collecting the capability variables given an upper bound, and the edges out of `try`
+/// bodies.
 pub(crate) fn upper_arena_enter() {
     ORDER_REQUIREMENTS.with(|r| *r.borrow_mut() = Some(Vec::new()));
     UPPER_ARENA.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    TRY_EDGES.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    PARTLY_REPORTED.with(|reported| reported.borrow_mut().clear());
+    SETTLED.with(|settled| settled.set(false));
 }
 
 /// Stop collecting, and drop each variable's upper bounds.
 pub(crate) fn upper_arena_exit() {
     ORDER_REQUIREMENTS.with(|r| r.borrow_mut().take());
+    TRY_EDGES.with(|slot| slot.borrow_mut().take());
+    PARTLY_REPORTED.with(|reported| reported.borrow_mut().clear());
+    SETTLED.with(|settled| settled.set(false));
     for var in UPPER_ARENA.with(|slot| slot.borrow_mut().take().unwrap_or_default()) {
         var.uppers.borrow_mut().clear();
     }
@@ -1895,6 +2368,13 @@ impl CapabilityVar {
             .iter()
             .any(|(v, f)| v.uid == source.uid && *f == filter)
         {
+            if let Some(catch) = &filter.catches {
+                TRY_EDGES.with(|slot| {
+                    if let Some(edges) = slot.borrow_mut().as_mut() {
+                        edges.push((Rc::clone(catch), Rc::clone(source)));
+                    }
+                });
+            }
             incoming.push((Rc::clone(source), filter));
             capability_fact_written();
         }
@@ -2318,6 +2798,9 @@ impl fmt::Display for Effect {
             Effect::Append(x) => write!(f, "Append({x})"),
             Effect::RunTransaction => f.write_str("RunTransaction"),
             Effect::AffectWorld => f.write_str("AffectWorld"),
+            Effect::Raise(raised) => {
+                write!(f, "Raise({})", crate::ccl::chl_print::chl_type(&raised.ty))
+            }
         }
     }
 }
@@ -2331,7 +2814,7 @@ impl Capability {
             Capability::Causes(Effect::Write(x) | Effect::WriteTxn(x) | Effect::Append(x)) => {
                 Some(x)
             }
-            Capability::Causes(Effect::RunTransaction | Effect::AffectWorld)
+            Capability::Causes(Effect::RunTransaction | Effect::AffectWorld | Effect::Raise(_))
             | Capability::Param(_)
             | Capability::Every(_) => None,
         }
@@ -2360,7 +2843,7 @@ impl CapabilitySet {
             .filter_map(|r| r.requirement().terms.first())
             .chain(self.causes.iter().filter_map(|e| match e {
                 Effect::Write(x) | Effect::WriteTxn(x) | Effect::Append(x) => Some(x),
-                Effect::RunTransaction | Effect::AffectWorld => None,
+                Effect::RunTransaction | Effect::AffectWorld | Effect::Raise(_) => None,
             }))
     }
 }
@@ -2395,6 +2878,11 @@ impl Capabilities {
 
 impl Written {
     /// These clauses with `f` applied to each variable they name.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "an `Effect` reaches a `Type` only through a `Raised`, which hashes and orders \
+                  by its site and instance"
+    )]
     pub fn map_names(&self, mut f: impl FnMut(&Name) -> Name) -> Written {
         let causes = self
             .set
@@ -2404,7 +2892,7 @@ impl Written {
                 Effect::Write(x) => Effect::Write(f(x)),
                 Effect::WriteTxn(x) => Effect::WriteTxn(f(x)),
                 Effect::Append(x) => Effect::Append(f(x)),
-                Effect::RunTransaction | Effect::AffectWorld => e.clone(),
+                Effect::RunTransaction | Effect::AffectWorld | Effect::Raise(_) => e.clone(),
             })
             .collect();
         Written {

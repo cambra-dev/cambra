@@ -167,6 +167,15 @@ pub(super) struct InferCtx {
     ordered_loops: Vec<OrderedLoop>,
     /// Each `with begin():` block emitted, with the variable collecting what its body causes.
     capability_transactions: Vec<(NodeId, Rc<CapabilityVar>)>,
+    /// Each `try` emitted, innermost first: a `try` is recorded once its body is emitted.
+    capability_tries: Vec<TryFrame>,
+    /// Each `raise`'s node and the type of what it raises, which must be one the compiler carries
+    /// as an exception ([`InferCtx::uncompiled_exceptions`]).
+    effect_raises: Vec<(NodeId, Type)>,
+    /// Each call whose callee's type was an inference variable when the call was emitted, by
+    /// the variable collecting what the call causes, with that type. The callee may be a
+    /// parameter, whose function each use of the definition passes ([`Self::settle_catches`]).
+    capability_calls_of_variables: Vec<(Rc<CapabilityVar>, Type)>,
     /// What lowering marks each marked node as: an expression statement, which an inert one
     /// is refused among, or a sink binding, which causes `AffectWorld`.
     pub(super) marks: HashMap<NodeId, crate::ccl::lower::Mark>,
@@ -429,6 +438,7 @@ impl CapabilityFrame {
             discharges: Default::default(),
             at: None,
             stated: Default::default(),
+            catches: None,
             except: Default::default(),
         }
     }
@@ -470,6 +480,8 @@ struct NodeCapabilities {
     at: Option<NodeId>,
     /// Whether it is a `with begin():` block's body.
     transaction: bool,
+    /// The exceptions a `try` catches, for a `try`'s body: they do not reach the `try`.
+    catches: Option<Rc<crate::ccl::capabilities::Catch>>,
 }
 
 /// A `for` loop emitted ([`InferCtx::effect_loops`]).
@@ -490,8 +502,9 @@ struct OrderedLoop {
 
 /// Whether what `var` collects, a loop body's capabilities, makes its iterations interact: a write
 /// to an induction variable not among `declared`, the ones the body declares, outlives the
-/// iteration (`docs/chl-spec.md`, "Ordered loops"). `WriteTxn(x)` orders nothing: the
-/// run's transactions commit in commit order, whatever position the iteration has.
+/// iteration, and so does an exception, which a `try` in the body would have stopped before it
+/// reached `var` (`docs/chl-spec.md`, "Ordered loops"). `WriteTxn(x)` orders nothing:
+/// the run's transactions commit in commit order, whatever position the iteration has.
 fn iterations_interact(var: &Rc<CapabilityVar>, declared: &HashSet<Name>) -> bool {
     interacting(var, declared).is_some()
 }
@@ -524,11 +537,22 @@ fn interacting(var: &Rc<CapabilityVar>, declared: &HashSet<Name>) -> Option<Scop
     // write to every variable, the accumulators outside the loop's too.
     var.resolved().into_iter().find(|l| match &l.item {
         Capability::Causes(Effect::Write(x)) => !declared.contains(x),
+        // `Effect` and `Write(*)` hold a write to every variable, the accumulators outside the
+        // loop's too, and `Raise(*)` an exception of every type.
         item => item.orders_a_loop(),
     })
 }
 
-/// The capabilities of every function nested in a value, through its inferred lower bounds.
+/// A `try` emitted, for [`InferCtx::settle_catches`]: the variable collecting what its body
+/// causes, and the type and position of each clause.
+struct TryFrame {
+    var: Rc<CapabilityVar>,
+    clauses: Vec<Type>,
+    node: NodeId,
+}
+
+/// The capabilities of every function nested in `ty`, including functions reached through
+/// inference variables' lower bounds. Scope checks read the whole value a scope hands outward.
 fn type_capabilities(ty: &Type) -> Vec<ScopedCapability> {
     fn collect(ty: &Type, seen: &mut HashSet<*const InferVar>, out: &mut Vec<ScopedCapability>) {
         if let Type::Infer(v) = ty.peel_refinements() {
@@ -561,7 +585,8 @@ fn type_capabilities(ty: &Type) -> Vec<ScopedCapability> {
     out
 }
 
-/// Whether a concrete value flows into a callee through its inferred lower bounds.
+/// Whether a value other than an inference variable flows into `ty`, directly or through the
+/// lower bounds of the variables flowing into it.
 fn receives_a_value(ty: &Type) -> bool {
     let mut seen = HashSet::new();
     let mut stack = vec![ty.clone()];
@@ -573,6 +598,21 @@ fn receives_a_value(ty: &Type) -> bool {
             continue;
         }
         stack.extend(v.bounds.borrow().lower().iter().map(|b| b.ty.clone()));
+    }
+    false
+}
+
+/// Whether one of `targets` flows into `var`, through any edge whatever it filters.
+fn reaches_any(var: &Rc<CapabilityVar>, targets: &HashSet<CapabilityVarId>) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![Rc::clone(var)];
+    while let Some(v) = stack.pop() {
+        if targets.contains(&v.uid) {
+            return true;
+        }
+        if seen.insert(v.uid) {
+            stack.extend(v.incoming().into_iter().map(|(source, _)| source));
+        }
     }
     false
 }
@@ -837,6 +877,9 @@ impl InferCtx {
             effect_loops: Vec::new(),
             ordered_loops: Vec::new(),
             capability_transactions: Vec::new(),
+            capability_tries: Vec::new(),
+            effect_raises: Vec::new(),
+            capability_calls_of_variables: Vec::new(),
             marks: HashMap::new(),
             capability_calls: HashSet::new(),
             capability_public: Vec::new(),
@@ -858,6 +901,142 @@ impl InferCtx {
             .iter()
             .filter_map(|c| filter.pass(c))
             .collect()
+    }
+
+    /// An error at each `raise` whose value's type, once emission has resolved it, holds a
+    /// function the compiler does not carry as an exception yet
+    /// ([`crate::ccl::capabilities::uncompiled_exception_part`]).
+    pub(super) fn uncompiled_exceptions(&self) -> Vec<LocatedInferError> {
+        self.effect_raises
+            .iter()
+            .filter_map(|(site, ty)| {
+                let ty = crate::ccl::infer::solve::resolve_var_type(ty).ok()?;
+                // A part still a variable is reported where its type is.
+                let part = crate::ccl::capabilities::uncompiled_exception_part(&ty)?;
+                if matches!(part, Type::Infer(_)) {
+                    return None;
+                }
+                Some(LocatedInferError::new(
+                    InferError::ExceptionHoldsAFunction {
+                        ty: crate::ccl::chl_print::chl_type(&ty),
+                    },
+                    *site,
+                ))
+            })
+            .collect()
+    }
+
+    /// Answer an error at each `try` clause that catches none of the exceptions its body
+    /// raises (`docs/chl-spec.md`, "Exceptions"), once emission has resolved their types.
+    ///
+    /// A `try` catches by type ([`crate::ccl::capabilities::Catch`]): an exception goes to the first
+    /// clause whose type does not exclude its own, which must cover it
+    /// ([`crate::ccl::capabilities::partly_caught`] reports one that does not). A clause names a
+    /// type an exception may have. A resolution of a capability variable computed while a type was
+    /// still open is stale, so this marks the types settled before anything reads the capabilities
+    /// a `try` stops. The `try`s are taken innermost first, because what reaches an outer one's
+    /// body is what its inner ones let through.
+    pub(super) fn settle_catches(&mut self) -> Vec<LocatedInferError> {
+        crate::ccl::capabilities::exceptions_settled();
+        // A call of a function no value of the definition's own flows into, such as a
+        // parameter's, causes what each use passes. A `try` reaching one may catch at any use,
+        // so none of its clauses is dead at the definition.
+        let open: HashSet<CapabilityVarId> = self
+            .capability_calls_of_variables
+            .iter()
+            .filter(|(_, callee)| !receives_a_value(callee))
+            .map(|(call, _)| call.uid)
+            .collect();
+        let mut errors = Vec::new();
+        for t in &self.capability_tries {
+            if reaches_any(&t.var, &open)
+                || t.var.reaches(&|v| {
+                    v.open_input.get()
+                        && v.incoming().is_empty()
+                        && v.own().is_empty()
+                        && !v.closed().1
+                })
+            {
+                continue;
+            }
+            // A clause catches a type the compiler carries as an exception.
+            let uncompiled: Vec<&Type> = t
+                .clauses
+                .iter()
+                .filter(|c| crate::ccl::capabilities::uncompiled_exception_part(c).is_some())
+                .collect();
+            for c in &uncompiled {
+                errors.push(LocatedInferError::new(
+                    InferError::ExceptionHoldsAFunction {
+                        ty: crate::ccl::chl_print::chl_type(c),
+                    },
+                    t.node,
+                ));
+            }
+            if !uncompiled.is_empty() {
+                continue;
+            }
+            // `Effect` and `Raise(*)` raise every type, so each clause would take part of one
+            // (`docs/chl-spec.md`, "Exceptions").
+            let raises_anything = t.var.resolved().into_iter().find_map(|c| match c.item {
+                Capability::Every(every) if every.raises_anything() => Some(every),
+                _ => None,
+            });
+            if let Some(top) = raises_anything {
+                errors.push(LocatedInferError::new(
+                    InferError::ExceptAroundEveryRaise {
+                        clause: crate::ccl::chl_print::chl_type(&t.clauses[0]),
+                        top: Capability::Every(top).to_string(),
+                        variable: false,
+                    },
+                    t.node,
+                ));
+                continue;
+            }
+            let mut hits = vec![0usize; t.clauses.len()];
+            for capability in t.var.resolved() {
+                let Capability::Causes(Effect::Raise(raised)) = &capability.item else {
+                    continue;
+                };
+                // A type still holding a variable generalizes into a type parameter, which
+                // reaches every clause (`covers`).
+                let Some(ty) = raised.decided_type() else {
+                    continue;
+                };
+                use crate::ccl::capabilities::Sent;
+                if let Sent::To(i) | Sent::Partly(i) =
+                    crate::ccl::capabilities::sent(&t.clauses, &ty)
+                {
+                    hits[i] += 1;
+                }
+            }
+            // A clause variable whose bound holds `Raise(*)`, `E <: Effect`, may raise every type
+            // at a use, so a clause the stated exceptions leave idle is one it would take part
+            // of: the writer states what the call raises beside it.
+            let raising_variable = t.var.resolved().into_iter().find(|c| match &c.item {
+                Capability::Param(p) => {
+                    p.of_causes
+                        && Every::of_direction(true)
+                            .less(p.except.iter().chain(&p.param.clause_except).cloned())
+                            .raises_anything()
+                }
+                _ => false,
+            });
+            for (catches, _) in t.clauses.iter().zip(&hits).filter(|(_, n)| **n == 0) {
+                let error = match &raising_variable {
+                    Some(variable) => InferError::ExceptAroundEveryRaise {
+                        clause: crate::ccl::chl_print::chl_type(catches),
+                        top: variable.item.to_string(),
+                        variable: true,
+                    },
+                    None => InferError::ExceptCatchesNothing {
+                        ty: crate::ccl::chl_print::chl_type(catches),
+                    },
+                };
+                errors.push(LocatedInferError::new(error, t.node));
+            }
+        }
+        errors
     }
 
     fn capability_frame(&self) -> &CapabilityFrame {
@@ -882,6 +1061,7 @@ impl InferCtx {
             body: None,
             at: None,
             transaction: false,
+            catches: None,
         });
         (Capabilities::var(var), Capabilities::var(own))
     }
@@ -903,6 +1083,7 @@ impl InferCtx {
                     &node.var,
                     Filter {
                         at: node.at,
+                        catches: node.catches,
                         ..Filter::default()
                     },
                 ),
@@ -911,6 +1092,7 @@ impl InferCtx {
                     Filter {
                         discharges: [Requirement::transaction()].into_iter().collect(),
                         at: node.at,
+                        catches: node.catches,
                         ..Filter::default()
                     },
                 ),
@@ -1004,8 +1186,8 @@ impl InferCtx {
         }
     }
 
-    /// What public functions do to the variables of their module's top level, which other
-    /// modules then do by calling them (`docs/chl-spec.md`, "Discharging requirements and
+    /// What functions nested in public members do to the module's top-level variables,
+    /// which other modules then do by calling them (`docs/chl-spec.md`, "Discharging requirements and
     /// effects"): each one naming an induction variable, which `docs/chl-spec.md`, "9.10
     /// Induction variables stay in their module", keeps in its module, and each append to a
     /// private feed, which makes the feed the run's.
@@ -1221,6 +1403,15 @@ impl InferCtx {
             Capability::Causes(Effect::Write(x)) => {
                 format!("its body writes `{x}`, a variable bound outside it")
             }
+            // A polymorphic definition is refused where it stands, and there the exception's type
+            // may be one its uses decide.
+            Capability::Causes(Effect::Raise(raised)) => match raised.resolved() {
+                Some(ty) => format!(
+                    "an exception of type `{}` may escape its body",
+                    crate::ccl::chl_print::chl_type(&ty)
+                ),
+                None => "an exception may escape its body".to_string(),
+            },
             item => format!("its body causes `{item}`"),
         };
         Some(LocatedInferError::new(
@@ -1368,13 +1559,8 @@ impl InferCtx {
         let undetermined = |v: &CapabilityVar| {
             self.capability_calls.contains(&v.uid) && v.incoming().is_empty() && v.own().is_empty()
         };
-        // A top or a clause variable of the `causes` clause, `WriteTxn(*)` or `E`, stands for
-        // capabilities as a listed one does.
         let idle = |var: &CapabilityVar| {
-            let set = crate::ccl::capabilities::set_of(&var.resolved());
-            set.causes.is_empty()
-                && set.tops_of(true).next().is_none()
-                && !set.params.iter().any(|p| p.of_causes)
+            crate::ccl::capabilities::set_of(&var.resolved()).causes_nothing()
                 && !var.reaches(&undetermined)
         };
         let empty: Vec<&(NodeId, Rc<CapabilityVar>)> = self
@@ -3827,6 +4013,13 @@ impl Typing for InferCtx {
             )
             .collect();
         for item in written.items().chain(taken) {
+            if let Capability::Causes(Effect::Raise(raised)) = &item
+                && crate::ccl::capabilities::uncompiled_exception_part(&raised.ty).is_some()
+            {
+                return Err(self.raise(InferError::ExceptionHoldsAFunction {
+                    ty: crate::ccl::chl_print::chl_type(&raised.ty),
+                }));
+            }
             let Some(name) = item.variable() else {
                 continue;
             };
@@ -3921,6 +4114,7 @@ impl Typing for InferCtx {
             body: None,
             at: Some(node),
             transaction: false,
+            catches: None,
         });
         let r = f(self);
         self.leave_node_capabilities();
@@ -3955,6 +4149,7 @@ impl Typing for InferCtx {
             body: None,
             at: Some(node),
             transaction: false,
+            catches: None,
         });
         let r = f(self);
         self.leave_node_capabilities();
@@ -4041,6 +4236,42 @@ impl Typing for InferCtx {
         self.unordered_loop_error(node, source, positions_detail(&positions))
     }
 
+    fn raise_type(&mut self, _recorded: &Type) -> Type {
+        self.fresh()
+    }
+
+    fn record_raise(&mut self, site: NodeId, ty: &Type) {
+        self.effect_raises.push((site, ty.clone()));
+        self.record_capability(Capability::Causes(Effect::Raise(
+            crate::ccl::capabilities::Raised::at(site, ty.clone()),
+        )));
+    }
+
+    fn try_body<R>(&mut self, node: NodeId, catches: &[Type], f: impl FnOnce(&mut Self) -> R) -> R {
+        // A variable of its own around the body's, as a statement's: the body's capabilities,
+        // the function's own variables included, stay on it, and only the edge out of it stops
+        // what is caught.
+        let var = CapabilityVar::fresh(self.level);
+        let catch = Rc::new(crate::ccl::capabilities::Catch::new(node, catches.to_vec()));
+        self.node_capabilities.push(NodeCapabilities {
+            var: Rc::clone(&var),
+            own: Rc::clone(&var),
+            inflow: Inflow::All,
+            body: None,
+            at: None,
+            transaction: false,
+            catches: Some(catch),
+        });
+        let r = f(self);
+        self.leave_node_capabilities();
+        self.capability_tries.push(TryFrame {
+            var,
+            clauses: catches.to_vec(),
+            node,
+        });
+        r
+    }
+
     fn note_binding(&mut self, name: &Name, ty: &Type, node: NodeId) {
         if self.capability_frame().depth == 0 && self.public.contains(name) {
             self.capability_public
@@ -4077,6 +4308,7 @@ impl Typing for InferCtx {
             body: None,
             at: Some(node),
             transaction: true,
+            catches: None,
         });
         let r = f(self);
         let var = self
@@ -4431,6 +4663,8 @@ impl Typing for InferCtx {
         {
             call.open_input
                 .set(!receives_a_value(fn_ty) && !kind.is_some_and(|k| k.resolved().is_data()));
+            self.capability_calls_of_variables
+                .push((Rc::clone(call), fn_ty.clone()));
         }
         let expected = expected.with_capabilities(capabilities);
         self.require_sub(fn_ty, &expected, at)?;

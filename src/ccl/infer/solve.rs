@@ -188,7 +188,7 @@ pub(super) struct CoalesceCtx {
     /// instantiation variables.
     #[cfg(debug_assertions)]
     in_predicate: usize,
-    /// The right-hand sides [`pin_empty_list_elements`] skipped as generalized, whose
+    /// The right-hand sides [`pin_unreached_values`] skipped as generalized, whose
     /// literals only the walk's copies pin. The walk checks that it generalizes each of
     /// them too: one it walked as monomorphic would keep a literal nothing pins. Debug
     /// builds only.
@@ -982,8 +982,9 @@ fn pin_empty_list_element(list_ty: &Type, ctx: &mut CoalesceCtx) {
     }
 }
 
-/// [`pin_empty_list_element`] over every empty list literal in the tree a walk is about
-/// to coalesce, before the walk reads anything.
+/// [`pin_empty_list_element`] over every empty list literal, and [`pin_valueless_call`] over
+/// every call no value returns from, in the tree a walk is about to coalesce, before the walk
+/// reads anything.
 ///
 /// Skips the right-hand side of a generalized `let`: each use's specialization clone is
 /// walked, and pinned, on its own, so a literal there takes each use's type rather than
@@ -993,7 +994,12 @@ fn pin_empty_list_element(list_ty: &Type, ctx: &mut CoalesceCtx) {
 /// Term nodes only: a refinement predicate rides a *type* slot, which this walk does not
 /// enter, so a predicate's copy keeps its own variables and is answered by whatever the
 /// original resolves to.
-fn pin_empty_list_elements(expr: &Expr, level: Level, ctx: &mut CoalesceCtx) {
+fn pin_unreached_values(expr: &Expr, level: Level, ctx: &mut CoalesceCtx) {
+    if matches!(expr.node, TypedExprNode::Apply { .. }) {
+        let prev = std::mem::replace(&mut ctx.current_node, expr.node_id());
+        pin_valueless_call(expr, ctx);
+        ctx.current_node = prev;
+    }
     match &expr.node {
         TypedExprNode::List(elts) if elts.is_empty() => {
             let prev = std::mem::replace(&mut ctx.current_node, expr.node_id());
@@ -1009,19 +1015,40 @@ fn pin_empty_list_elements(expr: &Expr, level: Level, ctx: &mut CoalesceCtx) {
                 #[cfg(debug_assertions)]
                 ctx.skipped_as_generalized.insert(bound_expr.node_id());
             } else {
-                pin_empty_list_elements(bound_expr, level + 1, ctx);
+                pin_unreached_values(bound_expr, level + 1, ctx);
             }
-            pin_empty_list_elements(body, level, ctx);
+            pin_unreached_values(body, level, ctx);
             return;
         }
         TypedExprNode::MutDecl { init, body, .. } => {
-            pin_empty_list_elements(init, level + 1, ctx);
-            pin_empty_list_elements(body, level, ctx);
+            pin_unreached_values(init, level + 1, ctx);
+            pin_unreached_values(body, level, ctx);
             return;
         }
         _ => {}
     }
-    expr.walk_children(|child| pin_empty_list_elements(child, level, ctx));
+    expr.walk_children(|child| pin_unreached_values(child, level, ctx));
+}
+
+/// Pin the result of a call that may raise and that no value returns from, to the type of its
+/// position: every path through its callee raises, so it contributes no value
+/// (`docs/chl-spec.md`, "Exceptions"), and its type is what its uses require, as a `raise`'s
+/// is. `def g(x): raise x` returns its parameter `B`, which nothing below bounds at a use. See
+/// `src/ccl/design/type-inference.md`, "Pin sites".
+fn pin_valueless_call(call: &Expr, ctx: &mut CoalesceCtx) {
+    // `value_reaches` re-resolves the type, minting the predicate terms it rebuilds, so it is
+    // asked last: a call that raises nothing mints no id here.
+    if !matches!(call.ty, Type::Infer(_))
+        || !call.capabilities.set().may_raise()
+        || value_reaches(&call.ty)
+    {
+        return;
+    }
+    let chosen = payload_pin(&call.ty, ctx);
+    if let Err(err) = pin_both_ways(&chosen, &call.ty) {
+        let label = "this call".to_string();
+        ctx.push_error(map_constrain_err(err, &label));
+    }
 }
 
 /// Pin a lambda's parameter when neither a value nor a demand reaches it, to the type of
@@ -1657,7 +1684,7 @@ pub(super) fn coalesce_pass(
     // inline `[]` reads the lambda's parameter before it ever sees the list. See
     // [`pin_empty_list_element`] for what the pin is and why it runs here.
     ctx.occurrences.add_roots(expr);
-    pin_empty_list_elements(expr, 0, &mut ctx);
+    pin_unreached_values(expr, 0, &mut ctx);
     coalesce_node(expr, 0, &mut ctx);
     decide_suspended_memberships(expr.node_id(), &mut ctx);
     debug_assert!(
@@ -1683,14 +1710,17 @@ pub(super) fn coalesce_pass(
 }
 
 /// Give each node of `expr` whose capabilities are still a variable what the variable resolves
-/// to.
+/// to, and each exception a node raises the type it resolves to: one a node met earlier in the
+/// walk held may have waited on an obligation below it.
 fn settle_capabilities(expr: &mut Expr) {
     for slot in [&mut expr.capabilities, &mut expr.own_capabilities] {
-        if let crate::ccl::capabilities::Repr::Var(v) = slot.repr() {
-            *slot = crate::ccl::capabilities::Capabilities::known(
-                crate::ccl::capabilities::set_of(&v.resolved()),
-            );
-        }
+        let set = match slot.repr() {
+            crate::ccl::capabilities::Repr::Var(v) => {
+                crate::ccl::capabilities::set_of(&v.resolved())
+            }
+            _ => slot.set(),
+        };
+        *slot = crate::ccl::capabilities::Capabilities::known(set.with_raises_resolved());
     }
     expr.walk_children_mut(settle_capabilities);
 }
@@ -1810,6 +1840,50 @@ fn check_scope_valid_go(expr: &Expr, scope: &BTreeSet<Name>, errors: &mut Vec<Lo
 
 /// Resolve a type that may contain inference variables into a concrete
 /// `Type`, via the compact → simplify → coalesce pipeline.
+/// Whether every path through `e` raises, so that it has no value: a `raise`, and a `try`,
+/// a conditional, or a statement sequence all of whose values are one.
+fn never_has_value(e: &Expr) -> bool {
+    match &e.node {
+        TypedExprNode::Raise { .. } => true,
+        TypedExprNode::Try { body, handlers } => {
+            never_has_value(body) && handlers.iter().all(|h| never_has_value(&h.body))
+        }
+        TypedExprNode::Case { branches, .. } => {
+            !branches.is_empty() && branches.iter().all(|b| never_has_value(&b.body))
+        }
+        TypedExprNode::Let { body, .. }
+        | TypedExprNode::ExprStmt { body, .. }
+        | TypedExprNode::MutDecl { body, .. } => never_has_value(body),
+        _ => false,
+    }
+}
+
+/// The type a node with no value stands at ([`never_has_value`]), from `ty`, the variable
+/// emission gave it: no value reaches it, so it is what its position expects, the bound the
+/// join or the use above it puts on it, or `Unit` where nothing does, as for a `raise`
+/// standing as a statement.
+fn stands_at(ty: &Type) -> Type {
+    // The bound above may be another node with no value, a `try` whose every path raises
+    // inside one that has a value: its own bound is what both stand at.
+    let mut current = ty.clone();
+    let mut seen = std::collections::HashSet::new();
+    while let Type::Infer(v) = &current {
+        if !seen.insert(v.uid) {
+            break;
+        }
+        let Some(upper) = v.bounds.borrow().upper().first().map(|b| b.ty.clone()) else {
+            break;
+        };
+        if let Ok(resolved) = resolve_var_type(&upper)
+            && !crate::ccl::subst::type_contains_infer(&resolved)
+        {
+            return resolved;
+        }
+        current = upper;
+    }
+    Type::Base(crate::ccl::BaseType::Unit)
+}
+
 pub(crate) fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
     // A generalized type is born after inference, resolved: the solver has nothing to say about it
     // (`src/ccl/design/type-parameters.md`, "Generalized types").
@@ -2292,7 +2366,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             #[cfg(debug_assertions)]
             assert!(
                 !ctx.skipped_as_generalized.contains(&bound_expr.node_id()),
-                "the empty-literal pre-pass skipped this `let` as generalized and the walk \
+                "the pin pre-pass skipped this `let` as generalized and the walk \
                  coalesces it as monomorphic, so its literals are never pinned: the two must \
                  agree on `should_generalize`"
             );
@@ -2430,6 +2504,27 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         TypedExprNode::Record(fs) => {
             for entry in fs.iter_mut() {
                 coalesce_node(&mut entry.value, level, ctx);
+            }
+        }
+        TypedExprNode::Raise { value } => coalesce_node(value, level, ctx),
+        TypedExprNode::Try { body, handlers } => {
+            coalesce_node(body, level, ctx);
+            for h in handlers.iter_mut() {
+                with_shadows(ctx, Some(h.binding.name.clone()), |ctx| {
+                    coalesce_node(&mut h.body, level, ctx);
+                });
+                resolve_binder_slot(
+                    &mut h.binding.ty,
+                    || "except clause's exception".to_string(),
+                    level,
+                    ctx,
+                );
+                resolve_binder_slot(
+                    &mut h.catches,
+                    || "except clause's type".to_string(),
+                    level,
+                    ctx,
+                );
             }
         }
         TypedExprNode::Case {
@@ -2647,6 +2742,13 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     let (resolved, pending) =
         crate::ccl::infer::solver::coalesce::collecting_memberships(|| resolve_var_type(&expr.ty));
     match resolved {
+        // A node every path through which raises has no value, so nothing bounds its type
+        // from below: it stands at what its position expects of it. Its own variable resolves
+        // from its upper bounds alone, which may be wider than the join it stands in (the
+        // annotation above a `try`), so the join's type is read instead.
+        Ok(_) if never_has_value(expr) => {
+            expr.ty = stands_at(&expr.ty);
+        }
         Ok(ty) => {
             // Log the graph read for the ordering-invariant check. The
             // var-laden `expr.ty` shares the live `InferVar`s, so the
@@ -2662,7 +2764,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             for slot in [&mut expr.capabilities, &mut expr.own_capabilities] {
                 if let crate::ccl::capabilities::Repr::Var(v) = slot.repr() {
                     *slot = crate::ccl::capabilities::Capabilities::known(
-                        crate::ccl::capabilities::set_of(&v.resolved()),
+                        crate::ccl::capabilities::set_of(&v.resolved()).with_raises_resolved(),
                     );
                 }
             }
@@ -3961,7 +4063,7 @@ pub(super) fn specialize_use(
     // pinned there.
     ctx.occurrences.add_roots(&clone);
     if !ctx.discarding {
-        pin_empty_list_elements(&clone, cutoff + 1 + raise, ctx);
+        pin_unreached_values(&clone, cutoff + 1 + raise, ctx);
     }
     #[cfg(debug_assertions)]
     let in_predicate = std::mem::take(&mut ctx.in_predicate);
