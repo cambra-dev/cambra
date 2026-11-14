@@ -269,6 +269,9 @@ fn covers_part(guard: &TileGuard, whole: &[Value], part: &Predicate, level: usiz
         TileGuard::Record(fields) => fields
             .values()
             .all(|field| covers_part(field, whole, part, level)),
+        TileGuard::Union(_) => {
+            unreachable!("a reading's Int output has no variant payload guard")
+        }
         TileGuard::Scalar(pred) | TileGuard::Aggregation(pred) => {
             let rows = TileGuard::leaf_rows(pred);
             rows.is_true() || (level <= whole.len() && rows.contains_path(&whole[..level]))

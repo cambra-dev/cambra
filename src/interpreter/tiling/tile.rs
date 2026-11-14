@@ -10,12 +10,20 @@ use std::borrow::Cow;
 use super::curry_level::CurryLevel;
 use super::guard::domain_prefix;
 use crate::{
-    ccl::AggregateKind,
+    ccl::{AggregateKind, TagMap},
     interpreter::{
         BinOpKind, ColumnValue, Extent, FunctionGuard, LogicKind, Position, Predicate, RowIndex,
         TileGuard, Tiling, Value, apply_binop_column, tuple_field,
     },
 };
+
+/// One arm of a [`Tile::Union`]: the rows carrying its tag, ascending, and their payloads as
+/// one tile standing over those rows in that order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnionArmTile {
+    pub rows: Vec<usize>,
+    pub tile: Tile,
+}
 
 /// A materialized data tile produced by a [`TileProducer`](crate::interpreter::tile_operators::TileProducer).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +40,12 @@ pub enum Tile {
         fields: HashMap<SmolStr, Tile>,
         absent: HashMap<SmolStr, BitSet>,
     },
+    /// A variant whose payload holds a collection: the rows it stands over partitioned among
+    /// its tags, and each arm's payloads a tile over that arm's rows, so a collection payload
+    /// stays a level rather than a materialized cell. A variant with no level in any payload is
+    /// a [`ColumnValue::Union`] column. See `src/interpreter/design-operators.md`, "A variant's
+    /// payload stays a tile".
+    Union(TagMap<UnionArmTile>),
     /// One collection level, grouped by enclosing row in compressed sparse row form.
     /// There is one enclosing row at the root and one per parent key inside a codomain.
     /// The recursive codomain permits records between collection levels.
@@ -218,6 +232,8 @@ impl Tile {
             // A product value is empty when every component is; a struct-of-arrays record
             // fills its fields together, so either reading agrees there.
             Tile::Record { fields: m, .. } => m.values().all(Tile::is_empty),
+            // A row's tag is data, so a union holds something as soon as it has a row.
+            Tile::Union(arms) => union_rows(arms) == 0,
             // A collection holds something as soon as one key is live. A key is data: a
             // consumer that broadcasts over the keys, or releases them, has an answer
             // before any value lands. Values that hold nothing is the level below being
@@ -261,6 +277,15 @@ impl Tile {
                         tiling_fields
                             .get(k)
                             .is_some_and(|s| t.check_from_over(s, levels))
+                    })
+            }
+            // A union's arms stand at the union's own level, over the rows carrying them.
+            (Tile::Union(arms), Tiling::Union(tilings)) => {
+                arms.len() == tilings.len()
+                    && arms.iter().all(|(tag, arm)| {
+                        tilings
+                            .get(tag)
+                            .is_some_and(|t| arm.tile.check_from_over(t, levels))
                     })
             }
             (
@@ -318,6 +343,14 @@ impl Tile {
         match self {
             Tile::Scalar(cv) => !cv.is_empty(),
             Tile::Record { fields: m, .. } => m.values().all(Tile::is_terminal),
+            // Every row has its tag, and each arm's payloads are whole.
+            Tile::Union(arms) => {
+                union_rows(arms) > 0
+                    && arms
+                        .values()
+                        .filter(|arm| !arm.rows.is_empty())
+                        .all(|arm| arm.tile.is_terminal())
+            }
             Tile::DataFunction {
                 domain_predicate, ..
             } => domain_predicate.as_bool().unwrap_or(false),
@@ -372,6 +405,7 @@ impl Tile {
                     ..
                 } => domain_predicate.qualifies() || states_a_qualified(codomain),
                 Tile::Record { fields, .. } => fields.values().any(states_a_qualified),
+                Tile::Union(arms) => arms.values().any(|arm| states_a_qualified(&arm.tile)),
                 _ => false,
             }
         }
@@ -395,6 +429,9 @@ impl Tile {
                 Tile::Record { fields, .. } => {
                     fields.values_mut().for_each(|field| walk(field, above))
                 }
+                Tile::Union(arms) => arms
+                    .iter_mut()
+                    .for_each(|(_, arm)| walk(&mut arm.tile, above)),
                 _ => {}
             }
         }
@@ -574,6 +611,39 @@ impl Tile {
                     )
                 })
             }
+            // A union's rows are partitioned among its tags. A whole value is one row, whose
+            // two arrivals carry the one tag, so the arm's payloads merge whole. Under a
+            // collection the other side's rows follow these, each in the arm of its own tag.
+            (Tile::Union(s_arms), Tile::Union(o_arms)) => {
+                let shift = union_rows(s_arms);
+                if whole && shift == 0 {
+                    // Nothing had arrived, so the other side is the whole value so far.
+                    *s_arms = o_arms;
+                } else if whole && union_rows(&o_arms) == 0 {
+                } else if whole {
+                    let (tag, o_arm) = o_arms
+                        .into_iter()
+                        .find(|(_, arm)| !arm.rows.is_empty())
+                        .expect("a union with a row has an arm holding it");
+                    let s_arm = s_arms.get_mut(&tag).filter(|arm| !arm.rows.is_empty());
+                    let Some(s_arm) = s_arm else {
+                        panic!(
+                            "two arrivals of one value carry different tags: `{tag}` beside \
+                             {s_arms:?}"
+                        )
+                    };
+                    s_arm.tile.merge_part(o_arm.tile, true);
+                } else {
+                    for (tag, o_arm) in o_arms {
+                        let s_arm = s_arms.get_or_insert_with(tag.clone(), || UnionArmTile {
+                            rows: Vec::new(),
+                            tile: o_arm.tile.select_rows(&[]),
+                        });
+                        s_arm.rows.extend(o_arm.rows.iter().map(|r| r + shift));
+                        s_arm.tile.merge_part(o_arm.tile, false);
+                    }
+                }
+            }
             // Change-append: `other`'s new positions are strictly greater than any already
             // present (a changelog only grows forward), so appending preserves the ascending
             // order the fold relies on. A store's changelogs hold one row per store, so they
@@ -662,6 +732,15 @@ impl Tile {
             Tile::Record { fields, absent } if absent.is_empty() => {
                 fields.values_mut().for_each(|t| t.retain_rows(mask))
             }
+            // Each arm keeps the rows the mask names among its own, renumbered among those kept.
+            Tile::Union(arms) => {
+                let renumbered = kept_row_numbers(mask);
+                for (_, arm) in arms.iter_mut() {
+                    let arm_mask: Vec<bool> = arm.rows.iter().map(|&r| mask[r]).collect();
+                    arm.rows = arm.rows.iter().filter_map(|&r| renumbered[r]).collect();
+                    arm.tile.retain_rows(&arm_mask);
+                }
+            }
             // A record with absent cells keeps its rows by gathering them, and a store is
             // vectorized over its rows the same way ([`Tile::select_rows`]).
             Tile::Record { .. } | Tile::Store { .. } => {
@@ -741,6 +820,31 @@ impl Tile {
             }
             Tile::DataFunction { .. } => {
                 self.regroup_rows(&rows.iter().map(|r| vec![*r]).collect::<Vec<_>>())
+            }
+            // Each picked row lands in its own arm, which gathers the slots of its picks.
+            Tile::Union(arms) => {
+                let slots = union_slots(arms);
+                let mut picked: Vec<(Vec<usize>, Vec<usize>)> =
+                    vec![Default::default(); arms.len()];
+                for (out, &row) in rows.iter().enumerate() {
+                    let (arm, slot) = slots[row];
+                    picked[arm].0.push(out);
+                    picked[arm].1.push(slot);
+                }
+                Tile::Union(TagMap::from_arms(
+                    arms.iter()
+                        .zip(picked)
+                        .map(|((tag, arm), (out_rows, arm_slots))| {
+                            (
+                                tag.clone(),
+                                UnionArmTile {
+                                    rows: out_rows,
+                                    tile: arm.tile.select_rows(&arm_slots),
+                                },
+                            )
+                        })
+                        .collect(),
+                ))
             }
             Tile::Aggregation {
                 kind,
@@ -929,6 +1033,7 @@ impl Tile {
                 codomain.compact();
             }
             Tile::Record { fields, .. } => fields.values_mut().for_each(Tile::compact),
+            Tile::Union(arms) => arms.iter_mut().for_each(|(_, arm)| arm.tile.compact()),
             // A fold holds an element, and `Sole`'s is whatever shape the element has, so
             // an accumulator can carry levels with released keys of their own. Compacting
             // it keeps the row count: a collection's rows are its `row_starts`, which
@@ -1040,6 +1145,26 @@ impl Tile {
                     t.remove_guarded_under(g, row_paths, under_a_level);
                 }
             }
+            // A union releases each arm's region among the rows carrying it. With no level
+            // above, a guard naming an arm whole clears it: a row cannot keep its tag without
+            // its payload, and the whole value is that row.
+            (Tile::Union(arms), TileGuard::Union(guards)) => {
+                for (tag, arm) in arms.iter_mut() {
+                    let Some(g) = guards.get(tag).cloned() else {
+                        continue;
+                    };
+                    if !under_a_level && g.is_universal() {
+                        arm.rows.clear();
+                        arm.tile = arm.tile.select_rows(&[]);
+                        continue;
+                    }
+                    let paths: Vec<Vec<Value>> = match row_paths {
+                        [] => Vec::new(),
+                        _ => arm.rows.iter().map(|&r| row_path(row_paths, r)).collect(),
+                    };
+                    arm.tile.remove_guarded_under(g, &paths, under_a_level);
+                }
+            }
             // Or: apply each arm in sequence.  Each arm removes the elements
             // it describes; together they remove the union of all arms.
             (tile, TileGuard::Or(arms)) => {
@@ -1100,6 +1225,7 @@ impl Tile {
         match self {
             Tile::Scalar(cv) => !cv.is_empty(),
             Tile::Record { fields, .. } => fields.values().any(Tile::holds_a_plain_value),
+            Tile::Union(arms) => arms.values().any(|arm| arm.tile.holds_a_plain_value()),
             Tile::DataFunction { codomain, .. } => codomain.holds_a_plain_value(),
             Tile::Aggregation { .. } | Tile::Store { .. } => false,
         }
@@ -1144,6 +1270,23 @@ impl Tile {
                     .map(|(k, t)| (k.clone(), t.to_guard_impl(row_paths)))
                     .collect(),
             ),
+            // Each arm names what it holds, and the rows other tags carry whole: a row's tag
+            // is fixed, so an arm will never hold anything there, and naming those rows is what
+            // lets a row whose own arm is whole be released by its key ([`TileGuard::flatten_or`]).
+            Tile::Union(arms) => {
+                let slots = union_slots(arms);
+                TileGuard::Union(arms.map(|_, arm| {
+                    let own: Vec<Vec<Value>> =
+                        arm.rows.iter().map(|&r| row_path(row_paths, r)).collect();
+                    let elsewhere: Vec<Vec<Value>> = (0..slots.len())
+                        .filter(|r| arm.rows.binary_search(r).is_err())
+                        .map(|r| row_path(row_paths, r))
+                        .collect();
+                    arm.tile
+                        .to_guard_impl(&own)
+                        .union(&whole_beneath(&arm.tile, &elsewhere))
+                }))
+            }
             // **A key is released once what it holds is complete.** A scalar under a key is
             // complete as soon as it is there, so every key present is releasable. A
             // collection under a key may still grow, and only `domain_predicate` says which
@@ -1510,6 +1653,12 @@ impl Tile {
                         walk(field, depth, f);
                     }
                 }
+                // A union's arms stand over its rows as a record's fields do.
+                Tile::Union(arms) => {
+                    for (_, arm) in arms.iter_mut() {
+                        walk(&mut arm.tile, depth, f);
+                    }
+                }
                 _ => {}
             }
         }
@@ -1599,6 +1748,7 @@ impl Tile {
         match self {
             Tile::Scalar(cv) => cv.len(),
             Tile::Record { fields, .. } => fields.values().map(Tile::cell_count).sum(),
+            Tile::Union(arms) => arms.values().map(|arm| arm.tile.cell_count()).sum(),
             Tile::DataFunction {
                 domain, codomain, ..
             } => domain.len() + codomain.cell_count(),
@@ -1623,6 +1773,7 @@ impl Tile {
         match self {
             Tile::Scalar(cv) => cv.len(),
             Tile::Record { fields, absent } => record_rows(fields, absent),
+            Tile::Union(arms) => union_rows(arms),
             Tile::DataFunction { row_starts, .. } => row_starts.len(),
             Tile::Aggregation { accumulator, .. } => accumulator.rows(),
             Tile::Store { .. } => 1,
@@ -1682,6 +1833,23 @@ impl Tile {
         }
     }
 
+    /// The arm of this union carrying `row`, with the row's slot in that arm's tile; `None` for
+    /// a tile that is not a union, or a row it does not stand over.
+    pub fn union_arm_at(
+        &self,
+        row: usize,
+    ) -> Option<(&crate::ccl::FieldKey, &UnionArmTile, usize)> {
+        let Tile::Union(arms) = self else {
+            return None;
+        };
+        arms.iter().find_map(|(tag, arm)| {
+            arm.rows
+                .binary_search(&row)
+                .ok()
+                .map(|slot| (tag, arm, slot))
+        })
+    }
+
     /// Whether this tile is the keyed-data representation, the test an operator makes when
     /// it walks a chain of levels.
     pub fn is_data_function(&self) -> bool {
@@ -1707,6 +1875,7 @@ impl Tile {
         match self {
             Tile::DataFunction { .. } => true,
             Tile::Record { fields, .. } => fields.values().any(Tile::holds_a_level),
+            Tile::Union(arms) => arms.values().any(|arm| arm.tile.holds_a_level()),
             Tile::Scalar(_) | Tile::Aggregation { .. } | Tile::Store { .. } => false,
         }
     }
@@ -1965,6 +2134,34 @@ impl Tile {
                     })
                     .collect(),
             ),
+            // Each arm names what it holds at its own rows, as a record's field does, and the
+            // rows other tags carry whole, which it will never hold anything at
+            // ([`Tile::to_guard`]).
+            Tile::Union(arms) => {
+                let slots = union_slots(arms);
+                TileGuard::Union(arms.map(|_, arm| {
+                    let own: Vec<Vec<Value>> =
+                        arm.rows.iter().map(|&r| row_path(row_paths, r)).collect();
+                    let elsewhere: Vec<Vec<Value>> = (0..slots.len())
+                        .filter(|r| arm.rows.binary_search(r).is_err())
+                        .map(|r| row_path(row_paths, r))
+                        .collect();
+                    let held = match &arm.tile {
+                        tile if tile.holds_a_level() => tile.held_guard(&own),
+                        Tile::Record { .. } => arm.tile.held_guard(&own),
+                        Tile::Scalar(cells) if !cells.is_empty() => {
+                            TileGuard::Scalar(Predicate::qualified(
+                                Predicate::union_all(
+                                    own.iter().map(|path| Predicate::exactly(path)).collect(),
+                                ),
+                                Predicate::True,
+                            ))
+                        }
+                        other => empty_guard_of(other),
+                    };
+                    held.union(&whole_beneath(&arm.tile, &elsewhere))
+                }))
+            }
             // A key whose value is a **scalar** is held whole as soon as it is there, so
             // every key present is named. A key whose value still holds a level may be
             // growing, and only this level's `domain_predicate` says which will not. A key it
@@ -2264,6 +2461,29 @@ impl Tile {
                     )
                 })
             }
+            Tile::Union(arms) => {
+                let named: Vec<Option<TileGuard>> = arms
+                    .values()
+                    .map(|arm| {
+                        let paths: Vec<Vec<Value>> =
+                            arm.rows.iter().map(|&r| row_path(row_paths, r)).collect();
+                        arm.tile.deleted_guard_under(&paths)
+                    })
+                    .collect();
+                named.iter().any(Option::is_some).then(|| {
+                    TileGuard::Union(TagMap::from_arms(
+                        arms.iter()
+                            .zip(named)
+                            .map(|((tag, arm), guard)| {
+                                (
+                                    tag.clone(),
+                                    guard.unwrap_or_else(|| empty_guard_of(&arm.tile)),
+                                )
+                            })
+                            .collect(),
+                    ))
+                })
+            }
             Tile::Aggregation { accumulator, .. } => {
                 assert!(
                     !accumulator.holds_deleted_rows(),
@@ -2283,6 +2503,7 @@ impl Tile {
                 codomain, deleted, ..
             } => !deleted.is_empty() || codomain.holds_deleted_rows(),
             Tile::Record { fields, .. } => fields.values().any(Tile::holds_deleted_rows),
+            Tile::Union(arms) => arms.values().any(|arm| arm.tile.holds_deleted_rows()),
             Tile::Aggregation { accumulator, .. } => accumulator.holds_deleted_rows(),
             Tile::Scalar(_) | Tile::Store { .. } => false,
         }
@@ -2457,9 +2678,73 @@ fn empty_guard_of(tile: &Tile) -> TileGuard {
                 .map(|(name, field)| (name.clone(), empty_guard_of(field)))
                 .collect(),
         ),
+        Tile::Union(arms) => TileGuard::Union(arms.map(|_, arm| empty_guard_of(&arm.tile))),
         Tile::DataFunction { .. } | Tile::Store { .. } => {
             TileGuard::Function(FunctionGuard::Domain(Predicate::False))
         }
+    }
+}
+
+/// The guard naming everything `tile`'s shape holds beneath each of `paths`, the enclosing
+/// paths of rows of the level `tile` stands at.
+fn whole_beneath(tile: &Tile, paths: &[Vec<Value>]) -> TileGuard {
+    let rows = Predicate::union_all(paths.iter().map(|p| Predicate::exactly(p)).collect());
+    let whole = Predicate::qualified(rows, Predicate::True);
+    match tile {
+        Tile::Scalar(_) => TileGuard::Scalar(whole),
+        Tile::Aggregation { .. } => TileGuard::Aggregation(whole),
+        Tile::Record { fields, .. } => TileGuard::Record(
+            fields
+                .iter()
+                .map(|(name, field)| (name.clone(), whole_beneath(field, paths)))
+                .collect(),
+        ),
+        Tile::Union(arms) => TileGuard::Union(arms.map(|_, arm| whole_beneath(&arm.tile, paths))),
+        Tile::DataFunction { .. } | Tile::Store { .. } => {
+            TileGuard::Function(FunctionGuard::Domain(whole))
+        }
+    }
+}
+
+/// The rows a union stands over, which its arms partition.
+fn union_rows(arms: &TagMap<UnionArmTile>) -> usize {
+    arms.values().map(|arm| arm.rows.len()).sum()
+}
+
+/// For each row a union stands over, the position of the arm carrying it and the row's slot
+/// in that arm's tile.
+fn union_slots(arms: &TagMap<UnionArmTile>) -> Vec<(usize, usize)> {
+    let mut slots = vec![(usize::MAX, usize::MAX); union_rows(arms)];
+    for (position, arm) in arms.values().enumerate() {
+        for (slot, &row) in arm.rows.iter().enumerate() {
+            slots[row] = (position, slot);
+        }
+    }
+    slots
+}
+
+/// For each row, its number among the rows `mask` keeps, or `None` where it is dropped.
+fn kept_row_numbers(mask: &[bool]) -> Vec<Option<usize>> {
+    let mut next = 0;
+    mask.iter()
+        .map(|&keep| {
+            keep.then(|| {
+                next += 1;
+                next - 1
+            })
+        })
+        .collect()
+}
+
+/// The path reaching row `row` of a level whose rows `row_paths` reaches, the one root path
+/// standing for every row where a single path is all that is known.
+///
+/// Empty where no path is known: a release reads paths only where its guard names one.
+fn row_path(row_paths: &[Vec<Value>], row: usize) -> Vec<Value> {
+    match row_paths {
+        [] => Vec::new(),
+        [only] => only.clone(),
+        paths => paths[row].clone(),
     }
 }
 
@@ -2773,6 +3058,69 @@ fn merged_rows(
                 deleted,
             }
         }
+        // Each row of the result carries the tag of the side that delivered it, and a row both
+        // delivered carries one tag on both. Each arm then merges the rows carrying its tag.
+        (Tile::Union(l_arms), Tile::Union(r_arms)) => {
+            let (l_slots, r_slots) = (union_slots(l_arms), union_slots(r_arms));
+            let tag_at = |arms: &TagMap<UnionArmTile>, position: usize| {
+                arms.keys()
+                    .nth(position)
+                    .cloned()
+                    .expect("a slot names one of its union's arms")
+            };
+            // Per tag: the result rows carrying it, and for each its source, whether the level
+            // above settled it, and its path, all within the arm.
+            type ArmRows = (Vec<usize>, Vec<RowSource>, Vec<bool>, Vec<Vec<Value>>);
+            let mut per_tag: Vec<(crate::ccl::FieldKey, ArmRows)> = Vec::new();
+            for (row, source) in order.iter().enumerate() {
+                let (tag, arm_source) = match *source {
+                    RowSource::Left(i) => {
+                        let (arm, slot) = l_slots[i];
+                        (tag_at(l_arms, arm), RowSource::Left(slot))
+                    }
+                    RowSource::Right(j) => {
+                        let (arm, slot) = r_slots[j];
+                        (tag_at(r_arms, arm), RowSource::Right(slot))
+                    }
+                    RowSource::Both(i, j) => {
+                        let ((l_arm, l_slot), (r_arm, r_slot)) = (l_slots[i], r_slots[j]);
+                        let tag = tag_at(l_arms, l_arm);
+                        assert_eq!(
+                            tag,
+                            tag_at(r_arms, r_arm),
+                            "two arrivals of one row carry different tags"
+                        );
+                        (tag, RowSource::Both(l_slot, r_slot))
+                    }
+                };
+                let at = match per_tag.iter().position(|(t, _)| *t == tag) {
+                    Some(at) => at,
+                    None => {
+                        per_tag.push((tag, Default::default()));
+                        per_tag.len() - 1
+                    }
+                };
+                let (rows, sources, arm_settled, paths) = &mut per_tag[at].1;
+                rows.push(row);
+                sources.push(arm_source);
+                arm_settled.push(settled.get(row).copied().unwrap_or(false));
+                paths.push(row_path(row_paths, row));
+            }
+            Tile::Union(l_arms.map(|tag, l_arm| {
+                let r_tile = r_arms
+                    .get(tag)
+                    .map_or_else(|| l_arm.tile.select_rows(&[]), |arm| arm.tile.clone());
+                let (rows, sources, arm_settled, paths) = per_tag
+                    .iter()
+                    .find(|(t, _)| t == tag)
+                    .map(|(_, rows)| rows.clone())
+                    .unwrap_or_default();
+                UnionArmTile {
+                    tile: merged_rows(&l_arm.tile, &r_tile, &sources, &arm_settled, &paths),
+                    rows,
+                }
+            }))
+        }
         // An aggregation stands over rows without keys of its own. A row one side delivered
         // is picked, and a row both sides delivered is that row's two contributions folded
         // by the aggregate's own law, as a whole aggregation's two halves are
@@ -2851,6 +3199,13 @@ fn columns_whole_or_absent(tile: &Tile, rows: usize) -> bool {
             Some(missing) => f.rows() + missing.len() == rows && missing.iter().all(|r| r < rows),
             None => columns_whole_or_absent(f, rows),
         }),
+        Tile::Union(arms) => {
+            let held = union_rows(arms);
+            (held == 0 || held == rows)
+                && arms
+                    .values()
+                    .all(|arm| columns_whole_or_absent(&arm.tile, arm.rows.len()))
+        }
         Tile::DataFunction { row_starts, .. } => row_starts.len() == rows,
         Tile::Aggregation { .. } | Tile::Store { .. } => true,
     }
@@ -2953,6 +3308,7 @@ pub fn validate_tile(tile: &Tile) -> bool {
         // A record at the top level is a record of whole values; only a collection's keys
         // pin its fields to one count.
         Tile::Record { fields, .. } => fields.values().all(validate_tile),
+        Tile::Union(arms) => valid_over(tile, union_rows(arms)),
         Tile::Aggregation {
             accumulator,
             terminal,
@@ -3006,6 +3362,40 @@ fn valid_over_settled(
             Some(missing) => t.rows() + missing.len() == rows && missing.iter().all(|r| r < rows),
             None => valid_over_settled(t, rows, row_paths, above, settled),
         }),
+        // Every row carries one tag, or none has arrived yet; each arm's rows are ascending and
+        // its tile stands over them.
+        Tile::Union(arms) => {
+            let held = union_rows(arms);
+            let mut seen = vec![false; held];
+            let partitioned = arms.values().all(|arm| {
+                arm.rows.windows(2).all(|w| w[0] < w[1])
+                    && arm
+                        .rows
+                        .iter()
+                        .all(|&r| r < held && !std::mem::replace(&mut seen[r], true))
+            });
+            let arrived = match held {
+                0 => !settled.contains(&true) || rows == 0,
+                _ => held == rows,
+            };
+            partitioned
+                && arrived
+                && arms.values().all(|arm| {
+                    let paths: Option<Vec<Vec<Value>>> = row_paths
+                        .map(|paths| arm.rows.iter().map(|&r| row_path(paths, r)).collect());
+                    let arm_settled: Vec<bool> = match settled.is_empty() {
+                        true => Vec::new(),
+                        false => arm.rows.iter().map(|&r| settled[r]).collect(),
+                    };
+                    valid_over_settled(
+                        &arm.tile,
+                        arm.rows.len(),
+                        paths.as_deref(),
+                        above,
+                        &arm_settled,
+                    )
+                })
+        }
         Tile::DataFunction {
             row_starts,
             domain,
@@ -5705,6 +6095,147 @@ mod tests {
         };
         assert_eq!(guards["a"], TileGuard::Scalar(Predicate::True));
         assert_eq!(guards["b"], TileGuard::Scalar(Predicate::False));
+    }
+
+    // ── Tile::Union ───────────────────────────────────────────────────────────
+
+    /// A union over `rows`, each `Some(values)` an arm `some` holding the collection
+    /// `{0 ↦ values[0], …}`, complete where `whole`, and each `None` an arm `none` holding `unit`.
+    fn options(rows: &[Option<Vec<i64>>], whole: bool) -> Tile {
+        let (mut some_rows, mut none_rows) = (Vec::new(), Vec::new());
+        let (mut starts, mut keys, mut values) = (Vec::new(), Vec::new(), Vec::new());
+        for (row, cell) in rows.iter().enumerate() {
+            match cell {
+                Some(vs) => {
+                    some_rows.push(row);
+                    starts.push(keys.len());
+                    keys.extend((0..vs.len() as u64).collect::<Vec<_>>());
+                    values.extend(vs.iter().copied());
+                }
+                None => none_rows.push(row),
+            }
+        }
+        let n_none = none_rows.len();
+        Tile::Union(TagMap::from_arms(vec![
+            (
+                crate::ccl::FieldKey::Name("none".into()),
+                UnionArmTile {
+                    rows: none_rows,
+                    tile: Tile::Scalar(ColumnValue::Units(n_none)),
+                },
+            ),
+            (
+                crate::ccl::FieldKey::Name("some".into()),
+                UnionArmTile {
+                    rows: some_rows,
+                    tile: Tile::grouped(
+                        starts,
+                        ColumnValue::from_uints(keys),
+                        Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+                        if whole {
+                            Predicate::True
+                        } else {
+                            Predicate::False
+                        },
+                        BitSet::new(),
+                    ),
+                },
+            ),
+        ]))
+    }
+
+    /// Rows under a collection follow one another, each landing in the arm of its own tag.
+    #[test]
+    fn merging_union_rows_appends_each_arm() {
+        let mut held = options(&[Some(vec![1]), None], true);
+        held.merge_rows(options(&[None, Some(vec![2, 3])], true));
+        assert_eq!(
+            held,
+            options(&[Some(vec![1]), None, None, Some(vec![2, 3])], true)
+        );
+    }
+
+    /// A gather takes each row from its own arm, as many times as it is named.
+    #[test]
+    fn selecting_union_rows_gathers_each_from_its_arm() {
+        let tile = options(&[Some(vec![1]), None, Some(vec![2])], true);
+        assert_eq!(
+            tile.select_rows(&[2, 1, 2]),
+            options(&[Some(vec![2]), None, Some(vec![2])], true)
+        );
+    }
+
+    /// A filter keeps each arm's surviving rows, renumbered among those kept.
+    #[test]
+    fn retaining_union_rows_renumbers_each_arm() {
+        let mut tile = options(&[Some(vec![1]), None, Some(vec![2])], true);
+        tile.retain_rows(&[true, false, true]);
+        assert_eq!(tile, options(&[Some(vec![1]), Some(vec![2])], true));
+    }
+
+    /// A whole value is releasable once its tag's payload is complete: the other arm names the
+    /// row whole too, since it will never hold anything there.
+    #[test]
+    fn a_union_is_releasable_once_its_payload_is_complete() {
+        assert!(options(&[Some(vec![1, 2])], true).to_guard().is_universal());
+        assert!(
+            !options(&[Some(vec![1, 2])], false)
+                .to_guard()
+                .is_universal()
+        );
+    }
+
+    /// Releasing a whole value clears it, tag included.
+    #[test]
+    fn releasing_a_whole_union_clears_it() {
+        let mut tile = options(&[Some(vec![1])], true);
+        let guard = tile.to_guard();
+        tile.remove_guarded(guard);
+        assert!(tile.is_empty(), "{tile:?}");
+    }
+
+    /// A key delivered twice merges what it holds: the two arrivals carry one tag, and the
+    /// collection under it grows by the second's keys.
+    #[test]
+    fn a_union_payload_grows_under_a_repeated_key() {
+        let keyed = |payload: Tile| {
+            Tile::data_function(
+                ColumnValue::from_uints(vec![0]),
+                Box::new(payload),
+                Predicate::False,
+                BitSet::new(),
+            )
+        };
+        let part = |key: u64, value: i64| {
+            let Tile::Union(mut arms) = options(&[Some(vec![value])], false) else {
+                unreachable!()
+            };
+            let some = arms
+                .get_mut(&crate::ccl::FieldKey::Name("some".into()))
+                .unwrap();
+            some.tile = Tile::grouped(
+                vec![0],
+                ColumnValue::from_uints(vec![key]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![value]))),
+                Predicate::False,
+                BitSet::new(),
+            );
+            Tile::Union(arms)
+        };
+        let mut merged = keyed(part(0, 10));
+        merged.merge(keyed(part(1, 20)));
+        let Tile::DataFunction { codomain, .. } = &merged else {
+            panic!("a collection stays a collection: {merged:?}")
+        };
+        let Some((_, arm, slot)) = codomain.union_arm_at(0) else {
+            panic!("the key's value carries its tag: {codomain:?}")
+        };
+        assert_eq!(slot, 0);
+        assert_eq!(arm.tile.rows(), 1, "one row, the repeated key's");
+        let Tile::DataFunction { domain, .. } = &arm.tile else {
+            panic!("the payload is a level")
+        };
+        assert_eq!(domain, &ColumnValue::from_uints(vec![0, 1]));
     }
 
     // ── Tile::remove_guarded ──────────────────────────────────────────────────

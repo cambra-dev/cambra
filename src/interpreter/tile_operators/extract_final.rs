@@ -194,8 +194,10 @@ impl TileProducer for ExtractFinalProducer {
         // TODO don't assume sorting; we need to sort by the key value instead.
         let live_outer = (0..domain.len()).rev().find(|i| !deleted.contains(*i));
         if let Some(final_idx) = live_outer {
-            let tile = if codomain.is_data_function() {
-                // That key's group, taken out on its own, is the value at this position. Every
+            let tile = if codomain.holds_a_level() {
+                // That key's group, taken out on its own, is the value at this position, and a
+                // variant or a record holding a collection is that key's row taken out the same
+                // way. Every
                 // level's predicates are restated over the group's own paths: a level beneath
                 // the group's own still names the indexed key in its enclosing paths.
                 source_tile

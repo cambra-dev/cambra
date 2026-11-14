@@ -426,6 +426,33 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                     walk(field_tile, &label, level, rows, above, nodes, entries);
                 }
             }
+            // A row's tag is an entry of its own, so a row that changes tags is caught, and each
+            // arm is walked over the rows carrying it, as a record's fields are over the
+            // record's.
+            Tile::Union(arms) => {
+                for (tag, arm) in arms.iter() {
+                    let mut label = label.to_vec();
+                    label.push(SmolStr::new(format!("`{tag}")));
+                    let arm_rows: Vec<Option<Vec<Value>>> = arm
+                        .rows
+                        .iter()
+                        .map(|&row| rows.get(row).cloned().flatten())
+                        .collect();
+                    for path in arm_rows.iter().flatten() {
+                        entries.insert(
+                            (label.clone(), path.clone()),
+                            Entry {
+                                value: EntryValue::Key,
+                                complete: match level {
+                                    0 => true,
+                                    _ => above.contains_path(path),
+                                },
+                            },
+                        );
+                    }
+                    walk(&arm.tile, &label, level, &arm_rows, above, nodes, entries);
+                }
+            }
             Tile::Scalar(column) => {
                 for (row, path) in rows.iter().enumerate() {
                     let Some(path) = path else { continue };
@@ -581,8 +608,19 @@ fn released_whole(guard: &TileGuard, label: &[SmolStr]) -> bool {
             .split_first()
             .and_then(|(field, rest)| fields.get(field).map(|g| released_whole(g, rest)))
             .unwrap_or(false),
+        TileGuard::Union(arms) => label
+            .split_first()
+            .and_then(|(arm, rest)| union_arm(arms, arm).map(|g| released_whole(g, rest)))
+            .unwrap_or(false),
         _ => false,
     }
+}
+
+/// The guard of the union arm a [`completion_view`] label names, `` `tag ``.
+fn union_arm<'g>(arms: &'g crate::ccl::TagMap<TileGuard>, label: &str) -> Option<&'g TileGuard> {
+    arms.iter()
+        .find(|(tag, _)| format!("`{tag}") == label)
+        .map(|(_, g)| g)
 }
 
 /// The paths reaching collection level `level` under record fields `label` that `guard`
@@ -599,6 +637,12 @@ fn released_at(guard: &TileGuard, label: &[SmolStr], level: usize) -> Predicate 
                 Some((field, rest)) => fields
                     .get(field)
                     .map_or(Predicate::False, |g| walk(g, rest, depth, level)),
+                None => Predicate::False,
+            },
+            TileGuard::Union(arms) => match label.split_first() {
+                Some((arm, rest)) => {
+                    union_arm(arms, arm).map_or(Predicate::False, |g| walk(g, rest, depth, level))
+                }
                 None => Predicate::False,
             },
             TileGuard::Function(FunctionGuard::Codomain(inner)) if depth < level => {
@@ -629,6 +673,12 @@ fn released_cells_at(guard: &TileGuard, label: &[SmolStr]) -> Predicate {
             Some((field, rest)) => fields
                 .get(field)
                 .map_or(Predicate::False, |g| released_cells_at(g, rest)),
+            None => Predicate::False,
+        },
+        TileGuard::Union(arms) => match label.split_first() {
+            Some((arm, rest)) => {
+                union_arm(arms, arm).map_or(Predicate::False, |g| released_cells_at(g, rest))
+            }
             None => Predicate::False,
         },
         TileGuard::Scalar(pred) | TileGuard::Aggregation(pred) if label.is_empty() => {

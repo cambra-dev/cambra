@@ -56,6 +56,13 @@ determined in a single step: from `⊥` to its terminal value.
 Function tiles can be determined incrementally, with each new tile covering a disjoint portion
 of the domain. Partial function tiles are terminal when they are total.
 
+**Sum terms** (a variant over tags `cᵢ` with payload types `Pᵢ`): The tiling is `{⊥}` together
+with a pair `(cᵢ, x)` for each tag and each tile `x` of `Pᵢ`'s tiling, `⊥` included: `(c, ⊥)` knows
+the tag and nothing of the payload. `(c, x) ⊕ (c, y)` is `(c, x ⊕ y)` where `x ⊕ y` is defined, and
+two different tags are incompatible: a value takes on one tag. A sum tile is terminal when its
+payload tile is. A payload that is a function term is therefore determined incrementally under its
+tag, as a function term is on its own.
+
 **Aggregate terms** (e.g. `sum(f)`, `max(f)`, `min(f)`, where `f: I ⇒ T`):
 An aggregate operator takes a function tiling (`I ⇀ T`) as input and produces tiles in a
 tiling specific to the aggregation. For `sum`, the tiling is `Count × Sum`; for `max`,

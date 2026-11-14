@@ -195,6 +195,8 @@ fn release_guard_for(tile: &Tile) -> TileGuard {
                 .map(|(k, t)| (k.clone(), release_guard_for(t)))
                 .collect(),
         ),
+        // A variant names its arms' regions, and its rows' tags with them.
+        variant @ Tile::Union(_) => variant.to_guard(),
         other => panic!("Unexpected top-level tile shape: {other:?}"),
     }
 }
