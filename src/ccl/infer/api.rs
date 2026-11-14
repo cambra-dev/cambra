@@ -161,6 +161,18 @@ pub struct TypeInferenceContext {
 
     /// The program's trait instances, which lowering builds.
     pub(crate) instances: Rc<InstanceTable>,
+
+    /// The `ExprStmt` of each expression statement the program writes, which lowering
+    /// records ([`crate::ccl::lower::LoweringContext`]).
+    pub(crate) expression_statements: HashSet<NodeId>,
+
+    /// The binders of the root's public members, which the linked program's inference holds
+    /// to what a public member's type may name, as a module check does its module's.
+    pub(crate) root_public: HashSet<Name>,
+
+    /// The expression statements [`infer`] found to cause nothing, which the compile reports
+    /// once the checks that diagnose a statement more precisely have run.
+    pub(crate) inert: Vec<LocatedInferError>,
 }
 
 /// RAII guard returned by [`TypeInferenceContext::enter_scope`].
@@ -342,6 +354,13 @@ impl StatedRequirement {
 pub enum InferError {
     /// A variable was referenced but not bound in the current scope.
     UnboundVariable(String),
+    /// A statement whose value is discarded and which causes nothing, so it does nothing
+    /// (`docs/chl-spec.md`, "4.9 Expression statement").
+    InertStatement,
+    /// A public function whose type names an induction variable its module's top level binds,
+    /// which no other module may read or write (`docs/chl-spec.md`, "9.10 Induction variables
+    /// stay in their module").
+    VariablePastItsScope { member: String, item: String },
     /// A type mismatch was detected between two solved types.
     ///
     /// Named for the roles rather than positionally: `constrain_subtype(lhs, rhs)`
@@ -1029,6 +1048,8 @@ impl InferError {
             // binder join) a term `respell` rewrites.
             InferError::UnboundVariable(_)
             | InferError::NoJoinOverBinder { .. }
+            | InferError::InertStatement
+            | InferError::VariablePastItsScope { .. }
             | InferError::Unsupported(_)
             | InferError::EmptyCase { .. }
             | InferError::UnresolvedHole { .. }
@@ -1500,6 +1521,18 @@ impl std::fmt::Debug for InferError {
         let w = crate::ccl::chl_print::Writer::default();
         match self {
             InferError::UnboundVariable(name) => write!(f, "Unbound variable: '{}'", name),
+            InferError::InertStatement => write!(
+                f,
+                "this statement causes nothing and its value is discarded, so it does nothing: \
+                 remove it, or write `_ = …` to compute it and keep nothing"
+            ),
+            InferError::VariablePastItsScope { member, item } => write!(
+                f,
+                "`{member}` is public and its type has `{item}`, which names an induction variable \
+                 of this module, which only this module may read or write: take the variable as a \
+                 `Mut` parameter, feed its values out through a public feed, or bind its value at \
+                 the position you want to a public member"
+            ),
             InferError::TypeMismatch {
                 ctx,
                 found,
@@ -2047,7 +2080,14 @@ pub fn infer(
     // variable's bounds, breaking the `Rc` cycles that would otherwise leak
     // the whole variable graph. See [`InferArena`].
     let mut arena = InferArena::new();
-    let ty = super::run(&mut arena, expr, &ctx.source_types, &ctx.instances);
+    let ty = super::run(
+        &mut arena,
+        expr,
+        &ctx.source_types,
+        &ctx.instances,
+        &ctx.root_public,
+        &ctx.expression_statements,
+    );
     #[cfg(debug_assertions)]
     if std::env::var_os("DUMP_KINDS").is_some() {
         eprintln!("=== kind vars ===\n{}", crate::ccl::ty::dump_kind_vars());
@@ -2060,7 +2100,8 @@ pub fn infer(
             crate::ccl::symbolic::symbolic_typed(expr)
         );
     }
-    let ty = ty?;
+    let (ty, inert) = ty?;
+    ctx.inert = inert;
     // Only on success: an error path's tree is reported against, and the
     // annotation is part of what an `AnnotationMismatch` renders.
     clear_annotations(expr);
@@ -2090,9 +2131,17 @@ pub fn check_module(
         params,
         reported,
         public,
+        &ctx.expression_statements,
         true,
     );
-    let Some((_, schemes, opened, top_level)) = outcome.typed else {
+    let Some(super::Inferred {
+        schemes,
+        opened,
+        top_level,
+        inert,
+        ..
+    }) = outcome.typed
+    else {
         return ModuleCheckResult {
             before: outcome.before,
             contracts: HashMap::new(),
@@ -2102,6 +2151,10 @@ pub fn check_module(
             recovered: outcome.recovered,
         };
     };
+    // A module checked on its own runs no later check that diagnoses a statement more
+    // precisely, so an inert statement is reported here.
+    let mut errors = outcome.errors;
+    errors.extend(inert);
     let mut contracts: HashMap<Name, Contract> = schemes
         .into_iter()
         .filter(|(name, _)| !outcome.unavailable.contains(name))
@@ -2138,7 +2191,7 @@ pub fn check_module(
         top_level: complete.then_some(top_level),
         before: outcome.before,
         has_typed_tree: true,
-        errors: outcome.errors,
+        errors,
         recovered: outcome.recovered,
     }
 }

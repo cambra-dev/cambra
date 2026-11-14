@@ -713,7 +713,9 @@ pub(crate) fn run(
     expr: &mut Expr,
     sources: &HashMap<String, Type>,
     instances: &Rc<solver::traits::InstanceTable>,
-) -> Result<Type, Vec<LocatedInferError>> {
+    public: &HashSet<Name>,
+    statements: &HashSet<NodeId>,
+) -> Result<(Type, Vec<LocatedInferError>), Vec<LocatedInferError>> {
     let outcome = run_with_params(
         arena,
         expr,
@@ -721,11 +723,12 @@ pub(crate) fn run(
         instances,
         &[],
         &HashSet::new(),
-        &HashSet::new(),
+        public,
+        statements,
         false,
     );
     match outcome.typed {
-        Some((ty, ..)) if outcome.errors.is_empty() => Ok(ty),
+        Some(inferred) if outcome.errors.is_empty() => Ok((inferred.ty, inferred.inert)),
         _ => Err(outcome.errors),
     }
 }
@@ -741,21 +744,17 @@ pub(crate) type OpenedVars = HashMap<crate::ccl::InferVarId, Rc<crate::ccl::ty::
 pub(crate) struct RunOutcome {
     /// The tree before emission, at the identities earlier errors can still name.
     pub before: Expr,
-    pub typed: Option<(
-        Type,
-        NotedSchemes,
-        OpenedVars,
-        crate::ccl::capabilities::CapabilitySet,
-    )>,
+    pub typed: Option<Inferred>,
     pub errors: Vec<LocatedInferError>,
     pub recovered: HashMap<NodeId, StandIn>,
     pub unavailable: HashSet<Name>,
 }
 
-/// [`run`] with a module's type parameters `params` open throughout `expr`,
-/// also returning the scheme each generalized binding in `reported` is bound at
-/// ([`typing::Typing::note_scheme`]), and the variable each parameter with no kind
-/// written is opened as.
+/// [`run`] with a module's type parameters `params` open throughout `expr`, returning what it
+/// infers ([`Inferred`]): besides the type, the scheme each generalized binding in `reported` is
+/// bound at ([`typing::Typing::note_scheme`]), the variable each parameter with no kind written is
+/// opened as, what the top level requires and causes, and the expression statements that cause
+/// nothing.
 ///
 /// A run whose emission recovered from a statement stops after emission, and inference
 /// starts over in `arena`, restarted, on a copy of `expr` as it was, with the expression of
@@ -784,6 +783,7 @@ pub(crate) fn run_with_params(
     params: &[ModuleCheckParam],
     reported: &HashSet<Name>,
     public: &HashSet<Name>,
+    statements: &HashSet<NodeId>,
     recover_all: bool,
 ) -> RunOutcome {
     // Emission rewrites the tree it types, so a run that starts over needs it as it was: a
@@ -798,7 +798,9 @@ pub(crate) fn run_with_params(
     let RunFailure {
         mut errors,
         mut recovered,
-    } = match run_once(expr, sources, instances, params, reported, public) {
+    } = match run_once(
+        expr, sources, instances, params, reported, public, statements,
+    ) {
         Ok(typed) => {
             return RunOutcome {
                 before: pristine,
@@ -842,7 +844,9 @@ pub(crate) fn run_with_params(
         if recover_all {
             unavailable = unavailable_contracts(&rest);
         }
-        let failure = match run_once(&mut rest, sources, instances, params, reported, public) {
+        let failure = match run_once(
+            &mut rest, sources, instances, params, reported, public, statements,
+        ) {
             Ok(found) => {
                 typed = Some(found);
                 if recover_all {
@@ -1173,15 +1177,8 @@ fn run_once(
     params: &[ModuleCheckParam],
     reported: &HashSet<Name>,
     public: &HashSet<Name>,
-) -> Result<
-    (
-        Type,
-        NotedSchemes,
-        OpenedVars,
-        crate::ccl::capabilities::CapabilitySet,
-    ),
-    RunFailure,
-> {
+    statements: &HashSet<NodeId>,
+) -> Result<Inferred, RunFailure> {
     let failed = |errors| RunFailure {
         errors,
         recovered: Vec::new(),
@@ -1204,6 +1201,7 @@ fn run_once(
         .map_err(|e| failed(vec![e]))?;
     sub_ctx.reported = reported.clone();
     sub_ctx.public = public.clone();
+    sub_ctx.expression_statements = statements.clone();
 
     // Pass 1: emit constraints. The high-value variants
     // (`UnboundVariable`/`TypeMismatch`/`ExpectedFunction`) all originate here.
@@ -1381,8 +1379,60 @@ fn run_once(
     // validator does not traverse for witness references. This additional walk is debug-only.
     #[cfg(debug_assertions)]
     debug_assert_no_free_witness(expr, "post-inference");
-    let top_level = sub_ctx.top_level_capabilities();
-    Ok((expr.ty.clone(), sub_ctx.schemes_noted, opened, top_level))
+    // An expression statement does something only by what it causes.
+    let inert: Vec<LocatedInferError> = sub_ctx
+        .inert_statements()
+        .into_iter()
+        .map(|node| LocatedInferError::new(InferError::InertStatement, node))
+        .collect();
+    // A public function's type naming a variable its module keeps is a type the module's
+    // interface cannot state, so it fails inference outright.
+    let exported = sub_ctx.exported_capabilities();
+    let escaping: Vec<LocatedInferError> = exported
+        .escaping
+        .into_iter()
+        .map(|(node, name, capability)| {
+            let item = match &capability.item {
+                crate::ccl::capabilities::Capability::Requires(r) => r.to_string(),
+                crate::ccl::capabilities::Capability::Causes(e) => e.to_string(),
+            };
+            LocatedInferError::new(
+                InferError::VariablePastItsScope {
+                    member: name.base().to_string(),
+                    item,
+                },
+                node,
+            )
+        })
+        .collect();
+    if !escaping.is_empty() {
+        return Err(failed(escaping));
+    }
+    // A private feed a public function appends to is appended to by other modules, so it is
+    // the run's, as a public feed is.
+    let mut top_level = sub_ctx.top_level_capabilities();
+    top_level = top_level.union(&crate::ccl::capabilities::set_of(
+        &exported.appends.into_iter().collect(),
+    ));
+    Ok(Inferred {
+        ty: expr.ty.clone(),
+        schemes: sub_ctx.schemes_noted,
+        opened,
+        top_level,
+        inert,
+    })
+}
+
+/// What [`run_with_params`] infers of a tree.
+pub(crate) struct Inferred {
+    pub(crate) ty: Type,
+    pub(crate) schemes: NotedSchemes,
+    pub(crate) opened: OpenedVars,
+    /// What the tree's top level requires and causes, less what its scopes discharge.
+    pub(crate) top_level: crate::ccl::capabilities::CapabilitySet,
+    /// The expression statements that cause nothing, each an error the caller reports once
+    /// the checks that diagnose a statement more precisely have run.
+    pub(crate) inert: Vec<LocatedInferError>,
 }
 
 use crate::ccl::Expr;

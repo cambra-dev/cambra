@@ -1867,12 +1867,16 @@ fn lower_loop_body_chain_scoped(
             // A bare expression statement — the `Feed`/`Yield` guards above
             // did not match, so this is an ordinary side-effect (e.g. a call
             // to a pass-by-reference writer, `bump(cnt)`). Sequence it before
-            // the rest; its value is discarded (the loop body is a statement).
-            // Post-inline it may reveal a `MutWrite` (accumulator loop) or turn
-            // out pure (the phase drops the loop as a no-op).
+            // the rest; its value is discarded (the loop body is a statement),
+            // so it is an expression statement, which inference refuses when it
+            // causes nothing ([`EXPRESSION_STATEMENT`]).
             ChlStmt::Expr(value) => {
                 let lowered = lower_expr(value, ctx)?;
-                ctx.tag_machinery(Expr::expr_stmt(lowered, chain), stmt.span, "lower.stmt_seq")
+                ctx.tag_machinery(
+                    Expr::expr_stmt(lowered, chain),
+                    stmt.span,
+                    EXPRESSION_STATEMENT,
+                )
             }
             // `with begin(): <block>` inside an `if` in the loop body: a per-path
             // transaction site is unsound (§4.3 transaction verdict) — rejected.

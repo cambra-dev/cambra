@@ -6,7 +6,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::capabilities::{
-    Capabilities, Capability, CapabilityVar, Effect, Filter, Repr, Requirement, ScopedCapability,
+    Bound as CapabilityBound, Capabilities, Capability, CapabilityVar, Effect, Filter, Repr,
+    Requirement, ScopedCapability,
 };
 use crate::ccl::ccl_utils::TermMemo;
 use crate::ccl::infer::solver::barrier::EdgeReport;
@@ -148,6 +149,15 @@ pub(super) struct InferCtx {
     root_capabilities: Option<Rc<CapabilityVar>>,
     /// Where each mutable variable and feed in scope is bound, for the capability that names it.
     capability_binders: HashMap<Name, CapabilityBinder>,
+    /// Each statement emitted, with the variable collecting what it causes.
+    capability_statements: Vec<(NodeId, Rc<CapabilityVar>)>,
+    /// The `ExprStmt` of each expression statement the program writes, the statements an
+    /// inert one is refused among.
+    pub(super) expression_statements: HashSet<NodeId>,
+    /// Each public member of the module, with its type and its `let`.
+    capability_public: Vec<(Name, Type, NodeId)>,
+    /// The variable of every call site ([`InferCtx::call_capabilities`]).
+    capability_calls: HashSet<crate::ccl::capabilities::CapabilityVarId>,
     /// Lexical scope: name → [`Binding`] for in-scope variables and let-bound
     /// names. Lambda params and `Case`/`Loop` binders bind monomorphically; a
     /// polymorphic `let` additionally stashes its typed definition subtree so
@@ -344,6 +354,16 @@ impl DeferredMethod {
 /// A [`DefGroup`](crate::ccl::TypedExprNode::DefGroup) under emission: what its members are
 /// emitted at, wherever a reference first needs one (`src/ccl/design/nominal-types.md`,
 /// "Associated functions").
+/// What a module's public functions do to the variables of its top level
+/// ([`InferCtx::exported_capabilities`]).
+#[derive(Default)]
+pub(super) struct ExportedCapabilities {
+    /// A public function naming an induction variable, with its `let` and the capability.
+    pub(super) escaping: Vec<(NodeId, Name, ScopedCapability)>,
+    /// An append to a private feed, which the top level then causes too.
+    pub(super) appends: Vec<ScopedCapability>,
+}
+
 /// A function body, or the module's top level, under emission: the variable collecting
 /// what it requires and causes.
 struct CapabilityFrame {
@@ -401,7 +421,7 @@ struct NodeCapabilities {
 struct CapabilityBinder {
     depth: u32,
     /// A parameter's history is its argument's, so the call records what is done to it, and
-    /// the function's type does not ([`ScopedCapability::parameter`]).
+    /// the function's type does not ([`crate::ccl::capabilities::Bound::Parameter`]).
     parameter: bool,
     /// A transactional mutable variable: reading or writing it requires `Transaction`, and its
     /// capabilities are `ReadTxn` and `WriteTxn`.
@@ -584,6 +604,10 @@ impl InferCtx {
             node_capabilities: Vec::new(),
             root_capabilities: None,
             capability_binders: HashMap::new(),
+            capability_statements: Vec::new(),
+            expression_statements: HashSet::new(),
+            capability_calls: HashSet::new(),
+            capability_public: Vec::new(),
         }
     }
 
@@ -677,8 +701,11 @@ impl InferCtx {
         // included, stays out of the function's type at the frame's filter.
         ScopedCapability {
             item,
-            bound_at: binder.filter(|b| !b.escapes).map(|b| b.depth),
-            parameter: binder.is_some_and(|b| b.parameter),
+            bound: match binder {
+                Some(b) if b.parameter => CapabilityBound::Parameter,
+                Some(b) if !b.escapes => CapabilityBound::At(b.depth),
+                _ => CapabilityBound::Escaping,
+            },
         }
     }
 
@@ -749,10 +776,55 @@ impl InferCtx {
         }
     }
 
+    /// What public functions do to the variables of their module's top level, which other
+    /// modules then do by calling them (`docs/chl-spec.md`, "Discharging requirements and
+    /// effects"): each one naming an induction variable, which `docs/chl-spec.md`, "9.10
+    /// Induction variables stay in their module", keeps in its module, and each append to a
+    /// private feed, which makes the feed the run's.
+    pub(super) fn exported_capabilities(&self) -> ExportedCapabilities {
+        let mut out = ExportedCapabilities::default();
+        for (name, ty, node) in &self.capability_public {
+            for capability in type_capabilities(ty) {
+                if capability.bound != CapabilityBound::At(0) {
+                    continue;
+                }
+                match &capability.item {
+                    Capability::Causes(Effect::Append(_)) => out.appends.push(capability),
+                    _ => out.escaping.push((*node, name.clone(), capability)),
+                }
+            }
+        }
+        out
+    }
+
+    /// The statements emitted that cause nothing and so do nothing
+    /// (`docs/chl-spec.md`, "4.9 Expression statement").
+    ///
+    /// A statement in a polymorphic definition can call a function that only each use of the
+    /// definition determines: a parameter's. That call's variable has nothing flowing into it
+    /// at the definition, where each use fills a copy of its own, so a statement reaching one
+    /// may do something and is not reported.
+    pub(super) fn inert_statements(&self) -> Vec<NodeId> {
+        let undetermined = |v: &CapabilityVar| {
+            self.capability_calls.contains(&v.uid) && v.incoming().is_empty() && v.own().is_empty()
+        };
+        self.capability_statements
+            .iter()
+            .filter(|(_, var)| {
+                crate::ccl::capabilities::set_of(&var.resolved())
+                    .causes
+                    .is_empty()
+                    && !var.reaches(&undetermined)
+            })
+            .map(|(node, _)| *node)
+            .collect()
+    }
+
     /// The capabilities a call site expects of its callee: a fresh variable whose capabilities flow
     /// into the enclosing function body's, through the body's filter.
     fn call_capabilities(&mut self) -> Capabilities {
         let call = CapabilityVar::fresh(self.level);
+        self.capability_calls.insert(call.uid);
         self.node_capability_var()
             .flows_from(&call, Filter::default());
         Capabilities::var(call)
@@ -2543,6 +2615,33 @@ impl Typing for InferCtx {
         }
     }
 
+    fn statement<R>(&mut self, node: NodeId, f: impl FnOnce(&mut Self) -> R) -> R {
+        if !self.expression_statements.contains(&node) {
+            return f(self);
+        }
+        // The statement's own variable, which keeps everything it does, the enclosing
+        // function's own variables included: a statement that writes one does something.
+        let var = CapabilityVar::fresh(self.level);
+        self.node_capabilities.push(NodeCapabilities {
+            var: Rc::clone(&var),
+            // Not a node of its own: what it records is the statement's.
+            own: Rc::clone(&var),
+            inflow: Inflow::All,
+            body: None,
+        });
+        let r = f(self);
+        self.leave_node_capabilities();
+        self.capability_statements.push((node, var));
+        r
+    }
+
+    fn note_binding(&mut self, name: &Name, ty: &Type, node: NodeId) {
+        if self.capability_frame().depth == 0 && self.public.contains(name) {
+            self.capability_public
+                .push((name.clone(), ty.clone(), node));
+        }
+    }
+
     fn declare_mutable(&mut self, name: &Name, ty: &Type) {
         self.bind_capability_name(name, ty, true);
     }
@@ -2940,12 +3039,44 @@ fn mark_constant_family_holes(body: &Type, param: &smol_str::SmolStr) {
     body.walk_children(|c| mark_constant_family_holes(c, param));
 }
 
+/// The capabilities of every function nested in a value, through its inferred lower bounds.
+fn type_capabilities(ty: &Type) -> Vec<ScopedCapability> {
+    fn collect(ty: &Type, seen: &mut HashSet<*const InferVar>, out: &mut Vec<ScopedCapability>) {
+        if let Type::Infer(v) = ty.peel_refinements() {
+            if seen.insert(Rc::as_ptr(v)) {
+                let lowers: Vec<Type> = v
+                    .bounds
+                    .borrow()
+                    .lower()
+                    .iter()
+                    .map(|b| b.ty.clone())
+                    .collect();
+                for lower in lowers {
+                    collect(&lower, seen, out);
+                }
+            }
+            return;
+        }
+        if let Type::Fun { capabilities, .. } = ty {
+            out.extend(match capabilities.repr() {
+                Repr::Var(v) => v.resolved().into_iter().collect(),
+                _ => Capabilities::capabilities_of(capabilities),
+            });
+        }
+        ty.walk_children(|child| collect(child, seen, out));
+    }
+    let mut out = Vec::new();
+    collect(ty, &mut HashSet::new(), &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ccl::Name;
     use crate::ccl::infer::typing::Typing;
-    use crate::ccl::provenance::NodeId;
 
     /// A variable minted inside `scoped` carries the binder in its telescope,
     /// and one minted outside does not. This is the threading end to end

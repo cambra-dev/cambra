@@ -4447,12 +4447,15 @@ frame's filter. Capabilities are recorded on the node that does them:
 
 A value read is a mention whose handle becomes its value (`read_value` in `emit.rs`). A mention
 passed by reference, or to `await_final`, stays a handle and reads nothing. A parameter's history is
-its argument's, so a capability naming a parameter is not recorded. A `MutDecl` binder is declared,
-not a parameter (`Typing::declare_mutable`). `InferCtx::record_capability` records a read or a write
-of a declared transactional variable as `ReadTxn(𝑥)` or `WriteTxn(𝑥)`, which belong to the run, so
-no scope discharges them; a `Mut` parameter's is its argument's, which the call records. Lowering
-refuses a transactional variable declared in a function body, so every transactional binder is at
-depth 0.
+its argument's, so a capability naming a parameter is `CapabilityBound::Parameter`, which no
+function body's filter admits: the nodes doing it keep it, a statement's below among them. A
+`MutDecl` binder is declared, not a parameter (`Typing::declare_mutable`).
+`InferCtx::record_capability` records a read or a write of a declared transactional variable as
+`ReadTxn(𝑥)` or `WriteTxn(𝑥)`, which belong to the run, so no scope discharges them.
+`bind_capability_name` marks only a declared variable transactional, so a `Mut` parameter's read or
+write, of a transactional variable or not, is `Read(𝑥)` or `Write(𝑥)` bound at the parameter; the
+call records its argument's. Lowering refuses a transactional variable declared in a function body,
+so every transactional binder is at depth 0.
 
 **A feed reached through another name is not tracked.** A capability is keyed by the name it is
 recorded through. A `Mut` handle cannot travel, so for a `Mut` that name is always the variable.
@@ -4484,6 +4487,24 @@ compute function's capabilities stay in its type. A chain's and a cast's capabil
 of their parts' (`Typing::composed_capabilities`). The kind is the lowering stamp where the node
 carries one, as `emit_node` applies it.
 
+### Checks that read a body's capabilities
+
+**Statements.** An expression statement a program writes before its block's last statement gets a
+capability variable of its own around its expression's, which keeps every capability, the enclosing
+function's own variables' included, as every node's does (`Typing::statement`; lowering labels each
+one `lower::EXPRESSION_STATEMENT`, which `lower::expression_statements` reads). A parameter's
+capability is `Bound::Parameter`: it reaches the statement's variable and no function body's type. A
+statement whose variable causes nothing is inert (`InferError::InertStatement`), unless it reaches a
+call variable with nothing flowing into it, the call of a function a polymorphic definition takes as
+a parameter, which only each use determines (`InferCtx::inert_statements`). Inference returns the
+inert statements, and the compile reports them only where inference reports no error: an argument
+passed wrongly by reference, which inference refuses, is the more precise diagnosis.
+
+**Public functions.** A public function's capabilities naming an induction variable of the top
+level, `Bound::At(0)`, are an error at its `let` (`InferError::VariablePastItsScope`). An append to
+a private feed instead joins the top level's capabilities, since other modules append to the feed
+through the function (`InferCtx::exported_capabilities`).
+
 ### Polymorphism and materialization
 
 **Levels.** A capability variable is minted at the emission level. `type_level` leaves capabilities
@@ -4511,7 +4532,7 @@ which flows into the node's, and a node's variable flows into its parent's, but 
 begin():` block's less `Transaction`, which the block supplies, and not into a lambda's: making a
 function does nothing. A function body's frame is its body node's variable seen through the frame's
 filter, which keeps out what names a variable the body binds or a parameter, whose history is its
-argument's (`ScopedCapability::parameter`).
+argument's (`Bound::Parameter`).
 
 A clone's copies hold what its use's arguments bring, which the pin joining it to the use carries
 in, so one clone has one set of capabilities at each node. Uses whose arguments bring different

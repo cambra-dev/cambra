@@ -180,18 +180,6 @@ fn clauses_of(code: &str, member: &str) -> String {
     "bump_stock",
     "requires ReadTxn(stock) causes WriteTxn(stock), RunTransaction"
 )]
-// A read of an induction variable the function does not bind requires it.
-#[case(
-    indoc! {"
-        cnt := 0
-        for x in [1, 2]:
-            cnt += x
-        pub def peek(n: Int) => Int:
-            cnt + n
-    "},
-    "peek",
-    "requires Read(cnt)"
-)]
 fn a_contract_states_what_the_function_causes(
     #[case] code: &str,
     #[case] member: &str,
@@ -277,6 +265,152 @@ fn a_feed_reached_through_another_name(
     #[case] expected: &str,
 ) {
     assert_eq!(clauses_of(code, member), expected);
+}
+
+/// An expression statement before its block's last statement, or anywhere in a loop body, is
+/// evaluated only for what it causes, so one that causes nothing is refused (`docs/chl-spec.md`,
+/// "4.9 Expression statement"), in every module of the program.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_pure_call(
+    indoc! {"
+        def f(x):
+            x + 1
+        f(3)
+        2
+    "},
+    ""
+)]
+#[case::arithmetic(
+    indoc! {"
+        x = 1
+        x + 1
+        2
+    "},
+    ""
+)]
+#[case::in_a_loop_body(
+    indoc! {"
+        cnt := 0
+        for x in [1, 2]:
+            x + 1
+            cnt += x
+        cnt
+    "},
+    ""
+)]
+#[case::in_a_loop_in_a_def(
+    indoc! {"
+        def total(xs):
+            c := 0
+            for x in xs:
+                x + 1
+                c += x
+            c
+        total([1, 2])
+    "},
+    ""
+)]
+#[case::in_a_run_module(
+    indoc! {"
+        run lib as l
+        1
+    "},
+    indoc! {"
+        visits: Mut(Int, Txn) := 0
+        x = 1
+        x + 1
+    "}
+)]
+#[case::in_an_imported_function(
+    indoc! {"
+        import lib
+        lib::f(1)
+    "},
+    indoc! {"
+        pub def f(n):
+            n + 1
+            n
+    "}
+)]
+fn an_expression_statement_that_causes_nothing_is_refused(#[case] root: &str, #[case] lib: &str) {
+    let modules: &[(&str, &str)] = if lib.is_empty() { &[] } else { &[("lib", lib)] };
+    let errors = super::modules::compile_errors(&program(root, modules));
+    assert!(
+        errors.contains("this statement causes nothing and its value is discarded"),
+        "{errors}"
+    );
+}
+
+/// The root's last statement is the program's value, so `cambra check` keeps it, as running the
+/// program does.
+#[test]
+fn a_roots_last_statement_is_its_value() {
+    interface_of(indoc! {"
+        x = 1
+        x + 1
+    "});
+}
+
+/// A statement calling a function parameter does what the function each use passes does,
+/// which the definition does not know, so the definition does not refuse it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_statement_calling_a_parameter_is_kept() {
+    super::helpers::check_program_scalar(
+        &program(
+            indoc! {"
+                def each(f, x):
+                    f(x)
+                    x
+                each(\\y -> y + 1, 2)
+            "},
+            &[],
+        ),
+        cambra::interpreter::Value::Int(2),
+    );
+}
+
+/// A public function whose type names an induction variable of its module would let another
+/// module read or write it (`docs/chl-spec.md`, "9.10 Induction variables stay in their
+/// module"), whether the module is checked on its own or is the root of a program that runs.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_read(
+    indoc! {"
+        pub def current(n: Int):
+            cnt + n
+    "},
+    "has `Read(cnt)`"
+)]
+#[case::in_a_tuple("pub api = (\\n -> cnt + n, 0)\n", "has `Read(cnt)`")]
+#[case::in_a_record("pub api = (read=\\n -> cnt + n)\n", "has `Read(cnt)`")]
+#[case::in_a_returned_function(
+    indoc! {r#"
+        pub def maker(n: Int):
+            \x -> cnt + x + n
+    "#},
+    "has `Read(cnt)`"
+)]
+#[case::a_write(
+    indoc! {"
+        def bump(c: Mut(Int)):
+            c += 1
+        pub def tick(n: Int):
+            bump(cnt)
+            n
+    "},
+    "has `Write(cnt)`"
+)]
+fn a_public_function_naming_an_induction_variable_is_refused(
+    #[case] code: &str,
+    #[case] needle: &str,
+) {
+    let code = format!("cnt := 0\nfor x in [1, 2]:\n    cnt += x\n{code}");
+    let errors = errors_of(&code);
+    assert!(errors.contains(needle), "{errors}");
+    let errors = super::modules::compile_errors(&program(&format!("{code}0\n"), &[]));
+    assert!(errors.contains(needle), "{errors}");
 }
 
 /// A transactional variable belongs to the run, so it is declared at a module's top level

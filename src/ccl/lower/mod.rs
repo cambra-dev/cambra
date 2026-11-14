@@ -732,6 +732,10 @@ pub struct LoweringContext {
     /// Where the module being lowered performs IO, if it does: the first call to
     /// a registered source (`docs/chl-spec.md`, "9.7 Importing asserts a shareable module").
     pub(super) io_site: Option<Span>,
+    /// The root's last statement, where `cambra check` lowers the root as a module: the
+    /// program's value, as it is where the program runs, so not an expression statement
+    /// ([`EXPRESSION_STATEMENT`]).
+    pub(super) root_value: Option<Span>,
     /// Each reference to a name a run's `use` clause binds, by its node, with
     /// where it is written ([`Self::reference`]).
     pub(super) run_use_reads: HashMap<crate::ccl::provenance::NodeId, Span>,
@@ -771,6 +775,9 @@ pub struct LoweringContext {
     /// inference rather than a module check, so they are kept here for the rule that decides
     /// whether a module is imported or run (`docs/chl-spec.md`, "Shareable modules").
     pub(crate) root_statements: Vec<modules::ModuleStatement>,
+    /// What the root declares, which tells the linked program's inference the root's public
+    /// members, as a module check is told its module's.
+    pub(crate) root_interface: Option<Rc<modules::Interface>>,
     /// Where each run of the linked program is brought in
     /// ([`modules::RunSites`]).
     pub(crate) run_sites: modules::RunSites,
@@ -1473,6 +1480,26 @@ impl LoweringContext {
     pub(super) fn fresh_callee_name(&mut self) -> String {
         self.mint_synthetic_id("__callee")
     }
+}
+
+/// The rewrite label of the `ExprStmt` an expression statement lowers to, one the program
+/// writes before its block's last statement, which inference refuses when it causes nothing
+/// (`docs/chl-spec.md`, "4.9 Expression statement"). A statement lowering builds for a loop,
+/// an `if` or a `match` is not one. Every copy of the statement keeps its label, so the
+/// statements of each run and shared import of a module are found by it
+/// ([`expression_statements`]).
+pub(crate) const EXPRESSION_STATEMENT: RewriteLabel = "lower.expression_statement";
+
+/// The `ExprStmt` of each expression statement in the trees `projection` attributes
+/// ([`EXPRESSION_STATEMENT`]).
+pub(crate) fn expression_statements(
+    projection: &crate::ccl::provenance::SourceProjection,
+) -> HashSet<crate::ccl::provenance::NodeId> {
+    projection
+        .iter()
+        .filter(|(_, attribution)| attribution.rewritten.label == EXPRESSION_STATEMENT)
+        .map(|(&id, _)| id)
+        .collect()
 }
 
 /// Prefix for synthetic parameter names representing the tupled domain of a
