@@ -1319,6 +1319,19 @@ pub fn admits_resolved(
     admits(d, k, &id, &id, d, d, &mut cache, scope, Membership::Check).is_ok()
 }
 
+/// [`admits_resolved`] under a walk's whole witness context rather than a list of binders.
+pub fn admits_in_context(
+    d: &Type,
+    k: &TypeKind,
+    ctx: &crate::ccl::ty::WitnessContext,
+    scope: &dyn ScopeEnv,
+) -> bool {
+    let mut cache = ConstrainCache::for_derivation(Derivation::PostPass);
+    cache.seed_context(ctx);
+    let id = Subst::id();
+    admits(d, k, &id, &id, d, d, &mut cache, scope, Membership::Check).is_ok()
+}
+
 /// [`admits_resolved`] for a whole resolved kind: whether `k` contains `sub`, run as a check.
 pub fn contains_resolved(
     sub: &TypeKind,

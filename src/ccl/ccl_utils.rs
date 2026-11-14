@@ -143,6 +143,25 @@ pub(crate) fn tag_case_to_guard_case(case: Expr) -> Expr {
     rebuilt
 }
 
+/// [`tag_case_to_guard_case`] for a `match` that selects a value. Its tags are exhaustive, so
+/// the last arm needs no test, and it becomes the trailing `true` arm in place of the `unit`
+/// arm a statement's `match` falls through to.
+pub(crate) fn value_tag_case_to_guard_case(case: Expr) -> Expr {
+    let has_default = matches!(&case.node, TypedExprNode::Case { branches, .. }
+        if branches.last().is_some_and(|b| b.pattern.is_none()));
+    let mut guarded = tag_case_to_guard_case(case);
+    if !has_default {
+        let TypedExprNode::Case { branches, .. } = &mut guarded.node else {
+            unreachable!("tag_case_to_guard_case builds a Case")
+        };
+        let fallthrough = branches
+            .pop()
+            .expect("tag_case_to_guard_case appends the fall-through arm");
+        branches.last_mut().expect("a match has an arm").guard = fallthrough.guard;
+    }
+    guarded
+}
+
 /// `scrut ▷ variant_is(tag)`: the guard a tag-dispatching arm reads as.
 pub(crate) fn tag_test(scrut: &Expr, tag: Label) -> Expr {
     let bool_ty = Type::Base(BaseType::Bool);
@@ -576,7 +595,10 @@ pub(crate) fn predicate_term(term: &Expr) -> Expr {
 ///   `𝑥 ▷ (𝑘 ▷ (𝑓 ▷ converse))` as `𝑥`; a chain `iterate ≫ 𝑓` as `𝑓`;
 ///   `𝑎 ▷ (𝑓 ▷ strength_over)` as `λ 𝑘 → (𝑎, 𝑘 ▷ (𝑎 ▷ 𝑓))`; `𝑥 ▷ (𝑐 ▷ map(𝑔))` as `(𝑥 ▷ 𝑐) ▷ 𝑔`;
 ///   and a `Realize` as the conditional it stages;
-/// - a projection out of a tuple or record former reads the component.
+/// - a projection out of a tuple or record former reads the component;
+/// - a `match` over a constructor's value reads the arm it selects ([`known_constructor`]); a
+///   variant projection reads as the one-arm `match` it compiles ([`projection_as_match`]), and
+///   `𝑥 ▷ variant_wrap(𝑡)` as the constructor `` `𝑡(𝑥) ``.
 ///
 /// Type-blind, as predicate equality is: type slots ride along, and the nodes the rewrite
 /// builds carry none it needs. It mints no node identity, so an equality can run it.
@@ -622,7 +644,10 @@ fn reduce_head(e: Expr, fuel: &mut usize) -> Expr {
         }
         TypedExprNode::Case {
             scrutinee: Some(_), ..
-        } => match_by_tags(e),
+        } => {
+            let e = match_by_tags(e);
+            known_constructor(&e, fuel).unwrap_or(e)
+        }
         // A chain headed by planning's `iterate` is the rest of the chain: `iterate` maps each
         // key to itself, as it does applied.
         TypedExprNode::Compose(steps) if steps.len() > 1 && is_iterate(&steps[0]) => {
@@ -645,6 +670,50 @@ fn is_iterate(e: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+/// A `match` over a value its constructor builds where it stands, `match C(𝑥) { C(𝑝) → body }`,
+/// read as the arm that constructor selects: `body` with `𝑝` bound to `𝑥`. `None` where the
+/// scrutinee is no constructor's value or no arm is known to select it.
+fn known_constructor(e: &Expr, fuel: &mut usize) -> Option<Expr> {
+    let TypedExprNode::Case {
+        scrutinee: Some(scrutinee),
+        branches,
+    } = &e.node
+    else {
+        return None;
+    };
+    let (tag, payload) = match &scrutinee.node {
+        TypedExprNode::NominalCtor {
+            decl,
+            ctor,
+            payload,
+            ..
+        } => (decl.tag(ctor), payload),
+        TypedExprNode::VariantCtor { tag, payload, .. } => (tag.clone(), payload),
+        _ => return None,
+    };
+    // The first arm that matches, which needs a guard known to hold.
+    for branch in branches {
+        if !matches!(branch.guard.node, TypedExprNode::Lit(Lit::Bool(true))) {
+            return None;
+        }
+        match &branch.pattern {
+            Some(pattern) if pattern.tag() == tag => {
+                return Some(normalize(
+                    substitute_term(
+                        branch.body.clone_preserving_ids(),
+                        &pattern.binding.name,
+                        payload,
+                    ),
+                    fuel,
+                ));
+            }
+            Some(_) => continue,
+            None => return Some(branch.body.clone_preserving_ids()),
+        }
+    }
+    None
 }
 
 /// `argument ▷ function` built without an identity, then reduced.
@@ -816,8 +885,19 @@ fn reduce_application(
         TypedExprNode::Builtin(Builtin::Neg) => Some(unary(UnaryOpKind::Neg, a(), ty)),
         TypedExprNode::DisjointJoin(legs) => read_fan_out(argument, legs, ty, fuel),
         TypedExprNode::Builtin(Builtin::FinalOrDefault) => {
-            read_eliminated_match(argument, ty, fuel)
+            read_eliminated_match(argument, ty, fuel).map(|m| reduce_head(m, fuel))
         }
+        TypedExprNode::Builtin(Builtin::VariantProject(FieldKey::Name(tag))) => {
+            Some(reduce_head(projection_as_match(a(), tag, ty), fuel))
+        }
+        TypedExprNode::Builtin(Builtin::VariantWrap(FieldKey::Name(tag))) => Some(
+            Expr::throwaway(TypedExprNode::VariantCtor {
+                tag: tag.clone(),
+                tag_occurrence: Occurrence::PLACEHOLDER,
+                payload: Box::new(a()),
+            })
+            .with_ty(ty.clone()),
+        ),
         TypedExprNode::Builtin(Builtin::BinOp(op)) => {
             // A binary operation's argument is a pair, so one that is not a pair former
             // reads as its two components (tuple η).
@@ -956,6 +1036,36 @@ fn read_eliminated_match(argument: &Expr, ty: &Type, fuel: &mut usize) -> Option
         })
         .with_ty(ty.clone()),
     )
+}
+
+/// `𝑥 ▷ variant_project(𝑡)` read back as the one-arm `match 𝑥 { 𝑡(𝑝) → 𝑝 }` lambda elimination
+/// compiles to it, the arm's head spelled by its tag ([`match_by_tags`]): a `match` over a
+/// one-constructor type, a `std` collection's representation read out of its constructor.
+fn projection_as_match(scrutinee: Expr, tag: &Label, ty: &Type) -> Expr {
+    let payload = Name::fresh("__match_payload");
+    let read = Expr::throwaway(TypedExprNode::Var(payload.clone())).with_ty(ty.clone());
+    Expr::throwaway(TypedExprNode::Case {
+        scrutinee: Some(Box::new(scrutinee)),
+        branches: vec![Branch {
+            pattern: Some(crate::ccl::Pattern {
+                head: crate::ccl::PatternHead::Tag(tag.clone()),
+                head_occurrence: Occurrence::PLACEHOLDER,
+                binding: TypedBinding {
+                    name: payload,
+                    site: None,
+                    occurrence: Occurrence::PLACEHOLDER,
+                    ty: Type::Hole,
+                    user_annotation: None,
+                    transparency: BindingTransparency::Transparent,
+                },
+                empty_payload: false,
+            }),
+            guard: Expr::throwaway(TypedExprNode::Lit(Lit::Bool(true)))
+                .with_ty(Type::Base(BaseType::Bool)),
+            body: read,
+        }],
+    })
+    .with_ty(ty.clone())
 }
 
 /// `argument ▷ (⊔ᵢ (π̂ᵢ ▷ filter_values ≫ 𝑒ᵢ))` read back as the value `Case` lambda elimination
@@ -2525,6 +2635,17 @@ pub fn is_trivially_true_bare_predicate(bare: &Expr) -> bool {
     matches!(&bare.node, TypedExprNode::Apply { argument, function }
         if matches!(&argument.node, TypedExprNode::Var(n) if n.is_elem())
             && is_trivially_true_predicate(function))
+}
+
+/// Is `bare` constant in the element, `__elem ▷ (𝑔 ▷ const)`? A domain refined by one keeps
+/// every element or none, which is how a branch condition restricts its collection.
+pub fn is_element_constant_bare_predicate(bare: &Expr) -> bool {
+    let TypedExprNode::Apply { argument, function } = &bare.node else {
+        return false;
+    };
+    matches!(&argument.node, TypedExprNode::Var(n) if n.is_elem())
+        && matches!(&function.node, TypedExprNode::Apply { function, .. }
+            if matches!(&function.node, TypedExprNode::Builtin(Builtin::Const)))
 }
 
 /// Refine `base` by an already-**bare** predicate (`__elem ▷ p`), degenerating to

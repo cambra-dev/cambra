@@ -5,8 +5,9 @@
 use crate::ccl::ccl_utils::{TermMemo, strip_refinements};
 use crate::ccl::infer::solver::smt::ScopeEnv;
 use crate::ccl::infer::solver::{
-    ConstrainCache, Derivation, PolyScheme, constrain_subtype_in, constrain_subtype_under_in,
-    fresh_var, prim,
+    ConstrainCache, Derivation, PolyScheme,
+    constrain::admits_in_context,
+    constrain_subtype_in, constrain_subtype_under_in, fresh_var, prim,
     traits::{product_components, product_fields},
 };
 use crate::ccl::infer::{InferError, LocatedInferError};
@@ -1210,9 +1211,7 @@ fn check_realized(
 ) -> Result<Type, LocatedInferError> {
     let bug = |what: String| InferError::Unsupported(format!("{what}; this is a compiler bug"));
     let Some(bodies) = candidate_bodies(recorded.peel_refinements()) else {
-        return Err(ctx.raise(bug(format!(
-            "a realized conditional is typed `{recorded}`, not a sum over listed candidates"
-        ))));
+        return check_realized_domain_membership(legs, recorded, ctx);
     };
     if legs.is_empty() {
         return Err(ctx.raise(bug(format!(
@@ -1246,7 +1245,7 @@ fn check_realized(
         };
         realized[i] = true;
         let body = &bodies[i];
-        // The leg's own domain, which carries its gate, over the body's codomain.
+        // Keep the branch condition in the leg's domain for the subtype check.
         let (Some(leg_dom), Some(codomain)) = (leg_ty.domain(), body.codomain()) else {
             unreachable!("a leg matched a body by its domain, and both are collections")
         };
@@ -1259,6 +1258,56 @@ fn check_realized(
             "the candidate body `{}` of `{recorded}` has no realized leg",
             bodies[i]
         ))));
+    }
+    Ok(recorded.clone())
+}
+
+/// Check each leg's domain for membership in the result sum's type kind. A branch condition
+/// is constant in the element, so membership is checked on the domain before that refinement.
+fn check_realized_domain_membership(
+    legs: &mut [Expr],
+    recorded: &Type,
+    ctx: &mut CheckCtx,
+) -> Result<Type, LocatedInferError> {
+    let bug = |what: String| InferError::Unsupported(format!("{what}; this is a compiler bug"));
+    let head = recorded.peel_refinements();
+    let Some([binder]) = head.sum() else {
+        return Err(ctx.raise(bug(format!(
+            "a realized conditional is typed `{recorded}`, not a sum over one kind"
+        ))));
+    };
+    let kind = binder.type_kind();
+    if legs.is_empty() {
+        return Err(ctx.raise(bug(format!(
+            "a realized conditional typed `{recorded}` has no leg"
+        ))));
+    }
+    for leg in legs.iter_mut() {
+        let leg_ty = ctx.subexpr(leg)?;
+        let Some(leg_dom) = leg_ty.domain() else {
+            return Err(ctx.raise(bug(format!(
+                "a realized leg `{leg_ty}` of `{recorded}` is not a collection"
+            ))));
+        };
+        let mut domain_refinements = crate::ccl::RefinementSet::new();
+        for r in leg_dom.refinements() {
+            if !crate::ccl::ccl_utils::is_element_constant_bare_predicate(&r.predicate) {
+                domain_refinements.insert(r.clone());
+            }
+        }
+        let candidate = Type::refined(leg_dom.peel_refinements().clone(), domain_refinements);
+        if !admits_in_context(&candidate, &kind, &ctx.witness_ctx, &ctx.scope()) {
+            return Err(ctx.raise(bug(format!(
+                "a realized leg's domain `{candidate}` is not in `{recorded}`'s kind"
+            ))));
+        }
+        let body = head.instantiate_sum(&candidate);
+        let Some(codomain) = body.codomain() else {
+            unreachable!("a sum's body is a collection")
+        };
+        // Keep the branch condition in the leg's domain for the subtype check.
+        let expected = Type::fun_like(&body, leg_dom, codomain);
+        ctx.require_sub(&leg_ty, &expected, &|| "realized leg".to_string())?;
     }
     Ok(recorded.clone())
 }

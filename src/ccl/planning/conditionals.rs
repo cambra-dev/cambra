@@ -13,13 +13,9 @@
 //! to (`src/ccl/design/type-inference.md`, "A realized conditional is typed as its sum"). Nothing
 //! that mentions the `Case`'s type changes.
 //!
-//! Only a witness over **named candidates** can be realized here: the legs are the
-//! candidates, so there have to be finitely many, named. A witness a `Case` picks between is
-//! realized. Every other is **materialized**: its `box` stays standing, the identity it is at
-//! runtime, and the value carries the witness in its keys. A jagged list literal's element
-//! position is a listed kind with no `Case` to pick a candidate, and a `List(𝑇)`'s `UIntRanges`
-//! and a `Map(𝐾, 𝑉)`'s `SubtypesOf(𝐾)` are described ones
-//! (`src/ccl/design/collections.md`, "Compiling a conditional collection").
+//! A conditional with enumerated domains accounts for every candidate in its arms. A conditional
+//! with a range kind or a subtype bound can also take an arm's domain from its value. Other sums
+//! keep their `box`; the collection carries its domain at runtime.
 
 use std::rc::Rc;
 
@@ -571,30 +567,55 @@ fn realize(
 /// One arm per branch, with the first-match path condition each is gated by.
 ///
 /// `witness` is the sum this fan-out realizes, absent for a same-domain conditional that
-/// names none. `None` where an arm's domain cannot be read: a multi-candidate arm is a
-/// genuinely nested conditional collection, and an arm naming no candidate needs the runtime
-/// witness, so either way the rewrite does not apply and the `Case` is left for
-/// op-conversion to reject.
+/// names none.
+///
+/// An arm with a known domain supplies it directly. A range kind or subtype bound supplies a
+/// runtime extent for a projected arm domain. Enumerated domains need a known arm domain so
+/// each candidate can be accounted for. The universe supplies no runtime extent.
 fn arm_choices(
     branches: Vec<crate::ccl::Branch>,
     witness: Option<crate::ccl::ty::Witness>,
 ) -> Option<Vec<ArmChoice>> {
+    use crate::ccl::ty::TypeKind;
+
+    let kind = witness.as_ref().map(|w| w.type_kind());
     let mut arms = Vec::new();
     let mut prior_guards: Vec<Expr> = Vec::new();
     // Flatten `elif` chains first, so a nested conditional collapses into one N-choice
     // fan-out rather than a union of unions.
     for b in flatten_trailing_value_case(branches) {
-        let dom = arm_domain(&b.body.ty)?;
+        let (arm, dom) = match arm_domain(&b.body.ty) {
+            Some(dom) => (discharge_determined_witnesses(b.body), dom),
+            None => match &kind {
+                Some(TypeKind::UIntRanges | TypeKind::SubtypesOf(_)) => unboxed_arm(b.body)?,
+                _ => return None,
+            },
+        };
         let gate = synthesize_arm_predicate(&b.guard, &prior_guards);
         prior_guards.push(b.guard);
         arms.push(ArmChoice {
             witness: witness.clone(),
             gate,
-            arm: discharge_determined_witnesses(b.body),
+            arm,
             dom,
         });
     }
     Some(arms)
+}
+
+/// `arm ▷ unbox`, the collection a sum-typed arm holds, with its domain: the projection of
+/// the arm's own witness. `None` when the arm's type binds no witness.
+fn unboxed_arm(arm: Expr) -> Option<(Expr, Type)> {
+    let _g = provenance::enter(
+        arm.node_id(),
+        "planning.unboxed_arm",
+        provenance::Nature::Machinery,
+    );
+    let stamp = crate::ccl::ty::unbox_type(&arm.ty)?;
+    let ty = crate::ccl::ty::unboxed_type(&arm.ty, &Rc::new(arm.clone()))?;
+    let dom = ty.domain()?;
+    let unboxed = Expr::apply(arm, Expr::builtin(Builtin::Unbox).with_ty(stamp)).with_ty(ty);
+    Some((unboxed, dom))
 }
 
 /// An arm with every **determined** witness discharged — the term *and* the types.
@@ -893,15 +914,17 @@ fn erase_determined_boxes(
     // nothing is recorded, and `instantiate_erased_witnesses` must not touch a binder that
     // is still live in the argument.
     //
-    // **Except one stating a described sum.** It re-views the argument's sum as the one its
-    // position declares — a mutable variable's seed restated at its value type is the case
-    // (`mut_elim::view_values_at_value_type`) — and the argument's own sum may be one this pass
-    // erases. Erasing both would leave a plain collection where the declared sum stands, so
-    // this one stays as the entry into that sum, which op-conversion takes as the identity.
-    let described = stated
-        .witness_kind()
-        .is_some_and(|k| !matches!(k, crate::ccl::ty::TypeKind::Enumerated(_)));
-    if argument.ty.peel_refinements().sum().is_some() && !described {
+    // A box that establishes a range kind, subtype bound, or the universe must survive
+    // erasure of the argument's own sum. It carries the result's declared type kind.
+    let preserves_result_kind = matches!(
+        stated.witness_kind(),
+        Some(
+            crate::ccl::ty::TypeKind::UIntRanges
+                | crate::ccl::ty::TypeKind::SubtypesOf(_)
+                | crate::ccl::ty::TypeKind::Type
+        )
+    );
+    if argument.ty.peel_refinements().sum().is_some() && !preserves_result_kind {
         return ((**argument).clone(), true);
     }
     // Only a determined witness — one candidate — is erasable.

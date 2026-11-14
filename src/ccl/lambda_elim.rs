@@ -2292,6 +2292,41 @@ fn elim_lambda_impl(
             Ok(typed_compose(vec![payload_pf, vw]).with_ty(result_ty))
         }
 
+        // **A one-arm match whose arm reads `param`** takes the payload apart as a `let` does:
+        // `λ 𝑥 → match 𝑠 { 𝑐(𝑤) → 𝑒 }` is the application `(𝑠 ▷ variant_project(𝑐)) ▷ (λ 𝑤 → 𝑒)`,
+        // and the application and nested-lambda rules carry `𝑤` beside the argument, as a
+        // dependent pair where the payload's type reads `param`: a collection built under the
+        // lambda and taken out of its constructor has keys chosen by `param`. The fan-out below
+        // pairs the two as a plain tuple, which a payload reading `param` does not fit.
+        TypedExprNode::Case {
+            scrutinee: Some(scrut),
+            branches,
+        } if branches.len() == 1
+            && branches[0].pattern.is_some()
+            && is_free(param, &branches[0].body) =>
+        {
+            let _g = provenance::enter(
+                body_id,
+                "lambda_elim.one_arm_match_as_application",
+                provenance::Nature::Machinery,
+            );
+            let consumed = arms_variant(&branches, &scrut.ty);
+            let [br] = <[Branch; 1]>::try_from(branches).expect("guarded: one branch");
+            debug_assert!(
+                matches!(&br.guard.node, TypedExprNode::Lit(Lit::Bool(true))),
+                "a scrutinee-Case branch carries the trivial guard"
+            );
+            let pat = br.pattern.expect("guarded: the branch binds a pattern");
+            let payload_ty = pat.binding.ty.clone();
+            let w = pat.binding.name.clone();
+            let vp = Expr::builtin(Builtin::VariantProject(FieldKey::Name(pat.tag())))
+                .with_ty(Type::fun(consumed, payload_ty.clone()));
+            let payload = Expr::apply(*scrut, vp).with_ty(payload_ty.clone());
+            let lambda = Expr::lambda(&w, pat.binding.occurrence, payload_ty, br.body);
+            let application = Expr::apply(payload, lambda).with_ty(body_ty.clone());
+            elim_lambda_kinded(ctx, param, param_ty, application, fun_kind)
+        }
+
         // A **scrutinee-`Case`** over a variant inside a lambda body
         // (`λ param → match scrut { cᵢ(wᵢ) → eᵢ }`): the point-free **union of
         // tag-restricts**. The branch tags *partition* the scrutinee's domain,
@@ -2800,6 +2835,46 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             Ok(result)
         }
 
+        // **A one-arm match in value position is a `let`** of its payload:
+        // `match 𝑠 { 𝑐(𝑤) → 𝑒 }` is `let 𝑤 = 𝑠 ▷ variant_project(𝑐) in 𝑒`. The one tag
+        // is every tag the scrutinee carries, so the projection is total and there is
+        // nothing to select between: no one-shot driver, no union, no collapse. That
+        // also holds when `𝑒` is a collection, which the C-form below cannot collapse to.
+        TypedExprNode::Case {
+            scrutinee: Some(scrut),
+            branches,
+        } if branches.len() == 1 && branches[0].pattern.is_some() => {
+            let _g = provenance::enter(
+                node_id,
+                "lambda_elim.one_arm_match_as_let",
+                provenance::Nature::Machinery,
+            );
+            let consumed = arms_variant(&branches, &scrut.ty);
+            let [br] = <[Branch; 1]>::try_from(branches).expect("guarded: one branch");
+            debug_assert!(
+                matches!(&br.guard.node, TypedExprNode::Lit(Lit::Bool(true))),
+                "a scrutinee-Case branch carries the trivial guard"
+            );
+            let pat = br.pattern.expect("guarded: the branch binds a pattern");
+            let payload_ty = pat.binding.ty.clone();
+            let vp = Expr::builtin(Builtin::VariantProject(FieldKey::Name(pat.tag())))
+                .with_ty(Type::fun(consumed, payload_ty.clone()));
+            let payload = Expr::apply(*scrut, vp).with_ty(payload_ty);
+            // An arm answering its payload is the projection itself.
+            if matches!(&br.body.node, TypedExprNode::Var(v) if *v == pat.binding.name) {
+                return elim_lambdas(ctx, payload);
+            }
+            let result = elim_lambdas(ctx, Expr::let_in(pat.binding, payload, br.body))?;
+            // The `let` lifts its body's type past the binder by discharging it with
+            // the projection, where the `Case` was typed with the binder discharged by
+            // inference; the two name one value.
+            #[cfg(debug_assertions)]
+            {
+                reclosed_let_ty = true;
+            }
+            Ok(result)
+        }
+
         // A **scalar scrutinee-`Case`** — a `match` in value position with no
         // enclosing lambda. Compiles to the same C-form the scalar *guard*-`Case`
         // uses, with the boolean gate replaced by the tag projection.
@@ -2811,6 +2886,21 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             .enumerate()
             .all(|(i, b)| b.pattern.is_some() || i + 1 == branches.len()) =>
         {
+            // A collection-valued `match` selects by tag tests as an `if` selects by its
+            // guards, and is left standing for planning to realize, as the guard `Case` above
+            // is. The C-form collapses one row to a scalar, which a collection
+            // standing under an enclosing loop's positions is not.
+            if is_collection_result(&ty) {
+                let case = Expr::new(TypedExprNode::Case {
+                    scrutinee: Some(scrut),
+                    branches,
+                })
+                .with_ty(ty);
+                return elim_lambdas(
+                    ctx,
+                    crate::ccl::ccl_utils::value_tag_case_to_guard_case(case),
+                );
+            }
             let result = build_scrutinee_case_cform(ctx, *scrut, branches, ty)?;
             Ok(result)
         }
