@@ -376,9 +376,9 @@ struct KeyReadInfo {
     /// The per-commit value extent for [`StoreValueStream`] (`commit` stores
     /// only; the accumulator value extent for induction stores).
     value_extent: Extent,
-    /// Whether the key is a reply tap read keyed by the item each value was committed for
-    /// rather than by commit time: it holds `(item position, value)` pairs, and a read
-    /// re-keys them by position ([`RekeySorted`]).
+    /// Whether the key is a commit store's reply tap, read keyed by the item each value was
+    /// committed for: it holds `(item position, value)` pairs, and a read re-keys them by
+    /// position ([`RekeySorted`]).
     by_item: bool,
     /// Whether the variable's declared type mentions a nominal type, whose value no
     /// reload carries over yet ([`StateConflict::NominalState`]). Read only for a
@@ -2724,20 +2724,6 @@ fn convert_impl_inner(
             ))
         }
 
-        // `by_commit_time` heads a reply tap binding, which letrec pattern recognition
-        // consumes whole (a read of the tap becomes a read of the store's field). Reaching
-        // this arm means a transactional `LetRec` group escaped recognition.
-        TypedExprNode::Apply { function, .. }
-            if as_builtin(function) == Some(Builtin::ByCommitTime) =>
-        {
-            Err(ConversionError::Unsupported(
-                "by_commit_time (a reply tap's re-keying by commit time) reached operator \
-                 conversion — letrec pattern recognition (the unified phase, \
-                 src/ccl/design/mutability.md) must consume it before this pass"
-                    .into(),
-            ))
-        }
-
         // `as_of_read` is a fed-out mutable variable read still missing its position, and
         // `rewrite_as_of_reads` pairs every one with its reading loop to build the `AsOf`
         // join. Reaching this arm means one was never paired and the check at the end of
@@ -3991,19 +3977,16 @@ fn body_tap_fields(body_ty: &Type) -> Vec<(Label, Type)> {
         .collect()
 }
 
-/// The extent of the value a store holds for writer `w`'s reply tap `field`, of type `tap_ty`: the
-/// tap's own, and for a tap read keyed by item ([`WriterSite::item_taps`]) the pair of the item's
-/// source position and that value, which the writer commits and `RekeySorted` re-keys.
+/// The extent of the value a commit store holds for writer `w`'s reply tap, of type `tap_ty`: the
+/// pair of the item's source position and the tap's value, which the writer commits and
+/// `RekeySorted` re-keys. A transaction's tap is keyed by the item it ran for
+/// (`src/ccl/design/mutability.md`, "Replies ride their transaction").
 fn stored_tap_extent(
     w: &WriterSite,
-    field: &Label,
     tap_ty: &Type,
     ctx: &mut OpConversionContext,
 ) -> Result<Extent, ConversionError> {
     let value = ctx.extent_of(tap_ty)?;
-    if !w.item_taps.contains(field) {
-        return Ok(value);
-    }
     let positions = w.source.ty.domain().ok_or_else(|| {
         ConversionError::TypeError(format!(
             "transact writer source must have function type, got {}",
@@ -4231,7 +4214,7 @@ fn build_commit_store(
         for (field, tap_ty) in taps {
             store_values.insert(
                 field.runtime_key(),
-                Tiling::Scalar(stored_tap_extent(w, field, tap_ty, ctx)?),
+                Tiling::Scalar(stored_tap_extent(w, tap_ty, ctx)?),
             );
         }
     }
@@ -4322,9 +4305,9 @@ fn build_commit_store(
             read_extents,
             item_extent,
             drive_resume,
-            // A tap keyed by item commits with its item's position, which the driver's rows
-            // carry for the writer.
-            !w.item_taps.is_empty(),
+            // A tap commits with its item's position, which the driver's rows carry for the
+            // writer.
+            !taps.is_empty(),
         );
         // Two slots of the driver: the body consumes rows, and the writer acks
         // finished attempts. The driver advances its item cursor on the release
@@ -4353,12 +4336,12 @@ fn build_commit_store(
         let mut write_keys: Vec<Value> = w.write_keys.iter().map(runtime_key).collect();
         let mut tap_fields: Vec<Label> = Vec::with_capacity(taps.len());
         for (field, tap_ty) in taps {
-            let tap_value_extent = stored_tap_extent(w, &field, &tap_ty, ctx)?;
+            let tap_value_extent = stored_tap_extent(w, &tap_ty, ctx)?;
             write_keys.push(store_key(&field));
             let prior = keys_map.insert(
                 field.clone(),
                 KeyReadInfo {
-                    by_item: w.item_taps.contains(&field),
+                    by_item: true,
                     // A reply tap is a per-commit event, not a persistent value:
                     // emit it only at the tick that wrote it, so two writers'
                     // taps to one defer don't smear across the shared clock. It
@@ -4389,7 +4372,6 @@ fn build_commit_store(
             w.read_keys.iter().map(runtime_key).collect(),
             write_keys,
             tap_fields.iter().map(Label::runtime_key).collect(),
-            w.item_taps.iter().map(Label::runtime_key).collect(),
             key_extent.clone(),
             value_extent.clone(),
         );

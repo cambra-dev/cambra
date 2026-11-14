@@ -610,7 +610,6 @@ Symbolic rendering: `letrec 𝑏₁ = 𝑒₁; …; 𝑏ₙ = 𝑒ₙ in body`.
 | `get_prev_seq` | `(𝐼 ⤇ 𝑉, 𝐼, 𝑉) ⇒ 𝑉` | history value at the predecessor of the given position; default at the first |
 | `get_prev_txn` | `(𝐼 ⤇ {time: Txn, write: 𝑉}, Txn, 𝑉) ⇒ 𝑉` | write of the latest commit strictly before the given time; default if none |
 | `begin_<site>` | `𝐼 ⇒ Txn` | the commit-time oracle for one `with begin():` site — where site `𝑠`'s iteration `𝑟` lands in the global commit order |
-| `by_commit_time` | `(𝐼 ⤇ {time: Txn, …}) ⇒ (Txn ⤇ {time: Txn, …})` | one site's commit records keyed by the commit time each carries. A denied iteration's record carries a time too in the model, where `begin_<site>` is injective over iterations; the engine allocates no tick for it. The tap's ``variant_project(`commit)`` drops it. Heads each in-block reply tap, so a reply's keys have type `Txn`; a [block's value](#a-block-in-value-position) is read keyed by item and does not pass through it |
 | `final_or_default` | `(𝐷 ⤇ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed stream; the default if the domain is empty. Compiles to `ExtractFinal`. A mutable variable's final value is `final_read`, a different term |
 | `final_read` | `(𝐷 ⤇ 𝑉) ⇒ 𝑉` | a mutable variable's value where its writers finish, sampled from the settled store, and its seed where they wrote nothing. `mut_elim` mints it for a loop's trailing read and `transact_phase` for `await_final`; it compiles to `StoreFinalRead`, one per enclosing position for an inner loop's |
 | `as_of_read` | `(Txn ⤇ 𝑉) ⇒ 𝑉` | a commit history read at an unspecified position — every fed-out mutable variable read. `rewrite_as_of_reads` pairs it with the reading loop that indexes it and builds the `AsOf` join; an unpaired one is a compile error, since nothing downstream supplies a position |
@@ -900,8 +899,9 @@ Input: a typed, inlined, surface-CCL tree. Output: pure CCL (`let`/`letrec` alge
    `λ 𝑡 → get_prev_txn(view, 𝑡, init)` over the (merged, per-key-viewed) commit streams.
 4. **Routes feeds**: each channel becomes a letrec-body output, unioned (`++`) across sites. A
    feed outside a `with begin():` block is a function over its contributing loop's domain. A feed
-   inside one reads its value off the commit record (a per-commit tap), keyed by commit time
-   through `by_commit_time`, so its domain is `Txn`. A feed under nested loops is keyed by the
+   inside one reads its value off the commit record (a per-commit tap), keyed by the item the
+   transaction ran for, so its domain is its site's source domain ([Replies ride their
+   transaction](#replies-ride-their-transaction)). A feed under nested loops is keyed by the
    tuple of every enclosing loop's position. An inner loop that writes nothing outside it is not
    a recurrence: each of its feeds is a tap of the enclosing loop's decision, one collection per
    enclosing position in the form a nested comprehension lowers to. A tap holds a collection
@@ -1250,7 +1250,8 @@ causal matcher (`letrec::check_letrec_causal`).
 - **`StoreValueStream`** — projects one key's commit-value stream, commit time ⇀ `V`, by folding the
   store changelog, on the axis the key's registration fixes: a mutable variable's **carry** stream
   gains a position at every commit tick and is the fold `AsOf` samples; an **in-block reply tap**
-  (`out << e` inside a block) appears only at the ticks that wrote it. The terminal read
+  (`out << e` inside a block) appears only at the ticks that wrote it, each value paired with the
+  item it answers, which `RekeySorted` re-keys it by. The terminal read
   [`await_final`](#await_final) does not come through here: it is `final_read`, compiling to
   `StoreFinalRead`, which samples the key once its own writers have drained.
 
@@ -1396,14 +1397,31 @@ Three shapes:
   snapshot. The `as_of` arm is a leaf that op-conversion's `zip` co-iterates with the request stream
   (the same `is_leaf_zip_arm` path as the commit-decision read above) — no new operator.
 
-**commit-ordered / commit-gated reply (reply *inside* the writing block).** A `<<` inside the block
-rides the writer decision as a `__to_<defer>` tap, committed atomically with the mutable variable write and
-read back as a per-commit value-stream (commit-tick-indexed). So it is **sequenced after the commit**
-and **gated**: a denied transaction (`if 𝑝:` false) proposes no write and emits no tap, replying
-nothing. The tap may read an induction accumulator (`resp << cnt`), which composes with the
-commit-decision co-iteration above. Contrast a sibling reply *outside* the block (`resp << cnt`),
-which rides the induction domain and fires every iteration regardless of commit — value-correct,
-request-indexed, but not commit-ordered. To gate or commit-order a reply, put it in the block.
+### Replies ride their transaction
+
+A `<<` inside a writing block rides the writer decision as a `__to_<defer>` tap, committed
+atomically with the block's writes. It is **sequenced after the commit** and **gated**: a denied
+transaction (`if 𝑝:` false) proposes no write and emits no tap, replying nothing. The tap may read
+an induction accumulator (`resp << cnt`), which composes with the commit-decision co-iteration
+above.
+
+A reply is keyed by the item its transaction ran for, the key the site's commit records carry:
+`plan_store` binds ``tap = commits_j ≫ .decision ≫ variant_project(`commit) ≫ .field : 𝐼 ⤇
+{`fired{𝑉} | `idle}``, and `channelize` routes the fired values. A request's reply therefore answers
+that request, which is what an HTTP route's response sink dispatches on. The commit order decides
+what each transaction read, and the key says which iteration replied.
+
+At runtime the store keys the tap by commit tick, as it keys every write. The `TransactWriter`
+commits each tap value as the pair of the item's source position, which the `TransactDriver`'s rows
+carry, and the value, and op-conversion reads the tap through `RekeySorted`, which re-keys the
+pairs by position. That re-keying rests on a site committing its items once each and in its
+source's order, which the `TransactDriver` guarantees by driving one item at a time
+([design-operators.md](../../interpreter/design-operators.md#the-commit-operator-interpretercommit_operatorrs),
+`RekeySorted`).
+
+A sibling reply outside the block (`resp << cnt`) rides the induction domain and fires every
+iteration regardless of commit: request-indexed and value-correct, but not commit-ordered. To gate
+or commit-order a reply, put it in the block.
 
 ### A block in value position
 
@@ -1416,10 +1434,9 @@ merges a tail `Case` that writes as it merges a bound one, so the feed sits on t
 path feeds it, so every path commits: a path that writes nothing proposes an empty write set and
 its read set, which the commit engine validates like any other proposal.
 
-`plan_store` binds the feed's tap keyed by the item it was committed for, as the commit records
-are, rather than by commit time, and does not hoist it into a channel:
-``tap = commits_j ≫ .decision ≫ variant_project(`commit) ≫ .field : 𝐼 ⤇ {`fired{𝑉} | `idle}``,
-with no `by_commit_time`. The block's values are `__values = tap ≫ variant_project(`fired) : 𝐼 ⤇
+`plan_store` binds the feed's tap keyed by item, as every tap ([Replies ride their
+transaction](#replies-ride-their-transaction)), and does not hoist it into a channel. The block's
+values are `__values = tap ≫ variant_project(`fired) : 𝐼 ⤇
 𝑉`:
 
 - **Outside a loop** the site runs over the singleton `[unit]`, as a standalone statement block
@@ -1431,11 +1448,7 @@ with no `by_commit_time`. The block's values are `__values = tap ≫ variant_pro
   function of its item (`carry_position`): a writer body is one of its snapshot and its item
   alone.
 
-Recognition records a tap read keyed by item on its writer (`WriterSite::item_taps`), and inference
-types its history over the writer source's domain. The commit store keys the tap by commit time,
-as every tap: the writer commits it as the pair of the item's source position, which the driver's
-rows carry, and the value, and op-conversion reads it through `RekeySorted`, which re-keys the
-pairs by position. An item's value is final at its commit
+An item's value is final at its commit
 ([design-operators.md](../../interpreter/design-operators.md#the-commit-operator-interpretercommit_operatorrs),
 `RekeySorted`).
 
@@ -1572,22 +1585,13 @@ their writes and outputs would stand whatever the block decides
 (`refuse_uncompiled_aborting_blocks`). Such a block in a branch is refused as [A block in a
 branch](#a-block-in-a-branch) describes.
 
-### A reply's `Txn` domain overstates its keys [Interim]
+### A reply's domain overstates its keys
 
-A commit-gated reply is typed `Txn ⤇ 𝑉`, but it holds a value only at the commits where its own
-site fired the tap: another site's commit, a denied iteration and an idle tap leave no key. The type
-names the clock the keys are drawn from rather than the keys present. `Txn` has no static extent, so
-a reader iterates the tile's keys rather than the domain. The one place the domain decides anything
-is op-conversion's choice of a commit store for a `Txn` domain, and `recognize_group` asserts that
-no induction recurrence reaches it with one. Two further gaps follow from the same typing:
-
-- Every store's clock is `Txn`, so the type does not keep apart two stores' commit times, which are
-  separate sequences.
-- A channel fed from two sites is ``{`out<<{Txn} | `out<<#1{Txn}}``, whose arm records which site
-  replied, although one store's commit times never collide.
-
-Typing a reply at its image, `{Txn | __elem ▷ ((commits_j ≫ .time) ▷ collection_contains)}`, makes
-its domain its key set; a clock indexed by its store closes both gaps above.
+**[Interim]** — a commit-gated reply is typed `𝐼 ⤇ 𝑉` over its site's source domain, but it holds a
+value only at the items whose transaction fired the tap: a denied item and an idle tap leave no key.
+The type names the domain the keys are drawn from rather than the keys present, so a reader iterates
+the tile's keys rather than the domain. Typing a reply at its image, `{𝐼 | __elem ▷ ((commits_j ≫
+.decision ≫ fired) ▷ collection_contains)}`, makes its domain its key set.
 
 ## `await_final`
 

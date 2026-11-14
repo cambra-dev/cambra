@@ -1062,7 +1062,6 @@ fn builtin_preserves_domain(builtin: &Builtin) -> bool {
         | Builtin::GetPrevSeq
         | Builtin::GetPrevTxn
         | Builtin::BeginTxn
-        | Builtin::ByCommitTime
         | Builtin::AwaitFinal
         | Builtin::Copair
         | Builtin::AsOfRead

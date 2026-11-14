@@ -1159,7 +1159,7 @@ fn escaping_a_block_refused(#[case] code: &str, #[case] needle: &str) {
 
 /// An exception escaping a block sends none of the outputs inside it, and the code after the
 /// block reads the outcome: the clause that catches it runs, or the value where none escaped.
-/// The aborted block still takes a commit time, `t2`, at which it sends nothing.
+/// The aborted block, at item 1, sends nothing.
 #[test]
 fn escaping_a_block_sends_no_output() {
     check_sink(
@@ -1181,7 +1181,7 @@ fn escaping_a_block_sends_no_output() {
                         0 - e
                 out << got
         "},
-        "[`got.d.out<<(t1) -> 90, `got.d.out<<(t3) -> 85, `out<<(0) -> 10, `out<<(1) -> -20, \
+        "[`got.d.out<<(0) -> 90, `got.d.out<<(2) -> 85, `out<<(0) -> 10, `out<<(1) -> -20, \
          `out<<(2) -> 5]",
     );
 }
@@ -1238,7 +1238,7 @@ fn a_clause_inside_a_block_feeds() {
                     except Int as e:
                         out << e
         "},
-        "[t2 -> 40, t3 -> 60]",
+        "[1 -> 40, 2 -> 60]",
     );
 }
 

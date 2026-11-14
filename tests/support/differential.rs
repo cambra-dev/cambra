@@ -80,8 +80,7 @@ pub fn run_interpreted(source: &str) -> Result<Value, String> {
 /// Read a compiled value of type `ty` in the interpreter's domain.
 ///
 /// `UInt` reads as `Int`: a key the compiler numbers is the key the interpreter numbers, and
-/// the two integer types differ only in representation. A key of type `Txn` is a commit
-/// time, which the runtime represents as a plain `UInt`.
+/// the two integer types differ only in representation.
 pub fn convert(v: TileValue, ty: &Type) -> Value {
     match (v, ty.peel_refinements()) {
         (
@@ -95,7 +94,6 @@ pub fn convert(v: TileValue, ty: &Type) -> Value {
                 .map(|b| (convert(b.input, domain), convert(b.output, codomain)))
                 .collect(),
         )),
-        (TileValue::UInt(u), Type::Txn) => Value::CommitTime(u as i64),
         (TileValue::Union { tag, inner }, Type::Variant(arms, _)) => {
             let arm = arms
                 .iter()

@@ -306,7 +306,7 @@ fn a_binding_read_inside_a_conditional_binding_s_arm() {
                 m := b
                 out << b
     "#};
-    check_sink(source, "[t1 -> 10, t2 -> 20, t3 -> 50, t4 -> 90]");
+    check_sink(source, "[10, 20, 50, 90]");
 }
 
 /// A nested guard holding a partial op its enclosing guard protects. The commit gate and the
@@ -323,7 +323,7 @@ fn a_nested_guard_is_evaluated_only_under_its_enclosing_guard() {
                         pool := pool + 1
                         out << pool
     "#};
-    check_sink(source, "[t1 -> 1, t2 -> 2]");
+    check_sink(source, "[1 -> 1, 2 -> 2]");
 }
 
 /// The value of an `if` or `match` whose branches write merges as a written variable does,
@@ -340,7 +340,7 @@ fn a_nested_guard_is_evaluated_only_under_its_enclosing_guard() {
                 else:
                     0
             out << t
-"#}, "[t1 -> 0, t2 -> 204, t3 -> 210]")]
+"#}, "[0, 204, 210]")]
 #[case::match_value(indoc! {r#"
     pool: Mut(Int, Txn) := 0
     out = test_sink()
@@ -354,7 +354,7 @@ fn a_nested_guard_is_evaluated_only_under_its_enclosing_guard() {
                     case Option::none:
                         0
             out << t + pool
-"#}, "[t1 -> 2, t2 -> 1, t3 -> 7]")]
+"#}, "[2, 1, 7]")]
 fn a_writing_branch_value_merges_as_a_variable(#[case] source: &str, #[case] expected: &str) {
     check_sink(source, expected);
 }
@@ -374,7 +374,7 @@ fn a_binding_read_inside_a_match_arm_that_ignores_its_payload() {
                 m := b
                 out << b
     "#};
-    check_sink(source, "[t1 -> 11, t2 -> 22, t3 -> 33, t4 -> 44]");
+    check_sink(source, "[11, 22, 33, 44]");
 }
 
 // ---------------------------------------------------------------------------
@@ -516,13 +516,12 @@ fn test_multi_variable_transactions(#[case] code: &str, #[case] expected: i64) {
 // Per-commit progress feeds (`out << e` *inside* the block)
 // ---------------------------------------------------------------------------
 
-/// A per-commit reply stream: `values` indexed by 1-based commit tick (the
-/// commit engine allocates ticks starting at 1, exactly as the prototype did —
-/// `u1 -> …`). A feed inside a `with begin():` block produces one entry per
-/// *committed* transaction, so a denied commit contributes no tick.
-fn commit_stream(ticks: &[u64], values: &[i64]) -> Tile {
+/// A reply stream: `values` keyed by the positions of the items that replied. A feed inside
+/// a `with begin():` block replies once per committed transaction, keyed by the item the
+/// transaction ran for, so a denied transaction contributes no entry.
+fn reply_stream(positions: &[u64], values: &[i64]) -> Tile {
     Tile::data_function(
-        ColumnValue::UInts(ticks.to_vec()),
+        ColumnValue::UInts(positions.to_vec()),
         Box::new(Tile::Scalar(ColumnValue::Ints(values.to_vec()))),
         Predicate::True,
         BitSet::new(),
@@ -738,10 +737,9 @@ fn test_compound_txn_mut_var_field() {
 }
 
 /// `out << pool` *inside* the block reports each transaction's committed
-/// (read-your-writes) value: `pool - r` after the write — 90, 70, 40 over commit
-/// ticks 1, 2, 3. The feed rides the writer decision as a `to_out` tap,
-/// committed atomically with the mutable variable write and read back as a per-commit
-/// value-stream (commit-tick-indexed). Contrast `await_final(pool)` (one scalar, the
+/// (read-your-writes) value: `pool - r` after the write — 90, 70, 40 for items 0, 1, 2. The
+/// feed rides the writer decision as a `to_out` tap, committed atomically with the mutable
+/// variable write and keyed by the item. Contrast `await_final(pool)` (one scalar, the
 /// completed 40) and a *fed-out* read `with begin(): out << pool` (an as-of sample
 /// latched to that read's own commit position) — three different constructs over the
 /// same store.
@@ -757,17 +755,33 @@ fn progress_feed_inside_tx() {
                     out << pool
             out
         "#},
-        commit_stream(&[1, 2, 3], &[90, 70, 40]),
+        reply_stream(&[0, 1, 2], &[90, 70, 40]),
+    );
+}
+
+/// A reply fed inside a block over a concatenated source is keyed by the item it answers, a
+/// position of the concatenation, whose positions are a union tagged by part: the store pairs
+/// each reply with that position and `RekeySorted` re-keys the tap by it.
+#[test]
+fn a_reply_over_a_concatenation_is_keyed_by_its_item() {
+    check_sink(
+        indoc! {r#"
+            pool: Mut(Int, Txn) := 100
+            out = test_sink()
+            for r in [10, 20] ++ [30]:
+                with begin():
+                    pool := pool - r
+                    out << r
+        "#},
+        "[`0(0) -> 10, `0(1) -> 20, `1(0) -> 30]",
     );
 }
 
 /// A denied transaction contributes no reply — the feed tap rides `commit`, so
 /// the engine appends nothing for a `commit: false` decision. 70 commits (pool →
-/// 30, reply 30); 50 fails `30 >= 50` → deny, no tick. So `out` is [30] at tick
-/// 1 alone.
+/// 30, reply 30); 50 fails `30 >= 50` → deny. So `out` is [30] at item 0 alone.
 ///
-/// The reply is keyed by its commit time, so its key has type `Txn` and not the loop's
-/// position type.
+/// The reply is keyed by the item it answers, so its key has the loop's position type.
 #[test]
 fn progress_feed_grant_deny() {
     let mut ctx = GlobalContext::default();
@@ -784,14 +798,14 @@ fn progress_feed_grant_deny() {
             out
         "#},
     );
-    assert_eq!(ast.ty.to_string(), "(Txn ⤇ Int)");
-    assert_eq!(tile, commit_stream(&[1], &[30]));
+    assert_eq!(ast.ty.to_string(), "(0..2 ⤇ Int)");
+    assert_eq!(tile, reply_stream(&[0], &[30]));
 }
 
 /// Replies from two `with begin():` sites join into one channel whose arms are each keyed by
-/// commit time, so both arms' keys have type `Txn`.
+/// their own site's items: the loop's positions, and the standalone block's singleton.
 #[test]
-fn reply_union_over_two_sites_is_keyed_by_commit_time() {
+fn reply_union_over_two_sites_is_keyed_by_item() {
     let mut ctx = GlobalContext::default();
     let (ast, _) = run_pipeline_with_ctx(
         &mut ctx,
@@ -809,7 +823,10 @@ fn reply_union_over_two_sites_is_keyed_by_commit_time() {
             out
         "#},
     );
-    assert_eq!(ast.ty.to_string(), "({`out<<{Txn} | `out<<#1{Txn}} ⤇ Int)");
+    assert_eq!(
+        ast.ty.to_string(),
+        "({`out<<{0..2} | `out<<#1{0..1}} ⤇ Int)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -853,11 +870,11 @@ fn string_valued_store() {
 
 /// One writer feeds *two* distinct reply streams inside the same block; the
 /// program returns both as a tuple. Each rides the writer decision as its own
-/// `__to_<defer>` tap and is read back per commit tick: `a` = 1,3,6 and `b` (sum
-/// of squares) = 1,5,14 over commit ticks 1,2,3.
+/// `__to_<defer>` tap and is read back keyed by item: `a` = 1,3,6 and `b` (sum
+/// of squares) = 1,5,14 over items 0,1,2.
 ///
 /// The tuple is a value, so each component is a materialized collection keyed by
-/// commit tick rather than one collection of pairs. The two feeds have their own
+/// item rather than one collection of pairs. The two feeds have their own
 /// domains, and a pair of collections is not a collection of pairs.
 #[test]
 fn two_reply_feeds_one_transaction() {
@@ -875,17 +892,17 @@ fn two_reply_feeds_one_transaction() {
                     outb << b
             (outa, outb)
         "#},
-        // A pair of collections, each keeping its own commit-tick domain — not one
+        // A pair of collections, each keeping its own item domain — not one
         // collection of pairs, which is what zipping the two would have made.
         Tile::tuple(vec![
             Tile::data_function(
-                ColumnValue::UInts(vec![1, 2, 3]),
+                ColumnValue::UInts(vec![0, 1, 2]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 3, 6]))),
                 Predicate::True,
                 BitSet::new(),
             ),
             Tile::data_function(
-                ColumnValue::UInts(vec![1, 2, 3]),
+                ColumnValue::UInts(vec![0, 1, 2]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 5, 14]))),
                 Predicate::True,
                 BitSet::new(),
@@ -898,8 +915,8 @@ fn two_reply_feeds_one_transaction() {
 /// inside `if x >= 2` (which writes `a`), while the `else` writes `b`. Both arms
 /// write, so *every* iteration commits — but the feed must fire only on its own
 /// route (`x >= 2`), not on the sibling `else` route's commit. The tap carries a
-/// `__fire` gate the engine honors, so over `[1, 2, 3]` (commit ticks 1, 2, 3)
-/// `out` receives 2 and 3 (ticks 2, 3) — not a value at tick 1. (Without the
+/// `__fire` gate the engine honors, so over `[1, 2, 3]` (items 0, 1, 2)
+/// `out` receives 2 and 3 (items 1, 2) — not a value at item 0. (Without the
 /// gate the tap would over-fire on every commit.)
 #[test]
 fn reply_feed_under_one_route_does_not_overfire() {
@@ -918,7 +935,7 @@ fn reply_feed_under_one_route_does_not_overfire() {
             out
         "#},
         Tile::data_function(
-            ColumnValue::UInts(vec![2, 3]),
+            ColumnValue::UInts(vec![1, 2]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
             Predicate::True,
             BitSet::new(),
@@ -930,7 +947,7 @@ fn reply_feed_under_one_route_does_not_overfire() {
 /// and replies on `out`. Both taps ride the same commit but must fire only on
 /// their own route — each carries its own `__fire` gate. x=1 → else (a += 100,
 /// out << 0); x=2 → if (a += 2, out << 2); x=3 → if (a += 3, out << 3). Every
-/// position commits (both arms write), so `out` is [0, 2, 3] keyed by commit time.
+/// position commits (both arms write), so `out` is [0, 2, 3] keyed by item.
 #[test]
 fn both_arms_feed_in_committing_block() {
     check_tile(
@@ -955,7 +972,7 @@ fn both_arms_feed_in_committing_block() {
             channel_union(
                 &["out<<", "out<<#1"],
                 &[0, 0, 1],
-                vec![ColumnValue::UInts(vec![2, 3]), ColumnValue::UInts(vec![1])],
+                vec![ColumnValue::UInts(vec![1, 2]), ColumnValue::UInts(vec![0])],
             ),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 0]))),
             channel_predicate(&["out<<", "out<<#1"]),
@@ -983,7 +1000,7 @@ fn ryw_of_conditionally_written_key_after_case() {
             out
         "#},
         Tile::data_function(
-            ColumnValue::UInts(vec![1, 2, 3]),
+            ColumnValue::UInts(vec![0, 1, 2]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 10, 20]))),
             Predicate::True,
             BitSet::new(),
@@ -1088,9 +1105,8 @@ fn assert_drawdown_replies(tile: &Tile, initial: i64, draws: &[i64]) {
 }
 
 /// Two writers both feed `out` (the reply of each transaction's committed
-/// value). Each writer's reply appears at its own commit tick, unioned across
-/// the two sites. (Regression: this used to smear writer 1's value forward onto
-/// writer 2's tick via carry-forward.) The two draws conflict on the pool, so
+/// value). Each writer's reply appears at its own item, unioned across
+/// the two sites. The two draws conflict on the pool, so
 /// the round-robin drain may serialize them either way — asserted as a valid
 /// drawdown rather than a fixed per-tick stream.
 #[test]
@@ -1265,7 +1281,7 @@ fn await_final_broadcast_over_a_reading_loop_stays_final() {
                 out << await_final(pool) + q
             out
         "#},
-        commit_stream(&[0, 1], &[71, 72]),
+        reply_stream(&[0, 1], &[71, 72]),
     );
 }
 
@@ -1290,7 +1306,7 @@ fn await_final_bound_then_read_in_a_feed_loop_stays_final() {
                 out << f + q
             out
         "#},
-        commit_stream(&[0, 1], &[91, 92]),
+        reply_stream(&[0, 1], &[91, 92]),
     );
 }
 
@@ -3449,7 +3465,7 @@ fn commit_decision_reads_induction_accumulator() {
 /// has no per-request correspondence, so its final value is broadcast into every
 /// transaction. Observed via an **in-block** (commit-ordered) reply — not a
 /// trailing read, which is an arbitrary as-of sample — so the committed values
-/// are deterministic: `pool` draws down `100 → 97 → 94` over commit ticks 1, 2.
+/// are deterministic: `pool` draws down `100 → 97 → 94` over items 0, 1.
 /// Exercises the writer's deferred-wakeup convergence: the broadcast `cnt`'s
 /// `ExtractFinal` is empty until its loop's own cycle drains, so the writer
 /// re-arms itself on the wakeup queue each not-ready pull rather than deadlocking
@@ -3470,7 +3486,7 @@ fn commit_decision_reads_cross_loop_accumulator_broadcast() {
                     out << pool
             out
         "#},
-        commit_stream(&[1, 2], &[97, 94]),
+        reply_stream(&[0, 1], &[97, 94]),
     );
 }
 
@@ -3509,7 +3525,7 @@ fn broadcast_read_races_a_second_writer() {
 /// `TestDataSource`'s three elements — a loop that converges only as
 /// the source's data arrives (via scheduler notifications), not synchronously.
 /// The txn decision reads `cnt`'s value (broadcast, 3), observed via an in-block
-/// reply — one commit, `pool = 100 − 3 = 97` at commit tick 1. This is the case
+/// reply — one commit, `pool = 100 − 3 = 97` at item 0. This is the case
 /// the old in-`get` pump could not handle (it spun without yielding to the
 /// scheduler); the deferred-wakeup path drives it — each not-ready pull re-arms
 /// the writer, and `check_for_notifications` delivers both the source's data and
@@ -3565,7 +3581,7 @@ fn broadcast_off_async_source_sibling_loop() {
         result = producer.get(universal.clone());
     }
     result.compact();
-    assert_eq!(result, commit_stream(&[1], &[97]));
+    assert_eq!(result, reply_stream(&[0], &[97]));
 }
 
 /// Stage-3 cross-domain read, reply side: the same loop reads `cnt` in the commit
@@ -3590,13 +3606,13 @@ fn commit_decision_reads_induction_accumulator_with_reply() {
 }
 
 /// Stage-3 commit-ordered/gated reply (in-block feed): a reply *inside* the block
-/// rides the commit record as a tap (commit-tick-indexed, like `progress_feed_in_tx`),
+/// rides the commit record as a tap (keyed by item, like `progress_feed_inside_tx`),
 /// so it is sequenced after the commit and — the gating half — a *denied*
 /// transaction replies nothing. Here `pool` starts at 100 and `r = 70, 50, 20`
 /// draws down; `r = 50` fails `pool >= r` (pool is 30) so its transaction denies.
 /// The reply reads the induction counter `cnt` (a Stage-3 cross-domain read inside
 /// the tap): `cnt` advances 1,2,3 on the request loop regardless of commit, but
-/// only the two *committed* iterations reply — values `[1, 3]` at commit ticks 1,2.
+/// only the two *committed* iterations reply — values `[1, 3]` at items 0, 2.
 #[test]
 fn commit_gated_reply_reading_induction_counter() {
     check_tile(
@@ -3612,14 +3628,14 @@ fn commit_gated_reply_reading_induction_counter() {
                         resps << cnt
             resps
         "#},
-        commit_stream(&[1, 2], &[1, 3]),
+        reply_stream(&[0, 2], &[1, 3]),
     );
 }
 
 /// Stage-3 commit-ordered reply that commits every iteration: the in-block reply
 /// reads the induction counter `cnt` (cross-domain, via the writer co-iteration)
 /// and — since no transaction denies — every request replies, values `[1, 2, 3]`
-/// at commit ticks 1,2,3. The mutable variable accumulates alongside; this is the worked
+/// at items 0, 1, 2. The mutable variable accumulates alongside; this is the worked
 /// example's `incr` endpoint in finite-batch form (reply riding the commit,
 /// reading the counter).
 #[test]
@@ -3636,19 +3652,18 @@ fn commit_ordered_reply_reading_induction_counter() {
                     resps << cnt
             resps
         "#},
-        commit_stream(&[1, 2, 3], &[1, 2, 3]),
+        reply_stream(&[0, 1, 2], &[1, 2, 3]),
     );
 }
 
 /// In-block reply with an interspersed deny: the reply tap `resp << q` rides the
 /// writer *decision*, so a denied transaction (`r == 0`, guard false) contributes
-/// no tick and no reply, while each committing position emits its
-/// read-your-writes value densely. This is the exact reply-path contract (a
-/// read-your-writes stream, not an arbitrary as-of sample) and must be preserved
-/// exactly under the consumer-driven store: r=0 denies, r=1 commits q:=2 (tick 1),
-/// r=2 commits q:=3 (tick 2) → `resp` = [2, 3] over commit ticks [1, 2].
+/// no reply, while each committing position emits its read-your-writes value. This is
+/// the exact reply-path contract (a read-your-writes stream, not an arbitrary as-of
+/// sample) and must be preserved exactly under the consumer-driven store: r=0 denies,
+/// r=1 commits q:=2, r=2 commits q:=3 → `resp` = [2, 3] over items [1, 2].
 #[test]
-fn in_block_reply_with_deny_is_dense() {
+fn in_block_reply_with_deny_replies_at_committing_items() {
     check_tile(
         indoc! {r#"
             resp: Feed(_)
@@ -3660,7 +3675,7 @@ fn in_block_reply_with_deny_is_dense() {
                         resp << q
             resp
         "#},
-        commit_stream(&[1, 2], &[2, 3]),
+        reply_stream(&[1, 2], &[2, 3]),
     );
 }
 
@@ -4422,7 +4437,7 @@ fn a_checked_lookup_at_keys_off_a_source_in_a_writing_block() {
         result = producer.get(universal.clone());
     }
     result.compact();
-    assert_eq!(result, commit_stream(&[1, 2, 3], &[10, 0, 10]));
+    assert_eq!(result, reply_stream(&[0, 1, 2], &[10, 0, 10]));
 }
 
 /// A checked lookup answers against its own transaction's snapshot: the first transaction's
@@ -4440,7 +4455,7 @@ fn a_checked_lookup_reads_its_own_transactions_snapshot() {
                         case Option::none: 0)
                     m[2] := r
         "#},
-        "[t1 -> 0, t2 -> 5]",
+        "[0, 5]",
     );
 }
 
@@ -5182,6 +5197,26 @@ fn a_block_value_in_a_branch(#[case] code: &str, #[case] expected: &str) {
     );
 }
 
+/// A feed inside a block in a branch whose condition reads a binding around it: the reply is
+/// keyed by the singleton's item, and the store's types never name the binding, since the site
+/// gates its source on the condition.
+#[test]
+fn a_feed_in_a_block_under_a_condition_on_a_binding() {
+    check_sink(
+        indoc! {"
+            pool: Mut(Int, Txn) := 100
+            out = test_sink()
+            c = 3
+            if c > 1:
+                with begin():
+                    pool := pool - c
+                    out << pool
+            out << 0
+        "},
+        "[`out<<(0) -> 97, `out<<#1(()) -> 0]",
+    );
+}
+
 /// A block's value in a branch feeding an accumulator: the loop's writer reads the value at the
 /// position its item carries, and the `else` arm adds where the block did not run.
 #[test]
@@ -5553,7 +5588,7 @@ fn a_function_ending_in_a_bound_block_value_or_a_feed() {
             out << take(10)
             spend(20)
         "},
-        "[`out<<(()) -> 90, `spend()/spend.out<<(t2) -> 70]",
+        "[`out<<(()) -> 90, `spend()/spend.out<<(0) -> 70]",
     );
 }
 
@@ -5611,7 +5646,7 @@ fn a_block_value_reads_an_earlier_block_in_its_loop() {
                 seen := seen + a
                 out << seen
     "},
-    "[t1 -> 90, t2 -> 160]"
+    "[90, 160]"
 )]
 fn a_block_reads_an_earlier_blocks_value_through_a_binding_or_in_statement_position(
     #[case] code: &str,
@@ -5636,7 +5671,7 @@ fn a_block_in_statement_position_reads_a_binding_computed_from_an_accumulator() 
                     pool := pool - d
                     out << pool
         "},
-        "[t1 -> 80, t2 -> 20, t3 -> -100]",
+        "[80, 20, -100]",
     );
 }
 

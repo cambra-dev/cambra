@@ -5228,7 +5228,8 @@ observable:
 
 - **Reply *inside* a block** (`out << e` within `with begin():`) rides the
   commit: it is **sequenced after the commit** and **gated** — a denied
-  transaction replies nothing — and is indexed by commit tick.
+  transaction replies nothing — and is keyed by the iteration whose
+  transaction fed it, so a request's reply answers that request.
 - **Reply *outside* the block** rides its own loop's domain and fires every iteration regardless of
   commit — request-indexed, value-correct, but not commit-ordered. A reply of a block's value waits
   for that block to commit, which every path of it does

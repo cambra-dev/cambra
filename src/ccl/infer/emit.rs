@@ -4397,9 +4397,10 @@ fn accumulator_body_domain(slots: impl IntoIterator<Item = Type>, item: Type) ->
 }
 
 /// The history of each `__to_<defer>` tap a writer's decision carries: the tap's value at each
-/// position of `domain`, in the order the decision's `commit` payload lists them. A tap in
-/// `item_taps` is read keyed by the item it was committed for, so its positions are the
-/// domain of the writer's `source` instead ([`crate::ccl::WriterSite::item_taps`]).
+/// position of `domain`, in the order the decision's `commit` payload lists them. A
+/// transaction's tap is read keyed by the item it was committed for, so with `domain` the
+/// commit clock `Txn` its positions are the domain of the writer's `source` instead
+/// (`src/ccl/design/mutability.md`, "Replies ride their transaction").
 ///
 /// The body is `(𝑝 : (slot₀, …, item)) ⇒ decision`, its codomain stored closed over `𝑝`; a
 /// nested writer's body takes `(𝑝 : ((enclosing, position), (slot₀, …, item)))`. A tap whose
@@ -4416,7 +4417,6 @@ pub(super) fn writer_tap_histories(
     domain: &Type,
     body_ty: &Type,
     source: &Expr,
-    item_taps: &[Label],
     enclosing: Option<(&Name, &Type)>,
     node_id: NodeId,
 ) -> Vec<(Label, Type)> {
@@ -4455,7 +4455,7 @@ pub(super) fn writer_tap_histories(
         .filter(|(f, _)| f != crate::ccl::F_WRITES)
         .map(|(f, t)| {
             let item_domain;
-            let domain = if item_taps.contains(f) {
+            let domain = if matches!(domain, Type::Txn) {
                 item_domain = source
                     .ty
                     .domain()
@@ -4711,15 +4711,13 @@ pub(super) fn emit_transact<C: Typing>(
     for w in writers.iter_mut() {
         emit_transact_writer(w, &key_types, parameter, ctx)?;
         // A `__to_<defer>` field on the writer's decision record becomes a
-        // virtual mutable variable key the consumer reads as `__hist.__to_…`. The store
-        // holds one tap value per commit, keyed by its commit time, so the field
-        // lives over the store's sequencing domain like a key history does.
+        // virtual mutable variable key the consumer reads as `__hist.__to_…`, keyed by the
+        // writer's item for a transaction and by the loop's position for an induction.
         let enclosing_value = parameter.map(|p| (&enclosing, enclosing_component(p)));
         fields.extend(writer_tap_histories(
             domain,
             &w.body.ty,
             &w.source,
-            &w.item_taps,
             enclosing_value.as_ref().map(|(e, t)| (*e, t)),
             node_id,
         ));

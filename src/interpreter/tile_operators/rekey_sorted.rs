@@ -7,8 +7,8 @@ use crate::interpreter::{ColumnValue, Consumer, Extent, Scheduler, Value, tuple_
 /// re-keying (group by the new key, then take the group's one element) for input that states
 /// its new keys in sorted order.
 ///
-/// Its one use is a reply tap read keyed by item (`src/ccl/design/mutability.md`, "A block in
-/// value position"): the tap's `StoreValueStream`, `Txn ⤇ (𝐼, 𝑉)`, holds the item position the
+/// Its one use is a commit store's reply tap (`src/ccl/design/mutability.md`, "Replies ride
+/// their transaction"): the tap's `StoreValueStream`, `Txn ⤇ (𝐼, 𝑉)`, holds the item position the
 /// writer committed each value with, and a site commits its items once each and in its source's
 /// order. No CCL term names it: op-conversion builds it for the read.
 ///
