@@ -917,6 +917,7 @@ mod tests {
                 write_keys: vec![Name::raw("k")],
                 source: var("src"),
                 body: var("wbody"),
+                item_taps: Vec::new(),
             }],
             domain: Type::Txn,
             parameter: None,

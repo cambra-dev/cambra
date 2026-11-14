@@ -1758,6 +1758,7 @@ mod tests {
                 write_keys: vec!["acc".into()],
                 source: list_123().with_ty(list_ty.clone()),
                 body,
+                item_taps: Vec::new(),
             }],
             domain: Type::UIntRange(3),
             parameter: None,

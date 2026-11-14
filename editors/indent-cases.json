@@ -100,6 +100,13 @@
       "rest": ["            v + 1", "        case `none:", "            0", "    return y"]
     },
     {
+      "name": "a with on the right of an assignment indents its body one level",
+      "lines": ["def f(c):", "    y = with begin():"],
+      "indent": 8,
+      "next": "c := c + 1",
+      "rest": ["        c", "    return y"]
+    },
+    {
       "name": "a def header spanning lines inside brackets indents from its first line",
       "lines": ["def f(a,", "      b):"],
       "indent": 4,

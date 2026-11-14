@@ -593,7 +593,7 @@ fn refused(#[case] code: &str, #[case] needle: &str) {
 /// the block an exception escapes, and the `raise` in a function value.
 #[rstest]
 // An exception escaping a block aborts its transaction and leaves the block's outcome to the
-// code after it, which nothing carries out of the commit yet.
+// code after it, which exception elimination does not give the block yet.
 #[case::an_exception_escaping_a_block(
     indoc! {"
         pool: Mut(Int, Txn) := 100
@@ -1019,6 +1019,32 @@ fn a_clause_inside_a_block_feeds() {
                         out << e
         "},
         "[t2 -> 40, t3 -> 60]",
+    );
+}
+
+/// A `try` ending a block in value position: the value of the block is the value of whichever of
+/// its blocks ran, and a clause's path commits with no write.
+#[test]
+fn a_try_ends_a_block_in_value_position() {
+    check_sink(
+        indoc! {"
+            def check(v):
+                if v > 15:
+                    raise v
+                v
+            pool: Mut(Int, Txn) := 100
+            out = test_sink()
+            for r in [10, 20, 5]:
+                got = with begin():
+                    try:
+                        d = check(r)
+                        pool := pool - d
+                        pool
+                    except Int as e:
+                        0 - e
+                out << got
+        "},
+        "[90, -20, 85]",
     );
 }
 

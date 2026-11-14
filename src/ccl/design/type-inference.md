@@ -4686,7 +4686,10 @@ whose variable causes nothing is inert (`InferError::InertStatement`), unless it
 variable with nothing flowing into it, the call of a function a polymorphic definition takes as a
 parameter, which only each use determines (`InferCtx::does_nothing`). Inference returns the
 inert statements, and the compile reports them only where inference reports no error: an argument
-passed wrongly by reference, which inference refuses, is the more precise diagnosis.
+passed wrongly by reference, which inference refuses, is the more precise diagnosis. The last
+statement of a block ending a function body is the function's value, which lowering builds as a
+statement: where its type is not `unit`, inference refuses it as not compiled rather than inert
+(`values_ending_function_blocks`).
 
 **Public members.** Every function nested in a public member's type is checked, including functions
 in products and returned functions. Its capabilities naming an induction variable of the top level,
