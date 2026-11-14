@@ -85,9 +85,11 @@ impl CheckedLookup {
                 "`lookup?`'s input rows must be `(collection, key)` pairs, got {codomain}"
             ));
         };
-        // Field 0 is the collection. A nested function tiling is one collection shared by
-        // every row; a scalar is a materialized map value per row. Anything else is a
-        // collection whose values are themselves collections, which has no answer shape.
+        // Field 0 is the collection. A nested function tiling is either one collection shared
+        // by every row or a collection per row, one run beneath each row; the tiling does not
+        // tell them apart, and the producer does, by the level's run count. A scalar is a
+        // materialized map value per row. Anything else is a collection whose values are
+        // themselves collections, which has no answer shape.
         let collection = fields
             .get(&tuple_field(0))
             .ok_or_else(|| "`lookup?`'s input rows have no collection field".to_string())?;
@@ -266,34 +268,50 @@ fn answer_in_value(key: &Value, m: &Value) -> Value {
 /// answers immediately ([`answer_in_value`]).
 fn answer_for(key: &Value, coll: &Tile) -> Option<Value> {
     match coll {
-        Tile::DataFunction {
-            domain, codomain, ..
-        } => {
-            assert!(
-                !codomain.holds_a_level(),
-                "a streamed collection maps keys to values, so its keys are one level"
-            );
-            match (0..domain.len()).find(|&i| &domain.index_at(i) == key) {
-                Some(i) => {
-                    // `None` here would read as "still deciding" for a shape that will never
-                    // change, and the lookup would spin instead of answering. Op-conversion's
-                    // `reject_unanswerable_lookup_collection` is what makes this unreachable.
-                    let Tile::Scalar(values) = codomain.as_ref() else {
-                        panic!(
-                            "CheckedLookup: an answer's `some` payload is one column value, so the \
-                         collection's codomain tiles as a scalar; got {codomain:?}"
-                        )
-                    };
-                    Some(some_of(values.index_at(i)))
-                }
-                None if coll.is_terminal() => Some(none()),
-                None => None,
-            }
+        Tile::DataFunction { domain, .. } => {
+            answer_in_run(key, coll, 0..domain.len(), || coll.is_terminal())
         }
         Tile::Scalar(col) if !col.is_empty() => Some(answer_in_value(key, &col.index_at(0))),
         // A materialized collection that has not arrived yet.
         Tile::Scalar(_) => None,
         other => panic!("CheckedLookup: collection is not a collection: {other:?}"),
+    }
+}
+
+/// `key`'s answer in the run `run` of the streamed collection `coll`: `some` of the value
+/// there, `none` where the run lacks it and `decided` says the run is complete, and nothing
+/// while it is still open.
+fn answer_in_run(
+    key: &Value,
+    coll: &Tile,
+    run: std::ops::Range<usize>,
+    decided: impl FnOnce() -> bool,
+) -> Option<Value> {
+    let Tile::DataFunction {
+        domain, codomain, ..
+    } = coll
+    else {
+        unreachable!("a streamed collection is a function tile: {coll:?}")
+    };
+    assert!(
+        !codomain.holds_a_level(),
+        "a streamed collection maps keys to values, so its keys are one level"
+    );
+    match run.into_iter().find(|&i| &domain.index_at(i) == key) {
+        Some(i) => {
+            // `None` here would read as "still deciding" for a shape that will never change,
+            // and the lookup would spin instead of answering. Op-conversion's
+            // `reject_unanswerable_lookup_collection` is what makes this unreachable.
+            let Tile::Scalar(values) = codomain.as_ref() else {
+                panic!(
+                    "CheckedLookup: an answer's `some` payload is one column value, so the \
+                     collection's codomain tiles as a scalar; got {codomain:?}"
+                )
+            };
+            Some(some_of(values.index_at(i)))
+        }
+        None if decided() => Some(none()),
+        None => None,
     }
 }
 
@@ -340,11 +358,32 @@ fn answer_key_stream(keys: &Tile, coll: &Tile, out_extent: &Extent) -> Tile {
     out
 }
 
+/// `key`'s answer in run `row` of `level`, the collection of the row at `position`, which is
+/// decided once `complete` calls `[position, key]` decided ([`answer_in_run`]).
+fn answer_in_row(
+    position: &Value,
+    key: &Value,
+    level: &Tile,
+    row: usize,
+    complete: &Predicate,
+) -> Option<Value> {
+    let (start, end) = level.row_run(row);
+    answer_in_run(key, level, start..end, || {
+        complete.contains_path(&[position.clone(), key.clone()])
+    })
+}
+
 /// How the rows of an assembled `(collection, key)` stream supply their collection.
 enum RowCollection<'a> {
     /// One collection shared by every row — the collection leg was closed in the iteration,
-    /// so `zip` fanned it in as a constant and it arrives as a nested function tile.
+    /// so `zip` fanned it in as a constant and it arrives as a nested function tile with one
+    /// run.
     Shared(&'a Tile),
+    /// One collection per row, a level beneath the rows with one run each, as a transaction's
+    /// snapshot of a collection-valued variable gives. `complete` is which `[position, key]`
+    /// paths are decided: the level's own statement, and every path beneath a row the stream
+    /// calls complete, since completeness closes downward.
+    Level { tile: &'a Tile, complete: Predicate },
     /// One materialized map value per row, as a mutable collection's mutable variable gives.
     PerRow(&'a ColumnValue),
 }
@@ -365,6 +404,9 @@ impl CheckedLookupProducer {
         for i in 0..domain.len() {
             let answer = match collection {
                 RowCollection::Shared(tile) => answer_for(&keys.index_at(i), tile),
+                RowCollection::Level { tile, complete } => {
+                    answer_in_row(&domain.index_at(i), &keys.index_at(i), tile, i, complete)
+                }
                 RowCollection::PerRow(col) => {
                     Some(answer_in_value(&keys.index_at(i), &col.index_at(i)))
                 }
@@ -495,7 +537,31 @@ impl TileProducer for CheckedLookupProducer {
                 };
                 let collection = match coll_tile {
                     Tile::Scalar(col) => RowCollection::PerRow(col),
-                    shared => RowCollection::Shared(shared),
+                    // One run per row is a collection per row: answering a key against the
+                    // whole level would find it in another row's collection, and would ask
+                    // for the whole level's completion where this row's is what decides.
+                    Tile::DataFunction {
+                        row_starts,
+                        domain_predicate: level,
+                        ..
+                    } if row_starts.len() == domain.len() => RowCollection::Level {
+                        tile: coll_tile,
+                        complete: domain_predicate.descend(1).union(level),
+                    },
+                    shared => {
+                        // A per-row level whose runs fell out of step with the rows would land
+                        // here and answer each key against every row's runs at once.
+                        if let Tile::DataFunction { row_starts, .. } = shared {
+                            debug_assert!(
+                                row_starts.len() <= 1,
+                                "CheckedLookup: a nested collection is one shared collection, one \
+                                 run, or one run per row; got {} runs for {} rows",
+                                row_starts.len(),
+                                domain.len()
+                            );
+                        }
+                        RowCollection::Shared(shared)
+                    }
                 };
                 let (kept, answers) = Self::answer_rows(domain, &key_col, &collection);
                 self.stream_tile(kept, answers, domain, domain_predicate, &out_extent)

@@ -4343,18 +4343,12 @@ fn a_checked_lookup_of_an_absent_key_in_a_read_only_block_answers_none() {
     );
 }
 
-/// A checked lookup of an absent key inside a block that writes stalls: the program quiesces
-/// without a final value of `n`, so `await_final(n)` never reaches a terminal tile.
+/// A checked lookup of an absent key inside a block that writes answers `Option::none`: the
+/// block's snapshot of `m` is complete for its row, so the key it lacks is decided absent.
 ///
-/// The block writes `n`, not `m`. The same lookup in a read-only block answers `Option::none`
-/// (the sibling above), and a lookup of a present key in a writing block commits
-/// (`a_keyed_read_at_the_loop_item_reads_the_snapshot`). Feeding the lookup out of the block
-/// instead of writing it stalls the same way: over a `[1, 2, 1]` loop with seed `{1: 10}`, the
-/// block replies at the first key and stops at the absent second one, and the `cambra` binary
-/// running that program does not exit. A key off a source, such as the storefront's
-/// `inventory[req.body.sku]`, reaches the same stall.
+/// The block writes `n`, not `m`, and a lookup of a present key in a writing block commits too
+/// (`a_keyed_read_at_the_loop_item_reads_the_snapshot`).
 #[test]
-#[should_panic(expected = "producer stopped short of a terminal tile")]
 fn a_checked_lookup_of_an_absent_key_in_a_writing_block() {
     check_scalar(
         indoc! {r#"
@@ -4372,6 +4366,81 @@ fn a_checked_lookup_of_an_absent_key_in_a_writing_block() {
             await_final(n)
         "#},
         Value::Int(0),
+    );
+}
+
+/// A checked lookup in a writing block at keys a data source delivers, the storefront's
+/// `inventory[req.body.sku]` shape: the absent key `2` answers `none` against its own
+/// transaction's snapshot rather than waiting for every transaction's, and the replies at the
+/// present key `1` around it go out too.
+#[test]
+fn a_checked_lookup_at_keys_off_a_source_in_a_writing_block() {
+    let code = indoc! {r#"
+        def or_zero(o: Option(Int)) => Int:
+            match o:
+                case Option::some(v):
+                    v
+                case Option::none:
+                    0
+        m: Mut(Map(Int, Int), Txn) := box(map([(1, 10)]))
+        n: Mut(Int, Txn) := 0
+        out: Feed(_)
+        for k in src():
+            with begin():
+                n := n + 1
+                out << or_zero(m[k])
+        out
+    "#};
+    let mut ctx = GlobalContext::default();
+    let src = Rc::new(RefCell::new(TestDataSource::new(
+        "src",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    src.borrow_mut().add_data(&[
+        (Value::UInt(0), Value::Int(1)),
+        (Value::UInt(1), Value::Int(2)),
+        (Value::UInt(2), Value::Int(1)),
+    ]);
+    src.borrow_mut().set_yield_predicate(Predicate::True);
+    ctx.register_source(src.clone());
+
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let loaded = LoadedProgram::test(code);
+    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = compiled
+        .main_mut()
+        .and_then(|o| o.producer.take())
+        .expect("program has a `main` output");
+    let universal = producer.tiling().universal_guard();
+    let mut result = producer.get(universal.clone());
+    let mut iters = 0usize;
+    while !result.is_terminal() {
+        iters += 1;
+        assert!(iters < 1024, "a lookup at a source's keys did not converge");
+        ctx.scheduler().check_for_notifications();
+        result = producer.get(universal.clone());
+    }
+    result.compact();
+    assert_eq!(result, commit_stream(&[1, 2, 3], &[10, 0, 10]));
+}
+
+/// A checked lookup answers against its own transaction's snapshot: the first transaction's
+/// `m` lacks key `2` and the second's holds what the first wrote there.
+#[test]
+fn a_checked_lookup_reads_its_own_transactions_snapshot() {
+    check_sink(
+        indoc! {r#"
+            m: Mut(Map(Int, Int), Txn) := box(map([(1, 10)]))
+            out = test_sink()
+            for r in [5, 7]:
+                with begin():
+                    out << (match m[2]:
+                        case Option::some(v): v
+                        case Option::none: 0)
+                    m[2] := r
+        "#},
+        "[t1 -> 0, t2 -> 5]",
     );
 }
 
@@ -4394,11 +4463,10 @@ fn a_counter_over_an_induction_map_at_a_present_key() {
     assert_eq!(map_entries_int(&value), vec![(3, 2)]);
 }
 
-/// The same counter starting at a key the seed does not hold stalls: the loop produces no
-/// position of `m`. The absent-key stall of a writing `Txn` block
-/// (`a_checked_lookup_of_an_absent_key_in_a_writing_block`) on an induction map.
+/// The same counter starting at a key the seed does not hold: the first position's lookup
+/// answers `none` against that position's snapshot of `m`, and the second reads the first's
+/// write.
 #[test]
-#[should_panic(expected = "producer stopped short of a terminal tile")]
 fn a_counter_over_an_induction_map_at_an_absent_key() {
     let value = final_mut_var_value(indoc! {r#"
         def or_zero(o: Option(Int)) => Int:
