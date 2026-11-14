@@ -429,10 +429,24 @@ fn lower_curried_call(
     let site = ctx.places.site(func_span);
     let mut reference = ctx.reference(callee, func_span);
     reference.site = Some(site);
-    let mut acc = ctx.tag_image(reference, func_span);
+    let callee = ctx.tag_image(reference, func_span);
+    apply_by_reference(callee, func_span, args, ctx)
+}
+
+/// `callee`, a function with a pass-by-reference parameter, applied to `args` one at a time,
+/// each lowered as an argument that may be a bare mutable variable or feed
+/// ([`lower_call_arg`]): `f(a, b, c)` → `c ▷ (b ▷ (a ▷ f))`. For one argument it is the
+/// application a tupled call builds.
+pub(super) fn apply_by_reference(
+    callee: Expr,
+    span: Span,
+    args: &[Spanned<ChlExpr>],
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    let mut acc = callee;
     for arg in args {
         let applied = Expr::apply(lower_call_arg(arg, ctx)?, acc);
-        acc = ctx.tag_machinery(applied, func_span, "lower.curried_call");
+        acc = ctx.tag_machinery(applied, span, "lower.curried_call");
     }
     Ok(acc)
 }
@@ -765,7 +779,7 @@ pub(super) fn lower_subscript(
 /// callee's inferred parameter type; lowering cannot know the signature (it runs
 /// before inference). A non-bare argument is a computed value expression and
 /// lowers through [`super::lower_expr`], where the gate still applies.
-fn lower_call_arg(
+pub(super) fn lower_call_arg(
     arg: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {

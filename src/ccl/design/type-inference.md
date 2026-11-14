@@ -4310,6 +4310,13 @@ included, for a name.
   argument no instance accepts fails the obligation where it arrives, as an operator's operand
   does. A `let` binding a name to a function of an instance is generalized (`should_generalize`),
   so each use of the name opens the signature afresh.
+- **A signature with a pass-by-reference parameter is curried.** A `Mut(V)`, `Mut(V, Txn)` or
+  `Feed(V)` among several parameters makes the signature's type `𝐴 ⇒ 𝐵 ⇒ 𝑂` in place of
+  `(𝐴, 𝐵) ⇒ 𝑂` (`function_over`), the shape a `def` with such a parameter lowers to, so a call
+  applies it argument by argument and inlining substitutes the caller's variable into the
+  instance function's named binder. Lowering reads the shape off the signature
+  (`lower::traits::instance_function`), which is lowered before any body, where a `def`'s is read
+  off its name. An instance's function takes each such parameter's annotation from the signature.
 - **A requirement's name** chooses no instance. Under `requires a: Area(S)`, `a::area` is the node
   at `Area(S)`, whose obligation the assumption `Area(S)` answers, as it answers
   `summon(Area(_))::area` applied to an `S`. Each use of the definition passes the instance its
