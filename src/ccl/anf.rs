@@ -136,18 +136,10 @@
 //! collection reads — and it is the shape a programmer writing `tmp = e`
 //! ahead of `out << tmp` gets.
 //!
-//! **A refined `Cast`'s value.** `groupby(c, key)` lowers to
-//! `cast({_ | __elem ▷ c ▷ key == __gb_k} ⤇ _, λ __gb_i → __gb_i ▷ c)`
-//! (`crate::ccl::lower::exprs`'s `lower_groupby`), and the two `c` are one term
-//! placed twice: inference dedups the predicate-side refinement against the
-//! body-side one by structural equality. The predicate rides a type slot, which
-//! this pass never descends into, so naming a sub-expression under the cast
-//! rewrites the body copy alone — and the fresh uid each hoist mints means
-//! normalizing the predicate copy too would still produce a second, unequal
-//! name. The two copies then type at unrelated witnesses. So a refined cast's
-//! value is left as lowering built it, but for its mutable-variable reads,
-//! which are renamed in both copies at once (below); an unrefined one, carrying
-//! no predicate to hold a copy, normalizes like any other operand.
+//! **A refined `Cast`'s value.** A predicate can quote a term also present in the
+//! cast's value. Both copies must keep the same names for inference to identify
+//! them. ANF preserves the value and renames mutable reads in both copies.
+//! Group-by expansion runs after ANF so its copies share the normalized source.
 //!
 //! **A value-position `Case`'s scrutinee.** `match c[k]:` dispatches on a
 //! *dependent* result — the checked lookup's codomain discharges its key
@@ -347,6 +339,8 @@ fn is_atomic(e: &Expr, muts: &Muts) -> bool {
         TypedExprNode::Comprehension { generators, .. } => {
             crate::ccl::comprehension::encodes_to_lambda(generators)
         }
+        // A group-by expands to a `λ` over its keys.
+        TypedExprNode::GroupBy { .. } => true,
         _ => false,
     }
 }
@@ -583,12 +577,38 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
             })
         }
 
+        // Normalize the source once before the expansion copies it into predicates, so
+        // the bindings it needs go ahead of the group-by and
+        // every copy is a copy of the normalized term. It stays inline rather than named: a
+        // `Σ`-typed collection bound by a `let` puts its witness out of scope at every use of
+        // the binder. The key reaches only types, which this pass never descends into, so it
+        // is left as it stands but for its reads of mutable variables, as a refined cast's
+        // value is ([`name_reads`]). The collapse is the groups' function, a term like any
+        // other.
+        TypedExprNode::GroupBy {
+            collection,
+            key,
+            collapse,
+        } => {
+            let (mut binds, collection) = peel(normalize(*collection, muts));
+            let collapse = collapse.map(|c| Box::new(normalize(*c, muts)));
+            let mut group_by = rebuild(TypedExprNode::GroupBy {
+                collection: Box::new(collection),
+                key,
+                collapse,
+            });
+            let mut reads = Vec::new();
+            name_reads(&mut group_by, muts, &mut reads);
+            binds.extend(read_bindings(reads));
+            let_chain(binds, group_by)
+        }
+
         TypedExprNode::Cast { value, target } => {
             // **The third recognition contract: a refined cast's value is
-            // copied into its own target.** `groupby(c, key)` lowers to
-            // `cast({_ | __elem ▷ c ▷ key == __gb_k} ⤇ _, λ __gb_i → __gb_i ▷
-            // c)` (`crate::ccl::lower::exprs`'s `lower_groupby`), and the two
-            // `c` are one term placed twice: inference dedups the
+            // copied into its own target.** A filtered comprehension encodes to
+            // `cast({_ | __elem ▷ s ▷ (λ x → p) } ⤇ _, λ r → r ▷ s ▷ …)`
+            // (`crate::ccl::comprehension`), and the two `s` are one term placed
+            // twice, as a group-by's collection is once expanded: inference dedups the
             // predicate-side refinement against the body-side one by structural
             // equality. The predicate rides a type slot, which this pass never
             // descends into, so naming a sub-expression here would rewrite the

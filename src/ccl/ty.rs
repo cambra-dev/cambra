@@ -5728,6 +5728,7 @@ fn eq_has_arm(node: &TypedExprNode) -> bool {
         // A refinement predicate is assembled from already-lowered terms, so a
         // comprehension never reaches one as a `Comprehension` node.
         N::Comprehension { .. } => unreachable!("a Comprehension reached a refinement predicate"),
+        N::GroupBy { .. } => unreachable!("a GroupBy reached a refinement predicate"),
         N::DefGroup { .. } => unreachable!("a DefGroup reached a refinement predicate"),
         N::Lit(_)
         | N::Var(_)

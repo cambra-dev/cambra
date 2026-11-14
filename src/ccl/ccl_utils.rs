@@ -497,8 +497,9 @@ pub(crate) fn strip_iterate_markers(e: &Expr) -> Expr {
                 flat.into_iter().next().expect("len == 1")
             }
             // The node's own slots survive, so the elements are replaced in place rather
-            // than rebuilt around them. `user_annotation` is the kind stamp lowering puts
-            // on a chain it mints — `present_key_domain`'s `c ≫ key` is one, and it lives
+            // than rebuilt around them. `user_annotation` is the kind stamp a chain is
+            // minted with — a group-by's `c ≫ key` (`comprehension::present_key_domain`)
+            // is one where its key is no lambda, and it lives
             // inside a refinement predicate, so this is the only rewrite it passes
             // through. Without the stamp it reaches inference as a `Compose` with no kind
             // (`src/ccl/design/type-inference.md`, "4.6 Data vs compute functions").
