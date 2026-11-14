@@ -234,25 +234,34 @@ pub enum CompactTypeKind {
     Type,
 }
 
-/// Where [`CompactType::equiv_in`] compares `vars`. Absorption reads represented shape alone
-/// (`Never`). A kind's candidates are compared as the types they materialize to, and a
-/// position naming no shape materializes as one of its variables (`WhereShapeless`).
+/// The reading a compact-position comparison applies recursively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VarsCompare {
-    Never,
-    WhereShapeless,
+enum Comparison {
+    /// Represented shape, excluding variable provenance.
+    Shape,
+    /// Materialized candidates: a shapeless position names its variables.
+    Candidate,
+    /// Invariant data domains: unresolved positions do not establish disagreement.
+    DataDomain,
 }
 
 impl CompactTypeKind {
     /// Do these two kinds denote the same set? The [`CompactType::equiv`] of a kind: the same
     /// comparison, reaching the positions a kind carries.
-    fn equiv_in(&self, other: &CompactTypeKind, vars_compare: VarsCompare) -> bool {
+    fn equiv_in(&self, other: &CompactTypeKind, comparison: Comparison) -> bool {
         use CompactTypeKind::{Enumerated, SubtypesOf, Type as Universe, UIntRanges};
         match (self, other) {
             (Enumerated(a), Enumerated(b)) => {
-                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.equiv_in(y, vars_compare))
+                if comparison == Comparison::DataDomain {
+                    a.iter()
+                        .all(|x| b.iter().any(|y| x.equiv_in(y, comparison)))
+                        && b.iter()
+                            .all(|y| a.iter().any(|x| x.equiv_in(y, comparison)))
+                } else {
+                    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.equiv_in(y, comparison))
+                }
             }
-            (SubtypesOf(a), SubtypesOf(b)) => a.equiv_in(b, vars_compare),
+            (SubtypesOf(a), SubtypesOf(b)) => a.equiv_in(b, comparison),
             (UIntRanges, UIntRanges) | (Universe, Universe) => true,
             _ => false,
         }
@@ -903,38 +912,15 @@ pub(super) fn denoted_domains(ct: &CompactType) -> Option<Vec<Type>> {
 /// A position that **names** rather than fills — a bare variable, a witness reference — is
 /// not a domain to disagree with: consuming a sum is what resolves it, and
 /// [`denoted_domains`] excludes witness atoms for the same reason.
-fn data_domains_disagree(a: &CompactType, b: &CompactType) -> bool {
-    let names_only = |ct: &CompactType| {
-        let o = ct.occupied();
-        (o.atoms == 0 && o.fun.is_none() && !o.others)
-            || ct.atoms.iter().any(|x| matches!(x, AtomKey::Witness(_)))
-    };
-    if names_only(a) || names_only(b) {
-        return false;
-    }
-    // A dependent tuple holds the positions a tuple of its arity does, closed: it is that tuple
-    // where no component reads an earlier one.
-    let keys = |ct: &CompactType| {
-        ct.rec
-            .as_ref()
-            .map(|r| r.keys().cloned().collect::<Vec<_>>())
-            .or_else(|| {
-                ct.dep_tuple
-                    .as_ref()
-                    .map(|d| (0..d.components.len()).map(FieldKey::Index).collect())
-            })
-    };
-    let width = |ct: &CompactType| {
-        ct.width.clone().or_else(|| {
-            ct.dep_tuple
-                .as_ref()
-                .map(|d| TupleWidth::Exactly(d.components.len()))
-        })
-    };
-    a.refinements != b.refinements
-        || a.atoms != b.atoms
-        || keys(a) != keys(b)
-        || width(a) != width(b)
+///
+/// **This is the one rule for whether two data domains are one.** The solver asks it of two
+/// collections' lower bounds before relating either to a consumer
+/// (`constrain::distinct_data_domains`), and the merge asks it of two function slots and of
+/// two invariant nominal arguments. The domain is the data at every position, so a record
+/// field or tuple component that differs makes the domains differ: `(0..1, 0..1)` and
+/// `(0..1, 0..2)` are two domains, not one to meet.
+pub(super) fn data_domains_disagree(a: &CompactType, b: &CompactType) -> bool {
+    !a.equiv_in(b, Comparison::DataDomain)
 }
 
 /// Merge binder kinds positionally, retaining the lesser existing ID at each position.
@@ -1726,24 +1712,32 @@ impl CompactType {
     /// would tell apart two spellings of one domain whose positions merely gathered different
     /// variables, and a meet of two kinds would then drop the domain both name.
     fn same_candidate(&self, other: &CompactType) -> bool {
-        self.equiv_in(other, VarsCompare::WhereShapeless)
+        self.equiv_in(other, Comparison::Candidate)
     }
 
-    /// This position's components where it is a closed tuple and nothing else that is a
-    /// product: a plain tuple's, or a dependent tuple's, with whether it is the dependent one.
-    fn closed_tuple(&self) -> Option<(Vec<&CompactType>, bool)> {
-        match (&self.rec, &self.dep_tuple) {
-            (Some(rec), None)
-                if self.width == Some(TupleWidth::Exactly(rec.len()))
-                    && rec
-                        .keys()
-                        .enumerate()
-                        .all(|(i, k)| *k == FieldKey::Index(i)) =>
-            {
-                Some((rec.values().collect(), false))
+    /// Components of one closed tuple. Plain and dependent contributions that agree
+    /// componentwise denote that tuple, including when both occupy this position.
+    fn closed_tuple(&self, comparison: Comparison) -> Option<Vec<&CompactType>> {
+        let plain = self.rec.as_ref().filter(|rec| {
+            self.width == Some(TupleWidth::Exactly(rec.len()))
+                && rec
+                    .keys()
+                    .enumerate()
+                    .all(|(i, k)| *k == FieldKey::Index(i))
+        });
+        match (plain, &self.dep_tuple) {
+            (Some(rec), None) => Some(rec.values().collect()),
+            (None, Some(dep)) if self.rec.is_none() && self.width.is_none() => {
+                Some(dep.components.iter().collect())
             }
-            (None, Some(dep)) if self.width.is_none() => {
-                Some((dep.components.iter().collect(), true))
+            (Some(rec), Some(dep))
+                if rec.len() == dep.components.len()
+                    && rec
+                        .values()
+                        .zip(&dep.components)
+                        .all(|(x, y)| x.equiv_in(y, comparison)) =>
+            {
+                Some(dep.components.iter().collect())
             }
             _ => None,
         }
@@ -1758,11 +1752,22 @@ impl CompactType {
     /// semantic-equivalence test nor the smaller Lean model's `equiv` relation; see
     /// `formal/design.md`, "Why the model carries `CompactTy` at all".
     pub(super) fn equiv(&self, other: &CompactType) -> bool {
-        self.equiv_in(other, VarsCompare::Never)
+        self.equiv_in(other, Comparison::Shape)
     }
 
-    fn equiv_in(&self, other: &CompactType, vars_compare: VarsCompare) -> bool {
-        if vars_compare == VarsCompare::WhereShapeless
+    fn equiv_in(&self, other: &CompactType, comparison: Comparison) -> bool {
+        if comparison == Comparison::DataDomain {
+            let names_only = |ct: &CompactType| {
+                let o = ct.occupied();
+                (o.atoms == 0 && o.fun.is_none() && !o.others)
+                    || ct.atoms.iter().any(|x| matches!(x, AtomKey::Witness(_)))
+            };
+            if names_only(self) || names_only(other) {
+                return true;
+            }
+        }
+
+        if comparison == Comparison::Candidate
             && self.shapes() == 0
             && other.shapes() == 0
             && self.vars != other.vars
@@ -1792,16 +1797,19 @@ impl CompactType {
         let keyed = |x: &BTreeMap<FieldKey, CompactType>, y: &BTreeMap<FieldKey, CompactType>| {
             x.len() == y.len()
                 && x.iter()
-                    .all(|(k, v)| y.get(k).is_some_and(|w| v.equiv_in(w, vars_compare)))
+                    .all(|(k, v)| y.get(k).is_some_and(|w| v.equiv_in(w, comparison)))
         };
         // **A plain tuple and a dependent tuple of one arity are one tuple** where their
         // components are: a dependent tuple whose components read no earlier one is the plain
         // tuple (`Type::dep_tuple`). A component that does read one is closed deeper than the
         // plain tuple's, so it compares unequal and the two stay two.
-        let tuples = match (self.closed_tuple(), other.closed_tuple()) {
-            (Some((a, a_dep)), Some((b, b_dep))) if a_dep != b_dep => Some(
-                a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| x.equiv_in(y, vars_compare)),
-            ),
+        let tuples = match (
+            self.closed_tuple(comparison),
+            other.closed_tuple(comparison),
+        ) {
+            (Some(a), Some(b)) => {
+                Some(a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| x.equiv_in(y, comparison)))
+            }
             _ => None,
         };
         atoms == &other.atoms
@@ -1815,7 +1823,7 @@ impl CompactType {
                                 && a.components
                                     .iter()
                                     .zip(&b.components)
-                                    .all(|(x, y)| x.equiv_in(y, vars_compare))
+                                    .all(|(x, y)| x.equiv_in(y, comparison))
                         }
                         _ => false,
                     }
@@ -1832,8 +1840,8 @@ impl CompactType {
                         && a.domains
                             .iter()
                             .zip(&b.domains)
-                            .all(|(x, y)| x.equiv_in(y, vars_compare))
-                        && a.body.equiv_in(&b.body, vars_compare)
+                            .all(|(x, y)| x.equiv_in(y, comparison))
+                        && a.body.equiv_in(&b.body, comparison)
                 }
                 _ => false,
             }
@@ -1845,33 +1853,39 @@ impl CompactType {
             && match (history_slot, &other.history_slot) {
                 (None, None) => true,
                 (Some(a), Some(b)) => {
-                    a.name == b.name
+                    (comparison == Comparison::DataDomain || a.name == b.name)
                         && a.kind == b.kind
-                        && a.value.equiv_in(&b.value, vars_compare)
-                        && a.domain.equiv_in(&b.domain, vars_compare)
+                        && a.value.equiv_in(&b.value, comparison)
+                        && a.domain.equiv_in(&b.domain, comparison)
                 }
                 _ => false,
             }
             && nominal.len() == other.nominal.len()
             && nominal.iter().all(|(decl, args)| {
                 other.nominal.get(decl).is_some_and(|args2| {
-                    args.iter()
-                        .zip(args2)
-                        .all(|(a, b)| a.equiv_in(b, vars_compare))
+                    args.len() == args2.len()
+                        && args
+                            .iter()
+                            .zip(args2)
+                            .all(|(a, b)| a.equiv_in(b, comparison))
                 })
             })
             && match (fun, &other.fun) {
                 (None, None) => true,
                 (Some(a), Some(b)) => {
-                    a.name == b.name
-                        && a.kind == b.kind
-                        && a.domains_disagree == b.domains_disagree
-                        && a.binders.len() == b.binders.len()
-                        && a.binders.iter().zip(&b.binders).all(|(x, y)| {
-                            x.id == y.id && x.type_kind.equiv_in(&y.type_kind, vars_compare)
-                        })
-                        && a.domain.equiv_in(&b.domain, vars_compare)
-                        && a.codomain.equiv_in(&b.codomain, vars_compare)
+                    let kind_pending = comparison == Comparison::DataDomain
+                        && (a.kind == KindPin::Unpinned || b.kind == KindPin::Unpinned);
+                    (comparison == Comparison::DataDomain || a.name == b.name)
+                        && (kind_pending || a.kind == b.kind)
+                        && (kind_pending
+                            || (a.domains_disagree == b.domains_disagree
+                                && a.binders.len() == b.binders.len()
+                                && a.binders.iter().zip(&b.binders).all(|(x, y)| {
+                                    (comparison == Comparison::DataDomain || x.id == y.id)
+                                        && x.type_kind.equiv_in(&y.type_kind, comparison)
+                                })))
+                        && a.domain.equiv_in(&b.domain, comparison)
+                        && a.codomain.equiv_in(&b.codomain, comparison)
                 }
                 _ => false,
             }
@@ -5322,6 +5336,143 @@ mod tests {
             ])),
             "the met domain is the union of the two records' fields"
         );
+    }
+
+    /// Two domains agree at every position or are two domains: a tuple component that differs
+    /// makes the tuples differ, as the whole domain would.
+    #[test]
+    fn data_domains_differing_in_a_component_disagree() {
+        let domain = |n: usize| {
+            compact_type(&Type::tuple(vec![
+                Type::index_range(1),
+                Type::index_range(n),
+            ]))
+            .term
+        };
+        assert!(data_domains_disagree(&domain(1), &domain(2)));
+        assert!(!data_domains_disagree(&domain(2), &domain(2)));
+    }
+
+    #[test]
+    fn data_domain_agreement_visits_every_structural_shape() {
+        let int = Type::Base(BaseType::Int);
+        let parameter = crate::ccl::TypeParam::declared("T");
+        let span = chl_parser::ast::Span::new(chl_parser::FileId::ROOT, 0, 0);
+        let nominal = NominalDecl::declared("N".into(), vec![Rc::clone(&parameter)], span, false);
+        nominal
+            .define(vec![crate::ccl::nominal::NominalCtor::unwritten(
+                "new".into(),
+                span,
+                vec![(None, Type::Param(parameter))],
+            )])
+            .unwrap();
+
+        let wrappers: Vec<Box<dyn Fn(Type) -> Type>> = vec![
+            Box::new(|t| Type::Variant(vec![(FieldKey::Name("a".into()), t)], Openness::Closed)),
+            Box::new(move |t| Type::Nominal(Rc::clone(&nominal), vec![t])),
+            Box::new(|t| Type::fun(t, Type::Base(BaseType::Int))),
+            Box::new(|t| Type::fun(Type::Base(BaseType::Int), t)),
+            Box::new(|t| Type::history(t, Type::Base(BaseType::Int), HistoryKind::Overwrite)),
+            Box::new(|t| Type::history(Type::Base(BaseType::Int), t, HistoryKind::Overwrite)),
+            Box::new(|t| Type::family(vec![(Name::raw("k"), Type::Base(BaseType::Int))], t)),
+        ];
+        for wrap in wrappers {
+            let a = compact_type(&wrap(Type::UIntRange(1))).term;
+            let b = compact_type(&wrap(Type::UIntRange(2))).term;
+            assert!(
+                data_domains_disagree(&a, &b),
+                "different domains: {a:?}, {b:?}"
+            );
+            assert!(!data_domains_disagree(&a, &a));
+            let unknown = compact_type(&wrap(Type::Hole)).term;
+            assert!(
+                !data_domains_disagree(&a, &unknown),
+                "an unresolved child is no disagreement"
+            );
+        }
+        let one_tag = Type::Variant(
+            vec![(FieldKey::Name("a".into()), int.clone())],
+            Openness::Closed,
+        );
+        let other_tag = Type::Variant(vec![(FieldKey::Name("b".into()), int)], Openness::Closed);
+        assert!(data_domains_disagree(
+            &compact_type(&one_tag).term,
+            &compact_type(&other_tag).term
+        ));
+    }
+
+    #[test]
+    fn an_unpinned_function_kind_does_not_distinguish_data_domains() {
+        let int = Type::Base(BaseType::Int);
+        let compute = compact_type(&Type::fun(int.clone(), int.clone())).term;
+        let data = compact_type(&Type::data_fun(int.clone(), int)).term;
+        let mut unpinned = compute.clone();
+        unpinned.fun.as_mut().unwrap().kind = KindPin::Unpinned;
+        assert!(!data_domains_disagree(&compute, &unpinned));
+        assert!(!data_domains_disagree(&data, &unpinned));
+        assert!(data_domains_disagree(&compute, &data));
+
+        let sum = compact_type(&Type::sum_over(
+            crate::ccl::TypeKind::UIntRanges,
+            None,
+            Type::Base(BaseType::Int),
+        ))
+        .term;
+        let function = unpinned.fun.as_mut().unwrap();
+        *function.domain = CompactType::default();
+        assert!(!data_domains_disagree(&unpinned, &sum));
+        unpinned.fun.as_mut().unwrap().kind = KindPin::Compute;
+        assert!(data_domains_disagree(&unpinned, &sum));
+    }
+
+    #[test]
+    fn local_sum_binder_identities_do_not_distinguish_data_domains() {
+        let sum = |value| {
+            compact_type(&Type::sum_over(
+                crate::ccl::TypeKind::UIntRanges,
+                None,
+                value,
+            ))
+            .term
+        };
+        let a = sum(Type::Base(BaseType::Int));
+        let b = sum(Type::Base(BaseType::Int));
+        let c = sum(Type::Base(BaseType::String));
+        assert!(!data_domains_disagree(&a, &b));
+        assert!(data_domains_disagree(&a, &c));
+    }
+
+    #[test]
+    fn redundant_plain_and_dependent_tuples_denote_one_data_domain() {
+        let plain = compact_type(&Type::Tuple(vec![Type::UIntRange(2), Type::UIntRange(3)])).term;
+        let dependent = CompactType {
+            dep_tuple: Some(CompactDepTuple {
+                names: vec![None, None],
+                components: plain.rec.as_ref().unwrap().values().cloned().collect(),
+            }),
+            ..CompactType::value()
+        };
+        let combined = CompactType::merge(false, plain.clone(), dependent.clone());
+        assert!(!data_domains_disagree(&combined, &plain));
+        assert!(!data_domains_disagree(&combined, &dependent));
+        assert!(combined.equiv(&plain));
+        let different =
+            compact_type(&Type::Tuple(vec![Type::UIntRange(2), Type::UIntRange(4)])).term;
+        assert!(data_domains_disagree(&combined, &different));
+    }
+
+    #[test]
+    fn enumerated_data_domain_kinds_ignore_candidate_order() {
+        let kind = |ranges: &[u64]| {
+            CompactTypeKind::Enumerated(
+                ranges
+                    .iter()
+                    .map(|n| compact_type(&Type::UIntRange(*n)).term)
+                    .collect(),
+            )
+        };
+        assert!(kind(&[1, 2]).equiv_in(&kind(&[2, 1]), Comparison::DataDomain));
+        assert!(!kind(&[1, 2]).equiv_in(&kind(&[1, 3]), Comparison::DataDomain));
     }
 
     /// The merge is commutative under `CompactType`'s own equality, including once
