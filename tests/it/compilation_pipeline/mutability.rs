@@ -3641,3 +3641,254 @@ fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
 ) {
     check_scalar(code, Value::Int(value));
 }
+
+/// A `Mut(V)` parameter's writes reach the caller wherever the call stands and whatever the
+/// function's body holds. A call stands bound whole, with an annotated `=> T` result, which is read
+/// through the same binder as an unannotated one, or a unit one; as a statement in a loop body,
+/// which discards the value the body ends in; or inside an expression, a declaration's or a
+/// write's value, a condition or a loop's source. A body may call another writer, declare a
+/// mutable variable of its own, write in an `if` or write in a loop.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::an_annotated_result(
+    indoc! {"
+        def add(c: Mut(Int), n: Int) => Int:
+            c += n
+            n
+        t := 0
+        x = add(t, 4)
+        t + x
+    "},
+    8
+)]
+#[case::a_unit_result(
+    indoc! {"
+        def add(c: Mut(Int), n: Int) => {}:
+            c += n
+        t := 0
+        add(t, 4)
+        t
+    "},
+    4
+)]
+#[case::a_statement_in_a_loop(
+    indoc! {"
+        def add(c: Mut(Int), n: Int):
+            c += n
+            n
+        t := 0
+        for x in [1, 2, 3]:
+            add(t, x)
+        t
+    "},
+    6
+)]
+#[case::an_annotated_statement_in_a_loop(
+    indoc! {"
+        def add(c: Mut(Int), n: Int) => Int:
+            c += n
+            n
+        t := 0
+        for x in [1, 2, 3]:
+            add(t, x)
+        t
+    "},
+    6
+)]
+#[case::a_computed_result_in_a_loop(
+    indoc! {"
+        def add(c: Mut(Int), n: Int) => Int:
+            c += n
+            n * 2
+        t := 0
+        for x in [1, 2, 3]:
+            add(t, x)
+        t
+    "},
+    6
+)]
+#[case::a_statement_in_a_nested_loop(
+    indoc! {"
+        def add(c: Mut(Int), n: Int) => Int:
+            c += n
+            n
+        t := 0
+        for x in [1, 2]:
+            for y in [10, 20]:
+                add(t, y)
+        t
+    "},
+    60
+)]
+#[case::call_in_an_expression(
+    indoc! {"
+        def add(c: Mut(Int), n: Int):
+            c += n
+            n
+        t := 0
+        x = add(t, 4) + 1
+        t + x
+    "},
+    9
+)]
+#[case::nested_writers(
+    indoc! {"
+        def add(c: Mut(Int), n: Int):
+            c += n
+            n
+        def add2(c: Mut(Int), n: Int):
+            a = add(c, n)
+            b = add(c, n)
+            a + b
+        t := 0
+        x = add2(t, 4)
+        t + x
+    "},
+    16
+)]
+#[case::a_local_mutable(
+    indoc! {"
+        def add(c: Mut(Int), n: Int):
+            k := n
+            k += 1
+            c += k
+            k
+        t := 0
+        x = add(t, 4)
+        t + x
+    "},
+    10
+)]
+#[case::a_writing_if(
+    indoc! {"
+        def add(c: Mut(Int), n: Int):
+            if n > 2:
+                c += n
+            else:
+                c += 0
+            n
+        t := 0
+        x = add(t, 4)
+        y = add(t, 1)
+        t + x + y
+    "},
+    9
+)]
+#[case::a_loop_in_the_body(
+    indoc! {"
+        def add(c: Mut(Int), xs):
+            for x in xs:
+                c += x
+            0
+        t := 0
+        x = add(t, [1, 2, 3])
+        t + x
+    "},
+    6
+)]
+#[case::a_declaration_value(
+    indoc! {"
+        def add(c: Mut(Int), n: Int):
+            c += n
+            n
+        t := 0
+        k := add(t, 4)
+        k += 1
+        t + k
+    "},
+    9
+)]
+#[case::a_write_value(
+    indoc! {"
+        def add(c: Mut(Int), n: Int):
+            c += n
+            n
+        t := 0
+        s := 0
+        s := add(t, 4)
+        t + s
+    "},
+    8
+)]
+#[case::a_condition(
+    indoc! {"
+        def add(c: Mut(Int), n: Int):
+            c += n
+            n
+        t := 0
+        y := 0
+        if add(t, 4) > 2:
+            y := 1
+        else:
+            y := 2
+        t + y
+    "},
+    5
+)]
+#[case::a_loop_source(
+    indoc! {"
+        def add(c: Mut(Int), n: Int):
+            c += n
+            n
+        t := 0
+        s := 0
+        for x in [add(t, 4), 1]:
+            s += x
+        t + s
+    "},
+    9
+)]
+#[case::both_operands(
+    indoc! {"
+        def add(c: Mut(Int), n: Int):
+            c += n
+            n
+        t := 0
+        x = add(t, 4) + add(t, 1)
+        t + x
+    "},
+    10
+)]
+#[case::a_result_of_writes(
+    indoc! {"
+        def add(c: Mut(Int), n: Int):
+            c += n
+            n
+        def both(c: Mut(Int)):
+            add(c, 1) + add(c, 2)
+        t := 0
+        x = both(t)
+        t + x
+    "},
+    6
+)]
+#[case::a_read_before_the_write(
+    indoc! {"
+        def add(c: Mut(Int), n: Int):
+            c += n
+            n
+        t := 1
+        x = t + add(t, 4)
+        t + x
+    "},
+    10
+)]
+#[case::an_expression_in_a_loop_body(
+    indoc! {"
+        def add(c: Mut(Int), n: Int):
+            k := n
+            k += 1
+            c += k
+            k
+        t := 0
+        s := 0
+        for x in [1, 2]:
+            y = add(t, x) + 1
+            s += y
+        t + s
+    "},
+    12
+)]
+fn a_mut_parameter_writes_whatever_the_result(#[case] code: &str, #[case] value: i64) {
+    check_scalar(code, Value::Int(value));
+}

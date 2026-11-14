@@ -27,7 +27,9 @@ required bare projections.
 Parameters with ordinary annotations retain those annotations on the lambda binding. For a tupled
 function, the binding carries a tuple of parameter annotations, with `Type::Hole` in unannotated
 positions. A `def` output annotation inserts an annotated binding for `__output` inside the lambda
-body. Its refinement predicate can therefore refer to function parameters.
+body. Its refinement predicate can therefore refer to function parameters. `opaque_output` renames
+the binder to the synthetic result binder it mints itself, so later passes read a lambda's result
+through one binder (`opaque_output::output_body`).
 
 A function with a `Mut(…)` or `Feed(…)` parameter uses named, curried lambdas instead. A mutable
 write and a feed each keep the parameter name as their target; a tuple projection cannot be a

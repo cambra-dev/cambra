@@ -492,6 +492,34 @@ fn is_handle_to(e: &Expr, name: &Name) -> bool {
 
 /// Whether `definiens` reads a mutable variable that `body` writes.
 ///
+/// Whether `definiens` writes a mutable variable it does not declare itself, by its
+/// capabilities. A write stands on the statement spine, where A-normalization put the call
+/// that makes it; moved into its use, into an operand or a declaration's value, it is off
+/// the spine, where `mut_elim` reads no write (`crate::ccl::mut_elim`, `flatten_spine`).
+fn writes_a_variable_bound_outside(definiens: &Expr) -> bool {
+    let set = definiens.capabilities.set();
+    let written: Vec<&Name> = set
+        .causes
+        .iter()
+        .filter_map(|e| match e {
+            crate::ccl::capabilities::Effect::Write(x) => Some(x),
+            _ => None,
+        })
+        .collect();
+    if written.is_empty() {
+        return false;
+    }
+    fn bound(e: &Expr, names: &mut HashSet<Name>) {
+        e.walk_binders(|b| {
+            names.insert(b.name.clone());
+        });
+        e.walk_children(|c| bound(c, names));
+    }
+    let mut own = HashSet::new();
+    bound(definiens, &mut own);
+    written.iter().any(|x| !own.contains(*x))
+}
+
 /// A read moved past a write reports the variable's value at the wrong position:
 /// in `x := 1; a = x; x += 4; [a, 2]` the element is `1`, the value when `a` was
 /// bound, not `5`. This asks [`is_mut_written`]'s question over every name the
@@ -590,7 +618,12 @@ fn inline_list_element_reads(mut expr: Expr, memo: &PredMemo) -> (Expr, bool) {
         && (crate::ccl::subst::type_free_vars(&ty).contains(&binding.name)
             || spelled_in_a_type(&body, &binding.name));
 
-    let (body, here) = if spelled || reads_a_variable_written_in(&bound_expr, &body) {
+    // A definiens that writes a variable it does not declare stays on the statement spine
+    // ([`writes_a_variable_bound_outside`]).
+    let (body, here) = if spelled
+        || reads_a_variable_written_in(&bound_expr, &body)
+        || writes_a_variable_bound_outside(&bound_expr)
+    {
         (*body, false)
     } else {
         let _g = provenance::enter(
@@ -744,7 +777,7 @@ fn a_list_element_reads(name: &Name, e: &Expr) -> bool {
 /// between the element and its constructor is not.
 ///
 /// The position is one bound on the rewrite — the caller applies it to what it
-/// moves, so a binding anywhere else keeps its `Let` — and three conditions are
+/// moves, so a binding anywhere else keeps its `Let` — and four conditions are
 /// the rest:
 ///
 /// - **An A-normalization temp binder** ([`Name::is_anf_temp`]). A binding a
@@ -754,6 +787,9 @@ fn a_list_element_reads(name: &Name, e: &Expr) -> bool {
 ///   ([`count_free`]), which makes the rewrite a move rather than a copy.
 /// - **No read of a variable the body writes** ([`reads_a_variable_written_in`]),
 ///   for its reason: the definiens moves past whatever the body writes.
+/// - **No write of a variable the definiens does not declare**
+///   ([`writes_a_variable_bound_outside`]): moved into the element, the write is off the
+///   statement spine.
 ///
 /// An element that is a computation rather than a constant is left standing as
 /// the computation it is, which is what op-conversion reports.
@@ -770,6 +806,7 @@ fn flatten_anf_bindings(mut elt: Expr) -> Expr {
     if !binding.name.is_anf_temp()
         || count_free(&binding.name, body) != 1
         || reads_a_variable_written_in(bound_expr, body)
+        || writes_a_variable_bound_outside(bound_expr)
     {
         return elt;
     }
@@ -1003,13 +1040,15 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
             // `𝑐 ▷ const ≫ box` — a `box` composed as a morphism, which
             // op-conversion has no arm for.
             //
-            // The three conditions are [`flatten_anf_bindings`]': an `AnfTemp`
+            // The conditions are [`flatten_anf_bindings`]': an `AnfTemp`
             // binder, one occurrence (a refinement predicate's counted), and no
-            // read of a variable the body writes.
+            // read of a variable the body writes; and no write of a variable the
+            // definiens does not declare ([`writes_a_variable_bound_outside`]).
             if !binder_spelled_in_a_type
                 && binding.name.is_anf_temp()
                 && count_free(&binding.name, &body) == 1
                 && !reads_a_variable_written_in(&bound_expr, &body)
+                && !writes_a_variable_bound_outside(&bound_expr)
                 && !stands_in_a_value_former(&binding.name, &body)
             {
                 let _g =
@@ -1069,6 +1108,7 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                 && binding.name.is_anf_temp()
                 && anf_chain_builds_a_product(&bound_expr)
                 && !reads_a_variable_written_in(&bound_expr, &body)
+                && !writes_a_variable_bound_outside(&bound_expr)
             {
                 let _g =
                     provenance::enter(node_id, "inline.anf_product", provenance::Nature::Machinery);

@@ -123,6 +123,7 @@ mod test_sink;
 mod traits;
 mod transactions;
 
+pub(crate) use functions::OUTPUT_BINDER;
 pub(crate) use stmts::TUPLE_ASSIGNMENT_LABEL;
 /// The names a type alias may not rebind, re-exported so the test that pins the
 /// refusal iterates the same source [`is_builtin_type_name`] reads.
