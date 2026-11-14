@@ -2674,6 +2674,12 @@ chain reads each position as its input carried there.
 
 #### `let` binders and scope exit
 
+`Subst::transport_type` rewrites a type slot inside a term without packing witnesses.
+`Subst::apply_type` rewrites a result leaving a binder and collects the projections that
+quote definitions whose form may change. Recursive reconstruction shares that record;
+packing runs once over the rebuilt result. Expression substitution and substitution composition
+use transport explicitly. The mode is independent of the surrounding call stack.
+
 When a result type leaves a transparent let binder's scope, references to the binder are replaced
 with its definition, subject to the mutable-definition exceptions below. A Pi binder has no
 defining value to substitute; leaving that binder instead
@@ -2697,6 +2703,20 @@ The implementation leaves the body type unchanged for `MutDecl` and `MutWrite` d
 They do not denote the immutable value required by this substitution: a mutable history is not
 its seed, and a write is not the written value. They are eliminated before consumers of the
 lifted type use that representation.
+
+A collection type leaving a `let` can project its domain through the definition. Later passes
+can rewrite a computed definition while a projection still quotes its old form. A projection
+can retain a term whose normal form identifies those rewrites (`subst::can_keep_projection_term`).
+
+For a projection through any other definition, scope exit replaces a settled single candidate
+with that candidate. A witness whose type kind names no candidates is bound by a fresh sum.
+For example, a domain `(0..2, σ₁(𝑡))` becomes `Σ (σ : 𝐾). (0..2, σ) ⤇ 𝑉` when `σ₁(𝑡)`
+ranges over `𝐾`. Projections over multiple candidates retain the source witness.
+
+Only a projection created by the discharge is packed during substitution. A type slot inside
+a term preserves its projected witnesses so that related slots keep the same binders. Coalescing
+packs completed types after the solver has resolved their domains.
+
 
 Coalescing closes the result using the resolved body and definition. Nested lets close from
 inside outward. If lambda elimination rewrites a definition quoted by the result type, its let

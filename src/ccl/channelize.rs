@@ -1191,13 +1191,18 @@ fn run_memoized(expr: Expr) -> Result<Expr, Located<DeferError>> {
     // `Fun` — the exact feed-side analog of `mut_elim::erase_mut`. The
     // strict post-channelize `typecheck` in `compile_program` backstops the
     // invariant.
-    let mut map = close_chan_domains(std::mem::take(&mut ctx.resolved_domains));
+    let raw = close_chan_domains(std::mem::take(&mut ctx.resolved_domains));
+    let mut domains = ChanDomains {
+        closed: raw.clone(),
+        raw,
+        closings: Vec::new(),
+    };
     let kinds: HashMap<Name, FunKind> =
         std::mem::take(&mut ctx.channel_kinds).into_iter().collect();
     // One predicate memo for the whole erasure, so occurrences that shared a predicate
     // term still share one afterwards ([`PredMemo`], "One memo per pass").
     let predicates: PredMemo<()> = PredMemo::default();
-    erase_chan_domains(&mut rewritten, &mut map, &kinds, &predicates);
+    erase_chan_domains(&mut rewritten, &mut domains, &kinds, &predicates);
     #[cfg(debug_assertions)]
     assert_no_type_residue(&rewritten);
     // Every feed is a channel's union now, so nothing appends to one, and this is the last
@@ -1480,6 +1485,44 @@ fn erase_chan_domains_in_slot(
     changed
 }
 
+/// The channel domains [`erase_chan_domains`] substitutes, and the `let` discharges a type
+/// over one of them takes outside the binders the domain names.
+struct ChanDomains {
+    /// Each channel's assembled domain, in the scope of the binders it names.
+    raw: HashMap<Name, Type>,
+    /// Each domain under the discharges the walk has passed: what decides whether a `let`
+    /// binder further out still closes over it.
+    closed: HashMap<Name, Type>,
+    /// The discharge of each `let` binder a domain named, innermost first.
+    closings: Vec<(Name, Subst)>,
+}
+
+/// Erase channel types from one type slot of the tree, then close the result over the
+/// `let` binders the walk has passed that it names. The discharge applies to the whole
+/// slot, as [`closed_let_type`](crate::ccl::ccl_utils::closed_let_type) applies it to a
+/// body type, so a collection over a sum's witness leaves its scope as the strict check
+/// rebuilds it: packed ([`pack_projections`](crate::ccl::subst::pack_projections)), where
+/// discharging the domain alone would quote the definition.
+fn erase_and_close_slot(
+    ty: &mut Type,
+    domains: &ChanDomains,
+    kinds: &HashMap<Name, FunKind>,
+    predicates: &PredMemo<()>,
+) {
+    if !erase_chan_domains_in_slot(ty, &domains.raw, kinds, predicates)
+        || domains.closings.is_empty()
+    {
+        return;
+    }
+    let mut free = crate::ccl::subst::type_free_vars(ty);
+    for (binder, discharge) in &domains.closings {
+        if free.contains(binder) {
+            *ty = discharge.apply_type(ty);
+            free = crate::ccl::subst::type_free_vars(ty);
+        }
+    }
+}
+
 /// whole-tree erasure — node types, user annotations, and
 /// the binder slots `walk_children_mut` does not reach (mirroring
 /// `mut_elim::erase_mut`'s coverage of the strict-wall checker).
@@ -1489,12 +1532,13 @@ fn erase_chan_domains_in_slot(
 /// filter-feed guard `x > n` referencing `let n = 0`). Inference never saw
 /// that predicate above the binder — the rigid `ChanDom` hid it — so its §6.2
 /// Let-closing discharge was vacuous there. Replay it here: after a `Let`'s
-/// subtree is erased, discharge `[name ↦ bound]` into every map value, so any
-/// substitution *above* the binder injects the closed form the strict checker
-/// derives. Still derivation-free — a discharge transport, not re-inference.
+/// subtree is erased, its discharge `[name ↦ bound]` is recorded for every domain
+/// naming `name`, and each slot erased above the binder applies it to the whole
+/// type ([`erase_and_close_slot`]), the closed form the strict checker derives.
+/// Still derivation-free — a discharge transport, not re-inference.
 fn erase_chan_domains(
     expr: &mut Expr,
-    map: &mut HashMap<Name, Type>,
+    domains: &mut ChanDomains,
     kinds: &HashMap<Name, FunKind>,
     predicates: &PredMemo<()>,
 ) {
@@ -1509,9 +1553,9 @@ fn erase_chan_domains(
     // that child — never in scope at this binder — so erasing binders before the
     // child recursion sees the same substitutions the old inline order did.
     expr.walk_binders_mut(|b| {
-        erase_chan_domains_in_slot(&mut b.ty, map, kinds, predicates);
+        erase_and_close_slot(&mut b.ty, domains, kinds, predicates);
         if let Some(ann) = &mut b.user_annotation {
-            erase_chan_domains_in_slot(&mut ann.ty, map, kinds, predicates);
+            erase_and_close_slot(&mut ann.ty, domains, kinds, predicates);
         }
     });
     if let TypedExprNode::Let {
@@ -1520,8 +1564,8 @@ fn erase_chan_domains(
         body,
     } = &mut expr.node
     {
-        erase_chan_domains(bound_expr, map, kinds, predicates);
-        erase_chan_domains(body, map, kinds, predicates);
+        erase_chan_domains(bound_expr, domains, kinds, predicates);
+        erase_chan_domains(body, domains, kinds, predicates);
         // §6.2 Let-closing on the substitution content (see fn docs).
         // A discharge template is not a tree node: it is cloned again at every
         // read, and that read is where the sibling is minted. An opaque binder, a
@@ -1532,18 +1576,23 @@ fn erase_chan_domains(
             // Only a domain naming the binder is rewritten. A `let` under a loop's position
             // lambda can read the position, and a domain built from that loop names a binder
             // after it, which a discharge passing under it would report as a capture.
-            for dom in map.values_mut() {
+            let mut closes = false;
+            for dom in domains.closed.values_mut() {
                 if crate::ccl::subst::type_free_vars(dom).contains(&binding.name) {
                     *dom = discharge.apply_type(dom);
+                    closes = true;
                 }
+            }
+            if closes {
+                domains.closings.push((binding.name.clone(), discharge));
             }
         }
     } else {
-        expr.walk_children_mut(|c| erase_chan_domains(c, map, kinds, predicates));
+        expr.walk_children_mut(|c| erase_chan_domains(c, domains, kinds, predicates));
     }
-    erase_chan_domains_in_slot(&mut expr.ty, map, kinds, predicates);
+    erase_and_close_slot(&mut expr.ty, domains, kinds, predicates);
     if let Some(ann) = &mut expr.user_annotation {
-        erase_chan_domains_in_slot(ann, map, kinds, predicates);
+        erase_and_close_slot(ann, domains, kinds, predicates);
     }
 }
 
