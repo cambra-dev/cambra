@@ -792,6 +792,7 @@ impl TileProducer for LookupProducer {
             domain,
             codomain,
             deleted,
+            domain_predicate,
             ..
         } = collection
         else {
@@ -814,12 +815,6 @@ impl TileProducer for LookupProducer {
                     .map(|i| values.index_at(i))
             })
             .collect();
-        // The type keeps every key inside its collection's domain, so an input that is
-        // complete answers every row.
-        assert!(
-            answers.iter().all(Option::is_some) || !tile.is_terminal(),
-            "Lookup: a key outside its collection's domain, which `apply`'s type rules out"
-        );
         if self.level == CurryLevel::OUTERMOST {
             return match answers.into_iter().next().flatten() {
                 Some(v) => Tile::Scalar(ColumnValue::from_values(vec![v], &out_extent)),
@@ -827,31 +822,25 @@ impl TileProducer for LookupProducer {
             };
         }
         let rows_level = CurryLevel::new(self.level.index() - 1);
-        let decided: Vec<bool> = answers.iter().map(Option::is_some).collect();
-        if !decided.iter().all(|&d| d) {
-            let undecided: Vec<Vec<Value>> = tile
-                .paths_at(rows_level)
-                .into_iter()
+        let paths = tile.paths_at(rows_level);
+        let complete = tile
+            .completion_at(rows_level)
+            .descend(1)
+            .union(domain_predicate);
+        let keep: Vec<bool> = answers.iter().map(Option::is_some).collect();
+        if !keep.iter().all(|&held| held) {
+            let withheld: Vec<&[Value]> = paths
+                .iter()
                 .zip(&answers)
-                .filter(|(_, answer)| answer.is_none())
-                .map(|(path, _)| path)
+                .enumerate()
+                .filter(|(row, (path, answer))| {
+                    let mut key_path = (*path).clone();
+                    key_path.push(keys.index_at(*row));
+                    answer.is_none() && !complete.contains_path(&key_path)
+                })
+                .map(|(_, (path, _))| path.as_slice())
                 .collect();
-            for level in 0..self.level.index() {
-                let missing = Predicate::flatten_or(
-                    undecided
-                        .iter()
-                        .map(|path| Predicate::exactly(&path[..=level]))
-                        .collect(),
-                );
-                let Tile::DataFunction {
-                    domain_predicate, ..
-                } = tile.values_at_mut(CurryLevel::new(level))
-                else {
-                    unreachable!("every level above the rows is a collection")
-                };
-                *domain_predicate = domain_predicate.minus(&missing);
-            }
-            tile.values_at_mut(rows_level).retain_keys(&decided);
+            tile.withhold(rows_level, &keep, &withheld);
         }
         *tile.values_at_mut(self.level) = Tile::Scalar(ColumnValue::from_values(
             answers.into_iter().flatten().collect(),
@@ -1081,7 +1070,7 @@ mod tests {
 
     /// Two rows, each a key and its own collection: row 0 reads `2` in `{1: 10, 2: 20}` and
     /// row 1 reads `second_key` in `{1: 30}`, whose `2` may still arrive.
-    fn keyed_rows(second_key: i64) -> LookupProducer {
+    fn keyed_rows(second_key: i64, complete: bool) -> LookupProducer {
         let record = Tile::Record {
             fields: HashMap::from([
                 (
@@ -1094,18 +1083,26 @@ mod tests {
                         vec![0, 2],
                         ColumnValue::Ints(vec![1, 2, 1]),
                         Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30]))),
-                        Predicate::False,
+                        if complete {
+                            Predicate::True
+                        } else {
+                            Predicate::False
+                        },
                         BitSet::new(),
                     ),
                 ),
             ]),
             absent: HashMap::new(),
         };
-        // The rows' collections are still growing, so no row is complete.
+        // Completion applies to both the rows and the collections they hold.
         let tile = Tile::data_function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(record),
-            Predicate::False,
+            if complete {
+                Predicate::True
+            } else {
+                Predicate::False
+            },
             BitSet::new(),
         );
         let tiling = Tiling::data_function(
@@ -1129,7 +1126,7 @@ mod tests {
     /// Each row's key is read in that row's own collection, not in one every row shares.
     #[test]
     fn each_row_reads_its_key_in_its_own_collection() {
-        let mut lookup = keyed_rows(1);
+        let mut lookup = keyed_rows(1, false);
         let out = lookup.get(lookup.tiling().universal_guard());
         assert_eq!(*out.key_levels()[0].1, ColumnValue::UInts(vec![0, 1]));
         assert_eq!(
@@ -1142,7 +1139,7 @@ mod tests {
     /// while the row whose key has arrived goes out.
     #[test]
     fn a_row_whose_key_has_not_arrived_is_withheld() {
-        let mut lookup = keyed_rows(2);
+        let mut lookup = keyed_rows(2, false);
         let out = lookup.get(lookup.tiling().universal_guard());
         assert_eq!(*out.key_levels()[0].1, ColumnValue::UInts(vec![0]));
         assert_eq!(
@@ -1156,5 +1153,17 @@ mod tests {
             panic!("the answer tiles as a collection: {out:?}")
         };
         assert!(!domain_predicate.contains_path(&[Value::UInt(1)]));
+    }
+
+    #[test]
+    fn a_key_absent_from_a_complete_row_leaves_no_unfinished_output() {
+        let mut lookup = keyed_rows(2, true);
+        let output = lookup.get(lookup.tiling().universal_guard());
+        assert_eq!(*output.key_levels()[0].1, ColumnValue::UInts(vec![0]));
+        assert_eq!(
+            scalar_tile_to_column_value(output.deepest_values().clone()),
+            ColumnValue::Ints(vec![20])
+        );
+        assert!(output.is_terminal());
     }
 }
