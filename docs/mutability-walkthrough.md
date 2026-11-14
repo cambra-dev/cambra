@@ -472,16 +472,17 @@ in for i in [1, 2, 3] do x := x + i; unit;
 x
 ```
 
-**Example B** — note the last block. A standalone transaction lowers as a *singleton loop*
-wrapping a `Begin`, so there is only ever one shape downstream and no special case for
-"a block not in a loop":
+**Example B** — note the last block. A standalone transaction lowers to a `Begin` on the
+statement chain, as a block in a loop body does. The transaction phase gives it the source a loop
+would: the singleton `[unit]`, one item and so one transaction.
 
 ```
 let out = defer
 in pool : Mut(Int, Txn) := 100
-in for r in [10, 20, 30] do begin { pool := pool - r; unit }; unit;
-   for __txn_item_0 in [unit] do begin { feed(out, pool); unit }; unit;
-out
+in for r in [10, 20, 30] ▷ Iterable::elements do
+     begin { pool := pool - r; feed(out, pool); unit }; unit;
+   begin { pool := pool - 5; feed(out, pool); unit };
+   pool ▷ await_final
 ```
 
 ### `infer` — `Mut` is an ordinary type here
@@ -529,13 +530,13 @@ writer site writes** never gets that far — its write history is statically emp
 becomes its seed. That covers a variable no block mentions and one some block only reads, which is
 a key of the store all the same.
 
-**Example B** after it. Both writing loops are hollowed out to `do unit` — their bodies
-lifted into the letrec below — which is the clearest single picture of what this phase does:
+**Example B** after it. The writing loop is hollowed out to `do unit` and the standalone block is
+gone, both bodies lifted into the letrec below, which is the clearest single picture of what this
+phase does:
 
 ```
 let out : feed(chan(out) ⤇ Int) = defer
 in for r in [10, 20, 30] do unit;
-   for __txn_item_0 in [unit] do unit;
    letrec
      pool : (Txn ⤇ Int) =
        λ __t : Txn →

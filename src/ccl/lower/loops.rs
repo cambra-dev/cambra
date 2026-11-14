@@ -56,16 +56,18 @@ fn stmt_has_feed(stmt: &Spanned<ChlStmt>) -> bool {
     }
 }
 
-/// Whether the loop body contains a top-level `with begin():` transaction block.
+/// Whether the loop body contains a `with begin():` transaction block, as one of its
+/// statements or in a branch of an `if`, a `match` or a `try`.
 ///
 /// A routing predicate, like [`for_body_has_yield`]/[`for_body_has_feed`]: a
 /// for-loop whose body has a `with` block (with or without sibling induction
 /// writes/feeds) takes the direct-mirror `For` path, where the block lowers to a
-/// [`TypedExprNode::Begin`] marker `transact_phase` later strips. (A `with`
-/// nested under an `if`/inner `for` is not this shape; the body walker rejects
-/// it.)
+/// [`TypedExprNode::Begin`] marker `transact_phase` later strips. A `with` in an inner
+/// `for` is that loop's, which [`body_has_with`] asks about.
 pub(super) fn for_body_has_with(stmts: &[Spanned<ChlStmt>]) -> bool {
-    stmts.iter().any(is_with)
+    stmts
+        .iter()
+        .any(|stmt| is_with(stmt) || stmt.node.branch_blocks().into_iter().any(for_body_has_with))
 }
 
 /// Whether `stmt` is a `with begin():` block, as a statement or on an assignment's right-hand
@@ -1424,7 +1426,6 @@ fn lower_nested_loop(
             body_stmts,
             acc_names,
             yield_defer,
-            false,
             outer_bindings,
             for_span,
             ctx,
@@ -1521,7 +1522,6 @@ pub(super) fn lower_direct_mirror_loop(
             body_stmts,
             acc_names,
             yield_defer,
-            false,
             outer_bindings,
             for_span,
             ctx,
@@ -1561,16 +1561,10 @@ pub(super) fn lower_direct_mirror_loop(
 /// `ChlStmt::If` arm below, which recurses through it to lower each branch's
 /// body identically — so a `+=` under an `if` produces the same `MutWrite`
 /// marker it would at top level, just nested inside a statement-position `Case`.
-///
-/// `in_conditional` is `true` when lowering an `if`-branch body: a per-iteration
-/// `with begin():` transaction inside a conditional is not yet supported (the
-/// per-path transaction verdict — see `design/mutability.md`), so it is rejected
-/// there rather than emitted as a `Begin` marker.
 fn lower_loop_body_chain(
     body_stmts: &[Spanned<ChlStmt>],
     acc_names: &[String],
     yield_defer: Option<&str>,
-    in_conditional: bool,
     outer_bindings: &HashSet<String>,
     for_span: Span,
     ctx: &mut LoweringContext,
@@ -1582,7 +1576,6 @@ fn lower_loop_body_chain(
             body_stmts,
             acc_names,
             yield_defer,
-            in_conditional,
             outer_bindings,
             for_span,
             ctx,
@@ -1590,22 +1583,11 @@ fn lower_loop_body_chain(
     })
 }
 
-/// The refusal of a `with begin():` block inside an `if` in a loop body, as a statement or
-/// in value position.
-fn with_in_conditional(span: Span) -> LoweringError {
-    LoweringError::unsupported(
-        span,
-        "a `with begin():` transaction inside an `if` in a for-loop body \
-         is not supported; move it to the loop's top level",
-    )
-}
-
 /// [`lower_loop_body_chain`] with the body's type aliases already in scope.
 fn lower_loop_body_chain_scoped(
     body_stmts: &[Spanned<ChlStmt>],
     acc_names: &[String],
     yield_defer: Option<&str>,
-    in_conditional: bool,
     outer_bindings: &HashSet<String>,
     for_span: Span,
     ctx: &mut LoweringContext,
@@ -1651,9 +1633,6 @@ fn lower_loop_body_chain_scoped(
             // is a per-iteration shadowing `let`, *never* a mutable write: `=`
             // is not a mutation operator (accumulators are written with `:=`
             // / `+=`). A loop-carried accumulator therefore never appears here.
-            ChlStmt::Assign { .. } if in_conditional && is_with(stmt) => {
-                return Err(with_in_conditional(stmt.span));
-            }
             ChlStmt::Assign {
                 target,
                 value,
@@ -1825,15 +1804,7 @@ fn lower_loop_body_chain_scoped(
                     outer_bindings,
                     ctx,
                     |body, scope, ctx| {
-                        lower_loop_body_chain(
-                            body,
-                            acc_names,
-                            yield_defer,
-                            true,
-                            scope,
-                            stmt.span,
-                            ctx,
-                        )
+                        lower_loop_body_chain(body, acc_names, yield_defer, scope, stmt.span, ctx)
                     },
                 )?;
                 ctx.tag_machinery(Expr::expr_stmt(case, chain), stmt.span, "lower.stmt_seq")
@@ -1860,15 +1831,7 @@ fn lower_loop_body_chain_scoped(
                     outer_bindings,
                     ctx,
                     |body, scope, ctx| {
-                        lower_loop_body_chain(
-                            body,
-                            acc_names,
-                            yield_defer,
-                            true,
-                            scope,
-                            stmt.span,
-                            ctx,
-                        )
+                        lower_loop_body_chain(body, acc_names, yield_defer, scope, stmt.span, ctx)
                     },
                 )?;
                 ctx.tag_machinery(Expr::expr_stmt(attempt, chain), stmt.span, "lower.stmt_seq")
@@ -1907,11 +1870,6 @@ fn lower_loop_body_chain_scoped(
                     stmt.span,
                     EXPRESSION_STATEMENT,
                 )
-            }
-            // `with begin(): <block>` inside an `if` in the loop body: a per-path
-            // transaction site is unsound (§4.3 transaction verdict) — rejected.
-            ChlStmt::With { .. } if in_conditional => {
-                return Err(with_in_conditional(stmt.span));
             }
             // `with begin(): <block>` — a per-iteration transaction, emitted
             // as a `Begin` marker (one statement in the loop body). Its
@@ -1997,7 +1955,6 @@ fn build_loop_if_case(
             &br.body,
             acc_names,
             yield_defer,
-            true,
             outer_bindings,
             br.cond.span,
             ctx,
@@ -2009,15 +1966,9 @@ fn build_loop_if_case(
         });
     }
     let else_chain = match else_body {
-        Some(eb) => lower_loop_body_chain(
-            eb,
-            acc_names,
-            yield_defer,
-            true,
-            outer_bindings,
-            stmt_span,
-            ctx,
-        )?,
+        Some(eb) => {
+            lower_loop_body_chain(eb, acc_names, yield_defer, outer_bindings, stmt_span, ctx)?
+        }
         // The implicit carry-forward arm: manufactured, so it is tagged here rather
         // than carrying a statement's image.
         None => ctx.tag_machinery(Expr::lit(Lit::Unit), stmt_span, "lower.loop_if_carry"),

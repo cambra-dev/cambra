@@ -64,33 +64,6 @@ fn replace(expr: Expr) -> Result<Expr, provenance::Located<String>> {
     }
 }
 
-/// Refuse an exception that escapes a `with begin():` block, which aborts the transaction
-/// (`docs/chl-spec.md`, "Exceptions"): its outcome would have to leave the commit, which
-/// nothing carries yet. An exception caught inside the block compiles. The refusal stands at
-/// the block.
-pub fn refuse_escaping_blocks(expr: &Expr) -> Result<(), provenance::Located<String>> {
-    if let TypedExprNode::Begin { body, .. } = &expr.node {
-        let mut escaping = Vec::new();
-        Cx::escapes(body, &mut escaping);
-        if let Some(raised) = escaping.first() {
-            return Err(provenance::Located::new(
-                format!(
-                    "an exception of type `{raised}` escaping a `with begin():` block is not \
-                     compiled yet; catch it inside the block"
-                ),
-                expr.node_id(),
-            ));
-        }
-    }
-    let mut result = Ok(());
-    expr.walk_children(|c| {
-        if result.is_ok() {
-            result = refuse_escaping_blocks(c);
-        }
-    });
-    result
-}
-
 /// The first `raise` in `e`, in a walk of its children.
 fn first_raise(e: &Expr) -> Option<provenance::NodeId> {
     if matches!(e.node, TypedExprNode::Raise { .. }) {
@@ -1162,19 +1135,33 @@ impl Cx {
                     arms,
                 )
             }
-            // A block's exceptions are caught inside it ([`refuse_escaping_blocks`]), so it
-            // commits as its body's statements decide.
-            TypedExprNode::Begin { body } => match self.elim(*body, arms) {
-                Elim::Pure(body) => Elim::Pure(
-                    kept.rebuild(TypedExprNode::Begin {
-                        body: Box::new(body),
-                    })
-                    .with_ty(ty),
-                ),
-                Elim::Raising(_) => {
-                    unreachable!("`refuse_escaping_blocks` refuses an exception escaping a block")
+            // A block an exception escapes is its body's outcome, and commits only where that
+            // holds a value: an escaping exception aborts it.
+            TypedExprNode::Begin { body, commits_on } => {
+                assert!(
+                    commits_on.is_none(),
+                    "exception elimination runs once, so no block commits on a tag yet"
+                );
+                match self.elim(*body, arms) {
+                    Elim::Pure(body) => Elim::Pure(
+                        kept.rebuild(TypedExprNode::Begin {
+                            body: Box::new(body),
+                            commits_on: None,
+                        })
+                        .with_ty(ty),
+                    ),
+                    Elim::Raising(body) => {
+                        let outcome = body.ty.clone();
+                        Elim::Raising(
+                            kept.rebuild(TypedExprNode::Begin {
+                                body: Box::new(body),
+                                commits_on: Some(Self::ok()),
+                            })
+                            .with_ty(outcome),
+                        )
+                    }
                 }
-            },
+            }
             node @ (TypedExprNode::Lambda { .. }
             | TypedExprNode::LetRec { .. }
             | TypedExprNode::DefGroup { .. }) => {
@@ -1436,7 +1423,7 @@ impl Cx {
             },
             Elim::Raising(body) => {
                 let state_ty = Self::outcome(&unit_ty, &inner);
-                let state = Name::fresh("__loop");
+                let state = Name::exception_loop();
                 // A projected domain quotes its source. Bind a computed sum once so later
                 // rewrites reach its definition rather than a second copy inside the type.
                 let (iter, source) = if iter.ty.read_view().sum().is_some()

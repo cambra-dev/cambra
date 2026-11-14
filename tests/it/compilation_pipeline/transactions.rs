@@ -4721,6 +4721,16 @@ fn a_block_value_in_a_list_is_refused() {
             pool
         out << left
 "}, "[90, 70, 40]")]
+#[case::a_binding_in_the_loop(indoc! {"
+    pool: Mut(Int, Txn) := 100
+    out = test_sink()
+    for r in [10, 20, 30]:
+        y = r * 2
+        left = with begin():
+            pool := pool - y
+            pool
+        out << left
+"}, "[80, 40, -20]")]
 #[case::each_branch_ends_in_its_value(indoc! {r#"
     pool: Mut(Int, Txn) := 100
     out = test_sink()
@@ -4788,8 +4798,7 @@ fn a_block_value_in_a_loop(#[case] code: &str, #[case] expected: &str) {
 }
 
 /// A feed whose positions depend on a block's value has no channel type the compiler can state
-/// outside the block's store, so it is refused: under a condition reading the value, or in a
-/// loop iterating a writing block's values under any condition.
+/// outside the block's store, so it is refused: under a condition reading the value.
 #[rstest]
 #[case::a_condition_on_the_value_in_a_loop(indoc! {"
     for r in [1, 2, 3]:
@@ -4798,14 +4807,6 @@ fn a_block_value_in_a_loop(#[case] code: &str, #[case] expected: &str) {
             pool
         if x > 95:
             out << x
-"})]
-#[case::any_condition_in_a_loop_reading_a_value(indoc! {"
-    for r in [1, 2, 3]:
-        x = with begin():
-            pool := pool - r
-            pool
-        if r > 1:
-            out << r
 "})]
 #[case::a_match_on_the_value(indoc! {"
     for r in [1, 2, 3]:
@@ -4840,8 +4841,9 @@ fn a_feed_depending_on_a_block_value_is_refused(#[case] code: &str) {
     );
 }
 
-/// A feed of a block's value under no condition, and a condition on a read-only block's value
-/// outside a loop, which is read once before it, compile.
+/// A feed of a block's value under no condition, a feed under a condition reading no value in a
+/// loop over a block's values, which the loop reads at its position, and a condition on a
+/// read-only block's value outside a loop, which is read once before it, compile.
 #[rstest]
 #[case::a_feed_of_the_value_in_a_loop(indoc! {"
     for r in [1, 2, 3]:
@@ -4850,6 +4852,14 @@ fn a_feed_depending_on_a_block_value_is_refused(#[case] code: &str) {
             pool
         out << x
 "}, "[99, 97, 94]")]
+#[case::any_condition_in_a_loop_reading_a_value(indoc! {"
+    for r in [1, 2, 3]:
+        x = with begin():
+            pool := pool - r
+            pool
+        if r > 1:
+            out << r
+"}, "[1 -> 2, 2 -> 3]")]
 #[case::a_condition_on_a_read_only_value_outside_a_loop(indoc! {"
     x = with begin():
         pool
@@ -4861,6 +4871,345 @@ fn a_feed_beside_a_block_value(#[case] code: &str, #[case] expected: &str) {
     check_sink(
         &format!("pool: Mut(Int, Txn) := 100\nout = test_sink()\n{code}"),
         expected,
+    );
+}
+
+/// A writing block in a branch commits only at the positions where the branch runs: its
+/// site's source is restricted to them. Outside a loop the source is the singleton, which the
+/// `if` empties or keeps.
+#[rstest]
+#[case::an_if_that_fails(indoc! {"
+    x = 1
+    if x > 2:
+        with begin():
+            pool := pool - 1
+"}, 100)]
+#[case::an_if_that_holds(indoc! {"
+    x = 3
+    if x > 2:
+        with begin():
+            pool := pool - 1
+"}, 99)]
+#[case::an_if_in_a_loop(indoc! {"
+    for r in [10, 20, 30]:
+        if r > 15:
+            with begin():
+                pool := pool - r
+"}, 50)]
+#[case::an_else_in_a_loop(indoc! {"
+    for r in [10, 20, 30]:
+        if r > 15:
+            with begin():
+                pool := pool - r
+        else:
+            with begin():
+                pool := pool + 1
+"}, 51)]
+#[case::a_condition_on_a_binding_in_the_loop(indoc! {"
+    for r in [10, 20, 30]:
+        y = r * 2
+        if y > 30:
+            with begin():
+                pool := pool - y
+"}, 0)]
+#[case::nested_ifs(indoc! {"
+    for r in [10, 20, 30]:
+        if r > 15:
+            y = r + 1
+            if y < 25:
+                with begin():
+                    pool := pool - y
+"}, 79)]
+#[case::a_match_arm(indoc! {"
+    for r in [10, 20, 30]:
+        match (`a(r) if r > 15 else `b(r)):
+            case `a(v):
+                with begin():
+                    pool := pool - v
+            case `b(w):
+                pass
+"}, 50)]
+#[case::a_block_reading_a_binding_in_the_loop(indoc! {"
+    for r in [10, 20, 30]:
+        y = r * 2
+        with begin():
+            pool := pool - y
+"}, -20)]
+// A loop under a branch runs at all of its positions or at none.
+#[case::a_loop_under_an_if_that_holds(indoc! {"
+    c = 1
+    if c > 0:
+        for r in [1, 2]:
+            with begin():
+                pool := pool - r
+"}, 97)]
+#[case::a_loop_under_an_if_that_fails(indoc! {"
+    c = 0
+    if c > 0:
+        for r in [1, 2]:
+            with begin():
+                pool := pool - r
+"}, 100)]
+#[case::a_loop_under_an_else_over_a_binding_of_the_branch(indoc! {"
+    c = 0
+    if c > 0:
+        with begin():
+            pool := pool + 10
+    else:
+        ys = [1, 2, 3]
+        for r in ys:
+            with begin():
+                pool := pool - r
+"}, 94)]
+#[case::a_branch_in_a_loop_under_a_branch(indoc! {"
+    c = 1
+    if c > 0:
+        for r in [1, 2, 3]:
+            if r > 1:
+                with begin():
+                    pool := pool - r
+"}, 95)]
+// A condition on the loop's accumulator reads its value at each position.
+#[case::a_condition_on_an_accumulator(indoc! {"
+    n := 0
+    for r in [1, 2, 3]:
+        n := n + r
+        if n > 2:
+            with begin():
+                pool := pool - r
+"}, 95)]
+#[case::a_condition_on_an_accumulator_written_after_the_block(indoc! {"
+    n := 0
+    for r in [1, 2, 3]:
+        if n > 0:
+            with begin():
+                pool := pool - r
+        n := n + r
+"}, 95)]
+#[case::a_condition_on_a_binding_reading_an_accumulator(indoc! {"
+    n := 0
+    for r in [1, 2, 3]:
+        n := n + r
+        m = n * 2
+        if m > 4:
+            with begin():
+                pool := pool - r
+"}, 95)]
+#[case::a_block_reading_the_accumulator_its_condition_reads(indoc! {"
+    n := 0
+    for r in [1, 2, 3]:
+        n := n + r
+        if n > 2:
+            with begin():
+                pool := pool - n
+"}, 91)]
+fn a_writing_block_in_a_branch(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(
+        &format!("pool: Mut(Int, Txn) := 100\n{code}\nawait_final(pool)\n"),
+        Value::Int(expected),
+    );
+}
+
+/// A block reads its loop's accumulator as the accumulator stands where the block does, before
+/// the writes later in the iteration, between two of them, or after them all.
+#[rstest]
+#[case::before_its_write(indoc! {"
+    n := 0
+    for r in [1, 2, 3]:
+        with begin():
+            pool := pool - n
+        n := n + r
+"}, 96)]
+#[case::between_two_writes(indoc! {"
+    n := 0
+    for r in [1, 2, 3]:
+        n := n + 1
+        with begin():
+            pool := pool - n
+        n := n + 10
+"}, 64)]
+#[case::through_a_binding_before_its_write(indoc! {"
+    n := 0
+    for r in [1, 2, 3]:
+        m = n * 2
+        with begin():
+            pool := pool - m
+        n := n + r
+"}, 92)]
+#[case::after_its_write(indoc! {"
+    n := 0
+    for r in [1, 2, 3]:
+        n := n + r
+        with begin():
+            pool := pool - n
+"}, 90)]
+fn a_block_reads_its_loops_accumulator_where_it_stands(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(
+        &format!("pool: Mut(Int, Txn) := 100\n{code}\nawait_final(pool)\n"),
+        Value::Int(expected),
+    );
+}
+
+/// A block in value position in a branch: its value is read where the block stands, at the
+/// positions the branch runs at, which are the positions its site commits at. The code around the
+/// branch runs at every position.
+#[rstest]
+#[case::fed_in_the_branch(indoc! {"
+    for r in [1, 2, 3]:
+        if r > 1:
+            x = with begin():
+                pool := pool - r
+                pool
+            out << x
+"}, "[1 -> 98, 2 -> 95]")]
+#[case::beside_an_else_that_feeds(indoc! {"
+    for r in [1, 2, 3]:
+        if r > 1:
+            x = with begin():
+                pool := pool - r
+                pool
+            out << x
+        else:
+            out << 0 - r
+"}, "[`out<<(1) -> 98, `out<<(2) -> 95, `out<<#1(0) -> -1]")]
+// The condition reads a binding the block's store never names: the site gates its source on it.
+#[case::outside_a_loop_on_a_binding(indoc! {"
+    c = 3
+    if c > 1:
+        x = with begin():
+            pool := pool - c
+            pool
+        out << x
+    out << 0
+"}, "[`out<<(()) -> 97, `out<<#1(()) -> 0]")]
+fn a_block_value_in_a_branch(#[case] code: &str, #[case] expected: &str) {
+    check_sink(
+        &format!("pool: Mut(Int, Txn) := 100\nout = test_sink()\n{code}"),
+        expected,
+    );
+}
+
+/// A block's value in a branch feeding an accumulator: the loop's writer reads the value at the
+/// position its item carries, and the `else` arm adds where the block did not run.
+#[test]
+fn a_block_value_in_a_branch_feeds_an_accumulator() {
+    check_scalar(
+        indoc! {"
+            pool: Mut(Int, Txn) := 100
+            total := 0
+            for r in [1, 2, 3]:
+                if r > 1:
+                    x = with begin():
+                        pool := pool - r
+                        pool
+                    total := total + x
+                else:
+                    total := total + 1000
+            total
+        "},
+        Value::Int(1193),
+    );
+}
+
+/// A block reading the value of an earlier block, in itself or in the condition it runs under,
+/// runs at a position once that block has committed its value there: its site's source carries
+/// the earlier block's values. The earlier block writes the variable the later one writes, or
+/// another one.
+#[rstest]
+#[case::another_variable(indoc! {"
+    for r in [10, 20, 30]:
+        v = with begin():
+            pool := pool - r
+            r * 2
+        with begin():
+            log := log + v
+    await_final(log)
+"}, 120)]
+#[case::a_condition_on_it(indoc! {"
+    for r in [10, 20, 30]:
+        v = with begin():
+            pool := pool - r
+            r * 2
+        if v > 30:
+            with begin():
+                log := log + v
+    await_final(log)
+"}, 100)]
+#[case::outside_a_loop(indoc! {"
+    v = with begin():
+        pool := pool - 10
+        7
+    if v > 5:
+        with begin():
+            log := log + v
+    await_final(log)
+"}, 7)]
+#[case::the_same_variable(indoc! {"
+    for r in [10, 20, 30]:
+        v = with begin():
+            pool := pool - r
+            r * 2
+        with begin():
+            pool := pool + v
+    await_final(pool)
+"}, 160)]
+// Both blocks write the same variable, so they share a store, which computes the value the
+// second block's condition reads: the second site's source is gated on it.
+#[case::a_condition_on_it_writing_the_same_variable(indoc! {"
+    for r in [10, 20, 30]:
+        v = with begin():
+            pool := pool - r
+            r * 2
+        if v > 30:
+            with begin():
+                pool := pool + 1
+    await_final(pool)
+"}, 42)]
+fn a_block_reading_another_blocks_value(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(
+        &format!("pool: Mut(Int, Txn) := 100\nlog: Mut(Int, Txn) := 0\n{code}\n"),
+        Value::Int(expected),
+    );
+}
+
+/// A block under a condition on the value of a block that writes nothing is refused: that value
+/// is a read at the iteration, which no source the site could carry holds.
+#[test]
+fn a_block_under_a_condition_on_a_read_only_value_is_refused() {
+    check_compile_error(
+        indoc! {"
+            pool: Mut(Int, Txn) := 100
+            log: Mut(Int, Txn) := 0
+            for r in [10, 20, 30]:
+                v = with begin():
+                    pool
+                if v > r:
+                    with begin():
+                        log := log + 1
+            await_final(log)
+        "},
+        "under a condition that reads an induction accumulator or the value of a",
+    );
+}
+
+/// A block reading another block's value over a concatenation is not compiled yet: the later
+/// site's source carries the earlier block's values per part of the concatenation, which no
+/// tagged form of a fed source builds. It is refused as an internal error.
+#[test]
+fn a_block_reading_another_blocks_value_over_a_concatenation_is_refused() {
+    check_compile_error(
+        indoc! {"
+            p: Mut(Int, Txn) := 0
+            q: Mut(Int, Txn) := 0
+            for x in [1, 2] ++ [3]:
+                v = with begin():
+                    p := p + x
+                    p
+                with begin():
+                    q := q + v
+            await_final(q)
+        "},
+        "no tagged fed form is built yet",
     );
 }
 
@@ -4991,31 +5340,15 @@ fn a_block_value_replies_while_its_source_is_open() {
 fn a_block_value_under_a_lambda_is_refused(#[case] code: &str) {
     check_compile_error(
         code,
-        "a `with begin():` block in value position is not compiled yet",
+        "a `with begin():` block in value position, or one an exception escapes, is not \
+         compiled yet",
     );
 }
 
-/// A block in value position in a loop that reads what the loop's iterations compute, the value of
-/// an earlier block or an accumulator the loop writes, is refused at the block: its store would
-/// read the loop while the loop reads the store.
+/// A block in value position in a loop that reads an accumulator the loop writes, or a binding
+/// computed from one, is refused at the block: its store would read the loop while the loop reads
+/// the store.
 #[rstest]
-#[case::the_value_of_an_earlier_block(
-    indoc! {"
-        pool: Mut(Int, Txn) := 100
-        seen: Mut(Int, Txn) := 0
-        out: Feed(_)
-        for r in [10, 20]:
-            a = with begin():
-                pool := pool - r
-                pool
-            b = with begin():
-                seen := seen + 1
-                seen + a
-            out << b
-        out
-    "},
-    "reads the value of an earlier block in its loop"
-)]
 #[case::an_accumulator_of_the_loop(
     indoc! {"
         pool: Mut(Int, Txn) := 100
@@ -5030,40 +5363,6 @@ fn a_block_value_under_a_lambda_is_refused(#[case] code: &str) {
         out
     "},
     "reads a variable its loop accumulates into"
-)]
-#[case::a_binding_computed_from_an_earlier_block(
-    indoc! {"
-        pool: Mut(Int, Txn) := 100
-        seen: Mut(Int, Txn) := 0
-        out: Feed(_)
-        for r in [10, 20]:
-            a = with begin():
-                pool := pool - r
-                pool
-            c = a + 1
-            b = with begin():
-                seen := seen + c
-                seen
-            out << b
-        out
-    "},
-    "reads the value of an earlier block in its loop"
-)]
-#[case::an_earlier_block_in_statement_position(
-    indoc! {"
-        pool: Mut(Int, Txn) := 100
-        seen: Mut(Int, Txn) := 0
-        out: Feed(_)
-        for r in [10, 20]:
-            a = with begin():
-                pool := pool - r
-                pool
-            with begin():
-                seen := seen + a
-                out << seen
-        out
-    "},
-    "reads the value of an earlier block in its loop"
 )]
 #[case::a_binding_computed_from_an_accumulator(
     indoc! {"
@@ -5080,21 +5379,6 @@ fn a_block_value_under_a_lambda_is_refused(#[case] code: &str) {
         out
     "},
     "reads a variable its loop accumulates into, or a binding computed from one"
-)]
-#[case::a_binding_computed_from_an_accumulator_in_statement_position(
-    indoc! {"
-        pool: Mut(Int, Txn) := 100
-        out: Feed(_)
-        acc := 0
-        for r in [10, 20, 30]:
-            acc += r
-            d = acc * 2
-            with begin():
-                pool := pool - d
-                out << pool
-        out
-    "},
-    "reads a binding computed from a variable its loop accumulates into"
 )]
 fn a_block_value_reading_its_loop_is_refused_at_the_block(
     #[case] code: &str,
@@ -5177,6 +5461,89 @@ fn a_function_ending_in_a_bound_block_value_or_a_feed() {
             spend(20)
         "},
         "[`out<<(()) -> 90, `spend()/spend.out<<(t2) -> 70]",
+    );
+}
+
+/// A block in a loop reads the value an earlier block in the loop committed at the same position.
+#[test]
+fn a_block_value_reads_an_earlier_block_in_its_loop() {
+    check_sink(
+        indoc! {"
+            pool: Mut(Int, Txn) := 100
+            seen: Mut(Int, Txn) := 0
+            out = test_sink()
+            for r in [10, 20]:
+                a = with begin():
+                    pool := pool - r
+                    pool
+                b = with begin():
+                    seen := seen + 1
+                    seen + a
+                out << b
+        "},
+        "[91, 72]",
+    );
+}
+
+/// A binding computed from an earlier block's value, and a block in statement position reading
+/// that value, read what the earlier block committed at the same position.
+#[rstest]
+#[case::a_binding_computed_from_it(
+    indoc! {"
+        pool: Mut(Int, Txn) := 100
+        seen: Mut(Int, Txn) := 0
+        out = test_sink()
+        for r in [10, 20]:
+            a = with begin():
+                pool := pool - r
+                pool
+            c = a + 1
+            b = with begin():
+                seen := seen + c
+                seen
+            out << b
+    "},
+    "[91, 162]"
+)]
+#[case::a_block_in_statement_position(
+    indoc! {"
+        pool: Mut(Int, Txn) := 100
+        seen: Mut(Int, Txn) := 0
+        out = test_sink()
+        for r in [10, 20]:
+            a = with begin():
+                pool := pool - r
+                pool
+            with begin():
+                seen := seen + a
+                out << seen
+    "},
+    "[t1 -> 90, t2 -> 160]"
+)]
+fn a_block_reads_an_earlier_blocks_value_through_a_binding_or_in_statement_position(
+    #[case] code: &str,
+    #[case] expected: &str,
+) {
+    check_sink(code, expected);
+}
+
+/// A block in statement position reads a binding computed from its loop's accumulator at its own
+/// position.
+#[test]
+fn a_block_in_statement_position_reads_a_binding_computed_from_an_accumulator() {
+    check_sink(
+        indoc! {"
+            pool: Mut(Int, Txn) := 100
+            out = test_sink()
+            acc := 0
+            for r in [10, 20, 30]:
+                acc += r
+                d = acc * 2
+                with begin():
+                    pool := pool - d
+                    out << pool
+        "},
+        "[t1 -> 80, t2 -> 20, t3 -> -100]",
     );
 }
 

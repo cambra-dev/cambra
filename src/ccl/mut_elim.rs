@@ -3055,9 +3055,11 @@ fn collect_writes_in(
 
 /// Drop the trailing `; unit` terminals a `with begin():` block lowering leaves
 /// on a read-only feed body, recursively: `ExprStmt { effect, unit }` collapses to
-/// the normalized `effect`, and a statement-`Case`'s arm bodies are normalized in
-/// place. The result is the clean generator body (`Case { gᵢ → Feed; true → unit }`
-/// / a bare `Feed`) that `channelize`'s feed fan-out recognizes.
+/// the normalized `effect`, a statement-`Case`'s arm bodies are normalized in
+/// place, and so is the body of each `let` ahead of them, such as the bindings of a loop's
+/// item and of the values of its blocks ([`crate::ccl::transact_phase`]). The result is the
+/// clean generator body (`Case { gᵢ → Feed; true → unit }` / a bare `Feed`) under its `let`s
+/// that `channelize`'s feed fan-out recognizes.
 fn strip_trailing_unit(expr: Expr) -> Expr {
     // The rebuilt `Case` below is the same logical node with stripped branch
     // bodies, so it carries its original `NodeId`; a pass that minted here would
@@ -3069,6 +3071,16 @@ fn strip_trailing_unit(expr: Expr) -> Expr {
             if matches!(body.node, TypedExprNode::Lit(Lit::Unit)) =>
         {
             strip_trailing_unit(*effect)
+        }
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            let mut rebuilt =
+                Expr::let_in_preserving(node_id, binding, *bound_expr, strip_trailing_unit(*body));
+            rebuilt.user_annotation = expr.user_annotation;
+            rebuilt
         }
         TypedExprNode::Case {
             scrutinee,
@@ -3097,20 +3109,15 @@ fn strip_trailing_unit(expr: Expr) -> Expr {
     }
 }
 
-/// Whether a loop body contains a **statement-position** guard-`Case` (`if p: …`,
-/// lowered to `ExprStmt { effect: Case{scrutinee: None}, … }`) — a conditional
-/// feed/write. Distinguishes a conditional feed loop (fanned out by `channelize`)
-/// from a straight-line feed loop (hoisted by `transform_feed_only_loop`). Ignores
-/// *value*-position `Case`s (a ternary in a feed value is straight-line).
+/// Whether a loop body contains a **statement-position** `Case` (`if p: …`, lowered to
+/// `ExprStmt { effect: Case{scrutinee: None}, … }`, or a `match`, whose `Case` has a
+/// scrutinee) — a conditional feed/write. Distinguishes a conditional feed loop (fanned out by
+/// `channelize`, which reads a `match` as the guards it converts to) from a straight-line feed
+/// loop (hoisted by `transform_feed_only_loop`). Ignores *value*-position `Case`s (a ternary in
+/// a feed value is straight-line).
 fn body_has_statement_case(expr: &Expr) -> bool {
     if let TypedExprNode::ExprStmt { expr: effect, .. } = &expr.node
-        && matches!(
-            &effect.node,
-            TypedExprNode::Case {
-                scrutinee: None,
-                ..
-            }
-        )
+        && matches!(&effect.node, TypedExprNode::Case { .. })
     {
         return true;
     }
@@ -4164,6 +4171,68 @@ impl<'a> WriterWalk<'a> {
             f.value = close_over(std::mem::take(&mut f.value), &arm.kept);
             let fire = close_over(std::mem::take(&mut f.fire), &arm.kept);
             f.fire = conjoin_path(&arm.pi, &fire);
+        }
+    }
+
+    /// Abort the writer where the value fed to `defer` does not carry `tag`
+    /// ([`TypedExprNode::Begin`]'s `commits_on`): there each variable it writes keeps its
+    /// snapshot, `snapshots[name]`, and no other feed fires (`docs/chl-spec.md`,
+    /// "Exceptions"). The value's own feed fires on every path, so the code after the block
+    /// reads the outcome of every iteration.
+    pub(crate) fn commit_only_on(
+        &mut self,
+        defer: &Name,
+        tag: &Label,
+        snapshots: &HashMap<Name, Expr>,
+        kept: &mut Vec<Kept>,
+    ) {
+        let value = &self
+            .feeds
+            .iter()
+            .find(|f| f.defer == *defer)
+            .expect("writer walk: a block that commits on a tag feeds its value")
+            .value;
+        let committed = crate::ccl::ccl_utils::tag_test(value, tag.clone());
+        let committed = bind_value(
+            kept,
+            &Name::fresh("__committed"),
+            Occurrence::mint(),
+            committed,
+        );
+        for (name, ty) in &self.writes {
+            let written = self.env.remove(name).unwrap_or_else(|| {
+                panic!("writer walk: `{name}`, which the writer writes, holds no value")
+            });
+            let snapshot = snapshots.get(name).cloned().unwrap_or_else(|| {
+                panic!("writer walk: `{name}`, which an aborting writer writes, has no snapshot")
+            });
+            let kept_or_written = Expr::new(TypedExprNode::Case {
+                scrutinee: None,
+                branches: vec![
+                    Branch {
+                        pattern: None,
+                        guard: committed.clone(),
+                        body: written,
+                    },
+                    Branch {
+                        pattern: None,
+                        guard: bool_lit(true),
+                        body: snapshot,
+                    },
+                ],
+            })
+            .with_ty(ty.clone());
+            let occurrence = self
+                .named_at
+                .get(name)
+                .map_or_else(Occurrence::mint, |&id| Occurrence::copied_from(id));
+            let value = bind_value(kept, name, occurrence, kept_or_written);
+            self.env.insert(name.clone(), value);
+        }
+        for f in &mut self.feeds {
+            if f.defer != *defer {
+                f.fire = conjoin_path(&committed, &f.fire);
+            }
         }
     }
 

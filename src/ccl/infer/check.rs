@@ -1145,7 +1145,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
             prim(BaseType::Unit)
         }
 
-        TypedExprNode::Begin { body } => emit_begin(body, ctx)?,
+        TypedExprNode::Begin { body, .. } => emit_begin(body, ctx)?,
 
         TypedExprNode::Error => crate::unexpected_error_node!(),
     };

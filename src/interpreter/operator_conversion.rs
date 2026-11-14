@@ -4261,12 +4261,44 @@ fn build_commit_store(
         // starts at `0` whatever the source has done: this drive finds its next
         // item by scanning up from its cursor, so an advanced source costs it a
         // comparison, where the induction drive's window would stall.
+        // A source reading an earlier writer's item tap reads it back from this store through
+        // the recurrence slot, as the writers read their snapshots: the source is in the
+        // store's own input chain. Its value at an item is final at that writer's commit for
+        // the item, and `RekeySorted` releases an item to the source once every item before
+        // it is decided. The names are marked rebuilt, so a reload never keeps a source that
+        // reads a store it rebuilds.
+        let mut scope = ctx.enter_scope();
+        for (fed, field) in &w.fed_back {
+            let info = keys_map.get(field).ok_or_else(|| {
+                ConversionError::Unsupported(format!(
+                    "a writer source reads the tap `{field}` of no earlier writer of its store"
+                ))
+            })?;
+            debug_assert!(info.by_item, "a fed-back tap is keyed by item");
+            let stream = Box::new(StoreValueStream::new(
+                store_fan.recurrence_slot(),
+                info.runtime_key.clone(),
+                info.value_extent.clone(),
+                false,
+            ));
+            let fan = Rc::new(FanOut::new(Box::new(RekeySorted::new(stream))));
+            scope.rebuilt.insert(fed.name.clone());
+            let binding = LetBinding {
+                fan,
+                kind: BindingKind::Free,
+                depth: scope.iterations.len(),
+                narrowed: scope.narrowed,
+                level: scope.level,
+            };
+            scope.scopes.bind(fed.name.clone(), binding);
+        }
         let IterationInput {
             op: source_op,
             resumed_after: drive_resume,
-        } = ctx.iteration_input(&w.source, None, continues, |ctx| {
+        } = scope.iteration_input(&w.source, None, continues, |ctx| {
             convert_impl(&w.source, None, ctx)
         })?;
+        drop(scope);
         // The body's input is the driver's tile, `(snap_{k₀}, …, item)`; the
         // snapshot columns carry each read key's per-commit value extent.
         let read_extents: Vec<Extent> = w

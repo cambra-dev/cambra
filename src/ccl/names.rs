@@ -142,6 +142,9 @@ pub enum SyntheticKind {
     /// bound on its own by the inliner so the function reaches its calls
     /// (`src/ccl/inline.rs`, "Functions held in products").
     Component,
+    /// The mutable variable exception elimination gives a loop whose body may raise, holding
+    /// the first exception in position order ([`crate::ccl::exceptions`]).
+    ExceptionLoop,
 }
 
 impl SyntheticKind {
@@ -159,6 +162,7 @@ impl SyntheticKind {
             SyntheticKind::IterRecord => "__iter_record",
             SyntheticKind::Output => "__output",
             SyntheticKind::Component => "__component",
+            SyntheticKind::ExceptionLoop => "__loop",
         }
     }
 }
@@ -670,6 +674,22 @@ impl Name {
     /// result?
     ///
     /// Asked by [`crate::ccl::opaque_output::output_body`].
+    /// The variable exception elimination gives a loop whose body may raise.
+    pub fn exception_loop() -> Self {
+        Self::synthetic(SyntheticKind::ExceptionLoop)
+    }
+
+    /// Is this the variable exception elimination gives a loop whose body may raise?
+    pub fn is_exception_loop(&self) -> bool {
+        matches!(
+            self,
+            Name::Synthetic {
+                kind: SyntheticKind::ExceptionLoop,
+                ..
+            }
+        )
+    }
+
     pub fn is_output(&self) -> bool {
         matches!(
             self,

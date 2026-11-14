@@ -79,9 +79,15 @@ const BROKEN: &[(&str, &str, &str)] = &[
         "terminal_in_agg[pool]",
         "CompilerRejects",
     ),
+    ("txn_if", "generator_max", "CompilerRejects"),
+    ("txn_raise", "generator_max", "CompilerRejects"),
+    ("txn_raise_before", "generator_max", "CompilerRejects"),
+    ("txn_raise_standalone", "generator_max", "CompilerRejects"),
+    ("txn_raise_then_block", "generator_max", "CompilerRejects"),
     ("txn_reply", "generator_max", "CompilerRejects"),
     ("txn_value", "generator_max", "CompilerRejects"),
     ("txn_value_standalone", "generator_max", "CompilerRejects"),
+    ("txn_value_then_block", "generator_max", "CompilerRejects"),
     ("txn_write_rhs", "generator_max", "CompilerRejects"),
 ];
 
@@ -549,6 +555,102 @@ fn skeletons() -> Vec<Skeleton> {
                 pool := pool - 1
                 {}
             out << x
+        "#}},
+        Skeleton { name: "txn_raise", hole: Ty::Int, scope: &[("pool", Ty::Int), ("r", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 100
+            for r in [1, 2]:
+                got = try:
+                        with begin():
+                            pool := pool - {}
+                            out << pool
+                            if r > 1:
+                                raise r
+                        0
+                    except Int as e:
+                        e
+                out << got
+        "#}},
+        Skeleton { name: "txn_raise_standalone", hole: Ty::Int, scope: &[("pool", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 100
+            got = try:
+                    with begin():
+                        pool := pool - 1
+                        raise {}
+                    0
+                except Int as e:
+                    e
+            out << got
+            out << await_final(pool)
+        "#}},
+        Skeleton { name: "txn_if", hole: Ty::Int, scope: &[("r", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 100
+            misses: Mut(Int, Txn) := 0
+            for r in [1, 2, 3]:
+                y = {}
+                if y > 2:
+                    with begin():
+                        pool := pool - y
+                        out << pool
+                else:
+                    with begin():
+                        misses := misses + 1
+            out << await_final(pool)
+            out << await_final(misses)
+        "#}},
+        Skeleton { name: "txn_if_standalone", hole: Ty::Int, scope: &[], body: indoc! {r#"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 100
+            x = {}
+            if x > 2:
+                with begin():
+                    pool := pool - x
+            out << await_final(pool)
+        "#}},
+        Skeleton { name: "txn_raise_before", hole: Ty::Int, scope: &[("r", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 100
+            for r in [1, 2, 3]:
+                try:
+                    if r == 2:
+                        raise r
+                    y = {}
+                    with begin():
+                        pool := pool - y
+                except Int as e:
+                    out << e
+            out << await_final(pool)
+        "#}},
+        Skeleton { name: "txn_value_then_block", hole: Ty::Int, scope: &[("pool", Ty::Int), ("r", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 100
+            log: Mut(Int, Txn) := 0
+            for r in [1, 2, 3]:
+                v = with begin():
+                    pool := pool - r
+                    {}
+                if v > 2:
+                    with begin():
+                        log := log + v
+            out << await_final(log)
+        "#}},
+        Skeleton { name: "txn_raise_then_block", hole: Ty::Int, scope: &[("pool", Ty::Int), ("r", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 100
+            log: Mut(Int, Txn) := 0
+            for r in [1, 2, 3]:
+                try:
+                    with begin():
+                        pool := pool - r
+                        if {} > 2:
+                            raise r
+                    with begin():
+                        log := log + r
+                except Int:
+                    pass
+            out << await_final(log)
         "#}},
         Skeleton { name: "mut_init", hole: Ty::Int, scope: &[], body: indoc! {r#"
             acc := {}

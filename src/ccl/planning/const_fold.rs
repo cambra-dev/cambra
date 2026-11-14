@@ -10,7 +10,9 @@
 //! Planning runs after lambda elimination, so every operator in the term is already
 //! point-free and the fold recognizes three shapes:
 //!
-//! - `Var(𝑥)` where an enclosing `Let` binds 𝑥 to a literal.
+//! - `Var(𝑥)` where an enclosing `Let` binds 𝑥 to a literal, or to a chain of `let`s ending in
+//!   one: a function's result binding inlined into a binding, `let __output = 1 in __output`, is
+//!   left this way once the transaction the function's body ran is stripped onto the store.
 //! - `(𝑎, 𝑏) ▷ binop` where 𝑎 and 𝑏 are literals.
 //! - `𝑎 ▷ neg` and `𝑎 ▷ not_fn` where 𝑎 is a literal.
 //!
@@ -134,10 +136,7 @@ fn fold(expr: &mut Expr, consts: &mut Consts) {
             None
         } else {
             fold(bound_expr, consts);
-            match &bound_expr.node {
-                TypedExprNode::Lit(lit) => Some(lit.clone()),
-                _ => None,
-            }
+            tail_literal(bound_expr)
         };
         consts.push(binding.name.clone(), lit);
         fold(body, consts);
@@ -159,6 +158,18 @@ fn fold(expr: &mut Expr, consts: &mut Consts) {
     consts.0.truncate(base);
     while let Some(reduction) = reduce(expr, consts) {
         reduction.apply(expr);
+    }
+}
+
+/// The literal `e` evaluates to where it is one, or a chain of `let`s ending in one: a function's
+/// result binding inlined into a binding, `let __output = 1 in 1` once its read is folded, is
+/// `1` to the binding, as a program's own `let g = 1 in g` is. The chain stays in the tree,
+/// whose nodes keep their ids, and the binding reads its value.
+fn tail_literal(e: &Expr) -> Option<Lit> {
+    match &e.node {
+        TypedExprNode::Lit(lit) => Some(lit.clone()),
+        TypedExprNode::Let { body, .. } => tail_literal(body),
+        _ => None,
     }
 }
 
@@ -568,6 +579,49 @@ mod tests {
 
     fn is_const_bool(expr: &Expr, b: bool) -> bool {
         const_literal(expr).is_some_and(|lit| *lit == Lit::Bool(b))
+    }
+
+    /// A binding of a `let` chain ending in a literal, what a function's result binding is once
+    /// inlined, reads as that literal: `let x = (let __output = 1 in __output) in x + 1` folds
+    /// its body to `2`, and the chain stays.
+    #[test]
+    fn a_binding_of_a_chain_ending_in_a_literal_reads_as_the_literal() {
+        let lit = |n| Expr::new(TypedExprNode::Lit(Lit::Int(n))).with_ty(int());
+        let output = Name::output();
+        let read = Expr::new(TypedExprNode::Var(output.clone())).with_ty(int());
+        let chain =
+            Expr::let_bind(output, crate::ccl::Occurrence::mint(), lit(1), read).with_ty(int());
+        let x = var("x", int());
+        let sum = Expr::apply(
+            Expr::tuple(vec![x, lit(1)]).with_ty(Type::Tuple(vec![int(), int()])),
+            builtin(
+                Builtin::BinOp(BinOpKind::Arithmetic(crate::ccl::ArithmeticKind::Add)),
+                Type::fun(Type::Tuple(vec![int(), int()]), int()),
+            ),
+        )
+        .with_ty(int());
+        let mut expr =
+            Expr::let_bind("x", crate::ccl::Occurrence::mint(), chain, sum).with_ty(int());
+        fold_constants(&mut expr);
+        let TypedExprNode::Let { body, .. } = &expr.node else {
+            panic!("the binding stays: {}", symbolic(&expr));
+        };
+        assert!(
+            matches!(body.node, TypedExprNode::Lit(Lit::Int(2))),
+            "{}",
+            symbolic(&expr)
+        );
+    }
+
+    /// A program's own binding of a literal stays, with its body folded: `let g = 10 in g + 3`
+    /// is `let g = 10 in 13`.
+    #[test]
+    fn a_program_binding_of_a_literal_stays() {
+        let lit = |n| Expr::new(TypedExprNode::Lit(Lit::Int(n))).with_ty(int());
+        let mut expr =
+            Expr::let_bind("g", crate::ccl::Occurrence::mint(), lit(10), lit(13)).with_ty(int());
+        fold_constants(&mut expr);
+        assert!(matches!(expr.node, TypedExprNode::Let { .. }));
     }
 
     /// `true and 𝑝` is 𝑝 wherever the gate sits in its composition, and the elements around
