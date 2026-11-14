@@ -240,6 +240,15 @@ pub(super) struct InferCtx {
     /// ([`Typing::open_poly`]). Identities are unique, so an entry outlives its `Poly`
     /// harmlessly.
     opened_clause_params: HashMap<crate::ccl::ty::TypeParamId, Rc<CapabilityVar>>,
+    /// Each instance's associated effect types, by the instance's parameter for each: what
+    /// its functions cause beyond what their signatures list (`docs/chl-spec.md`, "Effects
+    /// in traits"). Minted on first reference, at the top level, so every use of the instance
+    /// shares it.
+    instance_effects: RefCell<HashMap<crate::ccl::ty::TypeParamId, Rc<CapabilityVar>>>,
+    /// Each variable standing for an associated effect type at a call or a use, waiting on
+    /// the obligation that decides which instance's, or which requirement's in scope, it is
+    /// ([`InferCtx::settle_effect_links`]).
+    effect_links: Vec<EffectLink>,
     /// The generalized bindings whose schemes a module check reports, and the
     /// scheme each was bound at, written as an annotation would state it
     /// ([`Typing::note_scheme`]).
@@ -435,6 +444,16 @@ struct NodeCapabilities {
     body: Option<Rc<CapabilityVar>>,
 }
 
+/// A variable standing for an associated effect type, `Writes`, at a call of a trait's
+/// function or a use of a definition requiring the trait: it holds what the instance the
+/// obligation selects does, or the requirement in scope that answers it.
+struct EffectLink {
+    obligation: Rc<TraitObligation>,
+    /// The trait's parameter for the associated effect type.
+    assoc: crate::ccl::ty::TypeParamId,
+    target: Rc<CapabilityVar>,
+}
+
 /// A generalized `def` whose `requires` clause is an upper bound, which no trait requirement
 /// inference adds may exceed (`docs/chl-spec.md`, "Writing requirements and effects").
 struct BoundedRequires {
@@ -621,6 +640,8 @@ impl InferCtx {
             shared_holes: RefCell::new(HashMap::new()),
             opened_params: Vec::new(),
             opened_clause_params: HashMap::new(),
+            instance_effects: Default::default(),
+            effect_links: Vec::new(),
             reported: HashSet::new(),
             public: HashSet::new(),
             schemes_noted: Vec::new(),
@@ -954,18 +975,204 @@ impl InferCtx {
         set.params
             .iter()
             .map(|p| {
-                Rc::clone(
-                    self.opened_clause_params
-                        .get(&p.param.id)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "clause parameter `{}` is named outside the definition opening it",
-                                p.param.spelling
-                            )
-                        }),
-                )
+                if let Some(var) = self.opened_clause_params.get(&p.param.id) {
+                    return Rc::clone(var);
+                }
+                assert!(
+                    self.instances.is_instance_effect(p.param.id),
+                    "clause parameter `{}` is named outside the definition opening it",
+                    p.param.spelling
+                );
+                self.instance_effect(p)
             })
             .collect()
+    }
+
+    /// The variable an instance's associated effect type `param` collects on, bounded by what
+    /// its bound in the trait takes away, `Writes <: Effect except RunTransaction`
+    /// (`docs/chl-spec.md`, "Effects in traits").
+    fn instance_effect(&self, param: &crate::ccl::capabilities::ClauseParam) -> Rc<CapabilityVar> {
+        Rc::clone(
+            self.instance_effects
+                .borrow_mut()
+                .entry(param.param.id)
+                .or_insert_with(|| {
+                    let var = CapabilityVar::fresh(0);
+                    if !param.param.clause_except.is_empty() {
+                        let mut set = crate::ccl::capabilities::CapabilitySet::default();
+                        set.add_every(
+                            Every::of_direction(param.of_causes)
+                                .less(param.param.clause_except.clone()),
+                        );
+                        var.bound_above(Upper {
+                            set,
+                            of_requires: !param.of_causes,
+                            of_causes: param.of_causes,
+                            blame: Blame::Bound(
+                                param
+                                    .param
+                                    .bound_at
+                                    .expect("a bound taking `except` is written"),
+                            ),
+                        });
+                    }
+                    var
+                }),
+        )
+    }
+
+    /// Link `target` to the associated effect type `assoc` of whatever `obligation` selects,
+    /// now if it has selected, and otherwise once emission is complete.
+    pub(super) fn link_effect(
+        &mut self,
+        obligation: &Rc<TraitObligation>,
+        assoc: crate::ccl::ty::TypeParamId,
+        target: Rc<CapabilityVar>,
+    ) {
+        let link = EffectLink {
+            obligation: Rc::clone(obligation),
+            assoc,
+            target,
+        };
+        if !self.settle(&link) {
+            self.effect_links.push(link);
+        }
+    }
+
+    /// Normalize `ty`, a call's type of a function of `trait_`, whose clauses may name the
+    /// trait's associated effect types: each stands for a fresh variable, linked to what
+    /// `obligation` selects.
+    pub(super) fn normalize_trait_call(
+        &mut self,
+        ty: &Type,
+        trait_: &Trait,
+        obligation: &Rc<TraitObligation>,
+    ) -> Type {
+        let vars: Vec<_> = trait_
+            .effect_assocs
+            .iter()
+            .map(|p| (p.param.id, CapabilityVar::fresh(self.level)))
+            .collect();
+        for (id, var) in &vars {
+            self.opened_clause_params.insert(*id, Rc::clone(var));
+        }
+        let normalized = self.normalize_annotation(ty);
+        for (id, var) in vars {
+            self.opened_clause_params.remove(&id);
+            self.link_effect(obligation, id, var);
+        }
+        normalized
+    }
+
+    /// Link each associated effect type `requirement` gives a parameter at a use of a
+    /// definition requiring it: the copy of the definition's variable for it, in
+    /// `copies`, holds what the use's `obligation` selects.
+    pub(super) fn link_requirement_effects(
+        &mut self,
+        requirement: &TraitRequirement,
+        obligation: &Rc<TraitObligation>,
+        copies: &HashMap<crate::ccl::capabilities::CapabilityVarId, Rc<CapabilityVar>>,
+    ) {
+        for (assoc, member) in &requirement.effect_assoc {
+            let Some(var) = self.opened_clause_params.get(&member.param.id) else {
+                continue;
+            };
+            if let Some(copy) = copies.get(&var.uid) {
+                let copy = Rc::clone(copy);
+                self.link_effect(obligation, *assoc, copy);
+            }
+        }
+    }
+
+    /// Settle every link still waiting, once emission is complete: its variable holds what every
+    /// instance and requirement still answering its obligation does. A definition's obligation
+    /// that its scheme carries was left to its uses when it generalized
+    /// ([`TraitObligation::effects`]).
+    pub(super) fn settle_effect_links(&mut self) {
+        for link in std::mem::take(&mut self.effect_links) {
+            self.settle_at_last(&link);
+        }
+    }
+
+    /// Settle `link` whatever its obligation has decided: by what it selected, or by every
+    /// instance and requirement still answering it.
+    fn settle_at_last(&self, link: &EffectLink) {
+        if self.settle(link) {
+            return;
+        }
+        {
+            for instance in link.obligation.candidates() {
+                if let Some((_, own)) = instance
+                    .effect_assocs
+                    .iter()
+                    .find(|(id, _)| *id == link.assoc)
+                {
+                    link.target
+                        .flows_from(&self.instance_effect(own), Filter::default());
+                }
+            }
+            for assumption in link.obligation.assumptions() {
+                if let Some((_, member)) = assumption
+                    .effect_assoc
+                    .iter()
+                    .find(|(id, _)| *id == link.assoc)
+                    && let Some(var) = self.opened_clause_params.get(&member.param.id)
+                {
+                    link.target.flows_from(var, Filter::default());
+                }
+            }
+        }
+    }
+
+    fn pending_links(&self) -> usize {
+        self.effect_links.len()
+    }
+
+    fn settle_links_since(&mut self, start: usize, scheme: &Type) {
+        let carried: HashSet<_> = scheme_obligations(scheme, self.level)
+            .iter()
+            .map(|o| o.uid)
+            .collect();
+        for link in self.effect_links.split_off(start) {
+            if self.settle(&link) {
+                continue;
+            }
+            if carried.contains(&link.obligation.uid) {
+                link.obligation.add_effect(link.assoc, link.target);
+                continue;
+            }
+            self.settle_at_last(&link);
+        }
+    }
+
+    /// Give `link`'s target what answers its obligation: the selected instance's associated
+    /// effect type, or the one a requirement in scope gives it. Whether it is settled.
+    fn settle(&self, link: &EffectLink) -> bool {
+        if let Some(instance) = link.obligation.selected_instance() {
+            if let Some((_, own)) = instance
+                .effect_assocs
+                .iter()
+                .find(|(id, _)| *id == link.assoc)
+            {
+                link.target
+                    .flows_from(&self.instance_effect(own), Filter::default());
+            }
+            return true;
+        }
+        if let [assumption] = link.obligation.assumptions().as_slice()
+            && link.obligation.candidates().is_empty()
+        {
+            if let Some((_, member)) = assumption
+                .effect_assoc
+                .iter()
+                .find(|(id, _)| *id == link.assoc)
+                && let Some(var) = self.opened_clause_params.get(&member.param.id)
+            {
+                link.target.flows_from(var, Filter::default());
+            }
+            return true;
+        }
+        false
     }
 
     /// Record on `var` the items `written` lists, and bound it by them where a clause is
@@ -985,27 +1192,51 @@ impl InferCtx {
         if written.open_requires && written.open_causes {
             return;
         }
-        // A parameter bounds its part by its rigid capability, less what the clause takes from it.
+        // A parameter standing rigidly, a definition's own, bounds its part by its capability,
+        // less what the clause takes from it. Any other, an instance's associated effect type or
+        // one a call stands for, is what flows there: anything its `except` does not take away,
+        // the top of its direction less it, and its part is open without one. Its own bound
+        // checks what the bound takes away.
         let mut set = written.set.clone();
-        set.params = written
+        set.params.clear();
+        let (mut open_requires, mut open_causes) = (written.open_requires, written.open_causes);
+        for (param, var) in written
             .set
             .params
             .iter()
             .zip(self.clause_param_vars(&written.set))
-            .flat_map(|(param, v)| {
-                v.own().into_iter().filter_map(move |l| match l.item {
+        {
+            let rigid: Vec<_> = var
+                .own()
+                .into_iter()
+                .filter_map(|l| match l.item {
                     Capability::Param(p) => Some(crate::ccl::capabilities::ClauseParam {
                         except: param.except.clone(),
                         ..p
                     }),
                     _ => None,
                 })
-            })
-            .collect();
+                .collect();
+            if rigid.is_empty() {
+                if !param.except.is_empty() {
+                    set.add_every(
+                        Every::of_direction(param.of_causes).less(param.except.iter().cloned()),
+                    );
+                } else if param.of_causes {
+                    open_causes = true;
+                } else {
+                    open_requires = true;
+                }
+            }
+            set.params.extend(rigid);
+        }
+        if open_requires && open_causes {
+            return;
+        }
         var.bound_above(Upper {
             set,
-            of_requires: !written.open_requires,
-            of_causes: !written.open_causes,
+            of_requires: !open_requires,
+            of_causes: !open_causes,
             blame,
         });
     }
@@ -2734,6 +2965,9 @@ impl Typing for InferCtx {
                         ),
                     });
                 }
+                // Keyed by the opened parameter too, which the opened requirements' associated
+                // effect types name.
+                self.opened_clause_params.insert(opened.id, Rc::clone(&var));
                 self.opened_clause_params.insert(p.param.id, var);
             }
             self.opened_params
@@ -2750,10 +2984,26 @@ impl Typing for InferCtx {
         if let Some(e) = failed {
             return Err(e);
         }
+        // A requirement's associated effect types are parameters of the `Poly`, so they open with
+        // it.
+        let opened: HashMap<crate::ccl::ty::TypeParamId, Rc<crate::ccl::ty::TypeParam>> = poly
+            .params
+            .iter()
+            .zip(&params)
+            .map(|(declared, open)| (declared.param.id, Rc::clone(&open.param)))
+            .collect();
         let requires = poly
             .requires
             .iter()
-            .map(|r| Rc::new(r.map_types(|t| self.normalize_annotation(t))))
+            .map(|r| {
+                let mut r = r.map_types(|t| self.normalize_annotation(t));
+                for (_, member) in &mut r.effect_assoc {
+                    if let Some(open) = opened.get(&member.param.id) {
+                        member.param = Rc::clone(open);
+                    }
+                }
+                Rc::new(r)
+            })
             .collect();
         Ok(crate::ccl::ty::PolyType {
             params,
@@ -2840,23 +3090,51 @@ impl Typing for InferCtx {
         if let Type::Fun { capabilities, .. } = recorded
             && let Repr::Written(written) = capabilities.repr()
         {
-            // A parameter the clause names is what the body passes on, so it flows in, less what
-            // the clause takes from it.
+            // A parameter the clause names is what the body passes on, so it flows in; at an
+            // instance's function it is the instance's associated effect type, which the body
+            // defines beyond what the signature lists, so the body flows out to it instead,
+            // less those items.
+            #[expect(
+                clippy::mutable_key_type,
+                reason = "a `Capability` reaches a `Type` only through its requirement's trait \
+                          declaration, and a trait hashes and orders by its module path and name"
+            )]
+            let stated: std::collections::BTreeSet<Capability> = written
+                .items()
+                .filter(|item| !matches!(item, Capability::Param(_)))
+                .collect();
             for (p, param) in written
                 .set
                 .params
                 .iter()
                 .zip(self.clause_param_vars(&written.set))
             {
-                var.flows_from(
-                    &param,
-                    Filter {
-                        except: p.except.clone(),
-                        ..Filter::default()
-                    },
-                );
+                if written.of_instance.is_some() {
+                    param.flows_from(
+                        &var,
+                        Filter {
+                            stated: stated.clone(),
+                            ..Filter::default()
+                        },
+                    );
+                } else {
+                    var.flows_from(
+                        &param,
+                        Filter {
+                            except: p.except.clone(),
+                            ..Filter::default()
+                        },
+                    );
+                }
             }
-            self.bound_written(&var, written, Blame::Clause(written.at));
+            let blame = match written.of_instance {
+                Some(crate::ccl::capabilities::Signature::Written) => {
+                    Blame::Signature(Some(written.at))
+                }
+                Some(crate::ccl::capabilities::Signature::Compiler) => Blame::Signature(None),
+                None => Blame::Clause(written.at),
+            };
+            self.bound_written(&var, written, blame);
         }
         let depth = self.capability_frame().depth + 1;
         self.capability_frames.push(CapabilityFrame { depth });
@@ -2926,6 +3204,14 @@ impl Typing for InferCtx {
             at: clauses.at,
             node: definition.node_id(),
         });
+    }
+
+    fn pending_effect_links(&self) -> usize {
+        self.pending_links()
+    }
+
+    fn settle_effect_links_since(&mut self, start: usize, scheme: &Type) {
+        self.settle_links_since(start, scheme);
     }
 
     fn check_written(&self, capabilities: &Capabilities) -> Result<(), LocatedInferError> {

@@ -683,6 +683,11 @@ pub struct LoweringContext {
     /// innermost last, which `a::f` reads (`docs/chl-spec.md`, "Summoning an instance").
     pub(super) named_requirements: Vec<NamedRequirement>,
 
+    /// The trait function whose signature is being lowered, `App::app`. Its clauses, and those
+    /// of every function type in it, are exact, so a `_` in one is refused
+    /// (`docs/chl-spec.md`, "Effects in traits").
+    pub(super) in_signature: Option<String>,
+
     /// The members of compiler-provided declarations the module names, by binding name: the
     /// ones a qualified reference names, and the candidates of a method call of their name
     /// (`src/ccl/design/nominal-types.md`, "The compiler-provided `Option`").

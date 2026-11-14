@@ -2458,7 +2458,7 @@ fn a_hole_in_a_bound_is_spelled_by_its_member() {
         stock: Mut(Int, Txn) := 10
         type Box = Int
         trait Take(T):
-            def take(t: T, s: Mut(Int, Txn), n: Int) => Int
+            def take(t: T, s: Mut(Int, Txn), n: Int) => Int causes RunTransaction
         instance Take(Box):
             def take(t, s, n):
                 with begin():
@@ -2474,7 +2474,7 @@ fn a_hole_in_a_bound_is_spelled_by_its_member() {
         stock: Mut(Int, Txn) := 10
         type Box = Int
         trait Take(T):
-            def take(t: T, s: Mut(Int, Txn), n: Int) => Int
+            def take(t: T, s: Mut(Int, Txn), n: Int) => Int causes RunTransaction
         instance Take(Box):
             def take(t, s, n):
                 with begin():
@@ -2492,7 +2492,7 @@ fn a_hole_in_a_bound_is_spelled_by_its_member() {
         stock: Mut(Int, Txn) := 10
         type Box = Int
         trait Take(T):
-            def take(t: T, s: Mut(Int, Txn), n: Int) => Int
+            def take(t: T, s: Mut(Int, Txn), n: Int) => Int causes RunTransaction
         instance Take(Box):
             def take(t, s, n):
                 with begin():
@@ -2525,7 +2525,7 @@ fn a_hole_in_a_bound_is_spelled_by_its_member() {
         type Amount = Int
         stock: Mut(Amount, Txn) := Amount::new(10)
         trait Bump(T):
-            def bump(s: Mut(T, Txn)) => Int
+            def bump(s: Mut(T, Txn)) => Int causes RunTransaction
         instance Bump(Amount):
             def bump(s):
                 with begin():
@@ -2541,7 +2541,7 @@ fn a_hole_in_a_bound_is_spelled_by_its_member() {
         stock: Mut(Int, Txn) := 10
         type Box = Int
         trait Take(T):
-            def take(t: T, s: Mut(Int, Txn), n: Int) => Int
+            def take(t: T, s: Mut(Int, Txn), n: Int) => Int causes RunTransaction
         instance Take(Box):
             def take(t, s: Mut(Int, Txn), n):
                 with begin():

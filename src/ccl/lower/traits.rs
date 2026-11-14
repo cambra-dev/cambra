@@ -357,8 +357,8 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
     let mut operands: Vec<Rc<TypeParam>> = Vec::new();
     let mut assocs: Vec<(Assoc, Rc<TypeParam>)> = Vec::new();
     let assoc_names = decl.items.iter().filter_map(|i| match i {
-        TraitItem::AssocType { name, .. } => Some(name),
-        TraitItem::Function(_) => None,
+        TraitItem::AssocType { name, bound, .. } if clause_bound(bound).is_none() => Some(name),
+        TraitItem::AssocType { .. } | TraitItem::Function(_) => None,
     });
     for (n, is_operand) in decl
         .params
@@ -407,10 +407,21 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
         let TraitItem::AssocType {
             name: n,
             bound: Some(bound),
+            except,
         } = item
         else {
             continue;
         };
+        if clause_bound(&Some(bound.clone())).is_some() {
+            continue;
+        }
+        if let Some(first) = except.first() {
+            return Err(LoweringError::unsupported(
+                first.span,
+                "`except` takes capabilities out of a bound of `Effect` or `Context`, and this \
+                 bound is a type",
+            ));
+        }
         let assoc = Assoc::Declared(n.node.clone());
         let lowered = lower_type_expr(bound, ctx)?;
         let own = assocs
@@ -431,6 +442,47 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
             ));
         }
         assoc_bounds.push((assoc, lowered));
+    }
+    // An associated type bounded by `Effect` or `Context` stands for a clause of the trait's
+    // signatures, which each instance's functions decide.
+    let mut effect_assocs = Vec::new();
+    for item in &decl.items {
+        let TraitItem::AssocType {
+            name: n,
+            bound,
+            except,
+        } = item
+        else {
+            continue;
+        };
+        let Some(of_causes) = clause_bound(bound) else {
+            continue;
+        };
+        if let Some(why) = taken_type_name(&n.node, ctx) {
+            return Err(LoweringError::unsupported(n.span, why));
+        }
+        if let Some(first) = names.iter().find(|m| m.node == n.node) {
+            return Err(LoweringError::unsupported(
+                n.span,
+                format!("`{}` is declared twice in `trait {}`", n.node, name.node),
+            )
+            .with_related(first.span, "first declared here"));
+        }
+        names.push(n);
+        let param = TypeParam::declared_except(
+            n.node.clone(),
+            clauses::bound_except(except, of_causes, ctx)?,
+            bound.as_ref().map(|b| b.span),
+        );
+        ctx.declare_type_throughout(
+            n.node.as_str(),
+            Some(n.span),
+            AliasType::Type(Type::Param(Rc::clone(&param))),
+        );
+        ctx.clause_params.insert(param.id, of_causes);
+        effect_assocs.push(crate::ccl::capabilities::ClauseParam::whole(
+            param, of_causes,
+        ));
     }
     // What every instance requires of the trait's types: requirements of the traits declared
     // above it.
@@ -471,6 +523,7 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
         supplied_by: Supplier::Instances,
         assocs,
         assoc_bounds,
+        effect_assocs,
         functions,
         requires,
         named,
@@ -504,6 +557,17 @@ fn settle_written_capabilities(ty: &mut Type) -> Result<(), String> {
     result
 }
 
+/// Whether an associated type's bound makes it stand for a clause: `Some(true)` for `Effect`,
+/// which a `causes` clause names, `Some(false)` for `Context`, which a `requires` clause names,
+/// and `None` for any other bound, or none.
+fn clause_bound(bound: &Option<Spanned<ChlExpr>>) -> Option<bool> {
+    match &bound.as_ref()?.node {
+        ChlExpr::Name(n) if n == crate::ccl::nominal::EFFECT => Some(true),
+        ChlExpr::Name(n) if n == crate::ccl::nominal::CONTEXT => Some(false),
+        _ => None,
+    }
+}
+
 /// Make every data-function type in `ty` whose funkind is a hole a plain collection. An
 /// instance's associated type is one type at every use, and a funkind hole is a fresh kind per
 /// use, which a sum could pin after inference has read the instance
@@ -531,6 +595,7 @@ fn declare_function(
         params,
         output,
         requires,
+        causes,
     } = &sig.node;
     let qualified = format!("{trait_name}::{}", name.node);
     for tp in type_params {
@@ -546,11 +611,12 @@ fn declare_function(
             .with_related(clash.span, "declared here"));
         }
         if tp.annotation.is_some() {
-            return Err(LoweringError::internal(
+            return Err(LoweringError::unsupported(
                 tp.name_span,
                 format!(
                     "type parameter `{}` of `{qualified}` has a kind or a bound; a trait \
-                     function's type parameter takes neither yet",
+                     function's type parameters take neither yet, an effect bound such as \
+                     `E <: Effect` included",
                     tp.name
                 ),
             ));
@@ -569,7 +635,34 @@ fn declare_function(
     // The requirements come first: a parameter's type and the result read the associated
     // types of the ones the clause names, `r::Output`.
     let mut members = Vec::new();
-    let (requires, named) = lower_named_requirements(requires, Some(&mut members), ctx)?;
+    // A signature is a written function type, whose clauses are exact; its trait
+    // requirements are the function's own.
+    let outer_signature = ctx.in_signature.replace(qualified.clone());
+    let capabilities = clauses::lower_clauses(requires, causes, clauses::Site::Type, sig.span, ctx);
+    ctx.in_signature = outer_signature.clone();
+    let capabilities = capabilities?.map_or_else(
+        crate::ccl::capabilities::Capabilities::none,
+        crate::ccl::capabilities::Capabilities::written,
+    );
+    // A trait is a contract over instances other modules may declare, so its signature names
+    // no variable of one module's: an instance's writes are an associated effect type's.
+    if let Some((at, item)) = clauses::item_naming_a_variable(requires, causes, ctx)? {
+        return Err(LoweringError::unsupported(
+            at,
+            format!(
+                "`{qualified}` names `{item}`; a trait's signature names no variable, and an \
+                 associated type bounded by `Effect`, `Writes <: Effect`, states what an \
+                 instance's functions do"
+            ),
+        ));
+    }
+    let trait_items: Vec<Spanned<chl_parser::ast::Requirement>> = requires
+        .items
+        .iter()
+        .filter(|r| !clauses::is_context_item(r, ctx))
+        .cloned()
+        .collect();
+    let (requires, named) = lower_named_requirements(&trait_items, Some(&mut members), ctx)?;
     if let Some(bounded) = members.iter().find(|m| m.bound_at.is_some()) {
         return Err(LoweringError::internal(
             bounded.bound_at.unwrap_or(sig.span),
@@ -582,7 +675,9 @@ fn declare_function(
     }
     let in_scope = ctx.named_requirements.len();
     ctx.named_requirements.extend(named);
+    ctx.in_signature = Some(qualified.clone());
     let typed = signature_types(params, output.as_ref(), &qualified, trait_name, name, ctx);
+    ctx.in_signature = outer_signature;
     ctx.named_requirements.truncate(in_scope);
     let (inputs, output) = typed?;
     // A call opens the function's own type parameters afresh, so its arguments determine
@@ -614,6 +709,7 @@ fn declare_function(
             inputs,
             output,
             requires,
+            capabilities,
         },
     })
 }
@@ -1220,6 +1316,23 @@ fn declare_instance(
             .filter_map(|m| m.bound().map(|b| (Rc::clone(&m.param), b.clone())))
             .collect(),
         functions,
+        effect_assocs: trait_
+            .effect_assocs
+            .iter()
+            .map(|p| {
+                (
+                    p.param.id,
+                    crate::ccl::capabilities::ClauseParam::whole(
+                        TypeParam::declared_except(
+                            p.param.spelling.clone(),
+                            p.param.clause_except.clone(),
+                            p.param.bound_at,
+                        ),
+                        p.of_causes,
+                    ),
+                )
+            })
+            .collect(),
         declared: Some(DeclaredAt {
             module: ctx
                 .module
@@ -1653,8 +1766,9 @@ fn lower_instance_def(
     else {
         unreachable!("`declare_instances` admitted only `def`s")
     };
-    // What an instance's function requires and causes is its trait's signature's, which
-    // states none yet (`docs/chl-spec.md`, "Effects in traits").
+    // What an instance's function requires and causes is bounded by its trait's signature,
+    // which states it (`docs/chl-spec.md`, "Effects in traits"), so the function writes no
+    // clause of its own.
     let context = requires
         .items
         .iter()
@@ -1664,7 +1778,7 @@ fn lower_instance_def(
         return Err(LoweringError::unsupported(
             span,
             "an instance's function requires and causes what its trait's signature states, \
-             and a clause stating that on an instance is not supported yet",
+             so it writes no clause; the trait's signature writes it",
         ));
     }
     let requires = requires.items.as_slice();
@@ -1911,12 +2025,55 @@ fn lower_instance_def(
         &spans,
         &params,
         Some(&output),
-        None,
+        Some(signature_bound(
+            &function.signature.capabilities,
+            trait_,
+            instance,
+        )),
         requires,
         body,
         ctx,
     )?;
     Ok((binding, func, annotation))
+}
+
+/// The clauses an instance's function is bounded by: its signature's, as a `def`'s clauses
+/// under `only`, so its body is checked against them with the signature as the secondary
+/// capability. An associated effect type the signature names is `instance`'s own, which the body
+/// defines.
+fn signature_bound(
+    capabilities: &crate::ccl::capabilities::Capabilities,
+    trait_: &Trait,
+    instance: &TraitInstance,
+) -> crate::ccl::capabilities::Written {
+    let crate::ccl::capabilities::Repr::Written(written) = capabilities.repr() else {
+        unreachable!("lowering writes every signature's clauses")
+    };
+    let mut set = written.set.clone();
+    set.params = written
+        .set
+        .params
+        .iter()
+        .map(|p| {
+            instance
+                .effect_assocs
+                .iter()
+                .find(|(id, _)| *id == p.param.id)
+                .map_or_else(|| p.clone(), |(_, own)| own.clone())
+        })
+        .collect();
+    crate::ccl::capabilities::Written {
+        set,
+        open_requires: false,
+        open_causes: false,
+        of_def: true,
+        of_instance: Some(if trait_.is_compiler() {
+            crate::ccl::capabilities::Signature::Compiler
+        } else {
+            crate::ccl::capabilities::Signature::Written
+        }),
+        ..written.clone()
+    }
 }
 
 impl LoweringContext {

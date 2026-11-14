@@ -371,6 +371,10 @@ pub enum InferError {
     CapabilityBeyondBound { item: String },
     /// A body requiring or causing `item` beyond its definition's `only` clause.
     CapabilityBeyondClause { item: String },
+    /// An instance's function requiring or causing `item` beyond its trait's signature
+    /// (`docs/chl-spec.md`, "Effects in traits"). `compiler` is set for a compiler trait's
+    /// signature, which a program writes nowhere and which takes no associated type.
+    CapabilityBeyondSignature { item: String, compiler: bool },
     /// A written clause's `item` names no variable of the kind it takes in scope.
     ClauseNamesNoVariable {
         item: String,
@@ -1079,6 +1083,7 @@ impl InferError {
             | InferError::CapabilityBeyondBound { .. }
             | InferError::CapabilityBeyondClause { .. }
             | InferError::ClauseNamesNoVariable { .. }
+            | InferError::CapabilityBeyondSignature { .. }
             | InferError::Unsupported(_)
             | InferError::EmptyCase { .. }
             | InferError::UnresolvedHole { .. }
@@ -1569,6 +1574,20 @@ impl std::fmt::Debug for InferError {
                  take an induction variable, `WriteTxn` and `ReadTxn` a transactional one, and \
                  `Append` a feed"
             ),
+            // A compiler trait takes no associated type, so the hint is for a program's trait.
+            InferError::CapabilityBeyondSignature { item, compiler } => {
+                write!(
+                    f,
+                    "this has `{item}`, which the trait's signature does not list"
+                )?;
+                if !compiler {
+                    write!(
+                        f,
+                        "; an associated type bounded by `Effect` lets instances differ"
+                    )?;
+                }
+                Ok(())
+            }
             InferError::CapabilityBeyondClause { item } => write!(
                 f,
                 "this has `{item}`, which the definition's clause, bounded by `only` or \

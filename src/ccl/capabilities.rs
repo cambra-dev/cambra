@@ -46,6 +46,7 @@ impl Requirement {
             trait_,
             args: Vec::new(),
             terms,
+            effect_assoc: Vec::new(),
             assoc: Vec::new(),
             at: None,
         })
@@ -1060,6 +1061,19 @@ pub struct Written {
     /// A `def`'s clauses, which the stamp on its body's lambda carries to the body's effect
     /// variable (`Typing::function_body`). As an annotation the stamp states nothing.
     pub of_def: bool,
+    /// An instance's function's clauses, its signature's: the parameters they name are the
+    /// instance's associated effect types, which the body defines rather than is bounded by
+    /// (`docs/chl-spec.md`, "Effects in traits"). It says whose signature they are.
+    pub of_instance: Option<Signature>,
+}
+
+/// Whose signature bounds an instance's function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Signature {
+    /// A trait a program declares, whose signature is written in it.
+    Written,
+    /// One of the compiler's traits, an operator's or `Iterable`, written nowhere in a program.
+    Compiler,
 }
 
 /// One requirement or effect, as a [`CapabilityVar`] records it.
@@ -1311,6 +1325,9 @@ impl Upper {
 pub enum Blame {
     /// A `def`'s `only` clause.
     Clause(chl_parser::ast::Span),
+    /// The trait's signature bounding an instance's function, where a program writes it: `None`
+    /// for a compiler trait's.
+    Signature(Option<chl_parser::ast::Span>),
     /// A written function type, whose clauses are exact.
     Written(chl_parser::ast::Span),
     /// A clause variable's bound, `E <: Effect except RunTransaction`, which each use's
@@ -1792,6 +1809,33 @@ impl Capabilities {
 
     pub fn repr(&self) -> &Repr {
         &self.0
+    }
+
+    /// This with each clause parameter `respell` maps replaced, in a set the type states or
+    /// a program writes. A variable inference is still collecting is kept.
+    pub fn with_params_respelled(
+        &self,
+        respell: &impl Fn(&crate::ccl::ty::TypeParam) -> Option<Rc<crate::ccl::ty::TypeParam>>,
+    ) -> Capabilities {
+        let set_respelled = |set: &CapabilitySet| CapabilitySet {
+            params: set
+                .params
+                .iter()
+                .map(|p| match respell(&p.param) {
+                    Some(param) => ClauseParam { param, ..p.clone() },
+                    None => p.clone(),
+                })
+                .collect(),
+            ..set.clone()
+        };
+        match self.repr() {
+            Repr::Known(set) => Capabilities::known(set_respelled(set)),
+            Repr::Written(w) => Capabilities::written(Written {
+                set: set_respelled(&w.set),
+                ..w.clone()
+            }),
+            Repr::Var(_) => self.clone(),
+        }
     }
 
     /// Whether this states nothing: what every data function's type states.
@@ -2402,7 +2446,10 @@ mod tests {
         let variable = |bound: BTreeSet<Capability>, own: BTreeSet<Capability>| {
             Capability::Param(ClauseParam {
                 except: own,
-                ..ClauseParam::whole(crate::ccl::ty::TypeParam::declared_except("E", bound), true)
+                ..ClauseParam::whole(
+                    crate::ccl::ty::TypeParam::declared_except("E", bound, None),
+                    true,
+                )
             })
         };
         let commits = Capability::Causes(Effect::RunTransaction);
