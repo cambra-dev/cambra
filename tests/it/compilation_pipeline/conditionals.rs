@@ -1645,6 +1645,76 @@ fn test_boxed_conditional_collection(#[case] code: &str, #[case] expected: Value
     check_scalar(code, expected);
 }
 
+/// A collection boxed inside a loop whose binder its domain reads: a filter reading the loop
+/// variable, or a group of a `groupby` read at the loop's key. Lambda elimination moves the
+/// morphisms out of the binder's scope, so each type naming it is generalized, a sum's
+/// candidates among its parts (`src/ccl/design/type-parameters.md`, "Generalized types").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::summed("sum([sum(box([y for y in [1, 2, 3] if y > k])) for k in [0, 1]])", 11)]
+#[case::iterated(
+    "sum([sum([y for y in box([y for y in [1, 2, 3] if y > k])]) for k in [0, 1]])",
+    11
+)]
+#[case::in_a_for_statement(
+    indoc! {"
+        t := 0
+        for k in [0, 1]:
+            for y in box([y for y in [1, 2, 3] if y > k]):
+                t := t + y
+        t
+    "},
+    11
+)]
+#[case::a_group(
+    indoc! {r"
+        g = groupby([1, 2, 3], \x -> x > 1)
+        sum([sum([x for x in box(g1)]) for g1 in g])
+    "},
+    6
+)]
+#[case::a_group_chosen_over_a_list(
+    indoc! {r"
+        g = groupby([1, 2, 3], \x -> x > 1)
+        c = 1 > 0
+        sum([sum([x for x in (box(g1) if c else box([7]))]) for g1 in g])
+    "},
+    6
+)]
+#[case::a_list_chosen_over_a_group(
+    indoc! {r"
+        g = groupby([1, 2, 3], \x -> x > 1)
+        c = 1 > 2
+        sum([sum([x for x in (box(g1) if c else box([7]))]) for g1 in g])
+    "},
+    14
+)]
+#[case::chosen_per_group(
+    indoc! {r"
+        g = groupby([1, 2, 3], \x -> x > 1)
+        sum([sum([x for x in (box(g1) if sum(g1) > 3 else box([7]))]) for g1 in g])
+    "},
+    12
+)]
+#[case::filters_reading_two_loops(
+    indoc! {r"
+        c = 1 > 0
+        sum([sum([x for x in (box([y for y in [1, 2, 3] if y > k]) if c else box([y for y in [1, 2, 3] if y > j]))]) for k in [0, 1] for j in [1, 2]])
+    "},
+    22
+)]
+#[case::groups_at_two_keys(
+    indoc! {r"
+        g = groupby([1, 2, 3], \x -> x > 1)
+        c = 1 > 0
+        sum([sum([sum([x for x in (box(g1) if c else box(g2))]) for g2 in g]) for g1 in g])
+    "},
+    12
+)]
+fn a_collection_boxed_under_the_binder_its_domain_reads(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
 /// A boxed conditional chosen once and observed by its keys. Realization unions one gated leg
 /// per arm, and the value is the leg holding rows, keyed by its own keys
 /// (`src/ccl/design/collections.md`, "Compiling a conditional collection").

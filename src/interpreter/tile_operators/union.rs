@@ -119,7 +119,11 @@ impl UnionOperator {
         // Agreeing arms keep their shared tiling: a `Tiling` carries layout an
         // `Extent` cannot (a record column is struct-of-arrays), and that is the
         // one thing the operands know that the type does not.
-        let codomain = if codomains.windows(2).all(|w| w[0] == w[1]) {
+        // Rows the type bounds as a sum's are merged at that bound even where the arms' keys
+        // happen to agree: which keys a row has is its value's, carried in its own tiling.
+        let sum_rows = matches!(&declared_codomain, Extent::Function { .. })
+            && codomains[0].extent() != declared_codomain;
+        let codomain = if codomains.windows(2).all(|w| w[0] == w[1]) && !sum_rows {
             debug_assert_eq!(
                 codomains[0].extent(),
                 declared_codomain,
