@@ -14,6 +14,7 @@
 // hazard therefore doesn't apply here.
 #![allow(clippy::mutable_key_type)]
 
+use crate::ccl::capabilities::{Capabilities, Capability, Filter, Repr, ScopedCapability};
 use crate::ccl::nominal::{Variance, sides};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -106,20 +107,20 @@ pub enum ConstrainError {
     },
     /// A non-feed type flowed into a [`Type::History`] requirement — e.g.
     /// a plain value or a collection passed to a function that feeds its parameter.
-    /// The reverse direction is fine (a feed reads as its collection); only the
-    /// write capability cannot be conjured from a value.
+    /// The reverse direction is fine (a feed reads as its collection); only a
+    /// feed handle cannot be conjured from a value.
     NotAFeed {
         /// The non-feed type that was required to be a feed handle.
         found: Box<Type>,
         /// The feed type demanded.
         required: Box<Type>,
     },
-    /// Two function types met whose kinds disagree: a compute function (a
-    /// capability, `⇒`) where a data collection (`⤇`) is demanded, or the
+    /// Two function types met whose kinds disagree: a compute function (`⇒`) where a
+    /// data collection (`⤇`) is demanded, or the
     /// reverse. The kinds are incomparable, so neither direction is a legal
-    /// coercion — a capability used as a collection would iterate a *declared*
+    /// coercion — a compute function used as a collection would iterate a *declared*
     /// domain the value does not actually cover, and a collection used as a
-    /// capability would lose the invariance its domain is typed under.
+    /// compute function would lose the invariance its domain is typed under.
     KindMismatch {
         /// The supplied function.
         lhs: Box<Type>,
@@ -693,6 +694,35 @@ fn kind_edge_subst(own: &Subst, far: &Type, far_subst: &Subst) -> Subst {
     Bound::edge(own.clone(), far.clone(), far_subst.clone()).render_subst()
 }
 
+/// Capabilities are covariant: a function that does less stands where one that may do more is
+/// expected, so what the left side's capabilities hold flows into the right side's
+/// (`src/ccl/design/type-inference.md`, "Capability variables").
+///
+/// A known set on the right is a ceiling only where a written clause states it, and no
+/// clause is written yet, so a known right side records nothing.
+fn constrain_capabilities(e0: &Capabilities, e1: &Capabilities) {
+    match (e0.repr(), e1.repr()) {
+        (Repr::Var(v0), Repr::Var(v1)) => v1.flows_from(v0, Filter::default()),
+        (Repr::Known(set), Repr::Var(v1)) => {
+            for r in &set.requires {
+                v1.record(ScopedCapability {
+                    item: Capability::Requires(r.clone()),
+                    bound_at: None,
+                    parameter: false,
+                });
+            }
+            for e in &set.causes {
+                v1.record(ScopedCapability {
+                    item: Capability::Causes(e.clone()),
+                    bound_at: None,
+                    parameter: false,
+                });
+            }
+        }
+        (_, Repr::Known(_)) => {}
+    }
+}
+
 /// Relate two function kinds by **recording the edge**, and nothing else.
 ///
 /// Whether the two are compatible, how many binders each is over, and what those binders
@@ -732,14 +762,14 @@ fn constrain_fun_kind(
         (other, FunKind::Var(v)) => {
             v.record_under(other.clone(), true, kind_edge_subst(sr, lhs, sl));
         }
-        // Both concrete: a capability is not a collection, a plain collection is not a sum —
+        // Both concrete: a compute function is not a collection, a plain collection is not a sum —
         // entering one is a term — and two sums of different width are two types. Nothing
         // arriving later can change any of that.
         _ if k0.resolved() == k1.resolved() => return Ok(()),
         _ => return Err(mismatch()),
     }
     // **A kind required to be two points is rejected at the edge that completed it.** A
-    // consumer is minted pinned `Data` ([`FunKind::fresh_data`]), so a capability reaching
+    // consumer is minted pinned `Data` ([`FunKind::fresh_data`]), so a compute function reaching
     // one is this rejection — the same one a concrete pair is, reported where both sides can
     // still be named rather than left for coalesce, which reaches a conflicted variable only
     // where some position happens to materialize from it.
@@ -1437,6 +1467,7 @@ fn eliminate_at(ty: &Type, s: &Subst) -> Option<(Type, Subst)> {
             fun_kind,
             domain,
             codomain,
+            capabilities,
         } => {
             let parts = match fun_kind {
                 FunKind::Data(Some(ws)) => rest.discharged_through(ws, &term),
@@ -1450,6 +1481,7 @@ fn eliminate_at(ty: &Type, s: &Subst) -> Option<(Type, Subst)> {
                     fun_kind: FunKind::Data(None),
                     domain: domain.clone(),
                     codomain: codomain.clone(),
+                    capabilities: capabilities.clone(),
                 },
                 parts,
             ))
@@ -1588,18 +1620,21 @@ fn constrain_go_impl(
                 fun_kind: k0,
                 domain: d0,
                 codomain: c0,
+                capabilities: e0,
             },
             Type::Fun {
                 name: n1,
                 fun_kind: k1,
                 domain: d1,
                 codomain: c1,
+                capabilities: e1,
             },
         ) => {
             // The kind edge (see [`constrain_fun_kind`]): recorded, not answered. What the two
             // kinds turn out to be, and how their binders correspond, is read once the kind
             // graph is closed.
             constrain_fun_kind(k0, k1, lhs, rhs, sl, sr)?;
+            constrain_capabilities(e0, e1);
             // **Binders correspond by position across this edge.** A sum's binders are its
             // kind's positions, so position `i` of one side is position `i` of the other,
             // and the edge carries that correspondence in its own substitution — the Σ
@@ -2195,6 +2230,7 @@ fn constrain_go_impl(
         // the new upper by bridging the holder gap and composing **forward**
         // onto the two content sides.
         (Type::Infer(lv), _) if type_level(rhs) <= lv.level() => {
+            crate::ccl::capabilities::lower_capability_levels(rhs, lv.level());
             let lows = {
                 let bound =
                     Bound::edge(sl.clone(), rhs.clone(), sr.clone()).with_origin(cache.origins.1);
@@ -2296,6 +2332,7 @@ fn constrain_go_impl(
         // inverse, and a non-invertible discharge degraded to `id` twice over.
         // Here the forward morphism is read directly off the edge.
         (_, Type::Infer(rv)) if type_level(lhs) <= rv.level() => {
+            crate::ccl::capabilities::lower_capability_levels(lhs, rv.level());
             let ups = {
                 let bound =
                     Bound::edge(sr.clone(), lhs.clone(), sl.clone()).with_origin(cache.origins.0);
@@ -2449,7 +2486,7 @@ fn constrain_go_impl(
         }
 
         // Feed handles are invariant in the payload: feeding writes into
-        // the channel (contravariant capability) while reading consumes it
+        // the channel (contravariant) while reading consumes it
         // (covariant), so a feed handle meeting a feed handle equates the
         // payloads. The bidirectional edge is what carries a feed
         // contribution made through a function parameter back to the
@@ -2479,7 +2516,7 @@ fn constrain_go_impl(
             _,
         ) => constrain_go(function, rhs, sl, sr, cache, scope),
         // Nothing but a feed satisfies a feed requirement: a feed reads as its collection,
-        // but the write capability cannot be conjured from a value, a collection included
+        // but a feed handle cannot be conjured from a value, a collection included
         // (`g(5)` or `g([1, 2])` where `g` feeds its parameter, `x = [1, 2]; x << 3`). A
         // `<<` targeting a `:=` mutable variable lands here
         // too, as the handle it is — the left side matches `_`, so the cross-kind pair
@@ -2743,6 +2780,7 @@ fn escaping_param(ty: &Type, target_level: Level) -> Option<Rc<crate::ccl::ty::T
 /// constrain_subtype solver's level-mismatch branches).
 pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCache) -> Type {
     if type_level(ty) <= target_level {
+        crate::ccl::capabilities::lower_capability_levels(ty, target_level);
         return ty.clone();
     }
     match ty {
@@ -2855,7 +2893,17 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             fun_kind,
             domain: d,
             codomain: c,
+            capabilities,
         } => Type::Fun {
+            // A capability variable crossing to a shallower level is no longer local to the
+            // scope it was minted in, so it moves rather than being copied: an instantiation
+            // of the deeper scope's scheme then shares it.
+            capabilities: {
+                if let Repr::Var(v) = capabilities.repr() {
+                    v.lower_level(target_level);
+                }
+                capabilities.clone()
+            },
             name: name.clone(),
             // A sum's **candidates** are an invariant position, so they cross a level
             // boundary through two-way proxies rather than the polar one-way
@@ -2942,6 +2990,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 fun_kind,
                 domain,
                 codomain,
+                capabilities,
             } = function.as_ref()
             else {
                 unreachable!("a history's function is an unrefined function, got {function}")
@@ -2952,6 +3001,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                     fun_kind: fun_kind.clone(),
                     domain: Box::new(extrude_invariant(domain, target_level, cache)),
                     codomain: Box::new(extrude_invariant(codomain, target_level, cache)),
+                    capabilities: capabilities.clone(),
                 },
                 *history_kind,
             )
@@ -3657,7 +3707,7 @@ mod tests {
                 &mut ConstrainCache::new()
             )
             .is_ok(),
-            "a capability's domain is not data — acquiring a refinement is sound"
+            "a compute function's domain is not data — acquiring a refinement is sound"
         );
 
         // Nor either base direction.
@@ -4087,7 +4137,7 @@ mod tests {
     #[test]
     fn plain_value_is_not_a_feed() {
         // Int </: feed(D, Int) and (D ⤇ Int) </: feed(D, Int) — a feed reads as its
-        // collection, but the write capability cannot be conjured from a value, a
+        // collection, but a feed handle cannot be conjured from a value, a
         // collection included.
         for value in [
             prim(BaseType::Int),
@@ -5160,8 +5210,8 @@ mod tests {
     #[test]
     fn kind_data_where_compute_is_rejected() {
         // `Data ⋠ Compute`: there is no upcast from a collection to a
-        // capability. A collection's domain is invariant — it *is* the data — so
-        // re-viewing it as a capability, whose domain is contravariant, is not a
+        // compute function. A collection's domain is invariant — it *is* the data — so
+        // re-viewing it as a compute function, whose domain is contravariant, is not a
         // weakening of the same claim but a different one.
         // `0..3 ⤇ Int ⊀ 0..3 ⇒ Int`.
         let mut cache = ConstrainCache::new();
@@ -5177,7 +5227,7 @@ mod tests {
 
     #[test]
     fn kind_compute_where_data_is_rejected() {
-        // `Compute ⋠ Data`: a capability supplied where a collection is demanded is
+        // `Compute ⋠ Data`: a compute function supplied where a collection is demanded is
         // the rejection (the silent-row-loss guard). `0..3 ⇒ Int ⊀ 0..3 ⤇ Int`.
         let mut cache = ConstrainCache::new();
         assert!(matches!(
@@ -5198,6 +5248,7 @@ mod tests {
             fun_kind,
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(prim(BaseType::Int)),
+            capabilities: Capabilities::none(),
         }
     }
 
@@ -5259,7 +5310,7 @@ mod tests {
         )
         .expect("a var meeting Data records the pin");
         // `Data(None)` is a *plain* collection, one of the three concrete kinds — the pin
-        // records which, not merely that it is not a capability.
+        // records which, not merely that it is not a compute function.
         assert_eq!(a.resolved(), KindPin::Plain);
         assert_eq!(
             b.resolved(),
@@ -5302,7 +5353,7 @@ mod tests {
 
     /// **A plain collection and a sum do not merge.** Neither is below the other, so one
     /// function required to be both holds two fun kinds at once — the same contradiction a
-    /// capability meeting a collection is, and read at the same place.
+    /// compute function meeting a collection is, and read at the same place.
     #[test]
     fn a_plain_collection_and_a_sum_do_not_merge() {
         let v = FunKindVar::fresh();
@@ -5411,6 +5462,7 @@ mod tests {
             fun_kind: FunKind::Var(Rc::clone(&v)),
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(prim(BaseType::Int)),
+            capabilities: Capabilities::none(),
         };
         let mut cache = ConstrainCache::new();
         constrain_subtype(

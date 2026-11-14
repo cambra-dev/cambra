@@ -466,6 +466,7 @@ fn zip_of(arms: Vec<Expr>, fun_kind: &FunKind) -> Expr {
                     fun_kind: fun_kind.clone(),
                     domain: Box::new(domain),
                     codomain: Box::new(codomain),
+                    capabilities: crate::ccl::capabilities::Capabilities::none(),
                 },
             })
         })
@@ -637,7 +638,7 @@ fn compose_split_last(expr: &Expr) -> Option<(&[Expr], &Expr)> {
 /// The head case is the one that matters: `left` there is routinely `id`, the unit
 /// of composition, which contributes no kind of its own (`id ≫ xs` is `xs`, a
 /// collection). Reading the kind off `id` is what flattens a comprehension's
-/// columns to capabilities.
+/// columns to compute functions.
 fn try_pairwise_in_compose(
     expr: &mut Expr,
     detect: impl Fn(&Expr, &Expr) -> bool,
@@ -691,7 +692,7 @@ fn try_pairwise_in_compose(
     if !(collapsed && expr.ty.sum().is_some() && ty.sum().is_none()) {
         expr.ty = ty;
         // A collapsed constant `𝑔 ▷ const` takes the chain's type, which may be a collection
-        // where the step it was reduced in was a capability, and `const`'s own stamp is read
+        // where the step it was reduced in was a compute function, and `const`'s own stamp is read
         // off the application it heads.
         if collapsed
             && let TypedExprNode::Apply { argument, function } = &mut expr.node
@@ -704,7 +705,7 @@ fn try_pairwise_in_compose(
     // at an unnarrowed element — the projection a predicate compiled at a narrowed base
     // carries, whose own type inference stamped before the narrowing existed. Restoring the
     // chain's recorded domain therefore has to reach the head as well, or the node
-    // contradicts its own first step: harmless while the domain was a capability's and
+    // contradicts its own first step: harmless while the domain was a compute function's and
     // contravariant, reported at the next wall once it is a collection's and invariant.
     if let (TypedExprNode::Compose(elts), Some(chain_dom)) = (&mut expr.node, expr.ty.domain())
         && let Some(head) = elts.first_mut()
@@ -1164,6 +1165,7 @@ fn try_const_reduce(expr: &mut Expr) -> bool {
                     fun_kind: mint_kind.clone(),
                     domain: Box::new(dom),
                     codomain: Box::new(cod),
+                    capabilities: crate::ccl::capabilities::Capabilities::none(),
                 },
                 _ => Type::Hole,
             };
@@ -1406,7 +1408,7 @@ fn try_uncurry_curried(expr: &mut Expr) -> bool {
 /// equationally sound anywhere the pattern appears.
 ///
 /// In practice this fires on uncurried multi-arg UDF call sites: after
-/// `inline_capability_lambdas` beta-reduces the outer user-parameter lambda,
+/// `inline_compute_lambdas` beta-reduces the outer user-parameter lambda,
 /// references like `__arg_pair.0` are left as `Apply(Tuple([list, n]),
 /// Proj(0))`.  Operator conversion's list-element path needs the projection
 /// folded, so this rule must fire before `operator_conversion` runs.
@@ -1495,6 +1497,7 @@ fn try_exponential_beta(expr: &mut Expr) -> bool {
                         fun_kind: mint_kind.clone(),
                         domain: Box::new(a.clone()),
                         codomain: Box::new(a),
+                        capabilities: crate::ccl::capabilities::Capabilities::none(),
                     })
                     .unwrap_or(Type::Hole);
             let id_node = id().with_ty(id_ty);
@@ -1567,6 +1570,7 @@ fn try_partial_lookup(expr: &mut Expr) -> bool {
                 fun_kind: mint_kind.clone(),
                 domain: Box::new(key_ty),
                 codomain: Box::new(option_ty),
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
             };
             // `curry(lookup?) : ((𝐶, 𝐾) ⇒ Option(𝑉)) ⇒ (𝐶 ⇒ (𝐾 ⇒ Option(𝑉)))`, applied at
             // the collection to leave the morphism the keys compose into.
@@ -2178,6 +2182,7 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(a),
             codomain: Box::new(b),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         }
     }
 
@@ -2200,6 +2205,7 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: fun_tys.first().unwrap().0.clone(),
             codomain: fun_tys.last().unwrap().1.clone(),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         Expr::compose(elts).with_ty(ty)
     }
@@ -3025,7 +3031,7 @@ mod tests {
     /// and a `Data` kind on it survive.
     ///
     /// Rebuilding the type from its parts mints `FunKind::Compute` and drops the
-    /// binder, which reads a collection as a capability and unbinds a dependent
+    /// binder, which reads a collection as a compute function and unbinds a dependent
     /// refinement's key. Both arms of the rule are covered — with 𝑓 absent the
     /// `map` node carries the type itself, with 𝑓 present the compose does.
     #[test]
@@ -3050,6 +3056,7 @@ mod tests {
             fun_kind: FunKind::Data(None),
             domain: Box::new(domain),
             codomain: Box::new(Type::data_fun(b_ty.clone(), c2_ty.clone())),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
 
         // 𝑓 absent: the bare `.0` arm.

@@ -311,11 +311,13 @@ pub(crate) fn is_atomic_term(e: &Expr) -> bool {
 /// would otherwise be paid at each: a program of a few dozen statements overflows a test
 /// thread's stack in a debug build.
 fn normalize(e: Expr, muts: &Muts) -> Expr {
-    match &e.node {
+    // One stack frame per node over the whole tree; grow on demand, as the other
+    // pass-level walks do.
+    stacker::maybe_grow(512 * 1024, 1024 * 1024, || match &e.node {
         TypedExprNode::Let { .. } => normalize_let(e, muts),
         TypedExprNode::ExprStmt { .. } => normalize_expr_stmt(e, muts),
         _ => normalize_node(e, muts),
-    }
+    })
 }
 
 /// Rebuild `node` with `e`'s id, type, annotation and site. Lowering pre-stamps some nodes'

@@ -970,7 +970,7 @@ fn join_plan_to_expr(
                             .collect(),
                     )
                     // A list literal is a collection, and the kinds are
-                    // incomparable — stamping the capability kind here makes the
+                    // incomparable — stamping the compute kind here makes the
                     // post-planning wall reject the node against its own rule.
                     .with_ty(Type::data_fun(
                         Type::index_range(indices_to_flatten.len()),
@@ -981,7 +981,7 @@ fn join_plan_to_expr(
                     // join output (stamped `data_fun` above) and the result is
                     // that same output re-addressed over a flattened domain.
                     // Flattening re-indexes rows; it does not turn them into a
-                    // capability.
+                    // compute function.
                     Type::fun(
                         Type::data_fun(
                             Type::Tuple(vec![probe_output_ty.clone(), build_output_ty.clone()]),
@@ -1133,7 +1133,7 @@ fn convert_loop_join(
             .collect(),
     )
     // A list literal is a collection (`emit_list`), and the kinds are
-    // incomparable — the capability kind here is a claim the node's own rule
+    // incomparable — the compute kind here is a claim the node's own rule
     // contradicts at the next wall.
     .with_ty(Type::data_fun(
         Type::index_range(perm.len()),

@@ -270,6 +270,8 @@ fn residual_after_fanout(body: Expr, defer_name: &Name) -> Expr {
         },
         ty,
         user_annotation,
+        capabilities,
+        own_capabilities,
         node_id,
         site,
     } = body
@@ -294,6 +296,8 @@ fn residual_after_fanout(body: Expr, defer_name: &Name) -> Expr {
         },
         ty,
         user_annotation,
+        capabilities,
+        own_capabilities,
         node_id,
         site,
     }
@@ -524,6 +528,8 @@ fn erase_spine_feeds(body: Expr, defer_name: &Name) -> Expr {
         node,
         ty,
         user_annotation,
+        capabilities,
+        own_capabilities,
         node_id,
         site,
     } = body;
@@ -561,6 +567,8 @@ fn erase_spine_feeds(body: Expr, defer_name: &Name) -> Expr {
         node,
         ty,
         user_annotation,
+        capabilities,
+        own_capabilities,
         node_id,
         site,
     }
@@ -734,6 +742,11 @@ fn lift_defer(
                 site: fed_at,
             } => TypedExpr {
                 ty: head.ty,
+                capabilities: crate::ccl::capabilities::of_feed(binding_name, &value.capabilities),
+                own_capabilities: crate::ccl::capabilities::of_feed(
+                    binding_name,
+                    &crate::ccl::capabilities::Capabilities::none(),
+                ),
                 node: TypedExprNode::Feed {
                     name_occurrence,
                     name: binding_name.clone(),
@@ -754,6 +767,11 @@ fn lift_defer(
                 value,
             } => TypedExpr {
                 ty: head.ty,
+                capabilities: crate::ccl::capabilities::of_feed(binding_name, &value.capabilities),
+                own_capabilities: crate::ccl::capabilities::of_feed(
+                    binding_name,
+                    &crate::ccl::capabilities::Capabilities::none(),
+                ),
                 node: TypedExprNode::Define {
                     name_occurrence,
                     name: binding_name.clone(),
@@ -819,6 +837,8 @@ fn replace_result_var(expr: Expr, replacement: Expr) -> Expr {
         node,
         ty: _,
         user_annotation,
+        capabilities,
+        own_capabilities,
         node_id,
         site,
     } = expr;
@@ -847,6 +867,8 @@ fn replace_result_var(expr: Expr, replacement: Expr) -> Expr {
         node: new_node,
         ty,
         user_annotation,
+        capabilities,
+        own_capabilities,
         node_id,
         site,
     }
@@ -1152,6 +1174,15 @@ fn run_memoized(expr: Expr) -> Result<Expr, Located<DeferError>> {
     erase_chan_domains(&mut rewritten, &mut map, &kinds, &predicates);
     #[cfg(debug_assertions)]
     assert_no_type_residue(&rewritten);
+    // Every feed is a channel's union now, so nothing appends to one.
+    crate::ccl::capabilities::discharge(&mut rewritten, &|item| {
+        matches!(
+            item,
+            crate::ccl::capabilities::Capability::Causes(crate::ccl::capabilities::Effect::Append(
+                _
+            ))
+        )
+    });
     Ok(rewritten)
 }
 
@@ -1262,6 +1293,7 @@ fn erase_chan_domains_in_type(
             fun_kind: fun_kind.unwrap_or(FunKind::Data(None)),
             domain,
             codomain: value,
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         erase_chan_domains_in_type(ty, map, kinds);
         return true;
@@ -1853,8 +1885,9 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), Located<DeferError>> {
 /// recursed into structurally.
 fn channelize_expr(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located<DeferError>> {
     // One stack frame per node over the whole tree; grow on demand, as the other
-    // pass-level walks do.
+    // pass-level walks do. A node rebuilt over channelized children does what they do.
     stacker::maybe_grow(512 * 1024, 1024 * 1024, || channelize_inner(expr, ctx))
+        .map(Expr::absorbing_children_capabilities)
 }
 
 fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located<DeferError>> {
@@ -1865,6 +1898,8 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
         node,
         ty,
         user_annotation,
+        capabilities,
+        own_capabilities,
         node_id,
         site,
     } = expr;
@@ -2088,6 +2123,8 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
                 },
                 ty,
                 user_annotation,
+                capabilities,
+                own_capabilities,
                 node_id,
                 site,
             })
@@ -2101,6 +2138,8 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
                 node: other,
                 ty,
                 user_annotation,
+                capabilities,
+                own_capabilities,
                 node_id,
                 site,
             };
@@ -2304,10 +2343,18 @@ fn assert_no_shadowed_captures(body: &Expr, channels: &HashMap<Name, Expr>) {
 /// free variable is never rebound on this spine
 /// ([`assert_no_shadowed_captures`] checks it in debug).
 fn bind_cluster_at_scope(expr: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
+    // Each node the cluster is placed under does what the cluster's channels do.
+    bind_cluster_at_scope_in(expr, group).absorbing_children_capabilities()
+}
+
+/// [`bind_cluster_at_scope`] at one node.
+fn bind_cluster_at_scope_in(expr: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
     let TypedExpr {
         node,
         ty,
         user_annotation,
+        capabilities,
+        own_capabilities,
         node_id,
         site,
     } = expr;
@@ -2341,6 +2388,8 @@ fn bind_cluster_at_scope(expr: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
                     },
                     ty,
                     user_annotation,
+                    capabilities,
+                    own_capabilities,
                     node_id,
                     site,
                 };
@@ -2354,6 +2403,8 @@ fn bind_cluster_at_scope(expr: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
                 },
                 ty,
                 user_annotation,
+                capabilities,
+                own_capabilities,
                 node_id,
                 site,
             }
@@ -2365,6 +2416,8 @@ fn bind_cluster_at_scope(expr: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
             },
             ty,
             user_annotation,
+            capabilities,
+            own_capabilities,
             node_id,
             site,
         },
@@ -2383,6 +2436,8 @@ fn bind_cluster_at_scope(expr: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
                     node: TypedExprNode::LetRec { bindings, body },
                     ty,
                     user_annotation,
+                    capabilities,
+                    own_capabilities,
                     node_id,
                     site,
                 };
@@ -2395,6 +2450,8 @@ fn bind_cluster_at_scope(expr: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
                 },
                 ty,
                 user_annotation,
+                capabilities,
+                own_capabilities,
                 node_id,
                 site,
             }
@@ -2404,6 +2461,8 @@ fn bind_cluster_at_scope(expr: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
                 node: other,
                 ty,
                 user_annotation,
+                capabilities,
+                own_capabilities,
                 node_id,
                 site,
             };
@@ -2743,6 +2802,8 @@ fn extract_for_defer(
     stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
         extract_for_defer_impl(expr, defer_name, feeds, define, in_inner_scope, None)
     })
+    // A node rebuilt over what extraction left of its children does what they do.
+    .map(Expr::absorbing_children_capabilities)
 }
 
 /// Check that a walk with `in_inner_scope` set collected no define.
@@ -2802,6 +2863,8 @@ fn extract_for_defer_impl(
         node,
         ty,
         user_annotation,
+        capabilities,
+        own_capabilities,
         node_id,
         site,
     } = expr;
@@ -3022,6 +3085,8 @@ fn extract_for_defer_impl(
                         },
                     ty: function_ty,
                     user_annotation: function_user_annotation,
+                    capabilities: _,
+                    own_capabilities: _,
                     // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
                     node_id: function_node_id,
                     site,
@@ -3079,6 +3144,8 @@ fn extract_for_defer_impl(
                     },
                     ty: function_ty,
                     user_annotation: function_user_annotation,
+                    capabilities: crate::ccl::capabilities::Capabilities::none(),
+                    own_capabilities: crate::ccl::capabilities::Capabilities::none(),
                     // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
                     node_id: function_node_id,
                     site,
@@ -3351,6 +3418,8 @@ fn extract_for_defer_impl(
                                 },
                                 ty: elt_ty,
                                 user_annotation: elt_user_ann,
+                                capabilities: crate::ccl::capabilities::Capabilities::none(),
+                                own_capabilities: crate::ccl::capabilities::Capabilities::none(),
                                 // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
                                 node_id: elt_node_id,
                                 site: elt_site,
@@ -3417,6 +3486,8 @@ fn extract_for_defer_impl(
                             },
                             ty: elt_ty,
                             user_annotation: elt_user_ann,
+                            capabilities: crate::ccl::capabilities::Capabilities::none(),
+                            own_capabilities: crate::ccl::capabilities::Capabilities::none(),
                             // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
                             node_id: elt_node_id,
                             site: elt_site,
@@ -3484,7 +3555,7 @@ fn extract_for_defer_impl(
             {
                 let _g = provenance::enter(feed, "channelize.feed", provenance::Nature::Expansion);
                 // The channel contribution is this lambda with the fed value for its body, so
-                // it is the same collection-or-capability the lambda was — `Expr::lambda`
+                // it is a collection or a compute function as the lambda was — `Expr::lambda`
                 // stamps `Compute`, so the incoming kind is carried back on. Its binder is
                 // one more position the contribution is keyed by.
                 let wrapped = contribution_lambda(&param, v, Some(&ty));
@@ -3772,6 +3843,8 @@ fn extract_for_defer_impl(
         node,
         ty,
         user_annotation,
+        capabilities,
+        own_capabilities,
         node_id,
         site,
     })
@@ -4109,6 +4182,7 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::refined_one(Type::Hole, refinement)),
             codomain: Box::new(Type::Hole),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         });
         let free = crate::ccl::ccl_utils::free_reads(&typed);
         assert!(

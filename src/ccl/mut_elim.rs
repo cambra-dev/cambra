@@ -183,11 +183,21 @@ pub fn run(expr: Expr) -> Expr {
         !contains_mut_type(&out),
         "letrec phase post-condition violated: a history survived the phase"
     );
+    // Every induction variable is a recurrence now, so nothing reads or writes one.
+    crate::ccl::capabilities::discharge(&mut out, &|item| {
+        matches!(
+            item,
+            crate::ccl::capabilities::Capability::Causes(crate::ccl::capabilities::Effect::Write(
+                _
+            ))
+        ) || matches!(item, crate::ccl::capabilities::Capability::Requires(r)
+            if r.requirement().trait_ == crate::ccl::infer::solver::traits::Trait::read())
+    });
     out
 }
 
 /// Replace each `let __output : 𝑇 = body in __output` by `body` where `body`
-/// holds a `MutWrite`, a `For`, or a `Feed` ([`opaque_output::output_body`]).
+/// writes or feeds a variable, or holds a loop ([`opaque_output::output_body`]).
 ///
 /// Inlining a writer leaves its body under that binding at the call site, so
 /// the body's statements sit in the definiens of `__output` and not on the
@@ -198,9 +208,34 @@ pub fn run(expr: Expr) -> Expr {
 fn peel_effectful_outputs(mut expr: Expr) -> Expr {
     expr.map_children(peel_effectful_outputs);
     match opaque_output::output_body(&expr) {
-        Some(body) if contains_marker(body) || body_has_feed(body) => opaque_output::peel(expr),
+        Some(body) if holds_loop(body) || writes(body) || feeds(body) => opaque_output::peel(expr),
         _ => expr,
     }
+}
+
+/// Whether evaluating `e` writes a mutable variable ([`Expr::capabilities`]).
+fn writes(e: &Expr) -> bool {
+    e.capabilities.set().causes.iter().any(|c| {
+        matches!(
+            c,
+            crate::ccl::capabilities::Effect::Write(_)
+                | crate::ccl::capabilities::Effect::WriteTxn(_)
+        )
+    })
+}
+
+/// Whether evaluating `e` feeds a feed ([`Expr::capabilities`]).
+fn feeds(e: &Expr) -> bool {
+    e.capabilities
+        .set()
+        .causes
+        .iter()
+        .any(|c| matches!(c, crate::ccl::capabilities::Effect::Append(_)))
+}
+
+/// Whether `e` holds a loop, which this phase compiles whatever the loop does.
+fn holds_loop(e: &Expr) -> bool {
+    matches!(e.node, TypedExprNode::For { .. }) || e.any_child(holds_loop)
 }
 
 /// Whether the subtree still contains a pre-phase marker node.
@@ -947,7 +982,7 @@ fn rewrite(mut expr: Expr, declared: &mut Declared) -> Expr {
             // vanishes — no accumulator, no feed, e.g. a transaction-emptied
             // `For` — is read off the live-set difference, so this site does not
             // predict it. Predicting it meant re-running `collect_writes` and
-            // `body_has_feed` here to guess what `transform_loop` would decide
+            // the loop body's capabilities here to guess what `transform_loop` would decide
             // ~140 lines away.
             let _g = site.enter(LOOP_LABEL, provenance::Nature::Expansion);
             return transform_loop(site, *position, target, *iter, *loop_body, *body, declared);
@@ -1125,7 +1160,10 @@ fn end_with(body: Expr, end: &dyn Fn(Expr) -> Expr, ty: &Type) -> Expr {
         TypedExprNode::Case {
             scrutinee,
             mut branches,
-        } if branches.iter().any(|b| contains_marker(&b.body)) => {
+        } if branches
+            .iter()
+            .any(|b| holds_loop(&b.body) || writes(&b.body)) =>
+        {
             for br in branches.iter_mut() {
                 let taken = std::mem::take(&mut br.body);
                 br.body = end_with(taken, end, ty);
@@ -1984,6 +2022,7 @@ fn feed_each(defer: Name, collection: Expr, site: Option<Rc<crate::ccl::site::Si
             fun_kind: fun_kind.clone(),
             domain: domain.clone(),
             codomain: codomain.clone(),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         },
         other => panic!("a fed collection is a function, got {other}"),
     };
@@ -2051,7 +2090,7 @@ fn transform_loop(
         // ordinary map of the loop source. Otherwise the body inlined to neither
         // a write nor a feed (a `for x: pure_call()` whose call didn't mutate) —
         // observationally a no-op; drop the loop and keep the continuation.
-        if body_has_feed(&loop_body) {
+        if feeds(&loop_body) {
             // A **conditional** feed (`if p: out << e`, a statement-`Case`) is fanned
             // out by `channelize` into one refined-source channel per feeding arm —
             // the same path a non-transactional conditional feed takes. The
@@ -2705,12 +2744,6 @@ fn collect_writes_in(
     expr.walk_children(|c| collect_writes_in(c, None, declared, introduced, out));
 }
 
-/// Whether `expr` contains a `Feed` marker (backs the no-op-loop invariant
-/// check in [`transform_loop`]).
-fn body_has_feed(expr: &Expr) -> bool {
-    matches!(expr.node, TypedExprNode::Feed { .. }) || expr.any_child(body_has_feed)
-}
-
 /// Drop the trailing `; unit` terminals a `with begin():` block lowering leaves
 /// on a read-only feed body, recursively: `ExprStmt { effect, unit }` collapses to
 /// the normalized `effect`, and a statement-`Case`'s arm bodies are normalized in
@@ -2818,6 +2851,8 @@ fn splice_after_unit(chain: Expr, tail: Expr) -> Expr {
                 node: other,
                 ty: chain.ty,
                 user_annotation: chain.user_annotation,
+                capabilities: chain.capabilities,
+                own_capabilities: chain.own_capabilities,
                 node_id: chain.node_id,
                 site: chain.site,
             };
@@ -2938,7 +2973,7 @@ fn share_a_binding(values: &[&Expr], kept: &[Kept]) -> bool {
 /// Whether `e` is an `if` or a `match` some branch of which writes, feeds, or runs a loop. The
 /// write may sit in a binding of the branch (`u = if …: x += 1; …`), off the branch's spine.
 fn is_writing_case(e: &Expr) -> bool {
-    matches!(e.node, TypedExprNode::Case { .. }) && (contains_marker(e) || body_has_feed(e))
+    matches!(e.node, TypedExprNode::Case { .. }) && (holds_loop(e) || writes(e) || feeds(e))
 }
 
 /// The end of a chain of statements, which is `unit`.
@@ -3255,6 +3290,8 @@ impl<'a> WriterWalk<'a> {
                             node,
                             ty: effect.ty,
                             user_annotation: effect.user_annotation,
+                            capabilities: effect.capabilities,
+                            own_capabilities: effect.own_capabilities,
                             node_id: effect_id,
                             site: effect.site,
                         };
@@ -3288,7 +3325,7 @@ impl<'a> WriterWalk<'a> {
                         // only because a call might have hidden a pass-by-reference write.
                         let mut inner_accs = Vec::new();
                         collect_writes(&inner_body, self.declared, &mut inner_accs);
-                        if inner_accs.is_empty() && !body_has_feed(&inner_body) {
+                        if inner_accs.is_empty() && !feeds(&inner_body) {
                             return self.walk_chain(*body, kept);
                         }
                         let fold = fold_induction_loop(
@@ -3359,6 +3396,8 @@ impl<'a> WriterWalk<'a> {
                     node: other,
                     ty: block.ty,
                     user_annotation: block.user_annotation,
+                    capabilities: block.capabilities,
+                    own_capabilities: block.own_capabilities,
                     node_id: stmt_id,
                     site: block.site,
                 };

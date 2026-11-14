@@ -404,6 +404,7 @@ fn simplify_reconstruct(
     let new_fun = ct.fun.map(|cf| CompactFun {
         name: cf.name,
         kind: cf.kind,
+        capabilities: cf.capabilities,
         // A binder's candidates are ordinary positions, so they are reconstructed like any
         // other. The binder's identity carries through unchanged: a binder is not a
         // position, and simplification merges positions.
@@ -500,6 +501,7 @@ mod tests {
     fn compute_fun(dom: CompactType, cod: CompactType) -> Option<CompactFun> {
         Some(CompactFun {
             binders: Vec::new(),
+            capabilities: Default::default(),
             name: None,
             kind: KindPin::Compute,
             domains_disagree: false,

@@ -1470,7 +1470,7 @@ pub fn flatten_trailing_value_case(mut branches: Vec<Branch>) -> Vec<Branch> {
 /// The chain's **kind** is the head morphism's, matching the inference rule
 /// (`emit_compose`): a chain's domain is the head's domain, so the chain denotes
 /// a collection exactly when the head does. Mapping a function over a collection
-/// (`xs ≫ f`) leaves a collection; a chain of capabilities stays a capability.
+/// (`xs ≫ f`) leaves a collection; a chain of compute functions stays a compute function.
 pub fn typed_compose(elts: Vec<Expr>) -> Expr {
     let fun_kind = match &elts[0].ty {
         Type::Fun { fun_kind, .. } => fun_kind.clone(),
@@ -1503,6 +1503,7 @@ pub(crate) fn chain_type(elts: &[Expr], fun_kind: crate::ccl::ty::FunKind) -> Ty
             fun_kind,
             domain: Box::new(head_domain),
             codomain: Box::new(last_codomain),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         },
     )
 }
@@ -1519,6 +1520,7 @@ pub(crate) fn pointwise_view(head: Expr, steps: Vec<Expr>) -> Expr {
         fun_kind,
         domain,
         codomain,
+        capabilities,
     } = head.ty.peel_refinements().clone()
     else {
         panic!("a view reads a collection, got {}", head.ty)
@@ -1535,6 +1537,7 @@ pub(crate) fn pointwise_view(head: Expr, steps: Vec<Expr>) -> Expr {
         fun_kind: fun_kind.clone(),
         domain: domain.clone(),
         codomain: codomain.clone(),
+        capabilities: capabilities.clone(),
     };
     let value = crate::ccl::subst::open_codomain(&named, &codomain);
     let mut body =
@@ -1559,6 +1562,7 @@ pub(crate) fn pointwise_view(head: Expr, steps: Vec<Expr>) -> Expr {
             fun_kind,
             domain: domain.clone(),
             codomain: Box::new(body.ty.clone()),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         }
     };
     Expr::lambda(position, Occurrence::mint(), *domain, body).with_ty(ty)
@@ -1664,6 +1668,7 @@ pub(crate) fn indexed_loop(position: Option<Name>, source: Expr, step: Expr) -> 
         fun_kind: fun_kind.clone(),
         domain: domain.clone(),
         codomain: codomain.clone(),
+        capabilities: crate::ccl::capabilities::Capabilities::none(),
     };
     let item = crate::ccl::subst::open_codomain(&named, &codomain);
     let read = Expr::apply(
@@ -1821,6 +1826,7 @@ fn without_unread_binder(stated: Type, elts: &[Expr]) -> Type {
         fun_kind,
         domain,
         codomain,
+        capabilities,
     } = &stated
     else {
         return stated;
@@ -1838,6 +1844,7 @@ fn without_unread_binder(stated: Type, elts: &[Expr]) -> Type {
         fun_kind: fun_kind.clone(),
         domain: domain.clone(),
         codomain: codomain.clone(),
+        capabilities: capabilities.clone(),
     }
 }
 
@@ -1899,11 +1906,13 @@ pub(crate) fn read_at_position(
                     fun_kind,
                     domain,
                     codomain,
+                    capabilities,
                 } => Type::Fun {
                     name: Some(b.refreshed()),
                     fun_kind,
                     domain,
                     codomain,
+                    capabilities,
                 },
                 other => other,
             };
@@ -2008,7 +2017,7 @@ pub fn make_iterate(predicate: Expr) -> Expr {
     // kind decide whether iterating is
     // acceptable at all — every chain led by an iteration source inherits `Data`
     // from here (`typed_compose`), so a site whose value-producer is a mere
-    // capability is a kind error rather than something a later stamp papers over.
+    // compute function is a kind error rather than something a later stamp papers over.
     apply_primitive(
         predicate,
         Builtin::Iterate,
@@ -2292,6 +2301,7 @@ pub fn refined_data_fun(
             Refinement::born(Rc::new(predicate)),
         )),
         codomain: Box::new(codomain),
+        capabilities: crate::ccl::capabilities::Capabilities::none(),
     }
 }
 
@@ -2493,7 +2503,7 @@ pub fn canonicalize_cast_types(expr: &mut Expr) {
 /// `value_ty: None` computes the canonical *target* (born refinements alone);
 /// `Some` computes the canonical node *type* (value's domain refinements ∪ born).
 ///
-/// A cast re-views its value **at the target**, so the data-vs-capability answer comes from
+/// A cast re-views its value **at the target**, so the data-vs-compute answer comes from
 /// `born` — `emit_cast` reads it there, and a view rebuilt from a neighbour's type states
 /// whatever that neighbour was. Only that answer travels: the binder slot is named at each
 /// type's own domain position

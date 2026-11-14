@@ -1478,6 +1478,7 @@ mod tests {
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(int()),
             codomain: Box::new(int()),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         assert!(smt_sub(&int(), &lhs, &rhs, &scoped("f", opaque)).unwrap());
     }

@@ -478,12 +478,14 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
                 fun_kind: k1,
                 domain: d1,
                 codomain: c1,
+                capabilities: e1,
             },
             Type::Fun {
                 name: n2,
                 fun_kind: k2,
                 domain: d2,
                 codomain: c2,
+                capabilities: e2,
             },
         ) => {
             // Two sums agree iff their binders' type kinds agree pairwise, binder by binder
@@ -508,6 +510,7 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
                 });
             slots_agree
                 && n1 == n2
+                && e1 == e2
                 && types_agree_modulo_unread(d1, d2, refinements)
                 && types_agree_modulo_unread(c1, c2, refinements)
         }
@@ -1664,7 +1667,23 @@ pub(super) fn coalesce_pass(
     if ctx.errors.is_empty() {
         crate::ccl::provenance::run_debug_check(|| assert_reads_stable(&ctx.reads));
     }
+    // Every node's capabilities are known once inference ends, those of a node the walk
+    // resolves no type at included.
+    settle_capabilities(expr);
     ctx.errors
+}
+
+/// Give each node of `expr` whose capabilities are still a variable what the variable resolves
+/// to.
+fn settle_capabilities(expr: &mut Expr) {
+    for slot in [&mut expr.capabilities, &mut expr.own_capabilities] {
+        if let crate::ccl::capabilities::Repr::Var(v) = slot.repr() {
+            *slot = crate::ccl::capabilities::Capabilities::known(
+                crate::ccl::capabilities::set_of(&v.resolved()),
+            );
+        }
+    }
+    expr.walk_children_mut(settle_capabilities);
 }
 
 /// Check term and witness references in each node's type against its enclosing scope.
@@ -2393,6 +2412,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                         fun_kind: first_kind.clone(),
                         domain: Box::new((**first_dom).clone()),
                         codomain: Box::new((**last_cod).clone()),
+                        capabilities: crate::ccl::capabilities::Capabilities::none(),
                     },
                 );
             }
@@ -2627,6 +2647,15 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // graph read and so is not what this guards.)
             ctx.record_read(&expr.ty, &ty, || label.clone());
             expr.ty = ty;
+            // The node's capabilities and its own, resolved as its type is (`src/ccl/design/
+            // type-inference.md`, "4.9 Capabilities").
+            for slot in [&mut expr.capabilities, &mut expr.own_capabilities] {
+                if let crate::ccl::capabilities::Repr::Var(v) = slot.repr() {
+                    *slot = crate::ccl::capabilities::Capabilities::known(
+                        crate::ccl::capabilities::set_of(&v.resolved()),
+                    );
+                }
+            }
         }
         Err(err) => {
             let ty = expr.ty.clone();
@@ -2657,20 +2686,22 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // refinement predicates) does any work; skip cloning the bound
             // expression when the discharge would be vacuous. An opaque binder
             // has no definiens to discharge at all, so its body type lifts with
-            // the binder's name still in it (`Typing::close_let_type`).
+            // the binder's name still in it (`Typing::close_let_type`). Through the
+            // deref, as for `ExprStmt` below: `emit_let` passes its body along as a value.
             // A stand-in definition (`run_with_params`) has no value to discharge, as
             // emission kept the name over it (`ScopeExit::Keep`).
+            let body_ty = read_mut(&body.ty);
             if binding.transparency == BindingTransparency::Transparent
                 && !matches!(bound_expr.node, TypedExprNode::Error)
-                && crate::ccl::subst::type_free_vars(&body.ty).contains(&binding.name)
+                && crate::ccl::subst::type_free_vars(&body_ty).contains(&binding.name)
             {
                 let sigma = crate::ccl::subst::Subst::discharge(
                     &binding.name,
                     crate::ccl::ccl_utils::predicate_term(bound_expr),
                 );
-                Some(sigma.apply_type(&body.ty))
+                Some(sigma.apply_type(&body_ty))
             } else {
-                Some(body.ty.clone())
+                Some(body_ty)
             }
         }
         // An effect statement carries its continuation's type, so the lifted type has
@@ -2686,8 +2717,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         // the mutable variable's *value*. Lifting `body.ty` verbatim would re-stamp the node
         // with the handle the read just looked through, contradicting the rule that
         // typed it — and the wall that re-runs that rule would then have to accept a
-        // value against a handle. A `Let` needs no deref here because it does not
-        // deref either (`emit_let` passes its body along; it cannot bind a mutable variable).
+        // value against a handle.
         TypedExprNode::ExprStmt { body, .. } => Some(read_mut(&body.ty)),
         // A mutable introduction's result type cannot name its binder: every read that
         // reaches a type is named first (`src/ccl/design/mutability.md`, "A read is named
@@ -4468,6 +4498,7 @@ pub(super) fn specialize_projection_domain(morphism: &mut Expr, input: &Type) {
             fun_kind: crate::ccl::FunKind::Compute,
             domain: Box::new(read_through(input)),
             codomain: codomain.clone(),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
     }
 }
@@ -4964,6 +4995,70 @@ mod tests {
             "the two identical `Int` uses share one specialization"
         );
         assert_eq!(used_names.len(), 2);
+    }
+
+    /// `x : history := 10 in λ y → body`, inferred, as the type its lambda has.
+    fn lambda_over_a_mutable_variable(history: Type, body: TypedExpr) -> Type {
+        let lambda = TypedExpr::lambda("y", crate::ccl::Occurrence::mint(), Type::Hole, body);
+        let mut e = TypedExpr::mut_decl(
+            "x",
+            crate::ccl::Occurrence::mint(),
+            history,
+            lit_int(10),
+            lambda,
+        );
+        run_inference(&mut e).expect("a lambda over a mutable variable type-checks")
+    }
+
+    fn lambda_over_a_transactional_variable(body: TypedExpr) -> Type {
+        lambda_over_a_mutable_variable(Type::mutable(Type::Txn, Type::Base(BaseType::Int)), body)
+    }
+
+    /// Reading an induction variable bound outside the function requires a position in its
+    /// history (`src/ccl/design/type-inference.md`, "Capability variables").
+    #[test]
+    fn an_induction_read_requires_a_position_in_its_history() {
+        let ty = lambda_over_a_mutable_variable(
+            Type::mutable(Type::Hole, Type::Base(BaseType::Int)),
+            TypedExpr::binop(
+                TypedExpr::var("x"),
+                BinOpKind::Arithmetic(ArithmeticKind::Add),
+                TypedExpr::var("y"),
+            ),
+        );
+        let Type::Fun { capabilities, .. } = &ty else {
+            panic!("a lambda has a function type, got {ty}");
+        };
+        assert_eq!(capabilities.to_string(), " requires Read(x)");
+    }
+
+    /// Reading a transactional variable requires a transaction and the variable's history, and
+    /// a `with begin():` body supplies the transaction but not the history, which is the
+    /// run's (`src/ccl/design/type-inference.md`, "Capability variables").
+    #[test]
+    fn a_transactional_read_requires_a_transaction_outside_a_block() {
+        let read = || {
+            TypedExpr::binop(
+                TypedExpr::var("x"),
+                BinOpKind::Arithmetic(ArithmeticKind::Add),
+                TypedExpr::var("y"),
+            )
+        };
+        let outside = lambda_over_a_transactional_variable(read());
+        let inside = lambda_over_a_transactional_variable(TypedExpr::begin(TypedExpr::mut_write(
+            "x",
+            crate::ccl::Occurrence::mint(),
+            read(),
+        )));
+        let clauses = |ty: &Type| match ty {
+            Type::Fun { capabilities, .. } => capabilities.to_string(),
+            other => panic!("a lambda has a function type, got {other}"),
+        };
+        assert_eq!(clauses(&outside), " requires Transaction, ReadTxn(x)");
+        assert_eq!(
+            clauses(&inside),
+            " requires ReadTxn(x) causes WriteTxn(x), RunTransaction"
+        );
     }
 
     /// Typechecking a dead definition must not resurrect it, and must not

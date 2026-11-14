@@ -712,7 +712,7 @@ fn all_witnesses_realized(
 /// 3. `Var` references bound to a **collection** ([`FunKind::Data`]) —
 ///    op-conversion's `Var` arm returns its bound op directly under
 ///    `input=None`, and that bound op was itself iterate-wrapped at its
-///    let-bind site. A capability-typed `Var` has no such wrapping behind it,
+///    let-bind site. A `Var` typed as a compute function has no such wrapping behind it,
 ///    so the kind is what distinguishes them rather than mere `Fun`-ness.
 /// 4. A `Let` whose bound value and body both are: op-conversion feeds the `let`'s input to
 ///    both sides.
@@ -1070,6 +1070,7 @@ fn base_keys(
                 fun_kind: crate::ccl::FunKind::Data(None),
                 domain: Box::new(first.clone()),
                 codomain,
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
             };
             let nested = typed_compose(vec![outer, family]).with_ty(nested_ty);
             let p = Name::fresh("__keys");
@@ -1274,12 +1275,12 @@ mod tests {
     fn test_is_iteration_bearing_var_function_typed() {
         // A **collection**-typed `Var` references a let-bound iteration source
         // that was already iterate-wrapped at its bind site, so the
-        // dereference itself doesn't need another wrap. A capability-typed `Var`
-        // has no such wrapping behind it and is not iteration-bearing.
+        // dereference itself doesn't need another wrap. A `Var` typed as a compute
+        // function has no such wrapping behind it and is not iteration-bearing.
         let coll = var("xs").with_ty(data_fun_ty(Type::UIntRange(3), int_ty()));
         assert!(is_iteration_bearing(&coll));
-        let capability = var("f").with_ty(fun_ty(Type::UIntRange(3), int_ty()));
-        assert!(!is_iteration_bearing(&capability));
+        let compute = var("f").with_ty(fun_ty(Type::UIntRange(3), int_ty()));
+        assert!(!is_iteration_bearing(&compute));
     }
 
     #[test]

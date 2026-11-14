@@ -207,6 +207,36 @@ fn hash_name_ref(name: &Name, env: &[&Name], free: FreeVars<'_>, state: &mut Def
     }
 }
 
+/// Hash the requirements and effects `capabilities` states, each variable it names by its position
+/// in `env`, as any other name is, so two compilations naming one variable by different ids
+/// hash alike. An unresolved variable contributes only that it is one.
+fn hash_capabilities(
+    capabilities: &crate::ccl::capabilities::Capabilities,
+    env: &[&Name],
+    free: FreeVars<'_>,
+    state: &mut DefaultHasher,
+) {
+    let crate::ccl::capabilities::Repr::Known(set) = capabilities.repr() else {
+        0u8.hash(state);
+        return;
+    };
+    1u8.hash(state);
+    set.requires.len().hash(state);
+    for r in &set.requires {
+        r.requirement().trait_.hash(state);
+        for x in &r.requirement().terms {
+            hash_name_ref(x, env, free, state);
+        }
+    }
+    set.causes.len().hash(state);
+    for e in &set.causes {
+        std::mem::discriminant(e).hash(state);
+        if let Some(x) = e.variable() {
+            hash_name_ref(x, env, free, state);
+        }
+    }
+}
+
 /// Hash a type with the caller's term and witness environments. Recursive type fields and
 /// predicate terms retain the witness scope. Unresolved type identities and witness references
 /// outside that scope are not distinguished; see
@@ -295,8 +325,10 @@ fn hash_type<'a>(
             codomain,
             fun_kind,
             name: _,
+            capabilities,
         } => {
             std::mem::discriminant(fun_kind).hash(state);
+            hash_capabilities(capabilities, env, free, state);
             if let FunKind::Var(v) = fun_kind {
                 std::mem::discriminant(&v.resolved()).hash(state);
             }
@@ -742,6 +774,7 @@ fn hash_rel<'a>(
     // lowering can already construct non-Hole types and refinement predicates.
     hash_type(&e.ty, env, wenv, free, &mut h);
     hash_opt_type(e.user_annotation.as_ref(), env, wenv, free, &mut h);
+    hash_capabilities(&e.capabilities, env, free, &mut h);
     h.finish()
 }
 
@@ -1121,6 +1154,7 @@ mod tests {
                 fun_kind: FunKind::fresh_var(),
                 domain: Box::new(int()),
                 codomain: Box::new(int()),
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
             })
         };
         assert_ne!(h(&unpinned()), h(&typed(Type::fun(int(), int()))));
@@ -1145,6 +1179,7 @@ mod tests {
                 fun_kind,
                 domain: Box::new(int()),
                 codomain: Box::new(int()),
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
             })
         };
         assert_ne!(h(&pinned(true)), h(&pinned(false)));

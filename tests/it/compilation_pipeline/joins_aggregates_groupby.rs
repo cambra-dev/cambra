@@ -451,7 +451,7 @@ fn a_bare_groupby_tail_is_driven() {
     // with the bare list literal `[1, 2, 3]` (case above) it denotes.
     //
     // These are **post-planning** types, so a `⇒` here does not mean inference
-    // typed the collection as a capability: lambda elimination and planning are
+    // typed the collection as a compute function: lambda elimination and planning are
     // denotation-preserving but *not* kind-preserving — a reconstructed type is
     // canonicalized to `Compute` (`Type::without_pi_names`; see
     // `src/ccl/design/type-inference.md`, "4.6 Data vs compute functions"). So

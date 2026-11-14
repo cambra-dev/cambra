@@ -292,11 +292,11 @@ impl Openness {
     }
 }
 
-/// Whether a [`Type::Fun`]'s domain is a **capability** or a **collection** — the
+/// Whether a [`Type::Fun`] is a **compute function** or a **collection** — the
 /// compute-function vs data-function distinction.
 ///
-/// - [`FunKind::Compute`] — `α ⇒ β`: the domain is a *capability*, the inputs
-///   the function accepts. No data sits behind it, so shrinking the domain only
+/// - [`FunKind::Compute`] — `α ⇒ β`: the domain is only the inputs the function
+///   accepts. No data sits behind it, so shrinking the domain only
 ///   under-promises; the contravariant meet at a control-flow join is a sound,
 ///   lossy simplification.
 /// - [`FunKind::Data`] — `α ⤇ β`: the domain is a *collection*'s index set.
@@ -323,7 +323,7 @@ impl Openness {
 /// solver resolves it, like a type variable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FunKind {
-    /// A compute function / capability (`⇒`): lossy meet at a join is fine.
+    /// A compute function (`⇒`): lossy meet at a join is fine.
     Compute,
     /// A data function / collection (`⤇`): the domain is data; joins must be lossless.
     ///
@@ -409,7 +409,7 @@ impl FunKind {
             FunKind::Data(..) => "⤇",
             // Every data spelling reads as a collection: `Data` is data with plain-vs-sum
             // still open, and `Plain` and `Sum` are the two ways it settles. Rendering
-            // those as `⇒` printed a collection as a capability.
+            // those as `⇒` printed a collection as a compute function.
             FunKind::Var(v) if v.resolved().is_data() => "⤇",
             FunKind::Var(_) => "⇒",
         }
@@ -431,7 +431,7 @@ impl FunKind {
     }
 
     /// Whether a function of this kind has **its domain as its data**: every kind but one
-    /// known to be a capability. A joined binder's refinement on such a domain states the
+    /// known to be a compute function's. A joined binder's refinement on such a domain states the
     /// collection's keys, which have no join, so it is kept rather than dropped
     /// ([`crate::ccl::subst::Mapping::Join`]). A kind nothing has settled counts, so an
     /// undecided domain is reported rather than widened.
@@ -469,7 +469,7 @@ impl FunKind {
     /// A fresh kind variable **pinned to `Data`** — a consumer's function, polymorphic in
     /// the slot but a collection by construction (`src/ccl/design/type-inference.md`,
     /// "Consuming a sum: pinning the consumer's kind"). The kind equation relates it to
-    /// a plain collection and to a sum alike; a capability flowing in is the conflict.
+    /// a plain collection and to a sum alike; a compute function flowing in is the conflict.
     pub fn fresh_data() -> FunKind {
         let v = FunKindVar::fresh();
         v.stamp_data();
@@ -595,15 +595,15 @@ impl KindPin {
             (Unpinned, p) | (p, Unpinned) => p,
             (Conflict, _) | (_, Conflict) => Conflict,
             (Compute, Compute) => Compute,
-            // A capability meeting data, in any of its three spellings.
+            // A compute function meeting data, in any of its three spellings.
             (Compute, _) | (_, Compute) => Conflict,
-            // `Data` says only "not a capability", so anything data refines it.
+            // `Data` says only "not a compute function", so anything data refines it.
             (Data, p) | (p, Data) => p,
             (Plain, Plain) => Plain,
             // **A plain collection and a sum do not merge.** Neither is below the other:
             // entering a sum is a term, and a sum is not a collection with the choice
             // forgotten. One function required to be both is the same contradiction a
-            // capability meeting a collection is.
+            // compute function meeting a collection is.
             (Plain, Sum(_)) | (Sum(_), Plain) => Conflict,
             // **Two sums at one kind are one consumption reached twice.** Their arities
             // must agree; a disagreement is a mismatch between the two types, not a state
@@ -701,7 +701,7 @@ fn built_width(sources: &[FunKind]) -> Option<usize> {
 /// the arity becomes known.
 ///
 /// The two eliminations cannot know a function's kind: applying a value and destructuring a
-/// function are one node for a collection and for a capability alike. Each mints one of
+/// function are one node for a collection and for a compute function alike. Each mints one of
 /// these, and the kinds that reach it are recorded as bounds.
 ///
 /// Bounds are **not identity**. Two variables related by an edge have *corresponding*
@@ -787,7 +787,7 @@ impl FunKindVar {
     /// **What this kind is**, as far as everything recorded says: the join of every point
     /// that has reached it, from either side.
     ///
-    /// Both sides, because the `FunKind` lattice is flat — a capability, a plain collection
+    /// Both sides, because the `FunKind` lattice is flat — a compute function, a plain collection
     /// and a sum of a given width are mutually incomparable — so an edge fixes a variable
     /// rather than bounding it, and which side the fact arrived on says nothing.
     ///
@@ -1253,10 +1253,10 @@ pub enum Type {
         /// renaming their Pi binder reconcile there (see the substitution
         /// machinery).
         name: Option<crate::ccl::Name>,
-        /// Whether this function is a capability (`Compute`) or a data collection
+        /// Whether this function is a compute function (`Compute`) or a data collection
         /// (`Data`). See [`FunKind`]. The derived [`PartialEq`] compares it: a
         /// data function and a compute function over the same domain/codomain
-        /// are genuinely different types (one carries data, one a capability).
+        /// are genuinely different types (one carries data, one computes).
         ///
         /// Nothing structural distinguishes the two — only the construction
         /// site knows — so downstream the kind is *carried, never re-derived*:
@@ -1267,6 +1267,11 @@ pub enum Type {
         domain: Box<Type>,
         /// The result type. Covariant position; may reference `name`.
         codomain: Box<Type>,
+        /// What a call reads from its context and contributes besides its result
+        /// (`docs/chl-spec.md`, "6.9 Capabilities"). A
+        /// data function's are [`Capabilities::none`](crate::ccl::capabilities::Capabilities::none).
+        /// A rebuild copies them from the type it replaces, as it copies `fun_kind`.
+        capabilities: crate::ccl::capabilities::Capabilities,
     },
     /// An ordered product type with unnamed fields (tuple). Its width is part of the
     /// type: two tuples relate only at equal width (`docs/chl-spec.md`, "Tuple width").
@@ -1799,6 +1804,8 @@ pub struct TraitRequirement {
     pub trait_: crate::ccl::infer::solver::traits::Trait,
     /// One per operand position.
     pub args: Vec<Type>,
+    /// One per term parameter of the trait: the variable `x` in `Read(x)`.
+    pub terms: Vec<crate::ccl::Name>,
     /// The associated types the clause names. One it leaves unnamed is absent, and
     /// leaves that position open.
     pub assoc: Vec<(crate::ccl::infer::solver::traits::Assoc, Type)>,
@@ -1809,7 +1816,10 @@ pub struct TraitRequirement {
 
 impl PartialEq for TraitRequirement {
     fn eq(&self, other: &Self) -> bool {
-        self.trait_ == other.trait_ && self.args == other.args && self.assoc == other.assoc
+        self.trait_ == other.trait_
+            && self.args == other.args
+            && self.terms == other.terms
+            && self.assoc == other.assoc
     }
 }
 impl Eq for TraitRequirement {}
@@ -1817,6 +1827,7 @@ impl std::hash::Hash for TraitRequirement {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.trait_.hash(state);
         self.args.hash(state);
+        self.terms.hash(state);
         self.assoc.hash(state);
     }
 }
@@ -1827,6 +1838,7 @@ impl TraitRequirement {
         TraitRequirement {
             trait_: self.trait_.clone(),
             args: self.args.iter().map(&mut f).collect(),
+            terms: self.terms.clone(),
             assoc: self.assoc.iter().map(|(n, t)| (n.clone(), f(t))).collect(),
             at: self.at,
         }
@@ -2469,6 +2481,7 @@ impl Type {
             fun_kind: FunKind::Data(Some(Rc::new(vec![witness]))),
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         }
     }
 
@@ -2496,6 +2509,7 @@ impl Type {
             fun_kind: FunKind::Data(slot),
             domain,
             codomain,
+            capabilities,
         } = body
         else {
             unreachable!("a sum's body is a data function, got a non-data shape")
@@ -2512,6 +2526,7 @@ impl Type {
                 fun_kind: FunKind::Data(slot),
                 domain,
                 codomain,
+                capabilities: capabilities.clone(),
             };
         }
         // The new binder goes outermost; the body's occurrences already name it.
@@ -2524,6 +2539,7 @@ impl Type {
             fun_kind: FunKind::Data(Some(Rc::new(ws))),
             domain,
             codomain,
+            capabilities: capabilities.clone(),
         }
     }
 
@@ -2817,8 +2833,8 @@ fn fmt_type(
         Type::BarrierVar(var) => write!(f, ":>{}", var.uid),
         Type::UIntRange(n) => write!(f, "0..{n}"),
         // The rendered symbol reflects the resolved `kind`: `⇒` for a compute
-        // capability (and an unresolved kind var), `⤇` for a data collection
-        // (see `FunKind::function`), making the collection/capability distinction
+        // function (and an unresolved kind var), `⤇` for a data collection
+        // (see `FunKind::function`), making the collection/compute distinction
         // legible in every type string.
         //
         // The codomain renders one function deeper, named or not: the index
@@ -2828,6 +2844,7 @@ fn fmt_type(
             fun_kind,
             domain,
             codomain,
+            capabilities,
         } => {
             // A sum renders as its binder prefixes then the function they bind over. The
             // binder is written, and its **id is not**: rendering the id would make
@@ -2845,8 +2862,8 @@ fn fmt_type(
             let cod = at(codomain, Some(&inner));
             let dom = at(domain, binders);
             match name {
-                Some(x) => write!(f, "(({x}: {dom}) {} {cod})", fun_kind.arrow()),
-                None => write!(f, "({dom} {} {cod})", fun_kind.arrow()),
+                Some(x) => write!(f, "(({x}: {dom}) {} {cod}{capabilities})", fun_kind.arrow()),
+                None => write!(f, "({dom} {} {cod}{capabilities})", fun_kind.arrow()),
             }
         }
         Type::Tuple(ts) => {
@@ -3030,18 +3047,24 @@ fn fmt_type(
                     }
                 })
                 .collect();
+            // A function body's capabilities join the trait requirements after the codomain.
+            let (body, capabilities) = match &poly.body {
+                Type::Fun { capabilities, .. } => (
+                    poly.body
+                        .clone()
+                        .with_capabilities(crate::ccl::capabilities::Capabilities::none()),
+                    capabilities.clone(),
+                ),
+                body => (body.clone(), crate::ccl::capabilities::Capabilities::none()),
+            };
+            let requires = poly.requires_text(|t| at(t, binders).to_string());
             write!(
                 f,
-                "forall ({}) {}",
+                "forall ({}) {}{}",
                 params.join(", "),
-                at(&poly.body, binders)
-            )?;
-            let requires = poly.requires_text(|t| at(t, binders).to_string());
-            if requires.is_empty() {
-                Ok(())
-            } else {
-                write!(f, " requires {}", requires.join(", "))
-            }
+                at(&body, binders),
+                crate::ccl::capabilities::clauses(requires, &capabilities)
+            )
         }
         Type::Txn => write!(f, "Txn"),
         Type::History {
@@ -3221,6 +3244,30 @@ impl Type {
         Type::Record(fields)
     }
 
+    /// This function type with `capabilities` in place of its own.
+    ///
+    /// # Panics
+    ///
+    /// When `self` is not a function type.
+    pub fn with_capabilities(self, capabilities: crate::ccl::capabilities::Capabilities) -> Self {
+        match self {
+            Type::Fun {
+                name,
+                fun_kind,
+                domain,
+                codomain,
+                ..
+            } => Type::Fun {
+                name,
+                fun_kind,
+                domain,
+                codomain,
+                capabilities,
+            },
+            other => panic!("`with_effects` takes a function type, got {other}"),
+        }
+    }
+
     /// Helper for creating a non-dependent **compute** function type
     /// (`name: None`, `kind: Compute`).
     pub fn fun(domain: Self, codomain: Self) -> Self {
@@ -3229,6 +3276,7 @@ impl Type {
             fun_kind: FunKind::Compute,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         }
     }
 
@@ -3296,6 +3344,7 @@ impl Type {
             fun_kind,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         }
     }
 
@@ -3322,6 +3371,7 @@ impl Type {
                 fun_kind,
                 domain: Box::new(domain),
                 codomain: Box::new(codomain),
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
             }
         }
     }
@@ -3433,6 +3483,7 @@ impl Type {
             fun_kind: FunKind::Data(None),
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         }
     }
 
@@ -3448,6 +3499,7 @@ impl Type {
             fun_kind,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         }
     }
 
@@ -3481,7 +3533,7 @@ impl Type {
     /// `channelize::erase_chan_domains_in_type` erases it to exactly that. A pass that
     /// rebuilds around a still-unerased handle — the chain a per-iteration feed becomes —
     /// has a kind to copy, and taking the `Compute` default there declares a collection a
-    /// capability. ([`HistoryKind::Overwrite`] is not this case: a mutable variable handle
+    /// compute function. ([`HistoryKind::Overwrite`] is not this case: a mutable variable handle
     /// erases to its *value*, so it states no function type to copy.)
     ///
     /// **A sum is a function.** `Σ (𝑤 : 𝐾). (𝑤 ⤇ 𝑉)` is a collection exactly as `𝐷 ⤇ 𝑉`
@@ -3492,7 +3544,12 @@ impl Type {
     /// `WitnessRef` outside its binder means nothing at all.
     pub fn fun_like(exemplar: &Type, domain: Self, codomain: Self) -> Self {
         match exemplar {
-            Type::Fun { name, fun_kind, .. } => {
+            Type::Fun {
+                name,
+                fun_kind,
+                capabilities,
+                ..
+            } => {
                 // The exemplar's kind is copied as it stands, variable included: a
                 // variable *is* the kind at that position, and reading what the solver has
                 // recorded on it would make a rebuild depend on when it ran.
@@ -3509,6 +3566,7 @@ impl Type {
                     fun_kind: fun_kind.clone(),
                     domain: Box::new(domain),
                     codomain: Box::new(codomain),
+                    capabilities: capabilities.clone(),
                 }
             }
             Type::History {
@@ -3617,6 +3675,7 @@ impl Type {
                 fun_kind: FunKind::Data(Some(ws)),
                 domain,
                 codomain,
+                capabilities,
             } => Type::Fun {
                 name: name.clone(),
                 fun_kind: FunKind::Data(Some(Rc::new(
@@ -3631,6 +3690,7 @@ impl Type {
                 ))),
                 domain: Box::new(domain.rename_witnesses(renaming)),
                 codomain: Box::new(codomain.rename_witnesses(renaming)),
+                capabilities: capabilities.clone(),
             },
             other => {
                 let mut out = other.clone();
@@ -4002,6 +4062,7 @@ impl Type {
                     fun_kind: FunKind::Data(Some(ws)),
                     domain,
                     codomain,
+                    capabilities,
                 } => {
                     // The slot is a telescope: binder 𝑖's kind is canonicalized under
                     // binders 0‥𝑖−1, the domain and codomain under all of them.
@@ -4030,6 +4091,7 @@ impl Type {
                         ))),
                         domain: Box::new(domain),
                         codomain: Box::new(codomain),
+                        capabilities: capabilities.clone(),
                     }
                 }
                 other => {
@@ -4113,6 +4175,7 @@ impl Type {
                 },
                 domain: Box::new(domain.without_pi_names()),
                 codomain: Box::new(codomain.without_pi_names()),
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
             },
             Type::BoundedHole(t) => Type::BoundedHole(Box::new(t.without_pi_names())),
             Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| t.without_pi_names()).collect()),
@@ -6549,6 +6612,7 @@ mod tests {
                 },
             )),
             codomain: Box::new(Type::Hole),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         let cast = TypedExpr::cast(TypedExpr::var("xs"), target);
         let _ = Refinement::born(Rc::new(cast));
@@ -7171,6 +7235,7 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::fun(Type::Base(BaseType::Int), refined)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         assert_eq!(ty.to_string(), "((k: Int) ⇒ (Int ⇒ {Int | k}))");
     }

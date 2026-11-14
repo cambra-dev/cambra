@@ -7,6 +7,7 @@
 //! See the design docs in `src/ccl/design/` for the full design rationale.
 
 pub mod anf;
+pub mod capabilities;
 pub mod ccl_utils;
 pub mod channelize;
 pub mod chl_print;

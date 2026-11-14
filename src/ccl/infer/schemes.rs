@@ -211,6 +211,7 @@ impl OperatorSchemes {
                     fun_kind: crate::ccl::FunKind::Data(None),
                     domain: Box::new(delta.clone()),
                     codomain: Box::new(epsilon.clone()),
+                    capabilities: crate::ccl::capabilities::Capabilities::none(),
                 },
                 Type::sum_over(
                     crate::ccl::ty::TypeKind::Enumerated(vec![delta]),
@@ -222,7 +223,7 @@ impl OperatorSchemes {
 
         // CollectionContains: ∀ι κ. (ι ⤇ κ) ⇒ (κ ⇒ Bool). The argument is a **data**
         // function: membership in a collection's outputs is defined only where the
-        // domain is the data, so the `⤇` rejects a capability here rather than leaving
+        // domain is the data, so the `⤇` rejects a compute function here rather than leaving
         // that to a convention. `κ` is shared between the morphism's codomain and the
         // predicate's domain, which is what resolves the refinement base at the use
         // site — a key domain `{κ | __elem ▷ (𝑚 ▷ collection_contains)}`
@@ -478,6 +479,7 @@ pub(super) fn uncurried_value_at_its_tuple(
         fun_kind,
         domain: argument,
         codomain,
+        capabilities,
     } = instantiated
     else {
         unreachable!("uncurry's scheme is a function")
@@ -522,7 +524,9 @@ pub(super) fn uncurried_value_at_its_tuple(
             fun_kind: result_kind,
             domain: tuple,
             codomain: Box::new(read),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         }),
+        capabilities,
     }
 }
 
@@ -565,6 +569,7 @@ fn uncurry_scheme(n: usize) -> PolyScheme {
             fun_kind: crate::ccl::FunKind::Data(None),
             domain: Box::new(key.clone()),
             codomain: Box::new(inner),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         });
     let components = names.into_iter().map(Some).zip(keys).collect();
     PolyScheme::poly(
@@ -667,7 +672,7 @@ mod tests {
         // Aggregate { input: λx → (a=1, b=2), kind: Max }. The input stands in for a
         // data collection of records (what `max` really consumes), so it carries
         // the `data_fun` provenance stamp lowering puts on a collection — without
-        // it, the bare lambda is a `Compute` capability and `max`'s `Data` demand
+        // it, the bare lambda is a `Compute` function and `max`'s `Data` demand
         // rejects it on *kind* before the codomain orderability under test.
         let lam = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {

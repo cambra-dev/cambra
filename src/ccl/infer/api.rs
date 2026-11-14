@@ -232,6 +232,7 @@ impl TypeInferenceContext {
             fun_kind: crate::ccl::ty::FunKind::Data(None),
             domain: Box::new(Type::DataSource(name.to_string())),
             codomain: Box::new(elem_ty),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         self.source_types.insert(name.to_string(), ty);
     }
@@ -2175,12 +2176,16 @@ impl Contract {
     pub fn uncurried(&self, arity: usize) -> Contract {
         let uncurry = |ty: &Type| {
             let mut domains = Vec::new();
+            // A call of the uncurried function applies every arrow, so it does what each
+            // of them does.
+            let mut capabilities = crate::ccl::capabilities::CapabilitySet::default();
             let mut at = ty;
             for _ in 0..arity {
                 let Type::Fun {
                     name,
                     domain,
                     codomain,
+                    capabilities: arrow,
                     ..
                 } = at
                 else {
@@ -2192,9 +2197,11 @@ impl Contract {
                     "a curried `def`'s later parameters do not read an earlier one: `{ty}`"
                 );
                 domains.push((**domain).clone());
+                capabilities = capabilities.union(&arrow.set());
                 at = codomain;
             }
             Type::fun(Type::tuple(domains), at.clone())
+                .with_capabilities(crate::ccl::capabilities::Capabilities::known(capabilities))
         };
         match self {
             _ if arity < 2 => self.clone(),
@@ -3357,6 +3364,7 @@ mod tests {
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::String)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         let error = |name, at: &str| InferError::ExpectedFunction {
             found: function(name),
@@ -3382,6 +3390,7 @@ mod tests {
             fun_kind: kind,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         let error = |ty| InferError::ExpectedFunction {
             found: ty,
@@ -3627,7 +3636,8 @@ mod tests {
                 name: None,
                 fun_kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
-                codomain: Box::new(Type::Base(BaseType::Int))
+                codomain: Box::new(Type::Base(BaseType::Int)),
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
             }
         );
     }
@@ -3889,7 +3899,8 @@ mod tests {
                 name: None,
                 fun_kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
-                codomain: Box::new(Type::Base(BaseType::Int))
+                codomain: Box::new(Type::Base(BaseType::Int)),
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
             }
         );
         // The param.ty was filled in as Int.
@@ -5003,7 +5014,8 @@ mod tests {
                 name: None,
                 fun_kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
-                codomain: Box::new(Type::Base(BaseType::Unit))
+                codomain: Box::new(Type::Base(BaseType::Unit)),
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
             }
         );
         if let TypedExprNode::Lambda { param, .. } = &expr.node {
@@ -5026,6 +5038,7 @@ mod tests {
             fun_kind: crate::ccl::ty::FunKind::Data(None),
             domain: Box::new(Type::DataSource("mystream".into())),
             codomain: Box::new(Type::Base(BaseType::String)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         let mut expr = Expr::new(TypedExprNode::Source("mystream".into(), Vec::new()));
         assert_eq!(infer(&mut expr, &mut ctx), Ok(source_ty));
@@ -5210,12 +5223,14 @@ mod tests {
             fun_kind: crate::ccl::ty::FunKind::Data(None),
             domain: Box::new(Type::DataSource("ints".into())),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         let str_ty = Type::Fun {
             name: None,
             fun_kind: crate::ccl::ty::FunKind::Data(None),
             domain: Box::new(Type::DataSource("strs".into())),
             codomain: Box::new(Type::Base(BaseType::String)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
 
         let mut e1 = Expr::new(TypedExprNode::Source("ints".into(), Vec::new()));
@@ -5457,6 +5472,7 @@ mod tests {
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         });
         let expr = Expr::new(TypedExprNode::Apply {
             function: Box::new(lambda),
@@ -5543,6 +5559,7 @@ mod tests {
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         });
         let expr = Expr::new(TypedExprNode::Apply {
             function: Box::new(func),
@@ -5598,6 +5615,7 @@ mod tests {
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         });
         assert_eq!(
             check_fully_typed(&expr),
@@ -5617,6 +5635,7 @@ mod tests {
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Hole),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         });
         assert_eq!(
             check_fully_typed(&expr),
@@ -5859,6 +5878,7 @@ mod tests {
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::UIntRange(2)),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         let expr = Expr::new(TypedExprNode::List(vec![int_elem, str_elem])).with_ty(list_ty);
         let result = typecheck(&expr);
@@ -5895,6 +5915,7 @@ mod tests {
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::String)),
             codomain: Box::new(Type::Base(BaseType::String)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         });
         let expr = Expr::new(TypedExprNode::Apply {
             function: Box::new(lambda),

@@ -65,6 +65,10 @@ struct KeyView {
     /// type-blind structural equality. Order is insertion order, so equality
     /// compares these as a set.
     refinements: Vec<Refinement>,
+    /// What a function at this position requires and causes, resolved: a clone has one set of
+    /// capabilities at each node, so uses whose functions do different things share none
+    /// (`src/ccl/design/type-inference.md`, "Capabilities on every expression"). Compared as a set.
+    capabilities: Vec<crate::ccl::capabilities::CapabilitySet>,
     /// Function contributions, **keyed by kind** so a compute function and a data
     /// collection at one position stay distinguishable rather than one shadowing
     /// the other — exactly as [`history`](Self::history) is keyed by
@@ -132,10 +136,17 @@ impl PartialEq for KeyView {
         fn same_kinds(a: &[crate::ccl::ty::TypeKind], b: &[crate::ccl::ty::TypeKind]) -> bool {
             a.len() == b.len() && a.iter().all(|k| b.contains(k))
         }
+        fn same_capabilities(
+            a: &[crate::ccl::capabilities::CapabilitySet],
+            b: &[crate::ccl::capabilities::CapabilitySet],
+        ) -> bool {
+            a.len() == b.len() && a.iter().all(|e| b.contains(e))
+        }
         self.atoms == other.atoms
             && self.witness == other.witness
             && same_kinds(&self.type_kinds, &other.type_kinds)
             && same_refinements(&self.refinements, &other.refinements)
+            && same_capabilities(&self.capabilities, &other.capabilities)
             && self.fun == other.fun
             && self.rec == other.rec
             && self.tuple_widths == other.tuple_widths
@@ -164,6 +175,11 @@ impl KeyView {
         for w in other.refinements {
             if !self.refinements.contains(&w) {
                 self.refinements.push(w);
+            }
+        }
+        for e in other.capabilities {
+            if !self.capabilities.contains(&e) {
+                self.capabilities.push(e);
             }
         }
         for (kind, (domain, codomain)) in other.fun {
@@ -335,7 +351,7 @@ impl fmt::Display for KeyView {
                 KindPin::Data => "⤇",
                 KindPin::Compute => "⇒",
                 KindPin::Conflict => "⇒!",
-                // Never reaches a key (`key_go` resolves it to the capability
+                // Never reaches a key (`key_go` resolves it to the compute-function
                 // default), but `KeyView` renders whatever it is handed.
                 KindPin::Unpinned => "⇒?",
                 KindPin::Plain | KindPin::Sum(_) => "⤇",
@@ -682,6 +698,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             domain,
             codomain,
             fun_kind,
+            capabilities,
         } => {
             // The domain is contravariant — the flip that makes the dual read
             // follow an argument's *lower* bounds.
@@ -703,7 +720,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             // reading them here is what compaction does at the same point in the solve.
             //
             // An unpinned var keys as `Compute`, not as its own `Unknown`: nothing
-            // required a kind, so coalesce gives it the capability default, and the
+            // required a kind, so coalesce gives it the compute-function default, and the
             // two would only ever differ before that. Keeping them apart would split
             // a generic use from a concrete compute one over a distinction that does
             // not reach the materialized type.
@@ -711,8 +728,15 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 KindPin::Unpinned => KindPin::Compute,
                 resolved => resolved,
             };
+            // What the function does, resolved, as compaction resolves it.
+            let does = capabilities.set();
             let mut acc = KeyView {
                 fun: BTreeMap::from([(key_kind, (Box::new(dom), Box::new(cod)))]),
+                capabilities: if does.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![does]
+                },
                 ..Default::default()
             };
             // A sum contributes its candidates too, each at this polarity — the same
@@ -1200,7 +1224,7 @@ mod tests {
         assert_ne!(
             spec_key(&Type::fun(int(), int())),
             spec_key(&Type::data_fun(int(), int())),
-            "a capability and a collection of the same shape must not share a clone"
+            "a compute function and a collection of the same shape must not share a clone"
         );
         // An *unresolved* kind does not split: both uses read the same unpinned var,
         // which keys as the `Compute` default rather than as its own point.
@@ -1209,6 +1233,7 @@ mod tests {
             fun_kind: crate::ccl::ty::FunKind::fresh_var(),
             domain: Box::new(int()),
             codomain: Box::new(int()),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         assert_eq!(
             spec_key(&unresolved()),
@@ -1218,7 +1243,7 @@ mod tests {
         assert_eq!(
             spec_key(&unresolved()),
             spec_key(&Type::fun(int(), int())),
-            "an unpinned kind is the capability default, so it shares a clone with \
+            "an unpinned kind is the compute-function default, so it shares a clone with \
              a concrete compute function rather than splitting off its own"
         );
         // And the merge keeps two concrete kinds apart rather than one shadowing the
@@ -1357,6 +1382,7 @@ mod refinement_closing_tests {
                 Type::Base(crate::ccl::BaseType::Int),
                 Refinement::born(dep_pred(binder)),
             )),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         }
     }
 
@@ -1400,7 +1426,9 @@ mod refinement_closing_tests {
                     Type::Base(crate::ccl::BaseType::Int),
                     Refinement::born(dep_pred(referenced)),
                 )),
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
             }),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         assert_ne!(
             spec_key(&nested("y")),

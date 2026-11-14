@@ -227,14 +227,6 @@ fn a_join_labels_the_types_of_its_contributing_values() {
     "},
     &["x", "y"],
 )]
-#[case::a_function_returning_a_mutable_variable(
-    indoc! {r"
-        x := 0
-        f = \z -> x
-        f
-    "},
-    &[r"\z -> x"],
-)]
 // A use failing at a value the join holds is the join's defect met downstream.
 #[case::a_join_and_a_use_failing_at_one_of_its_values(
     indoc! {r#"
@@ -717,15 +709,6 @@ fn an_unreadable_list_element_hides_no_independent_join() {
         y
     "#},
     &["x", r#"[1, "a"]"#],
-)]
-#[case::a_function_returning_a_mutable_variable(
-    indoc! {r#"
-        x := 0
-        f = \z -> x
-        y = [1, "a"]
-        (f, y)
-    "#},
-    &[r#"[1, "a"]"#, r"\z -> x"],
 )]
 fn a_mutability_error_is_reported_with_type_errors(#[case] code: &str, #[case] expected: &[&str]) {
     assert_eq!(underlined(code), expected);

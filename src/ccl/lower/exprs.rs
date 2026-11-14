@@ -474,7 +474,7 @@ fn lower_expression_call(
     }
     if matches!(func.node, ChlExpr::Lambda { .. }) {
         // `(\x -> e)(a)` is `f = \x -> e; f(a)`: binding the lambda makes it a
-        // let-bound capability, which the inliner substitutes and beta-reduces.
+        // let-bound compute function, which the inliner substitutes and beta-reduces.
         // Left in call position, the lambda would reach `lambda_elim` unreduced.
         let callee_name = ctx.fresh_callee_name();
         let lambda = lower_expr(func, ctx)?;

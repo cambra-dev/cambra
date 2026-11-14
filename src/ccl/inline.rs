@@ -1,9 +1,9 @@
 //! A single pre-lambda-elim inlining pass that substitutes `Let`-bound
-//! **capabilities** at their call sites.
+//! **compute functions** at their call sites.
 //!
-//! # [`inline_capability_lambdas`] — inlines `Let` bindings that are not collections
+//! # [`inline_compute_lambdas`] — inlines `Let` bindings that are not collections
 //!
-//! Runs **before** [`crate::ccl::lambda_elim`]. A capability has no data behind
+//! Runs **before** [`crate::ccl::lambda_elim`]. A compute function has no data behind
 //! it: nothing to share, and inlining is how it reaches its call sites to be
 //! specialized and beta-reduced there. A **collection** is left bound, because
 //! the binding *is* the data and op-conversion compiles it once behind a `Memo`
@@ -17,7 +17,7 @@
 //!   they are the same case.
 //! - **List-producing UDFs**: `Fun(Fun(_, _), _)` — generator functions and
 //!   list-returning `def`s lowered to `λ user_arg → λ __iter_record → body`.
-//!   A function *of* a collection is still a capability.
+//!   A function *of* a collection is still a compute function.
 //!
 //! After substituting the bound lambda at each call site, the resulting
 //! `Apply(arg, Lambda(x, body))` nodes are beta-reduced so that downstream
@@ -91,29 +91,29 @@ use std::collections::HashSet;
 // Public entry points
 // ---------------------------------------------------------------------------
 
-/// Inline `Let`-bound capabilities and beta-reduce their call sites.
+/// Inline `Let`-bound compute functions and beta-reduce their call sites.
 ///
 /// Runs **before** [`crate::ccl::lambda_elim`].  Walks the expression tree and
 /// substitutes each matching UDF at every free occurrence of its binding name
 /// in the body, beta-reducing at each call site, then drops the `Let` wrapper.
 ///
-/// Inlines any binding that is a capability (see [`should_inline`]): scalar
+/// Inlines any binding that is a compute function (see [`should_inline`]): scalar
 /// UDFs, list-producing UDFs, and curried functions all qualify. A collection is
 /// left intact.
 ///
 /// Literal tuple projections that arise from uncurried multi-arg call sites
-/// are folded here only when the tuple holds a capability
+/// are folded here only when the tuple holds a compute function
 /// ([`fold_product_projection`]); `crate::ccl::simplify` folds the rest as a
 /// general rule so it fires consistently throughout the tree.
-pub fn inline_capability_lambdas(expr: Expr) -> Expr {
+pub fn inline_compute_lambdas(expr: Expr) -> Expr {
     let expr = inline_impl(expr, &mut BinderScope::default(), &mut HashSet::new());
     inline_list_element_reads(expr, &PredMemo::new()).0
 }
 
 /// Refuse a call whose function the inliner could not resolve, pointing at the call.
 ///
-/// After [`inline_capability_lambdas`], a call to a capability has a lambda, a projection or a
-/// builtin as its function. Any other function was chosen from run-time data: a conditional
+/// After [`inline_compute_lambdas`], a call to a compute function has a lambda, a projection
+/// or a builtin as its function. Any other function was chosen from run-time data: a conditional
 /// over functions, as `pick(c)(5)` leaves when `pick` returns `inc if c else dbl`, a field of a
 /// product chosen that way, or an element of a collection of functions. Such a value has no
 /// tile, so a call to it would otherwise fail at operator conversion with no position
@@ -144,7 +144,7 @@ pub(crate) fn check_calls_resolved(expr: &Expr) -> Result<(), provenance::Locate
 
 /// Returns `true` when a `Let` binding of type `bound_ty` should be inlined.
 ///
-/// A **capability** is inlined: a scalar UDF, a list-producing UDF, a curried
+/// A **compute function** is inlined: a scalar UDF, a list-producing UDF, a curried
 /// function. There is no data behind it, so there is nothing to share, and
 /// inlining is how it reaches its call sites to be specialized there.
 ///
@@ -169,18 +169,18 @@ fn should_inline(bound_ty: &Type) -> bool {
 // Functions held in products
 // ---------------------------------------------------------------------------
 
-/// Whether a value of type `ty` holds a capability: it is one, or it is a tuple or
+/// Whether a value of type `ty` holds a compute function: it is one, or it is a tuple or
 /// record with a component that holds one.
 ///
 /// A tile carries values, not closures, so a function held in a product has no
 /// runtime representation. The inliner takes such a product apart until each
 /// function it holds sits in call position (`src/ccl/design/optimization.md`,
 /// "Functions held in products").
-fn holds_capability(ty: &Type) -> bool {
+fn holds_compute_function(ty: &Type) -> bool {
     match ty {
-        Type::Tuple(elts) => elts.iter().any(holds_capability),
-        Type::Record(fields) => fields.iter().any(|(_, t)| holds_capability(t)),
-        Type::Refinement(base, _) => holds_capability(base),
+        Type::Tuple(elts) => elts.iter().any(holds_compute_function),
+        Type::Record(fields) => fields.iter().any(|(_, t)| holds_compute_function(t)),
+        Type::Refinement(base, _) => holds_compute_function(base),
         ty => should_inline(ty),
     }
 }
@@ -206,11 +206,14 @@ fn product_components(expr: &Expr) -> Option<Vec<(ProjKey, &Expr)>> {
 }
 
 /// Whether `expr` is a tuple or record literal with a component that holds a
-/// capability. The components' own types decide, since those are what each
+/// compute function. The components' own types decide, since those are what each
 /// projection of the literal would carry.
-fn product_holds_capability(expr: &Expr) -> bool {
-    product_components(expr)
-        .is_some_and(|components| components.iter().any(|(_, e)| holds_capability(&e.ty)))
+fn product_holds_compute_function(expr: &Expr) -> bool {
+    product_components(expr).is_some_and(|components| {
+        components
+            .iter()
+            .any(|(_, e)| holds_compute_function(&e.ty))
+    })
 }
 
 /// Take `expr` apart into its components, in order.
@@ -233,10 +236,10 @@ fn into_product_components(expr: Expr) -> Vec<(ProjKey, Expr)> {
 }
 
 /// `(𝑎₀, …, 𝑎ₙ).𝑖 ⟹ 𝑎ᵢ`, and the same for a record literal's field, where the literal
-/// holds a capability.
+/// holds a compute function.
 ///
 /// A literal is folded whichever component the projection reads. Folding only the
-/// components that hold a capability would leave `(f=𝑔, k=1).k` with the function
+/// components that hold a compute function would leave `(f=𝑔, k=1).k` with the function
 /// `𝑔` still inside it. A literal holding only data is left for `simplify`'s
 /// `try_literal_tuple_projection`, which folds it after lambda elimination.
 ///
@@ -249,7 +252,7 @@ fn fold_product_projection(expr: Expr) -> Expr {
     let TypedExprNode::Proj(key) = &function.node else {
         return expr;
     };
-    if !product_holds_capability(argument)
+    if !product_holds_compute_function(argument)
         || !product_components(argument).is_some_and(|cs| cs.iter().any(|(k, _)| k == key))
     {
         return expr;
@@ -295,6 +298,7 @@ fn calls_a_lambda(expr: &Expr) -> bool {
 /// beta-reduction"). The caller has also checked [`calls_a_lambda`].
 fn beta_reduce_folded_call(expr: Expr, scope: &BinderScope) -> Expr {
     let node_id = expr.node_id();
+    let own = expr.own_capabilities.clone();
     let TypedExprNode::Apply { function, argument } = expr.node else {
         unreachable!("beta_reduce_folded_call: not a call")
     };
@@ -309,6 +313,7 @@ fn beta_reduce_folded_call(expr: Expr, scope: &BinderScope) -> Expr {
         "a lambda held in a product",
         scope,
     )
+    .doing_of_its_own(&own)
 }
 
 /// Whether every free occurrence of `name` in `expr` is the argument of a
@@ -337,7 +342,7 @@ fn only_projected(name: &Name, expr: &Expr) -> bool {
 }
 
 /// `let 𝑟 = (𝑘₀=𝑎₀, …) in body ⟹ let 𝑐₀ = 𝑎₀ in … body[𝑟.𝑘ᵢ ↦ 𝑐ᵢ]`, for a product that
-/// holds a capability and is used only through projections ([`only_projected`]).
+/// holds a compute function and is used only through projections ([`only_projected`]).
 ///
 /// Each component is then a binding of its own type: a function inlines to its
 /// calls, and a collection stays bound once, so no component is recomputed per
@@ -551,6 +556,8 @@ fn inline_list_element_reads(mut expr: Expr, memo: &PredMemo) -> (Expr, bool) {
         node,
         ty,
         user_annotation,
+        capabilities,
+        own_capabilities,
         node_id,
         site,
     } = expr;
@@ -565,9 +572,12 @@ fn inline_list_element_reads(mut expr: Expr, memo: &PredMemo) -> (Expr, bool) {
                 node,
                 ty,
                 user_annotation,
+                capabilities,
+                own_capabilities,
                 node_id,
                 site,
-            },
+            }
+            .absorbing_children_capabilities(),
             moved,
         );
     };
@@ -616,9 +626,12 @@ fn inline_list_element_reads(mut expr: Expr, memo: &PredMemo) -> (Expr, bool) {
             },
             ty,
             user_annotation,
+            capabilities,
+            own_capabilities,
             node_id,
             site,
-        },
+        }
+        .absorbing_children_capabilities(),
         moved || here,
     )
 }
@@ -702,7 +715,8 @@ fn move_into_list_elements(
         moved |= child_moved;
         child
     });
-    (body, moved)
+    // An element now holds the definiens, and does what it does.
+    (body.absorbing_children_capabilities(), moved)
 }
 
 /// Whether a list literal in `e`'s value, outside its types, has an element reading `name`: one
@@ -879,6 +893,8 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
         node,
         ty,
         user_annotation,
+        capabilities,
+        own_capabilities,
         node_id,
         site,
     } = expr;
@@ -939,7 +955,7 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
             // projection. Asked first, so a temp holding a function is split as well
             // when every use projects it.
             if !binder_spelled_in_a_type
-                && product_holds_capability(&bound_expr)
+                && product_holds_compute_function(&bound_expr)
                 && only_projected(&binding.name, &body)
             {
                 let split = {
@@ -1020,6 +1036,8 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                         },
                         ty,
                         user_annotation,
+                        capabilities,
+                        own_capabilities,
                     },
                 };
             }
@@ -1162,8 +1180,11 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                 node,
                 ty,
                 user_annotation,
+                capabilities,
+                own_capabilities,
             };
             expr.map_children(|child| inline_impl(child, scope, channels));
+            let expr = expr.absorbing_children_capabilities();
             // **A projection of a tuple literal holding a feed handle** is the element it
             // lands on. Beta reduction leaves this shape where a function of several
             // parameters is called with a handle: the parameter the body feeds is bound to a
@@ -1198,7 +1219,10 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
         node: new_node,
         ty,
         user_annotation,
+        capabilities,
+        own_capabilities,
     }
+    .absorbing_children_capabilities()
 }
 
 /// Whether beta reduction should bind `argument` rather than substitute it for `param` in
@@ -1209,7 +1233,7 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
 ///
 /// Two computations are still substituted. A product former's projections fold only when
 /// the projection meets the former (`simplify::try_literal_tuple_projection`), and a
-/// capability is inlined at its uses ([`should_inline`]) rather than bound.
+/// compute function is inlined at its uses ([`should_inline`]) rather than bound.
 fn is_shared_computation(argument: &Expr, param: &Name, body: &Expr) -> bool {
     !matches!(argument.node, TypedExprNode::Var(_) | TypedExprNode::Lit(_))
         && !anf_chain_builds_a_product(argument)
@@ -1399,6 +1423,8 @@ fn inline_and_beta_reduce(
             node,
             ty,
             user_annotation,
+            capabilities,
+            own_capabilities,
             node_id,
             site,
         } = expr;
@@ -1410,7 +1436,8 @@ fn inline_and_beta_reduce(
         let function = inline_and_beta_reduce(*function, name, lambda, scope, memo);
         match function.node {
             TypedExprNode::Lambda { param, body } => {
-                return beta_reduce(node_id, param, *body, argument, name, scope);
+                return beta_reduce(node_id, param, *body, argument, name, scope)
+                    .doing_of_its_own(&own_capabilities);
             }
             // Not a Lambda (e.g. the bound expression is Var("id") rather
             // than a literal lambda) — skip beta-reduction and reconstruct
@@ -1426,6 +1453,8 @@ fn inline_and_beta_reduce(
                     },
                     ty,
                     user_annotation,
+                    capabilities,
+                    own_capabilities,
                 };
             }
         }
@@ -1440,6 +1469,8 @@ fn inline_and_beta_reduce(
         node,
         ty,
         user_annotation,
+        capabilities,
+        own_capabilities,
         node_id,
         site,
     } = expr;
@@ -1531,9 +1562,11 @@ fn inline_and_beta_reduce(
                 node,
                 ty,
                 user_annotation,
+                capabilities,
+                own_capabilities,
             };
             expr.map_children(|child| inline_and_beta_reduce(child, name, lambda, scope, memo));
-            return expr;
+            return expr.absorbing_children_capabilities();
         }
     };
 
@@ -1543,7 +1576,10 @@ fn inline_and_beta_reduce(
         node: new_node,
         ty,
         user_annotation,
+        capabilities,
+        own_capabilities,
     }
+    .absorbing_children_capabilities()
 }
 
 /// Beta-reduce `argument ▷ (λ param → body)`, the `Apply` numbered `node_id`.
@@ -1877,13 +1913,14 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         assert!(should_inline(&ty));
     }
 
     #[test]
     fn should_inline_curried_fun() {
-        // Int → (Int → Int): a capability, so inlined. Beta-reduction at
+        // Int → (Int → Int): a compute function, so inlined. Beta-reduction at
         // concrete call sites eliminates the nested lambda before any `curry`
         // combinator is produced.
         let ty = Type::Fun {
@@ -1895,14 +1932,16 @@ mod tests {
                 fun_kind: FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Int)),
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
             }),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         assert!(should_inline(&ty));
     }
 
     #[test]
     fn should_inline_refined_fun_codomain() {
-        // Int → Refinement(Int → Int, pred): a capability, so inlined —
+        // Int → Refinement(Int → Int, pred): a compute function, so inlined —
         // the refined codomain makes no difference.
         use crate::ccl::Refinement;
         use std::rc::Rc;
@@ -1913,12 +1952,14 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         let ty = Type::Fun {
             name: None,
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::refined_one(inner_fun, refinement)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         assert!(should_inline(&ty));
     }
@@ -1933,27 +1974,29 @@ mod tests {
             fun_kind: FunKind::Data(None),
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         assert!(!should_inline(&ty));
     }
 
-    /// The same domain at the **capability** kind is inlined. A `Compute` function
+    /// The same domain at the **compute** kind is inlined. A `Compute` function
     /// over `0..3` is a function that happens to accept those inputs, not a
     /// collection of them, and there is nothing behind it to share.
     #[test]
-    fn should_inline_a_capability_over_an_enumerable_domain() {
+    fn should_inline_a_compute_function_over_an_enumerable_domain() {
         let ty = Type::Fun {
             name: None,
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         assert!(should_inline(&ty));
     }
 
     #[test]
     fn should_inline_tuple_domain() {
-        // (Int, Int) → Int: an uncurried multi-arg capability, so inlined.
+        // (Int, Int) → Int: an uncurried multi-arg compute function, so inlined.
         let ty = Type::Fun {
             name: None,
             fun_kind: FunKind::Compute,
@@ -1962,13 +2005,14 @@ mod tests {
                 Type::Base(BaseType::Int),
             ])),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         assert!(should_inline(&ty));
     }
 
     #[test]
     fn should_inline_mixed_tuple_domain() {
-        // (UIntRange(3), Int) → Int: a capability over a tuple, so inlined — the
+        // (UIntRange(3), Int) → Int: a compute function over a tuple, so inlined — the
         // enumerable first component makes no difference.
         let ty = Type::Fun {
             name: None,
@@ -1978,6 +2022,7 @@ mod tests {
                 Type::Base(BaseType::Int),
             ])),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         assert!(should_inline(&ty));
     }
@@ -2009,7 +2054,7 @@ mod tests {
     fn should_inline_list_to_scalar_udf() {
         // Fun(Fun(UIntRange, Int), Int): takes a list, returns a scalar (e.g. a
         // user-defined sum/fold). A function *of* a collection is still a
-        // capability, so it is inlined like any other.
+        // compute function, so it is inlined like any other.
         let int = Type::Base(BaseType::Int);
         let list = fn_ty(Type::UIntRange(3), int.clone());
         assert!(should_inline(&fn_ty(list, int)));
@@ -2035,7 +2080,7 @@ mod tests {
     #[test]
     fn scalar_let_unchanged() {
         let expr = scalar_let();
-        let result = inline_capability_lambdas(expr.clone());
+        let result = inline_compute_lambdas(expr.clone());
         assert_eq!(result, expr);
     }
 
@@ -2050,7 +2095,7 @@ mod tests {
         let id_expr = TypedExpr::var("id").with_ty(fun_ty.clone());
         let body = TypedExpr::var("f").with_ty(fun_ty.clone());
         let expr = TypedExpr::let_bind("f", Occurrence::mint(), id_expr.clone(), body);
-        let result = inline_capability_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
         // Alias `f → id` is substituted; result is just `id`.
         assert_eq!(result, id_expr);
     }
@@ -2058,14 +2103,14 @@ mod tests {
     #[test]
     fn curried_let_is_inlined() {
         // let f: Int → (Int → Int) = curry_add in f
-        // A capability, so the curried Let IS inlined.
-        // After inline_capability_lambdas: the Let is dropped and the result is Var("curry_add").
+        // A compute function, so the curried Let IS inlined.
+        // After inline_compute_lambdas: the Let is dropped and the result is Var("curry_add").
         let int = Type::Base(BaseType::Int);
         let curried_ty = Type::fun(int.clone(), Type::fun(int.clone(), int.clone()));
         let curry_expr = TypedExpr::var("curry_add").with_ty(curried_ty.clone());
         let body = TypedExpr::var("f").with_ty(curried_ty.clone());
         let expr = TypedExpr::let_bind("f", Occurrence::mint(), curry_expr.clone(), body);
-        let result = inline_capability_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
         assert_eq!(result, curry_expr);
     }
 
@@ -2083,7 +2128,7 @@ mod tests {
         .with_ty(int.clone());
         let expr = TypedExpr::let_bind("f", Occurrence::mint(), id_expr.clone(), apply);
 
-        let result = inline_capability_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
 
         // The Let wrapper should be gone; Var(f) replaced by id_expr.
         // Note: id_expr is Var("id"), not a Lambda, so Apply(Lit(3), id_expr)
@@ -2118,7 +2163,7 @@ mod tests {
             .with_ty(Type::Tuple(vec![int.clone(), int.clone()]));
         let expr = TypedExpr::let_bind("f", Occurrence::mint(), id_expr.clone(), body);
 
-        let result = inline_capability_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
 
         let expected_call3 = TypedExpr::new(TypedExprNode::Apply {
             argument: Box::new(TypedExpr::lit(Lit::Int(3)).with_ty(int.clone())),
@@ -2164,8 +2209,7 @@ mod tests {
         let body = TypedExpr::tuple(vec![call(computed.clone()), call(read("a"))])
             .with_ty(Type::Tuple(vec![int.clone(), int.clone()]));
 
-        let result =
-            inline_capability_lambdas(TypedExpr::let_bind("f", Occurrence::mint(), f, body));
+        let result = inline_compute_lambdas(TypedExpr::let_bind("f", Occurrence::mint(), f, body));
 
         let TypedExprNode::Tuple(calls) = &result.node else {
             panic!("expected the tuple of the two calls, got {result:?}");
@@ -2207,7 +2251,7 @@ mod tests {
         let body = TypedExpr::lit(Lit::Int(42)).with_ty(int.clone());
         let expr = TypedExpr::let_bind("f", Occurrence::mint(), id_expr, body);
 
-        let result = inline_capability_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
         let expected = TypedExpr::lit(Lit::Int(42)).with_ty(int);
         assert_eq!(result, expected);
     }
@@ -2235,7 +2279,7 @@ mod tests {
         let inner_let = TypedExpr::let_bind("g", Occurrence::mint(), id_g.clone(), outer_apply);
         let expr = TypedExpr::let_bind("f", Occurrence::mint(), id_f.clone(), inner_let);
 
-        let result = inline_capability_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
 
         // Both f and g should be substituted with id.
         let expected_inner = TypedExpr::new(TypedExprNode::Apply {
@@ -2262,6 +2306,7 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         }
     }
 
@@ -2460,7 +2505,7 @@ mod tests {
             .with_ty(list.clone());
         let expr = TypedExpr::let_bind("rep", Occurrence::mint(), outer, call);
 
-        let result = inline_capability_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
 
         let expected =
             TypedExpr::lambda("__iter_record", Occurrence::mint(), range, arg).with_ty(list);
@@ -2494,7 +2539,7 @@ mod tests {
         let call = TypedExpr::apply(arg.clone(), TypedExpr::var("id").with_ty(udf_ty)).with_ty(int);
         let expr = TypedExpr::let_bind("id", Occurrence::mint(), lambda, call);
 
-        assert_eq!(inline_capability_lambdas(expr), arg);
+        assert_eq!(inline_compute_lambdas(expr), arg);
     }
 
     /// Reading through the handle does not weaken the guard: a mutable variable whose *value*
@@ -2520,8 +2565,7 @@ mod tests {
         )
         .with_ty(int);
 
-        let _ =
-            inline_capability_lambdas(TypedExpr::let_bind("id", Occurrence::mint(), lambda, call));
+        let _ = inline_compute_lambdas(TypedExpr::let_bind("id", Occurrence::mint(), lambda, call));
     }
 
     /// The complement: a parameter refinement the argument does *not* carry is a
@@ -2551,49 +2595,49 @@ mod tests {
         let call = TypedExpr::apply(arg, TypedExpr::var("f").with_ty(udf_ty)).with_ty(int.clone());
         let expr = TypedExpr::let_bind("f", Occurrence::mint(), lambda, call);
 
-        let _ = inline_capability_lambdas(expr);
+        let _ = inline_compute_lambdas(expr);
     }
 
-    // inline_capability_lambdas — end-to-end pass behaviour
+    // inline_compute_lambdas — end-to-end pass behaviour
     // -----------------------------------------------------------------------
 
     #[test]
-    fn inline_capability_lambdas_inlines_scalar_let() {
+    fn inline_compute_lambdas_inlines_scalar_let() {
         // Scalar UDF: `let f: Int → Int = id in Var("f")`.
-        // After inline_capability_lambdas: the Let is dropped and the result is Var("id").
+        // After inline_compute_lambdas: the Let is dropped and the result is Var("id").
         let int = Type::Base(BaseType::Int);
         let ident = TypedExpr::var("id").with_ty(fn_ty(int.clone(), int.clone()));
         let body = TypedExpr::var("f").with_ty(fn_ty(int.clone(), int.clone()));
         let expr = TypedExpr::let_bind("f", Occurrence::mint(), ident.clone(), body);
-        let result = inline_capability_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
         assert_eq!(result, ident);
     }
 
     #[test]
-    fn inline_capability_lambdas_inlines_user_curried_let() {
+    fn inline_compute_lambdas_inlines_user_curried_let() {
         // `let f: Int → (Int → Int) = g in f` — user-curried scalar.
-        // A capability, so `should_inline` returns true and
-        // the Let IS inlined. After inline_capability_lambdas: the result is Var("g").
+        // A compute function, so `should_inline` returns true and
+        // the Let IS inlined. After inline_compute_lambdas: the result is Var("g").
         let int = Type::Base(BaseType::Int);
         let curried = fn_ty(int.clone(), fn_ty(int.clone(), int.clone()));
         let ident = TypedExpr::var("g").with_ty(curried.clone());
         let body = TypedExpr::var("f").with_ty(curried);
         let expr = TypedExpr::let_bind("f", Occurrence::mint(), ident.clone(), body);
-        let result = inline_capability_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
         assert_eq!(result, ident);
     }
 
     #[test]
-    fn inline_capability_lambdas_inlines_and_beta_reduces_list_udf() {
+    fn inline_compute_lambdas_inlines_and_beta_reduces_list_udf() {
         // Mirror the simplest generator-function lowering:
         //   let doubles = λ xs → λ __iter_record → __iter_record ▷ xs ▷ (λ x → x)
         //   in [1, 2, 3] ▷ doubles
-        // After inline_capability_lambdas: the outer `λ xs` is substituted and beta-reduced,
+        // After inline_compute_lambdas: the outer `λ xs` is substituted and beta-reduced,
         // leaving `λ __iter_record → __iter_record ▷ [1, 2, 3] ▷ (λ x → x)`.
         let int = Type::Base(BaseType::Int);
         let range = Type::UIntRange(3);
         // The list, and the `λ __iter_record` that denotes it, are **collections**
-        // (`⤇`); the UDF around them is a capability taking one to another.
+        // (`⤇`); the UDF around them is a compute function taking one to another.
         let list = Type::data_fun(range.clone(), int.clone());
         let udf_ty = fn_ty(list.clone(), list.clone());
 
@@ -2635,7 +2679,7 @@ mod tests {
         .with_ty(list.clone());
         let expr = TypedExpr::let_bind("doubles", Occurrence::mint(), outer_lambda, call);
 
-        let result = inline_capability_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
 
         // Expected: the top-level node is the inner Lambda (no more Let, no
         // more outer `λ xs`), with `xs` substituted by the concrete list.
@@ -2660,11 +2704,11 @@ mod tests {
     }
 
     #[test]
-    fn inline_capability_lambdas_substitutes_arg_pair_into_multi_arg_body() {
+    fn inline_compute_lambdas_substitutes_arg_pair_into_multi_arg_body() {
         // Mirror the uncurried multi-arg shape:
         //   let f = λ __arg_pair → λ __iter_record → … __arg_pair.0 …
         //   in ([1, 2, 3], 10) ▷ f
-        // After inline_capability_lambdas: the outer `λ __arg_pair` is
+        // After inline_compute_lambdas: the outer `λ __arg_pair` is
         // beta-reduced, leaving `Tuple([1,2,3], 10).0` in the body. The
         // literal-tuple-projection fold lives in `crate::ccl::simplify` and
         // is *not* applied here — this test asserts only the substitution +
@@ -2728,7 +2772,7 @@ mod tests {
             .with_ty(list.clone());
         let expr = TypedExpr::let_bind("f", Occurrence::mint(), outer_lambda, call);
 
-        let result = inline_capability_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
 
         // Expected: outer Let / outer `λ __arg_pair` are gone; references to
         // `__arg_pair` are rewritten to the concrete tuple literal, so the
@@ -2755,9 +2799,9 @@ mod tests {
     }
 
     #[test]
-    fn inline_capability_lambdas_beta_reduces_scalar_lambda_call() {
+    fn inline_compute_lambdas_beta_reduces_scalar_lambda_call() {
         // let f: Int → Int = λ x → Lit(42) in Apply(Lit(3), Var("f"))
-        // After inline_capability_lambdas: Lit(42) (the constant lambda is beta-reduced,
+        // After inline_compute_lambdas: Lit(42) (the constant lambda is beta-reduced,
         // discarding the argument Lit(3)).
         let int = Type::Base(BaseType::Int);
         let lambda = TypedExpr::lambda(
@@ -2774,17 +2818,17 @@ mod tests {
         .with_ty(int.clone());
         let expr = TypedExpr::let_bind("f", Occurrence::mint(), lambda, call);
 
-        let result = inline_capability_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
         let expected = TypedExpr::lit(Lit::Int(42)).with_ty(int);
         assert_eq!(result, expected);
     }
 
     #[test]
-    fn inline_capability_lambdas_substitutes_pair_into_multi_arg_scalar_body() {
+    fn inline_compute_lambdas_substitutes_pair_into_multi_arg_scalar_body() {
         // let add: Tuple(Int, Int) → Int = λ __pair → __pair.0 + __pair.1
         // in add(Tuple(Lit(1), Lit(2)))
         //
-        // After inline_capability_lambdas: the body becomes
+        // After inline_compute_lambdas: the body becomes
         //   Tuple(1, 2).0 + Tuple(1, 2).1
         // — the literal-tuple projections survive here and are folded later
         // by `crate::ccl::simplify::try_literal_tuple_projection`.
@@ -2836,7 +2880,7 @@ mod tests {
         .with_ty(int.clone());
 
         let expr = TypedExpr::let_bind("add", Occurrence::mint(), lambda, call);
-        let result = inline_capability_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
 
         // Expected: Tuple(1,2).0 + Tuple(1,2).1 — projections unfolded here.
         let expected_left = TypedExpr::new(TypedExprNode::Apply {
@@ -2906,7 +2950,7 @@ mod tests {
         .with_ty(int.clone());
 
         let result =
-            inline_capability_lambdas(TypedExpr::let_bind("add", Occurrence::mint(), lambda, call));
+            inline_compute_lambdas(TypedExpr::let_bind("add", Occurrence::mint(), lambda, call));
 
         let TypedExprNode::Let {
             binding: floated,

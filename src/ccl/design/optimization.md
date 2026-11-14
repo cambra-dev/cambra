@@ -13,7 +13,7 @@ described in [ir.md](ir.md).
 
 ## Inlining Pass (`ccl/inline.rs`)
 
-`inline_capability_lambdas` runs on the typed CCL tree after inference and before transaction
+`inline_compute_lambdas` runs on the typed CCL tree after inference and before transaction
 rewriting, channelization, and lambda elimination. It visits `Let` bindings and performs three
 rewrites: it removes safe variable aliases, expands eligible function bindings at their uses,
 then relocates bindings read in list elements. Expanding a call while its source lambda is still
@@ -72,10 +72,10 @@ lambda: the argument replaces the lambda parameter in its body. An argument that
 computation, read more than once in the body, is bound instead, `let 𝑥′ = argument in body[𝑝 :=
 𝑥′]` for a fresh `𝑥′` (`is_shared_computation`): a copy at each read computes it at each read,
 and the copies compound across nested inlined calls, a function reading its parameter twice
-inlined `𝑛` deep computing `2ⁿ` paths. A variable, a literal, a product former and a capability
-are still substituted, the former because its projections fold only where they meet it and the
-capability because it is inlined at its uses. If the substituted function is not a lambda, the
-application remains. Substitution respects binders that shadow the function
+inlined `𝑛` deep computing `2ⁿ` paths. A variable, a literal, a product former and a compute
+function are still substituted, the former because its projections fold only where they meet it
+and the compute function because it is inlined at its uses. If the substituted function is not
+a lambda, the application remains. Substitution respects binders that shadow the function
 name and also visits refinement predicates stored in type slots, where a use may otherwise be
 missed by the ordinary expression walk.
 
@@ -134,14 +134,15 @@ domain mismatch.
 
 A tuple or record that holds a function has no tile, because a tile carries values and not
 functions. The inliner takes such a product apart until each function it holds sits in call
-position, where it inlines as a let-bound one does. A product **holds a capability** when one of its
-components is a capability or is itself a product holding one (`holds_capability`).
+position, where it inlines as a let-bound one does. A product **holds a compute function** when
+one of its components is a compute function or is itself a product holding one
+(`holds_compute_function`).
 
 Two rewrites do it:
 
 - **A projection of a literal is folded.** `(𝑎₀, …, 𝑎ₙ).𝑖` becomes `𝑎ᵢ`, and likewise a record
-  literal's field, when the literal holds a capability (`fold_product_projection`). The literal is
-  folded whichever component is read: folding only the function components would leave
+  literal's field, when the literal holds a compute function (`fold_product_projection`). The
+  literal is folded whichever component is read: folding only the function components would leave
   `(f=𝑔, k=1).k` with `𝑔` inside it. This is how a function passed to a multi-argument function
   reaches its call, since the parameter is a component of the argument tuple.
 - **A let-bound literal is split.** `let 𝑟 = (𝑘₀=𝑎₀, …) in body` becomes one `let` per component,
@@ -155,12 +156,12 @@ there (`beta_reduce_folded_call`). A lambda written in call position is not this
 binds it first (`lower::exprs::lower_expression_call`), so it inlines as a let-bound lambda, and an
 anonymous `Apply(arg, Lambda)` that no fold produced is left for `lambda_elim`.
 
-After inlining, the function of every call to a capability is a lambda, a projection or a builtin.
-Any other function was chosen from run-time data: a conditional over functions, a field of a
-product chosen by one, or an element of a collection of functions. `check_calls_resolved` refuses
-such a call, at the call's span, before the transactional slice runs. A function that no call
-consumes, such as a program's result, has no tile either, and compilation fails in planning or at
-operator conversion.
+After inlining, the function of every call to a compute function is a lambda, a projection or a
+builtin. Any other function was chosen from run-time data: a conditional over functions, a field
+of a product chosen by one, or an element of a collection of functions. `check_calls_resolved`
+refuses such a call, at the call's span, before the transactional slice runs. A function that no
+call consumes, such as a program's result, has no tile either, and compilation fails in planning
+or at operator conversion.
 
 ### Limitations
 

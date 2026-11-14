@@ -1983,7 +1983,7 @@
             "nature": "machinery",
             "label": "lower.image"
           },
-          "type": "(Int ⇒ Unit)",
+          "type": "(Int ⇒ Unit causes Append(totals))",
           "children": [
             {
               "id": 8,
