@@ -1383,6 +1383,13 @@ fn a_correlated_comprehension_runs_inside_a_transaction(
      for r in [1, 2]]) for q in [1, 2]])",
     99
 )]
+// A chain of filters, each reading the level just outside it, with every level's element in
+// the sum: over `[1, 2, 3, 4]` each increasing chain contributes its elements.
+#[case::depth_4_chained_filters(
+    "sum([a + sum([b + sum([c + sum([d for d in [1, 2, 3, 4] if d > c]) for c in [1, 2, 3, 4] if c > b]) \
+     for b in [1, 2, 3, 4] if b > a]) for a in [1, 2, 3, 4]])",
+    49
+)]
 // A body that never applies the inner source, so the domain is read off the type, and the
 // filter on it rides the pair one level down: `r` counts 2 elements at `q = 1` and 1 at
 // `q = 2`, so (1 + 2)·3.

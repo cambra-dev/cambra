@@ -832,7 +832,7 @@ impl Tile {
     /// ([`Self::to_guard`]), so nothing reads them.
     pub(crate) fn withhold(&mut self, level: CurryLevel, keep: &[bool], withheld: &[&[Value]]) {
         for depth in 0..=level.index() {
-            let prefixes = Predicate::flatten_or(
+            let prefixes = Predicate::union_all(
                 withheld
                     .iter()
                     .map(|path| Predicate::exactly(&path[..=depth]))

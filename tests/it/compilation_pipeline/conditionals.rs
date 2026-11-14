@@ -1762,6 +1762,68 @@ fn a_boxed_conditional_keyed_by_its_arm(#[case] source: &str, #[case] expected: 
     check_sink(source, expected);
 }
 
+/// A conditional between two lists over one domain, the source of a loop nested in another.
+/// Realization restricts each arm by its branch condition before taking the union, so the
+/// arm the condition rejects holds no row beneath any enclosing position.
+#[rstest]
+#[case::fed_from_the_first_arm(
+    indoc! {r"
+        ch: Feed(_)
+        for i in [1, 2]:
+            for q in ([1, 2] if c else [3, 4]):
+                ch << q
+        sum([v for v in ch])
+    "},
+    true,
+    6
+)]
+#[case::fed_from_the_second_arm(
+    indoc! {r"
+        ch: Feed(_)
+        for i in [1, 2]:
+            for q in ([1, 2] if c else [3, 4]):
+                ch << q
+        sum([v for v in ch])
+    "},
+    false,
+    14
+)]
+#[case::accumulated_from_the_first_arm(
+    indoc! {r"
+        acc := 0
+        for i in [1, 2]:
+            for q in ([1, 2] if c else [3, 4]):
+                acc := acc + q
+        acc
+    "},
+    true,
+    6
+)]
+#[case::accumulated_from_the_second_arm(
+    indoc! {r"
+        acc := 0
+        for i in [1, 2]:
+            for q in ([1, 2] if c else [3, 4]):
+                acc := acc + q
+        acc
+    "},
+    false,
+    14
+)]
+fn a_conditional_list_as_a_nested_loop_source(
+    #[case] body: &str,
+    #[case] c: bool,
+    #[case] expected: i64,
+) {
+    let c = if c { "2 > 1" } else { "1 > 2" };
+    check_scalar(
+        &formatdoc! {"
+            c = {c}
+            {body}"},
+        Value::Int(expected),
+    );
+}
+
 /// **Two witnesses live at once, end to end.** A comprehension over two conditional
 /// collections opens both sums while typing one body, and one site carries both:
 /// `Σ (σ₄ : 𝐾₄). Σ (σ₇ : 𝐾₇). ((σ₄, σ₇) ⤇ Int)`. Typing is pinned by
