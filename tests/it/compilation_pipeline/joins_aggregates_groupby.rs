@@ -835,6 +835,7 @@ fn a_group_s_filtered_elements_fed_per_group(#[case] body: &str, #[case] expecte
 /// the inner loop's domain, whose source reads the outer element, so the filtered source is that
 /// element's collection read under the filter.
 #[rstest]
+#[timeout(Duration::from_secs(10))]
 #[case::fed_from_a_group(
     indoc! {r"
         g = groupby([1, 2, 3, 4, 5], \x -> x > 2)
@@ -846,6 +847,20 @@ fn a_group_s_filtered_elements_fed_per_group(#[case] body: &str, #[case] expecte
         sum([v for v in ch])
     "},
     14
+)]
+// The guard reads the group as well as the element, so each filter stage's type quotes the
+// group's membership in every slot; checking it once compiled in about 14 s.
+#[case::guarded_by_the_group(
+    indoc! {r"
+        g = groupby([1, 2, 3, 4, 5], \x -> x > 2)
+        ch: Feed(_)
+        for g2 in g:
+            for q in g2:
+                if q > sum(g2) - 8:
+                    ch << q
+        sum([v for v in ch])
+    "},
+    8
 )]
 #[case::fed_from_a_boxed_row(
     indoc! {r"
