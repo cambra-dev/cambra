@@ -253,6 +253,9 @@ impl<'a> ProgramLowering<'a> {
         };
         let mut params = Vec::new();
         let mut modules: HashMap<SmolStr, Rc<HashMap<QualifiedName, Name>>> = HashMap::new();
+        // Each transactional entry minted below, by its spelling, which the module's own
+        // references reach it by.
+        let mut minted_entries: Vec<(QualifiedName, Name)> = Vec::new();
         for parameter in &lowered.interface.parameters {
             if let ParameterKind::Type { param, bound, .. } = &parameter.kind {
                 params.push(match bound {
@@ -268,16 +271,33 @@ impl<'a> ProgramLowering<'a> {
                 opaque_members(ty, &mut params);
                 let mut names = HashMap::new();
                 for (binder, entry) in parameter.entry_lets() {
-                    let node = match entry.as_feed() {
-                        Some(_) => TypedExprNode::Defer,
-                        None => TypedExprNode::Abstract,
+                    // A transactional variable's entry keeps the declaration it lowered to,
+                    // minted here: a run the module passes the parameter to has it in the scope
+                    // its own chain is uniquified in ([`mut_entries`]), where a name is minted.
+                    let name = if crate::ccl::lower::stmts::is_mut_entry(&entry) {
+                        let minted = Name::fresh(binder.to_string().as_str());
+                        let declaration = parameter_let(&mut chain, &binder.to_string());
+                        let (TypedExprNode::Let { binding, .. }
+                        | TypedExprNode::MutDecl { binding, .. }) = &mut declaration.node
+                        else {
+                            unreachable!("`parameter_let` answers a binding");
+                        };
+                        binding.name = minted.clone();
+                        minted_entries.push((binder.clone(), minted.clone()));
+                        minted
+                    } else {
+                        let node = match entry.as_feed() {
+                            Some(_) => TypedExprNode::Defer,
+                            None => TypedExprNode::Abstract,
+                        };
+                        let value = ctx.tag_image(Expr::new(node), parameter.declared);
+                        read_argument(&mut chain, &binder.to_string(), value);
+                        binder.raw()
                     };
-                    let value = ctx.tag_image(Expr::new(node), parameter.declared);
-                    read_argument(&mut chain, &binder.to_string(), value);
                     let entry = binder
                         .strip_prefix(&QualifiedName::new(parameter.name.clone()))
                         .expect("a parameter's entries are spelled under it");
-                    names.insert(entry, binder.raw());
+                    names.insert(entry, name);
                 }
                 // A run the module passes the parameter to reaches its entries'
                 // `let`s, which the module's uniquification resolves.
@@ -312,6 +332,7 @@ impl<'a> ProgramLowering<'a> {
         let imports = self.import_checks.get(&file).cloned().unwrap_or_default();
         let chain = checked_by(chain, &QualifiedName::new("import"), &imports, ctx);
         let mut qualified = self.shared_names(&lowered.scope);
+        qualified.extend(minted_entries);
         self.checking = true;
         let chain = self.expand_runs(
             chain,
