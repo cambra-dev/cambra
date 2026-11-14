@@ -511,7 +511,10 @@ impl<'a> Blame<'a> {
     fn infer(&self, errors: Vec<LocatedInferError>, tree: &Expr) -> Vec<CompileError> {
         let mut reported: Vec<CompileError> = Vec::new();
         for located in errors {
-            let span = self.span(located.node_id, Some(tree));
+            let span = located
+                .error
+                .written_at()
+                .unwrap_or_else(|| self.span(located.node_id, Some(tree)));
             // A related position is a secondary label only where it is not part of
             // what the primary one underlines.
             let within = |inner: Span| {

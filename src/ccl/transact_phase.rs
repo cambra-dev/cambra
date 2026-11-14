@@ -671,6 +671,14 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<Str
                 let t = &r.requirement().trait_;
                 *t == Trait::transaction() || *t == Trait::read_txn()
             }
+            Capability::Every(top) => matches!(
+                top.family,
+                Some(
+                    crate::ccl::capabilities::Family::WriteTxn
+                        | crate::ccl::capabilities::Family::ReadTxn
+                )
+            ),
+            Capability::Param(_) => false,
         }
     });
     Ok(out)

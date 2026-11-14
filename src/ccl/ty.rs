@@ -1638,11 +1638,27 @@ pub struct TypeParam {
     /// the terms its declaration writes. Zero for every other parameter, each occurrence a
     /// [`Type::Param`].
     pub arity: usize,
+    /// For a parameter standing for a clause, what its bound's `except` takes away:
+    /// `E <: Effect except RunTransaction` (`docs/chl-spec.md`, "Kinds and bounds").
+    pub clause_except: std::collections::BTreeSet<crate::ccl::capabilities::Capability>,
 }
 
 impl TypeParam {
     /// A declared parameter: what lowering writes for `T` in `forall (T) V`.
     pub fn declared(spelling: impl Into<SmolStr>) -> Rc<TypeParam> {
+        TypeParam::declared_except(spelling, Default::default())
+    }
+
+    /// A declared parameter standing for a clause, whose bound takes `except` away.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
+                  and a trait hashes and orders by its module path and name"
+    )]
+    pub fn declared_except(
+        spelling: impl Into<SmolStr>,
+        except: std::collections::BTreeSet<crate::ccl::capabilities::Capability>,
+    ) -> Rc<TypeParam> {
         Rc::new(TypeParam {
             id: TypeParamId(TYPE_PARAM_COUNTER.fetch_add(1, Ordering::Relaxed)),
             spelling: spelling.into(),
@@ -1651,6 +1667,7 @@ impl TypeParam {
             bound_at: None,
             generalized: false,
             arity: 0,
+            clause_except: except,
         })
     }
 
@@ -1676,6 +1693,7 @@ impl TypeParam {
             bound_at: None,
             generalized: true,
             arity,
+            clause_except: Default::default(),
         })
     }
 
@@ -1690,6 +1708,7 @@ impl TypeParam {
             bound_at: None,
             generalized: false,
             arity,
+            clause_except: Default::default(),
         })
     }
 
@@ -1720,6 +1739,29 @@ impl TypeParam {
             bound_at,
             generalized: false,
             arity,
+            clause_except: Default::default(),
+        })
+    }
+
+    /// This parameter with `except` as what its clause bound takes away.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
+                  and a trait hashes and orders by its module path and name"
+    )]
+    pub fn with_clause_except(
+        self: &Rc<TypeParam>,
+        except: std::collections::BTreeSet<crate::ccl::capabilities::Capability>,
+    ) -> Rc<TypeParam> {
+        Rc::new(TypeParam {
+            id: self.id,
+            spelling: self.spelling.clone(),
+            opened_at: self.opened_at,
+            bound: self.bound.clone(),
+            bound_at: self.bound_at,
+            generalized: self.generalized,
+            arity: self.arity,
+            clause_except: except,
         })
     }
 
@@ -3042,7 +3084,11 @@ fn fmt_type(
                     };
                     match &p.kind {
                         TypeKind::Type => name,
-                        TypeKind::SubtypesOf(bound) => format!("{name} <: {}", at(bound, binders)),
+                        TypeKind::SubtypesOf(bound) => format!(
+                            "{name} <: {}{}",
+                            at(bound, binders),
+                            crate::ccl::capabilities::except_text(&p.param.clause_except)
+                        ),
                         other => format!("{name}: {other}"),
                     }
                 })

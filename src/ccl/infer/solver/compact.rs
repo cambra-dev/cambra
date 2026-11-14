@@ -971,11 +971,21 @@ impl CompactFun {
     fn merge(pol: bool, a: CompactFun, b: CompactFun) -> CompactFun {
         let name = a.name.clone().or_else(|| b.name.clone());
         // Capabilities are covariant: a positive position holds either function, so it may do
-        // what either does, and a negative one accepts only what both accept.
+        // what either does, and a negative one accepts only what both accept. The variables
+        // at a negative one are each a call's expectation of the one function value there,
+        // so every one stays: they stand for what that value does.
         let capabilities = Rc::new(if pol {
             a.capabilities.union(&b.capabilities)
         } else {
-            a.capabilities.intersection(&b.capabilities)
+            let mut meet = a.capabilities.intersection(&b.capabilities);
+            meet.vars = a
+                .capabilities
+                .vars
+                .iter()
+                .chain(&b.capabilities.vars)
+                .map(|(id, v)| (*id, Rc::clone(v)))
+                .collect();
+            meet
         });
         let codomain = Box::new(CompactType::merge(pol, *a.codomain, *b.codomain));
         // The domain merges **contravariantly** and as one ordinary position — there is no
@@ -2257,7 +2267,7 @@ pub enum JoinedPosition {
 /// following, so that spurious cycles (`?a <: ?b` and `?b <: ?a`) — which
 /// don't represent real recursive types — get pruned.
 pub fn compact_type(ty: &Type) -> CompactGraph {
-    compact_type_with(ty, true)
+    compact_type_with(ty, true, false)
 }
 
 /// [`compact_type`] with the opposite-polarity collapse suppressed **entirely**,
@@ -2274,11 +2284,19 @@ pub fn compact_type(ty: &Type) -> CompactGraph {
 /// [`fallback_allowed`] already confines the collapse to the entered position, so
 /// disabling it there disables it everywhere.
 pub fn compact_type_polarity_only(ty: &Type) -> CompactGraph {
-    compact_type_with(ty, false)
+    compact_type_with(ty, false, false)
 }
 
-fn compact_type_with(ty: &Type, collapse: bool) -> CompactGraph {
+/// [`compact_type_polarity_only`], with each function position's capabilities also holding the
+/// capability variables standing at it, which a rendering of a polymorphic type names
+/// (`src/ccl/design/type-inference.md`, "Polymorphism and materialization").
+pub fn compact_type_for_display(ty: &Type) -> CompactGraph {
+    compact_type_with(ty, false, true)
+}
+
+fn compact_type_with(ty: &Type, collapse: bool, capability_vars: bool) -> CompactGraph {
     let mut st = CompactState::new(collapse);
+    st.capability_vars = capability_vars;
     // One walk forces a shared predicate under one substitution once, however many bounds
     // carry it (`Subst::force_refinement`).
     let term = crate::ccl::subst::with_transport_memo(|| {
@@ -2979,6 +2997,10 @@ struct CompactState {
     /// Whether the opposite-polarity collapse may fire at all on this walk.
     /// False for [`compact_type_polarity_only`]; see [`fallback_allowed`].
     collapse: bool,
+    /// Whether each function position records the capability variables standing at it
+    /// ([`CapabilitySet::vars`](crate::ccl::capabilities::CapabilitySet::vars)): only a rendering of a
+    /// polymorphic type reads them ([`compact_type_for_display`]).
+    capability_vars: bool,
     /// The functions the walk is inside of, and the closing memo over them
     /// (`src/ccl/design/type-inference.md`, "Where the conversions run"): a
     /// refinement's references to enclosing binders become indices before
@@ -3027,6 +3049,7 @@ impl CompactState {
             barrier_recursive: HashMap::new(),
             rec_vars: BTreeMap::new(),
             collapse,
+            capability_vars: false,
             scope: RefinementScope::default(),
             data_domain_depth: 0,
             candidate_widened: None,
@@ -3035,6 +3058,28 @@ impl CompactState {
             own_content: Default::default(),
         }
     }
+}
+
+/// The set `capabilities` states at a position of polarity `pol`, with the capability variables
+/// standing there when the walk records them: at an input, the position's own variable, and
+/// at an output, every variable flowing into it, which a rendering keeps where it also stands
+/// at an input.
+fn capabilities_at(
+    capabilities: &crate::ccl::capabilities::Capabilities,
+    pol: bool,
+    st: &CompactState,
+) -> crate::ccl::capabilities::CapabilitySet {
+    let mut set = capabilities.set();
+    if st.capability_vars
+        && let crate::ccl::capabilities::Repr::Var(v) = capabilities.repr()
+    {
+        set.vars = if pol {
+            v.reaching()
+        } else {
+            std::iter::once((v.uid, Rc::clone(v))).collect()
+        };
+    }
+    set
 }
 
 /// The resolution of a barrier variable, under `subst_acc`, as a [`CompactType`]: the join
@@ -3798,7 +3843,7 @@ fn compact_go_inner(
                         KindPin::Sum(_) => KindPin::Data,
                         other => other,
                     },
-                    capabilities: Rc::new(capabilities.set()),
+                    capabilities: Rc::new(capabilities_at(capabilities, pol, st)),
                     name: name.clone(),
                     binders,
                     domains_disagree: false,

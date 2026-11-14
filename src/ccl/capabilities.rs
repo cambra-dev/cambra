@@ -5,9 +5,10 @@
 //! [`Capabilities`] rides every [`Type::Fun`](crate::ccl::Type::Fun). A collection is a
 //! data function, and its type's capabilities are always [`Capabilities::none`].
 
+use smol_str::SmolStr;
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     hash::{Hash, Hasher},
     rc::Rc,
@@ -17,6 +18,8 @@ use std::{
 use crate::ccl::{
     Level, Name,
     infer::solver::traits::{Supplier, Trait},
+    names::Home,
+    provenance::NodeId,
     ty::TraitRequirement,
 };
 
@@ -68,6 +71,11 @@ impl Requirement {
     /// at.
     pub fn read(x: Name) -> Requirement {
         Requirement::of(Trait::read(), vec![x])
+    }
+
+    /// This requirement with `f` applied to each term argument.
+    pub fn map_terms(&self, f: &mut impl FnMut(&Name) -> Name) -> Requirement {
+        Requirement::of(self.0.trait_.clone(), self.0.terms.iter().map(f).collect())
     }
 
     /// The trait requirement this is.
@@ -142,20 +150,16 @@ pub fn discharge(expr: &mut crate::ccl::Expr, discharged: &impl Fn(&Capability) 
         let Repr::Known(set) = capabilities.repr() else {
             return capabilities.clone();
         };
-        Capabilities::known(CapabilitySet {
-            requires: set
-                .requires
-                .iter()
-                .filter(|r| !discharged(&Capability::Requires((*r).clone())))
-                .cloned()
-                .collect(),
-            causes: set
-                .causes
-                .iter()
-                .filter(|e| !discharged(&Capability::Causes((*e).clone())))
-                .cloned()
-                .collect(),
-        })
+        let mut left = set.clone();
+        left.requires
+            .retain(|r| !discharged(&Capability::Requires(r.clone())));
+        left.causes
+            .retain(|e| !discharged(&Capability::Causes(e.clone())));
+        left.params
+            .retain(|p| !discharged(&Capability::Param(p.clone())));
+        left.tops
+            .retain(|t| !discharged(&Capability::Every(t.clone())));
+        Capabilities::known(left)
     }
     fn in_type(ty: &mut crate::ccl::Type, discharged: &impl Fn(&Capability) -> bool) {
         if let crate::ccl::Type::Fun { capabilities, .. } = ty {
@@ -199,10 +203,23 @@ pub fn assert_monotone(expr: &crate::ccl::Expr, after: &str) {
         "after {after}: `{}` does not state its own effect",
         crate::ccl::symbolic::symbolic(expr)
     );
+    // A top of the node's holds what it holds, which a normalized set keeps no copy of.
+    let held = |item: Capability| total.tops.iter().any(|top| top.holds(&item));
     let check = |part: CapabilitySet, of: &dyn Fn() -> String| {
         let missing = CapabilitySet {
-            requires: part.requires.difference(&total.requires).cloned().collect(),
-            causes: part.causes.difference(&total.causes).cloned().collect(),
+            requires: part
+                .requires
+                .difference(&total.requires)
+                .filter(|r| !held(Capability::Requires((*r).clone())))
+                .cloned()
+                .collect(),
+            causes: part
+                .causes
+                .difference(&total.causes)
+                .filter(|e| !held(Capability::Causes((*e).clone())))
+                .cloned()
+                .collect(),
+            ..CapabilitySet::default()
         };
         if !missing.is_empty() {
             panic!(
@@ -315,6 +332,7 @@ impl Capabilities {
                     Some(x) => Some(e.naming(map(x)?)),
                 })
                 .collect(),
+            ..set.clone()
         })
     }
 }
@@ -366,43 +384,645 @@ pub fn of_feed(target: &Name, value: &Capabilities) -> Capabilities {
     Capabilities::known(set)
 }
 
+/// A declared type parameter standing for a clause (`docs/chl-spec.md`, "Kinds and bounds"):
+/// `E <: Effect` in a `causes` clause, `R <: Context` in a `requires` clause.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ClauseParam {
+    pub param: Rc<crate::ccl::ty::TypeParam>,
+    /// Whether it is bounded by `Effect` and stands in a `causes` clause.
+    pub of_causes: bool,
+    /// What `except` takes out of it here, `E except Raise(Int)`: its clause's `except`, or its
+    /// own in parentheses, or what an edge it crossed takes away (`Filter::pass`).
+    pub except: BTreeSet<Capability>,
+}
+
+impl ClauseParam {
+    /// `param`, standing in the clause `of_causes` gives, whole.
+    pub fn whole(param: Rc<crate::ccl::ty::TypeParam>, of_causes: bool) -> ClauseParam {
+        ClauseParam {
+            param,
+            of_causes,
+            except: BTreeSet::new(),
+        }
+    }
+}
+
 /// The requirements and effects a function type states.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct CapabilitySet {
     pub requires: BTreeSet<Requirement>,
     pub causes: BTreeSet<Effect>,
+    /// The declared parameters the clauses name, `E` in `causes E`.
+    pub params: BTreeSet<ClauseParam>,
+    /// The capability variables standing at this position, which only a rendering of a
+    /// polymorphic type collects (`super::infer::solver::display`): at an input, the
+    /// position's own variable; at an output, every variable flowing into it.
+    pub vars: BTreeMap<CapabilityVarId, Rc<CapabilityVar>>,
+    /// The variables a rendering names in each clause: `R` in `requires R` and `E` in
+    /// `causes E` (`docs/chl-spec.md`, "Kinds and bounds").
+    pub named_requires: BTreeSet<SmolStr>,
+    pub named_causes: BTreeSet<SmolStr>,
+    /// The tops the clauses hold, `Effect`, `Context` and a family's such as `Write(*)`, each
+    /// less what `except` takes from it (`docs/chl-spec.md`, "Writing requirements and
+    /// effects"). [`CapabilitySet::normalized`] keeps none another holds.
+    pub tops: BTreeSet<Every>,
 }
 
 impl CapabilitySet {
+    /// Each requirement, then each effect.
+    pub fn items(&self) -> impl Iterator<Item = Capability> + '_ {
+        self.requires
+            .iter()
+            .map(|r| Capability::Requires(r.clone()))
+            .chain(self.causes.iter().map(|e| Capability::Causes(e.clone())))
+            .chain(self.params.iter().map(|p| Capability::Param(p.clone())))
+            .chain(self.tops.iter().cloned().map(Capability::Every))
+    }
+
+    /// The tops of one direction: the `causes` clause's (`of_causes`) or the `requires`
+    /// clause's.
+    pub fn tops_of(&self, of_causes: bool) -> impl Iterator<Item = &Every> + '_ {
+        self.tops.iter().filter(move |t| t.of_causes == of_causes)
+    }
+
+    /// Whether this set lists `item`, or holds it through one of its tops.
+    pub fn states(&self, item: &Capability) -> bool {
+        let listed = match item {
+            Capability::Requires(r) => self.requires.contains(r),
+            Capability::Causes(e) => self.causes.contains(e),
+            Capability::Param(_) => self
+                .params
+                .iter()
+                .any(|p| taken_away(item, &BTreeSet::from([Capability::Param(p.clone())]))),
+            Capability::Every(_) => false,
+        };
+        listed || self.tops.iter().any(|top| top.holds(item))
+    }
+
+    /// This set as a clause writes it: a capability it lists is not taken away from a top
+    /// holding its family, which then holds it, so the list leaves it out; and no top holds
+    /// another, or takes away what it does not hold.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
+                  and a trait hashes and orders by its module path and name"
+    )]
+    pub fn normalized(mut self) -> CapabilitySet {
+        let listed: Vec<Capability> = self
+            .items()
+            .filter(|i| !matches!(i, Capability::Every(_)))
+            .collect();
+        // What a top takes away and the set holds otherwise, it holds: a listed capability, one
+        // another top holds, and of a family it takes away, what another top holds of it. Each
+        // step drops an entry, or replaces a family's top with capabilities of the family, which
+        // no later step replaces, so this ends.
+        let mut tops: Vec<Every> = std::mem::take(&mut self.tops).into_iter().collect();
+        'filled: loop {
+            for (i, a) in tops.iter().enumerate() {
+                let others: Vec<&Every> = tops
+                    .iter()
+                    .enumerate()
+                    .filter(|&(j, _)| j != i)
+                    .map(|(_, b)| b)
+                    .collect();
+                let mut except = BTreeSet::new();
+                let mut filled = false;
+                for e in &a.except {
+                    if listed.contains(e) || others.iter().any(|b| b.holds(e)) {
+                        filled = true;
+                        continue;
+                    }
+                    if let Capability::Every(family) = e
+                        && let Some(b) = others.iter().find(|b| b.overlaps(e))
+                    {
+                        except.extend(b.except.iter().filter(|x| family.holds(x)).cloned());
+                        filled = true;
+                        continue;
+                    }
+                    except.insert(e.clone());
+                }
+                if filled {
+                    tops[i] = a.with_except(except);
+                    continue 'filled;
+                }
+            }
+            break;
+        }
+        for top in tops {
+            self.add_every(top);
+        }
+        let tops = self.tops.clone();
+        let held = |item: Capability| tops.iter().any(|top| top.holds(&item));
+        self.requires
+            .retain(|r| !held(Capability::Requires(r.clone())));
+        self.causes.retain(|e| !held(Capability::Causes(e.clone())));
+        self.params.retain(|p| !held(Capability::Param(p.clone())));
+        // A listed capability another listed one holds, a `Raise` of a subtype, is left out.
+        let kept = pruned(self.causes.iter().cloned().map(Capability::Causes));
+        self.causes
+            .retain(|e| kept.contains(&Capability::Causes(e.clone())));
+        let kept = pruned(self.params.iter().cloned().map(Capability::Param));
+        self.params
+            .retain(|p| kept.contains(&Capability::Param(p.clone())));
+        self
+    }
+
+    /// Hold `every`, beside the tops this holds already: a top of its family and direction
+    /// joins it, and a top one of them holds is dropped.
+    pub fn add_every(&mut self, every: Every) {
+        let mut every = every;
+        let same: Vec<Every> = self
+            .tops
+            .iter()
+            .filter(|t| {
+                t.of_causes == every.of_causes && t.family == every.family && t.owner == every.owner
+            })
+            .cloned()
+            .collect();
+        for t in same {
+            self.tops.remove(&t);
+            every = every.join(&t);
+        }
+        if self
+            .tops
+            .iter()
+            .any(|t| t.holds(&Capability::Every(every.clone())))
+        {
+            return;
+        }
+        self.tops
+            .retain(|t| !every.holds(&Capability::Every(t.clone())));
+        self.tops.insert(every);
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.requires.is_empty() && self.causes.is_empty()
+        self.requires.is_empty()
+            && self.causes.is_empty()
+            && self.params.is_empty()
+            && self.vars.is_empty()
+            && self.named_requires.is_empty()
+            && self.named_causes.is_empty()
+            && self.tops.is_empty()
     }
 
     pub fn union(&self, other: &CapabilitySet) -> CapabilitySet {
-        CapabilitySet {
+        let mut vars = self.vars.clone();
+        vars.extend(other.vars.iter().map(|(k, v)| (*k, Rc::clone(v))));
+        let mut out = CapabilitySet {
             requires: self.requires.union(&other.requires).cloned().collect(),
             causes: self.causes.union(&other.causes).cloned().collect(),
+            params: self.params.union(&other.params).cloned().collect(),
+            vars,
+            named_requires: self
+                .named_requires
+                .union(&other.named_requires)
+                .cloned()
+                .collect(),
+            named_causes: self
+                .named_causes
+                .union(&other.named_causes)
+                .cloned()
+                .collect(),
+            tops: self.tops.clone(),
+        };
+        for top in &other.tops {
+            out.add_every(top.clone());
         }
-    }
-
-    /// This set less each requirement and effect `other` lists.
-    pub fn without(&self, other: &CapabilitySet) -> CapabilitySet {
-        let mut out = self.clone();
-        out.requires.retain(|r| !other.requires.contains(r));
-        out.causes.retain(|e| !other.causes.contains(e));
         out
     }
 
+    /// This set less each requirement and effect `other` states, and each top and clause
+    /// variable it lists.
+    pub fn without(&self, other: &CapabilitySet) -> CapabilitySet {
+        let mut out = self.clone();
+        out.requires
+            .retain(|r| !other.states(&Capability::Requires(r.clone())));
+        out.causes
+            .retain(|e| !other.states(&Capability::Causes(e.clone())));
+        out.params.retain(|p| !other.params.contains(p));
+        out.tops.retain(|top| !other.tops.contains(top));
+        out
+    }
+
+    /// What both sets hold: the items both list, each item one lists that a top of the other
+    /// holds, and where two tops meet, what both hold.
     pub fn intersection(&self, other: &CapabilitySet) -> CapabilitySet {
-        CapabilitySet {
+        let both = |a: &CapabilitySet, b: &CapabilitySet, item: &Capability| {
+            a.states(item) && b.states(item)
+        };
+        let mut out = CapabilitySet {
             requires: self
                 .requires
-                .intersection(&other.requires)
+                .union(&other.requires)
+                .filter(|r| both(self, other, &Capability::Requires((*r).clone())))
                 .cloned()
                 .collect(),
-            causes: self.causes.intersection(&other.causes).cloned().collect(),
+            causes: self
+                .causes
+                .union(&other.causes)
+                .filter(|e| both(self, other, &Capability::Causes((*e).clone())))
+                .cloned()
+                .collect(),
+            params: self
+                .params
+                .union(&other.params)
+                .filter(|p| both(self, other, &Capability::Param((*p).clone())))
+                .cloned()
+                .collect(),
+            vars: self
+                .vars
+                .iter()
+                .filter(|(k, _)| other.vars.contains_key(k))
+                .map(|(k, v)| (*k, Rc::clone(v)))
+                .collect(),
+            named_requires: self
+                .named_requires
+                .intersection(&other.named_requires)
+                .cloned()
+                .collect(),
+            named_causes: self
+                .named_causes
+                .intersection(&other.named_causes)
+                .cloned()
+                .collect(),
+            tops: BTreeSet::new(),
+        };
+        for a in &self.tops {
+            for b in &other.tops {
+                if let Some(meet) = a.meet(b) {
+                    out.add_every(meet);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// A family of capabilities its top, `Write(*)` for writes, holds every one of
+/// (`docs/chl-spec.md`, "Writing requirements and effects").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Family {
+    /// `Read(x)` for every induction variable `x`.
+    Read,
+    /// `Write(x)` for every induction variable `x`.
+    Write,
+    /// `ReadTxn(x)` for every transactional variable `x`.
+    ReadTxn,
+    /// `WriteTxn(x)` for every transactional variable `x`.
+    WriteTxn,
+    /// `Append(f)` for every feed `f`.
+    Append,
+}
+
+impl Family {
+    /// Whether this family's capabilities are effects rather than requirements.
+    pub fn of_causes(self) -> bool {
+        !matches!(self, Family::Read | Family::ReadTxn)
+    }
+
+    /// This family's top, `Write(*)`.
+    pub fn top(self) -> Every {
+        Every {
+            of_causes: self.of_causes(),
+            family: Some(self),
+            owner: None,
+            except: BTreeSet::new(),
         }
     }
+
+    /// This family's top over the state of one run, `WriteTxn(inv::*)`.
+    pub fn owned_top(self, owner: Owner) -> Every {
+        debug_assert!(
+            matches!(self, Family::ReadTxn | Family::WriteTxn),
+            "only a transactional family's top is a run's"
+        );
+        Every {
+            owner: Some(owner),
+            ..self.top()
+        }
+    }
+
+    /// Whether `item`, a requirement or an effect, is of this family.
+    fn has(self, item: &Capability) -> bool {
+        match (self, item) {
+            (Family::Read, Capability::Requires(r)) => r.requirement().trait_ == Trait::read(),
+            (Family::ReadTxn, Capability::Requires(r)) => {
+                r.requirement().trait_ == Trait::read_txn()
+            }
+            (Family::Write, Capability::Causes(Effect::Write(_)))
+            | (Family::WriteTxn, Capability::Causes(Effect::WriteTxn(_)))
+            | (Family::Append, Capability::Causes(Effect::Append(_))) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Family {
+    /// The name its capabilities are written with, `Write` in `Write(x)`.
+    fn name(self) -> &'static str {
+        match self {
+            Family::Read => "Read",
+            Family::Write => "Write",
+            Family::ReadTxn => "ReadTxn",
+            Family::WriteTxn => "WriteTxn",
+            Family::Append => "Append",
+        }
+    }
+}
+
+impl fmt::Display for Family {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}(*)", self.name())
+    }
+}
+
+/// The run whose transactional state a top of `ReadTxn` or `WriteTxn` holds, `inv` in
+/// `WriteTxn(inv::*)`: every transactional variable of the run and of the runs it declares
+/// (`docs/chl-spec.md`, "Writing requirements and effects").
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Owner {
+    /// A run, by its home. A shared import holds no transactional variable.
+    Home(Home),
+    /// The run a qualifier of the module being lowered reaches, a run it declares or a
+    /// Module-typed parameter, until creating a run of the module puts that run's home in its
+    /// place. Where the module is checked on its own a parameter's stays, and holds only
+    /// itself.
+    Qualifier(SmolStr),
+    /// `Module::*`: the module a Module type describes, until a parameter of that type puts
+    /// itself in its place.
+    Module,
+}
+
+impl Owner {
+    /// Whether this holds every variable `other` does.
+    fn contains(&self, other: &Owner) -> bool {
+        match (self, other) {
+            (Owner::Home(Home::Run(outer)), Owner::Home(Home::Run(inner))) => {
+                inner.is_within(outer)
+            }
+            (a, b) => a == b,
+        }
+    }
+
+    /// Whether `x`, a transactional variable, is this run's or one it declares.
+    fn holds_variable(&self, x: &Name) -> bool {
+        match (self, x.home()) {
+            (Owner::Home(Home::Run(outer)), Some(Home::Run(inner))) => inner.is_within(outer),
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for Owner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Owner::Home(home) => home.fmt(f),
+            Owner::Qualifier(q) => f.write_str(q),
+            Owner::Module => f.write_str("Module"),
+        }
+    }
+}
+
+/// A top written in a clause: `Effect` or `Context`, every capability of one direction, or a
+/// family's, `Write(*)`, every write; less what `except` takes away (`docs/chl-spec.md`,
+/// "Writing requirements and effects").
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Every {
+    /// Of effects rather than requirements.
+    pub of_causes: bool,
+    /// The family it holds, or `None` for every capability of its direction.
+    pub family: Option<Family>,
+    /// The run whose variables it holds, `inv` in `WriteTxn(inv::*)`, or `None` for every
+    /// variable's.
+    pub owner: Option<Owner>,
+    /// What it holds less: each a capability of its own, or a top of a family within it.
+    pub except: BTreeSet<Capability>,
+}
+
+impl Every {
+    /// `Effect` (`of_causes`) or `Context`, taking nothing away.
+    pub fn of_direction(of_causes: bool) -> Every {
+        Every {
+            of_causes,
+            family: None,
+            owner: None,
+            except: BTreeSet::new(),
+        }
+    }
+
+    /// How a clause writes this, less its `except`: `Effect`, `Write(*)` or `WriteTxn(inv::*)`.
+    fn head(&self) -> String {
+        match (self.family, &self.owner) {
+            (Some(family), Some(owner)) => format!("{}({owner}::*)", family.name()),
+            (Some(family), None) => family.to_string(),
+            (None, _) => (if self.of_causes { "Effect" } else { "Context" }).to_string(),
+        }
+    }
+
+    /// Whether this holds every variable `other`'s owner does.
+    fn owns(&self, other: &Option<Owner>) -> bool {
+        match (&self.owner, other) {
+            (None, _) => true,
+            (Some(a), Some(b)) => a.contains(b),
+            (Some(_), None) => false,
+        }
+    }
+
+    /// Whether this holds `item`: one of its direction and family that `except` does not take
+    /// away, or, for another top, one that holds nothing this does not.
+    pub fn holds(&self, item: &Capability) -> bool {
+        if item.of_causes() != self.of_causes {
+            return false;
+        }
+        match item {
+            Capability::Every(other) => {
+                let within = match (self.family, other.family) {
+                    (None, _) => true,
+                    (Some(f), Some(g)) => f == g,
+                    (Some(_), None) => false,
+                };
+                within && self.owns(&other.owner) && self.except.iter().all(|e| !other.overlaps(e))
+            }
+            // A clause variable stands for whatever its bound admits, so a top holds it only
+            // where the bound takes away all the top does.
+            Capability::Param(p) => {
+                self.family.is_none()
+                    && self
+                        .except
+                        .iter()
+                        .all(|e| taken_away(e, &p.param.clause_except) || taken_away(e, &p.except))
+            }
+            item => {
+                self.family.is_none_or(|f| f.has(item))
+                    && self
+                        .owner
+                        .as_ref()
+                        .is_none_or(|o| item.variable().is_some_and(|x| o.holds_variable(x)))
+                    && !taken_away(item, &self.except)
+            }
+        }
+    }
+
+    /// Whether this and `item` hold a capability in common: a top meets a family top unless
+    /// it takes the family away, since no list of capabilities exhausts a family.
+    pub fn overlaps(&self, item: &Capability) -> bool {
+        match item {
+            Capability::Every(other) => self.meet(other).is_some(),
+            item => self.holds(item),
+        }
+    }
+
+    /// Whether this holds a capability naming a mutable variable: a write or a read.
+    pub fn names_mutable_variables(&self) -> bool {
+        [Family::Read, Family::Write]
+            .into_iter()
+            .any(|f| self.overlaps(&Capability::Every(f.top())))
+    }
+
+    /// Whether this holds a capability naming a feed: an append.
+    pub fn names_feeds(&self) -> bool {
+        self.overlaps(&Capability::Every(Family::Append.top()))
+    }
+
+    /// This, taking away `except` instead, less what lies outside it.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
+                  and a trait hashes and orders by its module path and name"
+    )]
+    fn with_except(&self, except: BTreeSet<Capability>) -> Every {
+        let bare = Every {
+            except: BTreeSet::new(),
+            ..self.clone()
+        };
+        Every {
+            except: pruned(except.into_iter().filter(|e| bare.overlaps(e))),
+            ..bare
+        }
+    }
+
+    /// This with `items` taken away too.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
+                  and a trait hashes and orders by its module path and name"
+    )]
+    pub fn less(&self, items: impl IntoIterator<Item = Capability>) -> Every {
+        let mut except = self.except.clone();
+        except.extend(items);
+        self.with_except(except)
+    }
+
+    /// Whether `except` takes all of this away.
+    pub fn is_taken(&self) -> bool {
+        let bare = Every {
+            except: BTreeSet::new(),
+            ..self.clone()
+        };
+        taken_away(&Capability::Every(bare), &self.except)
+    }
+
+    /// The top holding what this or `other`, of its direction and family, holds: what both
+    /// take away.
+    fn join(&self, other: &Every) -> Every {
+        let kept = |a: &Every, b: &Every| {
+            a.except
+                .iter()
+                .filter(|e| taken_away(e, &b.except))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let mut except = kept(self, other);
+        except.extend(kept(other, self));
+        self.with_except(except.into_iter().collect())
+    }
+
+    /// The top holding what both this and `other` hold, `None` when they hold nothing in
+    /// common: the narrower family, less what either takes away.
+    pub fn meet(&self, other: &Every) -> Option<Every> {
+        if self.of_causes != other.of_causes {
+            return None;
+        }
+        let family = match (self.family, other.family) {
+            (None, f) | (f, None) => f,
+            (Some(f), Some(g)) if f == g => Some(f),
+            _ => return None,
+        };
+        let owner = if self.owns(&other.owner) {
+            other.owner.clone()
+        } else if other.owns(&self.owner) {
+            self.owner.clone()
+        } else {
+            return None;
+        };
+        let met = Every {
+            of_causes: self.of_causes,
+            family,
+            owner,
+            except: BTreeSet::new(),
+        }
+        .less(self.except.iter().chain(&other.except).cloned());
+        (!met.is_taken()).then_some(met)
+    }
+}
+
+/// `items` less each that another holds: one of two that hold each other, the first, stays.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
+              and a trait hashes and orders by its module path and name"
+)]
+pub fn pruned(items: impl IntoIterator<Item = Capability>) -> BTreeSet<Capability> {
+    let items: BTreeSet<Capability> = items.into_iter().collect();
+    let holds = |a: &Capability, b: &Capability| taken_away(b, &BTreeSet::from([a.clone()]));
+    items
+        .iter()
+        .filter(|e| {
+            !items
+                .iter()
+                .any(|f| f != *e && holds(f, e) && (!holds(e, f) || f < *e))
+        })
+        .cloned()
+        .collect()
+}
+
+/// ` except x` or ` except (x, y)` for what `except` takes away, and nothing when it takes
+/// nothing (`docs/chl-spec.md`, "Writing requirements and effects").
+#[expect(
+    clippy::mutable_key_type,
+    reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
+              and a trait hashes and orders by its module path and name"
+)]
+pub fn except_text(except: &BTreeSet<Capability>) -> String {
+    let taken: Vec<String> = except.iter().map(ToString::to_string).collect();
+    match taken.as_slice() {
+        [] => String::new(),
+        [one] => format!(" except {one}"),
+        many => format!(" except ({})", many.join(", ")),
+    }
+}
+
+/// Whether `except` takes `item` away: it lists it, or a top it lists holds it
+/// (`docs/chl-spec.md`, "Writing requirements and effects").
+#[expect(
+    clippy::mutable_key_type,
+    reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
+              and a trait hashes and orders by its module path and name"
+)]
+pub fn taken_away(item: &Capability, except: &BTreeSet<Capability>) -> bool {
+    except.iter().any(|e| match (e, item) {
+        (e, item) if e == item => true,
+        (Capability::Every(top), item) => top.holds(item),
+        // A clause variable holds itself less more than it takes away.
+        (Capability::Param(p), Capability::Param(q)) => {
+            p.param.id == q.param.id
+                && p.of_causes == q.of_causes
+                && p.except
+                    .iter()
+                    .all(|e| taken_away(e, &q.except) || taken_away(e, &q.param.clause_except))
+        }
+        _ => false,
+    })
 }
 
 /// The `requires` and `causes` clauses of a [`Type::Fun`](crate::ccl::Type::Fun).
@@ -419,6 +1039,27 @@ pub enum Repr {
     /// A set inference is still collecting (`src/ccl/design/type-inference.md`,
     /// "Capability variables").
     Var(Rc<CapabilityVar>),
+    /// Clauses as a program writes them, before inference reads them
+    /// ([`crate::ccl::infer`]'s `normalize_annotation`): a known set, or a variable holding
+    /// the set when a clause ends in `_`.
+    Written(Written),
+}
+
+/// The clauses a function type or a `def` writes (`docs/chl-spec.md`, "Writing requirements
+/// and effects").
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Written {
+    /// The requirements and effects the clauses list.
+    pub set: CapabilitySet,
+    /// Whether the `requires` clause, and the `causes` clause, admit what inference adds: a
+    /// written `_`, or a `def`'s clause without `only`.
+    pub open_requires: bool,
+    pub open_causes: bool,
+    /// Where the clauses are written, for the secondary label of a body that exceeds them.
+    pub at: chl_parser::ast::Span,
+    /// A `def`'s clauses, which the stamp on its body's lambda carries to the body's effect
+    /// variable (`Typing::function_body`). As an annotation the stamp states nothing.
+    pub of_def: bool,
 }
 
 /// One requirement or effect, as a [`CapabilityVar`] records it.
@@ -426,14 +1067,70 @@ pub enum Repr {
 pub enum Capability {
     Requires(Requirement),
     Causes(Effect),
+    /// A declared parameter of a definition being emitted, which stands rigidly for what
+    /// each use passes (`InferCtx::open_poly`).
+    Param(ClauseParam),
+    /// A top: `Effect` or `Context`, every capability of one direction, or a family's, less
+    /// what `except` takes away.
+    Every(Every),
+}
+
+impl Capability {
+    /// Whether this is an effect rather than a requirement.
+    pub fn of_causes(&self) -> bool {
+        match self {
+            Capability::Requires(_) => false,
+            Capability::Causes(_) => true,
+            Capability::Param(p) => p.of_causes,
+            Capability::Every(e) => e.of_causes,
+        }
+    }
 }
 
 /// A [`Capability`] with where the variable it names is bound, which decides the function bodies
 /// it leaves.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// Equality, ordering and hashing leave out [`at`](Self::at): where a capability entered does not
+/// make it another capability, and a set keeps the first place it entered.
+#[derive(Debug, Clone)]
 pub struct ScopedCapability {
     pub item: Capability,
     pub bound: Bound,
+    /// The node where the capability entered the variable holding it: the statement recording
+    /// it, or the call an edge carried it through. `None` for one a type states.
+    pub at: Option<NodeId>,
+}
+
+impl ScopedCapability {
+    fn key(&self) -> (&Capability, Bound) {
+        (&self.item, self.bound)
+    }
+}
+
+impl PartialEq for ScopedCapability {
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+
+impl Eq for ScopedCapability {}
+
+impl PartialOrd for ScopedCapability {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScopedCapability {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key().cmp(&other.key())
+    }
+}
+
+impl Hash for ScopedCapability {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key().hash(state);
+    }
 }
 
 /// Where the variable a [`ScopedCapability`] names is bound.
@@ -466,6 +1163,15 @@ pub struct Filter {
     /// Requirements the edge's context supplies, `Transaction` inside a `with begin():`
     /// body.
     pub discharges: BTreeSet<Requirement>,
+    /// The node the edge stands for, a call: each capability crossing it entered the receiving
+    /// variable there.
+    pub at: Option<NodeId>,
+    /// The items a written clause states beside the parameter the edge leads to: the
+    /// parameter stands for the rest of the clause, not for these.
+    pub stated: BTreeSet<Capability>,
+    /// What a clause's `except` takes out of the clause variable the edge leaves
+    /// (`docs/chl-spec.md`, "Writing requirements and effects").
+    pub except: BTreeSet<Capability>,
 }
 
 impl Filter {
@@ -476,11 +1182,57 @@ impl Filter {
             .is_none_or(|kind| kind.resolved().is_data())
     }
 
+    /// `capability` as it leaves this edge, or `None` where the edge stops it. A top passes less
+    /// what the edge discharges, as its items would (`docs/chl-spec.md`, "Discharging
+    /// requirements and effects"), and a top or a clause variable less what its `except` takes.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
+                  and a trait hashes and orders by its module path and name"
+    )]
+    pub fn pass(&self, capability: &ScopedCapability) -> Option<ScopedCapability> {
+        if !self.admits(capability) {
+            return None;
+        }
+        if let Capability::Param(p) = &capability.item {
+            if self.except.is_empty() {
+                return Some(capability.clone());
+            }
+            let except = pruned(p.except.iter().chain(&self.except).cloned());
+            return Some(ScopedCapability {
+                item: Capability::Param(ClauseParam {
+                    except,
+                    ..p.clone()
+                }),
+                ..capability.clone()
+            });
+        }
+        let Capability::Every(every) = &capability.item else {
+            return Some(capability.clone());
+        };
+        let discharged = self
+            .discharges
+            .iter()
+            .map(|r| Capability::Requires(r.clone()));
+        let passed = every.less(discharged.chain(self.except.iter().cloned()));
+        (!passed.is_taken()).then(|| ScopedCapability {
+            item: Capability::Every(passed),
+            ..capability.clone()
+        })
+    }
+
     /// Whether `capability` passes this edge.
     pub fn admits(&self, capability: &ScopedCapability) -> bool {
         if let Capability::Requires(r) = &capability.item
             && self.discharges.contains(r)
         {
+            return false;
+        }
+        // What a stated item holds is the position's own, whichever site it came from.
+        if taken_away(&capability.item, &self.stated) {
+            return false;
+        }
+        if taken_away(&capability.item, &self.except) {
             return false;
         }
         match (self.below, capability.bound) {
@@ -520,6 +1272,101 @@ pub struct CapabilityVar {
     own: RefCell<BTreeSet<ScopedCapability>>,
     incoming: RefCell<Vec<(Rc<CapabilityVar>, Filter)>>,
     resolved_at: RefCell<Option<(u64, BTreeSet<ScopedCapability>)>>,
+    /// The sets this variable may not exceed, checked once emission is complete
+    /// ([`exceeded_uppers`]).
+    uppers: RefCell<Vec<Upper>>,
+    /// Where the written function type this variable stands for is written, when a clause
+    /// of it ends in `_`, which a bounded clause it reaches then bounds
+    /// ([`CapabilityVar::bound_holes_reaching`]).
+    hole: Cell<Option<chl_parser::ast::Span>>,
+}
+
+/// A set a [`CapabilityVar`] may not exceed, and what a failure reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upper {
+    pub set: CapabilitySet,
+    /// Whether the bound holds of the requirements, and of the effects: a `def` may write
+    /// `only` on one clause and leave the other a lower bound.
+    pub of_requires: bool,
+    pub of_causes: bool,
+    pub blame: Blame,
+}
+
+impl Upper {
+    /// Whether `item` is within this bound.
+    pub fn admits(&self, item: &Capability) -> bool {
+        let of_causes = item.of_causes();
+        let bounded = if of_causes {
+            self.of_causes
+        } else {
+            self.of_requires
+        };
+        !bounded || self.set.states(item)
+    }
+}
+
+/// Where a failed [`Upper`] is written. The first capability beyond it is reported at the node
+/// where it entered the variable, with this as the secondary label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Blame {
+    /// A `def`'s `only` clause.
+    Clause(chl_parser::ast::Span),
+    /// A written function type, whose clauses are exact.
+    Written(chl_parser::ast::Span),
+    /// A clause variable's bound, `E <: Effect except RunTransaction`, which each use's
+    /// argument meets.
+    Bound(chl_parser::ast::Span),
+}
+
+/// An [`Upper`] that a variable's capabilities exceed.
+#[derive(Debug, Clone)]
+pub struct Exceeded {
+    /// The first capability beyond the bound.
+    pub capability: ScopedCapability,
+    pub blame: Blame,
+}
+
+thread_local! {
+    /// Every capability variable with an upper bound in the active inference run, with the
+    /// lifetime of `crate::ccl::infer_var`'s arenas. `None` outside a run, where an upper
+    /// bound records nowhere and is not checked.
+    static UPPER_ARENA: RefCell<Option<Vec<Rc<CapabilityVar>>>> = const { RefCell::new(None) };
+}
+
+/// Begin collecting the capability variables given an upper bound.
+pub(crate) fn upper_arena_enter() {
+    UPPER_ARENA.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stop collecting, and drop each variable's upper bounds.
+pub(crate) fn upper_arena_exit() {
+    for var in UPPER_ARENA.with(|slot| slot.borrow_mut().take().unwrap_or_default()) {
+        var.uppers.borrow_mut().clear();
+    }
+}
+
+/// Each upper bound of the active run that its variable's capabilities exceed, in the order the
+/// bounds were recorded.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
+              and a trait hashes and orders by its module path and name"
+)]
+pub(crate) fn exceeded_uppers() -> Vec<Exceeded> {
+    let vars = UPPER_ARENA.with(|slot| slot.borrow().clone().unwrap_or_default());
+    let mut out = Vec::new();
+    for var in vars {
+        let capabilities = var.resolved();
+        for upper in var.uppers.borrow().iter() {
+            if let Some(capability) = capabilities.iter().find(|l| !upper.admits(&l.item)) {
+                out.push(Exceeded {
+                    capability: capability.clone(),
+                    blame: upper.blame,
+                });
+            }
+        }
+    }
+    out
 }
 
 impl CapabilityVar {
@@ -530,7 +1377,121 @@ impl CapabilityVar {
             own: RefCell::new(BTreeSet::new()),
             incoming: RefCell::new(Vec::new()),
             resolved_at: RefCell::new(None),
+            uppers: RefCell::new(Vec::new()),
+            hole: Cell::new(None),
         })
+    }
+
+    /// Mark this variable as a written function type's whose clause ends in `_`, written at
+    /// `at`.
+    pub fn mark_hole(&self, at: chl_parser::ast::Span) {
+        self.hole.set(Some(at));
+    }
+
+    /// Bound each hole flowing into this variable by this variable's bounds, through the
+    /// edges between: a `_` whose capabilities reach a bounded clause admits only what that
+    /// clause does, besides what an edge on the way discharges, so each use's argument meets
+    /// the bound where it is passed (`docs/chl-spec.md`, "Writing requirements and effects").
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "a `Requirement` reaches a `Type` only through its trait declaration, and a \
+                  trait hashes and orders by its module path and name"
+    )]
+    pub fn bound_holes_reaching(self: &Rc<Self>) {
+        let uppers = self.uppers();
+        if uppers.is_empty() {
+            return;
+        }
+        // Each variable reaching this one, with the requirements every path from it discharges.
+        let mut reached: HashMap<CapabilityVarId, (Rc<CapabilityVar>, BTreeSet<Requirement>)> =
+            HashMap::new();
+        let mut stack = vec![(Rc::clone(self), BTreeSet::new())];
+        while let Some((w, discharged)) = stack.pop() {
+            for (source, filter) in w.incoming() {
+                let mut on_path = discharged.clone();
+                on_path.extend(filter.discharges.iter().cloned());
+                let updated = match reached.get_mut(&source.uid) {
+                    Some((_, seen)) => {
+                        let met: BTreeSet<Requirement> =
+                            seen.intersection(&on_path).cloned().collect();
+                        let changed = met.len() < seen.len();
+                        *seen = met.clone();
+                        changed.then_some(met)
+                    }
+                    None => {
+                        reached.insert(source.uid, (Rc::clone(&source), on_path.clone()));
+                        Some(on_path)
+                    }
+                };
+                if let Some(discharged) = updated {
+                    stack.push((source, discharged));
+                }
+            }
+        }
+        for (hole, discharged) in reached.into_values() {
+            let Some(at) = hole.hole.get() else {
+                continue;
+            };
+            let (requires_closed, causes_closed) = hole.closed();
+            for upper in &uppers {
+                let of_requires = upper.of_requires && !requires_closed;
+                let of_causes = upper.of_causes && !causes_closed;
+                if !(of_requires || of_causes) {
+                    continue;
+                }
+                let mut set = upper.set.clone();
+                set.requires.extend(discharged.iter().cloned());
+                // The hole holds what the bound admits, as an exact clause holds what it lists,
+                // so the type it stands in states what a use may pass: a clause variable the
+                // bound names as its rigid capability, which each use's copy leaves out.
+                for item in set.items() {
+                    let side = if item.of_causes() {
+                        of_causes
+                    } else {
+                        of_requires
+                    };
+                    if side {
+                        hole.record(ScopedCapability {
+                            item,
+                            bound: Bound::Escaping,
+                            at: None,
+                        });
+                    }
+                }
+                hole.bound_above(Upper {
+                    set,
+                    of_requires,
+                    of_causes,
+                    blame: Blame::Written(at),
+                });
+            }
+        }
+    }
+
+    /// Bound this variable by `upper`. A set already bounding it is not recorded again, so
+    /// a `def`'s `only` clause and the annotation stamping it report once.
+    pub fn bound_above(self: &Rc<Self>, upper: Upper) {
+        let mut uppers = self.uppers.borrow_mut();
+        if uppers.iter().any(|u| {
+            u.set == upper.set
+                && u.of_requires == upper.of_requires
+                && u.of_causes == upper.of_causes
+        }) {
+            return;
+        }
+        if uppers.is_empty() {
+            UPPER_ARENA.with(|slot| {
+                if let Some(arena) = slot.borrow_mut().as_mut() {
+                    arena.push(Rc::clone(self));
+                }
+            });
+        }
+        uppers.push(upper);
+    }
+
+    /// The sets bounding this variable.
+    pub fn uppers(&self) -> Vec<Upper> {
+        self.uppers.borrow().clone()
     }
 
     pub fn level(&self) -> Level {
@@ -616,10 +1577,26 @@ impl CapabilityVar {
                     if !filter.holds() {
                         continue;
                     }
+                    // A variable a written function type bounds passes on only what the type
+                    // states: a capability beyond it is reported where it meets the type, and
+                    // stops there rather than reaching every variable downstream as a second
+                    // error. A `def`'s `only` clause passes on what its body does, which a
+                    // caller's constructs, a `try` say, still read.
+                    let written: Vec<Upper> = src
+                        .uppers
+                        .borrow()
+                        .iter()
+                        .filter(|u| matches!(u.blame, Blame::Written(_)))
+                        .cloned()
+                        .collect();
                     let flowing: Vec<ScopedCapability> = sets[&src.uid]
                         .iter()
-                        .filter(|l| filter.admits(l))
-                        .cloned()
+                        .filter(|l| written.iter().all(|u| u.admits(&l.item)))
+                        .filter_map(|l| filter.pass(l))
+                        .map(|l| ScopedCapability {
+                            at: filter.at.or(l.at),
+                            ..l
+                        })
                         .collect();
                     let into = sets.get_mut(&id).expect("every reached variable has a set");
                     for l in flowing {
@@ -634,6 +1611,31 @@ impl CapabilityVar {
         let out = sets.remove(&self.uid).expect("the variable's own set");
         *self.resolved_at.borrow_mut() = Some((now, out.clone()));
         out
+    }
+
+    /// This variable and every variable flowing into it, through edges whose filters hold
+    /// or do not.
+    pub fn reaching(self: &Rc<Self>) -> BTreeMap<CapabilityVarId, Rc<CapabilityVar>> {
+        let mut out = BTreeMap::new();
+        let mut stack = vec![Rc::clone(self)];
+        while let Some(v) = stack.pop() {
+            if out.contains_key(&v.uid) {
+                continue;
+            }
+            stack.extend(v.incoming().into_iter().map(|(w, _)| w));
+            out.insert(v.uid, v);
+        }
+        out
+    }
+
+    /// Whether an upper bound closes the requirements, and the effects, this variable
+    /// holds: a written clause without `_` states them exactly.
+    pub fn closed(&self) -> (bool, bool) {
+        let uppers = self.uppers.borrow();
+        (
+            uppers.iter().any(|u| u.of_requires),
+            uppers.iter().any(|u| u.of_causes),
+        )
     }
 
     /// Whether `pred` holds of this variable or of any variable flowing into it.
@@ -693,6 +1695,55 @@ impl Hash for CapabilityVar {
     }
 }
 
+/// Each use of a polymorphic definition, by its node: the copies its instantiation made of the
+/// definition's capability variables, which a specialization the use mints takes for its own nodes
+/// (`src/ccl/design/type-inference.md`, "Capabilities on every expression").
+///
+/// A copy holds what the use's arguments bring where the definition's effect parameters stand,
+/// which a fresh copy of the definition's variable does not.
+#[derive(Debug, Default)]
+pub struct UseCapabilities {
+    uses: HashMap<NodeId, HashMap<CapabilityVarId, Rc<CapabilityVar>>>,
+}
+
+impl UseCapabilities {
+    /// The use at `node` instantiated its definition with `copies`.
+    pub fn record_use(
+        &mut self,
+        node: NodeId,
+        copies: &HashMap<CapabilityVarId, Rc<CapabilityVar>>,
+    ) {
+        if !copies.is_empty() {
+            self.uses.insert(node, copies.clone());
+        }
+    }
+
+    /// The copies the use at `node` made, which the specialization it mints takes in place of
+    /// fresh ones.
+    pub fn copies(&self, node: NodeId) -> HashMap<CapabilityVarId, Rc<CapabilityVar>> {
+        self.uses.get(&node).cloned().unwrap_or_default()
+    }
+
+    /// A specialization was minted whose nodes are copies of its definition's, each by its
+    /// original in `origins`, and whose capability variables are `freshened`'s copies of theirs:
+    /// each use in it records the specialization's copies of its original's copies, which hold
+    /// what the specialization's own use brings, so a specialization it mints in turn takes
+    /// those.
+    pub fn specialize(
+        &mut self,
+        origins: &HashMap<NodeId, NodeId>,
+        freshened: &HashMap<CapabilityVarId, Rc<CapabilityVar>>,
+    ) {
+        let at = |var: &Rc<CapabilityVar>| Rc::clone(freshened.get(&var.uid).unwrap_or(var));
+        for (clone, original) in origins {
+            if let Some(inner) = self.uses.get(original) {
+                let inner = inner.iter().map(|(id, var)| (*id, at(var))).collect();
+                self.uses.insert(*clone, inner);
+            }
+        }
+    }
+}
+
 /// The set a group of capabilities states, without the depths that only inference reads.
 #[expect(
     clippy::mutable_key_type,
@@ -709,9 +1760,13 @@ pub fn set_of(capabilities: &BTreeSet<ScopedCapability>) -> CapabilitySet {
             Capability::Causes(e) => {
                 set.causes.insert(e.clone());
             }
+            Capability::Param(p) => {
+                set.params.insert(p.clone());
+            }
+            Capability::Every(every) => set.add_every(every.clone()),
         }
     }
-    set
+    set.normalized()
 }
 
 impl Capabilities {
@@ -731,6 +1786,10 @@ impl Capabilities {
         Capabilities(Rc::new(Repr::Var(v)))
     }
 
+    pub fn written(written: Written) -> Capabilities {
+        Capabilities(Rc::new(Repr::Written(written)))
+    }
+
     pub fn repr(&self) -> &Repr {
         &self.0
     }
@@ -740,6 +1799,7 @@ impl Capabilities {
         match self.repr() {
             Repr::Known(set) => set.is_empty(),
             Repr::Var(v) => v.resolved().is_empty(),
+            Repr::Written(w) => w.set.is_empty() && !w.open_requires && !w.open_causes,
         }
     }
 
@@ -748,6 +1808,7 @@ impl Capabilities {
         match self.repr() {
             Repr::Known(set) => set.clone(),
             Repr::Var(v) => set_of(&v.resolved()),
+            Repr::Written(w) => w.set.clone(),
         }
     }
 
@@ -759,9 +1820,11 @@ impl Capabilities {
             .iter()
             .map(|r| Capability::Requires(r.clone()))
             .chain(set.causes.iter().map(|e| Capability::Causes(e.clone())))
+            .chain(set.tops.iter().cloned().map(Capability::Every))
             .map(|item| ScopedCapability {
                 item,
                 bound: Bound::Escaping,
+                at: None,
             })
             .collect()
     }
@@ -769,7 +1832,7 @@ impl Capabilities {
     /// The level of a variable, and 0 for a known set.
     pub fn level(&self) -> Level {
         match self.repr() {
-            Repr::Known(_) => 0,
+            Repr::Known(_) | Repr::Written(_) => 0,
             Repr::Var(v) => v.level(),
         }
     }
@@ -798,6 +1861,99 @@ impl fmt::Display for Effect {
     }
 }
 
+impl Capability {
+    /// The variable this names: `x` in `Write(x)`, `WriteTxn(x)`, `Append(x)`, `Read(x)` and
+    /// `ReadTxn(x)`.
+    pub fn variable(&self) -> Option<&Name> {
+        match self {
+            Capability::Requires(r) => r.requirement().terms.first(),
+            Capability::Causes(Effect::Write(x) | Effect::WriteTxn(x) | Effect::Append(x)) => {
+                Some(x)
+            }
+            Capability::Causes(Effect::RunTransaction | Effect::AffectWorld)
+            | Capability::Param(_)
+            | Capability::Every(_) => None,
+        }
+    }
+}
+
+impl Written {
+    /// These clauses with `f` applied to each variable they name.
+    pub fn map_names(&self, mut f: impl FnMut(&Name) -> Name) -> Written {
+        let causes = self
+            .set
+            .causes
+            .iter()
+            .map(|e| match e {
+                Effect::Write(x) => Effect::Write(f(x)),
+                Effect::WriteTxn(x) => Effect::WriteTxn(f(x)),
+                Effect::Append(x) => Effect::Append(f(x)),
+                Effect::RunTransaction | Effect::AffectWorld => e.clone(),
+            })
+            .collect();
+        Written {
+            set: CapabilitySet {
+                requires: self
+                    .set
+                    .requires
+                    .iter()
+                    .map(|r| r.map_terms(&mut f))
+                    .collect(),
+                causes,
+                ..self.set.clone()
+            },
+            ..self.clone()
+        }
+        .map_except_names(f)
+    }
+
+    /// These clauses with `f` applied to each variable what their `except` takes away names.
+    fn map_except_names(mut self, mut f: impl FnMut(&Name) -> Name) -> Written {
+        let mut item = |item: &Capability| match item {
+            Capability::Causes(Effect::Write(x)) => Capability::Causes(Effect::Write(f(x))),
+            Capability::Causes(Effect::WriteTxn(x)) => Capability::Causes(Effect::WriteTxn(f(x))),
+            Capability::Causes(Effect::Append(x)) => Capability::Causes(Effect::Append(f(x))),
+            Capability::Requires(r) => Capability::Requires(r.map_terms(&mut f)),
+            item => item.clone(),
+        };
+        self.set.params = self
+            .set
+            .params
+            .iter()
+            .map(|p| ClauseParam {
+                except: p.except.iter().map(&mut item).collect(),
+                ..p.clone()
+            })
+            .collect();
+        self.set.tops = self
+            .set
+            .tops
+            .iter()
+            .map(|t| Every {
+                except: t.except.iter().map(&mut item).collect(),
+                ..t.clone()
+            })
+            .collect();
+        self
+    }
+
+    /// Each requirement and effect the clauses list.
+    pub fn items(&self) -> impl Iterator<Item = Capability> + '_ {
+        self.set.items()
+    }
+}
+
+impl fmt::Display for Capability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Capability::Requires(r) => r.fmt(f),
+            Capability::Causes(e) => e.fmt(f),
+            Capability::Param(p) => write!(f, "{}{}", p.param.spelling, except_text(&p.except)),
+            Capability::Every(every) => write!(f, "{}{}", every.head(), except_text(&every.except)),
+        }
+    }
+}
+
 /// The clauses as a function type writes them after its codomain: ` requires …` and
 /// ` causes …`, each left out when empty.
 impl fmt::Display for Capabilities {
@@ -809,10 +1965,88 @@ impl fmt::Display for Capabilities {
 /// The clauses after a function type's codomain: `traits` and the context requirements in
 /// one `requires` clause, then the `causes` clause (`docs/chl-spec.md`, "Writing requirements
 /// and effects"). A polymorphic type passes its trait requirements as `traits`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
+              and a trait hashes and orders by its module path and name"
+)]
 pub fn clauses(mut traits: Vec<String>, capabilities: &Capabilities) -> String {
-    let set = capabilities.set();
+    let set = capabilities.set().normalized();
     traits.extend(set.requires.iter().map(ToString::to_string));
-    let causes: Vec<String> = set.causes.iter().map(ToString::to_string).collect();
+    traits.extend(set.named_requires.iter().map(ToString::to_string));
+    let mut causes: Vec<String> = set.causes.iter().map(ToString::to_string).collect();
+    causes.extend(set.named_causes.iter().map(ToString::to_string));
+    // A clause's `except` takes from each of its variables and tops what lies within it, so it
+    // ends the clause after the tops. One every variable takes away is the clause's, and a
+    // variable or top taking away other than that stands in parentheses with its own.
+    let written = match capabilities.repr() {
+        Repr::Written(w) => Some(w),
+        _ => None,
+    };
+    for (of_causes, clause) in [(false, &mut traits), (true, &mut causes)] {
+        let params: Vec<&ClauseParam> = set
+            .params
+            .iter()
+            .filter(|p| p.of_causes == of_causes)
+            .collect();
+        // A variable a rendering has not named, which only a type printed mid-inference holds,
+        // and a written clause's `_`, take nothing away.
+        let unnamed: Vec<String> = if of_causes {
+            set.vars.values().map(|v| format!("{v:?}")).collect()
+        } else {
+            Vec::new()
+        };
+        let hole = written.is_some_and(|w| {
+            if of_causes {
+                w.open_causes
+            } else {
+                w.open_requires
+            }
+        });
+        let named = if of_causes {
+            &set.named_causes
+        } else {
+            &set.named_requires
+        };
+        let whole = hole || !unnamed.is_empty() || !named.is_empty();
+        let shared = match params.first() {
+            Some(first) if !whole && params.iter().all(|p| p.except == first.except) => {
+                first.except.clone()
+            }
+            _ => BTreeSet::new(),
+        };
+        for p in &params {
+            clause.push(if p.except == shared {
+                p.param.spelling.to_string()
+            } else {
+                format!("({}{})", p.param.spelling, except_text(&p.except))
+            });
+        }
+        clause.extend(unnamed);
+        if hole {
+            clause.push("_".to_string());
+        }
+        let has_variables = whole || !params.is_empty();
+        let mut except = shared.clone();
+        for top in set.tops_of(of_causes) {
+            let name = top.head();
+            let bare = Every {
+                except: BTreeSet::new(),
+                ..top.clone()
+            };
+            if !has_variables {
+                clause.push(name);
+                except.extend(top.except.iter().cloned());
+            } else if bare.less(shared.iter().cloned()) == *top {
+                clause.push(name);
+            } else {
+                clause.push(format!("({name}{})", except_text(&top.except)));
+            }
+        }
+        if let Some(last) = clause.last_mut() {
+            last.push_str(&except_text(&except));
+        }
+    }
     let mut out = String::new();
     if !traits.is_empty() {
         out.push_str(" requires ");
@@ -823,6 +2057,130 @@ pub fn clauses(mut traits: Vec<String>, capabilities: &Capabilities) -> String {
         out.push_str(&causes.join(", "));
     }
     out
+}
+
+/// `ty` with each owner of a top its written clauses hold, `inv` in `WriteTxn(inv::*)`,
+/// replaced by what `f` gives for it, where it gives one: a Module type's `Module::*` by the
+/// parameter it types, and a qualifier by the run it reaches once a run of its module is
+/// created.
+pub fn replace_owners(ty: &mut crate::ccl::Type, f: &impl Fn(&Owner) -> Option<Owner>) {
+    fn in_item(item: &Capability, f: &impl Fn(&Owner) -> Option<Owner>) -> Capability {
+        match item {
+            Capability::Every(top) => Capability::Every(in_top(top, f)),
+            item => item.clone(),
+        }
+    }
+    fn in_top(top: &Every, f: &impl Fn(&Owner) -> Option<Owner>) -> Every {
+        Every {
+            owner: top
+                .owner
+                .as_ref()
+                .map(|o| f(o).unwrap_or_else(|| o.clone())),
+            except: top.except.iter().map(|e| in_item(e, f)).collect(),
+            ..top.clone()
+        }
+    }
+    if let crate::ccl::Type::Fun { capabilities, .. } = ty
+        && let Repr::Written(written) = capabilities.repr()
+    {
+        let mut written = written.clone();
+        written.set.tops = written.set.tops.iter().map(|t| in_top(t, f)).collect();
+        written.set.params = written
+            .set
+            .params
+            .iter()
+            .map(|p| ClauseParam {
+                except: p.except.iter().map(|e| in_item(e, f)).collect(),
+                ..p.clone()
+            })
+            .collect();
+        *capabilities = Capabilities::written(written);
+    }
+    ty.walk_children_mut(|child| replace_owners(child, f));
+}
+
+/// `ty` as a module's interface writes it, with its own state as `Module::*`: each `ReadTxn(x)`
+/// and `WriteTxn(x)` whose `x` is `own`, a variable no other module can name, and each top over
+/// a run the module declares, which no other module can name either
+/// (`docs/chl-spec.md`, "9.14 Checking a module on its own").
+pub fn own_state_as_module(ty: &mut crate::ccl::Type, own: &impl Fn(&Name) -> bool) {
+    if let crate::ccl::Type::Fun { capabilities, .. } = ty {
+        let set = capabilities.set();
+        let hidden = |item: &Capability| match item {
+            Capability::Causes(Effect::WriteTxn(x)) => own(x),
+            Capability::Requires(r) if r.requirement().trait_ == Trait::read_txn() => {
+                r.requirement().terms.first().is_some_and(own)
+            }
+            Capability::Every(top) => matches!(top.owner, Some(Owner::Home(Home::Run(_)))),
+            _ => false,
+        };
+        if set.items().any(|item| hidden(&item)) {
+            let mut out = CapabilitySet {
+                requires: BTreeSet::new(),
+                causes: BTreeSet::new(),
+                tops: BTreeSet::new(),
+                ..set.clone()
+            };
+            for item in set.items() {
+                match item {
+                    Capability::Every(top) if hidden(&Capability::Every(top.clone())) => {
+                        out.add_every(Every {
+                            owner: Some(Owner::Module),
+                            ..top
+                        });
+                    }
+                    item if hidden(&item) => {
+                        let family = if item.of_causes() {
+                            Family::WriteTxn
+                        } else {
+                            Family::ReadTxn
+                        };
+                        out.add_every(family.owned_top(Owner::Module));
+                    }
+                    Capability::Requires(r) => {
+                        out.requires.insert(r);
+                    }
+                    Capability::Causes(e) => {
+                        out.causes.insert(e);
+                    }
+                    Capability::Every(top) => out.add_every(top),
+                    Capability::Param(_) => {}
+                }
+            }
+            *capabilities = Capabilities::known(out.normalized());
+        }
+    }
+    ty.walk_children_mut(|child| own_state_as_module(child, own));
+}
+
+/// The highest level of a capability variable standing at an input of `ty`: in a function type
+/// at a negative position, as a parameter's type is. A definition whose parameter's clause is
+/// left open by its body is polymorphic in it, as it is in an open type
+/// (`docs/chl-spec.md`, "Writing requirements and effects"), and `type_level` leaves capabilities
+/// out.
+pub fn input_capability_level(ty: &crate::ccl::Type) -> Level {
+    fn go(ty: &crate::ccl::Type, positive: bool) -> Level {
+        match ty {
+            crate::ccl::Type::Fun {
+                domain,
+                codomain,
+                capabilities,
+                ..
+            } => {
+                let own = match capabilities.repr() {
+                    Repr::Var(v) if !positive => v.level(),
+                    _ => 0,
+                };
+                own.max(go(domain, !positive)).max(go(codomain, positive))
+            }
+            other => {
+                let mut level = 0;
+                other.walk_children(|child| level = level.max(go(child, positive)));
+                level
+            }
+        }
+    }
+    go(ty, true)
 }
 
 /// Lower every capability variable in `ty` to at most `level`: `ty` is becoming a bound of a
@@ -857,5 +2215,250 @@ mod tests {
         requirements.sort();
         let written: Vec<String> = requirements.iter().map(ToString::to_string).collect();
         assert_eq!(written, ["Transaction", "ObserveWorld", "Read(x)"]);
+    }
+
+    fn write(x: &str) -> Capability {
+        Capability::Causes(Effect::Write(Name::from(x)))
+    }
+
+    fn top(family: Family) -> Capability {
+        Capability::Every(family.top())
+    }
+
+    fn effect() -> Every {
+        Every::of_direction(true)
+    }
+
+    /// The clauses `items` print as, normalized.
+    fn printed(items: impl IntoIterator<Item = Capability>) -> String {
+        clauses(Vec::new(), &Capabilities::known(set_of(&items_at(items))))
+    }
+
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
+                  and a trait hashes and orders by its module path and name"
+    )]
+    fn items_at(items: impl IntoIterator<Item = Capability>) -> BTreeSet<ScopedCapability> {
+        items
+            .into_iter()
+            .map(|item| ScopedCapability {
+                item,
+                bound: Bound::Escaping,
+                at: None,
+            })
+            .collect()
+    }
+
+    /// `Effect` and `Context` hold every capability of their direction, a family's top every
+    /// capability of the family, and nothing of the other direction.
+    #[test]
+    fn a_top_holds_its_family() {
+        let context = Every::of_direction(false);
+        let read = Capability::Requires(Requirement::read(Name::from("x")));
+        assert!(effect().holds(&top(Family::Write)));
+        assert!(Family::Write.top().holds(&write("x")));
+        assert!(!Family::Write.top().holds(&Capability::Every(effect())));
+        assert!(!Family::Write.top().holds(&top(Family::Append)));
+        assert!(
+            !Family::Write
+                .top()
+                .holds(&Capability::Causes(Effect::RunTransaction))
+        );
+        assert!(context.holds(&top(Family::Read)));
+        assert!(Family::Read.top().holds(&read));
+        assert!(
+            !Family::Read
+                .top()
+                .holds(&Capability::Requires(Requirement::transaction()))
+        );
+        assert!(!effect().holds(&read));
+        assert!(!context.holds(&write("x")));
+    }
+
+    /// A run's top, `WriteTxn(h::*)`, holds a write to each transactional variable of the run
+    /// and of the runs it declares, and no other: the global top holds it, and two runs' tops
+    /// meet only where one run is within the other.
+    #[test]
+    fn a_runs_top_holds_its_state() {
+        let run = |path: &[&str]| {
+            path.iter()
+                .fold(crate::ccl::RunPath::default(), |p, s| p.child(*s))
+        };
+        let var = |path: &[&str]| {
+            Name::fresh_in("stock", Some(std::sync::Arc::new(Home::Run(run(path)))))
+        };
+        let write = |x: Name| Capability::Causes(Effect::WriteTxn(x));
+        let of = |path: &[&str]| Family::WriteTxn.owned_top(Owner::Home(Home::Run(run(path))));
+        assert!(of(&["h"]).holds(&write(var(&["h"]))));
+        assert!(of(&["h"]).holds(&write(var(&["h", "inv"]))));
+        assert!(!of(&["h"]).holds(&write(var(&["l"]))));
+        assert!(!of(&["h", "inv"]).holds(&write(var(&["h"]))));
+        assert!(!of(&["h"]).holds(&write(Name::from("stock"))));
+        assert!(Family::WriteTxn.top().holds(&Capability::Every(of(&["h"]))));
+        assert!(!of(&["h"]).holds(&top(Family::WriteTxn)));
+        assert!(of(&["h"]).holds(&Capability::Every(of(&["h", "inv"]))));
+        assert_eq!(of(&["h"]).meet(&of(&["h", "inv"])), Some(of(&["h", "inv"])));
+        assert_eq!(of(&["h"]).meet(&of(&["l"])), None);
+        let abstract_ = Family::WriteTxn.owned_top(Owner::Qualifier("p".into()));
+        assert!(!abstract_.holds(&write(var(&["h"]))));
+        assert!(abstract_.holds(&Capability::Every(abstract_.clone())));
+        assert_eq!(
+            Capability::Every(of(&["h", "inv"])).to_string(),
+            "WriteTxn(h::inv::*)"
+        );
+    }
+
+    /// `except` takes away within a top what the top holds: a capability, or a family's top and
+    /// all it holds; a top taking away one capability of a family still meets the family.
+    #[test]
+    fn except_takes_away_within_a_top() {
+        let no_writes = effect().less([top(Family::Write)]);
+        assert!(!no_writes.holds(&write("x")));
+        assert!(!no_writes.overlaps(&top(Family::Write)));
+        assert!(no_writes.holds(&top(Family::Append)));
+        let no_x = effect().less([write("x")]);
+        assert!(!no_x.holds(&write("x")));
+        assert!(no_x.holds(&write("y")));
+        assert!(no_x.overlaps(&top(Family::Write)));
+        assert!(!no_x.holds(&top(Family::Write)));
+        assert!(no_x.holds(&Capability::Every(Family::Write.top().less([write("x")]))));
+        // What lies outside a top is not kept as taken from it.
+        assert!(
+            Family::Write
+                .top()
+                .less([top(Family::Append)])
+                .except
+                .is_empty()
+        );
+    }
+
+    /// The meet of two tops holds what both hold, and none where their families differ.
+    #[test]
+    fn tops_meet_exactly() {
+        let met = effect().less([write("x")]).meet(&Family::Write.top());
+        assert_eq!(met, Some(Family::Write.top().less([write("x")])));
+        assert_eq!(Family::Write.top().meet(&Family::Append.top()), None);
+        assert_eq!(
+            effect()
+                .less([top(Family::Write)])
+                .meet(&Family::Write.top()),
+            None
+        );
+    }
+
+    /// A set prints what it holds once: a capability or a top another top holds is left out,
+    /// and what one top takes away and another holds is held.
+    #[test]
+    fn a_set_holds_what_its_tops_hold() {
+        assert_eq!(
+            printed([write("x"), top(Family::Write)]),
+            " causes Write(*)"
+        );
+        assert_eq!(
+            printed([Capability::Every(effect()), top(Family::Write)]),
+            " causes Effect"
+        );
+        assert_eq!(
+            printed([Capability::Every(effect().less([write("x")])), write("x")]),
+            " causes Effect"
+        );
+        assert_eq!(
+            printed([
+                Capability::Every(effect().less([top(Family::Write)])),
+                Capability::Every(Family::Write.top().less([write("x")])),
+            ]),
+            " causes Effect except Write(x)"
+        );
+        assert_eq!(
+            printed([
+                Capability::Every(effect().less([top(Family::Write)])),
+                write("x")
+            ]),
+            " causes Write(x), Effect except Write(*)"
+        );
+    }
+
+    /// An intersection holds each capability one set lists and the other holds through a top.
+    #[test]
+    fn an_intersection_is_exact() {
+        let set = |items: Vec<Capability>| set_of(&items_at(items));
+        let both = set(vec![Capability::Every(effect())]).intersection(&set(vec![write("x")]));
+        assert_eq!(both, set(vec![write("x")]));
+        let both = set(vec![Capability::Every(effect().less([write("x")]))])
+            .intersection(&set(vec![top(Family::Write)]));
+        assert_eq!(
+            both,
+            set(vec![Capability::Every(
+                Family::Write.top().less([write("x")])
+            )])
+        );
+    }
+
+    /// A clause variable stands for whatever its bound admits, so a top holds it only where the
+    /// bound takes away all the top does.
+    #[test]
+    fn a_top_holds_a_clause_variable_within_its_bound() {
+        let variable = |bound: BTreeSet<Capability>, own: BTreeSet<Capability>| {
+            Capability::Param(ClauseParam {
+                except: own,
+                ..ClauseParam::whole(crate::ccl::ty::TypeParam::declared_except("E", bound), true)
+            })
+        };
+        let commits = Capability::Causes(Effect::RunTransaction);
+        let none = BTreeSet::new;
+        let no_commit = effect().less([commits.clone()]);
+        assert!(effect().holds(&variable(none(), none())));
+        assert!(!no_commit.holds(&variable(none(), none())));
+        assert!(no_commit.holds(&variable([commits.clone()].into(), none())));
+        assert!(no_commit.holds(&variable(none(), [commits.clone()].into())));
+        assert!(!Family::Write.top().holds(&variable(none(), none())));
+    }
+
+    /// A clause variable holds itself less more: `E` holds `E except RunTransaction`, and not the
+    /// other way round.
+    #[test]
+    fn a_clause_variable_holds_itself_less_more() {
+        let param = crate::ccl::ty::TypeParam::declared("E");
+        let whole = ClauseParam::whole(Rc::clone(&param), true);
+        let less = ClauseParam {
+            except: [Capability::Causes(Effect::RunTransaction)].into(),
+            ..whole.clone()
+        };
+        let set = |p: &ClauseParam| BTreeSet::from([Capability::Param(p.clone())]);
+        assert!(taken_away(&Capability::Param(less.clone()), &set(&whole)));
+        assert!(!taken_away(&Capability::Param(whole.clone()), &set(&less)));
+        assert_eq!(
+            printed([Capability::Param(whole), Capability::Param(less)]),
+            " causes E"
+        );
+    }
+
+    /// What `except` takes away is kept once: an item another item holds is left out.
+    #[test]
+    fn except_keeps_what_no_other_item_holds() {
+        let less = effect().less([write("x"), top(Family::Write)]);
+        assert_eq!(less.except, [top(Family::Write)].into());
+    }
+
+    /// An edge taking a family away stops that family's top and passes `Effect` less it.
+    #[test]
+    fn an_edge_taking_a_family_away_stops_its_top() {
+        let filter = Filter {
+            except: [top(Family::Write)].into(),
+            ..Filter::default()
+        };
+        let at = |item| ScopedCapability {
+            item,
+            bound: Bound::Escaping,
+            at: None,
+        };
+        let (write_top, every) = (at(top(Family::Write)), at(Capability::Every(effect())));
+        assert!(filter.pass(&write_top).is_none());
+        let passed = filter.pass(&every).expect("`Effect` passes less writes");
+        assert_eq!(
+            passed.item,
+            Capability::Every(effect().less([top(Family::Write)]))
+        );
     }
 }

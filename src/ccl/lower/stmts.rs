@@ -16,7 +16,7 @@ use crate::{
         Type, TypedBinding, TypedExprNode,
     },
     chl_parser::ast::{
-        AnnotationMode, ArmPattern, AssignTarget, BinOp as ChlBinOp, EntryForm, IfBranch,
+        AnnotationMode, ArmPattern, AssignTarget, BinOp as ChlBinOp, Clause, EntryForm, IfBranch,
         KindAnnotation, MatchArm, ModuleTypeEntry, PayloadPattern, Requirement, Span, Spanned,
         Stmt as ChlStmt, TraitType, TypeAnnotation, TypeParam, is_type_name,
     },
@@ -1069,6 +1069,7 @@ pub(super) fn lower_middle_stmt(
             params,
             output,
             requires,
+            causes,
             body: fn_body,
         } => {
             let (func_expr, annotation) = lower_def(
@@ -1077,6 +1078,7 @@ pub(super) fn lower_middle_stmt(
                 params,
                 output.as_ref(),
                 requires,
+                causes,
                 fn_body,
                 ctx,
             )?;
@@ -1366,6 +1368,7 @@ fn stand_in_for_failed(
             params,
             output,
             requires,
+            causes,
             ..
         } => {
             let omitted = [Spanned::new(
@@ -1383,6 +1386,7 @@ fn stand_in_for_failed(
                 params,
                 output.as_ref(),
                 requires,
+                causes,
                 &omitted,
                 ctx,
             ) {
@@ -2373,6 +2377,11 @@ pub(super) fn lower_let_annotation(
 /// when it opens the `Poly`, and each kind lowered with the parameters before it in
 /// scope. Each is also pushed onto [`LoweringContext::type_params_in_scope`]. Return
 /// them as a `Poly`'s parameter list. The caller owns both scopes and restores them.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
+              and a trait hashes and orders by its module path and name"
+)]
 pub(super) fn declare_type_params(
     type_params: &[TypeParam],
     ctx: &mut LoweringContext,
@@ -2413,7 +2422,28 @@ pub(super) fn declare_type_params(
             continue;
         }
         let kind = lower_kind(tp, &type_params[i..], ctx)?;
-        let param = crate::ccl::ty::TypeParam::declared(name);
+        let clause_bound = match &kind {
+            crate::ccl::ty::TypeKind::SubtypesOf(bound) => match &**bound {
+                Type::Nominal(decl, _) if *decl == crate::ccl::nominal::effect() => Some(true),
+                Type::Nominal(decl, _) if *decl == crate::ccl::nominal::context() => Some(false),
+                _ => None,
+            },
+            _ => None,
+        };
+        let except = match (clause_bound, tp.except.first()) {
+            (_, None) => Default::default(),
+            (Some(of_causes), Some(_)) => clauses::bound_except(&tp.except, of_causes, ctx)?,
+            (None, Some(first)) => {
+                return Err(LoweringError::unsupported(
+                    first.span,
+                    "`except` takes capabilities out of a bound of `Effect` or `Context`",
+                ));
+            }
+        };
+        let param = crate::ccl::ty::TypeParam::declared_except(name, except);
+        if let Some(of_causes) = clause_bound {
+            ctx.clause_params.insert(param.id, of_causes);
+        }
         ctx.declare_type_throughout(
             name,
             Some(tp.name_span),
@@ -2470,6 +2500,16 @@ pub(super) fn lower_kind(
             }
         },
     };
+    // `Effect` and `Context` bound a parameter standing for a clause, and are no type a
+    // value has, so a bound is the one place they are written.
+    if let ChlExpr::Name(n) = &bound.node
+        && let Some(decl) = clause_bound(n)
+    {
+        return Ok(TypeKind::SubtypesOf(Box::new(Type::Nominal(
+            decl,
+            Vec::new(),
+        ))));
+    }
     Ok(TypeKind::SubtypesOf(Box::new(lower_bound(
         bound, &tp.name, unopened, ctx,
     )?)))
@@ -2486,6 +2526,65 @@ pub(super) fn is_kind(e: &ChlExpr) -> bool {
     }
 }
 
+/// `ty`, a function type `T => U`, stating the clauses written after it. A function value's
+/// trait requirements are resolved where it is made, so the `requires` clause names only
+/// context.
+fn with_written_clauses(
+    ty: Type,
+    requires: &Clause<Requirement>,
+    causes: &Clause<TraitType>,
+    at: Span,
+    ctx: &mut LoweringContext,
+) -> Result<Type, LoweringError> {
+    if let Some(item) = requires
+        .items
+        .iter()
+        .find(|r| !clauses::is_context_item(r, ctx))
+    {
+        return Err(LoweringError::unsupported(
+            item.span,
+            "a function type's `requires` clause names only `ObserveWorld`, \
+             `ReadTxn(x)`, `Read(x)`, the tops `Context`, `ReadTxn(*)` and `Read(*)`, \
+             clause variables bounded by `Context` and `_`: \
+             a function value's trait requirements are resolved where it is made, and a \
+             polymorphic type `forall (…)` states its own",
+        ));
+    }
+    let written = clauses::lower_clauses(requires, causes, clauses::Site::Type, at, ctx)?
+        .expect("a function type's clauses are always stated");
+    Ok(ty.with_capabilities(crate::ccl::capabilities::Capabilities::written(written)))
+}
+
+/// Refuses a clause on a data-function type `D |=> V`, a collection, which requires and causes
+/// nothing.
+fn refuse_collection_clauses(
+    requires: &Clause<Requirement>,
+    causes: &Clause<TraitType>,
+) -> Result<(), LoweringError> {
+    match requires
+        .items
+        .first()
+        .map(|r| r.span)
+        .or_else(|| causes.items.first().map(|c| c.span))
+    {
+        Some(span) => Err(LoweringError::unsupported(
+            span,
+            "a data-function type `D |=> V` is a collection, which requires and causes \
+             nothing, so it states no `requires` or `causes` clause",
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The declaration `Effect` or `Context` names, which bound a type parameter standing for a
+/// `causes` or a `requires` clause.
+fn clause_bound(name: &str) -> Option<Rc<NominalDecl>> {
+    match name {
+        crate::ccl::nominal::EFFECT => Some(crate::ccl::nominal::effect()),
+        crate::ccl::nominal::CONTEXT => Some(crate::ccl::nominal::context()),
+        _ => None,
+    }
+}
 /// Lower the bound of type parameter `name`, refusing one that names `name` itself or a
 /// parameter declared after it (`docs/chl-spec.md`, "Kinds and bounds").
 ///
@@ -3436,6 +3535,15 @@ pub(super) fn lower_type_expr_or_poly(
                     ),
                 ));
             }
+            if clause_bound(id).is_some() {
+                return Err(LoweringError::unsupported(
+                    annotation.span,
+                    format!(
+                        "`{id}` bounds a type parameter standing for a clause, as in \
+                         `E <: Effect`; no value has it as its type"
+                    ),
+                ));
+            }
             match ctx.type_alias(id.as_str(), annotation.span) {
                 AliasAt::InScope(AliasType::Type(ty)) => Ok(ty.clone()),
                 AliasAt::InScope(AliasType::Module(_)) => Err(module_type_as_value_type(
@@ -3642,30 +3750,45 @@ pub(super) fn lower_type_expr_or_poly(
         // `f: (Int => Int) = \x -> …` matches its value. `Type::fun` builds the
         // non-dependent form (`name: None`): the surface has no binder to make it a Pi
         // type.
+        //
+        // A function value's trait requirements are resolved where it is made, so its type's
+        // `requires` clause names only context; a polymorphic type's trait requirements are
+        // split off its body's clause before the body lowers (`split_forall_clause`).
         // A parenthesised binder `(k: K) |=> V(k)` binds the domain's value in the codomain
         // (`docs/chl-spec.md`, "Family parameters").
         ChlExpr::FunctionType {
             domain,
             arrow,
             codomain,
+            requires,
+            causes,
         } if matches!(domain.node, ChlExpr::TypeBinder { .. }) => {
             let ChlExpr::TypeBinder { name, ty } = &domain.node else {
                 unreachable!("matched a binder")
             };
             refuse_misannotated_type_binder(name, ty)?;
+            if *arrow == chl_parser::ast::Arrow::Data {
+                refuse_collection_clauses(requires, causes)?;
+            }
             let domain = lower_type_expr(ty, ctx)?;
             let fun_kind = match arrow {
                 chl_parser::ast::Arrow::Compute => crate::ccl::FunKind::Compute,
                 chl_parser::ast::Arrow::Data => crate::ccl::FunKind::Data(None),
             };
             let codomain = under_type_binders(&[(name, domain.clone())], codomain, ctx)?;
-            Ok(Type::Fun {
+            let ty = Type::Fun {
                 name: Some(Name::fresh(name.node.clone())),
                 fun_kind,
                 domain: Box::new(domain),
                 codomain: Box::new(codomain),
                 capabilities: crate::ccl::capabilities::Capabilities::none(),
-            })
+            };
+            match arrow {
+                chl_parser::ast::Arrow::Compute => {
+                    with_written_clauses(ty, requires, causes, annotation.span, ctx)
+                }
+                chl_parser::ast::Arrow::Data => Ok(ty),
+            }
         }
         ChlExpr::TypeBinder { name, .. } => Err(LoweringError::unsupported(
             annotation.span,
@@ -3684,20 +3807,26 @@ pub(super) fn lower_type_expr_or_poly(
             domain,
             arrow: chl_parser::ast::Arrow::Compute,
             codomain,
-        } => Ok(Type::fun(
-            lower_type_expr(domain, ctx)?,
-            covariant(codomain, ctx)?,
-        )),
+            requires,
+            causes,
+        } => {
+            let ty = Type::fun(lower_type_expr(domain, ctx)?, covariant(codomain, ctx)?);
+            with_written_clauses(ty, requires, causes, annotation.span, ctx)
+        }
         // A data-function type `T |=> U`, a collection over `T` (`docs/chl-spec.md`,
         // "6.3 Direction: collection types [Decided]"). A sum is a data function whose
         // domain is its witness, so a bare `_` domain admits a sum as well as a plain
         // collection, and its funkind is a hole. Any written domain, a type parameter
         // included, names a type, which no witness is, so it makes a plain collection.
+        // A collection requires and causes nothing, so it states no clause.
         ChlExpr::FunctionType {
             domain,
             arrow: chl_parser::ast::Arrow::Data,
             codomain,
+            requires,
+            causes,
         } => {
+            refuse_collection_clauses(requires, causes)?;
             let domain = lower_type_expr(domain, ctx)?;
             let fun_kind = if matches!(domain, Type::Hole) {
                 crate::ccl::FunKind::data_hole()
@@ -3736,14 +3865,20 @@ pub(super) fn lower_type_expr_or_poly(
             body,
             requires,
         } => {
+            // The clause after the body's codomain is the polymorphic type's one clause: its
+            // trait requirements are the `Poly`'s, and its context requirements the
+            // function type's (`docs/chl-spec.md`, "Writing requirements and effects"). An
+            // item may name a type parameter, so the clause splits with them in scope.
             let snapshot = ctx.snapshot_type_aliases();
             let scoped = ctx.type_param_scope();
             let poly = declare_type_params(type_params, ctx).and_then(|mut params| {
-                let (requires, named) = lower_named_requirements(requires, Some(&mut params), ctx)?;
+                let (body, requires) = split_forall_clause(body, requires, ctx);
+                let (requires, named) =
+                    lower_named_requirements(&requires, Some(&mut params), ctx)?;
                 // The body reads the associated types of the requirements the clause names.
                 let in_scope = ctx.named_requirements.len();
                 ctx.named_requirements.extend(named);
-                let body = lower_type_expr(body, ctx);
+                let body = lower_type_expr(&body, ctx);
                 ctx.named_requirements.truncate(in_scope);
                 let body = body?;
                 Ok(Type::Poly(std::rc::Rc::new(crate::ccl::ty::PolyType {
@@ -3763,6 +3898,29 @@ pub(super) fn lower_type_expr_or_poly(
             format!("{} is not a type", describe_type_form(other)),
         )),
     }
+}
+
+/// A polymorphic type's body and its trait requirements: those written after the `forall`'s
+/// body, and the trait requirements of the clause after its function type's codomain, which
+/// the parser gives the arrow. The body keeps its context requirements.
+fn split_forall_clause(
+    body: &Spanned<ChlExpr>,
+    requires: &[Spanned<Requirement>],
+    ctx: &LoweringContext,
+) -> (Spanned<ChlExpr>, Vec<Spanned<Requirement>>) {
+    let mut body = body.clone();
+    let mut all = requires.to_vec();
+    if let ChlExpr::FunctionType { requires, .. } = &mut body.node {
+        let (context, traits): (Vec<_>, Vec<_>) = std::mem::take(&mut requires.items)
+            .into_iter()
+            .partition(|r| clauses::is_context_item(r, ctx));
+        if context.is_empty() && requires.only.is_none() {
+            requires.span = None;
+        }
+        requires.items = context;
+        all.extend(traits);
+    }
+    (body, all)
 }
 
 /// The error of a Module type, spelled `what`, written at `span` where a value's
@@ -3904,7 +4062,9 @@ pub(super) fn lower_alias_type(
             // A type member is in scope in the entries after it, as a kind names
             // the type parameters before it.
             let aliases = ctx.snapshot_type_aliases();
+            ctx.in_module_type += 1;
             let module = lower_module_type(fields, ctx);
+            ctx.in_module_type -= 1;
             ctx.restore_type_aliases(aliases);
             Ok(AliasType::Module(Rc::new(module?)))
         }
@@ -4060,6 +4220,8 @@ fn collect_variant_arms(
 pub const RESERVED_TYPE_NAMES: &[&str] = &[
     "Array",
     "Collection",
+    "Context",
+    "Effect",
     "Feed",
     "FullMap",
     "List",

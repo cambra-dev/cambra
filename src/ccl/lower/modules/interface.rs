@@ -607,6 +607,20 @@ impl Interface {
         })
     }
 
+    /// `contract` as the interface writes it. Another module names none of this module's
+    /// private state, nor any state of a run it declares, so the contract writes it
+    /// `Module::*`: in the module's check tree that is a private member's, which has no home,
+    /// or one of those runs', which has its own.
+    fn written_contract(&self, contract: &Contract) -> String {
+        contract
+            .map_type(|ty| {
+                crate::ccl::capabilities::own_state_as_module(ty, &|x| {
+                    x.home().is_some() || !self.is_public(x.base())
+                })
+            })
+            .written(self.module.segments())
+    }
+
     /// The interface as `cambra check` prints it (`docs/chl-spec.md`, "9.14
     /// Checking a module on its own"): each parameter, then each public member
     /// in the order declared, a value with its contract from `contracts`, by
@@ -672,7 +686,7 @@ impl Interface {
                 } else {
                     ""
                 };
-                let written = contract.written(self.module.segments());
+                let written = self.written_contract(&contract);
                 members.push((member.declared, format!("pub {name}: {written}{constant}")));
             }
         }
@@ -703,10 +717,7 @@ impl Interface {
                         );
                         continue;
                     };
-                    let line = format!(
-                        "pub {binding}: {}",
-                        contract.written(self.module.segments())
-                    );
+                    let line = format!("pub {binding}: {}", self.written_contract(contract));
                     members.push((function.declared, line));
                 }
             }
