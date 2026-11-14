@@ -44,9 +44,12 @@
 //! | Apply-compose | `⟨x, ⟨F, G⟩ ≫ compose⟩ ≫ apply` | `⟨⟨x, F⟩ ≫ apply, G⟩ ≫ apply` | ✗ (restructures) |
 //! | Apply-zip | `⟨x, ⟨F, G⟩ ≫ zip⟩ ≫ apply` | `⟨⟨x, F⟩ ≫ apply, ⟨x, G⟩ ≫ apply⟩` | ✗ (duplicates `x`) |
 //! | Apply-constant-valued | `⟨x, h ≫ const⟩ ≫ apply` | `h` | ✗ (drops `x`) |
+//! | Apply-entries | `⟨x, F ≫ entries⟩ ≫ apply` | `⟨x, ⟨x, F⟩ ≫ apply⟩` | ✗ (restructures) |
+//! | Entries-value | `(c ▷ entries) ≫ .1` | `c` | ✗ (drops `entries`) |
+//! | Apply-strengthened | `⟨k, e ≫ (F ▷ strength_over) ≫ map(h)⟩ ≫ apply` | `⟨e, ⟨k, e ≫ F⟩ ≫ apply⟩ ≫ h` | ✗ (duplicates `e`) |
 //! | Product eta | `⟨f ≫ .0, f ≫ .1⟩` | `f` | ✗ (collapses) |
 //! | Flatten compose | `Compose([…, Compose([…]), …])` | `Compose([…flat…])` | ✓ |
-//! | Zip distribute | `⟨f0, f1⟩ ≫ ⟨g, h⟩` (if g,h will simplify), zips of any arity | `⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩` | ✗ (restructures) |
+//! | Zip distribute | `⟨f0, f1⟩ ≫ ⟨g, h⟩` (if g,h will simplify, and `⟨g, h⟩` is not a dependent pair), zips of any arity | `⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩` | ✗ (restructures) |
 //! | Uncurry of a nest | `(s ≫ curry(g)) ▷ uncurry(n)` and the forms in [`try_uncurry_curried`] | `⟨⟨.0 ≫ s, .1⟩, .2, …⟩ ≫ (g ▷ uncurry(n − 1))` | ✗ (drops structure) |
 //! | ANF morphism binding | `let x = 𝑚 in 𝑏` (`x` an ANF temp, `𝑚` a morphism, used once) | `𝑏[x := 𝑚]` | ✓ |
 
@@ -293,6 +296,9 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
         changed |= ruled("simplify.const_apply", expr, try_const_apply);
         changed |= ruled("simplify.apply_compose", expr, try_apply_compose);
         changed |= ruled("simplify.apply_zip", expr, try_apply_zip);
+        changed |= ruled("simplify.apply_entries", expr, try_apply_entries);
+        changed |= ruled("simplify.apply_strengthened", expr, try_apply_strengthened);
+        changed |= ruled("simplify.entries_value", expr, try_entries_value);
         changed |= ruled(
             "simplify.apply_constant_valued",
             expr,
@@ -490,8 +496,13 @@ fn as_curry(expr: &Expr) -> Option<&Expr> {
 /// Returns the inner `c` if `expr` is `const_(c)` i.e.
 /// `Apply { argument: c, function: Builtin(Const) }`.
 fn as_const(expr: &Expr) -> Option<&Expr> {
+    as_applied(expr, Builtin::Const)
+}
+
+/// The argument `𝑥` if `expr` is `𝑥 ▷ 𝑏` for the builtin `𝑏`.
+fn as_applied(expr: &Expr, b: Builtin) -> Option<&Expr> {
     if let TypedExprNode::Apply { argument, function } = &expr.node
-        && is_builtin(function, Builtin::Const)
+        && is_builtin(function, b)
     {
         return Some(argument);
     }
@@ -752,10 +763,22 @@ fn try_compose_identity(expr: &mut Expr) -> bool {
 
 /// Whether `source` is a generator's source as `compose_sum_generators` leaves it: a morphism
 /// to a sum, or one ending in `unbox`, whose collection is over the witness the sum projects
-/// (`σ₁(𝑐)`). The second is read from the term rather than from the projected domain, because a
-/// history over a projected domain has that type too and is not a generator's source. A `map`
-/// after the `unbox`, which a filter on the generator leaves, keeps its keys.
+/// (`σ₁(𝑐)`), or either collection held constant (`𝑐 ▷ const`) where it reads nothing of the
+/// enclosing value. An unboxed source is read from the term rather than from the projected
+/// domain, because a history over a projected domain has that type too and is not a
+/// generator's source. A `map` after the `unbox`, which a filter on the generator leaves, keeps
+/// its keys. A constant holding an `iterate` marker is an iteration source, which the rules
+/// reading this keep in place.
 fn over_a_witness(source: &Expr) -> bool {
+    fn marks_iteration(e: &Expr) -> bool {
+        is_builtin(e, Builtin::Iterate) || is_iteration(e) || e.any_child(marks_iteration)
+    }
+    if let Some(collection) = as_const(source) {
+        return !marks_iteration(collection)
+            && (collection.ty.sum().is_some()
+                || matches!(&collection.node, TypedExprNode::Apply { function, .. }
+                    if is_builtin(function, Builtin::Unbox)));
+    }
     let is_map = |e: &Expr| matches!(&e.node, TypedExprNode::Apply { function, .. } if is_builtin(function, Builtin::Map));
     let ends_in_unbox = match &source.node {
         TypedExprNode::Compose(elts) => elts
@@ -1050,6 +1073,7 @@ fn builtin_preserves_domain(builtin: &Builtin) -> bool {
         | Builtin::CurryOver
         | Builtin::StrengthOver
         | Builtin::MapDomain
+        | Builtin::Entries
         | Builtin::Compose
         | Builtin::Converse
         | Builtin::Uncurry(_)
@@ -1265,7 +1289,10 @@ fn try_product_beta(expr: &mut Expr) -> bool {
 /// - `curry(𝑔) ▷ uncurry ⟹ 𝑔`;
 /// - `(𝑠 ≫ curry(𝑔)) ▷ uncurry ⟹ (.0 ≫ 𝑠, .1) ▷ zip ≫ 𝑔`, both `𝑔(𝑠(𝑎), 𝑏)`;
 /// - `(𝑠 ≫ ⟨𝑡 ▷ const, curry(𝑔)⟩ ≫ compose) ▷ uncurry ⟹ (.0 ≫ 𝑠, .1 ≫ 𝑡) ▷ zip ≫ 𝑔`, both
-///   `𝑔(𝑠(𝑎), 𝑡(𝑏))`: a generator over a sum composed with its source;
+///   `𝑔(𝑠(𝑎), 𝑡(𝑏))`: a generator over a sum composed with its source. The same of the form
+///   [`try_compose_with_strength`] gives that composition,
+///   `(𝑠 ≫ (𝑡 ▷ const) ▷ strength_over ≫ map(𝑔)) ▷ uncurry`, so the two laws meet whichever
+///   fires first;
 /// - `(𝑠 ≫ 𝑐 ▷ const) ▷ uncurry ⟹ .1 ≫ 𝑐`, both `𝑐(𝑏)`: an inner collection reading nothing of
 ///   the outer element. The pair's domain is the type's, so dropping `𝑠` keeps it.
 ///
@@ -1286,8 +1313,24 @@ fn try_uncurry_curried(expr: &mut Expr) -> bool {
             {
                 Some(2)
             }
+            [.., strengthened, mapped]
+                if as_applied(strengthened, Builtin::StrengthOver)
+                    .is_some_and(|t| as_const(t).is_some())
+                    && as_applied(mapped, Builtin::Map).is_some() =>
+            {
+                Some(2)
+            }
             _ => None,
         }
+    }
+    /// `(𝑡, 𝑔)` out of the two-element tail [`tail`] matched: `⟨𝑡 ▷ const, curry(𝑔)⟩ ≫ compose`
+    /// or `(𝑡 ▷ const) ▷ strength_over ≫ map(𝑔)`.
+    fn composed_tail(first: Expr, second: Expr) -> (Expr, Expr) {
+        if is_builtin(&second, Builtin::Compose) {
+            let (t, curried) = into_zip(first);
+            return (into_argument(t), into_argument(curried));
+        }
+        (into_argument(into_argument(first)), into_argument(second))
     }
     let TypedExprNode::Apply { argument, function } = &expr.node else {
         return false;
@@ -1360,9 +1403,9 @@ fn try_uncurry_curried(expr: &mut Expr) -> bool {
         let [curried] = <[Expr; 1]>::try_from(tail_elts).expect("one element");
         (None, into_argument(curried))
     } else {
-        let [pair_elt, _compose] = <[Expr; 2]>::try_from(tail_elts).expect("two elements");
-        let (t, curried) = into_zip(pair_elt);
-        (Some(into_argument(t)), into_argument(curried))
+        let [first, second] = <[Expr; 2]>::try_from(tail_elts).expect("two elements");
+        let (t, g) = composed_tail(first, second);
+        (Some(t), g)
     };
     let g = flattened(g, n - 1, &parts[2..]);
     if n == 2 && elts.is_empty() && t.is_none() {
@@ -1671,20 +1714,49 @@ fn try_const_apply(expr: &mut Expr) -> bool {
     )
 }
 
-/// `⟨𝑥, 𝑓⟩ ≫ apply`, typed: `𝑓`'s value is a function, and the chain is its codomain.
+/// `⟨𝑥, 𝑓⟩ ≫ apply`, typed: `𝑓`'s value is a function, and the chain is its codomain at `𝑥`.
 fn applied(x: Expr, f: Expr, kind: &FunKind) -> Expr {
-    let result =
-        f.ty.codomain()
-            .and_then(|value| value.peel_refinements().codomain())
-            .unwrap_or(Type::Hole);
     let pair = zip_pair(x, f, kind);
-    let apply_ty = match pair.ty.codomain() {
-        Some(arguments) => Type::compute_fun_or_hole(&arguments, &result),
-        None => Type::Hole,
+    let apply_ty = match &pair.ty {
+        Type::Fun { codomain, .. } => {
+            apply_type(&crate::ccl::subst::open_codomain(&pair.ty, codomain))
+        }
+        _ => Type::Hole,
     };
     let elts = vec![pair, Expr::builtin(Builtin::Apply).with_ty(apply_ty)];
     let ty = crate::ccl::ccl_utils::chain_type(&elts, kind.clone());
     Expr::compose(elts).with_ty(ty)
+}
+
+/// The type of `apply` handed `arguments`, a value beside a function: the function's
+/// codomain at the value. A family's codomain reads its key, so applying one is dependent,
+/// `(𝑎: (𝐴, (𝑘: 𝐴) ⇒ 𝐵)) ⇒ 𝐵[𝑘 := 𝑎.0]`, and any other function's is the plain `(𝐴, 𝐴 ⇒ 𝐵) ⇒ 𝐵`.
+fn apply_type(arguments: &Type) -> Type {
+    let Type::Tuple(components) = arguments.peel_refinements() else {
+        return Type::Hole;
+    };
+    let [value, function] = components.as_slice() else {
+        return Type::Hole;
+    };
+    match function.peel_refinements() {
+        Type::Fun {
+            name: Some(key),
+            codomain,
+            ..
+        } if crate::ccl::subst::codomain_depends_on(key, codomain) => {
+            let args = Name::fresh("__args");
+            let at = Expr::apply(
+                Expr::var(&args).with_ty(arguments.clone()),
+                Expr::proj_index(0).with_ty(Type::fun(arguments.clone(), value.clone())),
+            )
+            .with_ty(value.clone());
+            let result = crate::ccl::subst::discharge_codomain(key, &at, codomain);
+            Type::pi(args, arguments.clone(), result)
+        }
+        function => {
+            Type::compute_fun_or_hole(arguments, &function.codomain().unwrap_or(Type::Hole))
+        }
+    }
 }
 
 /// `(𝐹, 𝐺)` if `m` is `⟨𝐹, 𝐺⟩ ≫ 𝑏` for the builtin `𝑏` taking a pair of functions to one.
@@ -1757,6 +1829,142 @@ fn try_apply_constant_valued(expr: &mut Expr) -> bool {
             };
             elts.pop();
             elts
+        },
+    )
+}
+
+/// Apply of a collection's entries: `⟨𝑥, 𝐹 ≫ entries⟩ ≫ apply  ⟹  ⟨𝑥, ⟨𝑥, 𝐹⟩ ≫ apply⟩`
+///
+/// The entry at a key is the key beside the value there, so the read becomes a read of the
+/// collection itself, which the other β-laws reduce further where `𝐹` is a known function.
+fn try_apply_entries(expr: &mut Expr) -> bool {
+    try_pairwise_in_compose(
+        expr,
+        |left, right| {
+            is_builtin(right, Builtin::Apply)
+                && as_zip(left).is_some_and(|(_, m)| {
+                    matches!(&m.node, TypedExprNode::Compose(elts)
+                        if elts.len() >= 2 && elts.last().is_some_and(|e| is_builtin(e, Builtin::Entries)))
+                })
+        },
+        |left, _apply, mint_kind| {
+            let (x, m) = take_zip(left);
+            let TypedExprNode::Compose(mut elts) = m.node else {
+                unreachable!("matched a compose")
+            };
+            elts.pop();
+            let collection = collapse_compose(elts);
+            // Both components read `𝑥`, so the value's read takes a copy of its own.
+            let x_again = x.clone();
+            vec![zip_pair(
+                x,
+                applied(x_again, collection, mint_kind),
+                mint_kind,
+            )]
+        },
+    )
+}
+
+/// The values of a collection's entries: `(𝑐 ▷ entries) ≫ .1  ⟹  𝑐`
+///
+/// The composed form of [`try_apply_entries`]: the entry at each key holds the value there
+/// second.
+///
+/// The chain's later steps read the key by the binder of the entries' type, so `𝑐` takes that
+/// binder in place of its own.
+fn try_entries_value(expr: &mut Expr) -> bool {
+    try_pairwise_in_compose(
+        expr,
+        |left, right| {
+            is_proj_idx(right, 1)
+                && matches!(&left.node, TypedExprNode::Apply { function, .. }
+                    if is_builtin(function, Builtin::Entries))
+        },
+        |left, _proj, _mint_kind| {
+            let binder = match left.ty.peel_refinements() {
+                Type::Fun { name, .. } => name.clone(),
+                _ => None,
+            };
+            let mut collection = into_argument(left);
+            if let Some(binder) = binder {
+                collection.ty = under_binder(&collection.ty, &binder);
+            }
+            vec![collection]
+        },
+    )
+}
+
+/// The function `ty` with its binder renamed to `binder`, its codomain reading `binder` where
+/// it read its own; `ty` itself where it binds no name.
+fn under_binder(ty: &Type, binder: &Name) -> Type {
+    match ty {
+        Type::Fun {
+            name: Some(own),
+            fun_kind,
+            domain,
+            codomain,
+            capabilities,
+        } if own != binder => {
+            let at = Expr::var(binder).with_ty((**domain).clone());
+            let codomain = crate::ccl::subst::discharge_codomain(own, &at, codomain);
+            Type::pi_kinded(
+                binder.clone(),
+                (**domain).clone(),
+                codomain,
+                fun_kind.clone(),
+            )
+            .with_capabilities(
+                capabilities.mapped(&|name| Some(if name == own { binder } else { name }.clone())),
+            )
+        }
+        Type::Refinement(base, refinements) => {
+            Type::refined(under_binder(base, binder), refinements.clone())
+        }
+        _ => ty.clone(),
+    }
+}
+
+/// Apply of a strengthened map: `⟨𝑘, 𝑒 ≫ (𝐹 ▷ strength_over) ≫ map(ℎ)⟩ ≫ apply  ⟹
+/// ⟨𝑒, ⟨𝑘, 𝑒 ≫ 𝐹⟩ ≫ apply⟩ ≫ ℎ`, with `𝑒` absent read as `id`.
+///
+/// At each input the collection is `ℎ` over the pairs of `𝑒`'s value with each value of the
+/// collection `𝐹` gives for it, so its entry at `𝑘` is `ℎ` of `𝑒`'s value beside `𝐹`'s value at
+/// `𝑘`. It is the β-law for the form [`try_compose_with_strength`] writes, so a read of a
+/// generator over a sum returns to first order whichever of the two fires first.
+fn try_apply_strengthened(expr: &mut Expr) -> bool {
+    fn strengthened_map(m: &Expr) -> bool {
+        matches!(&m.node, TypedExprNode::Compose(elts)
+            if matches!(elts.as_slice(), [.., strengthened, mapped]
+                if as_applied(strengthened, Builtin::StrengthOver).is_some()
+                    && as_applied(mapped, Builtin::Map).is_some()))
+    }
+    try_pairwise_in_compose(
+        expr,
+        |left, right| {
+            is_builtin(right, Builtin::Apply)
+                && as_zip(left).is_some_and(|(_, m)| strengthened_map(m))
+        },
+        |left, _apply, mint_kind| {
+            let (k, m) = take_zip(left);
+            let Some(input) = m.ty.domain() else {
+                unreachable!("a strengthened map is a function")
+            };
+            let TypedExprNode::Compose(mut elts) = m.node else {
+                unreachable!("matched a compose")
+            };
+            let h = into_argument(elts.pop().expect("matched a map"));
+            let f = into_argument(elts.pop().expect("matched a strength_over"));
+            let e = if elts.is_empty() {
+                id().with_ty(Type::fun(input.clone(), input))
+            } else {
+                collapse_compose(elts)
+            };
+            let read = if is_builtin(&e, Builtin::Id) {
+                f
+            } else {
+                collapse_compose(vec![e.clone(), f])
+            };
+            vec![zip_pair(e, applied(k, read, mint_kind), mint_kind), h]
         },
     )
 }
@@ -1876,7 +2084,12 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
         |left, right| {
             // Match: left is a zip, right is a zip with simplifying arms
             // But don't match if both arms are just id (which would create unnecessary complexity)
-            as_zip_arms(left).is_some() && is_simplifying_zip(right)
+            //
+            // Nor a dependent `right`, a pair whose later arm reads the earlier arm's output
+            // (`⟨id, 𝑔⟩`, typed `(𝑥 : 𝐴) × 𝐶(𝑥)`): distributed, the earlier arm becomes
+            // `left ≫ id`, and the pair of the two arms is typed as a plain tuple over `left`'s
+            // input, which no longer states that the later arm's type reads the earlier arm.
+            as_zip_arms(left).is_some() && is_simplifying_zip(right) && !is_dependent_pair(right)
         },
         |left, right, mint_kind| {
             // Each distributed arm is the chain `left ≫ arm`, typed by the rule for chains
@@ -1899,6 +2112,15 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
                 .collect();
             vec![zip_of(arms, mint_kind)]
         },
+    )
+}
+
+/// Whether `zip` is typed as a dependent pair: its codomain is a dependent tuple, a later
+/// component reading an earlier one.
+fn is_dependent_pair(zip: &Expr) -> bool {
+    matches!(
+        zip.ty.peel_refinements(),
+        Type::Fun { codomain, .. } if matches!(codomain.peel_refinements(), Type::DepTuple(_))
     )
 }
 

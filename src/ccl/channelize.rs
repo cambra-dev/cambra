@@ -943,6 +943,7 @@ pub(crate) fn loop_contributions(mut feed_loop: Expr) -> Vec<LoopFeed> {
             &mut feeds,
             &mut define,
             false,
+            &HashSet::new(),
         )
         .unwrap_or_else(|e| panic!("a feed-only loop inside a recurrence: {}", e.error));
         assert!(
@@ -980,6 +981,14 @@ fn at_rows(expr: &mut Expr) {
             !matches!(row, Type::Hole),
             "a feed reaching mutability elimination carries the row inference recorded"
         );
+        // A sum row needs its introduction: stamping a lambda with that row would replace
+        // its projected keys with a bound witness without changing the parameter's type.
+        let _g = provenance::enter(
+            value.node_id(),
+            "channelize.row",
+            provenance::Nature::Machinery,
+        );
+        crate::ccl::mut_elim::view_at_value_type(value, row);
         value.ty = row.clone();
     }
     expr.walk_children_mut(at_rows);
@@ -1096,13 +1105,13 @@ struct ChannelizeCtx {
     /// `x <<= y` records `x ↦ ChanDom(y)`); [`close_chan_domains`] resolves
     /// those before the substitution.
     resolved_domains: Vec<(Name, Type)>,
-    /// Each channelized defer's **binder slot**, keyed the same way as
+    /// Each channelized defer's assembled type, keyed the same way as
     /// [`Self::resolved_domains`]. A channel over a conditional source is a collection over
     /// that source's witness — `Σ (σ : 𝐾). σ ⤇ 𝑉` — and only the assembled channel's own
-    /// type says so: a witness reference carries no kind, so the slot cannot be
+    /// type says so: a witness reference carries no kind, so the binder slot cannot be
     /// reconstructed from the substituted domain. An alias records none and erases
     /// unbound, as it did before.
-    channel_kinds: Vec<(Name, FunKind)>,
+    channel_types: Vec<(Name, Type)>,
     /// The `let d = Defer` node that declares each deferred binding, which is
     /// where an error about the binding as a whole is raised
     /// ([`Self::at_declaration`]). Recorded as the walk reaches each declaration,
@@ -1114,7 +1123,7 @@ impl ChannelizeCtx {
     fn new() -> Self {
         Self {
             resolved_domains: Vec::new(),
-            channel_kinds: Vec::new(),
+            channel_types: Vec::new(),
             defer_decls: HashMap::new(),
         }
     }
@@ -1197,12 +1206,12 @@ fn run_memoized(expr: Expr) -> Result<Expr, Located<DeferError>> {
         raw,
         closings: Vec::new(),
     };
-    let kinds: HashMap<Name, FunKind> =
-        std::mem::take(&mut ctx.channel_kinds).into_iter().collect();
+    let channels: HashMap<Name, Type> =
+        std::mem::take(&mut ctx.channel_types).into_iter().collect();
     // One predicate memo for the whole erasure, so occurrences that shared a predicate
     // term still share one afterwards ([`PredMemo`], "One memo per pass").
     let predicates: PredMemo<()> = PredMemo::default();
-    erase_chan_domains(&mut rewritten, &mut domains, &kinds, &predicates);
+    erase_chan_domains(&mut rewritten, &mut domains, &channels, &predicates);
     #[cfg(debug_assertions)]
     assert_no_type_residue(&rewritten);
     // Every feed is a channel's union now, so nothing appends to one, and this is the last
@@ -1292,7 +1301,7 @@ fn subst_chan_domains_in_type(ty: &mut Type, map: &HashMap<Name, Type>) {
 fn erase_chan_domains_in_type(
     ty: &mut Type,
     map: &HashMap<Name, Type>,
-    kinds: &HashMap<Name, FunKind>,
+    channels: &HashMap<Name, Type>,
 ) -> bool {
     if let Type::History {
         function,
@@ -1311,9 +1320,16 @@ fn erase_chan_domains_in_type(
         else {
             unreachable!("a history's function is an unrefined function")
         };
-        let fun_kind = match domain.peel_refinements() {
-            Type::ChanDom(n, _) => kinds.get(n).cloned(),
+        let channel = match domain.peel_refinements() {
+            Type::ChanDom(n, _) => channels.get(n),
             _ => None,
+        };
+        let fun_kind = channel.and_then(Type::fun_kind).cloned();
+        // The function binds the channel's witnesses, so its domain is the channel's domain
+        // as recorded, its witness references bound here.
+        let domain = match &*domain {
+            Type::ChanDom(n, _) => map.get(n).map_or(domain, |d| Box::new(d.clone())),
+            _ => domain,
         };
         // A feed channel reads as a collection: erase History to its function, a data function
         // keeping the function's binder.
@@ -1324,19 +1340,36 @@ fn erase_chan_domains_in_type(
             codomain: value,
             capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
-        erase_chan_domains_in_type(ty, map, kinds);
+        erase_chan_domains_in_type(ty, map, channels);
         return true;
     }
     if let Type::ChanDom(name, _) = ty {
-        let Some(dom) = map.get(name) else {
+        let name = name.clone();
+        let Some(dom) = map.get(&name) else {
             return false;
         };
         *ty = dom.clone();
-        erase_chan_domains_in_type(ty, map, kinds);
+        // A domain standing alone, outside the channel's function, reads the witnesses of a
+        // channel that is a sum through the channel's name, as any collection read out of a
+        // name holding a sum does.
+        if let Some(channel) = channels.get(&name)
+            && let read = channel.read_view().into_owned()
+            && let Some(witnesses) = read.sum()
+        {
+            let term = Rc::new(Expr::var(&name).with_ty(read.clone()));
+            for (position, witness) in witnesses.iter().enumerate() {
+                let projected = Type::WitnessProjection(crate::ccl::ty::WitnessProjection::new(
+                    Rc::clone(&term),
+                    position,
+                ));
+                replace_witness_ref(ty, witness.id(), &projected);
+            }
+        }
+        erase_chan_domains_in_type(ty, map, channels);
         return true;
     }
     let mut changed = false;
-    ty.walk_children_mut(|t| changed |= erase_chan_domains_in_type(t, map, kinds));
+    ty.walk_children_mut(|t| changed |= erase_chan_domains_in_type(t, map, channels));
     changed
 }
 
@@ -1448,7 +1481,7 @@ fn slot_holds_type(
 fn erase_chan_domains_in_predicates(
     ty: &mut Type,
     map: &HashMap<Name, Type>,
-    kinds: &HashMap<Name, FunKind>,
+    channels: &HashMap<Name, Type>,
     predicates: &PredMemo<()>,
 ) -> bool {
     if !predicates_hold_type(ty, &is_channel_type, &mut HashSet::new()) {
@@ -1458,15 +1491,17 @@ fn erase_chan_domains_in_predicates(
         fn go(
             e: &mut Expr,
             map: &HashMap<Name, Type>,
-            kinds: &HashMap<Name, FunKind>,
+            channels: &HashMap<Name, Type>,
             memo: &PredMemo<()>,
         ) -> bool {
             let mut changed = false;
-            e.walk_type_slots_mut(|t| changed |= erase_chan_domains_in_slot(t, map, kinds, memo));
-            e.walk_children_mut(|c| changed |= go(c, map, kinds, memo));
+            e.walk_type_slots_mut(|t| {
+                changed |= erase_chan_domains_in_slot(t, map, channels, memo)
+            });
+            e.walk_children_mut(|c| changed |= go(c, map, channels, memo));
             changed
         }
-        go(pred, map, kinds, memo)
+        go(pred, map, channels, memo)
     })
 }
 
@@ -1477,11 +1512,11 @@ fn erase_chan_domains_in_predicates(
 fn erase_chan_domains_in_slot(
     ty: &mut Type,
     map: &HashMap<Name, Type>,
-    kinds: &HashMap<Name, FunKind>,
+    channels: &HashMap<Name, Type>,
     predicates: &PredMemo<()>,
 ) -> bool {
-    let mut changed = erase_chan_domains_in_type(ty, map, kinds);
-    changed |= erase_chan_domains_in_predicates(ty, map, kinds, predicates);
+    let mut changed = erase_chan_domains_in_type(ty, map, channels);
+    changed |= erase_chan_domains_in_predicates(ty, map, channels, predicates);
     changed
 }
 
@@ -1503,13 +1538,28 @@ struct ChanDomains {
 /// body type, so a collection over a sum's witness leaves its scope as the strict check
 /// rebuilds it: packed ([`pack_projections`](crate::ccl::subst::pack_projections)), where
 /// discharging the domain alone would quote the definition.
+///
+/// `node` is the node the slot belongs to: a domain read through a channel that is a sum quotes
+/// the channel's name, minted as part of rewriting that node.
 fn erase_and_close_slot(
     ty: &mut Type,
+    node: NodeId,
     domains: &ChanDomains,
-    kinds: &HashMap<Name, FunKind>,
+    channels: &HashMap<Name, Type>,
     predicates: &PredMemo<()>,
 ) {
-    if !erase_chan_domains_in_slot(ty, &domains.raw, kinds, predicates)
+    let reads_a_sum = |t: &Type| {
+        matches!(t, Type::ChanDom(n, _)
+            if channels.get(n).is_some_and(|c| c.read_view().sum().is_some()))
+    };
+    let _recording = slot_holds_type(ty, &reads_a_sum, &mut HashSet::new()).then(|| {
+        provenance::enter(
+            node,
+            "channelize.read_through_channel",
+            provenance::Nature::Machinery,
+        )
+    });
+    if !erase_chan_domains_in_slot(ty, &domains.raw, channels, predicates)
         || domains.closings.is_empty()
     {
         return;
@@ -1539,7 +1589,7 @@ fn erase_and_close_slot(
 fn erase_chan_domains(
     expr: &mut Expr,
     domains: &mut ChanDomains,
-    kinds: &HashMap<Name, FunKind>,
+    channels: &HashMap<Name, Type>,
     predicates: &PredMemo<()>,
 ) {
     // Erase this node's binder-declared type slots — both the declared type and
@@ -1552,10 +1602,11 @@ fn erase_chan_domains(
     // it stands, and a child's discharge only closes variables bound *inside*
     // that child — never in scope at this binder — so erasing binders before the
     // child recursion sees the same substitutions the old inline order did.
+    let node = expr.node_id();
     expr.walk_binders_mut(|b| {
-        erase_and_close_slot(&mut b.ty, domains, kinds, predicates);
+        erase_and_close_slot(&mut b.ty, node, domains, channels, predicates);
         if let Some(ann) = &mut b.user_annotation {
-            erase_and_close_slot(&mut ann.ty, domains, kinds, predicates);
+            erase_and_close_slot(&mut ann.ty, node, domains, channels, predicates);
         }
     });
     if let TypedExprNode::Let {
@@ -1564,8 +1615,8 @@ fn erase_chan_domains(
         body,
     } = &mut expr.node
     {
-        erase_chan_domains(bound_expr, domains, kinds, predicates);
-        erase_chan_domains(body, domains, kinds, predicates);
+        erase_chan_domains(bound_expr, domains, channels, predicates);
+        erase_chan_domains(body, domains, channels, predicates);
         // §6.2 Let-closing on the substitution content (see fn docs).
         // A discharge template is not a tree node: it is cloned again at every
         // read, and that read is where the sibling is minted. An opaque binder, a
@@ -1588,12 +1639,48 @@ fn erase_chan_domains(
             }
         }
     } else {
-        expr.walk_children_mut(|c| erase_chan_domains(c, domains, kinds, predicates));
+        expr.walk_children_mut(|c| erase_chan_domains(c, domains, channels, predicates));
     }
-    erase_and_close_slot(&mut expr.ty, domains, kinds, predicates);
+    erase_and_close_slot(&mut expr.ty, node, domains, channels, predicates);
     if let Some(ann) = &mut expr.user_annotation {
-        erase_and_close_slot(ann, domains, kinds, predicates);
+        erase_and_close_slot(ann, node, domains, channels, predicates);
     }
+    if let TypedExprNode::Apply { function, .. } = &mut expr.node {
+        open_a_sum_channel_read(function, channels);
+    }
+}
+
+/// A channel that is a sum, applied, opened as any sum is before it is applied: `ch ▷ unbox`,
+/// the collection over the projections `σᵢ(ch)` of the channel's witnesses. Inference typed
+/// the read as the channel's handle, which shows no sum; only the assembled channel's type does
+/// ([`ChannelizeCtx::channel_types`]). A read that passes the channel on whole keeps the sum.
+fn open_a_sum_channel_read(expr: &mut Expr, channels: &HashMap<Name, Type>) {
+    if !matches!(&expr.node, TypedExprNode::Var(n) if channels.contains_key(n))
+        || expr.ty.peel_refinements().sum().is_none()
+    {
+        return;
+    }
+    let _g = provenance::enter(
+        expr.node_id(),
+        "channelize.open_sum_channel",
+        provenance::Nature::Machinery,
+    );
+    let Some(stamp) = crate::ccl::ty::unbox_type(&expr.ty) else {
+        return;
+    };
+    let read = std::mem::replace(expr, Expr::new(TypedExprNode::Lit(Lit::Unit)));
+    let opened = crate::ccl::ty::unboxed_type(&read.ty, &Rc::new(read.clone()))
+        .expect("`unbox_type` stamped a type, so the read is a sum");
+    *expr = Expr::apply(read, Expr::builtin(Builtin::Unbox).with_ty(stamp)).with_ty(opened);
+}
+
+/// `ty` with each reference to `witness` outside refinement predicates replaced by `with`.
+fn replace_witness_ref(ty: &mut Type, witness: &crate::ccl::ty::WitnessId, with: &Type) {
+    if matches!(ty, Type::WitnessRef(w) if w == witness) {
+        *ty = with.clone();
+        return;
+    }
+    ty.walk_children_mut(|c| replace_witness_ref(c, witness, with));
 }
 
 /// Debug-only invariant: after [`run`] on a typed input, no expression or
@@ -2358,6 +2445,7 @@ fn channelize_cluster(
         // feeds.
         let mut feeds = Vec::new();
         let mut define: Option<(NodeId, Expr)> = None;
+        let bind_site = lets_ahead_of_bind_site(&rewritten, &defer_names);
         rewritten = extract_for_defer(
             rewritten,
             &Extract {
@@ -2367,6 +2455,7 @@ fn channelize_cluster(
             &mut feeds,
             &mut define,
             false,
+            &bind_site,
         )?;
         let (sites, feeds): (Vec<_>, Vec<Expr>) = feeds
             .into_iter()
@@ -2419,9 +2508,7 @@ fn channelize_cluster(
             // still holding its `ChanDom` surfaces at the debug residue
             // assert / strict wall.
             if let Some(dom) = ch.ty.read_view().domain() {
-                if let Some(k) = ch.ty.fun_kind() {
-                    ctx.channel_kinds.push((key.clone(), k.clone()));
-                }
+                ctx.channel_types.push((key.clone(), ch.ty.clone()));
                 ctx.resolved_domains.push((key, dom));
             }
         }
@@ -2510,6 +2597,34 @@ fn assert_no_shadowed_captures(body: &Expr, channels: &HashMap<Name, Expr>) {
         e.walk_children(|c| walk(c, protected, read));
     }
     walk(body, &protected, &read);
+}
+
+/// The `let`s on `body`'s spine that [`bind_cluster_at_scope`] binds the cluster of
+/// `defer_names` inside of: every one ahead of the first `let` or `letrec` that reads a cluster
+/// name, where the cluster's bindings land.
+fn lets_ahead_of_bind_site(body: &Expr, defer_names: &[(Name, Occurrence)]) -> HashSet<Name> {
+    let reads_cluster = |e: &Expr| defer_names.iter().any(|(d, _)| count_free(d, e) > 0);
+    let mut lets = HashSet::new();
+    let mut at = body;
+    loop {
+        match &at.node {
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } if !reads_cluster(bound_expr) => {
+                lets.insert(binding.name.clone());
+                at = body;
+            }
+            TypedExprNode::ExprStmt { body, .. } => at = body,
+            TypedExprNode::LetRec { bindings, body }
+                if !bindings.iter().any(|(_, def)| reads_cluster(def)) =>
+            {
+                at = body
+            }
+            _ => return lets,
+        }
+    }
 }
 
 /// Walk `expr` through `Let` / `ExprStmt` bodies to the scope where the
@@ -2972,12 +3087,16 @@ fn copair_type(feeds: &[Expr], sites: &[FieldKey], element: Option<&Type>) -> Ty
 /// `in_inner_scope` is `true` when the walk has crossed a [`TypedExprNode::Lambda`]
 /// or [`TypedExprNode::Case`] branch boundary — `Define` is disallowed in those
 /// contexts since the channelized binding would need to escape the inner scope.
+///
+/// `bind_site` names the lets the channel remains inside. A contribution that does not read
+/// one keeps no copy of it; copying it would close a type whose binder the channel never leaves.
 fn extract_for_defer(
     expr: Expr,
     cx: &Extract<'_>,
     feeds: &mut Vec<Contribution>,
     define: &mut Option<(NodeId, Expr)>,
     in_inner_scope: bool,
+    bind_site: &HashSet<Name>,
 ) -> Result<Expr, Located<DeferError>> {
     // Grow the stack on demand, as `lambda_elim`'s two recursion entries do. This
     // walk descends the whole tree in one stack frame per node, and the frame is large
@@ -2985,7 +3104,7 @@ fn extract_for_defer(
     // — deep enough trees overflow a test thread's default stack. Every level goes
     // through this wrapper, so each one checks the remaining headroom.
     stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
-        extract_for_defer_impl(expr, cx, feeds, define, in_inner_scope, None)
+        extract_for_defer_impl(expr, cx, feeds, define, in_inner_scope, None, bind_site)
     })
     // A node rebuilt over what extraction left of its children does what they do.
     .map(Expr::absorbing_children_capabilities)
@@ -3009,6 +3128,7 @@ fn extract_for_defer_impl(
     define: &mut Option<(NodeId, Expr)>,
     in_inner_scope: bool,
     position: Option<&Name>,
+    bind_site: &HashSet<Name>,
 ) -> Result<Expr, Located<DeferError>> {
     let defer_name = cx.defer_name;
     // A loop indexed by its position is the chain `source ≫ step` it denotes, whose arm below
@@ -3032,6 +3152,7 @@ fn extract_for_defer_impl(
                 define,
                 in_inner_scope,
                 Some(&position.name),
+                bind_site,
             )?;
             // A contribution is a loop of its own over the source, so it binds a position of
             // its own, which the step's reads of the loop's position become.
@@ -3169,7 +3290,8 @@ fn extract_for_defer_impl(
             bound_expr,
             body,
         } => {
-            let bound_expr = extract_for_defer(*bound_expr, cx, feeds, define, in_inner_scope)?;
+            let bound_expr =
+                extract_for_defer(*bound_expr, cx, feeds, define, in_inner_scope, bind_site)?;
             let body = if &binding.name == defer_name {
                 // Inner let shadows the defer name; do not descend.
                 *body
@@ -3181,7 +3303,8 @@ fn extract_for_defer_impl(
                 // with `let n = … in for-loop`) would float out to the
                 // cluster's bind site with `n` unbound.
                 let prev_len = feeds.len();
-                let new_body = extract_for_defer(*body, cx, feeds, define, in_inner_scope)?;
+                let new_body =
+                    extract_for_defer(*body, cx, feeds, define, in_inner_scope, bind_site)?;
                 // Wrap each feed extracted during the body walk with this
                 // let-binding — but only when the feed actually references the
                 // binding. A channel that escapes the scope where the binding
@@ -3203,7 +3326,10 @@ fn extract_for_defer_impl(
                     ..
                 } in feeds.iter_mut().skip(prev_len)
                 {
-                    if crate::ccl::ccl_utils::free_reads(feed).contains(&binding.name) {
+                    if crate::ccl::ccl_utils::free_reads(feed).contains(&binding.name)
+                        && !(bind_site.contains(&binding.name)
+                            && !crate::ccl::ccl_utils::is_free_in_value(&binding.name, feed))
+                    {
                         let _g = provenance::enter(
                             *feed_id,
                             "channelize.feed",
@@ -3234,8 +3360,22 @@ fn extract_for_defer_impl(
             }
         }
         TypedExprNode::ExprStmt { expr: e, body } => TypedExprNode::ExprStmt {
-            expr: Box::new(extract_for_defer(*e, cx, feeds, define, in_inner_scope)?),
-            body: Box::new(extract_for_defer(*body, cx, feeds, define, in_inner_scope)?),
+            expr: Box::new(extract_for_defer(
+                *e,
+                cx,
+                feeds,
+                define,
+                in_inner_scope,
+                bind_site,
+            )?),
+            body: Box::new(extract_for_defer(
+                *body,
+                cx,
+                feeds,
+                define,
+                in_inner_scope,
+                bind_site,
+            )?),
         },
         TypedExprNode::Apply { function, argument } => {
             // A comprehension's per-element step is `(𝑖 ▷ xs) ▷ (λ x → body)`:
@@ -3279,10 +3419,17 @@ fn extract_for_defer_impl(
                     &mut lambda_feeds,
                     &mut lambda_define,
                     true,
+                    bind_site,
                 )?;
                 no_inner_define(lambda_define);
-                let new_argument =
-                    extract_for_defer(*argument.clone(), cx, feeds, define, in_inner_scope)?;
+                let new_argument = extract_for_defer(
+                    *argument.clone(),
+                    cx,
+                    feeds,
+                    define,
+                    in_inner_scope,
+                    bind_site,
+                )?;
                 for Contribution {
                     value: v,
                     levels,
@@ -3327,8 +3474,10 @@ fn extract_for_defer_impl(
                     argument: Box::new(new_argument),
                 }
             } else {
-                let new_function = extract_for_defer(*function, cx, feeds, define, in_inner_scope)?;
-                let new_argument = extract_for_defer(*argument, cx, feeds, define, in_inner_scope)?;
+                let new_function =
+                    extract_for_defer(*function, cx, feeds, define, in_inner_scope, bind_site)?;
+                let new_argument =
+                    extract_for_defer(*argument, cx, feeds, define, in_inner_scope, bind_site)?;
                 TypedExprNode::Apply {
                     function: Box::new(new_function),
                     argument: Box::new(new_argument),
@@ -3343,11 +3492,19 @@ fn extract_for_defer_impl(
                 feeds,
                 define,
                 in_inner_scope,
+                bind_site,
             )?),
             target,
         },
         TypedExprNode::BinOp { left, op, right } => TypedExprNode::BinOp {
-            left: Box::new(extract_for_defer(*left, cx, feeds, define, in_inner_scope)?),
+            left: Box::new(extract_for_defer(
+                *left,
+                cx,
+                feeds,
+                define,
+                in_inner_scope,
+                bind_site,
+            )?),
             op,
             right: Box::new(extract_for_defer(
                 *right,
@@ -3355,6 +3512,7 @@ fn extract_for_defer_impl(
                 feeds,
                 define,
                 in_inner_scope,
+                bind_site,
             )?),
         },
         TypedExprNode::UnaryOp(op, inner) => TypedExprNode::UnaryOp(
@@ -3365,6 +3523,7 @@ fn extract_for_defer_impl(
                 feeds,
                 define,
                 in_inner_scope,
+                bind_site,
             )?),
         ),
         TypedExprNode::Aggregate { input, kind } => TypedExprNode::Aggregate {
@@ -3374,17 +3533,18 @@ fn extract_for_defer_impl(
                 feeds,
                 define,
                 in_inner_scope,
+                bind_site,
             )?),
             kind,
         },
         TypedExprNode::Tuple(elts) => TypedExprNode::Tuple(
             elts.into_iter()
-                .map(|e| extract_for_defer(e, cx, feeds, define, in_inner_scope))
+                .map(|e| extract_for_defer(e, cx, feeds, define, in_inner_scope, bind_site))
                 .collect::<Result<_, _>>()?,
         ),
         TypedExprNode::List(elts) => TypedExprNode::List(
             elts.into_iter()
-                .map(|e| extract_for_defer(e, cx, feeds, define, in_inner_scope))
+                .map(|e| extract_for_defer(e, cx, feeds, define, in_inner_scope, bind_site))
                 .collect::<Result<_, _>>()?,
         ),
         TypedExprNode::Compose(elts) => {
@@ -3630,6 +3790,7 @@ fn extract_for_defer_impl(
                             &mut lambda_feeds,
                             &mut lambda_define,
                             true,
+                            bind_site,
                         )?;
                         no_inner_define(lambda_define);
                         // Emit per-feed companion composes BEFORE pushing
@@ -3688,14 +3849,21 @@ fn extract_for_defer_impl(
                             site: elt_site,
                         });
                     }
-                    _ => new_elts.push(extract_for_defer(elt, cx, feeds, define, in_inner_scope)?),
+                    _ => new_elts.push(extract_for_defer(
+                        elt,
+                        cx,
+                        feeds,
+                        define,
+                        in_inner_scope,
+                        bind_site,
+                    )?),
                 }
             }
             TypedExprNode::Compose(new_elts)
         }
         TypedExprNode::Copair(elts) => TypedExprNode::Copair(
             elts.into_iter()
-                .map(|e| extract_for_defer(e, cx, feeds, define, in_inner_scope))
+                .map(|e| extract_for_defer(e, cx, feeds, define, in_inner_scope, bind_site))
                 .collect::<Result<_, _>>()?,
         ),
         TypedExprNode::Record(fields) => {
@@ -3709,7 +3877,7 @@ fn extract_for_defer_impl(
                 new_fields.push(RecordEntry {
                     label,
                     label_occurrence,
-                    value: extract_for_defer(value, cx, feeds, define, in_inner_scope)?,
+                    value: extract_for_defer(value, cx, feeds, define, in_inner_scope, bind_site)?,
                 });
             }
             TypedExprNode::Record(new_fields)
@@ -3732,7 +3900,14 @@ fn extract_for_defer_impl(
             let body = if &param.name == defer_name {
                 *body
             } else {
-                extract_for_defer(*body, cx, &mut local_feeds, &mut local_define, true)?
+                extract_for_defer(
+                    *body,
+                    cx,
+                    &mut local_feeds,
+                    &mut local_define,
+                    true,
+                    bind_site,
+                )?
             };
             no_inner_define(local_define);
             for Contribution {
@@ -3787,8 +3962,14 @@ fn extract_for_defer_impl(
             {
                 let mut branch_feeds = Vec::new();
                 let mut branch_define = None;
-                let body =
-                    extract_for_defer(body, cx, &mut branch_feeds, &mut branch_define, true)?;
+                let body = extract_for_defer(
+                    body,
+                    cx,
+                    &mut branch_feeds,
+                    &mut branch_define,
+                    true,
+                    bind_site,
+                )?;
                 no_inner_define(branch_define);
                 if !branch_feeds.is_empty() {
                     any_feed = true;
@@ -3961,6 +4142,7 @@ fn extract_for_defer_impl(
                 feeds,
                 define,
                 in_inner_scope,
+                bind_site,
             )?),
         },
         TypedExprNode::NominalCtor {
@@ -3976,6 +4158,7 @@ fn extract_for_defer_impl(
                 feeds,
                 define,
                 in_inner_scope,
+                bind_site,
             )?),
         },
         // Recognition runs after lambda_elim, so a
@@ -3994,10 +4177,10 @@ fn extract_for_defer_impl(
         TypedExprNode::LetRec { mut bindings, body } => {
             for (_, def) in bindings.iter_mut() {
                 let taken = std::mem::take(def);
-                *def = extract_for_defer(taken, cx, feeds, define, in_inner_scope)?;
+                *def = extract_for_defer(taken, cx, feeds, define, in_inner_scope, bind_site)?;
             }
             let prev_len = feeds.len();
-            let body = extract_for_defer(*body, cx, feeds, define, in_inner_scope)?;
+            let body = extract_for_defer(*body, cx, feeds, define, in_inner_scope, bind_site)?;
             let channels = !crate::ccl::letrec::group_has_causal(&bindings);
             for Contribution {
                 value: feed,

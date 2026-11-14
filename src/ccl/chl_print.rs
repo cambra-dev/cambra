@@ -1262,11 +1262,12 @@ mod tests {
     #[case("Map(String, Int)", "Map(String, Int)")]
     #[case("Set(Int)", "Set(Int)")]
     #[case("Collection(Int)", "Collection(Int)")]
-    #[case("FullMap(Int, String)", "Int |=> String")]
+    // `FullMap` is a type `std` declares, so it prints by name rather than as the collection
+    // it holds.
+    #[case("FullMap(Int, String)", "FullMap(Int, String)")]
+    #[case("FullMap(_, Int)", "FullMap(_, Int)")]
     #[case("Int |=> String", "Int |=> String")]
     #[case("_ |=> Int", "_ |=> Int")]
-    // A plain collection over a hole domain is not `_ |=> Int`, which admits a sum.
-    #[case("FullMap(_, Int)", "FullMap(_, Int)")]
     #[case("(Int |=> Int) |=> Int", "(Int |=> Int) |=> Int")]
     #[case("Int => Int |=> Int", "Int => Int |=> Int")]
     #[case("Int |=> Int => Int", "Int |=> Int => Int")]

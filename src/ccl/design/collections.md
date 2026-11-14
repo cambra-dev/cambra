@@ -6,9 +6,9 @@ constructor lowering and checked-lookup implementation. The
 [CHL collection reference](../../../docs/chl-spec.md#63-direction-collection-types-decided)
 owns the source-language interface and its planned changes.
 
-The current representation does not distinguish every planned surface collection type.
-In particular, `Set(K)` and `Map(K, unit)` lower to the same type, and iteration currently
-binds values for both. Proposed nominal distinctions and per-type operations are marked below.
+`Set`, `Map` and `FullMap` are nominal types declared in `std`. Their representations are data
+functions, and their `Iterable` instances choose keys or entries as the iteration elements.
+`Array`, `List` and `Collection` are structural collection types.
 
 A witness is a binder whose candidate domains are classified by a `TypeKind`. The general
 rules are owned by [Subtyping for sums](type-inference.md#subtyping-for-sums); this document
@@ -29,36 +29,39 @@ predicates (`src/interpreter/tiling/predicate.rs`) keep their bracket notation.
 
 ## The six collection types
 
-The annotation forms lower through `lower_type_application` in `lower/stmts.rs`:
+`Array`, `List` and `Collection` lower through `lower_type_application` in `lower/stmts.rs`.
+`Set`, `Map` and `FullMap` resolve to the nominal declarations in `std`:
 
-| Annotation | CCL representation | Domain information |
+| Annotation | CCL type or nominal representation | Domain information |
 |---|---|---|
 | `Array(n, T)` | `UIntRange(n) ⤇ T` | A statically written length. `n` must be a non-negative integer literal representable as `usize`. |
 | `List(T)` | `Σ (D : UIntRanges). D ⤇ T` | Some unsigned index range; the annotation does not name its length. |
-| `Set(K)` | `Σ (D : SubtypesOf(K)). D ⤇ unit` | A subset of key type `K`, with unit values. |
-| `Map(K, V)` | `Σ (D : SubtypesOf(K)). D ⤇ V` | A subset of key type `K` with values of type `V`. |
-| `FullMap(K, V)` | `K ⤇ V` | The domain is `K` itself, not a sum witness. |
+| `Set(K)` | Nominal, wrapping `Σ (D : SubtypesOf(K)). D ⤇ unit` | A subset of key type `K`, with unit values. |
+| `Map(K, V)` | Nominal, wrapping `Σ (D : SubtypesOf(K)). D ⤇ V` | A subset of key type `K` with values of type `V`. |
+| `FullMap(K, V)` | Nominal, wrapping `(k: K) ⤇ V(k)` | The domain is `K` itself, not a sum witness. |
 | `Collection(T)` | `Σ (D : Type). D ⤇ T` | An abstract domain without a narrower kind restriction. |
 
-`Array` and `FullMap` have explicit domains. The other four are sums. Introducing a sum
-requires a term such as `box`; a subtype constraint does not insert one. For example,
-`box([1, 2])` can satisfy `List(Int)`, whereas the bare literal has a concrete range domain.
-Widening an existing sum follows the kind/body relation, not a collection-specific coercion.
+`Array` has an explicit domain. `List` and `Collection` are sums. A sum requires a term such as
+`box`; a subtype constraint does not insert one. For example, `box([1, 2])` can satisfy
+`List(Int)`, whereas the bare literal has a concrete range domain. `Set` and `Map` wrap sums
+that their constructors introduce internally. `FullMap` wraps an explicit-domain collection.
+Widening a sum follows the kind/body relation.
 
 The abstract domain remains part of a collection value even when a consumer cannot name it
 statically. `Collection`'s `Type` kind admits every domain kind, but does not supply a runtime
 witness implementation; see
 [Compiling a conditional collection](#compiling-a-conditional-collection).
 
-`FullMap(_, V)` lets inference recover a producer's domain. A list literal can satisfy that
-annotation; this does not give it an unrefined `Int` domain. Likewise, a group-by retains its
-present-key domain. `full_map_annotations_are_satisfiable` and
+`FullMap(_, V)` lets inference recover a group-by's present-key domain, and only a group-by
+satisfies it, since `groupby` is the only operation that builds a `FullMap`.
+`only_a_group_by_satisfies_a_full_map_annotation` and
 `a_groupby_is_a_full_map_at_either_strength` cover annotation cases.
 A `FullMap(Int, Int)` parameter can be type-checked with a proven integer lookup `m[1]!` without
 establishing that a tested concrete collection can inhabit the parameter type.
 
 A data-function type `𝐷 |=> 𝑉` lowers to `(k: 𝐷) ⤇ 𝑉` under a fresh binder, as
-`FullMap(𝐾, 𝑉)` does (`Type::full_map_of`), and its funkind follows its domain:
+the representation of `FullMap(𝐾, 𝑉)` does (`Type::full_map_of`), and its funkind follows its
+domain:
 
 - A bare `_` domain gets a funkind hole (`FunKind::data_hole`), which normalization replaces with
   a fresh data funkind at each occurrence, plain or a sum. A lowered annotation is cloned by every
@@ -69,7 +72,7 @@ A data-function type `𝐷 |=> 𝑉` lowers to `(k: 𝐷) ⤇ 𝑉` under a fres
 
 The table does not promise that every declared lookup or iteration interface is implemented.
 Those boundaries are specified under [Lookup](#lookup-membership-discharge) and
-[Operations](#operations-how-the-trait-layer-dispatches-planned).
+[Operations](#operations-trait-dispatch).
 
 ## The empty literal names no element type
 
@@ -116,10 +119,9 @@ things carry its uses to the pin:
   and the groups' refinement, and a copy in a predicate keeps its own variables, which the pin,
   walking terms only, never reaches. So A-normalization names a literal collection once
   (`anf`, the `GroupBy` arm), and every copy reads the one binding the pin decides.
-- **The annotation's key type.** A `Set(𝐾)` or `Map(𝐾, 𝑉)` annotation meets the boxed key domain as
-  a membership in `SubtypesOf(𝐾)`, recorded on the key variable without a bound. The type of a
-  position reads that membership as a demand
-  ([The type of a position](type-inference.md#the-type-of-a-position)), so the element takes `𝐾`.
+- **The annotation's key type.** A `Set(𝐾)` or `Map(𝐾, 𝑉)` annotation relates the key domain to
+  `SubtypesOf(𝐾)`. Membership adds an upper bound from which the empty element's type can be
+  determined ([The type of a position](type-inference.md#the-type-of-a-position)).
 
 `map`'s entry is declared a pair, so its element is the pair `(𝐾, 𝑉)`, and the pin decides each
 component that no value reaches the same way. With no use, the element is unit, and a map's is
@@ -127,9 +129,9 @@ component that no value reaches the same way. With no use, the element is unit, 
 
 ### `empty_map()` [Interim]
 
-`empty_map()` constructs a keyed sum without deriving a type from entries:
-`Σ (σ : SubtypesOf(𝐾)). σ ⤇ 𝑉`. A `Map(𝐾, 𝑉)` annotation fixes its parameters. A `Set(𝐾)`
-annotation also works because `Set(𝐾)` is represented as `Map(𝐾, unit)`.
+`empty_map()` constructs an empty nominal map without deriving its types from entries:
+`Map(𝐾, 𝑉)` around `Σ (σ : SubtypesOf(𝐾)). σ ⤇ 𝑉`. A `Map(𝐾, 𝑉)` annotation
+fixes its parameters. A `Set(𝐾)` annotation is rejected: it names another nominal type.
 
 ```python
 cart: Mut(Map(String, Int), Txn) := empty_map()
@@ -150,50 +152,34 @@ inferred type. No entry is available from which to recover its key or value type
 would require a representation and inference rules for an unknown kind; this remains a proposal,
 not an implemented replacement for `empty_map()`. The decided nominal `Set` and `Map` replace it
 with the two values `Set::empty` and `Map::empty`; see
-[Telling `Set` and `Map` apart](#telling-set-and-map-apart-decided).
+[Telling `Set` and `Map` apart](#telling-set-and-map-apart).
 
 ## The collection type is declared, not read off the shape
 
-The planned operation interface selects an iteration element by collection type: values for
-arrays/lists/collections, keys for sets, and entries for maps. A function shape alone cannot
-identify that intent. A set and a map with unit values have the same representation, and a
-positional and a keyed collection can expose overlapping domain shapes.
+`Iterable` selects an iteration element by collection type: values for structural collections,
+keys for sets, and entries for maps and full maps. A function shape alone cannot identify that
+intent. A set and a map with unit values have the same representation, while their nominal
+identities select different instances. Loops and comprehensions call `Iterable::elements`;
+they do not infer the intended collection type from the representation's shape.
 
-Current loops bind the codomain unconditionally. The type-directed choice below is proposed
-work, not a dispatch mechanism already implemented by the compiler. `Set` is a nominal builtin with
-no edge to `Collection` ([Telling `Set` and `Map` apart](#telling-set-and-map-apart-decided)), so
-its keys are reached through `keys` rather than through a structural reading of its values.
+## Telling `Set` and `Map` apart
 
-## Telling `Set` and `Map` apart [Decided]
+The private constructors preserve each collection's identity. `Set` and `Map` obtain their
+representations from `@Builtin`. Their payloads are sums over `SubtypesOf(K)`, with unit values
+for `Set` and values of type `V` for `Map`. `FullMap` declares its constructor in CHL with
+payload `(𝑘: 𝐾) ⤇ 𝑉(𝑘)`. Variance follows these payload types.
 
-`Type` has no nominal collection constructor distinguishing `Set(K)` from `Map(K, unit)` today.
-The decision is that `Set`, `Map` and `FullMap` become **nominal builtins**: type constructors the
-compiler declares, opaque as a `type` declaration is
-([chl-spec, 6.8 Nominal types and methods [Decided]](../../../docs/chl-spec.md#68-nominal-types-and-methods-decided)),
-with no constructors or `extract` a program can reach. `Array`, `List` and `Collection` stay
-structural: the kind already tells a bare range `Fun`, `UIntRanges` and `Type` apart. `FullMap` is nominal
-because it iterates entries as `Map` does, which a structural `(𝑘: 𝐾) ⤇ 𝑉` does not.
+The constructor stays in the runtime value. An operation extracts the payload through a one-arm
+`match`. The representation gives no subtyping relation to a structural collection. An entry
+comprehension builds a structural collection from the values it selects.
 
-The three questions the decision answers:
+### Keys and entries
 
-- **The nominal constructor remains around the sum.** `Map(𝐾, 𝑉)` wraps
-  `Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉`, `Set(𝐾)` wraps `Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ unit`, and
-  `FullMap(𝐾, 𝑉)` wraps `(𝑘: 𝐾) ⤇ 𝑉`. Inference resolves the builtin's operations on the
-  name, and the first implementation erases it once they are resolved. Erasure is
-  [open in the spec](../../../docs/chl-spec.md#a-nominal-type-is-opaque).
-- **`Map(𝐾, 𝑉) <: Collection(𝑉)` does not hold**, and no edge leads from `Set` or `FullMap` to a
-  structural type. A nominal type is related only to itself, so reaching a `Collection` takes
-  the method `keys`, `values` or `items`, and `sum(m)` is rejected at the missing edge.
-- **Variance is read off the wrapped representation**, as a declared type's is read off its
-  constructors' parameter types.
-
-`FullMap(𝐾, 𝑉)`'s second parameter is a family over the key, since `𝑉` may depend on `𝑘` for a
-group-by. A nominal builtin's parameter therefore accepts a type family where a declared type's
-parameter takes a type.
-
-None of this is implemented. Current codomain iteration makes `for g in groupby(xs, key)` bind
-groups. Uniform entry iteration is a possible interim design: a set entry would be `(K, unit)`
-rather than `K`. That would change source-visible behavior and is not implemented here.
+A `Set` iterates its keys, and a `Map` or a `FullMap` its entries. `Iterable`'s `elements` of each
+is its representation, taken out of the constructor, through `map_domain` for a `Set` and
+`entries : (𝐷 ⤇ 𝑉) ⇒ (𝐷 ⤇ (𝐷, 𝑉))` for the other two. The `@Builtin` instances in `std` build that
+term at coalescing (`apply_collection_primitive` in `infer/solve.rs`). A loop over a group-by binds
+an entry, `for _ -> g in groupby(xs, key)`, and a loop over a map's values is `for _ -> v in m`.
 
 ## `groupby`'s exact type
 
@@ -209,10 +195,10 @@ The outer domain is this key morphism's image, not all inhabitants of `K`. Each 
 retains the source positions whose values have that key. The codomain depends on the outer key
 binder. Both the outer function and the inner group are data functions.
 
-This is an explicit-domain function, the `FullMap` representation, rather than a uniform
-`Map(K, V)` abbreviation. A `FullMap(_, _)` annotation, exact or bounded, can preserve and consume
-the group-by's type. A `Map(_, _)` annotation holds it boxed, a sum over the key domain, and a
-consumer iterates the groups through the sum (`a_keyed_annotation_compiles_and_runs`).
+This explicit-domain function is wrapped by `FullMap::new`. A `FullMap(_, _)` annotation,
+exact or bounded, preserves and consumes the group-by's nominal type
+(`a_keyed_annotation_compiles_and_runs`). A `Map(_, _)` annotation names another nominal type
+and does not accept a group-by.
 
 A checked lookup substitutes its key into the dependent group type during inference.
 The streamed collection-valued answer is rejected later at operator conversion; see
@@ -252,7 +238,7 @@ operator. The compiler does not provide a surface `in` expression yet.
 An iteration site over a present-key domain enumerates the keys instead of testing membership:
 its source is `𝑚 ▷ converse ▷ map_domain`, the image of the membership's collection `𝑚`, and the
 domain's other refinements restrict it (`membership_keys` in `planning/iterate.rs`). A
-comprehension whose element ignores the group reaches this, `[1 for g in groupby(xs, key)]` over
+comprehension whose element ignores the group reaches this, `[1 for _ -> g in groupby(xs, key)]` over
 a list `xs`, or `[1 for v in ages]` over a map `ages`, since nothing applies the partition.
 
 The source enumerates the domain level by level (`domain_keys` in `planning/iterate.rs`). A level
@@ -284,7 +270,7 @@ applying its key morphism already proves membership. The current rejection is re
 
 ### Constructor lowering: runtime `groupby` now, constant-folding later
 
-The implemented re-keying constructors return concrete data functions:
+The re-keying constructors build concrete data functions before wrapping them:
 
 | Constructor | Key morphism | Group collapse | Result |
 |---|---|---|---|
@@ -300,10 +286,11 @@ The collapse must consume its group. For a set, replacing `Drain` with a functio
 the group would leave the source without the consumer through which planning assigns an iteration
 site. Duplicate set elements are absorbed by the drain; duplicate map keys reach `Sole`.
 
-Neither constructor inserts `box`. A sum annotation requires explicit boxing, for example
-`m: Map(Int, Int) = box(map([1 -> 10, 2 -> 20]))`.
-`list(...)` is not a surface builtin; use `box` to introduce a list sum.
-Annotation-driven insertion of these constructors remains planned.
+Both constructors apply `box` to the re-keyed collection, then wrap the sum in the private
+nominal constructor: `Set::rep` or `Map::rep`. Source writes
+`m: Map(Int, Int) = map([1 -> 10, 2 -> 20])`. `groupby` instead wraps its explicit-domain result
+in `FullMap::new` without boxing. `list(...)` is not a surface builtin; `box` introduces a
+structural list sum. Annotation-driven insertion of re-keying constructors remains planned.
 
 Planning's constant fold does not evaluate an entire re-keying collection. Its scalar folding
 can prepare literal elements, but the group-by remains a runtime operation. A collection fold
@@ -329,49 +316,52 @@ only by an annotation or lookup remains planned.
 Literals are not the fault boundary: a map comprehension built from request data inherits this
 process fault. The appropriate failure behavior for that case remains an open decision.
 
-## Operations: how the trait layer dispatches [Planned]
+## Operations: trait dispatch
 
-The intended source interfaces are owned by
+The implemented `Iterable` and `Indexable` interfaces are traits declared in `std`.
+User-declared nominal types supply instances through ordinary trait declarations.
+The compiler supplies the `@Builtin` instances for `Set`, `Map` and `FullMap`, and answers
+structural collections directly through the collection rule.
+
+`for x in c` calls `Iterable::elements(c)`, requires `Iterable(𝐶)` of `c`'s type, and binds `x`
+to each value of `Elements`. A structural collection is its own `Elements`. A set exposes keys;
+a map or full map exposes entries `(key, value)`. A generic definition retains the requirement.
+See [A collection is answered off the table](type-inference.md#a-collection-is-answered-off-the-table).
+
+Subscripts call `Indexable::entries`; [Lookup](#lookup-membership-discharge) specifies checked
+and proven access. An entry comprehension such as `[v for _ -> v in m]` exposes a structural
+collection of map values, so the proposed view methods are not its only possible interface.
+
+Separate membership and ordering interfaces, and the lazy `keys`, `values` and `items` methods,
+remain proposals. Membership would distinguish map/set keys from structural collection values.
+Ordering would come from a positional domain or an ordering requirement, independently of
+incidental keyed storage order. The source contracts are owned by
 [collection types](../../../docs/chl-spec.md#63-direction-collection-types-decided),
 [subscripts](../../../docs/chl-spec.md#39-subscript-and-attribute-access), and
 [iteration](../../../docs/chl-spec.md#46-for--iteration).
-This section records the proposed implementation strategy, not today's dispatch.
-
-The proposal assigns per-type `Iterable`, `Index`, `Membership` and `Ordering` operations.
-These collection interfaces are distinct from the solver's implemented arithmetic/comparison
-trait tables. General contextual-parameter/typeclass resolution remains future work.
-
-- `for x in c` iterates `Iterable::elements(c)`, which places the requirement
-  `Iterable(𝐶)` on `c`'s type, and binds `x` to each value of its `Elements`
-  ([chl-spec, 4.6 `for` — iteration](../../../docs/chl-spec.md#46-for--iteration)). A structural
-  collection, including every comprehension result, is its own `Elements`
-  ([type-inference.md, "A collection is answered off the table"](type-inference.md#a-collection-is-answered-off-the-table)),
-  and a polymorphic `def` generalizes over the requirement. The instances for the nominal
-  collections are built in: keys for `Set`, entries for `Map` and `FullMap`. A nominal type is
-  related only to itself, so every producer of a value names the same head and the instance does
-  not depend on where the value flows.
-- Optional lookup would decide membership at runtime; proven access would require a key
-  refinement. The surface spellings are governed by the CHL reference, not duplicated here.
-- Membership would test map/set domains and list/collection values. A key-membership guard
-  would introduce the evidence required for proven lookup.
-- Ordering would come from positional domains or an explicit ordering instance, rather than
-  the incidental storage order of keyed data. Loop-carried dependencies and collection order
-  remain distinct questions.
-- The methods `keys`, `values` and `items` of `Map` and `FullMap`, and `keys` of `Set`, would
-  expose lazy views without copying collection data. The nominal `Map` has no edge to
-  `Collection(V)` ([Telling `Set` and `Map` apart](#telling-set-and-map-apart-decided)), so these
-  views are the only route to one, and `sum(m)` is an error where `sum(m.values())` is not.
-  Current value iteration permits `sum(m)` when the values support summation.
-
-The suggested re-pairing of an existing keyed domain is a representation plan, not an implemented
-runtime-free conversion API. No surface view constructor should be inferred from these names.
 
 ## Lookup: membership discharge
 
-The proven lookup `c[k]!` lowers as function application. It requires the key type to be below
+A subscript reads its collection through `Indexable`, the `std` trait whose function `entries`
+answers the collection as the function from each of its keys to the value there, of type
+`Entries`. Lowering writes `c[k]` as `(c ▷ entries, k) ▷ lookup?` and `c[k]!` as
+`k ▷ (c ▷ entries)`. A structural collection is its own `Entries`, by the collection rule, and
+coalescing removes the call. `Set`, `Map` and `FullMap` have `@Builtin` instances whose `Entries`
+is their representation, and coalescing replaces the call with the `match` that takes the
+representation out of its constructor.
+
+Where `c`'s type is known at the subscript, emission types `c ▷ entries` as that type's
+`Entries` directly, since both lookup rules read the function's structure where they stand.
+Where it is not, as for a parameter of an unannotated lambda, the call's obligation waits for
+the type, and the proven lookup is typed against the call's result variable as an application
+of an unknown function is. ANF leaves `c ▷ entries` in place over an atomic `c`, so the lookup
+reads `c`'s own binding.
+
+The proven lookup `c[k]!` is application of `c ▷ entries`. It requires the key type to be below
 the collection's domain. `c[k]` is checked lookup: it requires a compatible key type but decides
 presence at runtime and returns `Option`. The
 [CHL reference](../../../docs/chl-spec.md#39-subscript-and-attribute-access) owns the spellings.
+A direct call `c(k)` is application of `c` itself, so it reaches a structural collection only.
 
 A `FullMap(K, V)` parameter with a key of type `K` satisfies ordinary application.
 That typing rule does not construct a value at such a domain. A concrete keyed domain requires
@@ -382,8 +372,8 @@ A list's proven lookup accepts a `UInt` key whose refinement entails the range b
 
 ### The checked lookup `𝑐[𝑘]`
 
-Lowering emits `(c, k) ▷ lookup?`. `emit_apply` intercepts that builtin application and uses
-`emit_lookup_checked` rather than the ordinary collection-application rule:
+Lowering emits `(c ▷ entries, k) ▷ lookup?`. `emit_apply` intercepts that builtin application
+and uses `emit_lookup_checked` rather than the ordinary collection-application rule:
 
 1. `keyed_access_types` obtains the domain, optional key binder and codomain. For a sum,
    its first witness must have kind `SubtypesOf(K)`; the sum is instantiated at `K`.
@@ -398,9 +388,9 @@ Lowering emits `(c, k) ▷ lookup?`. `emit_apply` intercepts that builtin applic
 The key constraint is directional. Joining the lookup key and collection keys at a common
 supertype would admit a wrong-base key by widening instead of rejecting it.
 
-An exact `Map(K, V)` parameter exposes a usable type at emission. A bounded parameter can
-still be unresolved there and is rejected; binding the collection locally or giving the
-parameter an exact annotation can avoid that boundary. `checked_lookup_boundaries` also
+An exact `Map(K, V)` parameter exposes a usable type at emission, and a bounded one
+`m <: Map(K, V)` reaches the subscript's `Indexable` requirement from above, which a nominal
+bound settles as a lower one does. `checked_lookup_boundaries` also
 covers tuple targets and range domains. A tuple is a product, not a collection lookup target.
 
 Emission computes the dependent result once. Later type checks recover the payload from the
@@ -496,6 +486,13 @@ bound off its own term. It holds the binder's position rather than its id: infer
 sum's binders into each consumer's scope, and the term and the position stay the same. A type that
 mentions `σᵢ(𝑥)` and leaves the binding of `𝑥` substitutes `𝑥`'s definition, as any type naming a
 `let` binder does ([`let` binders and scope exit](type-inference.md#let-binders-and-scope-exit)).
+An elimination can know the sum before the term's type exposes it. `WitnessProjection::through`
+saves the sum binders when their candidate types, including quoted type slots, contain no
+inference variables. The saved sum has a unit codomain.
+It is a type child in the projection's scope. Substitution, binder conversion,
+freshening, coalescing and free-name checks reach it. Equality and hashing ignore both this type
+and the term's type slots.
+
 Realization rewrites `σᵢ(𝑐)` in a leg to the candidate the leg chose. It reads the witness off the
 term the projection quotes, under the id that term was typed with.
 

@@ -75,7 +75,7 @@
 //! [`Define`]: crate::ccl::TypedExprNode::Define
 
 use crate::ccl::{
-    BindingTransparency, Expr, FunKind, Lit, Name, ProjKey, Refinement, Type, TypedBinding,
+    BindingTransparency, Branch, Expr, FunKind, Lit, Name, ProjKey, Refinement, Type, TypedBinding,
     TypedExprNode,
     ccl_utils::{
         PredMemo, count_free, discharge_transparent_lets, free_names, free_names_in_value, is_free,
@@ -109,9 +109,14 @@ use std::rc::Rc;
 /// ([`fold_product_projection`]); `crate::ccl::simplify` folds the rest as a
 /// general rule so it fires consistently throughout the tree.
 pub fn inline_compute_lambdas(expr: Expr) -> Expr {
+    try_inline_compute_lambdas(expr).expect("inlining uses no unsupported reading in a refinement")
+}
+
+/// Inline compute functions, reporting a reading whose refinement cannot state its position.
+pub(crate) fn try_inline_compute_lambdas(expr: Expr) -> Result<Expr, String> {
     let expr = inline_impl(expr, &mut BinderScope::default(), &mut HashSet::new());
-    let expr = crate::ccl::observe_world::eliminate(expr);
-    inline_list_element_reads(expr, &PredMemo::new()).0
+    let expr = crate::ccl::observe_world::eliminate(expr)?;
+    Ok(inline_list_element_reads(expr, &PredMemo::new()).0)
 }
 
 /// Refuse a call whose function the inliner could not resolve, pointing at the call.
@@ -277,6 +282,70 @@ fn fold_product_projection(expr: Expr) -> Expr {
         reached_through(&mut component, call);
     }
     component
+}
+
+/// Whether `expr` is `match 𝐶(𝑥) { 𝐶(𝑤) → body }`, a value taken back out of the constructor
+/// that built it, which [`known_constructor`] reads.
+fn takes_out_its_constructor(expr: &Expr) -> bool {
+    let TypedExprNode::Case {
+        scrutinee: Some(scrutinee),
+        branches,
+    } = &expr.node
+    else {
+        return false;
+    };
+    let tag = match &scrutinee.node {
+        TypedExprNode::NominalCtor { decl, ctor, .. } => decl.tag(ctor),
+        TypedExprNode::VariantCtor { tag, .. } => tag.clone(),
+        _ => return false,
+    };
+    matches!(branches.as_slice(), [branch]
+        if branch.pattern.as_ref().is_some_and(|p| p.tag() == tag)
+            && matches!(branch.guard.node, TypedExprNode::Lit(Lit::Bool(true))))
+}
+
+/// `match 𝐶(𝑥) { 𝐶(𝑤) → body }`, which [`takes_out_its_constructor`] accepted, as `body` with `𝑤`
+/// bound to `𝑥` by the rule a call binds its argument by (`src/ccl/design/optimization.md`, "A
+/// value taken out of its constructor").
+///
+/// The `Case`, its pattern and the constructor die, and their parts move into the result.
+fn known_constructor(expr: Expr, scope: &BinderScope) -> Expr {
+    let node_id = expr.node_id();
+    let TypedExprNode::Case {
+        scrutinee: Some(scrutinee),
+        branches,
+    } = expr.node
+    else {
+        unreachable!("takes_out_its_constructor matched a scrutinee `Case`")
+    };
+    let payload = match scrutinee.node {
+        TypedExprNode::NominalCtor { payload, .. } | TypedExprNode::VariantCtor { payload, .. } => {
+            *payload
+        }
+        _ => unreachable!("takes_out_its_constructor matched a constructor"),
+    };
+    let [branch] =
+        <[Branch; 1]>::try_from(branches).expect("takes_out_its_constructor matched one branch");
+    let binding = branch
+        .pattern
+        .expect("takes_out_its_constructor matched a pattern")
+        .binding;
+    if is_shared_computation(&payload, &binding.name, &branch.body) {
+        let _g = provenance::enter(
+            node_id,
+            "inline.known_constructor",
+            provenance::Nature::Expansion,
+        );
+        return bind_argument(binding, payload, branch.body);
+    }
+    beta_reduce(
+        node_id,
+        binding,
+        branch.body,
+        payload,
+        "a constructor's payload",
+        scope,
+    )
 }
 
 /// Whether `expr` is a projection, `𝑝 ▷ .𝑘`.
@@ -1313,6 +1382,9 @@ fn inline_node(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
             }
             if calls_a_projection && calls_a_lambda(&expr) {
                 return inline_impl(beta_reduce_folded_call(expr, scope), scope, channels);
+            }
+            if takes_out_its_constructor(&expr) {
+                return inline_impl(known_constructor(expr, scope), scope, channels);
             }
             return fold_product_projection(expr);
         }

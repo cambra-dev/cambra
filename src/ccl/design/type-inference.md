@@ -813,22 +813,22 @@ conditional's reading unchanged.
 
 1. **An upper bound `𝛼 <: 𝑈`.** The answer is `𝑈` resolved, with the bound's recorded substitution
    applied. Where `𝑈` resolves to a variable, the answer is the type of that variable's position.
-2. **A recorded membership `𝛼 ∈ SubtypesOf(𝑈)`.** Membership draws no bound until
-   materialization decides it, but it is a demand as an upper bound is, and `𝑈` meets it. The
-   answer is `𝑈` resolved.
-3. **An occurrence in a lower bound.** A variable `𝑉` has a lower bound in which `𝛼` occurs at
+2. **An occurrence in a lower bound.** A variable `𝑉` has a lower bound in which `𝛼` occurs at
    position `𝑝`. The answer is `𝑉`'s polarity-correct reading (`compact_type_polarity_only`) at
    `𝑝`. Where that reading leaves `𝑝` unresolved, the answer is the type of `𝑉`'s position, read at
    `𝑝`.
 
 A bound's substitution can suspend the variable it reaches, so the bound read through it holds the
-suspension where the bound holds the variable. Both stand at that position: an upper bound is read
-as the variable's position as well as the suspension's, and an occurrence is recorded for both.
+suspension where the bound holds the variable. An upper-bound answer from the original variable is
+transported by the bound's substitution. An occurrence of the original variable records the inverse
+on its telescope, when that inverse exists, so an answer read in the holder's frame returns to the
+variable's frame. A discharge has no inverse and supplies no occurrence answer for the original
+variable. The rendered suspension still has its occurrence in the holder's frame.
 
-A bare variable is not an answer. The first answer that resolves fully wins; with none, the first
-answer with an unresolved position inside it does, which is what an upper bound to a partly known
-shape gives. Where the variable's trait obligations watch it, an answer that is not a base they
-accept, a product or a function among them, is not used (`accepted_position_type`): the site's
+A variable wrapped only in refinements is not an answer. The first answer that resolves fully wins;
+with none, the first answer with an unresolved position inside it does, which is what an upper bound
+to a partly known shape gives. Where the variable's trait obligations watch it, an answer that is not
+a base they accept, a product or a function among them, is not used (`accepted_position_type`): the site's
 fallback applies, and the conflict between the variable's reads and its context is reported where
 the two meet. A variable met again while its own answer is being computed contributes nothing,
 which ends the recursion at a cycle. Each variable's answer is computed once per question, and a
@@ -3163,9 +3163,14 @@ containment may record constraints, whereas compact merging combines existing co
 
 `admits` in `infer/solver/constrain.rs` is the one membership judgment. A candidate that is an
 inference variable, refinements peeled, records the kind on that variable in
-`InferBounds::type_kinds`, in every kind. The record draws no bound: an edge whose presence
-depended on the kind would be a second definition of the kind algebra, and an eager bound would
-have to be met with every other bound the variable receives.
+`InferBounds::type_kinds`. The record draws no bound: an edge whose presence depended on the kind
+would be a second definition of the kind algebra, and an eager bound would have to be met with
+every other bound the variable receives.
+
+`SubtypesOf(𝐾)` is the exception. Its membership is the edge `𝑑 <: 𝐾` and nothing else, so the
+edge is drawn when the membership is, as it is for a resolved candidate. That edge is what bounds
+`𝐾` where only the candidate does: the key type of `std`'s `Set(𝐾)` or `Map(𝐾, 𝑉)` built by
+`set` or `map` is the variable such a membership names.
 
 Recorded kinds have no polarity. Compaction joins them into the variable's compact type as a
 conjunction, and extrusion carries them at both polarities. A negative occurrence can carry a
@@ -3794,6 +3799,14 @@ refinement: a group-by under a loop whose key reads the loop's binder has keys
 `{𝐾 | 𝑘 ∈ 𝑀(𝑎)}`. A pair whose second component reads nothing of the first is the `Tuple` it
 always was.
 
+A `let` binding a collection and a one-arm `match` reach the same rule. Both are rewritten to an
+application whose function is a lambda over the bound name: `λ 𝑎 → let 𝑣 = 𝑑 in 𝑏` becomes
+`𝑑 ▷ (λ 𝑣 → 𝑏)`, and `λ 𝑎 → match 𝑠 { 𝑐(𝑤) → 𝑒 }` whose arm reads `𝑎` becomes
+`(𝑠 ▷ variant_project(𝑐)) ▷ (λ 𝑤 → 𝑒)`. The application rule then pairs the bound value with
+`𝑎`. The second case is how one of `std`'s collections built under a loop reaches the rule: its
+`Iterable` instance takes the representation out of its constructor with a `match`, and the
+representation's keys read the loop's binder.
+
 A program cannot write a dependent tuple. Inference introduces one through `uncurry(𝑛)`, which
 flattens a comprehension over several generators ([ir.md, "Several
 generators"](ir.md#several-generators)). Its scheme keys the flattened collection by
@@ -4078,10 +4091,9 @@ Every trait is a declaration (`TraitDecl`, held by `Trait`): its operands, its a
 and its functions. Lowering builds every one, the compiler's included: they are `std`'s
 (`stdlib/src/std.cambra`), and a `@Builtin` trait takes its product reading and its collection
 reading from `StdTrait::builtin_reading`. An instance (`TraitInstance`) is a head of patterns over
-its type variables, the associated types it fixes, its conditions and its functions. A compiler
-instance is a `@Builtin` one, whose head names base types and whose functions are primitives;
-every other instance's functions are its `def`s' bindings (`TraitInstance::binds_functions`), and
-inference reads that, not where an instance is declared.
+its type variables, the associated types it fixes, its conditions and its functions. A `@Builtin` instance supplies an implementation from the compiler. The arithmetic instances
+use primitives over base types, and the collection instances supply reads over nominal types.
+Ordinary instance functions are their `def`s' bindings (`TraitInstance::binds_functions`).
 A program's `InstanceTable` holds every instance lowering adds, `std`'s among them, and the traits
 the compiler names (`InstanceTable::std_trait`), which an operator, a loop and `max` require. A
 tree no program lowered, as a test builds, reads `InstanceTable::std`, the table of `std` alone.
@@ -4243,21 +4255,25 @@ reading at all.
 source `𝑐` lowers to `𝑐 ▷ Iterable::elements` (`lower_loop_source`), and over a data function, a
 sum, or a feed handle that call returns its argument. No row states it, so it is a **collection
 rule**: a candidate beside the rows, whose state an obligation records (`CollectionRule`). Only a
-trait with a collection reading has the rule (`Trait::reads_collections`), and only `Iterable` has
-one.
+trait with a collection reading has the rule (`Trait::reads_collections`): `Iterable`, and
+`Indexable`, whose `Entries` a subscript reads (`lower_entries`; see
+[collections.md, "Lookup: membership discharge"](collections.md#lookup-membership-discharge)).
+Each associates one type, the one the rule makes the collection (`Trait::collection_assoc`).
 
-- **The first collection applies it.** A contribution that is a function or an append history
-  clears the rows and relates the operand's variable to `Elements` (`narrow_collection`). Later
-  contributions reach `Elements` along that edge. A contribution is delivered without the edge
+- **The first collection applies it.** A structural collection clears the rows and relates the
+  operand's variable to `Elements` (`narrow_collection`). `Iterable` also accepts append histories. Later
+  contributions reach `Elements` along that edge. `Indexable`'s `Entries` is related the same way. A contribution is delivered without the edge
   substitutions it was recorded under, so a copy of it would name a dependent source's discharged
   binder free: a group-by's group names its key binder.
 - **A base or a nominal type rules it out**, as it rules out the product rule. A collection
   arriving after either is rejected, and a base or a nominal type arriving after a collection is
   rejected.
-- **An upper bound decides it as a lower bound does.** Only a collection is below a collection. A
-  structural upper bound on a watched variable is delivered to an obligation that reads
-  collections (`notify_upper`), and `link_watches` replays a linked variable's structural bounds on
-  both sides. A bounded annotation `xs <: Map(K, V)` gives its variable no lower bound at all.
+- **An upper bound decides it as a lower bound does.** Only a collection is below a collection,
+  and only a nominal type below a nominal type. A structural or nominal upper bound on a watched
+  variable is delivered to an obligation that reads collections (`notify_upper`), and
+  `link_watches` replays a linked variable's structural bounds on both sides and its nominal
+  upper bounds. A bounded annotation `xs <: Map(K, V)` gives its variable no lower bound at all,
+  so its nominal bound is what selects `Map`'s instance.
 - **While the rule may answer, the rows do not agree.** The rule associates the operand, which no
   row states, so `agreed_assoc` settles nothing for an obligation whose rule is open. Otherwise a
   program with one `Iterable` instance would deposit that instance's `Elements` on every loop
@@ -4265,8 +4281,8 @@ one.
 - **The requirement sweep skips the obligation** while the rule may answer, as it skips one the
   product rule answered: the rule accepts every collection, which an intersection of bases cannot
   state.
-- **Coalescing removes the call.** `𝑐 ▷ Iterable::elements` whose operand resolves to a
-  structural collection is replaced by `𝑐` before any other rule reads it, in the tree and in
+- **Coalescing removes the call.** `𝑐 ▷ Iterable::elements` or `𝑐 ▷ Indexable::entries` whose
+  operand resolves to a structural collection is replaced by `𝑐` before any other rule reads it, in the tree and in
   each predicate copy (`elements_of_a_collection`). A message's predicate copy drops it the same
   way, so a diagnostic spells the source as the program does. A call a declared instance answers
   is replaced by that instance's function, as any trait function's is
@@ -4299,14 +4315,14 @@ A contribution arriving at a position is one of six things, and each has its own
 | a **base** or a **nominal type** | `Int`, `Two(Int)` | narrows the candidate set by its head, and by a nominal type's arguments where the instances differ below it ([An instance's arguments](#an-instances-arguments)) |
 | **not determined yet** | a variable, a hole, a `Feed` handle whose payload arrives separately, to every trait but `Iterable` | nothing to say |
 | a **product** | a tuple, a record | answered componentwise by a structural trait, rejected by every other ([A product is answered off the table](#a-product-is-answered-off-the-table)) |
-| a **collection** | a function, a sum; a feed handle, to `Iterable` | answered by `Iterable` as itself, rejected by every other trait ([A collection is answered off the table](#a-collection-is-answered-off-the-table)) |
+| a **collection** | a function, a sum; a feed handle, to `Iterable` | answered by `Iterable` and `Indexable` as itself, rejected by every other trait ([A collection is answered off the table](#a-collection-is-answered-off-the-table)) |
 | **determined, and none of these** | a variant | rejected — no instance accepts it ([What the tables hold](#what-the-tables-hold)) |
 | a **type parameter** | `T` in `def f(T, x: T)` | answered by a `requires` assumption naming it; otherwise its bound is offered in its place, and with no bound, `MissingRequirement` ([type-parameters.md, "Obligations under assumptions"](type-parameters.md#obligations-under-assumptions)) |
 
-A variant's rejection, and a collection's by every trait but `Iterable`, is not silence, because "no
-base here" is true of both it and the second row. A collection that merely failed to narrow would
-leave `[1, 2] == [3, 4]` well-typed: a comparison has no associated position to strand, so nothing
-downstream would object either.
+A variant's rejection, and a collection's by every trait but `Iterable` and `Indexable`, is not
+silence, because "no base here" is true of both it and the second row. A collection that merely
+failed to narrow would leave `[1, 2] == [3, 4]` well-typed: a comparison has no associated position
+to strand, so nothing downstream would object either.
 
 A position that stays in the second row for the whole program — nothing ever determines it — is not a rejection either. Its obligation simply never narrows, and the variable is reported as unresolved rather than as a missing instance.
 
@@ -4845,7 +4861,9 @@ the ordinary trait solver to require `Orderable(𝑃, 𝑃)`. An orderable posit
 requirement whose capabilities remain abstract. An abstract condition that cannot be discharged
 stays in the inferred contract; a fully written contract must retain it. A keyed collection's
 positions are ordered by the key bound of its source's witness, and an index ranging over
-`UIntRanges` has `UInt`'s order. A refusal names the effect and source at the loop.
+`UIntRanges` has `UInt`'s order. A projected witness reads that bound from its source's resolved
+type, even when the projection's quote still holds an inference variable. A refusal names the
+effect and source at the loop.
 
 Loops whose ordering capabilities are already known during emission also place the ordinary
 `Orderable` obligation immediately. That obligation participates in the existing type-variable

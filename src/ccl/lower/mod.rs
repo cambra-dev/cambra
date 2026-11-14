@@ -690,6 +690,10 @@ pub struct LoweringContext {
     /// (`docs/chl-spec.md`, "9.16 The std root").
     pub(super) std_option: Option<Rc<NominalDecl>>,
 
+    /// `std`'s collection types, once that module has lowered: what `set`, `map`, `groupby`
+    /// and `empty_map` build ([`exprs::wrap_std_collection`]).
+    pub(super) std_collections: Vec<(crate::ccl::nominal::StdCollection, Rc<NominalDecl>)>,
+
     /// Shadow-depth counter keyed by surface spelling: how many enclosing local
     /// binders — loop targets, comprehension generators, lambda/`def` params —
     /// currently bind each name. The `transactional_vars` set is keyed by base
@@ -1918,9 +1922,7 @@ fn lower_expr_inner(
 /// its body, leaving a clean `Let* Record{…}` shape for `compile_program`.
 pub fn lower_stmts(module: &ChlModule, ctx: &mut LoweringContext) -> LoweringResult {
     // A module lowered alone reaches `std`'s traits, as the prelude gives a program's modules.
-    if !ctx.instances.has_std() {
-        ctx.instances = (*crate::ccl::infer::solver::traits::InstanceTable::std()).clone();
-    }
+    ctx.reach_std();
     let lowered = lower_root(module, ctx);
     let sinks = std::mem::take(&mut ctx.declared_sinks);
     let mut errors = lowered.errors;
@@ -2226,10 +2228,9 @@ pub(crate) mod test_helpers {
     /// A context outside any program, which reaches `std`'s traits and instances as a module
     /// the prelude reaches does, so a comprehension's `for` clause lowers.
     pub(crate) fn std_context() -> LoweringContext {
-        LoweringContext {
-            instances: (*crate::ccl::infer::solver::traits::InstanceTable::std()).clone(),
-            ..LoweringContext::default()
-        }
+        let mut ctx = LoweringContext::default();
+        ctx.reach_std();
+        ctx
     }
 
     /// Lower the CHL type expression `code`, a polymorphic type included, where a module the

@@ -1345,7 +1345,7 @@ fn test_incremental_constant_mutation_loop_over_nothing() {
 
 #[test_log::test]
 fn test_incremental_aggregates() {
-    let code = "[sum(x) for x in groupby(source1(), \\x -> x // 10)]";
+    let code = "[sum(x) for _ -> x in groupby(source1(), \\x -> x // 10)]";
     let mut ctx = GlobalContext::default();
 
     let test_source = Rc::new(RefCell::new(TestDataSource::new(
@@ -1808,7 +1808,7 @@ fn a_constant_arm_waits_for_its_constant_after_a_filtered_batch(#[case] code: &s
 #[timeout(Duration::from_secs(10))]
 fn a_group_arriving_below_one_held_is_not_released_early() {
     let tile = run_in_batches(
-        "[sum(x) for x in groupby(source1(), \\x -> x // 10)]",
+        "[sum(x) for _ -> x in groupby(source1(), \\x -> x // 10)]",
         &[(&[(0, 20)], 0), (&[(1, 10)], 1)],
     );
     assert_eq!(

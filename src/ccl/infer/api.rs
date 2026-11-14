@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
-use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates, walk_refined_predicates_mut};
+use crate::ccl::ccl_utils::{PredMemo, walk_quoted_terms_mut};
 use crate::ccl::chl_print::chl_type;
 use crate::ccl::infer::CheckMode;
 use crate::ccl::infer::solver::compact::JoinedPosition;
@@ -1528,6 +1528,11 @@ fn option_variant_hint(type_a: &Type, type_b: &Type) -> Option<&'static str> {
     )
 }
 
+/// The hint for a tuple or record applied or subscripted as though it were a collection.
+const PRODUCT_NOT_A_FUNCTION_HINT: &str = "hint: a tuple or record is a heterogeneous product, \
+     not a finite function — project it with `.0` (position) or `.name` (field) rather than \
+     applying or subscripting it";
+
 /// The hint for tuples of different widths, whether one is found where the other is required
 /// or the two meet at one position.
 const TUPLE_WIDTH_HINT: &str =
@@ -1854,6 +1859,7 @@ impl std::fmt::Debug for InferError {
             } => {
                 // A trait with no instance accepting anything at the position, as one a
                 // module declares no instance of, has no type to list.
+                let is_product = matches!(**found, Type::Tuple(_) | Type::Record(_));
                 let found = w.ty(found);
                 if accepted.is_empty() {
                     return write!(
@@ -1873,7 +1879,13 @@ impl std::fmt::Debug for InferError {
                     "No {trait_} instance for {at}: operand {} is {found}, but \
                      the only type accepted there is {accepted}",
                     position + 1,
-                )
+                )?;
+                if trait_ == crate::ccl::infer::solver::traits::StdTrait::Indexable.name()
+                    && is_product
+                {
+                    write!(f, "\n  {PRODUCT_NOT_A_FUNCTION_HINT}")?;
+                }
+                Ok(())
             }
             InferError::InstanceAfterUse { function, instance } => write!(
                 f,
@@ -2096,12 +2108,7 @@ impl std::fmt::Debug for InferError {
             InferError::ExpectedFunction { found, .. } => {
                 write!(f, "Expected a function, found {}", w.ty(found))?;
                 if matches!(found, Type::Tuple(_) | Type::Record(_)) {
-                    write!(
-                        f,
-                        "\n  hint: a tuple or record is a heterogeneous product, not a \
-                         finite function — project it with `.0` (position) or `.name` \
-                         (field) rather than applying or subscripting it"
-                    )?;
+                    write!(f, "\n  {PRODUCT_NOT_A_FUNCTION_HINT}")?;
                 }
                 Ok(())
             }
@@ -2732,14 +2739,15 @@ fn clear_annotations_in(expr: &mut Expr, predicates: &PredMemo<()>) -> bool {
     let mut cleared = expr.user_annotation.take().is_some();
     expr.walk_binders_mut(|b| cleared |= b.user_annotation.take().is_some());
     // Annotations also ride expressions hanging off *type* slots — a refinement's
-    // predicate — and those nodes are outside `walk_children` entirely. Inference
-    // reads them there (`groupby` stamps the key relation that ties `__gb_k` to its
-    // key function on a node inside the cast target's predicate), so clearing has
-    // to follow the same route, or an annotation survives exactly where only a type
-    // walk can find it.
+    // predicate, a witness projection's sum, a family's argument — and those nodes are
+    // outside `walk_children` entirely. Inference reads them there (`groupby` stamps the
+    // key relation that ties `__gb_k` to its key function on a node inside the cast
+    // target's predicate), and a definition discharged into a projection's sum carries
+    // its own, so clearing has to follow the same route, or an annotation survives
+    // exactly where only a type walk can find it.
     expr.walk_type_slots_mut(|ty| {
-        cleared |= walk_refined_predicates_mut(ty, predicates, &(), &mut |predicate, memo| {
-            clear_annotations_in(predicate, memo)
+        cleared |= walk_quoted_terms_mut(ty, predicates, &(), &mut |term, memo| {
+            clear_annotations_in(term, memo)
         });
     });
     expr.walk_children_mut(|child| cleared |= clear_annotations_in(child, predicates));
@@ -2776,14 +2784,17 @@ fn assert_annotations_cleared(expr: &Expr, visited: &mut HashSet<crate::ccl::Pre
             b.name
         );
     });
-    // An expression also hangs off the *type* slots — a refinement's predicate —
-    // and those nodes are outside `walk_children` entirely. Inference reads
-    // annotations there (`groupby` stamps its key relation on a node inside the
-    // cast target's predicate), so a check that walked only children would
-    // declare the tree clean while a live annotation sat in a type.
+    // An expression also hangs off the *type* slots — a refinement's predicate, a
+    // witness projection's sum, a family's argument — and those nodes are outside
+    // `walk_children` entirely. Inference reads annotations there (`groupby` stamps
+    // its key relation on a node inside the cast target's predicate), so a check
+    // that walked only children would declare the tree clean while a live
+    // annotation sat in a type.
     expr.walk_type_slots(|ty| {
-        walk_refined_predicates(ty, visited, &mut |predicate, visited| {
-            assert_annotations_cleared(predicate, visited);
+        ty.walk_quoted_terms(&mut |term| {
+            if visited.insert(Rc::as_ptr(term)) {
+                assert_annotations_cleared(term, visited);
+            }
         });
     });
     expr.walk_children(|child| assert_annotations_cleared(child, visited));

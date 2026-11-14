@@ -390,12 +390,15 @@ impl TileProducer for ConverseProducer {
 /// The output domain is unchanged; the codomain becomes a scalar version of the same domain values.
 pub struct MapDomain {
     /// Output tiling: `DataFunction { domain, codomain: Scalar(domain) }`, beneath the
-    /// standing levels above `level`.
+    /// standing levels above `level`, or with each key beside its value for
+    /// [`MapDomain::entries_at`].
     base: OperatorBase,
     /// The function input.
     input: Box<dyn TileOperator>,
     /// The level whose values are replaced — see [`MapDomain::new_at`].
     level: CurryLevel,
+    /// Whether each value is kept beside its key, `(k, v)`, rather than replaced by it.
+    entries: bool,
 }
 
 impl MapDomain {
@@ -407,22 +410,34 @@ impl MapDomain {
     /// [`MapDomain::new`] at `level`, leaving every level above it standing: each enclosing
     /// row's collection is re-viewed at its own keys.
     pub fn new_at(input: Box<dyn TileOperator>, level: CurryLevel) -> Self {
-        let Tiling::DataFunction { domain, .. } = input.tiling().values_at(level) else {
+        Self::build(input, level, false)
+    }
+
+    /// What [`Builtin::Entries`](crate::ccl::Builtin::Entries) compiles to: each value at
+    /// `level` beside its key, `(k, v)`, over the same keys.
+    pub fn entries_at(input: Box<dyn TileOperator>, level: CurryLevel) -> Self {
+        Self::build(input, level, true)
+    }
+
+    fn build(input: Box<dyn TileOperator>, level: CurryLevel, entries: bool) -> Self {
+        let Tiling::DataFunction { domain, codomain } = input.tiling().values_at(level) else {
             panic!(
                 "MapDomain expected a function tiling at {level}, got {:?}",
                 input.tiling()
             )
         };
         let domain = domain.clone();
-        let tiling = with_values_at(
-            input.tiling(),
-            level,
-            Tiling::data_function(domain.clone(), Tiling::Scalar(domain)),
-        );
+        let values = if entries {
+            Tiling::tuple(&[Tiling::Scalar(domain.clone()), (**codomain).clone()])
+        } else {
+            Tiling::Scalar(domain.clone())
+        };
+        let tiling = with_values_at(input.tiling(), level, Tiling::data_function(domain, values));
         Self {
             base: OperatorBase::new(tiling),
             input,
             level,
+            entries,
         }
     }
 }
@@ -451,6 +466,7 @@ impl TileOperator for MapDomain {
                 .input
                 .subscribe(self.tiling().universal_guard(), consumer, scheduler),
             level: self.level,
+            entries: self.entries,
         })
     }
 
@@ -459,13 +475,16 @@ impl TileOperator for MapDomain {
     }
 }
 
-/// Producer for [`MapDomain`]: replaces a function's codomain with its domain.
+/// Producer for [`MapDomain`]: replaces a function's codomain with its domain, or pairs it
+/// with its domain.
 struct MapDomainProducer {
     base: ProducerBase,
     /// The upstream producer whose codomain is replaced.
     input: Box<dyn TileProducer>,
     /// The level whose values are replaced — see [`MapDomain::new_at`].
     level: CurryLevel,
+    /// See [`MapDomain::entries_at`].
+    entries: bool,
 }
 
 impl TileProducer for MapDomainProducer {
@@ -484,7 +503,12 @@ impl TileProducer for MapDomainProducer {
         else {
             panic!("MapDomain expected a collection at {}", self.level)
         };
-        **codomain = Tile::Scalar(domain.clone());
+        let keys = Tile::Scalar(domain.clone());
+        **codomain = if self.entries {
+            Tile::tuple(vec![keys, (**codomain).clone()])
+        } else {
+            keys
+        };
         // Part of a value released releases nothing upstream (`release_impl`), so the input
         // hands it out again and it is taken back out here.
         if !self.base.obsolete_guard.is_empty() {
@@ -2428,6 +2452,7 @@ mod tests {
             base: ProducerBase::unowned(MapDomainProducer::alloc_id(), &tiling),
             input: Box::new(TestTileProducer::new(tile, tiling)),
             level: CurryLevel::new(1),
+            entries: false,
         }
     }
 

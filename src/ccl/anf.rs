@@ -341,8 +341,21 @@ fn is_atomic(e: &Expr, muts: &Muts) -> bool {
         }
         // A group-by expands to a `λ` over its keys.
         TypedExprNode::GroupBy { .. } => true,
+        // A subscript's collection read through `Indexable::entries` stands where the
+        // collection did, so the subscript's rule reads the collection's own binding: one whose
+        // definition failed is poisoned, and the subscript then reports nothing of its own.
+        TypedExprNode::Apply { argument, function } => {
+            is_indexable_entries(function) && is_atomic(argument, muts)
+        }
         _ => false,
     }
+}
+
+/// Whether `function` is `Indexable::entries`, the call a subscript reads its collection through.
+fn is_indexable_entries(function: &Expr) -> bool {
+    use crate::ccl::infer::solver::traits::{INDEXABLE_ENTRIES, StdTrait};
+    matches!(&function.node, TypedExprNode::TraitFn { trait_, function, .. }
+        if trait_.is_std(StdTrait::Indexable) && function.as_str() == INDEXABLE_ENTRIES)
 }
 
 /// [`is_atomic`] with no mutable variable in scope: whether a term is named where it stands, for
@@ -1096,7 +1109,7 @@ fn temp_read(name: &Name, definition: &Expr) -> Expr {
 /// siblings on one spine and every type names its binders where they are in scope.
 ///
 /// One exception is known: a nested `for` over a group's rows,
-/// `[r for g in groupby(xs, \s -> s) for r in g]`, still leaves a type naming a temp outside its
+/// `[r for _ -> g in groupby(xs, \s -> s) for r in g]`, still leaves a type naming a temp outside its
 /// scope. It is tracked in the vault as `type-checker-nested-for-over-a-groups-rows-out-of-scope`.
 ///
 /// Only this pass's own binders are peeled ([`Name::is_anf_temp`]). A `let` the

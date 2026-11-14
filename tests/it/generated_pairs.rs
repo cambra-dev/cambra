@@ -317,7 +317,7 @@ fn skeletons() -> Vec<Skeleton> {
         Skeleton { name: "tuple_extreme_per_group", hole: Ty::Int, scope: &[("v", Ty::Int)], body: indoc! {r#"
             g = groupby([1, 2, 3, 4], \x -> x // 2)
             out = test_sink()
-            out << sum([min([(v + {}, "a") for v in grp]).0 for grp in g])
+            out << sum([min([(v + {}, "a") for v in grp]).0 for _ -> grp in g])
         "#}},
         Skeleton { name: "nominal_operator_operand", hole: Ty::Int, scope: &[], body: indoc! {r#"
             type Money = Int
@@ -361,7 +361,7 @@ fn skeletons() -> Vec<Skeleton> {
 
             g = groupby([1, 2, 3, 4], \x -> Money::new(x + {}))
             out = test_sink()
-            out << sum([max(grp) for grp in g])
+            out << sum([max(grp) for _ -> grp in g])
         "#}},
         Skeleton { name: "nominal_key_join", hole: Ty::Int, scope: &[("x", Ty::Int)], body: indoc! {r#"
             type Money = Int
@@ -467,7 +467,7 @@ fn skeletons() -> Vec<Skeleton> {
         "#}},
         Skeleton { name: "lambda_body", hole: Ty::Int, scope: &[("e", Ty::Int)], body: indoc! {r#"
             out = test_sink()
-            out << sum([sum([s for s in g]) for g in groupby([1, 1, 2], \e -> {})])
+            out << sum([sum([s for s in g]) for _ -> g in groupby([1, 1, 2], \e -> {})])
         "#}},
         Skeleton { name: "aggregate_arg", hole: Ty::IntColl, scope: &[], body: indoc! {r#"
             out = test_sink()
@@ -656,11 +656,11 @@ fn skeletons() -> Vec<Skeleton> {
             out << acc
         "#}},
         Skeleton { name: "keyed_write_value", hole: Ty::Int, scope: &[("k", Ty::Str)], body: indoc! {r#"
-            m: Mut(Map(String, Int)) := box(map([("a", 1)]))
+            m: Mut(Map(String, Int)) := map([("a", 1)])
             for k in ["b"]:
                 m[k] := {}
             out = test_sink()
-            out << sum(m)
+            out << sum([v for _ -> v in m])
         "#}},
         Skeleton { name: "generator_yield", hole: Ty::Int, scope: &[("x", Ty::Int)], body: indoc! {r#"
             def gen_under_test(xs):
@@ -722,7 +722,7 @@ fn skeletons() -> Vec<Skeleton> {
         "#}},
         Skeleton { name: "groupby_source", hole: Ty::RecColl, scope: &[], body: indoc! {r#"
             out = test_sink()
-            out << sum([sum([r.a for r in g]) for g in groupby({}, \e -> e.b)])
+            out << sum([sum([r.a for r in g]) for _ -> g in groupby({}, \e -> e.b)])
         "#}},
         Skeleton { name: "record_feed", hole: Ty::Rec, scope: &[], body: indoc! {r#"
             out = test_sink()
@@ -874,7 +874,7 @@ fn skeletons() -> Vec<Skeleton> {
         Skeleton { name: "lambda_body_in_loop", hole: Ty::Int, scope: &[("i", Ty::Int), ("e", Ty::Int)], body: indoc! {r#"
             out = test_sink()
             for i in [1, 2]:
-                out << sum([sum([s for s in g]) for g in groupby([1, 1, 2], \e -> {})])
+                out << sum([sum([s for s in g]) for _ -> g in groupby([1, 1, 2], \e -> {})])
         "#}},
 
         // Terminal reads. Every other transactional skeleton reads the store in context, inside
@@ -989,7 +989,7 @@ fn skeletons() -> Vec<Skeleton> {
         Skeleton { name: "groups1_loop", hole: Ty::Int, scope: &[("g1", Ty::IntColl)], body: indoc! {r#"
             g = groupby([1, 2, 3, 4, 5], \x -> x > 2)
             ch: Feed(_)
-            for g1 in g:
+            for _ -> g1 in g:
                 ch << {}
             out = test_sink()
             out << sum([v for v in ch])
@@ -997,8 +997,8 @@ fn skeletons() -> Vec<Skeleton> {
         Skeleton { name: "groups2_loop", hole: Ty::Int, scope: &[("g1", Ty::IntColl), ("g2", Ty::IntColl)], body: indoc! {r#"
             g = groupby([1, 2, 3, 4, 5], \x -> x > 2)
             ch: Feed(_)
-            for g1 in g:
-                for g2 in g:
+            for _ -> g1 in g:
+                for _ -> g2 in g:
                     ch << {}
             out = test_sink()
             out << sum([v for v in ch])
@@ -1006,9 +1006,9 @@ fn skeletons() -> Vec<Skeleton> {
         Skeleton { name: "groups3_loop", hole: Ty::Int, scope: &[("g1", Ty::IntColl), ("g2", Ty::IntColl), ("g3", Ty::IntColl)], body: indoc! {r#"
             g = groupby([1, 2, 3, 4, 5], \x -> x > 2)
             ch: Feed(_)
-            for g1 in g:
-                for g2 in g:
-                    for g3 in g:
+            for _ -> g1 in g:
+                for _ -> g2 in g:
+                    for _ -> g3 in g:
                         ch << {}
             out = test_sink()
             out << sum([v for v in ch])
@@ -1016,18 +1016,18 @@ fn skeletons() -> Vec<Skeleton> {
         Skeleton { name: "groups2_comp", hole: Ty::Int, scope: &[("g1", Ty::IntColl), ("g2", Ty::IntColl)], body: indoc! {r#"
             g = groupby([1, 2, 3, 4, 5], \x -> x > 2)
             out = test_sink()
-            out << sum([sum([{} for g2 in g]) for g1 in g])
+            out << sum([sum([{} for _ -> g2 in g]) for _ -> g1 in g])
         "#}},
         Skeleton { name: "groups3_comp", hole: Ty::Int, scope: &[("g1", Ty::IntColl), ("g2", Ty::IntColl), ("g3", Ty::IntColl)], body: indoc! {r#"
             g = groupby([1, 2, 3, 4, 5], \x -> x > 2)
             out = test_sink()
-            out << sum([sum([sum([{} for g3 in g]) for g2 in g]) for g1 in g])
+            out << sum([sum([sum([{} for _ -> g3 in g]) for _ -> g2 in g]) for _ -> g1 in g])
         "#}},
         Skeleton { name: "groups3_source", hole: Ty::IntColl, scope: &[("g1", Ty::IntColl), ("g2", Ty::IntColl)], body: indoc! {r#"
             g = groupby([1, 2, 3, 4, 5], \x -> x > 2)
             ch: Feed(_)
-            for g1 in g:
-                for g2 in g:
+            for _ -> g1 in g:
+                for _ -> g2 in g:
                     for q in {}:
                         ch << q
             out = test_sink()
@@ -1457,7 +1457,7 @@ fn skeletons() -> Vec<Skeleton> {
         // A product key: a tuple names each group (`Equatable` on a product).
         Skeleton { name: "groupby_tuple_key", hole: Ty::RecColl, scope: &[], body: indoc! {r#"
             out = test_sink()
-            out << sum([sum([r.a for r in g]) for g in groupby({}, \e -> (e.a, e.b))])
+            out << sum([sum([r.a for r in g]) for _ -> g in groupby({}, \e -> (e.a, e.b))])
         "#}},
     ]
 }
@@ -1476,7 +1476,7 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "filtered_sum", ty: Ty::Int, needs: &[], decls: "", expr: "sum([z for z in [1, 2, 3, 4] if z > 2])" },
         Filler { name: "union_sum", ty: Ty::Int, needs: &[], decls: "", expr: "sum([1, 2] ++ [3, 4])" },
         Filler { name: "nested_comp_sum", ty: Ty::Int, needs: &[], decls: "", expr: "sum([sum([z for z in [1, 2]]) for w in [1, 2]])" },
-        Filler { name: "groupby_sum", ty: Ty::Int, needs: &[], decls: "", expr: "sum([sum([s for s in g]) for g in groupby([1, 1, 2], \\e2 -> e2)])" },
+        Filler { name: "groupby_sum", ty: Ty::Int, needs: &[], decls: "", expr: "sum([sum([s for s in g]) for _ -> g in groupby([1, 1, 2], \\e2 -> e2)])" },
         Filler { name: "tuple_proj", ty: Ty::Int, needs: &[], decls: "", expr: "(3, 4).0" },
         Filler { name: "record_proj", ty: Ty::Int, needs: &[], decls: "", expr: "(p=3, q=4).p" },
         Filler { name: "ternary", ty: Ty::Int, needs: &[], decls: "", expr: "(1 if 2 > 1 else 0)" },
@@ -1544,7 +1544,7 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "filtered_comp", ty: Ty::IntColl, needs: &[], decls: "", expr: "[z for z in [1, 2, 3, 4] if z > 2]" },
         Filler { name: "union", ty: Ty::IntColl, needs: &[], decls: "", expr: "[1, 2] ++ [3, 4]" },
         Filler { name: "dup_union", ty: Ty::IntColl, needs: &[], decls: "", expr: "[1, 2] ++ [1, 2]" },
-        Filler { name: "map_lit", ty: Ty::IntColl, needs: &[], decls: "", expr: "map([(\"a\", 1), (\"b\", 2)])" },
+        Filler { name: "map_lit", ty: Ty::IntColl, needs: &[], decls: "", expr: "[v for _ -> v in map([(\"a\", 1), (\"b\", 2)])]" },
         // Element-wise chains over the binder, which the planner fuses into one map. They cover
         // each side a literal stands on, operations whose operands do not commute, a value read
         // twice, and a leaf that is not element-wise (`sum`).
@@ -1565,7 +1565,7 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "binder_records_compared", ty: Ty::Bool, needs: &[Ty::Int], decls: "", expr: "(z={b} * 2) == (z={b} + 1)" },
         Filler { name: "binder_comp", ty: Ty::IntColl, needs: &[Ty::Int], decls: "", expr: "[z2 * {b} for z2 in [1, 2]]" },
         Filler { name: "binder_filtered_comp", ty: Ty::IntColl, needs: &[Ty::Int], decls: "", expr: "[z2 * {b} for z2 in [1, 2, 3] if z2 > {b}]" },
-        Filler { name: "map_arrow", ty: Ty::IntColl, needs: &[], decls: "", expr: "map([\"a\" -> 1, \"b\" -> 2])" },
+        Filler { name: "map_arrow", ty: Ty::IntColl, needs: &[], decls: "", expr: "[v for _ -> v in map([\"a\" -> 1, \"b\" -> 2])]" },
         // --- conditional collections: same-domain arms and boxed ones, chosen once or per row
         Filler { name: "cond_coll", ty: Ty::IntColl, needs: &[], decls: "", expr: "([1, 2] if 2 > 1 else [3, 4])" },
         Filler { name: "cond_boxed", ty: Ty::IntColl, needs: &[], decls: "", expr: "(box([1, 2]) if 2 > 1 else box([3, 4, 5]))" },
@@ -1664,7 +1664,7 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "rec_with_comp", ty: Ty::RecWithColl, needs: &[], decls: "", expr: "(xs=[z2 * 2 for z2 in [1, 2]], n=1)" },
         Filler { name: "rec_with_empty", ty: Ty::RecWithColl, needs: &[], decls: "", expr: "(xs=[z2 for z2 in [1, 2] if z2 > 99], n=0)" },
         Filler { name: "rec_with_union", ty: Ty::RecWithColl, needs: &[], decls: "", expr: "(xs=[1, 2] ++ [3], n=2)" },
-        Filler { name: "rec_with_map", ty: Ty::RecWithColl, needs: &[], decls: "", expr: "(xs=map([(\"a\", 1), (\"b\", 2)]), n=3)" },
+        Filler { name: "rec_with_map", ty: Ty::RecWithColl, needs: &[], decls: "", expr: "(xs=[v for _ -> v in map([(\"a\", 1), (\"b\", 2)])], n=3)" },
 
         // --- collections of integer collections: rows of one domain, jagged rows (`box`
         // binds each row's domain as a witness), and rows a comprehension builds
@@ -2287,6 +2287,33 @@ fn grid_agrees() {
         failures.join("\n"),
         changed.join("\n")
     );
+}
+
+#[test]
+fn nested_grouping_in_a_key_keeps_its_witness_scope() {
+    let failures: Vec<_> = [
+        "lambda_body/groupby_sum",
+        "lambda_body_in_loop/groupby_sum",
+        "nominal_key_groupby/groupby_sum",
+        "nominal_key_guard/groupby_sum",
+    ]
+    .into_iter()
+    .filter_map(|cell| {
+        let outcome = classify(&cell_program(cell));
+        (!matches!(outcome, Outcome::Agrees))
+            .then(|| format!("{cell}: {}: {}", outcome.kind(), outcome.detail()))
+    })
+    .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn a_map_fed_through_nested_loops_keeps_its_keys() {
+    for filler in ["map_arrow", "map_lit"] {
+        let cell = format!("four_loop_collection_feed_in_mut_loop/{filler}");
+        let outcome = classify(&cell_program(&cell));
+        assert_eq!(outcome, Outcome::Agrees, "{cell}: {}", outcome.detail());
+    }
 }
 
 /// The whole grid, for choosing what to fix next: the failures by cause, most cells first.

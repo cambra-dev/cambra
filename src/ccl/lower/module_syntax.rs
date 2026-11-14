@@ -400,6 +400,7 @@ impl Refusals {
                 }
             }
             TypeDeclBody::Single(ty) => self.expr(ty),
+            TypeDeclBody::Builtin => {}
         }
     }
 

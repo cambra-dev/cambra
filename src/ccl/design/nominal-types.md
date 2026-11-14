@@ -79,6 +79,13 @@ and whose input side is their meet, which both arms are subtypes of. Equating th
 arguments instead would need a join computed when the bounds are recorded, which the solver does
 not do.
 
+A relation between two applications carries the edge's substitutions into every argument. An
+invariant argument's two directions each carry them, swapped in the reverse direction, as a data
+domain's two directions do, and a bipolar argument's sides carry them as a covariant and a
+contravariant argument would. An argument that reads a binder the edge discharges, as a group-by's
+key domain reads the element it groups, crosses the edge with the discharge applied
+(`a_nested_group_by_is_a_family` in `tests/it/compilation_pipeline/family_parameters.rs`).
+
 ### Family parameters
 
 A family parameter, `V: K => Type`

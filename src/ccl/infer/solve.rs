@@ -1321,6 +1321,7 @@ pub(super) struct OccurrenceIndex {
 struct Occurrence {
     holder: Rc<crate::ccl::infer_var::InferVar>,
     position: Rc<[PositionStep]>,
+    from_holder: crate::ccl::subst::Subst,
 }
 
 impl OccurrenceIndex {
@@ -1359,18 +1360,33 @@ impl OccurrenceIndex {
                     (Rc::clone(bounds.lower()), Rc::clone(bounds.upper()))
                 };
                 for b in lower.iter() {
-                    let bound_ty = b.render_subst().apply_type(&b.ty);
+                    let into_holder = b.render_subst();
+                    let bound_ty = into_holder.apply_type(&b.ty);
                     // A substitution that reaches a variable suspends it, so the rendered
                     // bound holds the suspension where the bound itself holds the variable.
-                    // Both stand at the same position of the holder, so both occur there:
-                    // read through the rendering alone, the variable a suspension waits on
-                    // occurs nowhere.
+                    // A position read for the original variable must return to its frame.
+                    // Only an invertible substitution on that variable's scope supplies an
+                    // answer there; a discharge supplies no inverse.
                     let rendered_differs = bound_ty != b.ty;
-                    for ty in std::iter::once(&bound_ty).chain(rendered_differs.then_some(&b.ty)) {
+                    for (ty, rendered) in std::iter::once((&bound_ty, true))
+                        .chain(rendered_differs.then_some((&b.ty, false)))
+                    {
                         for_each_positioned_var(ty, &mut Vec::new(), &mut |u, position| {
+                            let from_holder = if rendered {
+                                crate::ccl::subst::Subst::id()
+                            } else {
+                                let in_scope = into_holder.shadow_all(
+                                    into_holder.binders().filter(|n| !u.telescope.contains(n)),
+                                );
+                                let Some(inverse) = in_scope.invert() else {
+                                    return;
+                                };
+                                inverse
+                            };
                             self.occurrences.entry(u.uid).or_default().push(Occurrence {
                                 holder: Rc::clone(&v),
                                 position: position.into(),
+                                from_holder,
                             });
                         });
                     }
@@ -1488,11 +1504,10 @@ fn position_answer(
     question: &mut PositionQuestion,
     partial: &mut Option<Type>,
 ) -> Option<Type> {
-    // A candidate answer, sorted into the full and the partial ones; a bare variable is
-    // not an answer.
+    // Refinements of an undetermined variable supply no shape to select.
     fn offer(t: &Type, partial: &mut Option<Type>) -> Option<Type> {
         match t {
-            Type::Infer(_) => None,
+            t if matches!(t.peel_refinements(), Type::Infer(_)) => None,
             t if !crate::ccl::subst::type_contains_infer(t) => Some(t.clone()),
             t => {
                 partial.get_or_insert_with(|| t.clone());
@@ -1521,27 +1536,27 @@ fn position_answer(
         // variable's as much as the suspension's, as in the occurrence index's sweep.
         if ty != b.ty
             && let Type::Infer(u) = &b.ty
-            && let Some(answer) = position_type_go(u, index, question, partial)
         {
-            return Some(answer);
+            let mut own_partial = None;
+            let own = position_type_go(u, index, question, &mut own_partial);
+            for answer in own.iter().chain(own_partial.iter()) {
+                let here = b.render_subst().apply_type(answer);
+                if let Some(answer) = offer(&here, partial) {
+                    return Some(answer);
+                }
+            }
         }
     }
-    // A recorded membership in `SubtypesOf(𝑈)` is a demand as an upper bound is: the variable
-    // stands for a type below `𝑈`, and `𝑈` is one.
-    let kinds = v.bounds.borrow().type_kinds.clone();
-    for k in kinds.iter() {
-        if let crate::ccl::ty::TypeKind::SubtypesOf(b) = k
-            && let Ok(resolved) = resolve_var_type(b)
-            && let Some(answer) = offer(&resolved, partial)
-        {
-            return Some(answer);
-        }
-    }
-    for Occurrence { holder, position } in index.of(v.uid) {
+    for Occurrence {
+        holder,
+        position,
+        from_holder,
+    } in index.of(v.uid)
+    {
         let holder_ty = Type::Infer(Rc::clone(&holder));
         if let Ok(reading) = coalesce_positive(&holder_ty)
             && let Some(at) = read_at(&reading, &position)
-            && let Some(answer) = offer(at, partial)
+            && let Some(answer) = offer(&from_holder.apply_type(at), partial)
         {
             return Some(answer);
         }
@@ -1549,7 +1564,7 @@ fn position_answer(
         let outer = position_type_go(&holder, index, question, &mut outer_partial);
         for outer in outer.iter().chain(outer_partial.iter()) {
             if let Some(at) = read_at(outer, &position)
-                && let Some(answer) = offer(at, partial)
+                && let Some(answer) = offer(&from_holder.apply_type(at), partial)
             {
                 return Some(answer);
             }
@@ -2249,13 +2264,16 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
 fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // `c ▷ Iterable::elements` over a structural collection is `c`: the collection rule
     // answered its obligation, so the collection is its own `Elements` and `elements` the
-    // identity (`src/ccl/design/type-inference.md`, "A collection is answered off the
-    // table"). The call goes before anything reads it, here and in each copy a predicate
-    // holds, so no pass after inference meets it.
+    // identity, as `Indexable::entries` is (`src/ccl/design/type-inference.md`, "A collection
+    // is answered off the table"). The call goes before anything reads it, here and in each
+    // copy a predicate holds, so no pass after inference meets it.
     if !ctx.discarding
         && let Some(collection) = elements_of_a_collection(expr)
     {
         *expr = collection;
+        return coalesce_node_inner(expr, level, ctx);
+    }
+    if !ctx.discarding && apply_collection_primitive(expr, ctx) {
         return coalesce_node_inner(expr, level, ctx);
     }
     if !ctx.discarding {
@@ -3103,8 +3121,8 @@ fn run_instance_primitive(expr: &mut Expr, instances: &InstanceTable) {
     }
 }
 
-/// The collection `expr` walks, when it is `c ▷ Iterable::elements` and `c`'s type resolves to
-/// a structural collection; the call's argument is moved out of it.
+/// The collection `expr` reads, when it is `c ▷ Iterable::elements` or `c ▷ Indexable::entries`
+/// and `c`'s type resolves to a structural collection; the call's argument is moved out of it.
 ///
 /// `c`'s type is read at the call's operand, or at `c` itself where the operand has not
 /// resolved: a tree whose inference failed has its argument typed and its operand unsettled.
@@ -3138,6 +3156,57 @@ pub(crate) fn elements_of_a_collection(expr: &mut Expr) -> Option<Expr> {
     Some(*argument)
 }
 
+/// Rewrite `c ▷ Iterable::elements` or `c ▷ Indexable::entries`, where the `@Builtin` instance of
+/// one of `std`'s collections answers it, to that instance's primitive applied to `c`: `let __op = c in …`. The primitive
+/// reads `c` with a `match`, which `lambda_elim` then meets over a bound value, as it meets one a
+/// program writes, rather than over a function's parameter. Whether the rewrite happened.
+fn apply_collection_primitive(expr: &mut Expr, ctx: &CoalesceCtx) -> bool {
+    let TypedExprNode::Apply { function, .. } = &expr.node else {
+        return false;
+    };
+    let TypedExprNode::TraitFn { function: name, .. } = &function.node else {
+        return false;
+    };
+    let Ok(Some(instance)) = matching_instance(function, ctx) else {
+        return false;
+    };
+    let Some(Implementation::Primitive(
+        body @ (InstanceBody::Elements(_) | InstanceBody::Representation(_)),
+    )) = instance.implementation(name)
+    else {
+        return false;
+    };
+    let Ok(ty) = resolve_var_type(&function.ty) else {
+        return false;
+    };
+    if left_unresolved_by_an_error(&ty) {
+        return false;
+    }
+    let body = *body;
+    let id = expr.node_id();
+    let TypedExprNode::Apply { argument, function } = std::mem::take(expr).node else {
+        unreachable!("matched an application above")
+    };
+    let built = {
+        let _f = crate::ccl::provenance::enter(
+            function.node_id(),
+            "infer.dispatch_trait_fn",
+            crate::ccl::provenance::Nature::Machinery,
+        );
+        body.build_applied(*argument, &ty)
+    };
+    *expr = Expr::preserve(id, built.node).with_ty(built.ty);
+    true
+}
+
+/// Whether `ty`, a trait function's type, takes a domain a refused edge left without bounds, a
+/// join with no answer say. The program fails with that edge's error, so the function is left
+/// as it stands rather than built at a type that names no collection.
+fn left_unresolved_by_an_error(ty: &Type) -> bool {
+    ty.domain()
+        .is_some_and(|d| matches!(d.peel_refinements(), Type::Infer(_)))
+}
+
 /// Replace a `TraitFn` a compiler instance answers with the function the instance builds at
 /// the node's type, the signature at the call's types.
 fn build_instance_function(expr: &mut Expr, instance: &TraitInstance) {
@@ -3152,6 +3221,9 @@ fn build_instance_function(expr: &mut Expr, instance: &TraitInstance) {
             "an instance of `{trait_}` the compiler provides runs a primitive for each function its trait declares"
         )
     };
+    if left_unresolved_by_an_error(&expr.ty) {
+        return;
+    }
     let id = expr.node_id();
     let built = {
         let _f = crate::ccl::provenance::enter(
@@ -3522,6 +3594,9 @@ fn coalesce_type_predicates_go(
         // A projection quotes a term as a predicate does, so its slots resolve the same way
         // and it leaves closed against the functions entered.
         Type::WitnessProjection(p) => {
+            if let Some(sum) = p.read_through_mut() {
+                coalesce_type_predicates_go(sum, level, ctx, scope);
+            }
             let memo = ctx.pred_memo.clone();
             memo.rebuild(p, &(), |term| {
                 coalesce_node(term, level, ctx);
@@ -4913,6 +4988,34 @@ mod tests {
         ArithmeticKind, BaseType, BinOpKind, BindingTransparency, Lit, Type, TypedExpr,
         TypedExprNode,
     };
+
+    #[test]
+    fn a_position_read_returns_to_the_variables_frame() {
+        use crate::ccl::infer_var::{Bound, InferVar, Telescope};
+        use crate::ccl::subst::Subst;
+        use crate::ccl::{Name, Refinement};
+        use std::rc::Rc;
+
+        let _arena = crate::ccl::infer::InferArena::new();
+        let key = Name::fresh("key");
+        let other = Name::fresh("other");
+        let var = InferVar::fresh_in(0, &Telescope::default().extended(key.clone()));
+        let holder = InferVar::fresh_in(0, &Telescope::default().extended(other.clone()));
+        let renamed = Subst::rename(key.clone(), other.clone());
+        holder.bounds.borrow_mut().lower_mut().extend([
+            Bound::with_subst(Type::Infer(Rc::clone(&var)), renamed),
+            Bound::conc(Type::refined_one(
+                Type::Base(BaseType::Int),
+                Refinement::born(Rc::new(
+                    TypedExpr::var(other.clone()).with_ty(Type::Base(BaseType::Bool)),
+                )),
+            )),
+        ]);
+        let mut index = super::OccurrenceIndex::default();
+        index.pending.push(Type::Infer(holder));
+        let chosen = super::position_type(&var, &mut index).expect("the holder fixes the position");
+        assert_eq!(crate::ccl::subst::type_free_vars(&chosen), [key].into());
+    }
 
     // ----- the projection's monomorphization (`specialize_projection_domain`) -----
 

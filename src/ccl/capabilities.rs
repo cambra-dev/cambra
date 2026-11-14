@@ -58,33 +58,43 @@ impl OrderableIfRequiredBy {
         if matches!(positions.peel_refinements(), Type::Infer(_)) {
             return self.positions.clone();
         }
-        let Type::WitnessRef(id) = positions.peel_refinements() else {
-            return positions;
-        };
-        let Some(iter) = &self.iter else {
-            return positions;
-        };
-        let iter = resolve(iter);
-        let kind = match iter.peel_refinements().sum() {
-            Some([only]) => Some(only.type_kind()),
-            Some(ws) => ws.iter().find(|w| w.id() == id).map(|w| w.type_kind()),
-            None => None,
-        }
-        .or_else(|| match self.positions.peel_refinements() {
-            Type::Infer(v) => v.witness_scope_kinds().iter().find_map(|k| {
-                let index = k.binder_position(id)?;
-                let carrier = Type::Fun {
-                    name: None,
-                    fun_kind: crate::ccl::ty::FunKind::Var(Rc::clone(k)),
-                    domain: Box::new(self.positions.clone()),
-                    codomain: Box::new(Type::Base(crate::ccl::BaseType::Unit)),
-                    capabilities: Capabilities::none(),
-                };
-                let carrier = resolve(&carrier);
-                carrier.sum()?.get(index).map(|w| w.type_kind())
+        let kind = match positions.peel_refinements() {
+            Type::WitnessProjection(p) => p.witness().map(|w| w.type_kind()).or_else(|| {
+                // The projection's quote may precede resolution of its source's type.
+                let term = resolve(&p.term.ty);
+                term.peel_refinements()
+                    .sum()?
+                    .get(p.position)
+                    .map(|w| w.type_kind())
             }),
+            Type::WitnessRef(id) => self
+                .iter
+                .as_ref()
+                .and_then(|iter| {
+                    let iter = resolve(iter);
+                    match iter.peel_refinements().sum() {
+                        Some([only]) => Some(only.type_kind()),
+                        Some(ws) => ws.iter().find(|w| w.id() == id).map(|w| w.type_kind()),
+                        None => None,
+                    }
+                })
+                .or_else(|| match self.positions.peel_refinements() {
+                    Type::Infer(v) => v.witness_scope_kinds().iter().find_map(|k| {
+                        let index = k.binder_position(id)?;
+                        let carrier = Type::Fun {
+                            name: None,
+                            fun_kind: crate::ccl::ty::FunKind::Var(Rc::clone(k)),
+                            domain: Box::new(self.positions.clone()),
+                            codomain: Box::new(Type::Base(crate::ccl::BaseType::Unit)),
+                            capabilities: Capabilities::none(),
+                        };
+                        let carrier = resolve(&carrier);
+                        carrier.sum()?.get(index).map(|w| w.type_kind())
+                    }),
+                    _ => None,
+                }),
             _ => None,
-        });
+        };
         match kind {
             Some(TypeKind::SubtypesOf(key)) => *key,
             Some(TypeKind::UIntRanges) => Type::Base(crate::ccl::BaseType::UInt),

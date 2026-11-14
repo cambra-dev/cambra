@@ -2,7 +2,7 @@
 //! the canonical "group by + per-group aggregate" shape.
 //!
 //! The projecting inner comprehension
-//! `[sum([s.amount for s in g]) for g in groupby(sales, \r -> r.region)]`
+//! `[sum([s.amount for s in g]) for _ -> g in groupby(sales, \r -> r.region)]`
 //! reaches operator conversion only through the exponential-eta rule in
 //! `src/ccl/simplify.rs`: λ-elimination closes `s.amount` over both the group
 //! and the element and re-splits it with `curry`, which operator conversion has

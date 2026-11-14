@@ -1107,7 +1107,7 @@ const NEITHER: &str = indoc! {r#"
 )]
 #[case::mixed_in_a_key(
     FEEDS_AND_DEFINES,
-    r"sum([sum(h) for h in groupby([1, 2], \e -> max(g(e)))])",
+    r"sum([sum(h) for _ -> h in groupby([1, 2], \e -> max(g(e)))])",
     "both feeds and a define"
 )]
 #[case::defined_twice_in_a_filter(
@@ -1945,7 +1945,7 @@ fn a_target_fed_from_two_places_names_the_other() {
 #[case::grouped_by_the_loop_variable(indoc! {r#"
     out = test_sink()
     for i in [1, 2]:
-        out << [sum(g) for g in groupby([1, 2, 3, 4], \e -> e // i)]
+        out << [sum(g) for _ -> g in groupby([1, 2, 3, 4], \e -> e // i)]
 "#}, "[[1 -> 1, 2 -> 2, 3 -> 3, 4 -> 4], [1, 5, 4]]")]
 #[case::through_a_let_of_the_loop_variable(indoc! {r#"
     out = test_sink()
@@ -2031,74 +2031,74 @@ fn rows_keyed_by_the_loops_around_the_feed(#[case] source: &str, #[case] expecte
 #[rstest]
 #[case::summed(indoc! {r#"
     out = test_sink()
-    for g in groupby([1, 2, 3, 4], \e -> e // 2):
+    for _ -> g in groupby([1, 2, 3, 4], \e -> e // 2):
         out << sum(g)
 "#}, "[1, 5, 4]")]
 #[case::under_a_condition_on_the_group(indoc! {r#"
     out = test_sink()
-    for g in groupby([1, 2, 3, 4], \e -> e // 2):
+    for _ -> g in groupby([1, 2, 3, 4], \e -> e // 2):
         if sum(g) > 3:
             out << sum(g)
 "#}, "[1 -> 5, 2 -> 4]")]
 #[case::filtered_rows_of_each_group(indoc! {r#"
     out = test_sink()
-    for g in groupby([1, 2, 3, 4, 5], \e -> e // 2):
+    for _ -> g in groupby([1, 2, 3, 4, 5], \e -> e // 2):
         out << [x for x in g if x > 1]
 "#}, "[[], [1 -> 2, 2 -> 3], [3 -> 4, 4 -> 5]]")]
 #[case::over_records(indoc! {r#"
     sales = [(region="east", amount=1), (region="west", amount=2), (region="east", amount=3)]
     out = test_sink()
-    for g in groupby(sales, \r -> r.region):
+    for _ -> g in groupby(sales, \r -> r.region):
         out << [s.amount for s in g]
 "#}, r#"["east" -> [0 -> 1, 2 -> 3], "west" -> [1 -> 2]]"#)]
 #[case::through_a_definition(indoc! {r#"
     def big(g):
         [z * 2 for z in g if z > 1]
     out = test_sink()
-    for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
+    for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
         out << big(g)
 "#}, "[[1 -> 4], [2 -> 6, 3 -> 8, 4 -> 10], [5 -> 12, 6 -> 14, 7 -> 16]]")]
 #[case::summed_per_element(indoc! {r#"
     out = test_sink()
-    for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
+    for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
         out << [sum([y for y in g]) for x in g]
 "#}, "[[3, 3], [2 -> 12, 3 -> 12, 4 -> 12], [5 -> 21, 6 -> 21, 7 -> 21]]")]
 #[case::rows_of_a_binding_in_the_loop(indoc! {r#"
     out = test_sink()
-    for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
+    for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
         h = [y for y in g if y > 1]
         out << [z * 2 for z in h]
 "#}, "[[1 -> 4], [2 -> 6, 3 -> 8, 4 -> 10], [5 -> 12, 6 -> 14, 7 -> 16]]")]
 #[case::a_binding_in_the_loop_filtered_by_its_element(indoc! {r#"
     out = test_sink()
-    for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
+    for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
         h = [y for y in g if y > 1]
         out << [sum([y for y in h if y > x]) for x in h]
 "#}, "[[1 -> 0], [2 -> 9, 3 -> 5, 4 -> 0], [5 -> 15, 6 -> 8, 7 -> 0]]")]
 #[case::each_row_filtered_by_its_element(indoc! {r#"
     out = test_sink()
-    for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
+    for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
         out << [sum([y for y in g if y > x]) for x in g]
 "#}, "[[2, 0], [2 -> 9, 3 -> 5, 4 -> 0], [5 -> 15, 6 -> 8, 7 -> 0]]")]
 #[case::filtered_rows_each_filtered_by_its_element(indoc! {r#"
     out = test_sink()
-    for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
+    for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
         out << [sum([y for y in g if y > x]) for x in g if x > 1]
 "#}, "[[1 -> 0], [2 -> 9, 3 -> 5, 4 -> 0], [5 -> 15, 6 -> 8, 7 -> 0]]")]
 #[case::rows_filtered_to_empty_each_summing_its_group(indoc! {r#"
     out = test_sink()
-    for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
+    for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
         out << [sum([y for y in g]) for x in g if x > 2]
 "#}, "[[], [2 -> 12, 3 -> 12, 4 -> 12], [5 -> 21, 6 -> 21, 7 -> 21]]")]
 #[case::rows_filtered_to_empty_each_filtered_by_its_element(indoc! {r#"
     out = test_sink()
-    for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
+    for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
         out << [sum([y for y in g if y > x]) for x in g if x > 2]
 "#}, "[[], [2 -> 9, 3 -> 5, 4 -> 0], [5 -> 15, 6 -> 8, 7 -> 0]]")]
 #[case::keyed_by_an_enclosing_loop(indoc! {r#"
     out = test_sink()
     for i in [1, 2]:
-        for g in groupby([1, 2, 3, 4], \e -> e // i):
+        for _ -> g in groupby([1, 2, 3, 4], \e -> e // i):
             out << max(g)
 "#}, "[(_0: 0, _1: 1) -> 1, (_0: 0, _1: 2) -> 2, (_0: 0, _1: 3) -> 3, (_0: 0, _1: 4) -> 4, (_0: 1, _1: 0) -> 1, (_0: 1, _1: 1) -> 3, (_0: 1, _1: 2) -> 4]")]
 fn a_loop_over_a_group_by_feeds_a_row_per_group(#[case] source: &str, #[case] expected: &str) {
@@ -2112,7 +2112,7 @@ fn a_correlated_comprehension_over_a_mapped_binding_in_a_group_loop() {
     check_sink(
         indoc! {r#"
             out = test_sink()
-            for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
+            for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
                 h = [y * 10 for y in g if y != 4]
                 out << [sum([y for y in h if y < x]) for x in h if x > 20]
         "#},
@@ -2633,7 +2633,7 @@ fn a_nested_feed_filter_reads_each_groups_elements(#[case] limit: i64, #[case] e
         &formatdoc! {r"
             out: Feed(_)
             for i in [1, 2]:
-                for g in groupby([1, 2, 3, 4], \x -> x // 2):
+                for _ -> g in groupby([1, 2, 3, 4], \x -> x // 2):
                     if sum(g) > {limit}:
                         out << sum(g)
             sum(out)

@@ -220,7 +220,7 @@ module](#912-field-labels-and-tags-belong-to-a-module)), a nominal type from its
 name parses wherever a name does.
 
 Postfix `!` unwraps an `Option` proven not to be `Option::none`
-([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)). `!=` is one token,
+([Subscript and unwrap syntax](#subscript-and-unwrap-syntax)). `!=` is one token,
 so `x! == y` needs the space.
 
 `:=` is the **mutation** operator (§4.3, §8.1) — it introduces and writes
@@ -963,7 +963,7 @@ _ in _ : forall (C, E) {e: E, c: C} => Bool requires r: Iterable(C), r::Elements
   feed with no final domain, `false` may never be answered.
 - **A true key-membership guard refines the key.** Under a true `k in s`, `k` is refined to the
   domain of `s`; under a true `k in m.keys()`, to the domain of `m`, so `m[k]!` checks there
-  ([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)). Value
+  ([Subscript and unwrap syntax](#subscript-and-unwrap-syntax)). Value
   membership in a `List` gives no index evidence.
 
 `in` and `not in` share level 9 with the comparators
@@ -1231,33 +1231,25 @@ refined present-key domain instead requires membership in that refinement. Prove
 define an absent-key runtime result. `!` can be used generally as a postfix operator to unwrap
 `Option` when it can be proven that it is an `Option::some`.
 
-#### Subscript and unwrap syntax [Decided]
+#### Subscript and unwrap syntax
 
-`c[k]` is the optional lookup. Its result is an `Option` refined by whether the key is present, and
-postfix `!` takes an `Option` refined to exclude `none`:
+Checked lookup `c[k]` takes a key of the collection's key type and returns `Option` of the
+value at that key. A present key yields `Option::some`. Absence yields `Option::none` once
+the collection can establish that it lacks the key. A set's value at a present key is unit.
 
-```
-_[_] : {m: Map(K, V), k: K} => {Option(V) where _.is_none() == (k not in m.keys())}
-_!   : {Option(T) where not _.is_none()} => T
-```
+Proven lookup `c[k]!` requires the key's type to establish that it belongs to the collection's
+domain. It reads the value directly. A key of type `K` satisfies this rule for a
+`FullMap(K, V)`. An entry read from a `Map` provides its key and value; its key type alone does
+not establish membership in the map's particular domain.
 
-`Option` is a nominal type ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)),
-so presence is stated by a term predicate over it rather than by a subtype naming one constructor.
-`is_none` is a method of `Option` declared with it, and the predicate calls it because a nominal
-type has no `==`. A lookup into a `Set` has the same type at `Option(unit)`. A lookup into an
-`Array(n, T)` states presence as `i < n`, and a `FullMap` lookup's result is
-`{Option(V) where not _.is_none()}` for every key. **[Open]** — the predicate a `List(T)` lookup
-states presence by. An index drawn from iterating `xs` is present.
+Both forms read the key-to-value function returned by `std`'s `Indexable::entries`. A structural
+collection provides itself, and a nominal collection provides that function through its
+`Indexable` instance. A direct call `c(k)` applies a structural collection as a function.
 
-`c[k]!` is accepted exactly where the refinement on `c[k]` entails `not _.is_none()`: under an
-`in` guard, for a key drawn from iterating `c`, or for a `FullMap`. Failure to establish presence
-is a type error at `!`, not a runtime unwrap failure. `!` has postfix precedence;
-`!=` remains one token, so `x! == y` requires a space before `==`.
-
-> **[Interim]** The compiler accepts `!` only directly after a subscript, as `c[k]!`. A `!` after
-> any other expression is a parse error.
-
-A direct call `c(k)` remains function application, not an optional membership test.
+**[Planned]** — a checked result refined by key presence and a general postfix `!` that unwraps
+an `Option` refined to exclude `none`. The predicate uses `Option::is_none()`. The compiler
+currently accepts postfix `!` only as part of `c[k]!`. A space before `==` separates that
+token from the postfix `!`.
 
 #### Method calls [Decided]
 
@@ -1350,8 +1342,8 @@ list of pairs, not intrinsically a map. Current keyed construction requires an e
 | `set(xs)` | An element of `xs`. | Unit. |
 | `map(entries)` | The first component of each pair. | The second component. |
 
-Both return concrete data functions over the present keys. A sum annotation requires `box`,
-for example `m: Map(Int, Int) = box(map([1 -> 10, 2 -> 20]))`.
+The constructors return nominal collections. For example,
+`m: Map(Int, Int) = map([1 -> 10, 2 -> 20])`.
 `list(...)` is not a builtin; `box([1, 2])` can satisfy a `List(Int)` annotation.
 
 Repeated set elements produce one key. Duplicate keys in a constant map are a compile-time error;
@@ -1363,21 +1355,19 @@ see [Re-keying is explicit](#re-keying-is-explicit-decided).
 unconstrained element type becomes unit. For example, `xs: List(Int) = box([])` selects `Int`.
 A value it is joined with is a use: in `box([1]) if c else box([])`, `[]` takes the other
 branch's element type, so the empty branch is an `Array(0, {Int where _ == 1})`.
-The same holds under a re-keying constructor: in `m: Map(String, Int) = box(map([]))` the
+The same holds under a re-keying constructor: in `m: Map(String, Int) = map([])` the
 annotation gives `[]` its element type, `(String, Int)`, and `set([])` with no use is a set of
 `unit`.
 
-`empty_map()` directly constructs an empty keyed sum. Its annotation must determine the key
-and value types:
+`empty_map()` constructs an empty `Map`. Its annotation supplies the key and value types.
 
 ```python
 cart: Mut(Map(String, Int), Txn) := empty_map()
 prices: Map(String, Int) = empty_map()
-seen: Set(String) = empty_map()
+seen: Set(String) = set([])
 ```
 
-The set annotation works because `Set(K)` currently lowers as `Map(K, unit)`. An unannotated
-`empty_map()` is rejected; later keyed writes do not replace its required type annotation.
+An `empty_map()` call requires a `Map` annotation. Use `set([])` for an empty set.
 Inference details and the distinction between empty positional and keyed domains belong to
 [The empty literal names no element type](../src/ccl/design/collections.md#the-empty-literal-names-no-element-type).
 
@@ -1446,7 +1436,7 @@ elements as inputs arrive.
 > comprehension shapes and emits specialised dataflow for them:
 > - `for x in xs for y in ys if x.k == y.k` is compiled as a hash
 >   join rather than a nested loop.
-> - `for g in groupby(c, key)` produces a keyed aggregate dispatch.
+> - `for _ -> g in groupby(c, key)` produces a keyed aggregate dispatch.
 >
 > These rewrites preserve the semantics described above; users should
 > not need to reason about which strategy the compiler picked.
@@ -1458,11 +1448,11 @@ elements as inputs arrive.
 > ([3.11 List, tuple, record literals](#311-list-tuple-record-literals)), and reading it as a `Map`
 > is `map([k -> v for …])`. A set comprehension is `set([e for …])`.
 >
-> Iterating a **keyed** collection yields its *entries* as pairs, destructured with the 2-tuple
+> Iterating a `Map` or `FullMap` yields entries, destructured with the 2-tuple
 > pattern in the `for` binder: `for k -> v in m` (≡ `for (k, v) in m`), and likewise
 > `for k -> g in groupby(c, key)`. A single binder takes the whole entry rather than the group
-> ([4.6 `for` — iteration](#46-for--iteration)), so iterating the groups alone is
-> `groupby(c, key).values()`.
+> ([4.6 `for` — iteration](#46-for--iteration)). Use `for _ -> g in groupby(c, key)`
+> to bind only the group.
 >
 > The `->` in a binder and the `->` in an element are both the 2-tuple, so
 > `[k -> v for k -> v in m]` and `[e for e in m]` denote one collection. With `m: Map(K, V)`,
@@ -1578,7 +1568,7 @@ expected type, a join — rather than at the constructor.
 with constructors `Option::some(T)` and `Option::none`
 ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)) and the method
 `Option::is_none` that a lookup's refinement tests
-([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)). A structural
+([Subscript and unwrap syntax](#subscript-and-unwrap-syntax)). A structural
 variant with the same arms is a different type, so `` y: Option(Int) = `some(1) `` is a type
 error and `y: Option(Int) = Option::some(1)` is the spelling.
 
@@ -1948,21 +1938,17 @@ for target in iter:
 collection. The body executes once per element of `iter`, with
 `target` bound to the current element.
 
-**What the element is depends on the collection kind [Planned].** The iteration
-element is chosen per type — it is *not* uniformly the value:
+The source's type determines the iteration element.
 
-| `iter` type | element bound to `target` |
+| Source type | Element |
 |---|---|
-| `List(T)` / `Array(n, T)` / `Collection(T)` | the value `T` |
-| `Set(K)` | the key `K` |
-| `Map(K, V)` / `FullMap(K, V)` | the entry `(K, V)` |
+| `List(T)`, `Array(n, T)`, `Collection(T)` | Value of type `T` |
+| `Set(K)` | Key of type `K` |
+| `Map(K, V)` | Entry `(k, v)`, with `k: K` and `v: V` |
+| `FullMap(K, V)` | Entry `(k, v)`, with `k: K` and `v: V(k)` |
 
-A **single** target binds the whole element; a **tuple / `->`** target
-destructures it, so a map iterates entries unpacked as `for k -> v in m:` (the
-north-star `storefront` rollup, §7.2). The keyed element carries its membership
-proof, so for a key from `for k -> v in m` (or `for k in s`) the refinement on `m[k]` excludes
-`Option::none`, and `m[k]! : V` type-checks (§3.9). Reaching a map's keys or values as their own
-collections is `m.keys()` / `m.values()` / `m.items()` (§6.3).
+A single target binds the whole element. A tuple pattern such as `for k -> v in m`
+destructures an entry. Use `for _ -> v in m` for the values or `for k -> _ in m` for the keys.
 
 **A loop walks its source's `Elements`.** `for x in c` places the built-in requirement `i:
 Iterable(C)` on `c`'s type `C`, iterates `summon(Iterable(_))::elements(c)`, and binds `x` to each
@@ -1973,20 +1959,6 @@ polymorphic `def` that iterates a parameter carries the requirement in its type:
 c: …` requires `Iterable(C)` of its parameter's type `C`, so each call iterates its argument by the
 argument's own instance. An ordered loop requires `Orderable` of its source's positions
 ([Ordered loops](#ordered-loops)).
-
-> **Direction [Decided] — the element is chosen per collection type.** `Set`, `Map` and `FullMap`
-> are nominal builtins
-> ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)), and each
-> satisfies `Iterable` through an instance the compiler provides, whose `Elements` yields what the
-> table above lists.
-
-> **[Interim].** Today `for`-in binds the **value** (codomain) for every
-> collection — so a map iterates its values (as `groupby` results do) and a set
-> iterates `unit`. A destructuring target takes the element apart, in either
-> spelling, `(k, v)` and `k -> v` alike. Entry/key iteration is the [Planned]
-> work; it only *adds* the type-directed element choice, so `for k -> v in m` is
-> the form to write once it lands. Design:
-> [collections.md, "Operations: how the trait layer dispatches [Planned]"](../src/ccl/design/collections.md#operations-how-the-trait-layer-dispatches-planned).
 
 **Iterations are unordered and may run in parallel** (§3) unless the loop is ordered: a
 loop-carried accumulator (below), or an exception escaping the body, sequences them in the
@@ -2391,7 +2363,7 @@ marked one carries its status per "How to read this document".)
 - `FullMap(K, V)` — *total*-map type (§6.3): every value of `K` is a key. `K` is the finite domain
   of keys present in what built the map, and only `groupby` builds one, so a lookup always finds
   its key. Today the proven lookup `m[k]!` answers `V`, and the key's type is its proof. Under
-  [Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided) the checked
+  [Subscript and unwrap syntax](#subscript-and-unwrap-syntax) the checked
   lookup `m[k]` answers `{Option(V) where not _.is_none()}`, which `!` unwraps without a proof at
   the call.
 - `Time` — a position in the commit order (**[Tentative]**). A transaction's time is one, which
@@ -2700,11 +2672,9 @@ length in a sum witness; it does not store a separate length field in a product 
 The current representations are specified in
 [The six collection types](../src/ccl/design/collections.md#the-six-collection-types).
 
-The implemented annotation forms are not six nominal types. `Set(K)` and `Map(K, unit)` lower
-to the same representation. `Array` and `FullMap` have explicit domains; the other four are
-dependent sums. Introducing one of those sums from a concrete collection requires `box`.
-Existing sums can widen under the sum-kind relation; that relation is not automatic insertion
-of a constructor into an unboxed term.
+`Array`, `List` and `Collection` are structural. `Set`, `Map` and `FullMap` are nominal
+types declared in `std`. `Array` has an explicit domain. `List` and `Collection` hide their
+domains in sums, introduced by `box`.
 
 **A data-function type `D |=> V`** is a collection over `D` with values of type `V`.
 
@@ -2725,13 +2695,11 @@ of a constructor into an unboxed term.
   over unordered collections take an explicit
   ordering instance. Default parallel iteration and loop-carried dependencies are specified in
   [Iteration](#46-for--iteration); storage order does not establish a source-language ordering.
-- Membership `in` tests the items iteration yields, so a map's keys are tested through
-  `m.keys()` ([Membership expressions](#membership-expressions-decided)). A true key-membership
-  guard refines the key for proven access.
-- Maps iterate entries, sets keys, and arrays/lists/collections values. The methods
-  `m.keys()`, `m.values()` and `m.items()` of a `Map` or `FullMap`, and `s.keys()` of a `Set`,
-  expose lazy collection views. Numeric `sum(m)` rejects entries; `sum(m.values())` requests
-  value aggregation.
+- Iteration binds the elements specified under [Iteration](#46-for--iteration). Numeric
+  `sum` over a map's values can use `sum([v for _ -> v in m])`.
+- **[Planned]** — membership expressions and the lazy view methods `keys`, `values` and `items`.
+  See [Membership expressions](#membership-expressions-decided) for the membership rule.
+
 - Arrays and lists share the `[…]` literal, chosen by annotation or usage. A set or a map is
   always built by `set([…])` or `map([…])`, since nothing re-keys a literal implicitly. The
   constructors and constant-element rule are in
@@ -2740,38 +2708,17 @@ of a constructor into an unboxed term.
   Feed uses `c << v`, and keyed mutation uses `c[i] := v`. Their current supported forms
   belong to [Mutability, transactions, and feeds](#8-mutability-transactions-and-feeds).
 
-**`Set`, `Map` and `FullMap` are nominal builtins [Decided].** Each is a nominal type
-([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)) that the
-compiler provides, so `Set(K)` and `Map(K, unit)` are distinct types. Nothing relates one of the
-three to a structural collection type: none widens to `Collection`, and the methods `keys`,
-`values` and `items` are the written route. `FullMap` has every operation `Map` has, and differs
-only in how it is built and in its lookup's refinement. The operations of all three are built in:
-lookup, iteration, the methods `keys`, `values` and `items` (`keys` alone for a `Set`), and the
-re-keying constructors `set([…])` and `map([…])`. Membership `in` is not one of them: it comes from
-the `Iterable` instance ([Membership expressions](#membership-expressions-decided)). The
-representation is
-[Telling `Set` and `Map` apart](../src/ccl/design/collections.md#telling-set-and-map-apart-decided).
+#### `Set`, `Map` and `FullMap` are nominal types
 
-A builtin differs from a declared nominal type in four ways:
+`std` declares each type. `Set(K)` and `Map(K, unit)` have distinct identities.
+`set`, `map`, `empty_map` and `groupby` construct values through private constructors.
+Operations read the collection through the type's `Iterable` and `Indexable` instances.
 
-- **No constructors or `extract`.** A program builds one through `set`, `map`, `groupby` or an
-  empty value, and takes it apart through its operations.
-- **Associated values.** `Set::empty` and `Map::empty` are values of the builtin, whose type
-  parameters are determined by their use ([Type parameters](#type-parameters)). A declared type
-  has no spelling for an associated value
-  ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
-- **Trait instances.** All three satisfy `Iterable` through instances the compiler provides
-  ([Trait requirements](#trait-requirements)). A declared type satisfies the traits its module
-  declares instances of ([Declaring an instance](#declaring-an-instance)).
-- **Stated variances.** A declared type's variance is read off its constructors' parameter types,
-  and a builtin has none to read, so each is stated. `Set(K)` is covariant in `K`, and `Map(K, V)`
-  in both `K` and `V`: a map over keys below `K` is a map over keys below any supertype of `K`.
-  `FullMap(K, V)` is invariant in `K`, since its key type is its domain and a collection's domain
-  is its data. Two `FullMap`s over one key type relate key by key: `FullMap(K, V₁)` is a subtype
-  of `FullMap(K, V₂)` when, at every key `k`, `V₁` at `k` is a subtype of `V₂` at `k`.
+`Set(K)` is covariant in `K`. `Map(K, V)` is covariant in both parameters.
+`FullMap(K, V)` is invariant in `K`, which is its domain. At a fixed `K`, a full map with
+family `V₁` is a subtype of one with family `V₂` when `V₁(k)` is below `V₂(k)` for every key.
 
-General contextual parameters for equality and ordering belong to the planned operation
-interface, not the compiler's implemented arithmetic trait tables.
+**[Planned]** — `Set::empty` and `Map::empty`, with type parameters determined by their uses.
 
 ### 6.4 Refinement syntax
 
@@ -3185,8 +3132,8 @@ renamed_type_stmt ::= "@" "RenamedFrom" "(" type_path ")" NEWLINE type_stmt
   ```python
   type Groups(K, V: K => Type) requires forall (k: K) V(k) <: _ |=> Int = (k: K) |=> V(k)
 
-  Groups::new(groupby([1, 2, 3], \x -> x > 1))           # accepted: groups of Int
-  Groups::new(groupby(["a", "bb"], \x -> x == "a"))      # an error: groups of String
+  Groups::new([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)])           # accepted: groups of Int
+  Groups::new([g for _ -> g in groupby(["a", "bb"], \x -> x == "a")])      # an error: groups of String
   def f(gs: Groups(Bool, \k -> _ |=> String)) => Int: 1  # an error: no group of Int
 
   def total(K, V: K => Type, gs: Groups(K, V)) => Int:
@@ -3231,16 +3178,14 @@ associated functions, so whatever name it takes is unavailable to every type dec
 
 #### Family parameters
 
-A parameter whose kind is a kind arrow, `V: K => Type`, is a **family parameter**: it takes a type
-for each value of `K`. The declaration applies it to the value binders of the types it writes,
-`(k: K) |=> V(k)`. In the kind, `=>` is the kind arrow, not a function type: `K` is the type of the
-values `V` is indexed by, and `Type` is what `V` gives at each
-([Kinds and bounds](#kinds-and-bounds)).
+A **family parameter** `V: K => Type` takes a type for each value of `K`. The declaration
+applies it to the value binders of the types it writes, as in `(k: K) |=> V(k)`. See
+[Kinds and bounds](#kinds-and-bounds).
 
 ```python
 type Groups(K, V: K => Type) = (k: K) |=> V(k)
 
-gs = Groups::new(groupby([1, 2, 3], \x -> x > 1))
+gs = Groups::new([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)])
 # gs's type, as a diagnostic writes it:
 #   Groups({Bool where _ in [1 > 1, 2 > 1, 3 > 1]},
 #          \k: {Bool where _ in [1 > 1, 2 > 1, 3 > 1]} ->
@@ -3263,7 +3208,7 @@ gs = Groups::new(groupby([1, 2, 3], \x -> x > 1))
   around it, and `V(k, k)`, `V(k + 1)` and a bare `V` are errors. Passing it to another family
   parameter, or as `FullMap`'s value type, passes the family:
   `type Outer(K, V: K => Type) = Groups(K, V)`, and `FullMap(K, V)` is `FullMap(K, \k -> V(k))`,
-  which is `(k: K) |=> V(k)`.
+  whose private constructor holds `(k: K) |=> V(k)`.
 - **A family parameter's index types are its binders' types.** The binder it is applied to, the
   family parameter it is passed to, and the map key it is read at range over its index type, up
   to refinements: `V: String => Type` is not applied to `(k: Bool)`.
@@ -3302,7 +3247,7 @@ requirement ::= …
 
 ```python
 def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) V(k) <: _ |=> Int:
-    sum([sum(grp) for grp in g])
+    sum([sum(grp) for _ -> grp in g])
 
 type Bag = List(Int)
 instance Iterable(Bag):
@@ -3310,7 +3255,7 @@ instance Iterable(Bag):
     def elements(b):
         b.extract()
 
-def count(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
+def count(K, V: K => Type, g: (k: K) |=> V(k)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
     sum([sum([x for x in grp]) for grp in g])
 
 count([Bag::new(box([1, 2])), Bag::new(box([3]))])   # 6
@@ -3371,7 +3316,7 @@ value.
   - A refinement of a nominal type is related to it by the ordinary refinement rule
     ([6.4 Refinement syntax](#64-refinement-syntax)): `{Option(V) where not _.is_none()}` is a
     subtype of `Option(V)`, which is what a lookup's result relies on
-    ([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)).
+    ([Subscript and unwrap syntax](#subscript-and-unwrap-syntax)).
 
   A join of two different nominal types, or of a nominal type and a type that is neither it nor a
   refinement of it, is an error at the join.
@@ -3386,8 +3331,7 @@ value.
   is. An instance of an arithmetic operator's trait defines the operator on its values, and an
   instance of `Equatable` or `Orderable` lets them be compared and makes them keys of a `Set`, a
   `Map` or a `groupby` ([Equality and order](#equality-and-order)). Deriving an instance from the
-  constructors, as with Rust's `#[derive]`, is **[Open]**. The nominal builtins `Set`, `Map` and
-  `FullMap` satisfy the built-in instances of `Iterable`, which the compiler provides.
+  constructors, as with Rust's `#[derive]`, is **[Open]**. `std` declares `Iterable` and `Indexable` instances for `Set`, `Map` and `FullMap`.
 - **The type of a nominal value is fixed by the expression that produced it.** Every producer of a
   value names the same nominal type, so a method and a trait requirement resolve the same way
   wherever the value flows.
@@ -3397,12 +3341,6 @@ value.
 - **A value names its declaration.** A value of a declared nominal type carries the declaration its
   constructor belongs to, as the version of the program that built it defines it, and compares in
   that declaration's order ([Equality and order](#equality-and-order)).
-- **[Open] — erasure after inference.** The first implementation keeps a declared nominal type
-  until operator conversion, which reads a value's shape off its constructors' parameter types, and
-  erases the nominal builtins once inference has resolved their operations. Whether a value keeps
-  the whole type, its arguments included, past inference, which could bound the data it holds, is
-  not decided.
-
 #### Associated functions and methods
 
 ```ebnf
@@ -4196,7 +4134,8 @@ trait requirement names one as it names these, which `std` declares and the prel
 | `Negatable` | unary `-` | 1 | `Output` | `neg` | `Int` |
 | `Equatable` | `==`, `!=`, `in`, `not in` | 2 | none | none | `Int`, `UInt`, `String`, `Bool`, and a tuple or record whose fields are `Equatable` |
 | `Orderable` | `<`, `<=`, `>`, `>=`, `max`, `min` | 2 | none | none | `Int`, `UInt`, `String`, `Bool`, and a tuple whose components are `Orderable` |
-| `Iterable` | `for`-in, a comprehension's `for` clause | 1 | `Elements` | `elements` | every collection, as its own `Elements` |
+| `Iterable` | `for`-in, a comprehension's `for` clause | 1 | `Elements` | `elements` | structural collections as themselves, plus the nominal collection instances |
+| `Indexable` | `c[k]`, `c[k]!` | 1 | `Entries` | `entries` | structural collections as themselves, plus the nominal collection instances |
 
 `max` and `min` place `Orderable(T, T)` on their element type `T`. A binary trait is satisfied by
 two operands of one listed type. A tuple or record satisfies `Equatable` only against the same
@@ -4459,11 +4398,14 @@ trait Scales(V, F):
 #### Declaring an instance
 
 ```ebnf
-instance_stmt ::= "instance" [ "forall" "(" Ident ( "," Ident )* [ "," ] ")" ]
+instance_stmt ::= "instance" [ "forall" "(" instance_param ( "," instance_param )* [ "," ] ")" ]
                   trait_name "(" expression ( "," expression )* ")" [ requires_clause ]
                   ( ":" NEWLINE INDENT instance_item+ DEDENT | NEWLINE )
+instance_param ::= Ident [ ":" expression ]
 instance_item ::= Ident "=" expression NEWLINE | def_stmt
 ```
+
+An instance parameter may name a type or declare a family kind such as `V: K => Type`.
 
 An `instance` block declares an **instance** of the trait its head names and installs it for the
 whole program: the types it is for, a definition of each of the trait's associated types, and a
@@ -4753,7 +4695,7 @@ lookup `c[k]` returns `Option::none` for an absent key
 ([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)). A postfix `!` is to
 unwrap the result where the collection is proven non-empty, as it unwraps a lookup whose key is
 proven present
-([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)). Until then `max` of
+([Subscript and unwrap syntax](#subscript-and-unwrap-syntax)). Until then `max` of
 an empty collection is not defined, and neither is `min` of one
 ([Partiality is not yet defined](#partiality-is-not-yet-defined-open)).
 
@@ -4771,45 +4713,23 @@ The north-star programs additionally assume non-aggregate built-ins —
 > call resolves among the methods of a
 > nominal type ([6.8 Nominal types and methods
 > [Decided]](#68-nominal-types-and-methods-decided)). `Set`, `Map` and
-> `FullMap` are nominal, so `catalog.keys()` resolves; `List` and
+> `FullMap` are nominal and can declare methods; `keys()` remains planned. `List` and
 > `Collection` are structural, so `orders.filter(…)` on one names no
 > method, and a trait's function is read from an instance
 > ([Summoning an instance](#summoning-an-instance)).
 
 ### 7.2 `groupby`
 
-```
-groupby(collection, key_fn) : K ⇒ Collection
-```
-
-`groupby(c, k)` denotes a function from key values to sub-collections:
-applied to a key `v`, it returns the elements of `c` for which
-`k(elem) == v`. Iterating `groupby(c, k)` yields one element per
-distinct key, where each element is itself the group of `c`-elements
-sharing that key.
+`groupby(c, key)` returns a `FullMap` over the keys produced by applying `key` to the values
+of `c`. The group at each key keeps the original positions of the values with that key.
 
 ```python
-[ sum([s.amount for s in g]) for g in groupby(sales, lambda r: r.region) ]
+[sum([s.amount for s in g]) for _ -> g in groupby(sales, \r -> r.region)]
+map([key -> sum([o.price for o in g]) for key -> g in groupby(paid, \o -> o.sku)])
 ```
 
-The standard pattern (above) — group, then aggregate per group — is
-what `groupby` is primarily designed to support.
-
-> **Direction [Decided].** Under the collections model, `groupby(c, key)`
-> returns a `FullMap` keyed by the keys present in `c`
-> ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided),
-> [src/ccl/design/collections.md](../src/ccl/design/collections.md)). Its
-> entries iterate as key–value pairs, so the rollup destructures the pair
-> in the `for` binder and rebuilds a map with `map` over a comprehension
-> ([3.12 Comprehensions](#312-comprehensions)):
->
-> ```python
-> map([key -> sum([o.price for o in g]) for key -> g in groupby(paid, \o -> o.sku)])
-> ```
->
-> (the north-star `storefront` `/stats` rollup). A single binder takes the whole
-> entry rather than the group (§4.6), so `for g in groupby(…).values()` is how to
-> iterate the groups alone — which is what the unkeyed form above does today.
+The first expression returns a structural collection of totals. The second constructs a nominal
+`Map` from the keyed totals. See [Comprehensions](#312-comprehensions).
 
 ### 7.3 Sources
 
@@ -6384,7 +6304,7 @@ modules are CHL source the compiler embeds (`stdlib/src/`). A diagnostic in one 
 
 | Module | Holds |
 | -- | -- |
-| `std` | `Option`, and the traits operators, loops and aggregates require ([Trait requirements](#trait-requirements)), with their instances for base types |
+| `std` | `Option`, `Set`, `Map`, `FullMap`, and the traits and instances used by operators, loops, aggregates and subscripts |
 
 **The prelude** is a list of `import` statements of std modules (`stdlib/prelude.cambra`). Every
 module outside the std root reaches each of their `use` items by its name, without an import, and
@@ -6395,7 +6315,7 @@ names nothing until a module imports it.
   or a `use` name spelled like a prelude name is the module's, in place of the prelude's, so adding
   a prelude name changes no module that already binds it.
 - **A std module reaches no prelude.** It imports each std module whose members it names.
-- **The prelude holds `Option`** and every trait of [Trait requirements](#trait-requirements).
+- The prelude imports the standard types and public traits used by these constructs.
 
 **`@Builtin` marks a declaration whose behaviour the compiler supplies.** Only `std` declares one,
 and its declaration states its type:
@@ -6403,10 +6323,12 @@ and its declaration states its type:
 - **A `@Builtin` trait** holds of types beyond its instances: `Equatable` of a product whose
   components are `Equatable`, `Orderable` of a tuple whose components are `Orderable`, and
   `Iterable` of every structural collection, as its own `Elements`.
-- **A `@Builtin` instance** is for base types, and runs a primitive for each function its trait
-  declares: `@Builtin instance Addable(String, String)` concatenates. Its block defines the
-  trait's associated types and no function. An instance of a trait that declares no function
-  supplies nothing, so it is never `@Builtin`: `std` writes `instance Equatable(Int, Int)`.
+- **A `@Builtin` type** receives its representation and private constructor from the compiler.
+  `Set` and `Map` use this form. `FullMap` declares its private constructor in CHL.
+- **A `@Builtin` instance** runs a primitive for each function its trait
+  declares. `Addable(String, String)` concatenates. The nominal collection instances also
+  receive their associated collection types from the compiler. A trait with no functions
+  needs no such primitive, as in `instance Equatable(Int, Int)`.
 
 ```python
 @Builtin
@@ -6421,11 +6343,8 @@ instance Addable(Int, Int):
     Output = Int
 ```
 
-`Option` is a `type` that `std` declares
-([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). The operations
-that answer an `Option`, the lookup `c[k]` and the unwrap `e!`
-([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)), answer that declaration
-in every module, a module that declares its own `Option` included.
+Checked lookup `c[k]` returns `std`'s `Option` even in a module that declares its own
+`Option`. See [Subscript and unwrap syntax](#subscript-and-unwrap-syntax).
 
 **[Planned]** — `std::http` and the alarm source and sink in `std::time`:
 `import std::http` binds `http`, then `http::serve(…)` and `http::ok(…)` ([7.3
@@ -6455,10 +6374,6 @@ def clock() => Int requires ObserveWorld
 pub def now() => Instant:
     Instant::new(clock())
 ```
-
-**[Decided]** — `Set`, `Map` and `FullMap` stay compiler builtins, as nominal types with no
-constructors
-([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)).
 
 ### 9.17 No trailing expressions
 

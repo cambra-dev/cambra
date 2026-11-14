@@ -73,8 +73,13 @@ pub(crate) fn contribution_lambda(
 pub(crate) fn key_by_positions(value: Expr, levels: usize) -> Expr {
     match classify_nest(&value, levels) {
         Nest::Product(generators) => nest_as_product(value, generators),
-        Nest::Indexed => flatten_nested_contribution(indexed_nest(value, levels), levels),
-        Nest::Flat => flatten_nested_contribution(value, levels),
+        // Flattened beneath the `let`s that open the nest: a `let` lifts the type it closes
+        // past its binder, which may pack a level's collection, and a packed level has no
+        // binder the flattened key could read.
+        Nest::Indexed => around_lets(value, &mut |nest| {
+            flatten_nested_contribution(indexed_nest(nest, levels), levels)
+        }),
+        Nest::Flat => around_lets(value, &mut |nest| flatten_nested_contribution(nest, levels)),
     }
 }
 
