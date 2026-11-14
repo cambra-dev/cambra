@@ -3639,23 +3639,65 @@ impl Type {
         }
     }
 
-    /// The type of a function binding `name` over `codomain`: [`Type::pi_kinded`] where
-    /// `codomain` depends on `name` ([`crate::ccl::subst::codomain_depends_on`]), and an
-    /// unnamed `Fun` otherwise.
+    /// The first unnamed function anywhere in this type whose codomain reads the function by
+    /// index ([`Type::assert_indices_bound`] at every depth).
+    #[cfg(debug_assertions)]
+    pub(crate) fn unbound_index_function(&self) -> Option<&Type> {
+        if let Type::Fun {
+            name: None,
+            codomain,
+            ..
+        } = self
+            && crate::ccl::subst::references_enclosing_function(codomain)
+        {
+            return Some(self);
+        }
+        let mut found = None;
+        self.walk_children(|c| {
+            if found.is_none() {
+                found = c.unbound_index_function();
+            }
+        });
+        found
+    }
+
+    /// Panic where this type is an unnamed function whose codomain reads the function by index:
+    /// an unnamed function counts as a crossing for the indices beneath it, so the reference
+    /// has a binder to count but none to read. It was built as the plain form of a dependent
+    /// function ([`Type::fun_over`]). Checked at the type's top, which is what a node stores; a
+    /// function inside it is checked where a node stores that, so the check stays one scan of
+    /// the codomain.
+    #[cfg(debug_assertions)]
+    pub(crate) fn assert_indices_bound(&self) {
+        if let Type::Fun {
+            name: None,
+            codomain,
+            ..
+        } = self.peel_refinements()
+        {
+            assert!(
+                !crate::ccl::subst::references_enclosing_function(codomain),
+                "an unnamed function's codomain reads the function by index: {self}"
+            );
+        }
+    }
+
+    /// The function of `binder` that `codomain` is: dependent, `binder` bound over the
+    /// codomain, exactly where the codomain reads it
+    /// ([`crate::ccl::subst::codomain_depends_on`]), and plain otherwise.
     ///
-    /// This is the rule coalescing applies to an inferred function type
-    /// (`src/ccl/design/type-inference.md`, "4.5 Dependent refinements via Pi types"), for a
-    /// function built after inference around a codomain read off its body. An unnamed `Fun`
-    /// around a codomain that reads `name` leaves `name` free in the type.
-    pub fn pi_if_dependent(
-        name: impl Into<crate::ccl::Name>,
+    /// A plain function over a codomain that reads its binder leaves the reference unbound
+    /// in a stored type, so a rebuild whose codomain may read the binder states it through
+    /// this rather than choosing between [`Type::pi_kinded`] and a plain [`Type::Fun`].
+    pub fn fun_over(
+        binder: impl Into<crate::ccl::Name>,
         domain: Self,
         codomain: Self,
         fun_kind: FunKind,
     ) -> Self {
-        let name = name.into();
-        if crate::ccl::subst::codomain_depends_on(&name, &codomain) {
-            Type::pi_kinded(name, domain, codomain, fun_kind)
+        let binder = binder.into();
+        if crate::ccl::subst::codomain_depends_on(&binder, &codomain) {
+            Type::pi_kinded(binder, domain, codomain, fun_kind)
         } else {
             Type::Fun {
                 name: None,
@@ -3666,7 +3708,6 @@ impl Type {
             }
         }
     }
-
     /// The family `\\𝑘₀: 𝐾₀, … -> body` ([`Type::Family`]), closing the body's references
     /// to the binders by name into indices, as [`Type::pi`] closes a codomain.
     pub fn family(binders: Vec<(crate::ccl::Name, Self)>, body: Self) -> Self {
@@ -6650,6 +6691,59 @@ mod tests {
     use super::*;
     use crate::ccl::Annotation;
     use crate::ccl::Occurrence;
+
+    /// `fun_over` binds its binder exactly where the codomain reads it.
+    #[test]
+    fn fun_over_binds_exactly_where_the_codomain_reads_it() {
+        let k = Name::from("k");
+        let reads_k = Type::refined(
+            Type::Base(BaseType::Int),
+            RefinementSet::one(Refinement::born(Rc::new(
+                crate::ccl::Expr::var(k.clone()).with_ty(Type::Base(BaseType::Int)),
+            ))),
+        );
+        let dependent = Type::fun_over(
+            k.clone(),
+            Type::Base(BaseType::Int),
+            reads_k.clone(),
+            FunKind::Compute,
+        );
+        assert!(matches!(&dependent, Type::Fun { name: Some(n), .. } if *n == k));
+        #[cfg(debug_assertions)]
+        dependent.assert_indices_bound();
+        let plain = Type::fun_over(
+            k,
+            Type::Base(BaseType::Int),
+            Type::Base(BaseType::Int),
+            FunKind::Compute,
+        );
+        assert!(matches!(plain, Type::Fun { name: None, .. }));
+    }
+
+    /// An unnamed function over a codomain that reads it by index reads a binder with no name.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "an unnamed function's codomain reads the function by index")]
+    fn an_unnamed_function_s_codomain_may_not_read_it() {
+        let k = Name::from("k");
+        let reads_k = Type::refined(
+            Type::Base(BaseType::Int),
+            RefinementSet::one(Refinement::born(Rc::new(
+                crate::ccl::Expr::var(k.clone()).with_ty(Type::Base(BaseType::Int)),
+            ))),
+        );
+        let Type::Fun { codomain, .. } = Type::pi(k, Type::Base(BaseType::Int), reads_k) else {
+            unreachable!("a Pi is a function")
+        };
+        Type::Fun {
+            name: None,
+            fun_kind: FunKind::Compute,
+            domain: Box::new(Type::Base(BaseType::Int)),
+            codomain,
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
+        }
+        .assert_indices_bound();
+    }
 
     #[test]
     fn uint_range_display_uses_exclusive_length() {

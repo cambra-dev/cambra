@@ -244,7 +244,7 @@ pub(crate) fn fn_of_bare_predicate(
     let body = crate::ccl::subst::Subst::rename(Name::elem(), param.clone()).apply_expr(bare);
     // A refined operator's result type records its operands, so the body's type can read
     // `param`, and the function is then a Pi over it.
-    let ty = Type::pi_if_dependent(param.clone(), base.clone(), body.ty.clone(), fun_kind);
+    let ty = Type::fun_over(param.clone(), base.clone(), body.ty.clone(), fun_kind);
     let lam = Expr::lambda(param, Occurrence::mint(), base.clone(), body).with_ty(ty);
     eliminate_lifted(lam).expect("lambda-elim of refinement predicate")
 }

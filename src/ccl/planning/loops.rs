@@ -1104,13 +1104,13 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     let decision_ty = crate::ccl::subst::open_codomain(&h_ty, &decision_ty);
     // Each field's history over the positions, keyed where its value reads the position.
     let field_history = |value: &Type| match &position {
-        Some(r) if crate::ccl::subst::type_free_vars(value).contains(r) => Type::pi_kinded(
+        Some(r) => Type::fun_over(
             r.clone(),
             domain_ty.clone(),
             value.clone(),
             crate::ccl::ty::FunKind::Data(None),
         ),
-        _ => crate::ccl::ccl_utils::history_ty(&domain_ty, value),
+        None => crate::ccl::ccl_utils::history_ty(&domain_ty, value),
     };
     // Op-conversion builds a commit store for a `Txn` domain and an induction store for any
     // other, so an induction group over a `Txn` domain (e.g. a loop over an in-block reply
@@ -1401,31 +1401,31 @@ fn curried_source_type(source: &Type, ctx: &Type, domain: &Type, binder: Option<
         !crate::ccl::subst::type_free_vars(&item).contains(pair),
         "letrec recognition: a nested source's item reads its pair only through its halves: {item}"
     );
-    let collection = if crate::ccl::subst::type_free_vars(&item).contains(&position) {
-        Type::pi_kinded(
-            position,
-            domain.clone(),
-            item,
-            crate::ccl::ty::FunKind::Data(None),
-        )
-    } else {
-        Type::data_fun(domain.clone(), item)
-    };
-    if crate::ccl::subst::type_free_vars(&collection).contains(&enclosing) {
-        Type::pi(enclosing, ctx.clone(), collection)
-    } else {
-        Type::fun(ctx.clone(), collection)
-    }
+    let collection = Type::fun_over(
+        position,
+        domain.clone(),
+        item,
+        crate::ccl::ty::FunKind::Data(None),
+    );
+    Type::fun_over(
+        enclosing,
+        ctx.clone(),
+        collection,
+        crate::ccl::ty::FunKind::Compute,
+    )
 }
 
 /// A morphism of a nested `Transact`'s enclosing parameter, `ctx ⇒ codomain`, dependent on it
 /// where `codomain` reads its `binder`.
 fn over_enclosing(binder: Option<&Name>, ctx: &Type, codomain: Type) -> Type {
     match binder {
-        Some(e) if crate::ccl::subst::type_free_vars(&codomain).contains(e) => {
-            Type::pi(e.clone(), ctx.clone(), codomain)
-        }
-        _ => Type::fun(ctx.clone(), codomain),
+        Some(e) => Type::fun_over(
+            e.clone(),
+            ctx.clone(),
+            codomain,
+            crate::ccl::ty::FunKind::Compute,
+        ),
+        None => Type::fun(ctx.clone(), codomain),
     }
 }
 
