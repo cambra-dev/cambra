@@ -1020,6 +1020,14 @@ const BAGS: &str = "[Bag::new(box([1, 2])), Bag::new(box([3]))]";
     "total([Bags::new(box([Bag::new(box([1, 2]))])), Bags::new(box([Bag::new(box([3]))]))])",
     6
 )]
+#[case::read_in_a_lambda(
+    indoc! {r"
+        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
+            sum([(\y -> sum([x for x in grp]) + y)(1) for grp in g])
+    "},
+    &format!("total({BAGS})"),
+    8
+)]
 #[case::one_group_reached_through_both_arms(
     indoc! {"
         def total(K, V: K => Type, g: FullMap(K, V), c: Bool) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):

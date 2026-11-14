@@ -2675,7 +2675,7 @@ impl InferCtx {
                         // A funkind the annotation left to inference is a fresh one per
                         // occurrence, as a `Hole` is a fresh type.
                         crate::ccl::ty::FunKind::Var(v) if v.is_hole() => {
-                            crate::ccl::ty::FunKind::fresh_data()
+                            crate::ccl::ty::FunKind::fresh_data_at(self.level)
                         }
                     other => other.clone(),
                 };

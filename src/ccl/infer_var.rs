@@ -1068,7 +1068,9 @@ impl InferVar {
 
     /// Mint a fresh variable carrying `telescope` as its scope, over a fresh kind.
     pub fn fresh_in(level: Level, telescope: &Telescope) -> Rc<InferVar> {
-        Self::fresh_over(level, telescope, crate::ccl::ty::FunKindVar::fresh())
+        let funkind = crate::ccl::ty::FunKindVar::fresh();
+        funkind.place_at(level);
+        Self::fresh_over(level, telescope, funkind)
     }
 
     /// Mint a fresh variable over a **given** kind, for a copy of an existing one.
@@ -1230,6 +1232,9 @@ impl InferVar {
     pub(crate) fn lower_level(&self, level: Level) {
         if self.level.get() > level {
             self.level.set(level);
+            if self.fun_kind.level().is_some() {
+                self.fun_kind.place_at(level);
+            }
         }
     }
 }
