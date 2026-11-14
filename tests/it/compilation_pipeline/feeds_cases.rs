@@ -10,7 +10,7 @@ use cambra::interpreter::{ColumnValue, Consumer, Predicate, Tile, Value};
 use rstest_log::rstest;
 
 use cambra::ccl::TagMap;
-use indoc::indoc;
+use indoc::{formatdoc, indoc};
 
 use super::helpers::*;
 
@@ -2620,5 +2620,24 @@ fn refined_read_fed_from_a_nested_loop() {
             sum(out)
         "},
         Value::Int(96),
+    );
+}
+
+#[rstest]
+#[case::mixed(2, 18)]
+#[case::every_group(0, 20)]
+#[case::no_groups(10, 0)]
+#[timeout(Duration::from_secs(10))]
+fn a_nested_feed_filter_reads_each_groups_elements(#[case] limit: i64, #[case] expected: i64) {
+    check_scalar(
+        &formatdoc! {r"
+            out: Feed(_)
+            for i in [1, 2]:
+                for g in groupby([1, 2, 3, 4], \x -> x // 2):
+                    if sum(g) > {limit}:
+                        out << sum(g)
+            sum(out)
+        "},
+        Value::Int(expected),
     );
 }

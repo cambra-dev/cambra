@@ -2611,23 +2611,11 @@ impl Subst {
         }
         let answer = if restricted.acts_on(&r.predicate) {
             let rewritten = restricted.force_acting_refinement(r);
-            // Scope-validity (design §6.2): a discharged binder must not survive
-            // in the rewritten predicate — once `[x ↦ arg]` fires, no free `x`
-            // may remain, or a downstream pass would observe a dangling
-            // reference. (Only `Discharge` entries are checked: a rename
-            // legitimately *introduces* its target.) In a correct implementation
-            // this never fires; it is the per-rewrite regression guard for
-            // substitution-descent bugs, backing the end-of-inference
-            // `check_scope_valid` debug walk. The binders checked are `restricted`'s, as the
-            // predicate names them: under the element, an element reference the substitution
-            // discharges is one refinement further out. A discharge whose term reads its own
-            // binder, as re-basing the element onto a product does (`__elem ↦ __elem.1`),
-            // introduces it like a rename and is not checked.
+            // Check discharged names in the predicate's scope. Its element indices are one
+            // deeper, and a replacement may introduce a name from the destination scope.
             #[cfg(debug_assertions)]
             for (b, m) in &restricted.binders {
-                if let Mapping::Discharge(term) = m
-                    && !is_free(b, term)
-                {
+                if matches!(m, Mapping::Discharge(_)) && !restricted.range_mentions(b) {
                     debug_assert!(
                         !is_free(b, &rewritten.predicate),
                         "discharged binder `{b}` still free after substitution into predicate",
@@ -5848,6 +5836,52 @@ mod locally_nameless_tests {
         assert_eq!(
             crate::ccl::symbolic::symbolic(predicate_of(&ty)),
             "__elem^1.0"
+        );
+    }
+
+    #[test]
+    fn discharging_an_enclosing_element_preserves_a_refinements_own_element() {
+        let ty = refined(equals(
+            TypedExpr::var(Name::elem()),
+            TypedExpr::var(Name::elem_at(1)),
+        ));
+        let out = Subst::discharge(Name::elem(), TypedExpr::lit(Lit::Int(7))).apply_type(&ty);
+        assert_eq!(
+            crate::ccl::symbolic::symbolic(predicate_of(&out)),
+            "__elem == 7"
+        );
+    }
+
+    #[test]
+    fn a_discharge_can_introduce_the_destination_element() {
+        let ty = refined(equals(
+            TypedExpr::var(Name::elem()),
+            TypedExpr::var(Name::elem_at(1)),
+        ));
+        let at = TypedExpr::apply(TypedExpr::var(Name::elem()), TypedExpr::proj_index(1));
+        let out = Subst::discharge(Name::elem(), at).apply_type(&ty);
+        assert_eq!(
+            crate::ccl::symbolic::symbolic(predicate_of(&out)),
+            "__elem == __elem^1.1"
+        );
+    }
+
+    #[test]
+    fn simultaneous_discharges_can_introduce_another_source_name() {
+        let x = Name::fresh("x");
+        let y = Name::fresh("y");
+        let ty = refined(TypedExpr::tuple(vec![
+            TypedExpr::var(&x),
+            TypedExpr::var(&y),
+        ]));
+        let subst = Subst::discharging(&HashMap::from([
+            (x, TypedExpr::var(&y)),
+            (y.clone(), TypedExpr::lit(Lit::Int(7))),
+        ]));
+        let out = subst.apply_type(&ty);
+        assert_eq!(
+            *predicate_of(&out),
+            TypedExpr::tuple(vec![TypedExpr::var(y), TypedExpr::lit(Lit::Int(7))]),
         );
     }
 

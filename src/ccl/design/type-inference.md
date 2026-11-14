@@ -2231,6 +2231,10 @@ Capture avoidance depends on the binder discipline and the substitution's scope 
 Assertions check violations instead of silently alpha-renaming arbitrary input trees. This is an
 implementation contract, not a proof that malformed substitutions cannot be represented.
 
+A refinement's discharge postcondition uses the substitution inside its predicate, with element
+indices shifted by one. A discharged name can remain when a replacement term introduces it from
+the destination scope. Simultaneous substitutions insert their replacement terms as written.
+
 #### Native bound edges and closure
 
 A stored `Bound` has a type and a substitution on each side of its relation:
