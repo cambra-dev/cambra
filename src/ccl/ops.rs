@@ -430,12 +430,9 @@ pub enum Builtin {
     /// **\[Interim\].**
     ///
     /// The one collection term that **is** a sum rather than entering one through
-    /// [`Box`](Self::Box). `box` pins its candidate to the argument's own type, which a
-    /// value with no entries does not have: a re-keying reads its key domain off the key
-    /// morphism's image, and with nothing to map there is no image. So the term states the
-    /// sum it is and leaves both parameters to the use site. See
-    /// `src/ccl/design/collections.md`,
-    /// "The empty collection has no key morphism \[Interim\]".
+    /// [`Box`](Self::Box). `box` pins its candidate to the argument's own type, while this
+    /// term states the sum it is and leaves both parameters to the use site. See
+    /// `src/ccl/design/collections.md`, "`empty_map()` \[Interim\]".
     ///
     /// A `Map(𝐾, 𝑉)` or `Set(𝐾)` annotation is what supplies them. Nothing else reaches
     /// them — a keyed write states its obligation on the value, not the key — so an

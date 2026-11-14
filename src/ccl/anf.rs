@@ -577,20 +577,28 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
             })
         }
 
-        // Normalize the source once before the expansion copies it into predicates, so
-        // the bindings it needs go ahead of the group-by and
-        // every copy is a copy of the normalized term. It stays inline rather than named: a
-        // `Σ`-typed collection bound by a `let` puts its witness out of scope at every use of
-        // the binder. The key reaches only types, which this pass never descends into, so it
-        // is left as it stands but for its reads of mutable variables, as a refined cast's
-        // value is ([`name_reads`]). The collapse is the groups' function, a term like any
-        // other.
+        // Normalize the source before group-by expansion copies it into predicates. Name an
+        // empty literal so inference pins one element type. Keep a sum-typed source inline
+        // so the expansion can use its witness.
         TypedExprNode::GroupBy {
             collection,
             key,
             collapse,
         } => {
-            let (mut binds, collection) = peel(normalize(*collection, muts));
+            let (mut binds, mut collection) = peel(normalize(*collection, muts));
+            // An empty literal is named, so its copies read one binding. Its element type is
+            // pinned from its uses, and the pin decides a term's variables, not those of a copy
+            // in a predicate (`src/ccl/design/collections.md`, "The empty collection's key type
+            // comes from its uses").
+            if matches!(&collection.node, TypedExprNode::List(elements) if elements.is_empty()) {
+                let name = Name::anf_temp();
+                let read = temp_read(&name, &collection);
+                binds.push((
+                    TypedBinding::new_unannotated(name, Occurrence::mint()),
+                    collection,
+                ));
+                collection = read;
+            }
             let collapse = collapse.map(|c| Box::new(normalize(*c, muts)));
             let mut group_by = rebuild(TypedExprNode::GroupBy {
                 collection: Box::new(collection),
