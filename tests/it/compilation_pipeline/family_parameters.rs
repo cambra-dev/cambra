@@ -2,7 +2,7 @@
 //! `V: K => Type` takes a family, a type for each value of `K`, which the declaration applies to
 //! the binders of the types it writes, `(k: K) |=> V(k)`.
 
-use indoc::indoc;
+use indoc::{formatdoc, indoc};
 use rstest::rstest;
 
 use cambra::interpreter::Value;
@@ -625,6 +625,51 @@ fn a_polymorphic_type_writes_its_family_parameter_s_kind(
     #[case] message: &str,
 ) {
     check_compile_error(&format!("{GROUPS}{annotation}\n1"), message);
+}
+
+/// Values of a family at two different keys have no common type but the bound on its values, as
+/// two type parameters have none but their bounds: groups at two keys meet as the bound.
+#[rstest]
+#[case::groups(
+    "V(k) <: _ |=> Int",
+    "sum([sum([sum(g1 if c else g2) for g2 in g]) for g1 in g])",
+    "[box([1, 2]), box([3])]",
+    12
+)]
+#[case::scalars(
+    "V(k) <: Int",
+    "sum([sum([(g1 if c else g2) for g2 in g]) for g1 in g])",
+    "[1, 2]",
+    6
+)]
+fn values_at_two_keys_join_at_the_family_s_bound(
+    #[case] bound: &str,
+    #[case] body: &str,
+    #[case] map: &str,
+    #[case] expected: i64,
+) {
+    check_scalar(
+        &formatdoc! {"
+            def pick(K, V: K => Type, g: FullMap(K, V), c: Bool) => Int requires forall (k: K) {bound}:
+                {body}
+            pick({map}, 1 > 0)
+        "},
+        Value::Int(expected),
+    );
+}
+
+/// With no bound on the family's values, values at two keys have no common type.
+#[test]
+fn values_at_two_keys_of_an_unbounded_family_have_no_common_type() {
+    check_compile_error(
+        indoc! {"
+            def pick(K, V: K => Type, g: FullMap(K, V), c: Bool) => Int:
+                pairs = [[(g1 if c else g2) for g2 in g] for g1 in g]
+                1
+            pick([1, 2], 1 > 0)
+        "},
+        "The values that meet here have no common type",
+    );
 }
 
 /// Inside a function, an application of its family parameter is opaque, as a type parameter is,

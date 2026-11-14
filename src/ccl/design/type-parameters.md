@@ -97,7 +97,9 @@ refused. A family parameter's bound is a family itself:
   variable that may read them, and the opened parameter's `bound` is that family.
 - **An application `V(t)` meets another type as the bound at its terms**
   (`subst::family_bound_at`, `constrain_go`'s family-bound arm). A meet of the application and a
-  type above that applied bound is the application (`relate_params_by_bounds`).
+  type above that applied bound is the application. Otherwise, at a join or a meet with any other
+  contribution, another application of the family at other terms among them, the application is
+  widened to that applied bound (`relate_params_by_bounds`), as a bounded parameter is below.
 - **Instantiating the scheme bounds the family's variable** at its own binders
   (`subst::family_at_names`), among the bounds each use checks.
 
