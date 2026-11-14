@@ -188,6 +188,9 @@ pub(super) struct CoalesceCtx {
     /// instantiation variables.
     #[cfg(debug_assertions)]
     in_predicate: usize,
+    /// Predicate-resolution inputs on the current recursion path, including quoted type
+    /// slots. Equal predicates alone do not identify a resolution input.
+    predicates_in_progress: Vec<crate::ccl::Refinement>,
     /// The right-hand sides [`pin_unreached_values`] skipped as generalized, whose
     /// literals only the walk's copies pin. The walk checks that it generalizes each of
     /// them too: one it walked as monomorphic would keep a literal nothing pins. Debug
@@ -1676,6 +1679,7 @@ pub(super) fn coalesce_pass(
         reads: Vec::new(),
         #[cfg(debug_assertions)]
         in_predicate: 0,
+        predicates_in_progress: Vec::new(),
         #[cfg(debug_assertions)]
         skipped_as_generalized: std::collections::HashSet::new(),
     };
@@ -3282,6 +3286,41 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
     );
 }
 
+/// A predicate and every type slot it reads, without following inference-variable bounds.
+/// A repeated input on the active path repeats the same resolution dependency. A finite
+/// chain of equal predicates has different nested type slots at each step.
+#[derive(PartialEq, Eq)]
+struct PredicateResolution {
+    predicate: crate::ccl::Refinement,
+    slots: Vec<Type>,
+}
+
+impl PredicateResolution {
+    fn of(predicate: &crate::ccl::Refinement) -> Self {
+        fn term(
+            e: &Expr,
+            slots: &mut Vec<Type>,
+            seen: &mut std::collections::HashSet<crate::ccl::PredicateId>,
+        ) {
+            e.walk_type_slots(|ty| {
+                slots.push(ty.clone());
+                ty.walk_quoted_terms(&mut |quoted| {
+                    if seen.insert(Rc::as_ptr(quoted)) {
+                        term(quoted, slots, seen);
+                    }
+                });
+            });
+            e.walk_children(|child| term(child, slots, seen));
+        }
+        let mut slots = Vec::new();
+        term(&predicate.predicate, &mut slots, &mut Default::default());
+        Self {
+            predicate: predicate.clone(),
+            slots,
+        }
+    }
+}
+
 /// [`coalesce_type_predicates`] carrying the functions it has descended
 /// through, so a predicate it rebuilds leaves closed against them.
 ///
@@ -3329,7 +3368,20 @@ fn coalesce_type_predicates_go(
             let base = inner.clone();
             refinements.rewrite_each(|_, r| {
                 let entered = Rc::clone(&r.predicate);
+                let this = r.clone();
                 memo.rebuild(r, &(), |pred| {
+                    let input = std::cell::OnceCell::new();
+                    let repeats = ctx.predicates_in_progress.iter().any(|prior| {
+                        *prior == this
+                            && &PredicateResolution::of(prior)
+                                == input.get_or_init(|| PredicateResolution::of(&this))
+                    });
+                    assert!(
+                        !repeats,
+                        "predicate resolution repeated inside its own type slots: {} reads itself",
+                        symbolic(&entered),
+                    );
+                    ctx.predicates_in_progress.push(this.clone());
                     #[cfg(debug_assertions)]
                     {
                         ctx.in_predicate += 1;
@@ -3339,6 +3391,7 @@ fn coalesce_type_predicates_go(
                     {
                         ctx.in_predicate -= 1;
                     }
+                    ctx.predicates_in_progress.pop();
                     crate::ccl::ccl_utils::type_element_reads_from_base(pred, &base);
                     true
                 });
@@ -5976,6 +6029,68 @@ mod tests {
         assert!(
             run_inference(&mut e).is_err(),
             "self-application must be rejected, not accepted or panic"
+        );
+    }
+}
+
+#[cfg(test)]
+mod predicate_resolution_tests {
+    use super::*;
+    use crate::ccl::{BaseType, BinOpKind, Lit};
+
+    #[test]
+    fn finite_equal_refinements_are_not_a_cycle() {
+        let int = Type::Base(BaseType::Int);
+        let mut ty = int.clone();
+        for _ in 0..16 {
+            let literal = Expr::lit(Lit::Int(5)).with_ty(ty);
+            let element = Expr::var(Name::elem()).with_ty(int.clone());
+            let predicate = Expr::binop(
+                element,
+                BinOpKind::Compare(crate::ccl::CompareKind::Equals),
+                literal,
+            )
+            .with_ty(Type::Base(BaseType::Bool));
+            ty = Type::refined_one(
+                int.clone(),
+                crate::ccl::Refinement::born(Rc::new(predicate)),
+            );
+        }
+        let mut expr = Expr::lit(Lit::Int(5)).with_ty(ty);
+        assert!(
+            coalesce_pass(
+                &mut expr,
+                Default::default(),
+                Default::default(),
+                InstanceTable::builtin(),
+                Default::default(),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "predicate resolution repeated inside its own type slots")]
+    fn a_predicate_reading_its_own_solver_variable_is_a_cycle() {
+        let variable = crate::ccl::infer::solver::fresh_var(0);
+        let predicate = Expr::binop(
+            Expr::var(Name::elem()).with_ty(Type::Base(BaseType::Int)),
+            BinOpKind::Compare(crate::ccl::CompareKind::Equals),
+            Expr::lit(Lit::Int(5)).with_ty(variable.clone()),
+        )
+        .with_ty(Type::Base(BaseType::Bool));
+        let refined = Type::refined_one(
+            Type::Base(BaseType::Int),
+            crate::ccl::Refinement::born(Rc::new(predicate)),
+        );
+        constrain_subtype(&refined, &variable, &mut ConstrainCache::new()).unwrap();
+        let mut expr = Expr::lit(Lit::Int(5)).with_ty(variable);
+        coalesce_pass(
+            &mut expr,
+            Default::default(),
+            Default::default(),
+            InstanceTable::builtin(),
+            Default::default(),
         );
     }
 }

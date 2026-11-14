@@ -768,6 +768,12 @@ its pre-coalesce predicate allocation and unresolved interior types. A value bin
 directly because no later specialization rebuilds its definition. Grouping values and matches
 over conditionally constructed collections exercise that path.
 
+Visiting a predicate's slots coalesces their types, including further predicates. The active
+resolution path records the predicate and all its quoted type slots, stopping at inference
+variables. Repeating this input repeats a resolution dependency and panics. Predicate equality
+alone ignores type slots and cannot detect a cycle: a finite chain can contain equal predicates
+with different nested types.
+
 Monomorphic variable uses share their binder's inference variables; they do not need a lexical
 lookup merely to read those bounds. Generalized uses do require the specialization scope, and
 lambda-parameter domain refresh is a separate operation. Slot resolution uses the type stored on
