@@ -1711,6 +1711,19 @@ fn test_boxed_conditional_collection(#[case] code: &str, #[case] expected: Value
     "},
     12
 )]
+// The loop feeds each element, so the loop's function type carries the box's domain, read
+// through the binder: the domain is a projection of the boxed term, whose one candidate reads
+// `i`.
+#[case::fed_from_a_loop_over_it(
+    indoc! {r"
+        ch: Feed(_)
+        for i in [1, 2]:
+            for q in box([y for y in [1, 2, 3] if y > i]):
+                ch << q
+        sum([v for v in ch])
+    "},
+    8
+)]
 fn a_collection_boxed_under_the_binder_its_domain_reads(#[case] code: &str, #[case] expected: i64) {
     check_scalar(code, Value::Int(expected));
 }
