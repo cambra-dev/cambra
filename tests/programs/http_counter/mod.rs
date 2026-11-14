@@ -1,13 +1,12 @@
 //! A scalar transactional mutable variable shared *live* across endpoints: `POST /set`
 //! overwrites `latest` (`Mut(String, Txn)`, last-write-wins); `GET /get` reads its
-//! current value cross-endpoint. The GET reads `latest` inside a read-only `with
-//! begin():` block that feeds it out — a live as-of read (`Builtin::AsOf`)
-//! latched to the GET request loop (the outer index): each GET sees the store's
-//! latest committed value as of its arrival, indexed by request position (which
-//! is how the HTTP sink dispatches). The as-of join resolves over a *live* store,
-//! where the terminal `ExtractFinal` read would never converge.
+//! current value cross-endpoint. The GET reads `latest` inside a `with begin():` block that
+//! only reads: a transaction of `latest`'s store, placed in the commit order when the
+//! request arrives, whose reply rides its commit keyed by the request position (which is
+//! how the HTTP sink dispatches). It resolves over a *live* store, where the terminal
+//! `await_final` read would never converge.
 //!
-//! The reply carries no id: replies ride the request loop (outer-indexed), so
+//! The reply carries no id: replies are keyed by the request loop's positions, so
 //! plain position-based HTTP dispatch on `String` values suffices — no
 //! `{id, payload}` records.
 
@@ -32,12 +31,10 @@ fn http_counter() {
 }
 
 /// A *computed* live cross-endpoint read: `GET /get` replies `latest + "!"`, where
-/// `latest` is overwritten by `POST /set`. This exercises the `as_of ≫ (λ x → x +
-/// "!")` shape at runtime — the map layer over the as-of latch — confirming it
-/// resolves rather than hanging: the pre-lambda-elim rewrite makes the computed
-/// reply a real as-of read (a map over the latch), not a never-resolving
-/// terminal render. (A `String` reply — the http sink only serializes
-/// `Strings` — with a non-identity map, the point being the map, not the value.)
+/// `latest` is overwritten by `POST /set`. The GET block's reply tap holds the computed
+/// value, and this confirms it resolves at runtime rather than hanging. (A `String`
+/// reply — the http sink only serializes `Strings` — with a non-identity map, the point
+/// being the map, not the value.)
 #[test]
 fn http_computed_live_read() {
     let port = reserve_test_port();
@@ -67,11 +64,10 @@ fn http_computed_live_read() {
 }
 
 /// A *multi-variable* live cross-endpoint read: `GET /get` replies `a + b`,
-/// reading **two** live mutable variables in one block. Snapshot consistency (§I-c)
-/// requires both reads to come from one commit snapshot — served by a single
-/// bundled `as_of((trigger, __hist))` folding the whole store at one frontier,
-/// the reply projecting each mutable variable off the latched snapshot record. A `POST
-/// /set` writes both mutable variables, so `a + b` reflects the latest committed values.
+/// reading **two** live mutable variables in one block. Snapshot consistency requires both
+/// reads to come from one commit snapshot, which the GET block's transaction reads them at. A
+/// `POST /set` writes both mutable variables, so `a + b` reflects the latest committed
+/// values.
 #[test]
 fn http_multi_mut_var_live_read() {
     let port = reserve_test_port();

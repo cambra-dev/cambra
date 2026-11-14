@@ -1064,9 +1064,7 @@ fn builtin_preserves_domain(builtin: &Builtin) -> bool {
         | Builtin::BeginTxn
         | Builtin::AwaitFinal
         | Builtin::Copair
-        | Builtin::AsOfRead
         | Builtin::FinalRead
-        | Builtin::AsOf
         | Builtin::VariantProject(_)
         | Builtin::LookupChecked
         | Builtin::Insert => false,

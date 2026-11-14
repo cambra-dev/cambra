@@ -16,9 +16,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ccl::{
     Builtin, Expr, F_DECISION, F_TIME, F_WRITE_TARGETS, F_WRITES, Name, ProjKey, TransactKey, Type,
     TypedBinding, TypedExprNode, WriterSite,
-    ccl_utils::{
-        PredMemo, apply_primitive, count_free, is_free_in_type, walk_refined_predicates_mut,
-    },
+    ccl_utils::{apply_primitive, count_free},
     letrec::{check_letrec_causal, group_has_causal},
     mut_elim::{binding, fun_parts, tvar},
     provenance,
@@ -694,8 +692,11 @@ fn recover_writer(site_dom: &Type, def: Expr) -> WriterSite {
     let write_targets = unwrap_const(write_targets.expect("commit record carries write_targets"));
     let decision = decision.expect("commit record carries a decision");
 
-    let TypedExprNode::Tuple(wt) = write_targets.node else {
-        panic!("letrec recognition: write_targets is not a tuple");
+    // A site that only reads names no target, the empty product `unit`.
+    let wt = match write_targets.node {
+        TypedExprNode::Tuple(wt) => wt,
+        TypedExprNode::Lit(crate::ccl::Lit::Unit) => Vec::new(),
+        _ => panic!("letrec recognition: write_targets is not a tuple"),
     };
     let write_keys: Vec<Name> = wt
         .into_iter()
@@ -928,8 +929,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
             (n.clone(), read)
         })
         .collect();
-    let mut body = Subst::discharge_env_in_place(body, &env);
-    collapse_snapshot_sources(&mut body, &hist, &hist_ty, &PredMemo::new());
+    let body = Subst::discharge_env_in_place(body, &env);
     for n in &binding_names {
         assert_eq!(
             count_free(n, &body),
@@ -940,79 +940,6 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
     }
 
     Expr::let_in(binding(hist, hist_ty), transact, body)
-}
-
-/// Collapse a multi-variable as-of read\'s snapshot source: the pre-elim
-/// as-of-read rewrite emits `as_of((trigger, (f_a: ⟨a-hist⟩, f_b: ⟨b-hist⟩)))`
-/// with a *record literal* of history reads (the history record does not exist
-/// yet). After the continuation's substitution every field is `__hist.f`; replace the
-/// literal with the mutable variable itself, so op-conversion latches ONE
-/// whole-variable snapshot per request (§I-c atomicity) instead of per-field
-/// reads.
-///
-/// Reaches the snapshots inside refinement predicates too, and rebuilds only a predicate that
-/// mentions `__hist`. Answers whether it changed anything.
-///
-/// The predicate branch has no known producer: `rewrite_as_of_reads` places a snapshot at the
-/// reply it feeds, outside any conditional's test. It is there because the substitution before
-/// it puts `__hist` wherever a read was, predicates included, so a snapshot literal in a
-/// predicate would otherwise reach op-conversion uncollapsed.
-fn collapse_snapshot_sources(
-    e: &mut Expr,
-    hist: &Name,
-    hist_ty: &Type,
-    memo: &PredMemo<()>,
-) -> bool {
-    let mut changed = false;
-    if let TypedExprNode::Apply { argument, function } = &mut e.node
-        && matches!(&function.node, TypedExprNode::Builtin(Builtin::AsOf))
-        && let TypedExprNode::Tuple(elts) = &mut argument.node
-        && let [_, source] = elts.as_mut_slice()
-        && let TypedExprNode::Record(fields) = &source.node
-        && !fields.is_empty()
-        && fields.iter().all(
-            |RecordEntry {
-                 label: f, value: v, ..
-             }| {
-                matches!(&v.node,
-                TypedExprNode::Apply { argument: sv, function: proj }
-                    if matches!(&sv.node, TypedExprNode::Var(n) if n == hist)
-                        && matches!(&proj.node, TypedExprNode::Proj(ProjKey::Field(pf)) if pf == f))
-            },
-        )
-    {
-        // Stamp the source with the mutable variable's *own* type (all keys + taps), not
-        // just the read subset — the `Var(__hist)` must agree with its binder,
-        // and op-conversion's snapshot read projects the fields it needs by name.
-        //
-        // The record literal is what the recording names: the mutable variable
-        // is exactly what it collapses to, and its per-field reads die with it.
-        // Scoped to this arm rather than the function, because the child walk
-        // below runs whether or not this arm fired.
-        let _g = provenance::enter(
-            source.node_id(),
-            "planning.snapshot_source",
-            provenance::Nature::Machinery,
-        );
-        *source = tvar(hist, hist_ty.clone());
-        // The argument tuple\'s recorded type keeps its shape; re-stamp the
-        // source slot.
-        if let Type::Tuple(tys) = &mut argument.ty
-            && tys.len() == 2
-        {
-            tys[1] = source.ty.clone();
-        }
-        changed = true;
-    }
-    e.walk_type_slots_mut(|ty| {
-        if is_free_in_type(hist, ty) {
-            changed |= walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
-                collapse_snapshot_sources(pred, hist, hist_ty, memo)
-            });
-        }
-    });
-    e.walk_children_mut(|c| changed |= collapse_snapshot_sources(c, hist, hist_ty, memo));
-    changed
 }
 
 /// A morphism of `(enclosing, position)` that does not read the position, restated as a

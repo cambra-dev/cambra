@@ -50,7 +50,7 @@
 
 use bit_set::BitSet;
 use smol_str::SmolStr;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound::{Excluded, Unbounded};
 
 use crate::ccl::{F_WRITES, Label};
@@ -1251,11 +1251,10 @@ pub fn store_current(tile: &Tile, key: &Value) -> Option<(Position, Value)> {
 /// Several commit-store readers/producers emit an append-only stream and, as a
 /// consumer releases a prefix, must stop re-emitting positions at or below the
 /// released edge (a re-emit would duplicate a domain position through a `Memo`
-/// merge, or re-latch a frozen `AsOf` snapshot). Each one otherwise hand-rolls
-/// the same watermark plus the monotone-max fold and the "≤ watermark" test; this
-/// centralizes that state and those two operations. The callers keep whatever
-/// *extra* work rides their release (forwarding the release upstream, compacting a
-/// `latched` set) — only the watermark itself lives here.
+/// merge). Each one otherwise hand-rolls the same watermark plus the monotone-max
+/// fold and the "≤ watermark" test; this centralizes that state and those two
+/// operations. The callers keep whatever *extra* work rides their release
+/// (forwarding the release upstream) — only the watermark itself lives here.
 #[derive(Default)]
 struct PrefixReleaseCursor {
     /// What has been released: nothing, a prefix through a position, or the whole
@@ -1809,9 +1808,8 @@ impl TileOperator for CommitOperator {
         // Wake this operator's consumer whenever any writer's (live) source
         // delivers a new item: the arrival drives a commit, and that commit must
         // propagate to a downstream reader of a store key or `__to_<defer>` tap (a
-        // live cross-endpoint read — a read-only transaction's reply). This is the
-        // same both-inputs-wake wiring `AsOf` uses; without it the sink reading a
-        // tap off a live commit store would never be notified and would hang.
+        // transaction's reply). Without it the sink reading a tap off a live commit
+        // store would never be notified and would hang.
         // Kick once immediately to start the drain loop.
         let (consumer, gate) = shared_consumer(consumer);
         consumer.notify();
@@ -1859,7 +1857,7 @@ impl TileOperator for CommitOperator {
             drain_start: 0,
             notifier: ChangeNotifier::new(consumer, scheduler),
             #[cfg(debug_assertions)]
-            reported_closed: HashSet::new(),
+            reported_closed: std::collections::HashSet::new(),
         })
     }
 }
@@ -1904,7 +1902,7 @@ struct CommitProducer {
     /// Every key a render has reported in `closed_keys`, for the check that no commit
     /// writes one afterwards.
     #[cfg(debug_assertions)]
-    reported_closed: HashSet<Value>,
+    reported_closed: std::collections::HashSet<Value>,
 }
 
 /// A proposal-stream record field, as its scalar column. The proposal codomain
@@ -1984,11 +1982,7 @@ impl TileProducer for CommitProducer {
         // this guard is the **intersection** of what every consumer (the writers
         // *and* the readers) has released — exactly the prefix safe to reclaim
         // (tile monotonicity: only `release` shrinks). Drop those committed
-        // versions, keeping the carry source a live position reads. A live `AsOf` reader
-        // *does* release the prefix below its latched frontier (`AsOfProducer::
-        // get_impl`), so a store with a writing endpoint still sheds its
-        // superseded history through this slot — the intersection just also
-        // waits on that reader's own released prefix.
+        // versions, keeping the carry source a live position reads.
         // Through the end of the prefix the meet covers, not its highest point: a tick the
         // meet skips is still read, and so is everything after it.
         //
@@ -2988,11 +2982,8 @@ impl TileProducer for InductionStoreProducer {
 ///   latest write ≤ each tick), which gains a position at every tick and so
 ///   closes only with the whole store.
 ///
-/// Two other reads of a transactional key do not come through here. A read fed
-/// *out* of a block folds the store as-of via [`AsOf`], sampling an arbitrary commit
-/// position, and a surface `await_final(x)` is a [`StoreFinalRead`], sampling the key
-/// once its writers have drained. Which read a program gets is selected by the term
-/// it wrote, never inferred from the reading loop.
+/// A surface `await_final(x)` does not come through here: it is a [`StoreFinalRead`],
+/// sampling the key once its writers have drained.
 pub struct StoreValueStream {
     base: OperatorBase,
     store_op: Box<dyn TileOperator>,
@@ -3223,9 +3214,7 @@ impl TileProducer for StoreValueStreamProducer {
 /// the store's seed if nothing wrote it.
 ///
 /// A Txn read samples the key's carried value; this one's position is where the key
-/// closes. It takes the same sample [`AsOf`] does, through the same
-/// [`store_current`] — the difference is what fixes the position: a trigger arrival
-/// there, the store's own closure here. So it is neither a reduction nor a
+/// closes, sampled through [`store_current`]. So it is neither a reduction nor a
 /// projection of the history, and needs no seed operand, because the store holds its
 /// seed beside its changelog.
 ///
@@ -3842,420 +3831,6 @@ impl TileProducer for StoreDenseReadProducer {
             self.release_cursor.advance_from(pred);
         }
         self.store_producer.release(obsolete_guard);
-    }
-}
-
-/// As-of (temporal) join: for each position of a `trigger` stream, latch the
-/// **current value** of the shared store's `key` at the moment that trigger
-/// position is first observed.
-///
-/// `trigger : Fun(B, _)` (e.g. an HTTP request stream), `source` the shared
-/// commit store (a [`Tile::Store`] fan slot), output `Fun(B, V)` — `key`'s
-/// value as of each trigger position. This is **every fed-out mutable variable read**, not
-/// only the live one: each reading transaction sees the store as of where it lands
-/// in the commit order. The HTTP case ("a request arriving now sees the store as
-/// committed by now" — the *live cross-endpoint read*) is the canonical instance,
-/// but a finite loop or a standalone singleton reads the same way — an as-of read
-/// at an arbitrary position. (The *completed* value is a different term,
-/// `await_final`, reduced by
-/// [`ExtractFinal`](crate::interpreter::tile_operators::ExtractFinal) over the key's
-/// [`StoreValueStream`];
-/// it never arrives here.) The reply is indexed
-/// by the trigger (the reading loop) — an *outer-indexed* read, not commit-clock
-/// indexed. The pairing is by *processing time* — the only ordering the tile model
-/// exposes between two independent streams — which is exactly "a reader sees what's
-/// committed as of its turn."
-///
-/// It folds the store directly ([`store_current`]) rather than through a
-/// per-key [`StoreValueStream`]: the drive-to-frontier and latest-value logic
-/// live in the step tiling now, so `AsOf` is the thin residual sampler — the
-/// per-request latch — that remains once the fold is centralized.
-///
-/// **Tile-legal by construction.** The output grows monotonically over `B`: once
-/// a trigger position `b` is latched (frozen to the store's then-current value),
-/// it never changes; later commits only affect *later* trigger positions. The
-/// different-value-per-request behaviour comes from `B` being a multi-position
-/// domain — each position an immutable snapshot — not from a scalar that mutates
-/// (which the immutability invariant forbids). It is the dual of a store's own
-/// driver: a driver latches an accumulator per *source* step; `AsOf` latches the
-/// store's current value per *trigger* step.
-/// One field of a multi-variable [`AsOf`] snapshot: the record field the reply
-/// projects (`snap.field`), the store's runtime key it samples, and its value
-/// extent.
-#[derive(Clone)]
-pub struct AsOfField {
-    pub field: SmolStr,
-    pub key: Value,
-    pub value_extent: Extent,
-}
-
-/// What an [`AsOf`] latches and emits per trigger position.
-#[derive(Clone)]
-enum AsOfOutput {
-    /// A single mutable variable → `Fun(B, V)` — the bare or computed single-variable
-    /// as-of read.
-    Scalar { key: Value, value_extent: Extent },
-    /// A whole-snapshot record → `Fun(B, Record{field: V})` — the multi-variable as-of
-    /// read. Every field is folded from a single source render
-    /// at one commit frontier (§I-c), so a reply reading several mutable variables sees a
-    /// consistent snapshot.
-    Record { fields: Vec<AsOfField> },
-}
-
-impl AsOfOutput {
-    /// The store keys sampled, in field order (one for `Scalar`, N for `Record`).
-    fn keys(&self) -> Vec<&Value> {
-        match self {
-            AsOfOutput::Scalar { key, .. } => vec![key],
-            AsOfOutput::Record { fields } => fields.iter().map(|f| &f.key).collect(),
-        }
-    }
-    /// The codomain tiling: each sampled value takes the tiling of its extent, as every
-    /// store read's does ([`read_tiling`]), so a collection-valued one is a level
-    /// (`src/interpreter/design-operators.md`, "A collection inside a value stays a tile").
-    fn codomain_tiling(&self) -> Tiling {
-        match self {
-            AsOfOutput::Scalar { value_extent, .. } => Tiling::from_extent(value_extent),
-            AsOfOutput::Record { fields } => Tiling::Record(
-                fields
-                    .iter()
-                    .map(|f| (f.field.clone(), Tiling::from_extent(&f.value_extent)))
-                    .collect(),
-            ),
-        }
-    }
-}
-
-pub struct AsOf {
-    /// Output tiling: `DataFunction { domain: B, codomain }` where `codomain` is
-    /// [`AsOfOutput::codomain_tiling`].
-    base: OperatorBase,
-    /// The trigger stream `Fun(B, _)` — drives one output position each.
-    trigger: Box<dyn TileOperator>,
-    /// The shared commit store (a [`Tile::Store`] fan slot) — the sampled
-    /// key(s)' current value(s) are latched per trigger position.
-    source: Box<dyn TileOperator>,
-    /// What to sample and emit — a single mutable variable or a whole snapshot record.
-    output: AsOfOutput,
-}
-
-impl AsOf {
-    /// `trigger : Fun(B, _)`, `source` the shared commit store (`Tiling::Store`),
-    /// `key`/`value_extent` the mutable variable to sample → output
-    /// `Fun(B, value_extent)`.
-    pub fn new(
-        trigger: Box<dyn TileOperator>,
-        source: Box<dyn TileOperator>,
-        key: Value,
-        value_extent: Extent,
-    ) -> Self {
-        Self::build(trigger, source, AsOfOutput::Scalar { key, value_extent })
-    }
-
-    /// The multi-variable **snapshot** read: sample every `field`'s mutable variable at
-    /// one commit snapshot → output `Fun(B, Record{field: V})`, from which
-    /// the reply projects each mutable variable. This is the §I-c snapshot-consistent
-    /// as-of read.
-    pub fn new_snapshot(
-        trigger: Box<dyn TileOperator>,
-        source: Box<dyn TileOperator>,
-        fields: Vec<AsOfField>,
-    ) -> Self {
-        Self::build(trigger, source, AsOfOutput::Record { fields })
-    }
-
-    fn build(
-        trigger: Box<dyn TileOperator>,
-        source: Box<dyn TileOperator>,
-        output: AsOfOutput,
-    ) -> Self {
-        let Tiling::DataFunction { domain: b_ext, .. } = trigger.tiling() else {
-            panic!("AsOf trigger must be a function, got {}", trigger.tiling());
-        };
-        debug_assert!(
-            matches!(source.tiling(), Tiling::Store { .. }),
-            "AsOf source must be a commit Store, got {}",
-            source.tiling()
-        );
-        let tiling = Tiling::data_function(b_ext.clone(), output.codomain_tiling());
-        Self {
-            base: OperatorBase::new(tiling),
-            trigger,
-            source,
-            output,
-        }
-    }
-}
-
-impl TileOperator for AsOf {
-    impl_operator_base!();
-
-    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
-        visit(value("trigger", &*self.trigger));
-        visit(value("source", &*self.source));
-    }
-
-    fn subscribe(
-        &mut self,
-        _intent_guard: TileGuard,
-        consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
-    ) -> Box<dyn TileProducer> {
-        // Both inputs wake the consumer: a new *trigger* position needs a fresh
-        // latch, and *source* progress (a new commit) is what lets an
-        // already-seen trigger position finally latch a value — and, crucially,
-        // re-pulls until the cyclic store converges (the source's first pull may
-        // only propose; later pulls commit and render).
-        let (consumer, gate) = shared_consumer(consumer);
-        let trigger = subscribe_forwarding(&mut *self.trigger, &consumer, scheduler);
-        let source = subscribe_forwarding(&mut *self.source, &consumer, scheduler);
-        let b_extent = match self.tiling() {
-            Tiling::DataFunction { domain, .. } => domain.clone(),
-            _ => unreachable!("AsOf tiles as a function"),
-        };
-        Box::new(AsOfProducer {
-            base: ProducerBase::new(
-                AsOfProducer::alloc_id(),
-                self.tiling(),
-                &self.base,
-                scheduler,
-            )
-            .sharing(gate),
-            trigger,
-            source,
-            output: self.output.clone(),
-            b_extent,
-            latched: Vec::new(),
-            seen: HashSet::new(),
-            release_cursor: PrefixReleaseCursor::default(),
-        })
-    }
-}
-
-struct AsOfProducer {
-    base: ProducerBase,
-    trigger: Box<dyn TileProducer>,
-    source: Box<dyn TileProducer>,
-    /// What to sample per trigger position (folded via [`store_current`]).
-    output: AsOfOutput,
-    b_extent: Extent,
-    /// `(b ↦ latched snapshot)` — each entry frozen at latch time; the inner
-    /// `Vec<Value>` holds the sampled value per key, in `output.keys()` order (one
-    /// for a scalar read, N for a snapshot). Grows as new triggers latch;
-    /// compacted of released positions in `release_impl`, so it stays bounded to
-    /// the live request window.
-    latched: Vec<(Value, Vec<Value>)>,
-    /// Trigger positions currently latched (so each is recorded once). Tracks
-    /// `latched`'s keys; released positions are dropped from both together.
-    seen: HashSet<Value>,
-    /// Prefix release watermark: every trigger position at or below it has been
-    /// released and must never re-latch (see `release_impl`). A request stream is
-    /// a monotone `UInt` domain released as a prefix, so a single watermark
-    /// captures the released region exactly.
-    release_cursor: PrefixReleaseCursor,
-}
-
-impl AsOfProducer {
-    /// Whether trigger position `b` lies at or below the released-prefix
-    /// watermark — i.e. the consumer has already taken it and it must not
-    /// re-latch.
-    fn is_released(&self, b: &Value) -> bool {
-        self.release_cursor.is_released(&Position::new(b.clone()))
-    }
-
-    /// Build the output tile from the currently-latched `(b ↦ snapshot)` pairs,
-    /// under `domain_predicate`. The latched set is already compacted of released
-    /// positions, so it emits exactly the live response window. The codomain is
-    /// [`AsOfOutput::codomain_tiling`]'s, each value indexed by the emitted domain position.
-    fn emit_latched(&self, domain_predicate: Predicate) -> Tile {
-        let n_keys = self.output.keys().len();
-        let mut bs = Vec::with_capacity(self.latched.len());
-        let mut cols: Vec<Vec<Value>> = vec![Vec::with_capacity(self.latched.len()); n_keys];
-        for (b, snap) in &self.latched {
-            bs.push(b.clone());
-            for (i, v) in snap.iter().enumerate() {
-                cols[i].push(v.clone());
-            }
-        }
-        let codomain = match &self.output {
-            AsOfOutput::Scalar { value_extent, .. } => {
-                stored_value_tile(cols.into_iter().next().unwrap_or_default(), value_extent)
-            }
-            AsOfOutput::Record { fields } => Tile::record(
-                fields
-                    .iter()
-                    .zip(cols)
-                    .map(|(f, col)| (f.field.clone(), stored_value_tile(col, &f.value_extent)))
-                    .collect(),
-            ),
-        };
-        let mut tile = Tile::data_function(
-            ColumnValue::from_values(bs, &self.b_extent),
-            Box::new(codomain),
-            // Terminality rides with the trigger: when no more requests will
-            // arrive (trigger terminal) the response set is complete.
-            domain_predicate,
-            BitSet::new(),
-        );
-        tile.qualify_codomain_by_keys();
-        tile
-    }
-}
-
-impl TileProducer for AsOfProducer {
-    fn state_info(&self) -> ProducerStateInfo {
-        let latched: usize = self
-            .latched
-            .iter()
-            .map(|(_, values)| 1 + values.len())
-            .sum();
-        ProducerStateInfo::holding(latched + self.seen.len())
-    }
-
-    impl_producer_base!();
-
-    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
-        visit("trigger", &*self.trigger);
-        visit("source", &*self.source);
-    }
-
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        // Sample the store's **current** tile once (consumer-driven): a request
-        // observes the store as of *this* pull's watermark — an arbitrary as-of
-        // position, which the unordered transactional model permits. We do not
-        // drive the store to a fixpoint here; the store's own writer steps one
-        // commit per pull and re-arms itself on the wakeup queue, and that wakeup
-        // fans through the cyclic `FanOut` to re-pull this reader as commits land.
-        // A trigger position latched this pull freezes to the watermark it sees;
-        // a later position, re-pulled after further commits, latches a later value.
-        let sg = self.source.tiling().universal_guard();
-        let source_tile = self.source.get(sg);
-        // Fold the store snapshot **once**, at the current frontier, for every
-        // sampled key — so a multi-variable read sees all its mutable variables at one
-        // commit time (§I-c). `None` if *any* key has no decided value yet, which
-        // makes the read all-or-nothing: a single missing key withholds the whole
-        // snapshot and re-pulls. This is safe for the shapes reached here because
-        // every scalar mutable variable has a seed (`seed_ops`) and the store opens only once
-        // every seed has arrived, so `store_current` always has a value once it is open — no
-        // mutable variable can be perpetually absent. (A future snapshot read that folds a
-        // key with a genuinely-empty log — e.g. an append-only collection with no
-        // writes — would stay non-terminal forever on the terminality gate below;
-        // revisit the coupling then.) The frontier bound is the same for every key,
-        // so it also drives the release below.
-        let frontier = store_frontier(&source_tile);
-        let snapshot: Option<Vec<Value>> = self
-            .output
-            .keys()
-            .iter()
-            .map(|k| store_current(&source_tile, k).map(|(_, v)| v))
-            .collect();
-        let trigger_tile = self.trigger.get(self.trigger.tiling().universal_guard());
-        let trigger_pred = match &trigger_tile {
-            Tile::DataFunction {
-                domain_predicate, ..
-            } => domain_predicate.clone(),
-            _ => Predicate::False,
-        };
-        let store_terminal = source_tile.is_terminal();
-        // Every trigger position latches as of its own arrival — the watermark the
-        // moment it is first observed — whatever the trigger's domain. Freeze-once:
-        // a position is recorded in `seen` exactly once, so its latched value never
-        // changes; new positions latch newer values as commits land across re-pulls.
-        // The read a program gets is therefore an arbitrary as-of sample, uniformly,
-        // which is what the unordered transactional model specifies (a program that
-        // means the completed value writes `await_final`, whose reducer is
-        // `ExtractFinal` over the key's [`StoreValueStream`], not this operator).
-        //
-        // If the store has no decided value yet, `snapshot` is `None` and we latch
-        // nothing this round — the position is left un-seen and latches on a later
-        // pull. Positions at or below the release watermark are skipped: the consumer
-        // has already taken them, so they must never re-latch even if the trigger
-        // re-presents one (a lazily-compacting trigger's domain still legally carries
-        // the position until it compacts). That skip is what makes the `release_impl`
-        // compaction safe.
-        if let (Tile::DataFunction { domain, .. }, Some(snap)) = (&trigger_tile, &snapshot) {
-            for i in 0..domain.len() {
-                let b = domain.index_at(i);
-                if self.is_released(&b) {
-                    continue;
-                }
-                if self.seen.insert(b.clone()) {
-                    self.latched.push((b, snap.clone()));
-                }
-            }
-        }
-        // Release the store *below* the decided frontier. AsOf needs only the
-        // current snapshot — a future trigger latches the latest-as-of-its-time,
-        // which is `>=` this — so the prefix is dead. Releasing it on this store
-        // fan slot is what lets a live store reclaim superseded history:
-        // `CommitProducer` GCs the `FanOut`-intersected prefix. The
-        // release names the last change strictly below the frontier, so the frontier's
-        // own change survives and the fold still finds each key's value.
-        if let Some(f) = &frontier {
-            release_store_below(&mut *self.source, &source_tile, f);
-        }
-        // Terminality gate. This reader samples one watermark per pull — it does not
-        // drive the store to a fixpoint itself — and relies on being re-pulled (via the
-        // writer's wakeup fanning through the cyclic `FanOut`) to converge. So it must stay
-        // **non-terminal** until the store itself is terminal, or it could report "done"
-        // while the store is still committing and freeze a store no other consumer drives.
-        //
-        // The unlatched-position half covers the one way a terminal store can still owe a
-        // value: the snapshot above is all-or-nothing, so a key with no decided value
-        // withholds it. Every present position latches on the pull that finds a snapshot,
-        // which is why this is otherwise false by the time the gate reads it.
-        let has_unlatched_position = matches!(&trigger_tile, Tile::DataFunction { domain, .. }
-        if (0..domain.len()).any(|i| {
-            let b = domain.index_at(i);
-            !self.is_released(&b) && !self.seen.contains(&b)
-        }));
-        let emit_pred = if store_terminal && !has_unlatched_position {
-            trigger_pred
-        } else {
-            Predicate::False
-        };
-        self.emit_latched(emit_pred)
-    }
-
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        // Compact: a released trigger position will never re-emit, so drop it from
-        // `latched`/`seen` outright rather than letting them grow for the
-        // operator's lifetime. This bounds both memory and the per-`get` re-scan
-        // of `latched` to the live request window — the motivating long-lived HTTP
-        // request stream.
-        //
-        // Correctness rests on the released prefix being recorded so it can never
-        // re-latch: dropping from `seen` alone would let a re-presented position
-        // (a lazily-compacting trigger) re-insert and latch a *fresh* value,
-        // violating the frozen-snapshot invariant. We instead advance a prefix
-        // watermark (the release cursor) — request positions form a monotone
-        // `UInt` domain released as a prefix, so a single watermark captures the
-        // released region — and the `get_impl` latch loop skips anything at or
-        // below it. The source is compacted in `get_impl` (released below its
-        // latest decided position, the only value future triggers need), not here;
-        // `release_impl` handles only the trigger side.
-        if let TileGuard::Function(FunctionGuard::Domain(pred)) = &obsolete_guard {
-            match self.release_cursor.advance_from(pred) {
-                ReleasedExtent::Nothing => {}
-                ReleasedExtent::All => {
-                    // Terminal release: the consumer is done with the whole
-                    // domain. Drop everything and latch nothing further (every
-                    // position is below the watermark).
-                    self.latched.clear();
-                    self.seen.clear();
-                }
-                ReleasedExtent::Through(w) => {
-                    self.latched.retain(|(b, _)| {
-                        let drop = Position::new(b.clone()) <= w;
-                        if drop {
-                            self.seen.remove(b);
-                        }
-                        !drop
-                    });
-                }
-            }
-        }
-        self.trigger.release(obsolete_guard);
     }
 }
 
@@ -6868,11 +6443,6 @@ impl TileProducer for TransactWriterProducer {
         //    releases, one writer's release can never strand another writer's (or
         //    a reader's) reads. Without this, a reading writer released nothing
         //    and pinned the commit log unbounded for its lifetime.
-        //
-        // A full-render `AsOf` reader (a live cross-endpoint read) still releases
-        // nothing on its own slot, so the intersection — hence GC — stays
-        // pinned while it is live; that is correct, as it may answer an as-of
-        // query at any past request position.
         if self.read_keys.is_empty() {
             if let Some(through) = &snapshot {
                 release_store_through(&mut *self.store_producer, through);
@@ -9649,8 +9219,7 @@ mod tests {
     /// terminality flowing through from the store. This checks the projection
     /// (both values visible while still committing) and that `ExtractFinal`
     /// composes over it once terminal — the mechanism a surface `await_final` read
-    /// compiles to, exercised here at the operator level. (A *fed-out* mutable variable read
-    /// is `AsOf` over the same stream, not `ExtractFinal`.)
+    /// compiles to, exercised here at the operator level.
     #[test]
     fn store_value_stream_projects_committed_values() {
         let value_ext = Extent::Base(BaseType::Int);

@@ -127,7 +127,7 @@
 //! variable at its entering value, so the write is lost.
 //!
 //! `Feed` and `Define` are recognized the same way and get the same
-//! treatment. `mut_elim`'s `collect_feed_only` walks a read-only `with
+//! treatment. `mut_elim`'s `collect_feed_only` walks an unwrapped `with
 //! begin():` block expecting each statement's effect to *be* the `Feed`, and
 //! `WriterWalk` the same on a loop body; a binding sealed around one
 //! plants a `Let` in the effect slot neither sees through. Threading the
@@ -740,7 +740,7 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
             row,
             site,
         } => {
-            let (binds, value) = atomize_handle(*value, muts);
+            let (binds, value) = atomize(*value, muts);
             let_chain(
                 binds,
                 rebuild(TypedExprNode::Feed {
@@ -758,7 +758,7 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
             name,
             value,
         } => {
-            let (binds, value) = atomize_handle(*value, muts);
+            let (binds, value) = atomize(*value, muts);
             let_chain(
                 binds,
                 rebuild(TypedExprNode::Define {
@@ -1102,11 +1102,9 @@ fn peel(mut e: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
 /// reads at all (`src/ccl/design/mutability.md`, "A mutable variable read is an
 /// explicit operation"): an application's argument, where `emit_apply` relates
 /// a bare reference to a `Mut` parameter, and an application's function, which
-/// is where a proven keyed read `m[k]!` puts the collection. A feed's value is the
-/// third — `transact_phase::rewrite_as_of_reads` turns a history read fed out
-/// of a read-only block into an as-of join, and it is the bare reference that
-/// says so. Naming any of them leaves the recognizer a `Var` it cannot read
-/// through, so each keeps whatever ordering it had.
+/// is where a proven keyed read `m[k]!` puts the collection. Naming either leaves
+/// the recognizer a `Var` it cannot read through, so each keeps whatever ordering
+/// it had.
 ///
 /// Which argument positions are pass-by-reference is not knowable here —
 /// it is a question about the callee's parameter, and inference has not run
@@ -1248,7 +1246,7 @@ fn atomize_stmt_effect(expr: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, E
             row,
             site,
         } => {
-            let (binds, value) = atomize_handle(*value, muts);
+            let (binds, value) = atomize(*value, muts);
             (
                 binds,
                 rebuild(TypedExprNode::Feed {
@@ -1265,7 +1263,7 @@ fn atomize_stmt_effect(expr: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, E
             name,
             value,
         } => {
-            let (binds, value) = atomize_handle(*value, muts);
+            let (binds, value) = atomize(*value, muts);
             (
                 binds,
                 rebuild(TypedExprNode::Define {

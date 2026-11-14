@@ -3,17 +3,14 @@
 //! end-to-end: `x: Mut(V, Txn)` folds into a commit store shared with the mutable variables
 //! some block relates it to, and each `with begin():` block is a writer.
 //!
-//! **Reading a mutable variable: two constructs, and the difference is what these tests
-//! assert.** A mutable variable read *fed out* of a `with begin():` block is an as-of read
-//! at the reading transaction's (arbitrary) commit position, indexed by the reading loop —
-//! compiled to `AsOf` uniformly, whether that loop is a live `DataSource` stream, a finite
-//! loop, or a standalone read's synthesized singleton. Each position latches at its own
-//! arrival, so such a read has no assertable value unless the program orders the arrival
-//! after the commits. `await_final(x)` is the **terminal** read: `x`'s final committed
-//! value once every writer has drained, compiled to `ExtractFinal` over the key's
-//! commit-value stream, and it consumes `x`. The batch tests below read their result with
-//! `await_final`, which is what makes a scalar-valued expected tile a *semantic*
-//! assertion.
+//! **Reading a mutable variable: two constructs, and the difference is what these tests assert.** A
+//! mutable variable read inside a `with begin():` block, a block that only reads included, is a
+//! snapshot read at the place the engine gives that transaction in the commit order, and a reply it
+//! feeds is keyed by the reading loop's item. Such a read has no assertable value unless the
+//! program orders its transaction after the commits. `await_final(x)` is the **terminal** read:
+//! `x`'s final committed value once every writer has drained, compiled to `StoreFinalRead`, and it
+//! consumes `x`. The batch tests below read their result with `await_final`, which is what makes a
+//! scalar-valued expected tile a *semantic* assertion.
 //!
 //! Translated from the prototype's transaction suite (its `txn x = e` introducer
 //! is the `x: Mut(V, Txn) := e` annotation here).
@@ -740,9 +737,8 @@ fn test_compound_txn_mut_var_field() {
 /// (read-your-writes) value: `pool - r` after the write — 90, 70, 40 for items 0, 1, 2. The
 /// feed rides the writer decision as a `to_out` tap, committed atomically with the mutable
 /// variable write and keyed by the item. Contrast `await_final(pool)` (one scalar, the
-/// completed 40) and a *fed-out* read `with begin(): out << pool` (an as-of sample
-/// latched to that read's own commit position) — three different constructs over the
-/// same store.
+/// completed 40) and a block that only reads, `with begin(): out << pool`, which reads at its
+/// own place in the commit order.
 #[test]
 fn progress_feed_inside_tx() {
     check_tile(
@@ -1008,13 +1004,11 @@ fn ryw_of_conditionally_written_key_after_case() {
     );
 }
 
-/// A **conditional feed in a read-only `with begin():` block** — a conditional
-/// reply that reads a mutable variable (`if r > 1: resp << pool`). The block commits no
-/// mutable variable, so the reply is a filtered as-of read: `channelize` fans the guard-
-/// `Case` out into a refined-source channel (the same path a non-transactional
-/// `if r > 1: resp << r` takes), rather than the feed-only hoist which handles
-/// only straight-line replies. `pool` is never written, so its as-of value is its
-/// init (100), replied at the guard-passing positions (r = 2, 3 → domain 1, 2).
+/// A **conditional feed in a `with begin():` block that only reads** — a conditional
+/// reply that reads a mutable variable (`if r > 1: resp << pool`). The block writes no
+/// mutable variable, and its reply tap fires on the guard's path. `pool` is never written, so
+/// every snapshot holds its init (100), replied at the guard-passing positions (r = 2, 3 →
+/// domain 1, 2).
 #[test]
 fn conditional_reply_in_readonly_block() {
     check_tile(
@@ -1224,19 +1218,18 @@ fn sustained_contention_conserves_pool() {
 //
 // The cases above use it as their result, so its ordinary path is covered
 // throughout. What is pinned here is what makes it a different read from a
-// fed-out one, and the rules that make "final" well-defined.
+// block's snapshot read, and the rules that make "final" well-defined.
 // ---------------------------------------------------------------------------
 
 /// **The point of the primitive.** The same mutable variable, read both ways in one program:
-/// a fed-out read inside a `with begin():` block samples an arbitrary commit position,
-/// and `await_final` reports the completed value.
+/// a block that only reads it reads at its own place in the commit order, and
+/// `await_final` reports the completed value.
 ///
-/// Only the completion read's value is asserted. The as-of half is asserted to be
+/// Only the completion read's value is asserted. The block's read is asserted to be
 /// *present* and not to be anything in particular — that is the difference between the
-/// two constructs, and pinning its number would pin whichever sample the scheduler
-/// happened to leave visible.
+/// two constructs, and pinning its number would pin whichever place the engine gave it.
 #[test]
-fn await_final_and_as_of_read_the_same_mut_var() {
+fn await_final_and_a_snapshot_read_the_same_mut_var() {
     let code = indoc! {r#"
         out: Feed(_)
         pool: Mut(Int, Txn) := 100
@@ -1257,17 +1250,13 @@ fn await_final_and_as_of_read_the_same_mut_var() {
     );
     assert!(
         fields.get("_0").is_some_and(|t| !t.is_empty()),
-        "the as-of read resolves to some sample"
+        "the block's read replies"
     );
 }
 
 /// A completeness read stays one **inside a reading loop**. Broadcast over a
 /// two-element loop, `await_final(pool)` is the same settled 70 at both positions: the
-/// loop indexes the broadcast, not the mutable variable, so the as-of rewrite (which
-/// fires on a mutable variable read a reading loop indexes) must not claim it.
-///
-/// The values separate the two compilations: an as-of sample latches at each position's
-/// arrival, so a rewritten read would report the seed (101, 102) rather than 71 and 72.
+/// loop indexes the broadcast, not the mutable variable.
 #[test]
 fn await_final_broadcast_over_a_reading_loop_stays_final() {
     check_tile(
@@ -1285,13 +1274,9 @@ fn await_final_broadcast_over_a_reading_loop_stays_final() {
     );
 }
 
-/// A **bound** await, read inside a feed loop — the shape that separates the two reads
-/// by *term* rather than by position. `channelize` closes the channel over the bindings
-/// its contribution names, so `let f = ⟨read⟩` is copied in directly above the broadcast:
-/// the shape the as-of rewrite matches. The rewrite claims only `as_of_read`, so `f`
-/// stays the completed 90 at both positions. Spelled `final_or_default`, as an as-of read
-/// once was, it would be matched instead and each position would latch its own arrival —
-/// the seed, reporting 101 and 102.
+/// A **bound** await, read inside a feed loop. `channelize` closes the channel over the
+/// bindings its contribution names, so `let f = ⟨read⟩` is copied in directly above the
+/// broadcast, and `f` stays the completed 90 at both positions.
 #[test]
 fn await_final_bound_then_read_in_a_feed_loop_stays_final() {
     check_tile(
@@ -2130,14 +2115,36 @@ fn registers_written_in_one_block_share_a_store() {
     check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![297])));
 }
 
+/// A block that only reads reads every variable it names at one snapshot, its transaction's,
+/// while another loop's transactions write them: each writing transaction keeps `a + b` at
+/// zero, so every read sees zero, wherever the engine places it among the writes.
+#[test]
+fn a_reading_block_sees_one_snapshot_of_two_variables_a_writer_moves_together() {
+    check_sink(
+        indoc! {r#"
+            a: Mut(Int, Txn) := 0
+            b: Mut(Int, Txn) := 0
+            out = test_sink()
+            for i in [1, 2, 3, 4, 5]:
+                with begin():
+                    a := i
+                    b := 0 - i
+            for r in [1, 2, 3, 4, 5]:
+                with begin():
+                    out << a + b
+        "#},
+        "[0, 0, 0, 0, 0]",
+    );
+}
+
 /// **Snapshot consistency** holds a store together too, and writes alone do not show it:
-/// nothing writes both mutable variables, but one block reads both, latching them at a
-/// single frontier, so they must come from one history record. The writers are
+/// nothing writes both mutable variables, but one block reads both at one snapshot, so they
+/// must come from one history record. The writers are
 /// exactly those of `unrelated_mut_vars_get_separate_stores` — only this read is added.
 ///
 /// The read stays a `with begin():` block because it *is* the subject; what is dropped is
-/// any assertion on the value it feeds. That value is an as-of sample at the reading
-/// transaction's arbitrary commit position, so pinning a number would pin a scheduling
+/// any assertion on the value it feeds. That value is read at the place the engine gives the
+/// reading transaction in the commit order, so pinning a number would pin a scheduling
 /// artifact.
 #[test]
 fn mut_vars_read_together_share_a_store() {
@@ -2177,19 +2184,11 @@ fn a_mut_var_read_by_a_writing_block_joins_its_store() {
     check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![10])));
 }
 
-/// A mutable variable **no block writes** is not a store key. Nothing can advance it, so its
-/// history is constant at its seed and reading it costs a key to learn what the
-/// declaration already says — it keeps its introduction on the spine and relates
-/// nothing, which is why `lim` neither joins `tot`'s store nor forms one of its own.
-/// (Contrast `a_mut_var_read_by_a_writing_block_joins_its_store`, whose unwritten
-/// `limit` *is* a key: a **writing** block reads it, so it is read at that block's
-/// commit snapshot.)
-///
-/// The read-only block is required — it is the only way an unwritten mutable variable reaches
-/// a footprint at all — so the fed value is an arbitrary as-of sample and is not
-/// asserted. The store list is what this test owns.
+/// A mutable variable a block that only reads it reads at that block's snapshot, as a writing
+/// block's does: the block is a transaction of the store, so the read pulls `lim` into `tot`'s
+/// store though nothing writes it.
 #[test]
-fn a_mut_var_no_block_writes_is_not_a_store_key() {
+fn a_mut_var_read_by_a_reading_block_joins_its_store() {
     let code = indoc! {r#"
         out: Feed(_)
         lim: Mut(Int, Txn) := 5
@@ -2201,7 +2200,7 @@ fn a_mut_var_no_block_writes_is_not_a_store_key() {
             out << tot + lim
         out
     "#};
-    assert_eq!(commit_stores(code), vec!["Txn[tot]"]);
+    assert_eq!(commit_stores(code), vec!["Txn[lim,tot]"]);
 }
 
 /// A defer fed **inside** a store is consumed inside it. The tap that carries `out`
@@ -2224,14 +2223,12 @@ fn a_defer_fed_inside_a_store_is_consumed_inside_it() {
     check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![4])));
 }
 
-/// The same, for the feed of a **read-only** block. That block is unwrapped onto the
-/// spine, so its feed survives as an effect statement and is carried into the store it
-/// reads — and an effect statement that feeds a defer is therefore something a later
-/// statement can depend on, even though it binds nothing.
+/// The same, for the feed of a block that only reads. That block is a site of the store
+/// it reads, so its feed is a tap the store's body binds, and the code consuming the defer
+/// is carried into the store.
 ///
-/// The defect this pins was a *compile* failure (`as_of source must be a bare store
-/// mutable variable read`), so compiling and evaluating is the assertion; the fed value is an
-/// arbitrary as-of sample and is not pinned.
+/// Compiling and evaluating is the assertion; the fed value is read at the place the engine
+/// gives the block in the commit order and is not pinned.
 #[test]
 fn a_defer_fed_by_a_read_only_block_is_consumed_inside_its_store() {
     let code = indoc! {r#"
@@ -2570,11 +2567,8 @@ fn bare_read_of_a_mut_param_outside_a_block_rejected() {
     );
 }
 
-/// A *computed* live cross-endpoint read (`resp << latest + 1`) compiles: the
-/// pre-lambda-elim as-of-read rewrite turns it into `as_of(…) ≫ (λ x → x + 1)`,
-/// whose reply lambda the elim pass point-frees. Running the rewrite before
-/// lambda-elim is what keeps the reply a liftable lambda rather than a
-/// point-free `const`.
+/// A *computed* live cross-endpoint read (`resp << latest + 1`) compiles: the GET block is a
+/// transaction whose reply tap holds the computed value.
 #[test]
 fn computed_live_cross_endpoint_read_compiles() {
     let code = indoc! {r#"
@@ -2593,13 +2587,12 @@ fn computed_live_cross_endpoint_read_compiles() {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     compile_program(&mut ctx, &LoadedProgram::test(code), consumer)
-        .expect("a computed live cross-endpoint read should compile to an as-of join");
+        .expect("a computed live cross-endpoint read should compile");
 }
 
 /// A live cross-endpoint read that combines the *request element* with a mutable variable
-/// read (`resp << a + req`) compiles: the as-of-read rewrite turns it into
-/// `zip((trigger, as_of(store))) ≫ (λ (req, snap) → e)`, pairing each request with
-/// its mutable variable snapshot. The end-to-end value is checked in
+/// read (`resp << a + req`) compiles: the GET block's decision reads the request item beside
+/// its snapshot of `a`. The end-to-end value is checked in
 /// `live_reply_combines_request_and_store`.
 #[test]
 fn live_read_combining_request_and_store_compiles() {
@@ -2618,19 +2611,18 @@ fn live_read_combining_request_and_store_compiles() {
     "#};
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    compile_program(&mut ctx, &LoadedProgram::test(code), consumer).expect(
-        "a live reply combining the request with a mutable variable read should compile to a zip read",
-    );
+    compile_program(&mut ctx, &LoadedProgram::test(code), consumer)
+        .expect("a live reply combining the request with a mutable variable read should compile");
 }
 
 /// End-to-end live check of the request-plus-variable reply (3b): a batch loop
 /// commits the mutable variable to 60, then a **live** source drives replies
-/// `resps << store + req`, each pairing the request with the store's as-of snapshot
-/// — the `zip((trigger, as_of)) ≫ (λ (req, s) → req + s)` shape driven incrementally.
+/// `resps << store + req`, each pairing the request with its transaction's snapshot of the
+/// store, driven incrementally.
 ///
 /// The requests are delivered only after the store has drained, which is what makes
-/// 65 and 75 assertable: an as-of read latches at its position's arrival, so a request
-/// arriving mid-drain would legally observe 0, 10 or 30 instead.
+/// 65 and 75 assertable: a request's transaction reads at its own place in the commit
+/// order, so a request arriving mid-drain would legally observe 0, 10 or 30 instead.
 #[test]
 fn live_reply_combines_request_and_store() {
     use cambra::ccl::context::CompileResultExt;
@@ -3324,7 +3316,7 @@ fn bare_mut_var_arg_to_ordinary_fn_is_gated() {
 /// binder. Before the fix, base-name footprint collection matched it, then
 /// panicked looking for its (non-existent) mutable variable `let`. The mutable variable write is
 /// `store = store - sum([1, 2, 3])` = 100 − 6 = 94, read back by the trailing
-/// read-only transaction (a live as-of read at position 0).
+/// transaction that only reads (its reply at item 0).
 #[test]
 fn like_named_comprehension_var_does_not_panic() {
     check_tile(
@@ -3549,9 +3541,9 @@ fn commit_decision_reads_induction_accumulator() {
 /// `[1,2,3]` → 3; the txn loop over `[10,20]` reads it). Unlike the co-indexed
 /// case above (same loop → request-indexed `zip`), a different loop's accumulator
 /// has no per-request correspondence, so its final value is broadcast into every
-/// transaction. Observed via an **in-block** (commit-ordered) reply — not a
-/// trailing read, which is an arbitrary as-of sample — so the committed values
-/// are deterministic: `pool` draws down `100 → 97 → 94` over items 0, 1.
+/// transaction. Observed via an **in-block** (commit-ordered) reply — not a trailing
+/// block's read, which reads at whatever place the engine gives it — so the committed
+/// values are deterministic: `pool` draws down `100 → 97 → 94` over items 0, 1.
 /// Exercises the writer's deferred-wakeup convergence: the broadcast `cnt`'s
 /// `ExtractFinal` is empty until its loop's own cycle drains, so the writer
 /// re-arms itself on the wakeup queue each not-ready pull rather than deadlocking
@@ -3745,8 +3737,8 @@ fn commit_ordered_reply_reading_induction_counter() {
 /// In-block reply with an interspersed deny: the reply tap `resp << q` rides the
 /// writer *decision*, so a denied transaction (`r == 0`, guard false) contributes
 /// no reply, while each committing position emits its read-your-writes value. This is
-/// the exact reply-path contract (a read-your-writes stream, not an arbitrary as-of
-/// sample) and must be preserved exactly under the consumer-driven store: r=0 denies,
+/// the exact reply-path contract (a read-your-writes stream, not a read at an engine-chosen
+/// place) and must be preserved exactly under the consumer-driven store: r=0 denies,
 /// r=1 commits q:=2, r=2 commits q:=3 → `resp` = [2, 3] over items [1, 2].
 #[test]
 fn in_block_reply_with_deny_replies_at_committing_items() {
@@ -3767,8 +3759,8 @@ fn in_block_reply_with_deny_replies_at_committing_items() {
 
 /// Live-store progress past an interior deny. A finite writer accumulates `total`
 /// with a middle deny (`[10, 0, 20]`: total 0→10, r=0 denies, →30), and a **live**
-/// request stream reads `total + req` as an as-of read latched at each request's
-/// arrival. The consumer-driven store steps past the deny under the writer's own
+/// request stream reads `total + req` in a block that only reads, placed in the commit order
+/// at each request's arrival. The consumer-driven store steps past the deny under the writer's own
 /// self-re-arm (no reader-side drive-to-fixpoint), so **every request is served** (no
 /// freeze — one reply per request), and the request delivered *after* the writer
 /// completes observes the **post-deny** commit (`total = 30`) — which the old
@@ -3776,8 +3768,8 @@ fn in_block_reply_with_deny_replies_at_committing_items() {
 /// frontier, so the drive returned the pre-deny `total = 10` and a request latching
 /// then froze there).
 ///
-/// The two requests arrive at different times because that is the only thing an as-of
-/// read's value follows. The first arrives before the writer has drained, so its
+/// The two requests arrive at different times because that is the only thing a reading
+/// transaction's place follows. The first arrives before the writer has drained, so its
 /// observation is asserted only to be **non-decreasing** and a member of the committed
 /// set; a specific value there would pin whichever commit the schedule happened to
 /// reach. The completed value has a name of its own (`await_final`).
@@ -4423,7 +4415,7 @@ fn a_keyed_write_commits_a_computed_value_at_a_computed_key() {
 }
 
 /// A checked lookup of a key the map-valued mutable variable does not hold answers `Option::none`
-/// inside a read-only block: key `2` is absent, and every position replies.
+/// inside a block that only reads it: key `2` is absent, and every position replies.
 ///
 /// `m` has no writer, so every transaction reads its seed and the replies are independent of
 /// commit order.
@@ -5245,8 +5237,8 @@ fn a_block_reads_its_loops_accumulator_where_it_stands(#[case] code: &str, #[cas
 }
 
 /// A block in value position in a branch: its value is read where the block stands, at the
-/// positions the branch runs at, which are the positions its site commits at. The code around the
-/// branch runs at every position.
+/// positions the branch runs at, which are the positions its site commits at, whether it writes or
+/// only reads. The code around the branch runs at every position.
 #[rstest]
 #[case::fed_in_the_branch(indoc! {"
     for r in [1, 2, 3]:
@@ -5276,6 +5268,30 @@ fn a_block_reads_its_loops_accumulator_where_it_stands(#[case] code: &str, #[cas
         out << x
     out << 0
 "}, "[`out<<(()) -> 97, `out<<#1(()) -> 0]")]
+#[case::a_block_that_only_reads(indoc! {"
+    for r in [1, 2, 3]:
+        if r > 1:
+            x = with begin():
+                pool
+            out << x + r
+"}, "[1 -> 102, 2 -> 103]")]
+// A read-only block in a loop under a branch, and under a condition on its loop's accumulator.
+#[case::a_read_only_block_in_a_loop_under_an_if(indoc! {"
+    c = 1
+    if c > 0:
+        for r in [1, 2]:
+            with begin():
+                out << pool + r
+    out << 0
+"}, "[`out<<(0) -> 101, `out<<(1) -> 102, `out<<#1(()) -> 0]")]
+#[case::a_read_only_block_under_a_condition_on_an_accumulator(indoc! {"
+    n := 0
+    for r in [1, 2, 3]:
+        n := n + r
+        if n > 2:
+            with begin():
+                out << pool + r
+"}, "[1 -> 102, 2 -> 103]")]
 fn a_block_value_in_a_branch(#[case] code: &str, #[case] expected: &str) {
     check_sink(
         &format!("pool: Mut(Int, Txn) := 100\nout = test_sink()\n{code}"),
@@ -5379,30 +5395,20 @@ fn a_block_value_in_a_branch_feeds_an_accumulator() {
                 pool := pool + 1
     await_final(pool)
 "}, 42)]
+// A block that only reads is a site too, and its value is carried as a writing block's is.
+#[case::a_condition_on_a_read_only_value(indoc! {"
+    for r in [10, 20, 30]:
+        v = with begin():
+            pool
+        if v > r * 4:
+            with begin():
+                log := log + 1
+    await_final(log)
+"}, 2)]
 fn a_block_reading_another_blocks_value(#[case] code: &str, #[case] expected: i64) {
     check_scalar(
         &format!("pool: Mut(Int, Txn) := 100\nlog: Mut(Int, Txn) := 0\n{code}\n"),
         Value::Int(expected),
-    );
-}
-
-/// A block under a condition on the value of a block that writes nothing is refused: that value
-/// is a read at the iteration, which no source the site could carry holds.
-#[test]
-fn a_block_under_a_condition_on_a_read_only_value_is_refused() {
-    check_compile_error(
-        indoc! {"
-            pool: Mut(Int, Txn) := 100
-            log: Mut(Int, Txn) := 0
-            for r in [10, 20, 30]:
-                v = with begin():
-                    pool
-                if v > r:
-                    with begin():
-                        log := log + 1
-            await_final(log)
-        "},
-        "under a condition that reads an induction accumulator or the value of a",
     );
 }
 

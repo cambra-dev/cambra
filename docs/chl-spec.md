@@ -731,7 +731,7 @@ nothing: appends commute, and a read of an accumulator is sequenced by the write
 transactional variables take effect in commit order, which the transaction engine decides at run
 time, not in the source's position order
 ([8.5 Ordering and concurrency](#85-ordering-and-concurrency)). A read of a transactional variable
-sees whichever commits come before it in that order, as an as-of read does ([8.3 Reads](#83-reads)).
+sees whichever commits come before its own transaction in that order ([8.3 Reads](#83-reads)).
 So a loop whose iterations only run blocks over transactional variables is unordered, and its
 source's positions need no order:
 
@@ -5177,9 +5177,10 @@ for req in withdraw_reqs:
   block's value, so a reply after the block is indexed by the iteration, as any reply outside a
   block is ([8.4 Feeds are the second form of
   mutability](#84-feeds-are-the-second-form-of-mutability)).
-- **A block that writes no transactional variable is a snapshot read.** It commits nothing, and its
-  value is as of an arbitrary commit position, as an as-of read's is ([8.3 Reads](#83-reads)). It
-  reads several variables at one snapshot: `(a, b) = with begin(): (a, b)`.
+- **A block that only reads transactional variables is a snapshot read.** It is a transaction like
+  any other: it takes its place in the commit order and reads the snapshot there
+  ([8.3 Reads](#83-reads)). It reads several variables at one snapshot:
+  `(a, b) = with begin(): (a, b)`.
 
 ### 8.3 Reads
 
@@ -5201,18 +5202,18 @@ for req in withdraw_reqs:
   ([8.7 Transactions as contextual parameters](#87-transactions-as-contextual-parameters)).
   A bare read that no block encloses is an error, and stays one: the block is what pins a
   **snapshot-consistent** view, so that several mutable variable reads in one
-  block see one commit snapshot. A read that wants no snapshot has the two terms
-  below instead — an as-of read fed out of a block, or `await_final`.
-- **As-of read.** A mutable variable read fed *out* of a block that does not
-  itself write that mutable variable is an **as-of read at an arbitrary commit
-  position** — the mutable variable's value as of wherever the reading transaction
-  lands in the commit order, replied indexed by the *reading* loop. This
-  is uniform whether the reader is a live request stream, a finite loop,
-  or the synthesized singleton of a standalone read.
+  block see one commit snapshot. A read that wants no snapshot is `await_final`, below.
+- **A block reads at its own place in the commit order.** Every transaction takes a place in
+  the commit order of the variables it mentions, whether or not it writes, and reads the
+  commits before that place. A block that only reads is a transaction too:
+  `with begin(): resp << balance` reads `balance` as of its own place and replies as any block
+  does ([8.4 Feeds are the second form of mutability](#84-feeds-are-the-second-form-of-mutability)).
+  This is uniform whether the reader is a live request stream, a finite loop, or a standalone
+  block.
 - **Terminal read — `await_final(x)`.** `await_final(x)` waits for `x`'s whole
   commit history to complete and yields its final value (§8.6). It is the only
-  terminal read of a mutable variable: every other read is an arbitrary as-of
-  sample, so a program that means the final value has to say so.
+  terminal read of a mutable variable: every other read is at a transaction's own place in the
+  commit order, so a program that means the final value has to say so.
 
 ### 8.4 Feeds are the second form of mutability
 
@@ -5306,9 +5307,8 @@ Consequences a program may rely on:
   requests, give the cross-endpoint guarantee: a client that sees `ok 2` then reads the counter
   observes `≥ 2`.
 - **Terminal vs. temporal reads.** `await_final` (and the trailing
-  induction read) wait for a history's *completeness*; an as-of read waits
-  only for the *frontier* (that no earlier-or-equal commit is still
-  outstanding) and samples the mutable variable as of the reader's own position.
+  induction read) wait for a history's *completeness*; a read in a block waits
+  only for the commits before its own transaction's place.
 - **A trigger alone imposes no order between iterations.** Program start makes a batch of
   transactions eligible without ordering them. Distinct source arrivals likewise order no loop
   whose body requires no order. The engine may choose any serialization consistent with the

@@ -223,7 +223,7 @@ impl ControlReply {
 }
 
 /// A reload's `200` body: the tally, a blank line, the difference at
-/// `as-of-read`, and the variables that begin above their loops' inputs.
+/// `channelized`, and the variables that begin above their loops' inputs.
 fn render_reload(report: &ReloadReport) -> String {
     let ReuseTally { kept, bound } = report.reuse;
     format!(
@@ -485,17 +485,16 @@ pub const OFFERED_PHASES: &[(&str, Phase)] = &[
     ("inferred", Phase::Infer),
     ("inlined", Phase::Inline),
     ("channelized", Phase::Channelize),
-    ("as-of-read", Phase::AsOfRead),
     ("lambda-elim", Phase::LambdaElim),
     ("planned", Phase::Planning),
 ];
 
-/// The phase `/diff` compares at when the request names none: `as-of-read`, the
+/// The phase `/diff` compares at when the request names none: `channelized`, the
 /// last position at which the tree still has binders, and the one `lambda_elim`
 /// consumes. The mutability and channelization rewrites are complete there and
 /// an edit still localizes the way it does further up — see
 /// `src/ccl/design/diffing.md`, "Which phase to diff".
-pub const DEFAULT_PHASE: Phase = Phase::AsOfRead;
+pub const DEFAULT_PHASE: Phase = Phase::Channelize;
 
 /// The phase a `phase=` spelling names, or `None` when it names none.
 pub fn phase_from_name(name: &str) -> Option<Phase> {
@@ -836,7 +835,7 @@ mod tests {
     fn diff_defaults_to_the_phase_before_lambda_elimination() {
         let (code, phase) = diff_of("/diff?x%20%3D%201%3B%20x");
         assert_eq!(code, "x = 1; x");
-        assert_eq!(phase, Phase::AsOfRead);
+        assert_eq!(phase, Phase::Channelize);
     }
 
     #[test]

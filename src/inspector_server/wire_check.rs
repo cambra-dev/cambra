@@ -27,11 +27,10 @@ use serde_json::Value;
 /// validator agree with the producer by construction and check nothing. A
 /// pane added upstream is meant to fail this list, and the failure is the
 /// notice that the wire changed.
-const PANE_IDS: [&str; 7] = [
+const PANE_IDS: [&str; 6] = [
     "pre-inference",
     "post-inference",
     "post-channelize",
-    "post-as-of-read",
     "post-lambda-elim",
     "post-planning",
     "post-conversion",
@@ -43,22 +42,13 @@ const PANE_IDS: [&str; 7] = [
 ///
 /// The kind is also the node-shape discriminant: `"holes"` and `"typed"`
 /// panes hold IR nodes, an `"operators"` pane holds operator nodes.
-const PANE_KINDS: [&str; 7] = [
-    "holes",
-    "typed",
-    "typed",
-    "typed",
-    "typed",
-    "typed",
-    "operators",
-];
+const PANE_KINDS: [&str; 6] = ["holes", "typed", "typed", "typed", "typed", "operators"];
 /// The adjacent pane windows, in order — the exact `paneLinks` from/to
 /// pairs a successful payload ships. One shorter than [`PANE_IDS`].
-const PANE_WINDOWS: [(&str, &str); 6] = [
+const PANE_WINDOWS: [(&str, &str); 5] = [
     ("pre-inference", "post-inference"),
     ("post-inference", "post-channelize"),
-    ("post-channelize", "post-as-of-read"),
-    ("post-as-of-read", "post-lambda-elim"),
+    ("post-channelize", "post-lambda-elim"),
     ("post-lambda-elim", "post-planning"),
     ("post-planning", "post-conversion"),
 ];
@@ -80,7 +70,6 @@ const ALLOWED_VIA: &[&str] = &[
     "Letrec",
     "EraseRefinements",
     "Channelize",
-    "AsOfRead",
     "LambdaElim",
     "Planning",
     "Convert",

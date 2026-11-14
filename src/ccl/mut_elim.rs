@@ -2268,8 +2268,8 @@ fn transform_loop(
     collect_writes(&loop_body, declared, &mut accs);
     if accs.is_empty() {
         // A loop with no accumulator. If its body feeds — a stateless generator,
-        // or a `with begin():` read-only transaction (`for r in iter: with
-        // begin(): out << balance` reads a mutable variable and feeds it, writing nothing) —
+        // or an unwrapped `with begin():` block that mentions no transactional variable
+        // (`for r in iter: with begin(): out << r`) —
         // it's the design's "plain map" path: each in-block feed becomes an
         // ordinary map of the loop source. Otherwise the body inlined to neither
         // a write nor a feed (a `for x: pure_call()` whose call didn't mutate) —
@@ -2281,9 +2281,7 @@ fn transform_loop(
             // plain-map hoist below (`transform_feed_only_loop`) only handles
             // straight-line feeds, so re-emit a conditional-feed loop as the loop
             // `λ 𝑟 → (𝑟 ▷ iter) ▷ (λ target → body)` at its position for `channelize` to fan out,
-            // rather than flattening it here. (A mutable variable read in the feed value stays
-            // in the arm value; `rewrite_as_of_reads` handles it post-channelize, as
-            // for the straight-line read-only reply.)
+            // rather than flattening it here.
             if body_has_statement_case(&loop_body) {
                 // Normalize away the block's trailing `; unit` terminals (a
                 // `with begin():` block lowers each arm as `Feed; unit` and the
@@ -2788,18 +2786,13 @@ pub(crate) fn fold_induction_loop(
     }
 }
 
-/// Rewrite an accumulator-free loop — a read-only `with begin():` transaction
-/// fed out (`for target in iter: out << value`) — to the plain-map form. Each
+/// Rewrite an accumulator-free loop — one whose `with begin():` block mentions no
+/// transactional variable and was unwrapped onto it (`for target in iter: out << value`) —
+/// to the plain-map form. Each
 /// in-block feed becomes a loop of its own, `iter ≫ (λ target → Feed(defer, value))`,
 /// which `channelize` routes as an ordinary loop's feed: its channel is the loop
 /// source mapped through the fed value at each position. There is no history
 /// binding and no letrec.
-///
-/// When `value` is a read of a transactional mutable variable (a `Var` `transact_phase`
-/// rebound to `as_of_read(__hist.k)`, constant in `target`), the map broadcasts that
-/// as-of read to every loop position; `transact_phase::rewrite_as_of_reads`
-/// (post-`channelize`, pre-lambda-elim) then pairs it with this loop as its trigger,
-/// which is where the outer-indexed as-of join gets the position it reads at.
 fn transform_feed_only_loop(
     loop_site: StmtSite,
     position: &Name,
@@ -2856,7 +2849,8 @@ fn transform_feed_only_loop(
     body_out
 }
 
-/// Walk an accumulator-free loop body (a read-only `with begin():` block:
+/// Walk an accumulator-free loop body (an unwrapped `with begin():` block that mentions no
+/// transactional variable:
 /// `Let`s, `Feed`s, terminal `Unit` — no `MutWrite`), collecting the body's
 /// bindings and each feed's `(defer, value closed over the bindings it reads,
 /// site)`.
@@ -2867,7 +2861,7 @@ fn transform_feed_only_loop(
 ///
 /// The site is the feed statement its map is recorded against, the same
 /// attribution the induction path's [`FeedSite`] carries.
-/// A feed a read-only block makes: its target and the target's occurrence, its value closed over
+/// A feed such a block makes: its target and the target's occurrence, its value closed over
 /// the block's bindings, its statement, and its site ([`crate::ccl::site`]).
 type FedAt = (
     Name,

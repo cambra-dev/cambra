@@ -1148,17 +1148,17 @@ fn escaping_a_block(#[case] code: &str, #[case] expected: i64) {
             pass
     await_final(pool) + n
 "}, "undoing such a write when the exception aborts the block is not compiled yet")]
-#[case::a_read_only_block_that_feeds(indoc! {"
+#[case::a_block_mentioning_no_variable_that_feeds(indoc! {"
     out: Feed(_)
     for r in [10, 20, 5]:
         try:
             with begin():
-                out << pool + r
+                out << r
                 check(r)
         except Int as e:
             out << 0 - e
     out
-"}, "sends output and writes no transactional variable is not compiled yet")]
+"}, "sends output and mentions no transactional variable is not compiled yet")]
 fn escaping_a_block_refused(#[case] code: &str, #[case] needle: &str) {
     let defs = indoc! {"
         def check(v):
@@ -1168,6 +1168,33 @@ fn escaping_a_block_refused(#[case] code: &str, #[case] needle: &str) {
         pool: Mut(Int, Txn) := 100
     "};
     check_compile_error(&format!("{defs}{code}"), needle);
+}
+
+/// An exception escaping a block that only reads sends none of its outputs, as a writing
+/// block's abort does: the block is a transaction of `pool`'s store.
+#[test]
+fn escaping_a_reading_block_sends_no_output() {
+    check_sink(
+        indoc! {"
+            def check(v):
+                if v > 15:
+                    raise v
+                v
+            pool: Mut(Int, Txn) := 100
+            out = test_sink()
+            for r in [10, 20, 5]:
+                got = try:
+                        d = with begin():
+                            out << pool + r
+                            check(r)
+                        d
+                    except Int as e:
+                        0 - e
+                out << got
+        "},
+        "[`got.d.out<<(0) -> 110, `got.d.out<<(2) -> 105, `out<<(0) -> 10, `out<<(1) -> -20, \
+         `out<<(2) -> 5]",
+    );
 }
 
 /// An exception escaping a block sends none of the outputs inside it, and the code after the

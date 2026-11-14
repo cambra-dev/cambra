@@ -115,7 +115,8 @@ struct TxnFrame {
     site: usize,
     wrote: bool,
     /// The mutable variables the block writes anywhere in its body. A read of a `Txn`
-    /// variable the block does not write is an as-of read.
+    /// variable the block does not write reads at whatever place the commit order gives the
+    /// block, which this interpreter does not judge.
     writes: BTreeSet<String>,
     /// Replies fed inside the block, each with its channel, its site and the key of the
     /// iteration that fed it, held until the block commits.
@@ -2317,8 +2318,8 @@ impl Interp {
                 None => return err(format!("`{name}` is a `Txn` variable read outside a block")),
                 Some(frame) if !frame.writes.contains(name) => {
                     return err(format!(
-                        "`{name}` is read as of an arbitrary commit position, which is not \
-                         judgeable"
+                        "`{name}` is read at the place the commit order gives its block, \
+                         which is not judgeable"
                     ));
                 }
                 Some(_) => {}

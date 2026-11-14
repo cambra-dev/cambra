@@ -816,8 +816,8 @@ impl LiveProgram {
         predecessor: &OperatorMap,
         loaded: &LoadedProgram,
     ) -> Result<Checked, ReloadError> {
-        let diff = difference(ctx, previous, loaded, Phase::AsOfRead)?
-            .unwrap_or_else(|| no_difference(Phase::AsOfRead));
+        let diff = difference(ctx, previous, loaded, Phase::Channelize)?
+            .unwrap_or_else(|| no_difference(Phase::Channelize));
         // This compile binds the ports the new version adds, keeps the listeners, and registers
         // no route. A compile that names its addresses would skip binding, so binding here refuses
         // a port already in use while the running graph is whole, rather than after it is torn

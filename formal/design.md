@@ -457,5 +457,5 @@ The reference contracts are
 [The model: histories and causal recursion](../src/ccl/design/mutability.md#the-model-histories-and-causal-recursion)
 and [Semantics](../src/ccl/design/mutability.md#semantics).
 The model would distinguish overwrite's last-write-wins and off-path carry-forward behavior
-from append's accumulation law, and arbitrary transactional as-of reads from terminal reads.
+from append's accumulation law, and a transaction's snapshot reads from terminal reads.
 `History`, `ChanDom`, `Hole` and `Infer` remain outside the current concrete typing grammar.

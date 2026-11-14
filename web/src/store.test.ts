@@ -45,14 +45,12 @@ describe("T3: wire-shape contract (golden fixture matches the TS types)", () => 
         "typed",
         "typed",
         "typed",
-        "typed",
         "operators",
       ]);
       expect(snap.paneLinks.map((l) => [l.from, l.to])).toEqual([
         ["pre-inference", "post-inference"],
         ["post-inference", "post-channelize"],
-        ["post-channelize", "post-as-of-read"],
-        ["post-as-of-read", "post-lambda-elim"],
+        ["post-channelize", "post-lambda-elim"],
         ["post-lambda-elim", "post-planning"],
         ["post-planning", "post-conversion"],
       ]);

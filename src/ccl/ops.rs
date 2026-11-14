@@ -708,8 +708,8 @@ pub enum Builtin {
     /// an induction accumulator is a type error and not a silent success.
     ///
     /// This is the only surface term that waits for a `Txn` history's
-    /// *completeness*; every other fed-out mutable variable read is an arbitrary as-of
-    /// sample ([`Self::AsOf`]). It is a surface marker in the sense the `For` /
+    /// *completeness*, and the only read of one outside a `with begin():` block. It is a
+    /// surface marker in the sense the `For` /
     /// `Begin` / `MutWrite` nodes are: [`crate::ccl::transact_phase`] consumes it,
     /// replacing each occurrence with [`Self::FinalRead`] over the mutable variable's
     /// history binding. So it never reaches op-conversion, and its arm there is a
@@ -723,24 +723,6 @@ pub enum Builtin {
     /// the deduplicated union of both input codomains.  Lowered from Python `a @ b`.
     Copair,
 
-    /// `as_of_read : (Txn ⇒ 𝑉) ⇒ 𝑉` — an **as-of read of a commit history whose position
-    /// is not yet supplied**, which is what every fed-out mutable variable read is.
-    /// [`crate::ccl::transact_phase`] binds each store key the continuation still names to
-    /// one; `rewrite_as_of_reads` then pairs it with the reading loop that indexes it and
-    /// rewrites the pair to an [`Self::AsOf`] join, which supplies the position. The two
-    /// are one construct in two stages, which is why they share the name.
-    ///
-    /// The stage exists so that an as-of read and a terminal read are **different terms**.
-    /// Both sample the same `Fun(Txn, V)` history and differ only in the position sampled, so
-    /// a single term for the pair would separate them by position alone — which does not
-    /// survive the passes that legitimately move a read (`channelize` copies a channel's
-    /// captured bindings inside the channel), letting an `await_final` land where the rewrite
-    /// matches. Distinct terms also make a *missed* rewrite loud: an unpaired `as_of_read` is
-    /// rejected after the rewrite rather than compiling to a read that waits forever.
-    ///
-    /// Minted post-inference, so it carries its own recorded type and has no scheme.
-    AsOfRead,
-
     /// `final_read : (𝐷 ⇒ 𝑉) ⇒ 𝑉` — the **terminal read** of a mutable variable: its value
     /// at the position its own writers finish, over its sequencing domain 𝐷 (`Txn`, or a
     /// loop's induction domain). [`crate::ccl::transact_phase`] mints it for a surface
@@ -748,39 +730,12 @@ pub enum Builtin {
     /// each naming the mutable variable's history binding. An inner loop's is one read per
     /// enclosing position.
     ///
-    /// Like [`Self::AsOfRead`] it is a *sample* of the carried value rather than a
-    /// reduction of a stream, so it takes no seed operand — tick 0 of every store is its
-    /// keys' seeds. Unlike `AsOfRead` it needs no pairing: the position comes from the
-    /// store's own closure rather than from a reading loop, so it reaches op-conversion
-    /// and compiles to the `StoreFinalRead` tile operator.
+    /// It is a *sample* of the carried value rather than a reduction of a stream, so it takes
+    /// no seed operand — tick 0 of every store is its keys' seeds. The position comes from
+    /// the store's own closure, and it compiles to the `StoreFinalRead` tile operator.
     ///
     /// Minted post-inference, so it carries its own recorded type and has no scheme.
     FinalRead,
-
-    /// `as_of : Tuple(Fun(B, _), Fun(Txn, V)) → Fun(B, V)` — the **as-of
-    /// (temporal) join**, the live cross-endpoint read. Applied as a tupled
-    /// argument `Apply(Tuple([trigger, source]), Builtin(AsOf))`: for each
-    /// `trigger` (request-loop) position, latch `source`'s (a transactional
-    /// mutable variable's running render, `Fun(Txn, V)`) latest-decided value as of that
-    /// position. The reply is indexed by the *trigger* (the enclosing request
-    /// loop), not the commit clock — an outer-indexed read.
-    ///
-    /// Born in [`crate::ccl::transact_phase`]'s `rewrite_as_of_reads`, run
-    /// **pre-lambda-elim** (after `channelize`): it recognizes a read-only reply — a chain
-    /// of as-of reads `let k₁ = as_of_read(balance.f₁) in … in trigger ≫ (λ r → e)` —
-    /// and supplies each read's position from the trigger, which is the one thing
-    /// [`Self::AsOfRead`] leaves open. Reading a single mutable variable → `as_of((trigger, balance.f)) ≫
-    /// (λ k → e)`; reading **several** → `as_of((trigger, balance)) ≫ (λ snap → e[kᵢ
-    /// ↦ snap.fᵢ])`, a single snapshot record folded at one commit frontier so the
-    /// mutable variables are read atomically (§I-c). Running before lambda elimination
-    /// keeps a computed reply (`e = k + 1`) a lambda the elim pass point-frees,
-    /// rather than a point-free `const` that could only be broadcast. Compiles to
-    /// the [`crate::interpreter::commit_operator`] `AsOf` tile operator (scalar- or
-    /// record-valued). It carries its **own recorded type** (no inference scheme):
-    /// op-conversion and every post-phase `typecheck` read `.ty` directly, and
-    /// planning treats it as an iteration-bearing source (it stages the trigger
-    /// inside its tuple rather than prepending an `iterate`).
-    AsOf,
 
     /// `variant_project(c) : Union({cᵢ: Pᵢ}) ⇒ P_c` — the elimination-side dual
     /// of [`crate::ccl::TypedExprNode::VariantCtor`]/`VariantWrap`. Projects the
@@ -1061,9 +1016,7 @@ impl Builtin {
             Self::BeginTxn => "begin",
             Self::AwaitFinal => "await_final",
             Self::Copair => "copair",
-            Self::AsOfRead => "as_of_read",
             Self::FinalRead => "final_read",
-            Self::AsOf => "as_of",
             // The arm index is rendered by `symbolic` (a `&'static str` cannot
             // carry it); this bare name is the fallback for other callers.
             Self::VariantProject(_) => "variant_project",

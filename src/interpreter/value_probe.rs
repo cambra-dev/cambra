@@ -1180,7 +1180,7 @@ mod tests {
             Tile::data_function(uints(&[0]), Box::new(store), Predicate::True, BitSet::new());
 
         let mut probes = ProbeTable::with_defaults();
-        probes.observe(None, 1, "AsOf#1", &tile, &unreleased());
+        probes.observe(None, 1, "Sink#1", &tile, &unreleased());
         let reading = newest(&probes, None, 1);
         assert_eq!(values(reading), vec!["(acc: [u0 ↦ \"a\", u2 ↦ \"b\"])"]);
     }

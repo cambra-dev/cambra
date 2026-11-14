@@ -1,14 +1,11 @@
 # A scalar transactional mutable variable shared *live* across two endpoints: POST /set
 # overwrites `latest` (a `Mut(String, Txn)` scalar store) and replies "ok"; GET /get
-# reads the current value cross-endpoint inside a read-only `with begin():` block.
+# reads the current value cross-endpoint inside a `with begin():` block that only reads.
 #
-# The GET read is a **live cross-endpoint read**: a transactional mutable variable may be
-# read only inside a `with begin():` block, and a read fed out of a block that
-# does not write `latest` is a live as-of read — it reads `latest`'s committed
-# value as of the reading request, indexed by the GET request loop (the outer
-# context), not the commit clock. Planning latches it through the as-of join
-# (`Builtin::AsOf`), the path that resolves over a *live* store (an `ExtractFinal`
-# terminal read never would).
+# The GET block is a transaction of `latest`'s store like the POST block: it takes its
+# place in the commit order when the request arrives and reads `latest` there, and its
+# reply rides its commit keyed by the GET request, which is how the HTTP response sink
+# dispatches replies to their requests.
 #
 # The POST reply `set_resps << "ok\n"` is a sibling of the `with begin():` block,
 # so it rides the POST request loop (request-indexed), matching how the HTTP

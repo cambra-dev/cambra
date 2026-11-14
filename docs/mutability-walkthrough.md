@@ -243,7 +243,7 @@ for req in reqs:
 | inside the writing loop/block | the value at the current position — the previous iteration's, or the just-written one (**read-your-writes**) |
 | after a `for` loop | the accumulator's **final** value (the loop has ended, so "latest" is unambiguous) |
 | inside a `with begin():` | a **snapshot-consistent** view — several reads in one block see one snapshot. This is why the block is required |
-| fed out of a read-only block | an **as-of read at an arbitrary commit position** — the variable as of wherever the reading transaction lands |
+| inside a block that only reads | the same snapshot read: the block is a transaction, so it reads as of its own place in the commit order |
 | `await_final(x)` | the one **terminal** mutable variable read: the value once every writer that can write `x` has drained. It **consumes** `x` — no later read or write may name it, which is what closes the writer set and makes "final" a fixed value |
 
 > **Transactional mutability is unordered by design.** There is no ordering guarantee
@@ -260,8 +260,8 @@ fires**, **what it is indexed by**, and **what it is allowed to read**. There ar
 placements, and they are not freely interchangeable — moving a `<<` between them is often
 a compile error rather than a change of behaviour.
 
-**1. Inside the writing block — commit-ordered and commit-gated.** The `<<` rides the
-writer's decision as a tap, committed atomically with the write. So it is sequenced
+**1. Inside the block — commit-ordered and commit-gated.** The `<<` rides the
+transaction's decision as a tap, committed atomically with its writes. So it is sequenced
 *after* the commit, keyed by the iteration that fed it, and **gated**: a denied transaction
 replies nothing.
 
@@ -297,29 +297,26 @@ resps
 
 `resps` is `[1, 2, 3]` — the induction counter, request-indexed, unrelated to the commit
 clock. Note *what* it replies: `cnt`, not `store`. It could not reply `store`, because a
-`Txn` mutable variable may only be read inside a block — which is what makes placement 3 exist.
+`Txn` mutable variable may only be read inside a block — which is what placement 1 is for,
+whether or not the block writes.
 
-**3. Inside a read-only block — an as-of sample.** A block that reads a variable it does
-not write is not a writer at all: it mints no commit-time oracle, produces no record, and
-takes no commit slot. It compiles to `AsOf` — the variable as of wherever this read lands
-in the commit order, indexed by the *reading* loop. The cross-endpoint read in the design
-doc's worked example is this shape; §7's Example B deliberately is not, because its
-standalone block *writes*, which makes it a second writer rather than a reader.
+A block that only reads is placement 1 with no write: it is a transaction, it takes a tick,
+and its reply rides its commit like any other. The cross-endpoint read in the design doc's
+worked example is this shape.
 
 ```python
 with begin():
     out << pool
 ```
 
-| Placement | Fires | Indexed by | May read the mutable variable |
+| Placement | Fires | Keyed by | May read the mutable variable |
 |---|---|---|---|
-| inside the writing block | only on commit | the iteration | yes — the block's snapshot, read-your-writes |
+| inside the block | only on commit | the iteration | yes — the block's snapshot, read-your-writes |
 | outside any block | every iteration | the loop's domain | **no** — a bare `Txn` read there is rejected |
-| inside a read-only block | every trigger position | the reading loop | yes — as an as-of sample |
 
 So the rule of thumb is directional: **to gate or commit-order a reply, put it in the
-block that writes.** What you get outside is value-correct and request-indexed, and what
-you get in a read-only block is a sample, never a promise about the final value.
+block.** What you get outside is value-correct and request-indexed, and what a block reads is
+as of its own place in the commit order, never a promise about the final value.
 
 ## 5. Mutability is a type
 
@@ -385,7 +382,6 @@ CHL source
   → transact_phase     three rejection gates, then TRANSACTIONAL elimination → Txn LetRec
   → mut_elim           INDUCTION elimination → causal LetRec
   → channelize         APPEND elimination → the letrec's output channels
-  → live-read rewrite  fed-out mutable variable reads → AsOf
   → lambda_elim        the LetRec travels through; bodies become point-free
   → plan_loops         point-free letrec patterns → the `Transact`
   → planning           the rest of `planning` — joins, group-by, and the iteration
@@ -499,31 +495,29 @@ in for i in [1, 2, 3] do x := x + i; unit; x
 ### `transact_phase` — the transactional slice
 
 Runs **first**, so the induction slice never meets a transaction loop. Three gates ahead of
-it only *reject* — nested transactions, a block writing no transactional variable, a guarded
+it only *reject* — nested transactions, a block writing only induction variables, a guarded
 induction write inside a block — so nothing downstream has to represent those shapes.
 `collect_txn_registers` then yields α-unique names that everything after keys on, rather
 than on syntax. Four steps:
 
-1. **strip** — consume every `Begin`, building one writer site per writing block: its
-   read/write footprint, its loop source, and a decision lambda built by threading
-   read-your-writes, the block's bindings kept as bindings
-   ([Loop-body bindings](../src/ccl/design/mutability.md#loop-body-bindings)). An in-block
-   `<<` becomes a `__to_<defer>` tap on the decision. A *read-only* block leaves
-   no writer site, but its footprint is kept — it is a reason two variables share a store.
+1. **strip** — consume every `Begin`, building one site per block that reads or writes a
+   transactional variable: its read/write footprint, its loop source, and a decision lambda built by
+   threading read-your-writes, the block's bindings kept as bindings ([Loop-body
+   bindings](../src/ccl/design/mutability.md#loop-body-bindings)). An in-block `<<` becomes a
+   `__to_<defer>` tap on the decision. A block that only reads is a site too, with an empty write
+   set.
 2. **partition** — union-find over those footprints, so a program gets one store per set of
-   variables some block actually relates, rather than one store overall. A block is the only
-   thing that forces two variables together, and for two reasons that land on the same set:
-   a writing block commits its keys at one tick, and a read-only block latches its reads at
-   one frontier. A store may not depend on its own `await_final`, checked here because the
-   rule is store-relative: an await of a key in a *different* store is an ordinary edge
+   variables some block actually relates, rather than one store overall. A block is the only thing
+   that forces two variables together: it reads its keys at one snapshot and commits them at one
+   tick, whether or not it writes. A store may not depend on its own `await_final`, checked here
+   because the rule is store-relative: an await of a key in a *different* store is an ordinary edge
    between two recurrences.
 3. **assemble** — one history binding per key (`λ 𝑡 → get_prev_txn(view, 𝑡, init)`), one
    commit-record binding per site over that site's loop domain, its decision evaluated at
    `begin_<site>(𝑟)`.
-4. **rebind** — each key's `let x = init` becomes `let x = as_of_read(hist_x)`, the read whose
-   sampling position `rewrite_as_of_reads` supplies later; each hoisted feed becomes a loop
-   over its tap, `for x in tap: defer << x`. A key read *only* by an await has no reference left to bind and is
-   skipped.
+4. **hoist** — each hoisted feed becomes a loop over its tap, `for x in tap: defer << x`. No
+   key is read outside a block, so the code around a store names its keys only through
+   `await_final`.
 
 Awaits resolve across the same phase: `await_final(x)` becomes `final_read(hist_x)`. A key **no
 writer site writes** never gets that far — its write history is statically empty, so the await
@@ -646,13 +640,9 @@ reply's domain overstates its
 keys](../src/ccl/design/mutability.md#a-replys-domain-overstates-its-keys) records
 what the domain says beyond the items that replied.
 
-### `rewrite_as_of_reads`, then `plan_loops` and the rest of planning
+### `plan_loops` and the rest of planning
 
-`rewrite_as_of_reads` is one rewrite, sitting between `channelize` and `lambda_elim` because
-it needs the pointful shape: afterward the pattern it matches is gone. It turns a fed-out
-read into `as_of`.
-
-Planning then runs in two passes over the same tree, and the listings below are after
+Planning runs in two passes over the same tree, and the listings below are after
 **both** — which is why each writer's source reads `iterate ≫ [1, 2, 3]`. `plan_loops`
 builds the `Transact` and leaves the source bare (`over [1, 2, 3]`); the general planning
 pass that follows is what stages it. Only the first pass is mutability-specific.
@@ -726,12 +716,10 @@ Two wrappers sit on top of that, and neither is mutability-specific:
   and compiles to `StoreFinalRead` per enclosing position;
 - a **co-iterated** read consumes the stream directly, since it is already a `𝐷 ⇀ 𝑉`.
 
-The exception is a `Txn` variable read *out of* a block: `rewrite_as_of_reads` turned that
-into `as_of` back before `lambda_elim`, so it never reaches this dispatch. It becomes
-`AsOf`, indexed by the **trigger** — the reading loop — rather than by the commit clock,
-which is why a reply matches its reader by position and needs no correlation id. A
-standalone read is the singleton-trigger case of the same operator, so there is no separate
-compilation for it. No *ordinary* `Txn` read has a "final value" path: the only read that waits
+A `Txn` variable is read only inside a block, and every block that reads one is a site, so a
+`Txn` read is a transaction's snapshot slot and a reply it feeds is a tap keyed by the item
+it answers, which is why a reply matches its request by position and needs no correlation id.
+No *ordinary* `Txn` read has a "final value" path: the only read that waits
 for completeness is the explicit `await_final`, which is a different term (`final_read`) and a
 different operator (`StoreFinalRead`).
 
@@ -742,13 +730,13 @@ above with a `→ FanOut#N` where the engine should be. §8 draws what is behind
 
 ### The mixed program
 
-The design doc's [worked example](../src/ccl/design/mutability.md#worked-example) puts
-both in one program across two HTTP endpoints — a `Mut(Int, Txn)` variable and an
-induction counter written in the same block, replying on one endpoint and reading as-of
-on the other. It is worth reading once you have these two, because it shows the one thing
-neither shows alone: **the two domains are independent**. The counter advances per
-request; only `Txn`-domain variables join the atomic commit. A program that wants the
-counter transactionally consistent declares it `Mut(Int, Txn)`.
+The design doc's [worked example](../src/ccl/design/mutability.md#worked-example) puts both in one
+program across two HTTP endpoints — a `Mut(Int, Txn)` variable and an induction counter written in
+the same block, replying on one endpoint and reading the variable in a block that only reads on the
+other. It is worth reading once you have these two, because it shows the one thing neither shows
+alone: **the two domains are independent**. The counter advances per request; only `Txn`-domain
+variables join the atomic commit. A program that wants the counter transactionally consistent
+declares it `Mut(Int, Txn)`.
 
 ## 8. Engines
 
@@ -810,7 +798,7 @@ against the direction of the `get` that causes it.
 |---|---|---|
 | store | `InductionStore` | `CommitOperator` + `TransactWriter` |
 | driver | `InductionDriver` | `TransactDriver` |
-| readers | `StoreDenseRead`, `StoreFinalRead` (one per enclosing position under a nest) | `AsOf`, `StoreValueStream`, `StoreFinalRead` |
+| readers | `StoreDenseRead`, `StoreFinalRead` (one per enclosing position under a nest) | `StoreValueStream`, `StoreFinalRead` |
 
 **Why the driver is a separate operator.** The accumulator has to reach the body, and the
 only sanctioned route is a tile pulled along an edge. Splitting the roles puts it on one:
@@ -877,7 +865,6 @@ which no key's changelog records anything.
 | `TransactDriver` | the item cursor, the emitted rows with their items, the `(item, frontier)` retry key | a pull, plus **release** — which is what advances the cursor | the body's `(snapshot…, item)` input |
 | `TransactWriter` | the in-flight proposals, its decided watermark | a decision read, plus the commit-ack release | the proposal stream |
 | `FanOut` (cyclic) | the memo of its input's last tile, per-branch release guards | a non-re-entrant pull refreshes the memo | its input's tile, per branch |
-| `AsOf` | one latched value per trigger position | a trigger position first observed | `trigger ⇀ value` |
 
 ### The dispatch table
 
@@ -890,7 +877,6 @@ between them is the letrec's shape:
 |---|---|
 | a binding read only via `get_prev_seq`, over an induction domain | `InductionStore` (+ `StoreDenseRead`) |
 | commit records + `begin_<site>` oracles + histories read via `get_prev_txn` | the commit operator (+ `TransactWriter`) |
-| a `Txn` history read out of a read-only block | `AsOf` |
 | a non-causal cycle, or a causal shape planning does not know | **compile error** — no silent fallback |
 
 ## Recap

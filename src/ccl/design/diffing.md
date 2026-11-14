@@ -534,8 +534,7 @@ complete phase order. The following table states which representation a diff obs
 | `Inline` | Compute-function bindings inlined and calls beta-reduced. |
 | `Transact` / `Letrec` | Intermediate transaction/induction history rewrites. |
 | `EraseRefinements` | Refinements dropped except on data function domains. |
-| `Channelize` | Deferred collections and feeds rewritten; as-of-read rewriting has not run. |
-| `AsOfRead` | Fed-out mutable reads rewritten, before lambda elimination. |
+| `Channelize` | Deferred collections and feeds rewritten, before lambda elimination. |
 | `LambdaElim` | Point-free term representation before loop recognition and join planning. |
 | `Planning` | Planned CCL consumed by operator conversion. |
 
@@ -566,7 +565,7 @@ body to several call sites. The tests `inlining_erases_function_boundaries` and
 
 `Transact` and `Letrec` expose intermediate history rewrites. They are useful for debugging
 those passes, but a source edit can appear in machinery with no direct source counterpart.
-`AsOfRead` is the last listed stop before lambda elimination; it retains the pointful shape
+`Channelize` is the last listed stop before lambda elimination; it retains the pointful shape
 needed to inspect bindings. Neither phase choice guarantees that one source edit stays one site.
 
 ### `Infer` has already spent some of that locality
