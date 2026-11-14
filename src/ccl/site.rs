@@ -102,6 +102,19 @@ impl Naming {
     }
 }
 
+/// The site of the `index`th place of `kind` spelled `spelling` in the root, outside every
+/// binding: what a test builds a node's site from.
+#[cfg(test)]
+pub(crate) fn root_site(kind: PlaceKind, spelling: &str, index: u32) -> Rc<Site> {
+    Site::written(Place {
+        module: Arc::from([]),
+        bindings: Arc::from([]),
+        kind,
+        spelling: SmolStr::new(spelling),
+        index,
+    })
+}
+
 /// The tags a copairing's recorded type `ty` gives its `n` operands, when it is a channel's:
 /// the arms of the variant its domain is, which are sites' tags (`FieldKey::Name`). A `++`'s arms
 /// are its operands' positions (`FieldKey::Index`), which a pass that flattens one `++` into

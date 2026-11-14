@@ -314,6 +314,7 @@ where
         | N::Proj(_)
         | N::Source(..)
         | N::LoadFrom(_)
+        | N::Reading(_)
         | N::Defer
         | N::Abstract
         | N::Error => {}
@@ -645,6 +646,7 @@ where
         | N::Proj(_)
         | N::Source(..)
         | N::LoadFrom(_)
+        | N::Reading(_)
         | N::Defer
         | N::Abstract
         | N::Error
@@ -824,6 +826,10 @@ mod tests {
             node(N::Proj(ProjKey::Index(0))),
             node(N::Source("src".into(), Vec::new())),
             node(N::LoadFrom("load_from_var".into())),
+            node(N::Reading(crate::ccl::Reading {
+                kind: crate::ccl::ReadingKind::Clock,
+                site: crate::ccl::site::root_site(crate::ccl::site::PlaceKind::Builtin, "clock", 0),
+            })),
             node(N::Defer),
             node(N::Abstract),
             node(N::Error),
@@ -949,6 +955,7 @@ mod tests {
         N::Proj(_) => "Proj",
         N::Source(..) => "Source",
         N::LoadFrom(_) => "LoadFrom",
+        N::Reading(_) => "Reading",
         N::Defer => "Defer",
         N::Abstract => "Abstract",
         N::Error => "Error",

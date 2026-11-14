@@ -3150,6 +3150,12 @@ fn run_passes(
     expr = recorded(capture_provenance, Phase::Inline, || {
         inline::inline_compute_lambdas(expr)
     });
+    crate::ccl::observe_world::check_filters(&expr).map_err(|message| {
+        vec![CompileError::Internal {
+            stage: "observeWorld",
+            message,
+        }]
+    })?;
     settle(
         &expr,
         "post-inline",

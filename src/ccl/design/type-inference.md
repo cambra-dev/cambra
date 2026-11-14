@@ -4461,6 +4461,7 @@ frame's filter. Capabilities are recorded on the node that does them:
 | `Feed` or `Define` into 𝑓 | `Append(𝑓)` |
 | `Begin` | `RunTransaction`; its body's frame discharges `Transaction` |
 | `Source` | `ObserveWorld` |
+| `Reading` | `ObserveWorld` |
 | a sink binding's `Defer` (`lower::SINK_BINDING`) | `AffectWorld` |
 | the declaration of a transactional variable 𝑥, which a module's top level holds (`InferCtx::bind_capability_name`) | `WriteTxn(𝑥)` |
 | the declaration of a public feed 𝑓 at a module's top level | `Append(𝑓)` |

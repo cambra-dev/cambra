@@ -6,8 +6,8 @@ use smol_str::SmolStr;
 
 use crate::{
     ccl::{
-        AggregateKind, Builtin, Expr, F_WRITES, FieldKey, Lit, Name, ProjKey, TagMap, TransactKey,
-        Type, TypedExprNode, V_COMMIT, WriterSite,
+        AggregateKind, Builtin, Expr, F_WRITES, FieldKey, Lit, Name, ProjKey, Reading, TagMap,
+        TransactKey, Type, TypedExprNode, V_COMMIT, WriterSite,
         ccl_utils::strip_refinements,
         ccl_utils::{free_names, is_trivially_true_predicate},
         content_hash::{ContentHash, content_hash},
@@ -47,9 +47,9 @@ use crate::{
             Aggregate, CheckedLookup, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut,
             Filter, FlattenTupleDomain, IterateExtent, Lookup, MakeRecord, MapAggregate, MapDomain,
             MapExtractAggregate, MapResult, MapResultToConst, MapResultToConstMode,
-            MapResultWithSource, Memo, PermuteRecordDomain, Product, Restrict, SelectField,
-            TileOperator, Tiling, Uncurry, UnionOperator, VariantIs, VariantProject, VariantWrap,
-            zip_arms_at, zip_arms_named_at,
+            MapResultWithSource, Memo, PermuteRecordDomain, Product, ReadingSource, Readings,
+            Restrict, SelectField, TileOperator, Tiling, Uncurry, UnionOperator, VariantIs,
+            VariantProject, VariantWrap, zip_arms_at, zip_arms_named_at,
         },
         tuple_field,
         uint_of_row,
@@ -115,7 +115,8 @@ pub fn convert_to_operators(
     expr: &Expr,
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
-    let op = convert_impl(expr, None, ctx)?;
+    [ctx.reading_a_source] = nodes_reaching(expr, [reads_a_source]);
+    let op = convert_root(expr, ctx)?;
     // A pure program has one synthetic output, so its sink belongs to the
     // expression that produced it — the program root.
     {
@@ -127,6 +128,26 @@ pub fn convert_to_operators(
 
 /// One compiled operator per program output.
 pub type OutputOperators = Vec<(SmolStr, Box<dyn TileOperator>)>;
+
+/// The program's value: its top-level bindings, then the value they are bound over, which the
+/// main output reads ([`OpConversionContext::bind_output`]).
+fn convert_root(
+    expr: &Expr,
+    ctx: &mut OpConversionContext,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
+    match &expr.node {
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            let mut scope = ctx.enter_scope();
+            compile_let_binding(expr.node_id(), binding, bound_expr, None, &mut scope)?;
+            convert_root(body, &mut scope)
+        }
+        _ => ctx.bind_output(expr),
+    }
+}
 
 /// Compile a `Let`'s bound expression into the innermost scope, shared by both
 /// conversion entry points, and return the input its body is converted with.
@@ -211,6 +232,15 @@ pub fn convert_outputs_to_operators(
     expr: &Expr,
     ctx: &mut OpConversionContext,
 ) -> Result<OutputOperators, ConversionError> {
+    [ctx.reading_a_source] = nodes_reaching(expr, [reads_a_source]);
+    convert_outputs(expr, ctx)
+}
+
+/// [`convert_outputs_to_operators`] past its walk of the whole tree.
+fn convert_outputs(
+    expr: &Expr,
+    ctx: &mut OpConversionContext,
+) -> Result<OutputOperators, ConversionError> {
     match &expr.node {
         TypedExprNode::Let {
             binding,
@@ -221,7 +251,7 @@ pub fn convert_outputs_to_operators(
             // No surrounding iteration here — this entry point compiles a
             // `Let* Record` chain from the top — so every binding is free.
             compile_let_binding(expr.node_id(), binding, bound_expr, None, &mut scope)?;
-            convert_outputs_to_operators(body, &mut scope)
+            convert_outputs(body, &mut scope)
         }
         TypedExprNode::Record(outs) => outs
             .iter()
@@ -231,7 +261,7 @@ pub fn convert_outputs_to_operators(
                      value: elt,
                      ..
                  }| {
-                    let op = convert_impl(elt, None, ctx)?;
+                    let op = ctx.bind_output(elt)?;
                     // The sink is the program's output boundary, so it belongs to the
                     // output expression rather than to the record or the program root.
                     let _scope = crate::ccl::provenance::converting(elt.node_id());
@@ -452,6 +482,12 @@ pub struct OpConversionContext {
     /// ([`reads_a_source`]). Installed by the same call, because both answer
     /// about the tree rather than about the compilation.
     unrecomputable: HashSet<NodeId>,
+    /// The source of each reading site's values ([`Self::reading_source`]).
+    readings: HashMap<Rc<crate::ccl::site::Site>, Rc<RefCell<ReadingSource>>>,
+    /// The nodes of the tree being converted whose value comes from a data source, through the
+    /// bindings between ([`nodes_reaching`]), on every compilation: an output reading one is a
+    /// reuse boundary ([`bind_output`](Self::bind_output)).
+    reading_a_source: HashSet<NodeId>,
     /// The nodes of that tree whose value comes from a `@LoadFrom`
     /// ([`is_a_load`]). Off the same [`nodes_reaching`] walk as the field above,
     /// and read where a store decides whether its seed summarizes positions.
@@ -901,6 +937,22 @@ impl OpConversionContext {
         );
         [self.unrecomputable, self.load_from_derived] =
             nodes_reaching(expr, [reads_a_source, is_a_load]);
+        self.readings.clear();
+    }
+
+    /// The source of `reading`'s site, which every copy of the call reads.
+    fn reading_source(&mut self, reading: &Reading) -> Rc<RefCell<ReadingSource>> {
+        let source = self
+            .readings
+            .entry(Rc::clone(&reading.site))
+            .or_insert_with(|| Rc::new(RefCell::new(ReadingSource::new(reading.kind))));
+        assert_eq!(
+            source.borrow().kind(),
+            reading.kind,
+            "one site is one call, of one kind of reading: {}",
+            reading.site,
+        );
+        Rc::clone(source)
     }
 
     /// Install where each node of the tree about to be converted stood in the
@@ -956,6 +1008,47 @@ impl OpConversionContext {
     /// is recomputable outside a reload, since nothing has been released.
     fn recomputable(&self, term: &Expr) -> bool {
         !self.unrecomputable.contains(&term.node_id())
+    }
+
+    /// Compile `term`, a value an output reads, reusing the operator a previous version built for
+    /// it where the two versions correspond and nothing it reads was rebuilt, as
+    /// [`bind_let`](Self::bind_let) reuses a binding's.
+    ///
+    /// An output is a reuse boundary for the reason a binding is: what the operator under it holds
+    /// may be all there is of what it computed. An operator inside, a [`Memo`] a zip's arms
+    /// share among them, releases what its input supplied once it holds it, so a source keeps
+    /// only what no retired producer had finished with, and a rebuild over it starts there. Keeping
+    /// the output's operator keeps what it holds; rebuilding it would lose the positions it had
+    /// taken. No [`Memo`] is interposed: one reader, the output, pulls it.
+    fn bind_output(&mut self, term: &Expr) -> Result<Box<dyn TileOperator>, ConversionError> {
+        // A rebuild of a term that reads no source reproduces everything it held, so only one
+        // that reads a source needs the fan-out a kept operator is handed on through.
+        if !self.reading_a_source.contains(&term.node_id()) {
+            return convert_impl(term, None, self);
+        }
+        let _scope = crate::ccl::provenance::converting(term.node_id());
+        self.reuse.bound += 1;
+        let correspondent = self
+            .reads_only_kept(term)
+            .then(|| self.correspondent(term))
+            .flatten();
+        let spent_but_rebuildable = correspondent
+            .as_ref()
+            .is_some_and(|e| e.fan().released_in_full() && self.recomputable(term));
+        if let Some(entry) = correspondent
+            && !spent_but_rebuildable
+        {
+            self.reuse.kept += 1;
+            trace!("keeping operator for an output");
+            self.keep_region(term, entry.fan());
+            let fan = entry.fan().clone();
+            self.record(term.node_id(), entry);
+            return Ok(fan.slot());
+        }
+        let op = convert_impl(term, None, self)?;
+        let fan = Rc::new(FanOut::new(op));
+        self.record(term.node_id(), Recorded::Operator(fan.clone()));
+        Ok(fan.slot())
     }
 
     /// Whether the operator behind `bound_expr` may be kept — that is, whether
@@ -3144,6 +3237,12 @@ fn convert_impl_inner(
                         payload_extent,
                     )))
                 }
+                // A reading at each position its input holds: the run records one value per
+                // position and call path.
+                Builtin::Reading(reading) => {
+                    let source = ctx.reading_source(reading);
+                    Ok(Box::new(Readings::at(input, source, ctx.level())))
+                }
                 // `variant_is(c)` — the total tag test. Same scrutinee shapes as
                 // `variant_project(c)`, but every key of the domain is answered,
                 // which is what a writer decision's guard position takes.
@@ -3399,6 +3498,18 @@ fn convert_impl_inner(
             Ok(Box::new(MapResultWithSource::projecting(
                 source, input, fields,
             )))
+        }
+
+        // A reading with no position operand stands outside every loop, at the one position
+        // with no keys (`src/ccl/observe_world.rs`). Under a lambda it is constant in the
+        // binder, so `lambda_elim` has made it a `const` and it is converted with no input.
+        TypedExprNode::Reading(reading) => {
+            assert!(
+                input.is_none(),
+                "a reading with no position operand is converted outside every loop: {}",
+                reading.site,
+            );
+            Ok(Box::new(Readings::once(ctx.reading_source(reading))))
         }
 
         // `@LoadFrom(x)`: the value the retired version held, as a constant.

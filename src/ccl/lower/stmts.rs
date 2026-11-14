@@ -13,7 +13,7 @@ use super::*;
 use crate::{
     ccl::{
         BaseType, BindingTransparency, Branch, Expr, FieldKey, Label, Lit, Pattern, PatternHead,
-        Type, TypedBinding, TypedExprNode,
+        Reading, ReadingKind, Type, TypedBinding, TypedExprNode,
     },
     chl_parser::ast::{
         AnnotationMode, ArmPattern, AssignTarget, BinOp as ChlBinOp, Clause, EntryForm, IfBranch,
@@ -1058,7 +1058,12 @@ pub(super) fn lower_middle_stmt(
             requires,
             causes,
             body: fn_body,
+            builtin,
         } => {
+            let supplied = match builtin {
+                None => None,
+                Some(at) => Some(builtin_body(*at, &name.node, is_top_level, ctx)?),
+            };
             let (func_expr, annotation) = lower_def(
                 stmt.span,
                 type_params,
@@ -1066,7 +1071,10 @@ pub(super) fn lower_middle_stmt(
                 output.as_ref(),
                 requires,
                 causes,
-                fn_body,
+                match &supplied {
+                    None => DefBody::Written(fn_body),
+                    Some(body) => DefBody::Supplied(body),
+                },
                 ctx,
             )?;
             Ok(bind_lowered_function(
@@ -1374,7 +1382,7 @@ fn stand_in_for_failed(
                 output.as_ref(),
                 requires,
                 causes,
-                &omitted,
+                DefBody::Written(&omitted),
                 ctx,
             ) {
                 return bind_lowered_function(name, function, annotation, body, stmt.span, ctx);
@@ -5421,6 +5429,37 @@ pub(super) fn lower_if(
         }),
         if_span,
     ))
+}
+
+/// The body the compiler supplies for the `@Builtin` function `name`, marked at `at`: a reading
+/// keyed by the function's site, for a function of a std module's top level the compiler knows
+/// by its path (`docs/chl-spec.md`, "9.16 The std root").
+fn builtin_body(
+    at: Span,
+    name: &str,
+    is_top_level: bool,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    let module = ctx.module.labels.as_ref().filter(|m| m.is_std());
+    let (Some(module), true) = (module, is_top_level) else {
+        return Err(LoweringError::unsupported(
+            at,
+            "a `@Builtin` function is declared at a std module's top level, and the compiler \
+             supplies its body",
+        ));
+    };
+    let Some(kind) = ReadingKind::supplied_by(&module.to_string(), name) else {
+        return Err(LoweringError::unsupported(
+            at,
+            format!("the compiler supplies no function `{module}::{name}`"),
+        ));
+    };
+    let reading = Expr::new(TypedExprNode::Reading(Reading {
+        kind,
+        site: ctx.places.site(at),
+    }))
+    .with_ty(Type::Base(BaseType::Int));
+    Ok(ctx.tag_image(reading, at))
 }
 
 #[cfg(test)]

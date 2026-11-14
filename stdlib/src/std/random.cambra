@@ -1,0 +1,25 @@
+# Random values: a reading whose value comes from the runtime's random source.
+#
+# `std::random` declares no state and opens no source, so a module imports it
+# (docs/chl-spec.md, "9.7 Importing asserts a shareable module"). A call is a reading, so it
+# requires `ObserveWorld`, and a module whose top level calls `next()` is run.
+#
+# Example, a token for each request, the same token wherever the iteration reads it:
+#
+#     import std::random
+#     tokens: Feed(_)
+#     for r in requests:
+#         t = random::next()
+#         tokens << (request=r, token=t)
+#
+# Status: [Decided] (docs/chl-spec.md, "Inputs from outside the program"). The std root it belongs
+# to is [Planned] (docs/chl-spec.md, "9.16 The std root").
+
+# Returns a random `Int`: a reading, whose value the compiler supplies (docs/chl-spec.md, "9.16 The
+# std root").
+#
+# - A call has one value at each position, the iterations of the loops around it, and call path
+#   (docs/chl-spec.md, "Inputs from outside the program"). Two calls are two readings, and one call
+#   evaluated again at its position returns its value again.
+@Builtin
+pub def next() => Int requires ObserveWorld

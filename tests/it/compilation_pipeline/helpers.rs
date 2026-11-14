@@ -66,15 +66,21 @@ pub(crate) fn operator_kinds_over_source1(code: &str) -> Vec<&'static str> {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let program = LoadedProgram::test(code);
     let compiled = compile_program(&mut ctx, &program, consumer).unwrap_or_render(&program);
-    compiled
-        .operator_graph
-        .nodes()
-        .iter()
-        .filter_map(|node| match node {
-            GraphNode::Operator { kind, .. } => Some(*kind),
-            GraphNode::Sink { .. } => None,
-        })
-        .collect()
+    // Nodes come in postorder, each sink after its output's root. An output reading a source
+    // is a reuse boundary, a fan-out slot a reload hands its operator on through, which is no
+    // part of the chain the output computes and is left out.
+    let mut kinds = Vec::new();
+    for node in compiled.operator_graph.nodes() {
+        match node {
+            GraphNode::Operator { kind, .. } => kinds.push(*kind),
+            GraphNode::Sink { .. } => {
+                if kinds.last() == Some(&"FanOutSlot") {
+                    kinds.pop();
+                }
+            }
+        }
+    }
+    kinds
 }
 
 /// The most values each kind of operator held at any lap of running `code` to its end, by

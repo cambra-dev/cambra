@@ -41,6 +41,17 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
 }
 
+/// `root`, loaded against the std modules under `stdlib/src/`, which the compiler does not embed
+/// yet, with every other module's file read from `files`.
+pub(crate) fn load_against_std(root: RootFile, files: &mut InMemory) -> LoadedProgram {
+    let std = std_modules();
+    let std: Vec<(&str, &str)> = std
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect();
+    LoadedProgram::load_with_std(root, files, &std)
+}
+
 /// Every std module, by module path and source text: `stdlib/src/std/time.cambra` is
 /// `std::time` (`docs/chl-spec.md`, "9.15 Module files").
 fn std_modules() -> Vec<(String, String)> {

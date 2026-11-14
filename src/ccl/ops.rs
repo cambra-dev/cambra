@@ -962,6 +962,75 @@ pub enum Builtin {
     /// **Never executed.** It appears only in [`Self::IntToUint`]'s codomain refinement,
     /// which nothing compiles into a filter, and CHL has no spelling for it.
     IntEqUint,
+    /// `reading(i) : 𝐴 ⇒ 𝑉` — the reading `i` at the position its argument holds
+    /// (`docs/chl-spec.md`, "Inputs from outside the program"): the run records one value per
+    /// position, and returns it wherever the argument holds that position again.
+    ///
+    /// Minted by `ObserveWorld` elimination, applied to the positions of the loops around a
+    /// [`TypedExprNode::Reading`] (`src/ccl/design/ir.md`, "Readings"). Its type is stamped on
+    /// the node, as [`Self::VariantIs`]'s is.
+    ///
+    /// [`TypedExprNode::Reading`]: crate::ccl::TypedExprNode::Reading
+    Reading(Reading),
+}
+
+/// One reading: which kind, and the site of the call
+/// (`docs/chl-spec.md`, "Inputs from outside the program"; `src/ccl/design/sites.md`).
+///
+/// The site is the call's place, reached through each call of a function inlining copied it
+/// through, outermost first. A pass that copies a term copies the site with it, so every copy of
+/// one evaluation is one reading, and two calls are two. Equality includes the site, so two
+/// calls are unequal terms (`src/ccl/design/ir.md`, "Readings").
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Reading {
+    pub kind: ReadingKind,
+    pub site: std::rc::Rc<crate::ccl::site::Site>,
+}
+
+impl Reading {
+    /// This reading reached through the call `call`, which inlining replaced by the body
+    /// holding it.
+    pub fn through(&mut self, call: &crate::ccl::site::Site) {
+        self.site = self.site.through(call);
+    }
+}
+
+/// What a `@Builtin` std function whose value comes from outside the program reads: a reading
+/// (`docs/chl-spec.md`, "Inputs from outside the program"). The compiler supplies the function's
+/// body by its path (`docs/chl-spec.md`, "9.16 The std root").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ReadingKind {
+    /// `std::time::clock()`: the runtime's clock, in nanoseconds since the Unix epoch.
+    Clock,
+    /// `std::random::next()`: a random `Int`.
+    Random,
+}
+
+impl ReadingKind {
+    /// Every kind of reading.
+    pub const ALL: [ReadingKind; 2] = [ReadingKind::Clock, ReadingKind::Random];
+
+    /// The std module and the name of the `@Builtin` function whose body this reading is.
+    pub fn declared_at(self) -> (&'static str, &'static str) {
+        match self {
+            ReadingKind::Clock => ("std::time", "clock"),
+            ReadingKind::Random => ("std::random", "next"),
+        }
+    }
+
+    /// The reading the `@Builtin` function `name` of the std module `module` takes, if any.
+    pub fn supplied_by(module: &str, name: &str) -> Option<ReadingKind> {
+        Self::ALL
+            .into_iter()
+            .find(|k| k.declared_at() == (module, name))
+    }
+}
+
+impl fmt::Display for ReadingKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (module, name) = self.declared_at();
+        write!(f, "{module}::{name}")
+    }
 }
 
 impl Builtin {
@@ -1018,6 +1087,7 @@ impl Builtin {
             Self::VariantIs(_) => "variant_is",
             Self::IntToUint => "int_to_uint",
             Self::IntEqUint => "int_eq_uint",
+            Self::Reading(_) => "reading",
         }
     }
 

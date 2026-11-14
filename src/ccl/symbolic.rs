@@ -364,6 +364,7 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         }
 
         TypedExprNode::LoadFrom(name) => (Precedence::Atom, format!("load_from({name})")),
+        TypedExprNode::Reading(reading) => (Precedence::Atom, format!("{}()", reading.kind)),
 
         TypedExprNode::Builtin(Builtin::VariantProject(tag)) => {
             (Precedence::Atom, format!("variant_project(`{tag})"))
@@ -380,6 +381,10 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
 
         TypedExprNode::Builtin(Builtin::VariantIs(tag)) => {
             (Precedence::Atom, format!("variant_is(`{tag})"))
+        }
+
+        TypedExprNode::Builtin(Builtin::Reading(reading)) => {
+            (Precedence::Atom, format!("reading({})", reading.kind))
         }
 
         TypedExprNode::Builtin(b) => (Precedence::Atom, b.name().to_string()),

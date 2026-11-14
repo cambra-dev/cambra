@@ -32,6 +32,7 @@ pub mod mut_read;
 pub mod mut_scope;
 pub mod names;
 pub mod nominal;
+pub mod observe_world;
 pub mod opaque_output;
 pub mod panes;
 pub mod planning;

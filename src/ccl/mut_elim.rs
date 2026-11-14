@@ -2489,8 +2489,8 @@ pub(crate) fn fold_induction_loop(
     );
 
     let r = position.clone();
-    // The item at the position: a group's reads its key.
-    let item_ty = {
+    // The element at the position: a group's reads its key.
+    let element_ty = {
         let source = source_fun(&iter.ty);
         let Type::Fun { name, codomain, .. } = &source else {
             panic!("letrec phase: loop source is not a function: {source}")
@@ -2498,6 +2498,17 @@ pub(crate) fn fold_induction_loop(
         crate::ccl::subst::codomain_renamed(name.as_ref(), &r, codomain)
     };
     let domain_ty = loop_domain(iter);
+    // The writer's argument carries nothing per position but the item, so a body whose value
+    // reads the loop's position (a reading's operand, `src/ccl/observe_world.rs`) takes it from
+    // the item, `(r, r ▷ iter)`. A type reading it stays over `r`, which `read_at_position`
+    // reads at each position.
+    let reads_position =
+        crate::ccl::free_names::count(position, &loop_body, crate::ccl::free_names::VALUE_READS)
+            > 0;
+    let item_ty = match reads_position {
+        true => Type::Tuple(vec![domain_ty.clone(), element_ty.clone()]),
+        false => element_ty.clone(),
+    };
     let acc_tys: Vec<Type> = accs.iter().map(|a| a.ty.clone()).collect();
     // The proposed write set, labelled by the accumulators' own names. A
     // positional tuple reads the same everywhere downstream and costs nothing
@@ -2525,7 +2536,20 @@ pub(crate) fn fold_induction_loop(
         let _g = acc.enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
         env.insert(acc.name.clone(), param.snapshot(i));
     }
-    env.insert(target.name.clone(), param.item());
+    if reads_position {
+        let item = param.item();
+        let component = |i: usize, ty: &Type| {
+            let mut proj = Expr::proj_index(i);
+            proj.ty = Type::fun(item_ty.clone(), ty.clone());
+            let mut app = Expr::apply(item.clone(), proj);
+            app.ty = ty.clone();
+            app
+        };
+        env.insert(position.clone(), component(0, &domain_ty));
+        env.insert(target.name.clone(), component(1, &element_ty));
+    } else {
+        env.insert(target.name.clone(), param.item());
+    }
     let p = param.name.clone();
     let p_ty = param.ty.clone();
 
@@ -2570,7 +2594,11 @@ pub(crate) fn fold_induction_loop(
         })
         .collect();
     let mut item_read = Expr::apply(tvar(&r, domain_ty.clone()), unboxed_source(iter));
-    item_read.ty = item_ty.clone();
+    item_read.ty = element_ty.clone();
+    if reads_position {
+        item_read = Expr::tuple(vec![tvar(&r, domain_ty.clone()), item_read]);
+        item_read.ty = item_ty.clone();
+    }
     snap_elts.push(item_read);
     // The type rewrites read the argument without placing it, so they take copies that keep
     // its identity; the term places the argument itself.

@@ -614,6 +614,15 @@ fn lower_for_body_stmts_scoped(
                 ));
             }
             ChlStmt::FunctionDef {
+                builtin: Some(builtin),
+                ..
+            } => {
+                return Err(LoweringError::unsupported(
+                    *builtin,
+                    "a `@Builtin` function is declared at a std module's top level",
+                ));
+            }
+            ChlStmt::FunctionDef {
                 owner: None,
                 name,
                 type_params,
@@ -622,6 +631,7 @@ fn lower_for_body_stmts_scoped(
                 requires,
                 causes,
                 body: fn_body,
+                builtin: None,
             } => {
                 let name_str = name.node.as_str().to_string();
                 if mutation_scope.contains(&name_str) {
@@ -634,7 +644,7 @@ fn lower_for_body_stmts_scoped(
                     output.as_ref(),
                     requires,
                     causes,
-                    fn_body,
+                    DefBody::Written(fn_body),
                     ctx,
                 )?;
                 frame_introduced.insert(name_str.clone());

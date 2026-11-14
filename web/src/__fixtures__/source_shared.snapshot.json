@@ -4572,8 +4572,37 @@
           ]
         },
         {
-          "label": "Sink(main)",
+          "label": "FanOutSlot",
           "nodeId": 442,
+          "role": "operator",
+          "tiling": "{Fn(Source(stdin) → String), Fn(Source(stdin) → String)}",
+          "spans": [
+            {
+              "file": 0,
+              "start": 87,
+              "end": 103
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": {
+                "kind": "named",
+                "name": "fan"
+              },
+              "kind": "share",
+              "deferred": false,
+              "subscribed": 441
+            }
+          ]
+        },
+        {
+          "label": "Sink(main)",
+          "nodeId": 443,
           "role": "sink",
           "tiling": null,
           "spans": [
@@ -4596,7 +4625,7 @@
               },
               "kind": "value",
               "deferred": false,
-              "subscribed": 441
+              "subscribed": 442
             }
           ]
         }
@@ -5343,6 +5372,10 @@
           441
         ],
         [
+          404,
+          442
+        ],
+        [
           405,
           439
         ],
@@ -5360,7 +5393,7 @@
         ],
         [
           408,
-          442
+          443
         ],
         [
           421,
