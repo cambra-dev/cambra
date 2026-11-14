@@ -341,6 +341,17 @@ fn align_sub(sub: &Type, sup: &Type) -> Type {
                 .map(|(a, b)| align_sub(a, b))
                 .collect(),
         ),
+        // A tuple instantiated at a dependent tuple's components reads the earlier ones as they
+        // do, by index, so it is that dependent tuple, under its names. One whose components
+        // read none is the plain tuple still ([`Type::closed_dep_tuple`]).
+        (Type::Tuple(subs), Type::DepTuple(sups)) if subs.len() == sups.len() => {
+            Type::closed_dep_tuple(
+                subs.iter()
+                    .zip(sups)
+                    .map(|(a, (name, b))| (name.clone(), align_sub(a, b)))
+                    .collect(),
+            )
+        }
         (Type::Record(subs), Type::Record(sups)) => Type::Record(
             subs.iter()
                 .map(|(label, a)| match sups.iter().find(|(l, _)| l == label) {
@@ -593,6 +604,21 @@ fn match_direct(
                 match_direct(p, a, params, &inner, out, met);
                 if let Some(ours) = pn {
                     inner.push((ours.clone(), an.clone().unwrap_or_else(|| ours.clone())));
+                }
+            }
+        }
+        // A plain tuple is the dependent tuple whose components read none before them.
+        (Type::Tuple(ps), Type::DepTuple(acts)) if ps.len() == acts.len() => {
+            for (p, (_, a)) in ps.iter().zip(acts) {
+                match_direct(p, a, params, pairs, out, met);
+            }
+        }
+        (Type::DepTuple(ps), Type::Tuple(acts)) if ps.len() == acts.len() => {
+            let mut inner = pairs.to_vec();
+            for ((pn, p), a) in ps.iter().zip(acts) {
+                match_direct(p, a, params, &inner, out, met);
+                if let Some(ours) = pn {
+                    inner.push((ours.clone(), ours.clone()));
                 }
             }
         }

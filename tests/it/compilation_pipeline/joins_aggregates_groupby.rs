@@ -751,6 +751,46 @@ fn groups_read_at_the_keys_of_nested_loops(#[case] body: &str, #[case] expected:
     );
 }
 
+/// Groups read at the keys of nested `for` loops. An inner loop's writer takes the pair of the
+/// enclosing value and its position, and its group reads the pair's halves
+/// (`src/ccl/design/ir.md`, "`Transact` — the domain-parameterized recurrence carrier").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::both_groups("t := t + sum(g1) + sum(g2)", 24)]
+#[case::the_inner_group("t := t + sum(g2)", 12)]
+#[case::the_outer_group("t := t + sum(g1)", 12)]
+#[case::the_inner_group_s_elements(
+    indoc! {"
+        for x in g2:
+            t := t + x
+    "},
+    12
+)]
+#[case::both_groups_elements(
+    indoc! {"
+        for x in g1:
+            t := t + x
+        for y in g2:
+            t := t + y
+    "},
+    24
+)]
+#[case::their_maxima("t := t + max(g1) * max(g2)", 16)]
+fn groups_read_at_the_keys_of_nested_for_loops(#[case] body: &str, #[case] expected: i64) {
+    let body = body.lines().collect::<Vec<_>>().join("\n        ");
+    check_scalar(
+        &formatdoc! {r"
+            g = groupby([1, 2, 3], \x -> x > 1)
+            t := 0
+            for g1 in g:
+                for g2 in g:
+                    {body}
+            t
+        "},
+        Value::Int(expected),
+    );
+}
+
 /// The sharing [`test_shared_grouping`] *describes*, pinned.
 ///
 /// Those value assertions hold whether the partition is bucketized once or
