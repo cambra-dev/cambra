@@ -2307,7 +2307,9 @@ Rendering a bound is different from transporting an edge. `Bound::render_subst` 
 content substitution with the inverse of the holder substitution. If the latter is not invertible,
 it preserves the invertible rename part and leaves the discharge part unapplied: the content is
 already in the post-discharge context. A non-injective rename part can also fall back to identity.
-Debug checks require every untransported binder to be absent from the content.
+Debug checks require every untransported binder to be absent from the content as the content
+substitution leaves it. Both sides of a dependent application discharge the parameter, so content
+naming it is in the post-discharge context once its own substitution has acted.
 Dropping the whole mixed substitution would also drop useful renames.
 
 A bound under a discharge states a fact about an instance `𝑉[σ]`. Compaction reads it as `𝑉`'s

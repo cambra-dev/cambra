@@ -744,6 +744,12 @@ fn a_let_outside_a_filtered_comprehension_moves_into_both_copies_of_its_source()
 // A correlated **filter** beside a correlated body, the filter riding the pair it filters
 // (`src/ccl/planning/correlated.rs`): 1*(2+3) + 2*3.
 #[case::correlated_filter("sum([sum([v * r for v in [1, 2, 3] if v > r]) for r in [1, 2]])", 11)]
+// The same filter on a comprehension that a second generator flattens, rather than summed
+// per row: (2 + 3) + 3.
+#[case::correlated_filter_flattened(
+    "sum([q for r in [1, 2] for q in [v for v in [1, 2, 3] if v > r]])",
+    8
+)]
 // A filter reading only the element, beside a body that reads the outer binder. It rides
 // the pair like a correlated one, since neither inner-source builder narrows the inner
 // domain itself, and stays on the component too, which states what the element is.
