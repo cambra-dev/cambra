@@ -164,9 +164,9 @@ pub struct TypeInferenceContext {
     /// The program's trait instances, which lowering builds.
     pub(crate) instances: Rc<InstanceTable>,
 
-    /// The `ExprStmt` of each expression statement the program writes, which lowering
-    /// records ([`crate::ccl::lower::LoweringContext`]).
-    pub(crate) expression_statements: HashSet<NodeId>,
+    /// What lowering marks each marked node as: an expression statement or a sink binding
+    /// ([`crate::ccl::lower::marked_nodes`]).
+    pub(crate) marks: HashMap<NodeId, crate::ccl::lower::Mark>,
 
     /// The binders of the root's public members, which the linked program's inference holds
     /// to what a public member's type may name, as a module check does its module's.
@@ -2236,7 +2236,7 @@ pub fn infer(
         &ctx.source_types,
         &ctx.instances,
         &ctx.root_public,
-        &ctx.expression_statements,
+        &ctx.marks,
     );
     #[cfg(debug_assertions)]
     if std::env::var_os("DUMP_KINDS").is_some() {
@@ -2281,7 +2281,7 @@ pub fn check_module(
         params,
         reported,
         public,
-        &ctx.expression_statements,
+        &ctx.marks,
         true,
     );
     let Some(super::Inferred {
@@ -2351,9 +2351,9 @@ pub struct ModuleCheckResult {
     pub(crate) before: Expr,
     /// Contracts established by surviving definitions or complete declarations.
     pub contracts: HashMap<Name, Contract>,
-    /// What the module's top level requires and causes, less what its scopes discharge, where
-    /// the check leaves a typed tree.
-    pub top_level: Option<crate::ccl::capabilities::CapabilitySet>,
+    /// What the module's top level requires and causes, less what its scopes discharge, each
+    /// capability at the node where it entered, where the check leaves a typed tree.
+    pub top_level: Option<Vec<crate::ccl::capabilities::ScopedCapability>>,
     /// Errors from the module and every recovery run.
     pub errors: Vec<LocatedInferError>,
     pub(crate) has_typed_tree: bool,

@@ -4461,6 +4461,9 @@ frame's filter. Capabilities are recorded on the node that does them:
 | `Feed` or `Define` into 𝑓 | `Append(𝑓)` |
 | `Begin` | `RunTransaction`; its body's frame discharges `Transaction` |
 | `Source` | `ObserveWorld` |
+| a sink binding's `Defer` (`lower::SINK_BINDING`) | `AffectWorld` |
+| the declaration of a transactional variable 𝑥, which a module's top level holds (`InferCtx::bind_capability_name`) | `WriteTxn(𝑥)` |
+| the declaration of a public feed 𝑓 at a module's top level | `Append(𝑓)` |
 | a value read of a transactional variable 𝑥 | `ReadTxn(𝑥)` and `Transaction` |
 | a value read of an induction variable 𝑥 | `Read(𝑥)` |
 | an `Apply` passing 𝑎 to a `Mut` parameter | `Read(𝑎)` and `Write(𝑎)`, or `ReadTxn(𝑎)` and `WriteTxn(𝑎)` when 𝑎 is transactional |
@@ -4631,11 +4634,11 @@ function's own.
 **Statements.** An expression statement a program writes before its block's last statement gets a
 capability variable of its own around its expression's, which keeps every capability, the enclosing
 function's own variables' included, as every node's does (`Typing::statement`; lowering labels each
-one `lower::EXPRESSION_STATEMENT`, which `lower::expression_statements` reads). A parameter's
-capability is `Bound::Parameter`: it reaches the statement's variable and no function body's type. A
-statement whose variable causes nothing is inert (`InferError::InertStatement`), unless it reaches a
-call variable with nothing flowing into it, the call of a function a polymorphic definition takes as
-a parameter, which only each use determines (`InferCtx::inert_statements`). Inference returns the
+one `lower::EXPRESSION_STATEMENT`, which `lower::marked_nodes` reads). A parameter's capability is
+`Bound::Parameter`: it reaches the statement's variable and no function body's type. A statement
+whose variable causes nothing is inert (`InferError::InertStatement`), unless it reaches a call
+variable with nothing flowing into it, the call of a function a polymorphic definition takes as a
+parameter, which only each use determines (`InferCtx::inert_statements`). Inference returns the
 inert statements, and the compile reports them only where inference reports no error: an argument
 passed wrongly by reference, which inference refuses, is the more precise diagnosis.
 

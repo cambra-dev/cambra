@@ -795,52 +795,37 @@ fn a_misused_import_argument_is_refused(#[case] root: &str, #[case] needle: &str
     assert_refused(&program(root, &[("scaled", SCALED)]), needle);
 }
 
-/// Importing a module that performs IO is an error at the `import`, pointing at
-/// the IO (`docs/chl-spec.md`, "9.7 Importing asserts a shareable module"): a sink it
-/// binds, or a source it reads.
+/// Importing a module whose top level requires or causes what none of its scopes discharges is
+/// an error at the `import`, pointing at the statement that does (`docs/chl-spec.md`,
+/// "Shareable modules"): binding a sink, reading a source, declaring a transactional
+/// variable, or declaring a public feed.
 #[rstest]
 #[case::a_sink(indoc! {"
     out = test_sink()
     out << 1
-"}, "out = test_sink()")]
+"}, "its top level causes `AffectWorld`", "out = test_sink()")]
 #[case::a_source(indoc! {"
     pub xs = stdin()
-"}, "pub xs = stdin()")]
-#[timeout(Duration::from_secs(10))]
-fn importing_a_module_that_performs_io_is_refused(#[case] audit: &str, #[case] io: &str) {
-    let errors = compile_errors(&program(
-        indoc! {"
-            import audit
-            1
-        "},
-        &[("audit", audit)],
-    ));
-    assert!(
-        errors.contains("module `audit` performs IO, so importing it is an error"),
-        "{errors}"
-    );
-    assert!(errors.contains("the IO it performs"), "{errors}");
-    assert!(errors.contains(io), "{errors}");
-}
-
-/// Importing a module that declares mutable state is an error at the `import`,
-/// pointing at the state: a module with state is run, not imported
-/// (`docs/chl-spec.md`, "9.7 Importing asserts a shareable module").
-#[rstest]
-#[case::transactional_variable("pub stock: Mut(Int, Txn) := 0\n")]
-#[case::private_variable(indoc! {"
+"}, "its top level requires `ObserveWorld`", "stdin()")]
+#[case::a_transactional_variable(indoc! {"
     stock: Mut(Int, Txn) := 0
     pub n = 1
-"})]
-#[case::mutable_variable("total := 0\n")]
-#[case::defined_output(indoc! {"
-    out: Feed(Int)
-    out <<= [1]
-"})]
-#[case::a_feed("pub events: Feed(_)\n")]
-#[case::a_feed_of_a_written_type("pub events: Feed(Int)\n")]
+"}, "its top level causes `WriteTxn(stock)`", "stock: Mut(Int, Txn) := 0")]
+#[case::a_public_feed(
+    "pub events: Feed(_)\n",
+    "its top level causes `Append(events)`",
+    "pub events: Feed(_)"
+)]
+#[case::a_route(indoc! {"
+    requests, responses = http_serve(\"8080\", \"GET\", \"/x\")
+    pub n = 1
+"}, "its top level requires `ObserveWorld`", "http_serve")]
 #[timeout(Duration::from_secs(10))]
-fn importing_a_module_that_declares_state_is_refused(#[case] library: &str) {
+fn importing_a_module_that_is_run_is_refused(
+    #[case] library: &str,
+    #[case] why: &str,
+    #[case] site: &str,
+) {
     let errors = compile_errors(&program(
         indoc! {"
             import inventory
@@ -849,12 +834,52 @@ fn importing_a_module_that_declares_state_is_refused(#[case] library: &str) {
         &[("inventory", library)],
     ));
     assert!(
-        errors.contains(
-            "module `inventory` declares mutable state, so importing it is an error: run it instead"
-        ),
+        errors.contains(&format!(
+            "module `inventory` is run, since {why}, so importing it is an error: run it instead"
+        )),
         "{errors}"
     );
-    assert!(errors.contains("the state it declares"), "{errors}");
+    assert!(errors.contains("this makes it a run"), "{errors}");
+    assert!(errors.contains(site), "{errors}");
+}
+
+/// A module whose only state is induction variables and private feeds is imported: its top
+/// level's end discharges what they cause (`docs/chl-spec.md`, "Shareable modules").
+/// Its top level may loop and branch, each set of arguments gets a shared import
+/// of its own, and two modules importing it with one set share one.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_module_with_only_induction_state_is_imported() {
+    let tally = indoc! {"
+        param n: Int = 1
+        total := 0
+        evens: Feed(_)
+        for x in [1, 2, 3, 4]:
+            total += x * n
+            if x > 2:
+                evens << x
+        bonus := 0
+        if n > 2:
+            bonus += 1000
+        else:
+            bonus += 0
+        pub sum = total + sum(evens) + bonus
+    "};
+    let mid = indoc! {"
+        import tally(n=2)
+        pub got = tally::sum
+    "};
+    let root = indoc! {"
+        import tally(n=2)
+        import tally(n=3) as three
+        import mid
+        tally::sum + three::sum * 10000 + mid::got * 100
+    "};
+    // `tally(n=2)` sums to 27, and `tally(n=3)` to 1037.
+    check_program_scalar(
+        &program(root, &[("tally", tally), ("mid", mid)]),
+        Value::Int(27 + 1037 * 10000 + 27 * 100),
+    );
 }
 
 /// A module of functions over the caller's state is imported: a call to its
@@ -1015,15 +1040,13 @@ fn a_misused_module_name_is_refused(#[case] root: &str, #[case] needle: &str) {
     );
 }
 
+/// A statement an imported module may not hold is refused there: one that does nothing, and a
+/// second binding of a public name.
 #[rstest]
 #[case::expression_statement(indoc! {"
     pub x = 1
     x + 1
-"}, "an imported module has none")]
-#[case::top_level_loop(indoc! {"
-    for x in [1]:
-        pass
-"}, "an imported module holds value bindings")]
+"}, "this statement causes nothing and its value is discarded, so it does nothing")]
 #[case::public_name_bound_twice(
     indoc! {"
         pub x = 1
@@ -1032,7 +1055,7 @@ fn a_misused_module_name_is_refused(#[case] root: &str, #[case] needle: &str) {
     "`x` is public, so it is bound exactly once at its module's top level"
 )]
 #[timeout(Duration::from_secs(10))]
-fn an_unsupported_library_statement_is_refused(#[case] library: &str, #[case] needle: &str) {
+fn a_misused_library_statement_is_refused(#[case] library: &str, #[case] needle: &str) {
     assert_refused(
         &program(
             indoc! {"
@@ -1186,7 +1209,7 @@ fn a_root_error_after_a_clean_run_has_no_copy_failure_label() {
     "#};
     let a = indoc! {"
         pub y = 1
-        visits := 0
+        visits: Mut(Int, Txn) := 0
     "};
     let errors = compile_errors(&program(root, &[("a", a)]));
     assert_eq!(report_count(&errors), 1, "{errors}");
@@ -1748,6 +1771,7 @@ fn a_rejected_run_reports_nothing_from_its_nonbinding_statements(
         visits := x
         visits := visits + 1
         visits := x + 1
+        committed: Mut(Int, Txn) := 0
         pub n = 1
     "};
     let mid = indoc! {r#"

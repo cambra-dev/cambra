@@ -714,7 +714,7 @@ pub(crate) fn run(
     sources: &HashMap<String, Type>,
     instances: &Rc<solver::traits::InstanceTable>,
     public: &HashSet<Name>,
-    statements: &HashSet<NodeId>,
+    marks: &HashMap<NodeId, crate::ccl::lower::Mark>,
 ) -> Result<(Type, Vec<LocatedInferError>), Vec<LocatedInferError>> {
     let outcome = run_with_params(
         arena,
@@ -724,7 +724,7 @@ pub(crate) fn run(
         &[],
         &HashSet::new(),
         public,
-        statements,
+        marks,
         false,
     );
     match outcome.typed {
@@ -854,7 +854,7 @@ pub(crate) fn run_with_params(
     params: &[ModuleCheckParam],
     reported: &HashSet<Name>,
     public: &HashSet<Name>,
-    statements: &HashSet<NodeId>,
+    marks: &HashMap<NodeId, crate::ccl::lower::Mark>,
     recover_all: bool,
 ) -> RunOutcome {
     // Emission rewrites the tree it types, so a run that starts over needs it as it was: a
@@ -869,9 +869,7 @@ pub(crate) fn run_with_params(
     let RunFailure {
         mut errors,
         mut recovered,
-    } = match run_once(
-        expr, sources, instances, params, reported, public, statements,
-    ) {
+    } = match run_once(expr, sources, instances, params, reported, public, marks) {
         Ok(typed) => {
             return RunOutcome {
                 before: pristine,
@@ -916,7 +914,7 @@ pub(crate) fn run_with_params(
             unavailable = unavailable_contracts(&rest);
         }
         let failure = match run_once(
-            &mut rest, sources, instances, params, reported, public, statements,
+            &mut rest, sources, instances, params, reported, public, marks,
         ) {
             Ok(found) => {
                 typed = Some(found);
@@ -1248,7 +1246,7 @@ fn run_once(
     params: &[ModuleCheckParam],
     reported: &HashSet<Name>,
     public: &HashSet<Name>,
-    statements: &HashSet<NodeId>,
+    marks: &HashMap<NodeId, crate::ccl::lower::Mark>,
 ) -> Result<Inferred, RunFailure> {
     let failed = |errors| RunFailure {
         errors,
@@ -1272,7 +1270,7 @@ fn run_once(
         .map_err(|e| failed(vec![e]))?;
     sub_ctx.reported = reported.clone();
     sub_ctx.public = public.clone();
-    sub_ctx.expression_statements = statements.clone();
+    sub_ctx.marks = marks.clone();
 
     // Pass 1: emit constraints. The high-value variants
     // (`UnboundVariable`/`TypeMismatch`/`ExpectedFunction`) all originate here.
@@ -1491,9 +1489,7 @@ fn run_once(
     // A private feed a public function appends to is appended to by other modules, so it is
     // the run's, as a public feed is.
     let mut top_level = sub_ctx.top_level_capabilities();
-    top_level = top_level.union(&crate::ccl::capabilities::set_of(
-        &exported.appends.into_iter().collect(),
-    ));
+    top_level.extend(exported.appends);
     Ok(Inferred {
         ty: expr.ty.clone(),
         schemes: sub_ctx.schemes_noted,
@@ -1508,8 +1504,9 @@ pub(crate) struct Inferred {
     pub(crate) ty: Type,
     pub(crate) schemes: NotedSchemes,
     pub(crate) opened: OpenedVars,
-    /// What the tree's top level requires and causes, less what its scopes discharge.
-    pub(crate) top_level: crate::ccl::capabilities::CapabilitySet,
+    /// What the tree's top level requires and causes, less what its scopes discharge, each
+    /// label at the node where it entered.
+    pub(crate) top_level: Vec<crate::ccl::capabilities::ScopedCapability>,
     /// The expression statements that cause nothing, each an error the caller reports once
     /// the checks that diagnose a statement more precisely have run.
     pub(crate) inert: Vec<LocatedInferError>,

@@ -158,9 +158,9 @@ pub(super) struct InferCtx {
     capability_binders: HashMap<Name, CapabilityBinder>,
     /// Each statement emitted, with the variable collecting what it causes.
     capability_statements: Vec<(NodeId, Rc<CapabilityVar>)>,
-    /// The `ExprStmt` of each expression statement the program writes, the statements an
-    /// inert one is refused among.
-    pub(super) expression_statements: HashSet<NodeId>,
+    /// What lowering marks each marked node as: an expression statement, which an inert one
+    /// is refused among, or a sink binding, which causes `AffectWorld`.
+    pub(super) marks: HashMap<NodeId, crate::ccl::lower::Mark>,
     /// Each public member of the module, with its type and its `let`.
     capability_public: Vec<(Name, Type, NodeId)>,
     /// Each generalized `def` whose `requires` clause is an upper bound: its type, the level
@@ -717,7 +717,7 @@ impl InferCtx {
             root_capabilities: None,
             capability_binders: HashMap::new(),
             capability_statements: Vec::new(),
-            expression_statements: HashSet::new(),
+            marks: HashMap::new(),
             capability_calls: HashSet::new(),
             capability_public: Vec::new(),
             bounded_requires: Vec::new(),
@@ -726,7 +726,7 @@ impl InferCtx {
 
     /// What the module's top level requires and causes, less what its scopes discharge
     /// (`docs/chl-spec.md`, "Shareable modules").
-    pub(super) fn top_level_capabilities(&self) -> CapabilitySet {
+    pub(super) fn top_level_capabilities(&self) -> Vec<ScopedCapability> {
         let root = self
             .root_capabilities
             .as_ref()
@@ -734,13 +734,10 @@ impl InferCtx {
         // The top level's frame keeps out what names a variable the top level binds, as a
         // function body's frame does what its body binds.
         let filter = CapabilityFrame { depth: 0 }.filter();
-        crate::ccl::capabilities::set_of(
-            &root
-                .resolved()
-                .into_iter()
-                .filter(|c| filter.admits(c))
-                .collect(),
-        )
+        root.resolved()
+            .iter()
+            .filter_map(|c| filter.pass(c))
+            .collect()
     }
 
     fn capability_frame(&self) -> &CapabilityFrame {
@@ -846,8 +843,12 @@ impl InferCtx {
                     escapes: public_feed || (declares && transactional),
                 },
             );
-            // Other modules append to a public feed, so declaring one is an output of the
-            // top level's, as declaring a transactional variable writes it.
+            // Declaring a transactional variable writes it, and other modules append to a
+            // public feed, so declaring one is an output of the top level's too. Neither
+            // capability is discharged where the variable's scope ends.
+            if transactional {
+                self.record_capability(Capability::Causes(Effect::Write(name.clone())));
+            }
             if public_feed {
                 self.record_capability(Capability::Causes(Effect::Append(name.clone())));
             }
@@ -3420,6 +3421,12 @@ impl Typing for InferCtx {
         }
     }
 
+    fn record_sink_binding(&mut self) {
+        if self.marks.get(&self.current_node_id) == Some(&crate::ccl::lower::Mark::Sink) {
+            self.record_capability(Capability::Causes(Effect::AffectWorld));
+        }
+    }
+
     fn record_read(&mut self, name: &Name, mention: &Expr) {
         // The mention reads the variable, whatever node reads through it: its own capabilities
         // state the read, so it stays where the mention does.
@@ -3444,7 +3451,7 @@ impl Typing for InferCtx {
     }
 
     fn statement<R>(&mut self, node: NodeId, f: impl FnOnce(&mut Self) -> R) -> R {
-        if !self.expression_statements.contains(&node) {
+        if self.marks.get(&node) != Some(&crate::ccl::lower::Mark::ExpressionStatement) {
             return f(self);
         }
         // The statement's own variable, which keeps everything it does, the enclosing

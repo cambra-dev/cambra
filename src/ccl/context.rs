@@ -2119,8 +2119,7 @@ fn run_frontend(
         projection
     };
     // The expression statements the program writes are inference's to read.
-    ctx.inference_ctx().expression_statements =
-        crate::ccl::lower::expression_statements(&lowering_projection);
+    ctx.inference_ctx().marks = crate::ccl::lower::marked_nodes(&lowering_projection);
 
     debug!("Lowered (pre-channelize):\n{}", symbolic(&expr));
 
@@ -2360,12 +2359,16 @@ fn recover_rejected_runs(tree: &mut Expr, runs: &RunSites, rejected: &HashSet<Sp
 /// raised it, and it carries a secondary label at the module's statement that
 /// reaches that code. Two errors are one when they stand at one span and read
 /// alike as their module writes them ([`error_key`]).
+///
+/// The module in `contracts_of`, if any, leaves its public members' contracts in
+/// `contracts`, and in `run_because` what makes it a run, when something does.
 fn check_modules(
     ctx: &mut GlobalContext,
     checks: Vec<ModuleCheck>,
     blame: &Blame<'_>,
     contracts_of: Option<FileId>,
     contracts: &mut HashMap<SmolStr, Contract>,
+    run_because: &mut Option<String>,
 ) -> CheckedModules {
     let mut own: HashMap<FileId, Vec<(Span, InferError)>> = HashMap::new();
     let mut seen: Vec<(Span, InferError)> = Vec::new();
@@ -2452,16 +2455,20 @@ fn check_modules(
             &checked.contracts,
         ));
         // A module whose own check failed has its errors reported already.
-        if let Some(top_level) = checked.top_level.clone()
+        if let Some(top_level) = &checked.top_level
             && checked.errors.is_empty()
         {
+            let obstacle = obstacle(&check.statements, top_level, |node| {
+                blame.span(node, Some(&tree))
+            });
+            if contracts_of == Some(check.file) {
+                *run_because = obstacle.as_ref().map(|o| o.phrase.clone());
+            }
             shareability.insert(
                 check.file,
                 Shareability {
                     module: check.module.clone(),
-                    top_level,
-                    runs_another: check.statements.iter().any(|s| s.runs),
-                    importable: check.interface.unimportable.is_none(),
+                    obstacle,
                 },
             );
         }
@@ -2584,38 +2591,64 @@ fn private_traits_in_contracts(
 /// modules").
 struct Shareability {
     module: ModulePath,
-    /// What its top level requires and causes, less what its scopes discharge.
-    top_level: crate::ccl::capabilities::CapabilitySet,
-    /// Whether it runs another module, which is run, so it is run too.
-    runs_another: bool,
-    /// Whether lowering can import it. One it cannot is refused at each `import` already,
-    /// and so is never refused at a `run`.
-    importable: bool,
+    /// What makes its top level unshareable, or `None` when it is shareable.
+    obstacle: Option<Obstacle>,
 }
 
-impl Shareability {
-    /// What makes the module's top level unshareable, as a phrase, or `None` when it is
-    /// shareable.
-    fn obstacle(&self) -> Option<String> {
-        if self.runs_another {
-            return Some("it runs another module".to_string());
-        }
-        let set = &self.top_level;
-        if let Some(r) = set.requires.iter().next() {
-            return Some(format!("its top level requires `{r}`"));
-        }
-        set.causes
-            .iter()
-            .next()
-            .map(|e| format!("its top level causes `{e}`"))
+/// What makes a module's top level unshareable: a phrase, and the statement it comes from.
+struct Obstacle {
+    phrase: String,
+    site: Span,
+}
+
+/// What makes a checked module's top level unshareable: a module one of its `statements`
+/// runs, or a capability its top level holds (`top_level`), at the span its node traces to
+/// (`span`). `None` when it is shareable.
+fn obstacle(
+    statements: &[crate::ccl::lower::modules::ModuleStatement],
+    top_level: &[crate::ccl::capabilities::ScopedCapability],
+    span: impl Fn(NodeId) -> Span,
+) -> Option<Obstacle> {
+    if let Some(run) = statements.iter().find(|s| s.runs) {
+        return Some(Obstacle {
+            phrase: "it runs another module".to_string(),
+            site: run.span,
+        });
     }
+    // Requirements first, as a clause lists them.
+    let capability = top_level
+        .iter()
+        .find(|l| matches!(l.item, crate::ccl::capabilities::Capability::Requires(_)))
+        .or_else(|| top_level.iter().next())?;
+    let phrase = match &capability.item {
+        crate::ccl::capabilities::Capability::Requires(r) => {
+            format!("its top level requires `{r}`")
+        }
+        crate::ccl::capabilities::Capability::Causes(e) => format!("its top level causes `{e}`"),
+        crate::ccl::capabilities::Capability::Every(every) => format!(
+            "its top level {} `{}`",
+            if every.of_causes {
+                "causes"
+            } else {
+                "requires"
+            },
+            capability.item
+        ),
+        crate::ccl::capabilities::Capability::Param(p) => {
+            unreachable!("a top level declares no clause parameter, so it holds no `{p:?}`")
+        }
+    };
+    let at = capability
+        .at
+        .unwrap_or_else(|| panic!("`{phrase}`: a top-level capability enters at a statement"));
+    Some(Obstacle {
+        phrase,
+        site: span(at),
+    })
 }
 
 /// An error at each `import` of a module that is not shareable, and at each `run` of one
-/// that is (`docs/chl-spec.md`, "Shareable modules"). A module lowering cannot
-/// import is refused at its imports during lowering, and is run. Lowering refuses to import
-/// every module this rule would make a run, so the error at an `import` is reached only once
-/// lowering imports such modules.
+/// that is (`docs/chl-spec.md`, "Shareable modules").
 fn import_and_run_errors(
     statements: &[crate::ccl::lower::modules::ModuleStatement],
     shareability: &HashMap<FileId, Shareability>,
@@ -2625,25 +2658,32 @@ fn import_and_run_errors(
         .filter_map(|statement| {
             // A module whose own check failed has its errors reported already.
             let target = shareability.get(&statement.target)?;
-            if !target.importable || !statement.importable_arguments {
+            if !statement.importable_arguments {
                 return None;
             }
             let module = &target.module;
-            let message = match (statement.runs, target.obstacle()) {
-                (true, None) => format!(
-                    "module `{module}` is shareable, since its top level requires and causes \
-                     nothing, so running it is an error: import it instead"
+            match (statement.runs, &target.obstacle) {
+                (true, None) => Some(LoweringError::unsupported(
+                    statement.span,
+                    format!(
+                        "module `{module}` is shareable, since its top level requires and causes \
+                         nothing, so running it is an error: import it instead"
+                    ),
+                )),
+                (false, Some(obstacle)) => Some(
+                    LoweringError::unsupported(
+                        statement.span,
+                        format!(
+                            "module `{module}` is run, since {}, so importing it is an error: \
+                             run it instead",
+                            obstacle.phrase
+                        ),
+                    )
+                    .with_related(obstacle.site, "this makes it a run"),
                 ),
-                (false, Some(obstacle)) => format!(
-                    "module `{module}` is run, since {obstacle}, so importing it is an error: \
-                     run it instead"
-                ),
-                (true, Some(_)) | (false, None) => return None,
-            };
-            Some(CompileError::Lower(LoweringError::unsupported(
-                statement.span,
-                message,
-            )))
+                (true, Some(_)) | (false, None) => None,
+            }
+            .map(CompileError::Lower)
         })
         .collect()
 }
@@ -2820,8 +2860,7 @@ pub fn check_program(
         gate_leaks(&leaks, "lowering");
         projection
     };
-    ctx.inference_ctx().expression_statements =
-        crate::ccl::lower::expression_statements(&projection);
+    ctx.inference_ctx().marks = crate::ccl::lower::marked_nodes(&projection);
     for (_name, source) in ctx.lowering_ctx().take_sources() {
         let name = source.borrow().get_id().to_string();
         let output_type = source.borrow().output_type();
@@ -2837,11 +2876,22 @@ pub fn check_program(
         .map(|check| Rc::clone(&check.interface));
     let blame = Blame::new(&projection, program.sources());
     let mut contracts = HashMap::new();
-    errors.extend(check_modules(ctx, checks, &blame, Some(root), &mut contracts).errors);
+    let mut run_because = None;
+    errors.extend(
+        check_modules(
+            ctx,
+            checks,
+            &blame,
+            Some(root),
+            &mut contracts,
+            &mut run_because,
+        )
+        .errors,
+    );
     let errors = merged_copies(errors);
     let interface = interface.expect("a program that checks has its root's file checked");
     if errors.is_empty() {
-        Ok(interface.written(&contracts))
+        Ok(interface.written(&contracts, run_because.as_deref()))
     } else {
         Err(CheckErrors {
             interface: Some(interface.written_established(&contracts)),
@@ -2962,7 +3012,7 @@ fn run_passes(
     // Module checks report intrinsic failures and omit their statements from subsequent
     // checks and linking's inference. Callers still meet surviving bodies and declared
     // signatures (`docs/modules.md`, "Checking a module on its own").
-    let checked = check_modules(ctx, checks, &blame, None, &mut HashMap::new());
+    let checked = check_modules(ctx, checks, &blame, None, &mut HashMap::new(), &mut None);
     recover_checked_statements(&mut expr, &checked.recovered, &blame);
     if let Some(runs) = blame.runs {
         recover_rejected_runs(&mut expr, runs, &checked.rejected_runs);
@@ -3775,6 +3825,7 @@ mod tests {
             &blame,
             Some(program.sources().root()),
             &mut contracts,
+            &mut None,
         );
         assert_eq!(
             checked.errors.len(),

@@ -31,8 +31,6 @@ pub struct Interface {
     /// its term, over the module's `const` parameters, or why its definition is not one,
     /// which a module reading it where a constant is required reports.
     pub(in crate::ccl::lower) constants: HashMap<SmolStr, Result<ConstTerm, Refused>>,
-    /// Why importing the module is an error, if it is.
-    pub unimportable: Option<Unimportable>,
 }
 
 /// One parameter of a module.
@@ -289,16 +287,6 @@ pub(super) const RUN_MODULE: &str = "an import name or a run name";
 /// What a module argument to an `import` is written as: a run is not one, since
 /// a shared import stands outside every run.
 pub(super) const IMPORT_MODULE: &str = "an import name";
-
-/// What makes a module one that is run and not imported (`docs/chl-spec.md`,
-/// "9.7 Importing asserts a shareable module").
-#[derive(Debug, Clone, Copy)]
-pub enum Unimportable {
-    /// The module performs IO here: it opens a source or binds a sink.
-    Io(Span),
-    /// The module declares mutable state here.
-    State(Span),
-}
 
 /// One member of a module: a binding at its top level.
 #[derive(Debug, Clone)]
@@ -633,22 +621,32 @@ impl Interface {
     /// The interface as `cambra check` prints it (`docs/chl-spec.md`, "9.14
     /// Checking a module on its own"): each parameter, then each public member
     /// in the order declared, a value with its contract from `contracts`, by
-    /// spelling, and then whether the module performs IO or declares state.
+    /// spelling, and then, when the module is run, what makes it one, `run_because`
+    /// (`docs/chl-spec.md`, "Shareable modules").
     ///
     /// # Panics
     ///
     /// If `contracts` lacks a public value member's or associated function's: every
     /// one is a binder of the module's check tree.
-    pub fn written(&self, contracts: &HashMap<SmolStr, Contract>) -> String {
-        self.write_contracts(contracts, false)
+    pub fn written(
+        &self,
+        contracts: &HashMap<SmolStr, Contract>,
+        run_because: Option<&str>,
+    ) -> String {
+        self.write_contracts(contracts, false, run_because)
     }
 
     /// Write a failed check's interface, omitting values with no established contract.
     pub(crate) fn written_established(&self, contracts: &HashMap<SmolStr, Contract>) -> String {
-        self.write_contracts(contracts, true)
+        self.write_contracts(contracts, true, None)
     }
 
-    fn write_contracts(&self, contracts: &HashMap<SmolStr, Contract>, partial: bool) -> String {
+    fn write_contracts(
+        &self,
+        contracts: &HashMap<SmolStr, Contract>,
+        partial: bool,
+        run_because: Option<&str>,
+    ) -> String {
         let mut lines = vec![format!("module {}", self.module)];
         for parameter in &self.parameters {
             let stated = match &parameter.kind {
@@ -738,41 +736,18 @@ impl Interface {
         }
         members.sort_by_key(|(span, _)| span.start);
         lines.extend(members.into_iter().map(|(_, line)| line));
-        match self.unimportable {
-            Some(Unimportable::Io(_)) => lines.push("performs IO".to_string()),
-            Some(Unimportable::State(_)) => lines.push("declares mutable state".to_string()),
-            None => {}
-        }
+        lines.extend(run_because.map(|why| format!("run, since {why}")));
         lines.join("\n") + "\n"
     }
 
-    /// The interface of a module that importing is an error for. Each import of
-    /// it is refused, so its members are never reached.
-    pub(super) fn unimportable(module: ModulePath, why: Unimportable) -> Self {
-        Interface {
-            module,
-            incomplete: false,
-            members: HashMap::new(),
-            types: HashMap::new(),
-            nominal: HashMap::new(),
-            traits: HashMap::new(),
-            modules: HashMap::new(),
-            parameters: Vec::new(),
-            constants: HashMap::new(),
-            unimportable: Some(why),
-        }
-    }
-
     /// The interface of the module `module`, lowered to `chain`, with the
-    /// parameters `parameters` its lowering recorded, and which cannot be
-    /// imported for `unimportable`, if it has a reason.
+    /// parameters `parameters` its lowering recorded.
     pub(super) fn of_lowered(
         module: ModulePath,
         ast: &ChlModule,
         chain: &Expr,
         mut parameters: Vec<Parameter>,
         ctx: &LoweringContext,
-        unimportable: Option<Unimportable>,
     ) -> Self {
         let bindings = &top_level_bindings(&ast.body);
         let aliases = &top_level_aliases(&ast.body);
@@ -850,7 +825,6 @@ impl Interface {
                     Some((binding.name.clone(), settled))
                 })
                 .collect(),
-            unimportable,
         }
     }
 }
