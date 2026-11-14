@@ -547,18 +547,38 @@ hashed tree holds one after inference.
 `PolyType` over declared parameters, one per variable above a cutoff, as lowering writes one, with
 the joins and meets the notation cannot write recorded beside it. An annotation mismatch against a
 `Poly` (`InferError::PolyAnnotationMismatch`) uses it for the right-hand side's type, with the
-cutoff at the binding's level, so `pick: forall (T) T => T = inc` reports `inc` as
-`forall (A) A => Int requires r: Addable(A, Int), r::Output <: Int`, written in CHL by
+cutoff at the binding's level, so `pick: forall (T) {T, T} => T = add` reports `add` as
+`forall (A, B) {A, B} => r::Output requires r: Addable(A, B)`, written in CHL by
 `chl_print::chl_inferred_poly`.
 
 - **One term.** The type is compacted together with the operands and associated types of every
-  obligation watching a variable it reaches, so a variable is one identity across the body and
-  the requirements. An operand stands at a positive position: values flow into it, and the
-  operator's own operand variable is reached only through what flows in. Each associated type's
-  variable is pinned against simplification's polar-only elimination, since it can occur at one
-  polarity of the term and still tie the requirement's `Output` to the body.
+  obligation watching a variable it reaches, and the positions of each conditional ordering
+  requirement, so a variable is one identity across the body and the requirements. An operand
+  stands at a positive position: values flow into it, and the operator's own operand variable is
+  reached only through what flows in. An associated type stands at a negative one, the domain of a
+  function: `r::Output <: T` states what the body demands of the instance's type, and a demand is
+  read from above. An ordering requirement's positions are a collection's domain and stand at
+  both polarities.
 - **Polarity-correct.** Compaction does not fall back to a variable's upper bound at a positive
   position, so a demand is never shown as a value.
+- **Both ends of an edge.** Inference records an edge between two variables on one of them, as
+  the levels decide, and a parameter is named by which variables stand together, so the rendering
+  reads the edges the other end holds too (`infer_var::var_edges_held_elsewhere`): the variables
+  below a variable at a positive position, above it at a negative one. Without them an
+  `Orderable` obligation's operands, which the loop's positions are below, print as parameters of
+  their own.
+- **Invariant positions.** A data function's domain is one type at either polarity, so compaction
+  reads every variable on either side there, and simplification merges the variables standing at
+  one such position. A group standing at one invariant position and nowhere else relates nothing
+  and goes as a polar-only variable does.
+- **Associated types.** Where an associated type's slot holds one variable alone, the variable
+  stands nowhere else among the requirements, and every position holding it holds nothing else,
+  it is the associated type, and the type writes `r::Output` in its place, a member parameter with
+  no clause of its own: `def add(a, b): a + b` prints as
+  `forall (A, B) {A, B} => r::Output requires r: Addable(A, B)`. A variable joined with another
+  type stays a parameter, even where what is joined is a deposit every instance the definition
+  sees agrees on, which is no fact of an abstract `r`
+  ([type-inference.md](type-inference.md), "What an obligation determines").
 - **Parameters.** Each variable above the cutoff that survives simplification becomes a parameter,
   named `A`, `B`, … in order, skipping a spelling a type parameter in the type already has. The
   order puts each parameter after the parameters its bound names, as a written `forall` must

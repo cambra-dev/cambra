@@ -342,7 +342,8 @@ fn a_module_typed_parameter_reaches_its_arguments_members(
         run generic(counter=c) as g
         g::v
     "},
-    "annotated as forall (T) T => T, but inferred as forall (A) A => Int"
+    "annotated as forall (T) T => T, but inferred as forall (A, B) A => B ∨ Int requires r: Addable(A, Int), \
+     r::Output <: B"
 )]
 #[case::a_member_its_module_entry_does_not_name(
     indoc! {"

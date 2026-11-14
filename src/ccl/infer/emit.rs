@@ -142,9 +142,10 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             match ctx.scopes.lookup(name) {
                 None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
                 Some(binding) => {
-                    let instance = binding
-                        .scheme
-                        .instantiate_with_params(ctx.level, &ctx.telescope);
+                    let instance =
+                        binding
+                            .scheme
+                            .instantiate_with_params(ctx.level, &ctx.telescope, node_id);
                     // The specialization this use mints takes its copies of the definition's
                     // capability variables (`capabilities::UseCapabilities`).
                     ctx.use_capabilities
@@ -154,6 +155,8 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                     for copy in instance.capability_copies.values() {
                         copy.note_use(node_id);
                     }
+                    ctx.record_order_assumptions(&instance.capability_copies);
+                    ctx.assume_at_use(&instance.obligations);
                     for (instantiation, bound, bound_at) in instance.bounds {
                         let check = |ctx: &mut InferCtx| {
                             ctx.require_sub(&instantiation, &bound, &|| {
@@ -457,7 +460,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             target,
             iter,
             body,
-        } => emit_for(position, target, iter, body, ctx)?,
+        } => emit_for(node_id, position, target, iter, body, ctx)?,
 
         // The write target's lookup is Emit-specific, like `Feed`'s: the
         // written value must flow into the mutable variable's binding type.
@@ -1069,7 +1072,7 @@ pub(super) fn emit_lambda<C: Typing>(
     // In Check mode `recorded` is the node's resolved type, so reading the kind
     // back reproduces what inference settled instead of minting a second
     // variable that nothing would constrain.
-    Ok(Type::Fun {
+    let ty = Type::Fun {
         name: Some(param.name.clone()),
         fun_kind: match recorded {
             Type::Fun { fun_kind, .. } => fun_kind.clone(),
@@ -1078,7 +1081,15 @@ pub(super) fn emit_lambda<C: Typing>(
         domain: Box::new(param_simple),
         codomain: Box::new(body_ty),
         capabilities,
-    })
+    };
+    if stamped
+        .unwrap_or(recorded)
+        .fun_kind()
+        .is_some_and(|k| k.resolved().is_data())
+    {
+        ctx.note_data_loop(ctx.current_node(), &ty);
+    }
+    Ok(ty)
 }
 
 /// Type a [`TypedExprNode::Cast`]: `cast(value, target)` re-views `value` at
@@ -3109,6 +3120,7 @@ pub(super) fn emit_mut_decl<C: Typing>(
 /// rule; the unified phase (src/ccl/design/mutability.md) eliminates the
 /// node before anything downstream runs.
 pub(super) fn emit_for<C: Typing>(
+    node: NodeId,
     position: &Name,
     target: &mut TypedBinding,
     iter: &mut Expr,
@@ -3129,8 +3141,18 @@ pub(super) fn emit_for<C: Typing>(
     // The element type left the source's Σ behind, so the edge carries it.
     let source_binders = iter_ty.peel_refinements().sum().unwrap_or(&[]).to_vec();
     let target_label = target.name.clone();
+    // A loop whose iterations interact runs in its source's position order, so the positions
+    // must be orderable (`docs/chl-spec.md`, "Ordered loops").
+    fn declared_in(e: &Expr, out: &mut std::collections::HashSet<Name>) {
+        if let TypedExprNode::MutDecl { binding, .. } = &e.node {
+            out.insert(binding.name.clone());
+        }
+        e.walk_children(|c| declared_in(c, out));
+    }
+    let mut declared = std::collections::HashSet::new();
+    declared_in(body, &mut declared);
     // The target's type may read the position, so its slot is minted in the position's scope.
-    ctx.scoped(position, &position_ty, |ctx| {
+    let ordered = ctx.scoped(position, &position_ty, |ctx| {
         // The target binds at the element type, normalized as `emit_lambda`'s param is.
         let target_simple = ctx.normalize(&target.ty);
         target.ty = target_simple.clone();
@@ -3146,9 +3168,27 @@ pub(super) fn emit_for<C: Typing>(
         // outside it: one that only feeds is a loop over its source's positions
         // (`crate::ccl::comprehension`, `index_loop`).
         ctx.note_loop_source(&target.name, position, iter, &position_ty, &target_simple);
-        ctx.scoped(&target.name, &target_simple, |ctx| ctx.subexpr(body))
+        let (emitted, ordered) = ctx.loop_body(node, &declared, |ctx| {
+            ctx.scoped(&target.name, &target_simple, |ctx| ctx.subexpr(body))
+        });
+        emitted?;
+        Ok(ordered)
     })?;
-
+    if ordered {
+        let required = ctx.require_trait(
+            Trait::orderable(),
+            node,
+            &[&position_ty, &position_ty],
+            None,
+            &|| "the positions of this ordered loop".to_string(),
+        );
+        if let Err(error) = required {
+            return Err(ctx
+                .unordered_loop(node, iter.node_id(), &position_ty)
+                .unwrap_or(error));
+        }
+    }
+    ctx.note_loop_order(node, iter.node_id(), &iter_ty, &position_ty);
     Ok(Type::Base(BaseType::Unit))
 }
 

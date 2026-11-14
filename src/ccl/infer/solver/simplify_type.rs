@@ -32,7 +32,7 @@ enum CoOccItem {
 ///
 /// Concrete contributions and position refinements survive variable elimination.
 /// [`simplify_reconstruct`] preserves them while applying `var_subst`.
-/// The three elimination/merge rules are specified in
+/// The four elimination/merge rules are specified in
 /// `src/ccl/design/type-inference.md`, "Simplification".
 ///
 /// Recursive variables must not merge with non-recursive ones, though the current
@@ -80,6 +80,8 @@ pub fn simplify_type_pinning(cty: CompactGraph, pinned: &BTreeSet<InferVarId>) -
     let mut rec_processed: BTreeSet<InferVarId> = BTreeSet::new();
     // co_occurrences[(pol, uid)] = set of items that ALWAYS co-occur with uid at polarity pol.
     let mut co_occurrences: HashMap<(bool, InferVarId), HashSet<CoOccItem>> = HashMap::new();
+    // The variables of each data function's domain, an invariant position.
+    let mut invariant_sites: Vec<BTreeSet<InferVarId>> = Vec::new();
 
     // Phase 1: analysis — walk the term, collecting co-occurrence sets.
     simplify_analyze(
@@ -89,14 +91,43 @@ pub fn simplify_type_pinning(cty: CompactGraph, pinned: &BTreeSet<InferVarId>) -
         &mut all_vars,
         &mut rec_processed,
         &mut co_occurrences,
+        &mut invariant_sites,
     );
 
     // Phase 2: decision — determine substitutions.
     let mut var_subst: HashMap<InferVarId, Option<InferVarId>> = HashMap::new();
 
+    // The variables standing at one invariant position are one type, and merge into one. A
+    // group standing at one invariant position and nowhere else relates nothing, so it goes as
+    // a polar-only variable does; any other stands at both polarities and stays.
+    for group in invariant_groups(&invariant_sites) {
+        let rep = *group.first().expect("a group holds a variable");
+        let sites = invariant_sites
+            .iter()
+            .filter(|site| group.iter().any(|v| site.contains(v)))
+            .count();
+        let alone = sites == 1
+            && !group.iter().any(|v| {
+                pinned.contains(v)
+                    || cty.rec_vars.contains_key(v)
+                    || outside_invariant_sites(&cty.term, *v)
+            });
+        for &v in &group {
+            if alone {
+                var_subst.insert(v, None);
+            } else if v != rep {
+                var_subst.insert(v, Some(rep));
+            }
+        }
+        if !alone {
+            pinned.insert(rep);
+        }
+    }
+
     // Eliminate polar-only non-recursive variables.
     for &v in &all_vars {
-        if !cty.rec_vars.contains_key(&v) && !pinned.contains(&v) {
+        // A variable an invariant site merged or removed is decided.
+        if !cty.rec_vars.contains_key(&v) && !pinned.contains(&v) && !var_subst.contains_key(&v) {
             let has_pos = co_occurrences.contains_key(&(true, v));
             let has_neg = co_occurrences.contains_key(&(false, v));
             if has_pos != has_neg {
@@ -198,6 +229,7 @@ fn simplify_analyze(
     all_vars: &mut BTreeSet<InferVarId>,
     rec_processed: &mut BTreeSet<InferVarId>,
     co_occurrences: &mut HashMap<(bool, InferVarId), HashSet<CoOccItem>>,
+    invariant_sites: &mut Vec<BTreeSet<InferVarId>>,
 ) {
     // Items present at this position (vars + atoms).
     #[allow(clippy::mutable_key_type)]
@@ -231,6 +263,7 @@ fn simplify_analyze(
                 all_vars,
                 rec_processed,
                 co_occurrences,
+                invariant_sites,
             );
         }
     }
@@ -245,6 +278,7 @@ fn simplify_analyze(
                 all_vars,
                 rec_processed,
                 co_occurrences,
+                invariant_sites,
             );
         }
     }
@@ -258,6 +292,7 @@ fn simplify_analyze(
                 all_vars,
                 rec_processed,
                 co_occurrences,
+                invariant_sites,
             );
         }
     }
@@ -271,6 +306,7 @@ fn simplify_analyze(
                 all_vars,
                 rec_processed,
                 co_occurrences,
+                invariant_sites,
             );
         }
     }
@@ -285,21 +321,23 @@ fn simplify_analyze(
                 all_vars,
                 rec_processed,
                 co_occurrences,
+                invariant_sites,
             );
         }
     }
     if let Some(cf) = &ct.fun {
-        {
-            {
-                simplify_analyze(
-                    &cf.domain,
-                    !pol,
-                    input_rec_vars,
-                    all_vars,
-                    rec_processed,
-                    co_occurrences,
-                );
-            }
+        simplify_analyze(
+            &cf.domain,
+            !pol,
+            input_rec_vars,
+            all_vars,
+            rec_processed,
+            co_occurrences,
+            invariant_sites,
+        );
+        // A data function's domain is invariant: the variables standing there are one type.
+        if is_data(cf) && !cf.domain.vars.is_empty() {
+            invariant_sites.push(cf.domain.vars.clone());
         }
         simplify_analyze(
             &cf.codomain,
@@ -308,6 +346,7 @@ fn simplify_analyze(
             all_vars,
             rec_processed,
             co_occurrences,
+            invariant_sites,
         );
     }
     // A history's children (value + domain) recurse at the same polarity
@@ -321,6 +360,7 @@ fn simplify_analyze(
             all_vars,
             rec_processed,
             co_occurrences,
+            invariant_sites,
         );
         simplify_analyze(
             domain,
@@ -329,6 +369,7 @@ fn simplify_analyze(
             all_vars,
             rec_processed,
             co_occurrences,
+            invariant_sites,
         );
     }
     // A nominal type's arguments recurse at the polarity their variance gives them
@@ -343,6 +384,7 @@ fn simplify_analyze(
                 all_vars,
                 rec_processed,
                 co_occurrences,
+                invariant_sites,
             );
         }
     }
@@ -376,10 +418,16 @@ fn simplify_reconstruct(
     let new_vars: BTreeSet<InferVarId> = ct
         .vars
         .iter()
-        .flat_map(|&tv| match var_subst.get(&tv) {
-            Some(Some(w)) => Some(*w), // replaced by w
-            Some(None) => None,        // eliminated
-            None => Some(tv),          // unchanged
+        // A variable merged into one merged in turn takes the last's identity.
+        .flat_map(|&tv| {
+            let mut v = tv;
+            loop {
+                match var_subst.get(&v) {
+                    Some(Some(w)) if *w != v => v = *w,
+                    Some(None) => return None,
+                    _ => return Some(v),
+                }
+            }
         })
         .collect();
 
@@ -488,6 +536,69 @@ fn simplify_reconstruct(
             )
         }),
     }
+}
+
+/// The variables of `sites` that stand at one invariant position together, transitively, each
+/// group in order with its least variable first.
+fn invariant_groups(sites: &[BTreeSet<InferVarId>]) -> Vec<Vec<InferVarId>> {
+    let mut groups: Vec<BTreeSet<InferVarId>> = Vec::new();
+    for site in sites {
+        let mut merged = site.clone();
+        groups.retain(|g| {
+            if g.is_disjoint(&merged) {
+                true
+            } else {
+                merged.extend(g.iter().copied());
+                false
+            }
+        });
+        groups.push(merged);
+    }
+    groups
+        .into_iter()
+        .map(|g| g.into_iter().collect())
+        .collect()
+}
+
+/// Whether `v` stands in `ct` anywhere but at the top of a data function's domain, the
+/// invariant position [`simplify_analyze`] collects.
+fn outside_invariant_sites(ct: &CompactType, v: InferVarId) -> bool {
+    if ct.vars.contains(&v) {
+        return true;
+    }
+    let below = |c: &CompactType| outside_invariant_sites(c, v);
+    ct.rec.iter().flat_map(|r| r.values()).any(below)
+        || ct.dep_tuple.iter().flat_map(|d| &d.components).any(below)
+        || ct
+            .family
+            .iter()
+            .flat_map(|f| f.domains.iter().chain(std::iter::once(&*f.body)))
+            .any(below)
+        || ct.var.iter().flat_map(|tags| tags.tags.values()).any(below)
+        || ct.fun.as_ref().is_some_and(|cf| {
+            let site_below = if is_data(cf) {
+                CompactType {
+                    vars: BTreeSet::new(),
+                    ..(*cf.domain).clone()
+                }
+            } else {
+                (*cf.domain).clone()
+            };
+            below(&site_below) || below(&cf.codomain)
+        })
+        || ct
+            .history_slot
+            .as_ref()
+            .is_some_and(|h| below(&h.value) || below(&h.domain))
+        || ct.nominal.iter().flat_map(|(_, args)| args).any(below)
+}
+
+/// Whether `cf` is a data function, whose domain is invariant.
+pub(super) fn is_data(cf: &CompactFun) -> bool {
+    !matches!(
+        cf.kind,
+        crate::ccl::ty::KindPin::Compute | crate::ccl::ty::KindPin::Unpinned
+    )
 }
 
 #[cfg(test)]

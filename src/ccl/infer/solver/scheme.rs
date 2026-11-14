@@ -69,8 +69,9 @@ pub struct Instance {
     /// ([`FreshenCache::capability_vars`]), which the specialization the use mints takes: a
     /// requirement's associated effect type is linked through it too.
     pub capability_copies: HashMap<CapabilityVarId, Rc<CapabilityVar>>,
-    /// The use's copy of each trait obligation the scheme carries, which the use links to the
-    /// instance it selects ([`TraitObligation::effects`]).
+    /// The use's copy of each trait obligation the scheme carries: the use answers each under
+    /// what it assumes, and links each to the instance it selects
+    /// ([`TraitObligation::effects`]).
     pub obligations: Vec<Rc<TraitObligation>>,
 }
 
@@ -122,8 +123,14 @@ impl PolyScheme {
     /// variable a copy could inherit a scope from. Every other variable stands there too,
     /// under the binders its original stood under inside the definition
     /// ([`FreshenCache::use_telescope`]).
-    pub fn instantiate_with_params(&self, current_level: Level, telescope: &Telescope) -> Instance {
+    pub fn instantiate_with_params(
+        &self,
+        current_level: Level,
+        telescope: &Telescope,
+        use_at: crate::ccl::provenance::NodeId,
+    ) -> Instance {
         let mut cache = FreshenCache::new();
+        cache.use_at = Some(use_at);
         cache.param_telescope = Some(telescope.clone());
         cache.use_telescope = Some(telescope.clone());
         let at = FreshenLevel::At(current_level);
@@ -237,6 +244,7 @@ pub struct FreshenCache {
     /// two uses of one generalized function are collected apart
     /// (`src/ccl/design/type-inference.md`, "Polymorphism and materialization").
     pub capability_vars: HashMap<CapabilityVarId, Rc<CapabilityVar>>,
+    pub ordering: HashMap<u32, crate::ccl::capabilities::Requirement>,
     /// Original kind-variable binder → the copy's binder at the same position.
     ///
     /// A kind variable's binders are quantified with it: they are the scope its edges
@@ -279,16 +287,19 @@ pub struct FreshenCache {
     /// placed under (`infer::solve::specialize_use`). Each variable minted stands where its
     /// original did with these entered.
     pub entered_binders: Vec<crate::ccl::Name>,
-    /// Obligation copies a specialization reset because they assumed one of the
-    /// specialized binding's own type parameters
-    /// ([`TraitObligation::reset_for_specialization`]). `specialize_use` redelivers
-    /// each once the clone is pinned.
+    /// The obligation copies a specialization clone reset, having assumed one of the
+    /// binding's own type parameters ([`Self::own_params`]): each resolves against its trait's
+    /// instances once the pin delivers the use's types (`infer::solve::specialize_use`).
     pub reset_obligations: Vec<Rc<TraitObligation>>,
     /// For a specialization clone, the specialized binding's own type parameters:
     /// an obligation copy assuming one is reset
     /// ([`TraitObligation::reset_for_specialization`]), and the rest of its
     /// assumptions are freshened with the clone. `None` for an instantiation.
     pub own_params: Option<Rc<[crate::ccl::ty::TypeParamId]>>,
+    /// The use an instantiation or a specialization clone is made for, where each copy of an
+    /// ordering requirement is reported (`docs/chl-spec.md`, "Conditional ordering
+    /// requirements"). `None` for a copy no use makes.
+    pub use_at: Option<crate::ccl::provenance::NodeId>,
     /// An operator scheme's Pi binder → the name this instantiation gives it.
     pub binders: HashMap<crate::ccl::Name, crate::ccl::Name>,
     /// Opened family parameter → what this instantiation stands it at: a variable that may
@@ -374,8 +385,57 @@ fn freshen_fun_kind(
     }
 }
 
-/// A copy of the capability variable `v` and of every variable above `lim` flowing into it, each
-/// with its capabilities and edges; one at or below `lim` is shared, as a type variable is.
+/// A conditional requirement with its operands copied through the function's substitution.
+fn freshen_requirement(
+    lim: Level,
+    r: &crate::ccl::capabilities::Requirement,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) -> crate::ccl::capabilities::Requirement {
+    let Some(order) = r.ordering() else {
+        return r.clone();
+    };
+    if order.satisfied.get() {
+        return r.clone();
+    }
+    if let Some(copy) = cache.ordering.get(&order.id) {
+        return copy.clone();
+    }
+    let iter = order
+        .iter
+        .as_ref()
+        .map(|t| freshen_above(lim, t, target, cache));
+    let positions = freshen_above(lim, &order.positions, target, cache);
+    let capabilities = match order.capabilities.repr() {
+        Repr::Var(v) => Capabilities::var(freshen_capability_var(lim, v, target, cache)),
+        _ => order.capabilities.clone(),
+    };
+    let assumptions = order
+        .assumptions
+        .borrow()
+        .iter()
+        .map(|r| Rc::new(r.map_types(|t| freshen_above(lim, t, target, cache))))
+        .collect();
+    let (node, source) = cache
+        .use_at
+        .map_or((order.node, order.source), |at| (at, at));
+    let copy = crate::ccl::capabilities::Requirement::orderable_if_required_by(
+        positions,
+        capabilities,
+        node,
+        source,
+        iter,
+        assumptions,
+    );
+    let copy = match cache.use_at {
+        Some(_) => copy.at_use(),
+        None => copy,
+    };
+    cache.ordering.insert(order.id, copy.clone());
+    copy
+}
+
+/// A per-use copy of a capability variable and its incoming capabilities and bounds.
 fn freshen_capability_var(
     lim: Level,
     v: &Rc<CapabilityVar>,
@@ -389,18 +449,38 @@ fn freshen_capability_var(
         return Rc::clone(f);
     }
     let f = CapabilityVar::fresh(target.level_of(v.level()));
+    f.open_input.set(v.open_input.get());
     // Cached before the edges are copied, so a cycle reaches the copy.
     cache.capability_vars.insert(v.uid, Rc::clone(&f));
     // A capability naming a parameter that stands for a clause is the definition's rigid stand-in
     // for what each use passes (`InferCtx::open_poly`); a use's copy holds what its arguments
     // bring instead.
     for capability in v.own() {
-        if !matches!(capability.item, Capability::Param(_)) {
-            f.record(capability);
+        match &capability.item {
+            Capability::Param(_) => {}
+            Capability::Requires(r) if r.ordering().is_some_and(|o| o.satisfied.get()) => {}
+            Capability::Requires(r) if r.ordering().is_some() => {
+                let requirement = freshen_requirement(lim, r, target, cache);
+                f.record(crate::ccl::capabilities::ScopedCapability {
+                    item: Capability::Requires(requirement),
+                    ..capability
+                });
+            }
+            _ => f.record(capability),
         }
     }
-    for (source, filter) in v.incoming() {
+    for (source, mut filter) in v.incoming() {
         let source = freshen_capability_var(lim, &source, target, cache);
+        filter.stated = filter
+            .stated
+            .into_iter()
+            .map(|item| match item {
+                Capability::Requires(r) => {
+                    Capability::Requires(freshen_requirement(lim, &r, target, cache))
+                }
+                item => item,
+            })
+            .collect();
         f.flows_from(&source, filter);
     }
     // Each use answers the bounds the definition states: a use's arguments can add capabilities
@@ -413,6 +493,12 @@ fn freshen_capability_var(
         {
             *used_at = None;
         }
+        upper.set.requires = upper
+            .set
+            .requires
+            .into_iter()
+            .map(|r| freshen_requirement(lim, &r, target, cache))
+            .collect();
         for param in std::mem::take(&mut upper.set.params) {
             if !param.except.is_empty() {
                 upper.set.add_every(

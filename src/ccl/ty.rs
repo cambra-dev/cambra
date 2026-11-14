@@ -1641,12 +1641,25 @@ pub struct TypeParam {
     /// For a parameter standing for a clause, what its bound's `except` takes away:
     /// `E <: Effect except RunTransaction` (`docs/chl-spec.md`, "Kinds and bounds").
     pub clause_except: std::collections::BTreeSet<crate::ccl::capabilities::Capability>,
+    /// Whether lowering made the parameter for a `_` in a written bound, so no source spells it
+    /// ([`TypeParam::anonymous`]).
+    pub anonymous: bool,
 }
 
 impl TypeParam {
     /// A declared parameter: what lowering writes for `T` in `forall (T) V`.
     pub fn declared(spelling: impl Into<SmolStr>) -> Rc<TypeParam> {
         TypeParam::declared_except(spelling, Default::default(), None)
+    }
+
+    /// A declared parameter lowering makes for a `_` in a written bound: `spelling` names it in
+    /// diagnostics, and no source writes it.
+    pub fn anonymous(spelling: impl Into<SmolStr>) -> Rc<TypeParam> {
+        let mut param = TypeParam::declared(spelling);
+        Rc::get_mut(&mut param)
+            .expect("a parameter just made has one owner")
+            .anonymous = true;
+        param
     }
 
     /// A declared parameter standing for a clause, whose bound, written at `bound_at`, takes
@@ -1670,6 +1683,7 @@ impl TypeParam {
             generalized: false,
             arity: 0,
             clause_except: except,
+            anonymous: false,
         })
     }
 
@@ -1696,6 +1710,7 @@ impl TypeParam {
             generalized: true,
             arity,
             clause_except: Default::default(),
+            anonymous: false,
         })
     }
 
@@ -1711,6 +1726,7 @@ impl TypeParam {
             generalized: false,
             arity,
             clause_except: Default::default(),
+            anonymous: false,
         })
     }
 
@@ -1742,6 +1758,7 @@ impl TypeParam {
             generalized: false,
             arity,
             clause_except: Default::default(),
+            anonymous: false,
         })
     }
 
@@ -1764,6 +1781,7 @@ impl TypeParam {
             generalized: self.generalized,
             arity: self.arity,
             clause_except: except,
+            anonymous: self.anonymous,
         })
     }
 

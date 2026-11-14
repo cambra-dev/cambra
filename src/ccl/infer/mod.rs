@@ -204,6 +204,56 @@ fn blame_node_for_place(expr: &Expr, uids: &[crate::ccl::InferVarId]) -> Option<
     node
 }
 
+/// `error`, a loop's refusal located at its source, moved to where the source is written:
+/// lowering binds a loop's source to a name the loop walks, and the binding holds the
+/// expression the program wrote.
+fn at_written_source(expr: &Expr, mut error: LocatedInferError) -> LocatedInferError {
+    fn bound_at(e: &Expr, name: &Name) -> Option<NodeId> {
+        if let crate::ccl::TypedExprNode::Let {
+            binding,
+            bound_expr,
+            ..
+        } = &e.node
+            && binding.name == *name
+        {
+            // The source's operands are bound before it, so the expression is the tail.
+            let mut tail: &Expr = bound_expr;
+            while let crate::ccl::TypedExprNode::Let { body, .. } = &tail.node {
+                tail = body;
+            }
+            return Some(tail.node_id());
+        }
+        let mut found = None;
+        e.walk_children(|c| {
+            if found.is_none() {
+                found = bound_at(c, name);
+            }
+        });
+        found
+    }
+    if let Some(crate::ccl::TypedExprNode::Var(name)) =
+        find_node(expr, error.node_id).map(|e| &e.node)
+        && let Some(bound) = bound_at(expr, name)
+    {
+        error.node_id = bound;
+    }
+    error
+}
+
+/// The node of `expr` whose id is `id`.
+fn find_node(expr: &Expr, id: NodeId) -> Option<&Expr> {
+    if expr.node_id() == id {
+        return Some(expr);
+    }
+    let mut found = None;
+    expr.walk_children(|child| {
+        if found.is_none() {
+            found = find_node(child, id);
+        }
+    });
+    found
+}
+
 /// Why two functions' kinds do not relate, read off what each side's kind settled to.
 fn kind_mismatch_reason(lhs: &Type, rhs: &Type) -> &'static str {
     use crate::ccl::ty::KindPin;
@@ -436,6 +486,7 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             position,
             found,
             accepted,
+            ..
         } => InferError::NoTraitInstance {
             trait_: trait_.to_string(),
             position,
@@ -736,14 +787,22 @@ pub(crate) fn run(
 /// An error for each capability variable's upper bound that its capabilities exceed, at the node where
 /// the first capability beyond it entered, with the clause or the written type as the secondary
 /// label.
-fn push_capability_failures(errors: &mut Vec<LocatedInferError>, expr: &Expr) {
+/// `beyond_clause` spells a capability a clause does not list ([`InferCtx::item_beyond_clause`]).
+fn push_capability_failures(
+    errors: &mut Vec<LocatedInferError>,
+    expr: &Expr,
+    beyond_clause: &dyn Fn(&crate::ccl::capabilities::Capability, chl_parser::ast::Span) -> String,
+) {
     use crate::ccl::capabilities::Blame;
     use crate::ccl::infer_var::Origin;
     // Each use of a polymorphic definition checks its own copy of the definition's bounds,
     // and the copies name the definition's nodes, so one failure is reported once.
     let mut reported = HashSet::new();
     for failure in crate::ccl::capabilities::exceeded_uppers() {
-        let item = failure.capability.item.to_string();
+        let item = match failure.blame {
+            Blame::Clause(at) => beyond_clause(&failure.capability.item, at),
+            _ => failure.capability.item.to_string(),
+        };
         if !reported.insert((failure.capability.at, item.clone(), failure.blame)) {
             continue;
         }
@@ -1318,8 +1377,6 @@ fn run_once(
     // checked here (`src/ccl/design/type-inference.md`, "Written clauses"), after each
     // associated effect type is given what the obligation standing for it selected.
     sub_ctx.settle_effect_links();
-    push_capability_failures(&mut errors, expr);
-    errors.extend(sub_ctx.requirements_beyond_clauses());
     errors.extend(sub_ctx.escaping_results());
     if !errors.is_empty() {
         return Err(sub_ctx.failure(errors));
@@ -1414,6 +1471,65 @@ fn run_once(
             failure.errors = located.into_iter().map(|(error, _)| error).collect();
             return Err(failure);
         }
+    }
+    // An ordered loop over a keyed collection requires `Orderable` of its keys, which its
+    // source's type states once resolved.
+    let unordered = sub_ctx.order_keyed_loops();
+    if !unordered.is_empty() {
+        return Err(failed(
+            unordered
+                .into_iter()
+                .map(|e| at_written_source(expr, e))
+                .collect(),
+        ));
+    }
+    // An operand no contribution reached is judged by what it resolves to, which the sweep's
+    // own deposits can determine, so this follows the sweep.
+    {
+        let mut cache = solver::ConstrainCache::new();
+        if let Err((error, node)) =
+            solver::traits::deliver_resolutions(&mut cache, |ty| resolve_var_type(ty).ok())
+        {
+            let failure = cache.take_failure();
+            // A loop's positions are the one operand known to reach here
+            // (`deliver_resolutions`); anything else is named generically.
+            let unordered = match (find_node(expr, node).map(|e| &e.node), &error) {
+                (
+                    Some(crate::ccl::TypedExprNode::For { iter, .. }),
+                    ConstrainError::NoTraitInstance { found, .. },
+                ) => typing::Typing::unordered_loop(&sub_ctx, node, iter.node_id(), found),
+                _ => None,
+            };
+            if let Some(unordered) = unordered {
+                return Err(failed(vec![at_written_source(expr, unordered)]));
+            }
+            let what = match find_node(expr, node).map(|e| &e.node) {
+                Some(crate::ccl::TypedExprNode::For { .. }) => {
+                    "the positions of a loop whose iterations interact, which runs in their order"
+                }
+                _ => "a value a trait requires",
+            };
+            return Err(failed(vec![
+                LocatedInferError::new(map_constrain_err(error, what), node).with_failure(failure),
+            ]));
+        }
+    }
+    // A loop's refusal moves to its written source, and a use's stays at the use; a
+    // capability's failure stays where it is raised, at a use of a definition among them.
+    let mut conditional: Vec<_> = sub_ctx
+        .check_loop_orders()
+        .into_iter()
+        .map(|e| match e.error {
+            InferError::UnorderedLoop { at_use: true, .. } => e,
+            _ => at_written_source(expr, e),
+        })
+        .collect();
+    push_capability_failures(&mut conditional, expr, &|item, clause| {
+        sub_ctx.item_beyond_clause(item, clause)
+    });
+    conditional.extend(sub_ctx.requirements_beyond_clauses());
+    if !conditional.is_empty() {
+        return Err(failed(conditional));
     }
     // Sealed *after* the requirement sweep, not before: the sweep itself narrows, and
     // legitimately so. What must not happen is a later pass narrowing a definition's

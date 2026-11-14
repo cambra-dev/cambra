@@ -2297,6 +2297,9 @@ pub fn compact_type_for_display(ty: &Type) -> CompactGraph {
 fn compact_type_with(ty: &Type, collapse: bool, capability_vars: bool) -> CompactGraph {
     let mut st = CompactState::new(collapse);
     st.capability_vars = capability_vars;
+    if capability_vars {
+        st.held_elsewhere = Some(Rc::new(crate::ccl::infer_var::var_edges_held_elsewhere()));
+    }
     // One walk forces a shared predicate under one substitution once, however many bounds
     // carry it (`Subst::force_refinement`).
     let term = crate::ccl::subst::with_transport_memo(|| {
@@ -3001,6 +3004,10 @@ struct CompactState {
     /// ([`CapabilitySet::vars`](crate::ccl::capabilities::CapabilitySet::vars)): only a rendering of a
     /// polymorphic type reads them ([`compact_type_for_display`]).
     capability_vars: bool,
+    /// For a rendering, the edges between two variables that the other end holds
+    /// ([`crate::ccl::infer_var::var_edges_held_elsewhere`]): a parameter is named by which
+    /// variables stand together, and an edge is a fact about both of its ends.
+    held_elsewhere: Option<Rc<crate::ccl::infer_var::HeldElsewhere>>,
     /// The functions the walk is inside of, and the closing memo over them
     /// (`src/ccl/design/type-inference.md`, "Where the conversions run"): a
     /// refinement's references to enclosing binders become indices before
@@ -3050,6 +3057,7 @@ impl CompactState {
             rec_vars: BTreeMap::new(),
             collapse,
             capability_vars: false,
+            held_elsewhere: None,
             scope: RefinementScope::default(),
             data_domain_depth: 0,
             candidate_widened: None,
@@ -4197,6 +4205,38 @@ fn compact_go_inner(
                     bc.origins = ContributionOrigins::born_at(b.origin, &b.ty);
                 }
                 bound = CompactType::merge(pol, bound, bc);
+            }
+            // **An edge between two variables is a fact about both.** Inference holds
+            // `𝑢 <: 𝑣` on one end, whichever the levels pick, so a rendering, which names a
+            // parameter by the variables standing together, reads the edges the other end
+            // holds too: the variables below this one at a positive position, above it at a
+            // negative one. A data function's domain is invariant, one type at either
+            // polarity, so there it reads every variable on either side.
+            if let Some(held) = st.held_elsewhere.clone() {
+                let mut partners: Vec<Rc<crate::ccl::InferVar>> = Vec::new();
+                if let Some((below, above)) = held.get(&uid) {
+                    partners.extend(if pol { below } else { above }.iter().cloned());
+                    if pos.invariant {
+                        partners.extend(if pol { above } else { below }.iter().cloned());
+                    }
+                }
+                if pos.invariant {
+                    let s = state.bounds.borrow();
+                    partners.extend(
+                        if pol { s.upper() } else { s.lower() }
+                            .iter()
+                            .filter(|b| b.self_subst.is_id() && b.ty_subst.is_id())
+                            .filter_map(|b| match &b.ty {
+                                Type::Infer(v) => Some(Rc::clone(v)),
+                                _ => None,
+                            }),
+                    );
+                }
+                for u in partners {
+                    let bc =
+                        compact_go(&Type::Infer(u), pol, subst_acc, pos.under(&new_parents), st);
+                    bound = CompactType::merge(pol, bound, bc);
+                }
             }
             // Whether the *shape* collapse fires: the primary walk produced no
             // concrete (atom / shape) contribution. Without it a variable whose only

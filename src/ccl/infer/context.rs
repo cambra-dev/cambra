@@ -159,6 +159,12 @@ pub(super) struct InferCtx {
     /// Each statement emitted, with the variable collecting what it causes and the one of
     /// the body it stands in.
     capability_statements: Vec<(NodeId, Rc<CapabilityVar>, Option<CapabilityVarId>)>,
+    /// Each `for` loop emitted, for [`InferCtx::check_loop_orders`]: its node, the variable
+    /// collecting what its body causes, the mutable variables the body declares, and whether
+    /// its iterations interacted when its body was emitted.
+    effect_loops: Vec<EffectLoop>,
+    /// Each ordered loop's source, for [`InferCtx::order_keyed_loops`].
+    ordered_loops: Vec<OrderedLoop>,
     /// Each `with begin():` block emitted, with the variable collecting what its body causes.
     capability_transactions: Vec<(NodeId, Rc<CapabilityVar>)>,
     /// What lowering marks each marked node as: an expression statement, which an inert one
@@ -417,6 +423,7 @@ impl CapabilityFrame {
     /// frame's own body binds.
     fn filter(&self) -> Filter {
         Filter {
+            of_causes: None,
             when_data: None,
             below: Some(self.depth),
             discharges: Default::default(),
@@ -463,6 +470,111 @@ struct NodeCapabilities {
     at: Option<NodeId>,
     /// Whether it is a `with begin():` block's body.
     transaction: bool,
+}
+
+/// A `for` loop emitted ([`InferCtx::effect_loops`]).
+struct EffectLoop {
+    node: NodeId,
+    var: Rc<CapabilityVar>,
+    declared: HashSet<Name>,
+    ordered: bool,
+}
+
+/// An ordered loop's source: the loop, the source's node, its type and its positions' type.
+struct OrderedLoop {
+    node: NodeId,
+    source: NodeId,
+    iter: Type,
+    positions: Type,
+}
+
+/// Whether what `var` collects, a loop body's capabilities, makes its iterations interact: a write
+/// to an induction variable not among `declared`, the ones the body declares, outlives the
+/// iteration (`docs/chl-spec.md`, "Ordered loops"). `WriteTxn(x)` orders nothing: the
+/// run's transactions commit in commit order, whatever position the iteration has.
+fn iterations_interact(var: &Rc<CapabilityVar>, declared: &HashSet<Name>) -> bool {
+    interacting(var, declared).is_some()
+}
+
+/// What an unordered loop's refusal says of a source whose positions are keys of type `key`.
+fn keys_detail(key: &Type) -> String {
+    format!(
+        "keys of type `{}`, which have no order",
+        crate::ccl::chl_print::chl_type(&crate::ccl::ccl_utils::strip_refinements(key))
+    )
+}
+
+/// What an unordered loop's refusal says of a source whose positions have type `positions`,
+/// as emission required `Orderable` of them: a concatenation's are a variant of its parts'.
+pub(super) fn positions_detail(positions: &Type) -> String {
+    match positions.peel_refinements() {
+        Type::Variant(..) => {
+            "the positions of a concatenation, which puts neither part first".to_string()
+        }
+        other => format!(
+            "positions of type `{}`, which have no order",
+            crate::ccl::chl_print::chl_type(&crate::ccl::ccl_utils::strip_refinements(other))
+        ),
+    }
+}
+
+/// The capability that makes a loop's iterations interact, as [`iterations_interact`] reads it.
+fn interacting(var: &Rc<CapabilityVar>, declared: &HashSet<Name>) -> Option<ScopedCapability> {
+    // A write to a variable the iteration declares stays in it. `Effect` and `Write(*)` hold a
+    // write to every variable, the accumulators outside the loop's too.
+    var.resolved().into_iter().find(|l| match &l.item {
+        Capability::Causes(Effect::Write(x)) => !declared.contains(x),
+        item => item.orders_a_loop(),
+    })
+}
+
+/// The capabilities of every function nested in a value, through its inferred lower bounds.
+fn type_capabilities(ty: &Type) -> Vec<ScopedCapability> {
+    fn collect(ty: &Type, seen: &mut HashSet<*const InferVar>, out: &mut Vec<ScopedCapability>) {
+        if let Type::Infer(v) = ty.peel_refinements() {
+            if seen.insert(Rc::as_ptr(v)) {
+                let lowers: Vec<Type> = v
+                    .bounds
+                    .borrow()
+                    .lower()
+                    .iter()
+                    .map(|b| b.ty.clone())
+                    .collect();
+                for lower in lowers {
+                    collect(&lower, seen, out);
+                }
+            }
+            return;
+        }
+        if let Type::Fun { capabilities, .. } = ty {
+            out.extend(match capabilities.repr() {
+                Repr::Var(v) => v.resolved().into_iter().collect(),
+                _ => Capabilities::capabilities_of(capabilities),
+            });
+        }
+        ty.walk_children(|child| collect(child, seen, out));
+    }
+    let mut out = Vec::new();
+    collect(ty, &mut HashSet::new(), &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Whether a concrete value flows into a callee through its inferred lower bounds.
+fn receives_a_value(ty: &Type) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![ty.clone()];
+    while let Some(ty) = stack.pop() {
+        let Type::Infer(v) = ty.peel_refinements() else {
+            return true;
+        };
+        if !seen.insert(Rc::as_ptr(v)) {
+            continue;
+        }
+        stack.extend(v.bounds.borrow().lower().iter().map(|b| b.ty.clone()));
+    }
+    false
 }
 
 /// A variable standing for an associated effect type, `Writes`, at a call of a trait's
@@ -722,6 +834,8 @@ impl InferCtx {
             root_capabilities: None,
             capability_binders: HashMap::new(),
             capability_statements: Vec::new(),
+            effect_loops: Vec::new(),
+            ordered_loops: Vec::new(),
             capability_transactions: Vec::new(),
             marks: HashMap::new(),
             capability_calls: HashSet::new(),
@@ -975,6 +1089,44 @@ impl InferCtx {
         returned.chain(handed_out).collect()
     }
 
+    /// `item`, which the bounded clause at `clause` does not list, as the definition's printed
+    /// contract spells it: an ordering requirement over positions inference typed names them
+    /// as the contract does, not as an inference variable.
+    pub(super) fn item_beyond_clause(
+        &self,
+        item: &Capability,
+        clause: chl_parser::ast::Span,
+    ) -> String {
+        let named = || {
+            let Capability::Requires(r) = item else {
+                return None;
+            };
+            let id = r.ordering()?.id;
+            let bounded = self.bounded_requires.iter().find(|b| b.at == clause)?;
+            let inferred = poly_for_display(&bounded.ty, bounded.level)?;
+            fn find(ty: &Type, id: u32) -> Option<Requirement> {
+                if let Type::Fun { capabilities, .. } = ty
+                    && let Some(r) = capabilities
+                        .set()
+                        .requires
+                        .into_iter()
+                        .find(|r| r.ordering().is_some_and(|o| o.id == id))
+                {
+                    return Some(r);
+                }
+                let mut found = None;
+                ty.walk_children(|child| {
+                    if found.is_none() {
+                        found = find(child, id);
+                    }
+                });
+                found
+            }
+            find(&inferred.poly.body, id).map(|r| r.to_string())
+        };
+        named().unwrap_or_else(|| item.to_string())
+    }
+
     /// An error at each `def` whose bounded `requires` clause a trait requirement inference
     /// added exceeds, with the clause as the secondary label.
     pub(super) fn requirements_beyond_clauses(&self) -> Vec<LocatedInferError> {
@@ -997,7 +1149,7 @@ impl InferCtx {
                 requires: beyond,
                 ..inferred.poly
             }
-            .requires_text(|t| t.to_string());
+            .requires_text(crate::ccl::chl_print::chl_type);
             out.push(
                 LocatedInferError {
                     error: InferError::CapabilityBeyondClause {
@@ -1011,6 +1163,196 @@ impl InferCtx {
             );
         }
         out
+    }
+
+    /// Require `Orderable` of the keys of each ordered loop whose source's positions are a
+    /// keyed collection's, `σ` of `Σ (σ : SubtypesOf(K))`, whose order is `K`'s
+    /// (`docs/chl-spec.md`, "Ordered loops"). Emission requires it of `σ` itself, which no
+    /// instance answers or refuses; the source's type is resolved only now.
+    pub(super) fn order_keyed_loops(&mut self) -> Vec<LocatedInferError> {
+        use crate::ccl::ty::TypeKind;
+        let mut errors = Vec::new();
+        for l in std::mem::take(&mut self.ordered_loops) {
+            let positions =
+                crate::ccl::infer::solve::resolve_var_type(&l.positions).unwrap_or(l.positions);
+            let Type::WitnessRef(id) = positions.peel_refinements() else {
+                continue;
+            };
+            let iter = crate::ccl::infer::solve::resolve_var_type(&l.iter).unwrap_or(l.iter);
+            // Resolving the source renames its binders, so a sum of one binder names the
+            // positions by being one.
+            let kind = match iter.peel_refinements().sum() {
+                Some([only]) => Some(only.type_kind()),
+                Some(ws) => ws.iter().find(|w| w.id() == id).map(|w| w.type_kind()),
+                None => None,
+            };
+            let detail = match kind {
+                Some(TypeKind::SubtypesOf(key)) => {
+                    if self
+                        .require_trait(Trait::orderable(), l.node, &[&key, &key], None, &|| {
+                            "the keys of an ordered loop's source".to_string()
+                        })
+                        .is_ok()
+                    {
+                        continue;
+                    }
+                    keys_detail(&key)
+                }
+                Some(TypeKind::Type) => {
+                    "the positions of a collection, which have no order".to_string()
+                }
+                _ => continue,
+            };
+            errors.extend(self.unordered_loop_error(l.node, l.source, detail));
+        }
+        errors
+    }
+
+    /// The error refusing the ordered loop `node` over the source at `source`, whose positions
+    /// `detail` describes, naming what orders the loop.
+    pub(super) fn unordered_loop_error(
+        &self,
+        node: NodeId,
+        source: NodeId,
+        detail: String,
+    ) -> Option<LocatedInferError> {
+        let l = self.effect_loops.iter().find(|l| l.node == node)?;
+        let why = match interacting(&l.var, &l.declared)?.item {
+            Capability::Causes(Effect::Write(x)) => {
+                format!("its body writes `{x}`, a variable bound outside it")
+            }
+            item => format!("its body causes `{item}`"),
+        };
+        Some(LocatedInferError::new(
+            InferError::UnorderedLoop {
+                why,
+                detail,
+                at_use: false,
+            },
+            source,
+        ))
+    }
+
+    pub(super) fn assume_at_use(&self, obligations: &[Rc<TraitObligation>]) {
+        for obligation in obligations {
+            if obligation.assumptions().is_empty() {
+                obligation.assume_more(&self.assumptions);
+            }
+        }
+    }
+
+    pub(super) fn record_order_assumptions(
+        &self,
+        copies: &HashMap<CapabilityVarId, Rc<CapabilityVar>>,
+    ) {
+        for var in copies.values() {
+            for capability in var.own() {
+                if let Capability::Requires(r) = capability.item
+                    && let Some(order) = r.ordering()
+                {
+                    r.record();
+                    order
+                        .assumptions
+                        .borrow_mut()
+                        .extend(self.assumptions.iter().cloned());
+                }
+            }
+        }
+    }
+
+    /// Hold each loop's order to what its body was found to cause once emission is done. A loop
+    /// is ordered, and requires `Orderable` of its positions, from what its body causes when it
+    /// is emitted, which is when a requirement can enter the scheme of the function holding
+    /// it. A body that interacts only through a function passed to it learns so later.
+    pub(super) fn check_loop_orders(&mut self) -> Vec<LocatedInferError> {
+        let mut errors = Vec::new();
+        for requirement in crate::ccl::capabilities::order_requirements() {
+            let Some(order) = requirement.ordering() else {
+                continue;
+            };
+            if requirement.is_satisfied() {
+                order.satisfied.set(true);
+                continue;
+            }
+            let set = order.capabilities.set();
+            let capability = set.items().find(Capability::orders_a_loop);
+            let why = |capability: &Capability| match order.at_use {
+                true => format!("the loop's body causes `{capability}`"),
+                false => format!("its body causes `{capability}`"),
+            };
+            let positions = order.position_type();
+            let detail = positions_detail(&positions);
+            if matches!(positions.peel_refinements(), Type::WitnessRef(_)) {
+                if let Some(capability) = capability {
+                    errors.push(LocatedInferError::new(
+                        InferError::UnorderedLoop {
+                            why: why(&capability),
+                            detail: "the positions of a collection, which have no order".to_owned(),
+                            at_use: order.at_use,
+                        },
+                        order.source,
+                    ));
+                }
+                continue;
+            }
+            if positions.holds_type(&|t| {
+                matches!(
+                    t,
+                    Type::Infer(_)
+                        | Type::Hole
+                        | Type::SharedHole(_)
+                        | Type::WitnessRef(_)
+                        | Type::WitnessProjection(_)
+                )
+            }) {
+                continue;
+            }
+            let positions = crate::ccl::ccl_utils::strip_refinements(&positions);
+            let saved_level = self.level;
+            let saved_telescope = self.telescope.clone();
+            self.level = self.level.max(type_level(&order.positions));
+            if let Type::Infer(v) = order.positions.peel_refinements() {
+                self.telescope = v.telescope.clone();
+            }
+            let result = self.with_assumptions(&order.assumptions.borrow(), |ctx| {
+                ctx.require_trait(
+                    Trait::orderable(),
+                    order.node,
+                    &[&positions, &positions],
+                    None,
+                    &|| "the positions of an ordered loop".to_owned(),
+                )
+            });
+            self.level = saved_level;
+            self.telescope = saved_telescope;
+            match result {
+                Ok(_) => order.satisfied.set(true),
+                Err(_) => {
+                    if let Some(capability) = capability {
+                        errors.push(LocatedInferError::new(
+                            InferError::UnorderedLoop {
+                                why: why(&capability),
+                                detail,
+                                at_use: order.at_use,
+                            },
+                            order.source,
+                        ));
+                    }
+                }
+            }
+        }
+        // A use copies both the loop's requirement and the definition's written one, and each
+        // fails at the use alike: one report each.
+        let mut kept: Vec<LocatedInferError> = Vec::new();
+        for e in errors {
+            if !kept
+                .iter()
+                .any(|k| k.node_id == e.node_id && k.error == e.error)
+            {
+                kept.push(e);
+            }
+        }
+        kept
     }
 
     /// What was emitted that causes nothing and so does nothing: each `with begin():` block
@@ -1084,6 +1426,26 @@ impl InferCtx {
 
     /// `item` as a capability a written clause states, bound where the variable it names binds.
     fn stated_capability(&self, item: Capability) -> ScopedCapability {
+        let item = match item {
+            Capability::Requires(r) if r.ordering().is_some() => {
+                let order = r.ordering().unwrap();
+                if matches!(order.capabilities.repr(), Repr::Written(_)) {
+                    let r = Requirement::orderable_if_required_by(
+                        self.normalize_annotation(&order.positions),
+                        self.normalize_capabilities(&order.capabilities),
+                        self.current_node_id,
+                        self.current_node_id,
+                        order.iter.clone(),
+                        self.assumptions.clone(),
+                    );
+                    r.record();
+                    Capability::Requires(r)
+                } else {
+                    Capability::Requires(r)
+                }
+            }
+            other => other,
+        };
         let binder = item
             .variable()
             .and_then(|n| self.capability_binders.get(n).copied());
@@ -1327,6 +1689,16 @@ impl InferCtx {
         // the top of its direction less it, and its part is open without one. Its own bound
         // checks what the bound takes away.
         let mut set = written.set.clone();
+        set.requires = set
+            .requires
+            .into_iter()
+            .map(
+                |r| match self.stated_capability(Capability::Requires(r)).item {
+                    Capability::Requires(r) => r,
+                    _ => unreachable!("normalizing a requirement preserves its direction"),
+                },
+            )
+            .collect();
         set.params.clear();
         let (mut open_requires, mut open_causes) = (written.open_requires, written.open_causes);
         for (param, var) in written
@@ -1371,9 +1743,27 @@ impl InferCtx {
         });
     }
 
-    /// The capabilities a written clause states, for the solver: a fresh variable holding the
-    /// set, and bounded by it where a clause is exact, not ending in `_`
-    /// (`docs/chl-spec.md`, "Writing requirements and effects").
+    /// Normalize the operands of built-in requirements before recording and bounding a clause.
+    fn normalize_written(
+        &self,
+        written: &crate::ccl::capabilities::Written,
+    ) -> crate::ccl::capabilities::Written {
+        let mut written = written.clone();
+        written.set.requires = written
+            .set
+            .requires
+            .into_iter()
+            .map(
+                |r| match self.stated_capability(Capability::Requires(r)).item {
+                    Capability::Requires(r) => r,
+                    _ => unreachable!("normalizing a requirement preserves its direction"),
+                },
+            )
+            .collect();
+        written
+    }
+
+    /// A variable holding a written clause and bounded where that clause is exact.
     #[expect(
         clippy::mutable_key_type,
         reason = "an `Item` reaches a `Type` only through its requirement's trait declaration, \
@@ -1386,7 +1776,9 @@ impl InferCtx {
         if written.of_def {
             return Capabilities::none();
         }
+        let written = self.normalize_written(written);
         let var = CapabilityVar::fresh(self.level);
+        var.open_input.set(written.open_causes);
         // A parameter a clause names relates both ways with the position: what flows in is
         // what the parameter stands for, and the position holds what it stands for. The items
         // the clause lists beside it are the position's own, so they stay out of it.
@@ -1405,6 +1797,7 @@ impl InferCtx {
             var.flows_from(
                 &param,
                 Filter {
+                    of_causes: Some(p.of_causes),
                     except: p.except.clone(),
                     ..Filter::default()
                 },
@@ -1412,12 +1805,13 @@ impl InferCtx {
             param.flows_from(
                 &var,
                 Filter {
+                    of_causes: Some(p.of_causes),
                     stated: stated.clone(),
                     ..Filter::default()
                 },
             );
         }
-        self.bound_written(&var, written, Blame::Written(written.at));
+        self.bound_written(&var, &written, Blame::Written(written.at));
         if written.open_requires || written.open_causes {
             var.mark_hole(written.at);
         }
@@ -1773,7 +2167,21 @@ impl InferCtx {
             "{trait_} is over {} type(s); an operator wired to it must supply that many",
             trait_.arity(),
         );
-        let positions: Vec<Type> = operand_types.iter().map(|_| self.fresh()).collect();
+        // Each operand's variable stands where the operand does: one placed under a
+        // function's witness binders, a loop's positions over a sum among them, may name
+        // those witnesses, and so may the variable the obligation watches for it.
+        let positions: Vec<Type> = operand_types
+            .iter()
+            .map(|operand| {
+                let position = self.fresh();
+                if let (Type::Infer(copy), Type::Infer(original)) =
+                    (&position, operand.peel_refinements())
+                {
+                    copy.inherit_witness_placement(original);
+                }
+                position
+            })
+            .collect();
         // Only a requested association gets a variable for the obligation to settle;
         // a pure requirement determines nothing and mints none.
         let wanted: Vec<(Assoc, Type)> = assoc
@@ -3070,6 +3478,7 @@ impl Typing for InferCtx {
             {
                 let of_causes = *decl == crate::ccl::nominal::effect();
                 let var = CapabilityVar::fresh(self.level);
+                var.open_input.set(of_causes);
                 var.record(ScopedCapability {
                     item: Capability::Param(crate::ccl::capabilities::ClauseParam::whole(
                         Rc::clone(&opened),
@@ -3176,6 +3585,21 @@ impl Typing for InferCtx {
             Ok(()) => Ok(()),
             Err(e) => {
                 let failure = self.cache.take_failure();
+                // An ordered loop refusing the positions that arrived here, at a use of the
+                // definition holding it, is refused as the loop.
+                if let crate::ccl::infer::solver::ConstrainError::NoTraitInstance {
+                    operator,
+                    found,
+                    ..
+                } = &e
+                    && let Some(refusal) = self.unordered_loop_error(
+                        *operator,
+                        self.current_node_id,
+                        positions_detail(&coalesce_for_error(found)),
+                    )
+                {
+                    return Err(refusal.with_failure(failure));
+                }
                 Err(self
                     .raise(map_constrain_err(e, &at()))
                     .with_failure(failure))
@@ -3221,6 +3645,7 @@ impl Typing for InferCtx {
         if let Type::Fun { capabilities, .. } = recorded
             && let Repr::Written(written) = capabilities.repr()
         {
+            let written = self.normalize_written(written);
             // A parameter the clause names is what the body passes on, so it flows in; at an
             // instance's function it is the instance's associated effect type, which the body
             // defines beyond what the signature lists, so the body flows out to it instead,
@@ -3244,6 +3669,7 @@ impl Typing for InferCtx {
                     param.flows_from(
                         &var,
                         Filter {
+                            of_causes: Some(p.of_causes),
                             stated: stated.clone(),
                             ..Filter::default()
                         },
@@ -3252,6 +3678,7 @@ impl Typing for InferCtx {
                     var.flows_from(
                         &param,
                         Filter {
+                            of_causes: Some(p.of_causes),
                             except: p.except.clone(),
                             ..Filter::default()
                         },
@@ -3265,7 +3692,7 @@ impl Typing for InferCtx {
                 Some(crate::ccl::capabilities::Signature::Compiler) => Blame::Signature(None),
                 None => Blame::Clause(written.at),
             };
-            self.bound_written(&var, written, blame);
+            self.bound_written(&var, &written, blame);
         }
         let depth = self.capability_frame().depth + 1;
         self.capability_frames.push(CapabilityFrame { depth });
@@ -3428,6 +3855,9 @@ impl Typing for InferCtx {
     }
 
     fn record_capability(&mut self, item: Capability) {
+        if let Capability::Requires(r) = &item {
+            r.record();
+        }
         // Recorded on the node, whatever binds the variable: a node's capabilities are what
         // evaluating it does. A variable the enclosing function body binds, a parameter's
         // included, stays out of the function's type at the frame's filter.
@@ -3507,6 +3937,108 @@ impl Typing for InferCtx {
             });
         self.capability_statements.push((node, var, body.flatten()));
         r
+    }
+
+    fn loop_body<R>(
+        &mut self,
+        node: NodeId,
+        declared: &HashSet<Name>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> (R, bool) {
+        // A variable of its own around the body's, as a statement's, keeping what names the
+        // enclosing function's own variables: an accumulator may be one.
+        let var = CapabilityVar::fresh(self.level);
+        self.node_capabilities.push(NodeCapabilities {
+            var: Rc::clone(&var),
+            own: Rc::clone(&var),
+            inflow: Inflow::All,
+            body: None,
+            at: Some(node),
+            transaction: false,
+        });
+        let r = f(self);
+        self.leave_node_capabilities();
+        let ordered = iterations_interact(&var, declared);
+        self.effect_loops.push(EffectLoop {
+            node,
+            var,
+            declared: declared.clone(),
+            ordered,
+        });
+        (r, ordered)
+    }
+
+    fn note_data_loop(&mut self, node: NodeId, ty: &Type) {
+        let Type::Fun {
+            domain,
+            capabilities,
+            ..
+        } = ty
+        else {
+            return;
+        };
+        let requirement = Requirement::orderable_if_required_by(
+            (**domain).clone(),
+            capabilities.clone(),
+            node,
+            node,
+            Some(ty.clone()),
+            self.assumptions.clone(),
+        );
+        self.record_capability(Capability::Requires(requirement));
+    }
+
+    fn note_loop_order(&mut self, node: NodeId, source: NodeId, iter: &Type, positions: &Type) {
+        let body = self
+            .effect_loops
+            .iter()
+            .find(|l| l.node == node)
+            .expect("a loop's effects are recorded before its requirement");
+        let guard = CapabilityVar::fresh(self.level);
+        guard.flows_from(
+            &body.var,
+            Filter {
+                except: body
+                    .declared
+                    .iter()
+                    .map(|x| Capability::Causes(Effect::Write(x.clone())))
+                    .collect(),
+                ..Filter::default()
+            },
+        );
+        let requirement = Requirement::orderable_if_required_by(
+            positions.clone(),
+            Capabilities::var(guard),
+            node,
+            source,
+            Some(iter.clone()),
+            self.assumptions.clone(),
+        );
+        let ordered = body.ordered;
+        if ordered {
+            requirement.ordering().unwrap().satisfied.set(true);
+        }
+        self.record_capability(Capability::Requires(requirement));
+        if !ordered {
+            return;
+        }
+        self.ordered_loops.push(OrderedLoop {
+            node,
+            source,
+            iter: iter.clone(),
+            positions: positions.clone(),
+        });
+    }
+
+    fn unordered_loop(
+        &self,
+        node: NodeId,
+        source: NodeId,
+        positions: &Type,
+    ) -> Option<LocatedInferError> {
+        let positions = crate::ccl::infer::solve::resolve_var_type(positions)
+            .unwrap_or_else(|_| positions.clone());
+        self.unordered_loop_error(node, source, positions_detail(&positions))
     }
 
     fn note_binding(&mut self, name: &Name, ty: &Type, node: NodeId) {
@@ -3893,7 +4425,14 @@ impl Typing for InferCtx {
         // The codomain stands under the binder, so it is minted where the binder is in scope.
         let result = self.scoped(&x, &d, |ctx| ctx.fresh_part(&demand_kind));
         let expected = Type::pi_kinded(x.clone(), d.clone(), result.clone(), demand_kind);
-        let expected = expected.with_capabilities(self.call_capabilities());
+        let capabilities = self.call_capabilities();
+        if let Type::Infer(_) = fn_ty.peel_refinements()
+            && let Repr::Var(call) = capabilities.repr()
+        {
+            call.open_input
+                .set(!receives_a_value(fn_ty) && !kind.is_some_and(|k| k.resolved().is_data()));
+        }
+        let expected = expected.with_capabilities(capabilities);
         self.require_sub(fn_ty, &expected, at)?;
         self.constrain_argument(arg_ty, &expected, at)?;
         // The application's type is `result` with the binder discharged to the
@@ -3944,39 +4483,6 @@ fn mark_constant_family_holes(body: &Type, param: &smol_str::SmolStr) {
         ));
     }
     body.walk_children(|c| mark_constant_family_holes(c, param));
-}
-
-/// The capabilities of every function nested in a value, through its inferred lower bounds.
-fn type_capabilities(ty: &Type) -> Vec<ScopedCapability> {
-    fn collect(ty: &Type, seen: &mut HashSet<*const InferVar>, out: &mut Vec<ScopedCapability>) {
-        if let Type::Infer(v) = ty.peel_refinements() {
-            if seen.insert(Rc::as_ptr(v)) {
-                let lowers: Vec<Type> = v
-                    .bounds
-                    .borrow()
-                    .lower()
-                    .iter()
-                    .map(|b| b.ty.clone())
-                    .collect();
-                for lower in lowers {
-                    collect(&lower, seen, out);
-                }
-            }
-            return;
-        }
-        if let Type::Fun { capabilities, .. } = ty {
-            out.extend(match capabilities.repr() {
-                Repr::Var(v) => v.resolved().into_iter().collect(),
-                _ => Capabilities::capabilities_of(capabilities),
-            });
-        }
-        ty.walk_children(|child| collect(child, seen, out));
-    }
-    let mut out = Vec::new();
-    collect(ty, &mut HashSet::new(), &mut out);
-    out.sort();
-    out.dedup();
-    out
 }
 
 #[cfg(test)]

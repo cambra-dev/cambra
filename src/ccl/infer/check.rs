@@ -1113,7 +1113,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
             target,
             iter,
             body,
-        } => emit_for(position, target, iter, body, ctx)?,
+        } => emit_for(node_id, position, target, iter, body, ctx)?,
 
         // A `Defer` leaf's type was minted during inference (`Feed(ρ)`);
         // like `Var`, the recorded type carries the full load — trust it.

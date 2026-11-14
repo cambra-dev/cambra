@@ -1154,15 +1154,28 @@ where
             )
             .then(expr.clone())
             .then(requires_clause(expr.clone()).or_not())
-            .map_with(|((type_params, body), requires), e| {
-                Spanned::new(
-                    e.span(),
+            .then(bounded_clause(Token::Causes, clause_item(expr.clone())).or_not())
+            .try_map(|(((type_params, mut body), requires), causes), span| {
+                if let Some(causes) = causes {
+                    let Expr::FunctionType { causes: stated, .. } = &mut body.node else {
+                        return Err(Rich::custom(
+                            span,
+                            "a causes clause belongs to a function type",
+                        ));
+                    };
+                    if stated.span.is_some() {
+                        return Err(Rich::custom(span, "a function type has one causes clause"));
+                    }
+                    **stated = causes;
+                }
+                Ok(Spanned::new(
+                    span,
                     Expr::Forall {
                         type_params,
                         body: Box::new(body),
                         requires: requires.unwrap_or_default(),
                     },
-                )
+                ))
             })
             .boxed();
 
@@ -2848,7 +2861,7 @@ where
     I: ValueInput<'src, Token = Token, Span = Span>,
     E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
 {
-    clause_item(expr).map(|ty| {
+    orderable_if_required_by_requirement(expr.clone()).or(clause_item(expr).map(|ty| {
         Spanned::new(
             ty.span,
             Requirement::Trait {
@@ -2856,7 +2869,29 @@ where
                 ty: ty.node,
             },
         )
-    })
+    }))
+}
+
+fn orderable_if_required_by_requirement<'src, I, E>(
+    expr: E,
+) -> impl Parser<'src, I, Spanned<Requirement>, PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+    E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
+{
+    select! { Token::Ident(s) if s == "OrderableIfRequiredBy" => () }
+        .ignore_then(
+            expr.clone()
+                .then_ignore(just(Token::Comma))
+                .then(clause_contents(clause_item(expr)))
+                .delimited_by(just(Token::LParen), just(Token::RParen)),
+        )
+        .map_with(|(positions, effects), e| {
+            Spanned::new(
+                e.span(),
+                Requirement::OrderableIfRequiredBy { positions, effects },
+            )
+        })
 }
 
 /// A clause item: a trait type whose name is capitalized, `Write(x)`, `_`, or a
@@ -2962,6 +2997,15 @@ where
     P: Parser<'src, I, Spanned<T>, PErr<'src>> + Clone,
     T: Clone,
 {
+    just(keyword).ignore_then(clause_contents(item))
+}
+
+fn clause_contents<'src, I, T, P>(item: P) -> impl Parser<'src, I, Clause<T>, PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+    P: Parser<'src, I, Spanned<T>, PErr<'src>> + Clone,
+    T: Clone,
+{
     // A parenthesized item with an `except` of its own: `(Write(*) except Write(x))`.
     let scoped = item
         .clone()
@@ -2975,8 +3019,7 @@ where
             .at_least(1)
             .collect::<Vec<_>>(),
     );
-    just(keyword)
-        .ignore_then(choice((nothing, listed)))
+    choice((nothing, listed))
         .then(except_list(item).or_not())
         .map_with(|((only, written), except), e| {
             let mut items = Vec::new();
@@ -3077,6 +3120,7 @@ where
                 requirements,
             });
         choice((
+            orderable_if_required_by_requirement(expr.clone()).map(|r| r.node),
             forall,
             bound,
             subtype,

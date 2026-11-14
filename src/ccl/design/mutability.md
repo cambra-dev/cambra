@@ -72,9 +72,10 @@ closes a cycle well-founded by monotone lattice convergence rather than causal d
 A loop runs in its source's key order, because the store is keyed by the source's positions. A
 comprehension across two sources (`[e for x in xs for y in ys]`, join or not) is keyed by
 `(𝑖, 𝑗)`, so a loop over one runs its pairs lexicographically. A concatenation `xs ++ ys` is keyed
-by a tagged union, so a loop over one runs each part in turn. A source that delivers out of that
-order, as a product or a concatenation with a streamed part does, is still run in it
-(`src/interpreter/design-operators.md`, "The driver").
+by a tagged union, whose parts have no order between them, so a loop that must run in order is
+refused over one (`docs/chl-spec.md`, "Ordered loops"). A source that delivers out of its order, as
+a product with a streamed part does, is still run in it (`src/interpreter/design-operators.md`, "The
+driver").
 
 A mutable variable's domain is the domain of the context that **writes** it (`Txn` excepted — never
 inferred, always spelled at the introduction). A `:=` inside a `for` body introduces one whose
@@ -610,12 +611,12 @@ Symbolic rendering: `letrec 𝑏₁ = 𝑒₁; …; 𝑏ₙ = 𝑒ₙ in body`.
 | `as_of_read` | `(Txn ⤇ 𝑉) ⇒ 𝑉` | a commit history read at an unspecified position — every fed-out mutable variable read. `rewrite_as_of_reads` pairs it with the reading loop that indexes it and builds the `AsOf` join; an unpaired one is a compile error, since nothing downstream supplies a position |
 | `await_final` | `Mut(𝑉, Txn) ⇒ 𝑉` | the terminal read of a transactional mutable variable — a surface marker `transact_phase` replaces with a `final_read` over the mutable variable's history binding, which compiles to `StoreFinalRead`. Its domain is the **handle**, not a value. See [`await_final`](#await_final) |
 
-`begin()` never reaches CCL — lowering records the block structure, and the phase mints one
-`begin_<site>` per site. The oracles are opaque, strictly monotone in arrival order, with
-pairwise-disjoint ranges; the commit engine realizes them by tick allocation, not by computing
-anything. Arrival order realizes the spec's edge from a commit to every arrival after its output
-was sent, which gives cross-endpoint external consistency ([8.5 Ordering and
-concurrency](../../../docs/chl-spec.md#85-ordering-and-concurrency)).
+Lowering records each block's structure, and the transaction phase mints one `begin_<site>` per
+site. The opaque oracles have pairwise-disjoint ranges and preserve the program's causal
+ordering dependencies, an arrival's on every commit whose output was sent before it included
+([8.5 Ordering and concurrency](../../../docs/chl-spec.md#85-ordering-and-concurrency)). A source's arrival order alone imposes no order on its transactions
+([Ordered loops](../../../docs/chl-spec.md#ordered-loops)). The commit engine realizes the oracles
+by allocating a commit time to each successful transaction.
 
 Multi-variable atomic blocks produce one shared record `{time, writes: {𝑘₁: 𝑉₁, …}}` per commit,
 and each variable's history reads it through a per-key view — atomicity by construction, since one
@@ -1092,8 +1093,9 @@ Reading it off:
   commit slot (`begin_<site>`/`BeginTxn` is the *writer* oracle only). It is pure composition, no
   commit record, no write set. **External consistency** is a real property of this same mechanism (not
   a competing guarantee): a GET issued once a POST's `ok`-reply has landed reads at an observation time ≥ that
-  POST's commit (an arrival is ordered after every commit whose output was sent before it, which
-  arrival-order monotonicity realizes), so a client that sees `ok 2` then GETs observes `≥ 2`;
+  POST's commit (an arrival is ordered after every commit whose output was sent before it,
+  [8.5 Ordering and concurrency](../../../docs/chl-spec.md#85-ordering-and-concurrency)), so a
+  client that sees `ok 2` then GETs observes `≥ 2`;
   a read with no such causal ordering samples an *arbitrary* position among concurrent commits — which
   is all the "arbitrary as-of" of the `AsOf` sections means.
 

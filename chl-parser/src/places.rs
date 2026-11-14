@@ -344,6 +344,12 @@ impl Walk {
     fn requirements(&mut self, requires: &[Spanned<Requirement>]) {
         for r in requires {
             match &r.node {
+                Requirement::OrderableIfRequiredBy { positions, effects } => {
+                    self.expr(positions);
+                    for item in effects.all_items() {
+                        item.node.args.iter().for_each(|a| self.expr(a));
+                    }
+                }
                 Requirement::Trait { ty, .. } => ty.args.iter().for_each(|a| self.expr(a)),
                 Requirement::Bound { bound, .. } => self.expr(bound),
                 Requirement::Subtype { sub, sup } => {

@@ -465,7 +465,7 @@ fn a_checked_module_prints_its_interface() {
             param T <: Int
             pub Count = {Int where _ > 0}
             pub base: {Int where _ > 0}  # a constant
-            pub double: forall (A) A => Int requires r: Multipliable(A, Int), r::Output <: Int
+            pub double: forall (A, B) A => B ∨ Int requires r: Multipliable(A, Int), r::Output <: B
             pub first: forall (U) {U, U} => U  # callable in a constant
             pub keep: T => T  # callable in a constant
             pub total: Int  # a constant

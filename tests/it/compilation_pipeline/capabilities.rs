@@ -106,7 +106,7 @@ fn clauses_of(code: &str, member: &str) -> String {
                 out << x
     "},
     "report_all",
-    "requires r: Iterable(A), r::Elements <: C causes Append(out)"
+    "requires r: Iterable(A), r::Elements <: C |=> D causes Append(out)"
 )]
 #[case(
     indoc! {"
@@ -114,7 +114,7 @@ fn clauses_of(code: &str, member: &str) -> String {
             [take(x) for x in xs]
     "},
     "take_listed",
-    "requires r: Iterable(A), r::Elements <: C, ReadTxn(Module::*) causes RunTransaction, \
+    "requires r: Iterable(A), r::Elements <: C |=> D, ReadTxn(Module::*) causes RunTransaction, \
      WriteTxn(Module::*)"
 )]
 // Each use of a polymorphic function collects its own capabilities, so a call that passes it a
@@ -148,7 +148,8 @@ fn clauses_of(code: &str, member: &str) -> String {
             t
     "},
     "total",
-    "requires r: Iterable(A), r::Elements <: B, r1: Addable(Int, C), r1::Output <: Int"
+    "requires r: Iterable(A), r::Elements <: C |=> D, r1: Addable(B ∨ Int, D), r1::Output <: B, \
+     Orderable(C, C)"
 )]
 #[case(
     indoc! {"
@@ -159,7 +160,7 @@ fn clauses_of(code: &str, member: &str) -> String {
             sum(g)
     "},
     "local_feed",
-    "requires r: Iterable(A), r::Elements <: B"
+    "requires r: Iterable(A), r::Elements <: B |=> C"
 )]
 // A `Mut` parameter's history is its argument's, so the call writes the argument: the
 // caller's own variable here, which is no effect of the caller's…
@@ -174,7 +175,7 @@ fn clauses_of(code: &str, member: &str) -> String {
             c
     "},
     "counted",
-    "requires r: Iterable(A), r::Elements <: B"
+    "requires r: Iterable(A), r::Elements <: B |=> C, Orderable(B, B)"
 )]
 // …and a transactional variable there, which is.
 #[case(
@@ -463,6 +464,26 @@ fn a_printed_contract_annotates_its_definition() {
     "},
     "Addable(A, B)"
 )]
+// An ordering requirement over positions inference typed names them as the printed contract
+// does, beside the requirement on the source it loops over.
+#[case::an_inferred_ordering_requirement(
+    indoc! {"
+        def each(E <: Effect, f: (Int => Int causes E), xs) requires nothing causes E:
+            for x in xs:
+                f(x)
+            0
+    "},
+    "this has `OrderableIfRequiredBy(B, E)`, which the definition's clause"
+)]
+#[case::the_source_of_an_inferred_ordering_requirement(
+    indoc! {"
+        def each(E <: Effect, f: (Int => Int causes E), xs) requires nothing causes E:
+            for x in xs:
+                f(x)
+            0
+    "},
+    "this has `r: Iterable(A), r::Elements <: B |=> Int`, which the definition's clause"
+)]
 #[case::an_argument_beyond_a_written_type(
     indoc! {"
         def call_with(f: Int => Int, x: Int):
@@ -592,8 +613,8 @@ fn a_capability_beyond_a_written_type_is_reported_once(#[case] code: &str) {
     );
 }
 
-/// A clause naming no variable is reported at the clause, which no node of the tree stands for,
-/// rather than at the whole definition.
+/// A clause naming no variable is reported at the item naming it, which no node of the tree
+/// stands for, rather than at the whole definition.
 #[test]
 fn a_clause_naming_no_variable_is_reported_at_the_clause() {
     let code = indoc! {"
@@ -612,7 +633,7 @@ fn a_clause_naming_no_variable_is_reported_at_the_clause() {
     let [cambra::ccl::context::CompileError::Infer { span, .. }] = errors.as_slice() else {
         panic!("expected one located inference error, got {errors:?}");
     };
-    assert_eq!(&code[span.start..span.end], "causes Write(nope)");
+    assert_eq!(&code[span.start..span.end], "Write(nope)");
 }
 
 /// A clause form this compiler does not implement yet, and one written where it cannot stand,
@@ -1741,6 +1762,17 @@ fn a_runs_state_is_written_where_it_has_one(#[case] code: &str, #[case] needle: 
     "},
     "pub maker: (Int => Int causes Append(*)) => Int => Int causes Append(*)"
 )]
+#[case::a_loop_running_appends(
+    indoc! {"
+        def loop_over(f: (Int => Int causes Append(*)), xs):
+            for x in xs:
+                f(x)
+            0
+        pub def go(a, b) => Int:
+            loop_over(\\y -> y, a ++ b)
+    "},
+    "pub go: forall (A, B) {A => Int, B => Int} => Int causes Append(*)"
+)]
 #[case::a_block_discharging_from_context(
     indoc! {"
         pub def apply(f: (Int => Int requires Context causes Effect except RunTransaction), x: Int) => Int:
@@ -2052,4 +2084,22 @@ fn a_capability_list_is_checked(#[case] code: &str, #[case] needle: &str) {
 fn a_top_names_every_variable(#[case] code: &str, #[case] needle: &str) {
     let errors = errors_of(code);
     assert!(errors.contains(needle), "{errors}");
+}
+
+/// A top holding what makes iterations interact orders a loop running it, so a loop over a
+/// concatenation is refused (`docs/chl-spec.md`, "Ordered loops").
+#[rstest]
+#[case::effect("Effect")]
+#[case::every_write("Write(*)")]
+fn a_top_orders_a_loop(#[case] top: &str) {
+    let errors = errors_of(&format!(
+        "def loop_over(f: (Int => Int causes {top}), xs):\n    for x in xs:\n        f(x)\n    \
+         0\npub def go(a, b) => Int:\n    loop_over(\\y -> y, a ++ b)\n"
+    ));
+    assert!(
+        errors.contains(&format!(
+            "since its body causes `{top}`, but this source has the positions of a concatenation"
+        )),
+        "{errors}"
+    );
 }

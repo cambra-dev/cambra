@@ -23,15 +23,96 @@ use crate::ccl::{
     ty::TraitRequirement,
 };
 
-/// A requirement of a trait a call's context supplies (`docs/chl-spec.md`, "Discharging
-/// requirements and effects"): `Transaction`, `ObserveWorld`, `ReadTxn(x)` or `Read(x)`. Trait requirements
-/// answered by instance search are not here: a function value's are resolved where it is made, so a
-/// function type's `requires` names only context.
+/// A requirement carried by a function's `requires` clause: a context-supplied trait or the
+/// compiler's conditional `OrderableIfRequiredBy` predicate. Instance-search requirements remain on
+/// the polymorphic scheme (`docs/chl-spec.md`, "Discharging requirements and effects").
 ///
-/// A context trait is over no types, so its trait and term arguments decide a requirement of
-/// it, and order it: by [`Supplier`], then by trait, then by term arguments.
+/// A conditional requirement has a stable identity while its operands are inferred. Its
+/// instantiations have separate identities; renamed and rendered views share its proof state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Requirement(TraitRequirement);
+pub struct Requirement(TraitRequirement, Option<Rc<OrderableIfRequiredBy>>);
+
+/// The operands and scope of one conditional ordering requirement. Its capability variable
+/// survives discharge of the body's outward capabilities.
+#[derive(Debug, Clone)]
+pub struct OrderableIfRequiredBy {
+    pub(crate) id: u32,
+    pub positions: crate::ccl::Type,
+    pub capabilities: Capabilities,
+    pub(crate) satisfied: Rc<Cell<bool>>,
+    pub(crate) node: NodeId,
+    pub(crate) source: NodeId,
+    pub(crate) iter: Option<crate::ccl::Type>,
+    pub(crate) assumptions: RefCell<Vec<Rc<TraitRequirement>>>,
+    /// Whether this is a use's copy, located at the use rather than at the loop
+    /// ([`Requirement::at_use`]).
+    pub(crate) at_use: bool,
+}
+
+impl OrderableIfRequiredBy {
+    pub(crate) fn position_type(&self) -> crate::ccl::Type {
+        use crate::ccl::{Type, ty::TypeKind};
+        let resolve =
+            |t: &Type| crate::ccl::infer::solve::resolve_var_type(t).unwrap_or_else(|_| t.clone());
+        let positions = resolve(&self.positions);
+        if matches!(positions.peel_refinements(), Type::Infer(_)) {
+            return self.positions.clone();
+        }
+        let Type::WitnessRef(id) = positions.peel_refinements() else {
+            return positions;
+        };
+        let Some(iter) = &self.iter else {
+            return positions;
+        };
+        let iter = resolve(iter);
+        let kind = match iter.peel_refinements().sum() {
+            Some([only]) => Some(only.type_kind()),
+            Some(ws) => ws.iter().find(|w| w.id() == id).map(|w| w.type_kind()),
+            None => None,
+        }
+        .or_else(|| match self.positions.peel_refinements() {
+            Type::Infer(v) => v.witness_scope_kinds().iter().find_map(|k| {
+                let index = k.binder_position(id)?;
+                let carrier = Type::Fun {
+                    name: None,
+                    fun_kind: crate::ccl::ty::FunKind::Var(Rc::clone(k)),
+                    domain: Box::new(self.positions.clone()),
+                    codomain: Box::new(Type::Base(crate::ccl::BaseType::Unit)),
+                    capabilities: Capabilities::none(),
+                };
+                let carrier = resolve(&carrier);
+                carrier.sum()?.get(index).map(|w| w.type_kind())
+            }),
+            _ => None,
+        });
+        match kind {
+            Some(TypeKind::SubtypesOf(key)) => *key,
+            Some(TypeKind::UIntRanges) => Type::Base(crate::ccl::BaseType::UInt),
+            Some(TypeKind::Enumerated(types)) if types.len() == 1 => types[0].clone(),
+            _ => positions,
+        }
+    }
+}
+
+impl PartialEq for OrderableIfRequiredBy {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+impl Eq for OrderableIfRequiredBy {}
+impl Hash for OrderableIfRequiredBy {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+thread_local! {
+    static ORDER_REQUIREMENTS: RefCell<Option<Vec<Requirement>>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn order_requirements() -> Vec<Requirement> {
+    ORDER_REQUIREMENTS.with(|r| r.borrow().clone().unwrap_or_default())
+}
 
 impl Requirement {
     fn of(trait_: Trait, terms: Vec<Name>) -> Requirement {
@@ -42,14 +123,137 @@ impl Requirement {
             "a context requirement names a context trait, over no types, at one term argument \
              per term parameter"
         );
-        Requirement(TraitRequirement {
-            trait_,
-            args: Vec::new(),
-            terms,
-            effect_assoc: Vec::new(),
-            assoc: Vec::new(),
-            at: None,
-        })
+        Requirement(
+            TraitRequirement {
+                trait_,
+                args: Vec::new(),
+                terms,
+                effect_assoc: Vec::new(),
+                assoc: Vec::new(),
+                at: None,
+            },
+            None,
+        )
+    }
+
+    pub(crate) fn orderable_if_required_by(
+        positions: crate::ccl::Type,
+        capabilities: Capabilities,
+        node: NodeId,
+        source: NodeId,
+        iter: Option<crate::ccl::Type>,
+        assumptions: Vec<Rc<TraitRequirement>>,
+    ) -> Requirement {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        Requirement(
+            TraitRequirement {
+                trait_: Trait::orderable_if_required_by(),
+                args: Vec::new(),
+                terms: Vec::new(),
+                effect_assoc: Vec::new(),
+                assoc: Vec::new(),
+                at: None,
+            },
+            Some(Rc::new(OrderableIfRequiredBy {
+                id: NEXT.fetch_add(1, Ordering::Relaxed),
+                positions,
+                capabilities,
+                satisfied: Rc::new(Cell::new(false)),
+                node,
+                source,
+                iter,
+                assumptions: RefCell::new(assumptions),
+                at_use: false,
+            })),
+        )
+    }
+
+    /// This ordering requirement as a use's copy, which a refusal reports at the use: the
+    /// requirement was made just now and is held nowhere else.
+    pub(crate) fn at_use(mut self) -> Requirement {
+        let order = self.1.as_mut().expect("an ordering requirement");
+        Rc::get_mut(order)
+            .expect("a copy made just now has one owner")
+            .at_use = true;
+        self
+    }
+
+    pub(crate) fn record(&self) {
+        if self.ordering().is_none() {
+            return;
+        }
+        ORDER_REQUIREMENTS.with(|slot| {
+            if let Some(rs) = slot.borrow_mut().as_mut()
+                && !rs.contains(self)
+            {
+                rs.push(self.clone());
+            }
+        });
+    }
+
+    pub fn ordering(&self) -> Option<&Rc<OrderableIfRequiredBy>> {
+        self.1.as_ref()
+    }
+
+    fn implied_by(&self, other: &Requirement) -> bool {
+        let (Some(required), Some(stated)) = (self.ordering(), other.ordering()) else {
+            return self == other;
+        };
+        let resolve = |ty: &crate::ccl::Type| {
+            crate::ccl::infer::solve::resolve_var_type(ty).unwrap_or_else(|_| ty.clone())
+        };
+        if resolve(&required.position_type()) != resolve(&stated.position_type()) {
+            return false;
+        }
+        let required = required.capabilities.causes_set();
+        let stated = stated.capabilities.causes_set();
+        required
+            .items()
+            .filter(|i| i.of_causes())
+            .all(|i| stated.states(&i))
+    }
+
+    pub(crate) fn with_ordering(
+        &self,
+        positions: crate::ccl::Type,
+        capabilities: Capabilities,
+    ) -> Self {
+        let mut order = (**self.ordering().expect("an ordering requirement")).clone();
+        order.positions = positions;
+        order.capabilities = capabilities;
+        Self(self.0.clone(), Some(Rc::new(order)))
+    }
+
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "requirements hash conditional operands by stable identity"
+    )]
+    pub fn is_satisfied(&self) -> bool {
+        let Some(r) = &self.1 else { return false };
+        if r.satisfied.get() {
+            return true;
+        }
+        if !matches!(r.capabilities.repr(), Repr::Var(_)) {
+            let set = r.capabilities.set();
+            if !set.named_causes.is_empty()
+                || !set.vars.is_empty()
+                || set.params.iter().any(|p| p.of_causes)
+            {
+                return false;
+            }
+        }
+        let capabilities = match r.capabilities.repr() {
+            Repr::Var(v) => {
+                if v.has_open_ordering_input() {
+                    return false;
+                }
+                v.resolved_causes()
+            }
+            _ => Capabilities::capabilities_of(&r.capabilities)
+                .into_iter()
+                .collect(),
+        };
+        !capabilities.iter().any(|c| c.item.may_order_a_loop())
     }
 
     /// The snapshot of a transaction, which a `with begin():` block supplies to its body.
@@ -75,11 +279,19 @@ impl Requirement {
     }
 
     /// This requirement with `f` applied to each term argument.
-    pub fn map_terms(&self, f: &mut impl FnMut(&Name) -> Name) -> Requirement {
+    pub fn map_terms(&self, f: &mut dyn FnMut(&Name) -> Name) -> Requirement {
+        if let Some(order) = self.ordering() {
+            let capabilities = match order.capabilities.repr() {
+                Repr::Written(w) => Capabilities::written(w.map_names(f)),
+                Repr::Known(_) => order.capabilities.map_known_names(f),
+                Repr::Var(_) => order.capabilities.clone(),
+            };
+            return self.with_ordering(order.positions.clone(), capabilities);
+        }
         Requirement::of(self.0.trait_.clone(), self.0.terms.iter().map(f).collect())
     }
 
-    /// The trait requirement this is.
+    /// The declaration identifying this requirement. Conditional operands are on `ordering`.
     pub fn requirement(&self) -> &TraitRequirement {
         &self.0
     }
@@ -91,13 +303,19 @@ impl PartialOrd for Requirement {
     }
 }
 
-/// Consistent with equality: a context requirement has no operands and no associated types.
+/// Context requirements compare by trait and terms; conditional requirements by identity.
 impl Ord for Requirement {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         let key = |r: &Requirement| (r.0.trait_.supplied_by, r.0.trait_.clone());
         key(self)
             .cmp(&key(other))
             .then_with(|| self.0.terms.cmp(&other.0.terms))
+            .then_with(|| {
+                self.1
+                    .as_ref()
+                    .map(|r| r.id)
+                    .cmp(&other.1.as_ref().map(|r| r.id))
+            })
     }
 }
 
@@ -449,7 +667,9 @@ impl CapabilitySet {
     /// Whether this set lists `item`, or holds it through one of its tops.
     pub fn states(&self, item: &Capability) -> bool {
         let listed = match item {
-            Capability::Requires(r) => self.requires.contains(r),
+            Capability::Requires(r) => {
+                self.requires.contains(r) || self.requires.iter().any(|s| r.implied_by(s))
+            }
             Capability::Causes(e) => self.causes.contains(e),
             Capability::Param(_) => self
                 .params
@@ -469,6 +689,7 @@ impl CapabilitySet {
                   and a trait hashes and orders by its module path and name"
     )]
     pub fn normalized(mut self) -> CapabilitySet {
+        self.requires.retain(|r| !r.is_satisfied());
         let listed: Vec<Capability> = self
             .items()
             .filter(|i| !matches!(i, Capability::Every(_)))
@@ -1099,6 +1320,41 @@ impl Capability {
             Capability::Every(e) => e.of_causes,
         }
     }
+
+    /// The families whose capabilities order a loop whose body causes one (`docs/chl-spec.md`,
+    /// "Ordered loops"). [`Self::orders_a_loop`] and [`Self::may_order_a_loop`] read it.
+    const ORDERING: [Family; 1] = [Family::Write];
+
+    /// Whether a loop whose body causes this is ordered by it: a write to an induction variable,
+    /// or a top holding one (`docs/chl-spec.md`, "Ordered loops"). A write orders the loop only
+    /// where its variable is bound outside the iteration, which the caller decides. A clause
+    /// parameter is not one: each use decides what it holds, through the loop's `OrderableIfRequiredBy`
+    /// requirement.
+    pub fn orders_a_loop(&self) -> bool {
+        match self {
+            Capability::Causes(e) => Self::ORDERING
+                .into_iter()
+                .any(|f| f.has(&Capability::Causes(e.clone()))),
+            Capability::Every(every) => Self::ORDERING
+                .into_iter()
+                .any(|f| every.overlaps(&Capability::Every(f.top()))),
+            Capability::Param(_) | Capability::Requires(_) => false,
+        }
+    }
+
+    /// Whether a loop whose body causes this may be ordered by it: what
+    /// [`orders_a_loop`](Self::orders_a_loop), or a clause parameter whose bound, less its
+    /// `except`, may hold such a capability.
+    pub fn may_order_a_loop(&self) -> bool {
+        match self {
+            Capability::Param(p) if p.of_causes => Self::ORDERING.into_iter().any(|f| {
+                Every::of_direction(true)
+                    .less(p.except.iter().chain(&p.param.clause_except).cloned())
+                    .overlaps(&Capability::Every(f.top()))
+            }),
+            other => other.orders_a_loop(),
+        }
+    }
 }
 
 /// A [`Capability`] with where the variable it names is bound, which decides the function bodies
@@ -1166,6 +1422,8 @@ pub enum Bound {
 /// (`src/ccl/design/type-inference.md`, "Capability variables").
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Filter {
+    /// A clause parameter receives capabilities of its own direction.
+    pub of_causes: Option<bool>,
     /// The edge holds only once this kind resolves to data: a lambda that turns out to be a
     /// collection is evaluated where it is built, so its body's capabilities are the enclosing
     /// body's, and a lambda that turns out to be a function's are latent in its type.
@@ -1237,13 +1495,22 @@ impl Filter {
 
     /// Whether `capability` passes this edge.
     pub fn admits(&self, capability: &ScopedCapability) -> bool {
+        if self
+            .of_causes
+            .is_some_and(|direction| direction != capability.item.of_causes())
+        {
+            return false;
+        }
         if let Capability::Requires(r) = &capability.item
             && self.discharges.contains(r)
         {
             return false;
         }
         // What a stated item holds is the position's own, whichever site it came from.
-        if taken_away(&capability.item, &self.stated) {
+        if taken_away(&capability.item, &self.stated)
+            || matches!(&capability.item, Capability::Requires(r)
+                if self.stated.iter().any(|s| matches!(s, Capability::Requires(s) if r.implied_by(s))))
+        {
             return false;
         }
         if taken_away(&capability.item, &self.except) {
@@ -1293,6 +1560,8 @@ pub struct CapabilityVar {
     /// of it ends in `_`, which a bounded clause it reaches then bounds
     /// ([`CapabilityVar::bound_holes_reaching`]).
     hole: Cell<Option<chl_parser::ast::Span>>,
+    /// An effect input supplied at a use. Empty lower bounds do not establish purity.
+    pub(crate) open_input: Cell<bool>,
 }
 
 /// A set a [`CapabilityVar`] may not exceed, and what a failure reports.
@@ -1312,6 +1581,11 @@ pub struct Upper {
 impl Upper {
     /// Whether `item` is within this bound.
     pub fn admits(&self, item: &Capability) -> bool {
+        if let Capability::Requires(r) = item
+            && r.is_satisfied()
+        {
+            return true;
+        }
         let forbidden = match item {
             Capability::Causes(e) => self.forbidden.contains(e),
             // A top holds what the bound forbids unless it takes it away.
@@ -1374,11 +1648,13 @@ thread_local! {
 
 /// Begin collecting the capability variables given an upper bound.
 pub(crate) fn upper_arena_enter() {
+    ORDER_REQUIREMENTS.with(|r| *r.borrow_mut() = Some(Vec::new()));
     UPPER_ARENA.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
 }
 
 /// Stop collecting, and drop each variable's upper bounds.
 pub(crate) fn upper_arena_exit() {
+    ORDER_REQUIREMENTS.with(|r| r.borrow_mut().take());
     for var in UPPER_ARENA.with(|slot| slot.borrow_mut().take().unwrap_or_default()) {
         var.uppers.borrow_mut().clear();
     }
@@ -1418,6 +1694,47 @@ impl CapabilityVar {
             resolved_at: RefCell::new(None),
             uppers: RefCell::new(Vec::new()),
             hole: Cell::new(None),
+            open_input: Cell::new(false),
+        })
+    }
+
+    fn has_open_ordering_input(&self) -> bool {
+        let mut seen = HashSet::new();
+        let mut stack = self.incoming();
+        if self.open_input.get()
+            && stack.is_empty()
+            && self.own.borrow().is_empty()
+            && !self.excludes_ordering()
+        {
+            return true;
+        }
+        while let Some((var, filter)) = stack.pop() {
+            if filter.of_causes == Some(false)
+                || !filter.holds()
+                || !seen.insert(var.uid)
+                || var.excludes_ordering()
+            {
+                continue;
+            }
+            let incoming = var.incoming();
+            if var.open_input.get() && incoming.is_empty() && var.own.borrow().is_empty() {
+                return true;
+            }
+            stack.extend(incoming);
+        }
+        false
+    }
+
+    pub(crate) fn excludes_ordering(&self) -> bool {
+        self.uppers.borrow().iter().any(|upper| {
+            upper.of_causes
+                && upper.set.named_causes.is_empty()
+                && upper.set.vars.is_empty()
+                && upper
+                    .set
+                    .items()
+                    .filter(Capability::of_causes)
+                    .all(|c| !c.may_order_a_loop())
         })
     }
 
@@ -1591,8 +1908,39 @@ impl CapabilityVar {
                   and a trait hashes and orders by its module path and name"
     )]
     pub fn resolved(&self) -> BTreeSet<ScopedCapability> {
+        self.resolve(None)
+            .into_iter()
+            .filter(|c| !matches!(&c.item, Capability::Requires(r) if r.is_satisfied()))
+            .collect()
+    }
+
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "requirements hash conditional operands by stable identity"
+    )]
+    pub(crate) fn resolved_causes(&self) -> BTreeSet<ScopedCapability> {
+        self.resolve(Some(true))
+    }
+
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "requirements hash conditional operands by stable identity"
+    )]
+    fn resolve(&self, direction: Option<bool>) -> BTreeSet<ScopedCapability> {
+        let allows = |filter: &Filter| {
+            direction.is_none() || filter.of_causes.is_none() || direction == filter.of_causes
+        };
+        let own = |v: &CapabilityVar| {
+            v.own
+                .borrow()
+                .iter()
+                .filter(|c| direction.is_none_or(|d| c.item.of_causes() == d))
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        };
         let now = CAPABILITY_FACTS.with(Cell::get);
         if let Some((at, capabilities)) = &*self.resolved_at.borrow()
+            && direction.is_none()
             && *at == now
         {
             return capabilities.clone();
@@ -1602,17 +1950,21 @@ impl CapabilityVar {
         let mut nodes: HashMap<CapabilityVarId, Rc<CapabilityVar>> = HashMap::new();
         let mut stack: Vec<Rc<CapabilityVar>> = Vec::new();
         let mut sets: HashMap<CapabilityVarId, BTreeSet<ScopedCapability>> = HashMap::new();
-        sets.insert(self.uid, self.own.borrow().clone());
-        for (v, _) in self.incoming.borrow().iter() {
-            stack.push(Rc::clone(v));
+        sets.insert(self.uid, own(self));
+        for (v, filter) in self.incoming.borrow().iter() {
+            if allows(filter) {
+                stack.push(Rc::clone(v));
+            }
         }
         while let Some(v) = stack.pop() {
             if v.uid == self.uid || nodes.contains_key(&v.uid) {
                 continue;
             }
-            sets.insert(v.uid, v.own.borrow().clone());
-            for (w, _) in v.incoming.borrow().iter() {
-                stack.push(Rc::clone(w));
+            sets.insert(v.uid, own(&v));
+            for (w, filter) in v.incoming.borrow().iter() {
+                if allows(filter) {
+                    stack.push(Rc::clone(w));
+                }
             }
             nodes.insert(v.uid, v);
         }
@@ -1628,7 +1980,7 @@ impl CapabilityVar {
             let mut changed = false;
             for &id in &ids {
                 for (src, filter) in incoming_of(id) {
-                    if !filter.holds() {
+                    if !allows(&filter) || !filter.holds() {
                         continue;
                     }
                     // A variable a written function type bounds passes on only what the type
@@ -1663,7 +2015,9 @@ impl CapabilityVar {
             }
         }
         let out = sets.remove(&self.uid).expect("the variable's own set");
-        *self.resolved_at.borrow_mut() = Some((now, out.clone()));
+        if direction.is_none() {
+            *self.resolved_at.borrow_mut() = Some((now, out.clone()));
+        }
         out
     }
 
@@ -1893,6 +2247,18 @@ impl Capabilities {
         }
     }
 
+    pub(crate) fn causes_set(&self) -> CapabilitySet {
+        let mut set = match self.repr() {
+            Repr::Var(v) => set_of(&v.resolved_causes()),
+            _ => self.set(),
+        };
+        set.requires.clear();
+        set.named_requires.clear();
+        set.params.retain(|p| p.of_causes);
+        set.tops.retain(|top| top.of_causes);
+        set
+    }
+
     /// Each requirement and effect this states, as a capability naming no depth: a known set
     /// comes from a type already materialized, whose variables no scope here binds.
     pub fn capabilities_of(capabilities: &Capabilities) -> Vec<ScopedCapability> {
@@ -1921,6 +2287,20 @@ impl Capabilities {
 
 impl fmt::Display for Requirement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(r) = &self.1 {
+            let mut set = r.capabilities.set();
+            set.requires.clear();
+            set.named_requires.clear();
+            set.params.retain(|p| p.of_causes);
+            set.tops.retain(|t| t.of_causes);
+            let clause = clauses(Vec::new(), &Capabilities::known(set));
+            return write!(
+                f,
+                "OrderableIfRequiredBy({}, {})",
+                r.positions,
+                clause.strip_prefix(" causes ").unwrap_or("nothing")
+            );
+        }
         write!(f, "{}", self.0.trait_)?;
         if !self.0.terms.is_empty() {
             let terms: Vec<String> = self.0.terms.iter().map(ToString::to_string).collect();

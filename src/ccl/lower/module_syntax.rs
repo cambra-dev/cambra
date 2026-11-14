@@ -350,6 +350,12 @@ impl Refusals {
     fn requires(&mut self, requires: &[Spanned<Requirement>]) {
         for requirement in requires {
             match &requirement.node {
+                Requirement::OrderableIfRequiredBy { positions, effects } => {
+                    self.expr(positions);
+                    for ty in effects.all_items() {
+                        self.trait_type(&ty.node);
+                    }
+                }
                 Requirement::Trait { ty, .. } => self.trait_type(ty),
                 Requirement::Bound { bound, .. } => self.expr(bound),
                 Requirement::Subtype { sub, sup } => {

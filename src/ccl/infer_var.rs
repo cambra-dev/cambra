@@ -1017,6 +1017,38 @@ pub(crate) fn lookup(uid: &InferVarId) -> Option<Rc<InferVar>> {
     })
 }
 
+/// What [`var_edges_held_elsewhere`] gives each variable: the variables recorded below it on
+/// their own side, then those recorded above it.
+pub(crate) type HeldElsewhere = HashMap<InferVarId, (Vec<Rc<InferVar>>, Vec<Rc<InferVar>>)>;
+
+/// The variable-to-variable edges of the active run, indexed by the variable each names as its
+/// bound: for `v`, the variables that hold `u <: v` as their own upper bound, and those that
+/// hold `v <: u` as their own lower bound. Inference records an edge between two variables on
+/// one of them, whichever their levels pick, so a reader asking what stands below or above
+/// `v` needs both ends ([`crate::ccl::infer::solver::compact::compact_type_for_display`]). An
+/// edge under a substitution states a fact about an instance, not the variable, and is left
+/// out.
+pub(crate) fn var_edges_held_elsewhere() -> HeldElsewhere {
+    let mut index = HeldElsewhere::new();
+    ACTIVE_ARENA.with(|slot| {
+        for u in slot.borrow().iter().flatten() {
+            let s = u.bounds.borrow();
+            for (holds_upper, list) in [(true, s.upper()), (false, s.lower())] {
+                for b in list.iter() {
+                    if let Type::Infer(v) = &b.ty
+                        && b.self_subst.is_id()
+                        && b.ty_subst.is_id()
+                    {
+                        let (below, above) = index.entry(v.uid).or_default();
+                        if holds_upper { below } else { above }.push(Rc::clone(u));
+                    }
+                }
+            }
+        }
+    });
+    index
+}
+
 impl InferVar {
     /// Mint a fresh, unconstrained inference variable at `level`.
     ///

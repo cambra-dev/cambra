@@ -3726,6 +3726,7 @@ pub(super) fn specialize_use(
         entered_binders,
         // The clone's capability variables are the use's copies (`capabilities::UseCapabilities`).
         capability_vars: ctx.use_capabilities.copies(use_expr.node_id()),
+        use_at: Some(use_expr.node_id()),
         ..FreshenCache::new()
     };
     // Quantified channel-domain names must instantiate to the SAME names the
@@ -3787,6 +3788,11 @@ pub(super) fn specialize_use(
     let mut cache = ConstrainCache::new().without_capabilities();
     let use_origin = Some(crate::ccl::infer_var::Origin::Node(use_expr.node_id()));
     cache.at(use_origin, use_origin);
+    for obligation in fresh.obligations.values() {
+        if obligation.assumptions().is_empty() {
+            obligation.assume_more(&ctx.assumptions);
+        }
+    }
     let pinned = constrain_subtype_in(
         &clone.ty,
         &use_expr.ty,
