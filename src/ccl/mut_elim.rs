@@ -727,6 +727,42 @@ pub(crate) fn lift_bindings_out_of_effect_position(mut expr: Expr) -> Expr {
     ))
 }
 
+/// Turn each `let x = write in body` whose `x` `body` does not read into the statement
+/// `write; body`.
+///
+/// A `def` whose last statement is a write has that write as its value, which inlining binds to
+/// the function's output binder: `let __output : Unit = stock := e in unit`. The write is then a
+/// binding's value rather than a statement of the block it was inlined into. Its value is `Unit`,
+/// so where nothing reads the binder the statement says the same, and puts the write on the spine
+/// where `transact_phase` orders a block's writes. A 1:1 reparent: the `ExprStmt` takes the
+/// `Let`'s id.
+pub(crate) fn sequence_bound_writes(mut expr: Expr) -> Expr {
+    expr.map_children(sequence_bound_writes);
+    let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = &expr.node
+    else {
+        return expr;
+    };
+    if !matches!(
+        bound_expr.node,
+        TypedExprNode::MutWrite { .. } | TypedExprNode::Feed { .. }
+    ) || crate::ccl::ccl_utils::is_free(&binding.name, body)
+    {
+        return expr;
+    }
+    let id = expr.node_id();
+    let TypedExprNode::Let {
+        bound_expr, body, ..
+    } = expr.node
+    else {
+        unreachable!("matched a `Let` above")
+    };
+    Expr::expr_stmt_preserving(id, *bound_expr, *body)
+}
+
 /// Apply [`push_binding_into_case`] and [`push_continuation_into_case`]
 /// everywhere in `expr`.
 ///
@@ -753,7 +789,7 @@ fn push_writing_cases(mut expr: Expr, in_writer_body: bool) -> Expr {
         **body = push_writing_cases(taken_body, true);
         return expr;
     }
-    if let TypedExprNode::Begin { body } = &mut expr.node {
+    if let TypedExprNode::Begin { body, .. } = &mut expr.node {
         let taken_body = std::mem::take(&mut **body);
         **body = push_writing_cases(taken_body, true);
         return expr;
@@ -3139,7 +3175,7 @@ fn share_a_binding(values: &[&Expr], kept: &[Kept]) -> bool {
 
 /// Whether `e` is an `if` or a `match` some branch of which writes, feeds, or runs a loop. The
 /// write may sit in a binding of the branch (`u = if …: x += 1; …`), off the branch's spine.
-fn is_writing_case(e: &Expr) -> bool {
+pub(crate) fn is_writing_case(e: &Expr) -> bool {
     matches!(e.node, TypedExprNode::Case { .. }) && (holds_loop(e) || writes(e) || feeds(e))
 }
 

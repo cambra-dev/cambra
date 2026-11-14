@@ -78,12 +78,24 @@ pub struct Located<E> {
     pub error: E,
     /// The node the error was raised at.
     pub node_id: NodeId,
+    /// Other nodes the error involves, each a secondary label with its text.
+    pub related: Vec<(NodeId, &'static str)>,
 }
 
 impl<E> Located<E> {
     /// `error` raised at `node_id`.
     pub fn new(error: E, node_id: NodeId) -> Self {
-        Located { error, node_id }
+        Located {
+            error,
+            node_id,
+            related: Vec::new(),
+        }
+    }
+
+    /// This error with `node` as a secondary label reading `label`.
+    pub fn with_related(mut self, node: NodeId, label: &'static str) -> Self {
+        self.related.push((node, label));
+        self
     }
 }
 

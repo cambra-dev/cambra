@@ -378,7 +378,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // A value known only by its type, which the `let` binding it states.
         TypedExprNode::Abstract => ctx.fresh(),
 
-        TypedExprNode::Begin { body } => emit_begin(body, ctx)?,
+        TypedExprNode::Begin { body, .. } => emit_begin(body, ctx)?,
 
         // The feed/define target lookup is Emit-specific (Check maintains no
         // scope): resolve the feed handle's type from the environment exactly
@@ -3145,7 +3145,7 @@ pub(super) fn emit_for<C: Typing>(
     Ok(Type::Base(BaseType::Unit))
 }
 
-/// Type a `Begin { body }` transaction-block marker: emit the per-transaction
+/// Type a `Begin { body, .. }` transaction-block marker: emit the per-transaction
 /// body chain and give the block itself type `Unit`. The block introduces no
 /// binder or scope — in-block mutable variable reads/writes/feeds are typed by their own
 /// `Var`/`MutWrite`/`Feed` rules. Shared by Emit and Check via [`Typing`], like

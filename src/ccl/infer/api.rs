@@ -359,6 +359,14 @@ pub enum InferError {
     /// A statement whose value is discarded and which causes nothing, so it does nothing
     /// (`docs/chl-spec.md`, "4.9 Expression statement").
     InertStatement,
+    /// A requirement of `Transaction`, by a read or a write of a transactional mutable variable
+    /// made here or by a call, that no `with begin():` block's body encloses, so nothing
+    /// supplies it (`docs/chl-spec.md`, "8.2 Transactions: `with begin():`").
+    TransactionOutsideBlock,
+    /// A `with begin():` block whose body writes no transactional mutable variable and feeds
+    /// nothing, directly or through a call, so it does nothing (`docs/chl-spec.md`, "8.2
+    /// Transactions: `with begin():`").
+    EmptyTransaction,
     /// A public function whose type names an induction variable its module's top level binds,
     /// which no other module may read or write (`docs/chl-spec.md`, "9.10 Induction variables
     /// stay in their module").
@@ -835,6 +843,10 @@ pub enum InferError {
         /// [`Self::same_defect`].
         at: String,
     },
+    /// A parameter written `Mut(V)`, a mutable variable, that is passed a transactional
+    /// variable, `Mut(V, Txn)`: two types (`docs/chl-spec.md`, "6.2 Non-purity as type wrappers"). Reported by
+    /// [`check_mut_discipline`].
+    TransactionalArgToMutParam { param: String },
     /// A `MutWrite` (`:=` / `+=`) targets a binding whose resolved type is not
     /// [`Type::History`] — a write to something that was never introduced as a
     /// mutable variable. Writes require a mutable (they never mean "shadow an
@@ -1105,6 +1117,8 @@ impl InferError {
             | InferError::ClauseNamesNoVariable { .. }
             | InferError::CapabilityBeyondSignature { .. }
             | InferError::NestedTransaction { .. }
+            | InferError::TransactionOutsideBlock
+            | InferError::EmptyTransaction
             | InferError::EscapesItsVariable { .. }
             | InferError::HandsOutItsVariable { .. }
             | InferError::Unsupported(_)
@@ -1118,6 +1132,7 @@ impl InferError {
             | InferError::TupleWidthConflict { .. }
             | InferError::MutNotBareVariable { .. }
             | InferError::MutArgNotMutable { .. }
+            | InferError::TransactionalArgToMutParam { .. }
             | InferError::TypeParamEscapes { .. }
             | InferError::ParamReadsBinder { .. }
             | InferError::ConstantFamilyReadsBinder { .. }
@@ -1609,6 +1624,17 @@ impl std::fmt::Debug for InferError {
                 "`{item}` names no variable in scope of the kind it takes: `Write` and `Read` \
                  take an induction variable, `WriteTxn` and `ReadTxn` a transactional one, and \
                  `Append` a feed"
+            ),
+            InferError::EmptyTransaction => write!(
+                f,
+                "this `with begin():` block does nothing: it writes no transactional (`Mut(_, \
+                 Txn)`) variable and feeds nothing (`out << …`), directly or through a call"
+            ),
+            InferError::TransactionOutsideBlock => write!(
+                f,
+                "this requires `Transaction` outside a `with begin():` block, whose body is what \
+                 supplies one: it reads or writes a transactional variable, or calls a function \
+                 that does; `await_final(x)` reads `x`'s final committed value outside a block"
             ),
             InferError::EscapesItsVariable { item, every: false } => write!(
                 f,
@@ -2180,6 +2206,14 @@ impl std::fmt::Debug for InferError {
                     w.ty(ty)
                 )
             }
+            InferError::TransactionalArgToMutParam { param } => {
+                write!(
+                    f,
+                    "`{param}` is written `Mut(…)`, a mutable variable, and is passed a \
+                     transactional one, whose type is `Mut(…, Txn)`; a parameter that takes a \
+                     transactional variable is written `Mut(…, Txn)`"
+                )
+            }
             InferError::MutArgNotMutable { .. } => {
                 write!(
                     f,
@@ -2252,10 +2286,125 @@ pub fn infer(
     }
     let (ty, inert) = ty?;
     ctx.inert = inert;
+    // Read while the annotations that state each parameter's domain are still there.
+    let mut errors = Vec::new();
+    transactional_args_to_mut_params(expr, &mut errors);
+    if !errors.is_empty() {
+        return Err(errors);
+    }
     // Only on success: an error path's tree is reported against, and the
     // annotation is part of what an `AnnotationMismatch` renders.
     clear_annotations(expr);
     Ok(ty)
+}
+
+/// An error at each argument passing a transactional variable to a parameter written `Mut(V)`.
+/// The annotation leaves the domain to inference, which a transactional argument fills with
+/// `Txn`, and `Mut(V)` is not `Mut(V, Txn)` (`docs/chl-spec.md`, "6.2 Non-purity as type
+/// wrappers"). A function so typed that no call names, as one passed as a value, is reported
+/// at itself.
+fn transactional_args_to_mut_params(expr: &Expr, errors: &mut Vec<LocatedInferError>) {
+    // Whether a lambda's parameter is written `Mut(V)` and holds a transactional variable.
+    fn misread(param: &TypedBinding) -> bool {
+        matches!(
+            param.annotation_ty().and_then(Type::history_parts),
+            Some((written, _, HistoryKind::Overwrite)) if !matches!(written, Type::Txn)
+        ) && matches!(param.ty.history_parts(), Some((Type::Txn, _, _)))
+    }
+    // Each let-bound function's misread parameters, by their position in its curried chain.
+    fn functions(e: &Expr, out: &mut HashMap<Name, Vec<(usize, String)>>) {
+        if let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            ..
+        } = &e.node
+        {
+            let mut at = Vec::new();
+            let mut level: &Expr = bound_expr;
+            let mut depth = 0;
+            while let TypedExprNode::Lambda { param, body } = &level.node {
+                if misread(param) {
+                    at.push((depth, param.name.base().to_string()));
+                }
+                level = body;
+                depth += 1;
+            }
+            if !at.is_empty() {
+                out.insert(binding.name.clone(), at);
+            }
+        }
+        e.walk_children(|child| functions(child, out));
+    }
+    // An error at each argument a call passes to a misread parameter.
+    fn calls(
+        e: &Expr,
+        functions: &HashMap<Name, Vec<(usize, String)>>,
+        called: &mut HashSet<Name>,
+        errors: &mut Vec<LocatedInferError>,
+    ) {
+        let mut arguments = Vec::new();
+        let mut head = e;
+        while let TypedExprNode::Apply { argument, function } = &head.node {
+            arguments.push(argument.as_ref());
+            head = function;
+        }
+        arguments.reverse();
+        if let TypedExprNode::Var(f) = &head.node
+            && let Some(params) = functions.get(f)
+            && !arguments.is_empty()
+        {
+            called.insert(f.clone());
+            for (depth, param) in params {
+                if let Some(argument) = arguments.get(*depth) {
+                    errors.push(LocatedInferError::new(
+                        InferError::TransactionalArgToMutParam {
+                            param: param.clone(),
+                        },
+                        argument.node_id(),
+                    ));
+                }
+            }
+            for argument in arguments {
+                calls(argument, functions, called, errors);
+            }
+            return;
+        }
+        e.walk_children(|child| calls(child, functions, called, errors));
+    }
+    // A misread function no call names, at its lambda.
+    fn uncalled(e: &Expr, called: &HashSet<Name>, errors: &mut Vec<LocatedInferError>) {
+        if let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } = &e.node
+            && called.contains(&binding.name)
+        {
+            // Its calls are reported: past its own lambdas, the bodies may hold other functions.
+            let mut level: &Expr = bound_expr;
+            while let TypedExprNode::Lambda { body, .. } = &level.node {
+                level = body;
+            }
+            uncalled(level, called, errors);
+            return uncalled(body, called, errors);
+        }
+        if let TypedExprNode::Lambda { param, .. } = &e.node
+            && misread(param)
+        {
+            errors.push(LocatedInferError::new(
+                InferError::TransactionalArgToMutParam {
+                    param: param.name.base().to_string(),
+                },
+                e.node_id(),
+            ));
+        }
+        e.walk_children(|child| uncalled(child, called, errors));
+    }
+    let mut misread_functions = HashMap::new();
+    functions(expr, &mut misread_functions);
+    let mut called = HashSet::new();
+    calls(expr, &misread_functions, &mut called, errors);
+    uncalled(expr, &called, errors);
 }
 
 /// Check `expr`, the check tree of a module checked on its own, with the

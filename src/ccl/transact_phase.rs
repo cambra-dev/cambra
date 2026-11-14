@@ -78,13 +78,14 @@ use crate::ccl::RecordEntry;
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::{
-    Builtin, Expr, F_DECISION, F_TIME, F_WRITE, F_WRITE_TARGETS, F_WRITES, FieldKey, HistoryKind,
-    Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode, WriterSite,
-    ccl_utils::{free_names_in_value, is_free, is_free_in_value},
+    BaseType, BinOpKind, Builtin, Expr, F_DECISION, F_TIME, F_WRITE, F_WRITE_TARGETS, F_WRITES,
+    FieldKey, HistoryKind, Lit, LogicKind, Name, ProjKey, Type, TypedBinding, TypedExprNode,
+    WriterSite,
+    ccl_utils::{free_names_in_value, is_free, is_free_in_value, refresh_let_binder},
     feed_nest::LoopFeed,
     mut_elim::{
         Declared, FeedSite, WriterParam, WriterWalk, binding, close_recurrence_group,
-        fold_induction_loop, hoist_feeds, tvar,
+        fold_induction_loop, hoist_feeds, is_writing_case, tvar,
     },
     provenance,
     provenance::{Located, NodeId},
@@ -700,21 +701,36 @@ fn compile_blocks(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Loca
     // `Case` inside a `with begin():` block, and the letrec phase merges it at the top
     // level; the binding is pushed into the branches only where neither does, the
     // same normalization the letrec phase applies through `flatten_spine`.
+    let expr = flatten_begin_bodies(expr);
     let expr = crate::ccl::mut_elim::push_bindings_into_writing_cases(expr);
     // A statement whose effect is a `Let` hides that binding from the rest of
     // the spine, which is where this phase places the stores' `Transact`s that
     // read it. Lift it onto the spine first.
     let expr = crate::ccl::mut_elim::lift_bindings_out_of_effect_position(expr);
+    // A function ending in a write leaves it bound to its output binder where it is inlined.
+    let expr = crate::ccl::mut_elim::sequence_bound_writes(expr);
+    if let Some((write, statement)) = write_off_a_spine(&expr) {
+        return Err(Located::new(
+            "this write or feed, reached through a call in a `with begin():` block, stands \
+             where the block cannot order it among its own, such as a later `elif`'s condition, \
+             a function value or a comprehension; that is not supported yet"
+                .to_string(),
+            write,
+        )
+        .with_related(statement, "the block reaches it through this"));
+    }
     // Over the tree before its blocks are stripped, which leaves each block's body outside it.
     let mut declared = Declared::of(&expr);
+    // Keys are ordered as their variables are declared: a store's keys, and each site's.
+    let order = declaration_order(&expr, txn_mut_vars);
     let mut harvest = Stripped::default();
     let stripped = strip(expr, txn_mut_vars, None, &mut harvest);
     // Post-strip invariants (release asserts, like the letrec-phase
     // post-conditions): every `Begin` was consumed (stripped into a site or
     // unwrapped), and no transactional write survives outside a block — a
-    // survivor is a mutable variable write outside a block that the lowering write gate
-    // (`check_mut_write_context`) should have rejected, and must never
-    // silently become a shadowing `let` that hides committed values.
+    // survivor is a write requiring a `Transaction` no block supplies, which inference
+    // refuses (`InferError::TransactionOutsideBlock`), and must never silently become a
+    // shadowing `let` that hides committed values.
     assert!(
         !contains_begin(&stripped),
         "transact_phase: a `with begin():` block (`Begin`) survived stripping"
@@ -722,14 +738,22 @@ fn compile_blocks(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Loca
     assert!(
         !writes_any(&stripped, txn_mut_vars),
         "transact_phase: a `MutWrite` to a transactional mutable variable survived stripping — an \
-         out-of-block mutable variable write the lowering write gate should have rejected"
+         out-of-block write inference should have refused"
     );
     let Stripped {
-        sites,
-        read_only_footprints,
+        mut sites,
+        mut read_only_footprints,
     } = harvest;
+    let position = |k: &Name| order.iter().position(|d| d == k);
+    for s in &mut sites {
+        s.read_keys.sort_by_key(|k| position(k));
+        s.write_keys.sort_by_key(|k| position(k));
+    }
+    for footprint in &mut read_only_footprints {
+        footprint.sort_by_key(|k| position(k));
+    }
     // Mutable variable keys: the union of every writer's footprint (read ∪ write), in
-    // first-occurrence order. These are exact (α-unique) `Name`s.
+    // declaration order. These are exact (α-unique) `Name`s.
     let mut key_names: Vec<Name> = Vec::new();
     for s in &sites {
         for k in s.read_keys.iter().chain(s.write_keys.iter()) {
@@ -738,6 +762,7 @@ fn compile_blocks(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Loca
             }
         }
     }
+    key_names.sort_by_key(|k| position(k));
     // One commit store per set of keys some block relates (see [`partition_keys`]),
     // matching the induction path's one-letrec-per-loop.
     let groups = partition_keys(&key_names, &sites, &read_only_footprints);
@@ -1151,6 +1176,421 @@ fn rename_var_uses(e: &mut Expr, from: &Name, to: &Name) {
     e.walk_children_mut(|c| rename_var_uses(c, from, to));
 }
 
+/// [`flatten_block`] applied to the body of every `with begin():` block in `expr`.
+fn flatten_begin_bodies(mut expr: Expr) -> Expr {
+    expr.map_children(flatten_begin_bodies);
+    let begin_id = expr.node_id();
+    let mut dropped = None;
+    if let TypedExprNode::Begin { body, .. } = &mut expr.node {
+        let _g = provenance::enter(begin_id, "transact.flatten", provenance::Nature::Machinery);
+        let taken = std::mem::take(&mut **body);
+        let before = taken.capabilities.set();
+        **body = flatten_block(taken);
+        dropped = Some(before.without(&body.capabilities.set()));
+    }
+    // What the body did that flattening dropped with the node doing it, a value evaluated for
+    // nothing or an inlined call's clause beyond its body, the block still does.
+    if let Some(dropped) = dropped.filter(|d| !d.is_empty()) {
+        expr.own_capabilities = crate::ccl::capabilities::of_parts(&[
+            &expr.own_capabilities,
+            &crate::ccl::capabilities::Capabilities::known(dropped),
+        ]);
+    }
+    expr.absorbing_children_capabilities()
+}
+
+/// `block`, a `with begin():` block's body, with its statements on one spine.
+///
+/// A call the block makes reaches here inlined: where the call stood — a statement's effect
+/// (`take(q)`), a binding's definition (`left = take(q)`), or an operand (`take(1) +
+/// take(2)`) — stands the callee's body, a chain of bindings and statements ending in its
+/// value, which [`walk_block`] and the footprint scans do not walk into. Each such chain is
+/// moved onto the block's spine in evaluation order, ahead of what it stood in, which keeps
+/// the chain's value ([`hoist_onto_spine`]); a statement left holding only a value does
+/// nothing and is dropped. Two calls of one function leave two copies of its body, binding
+/// the same names, so a binding moved out of a chain onto the spine takes a fresh binder
+/// ([`refresh_let_binder`]). A guard's branches are spines of their own and are flattened
+/// alike.
+fn flatten_block(block: Expr) -> Expr {
+    let mut spine = Vec::new();
+    let tail = hoist_onto_spine(block, &mut spine, false);
+    spine.into_iter().rev().fold(tail, |rest, step| match step {
+        SpineStep::Let(Some(id), binding, bound) => {
+            Expr::let_in_preserving(id, *binding, bound, rest)
+        }
+        SpineStep::Let(None, binding, bound) => Expr::let_in(*binding, bound, rest),
+        SpineStep::Statement(id, effect) => Expr::expr_stmt_preserving(id, effect, rest),
+    })
+}
+
+/// A binding or a statement [`hoist_onto_spine`] moves onto a block's spine, at the node it
+/// was. A binding it mints has none.
+enum SpineStep {
+    Let(Option<NodeId>, Box<TypedBinding>, Expr),
+    Statement(NodeId, Expr),
+}
+
+/// `e` with each binding and statement it evaluates first appended to `spine`, in order,
+/// and what remains: its value. `nested` is set inside a chain the spine does not hold, a
+/// definition's, a statement's or an operand's, whose bindings take fresh binders.
+///
+/// Only operands every evaluation of `e` evaluates are walked: an application's, an
+/// operator's, a constructor's, a write's and a feed's, a guard's first condition, and the left
+/// operand of `and` and `or`. `and` and `or` with a chain in their right operand become the
+/// guard they are, `b if a else False` and `True if a else b`. A function, a guard's branch, a comprehension and a loop
+/// each evaluate their parts per call, path or element, and keep them. Only an operand holding
+/// a chain that writes or feeds is walked ([`holds_a_chain`]), and each operand ahead of such a
+/// one has its value bound as it is reached, so it reads what the variables hold there and not
+/// what the later chain writes.
+fn hoist_onto_spine(e: Expr, spine: &mut Vec<SpineStep>, nested: bool) -> Expr {
+    let mut e = projected_element(e);
+    if let TypedExprNode::Apply { function, .. } = &mut e.node {
+        let taken = std::mem::take(&mut **function);
+        **function = projected_element(taken);
+    }
+    let id = e.node_id();
+    match e.node {
+        TypedExprNode::Let {
+            mut binding,
+            bound_expr,
+            body,
+        } => {
+            let bound = hoist_onto_spine(*bound_expr, spine, true);
+            let body = if nested {
+                refresh_let_binder(&mut binding, *body)
+            } else {
+                *body
+            };
+            spine.push(SpineStep::Let(Some(id), Box::new(binding), bound));
+            hoist_onto_spine(body, spine, nested)
+        }
+        TypedExprNode::ExprStmt { expr: effect, body } => {
+            let effect = hoist_onto_spine(*effect, spine, true);
+            // What is left of a call once its chain is on the spine is its value, evaluated
+            // for nothing.
+            if acts(&effect) {
+                spine.push(SpineStep::Statement(id, effect));
+            }
+            hoist_onto_spine(*body, spine, nested)
+        }
+        // `a and b` evaluates `b` only where `a` holds, and `a or b` only where it fails: a
+        // guard, whose branches are spines of their own.
+        TypedExprNode::BinOp {
+            left,
+            op: BinOpKind::BoolLogic(kind @ (LogicKind::And | LogicKind::Or)),
+            right,
+        } if holds_a_chain(&right) => {
+            let literal = |b: bool| {
+                let mut lit = Expr::lit(Lit::Bool(b));
+                lit.ty = Type::Base(BaseType::Bool);
+                lit
+            };
+            let branch = |guard: Expr, body: Expr| crate::ccl::Branch {
+                pattern: None,
+                guard,
+                body,
+            };
+            let branches = match kind {
+                LogicKind::And => {
+                    vec![branch(*left, *right), branch(literal(true), literal(false))]
+                }
+                _ => vec![branch(*left, literal(true)), branch(literal(true), *right)],
+            };
+            let case = Expr::preserve(
+                id,
+                TypedExprNode::Case {
+                    scrutinee: None,
+                    branches,
+                },
+            )
+            .with_ty(e.ty);
+            hoist_onto_spine(case, spine, nested)
+        }
+        TypedExprNode::Case {
+            scrutinee: None,
+            branches,
+        } => {
+            // The first guard is evaluated whenever the guard is: on the spine.
+            let mut branches = branches;
+            if let Some(first) = branches.first_mut() {
+                let guard = std::mem::take(&mut first.guard);
+                first.guard = hoist_onto_spine(guard, spine, true);
+            }
+            let branches = branches
+                .into_iter()
+                .map(|mut branch| {
+                    let taken = std::mem::take(&mut branch.body);
+                    branch.body = flatten_block(taken);
+                    branch
+                })
+                .collect();
+            Expr {
+                node: TypedExprNode::Case {
+                    scrutinee: None,
+                    branches,
+                },
+                ..e
+            }
+            .absorbing_children_capabilities()
+        }
+        // A function applied where it stands, `a ▷ (λ x → body)`, is `let x = a in body`:
+        // what inlining a call through a parameter leaves.
+        TypedExprNode::Apply { argument, function }
+            if matches!(function.node, TypedExprNode::Lambda { .. }) =>
+        {
+            let lambda_id = function.node_id();
+            let TypedExprNode::Lambda { mut param, body } = function.node else {
+                unreachable!("guarded above")
+            };
+            let argument = hoist_onto_spine(*argument, spine, true);
+            let body = if nested {
+                refresh_let_binder(&mut param, *body)
+            } else {
+                *body
+            };
+            spine.push(SpineStep::Let(Some(lambda_id), Box::new(param), argument));
+            hoist_onto_spine(body, spine, nested)
+        }
+        // With no chain on its right, the left operand is evaluated whenever the operator is.
+        TypedExprNode::BinOp {
+            left,
+            op: op @ BinOpKind::BoolLogic(LogicKind::And | LogicKind::Or),
+            right,
+        } => {
+            let left = hoist_onto_spine(*left, spine, true);
+            Expr {
+                node: TypedExprNode::BinOp {
+                    left: Box::new(left),
+                    op,
+                    right,
+                },
+                ..e
+            }
+            .absorbing_children_capabilities()
+        }
+        node @ (TypedExprNode::Apply { .. }
+        | TypedExprNode::Cast { .. }
+        | TypedExprNode::BinOp { .. }
+        | TypedExprNode::UnaryOp { .. }
+        | TypedExprNode::Tuple(_)
+        | TypedExprNode::Record(_)
+        | TypedExprNode::List(_)
+        | TypedExprNode::VariantCtor { .. }
+        | TypedExprNode::NominalCtor { .. }
+        | TypedExprNode::MutWrite { .. }
+        | TypedExprNode::Feed { .. }) => {
+            let mut e = Expr { node, ..e };
+            // `walk_children` and `map_children` visit the operands in one order.
+            let mut chains = Vec::new();
+            e.walk_children(|child| chains.push(holds_a_chain(child)));
+            if chains.contains(&true) {
+                let mut i = 0;
+                e.map_children(|child| {
+                    let later = chains[i + 1..].contains(&true);
+                    let holds = chains[i];
+                    i += 1;
+                    let value = if holds {
+                        hoist_onto_spine(child, spine, true)
+                    } else {
+                        child
+                    };
+                    if later {
+                        bind_on_spine(value, spine)
+                    } else {
+                        value
+                    }
+                });
+                e.absorb_children_capabilities();
+            }
+            e
+        }
+        node => Expr { node, ..e },
+    }
+}
+
+/// Whether the statement `effect` does anything: it causes an effect. What it only reads
+/// is evaluated for nothing.
+fn acts(effect: &Expr) -> bool {
+    !effect.capabilities.set().causes.is_empty()
+}
+
+/// Whether the function `f` of an application is a lambda, written where it stands or
+/// projected out of a tuple of values ([`projected_element`]).
+fn applies_a_lambda(f: &Expr) -> bool {
+    match &f.node {
+        TypedExprNode::Lambda { .. } => true,
+        TypedExprNode::Apply { argument, function } => match (&argument.node, &function.node) {
+            (TypedExprNode::Tuple(elements), TypedExprNode::Proj(ProjKey::Index(i))) => {
+                elements.iter().all(|element| {
+                    matches!(
+                        element.node,
+                        TypedExprNode::Var(_)
+                            | TypedExprNode::Lit(_)
+                            | TypedExprNode::Lambda { .. }
+                    )
+                }) && elements.get(*i).is_some_and(applies_a_lambda)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// The first write or feed in a `with begin():` block of `expr` that is not on the block's
+/// spine as the phase reads it: a statement's write or feed, or a statement of a branch of a
+/// guard or a `match` that stands as a statement, is bound, or ends the block, the three
+/// places [`WriterWalk`] walks one whose branches write ([`is_writing_case`]).
+/// [`flatten_block`] moves every chain a call leaves where the block evaluates it once; what
+/// it leaves is a write the block cannot order.
+fn write_off_a_spine(expr: &Expr) -> Option<(NodeId, NodeId)> {
+    fn first_write(e: &Expr) -> Option<NodeId> {
+        if matches!(
+            e.node,
+            TypedExprNode::MutWrite { .. }
+                | TypedExprNode::Feed { .. }
+                | TypedExprNode::Define { .. }
+        ) {
+            return Some(e.node_id());
+        }
+        let mut found = None;
+        e.any_child(|child| {
+            found = first_write(child);
+            found.is_some()
+        });
+        found
+    }
+    // A guard, or a `match`'s dispatch, which the phase reads as guards.
+    fn branches(e: &Expr) -> Option<(NodeId, NodeId)> {
+        let TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } = &e.node
+        else {
+            unreachable!("called on a `Case`")
+        };
+        // The scrutinee or the guard holding the write is the block's own.
+        let here = |part: &Expr| first_write(part).map(|w| (w, part.node_id()));
+        scrutinee.as_deref().and_then(here).or_else(|| {
+            branches
+                .iter()
+                .find_map(|b| here(&b.guard).or_else(|| spine(&b.body)))
+        })
+    }
+    // Each write is paired with the statement of the block whose part holds it: the program's,
+    // since flattening moved every chain a call left onto the spine.
+    fn spine(e: &Expr) -> Option<(NodeId, NodeId)> {
+        let here = |part: &Expr| first_write(part).map(|w| (w, e.node_id()));
+        match &e.node {
+            TypedExprNode::Let {
+                bound_expr, body, ..
+            } if is_writing_case(bound_expr) => branches(bound_expr).or_else(|| spine(body)),
+            TypedExprNode::Let {
+                bound_expr, body, ..
+            } => here(bound_expr).or_else(|| spine(body)),
+            TypedExprNode::ExprStmt { expr, body } => {
+                let found = match &expr.node {
+                    TypedExprNode::MutWrite { .. } | TypedExprNode::Feed { .. } => {
+                        let mut found = None;
+                        expr.any_child(|child| {
+                            found = here(child);
+                            found.is_some()
+                        });
+                        found
+                    }
+                    TypedExprNode::Case { .. } => branches(expr),
+                    // A nested block is refused as a nested transaction before here.
+                    TypedExprNode::Begin { .. } => None,
+                    _ => here(expr),
+                };
+                found.or_else(|| spine(body))
+            }
+            _ if is_writing_case(e) => branches(e),
+            _ => here(e),
+        }
+    }
+    match &expr.node {
+        TypedExprNode::Begin { body, .. } => spine(body),
+        _ => {
+            let mut found = None;
+            expr.any_child(|child| {
+                found = write_off_a_spine(child);
+                found.is_some()
+            });
+            found
+        }
+    }
+}
+
+/// `e` as the element it projects, when it projects one out of a tuple of values written
+/// where it stands, `(f, x) ▷ .0`: what inlining a call of several arguments leaves for
+/// each argument it passes on, a function among them. Otherwise `e`.
+fn projected_element(e: Expr) -> Expr {
+    let TypedExprNode::Apply { argument, function } = &e.node else {
+        return e;
+    };
+    let (TypedExprNode::Tuple(elements), TypedExprNode::Proj(ProjKey::Index(i))) =
+        (&argument.node, &function.node)
+    else {
+        return e;
+    };
+    let i = *i;
+    let values = elements.iter().all(|element| {
+        matches!(
+            element.node,
+            TypedExprNode::Var(_) | TypedExprNode::Lit(_) | TypedExprNode::Lambda { .. }
+        )
+    });
+    if !values || i >= elements.len() {
+        return e;
+    }
+    let TypedExprNode::Apply { argument, .. } = e.node else {
+        unreachable!("guarded above")
+    };
+    let TypedExprNode::Tuple(mut elements) = argument.node else {
+        unreachable!("guarded above")
+    };
+    projected_element(elements.swap_remove(i))
+}
+
+/// Whether `e` holds a chain [`hoist_onto_spine`] moves that causes an effect ([`acts`]): a
+/// binding, a statement or an application of a lambda, itself or in an operand it walks.
+fn holds_a_chain(e: &Expr) -> bool {
+    match &e.node {
+        TypedExprNode::Let { .. } | TypedExprNode::ExprStmt { .. } => acts(e),
+        TypedExprNode::Apply { function, .. } if applies_a_lambda(function) => acts(e),
+        // Its left operand is evaluated always, and its right one under a guard.
+        TypedExprNode::BinOp {
+            op: BinOpKind::BoolLogic(LogicKind::And | LogicKind::Or),
+            ..
+        } => e.any_child(holds_a_chain),
+        TypedExprNode::Apply { .. }
+        | TypedExprNode::Cast { .. }
+        | TypedExprNode::BinOp { .. }
+        | TypedExprNode::UnaryOp { .. }
+        | TypedExprNode::Tuple(_)
+        | TypedExprNode::Record(_)
+        | TypedExprNode::List(_)
+        | TypedExprNode::VariantCtor { .. }
+        | TypedExprNode::NominalCtor { .. }
+        | TypedExprNode::MutWrite { .. }
+        | TypedExprNode::Feed { .. } => e.any_child(holds_a_chain),
+        _ => false,
+    }
+}
+
+/// `value` bound on `spine` to a fresh binder, and a reference to it; a literal as it is.
+fn bind_on_spine(value: Expr, spine: &mut Vec<SpineStep>) -> Expr {
+    if matches!(value.node, TypedExprNode::Lit(_)) {
+        return value;
+    }
+    let name = Name::fresh("__operand");
+    let ty = value.ty.clone();
+    let mut binding = TypedBinding::new_unannotated(name.clone(), Occurrence::mint());
+    binding.ty = ty.clone();
+    spine.push(SpineStep::Let(None, Box::new(binding), value));
+    tvar(&name, ty)
+}
+
 /// Whether the subtree still contains a `with begin():` block marker.
 fn contains_begin(expr: &Expr) -> bool {
     matches!(expr.node, TypedExprNode::Begin { .. }) || expr.any_child(contains_begin)
@@ -1195,12 +1635,15 @@ fn strip(
             unreachable!("guarded above")
         };
         let begin_id = effect.node_id;
+        // What the block reads and writes, as its capabilities state it (`block_keys`): a block keeps
+        // its own through every rebuild, a call's in it whose body does less included.
+        let footprint = effect.capabilities.clone();
         let TypedExprNode::Begin { body: block } = effect.node else {
             unreachable!("guarded above")
         };
         // ``match m: case `tag(w): <writes>`` in the block reaches here as a
         // statement-position tag-`Case`. Convert the whole block once rather than
-        // at each consumer: `collect_footprint` separates a guard's spine reads
+        // at each consumer: `written_keys` separates a guard's spine writes
         // from an arm's conditional ones, and the writer walk scopes each arm's
         // writes to its path — neither reads a `Pattern`, and after the rewrite an
         // arm's scrutinee test sits in the guard where the footprint scan wants it
@@ -1218,7 +1661,8 @@ fn strip(
             g.blame(&[begin_id]);
             Box::new(crate::ccl::ccl_utils::statement_tag_cases_to_guards(*block))
         };
-        if writes_any(&block, txn_mut_vars) {
+        // A block writes what its type states it writes (`block_keys`).
+        if !block_keys(&footprint, &block, txn_mut_vars).1.is_empty() {
             // A writing block → a commit-record site keyed on the *enclosing*
             // loop. Partition it by mutable variable domain: the transactional remainder is
             // the commit decision; each induction `MutWrite` is lifted onto the
@@ -1245,7 +1689,7 @@ fn strip(
                     "transact_phase: inference refuses a commit inside a `with begin():` body"
                 );
                 let (txn_block, lifted) = partition_block(*block, txn_mut_vars);
-                let (read_keys, write_keys) = collect_footprint(&txn_block, txn_mut_vars);
+                let (read_keys, write_keys) = block_keys(&footprint, &txn_block, txn_mut_vars);
                 out.sites.push(RawSite {
                     parent: stmt_id,
                     target: target.clone(),
@@ -1267,7 +1711,7 @@ fn strip(
         // live/terminal as-of path unchanged (the shape a get-loop had before).
         // Its footprint is kept even though the block is not: the mutable variables it reads
         // are latched at one frontier, so they must share a store ([`partition_keys`]).
-        let (reads, _) = collect_footprint(&block, txn_mut_vars);
+        let (reads, _) = block_keys(&footprint, &block, txn_mut_vars);
         if reads.len() > 1 {
             out.read_only_footprints.push(reads);
         }
@@ -1449,7 +1893,7 @@ fn partition_block(block: Expr, txn_mut_vars: &HashSet<Name>) -> (Expr, Vec<Expr
 /// phase runs, which is what leaves this arm free to discharge unconditionally.
 ///
 /// **A binding the lift leaves with no consumer is dropped.** The transactional
-/// remainder is what states the block's footprint ([`collect_footprint`]) and
+/// remainder is what decides which of the block's writes are conditional ([`block_keys`]) and
 /// which induction accumulators the commit decision reads
 /// ([`cross_domain_reads`]), so a read-binding left behind by the write that
 /// consumed it claims a read the block no longer makes. For `cnt := cnt + 1`
@@ -1574,7 +2018,7 @@ pub fn check_no_induction_only_transactions(
     expr: &Expr,
     txn_mut_vars: &HashSet<Name>,
 ) -> Result<(), Located<String>> {
-    if let TypedExprNode::Begin { body } = &expr.node
+    if let TypedExprNode::Begin { body, .. } = &expr.node
         && !writes_any(body, txn_mut_vars)
         && let Some(name) = first_non_txn_write(body, txn_mut_vars)
     {
@@ -1616,7 +2060,7 @@ pub fn check_no_guarded_induction_write_in_block(
     expr: &Expr,
     txn_mut_vars: &HashSet<Name>,
 ) -> Result<(), Located<String>> {
-    if let TypedExprNode::Begin { body } = &expr.node
+    if let TypedExprNode::Begin { body, .. } = &expr.node
         && let Some(name) = guarded_non_txn_write(body, txn_mut_vars, false)
     {
         return Err(Located::new(
@@ -1660,7 +2104,7 @@ pub fn check_no_induction_write_reading_past_a_write(
     expr: &Expr,
     txn_mut_vars: &HashSet<Name>,
 ) -> Result<(), Located<String>> {
-    if let TypedExprNode::Begin { body } = &expr.node
+    if let TypedExprNode::Begin { body, .. } = &expr.node
         && let Some(var) = induction_write_reading_past_a_write(body, txn_mut_vars)
     {
         return Err(Located::new(
@@ -1786,8 +2230,8 @@ fn collect_write_targets(expr: &Expr, out: &mut HashSet<Name>) {
 /// `MutWrite` target:
 ///
 /// - A **write** inside a later block is a `MutWrite` targeting `x`; a **read** inside one
-///   is a bare `Var(x)` in the writer body. Outside a block both are already rejected at
-///   lowering (`lower_expr`'s read gate, `check_mut_write_context`).
+///   is a bare `Var(x)` in the writer body. Outside a block both are already refused by
+///   inference, since no block supplies the `Transaction` they require.
 /// - A **pass-by-reference argument** is the one mention lowering lets through — a
 ///   `Mut`-typed argument is a bare `Var` by rule, so `lower_call_arg` bypasses the
 ///   gate — and `inline` beta-reduces it into the callee body, where it becomes one of
@@ -2139,83 +2583,122 @@ fn first_non_txn_write(block: &Expr, txn_mut_vars: &HashSet<Name>) -> Option<Nam
     found
 }
 
-/// The block's transactional footprint: mutable variable keys read (snapshot) and written,
-/// each in first-occurrence order. Reads are bare `Var`s of a transactional
-/// mutable variable; writes are `MutWrite` targets.
+/// Each of `txn_mut_vars` in the order `expr` declares them.
+fn declaration_order(expr: &Expr, txn_mut_vars: &HashSet<Name>) -> Vec<Name> {
+    fn go(e: &Expr, txn_mut_vars: &HashSet<Name>, out: &mut Vec<Name>) {
+        if let TypedExprNode::MutDecl { binding, .. } = &e.node
+            && txn_mut_vars.contains(&binding.name)
+        {
+            out.push(binding.name.clone());
+        }
+        e.walk_children(|c| go(c, txn_mut_vars, out));
+    }
+    let mut out = Vec::new();
+    go(expr, txn_mut_vars, &mut out);
+    out
+}
+
+/// The keys a block reads and writes: each of `txn_mut_vars` whose read or write `footprint`,
+/// the block's capabilities, states (`docs/chl-spec.md`, "Discharging requirements and effects"),
+/// each in name order until `run` orders them as declared. A top in it holds every key it holds
+/// of its family, `WriteTxn(*)` every key and `WriteTxn(inv::*)` each of `inv`'s.
 ///
-/// A key written **conditionally** — inside a statement-`Case` arm (`if p: k :=
-/// e`) — also joins the *read* set. On a control-flow path where that arm does
-/// not fire, the writer walk merges `k` to its **carry** value (the previous
-/// committed value), which is only expressible as `k`'s read snapshot. A
-/// read-modify-write (`k := k + e`) already reads `k`, so this only adds the
-/// *absolute* conditional write (`k := e`) that would otherwise have no snapshot
-/// to carry. A purely spine (unconditional) write needs no carry, so it stays
-/// write-only — the peephole keeps unconditional programs snapshot-free.
-fn collect_footprint(block: &Expr, txn_mut_vars: &HashSet<Name>) -> (Vec<Name>, Vec<Name>) {
-    let mut reads = Vec::new();
-    let mut writes = Vec::new();
-    fn walk(
-        e: &Expr,
-        txn_mut_vars: &HashSet<Name>,
-        in_case: bool,
-        reads: &mut Vec<Name>,
-        writes: &mut Vec<Name>,
-    ) {
+/// Two more keys join the read set, for how a commit encodes its writes rather than for what
+/// the block observes. `block`, the block's transactional remainder, decides both:
+///
+/// - A key the block writes but not on every path: on a path that leaves it alone the commit
+///   carries its previous value, which is only expressible as its snapshot. A write in a
+///   statement-`Case` arm (`if p: k := e`) is conditional, and a key the type states a write
+///   of and no statement writes is written on no path.
+/// - A key whose write rewrites it from its snapshot: a keyed write `m[k] := v`, desugared to
+///   `m := insert(m, k, v)` (`mut_elim::desugar_keyed_writes`), commits the whole collection,
+///   whose other keys come from the snapshot. Its type writes `m` and reads nothing of it.
+fn block_keys(
+    footprint: &crate::ccl::capabilities::Capabilities,
+    block: &Expr,
+    txn_mut_vars: &HashSet<Name>,
+) -> (Vec<Name>, Vec<Name>) {
+    use crate::ccl::capabilities::{Capability, Effect, Requirement};
+    let set = footprint.set();
+    assert!(
+        set.params.is_empty(),
+        "a block's effects hold a clause variable after specialization, which gives each \
+         block its use's effects: {}",
+        crate::ccl::capabilities::clauses(Vec::new(), footprint)
+    );
+    let mut keys: Vec<&Name> = txn_mut_vars.iter().collect();
+    keys.sort();
+    let writes: Vec<Name> = keys
+        .iter()
+        .filter(|k| set.states(&Capability::Causes(Effect::WriteTxn((**k).clone()))))
+        .map(|k| (*k).clone())
+        .collect();
+    let written = written_keys(block, txn_mut_vars);
+    let reads = keys
+        .iter()
+        .filter(|k| {
+            set.states(&Capability::Requires(Requirement::read_txn((**k).clone())))
+                || (writes.contains(k)
+                    && (written.on_some_path.contains(k)
+                        || !written.on_every_path.contains(k)
+                        || written.from_snapshot.contains(k)))
+        })
+        .map(|k| (*k).clone())
+        .collect();
+    (reads, writes)
+}
+
+/// How a block's statements write its keys ([`block_keys`]).
+#[derive(Default)]
+struct WrittenKeys {
+    /// Written on the block's spine, so on every path.
+    on_every_path: HashSet<Name>,
+    /// Written in a statement-`Case` arm, which only that arm's path writes.
+    on_some_path: HashSet<Name>,
+    /// Written with a value that reads the key's own snapshot.
+    from_snapshot: HashSet<Name>,
+}
+
+/// How `block` writes each of `txn_mut_vars` ([`WrittenKeys`]).
+fn written_keys(block: &Expr, txn_mut_vars: &HashSet<Name>) -> WrittenKeys {
+    fn walk(e: &Expr, txn_mut_vars: &HashSet<Name>, in_case: bool, out: &mut WrittenKeys) {
         match &e.node {
-            // Exact-`Name` membership: a comprehension/loop variable merely
-            // *spelled* like a mutable variable (`[mutable variable for mutable variable in …]`) has a distinct
-            // α-unique `Name`, so it is not swept into the footprint (fixing the
-            // base-name panic where such a var had no mutable variable `let` to fold).
-            TypedExprNode::Var(n) if txn_mut_vars.contains(n) && !reads.contains(n) => {
-                reads.push(n.clone());
-            }
             TypedExprNode::MutWrite { name, value, .. } => {
-                // The write's value is read first (its embedded mutable variable reads are
-                // snapshots), then the target joins the write set.
-                walk(value, txn_mut_vars, in_case, reads, writes);
+                walk(value, txn_mut_vars, in_case, out);
                 if txn_mut_vars.contains(name) {
-                    if !writes.contains(name) {
-                        writes.push(name.clone());
+                    if in_case {
+                        &mut out.on_some_path
+                    } else {
+                        &mut out.on_every_path
                     }
-                    // A conditional (in-`Case`) write needs its prior value to
-                    // carry on the paths its arm does not fire — record the read.
-                    // This is deliberately *over-conservative*: a bare-deny write
-                    // (`if p: a := 5`, an absolute value) never references its
-                    // snapshot at runtime (the engine skips a denied write-set
-                    // wholesale), and a spine-then-conditional key carries the
-                    // literal spine value — yet both land in the read set. The cost
-                    // is only a wider staleness footprint (more spurious
-                    // conflict-retries once several writers share a mutable variable), harmless
-                    // for a single writer; a precise footprint is a later refinement.
-                    if in_case && !reads.contains(name) {
-                        reads.push(name.clone());
+                    .insert(name.clone());
+                    if is_free(name, value) {
+                        out.from_snapshot.insert(name.clone());
                     }
                 }
                 return;
             }
-            // A `Case` (an `if`/`elif`/`else` or a `match` routing writes, in statement
-            // position or bound by a `let`): its arms' writes are conditional.
+            // A guard is evaluated on the spine, and an arm's body on its path alone.
             TypedExprNode::Case {
                 scrutinee,
                 branches,
             } => {
                 if let Some(scrutinee) = scrutinee {
-                    walk(scrutinee, txn_mut_vars, in_case, reads, writes);
+                    walk(scrutinee, txn_mut_vars, in_case, out);
                 }
                 for b in branches {
-                    // A guard is evaluated on the spine (its reads are unconditional
-                    // snapshots), but arm bodies are conditional.
-                    walk(&b.guard, txn_mut_vars, in_case, reads, writes);
-                    walk(&b.body, txn_mut_vars, true, reads, writes);
+                    walk(&b.guard, txn_mut_vars, in_case, out);
+                    walk(&b.body, txn_mut_vars, true, out);
                 }
                 return;
             }
             _ => {}
         }
-        e.walk_children(|c| walk(c, txn_mut_vars, in_case, reads, writes));
+        e.walk_children(|c| walk(c, txn_mut_vars, in_case, out));
     }
-    walk(block, txn_mut_vars, false, &mut reads, &mut writes);
-    (reads, writes)
+    let mut out = WrittenKeys::default();
+    walk(block, txn_mut_vars, false, &mut out);
+    out
 }
 
 /// Build one [`WriterSite`] from a stripped site: its ``{`commit{writes} | `abort}``
@@ -2313,7 +2796,7 @@ fn build_writer(
     // writes) — the path-scoped deny semantics.
     //
     // The legal `MutWrite` targets inside this block: exactly the site's write
-    // keys (transactional mutable variables `collect_footprint` recorded), the only
+    // keys (transactional mutable variables `block_keys` gave the sites), the only
     // ones the decision's write set holds.
     let allowed_writes: HashSet<Name> = site.write_keys.iter().cloned().collect();
     let writes = site
@@ -3603,20 +4086,37 @@ mod tests {
         let mut list = Expr::new(TypedExprNode::List(vec![ten]));
         list.ty = list_ty;
 
+        // What inference gives the read and the write of their own.
+        let own = |set: crate::ccl::capabilities::CapabilitySet| {
+            crate::ccl::capabilities::Capabilities::known(set)
+        };
+        let read = tvar(&pool, int.clone()).doing_of_its_own(&own(
+            crate::ccl::capabilities::CapabilitySet {
+                requires: [crate::ccl::capabilities::Requirement::read_txn(
+                    pool.clone(),
+                )]
+                .into(),
+                ..Default::default()
+            },
+        ));
         let mut sub = Expr::new(TypedExprNode::BinOp {
-            left: Box::new(tvar(&pool, int.clone())),
+            left: Box::new(read),
             op: BinOpKind::Arithmetic(ArithmeticKind::Sub),
             right: Box::new(tvar(&r, int.clone())),
         });
         sub.ty = int.clone();
-        let mut write = Expr::mut_write(pool.clone(), Occurrence::mint(), sub);
+        let mut write = Expr::mut_write(pool.clone(), Occurrence::mint(), sub).doing_of_its_own(
+            &own(crate::ccl::capabilities::CapabilitySet {
+                causes: [crate::ccl::capabilities::Effect::WriteTxn(pool.clone())].into(),
+                ..Default::default()
+            }),
+        );
         write.ty = Type::Base(BaseType::Unit);
         let mut unit = Expr::new(TypedExprNode::Lit(Lit::Unit));
         unit.ty = Type::Base(BaseType::Unit);
         let mut block = Expr::expr_stmt(write, unit);
         block.ty = Type::Base(BaseType::Unit);
-        // The block sits as a `Begin` marker on the loop body:
-        // `ExprStmt(Begin{block}, unit)`.
+        // The block sits as a `Begin` marker on the loop body: `ExprStmt(Begin{block}, unit)`.
         let mut begin = Expr::begin(block);
         begin.ty = Type::Base(BaseType::Unit);
         let mut body_unit = Expr::new(TypedExprNode::Lit(Lit::Unit));

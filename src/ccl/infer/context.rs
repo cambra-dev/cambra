@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ccl::capabilities::{
     Blame, Bound as CapabilityBound, Capabilities, Capability, CapabilitySet, CapabilityVar,
-    Effect, Every, Filter, Repr, Requirement, ScopedCapability, Upper,
+    CapabilityVarId, Effect, Every, Filter, Repr, Requirement, ScopedCapability, Upper,
 };
 use crate::ccl::ccl_utils::TermMemo;
 use crate::ccl::infer::solver::barrier::EdgeReport;
@@ -156,8 +156,11 @@ pub(super) struct InferCtx {
     root_capabilities: Option<Rc<CapabilityVar>>,
     /// Where each mutable variable and feed in scope is bound, for the capability that names it.
     capability_binders: HashMap<Name, CapabilityBinder>,
-    /// Each statement emitted, with the variable collecting what it causes.
-    capability_statements: Vec<(NodeId, Rc<CapabilityVar>)>,
+    /// Each statement emitted, with the variable collecting what it causes and the one of
+    /// the body it stands in.
+    capability_statements: Vec<(NodeId, Rc<CapabilityVar>, Option<CapabilityVarId>)>,
+    /// Each `with begin():` block emitted, with the variable collecting what its body causes.
+    capability_transactions: Vec<(NodeId, Rc<CapabilityVar>)>,
     /// What lowering marks each marked node as: an expression statement, which an inert one
     /// is refused among, or a sink binding, which causes `AffectWorld`.
     pub(super) marks: HashMap<NodeId, crate::ccl::lower::Mark>,
@@ -168,7 +171,7 @@ pub(super) struct InferCtx {
     /// and its node ([`InferCtx::requirements_beyond_clauses`]).
     bounded_requires: Vec<BoundedRequires>,
     /// The variable of every call site ([`InferCtx::call_capabilities`]).
-    capability_calls: HashSet<crate::ccl::capabilities::CapabilityVarId>,
+    capability_calls: HashSet<CapabilityVarId>,
     /// Lexical scope: name → [`Binding`] for in-scope variables and let-bound
     /// names. Lambda params and `Case`/`Loop` binders bind monomorphically; a
     /// polymorphic `let` additionally stashes its typed definition subtree so
@@ -458,6 +461,8 @@ struct NodeCapabilities {
     /// The node a capability crossing into the parent's variable entered at, where it is not
     /// this one's own: a statement's, or a `with begin():` block's.
     at: Option<NodeId>,
+    /// Whether it is a `with begin():` block's body.
+    transaction: bool,
 }
 
 /// A variable standing for an associated effect type, `Writes`, at a call of a trait's
@@ -513,8 +518,8 @@ struct CapabilityBinder {
     /// A parameter's history is its argument's, so the call records what is done to it, and
     /// the function's type does not ([`crate::ccl::capabilities::Bound::Parameter`]).
     parameter: bool,
-    /// A transactional mutable variable: reading or writing it requires `Transaction`, and its
-    /// capabilities are `ReadTxn` and `WriteTxn`.
+    /// A transactional mutable variable, or a parameter passed one: reading or writing it
+    /// requires `Transaction`, and its capabilities are `ReadTxn` and `WriteTxn`.
     transactional: bool,
     /// A feed, which a clause names in `Append(f)`; every other binder here is a mutable
     /// variable.
@@ -717,6 +722,7 @@ impl InferCtx {
             root_capabilities: None,
             capability_binders: HashMap::new(),
             capability_statements: Vec::new(),
+            capability_transactions: Vec::new(),
             marks: HashMap::new(),
             capability_calls: HashSet::new(),
             capability_public: Vec::new(),
@@ -761,6 +767,7 @@ impl InferCtx {
             inflow: Inflow::of(node),
             body: None,
             at: None,
+            transaction: false,
         });
         (Capabilities::var(var), Capabilities::var(own))
     }
@@ -813,8 +820,7 @@ impl InferCtx {
     /// is its argument's.
     fn bind_capability_name(&mut self, name: &Name, ty: &Type, declares: bool) {
         if let Some((domain, _, history_kind)) = ty.history_parts() {
-            let transactional = declares
-                && matches!(history_kind, crate::ccl::ty::HistoryKind::Overwrite)
+            let transactional = matches!(history_kind, crate::ccl::ty::HistoryKind::Overwrite)
                 && matches!(domain, Type::Txn);
             let depth = self.capability_frame().depth;
             if declares && let Some(declared) = self.body_binds.last_mut() {
@@ -825,7 +831,7 @@ impl InferCtx {
                 }
             }
             debug_assert!(
-                !transactional || depth == 0,
+                !(declares && transactional) || depth == 0,
                 "lowering refuses `{name}`, a transactional variable declared below a module's \
                  top level"
             );
@@ -845,8 +851,8 @@ impl InferCtx {
             );
             // Declaring a transactional variable writes it, and other modules append to a
             // public feed, so declaring one is an output of the top level's too. Neither
-            // capability is discharged where the variable's scope ends.
-            if transactional {
+            // capability is discharged where the top level's scope ends.
+            if declares && transactional {
                 self.record_capability(Capability::Causes(Effect::Write(name.clone())));
             }
             if public_feed {
@@ -1007,26 +1013,44 @@ impl InferCtx {
         out
     }
 
-    /// The statements emitted that cause nothing and so do nothing
+    /// What was emitted that causes nothing and so does nothing: each `with begin():` block
+    /// whose body writes and feeds nothing (`docs/chl-spec.md`, "8.2 Transactions: `with
+    /// begin():`"), then each expression statement outside those blocks
     /// (`docs/chl-spec.md`, "4.9 Expression statement").
     ///
     /// A statement in a polymorphic definition can call a function that only each use of the
     /// definition determines: a parameter's. That call's variable has nothing flowing into it
-    /// at the definition, where each use fills a copy of its own, so a statement reaching one
-    /// may do something and is not reported.
-    pub(super) fn inert_statements(&self) -> Vec<NodeId> {
+    /// at the definition, where each use fills a copy of its own, so a statement or a block
+    /// reaching one may do something and is not reported.
+    pub(super) fn does_nothing(&self) -> Vec<(NodeId, InferError)> {
         let undetermined = |v: &CapabilityVar| {
             self.capability_calls.contains(&v.uid) && v.incoming().is_empty() && v.own().is_empty()
         };
-        self.capability_statements
+        // A top or a clause variable of the `causes` clause, `WriteTxn(*)` or `E`, stands for
+        // capabilities as a listed one does.
+        let idle = |var: &CapabilityVar| {
+            let set = crate::ccl::capabilities::set_of(&var.resolved());
+            set.causes.is_empty()
+                && set.tops_of(true).next().is_none()
+                && !set.params.iter().any(|p| p.of_causes)
+                && !var.reaches(&undetermined)
+        };
+        let empty: Vec<&(NodeId, Rc<CapabilityVar>)> = self
+            .capability_transactions
             .iter()
-            .filter(|(_, var)| {
-                crate::ccl::capabilities::set_of(&var.resolved())
-                    .causes
-                    .is_empty()
-                    && !var.reaches(&undetermined)
-            })
-            .map(|(node, _)| *node)
+            .filter(|(_, var)| idle(var))
+            .collect();
+        let in_empty =
+            |body: Option<CapabilityVarId>| empty.iter().any(|(_, var)| Some(var.uid) == body);
+        empty
+            .iter()
+            .map(|(node, _)| (*node, InferError::EmptyTransaction))
+            .chain(
+                self.capability_statements
+                    .iter()
+                    .filter(|(_, var, body)| idle(var) && !in_empty(*body))
+                    .map(|(node, _, _)| (*node, InferError::InertStatement)),
+            )
             .collect()
     }
 
@@ -1176,7 +1200,7 @@ impl InferCtx {
         &mut self,
         requirement: &TraitRequirement,
         obligation: &Rc<TraitObligation>,
-        copies: &HashMap<crate::ccl::capabilities::CapabilityVarId, Rc<CapabilityVar>>,
+        copies: &HashMap<CapabilityVarId, Rc<CapabilityVar>>,
     ) {
         for (assoc, member) in &requirement.effect_assoc {
             let Some(var) = self.opened_clause_params.get(&member.param.id) else {
@@ -3434,6 +3458,7 @@ impl Typing for InferCtx {
             unreachable!("a node under inference holds its capability variable")
         };
         let var = Rc::clone(var);
+        let prev = self.enter_node(mention.node_id());
         if let Some(transactional) = self.capability_binders.get(name).map(|b| b.transactional) {
             if transactional {
                 var.record(
@@ -3448,6 +3473,7 @@ impl Typing for InferCtx {
                 ),
             );
         }
+        self.leave_node(prev);
     }
 
     fn statement<R>(&mut self, node: NodeId, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -3464,10 +3490,22 @@ impl Typing for InferCtx {
             inflow: Inflow::All,
             body: None,
             at: Some(node),
+            transaction: false,
         });
         let r = f(self);
         self.leave_node_capabilities();
-        self.capability_statements.push((node, var));
+        // The `with begin():` body the statement stands in directly, if it stands in one: a
+        // statement of an empty block is reported as the block.
+        let body = self
+            .node_capabilities
+            .iter()
+            .rev()
+            .find_map(|e| match e.inflow {
+                Inflow::Closed => Some(None),
+                _ if e.transaction => Some(Some(e.var.uid)),
+                _ => None,
+            });
+        self.capability_statements.push((node, var, body.flatten()));
         r
     }
 
@@ -3506,9 +3544,17 @@ impl Typing for InferCtx {
             inflow: Inflow::All,
             body: None,
             at: Some(node),
+            transaction: true,
         });
         let r = f(self);
+        let var = self
+            .node_capabilities
+            .last()
+            .expect("the body's entry")
+            .var
+            .clone();
         self.leave_node_capabilities();
+        self.capability_transactions.push((node, var));
         r
     }
 

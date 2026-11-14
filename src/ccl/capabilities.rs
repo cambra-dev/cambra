@@ -8,7 +8,7 @@
 use smol_str::SmolStr;
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     hash::{Hash, Hasher},
     rc::Rc,
@@ -1694,7 +1694,7 @@ impl CapabilityVar {
 
     /// Whether `pred` holds of this variable or of any variable flowing into it.
     pub fn reaches(&self, pred: &dyn Fn(&CapabilityVar) -> bool) -> bool {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         let mut stack: Vec<Rc<CapabilityVar>> =
             self.incoming().into_iter().map(|(v, _)| v).collect();
         if pred(self) {
@@ -1955,6 +1955,61 @@ impl Capability {
             | Capability::Param(_)
             | Capability::Every(_) => None,
         }
+    }
+}
+
+impl CapabilitySet {
+    /// Each variable this set's capabilities name, those its tops and clause variables take
+    /// away included.
+    pub fn names(&self) -> Vec<&Name> {
+        let mut out: Vec<&Name> = self.items_named().collect();
+        for except in self
+            .tops
+            .iter()
+            .map(|t| &t.except)
+            .chain(self.params.iter().map(|p| &p.except))
+        {
+            out.extend(except.iter().filter_map(Capability::variable));
+        }
+        out
+    }
+
+    fn items_named(&self) -> impl Iterator<Item = &Name> + '_ {
+        self.requires
+            .iter()
+            .filter_map(|r| r.requirement().terms.first())
+            .chain(self.causes.iter().filter_map(|e| match e {
+                Effect::Write(x) | Effect::WriteTxn(x) | Effect::Append(x) => Some(x),
+                Effect::RunTransaction | Effect::AffectWorld => None,
+            }))
+    }
+}
+
+impl Capabilities {
+    /// The set a known `Capabilities` states, or `None` for a variable or written clauses.
+    pub fn known_set(&self) -> Option<&CapabilitySet> {
+        match self.repr() {
+            Repr::Known(set) => Some(set),
+            Repr::Var(_) | Repr::Written(_) => None,
+        }
+    }
+
+    /// A known set with `f` applied to each variable it names, as [`Written::map_names`] does
+    /// to written clauses.
+    pub fn map_known_names(&self, f: impl FnMut(&Name) -> Name) -> Capabilities {
+        let set = self
+            .known_set()
+            .expect("only a known set's names are mapped")
+            .clone();
+        let written = Written {
+            set,
+            open_requires: false,
+            open_causes: false,
+            at: chl_parser::ast::Span::new(chl_parser::FileId::ROOT, 0, 0),
+            of_def: false,
+            of_instance: None,
+        };
+        Capabilities::known(written.map_names(f).set)
     }
 }
 

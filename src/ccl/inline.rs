@@ -532,6 +532,39 @@ fn reads_a_variable_written_in(definiens: &Expr, body: &Expr) -> bool {
         .any(|name| is_mut_written(name, body))
 }
 
+/// Whether `definiens` writes a variable `body` reads or writes, by their capabilities: moved
+/// to its use in `body`, the write would follow what `body` does first, as `t = take(1)`
+/// followed by a read of what `take` writes would read the value from before the call. A top
+/// or a clause variable of either's clauses may name any variable. Conservative as
+/// [`reads_a_variable_written_in`] is: a read anywhere in `body` blocks the move.
+fn writes_what_the_body_touches(definiens: &Expr, body: &Expr) -> bool {
+    use crate::ccl::capabilities::{Capability, Effect, Family};
+    let writes = definiens.capabilities.set();
+    let written: Vec<&Name> = writes
+        .causes
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Write(x) | Effect::WriteTxn(x) => Some(x),
+            _ => None,
+        })
+        .collect();
+    let writes_any = writes.params.iter().any(|p| p.of_causes)
+        || writes.tops.iter().any(|t| {
+            [Family::Write, Family::WriteTxn]
+                .into_iter()
+                .any(|f| t.overlaps(&Capability::Every(f.top())))
+        });
+    if written.is_empty() && !writes_any {
+        return false;
+    }
+    body.capabilities.set().items().any(|item| match &item {
+        Capability::Every(_) | Capability::Param(_) => true,
+        item => item
+            .variable()
+            .is_some_and(|x| writes_any || written.contains(&x)),
+    })
+}
+
 /// Move every `Let`-bound definiens read in a list element into that element,
 /// everywhere in `expr` — its term tree and the refinement predicates riding its
 /// type slots alike. Reports whether anything moved.
@@ -1042,12 +1075,14 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
             //
             // The conditions are [`flatten_anf_bindings`]': an `AnfTemp`
             // binder, one occurrence (a refinement predicate's counted), and no
-            // read of a variable the body writes; and no write of a variable the
-            // definiens does not declare ([`writes_a_variable_bound_outside`]).
+            // read of a variable the body writes; no write of a variable the body
+            // reads or writes ([`writes_what_the_body_touches`]); and no write of a
+            // variable the definiens does not declare ([`writes_a_variable_bound_outside`]).
             if !binder_spelled_in_a_type
                 && binding.name.is_anf_temp()
                 && count_free(&binding.name, &body) == 1
                 && !reads_a_variable_written_in(&bound_expr, &body)
+                && !writes_what_the_body_touches(&bound_expr, &body)
                 && !writes_a_variable_bound_outside(&bound_expr)
                 && !stands_in_a_value_former(&binding.name, &body)
             {
@@ -1102,12 +1137,13 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
             // temp several projections read is substituted at every one. A
             // copy duplicates whatever its definiens does, and
             // `anf_chain_builds_a_product` admits a chain whose definientia are
-            // not pure, so the same write guard the read-once rule carries
-            // applies here.
+            // not pure, so the same guards the read-once rule carries apply
+            // here.
             if !binder_spelled_in_a_type
                 && binding.name.is_anf_temp()
                 && anf_chain_builds_a_product(&bound_expr)
                 && !reads_a_variable_written_in(&bound_expr, &body)
+                && !writes_what_the_body_touches(&bound_expr, &body)
                 && !writes_a_variable_bound_outside(&bound_expr)
             {
                 let _g =

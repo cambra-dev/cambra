@@ -609,10 +609,16 @@ impl<'a> Blame<'a> {
 
     fn unsupported(&self, error: Located<String>, tree: Option<&Expr>) -> Vec<CompileError> {
         let span = self.span(error.node_id, tree);
+        let mut related: Vec<(Span, String)> = error
+            .related
+            .iter()
+            .map(|(node, label)| (self.span(*node, tree), label.to_string()))
+            .collect();
+        related.extend(self.run_labels(error.node_id, span, tree));
         vec![CompileError::Unsupported {
             span,
             message: error.error,
-            related: self.run_labels(error.node_id, span, tree),
+            related,
         }]
     }
 }
@@ -3267,7 +3273,7 @@ fn run_passes(
     let mut channelized = recorded(capture_provenance, Phase::Channelize, || {
         channelize::run(phase_out)
     })
-    .map_err(|Located { error, node_id }| {
+    .map_err(|Located { error, node_id, .. }| {
         let span = blame.span(node_id, None);
         let subject = ctx.lowering_ctx().deferred_subject(error.defer());
         vec![CompileError::ChannelizeDefers {
