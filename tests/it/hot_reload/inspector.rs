@@ -124,14 +124,11 @@ fn await_reloaded_frame(socket: &mut WebSocket<TcpStream>, deadline: Instant) {
 /// A reload of `main` replaces the served payload with the new version's, and
 /// creating another branch does not.
 #[rstest::rstest]
-fn the_served_payload_follows_a_reload_of_main_and_no_other_branch(
-    #[values("0", "1")] dispatch: &str,
-) {
+fn the_served_payload_follows_a_reload_of_main_and_no_other_branch() {
     let inspect = reserve_test_port();
     let launched = launch_under_control_with(
         "[\"A\" + line for line in stdin()]\n",
         &[format!("--inspect={inspect}")],
-        dispatch,
     );
     await_inspector(inspect);
 
@@ -174,12 +171,11 @@ fn the_served_payload_follows_a_reload_of_main_and_no_other_branch(
 /// `/api/snapshot` already serves that version when the first such frame
 /// arrives (`src/inspector_model/design.md`, "A reload of main is followed").
 #[rstest::rstest]
-fn probe_frames_follow_a_reload_of_main_after_the_payload_does(#[values("0", "1")] dispatch: &str) {
+fn probe_frames_follow_a_reload_of_main_after_the_payload_does() {
     let inspect = reserve_test_port();
     let mut launched = launch_under_control_with(
         "[\"A\" + line for line in stdin()]\n",
         &[format!("--inspect={inspect}")],
-        dispatch,
     );
     await_inspector(inspect);
     let mut socket = connect_live(inspect);
@@ -219,12 +215,11 @@ fn probe_frames_follow_a_reload_of_main_after_the_payload_does(#[values("0", "1"
 /// constant's first reading carries its row, and the driver takes it with
 /// probing on when the client connects before the driver's first pass.
 #[rstest::rstest]
-fn a_reload_of_main_publishes_a_frame_before_any_input(#[values("0", "1")] dispatch: &str) {
+fn a_reload_of_main_publishes_a_frame_before_any_input() {
     let inspect = reserve_test_port();
     let launched = launch_under_control_with(
         "[\"A\" + line for line in stdin()]\n",
         &[format!("--inspect={inspect}")],
-        dispatch,
     );
     await_inspector(inspect);
     let mut socket = connect_live(inspect);
@@ -270,7 +265,6 @@ fn the_inspector_reloads_main_with_a_posted_version() {
     let launched = launch_under_control_with(
         "[\"A\" + line for line in stdin()]\n",
         &[format!("--inspect={inspect}")],
-        "1",
     );
     await_inspector(inspect);
 
@@ -304,7 +298,6 @@ fn a_posted_version_that_does_not_compile_is_refused_with_its_spans() {
     let launched = launch_under_control_with(
         "[\"A\" + line for line in stdin()]\n",
         &[format!("--inspect={inspect}")],
-        "1",
     );
     await_inspector(inspect);
 
@@ -334,7 +327,6 @@ fn an_inspector_without_a_control_port_takes_no_reload() {
     let _spawned = launch_with(
         "[\"A\" + line for line in stdin()]\n",
         &[format!("--inspect={inspect}")],
-        "1",
     );
     await_inspector(inspect);
 
@@ -352,7 +344,6 @@ fn a_reload_from_another_origin_is_refused() {
     let launched = launch_under_control_with(
         "[\"A\" + line for line in stdin()]\n",
         &[format!("--inspect={inspect}")],
-        "1",
     );
     await_inspector(inspect);
 
@@ -378,7 +369,6 @@ fn a_finished_program_takes_no_reload() {
     let launched = launch_under_control_with(
         "[x + 1 for x in [1, 2, 3]]\n",
         &[format!("--inspect={inspect}")],
-        "1",
     );
     await_inspector(inspect);
     launched.wait_until_finished(Duration::from_secs(30));

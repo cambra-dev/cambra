@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use cambra::interpreter::Value;
 use cambra::{
     ccl::context::{CompileError, GlobalContext, Phase},
     ccl::load::LoadedProgram,
@@ -25,18 +26,15 @@ use super::serving::{raw_http, reserve_test_port};
 /// Driven as a subprocess because a `main` output belongs to the binary's own
 /// loop, not to a sink a test can pump. Such a program is not short-lived: its
 /// source is unbounded, so it keeps running and is as reloadable as any other.
-/// `dispatch` is the binary's `CAMBRA_DISPATCH`: `"1"` runs the program
-/// dispatched, `"0"` in pull mode.
 pub(crate) fn stdin_across_reload(
     program: &str,
     reloaded: &str,
     before: &str,
     after: &str,
-    dispatch: &str,
 ) -> (String, String) {
     use std::io::Write;
 
-    let mut launched = launch_under_control(program, dispatch);
+    let mut launched = launch_under_control(program);
     let control = launched.control;
     let v2 = launched.spawned.program.dir.join("v2.cambra");
     std::fs::write(&v2, reloaded).expect("write v2");
@@ -158,22 +156,16 @@ impl Launched {
 ///
 /// The wait is not optional: the program binds its control port during
 /// compilation, so a request sent before then is refused rather than served.
-/// `dispatch` sets the binary's `CAMBRA_DISPATCH`, as [`stdin_across_reload`]
-/// says.
-pub(crate) fn launch_under_control(program: &str, dispatch: &str) -> Launched {
-    launch_under_control_with(program, &[], dispatch)
+pub(crate) fn launch_under_control(program: &str) -> Launched {
+    launch_under_control_with(program, &[])
 }
 
 /// [`launch_under_control`], passing `extra` to the binary as well.
-pub(crate) fn launch_under_control_with(
-    program: &str,
-    extra: &[String],
-    dispatch: &str,
-) -> Launched {
+pub(crate) fn launch_under_control_with(program: &str, extra: &[String]) -> Launched {
     let control = reserve_test_port();
     let mut args = vec![format!("--control={control}")];
     args.extend_from_slice(extra);
-    let spawned = launch_with(program, &args, dispatch);
+    let spawned = launch_with(program, &args);
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while std::net::TcpStream::connect(("127.0.0.1", control)).is_err() {
@@ -185,9 +177,8 @@ pub(crate) fn launch_under_control_with(
 }
 
 /// Spawn `program` as the `cambra` binary with `args`, from a scratch directory
-/// of its own. `dispatch` sets the binary's `CAMBRA_DISPATCH`, as
-/// [`stdin_across_reload`] says.
-pub(crate) fn launch_with(program: &str, args: &[String], dispatch: &str) -> Spawned {
+/// of its own.
+pub(crate) fn launch_with(program: &str, args: &[String]) -> Spawned {
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
 
@@ -203,7 +194,6 @@ pub(crate) fn launch_with(program: &str, args: &[String], dispatch: &str) -> Spa
         child: Command::new(env!("CARGO_BIN_EXE_cambra"))
             .args(args)
             .arg(&v1)
-            .env("CAMBRA_DISPATCH", dispatch)
             .env("CAMBRA_MORSEL_ROWS", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -212,7 +202,6 @@ pub(crate) fn launch_with(program: &str, args: &[String], dispatch: &str) -> Spa
             .expect("spawn cambra"),
         dir,
         stderr: None,
-        dispatched: dispatch != "0" && !dispatch.is_empty(),
     };
     let stderr = program.child.stderr.take().expect("piped stderr");
     program.stderr = Some(thread::spawn(move || {
@@ -253,7 +242,6 @@ pub(crate) struct RunningProgram {
     pub(crate) child: std::process::Child,
     pub(crate) dir: std::path::PathBuf,
     stderr: Option<thread::JoinHandle<String>>,
-    dispatched: bool,
 }
 
 impl RunningProgram {
@@ -263,7 +251,6 @@ impl RunningProgram {
             child,
             dir,
             stderr: None,
-            dispatched: true,
         }
     }
 
@@ -290,27 +277,10 @@ impl Drop for RunningProgram {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.dir);
-        let stderr = self
-            .stderr
-            .take()
-            .map(|reader| reader.join().expect("stderr reader"));
-        if self.dispatched && !thread::panicking() {
-            assert_dispatched(stderr.as_deref().unwrap_or_default());
+        if let Some(reader) = self.stderr.take() {
+            reader.join().expect("stderr reader");
         }
     }
-}
-
-fn assert_dispatched(stderr: &str) {
-    assert!(
-        !stderr.contains("running in pull mode"),
-        "a dispatched reload test must not fall back to pull mode: {stderr}"
-    );
-}
-
-#[test]
-#[should_panic(expected = "must not fall back")]
-fn a_reload_test_rejects_dispatcher_fallback() {
-    assert_dispatched("note: CAMBRA_DISPATCH: unsupported shape; running in pull mode");
 }
 
 /// Wait for `port` to stop accepting connections.
@@ -338,6 +308,7 @@ pub(crate) fn assert_port_released(port: u16) {
 /// gallery directory holds a program, not a fixture set. `{PORT}` is substituted
 /// by [`source`].
 pub(crate) mod fixtures {
+
     use indoc::indoc;
 
     pub const BUMP_OVER_SOURCE: &str = indoc! {r#"
@@ -1104,12 +1075,8 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
             .map(|(i, v)| (Value::uint_from_row(from + i), Value::Int(*v)))
             .collect()
     };
-    let pull = |ctx: &mut GlobalContext, live: &mut LiveProgram| -> Tile {
-        ctx.scheduler().check_for_notifications();
-        let producer = live
-            .main_producer_mut(MAIN_BRANCH)
-            .expect("the program's value is pulled");
-        producer.get(producer.tiling().universal_guard())
+    let pull = |_ctx: &mut GlobalContext, live: &mut LiveProgram| -> Tile {
+        crate::serving::run_branch_to_idle(live, MAIN_BRANCH)
     };
 
     let mut live =
@@ -1120,21 +1087,65 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
         .set_yield_predicate(Predicate::at_or_below(Value::uint_from_row(
             before.len() - 1,
         )));
-    for _ in 0..20 {
-        pull(&mut ctx, &mut live);
-    }
+    pull(&mut ctx, &mut live);
     live.reload(&mut ctx, MAIN_BRANCH, &LoadedProgram::test(v2), &no_main)
         .expect("v2 replaces v1");
     source.borrow_mut().add_data(&rows(before.len(), after));
     source.borrow_mut().set_yield_predicate(Predicate::True);
-    for _ in 0..500 {
-        let tile = pull(&mut ctx, &mut live);
-        if tile.is_terminal() {
-            let Tile::Scalar(ColumnValue::Ints(v)) = tile else {
-                panic!("an integer value, got {tile:?}");
-            };
-            return v[0];
-        }
+    let tile = pull(&mut ctx, &mut live);
+    assert!(
+        tile.is_terminal(),
+        "the replacement settles after its source closes"
+    );
+    let Tile::Scalar(ColumnValue::Ints(v)) = tile else {
+        panic!("an integer value")
+    };
+    v[0]
+}
+
+pub(super) fn source_prefix(
+    ctx: &mut GlobalContext,
+    values: &[Value],
+    cut: usize,
+    ty: cambra::ccl::BaseType,
+) -> std::rc::Rc<std::cell::RefCell<cambra::interpreter::TestDataSource>> {
+    use cambra::interpreter::{BaseType, Extent, Predicate, TestDataSource};
+    let source = std::rc::Rc::new(std::cell::RefCell::new(TestDataSource::new(
+        "source1",
+        cambra::ccl::Type::Base(ty.clone()),
+        Extent::Base(match ty {
+            cambra::ccl::BaseType::String => BaseType::String,
+            _ => BaseType::Int,
+        }),
+    )));
+    ctx.register_source(source.clone());
+    let rows: Vec<_> = values[..cut]
+        .iter()
+        .enumerate()
+        .map(|(i, value)| (Value::uint_from_row(i), value.clone()))
+        .collect();
+    source.borrow_mut().add_data(&rows);
+    if cut > 0 {
+        source
+            .borrow_mut()
+            .set_yield_predicate(Predicate::at_or_below(Value::uint_from_row(cut - 1)));
     }
-    panic!("the replacement never settled");
+    source
+}
+
+pub(super) fn finish_source(
+    source: &std::rc::Rc<std::cell::RefCell<cambra::interpreter::TestDataSource>>,
+    values: &[Value],
+    cut: usize,
+) {
+    let rows: Vec<_> = values
+        .iter()
+        .enumerate()
+        .skip(cut)
+        .map(|(i, value)| (Value::uint_from_row(i), value.clone()))
+        .collect();
+    source.borrow_mut().add_data(&rows);
+    source
+        .borrow_mut()
+        .set_yield_predicate(cambra::interpreter::Predicate::True);
 }

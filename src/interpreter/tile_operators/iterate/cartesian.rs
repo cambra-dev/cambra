@@ -35,11 +35,10 @@ pub(super) fn subscribe(
 ) -> Box<dyn TileProducer> {
     let mut fields: Vec<_> = fields.iter().map(|(n, e)| (n.clone(), e.clone())).collect();
     fields.sort_by(|(a, _), (b, _)| a.cmp(b));
-    let (wakeup, gate) = shared_consumer(consumer);
-    let leaf = wakeup.shared().clone();
-    IterateExtent::add_all_source_handles(&op.extent, leaf.clone(), cx);
+    let wakeup = shared_consumer(consumer);
+    let leaf = wakeup.clone();
+    IterateExtent::add_all_source_handles(&op.extent, cx);
     let base = ProducerBase::new(IterateExtentProducer::alloc_id(), op.tiling(), &op.base, cx)
-        .sharing(gate)
         .leaf(leaf.clone());
     let mut holds = Vec::new();
     for (side, (_, extent)) in fields.iter().enumerate() {
@@ -323,7 +322,7 @@ mod tests {
         )
     }
     fn rows(head: &mut dyn TileProducer) -> usize {
-        let mut tile = head.get(head.tiling().universal_guard());
+        let mut tile = head.read_in_pipeline(head.tiling().universal_guard());
         tile.compact();
         let Tile::DataFunction { domain, .. } = tile else {
             panic!("a product is a collection")
@@ -394,7 +393,7 @@ mod tests {
         add(&b, &[0], prefix(0));
         let mut p = head(Extent::DataSourceDomain(a), Extent::DataSourceDomain(b));
         assert_eq!(rows(&mut *p), 2);
-        let held = p.get(p.tiling().universal_guard()).to_guard();
+        let held = p.read_in_pipeline(p.tiling().universal_guard()).to_guard();
         let key = Value::Record(HashMap::from([
             ("a".into(), Value::UInt(1)),
             ("b".into(), Value::UInt(0)),
@@ -409,7 +408,7 @@ mod tests {
         let mut p = head(Extent::DataSourceDomain(a), Extent::uint_range(3));
         assert_eq!(rows(&mut *p), 9);
         let guard = product(prefix(1), prefix(0)).union(&product(prefix(0), prefix(1)));
-        let mut tile = p.get(guard.clone());
+        let mut tile = p.read_in_pipeline(guard.clone());
         tile.compact();
         let Tile::DataFunction { domain, .. } = tile else {
             panic!("a product is a collection")
@@ -487,7 +486,7 @@ mod tests {
         let mut p = head(Extent::DataSourceDomain(a.clone()), Extent::uint_range(2));
         assert_eq!(rows(&mut *p), 2);
         a.borrow_mut().set_yield_predicate(prefix(0));
-        let tile = p.get(p.tiling().universal_guard());
+        let tile = p.read_in_pipeline(p.tiling().universal_guard());
         let Tile::DataFunction {
             domain_predicate,
             domain,

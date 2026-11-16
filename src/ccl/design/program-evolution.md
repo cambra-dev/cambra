@@ -348,8 +348,8 @@ reload diffs against its own version, so a parent's reload never has to be follo
 the `released_position` of every fan-out it reads stops rising, per [Guards intersect at a
 fan-out](#guards-intersect-at-a-fan-out). A reload that keeps such a fan-out as an iteration input
 is refused, per [Routes across branches](#routes-across-branches). A branch's outputs stay
-subscribed and pulled for as long as its entry exists. The binary's driver pulls every branch's
-`main` output (`LiveProgram::pull_mains`). It prints `main`'s value as `Got value: …` and every
+subscribed for as long as its entry exists. `LiveProgram::run` schedules every branch's outputs
+through one shared dispatcher. It prints `main`'s value as `Got value: …` and every
 other branch's as `Got value from <branch>: …`, so a branch created under the name `main` after the
 first one is deleted prints unlabelled. A version whose `main` output has finished is no longer
 pulled. The process exits when every branch's `main` output has finished and every branch's sink
@@ -1241,22 +1241,22 @@ dispatcher thread and unblocks the thread on drop, so the thread's own shutdown 
 
 ### A subscription lasts as long as its producer
 
-Replacing a graph while sharing operators with it requires knowing which subscriptions are still
-live. Three registrations answer that the same way: the subscriber owns its side, and the registry
-holds a weak reference.
+Registrations for a compiled version end when its producer graph is retired. Fan-out slots use
+weak ownership; sources track producer release records; sink consumers hold detachable producer
+slots.
 
 - **Fan-out slots.** `FanOutShared::subscribers` holds a weak reference per slot, and the strong
   side lives in the `FanOutProducer` that slot handed out. A dead slot is skipped and renumbered per
   [Guards intersect at a fan-out](#guards-intersect-at-a-fan-out).
-- **Scheduler wake-ups.** `Scheduler::add_source_handle` records a `Weak<RefCell<dyn Consumer>>`,
-  and the `IterateExtentProducer` that registered it owns the strong side. A source handle outlives
-  a version and the subscriptions against it do not. A strong registration would keep every operator
-  any version ever subscribed alive and notified.
-- **Sink dispatch.** `SinkConsumer::detach` clears the producer slot at teardown. An operator the
-  next version carries forward still holds the notification closure that reaches the old sink
-  consumers, so without the clear they would keep being woken and keep writing to sinks the new
-  version now feeds. Clearing the slot also drops the operators behind it, which lets the fan-outs
-  they subscribed to see those subscriptions end.
+- **Source release records.** `IterateExtent` registers each producer with the sources it reads
+  through an initial empty release. Dropping the producer calls `retire_producer`, removing its
+  release records so a retired reader no longer constrains the release intersection.
+  `SourceRegistry` keeps strong source handles for inspection and route retirement; it registers
+  no notification consumers.
+- **Sink producer slots.** `SinkConsumer::detach` clears the producer slot at teardown, releasing
+  that consumer's ownership of the retired producer chain. Operators carried into the replacement
+  can still hold the old consumer without retaining its producer graph. Sink delivery belongs to
+  its dispatcher pipeline; notifications schedule that work without executing a sink.
 
 ### Nothing inside a fan-out owns it
 
@@ -1265,9 +1265,9 @@ from inside that chain closes a cycle and nothing in the subgraph is freed. `Fan
 distinction that avoids it: a downstream reader owns the fan-out, and a reader inside its input
 chain does not. Two readers sit inside:
 
-- **The notification closure.** `FanOutSlot::subscribe` hands the input a closure that wakes the
-  fan-out's consumers. The closure holds a weak reference and does nothing when it cannot upgrade,
-  which is when the fan-out is gone and has no consumers left to wake.
+- **The input notification consumer.** `FanOutSlot::subscribe` hands the input a consumer that
+  forwards notifications to the fan-out's consumers. It holds a weak reference and forwards
+  nothing when that reference cannot upgrade, after the fan-out is gone.
 - **A store's recurrence.** A store's driver reads the store to recover each position's prior value,
   and a transaction's writer reads it to decide a commit. Both hold the store by
   `FanOut::recurrence_slot`, and both read only while the fan-out is pulling the chain they sit

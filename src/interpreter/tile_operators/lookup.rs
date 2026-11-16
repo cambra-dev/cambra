@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use std::borrow::Cow;
 
 use bit_set::BitSet;
@@ -180,13 +182,13 @@ impl TileOperator for CheckedLookup {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        let (source, gate) = match &mut self.source {
+        let source = match &mut self.source {
             // Two inputs, so both wake the same consumer. The collection is what decides an
             // absence, so when it settles after the keys it is the input that completes the
             // answer — subscribed with a consumer of its own it would settle with nobody
             // scheduled to read it (see `shared_consumer`).
             LookupSource::Split { collection, keys } => {
-                let (shared, gate) = shared_consumer(consumer);
+                let shared = shared_consumer(consumer);
                 // A stream of keys is pulled at the projection, and each answer sits at its key's
                 // position; the collection is read whole, since every key is answered against
                 // all of it.
@@ -194,19 +196,16 @@ impl TileOperator for CheckedLookup {
                 let keys =
                     subscribe_forwarding_keeping_keys_if(keeps_keys, &mut **keys, &shared, cx);
                 let collection = subscribe_forwarding(&mut **collection, &shared, cx);
-                (ProducerSource::Split { collection, keys }, Some(gate))
+                ProducerSource::Split { collection, keys }
             }
             // One input, carrying both operands, so there is nothing to share.
-            LookupSource::Paired(pairs) => (
-                ProducerSource::Paired(pairs.subscribe(
-                    pairs.tiling().universal_guard(),
-                    // The pairs are pulled at the projection, and each answer sits at its
-                    // row's position.
-                    consumer,
-                    cx,
-                )),
-                None,
-            ),
+            LookupSource::Paired(pairs) => ProducerSource::Paired(pairs.subscribe(
+                pairs.tiling().universal_guard(),
+                // The pairs are pulled at the projection, and each answer sits at its
+                // row's position.
+                consumer,
+                cx,
+            )),
         };
         Box::new(CheckedLookupProducer {
             base: ProducerBase::new(
@@ -214,10 +213,8 @@ impl TileOperator for CheckedLookup {
                 &self.base.tiling,
                 &self.base,
                 cx,
-            )
-            .sharing(gate),
+            ),
             source,
-            released: false,
         })
     }
 }
@@ -225,7 +222,6 @@ impl TileOperator for CheckedLookup {
 struct CheckedLookupProducer {
     base: ProducerBase,
     source: ProducerSource,
-    released: bool,
 }
 
 /// [`LookupSource`] after subscription.
@@ -502,7 +498,6 @@ impl TileProducer for CheckedLookupProducer {
             return;
         }
         if obsolete_guard.expect_universal_or_empty(&self.name()) {
-            self.released = true;
             match &mut self.source {
                 ProducerSource::Split { collection, keys } => {
                     collection.release(collection.tiling().universal_guard());
@@ -528,7 +523,7 @@ impl CheckedLookupProducer {
         // What an answer with nothing in it tiles as: an empty column where one key is
         // answered, an empty collection where a stream of them is.
         let empty = self.tiling().empty_tile();
-        if self.released {
+        if self.obsolete_guard().is_universal() {
             return empty;
         }
         // Every leg is searched by position, and a release marks rows deleted rather than
@@ -990,7 +985,6 @@ mod tests {
                 collection: Box::new(TestTileProducer::new(coll.0, coll.1)),
                 keys: Box::new(TestTileProducer::new(keys.0, keys.1)),
             },
-            released: false,
         }
     }
 
@@ -999,7 +993,7 @@ mod tests {
     #[test]
     fn a_group_of_keys_per_row_answers_each_key_in_place() {
         let mut lookup = lookup_over(grouped_keys(), collection(true));
-        let out = lookup.get(lookup.tiling().universal_guard());
+        let out = lookup.read_in_pipeline(lookup.tiling().universal_guard());
         let levels = out.key_levels();
         assert_eq!(*levels[0].1, ColumnValue::UInts(vec![0, 1]));
         assert_eq!(*levels[1].0, vec![0, 2]);
@@ -1025,7 +1019,7 @@ mod tests {
     #[test]
     fn an_undecided_key_leaves_its_group_and_the_rest_goes_out() {
         let mut lookup = lookup_over(grouped_keys(), collection(false));
-        let out = lookup.get(lookup.tiling().universal_guard());
+        let out = lookup.read_in_pipeline(lookup.tiling().universal_guard());
         let levels = out.key_levels();
         assert_eq!(
             *levels[0].1,
@@ -1081,9 +1075,8 @@ mod tests {
                 collection: Box::new(TestTileProducer::new(coll, coll_tiling)),
                 keys: Box::new(spy),
             },
-            released: false,
         };
-        let out = lookup.get(lookup.tiling().universal_guard());
+        let out = lookup.read_in_pipeline(lookup.tiling().universal_guard());
         let taken = out.to_guard();
         assert!(
             matches!(
@@ -1108,7 +1101,7 @@ mod tests {
         );
         let keys_tiling = Tiling::data_function(uint(), Tiling::Scalar(int()));
         let mut lookup = lookup_over((keys, keys_tiling), collection(false));
-        let out = lookup.get(lookup.tiling().universal_guard());
+        let out = lookup.read_in_pipeline(lookup.tiling().universal_guard());
         let Tile::DataFunction {
             domain,
             domain_predicate,
@@ -1173,7 +1166,7 @@ mod tests {
     #[test]
     fn each_row_reads_its_key_in_its_own_collection() {
         let mut lookup = keyed_rows(1);
-        let out = lookup.get(lookup.tiling().universal_guard());
+        let out = lookup.read_in_pipeline(lookup.tiling().universal_guard());
         assert_eq!(*out.key_levels()[0].1, ColumnValue::UInts(vec![0, 1]));
         assert_eq!(
             scalar_tile_to_column_value(out.deepest_values().clone()),
@@ -1186,7 +1179,7 @@ mod tests {
     #[test]
     fn a_row_whose_key_has_not_arrived_is_withheld() {
         let mut lookup = keyed_rows(2);
-        let out = lookup.get(lookup.tiling().universal_guard());
+        let out = lookup.read_in_pipeline(lookup.tiling().universal_guard());
         assert_eq!(*out.key_levels()[0].1, ColumnValue::UInts(vec![0]));
         assert_eq!(
             scalar_tile_to_column_value(out.deepest_values().clone()),
@@ -1261,7 +1254,6 @@ mod projection_tests {
                 collection: Box::new(collection),
                 keys: Box::new(key_stream),
             },
-            released: false,
         };
         (lookup, key_pulls, collection_pulls)
     }
@@ -1288,7 +1280,7 @@ mod projection_tests {
     #[test]
     fn a_morsel_of_keys_is_answered_against_the_whole_collection() {
         let (mut lookup, key_pulls, collection_pulls) = lookup_over_streams();
-        let morsel = lookup.get(keys_between(2, 5));
+        let morsel = lookup.read_in_pipeline(keys_between(2, 5));
         assert_eq!(
             answers(&morsel),
             vec![
@@ -1308,9 +1300,9 @@ mod projection_tests {
     #[test]
     fn consecutive_morsels_are_answered_in_turn() {
         let (mut lookup, key_pulls, _) = lookup_over_streams();
-        lookup.get(keys_between(0, 3));
+        lookup.read_in_pipeline(keys_between(0, 3));
         lookup.release(keys_between(0, 3));
-        let next = lookup.get(keys_between(4, 7));
+        let next = lookup.read_in_pipeline(keys_between(4, 7));
         assert_eq!(
             answers(&next),
             vec![
@@ -1333,7 +1325,7 @@ mod projection_tests {
     #[test]
     fn asking_for_nothing_reads_nothing() {
         let (mut lookup, key_pulls, collection_pulls) = lookup_over_streams();
-        let tile = lookup.get(lookup.tiling().empty_guard());
+        let tile = lookup.read_in_pipeline(lookup.tiling().empty_guard());
         assert!(answers(&tile).is_empty());
         assert!(key_pulls.borrow().is_empty() && collection_pulls.borrow().is_empty());
     }
@@ -1360,8 +1352,7 @@ mod projection_tests {
                     Tiling::Scalar(int()),
                 )),
             },
-            released: false,
         };
-        lookup.get(keys_between(0, 1));
+        lookup.read_in_pipeline(keys_between(0, 1));
     }
 }

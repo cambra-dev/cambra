@@ -1,5 +1,7 @@
 use super::*;
 use crate::interpreter::operator_graph::value;
+#[cfg(test)]
+use crate::interpreter::tile_operators::test_helpers::Announce as _;
 use crate::{
     interpreter::{ColumnValue, Consumer, Projection, SubscribeContext, Value},
     pretty_graph::VizOptions,
@@ -86,7 +88,7 @@ impl TileOperator for ExtractFinal {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        let input = BreakerInput::new(consumer, self.source.tiling(), false, cx);
+        let input = BreakerInput::new(consumer, self.source.tiling(), false);
         // Only source notifications reach the consumer. The default is subscribed eagerly
         // but pulled only after a terminal source has no live positions.
         let source_producer =
@@ -122,10 +124,6 @@ struct ExtractFinalProducer {
     /// The source rows [`Breaker::consume_impl`] merged, kept to the row at the
     /// greatest key where the values are a column, and empty before the first consume.
     merged: Tile,
-    /// Whether the extraction is in consuming mode for the run
-    /// ([`Breaker::enter_consuming_mode`]): it then answers from `final_tile`, and only
-    /// `consume_impl` pulls its source and its default.
-    consuming: bool,
 }
 
 /// The final value of `source`, falling back to `default`, that nothing subscribed, answering at
@@ -156,9 +154,7 @@ impl ExtractFinalProducer {
             default,
             final_tile: None,
             complete: false,
-
             merged,
-            consuming: false,
         }
     }
 
@@ -271,7 +267,7 @@ impl TileProducer for ExtractFinalProducer {
         if self.obsolete_guard().is_universal() {
             return empty;
         }
-        if self.consuming {
+        if !self.base.reads_input() {
             return self.offer_impl(projection_guard);
         }
         if let Some(tile) = &self.final_tile {
@@ -343,10 +339,6 @@ impl TileProducer for ExtractFinalProducer {
 }
 
 impl Breaker for ExtractFinalProducer {
-    fn enter_consuming_mode(&mut self) {
-        self.consuming = true;
-    }
-
     /// Merges the source rows it answers at `guard`, a guard of the source's tiling, keeps the
     /// row at the greatest key, and releases the source at what the answer stated. Rows merge in
     /// the order they arrive, so the last row is not the final one: the key says which is. Once
@@ -356,11 +348,6 @@ impl Breaker for ExtractFinalProducer {
         debug_assert!(
             guard.check_from(self.source.tiling()),
             "{} consumes a guard of its source's tiling: {guard:?}",
-            self.name()
-        );
-        debug_assert!(
-            self.consuming,
-            "{} consumes once a dispatched run has put it in consuming mode",
             self.name()
         );
         if self.obsolete_guard().is_universal() || self.final_tile.is_some() || guard.is_empty() {
@@ -404,7 +391,7 @@ impl Breaker for ExtractFinalProducer {
     /// released whole, or the default it fell back to has not converged. A dispatcher issues no
     /// `consume_impl` after the finish, so nothing would read that default again, and pushing
     /// nothing would leave the reader with no value.
-    fn finish(&mut self, pushes: &mut Pushes<'_>) {
+    fn finish(&mut self, _input: InputId, pushes: &mut Pushes<'_>) {
         assert!(
             self.obsolete_guard().is_universal() || self.final_tile.is_some(),
             "{} finishes after it extracted its value: the source released whole and any \
@@ -661,7 +648,6 @@ mod tests {
     /// is discarded. A debug probe rejects the unnotified change; without assertions, Memo
     /// keeps returning an empty result. Convert this pin when repaired.
     #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "changed without notifying"))]
     fn bug_delayed_default_does_not_wake_a_memoized_consumer() {
         let ready = Rc::new(Cell::new(false));
         let consumer = Rc::new(RefCell::new(None));
@@ -681,16 +667,16 @@ mod tests {
             Box::new(move || observed.set(observed.get() + 1)),
             &mut SubscribeContext::new(),
         );
-        assert!(!producer.get(guard.clone()).is_terminal());
+        assert!(!producer.read_in_pipeline(guard.clone()).is_terminal());
 
         ready.set(true);
         consumer
             .borrow_mut()
             .as_mut()
             .unwrap()
-            .notify(&Projection::Everything);
+            .announce(&Projection::Everything);
         assert_eq!(notifications.get(), 0, "bug pin: the fallback wake is lost");
-        let Tile::Scalar(result) = producer.get(guard) else {
+        let Tile::Scalar(result) = producer.read_in_pipeline(guard) else {
             panic!("expected a scalar fallback");
         };
         assert_eq!(
@@ -721,11 +707,11 @@ mod tests {
             let guard = op.tiling().universal_guard();
             let mut producer =
                 op.subscribe(guard.clone(), Box::new(|| {}), &mut SubscribeContext::new());
-            assert!(producer.get(guard.clone()).is_terminal());
+            assert!(producer.read_in_pipeline(guard.clone()).is_terminal());
             assert!(retained(&*producer) > 0);
             producer.release(guard.clone());
             assert_eq!(retained(&*producer), 0, "a released cache holds nothing");
-            assert_eq!(producer.get(guard).cell_count(), 0);
+            assert_eq!(producer.read_in_pipeline(guard).cell_count(), 0);
         }
     }
 
@@ -738,7 +724,7 @@ mod tests {
         let guard = op.tiling().universal_guard();
         let mut producer =
             op.subscribe(guard.clone(), Box::new(|| {}), &mut SubscribeContext::new());
-        let Tile::Scalar(result) = producer.get(guard) else {
+        let Tile::Scalar(result) = producer.read_in_pipeline(guard) else {
             panic!("expected a scalar final value");
         };
         assert_eq!(result.as_single(), Some(Value::Int(10)));
@@ -791,7 +777,7 @@ mod tests {
         let mut op = ExtractFinal::new(Box::new(source), Box::new(default));
         let guard = op.tiling().universal_guard();
         let mut producer = op.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
-        let tile = producer.get(producer.tiling().universal_guard());
+        let tile = producer.read_in_pipeline(producer.tiling().universal_guard());
 
         let Tile::Scalar(cv) = tile else {
             panic!("expected a scalar tile");
@@ -827,7 +813,7 @@ mod tests {
         let mut op = ExtractFinal::new(Box::new(source), Box::new(default));
         let guard = op.tiling().universal_guard();
         let mut producer = op.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
-        let tile = producer.get(producer.tiling().universal_guard());
+        let tile = producer.read_in_pipeline(producer.tiling().universal_guard());
 
         let Tile::Scalar(cv) = tile else {
             panic!("expected a scalar tile");
@@ -857,7 +843,7 @@ mod tests {
         let mut producer = op.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
 
         // Non-terminal source → ExtractFinal emits empty but releases `[0, max)`.
-        let tile = producer.get(producer.tiling().universal_guard());
+        let tile = producer.read_in_pipeline(producer.tiling().universal_guard());
         assert!(
             !tile.is_terminal(),
             "a non-terminal source stays non-terminal"
@@ -903,7 +889,7 @@ mod projection_tests {
     #[test]
     fn the_stream_is_read_whole_to_find_its_last_position() {
         let (mut last, pulled) = final_of_finished_stream();
-        let tile = last.get(last.tiling().universal_guard());
+        let tile = last.read_in_pipeline(last.tiling().universal_guard());
         assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![30])));
         assert_eq!(pulled.borrow().len(), 1);
         assert!(pulled.borrow()[0].is_universal());
@@ -912,7 +898,7 @@ mod projection_tests {
     #[test]
     fn asking_for_nothing_reads_nothing() {
         let (mut last, pulled) = final_of_finished_stream();
-        let tile = last.get(last.tiling().empty_guard());
+        let tile = last.read_in_pipeline(last.tiling().empty_guard());
         assert_eq!(tile, last.tiling().empty_tile());
         assert!(pulled.borrow().is_empty());
     }
@@ -921,7 +907,7 @@ mod projection_tests {
     #[should_panic(expected = "extracts one final value")]
     fn a_key_projection_is_rejected() {
         let (mut last, _) = final_of_finished_stream();
-        last.get(keys_between(0, 1));
+        last.read_in_pipeline(keys_between(0, 1));
     }
 }
 
@@ -982,15 +968,15 @@ mod consuming_tests {
     fn the_greatest_key_is_final_whatever_arrived_last() {
         let source = source(0..12);
         let mut extract = final_over(&source, None);
-        extract.enter_consuming_mode();
-        extract.consume_impl(InputId::ONLY, keys_between(8, 11));
+        extract.begin_run();
+        extract.consume_in_pipeline(InputId::ONLY, keys_between(8, 11));
         assert_eq!(
             offer(&mut extract),
             None,
             "the source has not stated everything complete"
         );
         // The rows below arrive after the row at key 11, which stays final.
-        extract.consume_impl(InputId::ONLY, ints().universal_guard());
+        extract.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
         assert_eq!(offer(&mut extract), Some(value(11)));
         assert_eq!(source.borrow().pulled.len(), 2);
     }
@@ -1000,10 +986,10 @@ mod consuming_tests {
     fn a_later_morsel_with_smaller_keys_does_not_replace_the_final_row() {
         let source = source([1, 2, 9, 10]);
         let mut extract = final_over(&source, None);
-        extract.enter_consuming_mode();
-        extract.consume_impl(InputId::ONLY, keys_between(9, 11));
-        extract.consume_impl(InputId::ONLY, keys_between(0, 3));
-        extract.consume_impl(InputId::ONLY, ints().universal_guard());
+        extract.begin_run();
+        extract.consume_in_pipeline(InputId::ONLY, keys_between(9, 11));
+        extract.consume_in_pipeline(InputId::ONLY, keys_between(0, 3));
+        extract.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
         assert_eq!(offer(&mut extract), Some(value(10)));
     }
 
@@ -1012,13 +998,13 @@ mod consuming_tests {
     fn a_region_is_pulled_and_released_and_yields_no_value_yet() {
         let source = source(0..10);
         let mut extract = final_over(&source, None);
-        extract.enter_consuming_mode();
-        extract.consume_impl(InputId::ONLY, keys_between(2, 5));
+        extract.begin_run();
+        extract.consume_in_pipeline(InputId::ONLY, keys_between(2, 5));
         assert_eq!(source.borrow().pulled, vec![keys_between(2, 5)]);
         assert_eq!(source.borrow().released, vec![keys_between(2, 5)]);
         assert_eq!(offer(&mut extract), None);
-        extract.consume_impl(InputId::ONLY, keys_between(7, 9));
-        extract.consume_impl(InputId::ONLY, keys_between(4, 8));
+        extract.consume_in_pipeline(InputId::ONLY, keys_between(7, 9));
+        extract.consume_in_pipeline(InputId::ONLY, keys_between(4, 8));
         assert_eq!(
             source.borrow().released,
             vec![keys_between(2, 5), keys_between(7, 9), keys_between(4, 8)]
@@ -1029,8 +1015,8 @@ mod consuming_tests {
     fn nothing_consumed_pulls_nothing() {
         let source = source(0..10);
         let mut extract = final_over(&source, None);
-        extract.enter_consuming_mode();
-        extract.consume_impl(InputId::ONLY, ints().empty_guard());
+        extract.begin_run();
+        extract.consume_in_pipeline(InputId::ONLY, ints().empty_guard());
         assert!(source.borrow().pulled.is_empty());
     }
 
@@ -1039,21 +1025,21 @@ mod consuming_tests {
     fn an_empty_drained_source_yields_the_default() {
         let source = source([]);
         let mut extract = final_over(&source, default_of(7));
-        extract.enter_consuming_mode();
-        extract.consume_impl(InputId::ONLY, ints().universal_guard());
+        extract.begin_run();
+        extract.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
         assert_eq!(offer(&mut extract), Some(7));
         assert_eq!(extract.final_guard(), int().universal_guard());
     }
 
     /// A default that has not converged when the source drains leaves nothing held; the next
-    /// consume reads it again, as every pull does in pull mode.
+    /// consume reads it again, as every pull does queried inside a pipeline.
     #[test]
     fn an_unconverged_default_is_read_again_by_the_next_consume() {
         let source = source([]);
         let (default, cell) = ScriptedProducer::new(Tile::Scalar(ColumnValue::Ints(vec![])), int());
         let mut extract = final_over(&source, Some(Box::new(default)));
-        extract.enter_consuming_mode();
-        extract.consume_impl(InputId::ONLY, ints().universal_guard());
+        extract.begin_run();
+        extract.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
         assert_eq!(offer(&mut extract), None, "the default has not converged");
         assert_eq!(
             extract.final_guard(),
@@ -1062,7 +1048,7 @@ mod consuming_tests {
         );
 
         *cell.borrow_mut() = Tile::Scalar(ColumnValue::Ints(vec![7]));
-        extract.consume_impl(InputId::ONLY, ints().universal_guard());
+        extract.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
         assert_eq!(offer(&mut extract), Some(7));
         assert_eq!(extract.final_guard(), int().universal_guard());
     }
@@ -1075,9 +1061,12 @@ mod consuming_tests {
         let source = source([]);
         let (default, _) = ScriptedProducer::new(Tile::Scalar(ColumnValue::Ints(vec![])), int());
         let mut extract = final_over(&source, Some(Box::new(default)));
-        extract.enter_consuming_mode();
-        extract.consume_impl(InputId::ONLY, ints().universal_guard());
-        extract.finish(&mut Dispatcher::new(vec![vec![]], usize::MAX).pushes(PipelineId(0)));
+        extract.begin_run();
+        extract.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
+        extract.finish(
+            InputId::ONLY,
+            &mut Dispatcher::new(vec![vec![]], usize::MAX).pushes(PipelineId(0)),
+        );
     }
 
     /// An output released before the value was extracted pushes nothing, and that is no error.
@@ -1085,36 +1074,38 @@ mod consuming_tests {
     fn finish_after_the_output_was_released_pushes_nothing() {
         let source = growing_source(0..4);
         let mut extract = final_over(&source, None);
-        extract.enter_consuming_mode();
-        extract.consume_impl(InputId::ONLY, keys_between(0, 1));
+        extract.begin_run();
+        extract.consume_in_pipeline(InputId::ONLY, keys_between(0, 1));
         extract.release(int().universal_guard());
+        assert_eq!(extract.complete(), int().empty_guard());
         push_to(&mut extract, &[1]);
         let dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
-        dispatcher.finish_by_hand(PipelineId(0), |pushes| extract.finish(pushes));
+        dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+            extract.finish(InputId::ONLY, pushes)
+        });
         assert!(dispatcher.pop().is_none());
     }
 
-    /// A total source that is empty is an invariant violation, as in pull mode.
+    /// A total source that is empty is an invariant violation, as queried inside a pipeline.
     #[test]
     #[should_panic(expected = "declared total emitted no value")]
     fn an_empty_total_source_fails_loudly() {
         let source = source([]);
         let mut extract = final_over(&source, None);
-        extract.enter_consuming_mode();
-        extract.consume_impl(InputId::ONLY, ints().universal_guard());
+        extract.begin_run();
+        extract.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
     }
 
     #[test]
     fn final_guard_holds_the_value_until_it_is_released() {
         let source = source(0..4);
         let mut extract = final_over(&source, None);
-        extract.enter_consuming_mode();
-        extract.consume_impl(InputId::ONLY, ints().universal_guard());
+        extract.begin_run();
+        extract.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
         assert_eq!(extract.final_guard(), int().universal_guard());
-        assert_eq!(extract.complete(), int().universal_guard());
         extract.release(int().universal_guard());
-        assert_eq!(extract.complete(), int().universal_guard());
         assert_eq!(extract.final_guard(), int().empty_guard());
+        assert_eq!(extract.complete(), int().universal_guard());
         assert_eq!(offer(&mut extract), None);
     }
 
@@ -1122,8 +1113,8 @@ mod consuming_tests {
     fn a_consuming_extraction_offers_without_pulling() {
         let source = source(0..10);
         let mut extract = final_over(&source, None);
-        extract.enter_consuming_mode();
-        extract.consume_impl(InputId::ONLY, ints().universal_guard());
+        extract.begin_run();
+        extract.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
         let pulls = source.borrow().pulled.len();
         for _ in 0..3 {
             offer(&mut extract);
@@ -1137,12 +1128,12 @@ mod consuming_tests {
     fn a_key_the_source_withheld_is_merged_by_a_later_consume() {
         let source = growing_source([0, 1, 2]);
         let mut extract = final_over(&source, None);
-        extract.enter_consuming_mode();
-        extract.consume_impl(InputId::ONLY, keys_between(0, 5));
+        extract.begin_run();
+        extract.consume_in_pipeline(InputId::ONLY, keys_between(0, 5));
         assert!(!predicate(&source.borrow().released[0]).contains(&Value::UInt(3)));
         source.borrow_mut().rows.insert(3, value(3));
         source.borrow_mut().closed = true;
-        extract.consume_impl(InputId::ONLY, ints().universal_guard());
+        extract.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
         assert_eq!(offer(&mut extract), Some(value(3)));
     }
 
@@ -1151,22 +1142,22 @@ mod consuming_tests {
     fn a_consume_after_a_release_pulls_nothing() {
         let source = growing_source(0..4);
         let mut extract = final_over(&source, None);
-        extract.enter_consuming_mode();
-        extract.consume_impl(InputId::ONLY, keys_between(0, 1));
+        extract.begin_run();
+        extract.consume_in_pipeline(InputId::ONLY, keys_between(0, 1));
         extract.release(int().universal_guard());
         let pulls = source.borrow().pulled.len();
-        extract.consume_impl(InputId::ONLY, ints().universal_guard());
+        extract.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
         assert_eq!(source.borrow().pulled.len(), pulls);
         assert_eq!(source.borrow().wasted, 0);
     }
 
-    /// An extraction in consuming mode answers a pull before its first consume with nothing and
+    /// An extraction placed in a pipeline answers a pull before its first consume with nothing and
     /// pulls its input nothing.
     #[test]
     fn a_consuming_extraction_pulled_before_its_first_consume_pulls_nothing() {
         let source = growing_source(0..4);
         let mut extract = final_over(&source, None);
-        extract.enter_consuming_mode();
+        extract.begin_run();
         assert_eq!(scalar_of(&extract.get(int().universal_guard())), None);
         assert!(source.borrow().pulled.is_empty());
     }
@@ -1191,7 +1182,7 @@ mod consuming_tests {
             Self {
                 sut: {
                     let mut breaker = final_over(&sut_source, default_of(-1));
-                    breaker.enter_consuming_mode();
+                    breaker.begin_run();
                     breaker
                 },
                 sut_source,
@@ -1217,7 +1208,7 @@ mod consuming_tests {
                 }
                 Notify(_) => unreachable!("an extraction listens to no region"),
                 Consume(region) => {
-                    self.sut.consume_impl(InputId::ONLY, region.guard());
+                    self.sut.consume_in_pipeline(InputId::ONLY, region.guard());
                     if self.released || self.extracted {
                         return;
                     }
@@ -1273,13 +1264,13 @@ mod consuming_tests {
             if self.released {
                 return;
             }
-            // An extraction in pull mode over the keys that were answered yields the same value.
+            // An extraction queried inside a pipeline over the keys that were answered yields the same value.
             let twin_source = source(self.answered.iter().copied());
             let mut twin = final_over(&twin_source, default_of(-1));
             assert_eq!(
-                scalar_of(&twin.get(int().universal_guard())),
+                scalar_of(&twin.read_in_pipeline(int().universal_guard())),
                 offer(&mut self.sut),
-                "{}: the answer in pull mode",
+                "{}: the answer queried inside a pipeline",
                 self.trace
             );
         }

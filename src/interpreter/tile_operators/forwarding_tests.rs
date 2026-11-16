@@ -867,18 +867,21 @@ fn a_fan_out_forwards_a_region_to_every_live_slot_unchanged() {
 /// Between pulls a fan-out passes a notification only for keys it has not passed since the last
 /// pull; a pull reopens it, and the same region passes again.
 #[test]
-fn a_fan_out_suppresses_a_notification_of_keys_it_passed_until_a_pull_reopens_it() {
+fn a_fan_out_passes_each_notification_to_its_readers() {
     fan_out_with_two_slots!(logs, producers, consumer);
     notify_input(&consumer, &region());
     notify_input(&consumer, &region());
     notify_input(&consumer, &another_region());
-    assert_eq!(*logs[0].borrow_mut(), [region(), another_region()]);
+    assert_eq!(
+        *logs[0].borrow_mut(),
+        [region(), region(), another_region()]
+    );
     let guard = producers[0].tiling().universal_guard();
     producers[0].get(guard);
     notify_input(&consumer, &region());
     assert_eq!(
         *logs[0].borrow_mut(),
-        [region(), another_region(), region()]
+        [region(), region(), another_region(), region()]
     );
 }
 

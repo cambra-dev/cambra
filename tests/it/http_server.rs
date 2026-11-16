@@ -99,27 +99,14 @@ fn http_get(port: u16, path: &str) -> String {
 /// the scheduler notifies it; this function only needs to keep the scheduler
 /// ticking.
 ///
-/// `check_for_notifications` has no blocking form, so the scheduler has to be
-/// pumped on a timer; `recv_timeout` supplies that cadence while still returning
-/// the instant the response lands, rather than up to a tick later.
-fn drive_until<T>(ctx: &mut GlobalContext, rx: &mpsc::Receiver<T>, timeout: Duration) -> T {
-    const PUMP_INTERVAL: Duration = Duration::from_millis(10);
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        ctx.scheduler().check_for_notifications();
-
-        match rx.recv_timeout(PUMP_INTERVAL) {
-            Ok(value) => return value,
-            Err(mpsc::RecvTimeoutError::Timeout) => assert!(
-                Instant::now() < deadline,
-                "timed out after {timeout:?} waiting for HTTP response"
-            ),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("request thread dropped the channel without sending a response")
-            }
-        }
-    }
+/// The run polls live sources between drained passes. `recv_timeout` lets the response observer
+/// return as soon as the HTTP request completes.
+fn drive_until<T>(
+    program: &mut cambra::ccl::context::CompiledProgram,
+    rx: &mpsc::Receiver<T>,
+    timeout: Duration,
+) -> T {
+    crate::serving::drive_until_named(program, rx, timeout, "HTTP response")
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +129,7 @@ fn test_http_serve_echo() {
 
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     // Send one POST request from a background thread and collect the response.
     let (tx, rx) = mpsc::channel::<String>();
@@ -151,7 +138,7 @@ fn test_http_serve_echo() {
         tx.send(resp).unwrap();
     });
 
-    let response = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    let response = drive_until(&mut program, &rx, Duration::from_secs(5));
 
     assert_eq!(response, "Received: hello");
 }
@@ -171,7 +158,7 @@ fn test_http_serve_const() {
 
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     // Send one GET request from a background thread and collect the response.
     let (tx, rx) = mpsc::channel::<String>();
@@ -180,7 +167,7 @@ fn test_http_serve_const() {
         tx.send(resp).unwrap();
     });
 
-    let response = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    let response = drive_until(&mut program, &rx, Duration::from_secs(5));
 
     assert_eq!(response, "Hello, world!");
 }
@@ -202,7 +189,7 @@ fn test_http_serve_two_sequential_requests() {
 
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     // Send two requests sequentially; each blocks until the server responds.
     let (tx, rx) = mpsc::channel::<Vec<String>>();
@@ -212,7 +199,7 @@ fn test_http_serve_two_sequential_requests() {
         tx.send(vec![r1, r2]).unwrap();
     });
 
-    let responses = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    let responses = drive_until(&mut program, &rx, Duration::from_secs(5));
 
     assert_eq!(responses, vec!["OK: first", "OK: second"]);
 }
@@ -240,7 +227,7 @@ fn test_http_serve_two_paths() {
 
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     // Send requests sequentially: each http_post/http_get blocks until the
     // server responds, so the second request is only sent after the first
@@ -252,7 +239,7 @@ fn test_http_serve_two_paths() {
         tx.send(vec![r1, r2]).unwrap();
     });
 
-    let responses = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    let responses = drive_until(&mut program, &rx, Duration::from_secs(5));
 
     assert_eq!(responses, vec!["hello", "echo: world"]);
 }
@@ -279,7 +266,7 @@ fn test_http_serve_two_paths_shared_outer_let() {
 
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     let (tx, rx) = mpsc::channel::<Vec<String>>();
     thread::spawn(move || {
@@ -288,7 +275,7 @@ fn test_http_serve_two_paths_shared_outer_let() {
         tx.send(vec![r1, r2]).unwrap();
     });
 
-    let responses = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    let responses = drive_until(&mut program, &rx, Duration::from_secs(5));
     assert_eq!(responses, vec!["greeting: alice", "greeting: bob"]);
 }
 
@@ -311,7 +298,7 @@ fn test_http_serve_echo_with_outer_let() {
 
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     let (tx, rx) = mpsc::channel::<String>();
     thread::spawn(move || {
@@ -319,7 +306,7 @@ fn test_http_serve_echo_with_outer_let() {
         tx.send(resp).unwrap();
     });
 
-    let response = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    let response = drive_until(&mut program, &rx, Duration::from_secs(5));
     assert_eq!(response, "Echo: world");
 }
 
@@ -337,7 +324,7 @@ fn test_http_serve_with_a_parenthesised_pattern() {
 
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     let (tx, rx) = mpsc::channel::<String>();
     thread::spawn(move || {
@@ -345,7 +332,7 @@ fn test_http_serve_with_a_parenthesised_pattern() {
         tx.send(resp).unwrap();
     });
 
-    let response = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    let response = drive_until(&mut program, &rx, Duration::from_secs(5));
     assert_eq!(response, "Echo: world");
 }
 
@@ -376,7 +363,7 @@ fn test_http_serve_bound_to_one_name() {
 
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     let (tx, rx) = mpsc::channel::<String>();
     thread::spawn(move || {
@@ -384,7 +371,7 @@ fn test_http_serve_bound_to_one_name() {
         tx.send(resp).unwrap();
     });
 
-    let response = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    let response = drive_until(&mut program, &rx, Duration::from_secs(5));
     assert_eq!(response, "Echo: world");
 }
 
@@ -618,7 +605,7 @@ fn a_conditionally_fed_output_answers_the_requests_its_guard_admits() {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     let (tx, rx) = mpsc::channel::<(String, TcpStream)>();
     thread::spawn(move || {
@@ -635,10 +622,9 @@ fn a_conditionally_fed_output_answers_the_requests_its_guard_admits() {
         rejected.flush().unwrap();
         tx.send((http_post(port, "/g", "go"), rejected)).unwrap();
     });
-    let (admitted, mut rejected) = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    let (admitted, mut rejected) = drive_until(&mut program, &rx, Duration::from_secs(5));
     assert_eq!(admitted, "go");
 
-    ctx.scheduler().check_for_notifications();
     rejected.set_nonblocking(true).unwrap();
     let mut buf = [0u8; 64];
     assert!(
@@ -705,13 +691,13 @@ fn reply_to(code: &str, request: impl FnOnce() -> String + Send + 'static) -> St
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     let (tx, rx) = mpsc::channel::<String>();
     thread::spawn(move || {
         let _ = tx.send(request());
     });
-    drive_until(&mut ctx, &rx, Duration::from_secs(5))
+    drive_until(&mut program, &rx, Duration::from_secs(5))
 }
 
 /// A reply fed in the loop body, after a block that writes a mutable variable, answers each
@@ -769,7 +755,7 @@ fn a_reply_inside_a_writing_block_answers_each_request_with_its_own_value() {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     let (tx, rx) = mpsc::channel::<Vec<String>>();
     thread::spawn(move || {
@@ -778,7 +764,7 @@ fn a_reply_inside_a_writing_block_answers_each_request_with_its_own_value() {
         tx.send(vec![a, b]).unwrap();
     });
     assert_eq!(
-        drive_until(&mut ctx, &rx, Duration::from_secs(5)),
+        drive_until(&mut compiled, &rx, Duration::from_secs(5)),
         vec!["a", "ab"]
     );
 }
@@ -810,7 +796,7 @@ fn two_runs_serve_the_routes_their_arguments_give() {
     );
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let mut ctx = GlobalContext::default();
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     let (tx, rx) = mpsc::channel::<Vec<String>>();
     thread::spawn(move || {
@@ -818,6 +804,6 @@ fn two_runs_serve_the_routes_their_arguments_give() {
         let us = http_get(port, "/us");
         tx.send(vec![eu, us]).unwrap();
     });
-    let responses = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    let responses = drive_until(&mut program, &rx, Duration::from_secs(5));
     assert_eq!(responses, vec!["hello from eu", "hello from us"]);
 }

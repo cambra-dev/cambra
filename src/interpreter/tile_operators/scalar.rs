@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use bit_set::BitSet;
 
 use super::*;
@@ -118,14 +120,12 @@ impl TileOperator for Constant {
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
-        mut consumer: Box<dyn Consumer>,
+        _consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        consumer.notify(&Projection::Everything);
         Box::new(ConstantProducer {
             base: ProducerBase::new(ConstantProducer::alloc_id(), self.tiling(), &self.base, cx),
             tile: self.tile.clone(),
-            released: false,
         })
     }
 
@@ -142,7 +142,6 @@ impl TileOperator for Constant {
 struct ConstantProducer {
     base: ProducerBase,
     tile: Tile,
-    released: bool,
 }
 
 impl TileProducer for ConstantProducer {
@@ -178,7 +177,7 @@ impl TileProducer for ConstantProducer {
             let mut tile = self.tile.clone();
             tile.remove_guarded(self.obsolete_guard().clone());
             tile
-        } else if self.released {
+        } else if self.obsolete_guard().is_universal() {
             self.tiling().empty_tile()
         } else {
             self.tile.clone()
@@ -195,9 +194,7 @@ impl TileProducer for ConstantProducer {
         if self.tiling().is_data_function() {
             return;
         }
-        if obsolete_guard.expect_universal_or_empty(&self.name()) {
-            self.released = true;
-        }
+        obsolete_guard.expect_universal_or_empty(&self.name());
     }
 }
 
@@ -1054,10 +1051,9 @@ mod tests {
         fn subscribe(
             &mut self,
             _intent_guard: TileGuard,
-            mut consumer: Box<dyn Consumer>,
+            _consumer: Box<dyn Consumer>,
             _cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
-            consumer.notify(&Projection::Everything);
             Box::new(TestTileProducer::new(
                 self.tile.clone(),
                 self.tiling.clone(),
@@ -1087,7 +1083,7 @@ mod tests {
         let mut op = VariantProject::new(scrut, FieldKey::Index(0), Extent::Base(BaseType::Int));
         let mut cx = SubscribeContext::new();
         let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut cx);
-        let tile = producer.get(producer.tiling().universal_guard());
+        let tile = producer.read_in_pipeline(producer.tiling().universal_guard());
 
         let Tile::DataFunction {
             domain, codomain, ..
@@ -1107,7 +1103,7 @@ mod tests {
         let mut op = VariantProject::new(scrut, FieldKey::Index(1), Extent::Base(BaseType::Unit));
         let mut cx = SubscribeContext::new();
         let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut cx);
-        let tile = producer.get(producer.tiling().universal_guard());
+        let tile = producer.read_in_pipeline(producer.tiling().universal_guard());
 
         let Tile::DataFunction {
             domain, codomain, ..
@@ -1152,7 +1148,7 @@ mod tests {
         );
         let mut cx = SubscribeContext::new();
         let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut cx);
-        let out = producer.get(producer.tiling().universal_guard());
+        let out = producer.read_in_pipeline(producer.tiling().universal_guard());
 
         let Tile::DataFunction {
             domain, codomain, ..
@@ -1208,7 +1204,7 @@ mod tests {
         let mut cx = SubscribeContext::new();
         let mut producer =
             union.subscribe(union.tiling().universal_guard(), Box::new(|| {}), &mut cx);
-        let out = producer.get(producer.tiling().universal_guard());
+        let out = producer.read_in_pipeline(producer.tiling().universal_guard());
 
         let Tile::DataFunction {
             domain, codomain, ..
@@ -1298,7 +1294,7 @@ mod tests {
         );
         let mut cx = SubscribeContext::new();
         let mut producer = fan.subscribe(fan.tiling().universal_guard(), Box::new(|| {}), &mut cx);
-        let out = producer.get(producer.tiling().universal_guard());
+        let out = producer.read_in_pipeline(producer.tiling().universal_guard());
 
         let Tile::DataFunction {
             domain, codomain, ..
@@ -1447,7 +1443,6 @@ mod projection_tests {
         ConstantProducer {
             base: ProducerBase::unowned(ConstantProducer::alloc_id(), &tiling),
             tile,
-            released: false,
         }
     }
 
@@ -1466,7 +1461,7 @@ mod projection_tests {
     #[test]
     fn a_list_literal_answers_the_morsel_it_is_looked_up_at() {
         let mut literal = list_literal();
-        let first = literal.get(keys_between(0, 2));
+        let first = literal.read_in_pipeline(keys_between(0, 2));
         assert_eq!(int_entries(&first), [(0, 10), (1, 20), (2, 30)]);
         let TileGuard::Function(FunctionGuard::Domain(morsel)) = keys_between(0, 2) else {
             unreachable!("a morsel is a domain guard")
@@ -1477,7 +1472,7 @@ mod projection_tests {
             "the literal is decided in full, so the morsel is complete"
         );
         literal.release(keys_between(0, 2));
-        let rest = literal.get(keys_between(3, 9));
+        let rest = literal.read_in_pipeline(keys_between(3, 9));
         assert_eq!(int_entries(&rest), [(3, 40), (4, 50)]);
     }
 
@@ -1487,7 +1482,7 @@ mod projection_tests {
     fn scattered_keys_are_answered_alone() {
         let mut literal = list_literal();
         let scattered = Predicate::point(Value::UInt(1)).union(&Predicate::point(Value::UInt(4)));
-        let tile = literal.get(TileGuard::Function(FunctionGuard::Domain(scattered)));
+        let tile = literal.read_in_pipeline(TileGuard::Function(FunctionGuard::Domain(scattered)));
         assert_eq!(int_entries(&tile), [(1, 20), (4, 50)]);
     }
 
@@ -1495,7 +1490,7 @@ mod projection_tests {
     fn a_released_key_is_not_answered_inside_a_projection() {
         let mut literal = list_literal();
         literal.release(keys_between(1, 1));
-        let tile = literal.get(keys_between(0, 2));
+        let tile = literal.read_in_pipeline(keys_between(0, 2));
         assert_eq!(int_entries(&tile), [(0, 10), (2, 30)]);
     }
 
@@ -1507,14 +1502,16 @@ mod projection_tests {
         let mut seven = ConstantProducer {
             base: ProducerBase::unowned(ConstantProducer::alloc_id(), &tiling),
             tile: Tile::Scalar(ColumnValue::Ints(vec![7])),
-            released: false,
         };
         assert_eq!(
-            seven.get(tiling.universal_guard()),
+            seven.read_in_pipeline(tiling.universal_guard()),
             Tile::Scalar(ColumnValue::Ints(vec![7]))
         );
         seven.release(tiling.universal_guard());
-        assert_eq!(seven.get(tiling.empty_guard()), tiling.empty_tile());
+        assert_eq!(
+            seven.read_in_pipeline(tiling.empty_guard()),
+            tiling.empty_tile()
+        );
     }
 
     #[test]
@@ -1631,7 +1628,7 @@ mod variant_projection_tests {
             tag: commit(),
             variant_extents: TagMap::from_arms(vec![(commit(), Extent::Base(BaseType::Int))]),
         };
-        let tile = wrap.get(out_tiling.universal_guard());
+        let tile = wrap.read_in_pipeline(out_tiling.universal_guard());
         assert_eq!(keys(&tile), ColumnValue::UInts(vec![0]));
         let Tile::DataFunction {
             domain_predicate, ..
@@ -1680,7 +1677,7 @@ mod variant_projection_tests {
                 tag: commit(),
                 variant_extents: TagMap::from_arms(vec![(commit(), record.clone())]),
             };
-            let tile = wrap.get(out_tiling.universal_guard());
+            let tile = wrap.read_in_pipeline(out_tiling.universal_guard());
             assert_eq!(!tile.is_empty(), wrapped, "{tile:?}");
         }
     }
@@ -1711,7 +1708,7 @@ mod variant_projection_tests {
     #[test]
     fn a_wrapped_payload_stream_is_read_at_the_morsel() {
         let (mut wrap, pulled) = wrapped_payloads();
-        let morsel = wrap.get(keys_between(2, 4));
+        let morsel = wrap.read_in_pipeline(keys_between(2, 4));
         assert_eq!(keys(&morsel), ColumnValue::UInts(vec![2, 3, 4]));
         assert_eq!(*pulled.borrow(), [keys_between(2, 4)]);
     }
@@ -1775,7 +1772,7 @@ mod variant_projection_tests {
     #[test]
     fn an_arm_reads_its_rows_of_the_morsel_from_the_decision_stream() {
         let (mut commits, pulled) = commit_arm();
-        let morsel = commits.get(keys_between(2, 5));
+        let morsel = commits.read_in_pipeline(keys_between(2, 5));
         let Tile::DataFunction {
             domain, codomain, ..
         } = &morsel
@@ -1795,7 +1792,7 @@ mod variant_projection_tests {
             let Tile::DataFunction {
                 domain: ColumnValue::UInts(keys),
                 ..
-            } = arm.get(keys_between(2, 5))
+            } = arm.read_in_pipeline(keys_between(2, 5))
             else {
                 panic!("a collection of positions")
             };
@@ -1846,7 +1843,7 @@ mod variant_projection_tests {
             )
         };
         let (mut commits, pulled, released) = make();
-        let morsel = commits.get(keys_between(1, 4));
+        let morsel = commits.read_in_pipeline(keys_between(1, 4));
         let Tile::DataFunction { domain, .. } = &morsel else {
             panic!("a collection")
         };
@@ -1857,7 +1854,7 @@ mod variant_projection_tests {
         // The consumer releases a morsel. The scrutinee has no keys to take the release, and a
         // pull of every position answers none of the released ones.
         commits.release(keys_between(1, 4));
-        let mut rest = commits.get(commits.tiling().universal_guard());
+        let mut rest = commits.read_in_pipeline(commits.tiling().universal_guard());
         rest.compact();
         let Tile::DataFunction { domain, .. } = &rest else {
             panic!("a collection")
@@ -1927,7 +1924,7 @@ mod variant_projection_tests {
     #[test]
     fn a_tag_test_reads_the_decisions_of_the_morsel() {
         let (mut is_commit, pulled) = is_commit();
-        let morsel = is_commit.get(keys_between(2, 5));
+        let morsel = is_commit.read_in_pipeline(keys_between(2, 5));
         let Tile::DataFunction {
             domain, codomain, ..
         } = &morsel
