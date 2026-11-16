@@ -1119,6 +1119,30 @@ impl Predicate {
         Predicate::Intervals(set)
     }
 
+    /// Whether this predicate admits every position of `positions`, a set of `UInt` positions
+    /// whose every run is bounded: the region states every key of a domain whose extent is
+    /// `positions` (`Extent::UIntRange`), though it is not `True`.
+    pub fn covers_positions(&self, positions: &IntervalSet<u64>) -> bool {
+        positions.intervals().iter().all(|run| {
+            let (Some(first), Some(last)) = (run.left(), run.right()) else {
+                return false;
+            };
+            let first = *first.value() + u64::from(!first.is_closed());
+            let Some(last) = last.value().checked_sub(u64::from(!last.is_closed())) else {
+                return true;
+            };
+            if first > last {
+                return true;
+            }
+            let through = Predicate::at_or_below(Value::UInt(last));
+            let run = match first.checked_sub(1) {
+                Some(before) => through.minus(&Predicate::at_or_below(Value::UInt(before))),
+                None => through,
+            };
+            self.subsumes(&run)
+        })
+    }
+
     /// Everything ordered at or below `v`: the watermark a prefix release names.
     ///
     /// A record key is ordered lexicographically over its fields in name order, as [`Value`]'s
