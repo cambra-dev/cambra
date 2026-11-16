@@ -723,16 +723,29 @@ through ariadne.
 
 Grammar constructors are generic over `I: ValueInput<'src, Token = Token, Span = Span>`.
 This avoids naming the mapped token-stream input and recursive parser closure types at each
-entry. Productions match typed tokens with `just` rather than parsing string keywords.
+entry. Every entry point builds its input with `token_input`, so the grammar is instantiated at one
+input type. Productions match typed tokens with `just` rather than parsing string keywords.
 
-Boxed precedence productions replace nested concrete combinator types with a uniform `Boxed`
-type. Re-entering a recursive expression parser then does not clone a concrete type containing
-every intervening combinator layer. This limits representation-related stack costs; it does
-not establish a fixed nesting limit or prove that arbitrary nesting cannot exhaust the stack.
+Every helper returns a `BoxedParser`, and every parser a function binds at its top level is boxed.
+A chumsky combinator's type contains its operands' types, so an unboxed chain's type grows with
+each combinator in it. Monomorphizing and type-checking those types is most of this crate's compile
+time. A box replaces the chain's type with a uniform `Boxed`, at the cost of a dynamic call per
+parse step. Two kinds of parser stay unboxed. A small parser that is `Copy` and reused without
+cloning, such as `binder()` or `ident_only`, stays unboxed, because a box makes it move-only. The
+pieces a block or a `recursive` closure combines into one parser, such as `for_clause` and
+`if_clause` in `comp_clauses`, are not boxed one by one; the block's result is.
 
-Keep boxes at the established recursive/precedence boundaries. Without them, four levels of
-nested calls (`f(f(f(f(1))))`) overflowed a 2 MiB test thread stack.
-The grammar does not specify a portable maximum nesting depth.
+Each statement family is a function of its own: `control_flow_statements`, `module_statements`
+and `declaration_statements`. Each takes the shared parsers it reads as `BoxedParser` arguments and
+returns a struct of `StmtParser`s. rustc type-checks a closure as part of the function around it,
+so the split is there to keep `statement()`'s `recursive` closure from being one body holding every
+statement production.
+
+Boxes also bound the parser's stack use. Re-entering a recursive expression parser does not clone a
+concrete type containing every intervening combinator layer. Without boxes at the
+recursive/precedence boundaries, four levels of nested calls (`f(f(f(f(1))))`) overflowed a 2 MiB
+test thread stack. Boxing does not establish a fixed nesting limit or prove that arbitrary nesting
+cannot exhaust the stack. The grammar does not specify a portable maximum nesting depth.
 
 ## Testing
 
