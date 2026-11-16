@@ -992,7 +992,8 @@ wrong answer. A store the version adds is subject to the same rule
 A fold over a collection that carries a value resumes over the kept iteration at the position it
 reached, so an edit inside the loop governs the remaining elements, and a fold over another
 collection is a different node, which rebuilds the iteration and starts that collection from its
-first element. The resumed store seeds tick `0` with the value handed over, so a reader enumerating
+first element. An edited collection is another collection unless its binding is identified
+([An edited collection is folded whole unless it is identified](#an-edited-collection-is-folded-whole-unless-it-is-identified)). The resumed store seeds tick `0` with the value handed over, so a reader enumerating
 the whole collection reads that value for the positions the predecessor decided. A fold caught
 partway keeps what the retired version decided below the swap, and the new version decides the rest
 (`a_fold_interrupted_partway_resumes_at_the_position_it_reached`).
@@ -1059,6 +1060,139 @@ at `0` and scans up, so its source decides where it begins),
 and the input reads a source), and `a_loop_added_over_a_buildable_collection_reports_nothing` with
 `a_loop_added_over_a_folded_collection_reads_it_whole` for the case that is rebuilt.
 
+## Identified domains
+
+> **Status: [Prescribed].** [Identified domains](../../../docs/durability.md#identified-domains)
+> in the durability model decides the semantics, and this section prescribes the mechanism. None
+> of it is implemented, and `@Named` does not parse
+> ([8.10 `@Named`](../../../docs/chl-spec.md#810-named-decided)).
+
+**A binding decorated `@Named` is paired across versions by its `VarPath`, and the positions of the
+collection it binds are carried across every edit of its term.** The pairing is the one
+`state_identities` assigns a store ([Inherit and load](#inherit-and-load)): the scope the binding's
+site stands in, the binding's spelling, and its index among the identified bindings sharing both.
+Step 5 of [Order of a reload](#order-of-a-reload) takes the correspondence
+(`compile_replacement`), which pairs an identified binding by that path before it pairs anything by
+content, so an edited term under an identified binding is a rebuilt operator at a paired node, not
+a new node, and a renamed one is paired through `@RenamedFrom` or refused.
+
+A source and a feed are identified by declaration and need nothing here: their positions are
+carried by the release model, per
+[Where a producer registering now starts](#where-a-producer-registering-now-starts), and a loop over
+a feed takes its position from the row's feed key
+([A loop over a feed outlives a rebuild of the feed](../../../docs/durability.md#a-loop-over-a-feed-outlives-a-rebuild-of-the-feed)).
+
+### What the offer carries
+
+The offer gains two things for each identified collection the predecessor holds, beside the values
+of its mutable variables (`Offer::mutable_state`):
+
+- **The collection's positions**, with the generation each was minted under. The new version's
+  term mints only the positions its predecessor lacked, under the generation current at the swap,
+  and a reload marked `@Discard` starts a new generation first
+  ([Generation](../../../docs/durability.md#terms)).
+- **The decided region of each term over it that the new version rebuilds**: the tile the term
+  holds inside its boundary guard, read off its fan-out's memo as `live_state` reads a store's
+  value. The rebuilt operator seeds from that region and computes its new definition outside it
+  ([A term rebuilt over a carried domain keeps its decided region](../../../docs/durability.md#a-term-rebuilt-over-a-carried-domain-keeps-its-decided-region)).
+  `OperatorMap::handover` passes live producers today, and a rebuilt `map` holds no state, so the
+  carried region is the first state a stateless operator takes. It rides the reload's write
+  ([Checkpoints](../../../docs/durability.md#checkpoints)), and the operator forwards releases
+  below it as it does today.
+
+A reload marked `@Discard` cancels each in-flight position the edit drops, by prefix: the terms over
+the collection drop what they hold at it, a client with a call pending at it reports the call
+`unknown`, the input retained for it is released, and the reload's entry records the cancelled keys
+([Extending and dropping positions](../../../docs/durability.md#extending-and-dropping-positions)).
+
+### Refusals
+
+These join [Six refusals](#six-refusals), checked by `LiveProgram::check` off the planned tree
+before anything is torn down:
+
+- **An identified binding the new version neither declares under the same `VarPath` nor names with
+  `@RenamedFrom`**, without `@Discard`. Deleting it drops every position.
+- **An edit that drops a position of an identified collection**, without `@Discard`. For `range`,
+  a literal and a product of them the positions are the domain type, `0..𝑛` or a tuple of such
+  ranges, so the dropped positions are read off the two planned trees. A `groupby`'s positions come
+  from its input's data, so an edit of its term drops none, and a product over a source drops
+  positions only through a component whose positions are a type.
+- **An edit that changes the type of the positions**: a product of two collections to a product of
+  three, a `groupby` keyed by `String` to one keyed by `Int`. The carried positions are not
+  positions of the new collection.
+- **`@Named` on a binding whose term is not a minter of values**: a map, a filter, a comprehension,
+  a feed, a mutable variable or a source.
+- **Two bare calls of a function holding an identified binding, reordered.** This is the third of
+  the six refusals, because the binding is paired as the stores it sits beside are.
+
+### An edited collection is folded whole unless it is identified
+
+A mutable variable keeps its value across every reload by its `VarPath`, and a collection keeps its
+positions only when its binding is identified. The two carry separately, so a fold over an edited
+collection that is not identified folds the whole new collection onto the value the variable
+carried.
+
+```python
+def g(i):
+    i * 10
+
+def f(xs):
+    total := 0
+    for x in xs:
+        total := total + x
+    total
+
+idx = [0, 1, 2, 3, 4]          # v2: [0, 1, 2, 3, 4, 5]
+f([g(i) for i in idx])
+```
+
+v1 runs to the end and holds `100`. The reload edits `idx`:
+
+| `idx` | What the reload keeps | Value after the reload |
+| -- | -- | -- |
+| not identified | `total = 100`. The edited literal is a new node, so the fold over it is a fresh iteration that reads the new collection from `0` | `250` |
+| `@Named` | `total = 100` and positions `0` through `4`, which the fold released. The fold resumes at `5` | `150` |
+
+The first row is the rule of [Where a rebuilt store picks up](#where-a-rebuilt-store-picks-up),
+pinned by `a_fold_over_another_fixed_collection_starts_it_from_the_beginning` and
+`a_loop_added_over_a_folded_collection_reads_it_whole`. A deployment that restarts the process
+restarts `total` at `0` as well and reaches `150` either way. Here the value outlives the version
+and the collection does not, unless the author says it does, and nothing in the program says that
+the new list continues the old one. With `def f(xs): sum(xs)`, which keeps no variable, both rows
+give `150`.
+
+### Branch-and-reload
+
+Branch-and-reload carries each identified collection's positions, and each rebuilt term's decided
+region, from the parent's offer as a reload carries them from the predecessor's, and the parent
+keeps its own operators ([A reload changes no other branch](#a-reload-changes-no-other-branch)).
+A `@Discard` in the branch cancels the positions the branch's own operators hold and none of the
+parent's.
+
+### Tests that pin this section
+
+The implementation adds these cases to `tests/it/hot_reload/cases.rs`:
+
+- `an_identified_collection_extended_after_the_fold_ran_to_the_end_folds_the_new_element_alone`:
+  the `150` row above.
+- `an_identified_collection_extended_mid_fold_resumes_at_the_position_it_reached`: a fold caught
+  at position `3` keeps its value through `2` and folds `3` through `5`.
+- `a_term_rebuilt_over_an_identified_collection_keeps_the_values_its_predecessor_decided`: the
+  `doubled` example, read through a reader the new version adds.
+- `dropping_a_position_of_an_identified_collection_without_discard_is_refused`.
+- `a_discard_on_an_identified_collection_cancels_the_positions_it_drops`, once a call outside the
+  program exists to hold a position.
+- `renaming_an_identified_binding_without_renamed_from_is_refused`.
+- `named_on_a_map_is_refused`.
+
+### Left to a follow-up
+
+- **`/diff` reports the in-flight positions of each identified collection the reload edits**,
+  beside `unreadable_inputs`, so the author sees which positions the edit continues under the new
+  definition before loading it.
+- **`@Discard` only where a dropped position is in flight.** Dropping released positions could go
+  unmarked; the rule above requires the mark for every drop.
+
 ## The reload lifecycle
 
 > **Status: [Decided]** for every branch's reload and for branch-and-reload, pinned by the cases
@@ -1109,6 +1243,8 @@ Where each part of a program stands after a swap:
 | A rebuilt map or feed over a source | What the predecessor's producers on that source released | `carry_release_to_new_producers` |
 | A rebuilt recurrence over a kept iteration | One past what that iteration's readers released | `FanOut::released_position` |
 | A rebuilt recurrence over a rebuilt iteration | Where that iteration begins: a source's carried release, or `0` for a collection | `first_position_for_a_new_producer` |
+| A rebuilt term over an identified collection ([Prescribed](#identified-domains)) | The region its predecessor decided and no reader released is carried; the new definition computes the rest | The offer's carried regions, in the reload's write |
+| A rebuilt recurrence over an identified collection ([Prescribed](#identified-domains)) | One past what the carried iteration released, as over a kept iteration | `FanOut::released_position` |
 | A transaction writer's drive | Its writer's iteration input where the reload kept it, and `0` over a rebuilt one | Absolute item positions, released on the commit-ack |
 | A rebuilt store's commit tick | `0`, seeded from the carried value | Private and restartable |
 | A route, its listener, and the requests behind it | Where they were, while any version still binds a route on the port | `SourceSinkRegistry` |
