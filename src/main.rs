@@ -1,4 +1,9 @@
-use std::{collections::HashMap, path::Path, thread, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    thread,
+    time::Duration,
+};
 
 use cambra::{
     ccl::{
@@ -6,7 +11,7 @@ use cambra::{
         load::LoadedProgram,
         provenance::NodeId,
     },
-    control_port::{ControlPort, service},
+    control_port::{ControlMessage, ControlPort, ControlReply, ControlRequest, service},
     inspector_server::{ServedSnapshot, live::LiveChannel, serve_compiled},
     interpreter::{
         ColumnValue, Consumer, Scheduler,
@@ -31,11 +36,111 @@ fn poll_control(
     ctx: &mut GlobalContext,
     live: &mut LiveProgram,
     main_consumer: &dyn Fn() -> Box<dyn Consumer>,
+    relaunch: &Relaunch,
 ) {
     let Some(port) = control else { return };
     let Some(message) = port.poll() else { return };
+    if matches!(message.request(), ControlRequest::Restart { .. }) {
+        restart(message, ctx, relaunch);
+        return;
+    }
     let reply = service(message.request(), ctx, live, main_consumer);
     message.answer(reply);
+}
+
+/// What a restart runs the binary with again: the root file, and the ports the
+/// process bound, which `--inspect=0` and `--control=0` leave to the OS.
+///
+/// The restarted process binds the same ports, so a page and a script reach it
+/// where they reached the process it replaced.
+struct Relaunch {
+    root: PathBuf,
+    inspect_port: Option<u16>,
+    control_port: Option<u16>,
+}
+
+/// How long a restart waits for its reply to be written before replacing the
+/// process, which closes the reply's connection.
+const RESTART_REPLY_WITHIN: Duration = Duration::from_secs(5);
+
+/// Restart in answer to `message`, a `/restart`: check its version, answer, and
+/// replace the process with a fresh `cambra` that runs the version
+/// (`src/ccl/design/program-evolution.md`, "`/restart`").
+///
+/// Returns only when the restart did not happen, having answered why. A version
+/// that does not compile is refused with its spans, and the program goes on
+/// running.
+///
+/// The replacement is `exec` of the binary at the path this process started
+/// from, so a `cambra` rebuilt since then runs the restarted program. The
+/// version reaches it through a scratch file the new process reads and removes
+/// (`--root-text`), in place of the root file's text: its imports resolve from
+/// the root file's directory, and the file on disk is unchanged.
+#[cfg(unix)]
+fn restart(message: ControlMessage, ctx: &GlobalContext, relaunch: &Relaunch) {
+    use std::io::Write;
+    use std::os::unix::process::CommandExt;
+
+    let ControlRequest::Restart { code } = message.request() else {
+        unreachable!("only a `/restart` is handed to `restart`");
+    };
+    let code = code.clone();
+    let loaded = match LoadedProgram::read_with_root_text(&relaunch.root, code.as_str()) {
+        Ok(loaded) => loaded,
+        Err(e) => return message.answer(ControlReply::rejected(format!("error: {e}\n"))),
+    };
+    if let Err(refusal) = cambra::control_port::check_restart(ctx, &loaded) {
+        return message.answer(refusal);
+    }
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let text_file = std::env::temp_dir().join(format!(
+        "cambra-restart-{}-{started}.cambra",
+        std::process::id()
+    ));
+    if let Err(e) = std::fs::write(&text_file, &code) {
+        return message.answer(ControlReply::cannot_restart(&format!(
+            "writing the version to `{}` failed: {e}",
+            text_file.display()
+        )));
+    }
+
+    if !message.answer_once_sent(ControlReply::restarting(), RESTART_REPLY_WITHIN) {
+        eprintln!("cambra: the restart's reply was not written in time; restarting anyway");
+    }
+    eprintln!("cambra: restarting");
+    // `exec` discards what the process has buffered, so a partly written line
+    // would be lost.
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+
+    let binary = std::env::args_os()
+        .next()
+        .expect("a process is started with its own path");
+    let mut command = std::process::Command::new(binary);
+    if let Some(port) = relaunch.inspect_port {
+        command.arg(format!("--inspect={port}"));
+    }
+    if let Some(port) = relaunch.control_port {
+        command.arg(format!("--control={port}"));
+    }
+    command
+        .arg(format!("--root-text={}", text_file.display()))
+        .arg(&relaunch.root);
+    // Returns only when the replacement did not start.
+    let failed = command.exec();
+    eprintln!("cambra: restarting failed: {failed}; the program goes on running");
+    let _ = std::fs::remove_file(&text_file);
+}
+
+/// Restarting replaces the process with `exec`, which only Unix has; elsewhere
+/// a `/restart` is refused and the program goes on running.
+#[cfg(not(unix))]
+fn restart(message: ControlMessage, _ctx: &GlobalContext, _relaunch: &Relaunch) {
+    message.answer(ControlReply::cannot_restart(
+        "restarting replaces the process with Unix `exec`, which this platform lacks",
+    ));
 }
 
 /// Pull one branch's `main` output once, print what it delivered, and answer
@@ -70,6 +175,7 @@ fn pull_main(branch: &str, producer: &mut dyn TileProducer) -> bool {
 /// non-zero.
 fn run_program(
     loaded: &LoadedProgram,
+    root: &Path,
     inspect_port: Option<u16>,
     control_port: Option<u16>,
 ) -> Result<(), ()> {
@@ -104,7 +210,7 @@ fn run_program(
     // click in a pane names a node the running graph actually built. A reload
     // of `main` replaces both through `Inspection::follow`: see
     // `src/inspector_model/design.md`, "A reload of main is followed".
-    let mut inspection = match inspect_port {
+    let served = match inspect_port {
         Some(port) => {
             let (version, program) = live
                 .program(MAIN_BRANCH)
@@ -117,13 +223,16 @@ fn run_program(
                 version,
                 control.as_ref().map(ControlPort::client),
             ) {
-                Ok((channel, snapshot)) => Some(Inspection::new(
-                    channel,
-                    snapshot,
-                    src_name,
-                    version,
-                    ctx.scheduler().probes().clone(),
-                    source_nodes(&program.operator_graph),
+                Ok((channel, snapshot, port)) => Some((
+                    Inspection::new(
+                        channel,
+                        snapshot,
+                        src_name,
+                        version,
+                        ctx.scheduler().probes().clone(),
+                        source_nodes(&program.operator_graph),
+                    ),
+                    port,
                 )),
                 Err(e) => {
                     eprintln!("error: serving the inspector: {e}");
@@ -133,6 +242,12 @@ fn run_program(
         }
         None => None,
     };
+    let relaunch = Relaunch {
+        root: root.to_path_buf(),
+        inspect_port: served.as_ref().map(|(_, port)| *port),
+        control_port: control.as_ref().map(ControlPort::port),
+    };
+    let mut inspection = served.map(|(inspection, _)| inspection);
 
     // Pull every branch's `main` output until each has released everything,
     // and keep the scheduler running until every branch's sinks signal
@@ -141,7 +256,13 @@ fn run_program(
     // once per pass: a swap sits between two pulls, so a source delivering
     // without pause must not be able to starve it of its turn.
     loop {
-        poll_control(control.as_ref(), &mut ctx, &mut live, &main_consumer);
+        poll_control(
+            control.as_ref(),
+            &mut ctx,
+            &mut live,
+            &main_consumer,
+            &relaunch,
+        );
         if let Some(inspection) = inspection.as_mut() {
             inspection.follow(&live);
         }
@@ -167,7 +288,17 @@ fn run_program(
             inspection.publish(&sources);
         }
         if live.poll_finished() {
-            break;
+            if let Some(inspection) = inspection.as_ref() {
+                inspection.publish_final(ctx.scheduler());
+            }
+            // A finished program under `--inspect` keeps its process, so with a
+            // control port it can be restarted; without one, without
+            // `--inspect`, or without `exec` to restart with, nothing is left to
+            // do.
+            match (control.as_ref(), inspection.is_some()) {
+                (Some(port), true) if cfg!(unix) => await_restart(port, &ctx, &relaunch),
+                _ => break,
+            }
         }
         // A `main` output is pulled as soon as it is notified, so while one is
         // running the loop spins; a sink program is woken by its sources. A pass that
@@ -180,10 +311,26 @@ fn run_program(
         }
     }
 
-    if let Some(inspection) = inspection.as_ref() {
-        inspection.publish_final(ctx.scheduler());
-    }
     Ok(())
+}
+
+/// Answer control requests to a finished program until one restarts it, which
+/// replaces the process.
+///
+/// A finished program takes no request but `/restart`
+/// (`src/ccl/design/program-evolution.md`, "`/restart`"): a reload carries
+/// state forward into a run that has none left to carry, so every other verb is
+/// answered `409`, as the control port answers once the driver loop is gone.
+fn await_restart(port: &ControlPort, ctx: &GlobalContext, relaunch: &Relaunch) -> ! {
+    eprintln!("cambra: the program has finished; a `/restart` runs it again");
+    loop {
+        let message = port.wait();
+        if matches!(message.request(), ControlRequest::Restart { .. }) {
+            restart(message, ctx, relaunch);
+        } else {
+            message.answer(ControlReply::finished());
+        }
+    }
 }
 
 /// What the driver has taken delivery of in `tile`, to release back.
@@ -463,6 +610,8 @@ fn main() {
     let mut control_port: Option<u16> = None;
     let mut inspect_only_port: Option<u16> = None;
     let mut dump_snapshot = false;
+    // Not in the usage: a restart passes it to the process it starts (`restart`).
+    let mut root_text: Option<PathBuf> = None;
 
     for arg in &args[1..] {
         if arg == "--inspect" {
@@ -479,6 +628,8 @@ fn main() {
             inspect_only_port = Some(port_str.parse().expect("Invalid port for --inspect-only"));
         } else if arg == "--dump-snapshot" {
             dump_snapshot = true;
+        } else if let Some(path) = arg.strip_prefix("--root-text=") {
+            root_text = Some(PathBuf::from(path));
         } else {
             input_file = Some(arg.clone());
         }
@@ -508,7 +659,17 @@ fn main() {
         std::process::exit(1);
     });
 
-    let loaded = LoadedProgram::read(Path::new(&input_file)).unwrap_or_else(|e| {
+    let loaded = match &root_text {
+        None => LoadedProgram::read(Path::new(&input_file)),
+        // The restarted version, read once and removed: nothing else reads it.
+        Some(text_file) => std::fs::read_to_string(text_file)
+            .map_err(|e| format!("reading `{}`: {e}", text_file.display()))
+            .and_then(|text| {
+                let _ = std::fs::remove_file(text_file);
+                LoadedProgram::read_with_root_text(Path::new(&input_file), text)
+            }),
+    }
+    .unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(1);
     });
@@ -530,7 +691,7 @@ fn main() {
             inspect_port,
             control_port,
         } => {
-            if run_program(&loaded, inspect_port, control_port).is_err() {
+            if run_program(&loaded, Path::new(&input_file), inspect_port, control_port).is_err() {
                 std::process::exit(1);
             }
 
@@ -552,10 +713,17 @@ fn main() {
 mod tests {
     use crate::run_program;
     use cambra::ccl::load::LoadedProgram;
+    use std::path::Path;
     use test_log::test;
 
     #[test]
     fn test_run_program() {
-        run_program(&LoadedProgram::test("x = 1; x"), None, None).unwrap();
+        run_program(
+            &LoadedProgram::test("x = 1; x"),
+            Path::new("<test>"),
+            None,
+            None,
+        )
+        .unwrap();
     }
 }

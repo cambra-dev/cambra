@@ -1,25 +1,31 @@
-// Reloading the running program from the source pane.
+// Reloading and restarting the running program from the source pane.
 //
-// The server says whether it takes a reload (`GET /api/capabilities`), which it
-// does on a run with a control port. When it does, the page holds one
-// `EditSession` for its lifetime, and every source pane it draws is editable and
-// reloads through it. The session outlives the panes: a reload redraws every
+// A reload swaps in the pane's text as `main`'s next version and carries its
+// state forward; a restart replaces the process with a fresh one that runs the
+// text (`src/ccl/design/program-evolution.md`, "`/reload`" and "`/restart`"). The server says whether it takes them (`GET
+// /api/capabilities`), which it does on a run with a control port. When it
+// does, the page holds one `EditSession` for its lifetime, and every source pane
+// it draws is editable and sends through it. The session outlives the panes: a reload redraws every
 // pane, so the reload's outcome, and the reader's edit, have to be held
 // somewhere the next source pane can read them back from.
 //
-// The page sees an accepted version the way it sees any reload of `main`: a
-// frame names the new version and `followReloads` redraws. Nothing here touches
+// The page sees an accepted reload the way it sees any reload of `main`: a
+// frame names the new version and `followReloads` redraws. A restart replaces
+// the server along with the program, so the page waits for the new process's
+// server and loads itself from it (`reloadingOnRestart`). Nothing here touches
 // the panes.
 
 import type { ChangeSet } from "@codemirror/state";
 import type { LiveStore } from "./liveStore";
 import type { Diagnostic } from "./types";
 
-/** What one reload came to. */
+/** What one reload or restart came to. */
 export type ReloadOutcome =
   // `main` runs the version now. `kept` of `bound` is how much of the replaced
   // version it took over rather than built.
   | { kind: "reloaded"; kept: number; bound: number }
+  // A fresh process is replacing this one to run the version.
+  | { kind: "restarted" }
   // The compiler or the branch table refused the version, and the version that
   // was running still is. `diagnostics` are the compile errors, as byte spans
   // into `source`, the text that was sent; a refusal that points at no span
@@ -28,12 +34,15 @@ export type ReloadOutcome =
   // The request did not reach a running program, or the server refused it.
   | { kind: "failed"; message: string };
 
+/** What a version is sent to do: the server route it is posted to. */
+export type Verb = "reload" | "restart";
+
 /** Send a version to the server, and answer what came of it. */
-export type Reload = (source: string) => Promise<ReloadOutcome>;
+export type Send = (verb: Verb, source: string) => Promise<ReloadOutcome>;
 
 /**
  * What the source pane's status strip reports. `finished` is the run having
- * ended, after which the server takes no reload and the pane is read-only.
+ * ended, after which the server takes a restart and no reload.
  */
 export type EditStatus =
   | { kind: "idle" }
@@ -67,7 +76,7 @@ export class EditSession {
   /** Set by a disposed source pane, and taken by the next one. */
   carried: CarriedEditor | null = null;
 
-  constructor(private readonly send: Reload) {}
+  constructor(private readonly send: Send) {}
 
   get(): EditStatus {
     return this.status;
@@ -78,32 +87,46 @@ export class EditSession {
     return () => this.listeners.delete(fn);
   }
 
-  /** Whether the run has ended, after which nothing reloads. */
+  /** Whether the run has ended, after which only a restart is sent. */
   get finished(): boolean {
     return this.status.kind === "finished";
   }
 
   /**
-   * Reload with `source`, and answer the outcome; `null` when a reload is
+   * Reload with `source`, and answer the outcome; `null` when a version is
    * already in flight, which this one would race, or the run has ended.
    */
-  async reload(source: string): Promise<ReloadOutcome | null> {
-    if (this.status.kind === "reloading" || this.finished) return null;
+  reload(source: string): Promise<ReloadOutcome | null> {
+    return this.post("reload", source);
+  }
+
+  /**
+   * Restart the process with `source`, and answer the outcome; `null` when a
+   * version is already in flight. A finished run takes a restart.
+   */
+  restart(source: string): Promise<ReloadOutcome | null> {
+    return this.post("restart", source);
+  }
+
+  private async post(verb: Verb, source: string): Promise<ReloadOutcome | null> {
+    if (this.status.kind === "reloading") return null;
+    if (verb === "reload" && this.finished) return null;
     this.set({ kind: "reloading" });
     let outcome: ReloadOutcome;
     try {
-      outcome = await this.send(source);
+      outcome = await this.send(verb, source);
     } catch (e) {
       outcome = { kind: "failed", message: String(e) };
     }
-    // The run ending while the reload was in flight outranks its outcome.
+    // The run ending while the version was in flight outranks its outcome.
     if (!this.finished) this.set(outcome);
     return outcome;
   }
 
   /**
    * The run has ended. A finished program takes no reload
-   * (`src/ccl/design/program-evolution.md`, "`/reload`"), so this is final.
+   * (`src/ccl/design/program-evolution.md`, "`/reload`"), and lasts until a
+   * restart replaces it.
    */
   finish(): void {
     if (!this.finished) this.set({ kind: "finished" });
@@ -115,7 +138,7 @@ export class EditSession {
   }
 }
 
-/** The server's reply to `POST /api/reload`. */
+/** The server's reply to `POST /api/reload` or `POST /api/restart`. */
 interface ReloadReply {
   message?: unknown;
   diagnostics?: unknown;
@@ -124,15 +147,21 @@ interface ReloadReply {
 }
 
 /**
- * The outcome a reply to `POST /api/reload` reports.
+ * The outcome a reply to `verb`'s route reports.
  *
  * `200` is an accepted version and `400` a refused one. Every other status is
  * the request not reaching a program: a run without a control port (`404`), an
- * admission refusal (`403`, `415`), a program that has finished (`409`), or no
- * running program to reach (`503`).
+ * admission refusal (`403`, `415`), a finished program sent a reload (`409`),
+ * or no running program to reach (`503`).
  */
-export function outcomeOf(status: number, reply: ReloadReply, source: string): ReloadOutcome {
+export function outcomeOf(
+  status: number,
+  reply: ReloadReply,
+  source: string,
+  verb: Verb = "reload",
+): ReloadOutcome {
   const message = typeof reply.message === "string" ? reply.message : `HTTP ${status}`;
+  if (status === 200 && verb === "restart") return { kind: "restarted" };
   if (status === 200 && typeof reply.kept === "number" && typeof reply.bound === "number") {
     return { kind: "reloaded", kept: reply.kept, bound: reply.bound };
   }
@@ -146,15 +175,16 @@ export function outcomeOf(status: number, reply: ReloadReply, source: string): R
 }
 
 /**
- * A `Reload` that posts to this page's own server.
+ * A `Send` that posts to this page's own server, at `/api/reload` or
+ * `/api/restart`.
  *
  * JSON, because the server takes nothing else: a cross-site page can only send
  * a CORS-safelisted type without a preflight, and `application/json` is not one
  * (`src/inspector_server/reload.rs`, "Admission").
  */
-export function postReload(fetchImpl: typeof fetch = fetch): Reload {
-  return async (source) => {
-    const resp = await fetchImpl("/api/reload", {
+export function postVersion(fetchImpl: typeof fetch = fetch): Send {
+  return async (verb, source) => {
+    const resp = await fetchImpl(`/api/${verb}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ source }),
@@ -165,27 +195,80 @@ export function postReload(fetchImpl: typeof fetch = fetch): Reload {
     } catch {
       // A body that is not JSON leaves the status to say what happened.
     }
-    return outcomeOf(resp.status, reply, source);
+    return outcomeOf(resp.status, reply, source, verb);
   };
 }
 
-/** Whether the server takes `POST /api/reload`. Any failure reads as no. */
-export async function serverReloads(fetchImpl: typeof fetch = fetch): Promise<boolean> {
+/** What the server lets the page do, and which process answers. */
+export interface Capabilities {
+  /** The server takes `POST /api/reload` and `POST /api/restart`. */
+  reload: boolean;
+  /** Differs between any two processes' servers; `null` from one that omits it. */
+  instance: string | null;
+}
+
+/** The server's capabilities, or `null` when they cannot be read. */
+export async function serverCapabilities(fetchImpl: typeof fetch = fetch): Promise<Capabilities | null> {
   try {
     const resp = await fetchImpl("/api/capabilities");
-    if (!resp.ok) return false;
-    const body = (await resp.json()) as { reload?: unknown };
-    return body.reload === true;
+    if (!resp.ok) return null;
+    const body = (await resp.json()) as { reload?: unknown; instance?: unknown };
+    return {
+      reload: body.reload === true,
+      instance: typeof body.instance === "string" ? body.instance : null,
+    };
   } catch {
-    return false;
+    return null;
   }
 }
 
+/** How `reloadingOnRestart` waits for the restarted process. */
+export interface RestartWait {
+  fetchImpl?: typeof fetch;
+  /** Loads the page again; `location.reload` in the browser. */
+  loadPage?: () => void;
+  /** Milliseconds between polls of `/api/capabilities`. */
+  pollMs?: number;
+  /** Milliseconds after which a restarted process that never answered is a failure. */
+  within?: number;
+}
+
 /**
- * End `session` when the run `live` follows finishes, which the frame marked
- * `final` says.
+ * `send`, loading the page again from the restarted process after an accepted
+ * restart.
+ *
+ * A restart replaces the process, server included, and the new process numbers
+ * `main`'s versions from 1, so nothing the page holds describes it. The new
+ * process is the first whose `/api/capabilities` answers an `instance` other
+ * than `instance`, the page's own server's; while the port is closed, a poll
+ * fails and the wait goes on. A process that has not answered after `within`
+ * milliseconds makes the restart a failure.
  */
-export function finishWithRun(live: LiveStore, session: EditSession): void {
+export function reloadingOnRestart(send: Send, instance: string, wait: RestartWait = {}): Send {
+  const {
+    fetchImpl = fetch,
+    loadPage = () => location.reload(),
+    pollMs = 100,
+    within = 30_000,
+  } = wait;
+  return async (verb, source) => {
+    const outcome = await send(verb, source);
+    if (outcome.kind !== "restarted") return outcome;
+    const deadline = Date.now() + within;
+    while (Date.now() < deadline) {
+      const now = await serverCapabilities(fetchImpl);
+      if (now?.instance && now.instance !== instance) {
+        loadPage();
+        return outcome;
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+    }
+    return { kind: "failed", message: "the restarted process never answered" };
+  };
+}
+
+/** Keep `session` in step with the run `live` follows: finished on the frame marked `final`. */
+export function followRun(live: LiveStore, session: EditSession): void {
   const check = (): void => {
     if (live.get().status.kind === "finished") session.finish();
   };

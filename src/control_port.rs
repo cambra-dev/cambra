@@ -7,12 +7,13 @@
 //! | `/diff[/<branch>]` | `[phase=<p>&]<source>` | How `<source>` differs from the branch's current version |
 //! | `/diff/<a>/<b>` | `[phase=<p>]` | How `<b>`'s current version differs from `<a>`'s |
 //! | `/reload[/<branch>]` | `<source>` | Replace the branch's version with `<source>` |
+//! | `/restart` | `<source>` | Replace the `cambra` process with a fresh one that runs `<source>` |
 //! | `/branch/<name>[/from/<parent>]` | `<source>` | Create `<name>` from `<parent>` and reload it with `<source>` |
 //! | `/branch/<name>/delete` | nothing | Delete `<name>` |
 //! | `/branch/<name>/info` | nothing | Report `<name>`'s origin, versions and source |
 //! | `/branches` | nothing | List every branch |
 //!
-//! `/reload` and both `/branch` forms that change the table require `POST`,
+//! `/reload`, `/restart` and both `/branch` forms that change the table require `POST`,
 //! and any other method answers 405. An omitted `<branch>` or `<parent>`
 //! means `main`. A segment in a name position that is not a branch name is an
 //! unknown path, and answers 404.
@@ -28,6 +29,11 @@
 //! The inspector's `POST /api/reload` reaches the same queue through a
 //! [`ControlClient`] (`src/inspector_server/reload.rs`), so a reload from the
 //! page is answered by the same [`service`].
+//!
+//! `/restart` is the one verb [`service`] does not perform. A restart replaces
+//! the process, which only the `cambra` binary's driver can do: it checks the
+//! version with [`check_restart`], answers with [`ControlMessage::answer_once_sent`],
+//! and then `exec`s itself (`src/ccl/design/program-evolution.md`, "`/restart`").
 //!
 //! # Who may send a request
 //!
@@ -56,6 +62,7 @@
 
 use std::sync::mpsc::{Receiver, SendError, SyncSender, sync_channel};
 use std::thread;
+use std::time::Duration;
 
 use crate::ccl::context::{CompileError, GlobalContext, Phase, ReuseTally};
 use crate::ccl::load::{LoadError, LoadedProgram};
@@ -85,6 +92,9 @@ pub enum ControlRequest {
     },
     /// Replace `branch`'s version with `code`.
     Reload { branch: String, code: String },
+    /// Replace the process with a fresh one that runs `code`; only the binary's
+    /// driver performs it (`check_restart`).
+    Restart { code: String },
     /// Create `name` from `parent`'s current version and reload it with `code`.
     Branch {
         name: String,
@@ -105,6 +115,7 @@ impl ControlRequest {
     pub fn mutates(&self) -> bool {
         match self {
             ControlRequest::Reload { .. }
+            | ControlRequest::Restart { .. }
             | ControlRequest::Branch { .. }
             | ControlRequest::Delete { .. } => true,
             ControlRequest::Diff { .. }
@@ -218,6 +229,23 @@ pub struct ControlReply {
     /// How much of the replaced version an accepted reload or branch creation
     /// kept.
     pub reuse: Option<ReuseTally>,
+    /// Signals, once the reply is dropped, that it has been written. Set by
+    /// [`ControlMessage::answer_once_sent`], so a server thread drops each reply
+    /// after responding with it.
+    pub sent: Option<Sent>,
+}
+
+/// Signals its [`ControlMessage::answer_once_sent`] when dropped.
+///
+/// A drop rather than a call, so a server thread that writes a reply signals by
+/// letting the reply go, and one that fails to write it signals too.
+#[derive(Debug)]
+pub struct Sent(SyncSender<()>);
+
+impl Drop for Sent {
+    fn drop(&mut self) {
+        let _ = self.0.try_send(());
+    }
 }
 
 impl ControlReply {
@@ -228,6 +256,7 @@ impl ControlReply {
             body: body.into(),
             diagnostics: Vec::new(),
             reuse: None,
+            sent: None,
         }
     }
 
@@ -247,6 +276,25 @@ impl ControlReply {
     /// does not hold.
     pub fn not_found(body: impl Into<String>) -> Self {
         Self::with_status(404, body)
+    }
+
+    /// The `200` an accepted restart answers before the process is replaced.
+    pub fn restarting() -> Self {
+        Self::ok("restarting: a fresh `cambra` process runs the posted version\n")
+    }
+
+    /// The `501` a restart answers where the driver cannot replace its process.
+    pub fn cannot_restart(why: &str) -> Self {
+        Self::with_status(501, format!("this run cannot restart: {why}\n"))
+    }
+
+    /// The `409` a finished program waiting for a restart answers every other
+    /// request with.
+    pub fn finished() -> Self {
+        Self::with_status(
+            409,
+            "the program has finished; it takes no request but `/restart`\n",
+        )
     }
 
     /// A `503` carrying `body`: the request reached no running program.
@@ -357,6 +405,11 @@ pub fn service(
                 Err(e) => branch_error(e, &posted),
             }
         }
+        // A restart replaces the process, so only the binary's driver performs
+        // one; it never hands one to this function.
+        ControlRequest::Restart { .. } => {
+            ControlReply::cannot_restart("only the `cambra` binary replaces its process")
+        }
         ControlRequest::Branch { name, parent, code } => {
             let posted = LoadedProgram::from_text(POSTED, code.as_str());
             match live.create_branch(ctx, name, parent, &posted, main_consumer) {
@@ -385,6 +438,25 @@ pub fn service(
     }
 }
 
+/// Check that `loaded` compiles as a restart would run it, or answer the `400`
+/// that refuses it.
+///
+/// Compiled to [`Phase::Planning`] against the running program's sources and
+/// sinks and without opening ports, as `/diff` compiles, so the check changes
+/// nothing the running program serves. A failure is a `400` whose diagnostics
+/// are the errors' spans in `loaded`.
+pub fn check_restart(ctx: &GlobalContext, loaded: &LoadedProgram) -> Result<(), ControlReply> {
+    let errs = match ctx.sources_and_sinks().compile_to(loaded, Phase::Planning) {
+        Ok(_) => return Ok(()),
+        Err(errs) => errs,
+    };
+    let diagnostics = diagnostics_from_compile_errors(&errs, loaded.sources());
+    Err(ControlReply {
+        diagnostics,
+        ..ControlReply::rejected(ReloadError::Compile(errs).render(loaded.sources()))
+    })
+}
+
 /// One request awaiting an answer, together with the channel the server thread
 /// is blocked on.
 ///
@@ -407,6 +479,18 @@ impl ControlMessage {
         if let Some(tx) = self.reply.take() {
             let _ = tx.send(reply);
         }
+    }
+
+    /// Answer the request, then wait up to `within` for the server thread to
+    /// have written the reply; `true` when it has.
+    ///
+    /// For a reply the process will not outlive: a restart answers, then
+    /// replaces the process, which closes the reply's connection.
+    pub fn answer_once_sent(self, mut reply: ControlReply, within: Duration) -> bool {
+        let (tx, rx) = sync_channel(1);
+        reply.sent = Some(Sent(tx));
+        self.answer(reply);
+        rx.recv_timeout(within).is_ok()
     }
 }
 
@@ -480,6 +564,7 @@ impl ControlClient {
 pub struct ControlPort {
     rx: Receiver<ControlMessage>,
     client: ControlClient,
+    port: u16,
 }
 
 impl ControlPort {
@@ -518,15 +603,24 @@ impl ControlPort {
                 };
                 let header: tiny_http::Header =
                     "Content-Type: text/plain; charset=utf-8".parse().unwrap();
+                let ControlReply {
+                    status, body, sent, ..
+                } = reply;
                 let _ = request.respond(
-                    tiny_http::Response::from_string(reply.body)
-                        .with_status_code(reply.status)
+                    tiny_http::Response::from_string(body)
+                        .with_status_code(status)
                         .with_header(header),
                 );
+                drop(sent);
             }
         });
 
-        Ok(ControlPort { rx, client })
+        Ok(ControlPort { rx, client, port })
+    }
+
+    /// The port this control port bound, which `--control=0` leaves to the OS.
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     /// A handle that sends requests to this port's main loop, for a server
@@ -541,6 +635,18 @@ impl ControlPort {
     /// when nothing is queued.
     pub fn poll(&self) -> Option<ControlMessage> {
         self.rx.try_recv().ok()
+    }
+
+    /// Wait for the next request.
+    ///
+    /// For a main loop with nothing left to run but a request to wait on: a
+    /// finished program under `--inspect`, which takes a `/restart`. Never
+    /// returns `None` while the port is alive, since the port holds a sender of
+    /// its own.
+    pub fn wait(&self) -> ControlMessage {
+        self.rx
+            .recv()
+            .expect("the port's own client keeps its queue open")
     }
 }
 
@@ -692,6 +798,10 @@ fn parse_request(url: &str, body: &str) -> Result<ControlRequest, ControlReply> 
                 branch: rest.first().copied().unwrap_or(MAIN_BRANCH).to_string(),
                 code,
             })
+        }
+        ("restart", []) => {
+            require_code(&code)?;
+            Ok(ControlRequest::Restart { code })
         }
         ("branch", [name]) => {
             require_code(&code)?;
@@ -1078,6 +1188,7 @@ mod tests {
     fn a_malformed_name_or_path_answers_404() {
         assert_eq!(status_of("/branch/no.dots?x"), 404);
         assert_eq!(status_of("/reload/?x"), 404);
+        assert_eq!(status_of("/restart/main?x"), 404);
         assert_eq!(status_of("/diff/a/b/c?x"), 404);
         assert_eq!(status_of("/branch/a/rename"), 404);
         assert_eq!(status_of("/branches/list"), 404);
@@ -1099,6 +1210,11 @@ mod tests {
             require_post("GET", &reload).expect_err("refused").status,
             405
         );
+        let restart = parse_request("/restart", "x = 1; x").expect("parses");
+        assert_eq!(
+            require_post("GET", &restart).expect_err("refused").status,
+            405
+        );
         let create = parse_request("/branch/qa", "x = 1; x").expect("parses");
         assert_eq!(
             require_post("PUT", &create).expect_err("refused").status,
@@ -1108,6 +1224,16 @@ mod tests {
             let request = parse_request(read, "").expect("parses");
             assert!(require_post("GET", &request).is_ok(), "{read} only reads");
         }
+    }
+
+    /// `/restart` names no branch, because it discards them all.
+    #[test]
+    fn restart_takes_a_source_and_no_branch() {
+        match parse_request("/restart", "y = 2; y").expect("parses") {
+            ControlRequest::Restart { code } => assert_eq!(code, "y = 2; y"),
+            other => panic!("expected a restart request, got {other:?}"),
+        }
+        assert_eq!(status_of("/restart"), 400, "a restart carries its version");
     }
 
     /// The sourceless verbs ignore the request body.

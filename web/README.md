@@ -44,6 +44,7 @@ See [Running it](../docs/inspector.md#running-it). No `cargo`? After `npm run bu
 | **Read** the source | Syntax highlighting from the VS Code grammar, in the classes the VS Code and Neovim grammars use ([editors/README.md](../editors/README.md#inspector)). `./ci.sh editors` checks it against the lexer over every `.cambra` file in the repository. |
 | **Edit** the source, on a run with `--control` | The pane is editable. While its text differs from the version running, it is *edited*: hover, goto-definition and selection are off, the strip under the editor says so, and the other panes keep describing the running version. `Tab`/`⇧Tab` (or `Mod-]`/`Mod-[`) move the selected lines by two spaces, `Enter` keeps the line's indentation, and `Mod-z` undoes. |
 | **Mod-Enter** in an edited source pane | Reloads `main` with the pane's text. Accepted, the panes redraw on the new version and the strip reports how many operators it kept. Refused, the errors are underlined where they are and the running version keeps running. See [Editing the program](#editing-the-program). |
+| **Mod-Shift-Enter** in the source pane | Restarts the program with the pane's text: a fresh `cambra` process replaces the running one and runs the text, keeping no state, and the page loads again from it. Works on a finished program, which takes no reload. See [Editing the program](#editing-the-program). |
 | **Hover a squiggle** in the source | The diagnostic message. Type errors underline the offending span — and still render even when the program fails to compile, since the source panel always loads. |
 | **Open the ☰ Panes menu** in the header | A checkbox per pane. Unchecking one hides it and widens the rest; the hidden set persists across reloads. Every pane is listed, Source included — the invariant is that the layout is never empty, so the last visible pane's checkbox is disabled rather than Source being pinned. Panes cannot be reordered. |
 | **Click a pane's Copy button** | Copies that pane's text to the clipboard. The source pane yields the program verbatim; a tree pane yields one indented line per row; the Diagnostics pane yields each card's three lines. The button reports the outcome — a refused write says so rather than looking like it worked. |
@@ -221,31 +222,37 @@ binary search.
 
 ## Editing the program
 
-`GET /api/capabilities` answers `{"reload": true}` on a run started with `--inspect --control`.
-The page then holds one `EditSession` (`reload.ts`) for its lifetime, and the source pane is
-editable. `Mod-Enter` posts the pane's text to `POST /api/reload`, which reloads `main` through the
-run's control port (`src/inspector_server/reload.rs`). The panes redraw on the new version the way
-they follow any reload of `main` (`followReloads`).
+`GET /api/capabilities` answers `{"reload": true, "restart": true, "instance": "…"}` on a run
+started with `--inspect --control`; `restart` is `false` on Windows, which has no `exec`. The page
+then holds one `EditSession` (`reload.ts`) for its lifetime, and the source pane is editable.
+`Mod-Enter` posts the pane's text to `POST /api/reload`, which reloads `main` through the run's
+control port, carrying its state forward. The panes redraw on the new version the way they follow
+any reload of `main` (`followReloads`). `Mod-Shift-Enter` posts the text to `POST /api/restart`,
+which replaces the process with a fresh one that runs it (`src/inspector_server/reload.rs`). The
+new process numbers `main`'s versions from 1 and serves the page itself, so the page waits for a
+server answering an `instance` other than its own and loads itself again from it
+(`reloadingOnRestart`).
 
 - **Edited.** The payload's spans are bytes of the compiled text. While the document differs from
   it, the pane switches hover, goto-definition and selection off, paints no span, and clears the
   shared selection on entering the state. Undoing back to the compiled text switches them on again.
 - **A refused version** comes back with the compiler's diagnostics as byte spans into the text
-  sent. The pane converts them against that text, clamps them to the document, and underlines
-  them. A refusal with no span, such as removing a variable the running state holds, is reported
-  in the strip.
+  sent. The pane converts them against that text and underlines them, moved through any edit made
+  while the version was in flight. Once the document is no longer the text sent and those edits
+  are not known, as after a redraw, it underlines nothing. A refusal with no span, such as removing
+  a variable the running state holds, is reported in the strip.
 - **The redraw carries the editor.** A disposed source pane leaves its caret, its focus and, when
   it was edited, its text on the session, and the next pane takes them. So the reader's own reload
   lands with the caret where it was, and a reload from elsewhere (another tab, the control port)
   leaves text the reader has not sent in place, still edited, over the new version. The undo
   history does not survive the redraw.
-- **One reload at a time.** A `Mod-Enter` while one is in flight does nothing.
-- **A finished program takes no reload.** On the frame marked `final` the session finishes, the
-  pane turns read-only and the strip says why. The server answers a reload sent after that with
-  409 ([program-evolution.md](../src/ccl/design/program-evolution.md#reload)).
-
-There is no compile-from-scratch: the control port has no verb that restarts `main` with nothing
-kept.
+- **One version at a time.** A `Mod-Enter` or `Mod-Shift-Enter` while a version is in flight does
+  nothing.
+- **A finished program takes a restart and no reload.** On the frame marked `final` the session
+  finishes and the strip offers the restart; `Mod-Enter` sends nothing, and the server answers a
+  reload sent after that with 409
+  ([program-evolution.md](../src/ccl/design/program-evolution.md#restart)). A restart loads the
+  page again, so the session ends with the process.
 
 ## Scope: multi-pane (interactive, snapshot-first)
 

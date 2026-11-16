@@ -6,9 +6,10 @@
 //! requests that read them. [`serve`] compiles `code` itself and renders once;
 //! [`serve_compiled`] takes the compile a driver is about to run, and hands back
 //! a [`ServedSnapshot`] the driver replaces when a reload installs another
-//! version. There is no per-request recompilation. The one route that changes
-//! anything is `POST /api/reload`, on a run with a control port, and it hands
-//! the change to the driver rather than making it ([`super::reload`]).
+//! version. There is no per-request recompilation. The two routes that change
+//! anything are `POST /api/reload` and `POST /api/restart`, on a run with a
+//! control port, and they hand the change to the driver rather than making it
+//! ([`super::reload`]).
 //!
 //! # Routes
 //!
@@ -22,10 +23,14 @@
 //!   [`LiveServer::accept`]; it carries the probe frames a driver publishes
 //!   through the [`LiveChannel`], and nothing under [`serve`], which runs no
 //!   program.
-//! - `GET /api/capabilities` — `{"reload": bool}`: whether this server takes
-//!   `POST /api/reload`. `application/json`.
+//! - `GET /api/capabilities` — `{"reload": bool, "restart": bool, "instance":
+//!   string}`: whether this server takes `POST /api/reload` and `POST
+//!   /api/restart`, and a value no other process's server answers, which a
+//!   page waiting out a restart polls for. `application/json`.
 //! - `POST /api/reload` — reload `main` with the posted source, through the
 //!   run's control port ([`super::reload`]). `application/json`.
+//! - `POST /api/restart` — replace the process with a fresh one that runs the
+//!   posted source, through the run's control port. `application/json`.
 //! - `GET /` and `GET /index.html` — the CodeMirror frontend: the built,
 //!   self-contained `web/dist/index.html` bundle, which
 //!   fetches `/api/snapshot` and renders the source + IR tree. `text/html`.
@@ -54,7 +59,7 @@ use crate::ccl::context::{CompiledProgram, GlobalContext, compile_program};
 use crate::control_port::ControlClient;
 use crate::inspector_model::{Diagnostic, InspectorPayload, diagnostics_from_compile_errors};
 use crate::inspector_server::live::{LIVE_PATH, LiveChannel, LiveServer};
-use crate::inspector_server::reload::{self, RELOAD_PATH, capabilities_body};
+use crate::inspector_server::reload::{self, Verb, capabilities_body};
 use crate::interpreter::Consumer;
 use crate::util::bound_port;
 
@@ -257,6 +262,9 @@ pub fn serve(program: &LoadedProgram, port: u16) -> io::Result<()> {
 /// `control` is the run's control port, when it has one; `POST /api/reload`
 /// sends to it.
 ///
+/// Answers the channel the driver publishes frames on, the payload it replaces
+/// on a reload, and the port bound, which `port` `0` leaves to the OS.
+///
 /// The port is bound before the server thread starts, so a port already in use
 /// is this call's `Err` rather than a run with no server behind it. The server
 /// thread is detached, and outlives this call by design — a run finishes long
@@ -268,18 +276,19 @@ pub fn serve_compiled(
     port: u16,
     version: u64,
     control: Option<ControlClient>,
-) -> io::Result<(LiveChannel, ServedSnapshot)> {
+) -> io::Result<(LiveChannel, ServedSnapshot, u16)> {
     let live = LiveServer::start();
     let channel = live.channel();
     channel.follow(version);
     let snapshot = ServedSnapshot::new(snapshot_json_at_version(compiled, name, version));
     let bodies = Bodies::new(snapshot.clone(), diagnostics_body(&[]), control);
     let server = bind(name, port)?;
+    let port = bound_port(&server, port);
     thread::Builder::new()
         .name("cambra-inspector".to_string())
         .spawn(move || serve_bodies(&server, bodies, &live))
         .map_err(io::Error::other)?;
-    Ok((channel, snapshot))
+    Ok((channel, snapshot, port))
 }
 
 /// The path a request URL routes on: the URL without its query string, so a
@@ -313,9 +322,9 @@ fn serve_bodies(server: &tiny_http::Server, bodies: Bodies, live: &LiveServer) {
         }
         // Answered on a thread of its own: the main loop compiles the version
         // before it answers, and the routes below keep serving meanwhile.
-        if route(request.url()) == RELOAD_PATH {
+        if let Some(verb) = Verb::at(route(request.url())) {
             let control = bodies.control.clone();
-            thread::spawn(move || reload::answer(request, control));
+            thread::spawn(move || reload::answer(request, control, verb));
             continue;
         }
         // A response borrows its body: the snapshot is megabytes on a large

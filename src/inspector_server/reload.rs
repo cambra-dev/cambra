@@ -1,20 +1,24 @@
-//! `POST /api/reload`: the inspector's source pane reloading `main` with the
-//! text the reader edited.
+//! `POST /api/reload` and `POST /api/restart`: the inspector's source pane
+//! reloading `main` with the text the reader edited, or restarting the process
+//! with it.
 //!
-//! The route hands the text to the main loop as the control port's own
-//! [`ControlRequest::Reload`], through a [`ControlClient`] onto the same queue,
-//! and [`service`](crate::control_port::service) answers it. So a reload from
-//! the page and one from the control port are one operation, and the page sees
-//! the new version the way it sees any reload of `main`: through
-//! `src/inspector_model/design.md`, "A reload of main is followed".
+//! Each route hands the text to the main loop as the control port's own
+//! request, [`ControlRequest::Reload`] or [`ControlRequest::Restart`], through
+//! a [`ControlClient`] onto the same queue. So a reload or a restart from the
+//! page and one from the control port are one operation. The page sees a
+//! reloaded version the way it sees any new version of `main`: through
+//! `src/inspector_model/design.md`, "A reload of main is followed". A restart
+//! replaces the process, server included, so the page waits for the new
+//! process's server and loads itself again.
 //!
-//! The route exists only on a run started with `--control`. Without one there is
-//! no queue to send to, the route answers `404`, and `GET /api/capabilities`
-//! says `"reload": false`, which leaves the page's source pane read-only.
+//! The routes exist only on a run started with `--control`. Without one there
+//! is no queue to send to, each route answers `404`, and `GET
+//! /api/capabilities` says `false` for both, which leaves the page's source
+//! pane read-only.
 //!
 //! # Admission
 //!
-//! A reload runs the code it carries, and the server is reachable from every
+//! A reload or a restart runs the code it carries, and the server is reachable from every
 //! page the reader's browser loads. [`admit`] refuses each way such a page can
 //! reach it:
 //!
@@ -36,18 +40,46 @@ use crate::control_port::{
 };
 use crate::live_program::MAIN_BRANCH;
 
-/// The route's path.
-pub const RELOAD_PATH: &str = "/api/reload";
+/// What a posted version asks of the program.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Verb {
+    /// Reload `main`, carrying its state forward.
+    Reload,
+    /// Replace the process with a fresh one that runs the version.
+    Restart,
+}
 
-/// The body `POST /api/reload` takes.
+impl Verb {
+    /// The verb whose route `path` is, if it is one.
+    pub fn at(path: &str) -> Option<Verb> {
+        match path {
+            "/api/reload" => Some(Verb::Reload),
+            "/api/restart" => Some(Verb::Restart),
+            _ => None,
+        }
+    }
+
+    /// The control-port request carrying `source`.
+    fn request(self, source: String) -> ControlRequest {
+        match self {
+            Verb::Reload => ControlRequest::Reload {
+                branch: MAIN_BRANCH.to_string(),
+                code: source,
+            },
+            Verb::Restart => ControlRequest::Restart { code: source },
+        }
+    }
+}
+
+/// The body `POST /api/reload` and `POST /api/restart` take.
 #[derive(Deserialize)]
 struct ReloadBody {
     /// The version's source: the root file's whole text.
     source: String,
 }
 
-/// Whether a request with these headers may reload the program; see the module
-/// docs, "Admission".
+/// Whether a request with these headers may reload or restart the program; see
+/// the module docs, "Admission".
 pub fn admit(
     method: &str,
     host: Option<&str>,
@@ -57,7 +89,7 @@ pub fn admit(
     if !method.eq_ignore_ascii_case("POST") {
         return Err(ControlReply::with_status(
             405,
-            format!("{method} cannot reload; send POST\n"),
+            format!("{method} cannot change the program; send POST\n"),
         ));
     }
     let host = loopback_host(host)?;
@@ -66,7 +98,7 @@ pub fn admit(
     {
         return Err(ControlReply::with_status(
             403,
-            format!("a page at `{origin}` cannot reload a program served at `{host}`\n"),
+            format!("a page at `{origin}` cannot change a program served at `{host}`\n"),
         ));
     }
     let media_type = content_type.map(|ct| ct.split(';').next().unwrap_or("").trim());
@@ -79,9 +111,25 @@ pub fn admit(
     Ok(())
 }
 
-/// The `GET /api/capabilities` body: what this run lets the page do.
-pub fn capabilities_body(reload: bool) -> String {
-    serde_json::json!({ "reload": reload }).to_string()
+/// The `GET /api/capabilities` body: what this run lets the page do, and which
+/// process is answering.
+///
+/// A run with a control port takes a reload, and one without takes neither
+/// verb. A restart also needs Unix `exec`, so it is `false` elsewhere.
+///
+/// `instance` differs between any two processes' servers. A restart keeps the
+/// process id, since `exec` replaces the program and not the process, so the id
+/// alone cannot tell the restarted process from the one it replaced.
+pub fn capabilities_body(control: bool) -> String {
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    serde_json::json!({
+        "reload": control,
+        "restart": control && cfg!(unix),
+        "instance": format!("{}-{started}", std::process::id()),
+    })
+    .to_string()
 }
 
 /// The JSON body for a [`ControlReply`]: its text as `message`, the posted
@@ -103,23 +151,28 @@ fn message_body(message: &str) -> String {
     serde_json::json!({ "message": message, "diagnostics": [] }).to_string()
 }
 
-/// Answer one `POST /api/reload`, blocking until the main loop has.
+/// Answer one `POST` to `verb`'s route, blocking until the main loop has.
 ///
 /// Called on a thread of its own, so the compile the main loop runs does not
 /// hold up the snapshot and live routes the page uses meanwhile.
-pub fn answer(mut request: tiny_http::Request, control: Option<ControlClient>) {
+pub fn answer(mut request: tiny_http::Request, control: Option<ControlClient>, verb: Verb) {
     let admitted = admit(
         request.method().as_str(),
         header_value(&request, "Host").as_deref(),
         header_value(&request, "Origin").as_deref(),
         header_value(&request, "Content-Type").as_deref(),
     );
-    let (status, body) = match admitted {
-        Err(refusal) => (refusal.status, reply_body(&refusal)),
+    // `sent` is held until the response is written: a restart waits on it before
+    // replacing the process.
+    let (status, body, sent) = match admitted {
+        Err(refusal) => (refusal.status, reply_body(&refusal), None),
         Ok(()) => match control {
             None => (
                 404,
-                message_body("this run has no control port; start it with `--control` to reload"),
+                message_body(
+                    "this run has no control port; start it with `--control` to reload or restart",
+                ),
+                None,
             ),
             Some(control) => {
                 let mut text = String::new();
@@ -131,13 +184,11 @@ pub fn answer(mut request: tiny_http::Request, control: Option<ControlClient>) {
                         serde_json::from_str::<ReloadBody>(&text).map_err(|e| e.to_string())
                     });
                 match parsed {
-                    Err(e) => (400, message_body(&format!("not a reload body: {e}"))),
+                    Err(e) => (400, message_body(&format!("not a version body: {e}")), None),
                     Ok(ReloadBody { source }) => {
-                        let reply = control.ask(ControlRequest::Reload {
-                            branch: MAIN_BRANCH.to_string(),
-                            code: source,
-                        });
-                        (reply.status, reply_body(&reply))
+                        let reply = control.ask(verb.request(source));
+                        let body = reply_body(&reply);
+                        (reply.status, body, reply.sent)
                     }
                 }
             }
@@ -150,8 +201,9 @@ pub fn answer(mut request: tiny_http::Request, control: Option<ControlClient>) {
         .with_status_code(status)
         .with_header(content_type);
     if let Err(e) = request.respond(response) {
-        eprintln!("cambra: responding to a reload failed: {e}");
+        eprintln!("cambra: responding to a {verb:?} failed: {e}");
     }
+    drop(sent);
 }
 
 #[cfg(test)]
@@ -223,6 +275,13 @@ mod tests {
                 "{content_type:?}"
             );
         }
+    }
+
+    #[test]
+    fn each_verb_has_its_route() {
+        assert_eq!(Verb::at("/api/reload"), Some(Verb::Reload));
+        assert_eq!(Verb::at("/api/restart"), Some(Verb::Restart));
+        assert_eq!(Verb::at("/api/snapshot"), None);
     }
 
     #[test]
