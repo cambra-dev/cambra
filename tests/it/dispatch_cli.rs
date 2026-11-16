@@ -1,5 +1,6 @@
-//! The binary's dispatched run (`CAMBRA_DISPATCH`): a pure program prints what pull mode prints,
-//! and a program the planner refuses says so and runs in pull mode.
+//! The binary's dispatched run (`CAMBRA_DISPATCH`): a pure program prints what pull mode prints, a
+//! program over stdin prints each line's answer as the line arrives, and a product of stdin
+//! with a static collection runs dispatched.
 
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
@@ -12,8 +13,13 @@ fn run(name: &str, source: &str, dispatch: &str) -> Output {
     run_reading(name, source, dispatch, "")
 }
 
-/// [`run`] with `input` on the binary's stdin.
+/// [`run`] with `input` on the binary's stdin, read from a file.
 fn run_reading(name: &str, source: &str, dispatch: &str, input: &str) -> Output {
+    run_with(name, source, dispatch, None, input)
+}
+
+/// [`run_reading`] with `CAMBRA_MORSEL_ROWS` set to `rows`, where it is `Some`.
+fn run_with(name: &str, source: &str, dispatch: &str, rows: Option<&str>, input: &str) -> Output {
     let dir = std::env::temp_dir().join(format!(
         "cambra-dispatch-cli-{}-{name}-{dispatch}",
         std::process::id()
@@ -21,22 +27,18 @@ fn run_reading(name: &str, source: &str, dispatch: &str, input: &str) -> Output 
     std::fs::create_dir_all(&dir).expect("the temporary directory is writable");
     let path = dir.join(format!("{name}.cambra"));
     std::fs::write(&path, source).expect("the program file is writable");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cambra"))
-        .arg(&path)
-        .env("CAMBRA_DISPATCH", dispatch)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the binary runs");
-    child
-        .stdin
-        .take()
-        .expect("the binary's stdin is piped")
-        .write_all(input.as_bytes())
-        .expect("the binary takes its input");
-    let output = child
-        .wait_with_output()
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cambra"));
+    command.arg(&path).env("CAMBRA_DISPATCH", dispatch);
+    if let Some(rows) = rows {
+        command.env("CAMBRA_MORSEL_ROWS", rows);
+    }
+    // Stdin is a file holding the whole input, so the binary's stdin reader can read it to its
+    // end, past the end of input, before the run first polls it: both modes see one delivery.
+    let input_path = dir.join("input");
+    std::fs::write(&input_path, input).expect("the input file is writable");
+    let output = command
+        .stdin(std::fs::File::open(&input_path).expect("the input file is readable"))
+        .output()
         .expect("the binary runs to its end");
     std::fs::remove_dir_all(&dir).expect("the temporary directory is removable");
     assert!(
@@ -73,45 +75,153 @@ fn a_pure_program_prints_what_pull_mode_prints(#[case] name: &str, #[case] sourc
     );
 }
 
-/// A program the planner refuses runs in pull mode, after a note naming the refusal.
-#[test]
-fn a_refused_program_runs_in_pull_mode() {
-    // A pipeline's reader that also reads a live source is refused: the sum reads the let-bound
-    // list's sum, a pipeline, beside the lines of stdin.
-    let source = indoc! {"
-        xs = [1, 2]
-        sum([x + sum(xs) for x in [1 for line in stdin()]])
-    "};
-    let input = "a\nb\n";
-    let pulled = run_reading("a_refused_program", source, "0", input);
-    let dispatched = run_reading("a_refused_program", source, "1", input);
-    assert_eq!(dispatched.stdout, pulled.stdout);
-    let stderr = String::from_utf8_lossy(&dispatched.stderr);
+/// A pure collection cut into several morsels prints what pull mode prints: the `main` output
+/// merges the answers of its packages and hands over one answer at its finish.
+#[rstest::rstest]
+#[case::at_morsels_of_one_row("at_one_row", "[x * 10 for x in [1, 2, 3]]\n".to_string(), Some("1"))]
+#[case::over_more_than_one_morsel(
+    "over_one_morsel",
+    format!(
+        "[x * 10 for x in [{}]]\n",
+        (0..1100).map(|x| x.to_string()).collect::<Vec<_>>().join(", ")
+    ),
+    None
+)]
+fn a_collection_in_several_morsels_prints_what_pull_mode_prints(
+    #[case] name: &str,
+    #[case] source: String,
+    #[case] rows: Option<&str>,
+) {
+    let pulled = run_with(name, &source, "0", rows, "");
+    let dispatched = run_with(name, &source, "1", rows, "");
+    assert_eq!(
+        String::from_utf8_lossy(&dispatched.stdout),
+        String::from_utf8_lossy(&pulled.stdout),
+        "{name}: the dispatched run prints what pull mode prints"
+    );
     assert!(
-        stderr.contains("CAMBRA_DISPATCH: ") && stderr.contains("running in pull mode"),
-        "the refusal is noted: {stderr}"
+        !String::from_utf8_lossy(&dispatched.stderr).contains("running in pull mode"),
+        "{name} runs dispatched: {}",
+        String::from_utf8_lossy(&dispatched.stderr)
     );
 }
 
-/// A pure program that reads stdin, which the planner refuses since no push reaches the driver's
-/// consumer at its `main` output, runs in pull mode in the context the dispatched run compiled it
-/// in: a second compile would open a second stdin reader, and the first would take the input.
+/// A live source paired with a static collection runs through the dispatcher.
 #[test]
-fn a_refused_program_reading_stdin_takes_its_input() {
+fn a_live_product_runs_dispatched() {
+    let source = "sum([1 for line in stdin() for s in [1, 2]])\n";
+    let input = "a\nb\n";
+    let pulled = run_reading("a_live_product", source, "0", input);
+    let dispatched = run_reading("a_live_product", source, "1", input);
+    assert_eq!(dispatched.stdout, pulled.stdout);
+    let stderr = String::from_utf8_lossy(&dispatched.stderr);
+    assert!(
+        !stderr.contains("running in pull mode"),
+        "the product runs dispatched: {stderr}"
+    );
+}
+
+/// A map over stdin at the `main` output prints each line's answer before the next line arrives,
+/// dispatched as in pull mode: each line is written to the binary's stdin once the answer to the
+/// line before it is printed.
+#[rstest::rstest]
+fn a_map_over_stdin_prints_each_line_as_it_arrives(#[values("0", "1")] dispatch: &str) {
+    use std::io::{BufRead, BufReader};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
     let source = "[\"> \" + line for line in stdin()]\n";
-    let input = "a\nb\nc\n";
-    let pulled = run_reading("stdin_echo", source, "0", input);
-    let dispatched = run_reading("stdin_echo", source, "1", input);
-    let echoed = |output: &Output| {
-        String::from_utf8_lossy(&output.stdout)
-            .matches("\"> ")
-            .count()
-    };
-    assert_eq!(echoed(&pulled), 3, "pull mode echoes every line");
+    let dir = std::env::temp_dir().join(format!(
+        "cambra-dispatch-cli-{}-stdin-stream-{dispatch}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("the temporary directory is writable");
+    let path = dir.join("stream.cambra");
+    std::fs::write(&path, source).expect("the program file is writable");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cambra"))
+        .arg(&path)
+        .env("CAMBRA_DISPATCH", dispatch)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the binary runs");
+    // The printed strings, one per line of the tiles' `Debug` rendering that holds one.
+    let stdout = child.stdout.take().expect("the binary's stdout is piped");
+    let (printed, strings) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let line = line.expect("the binary prints text");
+            if let Some(string) = line.trim().strip_suffix(',')
+                && let Some(string) = string.strip_prefix('"')
+                && let Some(string) = string.strip_suffix('"')
+                && printed.send(string.to_string()).is_err()
+            {
+                return;
+            }
+        }
+    });
+    let mut stdin = child.stdin.take().expect("the binary's stdin is piped");
+    for line in ["a", "b", "c"] {
+        writeln!(stdin, "{line}").expect("the binary takes its input");
+        stdin.flush().expect("the line reaches the binary");
+        let answer = strings
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap_or_else(|_| panic!("the answer to {line:?} prints within 20 s"));
+        assert_eq!(
+            answer,
+            format!("> {line}"),
+            "the answer to {line:?}, before the next line"
+        );
+    }
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .expect("the binary runs to its end");
+    // The reader has sent every string the binary printed once it has read stdout to its end.
+    reader.join().expect("the reader reads stdout to its end");
+    std::fs::remove_dir_all(&dir).expect("the temporary directory is removable");
+    assert!(
+        output.status.success(),
+        "the binary exits once stdin closes"
+    );
     assert_eq!(
-        echoed(&dispatched),
-        3,
-        "the refused program echoes every line"
+        strings.try_iter().collect::<Vec<_>>(),
+        Vec::<String>::new(),
+        "nothing prints after the last answer"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("running in pull mode"),
+        "the program runs dispatched: {stderr}"
+    );
+}
+
+/// A program over stdin at the `main` output prints what pull mode prints, dispatched, the last
+/// terminal answer included.
+#[rstest::rstest]
+#[case::a_map("stdin_map", "[\"> \" + line for line in stdin()]\n")]
+#[case::a_filter("stdin_filter", "[line for line in stdin() if line != \"b\"]\n")]
+#[case::a_sum("stdin_sum", "sum([1 for line in stdin()])\n")]
+#[case::a_loop("stdin_loop", indoc! {"
+    count := 0
+    for line in stdin():
+        count += 1
+    count
+"})]
+fn a_program_over_stdin_prints_what_pull_mode_prints(#[case] name: &str, #[case] source: &str) {
+    let input = "a\nb\nc\n";
+    let pulled = run_reading(name, source, "0", input);
+    let dispatched = run_reading(name, source, "1", input);
+    assert_eq!(
+        String::from_utf8_lossy(&dispatched.stdout),
+        String::from_utf8_lossy(&pulled.stdout),
+        "{name}: the dispatched run prints what pull mode prints"
+    );
+    let stderr = String::from_utf8_lossy(&dispatched.stderr);
+    assert!(
+        !stderr.contains("running in pull mode"),
+        "{name} runs dispatched: {stderr}"
     );
 }
 

@@ -188,6 +188,53 @@ impl TileGuard {
         }
     }
 
+    /// The keys of the outermost level this guard names any part of: a `Domain` arm names its
+    /// keys, a `Codomain` arm the keys its path qualifies, or every key where a level beneath the
+    /// outermost names no path, and a cell's guard (`Scalar`, `Aggregation`) beneath a level the
+    /// keys its rows' paths qualify. A guard of no collection names every key, and an empty
+    /// guard none.
+    ///
+    /// What a reader of a row beneath its outermost keys reads again whole: every chain can be
+    /// pulled at its outermost keys (`TileProducer::restates`).
+    pub fn touched_keys(&self) -> Predicate {
+        // The outermost keys `keys`, the keys of a level `depth` levels beneath the outermost,
+        // reach: through the paths that qualify them, or all of them where a level names no path.
+        fn outermost(keys: &Predicate, depth: usize) -> Predicate {
+            match (keys, depth) {
+                (Predicate::False, _) => Predicate::False,
+                (keys, 0) => keys.clone(),
+                (Predicate::Qualified { enclosing, .. }, depth) => outermost(enclosing, depth - 1),
+                (Predicate::Or(arms), depth) => arms.iter().fold(Predicate::False, |acc, arm| {
+                    acc.union(&outermost(arm, depth))
+                }),
+                _ => Predicate::True,
+            }
+        }
+        fn touched(guard: &TileGuard, depth: usize) -> Predicate {
+            match guard {
+                TileGuard::Function(FunctionGuard::Domain(keys)) => outermost(keys, depth),
+                TileGuard::Function(FunctionGuard::Codomain(inner)) => touched(inner, depth + 1),
+                TileGuard::Or(arms) => arms
+                    .iter()
+                    .fold(Predicate::False, |acc, arm| acc.union(&touched(arm, depth))),
+                TileGuard::Record(fields) => {
+                    fields.values().fold(Predicate::False, |acc, field| {
+                        acc.union(&touched(field, depth))
+                    })
+                }
+                // A cell beneath a level is named by the paths of that level's rows.
+                TileGuard::Scalar(rows) | TileGuard::Aggregation(rows) => match depth {
+                    0 => match rows.is_false() {
+                        true => Predicate::False,
+                        false => Predicate::True,
+                    },
+                    depth => outermost(rows, depth - 1),
+                },
+            }
+        }
+        touched(self, 0)
+    }
+
     /// Whether any predicate constrains an enclosing path. `Tile::remove_guarded` uses this
     /// to avoid constructing paths when the guard can be evaluated against keys alone.
     pub fn names_a_path(&self) -> bool {
@@ -1101,6 +1148,33 @@ mod tests {
 
     fn name(tag: &str) -> FieldKey {
         FieldKey::Name(tag.into())
+    }
+
+    /// The outermost keys a guard touches: its domain arm's keys, the keys its codomain arm's path
+    /// qualifies, every key where a codomain arm names no path, the rows a record's cell names, and
+    /// no key for an empty guard.
+    #[test]
+    fn touched_keys_are_the_outermost_keys_a_guard_names_any_part_of() {
+        let point = |key: u64| Predicate::point(Value::UInt(key));
+        let beneath = |keys: Predicate| {
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+                FunctionGuard::Domain(keys),
+            ))))
+        };
+        let qualified = beneath(Predicate::qualified(point(1), point(5)));
+        assert_eq!(qualified.touched_keys(), point(1));
+        let unqualified = beneath(point(5));
+        assert_eq!(unqualified.touched_keys(), Predicate::True);
+        let both = TileGuard::Or(vec![
+            TileGuard::Function(FunctionGuard::Domain(point(0))),
+            qualified,
+        ]);
+        assert_eq!(both.touched_keys(), point(0).union(&point(1)));
+        let cell = TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Record(
+            HashMap::from([(SmolStr::from("a"), TileGuard::Scalar(point(1)))]),
+        ))));
+        assert_eq!(cell.touched_keys(), point(1));
+        assert_eq!(beneath(Predicate::False).touched_keys(), Predicate::False);
     }
 
     /// A guard naming every named tag of the domain whole closes to the universal guard, and one

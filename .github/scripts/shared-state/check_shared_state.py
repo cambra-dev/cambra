@@ -133,6 +133,10 @@ EXPECTED_EXCEPTIONS = [
     # decided pushes read and write on any thread. What crosses it is guards naming regions, never
     # a tile.
     ("src/interpreter/dispatcher.rs", "cell of `Vec<Parked>`"),
+    # Where the entry in front of a loop's drive records a decided push of the drive's source: the
+    # scope's pipeline and the store's input (`DecidedTarget`), set once when the run is planned.
+    # What crosses it is a pipeline id and a tiling, never a tile.
+    ("src/interpreter/dispatcher.rs", "shared cell of `Option<(PipelineId, Tiling)>`"),
     # The lock that orders a dispatcher's seals and closes; it guards no data.
     ("src/interpreter/dispatcher.rs", "cell of `()`"),
     # The lock a dispatcher's sleeping worker waits under; it guards no data.
