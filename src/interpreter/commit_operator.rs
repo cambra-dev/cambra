@@ -3062,6 +3062,11 @@ impl TileProducer for StoreValueStreamProducer {
         visit("store", &*self.store_producer);
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("store", &mut *self.store_producer);
+    }
+
     fn base(&self) -> &ProducerBase {
         &self.base
     }
@@ -3286,6 +3291,11 @@ struct StoreFinalReadProducer {
 impl TileProducer for StoreFinalReadProducer {
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("store", &*self.store_producer);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("store", &mut *self.store_producer);
     }
 
     fn base(&self) -> &ProducerBase {
@@ -3697,6 +3707,11 @@ impl StoreDenseReadProducer {
 impl TileProducer for StoreDenseReadProducer {
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("store", &*self.store_producer);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("store", &mut *self.store_producer);
     }
 
     impl_producer_base!();
