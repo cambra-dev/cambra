@@ -35,11 +35,11 @@ pub(crate) fn stdin_across_reload(
 
     let mut launched = launch_under_control(program);
     let control = launched.control;
-    let v2 = launched.program.dir.join("v2.cambra");
+    let v2 = launched.spawned.program.dir.join("v2.cambra");
     std::fs::write(&v2, reloaded).expect("write v2");
-    let mut input = launched.input.take().expect("piped stdin");
-    let collected = launched.collected.clone();
-    let reader = launched.reader.take().expect("reader thread");
+    let mut input = launched.spawned.input.take().expect("piped stdin");
+    let collected = launched.spawned.collected.clone();
+    let reader = launched.spawned.reader.take().expect("reader thread");
 
     writeln!(input, "{before}").expect("write before");
     input.flush().expect("flush");
@@ -59,19 +59,21 @@ pub(crate) fn stdin_across_reload(
     thread::sleep(Duration::from_millis(400));
     drop(input);
 
-    launched.program.wait_for_exit(Duration::from_secs(10));
+    launched
+        .spawned
+        .program
+        .wait_for_exit(Duration::from_secs(10));
     reader.join().expect("reader thread");
     let text = collected.lock().unwrap().clone();
     (reply, text)
 }
 
-/// A program running under `--control`, with its control port already answering.
+/// A spawned `cambra` binary, with its `stdin` held open and its `stdout`
+/// collected.
 ///
-/// Split out of [`stdin_across_reload`] because a test that only asks the control
-/// port a question needs the launch and none of the feeding.
-pub(crate) struct Launched {
+/// Every launch starts here. [`Launched`] adds a control port to it.
+pub(crate) struct Spawned {
     pub(crate) program: RunningProgram,
-    pub(crate) control: u16,
     /// The program's `stdin`, for a test that feeds it. `None` once taken.
     pub(crate) input: Option<std::process::ChildStdin>,
     /// Every line the program has written, accumulated by [`reader`](Self::reader).
@@ -79,7 +81,7 @@ pub(crate) struct Launched {
     pub(crate) reader: Option<thread::JoinHandle<()>>,
 }
 
-impl Launched {
+impl Spawned {
     /// Wait until the program has written every one of `needles`, failing the
     /// test after `within`.
     pub(crate) fn wait_for_output(&self, needles: &[&str], within: Duration) {
@@ -96,7 +98,18 @@ impl Launched {
             thread::sleep(Duration::from_millis(20));
         }
     }
+}
 
+/// A program running under `--control`, with its control port already answering.
+///
+/// Split out of [`stdin_across_reload`] because a test that only asks the control
+/// port a question needs the launch and none of the feeding.
+pub(crate) struct Launched {
+    pub(crate) spawned: Spawned,
+    pub(crate) control: u16,
+}
+
+impl Launched {
     /// Wait until the program has finished, and return the control port's whole
     /// response to the first request it no longer serves.
     ///
@@ -108,7 +121,7 @@ impl Launched {
     pub(crate) fn wait_until_finished(&self, within: Duration) -> String {
         use std::io::{Read, Write};
 
-        self.wait_for_output(&["Got value"], within);
+        self.spawned.wait_for_output(&["Got value"], within);
         let control = self.control;
         let deadline = Instant::now() + within;
         loop {
@@ -148,19 +161,37 @@ pub(crate) fn launch_under_control(program: &str) -> Launched {
 
 /// [`launch_under_control`], passing `extra` to the binary as well.
 pub(crate) fn launch_under_control_with(program: &str, extra: &[String]) -> Launched {
+    let control = reserve_test_port();
+    let mut args = vec![format!("--control={control}")];
+    args.extend_from_slice(extra);
+    let spawned = launch_with(program, &args);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", control)).is_err() {
+        assert!(Instant::now() < deadline, "control port never opened");
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    Launched { spawned, control }
+}
+
+/// Spawn `program` as the `cambra` binary with `args`, from a scratch directory
+/// of its own.
+pub(crate) fn launch_with(program: &str, args: &[String]) -> Spawned {
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
 
-    let control = reserve_test_port();
-    let dir = std::env::temp_dir().join(format!("cambra-live-{control}"));
+    // The process id keeps two test binaries apart, the counter two tests in one.
+    static LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let launch = LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("cambra-live-{}-{launch}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let v1 = dir.join("v1.cambra");
     std::fs::write(&v1, program).expect("write v1");
 
     let mut program = RunningProgram {
         child: Command::new(env!("CARGO_BIN_EXE_cambra"))
-            .arg(format!("--control={control}"))
-            .args(extra)
+            .args(args)
             .arg(&v1)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -181,15 +212,8 @@ pub(crate) fn launch_under_control_with(program: &str, extra: &[String]) -> Laun
         }
     });
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while std::net::TcpStream::connect(("127.0.0.1", control)).is_err() {
-        assert!(Instant::now() < deadline, "control port never opened");
-        thread::sleep(Duration::from_millis(50));
-    }
-
-    Launched {
+    Spawned {
         program,
-        control,
         input: Some(input),
         collected,
         reader: Some(reader),

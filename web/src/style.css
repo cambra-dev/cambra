@@ -1020,3 +1020,34 @@ button.live-group-head:hover {
   color: var(--fg-muted);
   padding: 2px 4px;
 }
+
+/* An editable source pane: the editor above, its status strip below. The editor
+   scrolls itself, so the body does not. */
+.panel-body.editable {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.panel.source .panel-body.editable .cm-editor {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: auto;
+}
+.edit-status {
+  flex: 0 0 auto;
+  padding: 0.25rem 0.9rem;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-muted);
+  border-top: 1px solid var(--border);
+}
+.edit-status[data-kind="edited"],
+.edit-status[data-kind="busy"] {
+  color: var(--fg);
+}
+.edit-status[data-kind="ok"] {
+  color: var(--type);
+}
+.edit-status[data-kind="error"] {
+  color: var(--err);
+}

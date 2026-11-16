@@ -1088,12 +1088,14 @@ fn the_driver_pulls_every_branch_and_exits_when_all_have_finished() {
 
     let mut launched = launch_under_control("[\"A\" + line for line in stdin()]\n");
     let control = launched.control;
-    let mut input = launched.input.take().expect("piped stdin");
-    let reader = launched.reader.take().expect("reader thread");
+    let mut input = launched.spawned.input.take().expect("piped stdin");
+    let reader = launched.spawned.reader.take().expect("reader thread");
 
     writeln!(input, "L1").expect("write");
     input.flush().expect("flush");
-    launched.wait_for_output(&["AL1"], Duration::from_secs(10));
+    launched
+        .spawned
+        .wait_for_output(&["AL1"], Duration::from_secs(10));
 
     let body = "[\"B\" + line for line in stdin()]\n";
     let reply = raw_http(
@@ -1108,12 +1110,17 @@ fn the_driver_pulls_every_branch_and_exits_when_all_have_finished() {
 
     writeln!(input, "L2").expect("write");
     input.flush().expect("flush");
-    launched.wait_for_output(&["AL2", "BL2"], Duration::from_secs(10));
+    launched
+        .spawned
+        .wait_for_output(&["AL2", "BL2"], Duration::from_secs(10));
     drop(input);
 
-    launched.program.wait_for_exit(Duration::from_secs(10));
+    launched
+        .spawned
+        .program
+        .wait_for_exit(Duration::from_secs(10));
     reader.join().expect("reader thread");
-    let out = launched.collected.lock().unwrap().clone();
+    let out = launched.spawned.collected.lock().unwrap().clone();
     let from_b: String = out
         .split("Got value")
         .filter(|chunk| chunk.starts_with(" from b:"))
