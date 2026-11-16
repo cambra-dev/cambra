@@ -96,6 +96,45 @@ impl Launched {
             thread::sleep(Duration::from_millis(20));
         }
     }
+
+    /// Wait until the program has finished, and return the control port's whole
+    /// response to the first request it no longer serves.
+    ///
+    /// A program that ends prints its value and then leaves the driver loop, and
+    /// the control port answers `200` until it has. So this waits for the value,
+    /// then repeats `GET /branches` until the status is something else, failing
+    /// the test after `within`. Each request has a read timeout: a control port
+    /// that never answers fails the test rather than hanging it.
+    pub(crate) fn wait_until_finished(&self, within: Duration) -> String {
+        use std::io::{Read, Write};
+
+        self.wait_for_output(&["Got value"], within);
+        let control = self.control;
+        let deadline = Instant::now() + within;
+        loop {
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", control)).expect("connect");
+            stream
+                .set_read_timeout(Some(within))
+                .expect("a read timeout");
+            write!(
+                stream,
+                "GET /branches HTTP/1.1\r\nHost: 127.0.0.1:{control}\r\nConnection: close\r\n\r\n"
+            )
+            .expect("write the request");
+            let mut response = String::new();
+            stream
+                .read_to_string(&mut response)
+                .expect("the control port answers rather than hanging");
+            if !response.starts_with("HTTP/1.1 200") {
+                return response;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the program never finished: the control port still serves"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
 /// Spawn `program` under `--control` on a reserved port and wait for that port to
