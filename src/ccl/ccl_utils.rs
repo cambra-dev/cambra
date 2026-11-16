@@ -958,6 +958,278 @@ fn read_eliminated_match(argument: &Expr, ty: &Type, fuel: &mut usize) -> Option
     )
 }
 
+/// Why the legs of a [`TypedExprNode::DisjointJoin`] are not disjoint by how they were built,
+/// or `None` where they are. A flat union keeps no record of which leg delivered a key, so a
+/// key two legs deliver in different pulls is lost: its release reaches every leg
+/// (`UnionOperator`). Each construction of one leaves its legs disjoint by a shape this reads.
+///
+/// - **Gated legs.** A value `Case`'s fan-out filters one input (`π̂ᵢ ▷ filter_values ≫ 𝑒ᵢ`),
+///   and a realized conditional restricts one collection (`𝑥 ▷ (π̂ᵢ ▷ restrict) ≫ 𝑒ᵢ`), by
+///   first-match gates `π̂ᵢ = 𝑔ᵢ ∧ ¬𝑔₀ ∧ … ∧ ¬𝑔ᵢ₋₁` ([`synthesize_arm_predicate`]), or by a
+///   conjunction of one such gate per conditional for a realized product. Two legs are
+///   disjoint where one gate has a conjunct the other negates. A leg whose gate folded to
+///   `true` has none, and one whose gate folded to `false` holds no row. A gate of one value
+///   for the whole collection (`𝑔 ▷ const`) keeps every row or none, so such legs may restrict
+///   different collections.
+/// - **Projected legs.** A scrutinee-`Case`'s fan-out projects a distinct tag of one scrutinee
+///   in each leg ([`ProjectedTag`]). A leg that projects a tag the scrutinee's closed type does
+///   not carry holds no row, and the legs beside it need no tag of their own.
+pub(crate) fn disjoint_join_gap(legs: &[Expr]) -> Option<String> {
+    let projections: Vec<Option<ProjectedTag<'_>>> = legs.iter().map(projected_tag).collect();
+    let live: Vec<usize> = (0..legs.len())
+        .filter(|&i| !projections[i].as_ref().is_some_and(|p| p.absent))
+        .collect();
+    if live.len() <= 1 {
+        return None;
+    }
+    let projected = live.iter().all(|&i| projections[i].is_some());
+    let projection_gap = projected
+        .then(|| projection_gap(&projections, &live))
+        .flatten();
+    if projected && projection_gap.is_none() {
+        return None;
+    }
+    // Legs that gate by first-match are disjoint by their gates, whatever they also project.
+    let gate_gap = gate_gap(legs, &live)?;
+    Some(projection_gap.unwrap_or(gate_gap))
+}
+
+/// Why the live legs, each of which projects a tag, project no distinct tags of one scrutinee.
+fn projection_gap(projections: &[Option<ProjectedTag<'_>>], live: &[usize]) -> Option<String> {
+    let first = projections[live[0]]
+        .as_ref()
+        .expect("every live leg projects");
+    let mut tags: Vec<&FieldKey> = Vec::with_capacity(live.len());
+    for &i in live {
+        let projection = projections[i].as_ref().expect("every live leg projects");
+        let same_scrutinee = projection.scrutinee.len() == first.scrutinee.len()
+            && projection
+                .scrutinee
+                .iter()
+                .zip(&first.scrutinee)
+                .all(|(a, b)| crate::ccl::eq_term_modulo_ty_slots(a, b));
+        if !same_scrutinee {
+            return Some(format!(
+                "legs {} and {i} project tags of different scrutinees",
+                live[0]
+            ));
+        }
+        if tags.contains(&projection.tag) {
+            return Some(format!("two legs project the tag {:?}", projection.tag));
+        }
+        tags.push(projection.tag);
+    }
+    None
+}
+
+/// Why the gates of the live legs do not each exclude the others.
+fn gate_gap(legs: &[Expr], live: &[usize]) -> Option<String> {
+    let mut collection: Option<&Expr> = None;
+    let mut kinds = (false, false);
+    let mut fuel = usize::MAX;
+    let element = Expr::var("disjoint_join_element").with_ty(Type::Hole);
+    let mut gated: Vec<(usize, Vec<Expr>)> = Vec::with_capacity(live.len());
+    for &i in live {
+        let gate = match gate_of(&legs[i]) {
+            Gate::None => None,
+            Gate::Filter(gate) => {
+                kinds.0 = true;
+                Some(gate)
+            }
+            Gate::Restrict {
+                collection: of,
+                gate,
+            } => {
+                kinds.1 = true;
+                let by_value = matches!(&gate.node, TypedExprNode::Apply { function, .. }
+                    if matches!(function.node, TypedExprNode::Builtin(Builtin::Const)));
+                if !by_value {
+                    match collection {
+                        Some(earlier) if !crate::ccl::eq_term_modulo_ty_slots(earlier, of) => {
+                            return Some(format!(
+                                "leg {i} restricts another collection than a leg before it"
+                            ));
+                        }
+                        _ => collection = Some(of),
+                    }
+                }
+                Some(gate)
+            }
+        };
+        let guard = match gate {
+            None => Expr::throwaway(TypedExprNode::Lit(Lit::Bool(true)))
+                .with_ty(Type::Base(BaseType::Bool)),
+            Some(gate) => normalize(
+                applied(
+                    element.clone_preserving_ids(),
+                    gate.clone_preserving_ids(),
+                    Type::Base(BaseType::Bool),
+                    &mut fuel,
+                ),
+                &mut fuel,
+            ),
+        };
+        if matches!(guard.node, TypedExprNode::Lit(Lit::Bool(false))) {
+            continue;
+        }
+        let mut conjuncts = Vec::new();
+        conjuncts_of(guard, &mut conjuncts);
+        gated.push((i, conjuncts));
+    }
+    if kinds.0 && kinds.1 {
+        return Some("the legs mix `filter_values` and `restrict` gates".to_owned());
+    }
+    for (at, (i, left)) in gated.iter().enumerate() {
+        for (j, right) in &gated[at + 1..] {
+            if !excludes(left, right) && !excludes(right, left) {
+                return Some(format!(
+                    "the gates of legs {i} and {j} hold no conjunct one negates of the other"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// The conjuncts of `guard`, its `and`s flattened.
+fn conjuncts_of(guard: Expr, into: &mut Vec<Expr>) {
+    match guard.node {
+        TypedExprNode::BinOp {
+            left,
+            op: BinOpKind::BoolLogic(LogicKind::And),
+            right,
+        } => {
+            conjuncts_of(*left, into);
+            conjuncts_of(*right, into);
+        }
+        _ => into.push(guard),
+    }
+}
+
+/// Whether some conjunct of `negating` negates a conjunction of conjuncts of `negated`: then
+/// `negated` implies what `negating` denies. An `elif` chain's earlier guard can itself be a
+/// conjunction, so the negation names several conjuncts at once.
+fn excludes(negating: &[Expr], negated: &[Expr]) -> bool {
+    negating.iter().any(|conjunct| {
+        let TypedExprNode::UnaryOp(UnaryOpKind::Not, inner) = &conjunct.node else {
+            return false;
+        };
+        let mut denied = Vec::new();
+        conjuncts_of(inner.clone_preserving_ids(), &mut denied);
+        denied.iter().all(|denied| {
+            negated
+                .iter()
+                .any(|other| crate::ccl::eq_term_modulo_ty_slots(denied, other))
+        })
+    })
+}
+
+/// The tag a leg of a scrutinee-`Case`'s fan-out projects, the steps that compute its
+/// scrutinee, and whether the scrutinee's closed type carries no such tag.
+struct ProjectedTag<'e> {
+    scrutinee: Vec<&'e Expr>,
+    tag: &'e FieldKey,
+    absent: bool,
+}
+
+/// The [`ProjectedTag`] of `leg`; `None` for a leg that projects no tag. A projection narrows
+/// the whole leg from a step of its composition or from a component of a `zip` that is one,
+/// since a `zip` inner-joins its components on their keys: the arm that reads the outer binder,
+/// `⟨id, 𝑠 ≫ variant_project(𝑐)⟩ ≫ 𝑒`, keeps only the keys tagged `𝑐`. The steps before such
+/// a `zip` are part of the scrutinee, since the component reads what they computed. Planning's
+/// `iterate` only narrows the keys and changes no value, so it does not change which tag a key
+/// carries, and it is no part of one.
+fn projected_tag(leg: &Expr) -> Option<ProjectedTag<'_>> {
+    let steps = composed(leg);
+    if let Some(found) = tag_in(steps) {
+        return Some(found);
+    }
+    steps.iter().enumerate().find_map(|(at, step)| {
+        let TypedExprNode::Apply { argument, function } = &step.node else {
+            return None;
+        };
+        if !matches!(function.node, TypedExprNode::Builtin(Builtin::Zip)) {
+            return None;
+        }
+        let TypedExprNode::Tuple(parts) = &argument.node else {
+            return None;
+        };
+        let mut found = parts.iter().find_map(projected_tag)?;
+        found
+            .scrutinee
+            .splice(0..0, steps[..at].iter().filter(|step| !is_iterate(step)));
+        Some(found)
+    })
+}
+
+/// The first `variant_project` among `steps`, with the steps before it.
+fn tag_in<'e>(steps: &'e [Expr]) -> Option<ProjectedTag<'e>> {
+    let at = steps.iter().position(|step| {
+        matches!(
+            step.node,
+            TypedExprNode::Builtin(Builtin::VariantProject(_))
+        )
+    })?;
+    let TypedExprNode::Builtin(Builtin::VariantProject(tag)) = &steps[at].node else {
+        unreachable!("found as a variant projection")
+    };
+    let absent = steps[at].ty.domain().is_some_and(|scrutinee| {
+        match strip_refinements(&scrutinee).structure().as_ref() {
+            Type::Variant(arms, crate::ccl::Openness::Closed) => {
+                arms.iter().all(|(arm, _)| arm != tag)
+            }
+            _ => false,
+        }
+    });
+    Some(ProjectedTag {
+        scrutinee: steps[..at]
+            .iter()
+            .filter(|step| !is_iterate(step))
+            .collect(),
+        tag,
+        absent,
+    })
+}
+
+/// The steps of `e`: its own where it is a composition, and `e` alone otherwise.
+fn composed(e: &Expr) -> &[Expr] {
+    match &e.node {
+        TypedExprNode::Compose(steps) => steps,
+        _ => std::slice::from_ref(e),
+    }
+}
+
+/// How a leg of a disjoint join gates the rows it keeps: by `filter_values` on the input, by
+/// `restrict` on a collection, or not at all.
+enum Gate<'e> {
+    Filter(&'e Expr),
+    Restrict {
+        collection: &'e Expr,
+        gate: &'e Expr,
+    },
+    None,
+}
+
+fn gate_of(leg: &Expr) -> Gate<'_> {
+    let Some(head) = composed(leg).first() else {
+        return Gate::None;
+    };
+    let TypedExprNode::Apply { argument, function } = &head.node else {
+        return Gate::None;
+    };
+    match &function.node {
+        TypedExprNode::Builtin(Builtin::FilterValues) => Gate::Filter(argument),
+        TypedExprNode::Apply {
+            argument: gate,
+            function: restrict,
+        } if matches!(restrict.node, TypedExprNode::Builtin(Builtin::Restrict)) => Gate::Restrict {
+            collection: argument,
+            gate,
+        },
+        _ => Gate::None,
+    }
+}
+
 /// `argument ▷ (⊔ᵢ (π̂ᵢ ▷ filter_values ≫ 𝑒ᵢ))` read back as the value `Case` lambda elimination
 /// built it from, `{ 𝑔ᵢ → argument ▷ 𝑒ᵢ }`; `None` for any other disjoint join.
 ///
@@ -3480,6 +3752,141 @@ mod tests {
                 if matches!(function.node, TypedExprNode::DisjointJoin(_))),
             "{}",
             crate::ccl::symbolic::symbolic(&fanned)
+        );
+    }
+
+    /// The legs of a disjoint join, as `fan_out` builds it.
+    fn legs_of(join: &Expr) -> &[Expr] {
+        match &join.node {
+            TypedExprNode::Apply { function, .. } => match &function.node {
+                TypedExprNode::DisjointJoin(legs) => legs,
+                other => panic!("a disjoint join, got {other:?}"),
+            },
+            other => panic!("an application of a disjoint join, got {other:?}"),
+        }
+    }
+
+    /// A value `Case`'s fan-out gates its legs first-match, so they are disjoint by
+    /// construction.
+    #[test]
+    fn a_case_fan_out_is_disjoint_by_construction() {
+        let join = fan_out(Expr::lit(Lit::Unit));
+        assert_eq!(disjoint_join_gap(legs_of(&join)), None);
+    }
+
+    /// Two filters whose second gate is not the first-match conjunction over the first are not
+    /// disjoint by construction, whatever rows they keep.
+    #[test]
+    fn unrelated_filters_are_not_disjoint_by_construction() {
+        let join = fan_out(Expr::apply(
+            Expr::lit(Lit::Bool(true)),
+            Expr::builtin(Builtin::Const),
+        ));
+        let gap = disjoint_join_gap(legs_of(&join));
+        assert!(
+            gap.as_deref()
+                .is_some_and(|gap| gap.contains("no conjunct one negates")),
+            "{gap:?}"
+        );
+    }
+
+    /// Legs that project distinct tags of one scrutinee are disjoint by construction; two that
+    /// project one tag, or tags of different scrutinees, are not.
+    #[test]
+    fn legs_projecting_tags_of_one_scrutinee_are_disjoint_by_distinct_tags() {
+        let leg = |scrutinee: &str, tag: &str| {
+            Expr::compose(vec![
+                Expr::var(scrutinee),
+                Expr::builtin(Builtin::VariantProject(FieldKey::Name(tag.into()))),
+            ])
+        };
+        assert_eq!(
+            disjoint_join_gap(&[leg("s", "some"), leg("s", "none")]),
+            None
+        );
+        assert!(
+            disjoint_join_gap(&[leg("s", "some"), leg("s", "some")])
+                .is_some_and(|gap| gap.starts_with("two legs project the tag"))
+        );
+        assert!(
+            disjoint_join_gap(&[leg("s", "some"), leg("t", "none")])
+                .is_some_and(|gap| gap.contains("different scrutinees"))
+        );
+    }
+
+    /// A realized conditional's legs restrict by one value each, first-match, so they may
+    /// restrict different collections. A leg whose gate folded to `false` holds no row and
+    /// joins any other. A per-row gate over another collection does not.
+    #[test]
+    fn restricted_legs_are_disjoint_by_their_values() {
+        let by_value = |value: Expr| Expr::apply(value, Expr::builtin(Builtin::Const));
+        let leg = |collection: &str, gate: Expr| {
+            Expr::compose(vec![
+                Expr::apply(
+                    Expr::var(collection),
+                    Expr::apply(gate, Expr::builtin(Builtin::Restrict)),
+                ),
+                Expr::builtin(Builtin::Id),
+            ])
+        };
+        let c = || Expr::var("c");
+        let not_c = Expr::apply(c(), Expr::builtin(Builtin::NotFn));
+        assert_eq!(
+            disjoint_join_gap(&[leg("xs", by_value(c())), leg("ys", by_value(not_c))]),
+            None
+        );
+        let never = by_value(Expr::lit(Lit::Bool(false)));
+        assert_eq!(
+            disjoint_join_gap(&[leg("xs", by_value(c())), leg("xs", never)]),
+            None
+        );
+        // A realized product of two conditionals: one first-match choice of each per leg.
+        let and = |a: Expr, b: Expr| {
+            Expr::apply(
+                Expr::tuple(vec![a, b]),
+                Expr::builtin(Builtin::BinOp(BinOpKind::BoolLogic(LogicKind::And))),
+            )
+        };
+        let not = |e: Expr| Expr::apply(e, Expr::builtin(Builtin::NotFn));
+        let (a, b) = (|| Expr::var("a"), || Expr::var("b"));
+        let product = [
+            and(a(), b()),
+            and(a(), not(b())),
+            and(not(a()), b()),
+            and(not(a()), not(b())),
+        ]
+        .map(|gate| leg("xs", by_value(gate)));
+        assert_eq!(disjoint_join_gap(&product), None);
+        let per_row = Expr::builtin(Builtin::Id);
+        assert!(
+            disjoint_join_gap(&[leg("xs", per_row.clone()), leg("ys", per_row)])
+                .is_some_and(|gap| gap.contains("restricts another collection"))
+        );
+    }
+
+    /// A projection inside a `zip` narrows its leg, with the steps before the `zip` part of its
+    /// scrutinee: legs over different steps project tags of different scrutinees.
+    #[test]
+    fn a_projection_in_a_zip_reads_the_steps_before_it() {
+        let leg = |before: &str, tag: &str| {
+            Expr::compose(vec![
+                Expr::var(before),
+                Expr::apply(
+                    Expr::tuple(vec![
+                        Expr::builtin(Builtin::Id),
+                        Expr::compose(vec![
+                            Expr::proj_field("d"),
+                            Expr::builtin(Builtin::VariantProject(FieldKey::Name(tag.into()))),
+                        ]),
+                    ]),
+                    Expr::builtin(Builtin::Zip),
+                ),
+            ])
+        };
+        assert_eq!(disjoint_join_gap(&[leg("p", "a"), leg("p", "b")]), None);
+        assert!(
+            disjoint_join_gap(&[leg("p", "a"), leg("q", "b")])
+                .is_some_and(|gap| gap.contains("different scrutinees"))
         );
     }
 
