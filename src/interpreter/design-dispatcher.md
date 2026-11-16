@@ -177,10 +177,16 @@ notification routes translate it into the reader's input coordinates.
 
 Publication and admission retain separate histories. `pushed` names output already published and
 can be shared by several writer pipelines. Queue `region` names input already scheduled, including
-acknowledged packages. `parked.brought` names input already admitted, including input still parked
-and input transferring into the queue. The transfer releases the parking lock before acquiring the
-queue lock; deriving admission from those two containers would leave a duplicate-admission window.
-Repeated loop rounds bypass ordinary deduplication and remain distinct packages.
+acknowledged packages. Admission subtracts that history and the parked regions under the same
+queue lock. A cached union of currently parked guards avoids scanning the backlog on each
+arrival; releasing parked work rebuilds that union from the remaining packages. Moving a region from parking into the queue holds the lock throughout, so another
+arrival cannot admit it during the transfer. Repeated loop rounds bypass ordinary deduplication
+and remain distinct packages.
+
+Ordered pipelines claim only while the queue's in-flight map is empty. Acknowledgement records
+consumption and updates its counter before removing the entry and unlocking the next claim.
+Graph composition requires every reserved package to remain pending, so neither an in-flight nor
+an acknowledged package can enter a newly composed graph.
 
 ## A loop in rounds
 

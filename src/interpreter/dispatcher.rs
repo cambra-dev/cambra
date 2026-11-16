@@ -138,6 +138,17 @@ struct QueueState {
     in_flight: HashMap<usize, TileGuard>,
     /// Deduplication and finish need the consumed region after individual packages are removed.
     region: Option<TileGuard>,
+    /// Admission and parked-to-pending transfers share this lock with queue history.
+    parked: Vec<Parked>,
+    /// Cached union of parked guards. Admission subtracts it without scanning the backlog.
+    parked_region: Option<TileGuard>,
+}
+
+impl QueueState {
+    fn park(&mut self, morsel: Parked) {
+        grow(&mut self.parked_region, &morsel.guard);
+        self.parked.push(morsel);
+    }
 }
 
 impl Queue {
@@ -153,8 +164,12 @@ impl Queue {
     /// # Panics
     ///
     /// In a debug build, when a morsel meets the region appended before.
-    fn append(&self, pipeline: usize, morsels: &[TileGuard]) -> bool {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+    fn append_locked(
+        &self,
+        state: &mut QueueState,
+        pipeline: usize,
+        morsels: &[TileGuard],
+    ) -> bool {
         let Some(first) = self.reserve(morsels.len()) else {
             return false;
         };
@@ -180,6 +195,10 @@ impl Queue {
     /// Where the guard algebra has no exact difference of `guard` and the region ([`guard_minus`]).
     fn append_unqueued(&self, guard: &TileGuard) -> bool {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        self.append_unqueued_locked(&mut state, guard)
+    }
+
+    fn append_unqueued_locked(&self, state: &mut QueueState, guard: &TileGuard) -> bool {
         let fresh = match state.region.as_ref() {
             Some(region) => guard_minus(guard, region),
             None => guard.clone(),
@@ -198,6 +217,10 @@ impl Queue {
     /// Append a repeated read of a loop's row, including its end, as a distinct package.
     fn append_again(&self, guard: &TileGuard) -> bool {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        self.append_again_locked(&mut state, guard)
+    }
+
+    fn append_again_locked(&self, state: &mut QueueState, guard: &TileGuard) -> bool {
         let Some(index) = self.reserve(1) else {
             return false;
         };
@@ -206,21 +229,17 @@ impl Queue {
         true
     }
 
-    fn has_pending(&self) -> bool {
-        !self
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pending
-            .is_empty()
-    }
-
     /// Move the oldest pending package to in-flight while its dependencies permit the claim.
-    fn claim(&self, pipeline: usize, ready: impl FnOnce() -> bool) -> Option<WorkPackage> {
+    fn claim(
+        &self,
+        pipeline: usize,
+        ordered: bool,
+        ready: impl FnOnce() -> bool,
+    ) -> Option<WorkPackage> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         // An append publishes prerequisite work before queuing this package. Inspect dependencies
         // after observing it under the lock; the check reads counters and takes no queue lock.
-        if state.pending.is_empty() || !ready() {
+        if state.pending.is_empty() || (ordered && !state.in_flight.is_empty()) || !ready() {
             return None;
         }
         let (index, guard) = state.pending.pop_front()?;
@@ -233,11 +252,12 @@ impl Queue {
     }
 
     /// Remove a matching claim. Monotonic indices distinguish repeated reads of the same guard.
-    fn acknowledge(&self, package: &WorkPackage) -> bool {
+    fn acknowledge(&self, package: &WorkPackage, on_ack: impl FnOnce()) -> bool {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.in_flight.get(&package.index) != Some(&package.guard) {
             return false;
         }
+        on_ack();
         state.in_flight.remove(&package.index);
         true
     }
@@ -344,16 +364,9 @@ struct Parked {
     splits: bool,
 }
 
-struct ParkedState {
-    morsels: Vec<Parked>,
-    brought: Option<TileGuard>,
-}
-
 /// A pipeline's queue, progress counters, and pushed, complete and parked regions for one run.
 struct PipelineState {
     queue: Queue,
-    /// How many packages have been claimed; graph composition requires none.
-    claimed: AtomicUsize,
     phase: AtomicPhase,
     /// How many of the pipelines it reads have not finished, plus one for the close of its
     /// arrivals where it takes arrivals and reads pipelines ([`Dispatcher::take_arrivals`]).
@@ -375,14 +388,9 @@ struct PipelineState {
     complete: Mutex<Vec<Completion>>,
     /// How many of the pipeline's packages have been acknowledged.
     acknowledged: AtomicUsize,
-    /// For an ordered pipeline, whether a package of it is in flight.
-    in_flight: AtomicBool,
     /// Whether this pipeline waits for its loop's round to settle before following its reads.
     followers_held: AtomicBool,
     held: AtomicBool,
-    /// Parked regions and the union of rows already admitted by pushes.
-    // shared-state-ok: guards naming input regions, never tiles.
-    parked: Mutex<ParkedState>,
 }
 
 /// What one source of a pipeline's breaker's input has completed of that input: a pipeline it
@@ -423,20 +431,14 @@ impl PipelineState {
     fn new(reads: usize) -> Self {
         Self {
             queue: Queue::new(),
-            claimed: AtomicUsize::new(0),
             phase: AtomicPhase::new(Phase::Running),
             unfinished: AtomicUsize::new(reads),
             pushed: Mutex::new(None),
             closed: Mutex::new(false),
             complete: Mutex::new(Vec::new()),
             acknowledged: AtomicUsize::new(0),
-            in_flight: AtomicBool::new(false),
             followers_held: AtomicBool::new(false),
             held: AtomicBool::new(false),
-            parked: Mutex::new(ParkedState {
-                morsels: Vec::new(),
-                brought: None,
-            }),
         }
     }
 
@@ -465,9 +467,7 @@ pub struct Dispatcher {
     failed: AtomicBool,
     /// Advances at every change that can make a claim succeed or end the run: an append, a close,
     /// an acknowledgement that frees an ordered pipeline's next package, completes a queue or
-    /// returns credit to a limited source, a finish, and a failure. It also advances when a claim
-    /// of an ordered pipeline that found nothing finds a package queued while it looked, for a
-    /// claim that found the pipeline's flag held meanwhile.
+    /// returns credit to a limited source, a finish, and a failure.
     generation: AtomicU64,
     /// How many threads sleep in [`Dispatcher::wait`]. An advance takes the `sleep` lock only when
     /// it is not zero.
@@ -583,11 +583,15 @@ impl Dispatcher {
             "composed graphs share their morsel size"
         );
         assert!(
-            graph
-                .states
-                .iter()
-                .all(|state| state.claimed.load(Ordering::Relaxed) == 0
-                    && state.phase.load() == Phase::Running),
+            graph.states.iter_mut().all(|state| state.queue.reserved()
+                == state
+                    .queue
+                    .state
+                    .get_mut()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .pending
+                    .len()
+                && state.phase.load() == Phase::Running),
             "a graph is composed before it executes"
         );
         let offset = self.infos.len();
@@ -928,40 +932,40 @@ impl Dispatcher {
     /// then states the row complete.
     fn queue_or_park(&self, reader: usize, guard: &TileGuard, again: bool) {
         let mut parked = self.states[reader]
-            .parked
+            .queue
+            .state
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let fresh = {
-            let brought = &mut parked.brought;
-            let fresh = match (again, brought.as_ref()) {
-                (false, Some(brought)) => guard_minus(guard, brought),
-                _ => guard.clone(),
+        let fresh = if again {
+            guard.clone()
+        } else {
+            let mut fresh = match &parked.region {
+                Some(queued) => guard_minus(guard, queued),
+                None => guard.clone(),
             };
-            if fresh.is_empty() {
-                return;
+            if let Some(pending) = &parked.parked_region {
+                fresh = guard_minus(&fresh, pending);
             }
-            *brought = Some(match brought.take() {
-                Some(before) => before.union(&fresh),
-                None => fresh.clone(),
-            });
             fresh
         };
+        if fresh.is_empty() {
+            return;
+        }
         let complete = self.ready_part(reader, &fresh, !again);
         let rest = guard_minus(&fresh, &complete);
         if !rest.is_empty() {
-            parked.morsels.push(Parked {
+            parked.park(Parked {
                 guard: rest,
                 splits: !again,
             });
         }
-        drop(parked);
         if complete.is_empty() {
             return;
         }
         let queue = &self.states[reader].queue;
         let appended = match again {
-            true => queue.append_again(&complete),
-            false => queue.append_unqueued(&complete),
+            true => queue.append_again_locked(&mut parked, &complete),
+            false => queue.append_unqueued_locked(&mut parked, &complete),
         };
         self.ensure(appended, || {
             format!(
@@ -974,29 +978,31 @@ impl Dispatcher {
     /// queue ([`park`](Self::park)). A complete push lands before the pushing pipeline counts its
     /// finish toward `reader`'s close, so `reader`'s queue is open.
     fn release_parked(&self, reader: usize) {
-        let released: Vec<(TileGuard, bool)> = {
-            let mut parked = self.states[reader]
-                .parked
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let mut released = Vec::new();
-            let mut kept = Vec::new();
-            for morsel in std::mem::take(&mut parked.morsels) {
-                let part = self.ready_part(reader, &morsel.guard, morsel.splits);
-                let rest = guard_minus(&morsel.guard, &part);
-                if !part.is_empty() {
-                    released.push((part, !morsel.splits));
-                }
-                if !rest.is_empty() {
-                    kept.push(Parked {
-                        guard: rest,
-                        splits: morsel.splits,
-                    });
-                }
+        let mut parked = self.states[reader]
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut released = Vec::new();
+        let mut kept = Vec::new();
+        for morsel in std::mem::take(&mut parked.parked) {
+            let part = self.ready_part(reader, &morsel.guard, morsel.splits);
+            let rest = guard_minus(&morsel.guard, &part);
+            if !part.is_empty() {
+                released.push((part, !morsel.splits));
             }
-            parked.morsels = kept;
-            released
-        };
+            if !rest.is_empty() {
+                kept.push(Parked {
+                    guard: rest,
+                    splits: morsel.splits,
+                });
+            }
+        }
+        parked.parked_region = None;
+        parked.parked = Vec::new();
+        for morsel in kept {
+            parked.park(morsel);
+        }
         if released.is_empty() {
             return;
         }
@@ -1008,12 +1014,12 @@ impl Dispatcher {
             true => {
                 let morsels: Vec<TileGuard> =
                     released.into_iter().map(|(morsel, _)| morsel).collect();
-                queue.append(reader, &morsels)
+                queue.append_locked(&mut parked, reader, &morsels)
             }
             // A round's row is read again whole ([`Parked`]).
             false => released.iter().all(|(morsel, again)| match *again {
-                true => queue.append_again(morsel),
-                false => queue.append_unqueued(morsel),
+                true => queue.append_again_locked(&mut parked, morsel),
+                false => queue.append_unqueued_locked(&mut parked, morsel),
             }),
         };
         self.ensure(appended, || {
@@ -1173,7 +1179,7 @@ impl Dispatcher {
     /// Mark `pipeline`, which reads a pipeline, as consuming its breaker's input whole, `input`
     /// cut one package per morsel ([`seed`]), in place of what the pipelines it reads push: the
     /// morsels are parked from the start, and the complete push that leaves every pipeline it reads
-    /// having complete them queues them ([`park`](Self::park)). A planner does so where no push
+    /// having completed them queues them ([`park`](Self::park)). A planner does so where no push
     /// reaches the reader restated in its keys, where two pipelines it reads can push one key, or
     /// where a pipeline it reads takes no push and names no region the planner could queue for the
     /// reader at the start (`run_program`). It takes no push ([`Landing::queue`]).
@@ -1202,19 +1208,17 @@ impl Dispatcher {
         let info = &mut self.infos[pipeline.0];
         info.whole = true;
         info.parks = true;
-        self.states[pipeline.0]
-            .parked
+        let mut state = self.states[pipeline.0]
+            .queue
+            .state
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .morsels
-            .extend(
-                seed(input, self.morsel_rows)
-                    .into_iter()
-                    .map(|guard| Parked {
-                        guard,
-                        splits: true,
-                    }),
-            );
+            .unwrap_or_else(PoisonError::into_inner);
+        for guard in seed(input, self.morsel_rows) {
+            state.park(Parked {
+                guard,
+                splits: true,
+            });
+        }
     }
 
     pub(crate) fn require_final_keys(
@@ -1483,29 +1487,29 @@ impl Dispatcher {
         });
         #[cfg(test)]
         self.run_transition_hook(false);
-        let parked_out;
-        let morsels = match self.infos[p].parks {
-            true => {
-                let mut parked = state.parked.lock().unwrap_or_else(PoisonError::into_inner);
-                let (complete, incomplete): (Vec<TileGuard>, Vec<TileGuard>) = morsels
-                    .iter()
-                    .cloned()
-                    .partition(|morsel| self.reads_complete(p, morsel));
-                parked
-                    .morsels
-                    .extend(incomplete.into_iter().map(|guard| Parked {
-                        guard,
-                        splits: false,
-                    }));
-                parked_out = complete;
-                if parked_out.is_empty() {
-                    return;
-                }
-                &parked_out[..]
+        let queue = &state.queue;
+        let mut admission = queue.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let ready;
+        let morsels = if self.infos[p].parks {
+            let (complete, incomplete): (Vec<TileGuard>, Vec<TileGuard>) = morsels
+                .iter()
+                .cloned()
+                .partition(|morsel| self.reads_complete(p, morsel));
+            for guard in incomplete {
+                admission.park(Parked {
+                    guard,
+                    splits: false,
+                });
             }
-            false => morsels,
+            ready = complete;
+            &ready[..]
+        } else {
+            morsels
         };
-        let appended = self.states[p].queue.append(p, morsels);
+        if morsels.is_empty() {
+            return;
+        }
+        let appended = queue.append_locked(&mut admission, p, morsels);
         self.ensure(appended, || {
             format!("pipeline {p} is queued nothing once it is closed")
         });
@@ -1543,46 +1547,17 @@ impl Dispatcher {
         if self.states[pipeline].held.load(Ordering::SeqCst) {
             return None;
         }
-        if !self.infos[pipeline].ordered {
-            return self.claim_in(pipeline);
-        }
-        let state = &self.states[pipeline];
-        // The flag is held while the claim looks, so at most one claim of the pipeline looks at
-        // once, and kept for the package it takes.
-        if state
-            .in_flight
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return None;
-        }
-        let package = self.claim_in(pipeline);
-        if package.is_none() {
-            state.in_flight.store(false, Ordering::SeqCst);
-            // A claim that found the flag held answered nothing for the pipeline, and may wait on
-            // a generation that a package queued since this look began has reached. The flag's
-            // operations and the generation's are sequentially consistent, so the generation read
-            // after the release sees that package's advance and every write before it, and a
-            // second look finds the package and wakes that claim.
-            self.generation.load(Ordering::SeqCst);
-            if self.claimable(pipeline) && self.takes_from(pipeline) {
-                self.advance();
-            }
-        }
-        package
-    }
-
-    /// Whether the queue contains an unclaimed package.
-    fn claimable(&self, pipeline: usize) -> bool {
-        self.states[pipeline].queue.has_pending()
+        self.claim_in(pipeline)
     }
 
     /// Claim the oldest pending package after observing its dependencies' progress.
     fn claim_in(&self, pipeline: usize) -> Option<WorkPackage> {
         let state = &self.states[pipeline];
-        let package = state.queue.claim(pipeline, || self.takes_from(pipeline))?;
-        state.claimed.fetch_add(1, Ordering::Relaxed);
-        Some(package)
+        state
+            .queue
+            .claim(pipeline, self.infos[pipeline].ordered, || {
+                self.takes_from(pipeline)
+            })
     }
 
     /// Whether `pipeline` may finish: it is running, its queue is closed and every package in it
@@ -1690,7 +1665,16 @@ impl Dispatcher {
         }
         let p = package.pipeline.0;
         let state = self.state(package.pipeline);
-        let held = state.queue.acknowledge(&package);
+        let mut acknowledged = 0;
+        let held = state.queue.acknowledge(&package, || {
+            // Record consumption before unlocking the next ordered claim or publishing finish.
+            #[cfg(test)]
+            self.record(Event::Consume {
+                pipeline: package.pipeline,
+                guard: package.guard.clone(),
+            });
+            acknowledged = state.acknowledged.fetch_add(1, Ordering::AcqRel) + 1;
+        });
         let refused = || match self.infos[p].ordered {
             true => format!(
                 "ordered pipeline {p} consumes the morsel claimed for it, in queue order: {:?}",
@@ -1702,17 +1686,6 @@ impl Dispatcher {
             ),
         };
         self.ensure(held, refused);
-        // Recorded before the count that lets the next package of an ordered pipeline, or the
-        // pipeline's finish, be claimed.
-        #[cfg(test)]
-        self.record(Event::Consume {
-            pipeline: package.pipeline,
-            guard: package.guard,
-        });
-        let acknowledged = state.acknowledged.fetch_add(1, Ordering::AcqRel) + 1;
-        if self.infos[p].ordered {
-            state.in_flight.store(false, Ordering::Release);
-        }
         // An acknowledgement frees an ordered pipeline's next package, may let the pipeline
         // finish or a pipeline that follows it claim, and returns credit to a limited source's
         // notify.
@@ -1939,14 +1912,15 @@ impl Dispatcher {
         // planner's end-of-run check), so nothing stays parked.
         {
             let parked = self.states[p]
-                .parked
+                .queue
+                .state
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            self.ensure(parked.morsels.is_empty(), || {
+            self.ensure(parked.parked.is_empty(), || {
                 format!(
                     "pipeline {p} finishes with rows parked that the pipelines it reads never \
                      complete: {:?}",
-                    parked.morsels
+                    parked.parked
                 )
             });
         }
@@ -3075,6 +3049,133 @@ mod tests {
         state.pending.len() + state.in_flight.len()
     }
 
+    #[test]
+    fn concurrent_admission_and_completion_queue_each_region_once() {
+        use crate::interpreter::tile_operators::test_helpers::keys_between;
+        use std::sync::Barrier;
+        let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], 1).unrecorded();
+        let reader = PipelineId(1);
+        dispatcher.park(reader);
+        let start = Barrier::new(9);
+        thread::scope(|scope| {
+            for worker in 0..8 {
+                let dispatcher = &dispatcher;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for key in 0..32 {
+                        let guard = keys_between(key, key);
+                        if worker % 2 == 0 {
+                            dispatcher.queue_for(reader, &guard);
+                            dispatcher.record_complete(1, 0, Some(&guard));
+                        } else {
+                            dispatcher.record_complete(1, 0, Some(&guard));
+                            dispatcher.queue_for(reader, &guard);
+                        }
+                    }
+                });
+            }
+            start.wait();
+        });
+        let mut regions = Vec::new();
+        while let Some(package) = dispatcher.claim_of(reader) {
+            regions.push(package.guard.clone());
+            dispatcher.acknowledge(package);
+        }
+        assert_eq!(regions.len(), 32);
+        assert_eq!(partition_gap(&keys_between(0, 31), &regions), None);
+        assert!(
+            dispatcher.states[1]
+                .queue
+                .state
+                .lock()
+                .unwrap()
+                .parked
+                .is_empty()
+        );
+        // Acknowledgement does not erase admission history. A round still repeats the region.
+        dispatcher.queue_for(reader, &keys_between(0, 31));
+        assert!(dispatcher.claim_of(reader).is_none());
+        dispatcher.queue_round(reader, &keys_between(0, 31));
+        let repeated = dispatcher
+            .claim_of(reader)
+            .expect("an explicit repeated round");
+        assert_eq!(repeated.guard, keys_between(0, 31));
+        dispatcher.acknowledge(repeated);
+    }
+
+    #[rstest::rstest]
+    fn parked_membership_compacts_and_drains(#[values(100, 1000, 10000)] count: u64) {
+        use crate::interpreter::tile_operators::test_helpers::keys_between;
+        let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], 1).unrecorded();
+        let reader = PipelineId(1);
+        dispatcher.park(reader);
+        for key in 0..count {
+            dispatcher.queue_for(reader, &keys_between(key, key));
+        }
+        {
+            let state = dispatcher.states[1].queue.state.lock().unwrap();
+            assert_eq!(state.parked.len(), count as usize);
+            assert_eq!(state.parked_region, Some(keys_between(0, count - 1)));
+        }
+        dispatcher.record_complete(1, 0, None);
+        let state = dispatcher.states[1].queue.state.lock().unwrap();
+        assert!(state.parked.is_empty());
+        assert!(state.parked_region.is_none());
+        assert_eq!(state.pending.len(), count as usize);
+    }
+
+    #[test]
+    fn concurrent_ordered_claims_reserve_one_package() {
+        use crate::interpreter::tile_operators::test_helpers::keys_between;
+        use std::sync::Barrier;
+        let mut dispatcher = Dispatcher::new(vec![vec![]], 1).unrecorded();
+        let source = PipelineId(0);
+        dispatcher.order(source);
+        dispatcher.notify(source, &keys_between(0, 1));
+        let start = Barrier::new(8);
+        let packages = thread::scope(|scope| {
+            let claims: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        dispatcher.claim_of(source)
+                    })
+                })
+                .collect();
+            claims
+                .into_iter()
+                .filter_map(|claim| claim.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(packages.len(), 1);
+        for package in packages {
+            dispatcher.acknowledge(package);
+        }
+        let next = dispatcher
+            .claim_of(source)
+            .expect("acknowledgement unlocks the next claim");
+        assert_eq!(next.guard, keys_between(1, 1));
+        dispatcher.acknowledge(next);
+        assert!(dispatcher.claim_of(source).is_none());
+    }
+
+    #[rstest::rstest]
+    fn composition_rejects_a_graph_after_a_claim(#[values(false, true)] acknowledged: bool) {
+        use crate::interpreter::tile_operators::test_helpers::keys_between;
+        let graph = Dispatcher::new(vec![vec![]], 1);
+        graph.notify(PipelineId(0), &keys_between(0, 0));
+        let package = graph.claim_of(PipelineId(0)).unwrap();
+        if acknowledged {
+            graph.acknowledge(package);
+        }
+        let mut outer = Dispatcher::new(vec![], 1);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| outer.append_graph(graph)))
+                .is_err()
+        );
+    }
+
     #[rstest::rstest]
     fn acknowledged_packages_leave_no_queue_history(#[values(false, true)] ordered: bool) {
         use crate::interpreter::tile_operators::test_helpers::keys_between;
@@ -3145,18 +3246,18 @@ mod tests {
         let queue = Queue::new();
         let guard = keys_between(0, 0);
         assert!(queue.append_again(&guard));
-        let first = queue.claim(0, || true).unwrap();
-        assert!(queue.acknowledge(&first));
+        let first = queue.claim(0, false, || true).unwrap();
+        assert!(queue.acknowledge(&first, || {}));
         assert!(queue.append_again(&guard));
-        let second = queue.claim(0, || true).unwrap();
+        let second = queue.claim(0, false, || true).unwrap();
         assert!(second.index > first.index);
-        assert!(!queue.acknowledge(&first));
+        assert!(!queue.acknowledge(&first, || {}));
         let mut wrong = second.clone();
         wrong.guard = keys_between(1, 1);
-        assert!(!queue.acknowledge(&wrong));
+        assert!(!queue.acknowledge(&wrong, || {}));
         assert_eq!(retained_package_guards(&queue), 1);
-        assert!(queue.acknowledge(&second));
-        assert!(!queue.acknowledge(&second));
+        assert!(queue.acknowledge(&second, || {}));
+        assert!(!queue.acknowledge(&second, || {}));
         assert_eq!(retained_package_guards(&queue), 0);
         assert_eq!(queue.region(), Some(guard));
     }
@@ -3167,15 +3268,15 @@ mod tests {
 
         let queue = Queue::new();
         assert!(queue.append_unqueued(&keys_between(0, 2)));
-        let first = queue.claim(0, || true).unwrap();
-        assert!(queue.acknowledge(&first));
+        let first = queue.claim(0, false, || true).unwrap();
+        assert!(queue.acknowledge(&first, || {}));
         assert_eq!(retained_package_guards(&queue), 0);
         assert!(queue.append_unqueued(&keys_between(1, 4)));
-        let second = queue.claim(0, || true).unwrap();
+        let second = queue.claim(0, false, || true).unwrap();
         assert_eq!(second.guard, keys_between(3, 4));
-        assert!(queue.acknowledge(&second));
+        assert!(queue.acknowledge(&second, || {}));
         assert!(queue.append_unqueued(&keys_between(0, 4)));
-        assert!(!queue.has_pending());
+        assert!(queue.state.lock().unwrap().pending.is_empty());
         assert_eq!(queue.reserved(), 2);
         assert!(queue.close());
         assert!(!queue.append_unqueued(&keys_between(0, 4)));
@@ -3305,7 +3406,13 @@ mod tests {
             close.join().unwrap();
         });
         assert_eq!(
-            dispatcher.states[1].parked.lock().unwrap().morsels.len(),
+            dispatcher.states[1]
+                .queue
+                .state
+                .lock()
+                .unwrap()
+                .parked
+                .len(),
             usize::from(parks)
         );
         dispatcher.record_complete(1, 0, None);
@@ -3345,10 +3452,11 @@ mod tests {
         assert_eq!(dispatcher.states[1].queue.reserved(), 0);
         assert!(
             dispatcher.states[1]
-                .parked
+                .queue
+                .state
                 .lock()
                 .unwrap()
-                .morsels
+                .parked
                 .is_empty()
         );
         assert!(matches!(dispatcher.try_claim(None), Next::Failed));
