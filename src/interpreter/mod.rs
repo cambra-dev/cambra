@@ -102,6 +102,7 @@ where
     F: FnMut(),
 {
     fn notify(&mut self, _arrived: &Projection) {
+        dispatcher::debug_assert_outside_a_run();
         self()
     }
 }
