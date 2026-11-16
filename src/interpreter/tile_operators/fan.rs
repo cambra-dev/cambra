@@ -512,9 +512,14 @@ impl TileProducer for ZipProducer {
                         None => p,
                         Some(prev) => prev.intersect(&p),
                     });
+                    let complete = if t.values_at(CurryLevel::new(1)).holds_a_level() {
+                        t.complete_keys()
+                    } else {
+                        domain_predicate.clone()
+                    };
                     domain_pred = Some(match domain_pred {
-                        None => domain_predicate.clone(),
-                        Some(prev) => prev.intersect(domain_predicate),
+                        None => complete.clone(),
+                        Some(prev) => prev.intersect(&complete),
                     });
                 }
                 let presence = presence.unwrap();
@@ -615,6 +620,10 @@ impl TileProducer for ZipProducer {
                             cell
                         })
                         .collect();
+                    if let Some(order) = cells.iter().copied().collect::<Option<Vec<_>>>() {
+                        codomains.push(values.select_rows(&order));
+                        continue;
+                    }
                     let (aligned, missing) = align_keyless(values, &cells);
                     if let Some(missing) = missing {
                         absent.insert(self.names[arm].clone(), missing);
