@@ -18,13 +18,16 @@ use std::{cell::RefCell, rc::Rc};
 use cambra::ccl::{
     Expr, FieldKey, HistoryKind, Lit, PredicateId, Type, TypeKind, TypedExprNode, anf,
     ccl_utils::walk_refined_predicates,
+    chl_print::NOT_PRINTABLE,
     comprehension,
     infer::{
         InferError, LocatedInferError, TypeInferenceContext, check_pre_channelize, infer,
         lit_singleton,
     },
     lower::{LoweringContext, lower_stmts},
-    mut_read, opaque_output, uniquify,
+    mut_read, opaque_output,
+    subst::JoinSite,
+    uniquify,
 };
 use cambra::chl_parser::{self, ast as chl_ast};
 use cambra::interpreter::{BaseType, Extent, TestDataSource};
@@ -83,6 +86,9 @@ fn ranges(lengths: &[u64]) -> Vec<Type> {
     lengths.iter().map(|n| Type::UIntRange(*n)).collect()
 }
 
+/// A `match` whose arms are collections over keys that read the arm's pattern binder has no
+/// join, and reports the same domain conflict a conditional's arms do (`docs/chl-spec.md`,
+/// "Joining the types of several values").
 #[test]
 fn arm_dependent_filter_result_is_rejected_as_keyed_by_an_arm_binder() {
     let code = indoc! {r"
@@ -96,14 +102,76 @@ fn arm_dependent_filter_result_is_rejected_as_keyed_by_an_arm_binder() {
     "};
     let errs = infer_program_err(code);
     assert!(!errs.is_empty());
+    let expected = format!(
+        "Collection domains have no common answer\n\
+         The keys of a collection a `match` arm results in depend on `p`, bound in the arm\n\
+         Keys: {NOT_PRINTABLE} > p.1\n\
+         A collection's domain is its data, so a join may not narrow it. Wrap each arm in \
+         `box` to keep them."
+    );
     for e in &errs {
         assert!(
             matches!(
                 e,
-                InferError::NoJoinOverBinder { binders, reads, .. }
+                InferError::NoJoinOverBinder { binders, reads, site: JoinSite::Arm, .. }
                     if reads.is_empty() && binders.iter().map(|b| b.base()).eq(["p"])
             ),
-            "expected the keys to join over `p`, got {e:?}"
+            "expected the keys to join over the arm binder `p`, got {e:?}"
+        );
+        assert_eq!(format!("{e:?}"), expected);
+    }
+}
+
+/// [`arm_dependent_filter_result_is_rejected_as_keyed_by_an_arm_binder`] with each arm
+/// wrapped in `box`, as its message advises: the arms join as sums.
+#[test]
+fn boxed_arm_dependent_filter_results_join() {
+    let code = indoc! {r"
+        def filter_against(tagged):
+            match tagged:
+                case `pair(p):
+                    box([x for x in [1, 2, 3] if x > p.1])
+                case `single(s):
+                    box([x for x in [1, 2, 3] if x > s])
+        filter_against(`pair((0, 1)))
+    "};
+    assert_eq!(
+        infer_program(code).to_string(),
+        "Σ (σ : SubtypesOf(0..3)). (σ ⤇ Int)"
+    );
+}
+
+/// A `<<` inside a `match` arm into a feed declared outside it joins over the arm's binder as a
+/// contribution, so it keeps the feed's message rather than the arm's.
+#[test]
+fn a_feed_written_in_an_arm_reports_the_feed_join() {
+    let code = indoc! {r"
+        o: Feed(_)
+        def filter_against(tagged):
+            match tagged:
+                case `pair(p):
+                    o << [x for x in [1, 2, 3] if x > p.1]
+                    1
+                case `single(s):
+                    2
+        filter_against(`pair((0, 1)))
+    "};
+    let errs = infer_program_err(code);
+    assert!(!errs.is_empty());
+    for e in &errs {
+        assert!(
+            matches!(
+                e,
+                InferError::NoJoinOverBinder { binders, site: JoinSite::Contribution, .. }
+                    if binders.iter().map(|b| b.base()).eq(["p"])
+            ),
+            "expected a feed contribution joined over `p`, got {e:?}"
+        );
+        assert!(
+            format!("{e:?}").starts_with(
+                "The keys of a collection written to a feed or mutable variable depend on `p`"
+            ),
+            "expected the feed's message, got {e:?}"
         );
     }
 }

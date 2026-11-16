@@ -5097,11 +5097,19 @@ Neither choice would justify acquiring an arbitrary scalar refinement. Convertin
 
 An arm's type leaves its pattern binder's scope as the join over every value the binder takes.
 `Typing::close_pattern_type` lifts the body's type onto a variable minted outside the binder, whose
-lower edge carries `Subst::join` of the binder; Check applies the same join to the reconstructed
+lower edge carries `Subst::join_arm` of the binder; Check applies the same join to the reconstructed
 type. The binder is joined over as a contribution's crossed binders are
 ([A contribution crosses the binders after its target](#a-contribution-crosses-the-binders-after-its-target)):
 a refinement naming the binder is dropped where it states a value, and is
 `InferError::NoJoinOverBinder` where it states a collection's keys or a function's parameter.
+
+The join's `Mapping::Join` carries `JoinSite::Arm`, and composition keeps it. A `JoinViolation`
+takes the site of the binders it names: `Arm` when every one carries it, and `Contribution`
+otherwise. The error reports an arm's violation at a collection's keys as a domain conflict between
+the arms, with the advice to wrap each arm in `box`, as `InferError::DomainJoinConflict` reports a
+conditional's. A `<<` inside the arm into a feed declared outside it joins over the same binder on
+the contribution's edge, which carries `JoinSite::Contribution`, so its error keeps the feed's
+message. Relabelling an error by its binder's name after inference cannot tell those two apart.
 
 An arm `case Shape::circle(r): r * r * 3` therefore types as `Int`: the refinement
 `__elem == r * r * 3` names `r` and states a value.
@@ -5119,7 +5127,10 @@ filter_against(`pair((0, 1)))
 ```
 
 The first arm's domain is refined by `p`, so inference reports `NoJoinOverBinder` naming `p`.
-Accepting it needs the dependency expressed in terms of values available outside the arm.
+Wrapping each arm in `box` makes each arm a sum, whose candidate widens to
+`SubtypesOf(0..3)`, and the `match` types as `Σ (σ : SubtypesOf(0..3)). σ ⤇ Int`
+(`tests/it/type_check.rs`, `boxed_arm_dependent_filter_results_join`). Accepting the plain
+collections needs the dependency expressed in terms of values available outside the arm.
 
 One proposed construction is a result predicate that performs the same match. In
 pseudocode, a predicate local to each arm,

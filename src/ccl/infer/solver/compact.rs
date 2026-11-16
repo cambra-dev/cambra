@@ -15,7 +15,7 @@ use smol_str::SmolStr;
 
 use crate::ccl::BarrierVar;
 use crate::ccl::infer_var::BarrierVarId;
-use crate::ccl::subst::{RefinementScope, Subst};
+use crate::ccl::subst::{JoinSite, RefinementScope, Subst};
 
 use crate::ccl::{
     BaseType, HistoryKind, InferVarId, Name, Openness, RefinementSet, Type, fresh_infer_var_id,
@@ -2247,6 +2247,8 @@ pub struct JoinViolation {
     pub refinement: crate::ccl::Refinement,
     /// Where the refinement stands.
     pub position: JoinedPosition,
+    /// The construct whose values the join is of ([`Subst::join_site`]).
+    pub site: JoinSite,
 }
 
 /// Where a [`JoinViolation`]'s refinement stands.
@@ -3714,6 +3716,7 @@ fn compact_go_inner(
                     };
                     if let Some((binders, position)) = violation {
                         st.join_violations.push(JoinViolation {
+                            site: subst_acc.join_site(&binders),
                             binders,
                             refinement: r.clone(),
                             position,

@@ -140,7 +140,22 @@ pub enum Mapping {
     /// domain naming the binder then has an answer, the domain with the binder discharged to
     /// that term ([`Subst::in_data_domain`]); a value's refinement is still dropped
     /// (`src/ccl/design/type-inference.md`, "A history's value may depend on its position").
-    Join(Option<Rc<TypedExpr>>),
+    ///
+    /// The [`JoinSite`] names the construct whose values are joined, for the diagnostic a
+    /// join with no answer gets.
+    Join(Option<Rc<TypedExpr>>, JoinSite),
+}
+
+/// The construct a [`Mapping::Join`] joins the values of. Composition keeps it
+/// ([`Subst::then`]), so compaction reports a join with no answer as the construct's own
+/// ([`crate::ccl::infer::solver::compact::JoinViolation`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinSite {
+    /// A contribution to a feed or mutable variable crossing the binders after its target,
+    /// or a lower bound leaving the scope of a function's binder.
+    Contribution,
+    /// A `match` arm's result leaving the scope of the arm's pattern binder.
+    Arm,
 }
 
 /// A substitution's entries by what their images read ([`Subst::image_table`]).
@@ -232,8 +247,10 @@ impl Mapping {
     fn image(&self) -> BTreeSet<Name> {
         match self {
             Mapping::Rename(to) => BTreeSet::from([to.clone()]),
-            Mapping::Discharge(t) | Mapping::Join(Some(t)) => crate::ccl::ccl_utils::free_names(t),
-            Mapping::Join(None) => BTreeSet::new(),
+            Mapping::Discharge(t) | Mapping::Join(Some(t), _) => {
+                crate::ccl::ccl_utils::free_names(t)
+            }
+            Mapping::Join(None, _) => BTreeSet::new(),
         }
     }
 
@@ -246,7 +263,7 @@ impl Mapping {
                 TypedExprNode::Var(n) => Some(n.clone()),
                 _ => None,
             },
-            Mapping::Join(_) => None,
+            Mapping::Join(..) => None,
         }
     }
 
@@ -258,7 +275,7 @@ impl Mapping {
             // A renamed occurrence retains its type, including inside predicates.
             Mapping::Rename(to) => TypedExpr::var(to.clone()).with_ty(occurrence_ty.clone()),
             Mapping::Discharge(t) => (**t).clone(),
-            Mapping::Join(_) => {
+            Mapping::Join(..) => {
                 unreachable!("a joined binder has no term; its occurrence stays")
             }
         };
@@ -275,7 +292,7 @@ impl Mapping {
             Mapping::Rename(to) => TypedExpr::preserve(node_id, TypedExprNode::Var(to.clone()))
                 .with_ty(occurrence_ty.clone()),
             Mapping::Discharge(t) => t.clone_at(node_id),
-            Mapping::Join(_) => {
+            Mapping::Join(..) => {
                 unreachable!("a joined binder has no term; its occurrence stays")
             }
         };
@@ -714,10 +731,20 @@ impl Subst {
     /// `[binder ↦ join]`: the type leaves `binder`'s scope as the join over every value
     /// it takes ([`Mapping::Join`]).
     pub fn join(binder: impl Into<Name>) -> Self {
+        Self::join_from(binder, JoinSite::Contribution)
+    }
+
+    /// [`Self::join`] for a `match` arm's result leaving the scope of its pattern binder
+    /// ([`JoinSite::Arm`]).
+    pub fn join_arm(binder: impl Into<Name>) -> Self {
+        Self::join_from(binder, JoinSite::Arm)
+    }
+
+    fn join_from(binder: impl Into<Name>, site: JoinSite) -> Self {
         let binder = binder.into();
         debug_assert_no_pi_bound(&binder);
         let mut m = BTreeMap::new();
-        m.insert(binder, Mapping::Join(None));
+        m.insert(binder, Mapping::Join(None, site));
         Subst::of_binders(m)
     }
 
@@ -727,7 +754,10 @@ impl Subst {
         let binder = binder.into();
         debug_assert_no_pi_bound(&binder);
         let mut m = BTreeMap::new();
-        m.insert(binder, Mapping::Join(Some(Rc::new(at_key))));
+        m.insert(
+            binder,
+            Mapping::Join(Some(Rc::new(at_key)), JoinSite::Contribution),
+        );
         Subst::of_binders(m)
     }
 
@@ -735,7 +765,7 @@ impl Subst {
     pub fn unkeyed_joined_binders(&self) -> impl Iterator<Item = &Binder> {
         self.binders
             .iter()
-            .filter(|(_, m)| matches!(m, Mapping::Join(None)))
+            .filter(|(_, m)| matches!(m, Mapping::Join(None, _)))
             .map(|(k, _)| k)
     }
 
@@ -743,7 +773,7 @@ impl Subst {
     pub fn joins_in(&self, e: &TypedExpr) -> bool {
         self.binders
             .iter()
-            .any(|(k, m)| matches!(m, Mapping::Join(_)) && is_free(k, e))
+            .any(|(k, m)| matches!(m, Mapping::Join(..)) && is_free(k, e))
     }
 
     /// Whether a binder this substitution joins over with no term at the key occurs free
@@ -751,7 +781,7 @@ impl Subst {
     pub fn joins_unkeyed_in(&self, e: &TypedExpr) -> bool {
         self.binders
             .iter()
-            .any(|(k, m)| matches!(m, Mapping::Join(None)) && is_free(k, e))
+            .any(|(k, m)| matches!(m, Mapping::Join(None, _)) && is_free(k, e))
     }
 
     /// The binders this substitution joins over that occur free in `e`, with or without a term
@@ -759,7 +789,7 @@ impl Subst {
     pub fn joined_over_in(&self, e: &TypedExpr) -> Vec<Name> {
         self.binders
             .iter()
-            .filter(|(k, m)| matches!(m, Mapping::Join(_)) && is_free(k, e))
+            .filter(|(k, m)| matches!(m, Mapping::Join(..)) && is_free(k, e))
             .map(|(k, _)| k.clone())
             .collect()
     }
@@ -769,7 +799,7 @@ impl Subst {
     pub fn joined_in(&self, e: &TypedExpr) -> Vec<Name> {
         self.binders
             .iter()
-            .filter(|(k, m)| matches!(m, Mapping::Join(None)) && is_free(k, e))
+            .filter(|(k, m)| matches!(m, Mapping::Join(None, _)) && is_free(k, e))
             .map(|(k, _)| k.clone())
             .collect()
     }
@@ -790,14 +820,18 @@ impl Subst {
     /// position where a joined binder's refinement is kept for the caller to report
     /// rather than dropped.
     pub fn without_joins(&self) -> Cow<'_, Subst> {
-        if !self.binders.values().any(|m| matches!(m, Mapping::Join(_))) {
+        if !self
+            .binders
+            .values()
+            .any(|m| matches!(m, Mapping::Join(..)))
+        {
             return Cow::Borrowed(self);
         }
         Cow::Owned(Subst {
             binders: self
                 .binders
                 .iter()
-                .filter(|(_, m)| !matches!(m, Mapping::Join(_)))
+                .filter(|(_, m)| !matches!(m, Mapping::Join(..)))
                 .map(|(k, m)| (k.clone(), m.clone()))
                 .collect(),
             witnesses: self.witnesses.clone(),
@@ -809,7 +843,7 @@ impl Subst {
     pub fn renamed(&self, binder: &Name) -> Option<&Binder> {
         match self.binders.get(binder)? {
             Mapping::Rename(to) => Some(to),
-            Mapping::Discharge(_) | Mapping::Join(_) => None,
+            Mapping::Discharge(_) | Mapping::Join(..) => None,
         }
     }
 
@@ -817,7 +851,11 @@ impl Subst {
     /// joined binder with a term at the key is discharged to it, and one without is left in
     /// place for compaction to report ([`Mapping::Join`]).
     pub fn in_data_domain(&self) -> Cow<'_, Subst> {
-        if !self.binders.values().any(|m| matches!(m, Mapping::Join(_))) {
+        if !self
+            .binders
+            .values()
+            .any(|m| matches!(m, Mapping::Join(..)))
+        {
             return Cow::Borrowed(self);
         }
         Cow::Owned(Subst {
@@ -825,8 +863,10 @@ impl Subst {
                 .binders
                 .iter()
                 .filter_map(|(k, m)| match m {
-                    Mapping::Join(None) => None,
-                    Mapping::Join(Some(t)) => Some((k.clone(), Mapping::Discharge(Rc::clone(t)))),
+                    Mapping::Join(None, _) => None,
+                    Mapping::Join(Some(t), _) => {
+                        Some((k.clone(), Mapping::Discharge(Rc::clone(t))))
+                    }
                     other => Some((k.clone(), other.clone())),
                 })
                 .collect(),
@@ -835,14 +875,37 @@ impl Subst {
         })
     }
 
+    /// The construct joining `binders`, each of which this substitution joins over:
+    /// [`JoinSite::Arm`] where there is one and every one leaves a `match` arm, and otherwise
+    /// [`JoinSite::Contribution`].
+    pub fn join_site<'a>(&self, binders: impl IntoIterator<Item = &'a Name>) -> JoinSite {
+        let mut binders = binders.into_iter().peekable();
+        let arm = binders.peek().is_some()
+            && binders.all(|b| {
+                let mapping = self.binders.get(b);
+                debug_assert!(
+                    matches!(mapping, Some(Mapping::Join(..))),
+                    "a join site is asked of `{b}`, which this substitution does not join over"
+                );
+                matches!(mapping, Some(Mapping::Join(_, JoinSite::Arm)))
+            });
+        if arm {
+            JoinSite::Arm
+        } else {
+            JoinSite::Contribution
+        }
+    }
+
     /// How a term `t` naming a binder this substitution joins over leaves its scope: joined
     /// with no term where `t` names one with none, and otherwise joined with `t` read at the
-    /// key.
-    fn join_through(&self, t: &TypedExpr) -> Mapping {
+    /// key. The join keeps `site`, or where none is given takes the site of the joined
+    /// binders `t` names ([`Self::join_site`]).
+    fn join_through(&self, t: &TypedExpr, site: Option<JoinSite>) -> Mapping {
+        let site = site.unwrap_or_else(|| self.join_site(&self.joined_over_in(t)));
         if self.joins_unkeyed_in(t) {
-            Mapping::Join(None)
+            Mapping::Join(None, site)
         } else {
-            Mapping::Join(Some(Rc::new(self.in_data_domain().apply_expr(t))))
+            Mapping::Join(Some(Rc::new(self.in_data_domain().apply_expr(t))), site)
         }
     }
 
@@ -996,11 +1059,11 @@ impl Subst {
                 Some(Mapping::Discharge(t)) => out.extend(crate::ccl::ccl_utils::free_names(t)),
                 // A joined binder's occurrence stays, and in a collection's domain a keyed
                 // join reads its term at the key instead ([`Self::in_data_domain`]).
-                Some(Mapping::Join(Some(t))) => {
+                Some(Mapping::Join(Some(t), _)) => {
                     out.insert(n.clone());
                     out.extend(crate::ccl::ccl_utils::free_names(t));
                 }
-                Some(Mapping::Join(None)) | None => {
+                Some(Mapping::Join(None, _)) | None => {
                     out.insert(n.clone());
                 }
             }
@@ -1018,12 +1081,12 @@ impl Subst {
     pub fn for_each_discharge_term_mut(&mut self, f: &mut impl FnMut(&mut TypedExpr)) {
         for m in self.binders.values_mut() {
             match m {
-                Mapping::Discharge(t) | Mapping::Join(Some(t)) => {
+                Mapping::Discharge(t) | Mapping::Join(Some(t), _) => {
                     let mut term = t.clone_preserving_ids();
                     f(&mut term);
                     *t = Rc::new(term);
                 }
-                Mapping::Rename(_) | Mapping::Join(None) => {}
+                Mapping::Rename(_) | Mapping::Join(None, _) => {}
             }
         }
         // A payload is a template, so it is copied at its own identities, as a discharge's is.
@@ -1168,12 +1231,17 @@ impl Subst {
                                 crate::ccl::eq_term_modulo_ty_slots(a, b)
                             }
                             (Mapping::Rename(_), _) | (_, Mapping::Rename(_)) => false,
-                            (Mapping::Join(a), Mapping::Join(b)) => match (a, b) {
-                                (None, None) => true,
-                                (Some(a), Some(b)) => crate::ccl::eq_term_modulo_ty_slots(a, b),
-                                _ => false,
-                            },
-                            (Mapping::Join(_), _) | (_, Mapping::Join(_)) => false,
+                            (Mapping::Join(a, sa), Mapping::Join(b, sb)) => {
+                                sa == sb
+                                    && match (a, b) {
+                                        (None, None) => true,
+                                        (Some(a), Some(b)) => {
+                                            crate::ccl::eq_term_modulo_ty_slots(a, b)
+                                        }
+                                        _ => false,
+                                    }
+                            }
+                            (Mapping::Join(..), _) | (_, Mapping::Join(..)) => false,
                         }
                 })
     }
@@ -1201,8 +1269,10 @@ impl Subst {
                 let entry = match m {
                     Mapping::Rename(to) => out(to).map(Mapping::Rename),
                     Mapping::Discharge(t) => shifted(t).map(Mapping::Discharge),
-                    Mapping::Join(Some(t)) => shifted(t).map(|t| Mapping::Join(Some(t))),
-                    Mapping::Join(None) => None,
+                    Mapping::Join(Some(t), site) => {
+                        shifted(t).map(|t| Mapping::Join(Some(t), *site))
+                    }
+                    Mapping::Join(None, _) => None,
                 };
                 changed |= key.is_some() || entry.is_some();
                 (
@@ -1224,7 +1294,7 @@ impl Subst {
         self.binders.values().any(|m| match m {
             Mapping::Rename(to) => to == name,
             Mapping::Discharge(t) => is_free(name, t),
-            Mapping::Join(at_key) => at_key.as_ref().is_some_and(|t| is_free(name, t)),
+            Mapping::Join(at_key, _) => at_key.as_ref().is_some_and(|t| is_free(name, t)),
         })
     }
 
@@ -1317,10 +1387,10 @@ impl Subst {
                 // takes a value per value of that binder. Where the key determines every
                 // binder it names, so does the key determine it, at its definition read at
                 // the key.
-                Some(Mapping::Discharge(t)) if b.joins_in(t) => b.join_through(t),
+                Some(Mapping::Discharge(t)) if b.joins_in(t) => b.join_through(t, None),
                 Some(Mapping::Discharge(t)) => Mapping::Discharge(Rc::new(b.apply_expr(t))),
-                Some(Mapping::Join(None)) => Mapping::Join(None),
-                Some(Mapping::Join(Some(t))) => b.join_through(t),
+                Some(Mapping::Join(None, site)) => Mapping::Join(None, *site),
+                Some(Mapping::Join(Some(t), site)) => b.join_through(t, Some(*site)),
                 None => match b.binders.get(&k) {
                     Some(mb) => mb.clone(),
                     None => continue,
@@ -1331,7 +1401,7 @@ impl Subst {
             let is_identity = match &composed {
                 Mapping::Rename(to) => *to == k,
                 Mapping::Discharge(t) => is_var_named(t, &k),
-                Mapping::Join(_) => false,
+                Mapping::Join(..) => false,
             };
             if !is_identity {
                 m.insert(k, composed);
@@ -1468,7 +1538,7 @@ impl Subst {
                         Some(n) => Mapping::Rename(n),
                         None => v.clone(),
                     },
-                    Mapping::Rename(_) | Mapping::Join(_) => v.clone(),
+                    Mapping::Rename(_) | Mapping::Join(..) => v.clone(),
                 };
                 (k.clone(), v)
             })
@@ -1899,7 +1969,7 @@ impl Subst {
                 Some(repl @ Mapping::Rename(_)) => return repl.as_expr(&self.apply_type(&e.ty)),
                 // A discharged term carries its own type/annotation, so return it wholesale
                 // rather than rebuilding `e`.
-                Some(repl) if !matches!(repl, Mapping::Join(_)) => return repl.as_expr(&e.ty),
+                Some(repl) if !matches!(repl, Mapping::Join(..)) => return repl.as_expr(&e.ty),
                 _ => Var(n.clone()),
             },
 
@@ -2252,7 +2322,7 @@ impl Subst {
         // carry the substituted binder in a refinement predicate.
         if let TypedExprNode::Var(n) = &e.node
             && let Some(repl) = self.binders.get(n)
-            && !matches!(repl, Mapping::Join(_))
+            && !matches!(repl, Mapping::Join(..))
         {
             // Root-carry: the replacement ROOT is built at the occurrence's own
             // id — a *preserve*, so the root inherits the occurrence's

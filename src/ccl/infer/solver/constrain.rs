@@ -169,6 +169,8 @@ pub enum ConstrainError {
         binders: Vec<Name>,
         /// The refinement, as written.
         refinement: Refinement,
+        /// The construct whose values the join is of.
+        site: crate::ccl::subst::JoinSite,
     },
     /// A shape the solver does not compile yet, which the message names. Reported as
     /// [`InferError::Unsupported`](crate::ccl::infer::InferError::Unsupported) rather than
@@ -1031,11 +1033,16 @@ fn distinct_data_domains(lows: &[Bound]) -> Option<(Type, Type)> {
 
 /// A refinement on the data domain `domain` naming a binder `subst` joins over with no term at
 /// the key, with the binders it names ([`ConstrainError::NoJoinOverBinder`]).
-fn joined_keys(domain: &Type, subst: &Subst) -> Option<(Vec<Name>, Refinement)> {
+fn joined_keys(domain: &Type, subst: &Subst) -> Option<ConstrainError> {
     let mut t = domain;
     while let Type::Refinement(base, rs) = t {
         if let Some(r) = rs.iter().find(|r| subst.joins_unkeyed_refinement(r)) {
-            return Some((subst.joined_in(&r.predicate), r.clone()));
+            let binders = subst.joined_in(&r.predicate);
+            return Some(ConstrainError::NoJoinOverBinder {
+                site: subst.join_site(&binders),
+                binders,
+                refinement: r.clone(),
+            });
         }
         t = base;
     }
@@ -1887,13 +1894,10 @@ fn constrain_go_impl(
                             {
                                 Err(ConstrainError::DomainJoinConflict { domains })
                             }
-                            _ if let Some((binders, refinement)) =
+                            _ if let Some(joined) =
                                 joined_keys(d0, sl).or_else(|| joined_keys(d1, sr)) =>
                             {
-                                Err(ConstrainError::NoJoinOverBinder {
-                                    binders,
-                                    refinement,
-                                })
+                                Err(joined)
                             }
                             _ => Err(ConstrainError::DataDomainMismatch {
                                 lhs: Box::new((**d0).clone()),

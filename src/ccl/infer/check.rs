@@ -659,7 +659,7 @@ impl Typing for CheckCtx {
         if !crate::ccl::subst::type_free_vars(&body_ty).contains(binder) {
             return body_ty;
         }
-        crate::ccl::subst::Subst::join(binder.clone()).apply_type(&body_ty)
+        crate::ccl::subst::Subst::join_arm(binder.clone()).apply_type(&body_ty)
     }
 
     fn bind_annotation(&mut self, _inferred: &Type, ann: &Type) -> Result<Type, LocatedInferError> {

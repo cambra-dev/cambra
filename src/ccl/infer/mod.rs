@@ -513,11 +513,13 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
         ConstrainError::NoJoinOverBinder {
             binders,
             refinement,
+            site,
         } => InferError::NoJoinOverBinder {
             binders,
             reads: Vec::new(),
             predicate: refinement.predicate,
             position: solver::compact::JoinedPosition::Keys,
+            site,
             fed_elsewhere: false,
         },
         ConstrainError::DataDomainMismatch { lhs, rhs, cause } => {
@@ -623,11 +625,13 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
             binders,
             refinement,
             position,
+            site,
         } => InferError::NoJoinOverBinder {
             binders,
             reads: Vec::new(),
             predicate: refinement.predicate,
             position,
+            site,
             fed_elsewhere: false,
         },
         // The same violation `check_scope_valid` reports post-inference, caught where it is
