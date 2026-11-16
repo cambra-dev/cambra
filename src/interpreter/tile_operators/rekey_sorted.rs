@@ -1,5 +1,6 @@
 use super::*;
 use crate::interpreter::operator_graph::value;
+use crate::interpreter::scheduler::restating;
 use crate::interpreter::{ColumnValue, Consumer, Extent, Scheduler, Value, tuple_field};
 
 /// Re-keys a collection of pairs by each pair's first component, `𝐾 ⤇ (𝐽, 𝑉)` to `𝐽 ⤇ 𝑉`, where
@@ -23,6 +24,13 @@ use crate::interpreter::{ColumnValue, Consumer, Extent, Scheduler, Value, tuple_
 /// leaves a gap the input keeps until the keys below it are released too; the operator drops
 /// those rows from its output itself. Its one input today, a reply tap's `StoreValueStream`,
 /// honors only a prefix of commit ticks, so a prefix is also all it could be told.
+///
+/// A region an input pushes or notifies names input positions, and which output keys sit at
+/// those positions is data the operator reads only at its next pull. The caller supplies the
+/// restatement, `restate`, from what it knows of the input: a reply tap's store records the
+/// item each commit answered ([`CommittedItems`]).
+///
+/// [`CommittedItems`]: crate::interpreter::commit_operator::CommittedItems
 pub struct RekeySorted {
     /// Output tiling: `DataFunction { domain: 𝐽, codomain: 𝑉 }`.
     base: OperatorBase,
@@ -31,15 +39,21 @@ pub struct RekeySorted {
     /// The output's domain, the pairs' first component, which a prefix of a union key needs
     /// for its tags.
     key: Extent,
+    /// A region of input positions restated as the output keys at those positions.
+    restate: Rc<dyn Fn(&Projection) -> Projection>,
 }
 
 impl RekeySorted {
-    pub fn new(input: Box<dyn TileOperator>) -> Self {
+    pub fn new(
+        input: Box<dyn TileOperator>,
+        restate: Rc<dyn Fn(&Projection) -> Projection>,
+    ) -> Self {
         let (tiling, key) = rekeyed_tiling(input.tiling());
         Self {
             base: OperatorBase::new(tiling),
             input,
             key,
+            restate,
         }
     }
 }
@@ -91,9 +105,14 @@ impl TileOperator for RekeySorted {
                 &self.base,
                 scheduler,
             ),
-            input: self
-                .input
-                .subscribe(self.tiling().universal_guard(), consumer, scheduler),
+            input: self.input.subscribe(
+                self.tiling().universal_guard(),
+                {
+                    let restate = self.restate.clone();
+                    restating(Box::new(move |region| restate(region)), consumer)
+                },
+                scheduler,
+            ),
             held: Vec::new(),
             complete_through: None,
             key: self.key.clone(),

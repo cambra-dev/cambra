@@ -1669,6 +1669,194 @@ pub fn proposal_stream_tiling(key_extent: &Extent, value_extent: &Extent) -> Til
     )
 }
 
+/// The item each commit of a reply tap keyed by item answered, per tap key: the commit tick a
+/// tap value landed at, mapped to the item position it was committed with.
+///
+/// A reply tap's read re-keys the tap's stream from commit ticks to items ([`RekeySorted`]), and a
+/// region of ticks the store pushes names that read's keys only through this map. The rows the read
+/// pulls carry the same items, but a push reaches the read before its pull. The store records each
+/// commit here in the step that decides it, and pushes only after that step, so every decided tick
+/// a push names is recorded before the push restates it. It is kept per tap key because one clock
+/// serves every writer: a tick one writer committed restates to no item in another writer's tap.
+///
+/// [`RekeySorted`]: crate::interpreter::tile_operators::RekeySorted
+#[derive(Clone, Default)]
+pub struct CommittedItems(std::rc::Rc<std::cell::RefCell<CommittedItemsState>>);
+
+#[derive(Default)]
+struct CommittedItemsState {
+    /// The tick the store opened at or the last commit recorded, of any writer: the ticks above
+    /// it are undecided.
+    decided: Option<Position>,
+    /// Per tracked tap, the item committed at each tick.
+    taps: HashMap<Value, TapItems>,
+}
+
+/// One tap's commits ([`CommittedItems`]).
+struct TapItems {
+    /// The domain of the tap's items, its writer's source positions, which a prefix of a union
+    /// position needs for its tags.
+    positions: Extent,
+    /// The item committed at each tick not yet released, in tick order, which is also item
+    /// order.
+    at: BTreeMap<Position, Value>,
+    /// The highest item committed at a released tick: every key at or below it is settled at
+    /// a released tick.
+    released: Option<Value>,
+}
+
+impl TapItems {
+    /// The highest item the tap has committed, released or not.
+    fn highest(&self) -> Option<&Value> {
+        self.at.values().next_back().or(self.released.as_ref())
+    }
+}
+
+impl CommittedItems {
+    /// Record the commits of the tap `key`, a write-only key whose values are
+    /// `(item position, value)` pairs.
+    /// `positions` is the domain of the items it answers, its writer's source positions.
+    pub fn track(&self, key: Value, positions: Extent) {
+        self.0.borrow_mut().taps.insert(
+            key,
+            TapItems {
+                positions,
+                at: BTreeMap::new(),
+                released: None,
+            },
+        );
+    }
+
+    /// Record that the store opened decided through `start`, its clock's first tick or where a
+    /// predecessor store stopped: a tick at or below it holds no commit of this store's.
+    fn open_at(&self, start: &Position) {
+        let mut state = self.0.borrow_mut();
+        debug_assert!(
+            state.decided.is_none(),
+            "a store opens once, before any commit: opening at {start} after {:?}",
+            state.decided
+        );
+        state.decided = Some(start.clone());
+    }
+
+    /// The tracked taps `writes` writes, each with the item it answers.
+    fn items_in(&self, writes: &HashMap<Value, Value>) -> Vec<(Value, Value)> {
+        self.0
+            .borrow()
+            .taps
+            .keys()
+            .filter_map(|key| {
+                let pair = writes.get(key)?;
+                let Value::Record(fields) = pair else {
+                    panic!("a tap keyed by item commits `(item position, value)` pairs, got {pair}")
+                };
+                let item = fields
+                    .get(&tuple_field(0))
+                    .expect("a tap keyed by item commits `(item position, value)` pairs");
+                Some((key.clone(), item.clone()))
+            })
+            .collect()
+    }
+
+    /// Record the commit at tick `tick`, with `items`, each a tap it wrote and the item it
+    /// answered.
+    fn record(&self, tick: &Position, items: Vec<(Value, Value)>) {
+        let mut state = self.0.borrow_mut();
+        debug_assert!(
+            state.decided.as_ref().is_none_or(|decided| tick > decided),
+            "commit ticks rise: {tick} after {:?}",
+            state.decided
+        );
+        state.decided = Some(tick.clone());
+        for (key, item) in items {
+            let tap = state.taps.get_mut(&key).expect("a recorded tap is tracked");
+            // A tap's items rise with its commit ticks, which the restatement rests on.
+            assert!(
+                tap.highest().is_none_or(|highest| item > *highest),
+                "a tap keyed by item commits its items in rising order: {item} after {:?}",
+                tap.highest()
+            );
+            tap.at.insert(tick.clone(), item);
+        }
+    }
+
+    /// Drop the ticks at or below `through`, which every reader has released, so no push
+    /// or notification names them again.
+    fn release_through(&self, through: &Position) {
+        for tap in self.0.borrow_mut().taps.values_mut() {
+            let kept = tap.at.split_off(&next_commit_tick(through));
+            if let Some((_, item)) = std::mem::replace(&mut tap.at, kept).into_iter().next_back() {
+                tap.released = Some(item);
+            }
+        }
+    }
+
+    /// `region`, a region of commit ticks, restated as the keys of the tap `key`'s read that
+    /// those ticks settle.
+    ///
+    /// A key is settled at the first commit of an item at or above it: its own, or, where the
+    /// item committed no reply, the next item's, since the tap commits its items in rising
+    /// order. A decided tick that committed item 𝑖 therefore settles the keys above the item
+    /// committed before it, through 𝑖, and a tick that committed no item settles none. The
+    /// undecided ticks settle every key above the highest item committed.
+    ///
+    /// # Panics
+    ///
+    /// For a region that names some undecided ticks and not others, whose items are not yet
+    /// known; and for a region beneath the ticks, which names a path through a tap value.
+    pub fn restate(&self, key: &Value, region: &Projection) -> Projection {
+        let Projection::Keys { level, keys } = region else {
+            return region.clone();
+        };
+        assert!(
+            level.enclosing().is_none(),
+            "a reply tap's region of commit ticks names whole ticks, got keys at {level}"
+        );
+        let state = self.0.borrow();
+        let tap = state
+            .taps
+            .get(key)
+            .unwrap_or_else(|| panic!("the tap {key} is tracked by item"));
+        let mut settled = Vec::new();
+        let mut below = tap.released.as_ref();
+        for (tick, item) in &tap.at {
+            if keys.contains(tick.value()) {
+                settled.push(
+                    above(below, Some(&tap.positions))
+                        .intersect(&Predicate::at_or_below_in(item.clone(), &tap.positions)),
+                );
+            }
+            below = Some(item);
+        }
+        let undecided = above(state.decided.as_ref().map(Position::value), None);
+        if !keys.intersect(&undecided).is_false() {
+            assert!(
+                undecided.minus(keys).is_false(),
+                "a region of the tap {key}'s commit ticks names the undecided ticks all or none, \
+                 got {keys:?}"
+            );
+            settled.push(above(tap.highest(), Some(&tap.positions)));
+        }
+        Projection::admitting(
+            settled
+                .iter()
+                .fold(Predicate::False, |all, keys| all.union(keys)),
+        )
+    }
+}
+
+/// The keys above `bound` in the domain `extent`, which a union key's prefix needs for its tags,
+/// and every key where there is no bound.
+fn above(bound: Option<&Value>, extent: Option<&Extent>) -> Predicate {
+    bound.map_or(Predicate::True, |bound| {
+        let through = match extent {
+            Some(extent) => Predicate::at_or_below_in(bound.clone(), extent),
+            None => Predicate::at_or_below(bound.clone()),
+        };
+        Predicate::True.minus(&through)
+    })
+}
+
 /// A commit operator over a multi-key store `Position ⇀ (Key ⇀ Value)`,
 /// fed by `n_writers` concurrent writers.
 ///
@@ -1704,6 +1892,8 @@ pub struct CommitOperator {
     /// every writer does: a key nobody can still write is final even while the
     /// store keeps committing other keys.
     writer_write_keys: Vec<Vec<Value>>,
+    /// The items its taps keyed by item committed, which their reads restate pushes with.
+    committed_items: CommittedItems,
 }
 
 /// Graph edges for a store's per-key tick-0 operators, keyed by the store key.
@@ -1728,6 +1918,7 @@ impl CommitOperator {
                 .map(|_| CycleSlot::new())
                 .collect(),
             writer_write_keys,
+            committed_items: CommittedItems::default(),
         }
     }
 
@@ -1750,7 +1941,14 @@ impl CommitOperator {
                 .map(|_| CycleSlot::new())
                 .collect(),
             writer_write_keys,
+            committed_items: CommittedItems::default(),
         }
+    }
+
+    /// The items this store's taps keyed by item commit, recorded for each tap the
+    /// caller [tracks](CommittedItems::track).
+    pub fn committed_items(&self) -> &CommittedItems {
+        &self.committed_items
     }
 
     /// Wire writer `k`'s input. Call after the operator is boxed, so the writer
@@ -1830,6 +2028,7 @@ impl TileOperator for CommitOperator {
             engine: None,
             output_tiling: self.tiling().clone(),
             drain_start: 0,
+            committed_items: self.committed_items.clone(),
             notifier: ChangeNotifier::new(consumer, scheduler),
             #[cfg(debug_assertions)]
             reported_closed: std::collections::HashSet::new(),
@@ -1872,6 +2071,8 @@ struct CommitProducer {
     /// changes only *which* transaction wins a race between conflicting writers,
     /// never correctness (conservation/non-negativity hold under any order).
     drain_start: usize,
+    /// The items its taps keyed by item committed ([`CommitOperator::committed_items`]).
+    committed_items: CommittedItems,
     /// Wakes this store's readers when a pull changes what it answers.
     notifier: ChangeNotifier,
     /// Every key a render has reported in `closed_keys`, for the check that no commit
@@ -1921,6 +2122,17 @@ impl CommitProducer {
         self.engine
             .as_mut()
             .expect("the store is open past the seed check at the head of the pull")
+    }
+
+    /// Validate and (if valid) commit `proposal` ([`CommitEngine::attempt`]), recording the
+    /// items its taps keyed by item answered at the tick it commits at.
+    fn attempt(&mut self, proposal: Proposal) -> CommitOutcome {
+        let taps = self.committed_items.items_in(&proposal.writes);
+        let outcome = self.open_engine().attempt(proposal);
+        if let CommitOutcome::Committed { ts } = &outcome {
+            self.committed_items.record(ts, taps);
+        }
+        outcome
     }
 }
 
@@ -1982,6 +2194,7 @@ impl TileProducer for CommitProducer {
                 .cloned()
         {
             engine.gc_released_prefix(&through);
+            self.committed_items.release_through(&through);
         }
     }
 }
@@ -2004,7 +2217,9 @@ impl CommitProducer {
                 }
             }
             if resolved == self.seed_producers.len() {
-                self.engine = Some(CommitEngine::new(seed));
+                let engine = CommitEngine::new(seed);
+                self.committed_items.open_at(engine.watermark());
+                self.engine = Some(engine);
                 // The engine holds the seed from here, so the concrete part is not kept twice.
                 self.seed.clear();
                 // The seed is read once, at the store's opening, so it is released there.
@@ -2094,7 +2309,7 @@ impl CommitProducer {
                 let write_set = value_to_map(&writes.index_at(j));
                 #[cfg(debug_assertions)]
                 let written: Vec<Value> = write_set.keys().cloned().collect();
-                let outcome = self.open_engine().attempt(Proposal {
+                let outcome = self.attempt(Proposal {
                     snapshot,
                     reads: value_to_map(&reads.index_at(j)),
                     writes: write_set,
@@ -6646,6 +6861,147 @@ mod tests {
     use crate::interpreter::validate_tile;
     use rstest::rstest;
     use std::{cell::RefCell, rc::Rc};
+
+    /// `CommittedItems` tracking the taps `a` and `b`, with each commit `(tick, writes)`
+    /// recorded, a write being a tap and the item it answered.
+    fn committed(commits: &[(u64, &[(&str, u64)])]) -> CommittedItems {
+        let items = CommittedItems::default();
+        items.track(Value::String("a".into()), Extent::Base(BaseType::UInt));
+        items.track(Value::String("b".into()), Extent::Base(BaseType::UInt));
+        items.open_at(&Position::new(Value::UInt(0)));
+        for (tick, writes) in commits {
+            let writes = writes
+                .iter()
+                .map(|(tap, item)| (Value::String((*tap).into()), Value::UInt(*item)))
+                .collect();
+            items.record(&Position::new(Value::UInt(*tick)), writes);
+        }
+        items
+    }
+
+    /// The projection of the commit ticks `keys` admits.
+    fn ticks(keys: Predicate) -> Projection {
+        Projection::admitting(keys)
+    }
+
+    /// The keys from `low` through `high`.
+    fn through(low: u64, high: u64) -> Predicate {
+        Predicate::True
+            .minus(&Predicate::at_or_below(Value::UInt(low)))
+            .intersect(&Predicate::at_or_below(Value::UInt(high)))
+            .union(&Predicate::point(Value::UInt(low)))
+    }
+
+    /// A commit settles the keys of the items before it that committed no reply.
+    #[test]
+    fn a_commit_settles_the_denied_items_below_it() {
+        let items = committed(&[(1, &[("a", 1)]), (2, &[("a", 3)])]);
+        let a = Value::String("a".into());
+        assert_eq!(
+            items.restate(&a, &ticks(Predicate::point(Value::UInt(1)))),
+            Projection::admitting(Predicate::at_or_below(Value::UInt(1)))
+        );
+        assert_eq!(
+            items.restate(&a, &ticks(Predicate::point(Value::UInt(2)))),
+            Projection::admitting(through(2, 3))
+        );
+    }
+
+    /// The store's start is decided when it opens, and holds no commit.
+    #[test]
+    fn the_start_settles_no_key() {
+        let items = committed(&[]);
+        assert_eq!(
+            items.restate(
+                &Value::String("a".into()),
+                &ticks(Predicate::point(Value::UInt(0)))
+            ),
+            Projection::Nothing
+        );
+    }
+
+    /// One clock serves both taps: a tick one tap committed settles no key of the other.
+    #[test]
+    fn a_tick_of_another_tap_settles_no_key() {
+        let items = committed(&[(1, &[("a", 0)]), (2, &[("b", 0)])]);
+        let (a, b) = (Value::String("a".into()), Value::String("b".into()));
+        let tick_2 = ticks(Predicate::point(Value::UInt(2)));
+        assert_eq!(items.restate(&a, &tick_2), Projection::Nothing);
+        assert_eq!(
+            items.restate(&b, &tick_2),
+            Projection::admitting(Predicate::at_or_below(Value::UInt(0)))
+        );
+    }
+
+    /// The undecided ticks settle every key above the highest item committed, released or not.
+    #[test]
+    fn the_undecided_ticks_settle_the_keys_above_the_highest_item() {
+        let items = committed(&[(1, &[("a", 0)]), (2, &[("a", 2)]), (3, &[])]);
+        items.release_through(&Position::new(Value::UInt(2)));
+        let a = Value::String("a".into());
+        let undecided = Predicate::True.minus(&Predicate::at_or_below(Value::UInt(2)));
+        assert_eq!(
+            items.restate(&a, &ticks(undecided)),
+            Projection::admitting(Predicate::True.minus(&Predicate::at_or_below(Value::UInt(2))))
+        );
+    }
+
+    /// A released tick's item bounds the keys the next commit settles.
+    #[test]
+    fn a_released_item_bounds_the_next_commit() {
+        let items = committed(&[(1, &[("a", 1)]), (2, &[("a", 4)])]);
+        items.release_through(&Position::new(Value::UInt(1)));
+        let unreleased = Predicate::True.minus(&Predicate::at_or_below(Value::UInt(1)));
+        assert_eq!(
+            items.restate(&Value::String("a".into()), &ticks(unreleased)),
+            Projection::admitting(Predicate::True.minus(&Predicate::at_or_below(Value::UInt(1))))
+        );
+    }
+
+    /// A writer over a concatenation answers union-keyed items, whose bounds name the domain's
+    /// tags.
+    #[test]
+    fn a_commit_settles_union_keyed_items() {
+        let positions = Extent::Union(TagMap::from_arms(vec![
+            (FieldKey::Index(0), Extent::Base(BaseType::UInt)),
+            (FieldKey::Index(1), Extent::Base(BaseType::UInt)),
+        ]));
+        let item = |tag, at| Value::Union {
+            tag: FieldKey::Index(tag),
+            inner: Box::new(Value::UInt(at)),
+        };
+        let items = CommittedItems::default();
+        let a = Value::String("a".into());
+        items.track(a.clone(), positions.clone());
+        items.open_at(&Position::new(Value::UInt(0)));
+        items.record(
+            &Position::new(Value::UInt(1)),
+            vec![(a.clone(), item(0, 0))],
+        );
+        items.record(
+            &Position::new(Value::UInt(2)),
+            vec![(a.clone(), item(1, 0))],
+        );
+        let tick_2 = ticks(Predicate::point(Value::UInt(2)));
+        assert_eq!(
+            items.restate(&a, &tick_2),
+            Projection::admitting(
+                Predicate::True
+                    .minus(&Predicate::at_or_below_in(item(0, 0), &positions))
+                    .intersect(&Predicate::at_or_below_in(item(1, 0), &positions))
+            )
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "names the undecided ticks all or none")]
+    fn a_region_naming_some_undecided_ticks_panics() {
+        let items = committed(&[(1, &[("a", 0)])]);
+        items.restate(
+            &Value::String("a".into()),
+            &ticks(Predicate::at_or_below(Value::UInt(5))),
+        );
+    }
 
     /// A fixture producer's answer with the released region subtracted — the
     /// post-condition [`TileProducer::get`] asserts. A fixture stands in for a real

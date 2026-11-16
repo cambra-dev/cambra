@@ -766,6 +766,7 @@ depends on the input's shape, the operator decides from its tiling when it subsc
 | `ExtractFinal` | the input | widens | Read whole; the keys are the last position. |
 | `PermuteRecordDomain`, `FlattenTupleDomain` | the input | restates | The keys are the input's with their fields renamed or spliced, so a region of the input's keys is the same keys renamed or spliced. |
 | `Aggregate`, `ExtractAggregate` | the input | widens | The accumulator has no keys. |
+| `RekeySorted` | the pairs | restates as its caller names it | Which output key a position holds is data the operator reads only at its next pull. A reply tap's read restates a region of commit ticks as the item keys those ticks settle, from the store's record of the item each commit answered (`CommittedItems::restate`). |
 | `MapAggregate`, `MapExtractAggregate` | the input | keeps | The groups keep the input's outermost keys. |
 | Stores, recurrences and the commit operators (`commit_operator.rs`) | every input | widens | A recurrence re-keys its inputs by its own positions. |
 
