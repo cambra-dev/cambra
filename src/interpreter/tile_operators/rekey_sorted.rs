@@ -135,6 +135,7 @@ impl TileProducer for RekeySortedProducer {
             codomain,
             domain_predicate,
             deleted,
+            ..
         } = input
         else {
             panic!("RekeySorted expected a collection, got {input:?}")
