@@ -425,7 +425,6 @@ impl TileProducer for ConverseProducer {
         visit("input", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
     }
@@ -669,7 +668,6 @@ impl TileProducer for MapDomainProducer {
         visit("input", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
     }
@@ -831,7 +829,6 @@ impl TileProducer for UncurryProducer {
         visit("input", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
     }
@@ -1239,7 +1236,6 @@ impl TileProducer for FilterProducer {
         visit("predicate", &*self.predicate);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
         visit("predicate", &mut *self.predicate);
@@ -1548,7 +1544,6 @@ impl TileProducer for RestrictProducer {
         visit("predicate", &*self.predicate);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("predicate", &mut *self.predicate);
     }
@@ -1916,6 +1911,17 @@ impl TileOperator for Product {
             .enclosing()
             .unwrap_or_else(|| unreachable!("the paired level is beneath a row"));
         let empty_level = self.tiling().values_at(level).empty_at_no_rows();
+        let outer_consumer = forwarding_consumer_keeping_keys(&shared, &scheduler.wakeup_queue());
+        let outer_consumer = crate::interpreter::scheduler::through_values(
+            self.paired,
+            self.tiling(),
+            outer_consumer,
+        );
+        let outer = self.outer.subscribe(
+            self.outer.tiling().universal_guard(),
+            outer_consumer,
+            scheduler,
+        );
         Box::new(ProductProducer {
             base: ProducerBase::new(
                 ProductProducer::alloc_id(),
@@ -1925,7 +1931,7 @@ impl TileOperator for Product {
             )
             .sharing(gate),
             // Both sides are pulled at the projection, aligned row for row.
-            outer: subscribe_forwarding_keeping_keys(&mut *self.outer, &shared, scheduler),
+            outer,
             inner: subscribe_forwarding_keeping_keys(&mut *self.inner, &shared, scheduler),
             level,
             empty_level,
@@ -1963,7 +1969,6 @@ impl TileProducer for ProductProducer {
         visit("inner", &*self.inner);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("outer", &mut *self.outer);
         visit("inner", &mut *self.inner);

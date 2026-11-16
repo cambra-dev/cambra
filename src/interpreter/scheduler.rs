@@ -414,6 +414,18 @@ impl WakeupQueue {
         queued.push(consumer);
     }
 
+    /// Notify every queued consumer of `Everything`, outside the cascade that queued it, and say
+    /// whether one was queued: [`Scheduler::deliver`] does so. A request made during the drain
+    /// waits for the next one ([`take`](Self::take)).
+    fn deliver(&self) -> bool {
+        let mut delivered = false;
+        for consumer in self.take() {
+            consumer.borrow_mut().notify(&Projection::Everything);
+            delivered = true;
+        }
+        delivered
+    }
+
     /// Take the currently-queued wakeups, leaving the queue empty. A wakeup
     /// fired during the drain may enqueue a fresh request (a still-converging
     /// producer re-arming); that lands in the now-empty queue and is delivered
@@ -596,11 +608,7 @@ other's subscribers",
             delivered = true;
         }
         // Take the queue after source delivery, outside its notification cascades.
-        // Requests created while this snapshot drains remain queued for the next drain.
-        for consumer in self.wakeups.take() {
-            consumer.borrow_mut().notify(&Projection::Everything);
-            delivered = true;
-        }
+        delivered |= self.wakeups.deliver();
         // Then pull every sink the wakes above reached, once each, so a change reaches a
         // sink in the call that delivers it.
         for pull in self.sink_pulls.take() {
@@ -863,7 +871,6 @@ mod tests {
                 visit("input", &*self.input);
             }
 
-            #[cfg(test)]
             fn visit_input_producers_mut(
                 &mut self,
                 visit: &mut dyn FnMut(&str, &mut dyn TileProducer),
@@ -1223,5 +1230,53 @@ mod tests {
                 Projection::Everything,
             ]
         );
+    }
+}
+
+/// Preserve notifications above `level` when the value at that level changes shape.
+/// Changes below it name their enclosing rows; completion passes only for whole values.
+pub(crate) fn through_values(
+    level: CurryLevel,
+    output: &crate::interpreter::Tiling,
+    downstream: Box<dyn Consumer>,
+) -> Box<dyn Consumer> {
+    if level == CurryLevel::OUTERMOST {
+        return widening(downstream);
+    }
+    Box::new(ThroughValues {
+        level,
+        output: output.clone(),
+        downstream,
+    })
+}
+
+struct ThroughValues {
+    level: CurryLevel,
+    output: crate::interpreter::Tiling,
+    downstream: Box<dyn Consumer>,
+}
+
+impl Consumer for ThroughValues {
+    fn notify(&mut self, region: &Projection) {
+        self.downstream.notify(&region.above(self.level));
+    }
+
+    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        let already_whole = *region == Projection::Everything;
+        let region = if landing.is_complete() {
+            let guard = crate::interpreter::tiling::through_shared_levels(
+                region.collection_guard(),
+                self.level.index(),
+                &self.output,
+            );
+            Projection::of(&guard).expect("completed shared rows name output rows")
+        } else {
+            region.above(self.level)
+        };
+        if !landing.is_complete() && !already_whole && region == Projection::Everything {
+            landing.widened(|landing| self.downstream.push(&region, landing));
+        } else {
+            self.downstream.push(&region, landing);
+        }
     }
 }
