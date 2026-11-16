@@ -110,6 +110,58 @@ fn arm_dependent_filter_result_panics_when_recording_an_escaping_bound() {
     assert!(message.contains("free in the lower bound"), "{message}");
 }
 
+/// `^*` states its product, so an arm computing `r ^* …` has a type naming its pattern binder
+/// `r`. Inference records that type, `r` still free, on the result variable outside the arm,
+/// and panics there. A refinement naming only an outer binder is recorded without one.
+#[rstest]
+#[case::names_the_binder(indoc! {r"
+    def area(s):
+        match s:
+            case `circle(r):
+                r ^* 2
+    area(`circle(2))
+"})]
+#[case::every_arm_names_its_binder(indoc! {r"
+    def area(s):
+        match s:
+            case `circle(r):
+                r ^* r
+            case `square(w):
+                w ^* w
+    area(`circle(2))
+"})]
+fn a_match_arm_naming_its_pattern_binder_panics_when_recording_an_escaping_bound(
+    #[case] code: &str,
+) {
+    let stmts = parse_module(code);
+    let mut expr = lower_uniquified(&stmts, &mut LoweringContext::default());
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        infer(&mut expr, &mut TypeInferenceContext::new())
+    }))
+    .expect_err("an arm type naming its binder currently panics while recording its bound");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .expect("scope assertion has a string panic payload");
+    assert!(message.contains("open bound recorded on"), "{message}");
+    assert!(message.contains("base: \"r\""), "{message}");
+    assert!(message.contains("free in the lower bound"), "{message}");
+}
+
+#[test]
+fn a_match_arm_s_type_keeps_a_refinement_naming_an_outer_binder() {
+    let code = indoc! {r"
+        k ^= 3
+        def area(s):
+            match s:
+                case `circle(r):
+                    k ^* 2
+        area(`circle(2))
+    "};
+    assert_eq!(infer_program(code).to_string(), "{Int | __elem == k * 2}");
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
