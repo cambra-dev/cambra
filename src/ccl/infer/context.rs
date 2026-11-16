@@ -1856,13 +1856,20 @@ impl InferCtx {
 
     /// Record on `var` the items `written` lists, and bound it by them where a clause is
     /// exact. A parameter in the bound is the opened one, which the variable it opened to
-    /// names.
+    /// names. `written` is normalized (`Self::normalize_written`).
     fn bound_written(
         &self,
         var: &Rc<CapabilityVar>,
         written: &crate::ccl::capabilities::Written,
         blame: Blame,
     ) {
+        debug_assert!(
+            written.set.requires.iter().all(|r| r
+                .ordering()
+                .is_none_or(|o| !matches!(o.capabilities.repr(), Repr::Written(_)))),
+            "`bound_written` takes a clause `normalize_written` normalized: no ordering \
+             requirement's capabilities are still written"
+        );
         for item in written.items() {
             if !matches!(item, Capability::Param(_)) {
                 var.record(self.stated_capability(item));
@@ -1877,16 +1884,6 @@ impl InferCtx {
         // the top of its direction less it, and its part is open without one. Its own bound
         // checks what the bound takes away.
         let mut set = written.set.clone();
-        set.requires = set
-            .requires
-            .into_iter()
-            .map(
-                |r| match self.stated_capability(Capability::Requires(r)).item {
-                    Capability::Requires(r) => r,
-                    _ => unreachable!("normalizing a requirement preserves its direction"),
-                },
-            )
-            .collect();
         set.params.clear();
         let (mut open_requires, mut open_causes) = (written.open_requires, written.open_causes);
         for (param, var) in written
