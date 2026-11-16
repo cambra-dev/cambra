@@ -655,6 +655,13 @@ impl Typing for CheckCtx {
         crate::ccl::ccl_utils::closed_let_type(binding, bound_expr, body_ty)
     }
 
+    fn close_pattern_type(&mut self, binder: &Name, body_ty: Type) -> Type {
+        if !crate::ccl::subst::type_free_vars(&body_ty).contains(binder) {
+            return body_ty;
+        }
+        crate::ccl::subst::Subst::join_arm(binder.clone()).apply_type(&body_ty)
+    }
+
     fn bind_annotation(&mut self, _inferred: &Type, ann: &Type) -> Result<Type, LocatedInferError> {
         // The annotation was already folded into the binder's type during
         // inference; nothing to re-check here. Check's `normalize` is the

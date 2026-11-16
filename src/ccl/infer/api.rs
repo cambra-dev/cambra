@@ -18,7 +18,7 @@ use crate::ccl::infer::solver::compact::JoinedPosition;
 use crate::ccl::infer::solver::display::InferredPoly;
 use crate::ccl::infer::solver::traits::InstanceTable;
 use crate::ccl::provenance::NodeId;
-use crate::ccl::subst::Subst;
+use crate::ccl::subst::{JoinSite, Subst};
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
     Expr, FieldKey, HistoryKind, InferVarId, Name, Type, TypedBinding, TypedExprNode,
@@ -546,14 +546,18 @@ pub enum InferError {
         /// Omitted from the message; excluded by [`Self::same_defect`].
         origin: String,
     },
-    /// A feed or a mutable variable receives a value whose collection keys or function
-    /// parameter depend on a binder bound between the target's declaration and the write,
-    /// which the contribution's edge joins over (`src/ccl/design/type-inference.md`, "A
-    /// contribution crosses the binders after its target"). The target's type is the join over
-    /// every value written to it. Collections over different keys have no join
-    /// (`docs/chl-spec.md`, "Joining the types of several values"), and the join of functions
-    /// over different parameters accepts only what each one accepts, which inference does not
-    /// state.
+    /// A value whose collection keys or function parameter depend on a binder the value's type
+    /// leaves the scope of as the join over every value the binder takes. Collections over
+    /// different keys have no join (`docs/chl-spec.md`, "Joining the types of several
+    /// values"), and the join of functions over different parameters accepts only what each one
+    /// accepts, which inference does not state.
+    ///
+    /// The [`JoinSite`] says which construct joins. A contribution to a feed or a mutable
+    /// variable joins over the binders bound between the target's declaration and the write
+    /// (`src/ccl/design/type-inference.md`, "A contribution crosses the binders after its
+    /// target"). A `match` arm's result joins over the arm's pattern binder
+    /// (`src/ccl/design/type-inference.md`, "Pattern-match arm binder referenced by the result
+    /// type").
     NoJoinOverBinder {
         /// The binders the predicate depends on.
         binders: Vec<Name>,
@@ -565,6 +569,8 @@ pub enum InferError {
         predicate: Rc<Expr>,
         /// Whether `predicate` states a collection's keys or a function's parameter.
         position: JoinedPosition,
+        /// The construct whose values the join is of.
+        site: JoinSite,
         /// Whether a loop variable among `binders` would key the target's rows, but the target
         /// is fed from more than one place, so a key does not say which place fed a row
         /// ([`LocatedInferError::fed_elsewhere`]).
@@ -1012,6 +1018,7 @@ impl InferError {
                     reads: ar,
                     predicate: ap,
                     position: ax,
+                    site: asite,
                     fed_elsewhere: af,
                 },
                 InferError::NoJoinOverBinder {
@@ -1019,12 +1026,14 @@ impl InferError {
                     reads: br,
                     predicate: bp,
                     position: bx,
+                    site: bsite,
                     fed_elsewhere: bf,
                 },
             ) => {
                 a == b
                     && ar == br
                     && ax == bx
+                    && asite == bsite
                     && af == bf
                     && crate::ccl::ty::eq_term_modulo_ty_slots(ap, bp)
             }
@@ -2231,28 +2240,48 @@ impl std::fmt::Debug for InferError {
                 reads,
                 predicate,
                 position,
+                site,
                 fed_elsewhere,
             } => {
                 let spelled =
                     |names: &[Name]| names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>();
+                let between = match site {
+                    JoinSite::Contribution => "between the target's declaration and the write",
+                    JoinSite::Arm => "in the arm",
+                };
                 let mut depends = Vec::new();
                 if !binders.is_empty() {
-                    depends.push(format!(
-                        "{}, bound between the target's declaration and the write",
-                        spelled(binders).join(", ")
-                    ));
+                    depends.push(format!("{}, bound {between}", spelled(binders).join(", ")));
                 }
                 if !reads.is_empty() {
                     depends.push(format!(
-                        "{}, read between the target's declaration and the write where the read \
-                         takes one value per iteration or call",
+                        "{}, read {between} where the read takes one value per iteration or call",
                         spelled(reads).join(", ")
                     ));
                 }
                 let predicate = crate::ccl::chl_print::chl_predicate(predicate);
                 let depends = depends.join("; and on ");
-                match position {
-                    JoinedPosition::Keys => write!(
+                // A `match` is one of the constructs `box` reconciles: its arms are the values
+                // joined, as in a conditional's [`InferError::DomainJoinConflict`].
+                match (site, position) {
+                    (JoinSite::Arm, JoinedPosition::Keys) => write!(
+                        f,
+                        "Collection domains have no common answer\n\
+                         The keys of a collection a `match` arm results in depend on {depends}\n\
+                         Keys: {predicate}\n\
+                         A collection's domain is its data, so a join may not narrow it. Wrap \
+                         each arm in `box` to keep them."
+                    )?,
+                    (JoinSite::Arm, JoinedPosition::Parameter) => write!(
+                        f,
+                        "The parameter of a function a `match` arm results in depends on \
+                         {depends}\n\
+                         Parameter: {predicate}\n\
+                         The `match`'s type is the join of every arm's result, and the join of \
+                         functions over different parameters accepts only what every one of them \
+                         accepts, which inference does not state."
+                    )?,
+                    (JoinSite::Contribution, JoinedPosition::Keys) => write!(
                         f,
                         "The keys of a collection written to a feed or \
                          mutable variable depend on {depends}\n\
@@ -2260,7 +2289,7 @@ impl std::fmt::Debug for InferError {
                          The target's type is the join of every value written to it, and \
                          collections over different keys have no join."
                     )?,
-                    JoinedPosition::Parameter => write!(
+                    (JoinSite::Contribution, JoinedPosition::Parameter) => write!(
                         f,
                         "The parameter of a function written to a feed or \
                          mutable variable depends on {depends}\n\
@@ -3870,6 +3899,7 @@ mod tests {
             reads: vec![],
             predicate: Rc::new(predicate),
             position: JoinedPosition::Keys,
+            site: JoinSite::Contribution,
             fed_elsewhere: false,
         };
         let predicate = |name: &str| {

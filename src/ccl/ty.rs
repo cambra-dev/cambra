@@ -5023,9 +5023,12 @@ impl RefinementTemplate {
         ) {
             return None;
         }
+        // The operands move under the refinement the predicate lands in, so an element
+        // reference they read free names one refinement further out.
+        let under = |t: &TypedExpr| crate::ccl::subst::shift_elems(t, 1);
         let operation = match (self, operands) {
-            (Self::BinOp(op), [a, b]) => TypedExpr::binop(a.clone(), op.unrefined(), b.clone()),
-            (Self::UnaryOp(op), [a]) => TypedExpr::unary(op.unrefined(), a.clone()),
+            (Self::BinOp(op), [a, b]) => TypedExpr::binop(under(a), op.unrefined(), under(b)),
+            (Self::UnaryOp(op), [a]) => TypedExpr::unary(op.unrefined(), under(a)),
             _ => panic!(
                 "{self:?} receives one term per operand of its operation, not {}",
                 operands.len()
@@ -6459,6 +6462,25 @@ mod tests {
     use super::*;
     use crate::ccl::Annotation;
     use crate::ccl::Occurrence;
+
+    /// An operator's predicate places its operands under the refinement it lands in, so an
+    /// operand reading an enclosing refinement's element names it one refinement further out.
+    /// `groupby`'s key predicate is such an operand.
+    #[test]
+    fn an_operator_predicate_shifts_the_elements_its_operands_read() {
+        let int = Type::Base(BaseType::Int);
+        let add = RefinementTemplate::BinOp(BinOpKind::Arithmetic(
+            crate::ccl::ArithmeticKind::AddRefined,
+        ));
+        let refined = add.refine(
+            int.clone(),
+            &[
+                TypedExpr::var(Name::elem()).with_ty(int.clone()),
+                TypedExpr::lit(Lit::Int(1)).with_ty(int.clone()),
+            ],
+        );
+        assert_eq!(refined.to_string(), "{Int | __elem == __elem^1 + 1}");
+    }
 
     #[test]
     fn uint_range_display_uses_exclusive_length() {

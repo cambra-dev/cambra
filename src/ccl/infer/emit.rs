@@ -3487,7 +3487,10 @@ pub(super) fn emit_case<C: Typing>(
             .as_ref()
             .map(|p| (p.binding.name.clone(), p.binding.ty.clone()));
         let body_ty = match scope_info {
-            Some((name, ty)) => ctx.scoped(&name, &ty, |ctx| emit_case_branch(b, ctx))?,
+            Some((name, ty)) => {
+                let body_ty = ctx.scoped(&name, &ty, |ctx| emit_case_branch(b, ctx))?;
+                ctx.close_pattern_type(&name, body_ty)
+            }
             None => emit_case_branch(b, ctx)?,
         };
         ctx.require_sub(&body_ty, &result_ty, &|| "this branch".to_string())?;

@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use crate::ccl::FieldKey;
 use crate::ccl::infer::solver::traits::{Assoc, OperatorCall, Trait};
 use crate::ccl::infer::solver::{PolyScheme, fresh_var, fun, prim};
+use crate::ccl::ops::REFINE_OPS;
 use crate::ccl::{AggregateKind, BaseType, BinOpKind, Builtin, Level, Type, UnaryOpKind};
 
 use super::product;
@@ -68,17 +69,18 @@ pub(super) enum OpSignature {
 }
 
 /// The refinement `op` states of its result, `__elem == 𝑎 op 𝑏`, or `None` for an operator
-/// whose result is unrefined. Exactly the `^` siblings refine their result: `^+`, `^-`, `^*`,
-/// the comparisons other than `!=`, `^and` and `^or`.
+/// whose result is unrefined. The `^` siblings refine their result: `^+`, `^-`, `^*`, the
+/// comparisons other than `!=`, `^and` and `^or`. Under [`REFINE_OPS`] so does each operator
+/// that has a `^` sibling.
 fn refinement_of_binop(op: BinOpKind) -> Option<crate::ccl::RefinementTemplate> {
-    op.is_refined()
+    (op.is_refined() || (REFINE_OPS && op.refined().is_some()))
         .then_some(crate::ccl::RefinementTemplate::BinOp(op))
 }
 
-/// The refinement `op` states of its result, `__elem == op 𝑎`: `^not`'s, and none for any
-/// other unary operator.
+/// The refinement `op` states of its result, `__elem == op 𝑎`: `^not`'s, `not`'s under
+/// [`REFINE_OPS`], and none for any other unary operator.
 fn refinement_of_unary(op: UnaryOpKind) -> Option<crate::ccl::RefinementTemplate> {
-    op.is_refined()
+    (op.is_refined() || (REFINE_OPS && op.refined().is_some()))
         .then_some(crate::ccl::RefinementTemplate::UnaryOp(op))
 }
 

@@ -1366,8 +1366,9 @@ mod tests {
             [nth_span(prog.sources(), "x * 2", 0)],
             "the span of `x * 2`"
         );
-        // `^*` refines its result by the product it computes.
-        let mul_ty = if spells_caret_operators() {
+        // `*` under `REFINE_OPS`, and `^*` always, refines its result by the product it
+        // computes.
+        let mul_ty = if crate::ccl::REFINE_OPS || spells_caret_operators() {
             "{Int | __elem == x * 2}"
         } else {
             "Int"

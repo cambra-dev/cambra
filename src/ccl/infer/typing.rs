@@ -666,6 +666,17 @@ pub(super) trait Typing {
     /// query learns about that name.
     fn close_let_type(&mut self, binding: &TypedBinding, bound_expr: &Expr, body_ty: Type) -> Type;
 
+    /// Lift a `Case` arm's type `body_ty` past the arm's pattern binder `binder`, after
+    /// [`Self::scoped`] has restored the enclosing scope.
+    ///
+    /// The binder takes one value per matched row, so the lifted type is the join over every
+    /// value ([`crate::ccl::subst::Mapping::Join`]): a refinement naming the binder is dropped
+    /// where it states a value, and is `InferError::NoJoinOverBinder` where it states a
+    /// collection's keys or a function's parameter. Emission suspends the join on the lifted
+    /// variable's lower edge, as [`Self::close_let_type`] suspends a discharge; Check applies
+    /// it to the reconstructed type.
+    fn close_pattern_type(&mut self, binder: &Name, body_ty: Type) -> Type;
+
     /// Reconcile a binder's inferred type with its user annotation. In Emit
     /// mode this records the **one-way** obligation `inferred <: ann` —
     /// an annotation has to *admit* the value, not equal it — surfacing

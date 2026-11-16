@@ -3208,10 +3208,15 @@ impl InferCtx {
 
     /// Name, in each [`InferError::NoJoinOverBinder`] whose binders include a loop variable a
     /// feed was joined over only because its channel is fed from another place
-    /// ([`Self::require_feed`]), that other place.
+    /// ([`Self::require_feed`]), that other place. A `match` arm's join is not a feed's, so its
+    /// error is unchanged even where a feed crosses the same binder.
     pub(super) fn name_other_feed_places(&self, errors: &mut [LocatedInferError]) {
         for e in errors {
-            if let InferError::NoJoinOverBinder { binders, .. } = &e.error
+            if let InferError::NoJoinOverBinder {
+                binders,
+                site: crate::ccl::subst::JoinSite::Contribution,
+                ..
+            } = &e.error
                 && let Some(&other) = binders.iter().find_map(|b| self.fed_elsewhere.get(b))
             {
                 e.fed_elsewhere(other);
@@ -4469,6 +4474,21 @@ impl Typing for InferCtx {
             unreachable!("fresh() yields a Type::Infer var");
         };
         let bound = Bound::with_subst(body_ty, Subst::discharge(name.clone(), definition));
+        enforce_bound_scope(v, "lower", &bound);
+        v.bounds.borrow_mut().lower_mut().push(bound);
+        lifted
+    }
+
+    fn close_pattern_type(&mut self, binder: &Name, body_ty: Type) -> Type {
+        debug_assert!(
+            !self.telescope.contains(binder),
+            "a pattern binder `{binder}` is lifted past before its scope is restored"
+        );
+        let lifted = self.fresh();
+        let Type::Infer(v) = &lifted else {
+            unreachable!("fresh() yields a Type::Infer var");
+        };
+        let bound = Bound::with_subst(body_ty, Subst::join_arm(binder.clone()));
         enforce_bound_scope(v, "lower", &bound);
         v.bounds.borrow_mut().lower_mut().push(bound);
         lifted

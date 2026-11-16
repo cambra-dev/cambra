@@ -2301,22 +2301,27 @@ mod tests {
         // mistaken for a strict improvement: a body called twice is inlined
         // twice, so one edit inside it diverges at both call sites.
         //
-        // The two calls pass *different* arguments that nonetheless share one
-        // specialization: monomorphization keys on instantiation identity, and
-        // a join of two singletons keeps neither refinement, so `a` and `b`
-        // both arrive as plain `Int`. Literal arguments would key apart and
-        // clone the helper during inference — the baseline would already be
-        // delocalized, and the contrast below would not be inlining's doing.
-        // See `src/ccl/design/diffing.md`, "How much to normalize".
+        // The annotations keep the edit local at `Infer` under `REFINE_OPS`, so
+        // the contrast below is inlining's doing in either configuration. Under
+        // `REFINE_OPS`, `+` refines its result, so `a` is typed
+        // `{Int | __elem == 1 + 1}` and `b` `{Int | __elem == 2 + 2}`. The
+        // parameter annotation `y: Int` instantiates `g` at plain `Int` for both
+        // calls, which share one specialization rather than cloning `g` per call.
+        // The codomain annotation `=> Int` keeps `{Int | __elem == y + 2}` off
+        // `g`'s type, so the edited literal does not reach the references to `g`
+        // or the uses of its results. Without `REFINE_OPS`, `+` leaves its result
+        // unrefined, and both calls share `g` at plain `Int` without the
+        // annotations. See `src/ccl/design/diffing.md`, "`Infer` has already
+        // spent some of that locality".
         let v1 = indoc! {"
-            def g(y):
+            def g(y: Int) => Int:
                 y + 2
             a = 1 + 1
             b = 2 + 2
             g(a) * g(b)
         "};
         let v2 = indoc! {"
-            def g(y):
+            def g(y: Int) => Int:
                 y + 5
             a = 1 + 1
             b = 2 + 2

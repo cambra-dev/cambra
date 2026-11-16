@@ -101,6 +101,8 @@ pub enum CoalesceError {
         refinement: crate::ccl::Refinement,
         /// Where the refinement stands.
         position: super::compact::JoinedPosition,
+        /// The construct whose values the join is of.
+        site: crate::ccl::subst::JoinSite,
     },
     /// A data function carrying >= 2 candidate domains (a conditional collection) met a compute
     /// function at a positive join, so collapsing to the ordinary meet would
@@ -449,6 +451,7 @@ pub fn coalesce_compact(graph: &CompactGraph) -> Result<Type, CoalesceError> {
             binders: violation.binders.clone(),
             refinement: violation.refinement.clone(),
             position: violation.position,
+            site: violation.site,
         });
     }
     coalesce_compact_go(&graph.term, true, &[])
