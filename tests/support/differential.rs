@@ -1,8 +1,10 @@
 //! Running one program through the compiler and through the differential interpreter, each
 //! observed through the sink `out`, and reading both answers in the interpreter's domain.
 //!
-//! Compiled into the two differential suites: the hand-written cases
-//! (`tests/it/differential_interp.rs`) and the generated grid (`tests/it/generated_pairs.rs`).
+//! The compiler's side of both differential suites, the hand-written cases
+//! (`tests/it/differential_interp.rs`) and the generated grid (`tests/it/generated_pairs.rs`), is
+//! a dispatched run ([`dispatch`]). [`run_compiled`] runs a program in pull mode, for the
+//! compilation-pipeline tests' `check_sink`.
 
 use cambra::ccl::Type;
 use cambra::ccl::context::{CompiledProgram, GlobalContext, compile_program};
@@ -21,7 +23,8 @@ pub enum Compiled {
     Rejected(String),
     /// The program completed and its sink could not state a value.
     Unreadable(SinkReadError),
-    /// The program did not complete within [`CAP`] pulls.
+    /// The program did not complete: within [`CAP`] pulls in pull mode, or by the end of a
+    /// dispatched run.
     DidNotFinish,
 }
 
@@ -31,12 +34,12 @@ impl std::fmt::Display for Compiled {
             Compiled::Value(v) => write!(f, "{v}"),
             Compiled::Rejected(errs) => write!(f, "rejected: {errs}"),
             Compiled::Unreadable(e) => write!(f, "sink unreadable: {e}"),
-            Compiled::DidNotFinish => write!(f, "did not finish within {CAP} pulls"),
+            Compiled::DidNotFinish => write!(f, "did not finish"),
         }
     }
 }
 
-/// Compile and run `source`, answering what sink `out` observed.
+/// Compile and run `source` in pull mode, answering what sink `out` observed.
 pub fn run_compiled(source: &str) -> Compiled {
     let mut ctx = GlobalContext::default();
     let sink = ctx.register_test_sink("out");
@@ -76,17 +79,34 @@ fn read_out(program: &CompiledProgram, sink: &TestSink) -> Compiled {
     }
 }
 
-/// What a dispatched run made of a program ([`run_dispatched`]).
+/// What a dispatched run made of a program.
 pub enum Dispatched {
     /// What the run made of it, as [`run_compiled`] reports it.
     Ran(Compiled),
     /// Why the planner refused it.
     Refused(String),
+    /// The runs at morsels of one row and of every row made different things of it, each
+    /// rendered.
+    MorselsDisagree { one: String, every: String },
+}
+
+impl std::fmt::Display for Dispatched {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Dispatched::Ran(ran) => ran.fmt(f),
+            Dispatched::Refused(why) => write!(f, "refused: {why}"),
+            Dispatched::MorselsDisagree { one, every } => write!(
+                f,
+                "the dispatched runs disagree: at morsels of 1 {one}, at morsels of every row \
+                 {every}"
+            ),
+        }
+    }
 }
 
 /// Compile `source` for a dispatched run and run its pipelines at morsels of `rows`
 /// (`cambra::interpreter::dispatcher::run_program`), answering what sink `out` observed.
-pub fn run_dispatched(source: &str, rows: usize) -> Dispatched {
+fn run_dispatched(source: &str, rows: usize) -> Dispatched {
     let mut ctx = GlobalContext::default();
     ctx.defer_sink_pulls();
     let sink = ctx.register_test_sink("out");
@@ -105,6 +125,27 @@ pub fn run_dispatched(source: &str, rows: usize) -> Dispatched {
     Dispatched::Ran(read_out(&program, &sink))
 }
 
+/// What a dispatched run of `source` makes of it at morsels of one row, where a run at morsels
+/// of every row makes the same of it, and [`Dispatched::MorselsDisagree`] otherwise.
+///
+/// Two values are the same where they compare equal, so a commit time compares by its rank
+/// (`chl_interp::Value`); any other outcome is the same where it renders the same.
+pub fn dispatch(source: &str) -> Dispatched {
+    let one = run_dispatched(source, 1);
+    let every = run_dispatched(source, usize::MAX);
+    let same = match (&one, &every) {
+        (Dispatched::Ran(Compiled::Value(a)), Dispatched::Ran(Compiled::Value(b))) => a == b,
+        (a, b) => a.to_string() == b.to_string(),
+    };
+    match same {
+        true => one,
+        false => Dispatched::MorselsDisagree {
+            one: one.to_string(),
+            every: every.to_string(),
+        },
+    }
+}
+
 /// The tests whose programs the planner refuses, with the start of the refusal each expects:
 /// one `<test name>\t<refusal>` line each, a test's name as its thread names it.
 const DISPATCH_REFUSED: &str = include_str!(concat!(
@@ -112,16 +153,15 @@ const DISPATCH_REFUSED: &str = include_str!(concat!(
     "/tests/it/dispatch_refused.txt"
 ));
 
-/// Check that `source`, whose sink `out` holds `pulled` in pull mode, holds it after a
-/// dispatched run too, at morsels of one row and of every row, or is refused as
-/// [`DISPATCH_REFUSED`] pins for the running test. With `CAMBRA_DISPATCH_REPORT` set, a refusal
-/// is printed as the line that would pin it instead of failing.
+/// Check that a dispatched run of `source` ([`dispatch`]) completes with a value, or that the
+/// planner refuses it as [`DISPATCH_REFUSED`] pins for the running test. For a test that checks
+/// only that the compiler runs a program, whatever it answers.
 ///
 /// # Panics
 ///
-/// Where the dispatched run answers otherwise, or is refused where nothing pins it, or a pin
-/// names a refusal the run no longer makes.
-pub fn check_dispatched(source: &str, pulled: &Value) {
+/// Where the run produces no value, or is refused where nothing pins it, or a pin names a refusal
+/// the run no longer makes.
+pub fn check_dispatched(source: &str) {
     let test = std::thread::current()
         .name()
         .unwrap_or("an unnamed thread")
@@ -131,39 +171,25 @@ pub fn check_dispatched(source: &str, pulled: &Value) {
         .filter_map(|line| line.split_once('\t'))
         .find(|(name, _)| *name == test)
         .map(|(_, refusal)| refusal);
-    for rows in [1, usize::MAX] {
-        match (run_dispatched(source, rows), pin) {
-            (Dispatched::Ran(Compiled::Value(dispatched)), None) => assert_eq!(
-                &dispatched, pulled,
-                "{test}: the dispatched run at morsels of {rows} answers what pull mode \
-                 answers\n  program:\n{source}"
-            ),
-            (Dispatched::Ran(ran), None) => {
-                panic!("{test}: the dispatched run at morsels of {rows}: {ran}\n{source}")
-            }
-            (Dispatched::Ran(_), Some(refusal)) => panic!(
-                "{test}: the dispatched run is no longer refused ({refusal}); remove its line \
-                 from tests/it/dispatch_refused.txt"
-            ),
-            (Dispatched::Refused(why), Some(refusal)) => assert!(
-                why.starts_with(refusal),
-                "{test}: the planner refuses the program as `{why}`, where \
-                 tests/it/dispatch_refused.txt pins `{refusal}`"
-            ),
-            (Dispatched::Refused(why), None) => {
-                let line = why.lines().next().unwrap_or_default();
-                match std::env::var_os("CAMBRA_DISPATCH_REPORT") {
-                    Some(_) => {
-                        println!("DISPATCH-REFUSED {test}\t{line}");
-                        return;
-                    }
-                    None => panic!(
-                        "{test}: the planner refuses the program: {why}\n  pin it in \
-                         tests/it/dispatch_refused.txt as `{test}<TAB>{line}`, or make it run"
-                    ),
-                }
-            }
+    match (dispatch(source), pin) {
+        (Dispatched::Ran(Compiled::Value(_)), None) => {}
+        (Dispatched::Refused(why), Some(refusal)) => assert!(
+            why.starts_with(refusal),
+            "{test}: the planner refuses the program as `{why}`, where \
+             tests/it/dispatch_refused.txt pins `{refusal}`"
+        ),
+        (other, Some(refusal)) => panic!(
+            "{test}: the dispatched run is no longer refused ({refusal}): {other}; remove its \
+             line from tests/it/dispatch_refused.txt"
+        ),
+        (Dispatched::Refused(why), None) => {
+            let line = why.lines().next().unwrap_or_default();
+            panic!(
+                "{test}: the planner refuses the program: {why}\n  pin it in \
+                 tests/it/dispatch_refused.txt as `{test}<TAB>{line}`, or make it run"
+            )
         }
+        (other, None) => panic!("{test}: the dispatched run: {other}\n  program:\n{source}"),
     }
 }
 
