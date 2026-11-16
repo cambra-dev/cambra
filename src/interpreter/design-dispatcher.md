@@ -111,18 +111,18 @@ reconstruct an already reclaimed prefix. Those rules belong to
 The inspector publishes observations without pulling producers. Its version boundary is specified
 in [A reload of main is followed](../inspector_model/design.md#a-reload-of-main-is-followed).
 
-## Parking arrivals until a read is complete
+## Waiting for input completion
 
 An admitted region waits until every dependency has completed the part of that region it supplies.
 For example, a loop seeded by `sum(source1())` cannot start from a partial sum. Its source positions
-remain parked until the seed is complete.
+remain waiting for inputs until the seed is complete.
 
-Parked work contains guards, not copies of rows. The producers retain those rows until consumption
+Work awaiting input completion contains guards, not copies of rows. The producers retain those rows until consumption
 releases them. A region contributed by a push may be split as its dependencies decide parts of it.
 A source morsel or a loop's closing row waits whole: its completion is part of the work requested.
 
 A source that never closes can keep a whole-input dependency unresolved indefinitely. This is a
-consequence of the computation's dependency, not evidence that the parked region has been consumed.
+consequence of the computation's dependency, not evidence that the region awaiting input completion has been consumed.
 
 ## Completeness in pushes
 
@@ -161,7 +161,7 @@ Notifications queue dispatcher work and mark inline caches dirty; no deferred wa
 A dependent pipeline admits only regions whose required contributions are complete. It records the
 regions already admitted so repeated pushes along different paths do not duplicate consumption.
 Its readiness rule is the same whether a region arrives already complete or becomes ready after
-parking.
+waiting for inputs.
 
 A pipeline reading both a live source and another pipeline can receive source arrivals and distinct
 rows contributed by that pipeline. A widened push does not supply another copy of source rows.
@@ -177,15 +177,15 @@ notification routes translate it into the reader's input coordinates.
 
 Publication and admission retain separate histories. `pushed` names output already published and
 can be shared by several writer pipelines. Queue `region` names input already scheduled, including
-acknowledged packages. Admission subtracts that history and the parked regions under the same
-queue lock. A cached union of currently parked guards avoids scanning the backlog on each
-arrival; releasing parked work rebuilds that union from the remaining packages. Moving a region from parking into the queue holds the lock throughout, so another
+acknowledged packages. Admission subtracts that history and the region awaiting input completions under the same
+queue lock. A cached union of guards currently awaiting input completion avoids scanning the backlog on each
+arrival; making waiting work ready rebuilds that union from the remaining packages. Moving a region from waiting for inputs into the queue holds the lock throughout, so another
 arrival cannot admit it during the transfer. Repeated loop rounds bypass ordinary deduplication
 and remain distinct packages.
 
 Ordered pipelines claim only while the queue's in-flight map is empty. Acknowledgement records
 consumption and updates its counter before removing the entry and unlocking the next claim.
-Graph composition requires every reserved package to remain pending, so neither an in-flight nor
+Graph composition requires every reserved package to remain ready, so neither an in-flight nor
 an acknowledged package can enter a newly composed graph.
 
 ## A loop in rounds
@@ -231,13 +231,13 @@ once every pipeline has finished.
 
 ## Claiming from several threads
 
-The dispatcher can be shared between workers. A per-pipeline mutex protects pending packages and
-in-flight claims. A claim moves the oldest pending package to the in-flight map; acknowledgement
+The dispatcher can be shared between workers. A per-pipeline mutex protects ready packages and
+in-flight claims. A claim moves the oldest ready package to the in-flight map; acknowledgement
 removes its entry, even when an earlier package is still running. Package indices increase for the
 run and are never reused. An acknowledgement must match an in-flight index and guard. Ordered
 pipelines permit at most one package in flight. No queue lock is held while an operator executes.
 
-Queue entries retain only pending and in-flight guards. Collection capacity can retain its peak
+Queue entries retain only ready and in-flight guards. Collection capacity can retain its peak
 allocation; it does not grow with the number of acknowledged packages. The accumulated region
 remains available for deduplication and finish after package entries are removed. Its size depends
 on the shape of that region. Atomic reservation and acknowledgement counts determine outstanding

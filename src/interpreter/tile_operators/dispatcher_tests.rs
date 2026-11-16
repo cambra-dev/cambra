@@ -1696,7 +1696,7 @@ fn a_read_decided_only_whole_records_no_part() {
             .base_mut()
             .pushing_to(Rc::new(RefCell::new(Paths(paths))));
         let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-        dispatcher.park(PipelineId(1));
+        dispatcher.wait_for_inputs(PipelineId(1));
         if whole_only {
             dispatcher.completes_whole_only(PipelineId(1), PipelineId(0));
         }
@@ -1727,7 +1727,7 @@ fn a_read_decided_only_whole_records_its_whole_push() {
         .base_mut()
         .pushing_to(Rc::new(RefCell::new(Paths(paths))));
     let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.park(PipelineId(1));
+    dispatcher.wait_for_inputs(PipelineId(1));
     dispatcher.completes_whole_only(PipelineId(1), PipelineId(0));
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
         scripted.borrow_mut().finish(InputId::ONLY, pushes)

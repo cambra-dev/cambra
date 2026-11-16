@@ -38,8 +38,8 @@ use crate::interpreter::{BaseType, DataSink, DataSourceDomainExtentImpl, Extent}
 ///
 /// [`SinkBreaker`]: crate::interpreter::tile_operators::SinkBreaker
 ///
-/// Every pipeline that reads another parks the rows its pushes and its start bring until every
-/// pipeline it reads has completed them, and reads each row once ([`Dispatcher::park`]). A push
+/// Every pipeline that reads another holds the rows its pushes and its start bring until every
+/// pipeline it reads has completed them, and reads each row once ([`Dispatcher::wait_for_inputs`]). A push
 /// brings the rows it names at the reader's entry, restated by the consumers between the two, a
 /// widening one's as every row. A reader reads its input whole ([`Dispatcher::read_whole`]) where
 /// a pipeline it reads pushes along no route to it, which the consumers between them declare
@@ -396,8 +396,8 @@ fn run_targets(
     // A loop's scope, which reads only pipelines that
     // range over one, as a loop over a let-bound source reads the source's memo, takes those
     // ranges as its own where each read's pushes reach its drive as the drive's positions: the
-    // scope is then notified of each delivery as rounds, as over the source itself, and parks each
-    // delivery until the pipelines it reads have completed it (`Dispatcher::park`).
+    // scope is then notified of each delivery as rounds, as over the source itself, and holds each
+    // delivery until the pipelines it reads have completed it (`Dispatcher::wait_for_inputs`).
     let one = Projection::admitting(Predicate::point(Value::UInt(0)));
     let inherited: Vec<Vec<LiveLeaf>> = (0..members.live.len())
         .map(|pipeline| {
@@ -515,7 +515,7 @@ fn run_targets(
         let mut starts: Vec<TileGuard> = Vec::new();
         let notifies = match (&members.located[pipeline], scopes[pipeline].as_ref()) {
             // Inherited ranges reach the drive as its positions. Nonprefix ranges wait for
-            // completion; otherwise the scope parks each delivery on the pipelines it reads.
+            // completion; otherwise the scope holds each delivery on the pipelines it reads.
             (Located::Store { .. }, _) if inherits => Notifies::Items,
             _ if inherits => match leaves.iter().all(LiveLeaf::yields_prefix) {
                 true => Notifies::Rounds,
@@ -635,7 +635,7 @@ fn run_targets(
                         // A keyed breaker's push arrives as keys along a route that keeps them. A
                         // breaker of one value brings rows where its push names rows no arrival
                         // brings, as a let-bound record's collection field does; where it names
-                        // only rows the arrivals bring, those rows read it, and wait parked for its
+                        // only rows the arrivals bring, those rows read it, and wait for its
                         // complete push.
                         let as_keys = match keyed {
                             true => routes_to(&pusher, pipeline)
@@ -660,14 +660,14 @@ fn run_targets(
         };
         planned[pipeline].live = true;
         planned[pipeline].whole |= matches!(notifies, Notifies::Whole);
-        // A store or a loop's scope steps on the pipelines it reads by pull, so it parks each
-        // delivery until they have completed it (`Dispatcher::park`).
+        // A store or a loop's scope steps on the pipelines it reads by pull, so it holds each
+        // delivery until they have completed it (`Dispatcher::wait_for_inputs`).
         if matches!(
             members.located[pipeline],
             Located::Store { .. } | Located::Scope { .. }
         ) && !members.reads[pipeline].is_empty()
         {
-            dispatcher.park(PipelineId(pipeline));
+            dispatcher.wait_for_inputs(PipelineId(pipeline));
             planned[pipeline].held = true;
         }
         if matches!(notifies, Notifies::Whole) {
@@ -1115,12 +1115,12 @@ pub(super) enum Consumes {
 }
 
 /// The dispatcher over the pipelines `reads` describes, with every pipeline that reads another
-/// parking the rows its pushes bring until the pipelines it reads have completed them, reading its
+/// holding the rows its pushes bring until the pipelines it reads have completed them, reading its
 /// input whole where a pipeline it reads reaches it along no route, and queued at the start the
 /// regions no push names ([`run_program`] says how). `arrivals` says whether a
 /// pipeline takes a live source's arrivals beside the pipelines it reads
-/// ([`Dispatcher::take_arrivals`]), which it parks ([`Dispatcher::park`]). `opens` says the
-/// dispatcher is the run's, where a store or a loop's scope parks its deliveries; in a loop's
+/// ([`Dispatcher::take_arrivals`]), which wait for input completion ([`Dispatcher::wait_for_inputs`]). `opens` says the
+/// dispatcher is the run's, where a store or a loop's scope holds its deliveries; in a loop's
 /// scope it follows the pipelines it reads, round by round. `kinds` says how each
 /// pipeline takes its packages; `pushes_with` names, for each pipeline, the first pipeline of its
 /// breaker, whose record of what the breaker pushed it shares ([`Dispatcher::share_pushes`]);
@@ -1184,11 +1184,11 @@ pub(super) fn plan_edges(
         }
         if arrivals[reader] {
             match kinds[reader] {
-                // A pipeline that pushes takes each delivery, parked until the pipelines it reads
+                // A pipeline that pushes takes each delivery, waiting for inputs until the pipelines it reads
                 // have completed it.
                 Consumes::Pushes => {
                     dispatcher.take_arrivals(PipelineId(reader));
-                    dispatcher.park(PipelineId(reader));
+                    dispatcher.wait_for_inputs(PipelineId(reader));
                     planned[reader].held = true;
                 }
                 // A store or a loop's scope over a live source takes each delivery once the
@@ -1214,7 +1214,7 @@ pub(super) fn plan_edges(
             // A nested loop's scope takes the row the scope around it queues it once the pipelines
             // it reads have finished the round, since its rounds pull them, and a store or a
             // loop's scope over a live source takes each delivery so.
-            // In the run's dispatcher a store or a loop's scope over a live source parks each
+            // In the run's dispatcher a store or a loop's scope over a live source holds each
             // delivery on what the pipelines it reads have completed instead (`run_targets`).
             Consumes::Rounds | Consumes::Whole if opens => continue,
             Consumes::Rounds | Consumes::Whole => {
@@ -1301,8 +1301,8 @@ pub(super) fn plan_edges(
                     None => arrival.guard,
                 })
             });
-        // Every reader parks the rows its pushes and its start bring until the pipelines it
-        // reads have completed them, and reads each row once ([`Dispatcher::park`]). A pipeline
+        // Every reader holds the rows its pushes and its start bring until the pipelines it
+        // reads have completed them, and reads each row once ([`Dispatcher::wait_for_inputs`]). A pipeline
         // that takes arrivals is queued its rows as its sources yield them, and any other reads
         // its input whole where a pipeline it reads reaches it by pull, or where nothing else
         // brings it a row.
@@ -1313,7 +1313,7 @@ pub(super) fn plan_edges(
             continue;
         }
         if !planned[reader].held {
-            dispatcher.park(PipelineId(reader));
+            dispatcher.wait_for_inputs(PipelineId(reader));
             planned[reader].held = true;
         }
         if !arrivals[reader] && !left.is_empty() {
@@ -1367,8 +1367,8 @@ pub struct Planned {
     pub rounds: Vec<Planned>,
     /// Whether the run notifies it of what a live source yields.
     pub live: bool,
-    /// Whether it parks its arrivals until the pipelines it reads have completed them
-    /// ([`Dispatcher::park`]).
+    /// Whether arrivals wait until the pipelines it reads have completed them
+    /// ([`Dispatcher::wait_for_inputs`]).
     pub held: bool,
 }
 

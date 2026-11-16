@@ -397,7 +397,7 @@ fn two_aggregates_of_one_binding() {
 
 /// A group-by's memo reads its input's memo and the `Converse` keying the groups, which reads that
 /// memo too and is no breaker. The input memo's push reaches the group-by's memo widened, so it
-/// parks its rows until that memo has decided them.
+/// holds its rows until that memo has decided them.
 #[test]
 fn a_group_by() {
     let source = indoc! {"
@@ -412,12 +412,12 @@ fn a_group_by() {
         planned
             .iter()
             .any(|plan| plan.name.starts_with("Memo") && !plan.whole && plan.held),
-        "the group-by's memo parks its rows: {planned:?}"
+        "the group-by's memo holds its rows until their inputs complete: {planned:?}"
     );
 }
 
 /// The two arms of a concatenation of comprehensions push under their own tags, so the sum reads
-/// both pipelines' pushes, parked until each arm has decided its rows, and no region at the start.
+/// both pipelines' pushes, waiting for inputs until each arm has decided its rows, and no region at the start.
 #[test]
 fn a_sum_over_two_concatenated_comprehensions() {
     let source = indoc! {"
@@ -439,7 +439,7 @@ fn a_sum_over_two_concatenated_comprehensions() {
 
 /// A sum read inside another comprehension: the outer sum's pipeline reads the inner sum's and the
 /// list's. The inner sum's push names every key of the outer sum's input, which the list's pushes
-/// name too, so the outer sum parks the rows the list's pushes bring until the inner sum is
+/// name too, so the outer sum holds the rows the list's pushes bring until the inner sum is
 /// decided, and reads each once.
 #[rstest_log::rstest]
 fn a_comprehension_reading_a_sum(#[values(1, usize::MAX)] rows: usize) {
@@ -466,7 +466,7 @@ fn a_comprehension_reading_a_sum(#[values(1, usize::MAX)] rows: usize) {
     );
     assert!(
         planned.iter().any(|plan| plan.held) && !planned.iter().any(|plan| plan.whole),
-        "the outer sum parks its rows, and no pipeline reads its input whole: {planned:?}"
+        "the outer sum holds its rows until their inputs complete, and no pipeline reads its input whole: {planned:?}"
     );
 }
 
@@ -683,11 +683,11 @@ fn a_loop_beside_a_sum() {
     );
 }
 
-/// A reader inside a loop's scope whose pushes can name one row twice parks its rows until the
+/// A reader inside a loop's scope whose pushes can name one row twice holds its rows until the
 /// pipelines it reads have decided them, as one in the run's dispatcher does, and reads no input
 /// whole outside its scheduled packages.
 #[test]
-fn a_reader_inside_a_loops_scope_parks() {
+fn a_reader_inside_a_loops_scope_waits_for_inputs() {
     let source = indoc! {"
         out = test_sink()
         total := 0
@@ -701,7 +701,7 @@ fn a_reader_inside_a_loops_scope_parks() {
     let inner = rounds(&planned);
     assert!(
         inner.iter().any(|plan| plan.held) && !inner.iter().any(|plan| plan.whole),
-        "a reader in the outer loop's scope parks, and none reads whole: {planned:?}"
+        "a reader in the outer loop's scope waits_for_inputs, and none reads whole: {planned:?}"
     );
 }
 
@@ -1666,7 +1666,7 @@ fn a_drive_over_a_live_source_reads_past_empty_positions(
 
 /// A loop over a let-bound map of a live source reads the map's `Memo`, the pipeline the run
 /// notifies of each delivery. The map's keys reach the loop's drive as its positions, so the loop's
-/// scope is notified of each delivery as rounds too, and parks it until the `Memo` has decided it.
+/// scope is notified of each delivery as rounds too, and holds it until the `Memo` has decided it.
 #[rstest_log::rstest]
 #[case::two_batches(two_batches(), 30)]
 #[case::one_key_batches(one_key_batches(10), 110)]
@@ -1698,7 +1698,7 @@ fn a_loop_over_a_let_bound_map_of_a_live_source(
                 && plan.live
                 && !plan.whole
                 && plan.held),
-        "the loop's scope takes the deliveries as rounds, parked on the `Memo`: {planned:?}"
+        "the loop's scope takes the deliveries as rounds, waiting for inputs on the `Memo`: {planned:?}"
     );
 }
 
@@ -2493,7 +2493,7 @@ fn a_let_bound_map_over_a_live_source(#[values(1, usize::MAX)] rows: usize) {
         planned
             .iter()
             .any(|plan| !plan.live && !plan.whole && plan.held && plan.name.starts_with("Memo")),
-        "the feed's `Memo` parks its rows: {planned:?}"
+        "the feed's `Memo` holds its rows until their inputs complete: {planned:?}"
     );
 }
 
@@ -2908,8 +2908,8 @@ fn a_reader_of_a_live_pipeline_through_a_build_edge(
     assert_eq!(value, Value::Int(expected));
 }
 
-/// A breaker whose chain reads a live source and a pipeline takes the source's arrivals and parks
-/// them (`Dispatcher::park`): each row adds the sum of `ys`, and a row arriving before the sum is
+/// A breaker whose chain reads a live source and a pipeline takes the source's arrivals and holds
+/// them (`Dispatcher::wait_for_inputs`): each row adds the sum of `ys`, and a row arriving before the sum is
 /// decided waits for it.
 #[rstest_log::rstest]
 fn a_reader_of_a_live_source_and_a_pipeline(#[values(1, usize::MAX)] rows: usize) {
@@ -2925,7 +2925,7 @@ fn a_reader_of_a_live_source_and_a_pipeline(#[values(1, usize::MAX)] rows: usize
     assert_eq!(value, Value::Int(30));
     assert!(
         planned.iter().any(|plan| plan.live && plan.held),
-        "the pipeline over the source parks its rows: {planned:?}"
+        "the pipeline over the source holds its rows until their inputs complete: {planned:?}"
     );
 }
 
@@ -3266,10 +3266,10 @@ fn an_aggregate_per_row_over_a_live_source_at_main(#[values(1, usize::MAX)] rows
     );
 }
 
-/// A filter over a live source that reads a sum takes the source's arrivals and parks them
-/// (`Dispatcher::park`). A sum over a literal is decided before the first delivery, so the first
+/// A filter over a live source that reads a sum takes the source's arrivals and holds them
+/// (`Dispatcher::wait_for_inputs`). A sum over a literal is decided before the first delivery, so the first
 /// delivery's rows are answered as they arrive. A sum over the live source is decided only at the
-/// last delivery, so the first delivery's rows stay parked until then.
+/// last delivery, so the first delivery's rows stay waiting for inputs until then.
 #[rstest_log::rstest]
 #[case::a_sum_over_a_literal("[x for x in source1() if sum([1, 2, 3]) > 5]", 3)]
 #[case::a_sum_over_the_source("[x for x in source1() if sum(source1()) > 2]", 0)]
@@ -3298,16 +3298,16 @@ fn a_filter_over_a_live_source_reading_a_sum(
             && !plan.whole
             && plan.held
             && plan.name.starts_with("SinkBreaker")),
-        "the `main` output's pipeline takes arrivals and parks them: {planned:?}"
+        "the `main` output's pipeline takes arrivals and holds them until their inputs complete: {planned:?}"
     );
 }
 
 /// The readers of a pipeline with a live source beneath it read no input whole: the inner
-/// comprehension's memo, the per-row sum and the outer comprehension's memo each park their rows
-/// until the pipelines they read have decided them (`src/interpreter/design-dispatcher.md`,
-/// "Parking arrivals until a read is decided").
+/// comprehension's memo, the per-row sum and the outer comprehension's memo each hold their rows
+/// until the pipelines they read have completed them (`src/interpreter/design-dispatcher.md`,
+/// "Waiting for input completion").
 #[rstest_log::rstest]
-fn readers_over_a_live_pipeline_park_their_rows(#[values(1, usize::MAX)] rows: usize) {
+fn readers_over_a_live_pipeline_wait_for_inputs(#[values(1, usize::MAX)] rows: usize) {
     let source = indoc! {"
         out = test_sink()
         ys = [y for y in source1()]
@@ -3323,7 +3323,7 @@ fn readers_over_a_live_pipeline_park_their_rows(#[values(1, usize::MAX)] rows: u
         planned
             .iter()
             .any(|plan| plan.held && plan.name.starts_with("MapAggregate")),
-        "the per-row sum parks its rows: {planned:?}"
+        "the per-row sum holds its rows until their inputs complete: {planned:?}"
     );
     assert_eq!(
         planned
@@ -3331,15 +3331,14 @@ fn readers_over_a_live_pipeline_park_their_rows(#[values(1, usize::MAX)] rows: u
             .filter(|plan| plan.held && !plan.name.starts_with("SinkBreaker"))
             .count(),
         3,
-        "the two memos and the sum park their rows: {planned:?}"
+        "the two memos and the sum hold their rows until their inputs complete: {planned:?}"
     );
 }
 
-/// The sums of `a_sum_over_rows_carrying_a_constant` over a live list. The sum's pipeline parks
+/// The sums of `a_sum_over_rows_carrying_a_constant` over a live list. The sum's pipeline holds
 /// each row until the constant is decided and reads it once at its outermost key, above the level
 /// the constant applies at, where `MapResultToConst` panics on a pull at or beneath that level, so
-/// the values check it (`src/interpreter/design-dispatcher.md`, "Parking arrivals until a read is
-/// decided").
+/// the values check it (`src/interpreter/design-dispatcher.md`, "Waiting for input completion").
 #[rstest_log::rstest]
 #[case::zipped_with_a_constant(
     indoc! {"
@@ -3378,7 +3377,7 @@ fn a_sum_over_rows_carrying_a_constant_reading_a_live_list(
         planned
             .iter()
             .any(|plan| plan.held && plan.name.starts_with("MapAggregate")),
-        "the per-row sum parks its rows: {planned:?}"
+        "the per-row sum holds its rows until their inputs complete: {planned:?}"
     );
 }
 
@@ -3426,7 +3425,7 @@ fn a_sum_over_live_rows_carrying_a_constant(
 
 /// The same filter fed to a sink. The comprehension is the constant of the `()` row above it, so
 /// a delivery's keys reach the sink's pipeline widened, and that pipeline reads its input whole
-/// once the source yields everything, parked until the sum is decided.
+/// once the source yields everything, waiting for inputs until the sum is decided.
 #[rstest_log::rstest]
 fn a_filter_over_a_live_source_reading_a_sum_into_a_sink(#[values(1, usize::MAX)] rows: usize) {
     let source = indoc! {"
@@ -3442,12 +3441,12 @@ fn a_filter_over_a_live_source_reading_a_sum_into_a_sink(#[values(1, usize::MAX)
         planned
             .iter()
             .any(|plan| plan.live && plan.whole && plan.held),
-        "a pipeline over the source reads it whole and parks its rows: {planned:?}"
+        "a pipeline over the source reads it whole and holds its rows until their inputs complete: {planned:?}"
     );
 }
 
 /// A sum whose rows read a sum over the same live source: the outer sum's pipeline takes the
-/// source's arrivals and parks them until the inner sum is decided, at the last delivery.
+/// source's arrivals and holds them until the inner sum is decided, at the last delivery.
 #[rstest_log::rstest]
 fn a_sum_over_a_live_source_reading_a_sum_over_it(#[values(1, usize::MAX)] rows: usize) {
     let (value, _) = dispatched_live(
@@ -3991,7 +3990,7 @@ fn a_loop_seeded_from_a_static_store_takes_each_delivery(#[values(1, usize::MAX)
 }
 
 /// A comprehension over a live source whose rows read a value another pipeline decides: a
-/// transaction store's final value, a sum, a loop's final value. Each delivery's rows park until
+/// transaction store's final value, a sum, a loop's final value. Each delivery's rows wait until
 /// that pipeline has decided it, whether its push reaches the comprehension or the comprehension
 /// reads it by pull.
 #[rstest_log::rstest]
@@ -4026,7 +4025,7 @@ fn a_live_comprehension_reading_a_decided_value(
 }
 
 /// A sum whose rows read a live list and a sum over a second live source that becomes decided
-/// between the list's two deliveries. Each row the list brings parks until the sum is decided; the
+/// between the list's two deliveries. Each row the list brings waits for inputs until the sum is decided; the
 /// sum's decided push brings no row the list's already brought, so the outer sum reads each once.
 #[rstest_log::rstest]
 #[case::a_sum_in_the_row(indoc! {"

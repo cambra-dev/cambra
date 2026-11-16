@@ -1056,9 +1056,8 @@ of its writers' sources, which are its inputs from 1: each seed is subscribed be
 in input 0's pipeline, a push of any seed queues that input whole, and the store's consume of it
 opens the store. A store opens before it steps, so each writer's pipeline reads input 0's, its
 sibling, and takes no package before input 0's has finished. Once input 0's pipeline
-has consumed its package, each writer's records it wholly decided, which releases what it parked
-(`Dispatcher::opens_before`, [Parking arrivals until a read is
-decided](design-dispatcher.md#parking-arrivals-until-a-read-is-decided)). A store's decided push that reaches its own
+has consumed its package, each writer's records it wholly decided, which releases its waiting inputs
+(`Dispatcher::opens_before`, [Waiting for input completion](design-dispatcher.md#waiting-for-input-completion)). A store's decided push that reaches its own
 pipelines around its recurrence is no read and records nothing. An induction store runs in a loop's
 scope instead ([A loop in rounds](design-dispatcher.md#a-loop-in-rounds)). A reader of a store reads every pipeline of
 it, so its queue closes once the last of them has finished. The pipelines of
@@ -1116,7 +1115,7 @@ end asserts that no retry remains. An induction store states no takes.
 
 The planner places the transaction drive's source entry in its writer's store pipeline. Source
 pushes therefore reach that entry in source keys, before the drive converts them to attempt
-counters. A transaction over a memoized product inherits that product's live regions, parks them
+counters. A transaction over a memoized product inherits that product's live regions, holds them
 until the memo decides them, and consumes them without waiting for either source to close.
 
 The store reclaims its changelog where every fan-out slot has released it
