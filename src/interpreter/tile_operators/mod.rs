@@ -852,6 +852,134 @@ macro_rules! impl_producer_base {
 // leak it to the crate root.
 pub(crate) use impl_producer_base;
 
+/// The debug build's check that a producer pulls each input no deeper than its `input_level`
+/// declares (`check_input_level`).
+#[cfg(debug_assertions)]
+mod pull_levels {
+    use super::{CurryLevel, TileGuard, TileProducer};
+    use std::cell::RefCell;
+
+    // The pulls in progress on this thread, innermost last, which `check_input_level` holds each
+    // input's pull against. An entry is `None` for a pull at no keys, which declares no input
+    // level.
+    //
+    // shared-state-ok: a debug build's record of the pulls on this thread's stack. What crosses it
+    // is the level a producer declares for each input, never a value passed between operators.
+    thread_local! {
+        // shared-state-ok: the record cell itself, for the reason on the macro above.
+        pub(super) static PULLS: RefCell<Vec<Option<PullFrame>>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    /// A producer's pull at the keys of a level, with the level it declares for each of its inputs
+    /// ([`TileProducer::input_level`]), keyed by the input's address ([`address_of`]). Entering one
+    /// records it for the inputs' pulls; dropping it, on return or unwind, removes it.
+    pub(super) struct PullFrame {
+        producer: String,
+        level: CurryLevel,
+        inputs: Vec<(usize, String, Option<CurryLevel>)>,
+    }
+
+    impl PullFrame {
+        pub(super) fn enter(
+            producer: &(impl TileProducer + ?Sized),
+            guard: &TileGuard,
+        ) -> PullScope {
+            let frame = match pulled_level(guard) {
+                Some(Some(level)) => {
+                    let mut inputs = Vec::new();
+                    producer.visit_input_producers(&mut |role, input| {
+                        inputs.push((
+                            address_of(input),
+                            role.to_owned(),
+                            producer.input_level(role, level),
+                        ));
+                    });
+                    Some(PullFrame {
+                        producer: producer.name(),
+                        level,
+                        inputs,
+                    })
+                }
+                _ => None,
+            };
+            PULLS.with_borrow_mut(|pulls| pulls.push(frame));
+            PullScope
+        }
+    }
+
+    /// The pull a [`PullFrame`] records, for as long as it runs.
+    pub(super) struct PullScope;
+
+    impl Drop for PullScope {
+        fn drop(&mut self) {
+            PULLS.with_borrow_mut(|pulls| pulls.pop());
+        }
+    }
+
+    /// The address a producer is reached at, which its own `get` and its consumer's
+    /// `visit_input_producers` agree on.
+    pub(super) fn address_of(producer: &(impl TileProducer + ?Sized)) -> usize {
+        std::ptr::from_ref(producer).cast::<()>() as usize
+    }
+
+    /// The level a pull at `guard` reaches keys at: `Some(level)` for the keys of `level`, and
+    /// `Some(None)` for the whole tile. `None` for a pull of nothing, or a guard that names no
+    /// projection, which leaves no level to hold a declaration to.
+    fn pulled_level(guard: &TileGuard) -> Option<Option<CurryLevel>> {
+        use crate::interpreter::Projection;
+        match Projection::of(guard) {
+            Ok(Projection::Keys { level, .. }) => Some(Some(level)),
+            Ok(Projection::Everything) => Some(None),
+            Ok(Projection::Nothing) | Err(_) => None,
+        }
+    }
+
+    /// Panic where the producer at `at` is pulled at `guard` by the producer the innermost pull
+    /// records, beneath the level that producer's `input_level` declares for it, or at any keys
+    /// where it declares a whole read. `name` names the producer at `at`, and is formatted only for
+    /// the panic. The planner checks that each operator of a loop's cycle restates the level its
+    /// consumer declares, and stops at an input declared read whole; an operator that restates a
+    /// level restates every level above it (`Restates::refuses`). A pull deeper than the
+    /// declaration, or at keys of an input declared read whole, is therefore one the planner never
+    /// checked. A pull may stop above the declaration: `Uncurry` pulls pairs named by their first
+    /// component alone at its input's outermost keys.
+    pub(super) fn check_input_level(at: usize, name: impl Fn() -> String, guard: &TileGuard) {
+        let Some(pulled) = pulled_level(guard) else {
+            return;
+        };
+        let violation = PULLS.with_borrow(|pulls| {
+            let Some(Some(frame)) = pulls.last() else {
+                return None;
+            };
+            let (_, role, declared) = frame.inputs.iter().find(|(input, ..)| *input == at)?;
+            let beneath = match (declared, pulled) {
+                (_, None) => false,
+                (None, Some(_)) => true,
+                (Some(declared), Some(pulled)) => pulled > *declared,
+            };
+            beneath.then(|| {
+                let shown = |at: Option<CurryLevel>| match at {
+                    Some(at) => format!("the keys of {at}"),
+                    None => "a whole read".to_owned(),
+                };
+                format!(
+                    "{} pulled at the keys of {} pulls its input `{role}` ({}) at {}, beneath what \
+                     its `input_level` declares, {}",
+                    frame.producer,
+                    frame.level,
+                    name(),
+                    shown(pulled),
+                    shown(*declared),
+                )
+            })
+        });
+        if let Some(violation) = violation {
+            panic!("{violation}");
+        }
+    }
+}
+
 /// Live runtime counterpart of a [`TileOperator`].
 ///
 /// Created by [`TileOperator::subscribe`], a producer services `get` queries
@@ -931,6 +1059,15 @@ pub trait TileProducer {
             gate.take();
         }
         self.base_mut().pulls += 1;
+        #[cfg(debug_assertions)]
+        let _pull = {
+            pull_levels::check_input_level(
+                pull_levels::address_of(&*self),
+                || self.name(),
+                &projection_guard,
+            );
+            pull_levels::PullFrame::enter(&*self, &projection_guard)
+        };
         let mut result = self.get_impl(projection_guard);
         // Released scalar cells are removed while their enclosing rows remain open;
         // see `src/interpreter/design-operators.md`, "The release contract".
@@ -999,10 +1136,12 @@ pub trait TileProducer {
         Restates::Outermost
     }
 
-    /// The level a pull of this producer at a projection of the keys of `level` pulls its input
-    /// `role` at, where `level` is beneath the outermost keys; `None` where it reads that input
-    /// whole. The default passes `level` to every input, which holds for an operator that keeps its
-    /// input's keys level for level; an operator that shifts levels overrides it.
+    /// The deepest level a pull of this producer at a projection of the keys of `level` pulls its
+    /// input `role` at; `None` where it reads that input whole at every such pull. It is monotone
+    /// in `level`: a deeper pull declares no shallower input level. The default passes `level` to
+    /// every input, which holds for an operator that keeps its input's keys level for level; an
+    /// operator that shifts levels, or reads an input whole, overrides it. The `get` wrapper
+    /// checks each pull against the declaration in a debug build (`check_input_level`).
     fn input_level(&self, _role: &str, level: CurryLevel) -> Option<CurryLevel> {
         Some(level)
     }
@@ -1668,6 +1807,80 @@ mod tests {
 
     fn int_tiling() -> Tiling {
         Tiling::Scalar(Extent::Base(BaseType::Int))
+    }
+
+    /// A producer over a two-level collection that pulls its input at member 1 under every row
+    /// whatever it is pulled at, and keeps the default `input_level`, which declares the level
+    /// it is pulled at.
+    #[cfg(debug_assertions)]
+    struct Deepening {
+        base: ProducerBase,
+        input: Box<dyn TileProducer>,
+    }
+
+    #[cfg(debug_assertions)]
+    impl TileProducer for Deepening {
+        impl_producer_base!();
+
+        fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+            visit("input", &*self.input);
+        }
+
+        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            use super::FunctionGuard;
+            use crate::interpreter::{Predicate, Value};
+            self.input
+                .get(TileGuard::Function(FunctionGuard::Codomain(Box::new(
+                    TileGuard::Function(FunctionGuard::Domain(Predicate::point(Value::UInt(1)))),
+                ))))
+        }
+
+        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+    }
+
+    #[cfg(debug_assertions)]
+    fn deepening() -> (Deepening, Tiling) {
+        let (tile, tiling) = super::test_helpers::two_levels_of_ints();
+        let (input, ..) = super::test_helpers::ProjectionSpy::new(tile, tiling.clone());
+        let deepening = Deepening {
+            base: ProducerBase::unowned(Deepening::alloc_id(), &tiling),
+            input: Box::new(input),
+        };
+        (deepening, tiling)
+    }
+
+    /// A producer pulled at the outermost keys that pulls its input beneath them, where its
+    /// `input_level` declares the outermost keys, fails the `get` wrapper's check.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "beneath what its `input_level` declares, the keys of level 0")]
+    fn a_pull_beneath_the_declared_input_level_panics() {
+        use super::FunctionGuard;
+        use crate::interpreter::{Predicate, Value};
+        let (mut deepening, _) = deepening();
+        deepening.get(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::point(Value::UInt(0)),
+        )));
+    }
+
+    /// The record of pulls in progress is emptied when a pull unwinds, so a later pull is held
+    /// against its own consumer's declaration rather than the one that panicked.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_pull_that_unwinds_leaves_no_record_behind() {
+        use super::FunctionGuard;
+        use crate::interpreter::{Predicate, Value};
+        let (mut deepening, tiling) = deepening();
+        let outermost =
+            TileGuard::Function(FunctionGuard::Domain(Predicate::point(Value::UInt(0))));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            deepening.get(outermost.clone())
+        }));
+        assert!(unwound.is_err(), "the pull beneath its declaration panics");
+        assert!(super::pull_levels::PULLS.with_borrow(Vec::is_empty));
+        let (tile, _) = super::test_helpers::two_levels_of_ints();
+        let (mut input, ..) = super::test_helpers::ProjectionSpy::new(tile, tiling);
+        input.get(outermost);
     }
 
     struct OneRow {

@@ -161,11 +161,17 @@ impl TileProducer for ConstantProducer {
         node.annotate(format!("{}", self.tiling()))
     }
 
+    /// It holds its whole tile, so it cuts a projection at any level: an outermost `Uncurry`
+    /// over a collection of collections pulls it at keys beneath the outermost ones.
+    fn restates(&self) -> Restates {
+        Restates::Every
+    }
+
     /// A collection constant answers the keys the projection admits, which is how a worker reads
     /// the table a list literal denotes one morsel at a time. A scalar constant has one position,
     /// so its projection is the whole value or nothing.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let projection = projection_guard.projection(&self.name());
+        let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
