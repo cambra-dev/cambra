@@ -7,6 +7,8 @@
 use smol_str::SmolStr;
 use std::collections::HashMap;
 
+use intervalsets::{Bounding, Interval, IntervalSet};
+
 use crate::interpreter::{CurryLevel, Extent, Predicate, Tiling, Value};
 
 /// Specifies a sub-region of interest within a [`Tile`](crate::interpreter::Tile), used for
@@ -714,6 +716,68 @@ impl TileGuard {
         }
     }
 
+    /// This guard of `tiling`, closed over what the tiling says of its keys.
+    ///
+    /// A guard of a union domain's outermost keys is the universal or the empty guard where it
+    /// names every tag of the domain whole or names none of it ([`Predicate::over_every_tag`]).
+    /// `Predicate::as_bool` answers `None` for `rest: false` with every named tag `True`, because
+    /// the predicate does not know the domain's tags; the tiling supplies them, so one guard per
+    /// arm adds up to the universal guard. An arm whose payload is itself union-keyed is whole
+    /// only where its payload predicate is `True`.
+    ///
+    /// An arm naming keys beneath the outermost collection is dropped where it names no key of
+    /// its level's extent, a finite range of positions: the paths of a row past its last
+    /// position, which a difference of nested guards leaves (`guard_minus`). A guard every arm of
+    /// which is dropped is the empty guard. Any other guard is answered as it is.
+    pub fn closed_over(self, tiling: &Tiling) -> TileGuard {
+        self.closed_over_tags(tiling).closed_over_levels(tiling)
+    }
+
+    /// The arms of this guard that name a key of their level's extent, where the extent is a
+    /// finite range of positions beneath the outermost collection
+    /// ([`closed_over`](Self::closed_over)).
+    fn closed_over_levels(self, tiling: &Tiling) -> TileGuard {
+        let arms = match &self {
+            TileGuard::Or(arms) => arms.as_slice(),
+            single => std::slice::from_ref(single),
+        };
+        let kept: Vec<TileGuard> = arms
+            .iter()
+            .filter(|arm| !names_no_key_of_its_level(arm, tiling, 0))
+            .cloned()
+            .collect();
+        match (kept.len() == arms.len(), kept.is_empty()) {
+            (true, _) => self,
+            (false, true) => tiling.empty_guard(),
+            (false, false) => TileGuard::flatten_or(kept),
+        }
+    }
+
+    fn closed_over_tags(self, tiling: &Tiling) -> TileGuard {
+        let TileGuard::Function(FunctionGuard::Domain(keys @ Predicate::Union { .. })) = &self
+        else {
+            return self;
+        };
+        let Some(Extent::Union(arms)) = tiling.domain_extent() else {
+            return self;
+        };
+        let tags = arms
+            .keys()
+            .map(|tag| {
+                let under = keys
+                    .under_tag(tag)
+                    .unwrap_or_else(|| unreachable!("matched as a union predicate"));
+                (tag.clone(), under)
+            })
+            .collect();
+        match Predicate::over_every_tag(tags) {
+            closed @ (Predicate::True | Predicate::False) => {
+                TileGuard::Function(FunctionGuard::Domain(closed))
+            }
+            _ => self,
+        }
+    }
+
     pub fn is_universal(&self) -> bool {
         match self {
             TileGuard::Scalar(pred) | TileGuard::Aggregation(pred) => pred.as_bool() == Some(true),
@@ -830,6 +894,35 @@ impl TileGuard {
             (TileGuard::Or(arms), _) => arms.iter().all(|g| g.check_from_under(tiling, above)),
             _ => false,
         }
+    }
+}
+
+/// Whether `arm`, a guard `depth` levels beneath the outermost collection of `tiling`, is a domain
+/// guard beneath it that names no key of its level's extent, a finite range of positions.
+fn names_no_key_of_its_level(arm: &TileGuard, tiling: &Tiling, depth: usize) -> bool {
+    match arm {
+        TileGuard::Function(FunctionGuard::Codomain(inner)) => tiling
+            .codomain()
+            .is_some_and(|codomain| names_no_key_of_its_level(inner, &codomain, depth + 1)),
+        TileGuard::Function(FunctionGuard::Domain(keys)) if depth > 0 => {
+            match tiling.domain_extent() {
+                Some(Extent::UIntRange(positions)) => keys
+                    .intersect(&Predicate::intervals(IntervalSet::from_iter(
+                        positions.intervals().iter().map(|positions| {
+                            let first = positions.lval().copied().unwrap_or(0);
+                            match positions.rval() {
+                                Some(last) => {
+                                    Interval::closed(Value::UInt(first), Value::UInt(*last))
+                                }
+                                None => Interval::closed_unbound(Value::UInt(first)),
+                            }
+                        }),
+                    )))
+                    .is_false(),
+                _ => false,
+            }
+        }
+        _ => false,
     }
 }
 
@@ -988,8 +1081,73 @@ impl FunctionGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::AggregateKind;
+    use crate::ccl::{AggregateKind, FieldKey, TagMap};
     use crate::interpreter::tiling::tests::*;
+    use crate::interpreter::{BaseType, ColumnValue};
+
+    fn keyed_by(arms: TagMap<Extent>) -> Tiling {
+        Tiling::data_function(
+            Extent::Union(arms),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        )
+    }
+
+    fn keys(tags: Vec<(FieldKey, Predicate)>, rest: bool) -> TileGuard {
+        TileGuard::Function(FunctionGuard::Domain(Predicate::tagged(
+            TagMap::from_arms(tags),
+            rest,
+        )))
+    }
+
+    fn name(tag: &str) -> FieldKey {
+        FieldKey::Name(tag.into())
+    }
+
+    /// A guard naming every named tag of the domain whole closes to the universal guard, and one
+    /// naming every tag nothing closes to the empty guard.
+    #[test]
+    fn a_guard_of_every_named_tag_closes_over_the_domain() {
+        let int = || Extent::Base(BaseType::Int);
+        let tiling = keyed_by(TagMap::from_arms(vec![
+            (name("a"), int()),
+            (name("b"), int()),
+        ]));
+        let whole = keys(
+            vec![(name("a"), Predicate::True), (name("b"), Predicate::True)],
+            false,
+        );
+        assert!(!whole.is_universal(), "{whole:?}");
+        assert!(whole.closed_over(&tiling).is_universal());
+        let nothing = keys(
+            vec![(name("a"), Predicate::False), (name("b"), Predicate::False)],
+            true,
+        );
+        assert!(!nothing.is_empty(), "{nothing:?}");
+        assert!(nothing.closed_over(&tiling).is_empty());
+    }
+
+    /// A guard with one tag named in part is answered as it is.
+    #[test]
+    fn a_guard_of_one_tag_in_part_stays_partial() {
+        let int = || Extent::Base(BaseType::Int);
+        let tiling = keyed_by(TagMap::from_positional(vec![int(), int()]));
+        let partial = Predicate::from_column_value(&ColumnValue::Ints(vec![1]));
+        let guard = keys(vec![(FieldKey::Index(0), partial.clone())], true);
+        assert_eq!(guard.clone().closed_over(&tiling), guard);
+    }
+
+    /// A guard of a domain that is not union-keyed is answered unchanged.
+    #[test]
+    fn a_guard_of_another_domain_is_unchanged() {
+        let tiling = Tiling::data_function(
+            Extent::Base(BaseType::Int),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let guard = TileGuard::Function(FunctionGuard::Domain(Predicate::from_column_value(
+            &ColumnValue::Ints(vec![1]),
+        )));
+        assert_eq!(guard.clone().closed_over(&tiling), guard);
+    }
 
     /// `domain_prefix` names every row before its head whole and the head's row up to its
     /// tail, and a later prefix absorbs the earlier one's arm beneath a row now whole.
@@ -1301,10 +1459,10 @@ mod tests {
     fn guard_intersect_domain_with_codomain_checks_from_its_tiling() {
         let met = upto(0).intersect(&inner_upto(1));
         let tiling = Tiling::data_function(
-            Extent::Base(crate::ccl::BaseType::UInt),
+            Extent::Base(BaseType::UInt),
             Tiling::data_function(
-                Extent::Base(crate::ccl::BaseType::UInt),
-                Tiling::Scalar(Extent::Base(crate::ccl::BaseType::Int)),
+                Extent::Base(BaseType::UInt),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
             ),
         );
         assert!(met.check_from(&tiling), "{met:?} against {tiling}");
