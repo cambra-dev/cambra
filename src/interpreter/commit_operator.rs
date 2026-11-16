@@ -1007,7 +1007,7 @@ impl Breaker for InductionStoreProducer {
     fn finish(&mut self, _input: InputId, pushes: &mut crate::interpreter::dispatcher::Pushes<'_>) {
         if self.run.is_some() {
             assert!(
-                self.held().is_universal(),
+                self.final_guard().is_universal(),
                 "{} finishes the run terminal",
                 self.name()
             );
@@ -1025,7 +1025,7 @@ impl BreakingProducer for InductionStoreProducer {
     /// through `resumed_after`, since its consumers took those from the predecessor
     /// ([`CommitEngine::seeded_at`]). A nested store publishes completed enclosing rows;
     /// a store over concatenation's tagged positions publishes only at terminality.
-    fn held(&self) -> TileGuard {
+    fn final_guard(&self) -> TileGuard {
         if matches!(self.engines, Engines::Rows(_)) && !self.breaker.terminal() {
             return TileGuard::flatten_or(
                 self.complete_rows
@@ -1040,10 +1040,10 @@ impl BreakingProducer for InductionStoreProducer {
                     .collect(),
             );
         }
-        if self.breaker.terminal() || !pushes_decided_positions(self.tiling()) {
+        if self.breaker.terminal() || !pushes_complete_positions(self.tiling()) {
             return self.breaker.held(self.tiling());
         }
-        let decided = self.decided();
+        let decided = self.complete();
         match &self.resumed_after {
             Some(resumed) => guard_minus(
                 &decided,
@@ -1061,22 +1061,15 @@ impl BreakingProducer for InductionStoreProducer {
 
     /// The positions the last step decided, row by row under rows: the store tile's own
     /// statement (`Tile::to_guard`).
-    fn decided(&self) -> TileGuard {
+    fn complete(&self) -> TileGuard {
         match &self.breaker.snapshot {
             Some(tile) => tile.to_guard(),
             None => self.tiling().empty_guard(),
         }
     }
 
-    /// What the store holds. A release of a store with no rows above it names the positions a
-    /// reader reads no more and removes nothing from the tile it reads; a nested store's offer
-    /// cuts the rows its readers released.
-    fn final_guard(&self) -> TileGuard {
-        self.held()
-    }
-
     /// The store publishes decided positions or completed enclosing rows after each round
-    /// its loop's scope consumes ([`held`](BreakingProducer::held)).
+    /// its loop's scope consumes ([`final_guard`](BreakingProducer::final_guard)).
     fn pushes_while_consuming(&self) -> bool {
         true
     }
@@ -1096,7 +1089,7 @@ impl BreakingProducer for InductionStoreProducer {
 /// Whether an induction store over `tiling` pushes its positions as it decides them: a flat store
 /// over positions a prefix of which has a spelling. A nested store publishes completed rows
 /// instead. A concatenation's tagged positions require the domain's tags to spell a prefix.
-pub(crate) fn pushes_decided_positions(tiling: &Tiling) -> bool {
+pub(crate) fn pushes_complete_positions(tiling: &Tiling) -> bool {
     fn tagged(extent: &Extent) -> bool {
         match extent {
             Extent::Union(_) => true,
@@ -1340,7 +1333,7 @@ impl BreakingProducer for CommitProducer {
     /// terminal. A reader of the store's changelog (`StoreValueStream`) takes the ticks as they are
     /// decided, and a reader of its final value takes it once the store is terminal
     /// (`Dispatcher::read_whole`).
-    fn held(&self) -> TileGuard {
+    fn complete(&self) -> TileGuard {
         if self.breaker.terminal() {
             return self.tiling().universal_guard();
         }
@@ -1354,7 +1347,7 @@ impl BreakingProducer for CommitProducer {
 
     /// What the store holds, whatever its readers released.
     fn final_guard(&self) -> TileGuard {
-        self.held()
+        self.complete()
     }
 
     /// The store pushes the ticks each consume decides.
@@ -5720,7 +5713,7 @@ struct DriverInputs {
     /// store's writer pipeline.
     placement: crate::interpreter::dispatcher::Placement,
     /// Where the entry in front of the source records a decided push while unplaced.
-    decides: crate::interpreter::dispatcher::DecidedTarget,
+    decides: crate::interpreter::dispatcher::CompletionTarget,
     store_producer: Box<dyn TileProducer>,
     source_producer: Box<dyn TileProducer>,
     /// Set by every notification the source sends, for a driver that pulls the source
@@ -5750,7 +5743,7 @@ fn subscribe_behind_entry(
 }
 
 /// [`subscribe_behind_entry`], answering beside the placement the entry's decided target
-/// ([`DecidedTarget`](crate::interpreter::dispatcher::DecidedTarget)).
+/// ([`CompletionTarget`](crate::interpreter::dispatcher::CompletionTarget)).
 fn subscribe_deciding(
     op: &mut dyn TileOperator,
     arrivals: Option<&crate::interpreter::tile_operators::Arrivals>,
@@ -5759,10 +5752,10 @@ fn subscribe_deciding(
 ) -> (
     Box<dyn TileProducer>,
     crate::interpreter::dispatcher::Placement,
-    crate::interpreter::dispatcher::DecidedTarget,
+    crate::interpreter::dispatcher::CompletionTarget,
 ) {
     let (entry, placement) = crate::interpreter::dispatcher::Entry::unplaced(op.tiling().clone());
-    let decides = entry.decided_target();
+    let decides = entry.complete_target();
     let entry: Box<dyn Consumer> = match item_level {
         Some(level) => {
             crate::interpreter::notifications::through_values(level, op.tiling(), Box::new(entry))
@@ -6141,7 +6134,7 @@ struct InductionDriverProducer {
     /// Whether the source has notified since it was last read.
     source_news: crate::interpreter::tile_operators::Arrivals,
     /// Where the entry in front of the source records a decided push while unplaced.
-    decides: crate::interpreter::dispatcher::DecidedTarget,
+    decides: crate::interpreter::dispatcher::CompletionTarget,
     /// The source as of its last read.
     source: DecodedSource,
     /// `None` for a drive whose body takes the position alone.
@@ -6329,7 +6322,7 @@ impl TileProducer for InductionDriverProducer {
         Some(next)
     }
 
-    fn decides_through(&self) -> Option<crate::interpreter::dispatcher::DecidedTarget> {
+    fn completes_through(&self) -> Option<crate::interpreter::dispatcher::CompletionTarget> {
         Some(self.decides.clone())
     }
 
@@ -6396,7 +6389,7 @@ impl Breaker for InductionDriverProducer {
 
 impl BreakingProducer for InductionDriverProducer {
     /// The region the last step's rendering states.
-    fn held(&self) -> TileGuard {
+    fn complete(&self) -> TileGuard {
         self.rendered.to_guard()
     }
 
@@ -8738,7 +8731,7 @@ mod tests {
                     if producer.recurrence_of().is_some() {
                         return;
                     }
-                    if let Some(target) = producer.decides_through() {
+                    if let Some(target) = producer.completes_through() {
                         assert!(
                             target.borrow().is_none(),
                             "source completeness retains no target in the discarded dispatcher"
@@ -11553,7 +11546,7 @@ mod tests {
     }
 
     /// A three-tick store: the seed holds both accounts, tick 1 writes only
-    /// `alice`, tick 2 writes only `bob`. Decided through the watermark `w`.
+    /// `alice`, tick 2 writes only `bob`. Completion through the watermark `w`.
     fn skew_store(w: u64) -> Tile {
         store_tile(
             &["alice", "bob"],
@@ -11584,16 +11577,16 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        assert!(pushes_decided_positions(&store(Extent::Base(
+        assert!(pushes_complete_positions(&store(Extent::Base(
             BaseType::UInt
         ))));
-        assert!(!pushes_decided_positions(&store(tagged)));
-        assert!(!pushes_decided_positions(&store(record)));
+        assert!(!pushes_complete_positions(&store(tagged)));
+        assert!(!pushes_complete_positions(&store(record)));
         let nested = Tiling::data_function(
             Extent::Base(BaseType::UInt),
             store(Extent::Base(BaseType::UInt)),
         );
-        assert!(!pushes_decided_positions(&nested));
+        assert!(!pushes_complete_positions(&nested));
     }
 
     #[test]

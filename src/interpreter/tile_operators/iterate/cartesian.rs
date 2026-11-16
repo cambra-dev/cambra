@@ -106,7 +106,7 @@ impl CartesianIteration {
             if pending.is_false() {
                 continue;
             }
-            let decided = side.extent.decided_region();
+            let decided = side.extent.complete_region();
             let values = iterate_extent(&side.extent, &side.producer);
             let rows = values.len();
             let mut tile = Tile::data_function(

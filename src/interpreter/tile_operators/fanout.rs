@@ -1450,7 +1450,7 @@ impl BreakingProducer for MemoProducer {
     /// some fields' cells beneath a row leaves the row in the cache, which states it, so only the
     /// keys released whole are added (`keys_released_whole`). `final_guard` takes the released
     /// region out again.
-    fn held(&self) -> TileGuard {
+    fn complete(&self) -> TileGuard {
         let stated = self.cached_tile.to_guard();
         let released = self.obsolete_guard();
         if released.is_empty() {
@@ -2985,7 +2985,7 @@ mod consuming_tests {
         memo.consume_in_pipeline(InputId::ONLY, nested_tiling().universal_guard());
         let released = TileGuard::Function(FunctionGuard::Codomain(Box::new(Keys(0, 1).guard())));
         memo.release(released.clone());
-        let before = Projection::of(&memo.held()).expect("a region of keys");
+        let before = Projection::of(&memo.complete()).expect("a region of keys");
         let held = Projection::of(&memo.final_guard()).expect("a region of paths");
         let released = Projection::of(&released).expect("a region of paths");
         assert_eq!(held.level(), Some(CurryLevel::new(1)));

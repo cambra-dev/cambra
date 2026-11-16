@@ -60,7 +60,7 @@ a shared producer without the required fan-out, and a live source whose arrivals
 pipeline as supported regions. The store restrictions are specified in
 [A store as a breaker](design-operators.md#a-store-as-a-breaker).
 
-A static source starts with its unreleased input. A live source announces its decided extent,
+A static source starts with its unreleased input. A live source announces its complete extent,
 including previously yielded regions when a run starts. The pipeline queues only what its breaker's
 input has not released. Subsequent polls announce additional progress. Several appearances of one
 source do not turn one delivered position into several loop requests.
@@ -111,9 +111,9 @@ reconstruct an already reclaimed prefix. Those rules belong to
 The inspector publishes observations without pulling producers. Its version boundary is specified
 in [A reload of main is followed](../inspector_model/design.md#a-reload-of-main-is-followed).
 
-## Parking arrivals until a read is decided
+## Parking arrivals until a read is complete
 
-An admitted region waits until every dependency has decided the part of that region it supplies.
+An admitted region waits until every dependency has completed the part of that region it supplies.
 For example, a loop seeded by `sum(source1())` cannot start from a partial sum. Its source positions
 remain parked until the seed is complete.
 
@@ -127,15 +127,15 @@ consequence of the computation's dependency, not evidence that the parked region
 ## Completeness in pushes
 
 Publication communicates two facts: which output regions can supply work, and which regions are
-decided. A decided key has a complete value or is known absent. A breaker may have decided more
+complete. A complete key has an immutable value or is known absent. A breaker may have completed more
 than it still holds because readers have released some of its output.
 
-| Input relationship | Work region | Decided region |
+| Input relationship | Work region | Complete region |
 | --- | --- | --- |
 | Preserves keys | Same keys | Same keys |
 | Restates keys | Restated keys | Restated keys |
-| Depends on the whole input | Whole output | Nothing until the input is wholly decided |
-| Depends on several inputs | Regions contributed by each input | Their required contributions must all be decided |
+| Depends on the whole input | Whole output | Nothing until the input is wholly complete |
+| Depends on several inputs | Regions contributed by each input | Their required contributions must all be complete |
 
 The dispatcher records completeness per dependency and intersects it with that dependency's reach.
 A region outside a dependency's reach need not wait for it. A dependency read only by pull must be
@@ -147,20 +147,20 @@ whole unless the paths' requirements can be tracked separately. A lookup table a
 rows is such a case.
 
 An operator replacing a value preserves notifications above that value's level. A change beneath
-it names the enclosing rows. A decided region beneath it passes only where it decides the whole
+it names the enclosing rows. A complete region beneath it passes only where it decides the whole
 value. A nested store publishes completed enclosing rows; a final read retains those row keys and
 participates in the body's pipeline dependencies, so the outer step waits for the read's value.
 
-Static ranges are decided at the start. Live ranges publish their decided extent as it grows.
-Breakers that publish while consuming announce their decided regions after each consume; breakers
+Static ranges are complete at the start. Live ranges publish their complete extent as it grows.
+Breakers that publish while consuming announce their complete regions after each consume; breakers
 that hold output announce them in a later publication pass. Completion publishes final progress.
 Notifications queue dispatcher work and mark inline caches dirty; no deferred wakeup schedules work.
 
 ## Reading each row once
 
-A dependent pipeline admits only regions whose required contributions are decided. It records the
+A dependent pipeline admits only regions whose required contributions are complete. It records the
 regions already admitted so repeated pushes along different paths do not duplicate consumption.
-Its readiness rule is the same whether a region arrives already decided or becomes ready after
+Its readiness rule is the same whether a region arrives already complete or becomes ready after
 parking.
 
 A pipeline reading both a live source and another pipeline can receive source arrivals and distinct
@@ -169,6 +169,18 @@ Releases of the breaker's input record which consumed regions remain unnecessary
 
 Closing rounds are explicit repeated reads. The last value of a nested row does not establish the
 row's end, and an empty row still has completeness to deliver.
+
+A breaker's `complete()` is authoritative. It preserves completion after payload reclamation.
+`final_guard()` derives the region available for publication, accounting for release and resumed
+store positions. The dispatcher's per-dependency completion is a cache of this statement after
+notification routes translate it into the reader's input coordinates.
+
+Publication and admission retain separate histories. `pushed` names output already published and
+can be shared by several writer pipelines. Queue `region` names input already scheduled, including
+acknowledged packages. `parked.brought` names input already admitted, including input still parked
+and input transferring into the queue. The transfer releases the parking lock before acquiring the
+queue lock; deriving admission from those two containers would leave a duplicate-admission window.
+Repeated loop rounds bypass ordinary deduplication and remain distinct packages.
 
 ## A loop in rounds
 
@@ -181,7 +193,7 @@ position first runs the body, publishes held output, and then steps the store. T
 cannot pass that step. A nested request remains outstanding until its row finishes, so the outer
 step cannot pass an unfinished inner row. Other independent work remains claimable.
 
-Quiescence alone does not permit a step: a body breaker can hold decided output it has not yet
+Quiescence alone does not permit a step: a body breaker can hold complete output it has not yet
 published. The controller publishes held output until no further work appears, then releases the
 step's dependencies. The production driver coordinates one claim at a time. The shared dispatcher
 does not provide a concurrent loop-settlement protocol.

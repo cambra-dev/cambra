@@ -2089,7 +2089,7 @@ fn a_loop_over_a_let_bound_live_list_steps_before_the_source_ends(
     "};
     fn decided_by_store(producer: &mut dyn TileProducer) -> Option<crate::interpreter::TileGuard> {
         if producer.name().starts_with("InductionStore") {
-            return producer.as_breaking_mut().map(|store| store.decided());
+            return producer.as_breaking_mut().map(|store| store.complete());
         }
         let mut decided = None;
         producer.visit_input_producers_mut(&mut |_, input| {

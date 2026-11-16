@@ -263,7 +263,7 @@ impl InductionStoreProducer {
         self.reach_local(self.drive(), &mut |breaker, _| {
             target = breaker
                 .as_producer()
-                .and_then(|producer| producer.decides_through());
+                .and_then(|producer| producer.completes_through());
         });
         if let Some(target) = target {
             *target.borrow_mut() = None;
@@ -283,7 +283,7 @@ impl InductionStoreProducer {
     }
 
     fn terminal(&self) -> bool {
-        self.held().is_universal()
+        self.final_guard().is_universal()
     }
 
     /// The path of the position the drive emits next, which the next round runs: the next its
@@ -316,8 +316,8 @@ impl InductionStoreProducer {
         self.run().drive
     }
 
-    /// Have the entry in front of the drive's source record a decided push of the source's keys
-    /// at `pipeline`, this scope's pipeline in the dispatcher around it, as decided positions of
+    /// Have the entry in front of the drive's source record a complete push of the source's keys
+    /// at `pipeline`, this scope's pipeline in the dispatcher around it, as complete positions of
     /// the store's input: the drive reads its source by pull, so no push of the source reaches the
     /// scope's entry otherwise, and the scope would park each round until the source is whole.
     pub(super) fn decide_through_drive(&mut self, pipeline: PipelineId) {
@@ -326,9 +326,9 @@ impl InductionStoreProducer {
         self.reach_local(self.drive(), &mut |breaker, _| {
             target = breaker
                 .as_producer()
-                .and_then(|producer| producer.decides_through());
+                .and_then(|producer| producer.completes_through());
         });
-        let target = target.expect("a loop's drive records its source's decided pushes");
+        let target = target.expect("a loop's drive records its source's complete pushes");
         *target.borrow_mut() = Some((pipeline, input));
     }
 
@@ -555,7 +555,7 @@ impl InductionStoreProducer {
     fn step_round(&mut self, guard: &TileGuard) {
         self.consume_impl(InputId::ONLY, guard.clone());
         assert!(
-            self.held().is_universal()
+            self.final_guard().is_universal()
                 || guard_minus(guard, &self.input_released(InputId::ONLY)).is_empty(),
             "{}'s step in the round of {guard:?} decides it",
             self.name()
@@ -587,11 +587,11 @@ impl InductionStoreProducer {
 
     /// The consumer the scope's pipeline pushes to, the store's, and whether the store pushes a
     /// region of its keys: a nested store pushes rows, and a flat store the positions its rounds
-    /// decide where it pushes any before it is terminal (`pushes_decided_positions`). Any other
+    /// decide where it pushes any before it is terminal (`pushes_complete_positions`). Any other
     /// pushes everything, once it is terminal.
     pub(super) fn pushing_end(&self) -> (SharedConsumer, bool) {
         let keyed = matches!(self.tiling(), Tiling::DataFunction { .. })
-            || crate::interpreter::commit_operator::pushes_decided_positions(self.tiling());
+            || crate::interpreter::commit_operator::pushes_complete_positions(self.tiling());
         let downstream = self
             .base()
             .downstream
@@ -911,19 +911,19 @@ mod tests {
         assert_eq!(compiled.value(), Value::Int(5));
     }
 
-    /// The store holds the positions its rounds decided before it is terminal, and everything
+    /// The store holds the positions its rounds complete before it is terminal, and everything
     /// after.
     #[test]
-    fn the_store_holds_its_decided_positions_then_everything_once_terminal() {
+    fn the_store_holds_its_complete_positions_then_everything_once_terminal() {
         let compiled = Compiled::of(SUM);
         compiled.consume(keys_between(0, 0));
-        let (held, decided) = {
+        let (held, complete) = {
             let store = induction(&compiled.scope);
-            (store.final_guard(), store.decided())
+            (store.final_guard(), store.complete())
         };
         assert!(
-            !held.is_empty() && !held.is_universal() && held == decided,
-            "{held:?}, deciding {decided:?}"
+            !held.is_empty() && !held.is_universal() && held == complete,
+            "{held:?}, deciding {complete:?}"
         );
         compiled.consume(keys_between(1, 2));
         assert!(induction(&compiled.scope).final_guard().is_universal());
@@ -977,7 +977,7 @@ mod tests {
             drive
                 .as_breaking_mut()
                 .expect("the drive is a pipeline breaker")
-                .held()
+                .complete()
         };
         with_drive(&mut induction(&compiled.scope), |drive| {
             assert_eq!(drive.next_position(), Some(Some(vec![Value::UInt(0)])));

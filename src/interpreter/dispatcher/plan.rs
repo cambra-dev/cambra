@@ -39,7 +39,7 @@ use crate::interpreter::{BaseType, DataSink, DataSourceDomainExtentImpl, Extent}
 /// [`SinkBreaker`]: crate::interpreter::tile_operators::SinkBreaker
 ///
 /// Every pipeline that reads another parks the rows its pushes and its start bring until every
-/// pipeline it reads has decided them, and reads each row once ([`Dispatcher::park`]). A push
+/// pipeline it reads has completed them, and reads each row once ([`Dispatcher::park`]). A push
 /// brings the rows it names at the reader's entry, restated by the consumers between the two, a
 /// widening one's as every row. A reader reads its input whole ([`Dispatcher::read_whole`]) where
 /// a pipeline it reads pushes along no route to it, which the consumers between them declare
@@ -397,7 +397,7 @@ fn run_targets(
     // range over one, as a loop over a let-bound source reads the source's memo, takes those
     // ranges as its own where each read's pushes reach its drive as the drive's positions: the
     // scope is then notified of each delivery as rounds, as over the source itself, and parks each
-    // delivery until the pipelines it reads have decided it (`Dispatcher::park`).
+    // delivery until the pipelines it reads have completed it (`Dispatcher::park`).
     let one = Projection::admitting(Predicate::point(Value::UInt(0)));
     let inherited: Vec<Vec<LiveLeaf>> = (0..members.live.len())
         .map(|pipeline| {
@@ -636,7 +636,7 @@ fn run_targets(
                         // breaker of one value brings rows where its push names rows no arrival
                         // brings, as a let-bound record's collection field does; where it names
                         // only rows the arrivals bring, those rows read it, and wait parked for its
-                        // decided push.
+                        // complete push.
                         let as_keys = match keyed {
                             true => routes_to(&pusher, pipeline)
                                 .iter()
@@ -661,7 +661,7 @@ fn run_targets(
         planned[pipeline].live = true;
         planned[pipeline].whole |= matches!(notifies, Notifies::Whole);
         // A store or a loop's scope steps on the pipelines it reads by pull, so it parks each
-        // delivery until they have decided it (`Dispatcher::park`).
+        // delivery until they have completed it (`Dispatcher::park`).
         if matches!(
             members.located[pipeline],
             Located::Store { .. } | Located::Scope { .. }
@@ -705,10 +705,14 @@ fn run_targets(
         execution.reach(pipeline, &mut root_reach, call);
     };
     let done = in_a_run(|| {
-        // A range over a static extent has decided every key from the start.
+        // A range over a static extent has completed every key from the start.
         for (pipeline, ranges) in members.leaves.iter().enumerate() {
             for range in ranges {
-                dispatcher.land_range_decided(PipelineId(pipeline), &Projection::Everything, range);
+                dispatcher.land_range_complete(
+                    PipelineId(pipeline),
+                    &Projection::Everything,
+                    range,
+                );
             }
         }
         match live.is_empty() {
@@ -720,7 +724,7 @@ fn run_targets(
         }
     });
     // Every breaker and range is terminal at the run's end, so each pipeline has recorded as
-    // decided by each of its sources all that a push of the source's every key lands as at its
+    // complete by each of its sources all that a push of the source's every key lands as at its
     // entry. A run that pauses stops at a drained boundary before its end, and checks nothing.
     #[cfg(debug_assertions)]
     if done {
@@ -733,11 +737,11 @@ fn run_targets(
                 else {
                     return;
                 };
-                let decided = dispatcher.decided_of(PipelineId(reader), PipelineId(source));
+                let complete = dispatcher.complete_of(PipelineId(reader), PipelineId(source));
                 debug_assert!(
-                    decided.covers(&reached),
-                    "{name} has decided all it reaches of {}'s input, {reached:?}, at the run's end, \
-                     which records {decided:?}",
+                    complete.covers(&reached),
+                    "{name} has completed all it reaches of {}'s input, {reached:?}, at the run's end, \
+                     which records {complete:?}",
                     members.names[reader]
                 );
             };
@@ -1102,7 +1106,7 @@ pub(super) enum Consumes {
     /// What the pipelines it reads push, as its edges' probes plan.
     Pushes,
     /// Its input whole, in order, once every pipeline it reads has finished, or over a live
-    /// source each delivery once they have decided it: a store that steps itself, or a loop's
+    /// source each delivery once they have completed it: a store that steps itself, or a loop's
     /// scope.
     Whole,
     /// One row per round of the scope it runs in, which queues it the row, once every pipeline it
@@ -1111,7 +1115,7 @@ pub(super) enum Consumes {
 }
 
 /// The dispatcher over the pipelines `reads` describes, with every pipeline that reads another
-/// parking the rows its pushes bring until the pipelines it reads have decided them, reading its
+/// parking the rows its pushes bring until the pipelines it reads have completed them, reading its
 /// input whole where a pipeline it reads reaches it along no route, and queued at the start the
 /// regions no push names ([`run_program`] says how). `arrivals` says whether a
 /// pipeline takes a live source's arrivals beside the pipelines it reads
@@ -1181,14 +1185,14 @@ pub(super) fn plan_edges(
         if arrivals[reader] {
             match kinds[reader] {
                 // A pipeline that pushes takes each delivery, parked until the pipelines it reads
-                // have decided it.
+                // have completed it.
                 Consumes::Pushes => {
                     dispatcher.take_arrivals(PipelineId(reader));
                     dispatcher.park(PipelineId(reader));
                     planned[reader].held = true;
                 }
                 // A store or a loop's scope over a live source takes each delivery once the
-                // pipelines it reads have decided it, or are quiescent where it follows them
+                // pipelines it reads have completed it, or are quiescent where it follows them
                 // (below), so it reads no row again.
                 Consumes::Rounds | Consumes::Whole => dispatcher.take_arrivals(PipelineId(reader)),
             }
@@ -1211,7 +1215,7 @@ pub(super) fn plan_edges(
             // it reads have finished the round, since its rounds pull them, and a store or a
             // loop's scope over a live source takes each delivery so.
             // In the run's dispatcher a store or a loop's scope over a live source parks each
-            // delivery on what the pipelines it reads have decided instead (`run_targets`).
+            // delivery on what the pipelines it reads have completed instead (`run_targets`).
             Consumes::Rounds | Consumes::Whole if opens => continue,
             Consumes::Rounds | Consumes::Whole => {
                 for &follow in read {
@@ -1244,21 +1248,21 @@ pub(super) fn plan_edges(
                 unreached = true;
                 continue;
             }
-            // A row reached along a path that passes a decided region on and along one that drops
+            // A row reached along a path that passes a complete region on and along one that drops
             // it depends on rows the region does not name, so the read decides it only once whole.
-            if routes.iter().any(|route| route.decides_part)
-                && routes.iter().any(|route| !route.decides_part)
+            if routes.iter().any(|route| route.completes_part)
+                && routes.iter().any(|route| !route.completes_part)
             {
                 for &shared in read_all
                     .iter()
                     .filter(|&&r| pushes_with[r] == pushes_with[read])
                 {
-                    dispatcher.decides_whole_only(PipelineId(reader), PipelineId(shared));
+                    dispatcher.completes_whole_only(PipelineId(reader), PipelineId(shared));
                 }
             }
-            // A read along a route reaches what a push of its every key, wholly decided, lands
+            // A read along a route reaches what a push of its every key, wholly complete, lands
             // as: a row elsewhere waits for nothing of it. One read by pull reaches all of it.
-            let region = decided_reach(&pusher, PipelineId(read), reader)
+            let region = complete_reach(&pusher, PipelineId(read), reader)
                 .iter()
                 .fold(input.empty_guard(), |region, arrival| {
                     region.union(&arrival.guard)
@@ -1298,7 +1302,7 @@ pub(super) fn plan_edges(
                 })
             });
         // Every reader parks the rows its pushes and its start bring until the pipelines it
-        // reads have decided them, and reads each row once ([`Dispatcher::park`]). A pipeline
+        // reads have completed them, and reads each row once ([`Dispatcher::park`]). A pipeline
         // that takes arrivals is queued its rows as its sources yield them, and any other reads
         // its input whole where a pipeline it reads reaches it by pull, or where nothing else
         // brings it a row.
@@ -1363,7 +1367,7 @@ pub struct Planned {
     pub rounds: Vec<Planned>,
     /// Whether the run notifies it of what a live source yields.
     pub live: bool,
-    /// Whether it parks its arrivals until the pipelines it reads have decided them
+    /// Whether it parks its arrivals until the pipelines it reads have completed them
     /// ([`Dispatcher::park`]).
     pub held: bool,
 }
@@ -1425,13 +1429,13 @@ pub(super) fn probe(
 }
 
 /// The region of `reader`'s input a push of `from`'s every key reaches through `consumer` when
-/// it is restated as a wholly decided region is: all `from` can ever decide of that input.
-pub(super) fn decided_reach(
+/// it is restated as a wholly complete region is: all `from` can ever decide of that input.
+pub(super) fn complete_reach(
     consumer: &SharedConsumer,
     from: PipelineId,
     reader: usize,
 ) -> Vec<Arrival> {
-    let mut landing = Landing::probe_decided(from);
+    let mut landing = Landing::probe_complete(from);
     consumer
         .borrow_mut()
         .notify(&Projection::Everything, &mut landing);
@@ -1548,7 +1552,7 @@ struct Beneath {
     live: Vec<LiveLeaf>,
 }
 
-/// A live iteration range: its consumer and the full extent whose decided region is announced.
+/// A live iteration range: its consumer and the full extent whose complete region is announced.
 #[derive(Clone)]
 pub(super) struct LiveLeaf {
     pub(super) consumer: SharedConsumer,
@@ -1923,7 +1927,7 @@ impl Planner {
         );
         self.scopes[scope].pipeline = Some(pipeline);
         // The store's seeds reach the scope's pipeline through their entries, which record what
-        // each seed has decided; the scope takes no push of them.
+        // each seed has completed; the scope takes no push of them.
         let seeds = read
             .store
             .borrow_mut()
@@ -2467,7 +2471,7 @@ fn reaches_recurrence(
 }
 
 /// The region of a range's keys a source's yield `yielded` decides.
-fn decided_region(yielded: &Predicate) -> Projection {
+fn complete_region(yielded: &Predicate) -> Projection {
     match yielded.is_true() {
         true => Projection::Everything,
         false => Projection::admitting(yielded.clone()),
@@ -2545,7 +2549,7 @@ impl LivePipeline {
         let mut positions = Predicate::False;
         let mut fresh_sources: Vec<LiveSource> = Vec::new();
         for (leaf, notified) in &mut self.leaves {
-            let yielded = leaf.extent.decided_region();
+            let yielded = leaf.extent.complete_region();
             debug_assert!(
                 notified.minus(&yielded).is_false(),
                 "a source's yield only grows: it yields {yielded:?}, short of {notified:?}"
@@ -2588,8 +2592,12 @@ impl LivePipeline {
                     positions = positions.union(&fresh);
                 }
             }
-            // The keys the source yields are decided: it yields a key once for good.
-            dispatcher.land_range_decided(self.pipeline, &decided_region(&yielded), &leaf.consumer);
+            // The keys the source yields are complete: it yields a key once for good.
+            dispatcher.land_range_complete(
+                self.pipeline,
+                &complete_region(&yielded),
+                &leaf.consumer,
+            );
             *notified = yielded;
         }
         let fresh = guard_minus(&arrivals, &self.announced);
@@ -2701,7 +2709,7 @@ fn drive_live(
                 Next::Wait(_) if execution.resume(dispatcher, reach) => {}
                 Next::Wait(_) => {
                     // A breaker that pushes only at its finish, as `MapAggregate`, finishes only
-                    // once every source yields everything: it pushes what it decided here, and the
+                    // once every source yields everything: it pushes what it completed here, and the
                     // pass runs on while that brings anything.
                     let before = dispatcher.changes();
                     execution.push_held(dispatcher, reach);

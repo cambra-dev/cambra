@@ -1477,40 +1477,24 @@ pub trait Breaker {
     }
 }
 
-/// A pipeline breaker that answers pulls: a producer that consumes the input it owns into state of
-/// its own, and answers its consumer from that state. After each consume the driver pushes what
-/// it has decided, where it [pushes while consuming](Self::pushes_while_consuming), and once the
-/// pipeline has consumed every package and nothing more can be queued for it, it calls
-/// [`finish`]. [`offer_impl`] is what the
-/// producer's `get_impl` answers with once it is consuming: it reads the state `consume_impl`
-/// built and never pulls the input.
-///
-/// A push climbs the producer's consumer to the next breaker (`dispatcher::Pushes`), so a
-/// consuming producer wakes no consumer: the work packages pushed are how its reader learns what
-/// it holds. Pull mode wakes its consumer as it always has.
-///
-/// [`finish`]: Breaker::finish
-/// [`offer_impl`]: Self::offer_impl
+/// A pipeline breaker that consumes its input into state and answers reads from that state.
+/// `complete` states which output is immutable. After each consume, the driver publishes
+/// progress where [`pushes_while_consuming`](Self::pushes_while_consuming) permits it; otherwise
+/// it publishes in a later pass. Once the input feeds close and every package is acknowledged,
+/// the dispatcher calls [`Breaker::finish`].
+/// [`offer_impl`](Self::offer_impl) reads the state without pulling the input.
 pub trait BreakingProducer: TileProducer + Breaker {
     /// Store keys whose writers have all completed. Other breakers declare none.
     fn completed_keys(&self) -> &[Value] {
         &[]
     }
 
-    /// The guard of what the producer holds: the state's own statement, before what a release
-    /// removed is taken out of it. Empty when it holds nothing.
-    fn held(&self) -> TileGuard;
+    /// The complete output region, including keys known absent and output already released.
+    /// This statement comes from the breaker's state. Publication and downstream readiness
+    /// derive from it; reclaiming payloads must preserve the statement.
+    fn complete(&self) -> TileGuard;
 
-    /// The region of the output the producer has decided: keys whose value no longer changes
-    /// and keys its statement rules out, which its readers' work waits for
-    /// (`src/interpreter/design-dispatcher.md`, "Completeness in pushes"). The default is
-    /// [`held`](Self::held). A producer that holds less than it has decided, so that what it
-    /// pushes stays whole, states the difference here.
-    fn decided(&self) -> TileGuard {
-        self.held()
-    }
-
-    /// The keys under which the producer holds a cell: [`held`](Self::held) less the keys its
+    /// The keys under which the producer holds a cell: [`complete`](Self::complete) less the keys its
     /// readers have released whole ([`keys_released_whole`]), closed over the producer's tiling
     /// (`TileGuard::closed_over`), so a row released through its last position is held no more. A
     /// key some of whose cells a reader released, as a selector releases the fields it does not
@@ -1523,7 +1507,7 @@ pub trait BreakingProducer: TileProducer + Breaker {
     /// ([`guard_minus`]), or a release of a collection's keys has an arm that is no region of keys
     /// and no codomain guard ([`keys_released_whole`]).
     fn final_guard(&self) -> TileGuard {
-        let held = self.held();
+        let held = self.complete();
         let obsolete = self.obsolete_guard();
         let left = match names_collection_keys(obsolete) {
             true => match keys_released_whole(obsolete) {
@@ -1931,8 +1915,8 @@ pub trait TileProducer {
 
     /// Where this producer is a loop's drive, the target the entry in front of its source records
     /// a decided push at while the drive reads the source by pull, and `None` for any other
-    /// producer ([`DecidedTarget`](crate::interpreter::dispatcher::DecidedTarget)).
-    fn decides_through(&self) -> Option<crate::interpreter::dispatcher::DecidedTarget> {
+    /// producer ([`CompletionTarget`](crate::interpreter::dispatcher::CompletionTarget)).
+    fn completes_through(&self) -> Option<crate::interpreter::dispatcher::CompletionTarget> {
         None
     }
 

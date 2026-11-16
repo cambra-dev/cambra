@@ -372,7 +372,7 @@ impl TileProducer for IterateExtentProducer {
             (extent, _) => extent.clone(),
         };
         let values = iterate_extent(&extent, &self.name());
-        let domain_predicate = extent.decided_region();
+        let domain_predicate = extent.complete_region();
         let mut tile = Tile::data_function(
             values.clone(),
             Box::new(Tile::Scalar(values)),
@@ -588,7 +588,7 @@ mod tests {
             .collect(),
         );
 
-        let predicate = extent.decided_region();
+        let predicate = extent.complete_region();
 
         match predicate {
             Predicate::Record(fields) => {

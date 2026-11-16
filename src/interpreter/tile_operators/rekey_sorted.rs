@@ -364,7 +364,7 @@ impl Breaker for RekeySortedProducer {
 }
 
 impl BreakingProducer for RekeySortedProducer {
-    fn held(&self) -> TileGuard {
+    fn complete(&self) -> TileGuard {
         self.output.to_guard()
     }
     fn offer_impl(&mut self, guard: TileGuard) -> Tile {

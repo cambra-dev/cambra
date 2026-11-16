@@ -165,7 +165,7 @@ impl Breaker for Scripted {
 }
 
 impl BreakingProducer for Scripted {
-    fn held(&self) -> TileGuard {
+    fn complete(&self) -> TileGuard {
         self.held.clone()
     }
 
@@ -1650,13 +1650,13 @@ fn a_route_declares_whether_each_path_keeps_its_keys() {
 /// read whatever their input holds. A path that keeps its keys does not, and neither does an
 /// outermost `Uncurry`'s, which widens a change but restates a decided region exactly.
 #[test]
-fn a_route_declares_whether_each_path_decides_part_of_a_row() {
+fn a_route_declares_whether_each_path_completes_part_of_a_row() {
     let shared = gated_entry(&ints());
 
     let mut paths = Paths(vec![
         forwarding_consumer(&shared),
         forwarding_consumer_keeping_keys(&shared),
-        crate::interpreter::notifications::widening_restating_decided(
+        crate::interpreter::notifications::widening_restating_complete(
             |region| region.clone(),
             forwarding_consumer_keeping_keys(&shared),
         ),
@@ -1670,7 +1670,7 @@ fn a_route_declares_whether_each_path_decides_part_of_a_row() {
     let parts: Vec<_> = routes
         .reached()
         .into_iter()
-        .map(|route| route.decides_part)
+        .map(|route| route.completes_part)
         .collect();
     assert_eq!(parts, [true, false, false, true]);
 }
@@ -1682,7 +1682,7 @@ fn a_route_declares_whether_each_path_decides_part_of_a_row() {
 #[cfg(debug_assertions)]
 #[test]
 fn a_read_decided_only_whole_records_no_part() {
-    use crate::interpreter::dispatcher::Decided;
+    use crate::interpreter::dispatcher::Completion;
     let recorded = |whole_only: bool| {
         let scripted = Scripted::holding(keys_between(0, 1));
         let shared = gated_entry(&ints());
@@ -1698,15 +1698,15 @@ fn a_read_decided_only_whole_records_no_part() {
         let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
         dispatcher.park(PipelineId(1));
         if whole_only {
-            dispatcher.decides_whole_only(PipelineId(1), PipelineId(0));
+            dispatcher.completes_whole_only(PipelineId(1), PipelineId(0));
         }
         dispatcher.finish_by_hand(PipelineId(0), |pushes| {
             scripted.borrow_mut().finish(InputId::ONLY, pushes)
         });
-        dispatcher.decided_of(PipelineId(1), PipelineId(0))
+        dispatcher.complete_of(PipelineId(1), PipelineId(0))
     };
-    assert!(matches!(recorded(true), Decided::Nothing));
-    assert!(matches!(recorded(false), Decided::Region(_)));
+    assert!(matches!(recorded(true), Completion::Nothing));
+    assert!(matches!(recorded(false), Completion::Region(_)));
 }
 
 /// A read decided only whole still records its whole push: once the pipeline it reads has decided
@@ -1714,7 +1714,7 @@ fn a_read_decided_only_whole_records_no_part() {
 #[cfg(debug_assertions)]
 #[test]
 fn a_read_decided_only_whole_records_its_whole_push() {
-    use crate::interpreter::dispatcher::Decided;
+    use crate::interpreter::dispatcher::Completion;
     let scripted = Scripted::holding(ints().universal_guard());
     let shared = gated_entry(&ints());
 
@@ -1728,13 +1728,13 @@ fn a_read_decided_only_whole_records_its_whole_push() {
         .pushing_to(Rc::new(RefCell::new(Paths(paths))));
     let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.park(PipelineId(1));
-    dispatcher.decides_whole_only(PipelineId(1), PipelineId(0));
+    dispatcher.completes_whole_only(PipelineId(1), PipelineId(0));
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
         scripted.borrow_mut().finish(InputId::ONLY, pushes)
     });
     assert!(matches!(
-        dispatcher.decided_of(PipelineId(1), PipelineId(0)),
-        Decided::Whole
+        dispatcher.complete_of(PipelineId(1), PipelineId(0)),
+        Completion::Whole
     ));
 }
 
@@ -2016,7 +2016,7 @@ fn appended_ingress_keeps_external_pushes_at_the_control_boundary() {
     assert_eq!(dispatcher.append_graph(body), 2);
 
     let entry = crate::interpreter::dispatcher::Entry::new(PipelineId(3), input.clone());
-    *entry.decided_target().borrow_mut() = Some((PipelineId(1), input.clone()));
+    *entry.complete_target().borrow_mut() = Some((PipelineId(1), input.clone()));
     let consumer: SharedConsumer = Rc::new(RefCell::new(entry));
 
     for (pusher, expected_reader) in [(0, 1), (2, 3)] {

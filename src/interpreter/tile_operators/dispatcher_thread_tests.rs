@@ -437,7 +437,7 @@ impl Breaker for ScriptBreaker {
 }
 
 impl BreakingProducer for ScriptBreaker {
-    fn held(&self) -> TileGuard {
+    fn complete(&self) -> TileGuard {
         guard_of(kept(self.consumed, self.keep))
     }
 
@@ -489,7 +489,7 @@ fn single_threaded(script: &Script) -> (Outcome, usize) {
             consumed[pipeline.0].push(guard.clone());
         }
     }
-    let held = breakers.iter().map(|b| b.borrow().held()).collect();
+    let held = breakers.iter().map(|b| b.borrow().complete()).collect();
     (Outcome { consumed, held }, events.len())
 }
 
@@ -1510,7 +1510,7 @@ impl Breaker for SharedHeld {
 }
 
 impl BreakingProducer for SharedHeld {
-    fn held(&self) -> TileGuard {
+    fn complete(&self) -> TileGuard {
         guard_of(self.consumed.load(SeqCst))
     }
 

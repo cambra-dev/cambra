@@ -119,6 +119,8 @@ struct ExtractFinalProducer {
     /// Cached result, re-emitted until release. May remain absent after source completion
     /// while waiting for the default. Collection-valued results retain a whole sub-tile.
     final_tile: Option<Tile>,
+    /// Completion survives reclamation of the extracted value.
+    complete: bool,
     /// Suppresses subsequent emissions after universal release.
     released: bool,
     /// The source rows [`Breaker::consume_impl`] merged, kept to the row at the
@@ -153,6 +155,7 @@ impl ExtractFinalProducer {
             source,
             default,
             final_tile: None,
+            complete: false,
             released: false,
             merged,
         }
@@ -312,12 +315,14 @@ impl TileProducer for ExtractFinalProducer {
         if let Some(final_idx) = live_outer {
             let tile = self.value_at(&source_tile, final_idx);
             self.final_tile = Some(tile.clone());
+            self.complete = true;
             return tile;
         }
         // No live positions remain. Cache the default only once it is complete.
         match self.pull_default() {
             Some(tile) => {
                 self.final_tile = Some(tile.clone());
+                self.complete = true;
                 tile
             }
             None => empty,
@@ -371,6 +376,7 @@ impl Breaker for ExtractFinalProducer {
             Some(final_idx) => Some(self.value_at(&self.merged, final_idx)),
             None => self.pull_default(),
         };
+        self.complete |= self.final_tile.is_some();
     }
 
     fn input_tiling(&self, _: InputId) -> Tiling {
@@ -407,10 +413,10 @@ impl Breaker for ExtractFinalProducer {
 impl BreakingProducer for ExtractFinalProducer {
     /// The extracted value, once there is one: none while the source has not drained, or while a
     /// default it fell back to has not converged. The next `consume_impl` reads the default again.
-    fn held(&self) -> TileGuard {
-        match self.final_tile {
-            Some(_) => self.tiling().universal_guard(),
-            None => self.tiling().empty_guard(),
+    fn complete(&self) -> TileGuard {
+        match self.complete {
+            true => self.tiling().universal_guard(),
+            false => self.tiling().empty_guard(),
         }
     }
 
@@ -1075,6 +1081,7 @@ mod consuming_tests {
         extract.begin_run();
         extract.consume_in_pipeline(InputId::ONLY, keys_between(0, 1));
         extract.release(int().universal_guard());
+        assert_eq!(extract.complete(), int().empty_guard());
         push_to(&mut extract, &[1]);
         let dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
         dispatcher.finish_by_hand(PipelineId(0), |pushes| {
@@ -1102,6 +1109,7 @@ mod consuming_tests {
         assert_eq!(extract.final_guard(), int().universal_guard());
         extract.release(int().universal_guard());
         assert_eq!(extract.final_guard(), int().empty_guard());
+        assert_eq!(extract.complete(), int().universal_guard());
         assert_eq!(offer(&mut extract), None);
     }
 

@@ -776,7 +776,7 @@ impl TileOperator for Uncurry {
         // change widens, and an outer key decides every pair whose first field it is.
         let level = self.level;
         let consumer = match level == CurryLevel::OUTERMOST {
-            true => crate::interpreter::notifications::widening_restating_decided(
+            true => crate::interpreter::notifications::widening_restating_complete(
                 |region| paired(region, CurryLevel::OUTERMOST),
                 consumer,
             ),

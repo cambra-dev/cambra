@@ -140,7 +140,7 @@ fn writer(k: usize) -> usize {
 #[test]
 fn an_induction_store_decides_each_position_it_steps() {
     let compiled = Compiled::of(SUM);
-    let decided = || compiled.breaker(|store| (store.held(), store.decided()));
+    let decided = || compiled.breaker(|store| (store.final_guard(), store.complete()));
     compiled.breaker(|store| store.consume_in_pipeline(InputId::ONLY, keys_between(0, 0)));
     let (held, after_one) = decided();
     assert_eq!(held, after_one);

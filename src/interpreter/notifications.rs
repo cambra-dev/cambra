@@ -75,7 +75,7 @@ struct ThroughValues {
 impl Consumer for ThroughValues {
     fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
         let already_whole = *region == Projection::Everything;
-        let region = if landing.is_decided() {
+        let region = if landing.is_complete() {
             let guard = crate::interpreter::tiling::through_shared_levels(
                 region.collection_guard(),
                 self.level.index(),
@@ -85,7 +85,7 @@ impl Consumer for ThroughValues {
         } else {
             region.above(self.level)
         };
-        if !landing.is_decided() && !already_whole && region == Projection::Everything {
+        if !landing.is_complete() && !already_whole && region == Projection::Everything {
             landing.widened(|landing| self.downstream.notify(&region, landing));
         } else {
             self.downstream.notify(&region, landing);
@@ -100,43 +100,43 @@ impl Consumer for ThroughValues {
 struct Widening(Box<dyn Consumer>);
 
 impl Consumer for Widening {
-    /// A change widens to every key. A decided region passes as every key where its source is
-    /// wholly decided, and not at all otherwise: each output key depends on every input key.
+    /// A change widens to every key. A complete region passes as every key where its source is
+    /// wholly complete, and not at all otherwise: each output key depends on every input key.
     fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
         match region {
             Projection::Everything => self.0.notify(region, landing),
-            _ if landing.is_wholly_decided() => self.0.notify(&Projection::Everything, landing),
-            _ if landing.is_decided() => {}
+            _ if landing.is_wholly_complete() => self.0.notify(&Projection::Everything, landing),
+            _ if landing.is_complete() => {}
             _ => landing.widened(|landing| self.0.notify(&Projection::Everything, landing)),
         }
     }
 
-    /// A change widens, and a decided region that is not whole passes as nothing.
+    /// A change widens, and a complete region that is not whole passes as nothing.
     fn route(&mut self, routes: &mut Routes) {
-        routes.widened(|routes| routes.deciding_part(|routes| self.0.route(routes)));
+        routes.widened(|routes| routes.completing_part(|routes| self.0.route(routes)));
     }
 }
 
-/// `consumer` behind a consumer that widens like [`widening`] except for a decided region, which it
+/// `consumer` behind a consumer that widens like [`widening`] except for a complete region, which it
 /// passes as `restate` names it: the region of the operator's keys each of whose values the input
 /// region decides. An operator that re-keys its input knows which of its keys an input key
-/// contributes to, as `Uncurry` pairs an outer key with each inner key beneath it, so a decided
+/// contributes to, as `Uncurry` pairs an outer key with each inner key beneath it, so a complete
 /// region of its input decides that region of its own keys, which [`widening`] would hold back
-/// until the input is wholly decided.
-pub fn widening_restating_decided(
+/// until the input is wholly complete.
+pub fn widening_restating_complete(
     restate: fn(&Projection) -> Projection,
     consumer: Box<dyn Consumer>,
 ) -> Box<dyn Consumer> {
-    Box::new(WideningRestatingDecided(restate, consumer))
+    Box::new(WideningRestatingComplete(restate, consumer))
 }
 
-struct WideningRestatingDecided(fn(&Projection) -> Projection, Box<dyn Consumer>);
+struct WideningRestatingComplete(fn(&Projection) -> Projection, Box<dyn Consumer>);
 
-impl Consumer for WideningRestatingDecided {
+impl Consumer for WideningRestatingComplete {
     fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
         match region {
             Projection::Everything => self.1.notify(region, landing),
-            _ if landing.is_decided() => self.1.notify(&(self.0)(region), landing),
+            _ if landing.is_complete() => self.1.notify(&(self.0)(region), landing),
             _ => landing.widened(|landing| self.1.notify(&Projection::Everything, landing)),
         }
     }
@@ -148,8 +148,8 @@ impl Consumer for WideningRestatingDecided {
 }
 
 /// [`restating`] for a lookup's collection operand: the rows a key of the operand names read that
-/// key and also their input's value, so the decided region it passes names only part of what
-/// those rows depend on ([`Routes::deciding_part`]).
+/// key and also their input's value, so the complete region it passes names only part of what
+/// those rows depend on ([`Routes::completing_part`]).
 pub fn restating_lookup(
     restate: Box<dyn Fn(&Projection) -> Projection>,
     consumer: Box<dyn Consumer>,
@@ -165,12 +165,12 @@ impl Consumer for RestatingLookup {
     }
 
     fn route(&mut self, routes: &mut Routes) {
-        routes.deciding_part(|routes| self.0.route(routes));
+        routes.completing_part(|routes| self.0.route(routes));
     }
 }
 
 /// `consumer` behind a consumer that passes each region on as `restate` names it, a change as a
-/// decided region: an operator that keeps its input's keys under another spelling, as `Uncurry`
+/// complete region: an operator that keeps its input's keys under another spelling, as `Uncurry`
 /// beneath a standing level names an outer and an inner key as one pair, restates both exactly.
 pub fn restating(
     restate: Box<dyn Fn(&Projection) -> Projection>,
@@ -267,15 +267,15 @@ impl OneLevelIn {
 }
 
 impl Consumer for OneLevelIn {
-    /// A decided region of the standing levels passes as it is. One that names keys at or beneath
-    /// level `at` passes as every key where its source is wholly decided, and not at all
+    /// A complete region of the standing levels passes as it is. One that names keys at or beneath
+    /// level `at` passes as every key where its source is wholly complete, and not at all
     /// otherwise: which output keys an input row stands beneath depends on its values, which no
     /// region carries.
     fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
-        if landing.is_decided() {
+        if landing.is_complete() {
             match region {
                 Projection::Keys { level, .. } if *level >= self.at => {
-                    if landing.is_wholly_decided() {
+                    if landing.is_wholly_complete() {
                         self.consumer.notify(&Projection::Everything, landing);
                     }
                 }
@@ -291,10 +291,10 @@ impl Consumer for OneLevelIn {
         }
     }
 
-    /// The input's keys stand one level in, so the path keeps them. A decided region beneath the
+    /// The input's keys stand one level in, so the path keeps them. A complete region beneath the
     /// standing levels that is not whole passes as nothing.
     fn route(&mut self, routes: &mut Routes) {
-        routes.deciding_part(|routes| self.consumer.route(routes));
+        routes.completing_part(|routes| self.consumer.route(routes));
     }
 }
 
@@ -354,7 +354,7 @@ mod tests {
         let reached = routes.reached();
         assert_eq!(reached.len(), 1);
         assert!(!reached[0].keeps_keys);
-        assert!(reached[0].decides_part);
+        assert!(reached[0].completes_part);
     }
 
     #[test]
@@ -383,12 +383,12 @@ mod tests {
             Predicate::qualified(row.clone(), Predicate::point(Value::UInt(7))),
         );
         consumer.notify(&part, &mut Landing::probe(PipelineId(0)));
-        consumer.notify(&part, &mut Landing::probe_decided(PipelineId(0)));
+        consumer.notify(&part, &mut Landing::probe_complete(PipelineId(0)));
         let whole = Projection::keys_at(
             CurryLevel::new(1),
             Predicate::qualified(row.clone(), Predicate::True),
         );
-        consumer.notify(&whole, &mut Landing::probe_decided(PipelineId(0)));
+        consumer.notify(&whole, &mut Landing::probe_complete(PipelineId(0)));
         let outer = Projection::admitting(row);
         assert_eq!(
             *received.borrow(),

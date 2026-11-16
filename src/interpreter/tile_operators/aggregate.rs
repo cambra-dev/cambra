@@ -293,7 +293,7 @@ impl BreakingProducer for AggregateProducer {
     /// The accumulator is one value, held once it is final, when the input has been released
     /// whole, and once it holds a value ([`answer`](Self::answer)). A partial accumulator is held
     /// by no guard, so nothing reads it as final.
-    fn held(&self) -> TileGuard {
+    fn complete(&self) -> TileGuard {
         let Tile::Aggregation { accumulator, .. } = &self.accumulator else {
             panic!("Accumulator must be Aggregation tile")
         };
@@ -378,6 +378,8 @@ struct ExtractAggregateProducer {
     /// The value a consume extracted from a terminal input, until the consumer releases the
     /// output. Empty before then.
     extracted: Tile,
+    /// Completion survives reclamation of the extracted value.
+    complete: bool,
 }
 
 impl ExtractAggregateProducer {
@@ -389,6 +391,7 @@ impl ExtractAggregateProducer {
             kind,
             only_terminal: true,
             extracted,
+            complete: false,
         }
     }
 
@@ -479,6 +482,7 @@ impl Breaker for ExtractAggregateProducer {
         let value = self.extract(input_result);
         if !value.is_empty() {
             self.extracted = value;
+            self.complete = true;
         }
         self.input.release(upstream_guard);
     }
@@ -498,10 +502,10 @@ impl Breaker for ExtractAggregateProducer {
 
 impl BreakingProducer for ExtractAggregateProducer {
     /// The extracted value, once there is one.
-    fn held(&self) -> TileGuard {
-        match self.extracted.is_empty() {
-            true => self.tiling().empty_guard(),
-            false => self.tiling().universal_guard(),
+    fn complete(&self) -> TileGuard {
+        match self.complete {
+            false => self.tiling().empty_guard(),
+            true => self.tiling().universal_guard(),
         }
     }
 
@@ -1311,7 +1315,7 @@ impl BreakingProducer for MapAggregateProducer {
     /// terminal; empty before the first consume. A group still folding holds no decided value, so
     /// a push names it once its input is complete, and a reader that read it before reads it again
     /// then (`Pushes::push_final` pushes each region once).
-    fn held(&self) -> TileGuard {
+    fn complete(&self) -> TileGuard {
         let Some(stated) = &self.stated else {
             return self.tiling().empty_guard();
         };
@@ -1482,7 +1486,7 @@ mod tests {
         );
         sums.begin_run();
         sums.consume_in_pipeline(InputId::ONLY, input_tiling.universal_guard());
-        let held = sums.held();
+        let held = sums.complete();
         let group = |g: u64| [Value::UInt(0), Value::UInt(g)];
         assert!(held.covers_path(&group(0)), "group 0 is settled: {held:?}");
         assert!(
@@ -1532,9 +1536,9 @@ mod tests {
             paths_guard(Predicate::qualified(point(0), through_two.clone())),
         );
         assert!(
-            !sums.held().covers_path(&[Value::UInt(0)]),
+            !sums.complete().covers_path(&[Value::UInt(0)]),
             "group 0 is still folding: {:?}",
-            sums.held()
+            sums.complete()
         );
         sums.consume_in_pipeline(
             InputId::ONLY,
@@ -1544,9 +1548,9 @@ mod tests {
             )),
         );
         assert!(
-            sums.held().covers_path(&[Value::UInt(0)]),
+            sums.complete().covers_path(&[Value::UInt(0)]),
             "{:?}",
-            sums.held()
+            sums.complete()
         );
         let answer = sums.offer_impl(output.universal_guard());
         let Tile::DataFunction {
@@ -3065,7 +3069,7 @@ mod aggregate_consuming_tests {
                 assert_eq!(self.sut.final_guard(), expected, "{trace}: final guard");
             } else {
                 assert!(
-                    self.sut.held().is_empty(),
+                    self.sut.complete().is_empty(),
                     "{trace}: a partial accumulator is held by no guard"
                 );
             }
@@ -3209,6 +3213,10 @@ mod aggregate_consuming_tests {
         );
         assert!(extract.input.obsolete_guard().is_universal());
         assert_eq!(extract.final_guard(), scalar_tiling().universal_guard());
+        assert_eq!(extract.complete(), scalar_tiling().universal_guard());
+        extract.release(scalar_tiling().universal_guard());
+        assert_eq!(extract.complete(), scalar_tiling().universal_guard());
+        assert_eq!(extract.final_guard(), scalar_tiling().empty_guard());
         let pulls = source.borrow().pulled.len();
         extract.get(scalar_tiling().universal_guard());
         assert_eq!(
@@ -3264,6 +3272,15 @@ mod aggregate_consuming_tests {
     }
 
     /// `Nothing` consumed pulls nothing.
+    #[test]
+    fn release_before_extraction_does_not_establish_completion() {
+        let source = source(0..4);
+        let mut extract = extract_over(&source);
+        extract.begin_run();
+        extract.release(scalar_tiling().universal_guard());
+        assert_eq!(extract.complete(), scalar_tiling().empty_guard());
+    }
+
     #[test]
     fn an_extraction_of_nothing_pulls_nothing() {
         let source = source(0..10);
