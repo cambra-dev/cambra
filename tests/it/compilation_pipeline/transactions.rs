@@ -5824,3 +5824,21 @@ fn a_feed_under_a_condition_on_a_block_value() {
         "[90]",
     );
 }
+
+/// A block reading a channel its loop declares is refused: a copy of the declaring binding into
+/// the block's site would be a second channel (`has_effect` in `refuse_conditional_sites`). The
+/// declaration causes nothing, so the refusal rests on the binding's value holding a `Defer`.
+#[test]
+fn a_block_reading_a_channel_its_loop_declares_is_refused() {
+    check_compile_error(
+        indoc! {"
+            t: Mut(Int, Txn) := 0
+            for r in [1, 2]:
+                o: Feed(_)
+                with begin():
+                    t := t + sum(o) + r
+            await_final(t)
+        "},
+        "reading or under a condition reading a binding in its loop or branch",
+    );
+}

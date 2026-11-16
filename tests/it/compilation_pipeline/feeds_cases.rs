@@ -2622,3 +2622,16 @@ fn refined_read_fed_from_a_nested_loop() {
         Value::Int(96),
     );
 }
+
+/// A feed channel read at two list elements stays bound once: inlining moves no definiens that
+/// declares a channel into list elements (`does_something` in `ccl/inline.rs`), since each copy
+/// would be a channel of its own. The literal then reaches op-conversion holding the binder, which
+/// it rejects as a computation in a list element position.
+#[test]
+fn a_feed_channel_read_at_two_list_elements_is_not_moved_into_them() {
+    check_compile_error(
+        "x: Feed(_); x << 5; [x, x]",
+        "a collection-valued list element must be written out as a list literal, \
+         but this one is a computation: x",
+    );
+}

@@ -890,12 +890,6 @@ fn replace_result_var(expr: Expr, replacement: Expr) -> Expr {
     }
 }
 
-/// Return `true` if `expr` contains a `Defer` node anywhere
-/// (transitively).
-fn contains_defer(expr: &Expr) -> bool {
-    matches!(expr.node, TypedExprNode::Defer) || expr.any_child(contains_defer)
-}
-
 /// What one feed contributes to its channel: the values it feeds, keyed by the positions of
 /// the loops around it, curried one collection level per loop, outermost first. `levels`
 /// counts those loops as the walk crosses them ([`extract_for_defer`]): 0 for a fed value
@@ -1410,7 +1404,7 @@ fn check_predicate_defers(
 
 /// Whether `e` binds a `defer` anywhere in its term.
 pub(crate) fn holds_defer(e: &Expr) -> bool {
-    matches!(e.node, TypedExprNode::Defer) || e.fold_children(false, |acc, c| acc || holds_defer(c))
+    matches!(e.node, TypedExprNode::Defer) || e.any_child(holds_defer)
 }
 
 /// Whether one type slot holds a type satisfying `hit`, structure and refinement predicates
@@ -2163,7 +2157,7 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
                 body: inner_body,
             } = &bound_expr.node
                 && is_defer_returning(inner_body, &inner_binding.name)
-                && contains_defer(inner_be)
+                && holds_defer(inner_be)
             {
                 // This arm rebuilds: it copies the inner scope out of the
                 // borrowed tree and splices the outer body into its tail, so the

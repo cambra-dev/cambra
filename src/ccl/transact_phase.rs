@@ -2369,10 +2369,7 @@ pub fn refuse_conditional_sites(
     /// Whether a copy of `e` would repeat something: an effect it causes, or a feed it declares,
     /// which is no effect but a channel of its own.
     fn has_effect(e: &Expr) -> bool {
-        fn declares(e: &Expr) -> bool {
-            matches!(e.node, TypedExprNode::Defer) || e.any_child(declares)
-        }
-        !e.capabilities.set().causes.is_empty() || declares(e)
+        !e.capabilities.set().causes.is_empty() || crate::ccl::channelize::holds_defer(e)
     }
     impl Walk<'_> {
         /// `names` and the names of the copied bindings they read, through one another.
