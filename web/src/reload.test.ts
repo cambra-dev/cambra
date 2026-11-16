@@ -7,7 +7,8 @@ import {
   followRun,
   outcomeOf,
   postVersion,
-  serverReloads,
+  reloadingOnRestart,
+  serverCapabilities,
 } from "./reload";
 
 /** A `fetch` answering every call with `status` and `body`. */
@@ -75,20 +76,77 @@ describe("postVersion", () => {
   });
 });
 
-describe("serverReloads", () => {
-  it("is the server's `reload` capability", async () => {
-    expect(await serverReloads(answering(200, { reload: true }))).toBe(true);
-    expect(await serverReloads(answering(200, { reload: false }))).toBe(false);
+describe("serverCapabilities", () => {
+  it("is the server's `reload` capability and its process's instance", async () => {
+    expect(await serverCapabilities(answering(200, { reload: true, instance: "7-1" }))).toEqual({
+      reload: true,
+      instance: "7-1",
+    });
+    expect(await serverCapabilities(answering(200, { reload: false }))).toEqual({
+      reload: false,
+      instance: null,
+    });
   });
 
   // A server that predates the route, or one that cannot be reached, leaves the
   // pane read-only rather than editable with nothing behind the chord.
-  it("is false when the capabilities cannot be read", async () => {
-    expect(await serverReloads(answering(404, {}))).toBe(false);
+  it("is null when the capabilities cannot be read", async () => {
+    expect(await serverCapabilities(answering(404, {}))).toBeNull();
     const throwing = vi.fn(async () => {
       throw new Error("offline");
     }) as never;
-    expect(await serverReloads(throwing)).toBe(false);
+    expect(await serverCapabilities(throwing)).toBeNull();
+  });
+});
+
+describe("reloadingOnRestart", () => {
+  /** A `fetch` answering `/api/capabilities` with each of `answers` in turn; `null` is a closed port. */
+  function capabilitiesInTurn(answers: (string | null)[]): typeof fetch {
+    return vi.fn(async () => {
+      const instance = answers.length > 1 ? answers.shift()! : answers[0]!;
+      if (instance === null) throw new Error("connection refused");
+      return new Response(JSON.stringify({ reload: true, instance }), { status: 200 });
+    }) as never;
+  }
+
+  // The old process answers until it is replaced, the port is closed while the
+  // new one starts, and the new one answers its own instance.
+  it("loads the page once the restarted process answers", async () => {
+    const loadPage = vi.fn();
+    const send = reloadingOnRestart(async () => ({ kind: "restarted" }), "old", {
+      fetchImpl: capabilitiesInTurn(["old", null, "new"]),
+      loadPage,
+      pollMs: 0,
+    });
+    expect(await send("restart", "x")).toEqual({ kind: "restarted" });
+    expect(loadPage).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a restarted process that never answers as a failure", async () => {
+    const loadPage = vi.fn();
+    const send = reloadingOnRestart(async () => ({ kind: "restarted" }), "old", {
+      fetchImpl: capabilitiesInTurn([null]),
+      loadPage,
+      pollMs: 0,
+      within: 20,
+    });
+    expect(await send("restart", "x")).toEqual({
+      kind: "failed",
+      message: "the restarted process never answered",
+    });
+    expect(loadPage).not.toHaveBeenCalled();
+  });
+
+  it("passes every other outcome through without waiting", async () => {
+    const fetchImpl = capabilitiesInTurn(["new"]);
+    const loadPage = vi.fn();
+    const send = reloadingOnRestart(async () => ({ kind: "reloaded", kept: 1, bound: 1 }), "old", {
+      fetchImpl,
+      loadPage,
+    });
+    expect(await send("reload", "x")).toEqual({ kind: "reloaded", kept: 1, bound: 1 });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(loadPage).not.toHaveBeenCalled();
   });
 });
 
@@ -145,7 +203,7 @@ describe("EditSession", () => {
     expect(session.get().kind).toBe("restarted");
   });
 
-  it("follows the run: finished on the frame marked final, going again after", () => {
+  it("follows the run: finished on the frame marked final", () => {
     const live = new LiveStore();
     const session = new EditSession(async () => ({ kind: "reloaded", kept: 0, bound: 0 }));
     followRun(live, session);
@@ -154,8 +212,5 @@ describe("EditSession", () => {
     expect(session.finished).toBe(false);
     live.apply({ version: 1, published: 2, final: true, nodes: [], sources: [] });
     expect(session.finished).toBe(true);
-    // A restart's version runs, and its frames are not final.
-    live.apply({ version: 2, published: 3, final: false, nodes: [], sources: [] });
-    expect(session.finished).toBe(false);
   });
 });

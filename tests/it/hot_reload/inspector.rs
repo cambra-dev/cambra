@@ -76,6 +76,41 @@ fn await_inspector(port: u16) {
     }
 }
 
+/// The `instance` the inspector on `port` answers in `/api/capabilities`, or
+/// `None` while nothing answers: a restart closes the port until the new
+/// process binds it.
+fn instance(port: u16) -> Option<String> {
+    use std::io::Read;
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .ok()?;
+    write!(
+        stream,
+        "GET /api/capabilities HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+    )
+    .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    let (_, body) = response.split_once("\r\n\r\n")?;
+    let capabilities: Value = serde_json::from_str(body).ok()?;
+    capabilities["instance"].as_str().map(str::to_string)
+}
+
+/// Wait until the inspector on `port` answers from a process other than the one
+/// that answered `before`, and answer the new process's `instance`.
+fn await_restarted(port: u16, before: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(now) = instance(port).filter(|now| now != before) {
+            return now;
+        }
+        assert!(Instant::now() < deadline, "no new process answered");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// A client of the inspector's `/api/live` socket.
 fn connect_live(port: u16) -> WebSocket<TcpStream> {
     let stream = TcpStream::connect(("127.0.0.1", port)).expect("connecting");
@@ -403,18 +438,19 @@ fn a_finished_program_takes_no_reload() {
     );
 }
 
-/// Under `--inspect=0 --control=0` the OS picks both ports, and each banner
-/// names the port it picked, so a reader of stderr can reach both servers.
-#[test]
-fn port_zero_prints_the_port_the_os_picked() {
+/// Spawn `program` under `--inspect=0 --control=0`, and answer it with the
+/// lines it writes on stderr, where each server announces the port it bound.
+fn launch_on_port_zero(program: &str) -> (RunningProgram, std::sync::mpsc::Receiver<String>) {
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
-    use std::sync::mpsc;
 
-    let dir = std::env::temp_dir().join(format!("cambra-port-zero-{}", std::process::id()));
+    static LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let launch = LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir =
+        std::env::temp_dir().join(format!("cambra-port-zero-{}-{launch}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let source = dir.join("v1.cambra");
-    std::fs::write(&source, "[line for line in stdin()]\n").expect("write v1");
+    std::fs::write(&source, program).expect("write v1");
     let mut program = RunningProgram {
         child: Command::new(env!("CARGO_BIN_EXE_cambra"))
             .args(["--inspect=0", "--control=0"])
@@ -427,13 +463,18 @@ fn port_zero_prints_the_port_the_os_picked() {
         dir,
     };
     let err = program.child.stderr.take().expect("piped stderr");
-    let (lines, banners) = mpsc::channel();
+    let (lines, banners) = std::sync::mpsc::channel();
     thread::spawn(move || {
         for line in BufReader::new(err).lines().map_while(Result::ok) {
             let _ = lines.send(line);
         }
     });
+    (program, banners)
+}
 
+/// The inspector's and the control port's ports, read off the next banner each
+/// server writes on `banners`.
+fn banner_ports(banners: &std::sync::mpsc::Receiver<String>) -> (u16, u16) {
     // The port in a banner's `http://localhost:PORT`.
     let port_after = |banner: &str, prefix: &str| -> Option<u16> {
         let rest = banner.strip_prefix(prefix)?;
@@ -444,7 +485,7 @@ fn port_zero_prints_the_port_the_os_picked() {
             .ok()
     };
     let (mut inspect, mut control_port) = (None, None);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while inspect.is_none() || control_port.is_none() {
         let left = deadline.saturating_duration_since(Instant::now());
         let banner = banners
@@ -453,7 +494,15 @@ fn port_zero_prints_the_port_the_os_picked() {
         inspect = inspect.or_else(|| port_after(&banner, "cambra: inspecting "));
         control_port = control_port.or_else(|| port_after(&banner, "cambra: control port at "));
     }
-    let (inspect, control_port) = (inspect.unwrap(), control_port.unwrap());
+    (inspect.unwrap(), control_port.unwrap())
+}
+
+/// Under `--inspect=0 --control=0` the OS picks both ports, and each banner
+/// names the port it picked, so a reader of stderr can reach both servers.
+#[test]
+fn port_zero_prints_the_port_the_os_picked() {
+    let (_program, banners) = launch_on_port_zero("[line for line in stdin()]\n");
+    let (inspect, control_port) = banner_ports(&banners);
     assert_ne!(inspect, 0, "the inspector's banner names the bound port");
     assert_ne!(
         control_port, 0,
@@ -465,85 +514,124 @@ fn port_zero_prints_the_port_the_os_picked() {
     assert!(branches.contains("main"), "{branches}");
 }
 
-/// A finished program takes a restart from the page: the version runs from a
-/// fresh compile, prints its value, and the payload follows it.
+/// A finished program restarts from the page: the posted version runs in a
+/// fresh process on the same port, prints its value on the same stdout, and is
+/// that process's first version of `main`. The root file on disk is unchanged.
 #[test]
 fn a_finished_program_restarts_from_the_inspector() {
-    use std::process::{Command, Stdio};
-
     let inspect = reserve_test_port();
-    let control = reserve_test_port();
-    let dir = std::env::temp_dir().join(format!("cambra-restart-{inspect}"));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    let file = dir.join("prog.cambra");
-    std::fs::write(&file, "[x + 1 for x in [1, 2, 3]]\n").expect("write the program");
-    let mut program = RunningProgram {
-        child: Command::new(env!("CARGO_BIN_EXE_cambra"))
-            .arg(format!("--inspect={inspect}"))
-            .arg(format!("--control={control}"))
-            .arg(&file)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn cambra"),
-        dir,
-    };
+    let original = "[x + 1 for x in [1, 2, 3]]\n";
+    let launched = launch_under_control_with(original, &[format!("--inspect={inspect}")]);
     await_inspector(inspect);
-    let (tx, rx) = std::sync::mpsc::channel();
-    let out = program.child.stdout.take().expect("piped stdout");
-    thread::spawn(move || {
-        use std::io::BufRead;
-        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
-            let _ = tx.send(line);
-        }
-    });
-
-    // Finished once a reload is refused.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let (status, reply) = post_reload(inspect, "[x + 1 for x in [1, 2, 3]]\n");
-        if status == 409 {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the program never finished: {reply}"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
-    let printed_before: Vec<String> = rx.try_iter().collect();
-    let restarted_at = version(&snapshot(inspect)) + 1;
+    launched.wait_until_finished(Duration::from_secs(30));
+    let before = instance(inspect).expect("the inspector answers");
 
     let restarted = "[x * 100 for x in [1, 2, 3]]\n";
     let (status, reply) = post_restart(inspect, restarted);
     assert_eq!(status, 200, "{reply}");
-    assert_eq!(
-        reply["message"],
-        format!("restarted: `main@{restarted_at}` from a fresh compile\n"),
-    );
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut printed = String::new();
-    while !printed.contains("300") {
-        let left = deadline.saturating_duration_since(Instant::now());
-        let line = rx
-            .recv_timeout(left)
-            .unwrap_or_else(|_| panic!("the restarted version prints its value: {printed}"));
-        printed.push_str(&line);
-        printed.push('\n');
-    }
-    assert!(
-        !printed_before.join("\n").contains("300"),
-        "the value is the restarted version's"
+    launched
+        .spawned
+        .wait_for_output(&["300"], Duration::from_secs(30));
+    await_restarted(inspect, &before);
+    let after = snapshot(inspect);
+    assert_eq!(version(&after), 1, "a restarted process numbers from 1");
+    assert_eq!(after["source"]["text"], restarted);
+    let on_disk = std::fs::read_to_string(launched.spawned.program.dir.join("v1.cambra"))
+        .expect("the root file");
+    assert_eq!(
+        on_disk, original,
+        "a restart leaves the file on disk as it was"
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while version(&snapshot(inspect)) != restarted_at {
-        assert!(
-            Instant::now() < deadline,
-            "the payload never followed the restart"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
-    assert_eq!(snapshot(inspect)["source"]["text"], restarted);
+}
+
+/// A running program restarts from the control port: the fresh process reads the
+/// same `stdin` and answers the lines written after the restart with the posted
+/// version.
+#[test]
+fn a_running_program_restarts_from_the_control_port() {
+    use std::io::Write;
+
+    let inspect = reserve_test_port();
+    let mut launched = launch_under_control_with(
+        "[\"A\" + line for line in stdin()]\n",
+        &[format!("--inspect={inspect}")],
+    );
+    await_inspector(inspect);
+    let mut input = launched.spawned.input.take().expect("piped stdin");
+    writeln!(input, "one").expect("write a line");
+    input.flush().expect("flush");
+    launched
+        .spawned
+        .wait_for_output(&["\"Aone\""], Duration::from_secs(10));
+    let before = instance(inspect).expect("the inspector answers");
+
+    let reply = control(
+        launched.control,
+        "/restart",
+        "[\"B\" + line for line in stdin()]\n",
+    );
+    assert!(reply.starts_with("restarting"), "{reply}");
+    await_restarted(inspect, &before);
+
+    writeln!(input, "two").expect("write a line");
+    input.flush().expect("flush");
+    launched
+        .spawned
+        .wait_for_output(&["\"Btwo\""], Duration::from_secs(10));
+    let branches = control(launched.control, "/branches", "");
+    assert!(branches.starts_with("main\tversion=1\t"), "{branches}");
+}
+
+/// A restart whose version does not compile is refused with the errors' spans
+/// in the posted text, and the process goes on running the version it had.
+#[test]
+fn a_restart_that_does_not_compile_is_refused_and_the_program_goes_on() {
+    let inspect = reserve_test_port();
+    let launched = launch_under_control_with(
+        "[\"A\" + line for line in stdin()]\n",
+        &[format!("--inspect={inspect}")],
+    );
+    await_inspector(inspect);
+    let before = instance(inspect).expect("the inspector answers");
+
+    let broken = "[\"A\" + nowhere for line in stdin()]\n";
+    let (status, reply) = post_restart(inspect, broken);
+    assert_eq!(status, 400, "{reply}");
+    let span = reply["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .find_map(|d| d["span"].as_object())
+        .unwrap_or_else(|| panic!("a diagnostic with a span: {reply}"));
+    let (start, end) = (
+        span["start"].as_u64().unwrap() as usize,
+        span["end"].as_u64().unwrap() as usize,
+    );
+    assert_eq!(&broken[start..end], "nowhere", "{reply}");
+
+    assert_eq!(instance(inspect).as_deref(), Some(before.as_str()));
+    assert_eq!(version(&settled_snapshot(inspect, launched.control)), 1);
+}
+
+/// A restart keeps the ports the OS picked under `--inspect=0 --control=0`, so a
+/// page and a script reach the restarted process where they reached the old one.
+#[test]
+fn a_restart_keeps_the_ports_the_os_picked() {
+    let (_program, banners) = launch_on_port_zero("[line for line in stdin()]\n");
+    let (inspect, control_port) = banner_ports(&banners);
+    let before = instance(inspect).expect("the inspector answers");
+
+    let reply = control(
+        control_port,
+        "/restart",
+        "[line + \"!\" for line in stdin()]\n",
+    );
+    assert!(reply.starts_with("restarting"), "{reply}");
+    assert_eq!(
+        banner_ports(&banners),
+        (inspect, control_port),
+        "the restarted process binds the ports the first one did"
+    );
+    await_restarted(inspect, &before);
 }

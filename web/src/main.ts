@@ -39,7 +39,7 @@ import { type LiveStatus, type LiveTag, LiveStore, connectLive } from "./liveSto
 import { renderLiveMenu } from "./liveMenu";
 import { LiveView, livePanelState, serializeLivePanel } from "./liveView";
 import { validateSnapshot } from "./wireValidate";
-import { EditSession, followRun, postVersion, serverReloads } from "./reload";
+import { EditSession, followRun, postVersion, reloadingOnRestart, serverCapabilities } from "./reload";
 import { isIrPane } from "./types";
 import type { Diagnostic, Snapshot, Span } from "./types";
 import { el } from "./dom";
@@ -601,7 +601,14 @@ async function main(): Promise<void> {
     // all.
     const live = new LiveStore();
     attachLive(live, snap);
-    const session = (await serverReloads()) ? new EditSession(postVersion()) : undefined;
+    const capabilities = await serverCapabilities();
+    const session = capabilities?.reload
+      ? new EditSession(
+          capabilities.instance === null
+            ? postVersion()
+            : reloadingOnRestart(postVersion(), capabilities.instance),
+        )
+      : undefined;
     if (session) followRun(live, session);
     followReloads(
       root,

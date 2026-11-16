@@ -87,7 +87,9 @@ JSON, with the posted version's compile errors as spans and a reload's reuse tal
 (`src/inspector_server/reload.rs`).
 
 A `<source>` is one file, the version's root. A version that imports or runs a module therefore
-fails to load it, and the 400 says that a program of several modules cannot be reloaded yet.
+fails to load it, and the 400 says that a program of several modules cannot be reloaded yet. A
+[`/restart`](#restart) reads its `<source>` as the root file's text instead, and loads the modules
+it names from disk.
 [docs/modules.md, "Program evolution"](../../../docs/modules.md#program-evolution) replaces the
 source with a bundle of every file.
 
@@ -101,14 +103,15 @@ answers 404.
 | `/diff[/<branch>]` | `[phase=<p>&]<source>` | Reports how `<source>` differs from the branch's current version, at phase `<p>`, and changes nothing |
 | `/diff/<branch>/<branch>` | `[phase=<p>]` | Reports how the second branch's current version differs from the first's, at phase `<p>`, and changes nothing |
 | `/reload[/<branch>]` | `<source>` | Replaces the branch's version with `<source>` |
-| `/restart` | `<source>` | Discards every branch and runs `<source>` from a fresh compile as `main` |
+| `/restart` | `<source>` | Replaces the `cambra` process with a fresh one that runs `<source>` |
 | `/branch/<name>[/from/<parent>]` | `<source>` | Creates branch `<name>` from `<parent>`'s current version and reloads it with `<source>`, as one step |
 | `/branch/<name>/delete` | nothing | Deletes branch `<name>` |
 | `/branch/<name>/info` | nothing | Reports branch `<name>`'s branch origin, its versions, and its current source |
 | `/branches` | nothing | Lists every branch |
 
 Status codes: 200 on success, 400 for a refusal or a compile error, 404 for an unknown path or a
-branch name the table does not hold, 405 for a verb that changes what runs sent without `POST`, and
+branch name the table does not hold, 405 for a verb that changes what runs sent without `POST`, 409
+for a request a finished program does not take, 501 for a restart on a platform without `exec`, and
 503 or 500 for a request the program dropped or never answered. A tombstoned name is one the table
 does not hold. A path segment in a `<name>` position that is not a valid `<name>` is an unknown
 path, so it answers 404. Segments are read by position, so a branch may be named `delete`, `info` or
@@ -152,21 +155,34 @@ other verb with 409; without one the control port answers every verb with 409.
 
 ### `/restart`
 
-A restart discards every branch and runs `<source>` from a fresh compile as `main`, the only branch
-in the table. Where a reload carries a branch's state forward, a restart keeps none: no operator is
-offered to the compile, so every store starts from its declaration and every loop from the first
-element its source still offers. What persists is what the process owns rather than a branch: its
-sources, the routes the new version still binds, and `main`'s version count, which goes on rising so
-that every version a reader saw keeps the number it was seen under. A discarded branch leaves a
-tombstone, as a deleted one does.
+A restart replaces the `cambra` process with a fresh one that runs `<source>`, whether the program
+is running or has finished. Nothing carries over. The new process compiles `<source>` as its first
+version, `main` is its only branch, and `main`'s version count starts again at `1`. Every source
+starts as it does on a fresh run. A source that reads the process's standard input continues with
+the input the old process had not read; input the old process had read is gone, as it is when the
+command is run again.
 
-`/restart` names no branch, because it discards them all, and `/restart/<branch>` is an unknown
-path. A compile error is a 400 that leaves every branch serving: the version is compiled to
-`Phase::Planning`, binding the ports it adds, before anything is torn down. No state guard runs,
-because there is no state to take over. A 200 reply reads ``restarted: `main@<n>` from a fresh
-compile``, and a second line ``discarded branches `<name>`, …`` when there were others.
+The process is replaced with Unix `exec` of the binary at the path the process started from, with
+the same `--inspect` and `--control` ports. A port the OS picked under `=0` is passed as the number
+it picked, so a page and a script reach the new process where they reached the old one. If
+`cambra` was rebuilt since the process started, the restarted program runs on the new build. The
+process id, standard input, standard output and standard error carry over. The listening ports
+close, and the new process binds them again, so a request sent in between is refused.
 
-A finished program takes a restart, under `--inspect --control`, and runs again.
+`<source>` replaces the root file's text, and the file on disk is unchanged. The root keeps its
+path, so the modules it names are read from disk under the root file's directory, and diagnostics
+name the root file. The new process reads `<source>` from a scratch file that `--root-text` names,
+and removes the file once read.
+
+`/restart` names no branch, and `/restart/<branch>` is an unknown path. Before replacing anything,
+the process compiles `<source>` to `Phase::Planning` without opening ports, as `/diff` does. A
+compile error is a 400 with the errors' spans, and the program goes on running. A 200 reply reads
+``restarting: a fresh `cambra` process runs the posted version``, and is written before the process
+is replaced. A failure after the check, such as a port another process holds, ends the restarted
+process as it would end any run.
+
+Windows has no `exec`. There a restart is refused with 501, `GET /api/capabilities` answers
+`"restart": false`, and a finished program does not wait for a restart.
 
 ### `/branch`
 

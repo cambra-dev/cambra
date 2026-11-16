@@ -118,9 +118,10 @@ edit above a construct shifts its bytes and an edit inside it changes its text.
 The source pane reloads `main` itself on such a run: `POST /api/reload` hands its text to the
 driver as the control port's `/reload` of `main` (`src/inspector_server/reload.rs`), and the page
 follows the result like any other reload. `POST /api/restart` hands it over as the control port's
-`/restart`, which runs it from a fresh compile as `main`'s next version, so a restart is followed
-the same way: the version number still rises, and every operator is new. Its text is not the payload's while the reader edits
-it, so the pane's span lookups are off until the two agree again
+`/restart`, which replaces the process with a fresh one that runs it. Nothing here follows a
+restart: the new process numbers `main`'s versions from 1 and serves the page itself, so the page
+loads again from it. The pane's text is not the payload's while the reader edits it, so the pane's
+span lookups are off until the two agree again
 ([web/README.md](../../web/README.md#editing-the-program)).
 
 Only `main` is followed. Every branch's producers hold the same `ProbeSlot`, because every branch

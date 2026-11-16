@@ -7,7 +7,7 @@
 //! | `/diff[/<branch>]` | `[phase=<p>&]<source>` | How `<source>` differs from the branch's current version |
 //! | `/diff/<a>/<b>` | `[phase=<p>]` | How `<b>`'s current version differs from `<a>`'s |
 //! | `/reload[/<branch>]` | `<source>` | Replace the branch's version with `<source>` |
-//! | `/restart` | `<source>` | Discard every branch and run `<source>` from a fresh compile as `main` |
+//! | `/restart` | `<source>` | Replace the `cambra` process with a fresh one that runs `<source>` |
 //! | `/branch/<name>[/from/<parent>]` | `<source>` | Create `<name>` from `<parent>` and reload it with `<source>` |
 //! | `/branch/<name>/delete` | nothing | Delete `<name>` |
 //! | `/branch/<name>/info` | nothing | Report `<name>`'s origin, versions and source |
@@ -29,6 +29,11 @@
 //! The inspector's `POST /api/reload` reaches the same queue through a
 //! [`ControlClient`] (`src/inspector_server/reload.rs`), so a reload from the
 //! page is answered by the same [`service`].
+//!
+//! `/restart` is the one verb [`service`] does not perform. A restart replaces
+//! the process, which only the `cambra` binary's driver can do: it checks the
+//! version with [`check_restart`], answers with [`ControlMessage::answer_once_sent`],
+//! and then `exec`s itself (`src/ccl/design/program-evolution.md`, "`/restart`").
 //!
 //! # Who may send a request
 //!
@@ -57,13 +62,14 @@
 
 use std::sync::mpsc::{Receiver, SendError, SyncSender, sync_channel};
 use std::thread;
+use std::time::Duration;
 
 use crate::ccl::context::{CompileError, GlobalContext, Phase, ReuseTally};
 use crate::ccl::load::{LoadError, LoadedProgram};
 use crate::inspector_model::{Diagnostic, diagnostics_from_compile_errors};
 use crate::live_program::{
     BranchError, LiveProgram, MAIN_BRANCH, MainConsumerFactory, ReloadError, ReloadReport,
-    Restarted, is_branch_name, render_unreadable,
+    is_branch_name, render_unreadable,
 };
 use crate::util::bound_port;
 
@@ -86,7 +92,8 @@ pub enum ControlRequest {
     },
     /// Replace `branch`'s version with `code`.
     Reload { branch: String, code: String },
-    /// Discard every branch and run `code` from a fresh compile as `main`.
+    /// Replace the process with a fresh one that runs `code`; only the binary's
+    /// driver performs it (`check_restart`).
     Restart { code: String },
     /// Create `name` from `parent`'s current version and reload it with `code`.
     Branch {
@@ -222,6 +229,23 @@ pub struct ControlReply {
     /// How much of the replaced version an accepted reload or branch creation
     /// kept.
     pub reuse: Option<ReuseTally>,
+    /// Signals, once the reply is dropped, that it has been written. Set by
+    /// [`ControlMessage::answer_once_sent`], so a server thread drops each reply
+    /// after responding with it.
+    pub sent: Option<Sent>,
+}
+
+/// Signals its [`ControlMessage::answer_once_sent`] when dropped.
+///
+/// A drop rather than a call, so a server thread that writes a reply signals by
+/// letting the reply go, and one that fails to write it signals too.
+#[derive(Debug)]
+pub struct Sent(SyncSender<()>);
+
+impl Drop for Sent {
+    fn drop(&mut self) {
+        let _ = self.0.try_send(());
+    }
 }
 
 impl ControlReply {
@@ -232,6 +256,7 @@ impl ControlReply {
             body: body.into(),
             diagnostics: Vec::new(),
             reuse: None,
+            sent: None,
         }
     }
 
@@ -253,6 +278,16 @@ impl ControlReply {
         Self::with_status(404, body)
     }
 
+    /// The `200` an accepted restart answers before the process is replaced.
+    pub fn restarting() -> Self {
+        Self::ok("restarting: a fresh `cambra` process runs the posted version\n")
+    }
+
+    /// The `501` a restart answers where the driver cannot replace its process.
+    pub fn cannot_restart(why: &str) -> Self {
+        Self::with_status(501, format!("this run cannot restart: {why}\n"))
+    }
+
     /// The `409` a finished program waiting for a restart answers every other
     /// request with.
     pub fn finished() -> Self {
@@ -266,23 +301,6 @@ impl ControlReply {
     fn unavailable(body: impl Into<String>) -> Self {
         Self::with_status(503, body)
     }
-}
-
-/// A restart's `200` body: `main`'s new version, and the branches it discarded.
-fn render_restart(restarted: &Restarted) -> String {
-    let mut reply = format!(
-        "restarted: `{MAIN_BRANCH}@{}` from a fresh compile\n",
-        restarted.version
-    );
-    if !restarted.discarded.is_empty() {
-        let names: Vec<String> = restarted
-            .discarded
-            .iter()
-            .map(|n| format!("`{n}`"))
-            .collect();
-        reply.push_str(&format!("discarded branches {}\n", names.join(", ")));
-    }
-    reply
 }
 
 /// A reload's `200` body: the tally, a blank line, the difference at
@@ -387,14 +405,10 @@ pub fn service(
                 Err(e) => branch_error(e, &posted),
             }
         }
-        // Every operator is built anew, so each takes the scheduler's probe slot
-        // as the first compile's did.
-        ControlRequest::Restart { code } => {
-            let posted = LoadedProgram::from_text(POSTED, code.as_str());
-            match live.restart(ctx, &posted, main_consumer) {
-                Ok(restarted) => ControlReply::ok(render_restart(&restarted)),
-                Err(e) => branch_error(e, &posted),
-            }
+        // A restart replaces the process, so only the binary's driver performs
+        // one; it never hands one to this function.
+        ControlRequest::Restart { .. } => {
+            ControlReply::cannot_restart("only the `cambra` binary replaces its process")
         }
         ControlRequest::Branch { name, parent, code } => {
             let posted = LoadedProgram::from_text(POSTED, code.as_str());
@@ -424,6 +438,25 @@ pub fn service(
     }
 }
 
+/// Check that `loaded` compiles as a restart would run it, or answer the `400`
+/// that refuses it.
+///
+/// Compiled to [`Phase::Planning`] against the running program's sources and
+/// sinks and without opening ports, as `/diff` compiles, so the check changes
+/// nothing the running program serves. A failure is a `400` whose diagnostics
+/// are the errors' spans in `loaded`.
+pub fn check_restart(ctx: &GlobalContext, loaded: &LoadedProgram) -> Result<(), ControlReply> {
+    let errs = match ctx.sources_and_sinks().compile_to(loaded, Phase::Planning) {
+        Ok(_) => return Ok(()),
+        Err(errs) => errs,
+    };
+    let diagnostics = diagnostics_from_compile_errors(&errs, loaded.sources());
+    Err(ControlReply {
+        diagnostics,
+        ..ControlReply::rejected(ReloadError::Compile(errs).render(loaded.sources()))
+    })
+}
+
 /// One request awaiting an answer, together with the channel the server thread
 /// is blocked on.
 ///
@@ -446,6 +479,18 @@ impl ControlMessage {
         if let Some(tx) = self.reply.take() {
             let _ = tx.send(reply);
         }
+    }
+
+    /// Answer the request, then wait up to `within` for the server thread to
+    /// have written the reply; `true` when it has.
+    ///
+    /// For a reply the process will not outlive: a restart answers, then
+    /// replaces the process, which closes the reply's connection.
+    pub fn answer_once_sent(self, mut reply: ControlReply, within: Duration) -> bool {
+        let (tx, rx) = sync_channel(1);
+        reply.sent = Some(Sent(tx));
+        self.answer(reply);
+        rx.recv_timeout(within).is_ok()
     }
 }
 
@@ -519,6 +564,7 @@ impl ControlClient {
 pub struct ControlPort {
     rx: Receiver<ControlMessage>,
     client: ControlClient,
+    port: u16,
 }
 
 impl ControlPort {
@@ -557,15 +603,24 @@ impl ControlPort {
                 };
                 let header: tiny_http::Header =
                     "Content-Type: text/plain; charset=utf-8".parse().unwrap();
+                let ControlReply {
+                    status, body, sent, ..
+                } = reply;
                 let _ = request.respond(
-                    tiny_http::Response::from_string(reply.body)
-                        .with_status_code(reply.status)
+                    tiny_http::Response::from_string(body)
+                        .with_status_code(status)
                         .with_header(header),
                 );
+                drop(sent);
             }
         });
 
-        Ok(ControlPort { rx, client })
+        Ok(ControlPort { rx, client, port })
+    }
+
+    /// The port this control port bound, which `--control=0` leaves to the OS.
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     /// A handle that sends requests to this port's main loop, for a server

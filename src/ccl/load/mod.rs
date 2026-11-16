@@ -288,6 +288,18 @@ impl LoadedProgram {
         Ok(Self::load(root, &mut files))
     }
 
+    /// [`Self::read`] with `text` in place of the root file's contents: the root
+    /// keeps its path, its module path and its directory, so every module it
+    /// names is read from disk as the file's own text would read it.
+    ///
+    /// A restart runs this way: the text is the version the reader posted, and
+    /// the file on disk is left as it was.
+    pub fn read_with_root_text(path: &Path, text: impl Into<String>) -> Result<Self, String> {
+        let (mut root, mut files) = DiskFiles::open(path)?;
+        root.text = text.into();
+        Ok(Self::load(root, &mut files))
+    }
+
     /// The program whose only file is the in-memory root `text`, which diagnostics
     /// name `path`. A module it names has no file.
     pub fn from_text(path: impl Into<String>, text: impl Into<String>) -> Self {

@@ -198,7 +198,7 @@ describe("the source pane once the run has finished", () => {
     expect(pressRestart(view)).toBe(true);
     expect(send).toHaveBeenCalledWith("restart", `${listMin.source.text}# again\n`);
     await settle();
-    expect(statusLine(session.get(), false).text).toBe("restarted from a fresh compile");
+    expect(statusLine(session.get(), false).text).toBe("restarted · loading the new process");
   });
 });
 

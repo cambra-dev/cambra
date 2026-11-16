@@ -97,9 +97,10 @@ Then open <http://localhost:8080> — the server binds loopback only.
 Routes: `GET /` (the frontend), `GET /api/snapshot` (the full model — degrades
 gracefully to source + diagnostics on a compile failure), `GET /api/diagnostics`,
 `GET /api/live` (a websocket carrying a run's recorded values),
-`GET /api/capabilities` (`{"reload": bool, "restart": bool}`), `POST
-/api/reload` (reload `main` with `{"source": …}`) and `POST /api/restart`
-(restart the program from it), the last two under `--control` only.
+`GET /api/capabilities` (`{"reload": bool, "restart": bool, "instance": string}`),
+`POST /api/reload` (reload `main` with `{"source": …}`) and `POST /api/restart`
+(replace the process with one that runs it), the last two under `--control`
+only.
 
 `--inspect-only` compiles the program and does not run it, so `/api/live`
 completes its handshake and carries nothing. `--inspect` runs the program, and
@@ -127,9 +128,13 @@ follows the result as above. It admits only a JSON `POST` whose `Host` names
 loopback and whose `Origin`, when present, is the page's own
 ([`reload.rs`](../src/inspector_server/reload.rs)). A posted version is one file,
 as on the control port. `Mod-Shift-Enter` posts it to `POST /api/restart`
-instead, the control port's `/restart`: every branch is discarded and the text
-runs from a fresh compile with no state kept. A finished program takes a restart
-and no reload, so a run that has ended can be edited and run again
+instead, the control port's `/restart`: a fresh `cambra` process replaces the
+running one and runs the text with no state kept, on the same ports, and the
+page loads again from it. A finished program takes a restart and no reload, so a
+run that has ended can be edited and run again. A restart runs the `cambra`
+binary at the path the process started from, so a binary rebuilt since then
+runs the restarted program. It needs Unix `exec`, so Windows answers 501 and
+offers no restart
 ([program-evolution.md](../src/ccl/design/program-evolution.md#restart)).
 
 ### One-shot snapshot dump

@@ -279,7 +279,7 @@ export function statusLine(
   if (status.kind === "reloaded") {
     return { text: `reloaded · ${status.kept} of ${status.bound} operators kept`, kind: "ok" };
   }
-  if (status.kind === "restarted") return { text: "restarted from a fresh compile", kind: "ok" };
+  if (status.kind === "restarted") return { text: "restarted · loading the new process", kind: "ok" };
   return {
     text: `${chord} reloads the running program with this text · ${restart} restarts it`,
     kind: "idle",

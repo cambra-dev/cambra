@@ -1,14 +1,15 @@
 //! `POST /api/reload` and `POST /api/restart`: the inspector's source pane
-//! reloading `main` with the text the reader edited, or restarting the program
-//! from it.
+//! reloading `main` with the text the reader edited, or restarting the process
+//! with it.
 //!
 //! Each route hands the text to the main loop as the control port's own
 //! request, [`ControlRequest::Reload`] or [`ControlRequest::Restart`], through
-//! a [`ControlClient`] onto the same queue, and
-//! [`service`](crate::control_port::service) answers it. So a reload or a
-//! restart from the page and one from the control port are one operation, and
-//! the page sees the new version the way it sees any new version of `main`:
-//! through `src/inspector_model/design.md`, "A reload of main is followed".
+//! a [`ControlClient`] onto the same queue. So a reload or a restart from the
+//! page and one from the control port are one operation. The page sees a
+//! reloaded version the way it sees any new version of `main`: through
+//! `src/inspector_model/design.md`, "A reload of main is followed". A restart
+//! replaces the process, server included, so the page waits for the new
+//! process's server and loads itself again.
 //!
 //! The routes exist only on a run started with `--control`. Without one there
 //! is no queue to send to, each route answers `404`, and `GET
@@ -44,7 +45,7 @@ use crate::live_program::MAIN_BRANCH;
 pub enum Verb {
     /// Reload `main`, carrying its state forward.
     Reload,
-    /// Discard every branch and run the version from a fresh compile.
+    /// Replace the process with a fresh one that runs the version.
     Restart,
 }
 
@@ -110,10 +111,25 @@ pub fn admit(
     Ok(())
 }
 
-/// The `GET /api/capabilities` body: what this run lets the page do. A run with
-/// a control port takes both verbs, and one without takes neither.
+/// The `GET /api/capabilities` body: what this run lets the page do, and which
+/// process is answering.
+///
+/// A run with a control port takes a reload, and one without takes neither
+/// verb. A restart also needs Unix `exec`, so it is `false` elsewhere.
+///
+/// `instance` differs between any two processes' servers. A restart keeps the
+/// process id, since `exec` replaces the program and not the process, so the id
+/// alone cannot tell the restarted process from the one it replaced.
 pub fn capabilities_body(control: bool) -> String {
-    serde_json::json!({ "reload": control, "restart": control }).to_string()
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    serde_json::json!({
+        "reload": control,
+        "restart": control && cfg!(unix),
+        "instance": format!("{}-{started}", std::process::id()),
+    })
+    .to_string()
 }
 
 /// The JSON body for a [`ControlReply`]: its text as `message`, the posted
@@ -146,14 +162,17 @@ pub fn answer(mut request: tiny_http::Request, control: Option<ControlClient>, v
         header_value(&request, "Origin").as_deref(),
         header_value(&request, "Content-Type").as_deref(),
     );
-    let (status, body) = match admitted {
-        Err(refusal) => (refusal.status, reply_body(&refusal)),
+    // `sent` is held until the response is written: a restart waits on it before
+    // replacing the process.
+    let (status, body, sent) = match admitted {
+        Err(refusal) => (refusal.status, reply_body(&refusal), None),
         Ok(()) => match control {
             None => (
                 404,
                 message_body(
                     "this run has no control port; start it with `--control` to reload or restart",
                 ),
+                None,
             ),
             Some(control) => {
                 let mut text = String::new();
@@ -165,10 +184,11 @@ pub fn answer(mut request: tiny_http::Request, control: Option<ControlClient>, v
                         serde_json::from_str::<ReloadBody>(&text).map_err(|e| e.to_string())
                     });
                 match parsed {
-                    Err(e) => (400, message_body(&format!("not a version body: {e}"))),
+                    Err(e) => (400, message_body(&format!("not a version body: {e}")), None),
                     Ok(ReloadBody { source }) => {
                         let reply = control.ask(verb.request(source));
-                        (reply.status, reply_body(&reply))
+                        let body = reply_body(&reply);
+                        (reply.status, body, reply.sent)
                     }
                 }
             }
@@ -183,6 +203,7 @@ pub fn answer(mut request: tiny_http::Request, control: Option<ControlClient>, v
     if let Err(e) = request.respond(response) {
         eprintln!("cambra: responding to a {verb:?} failed: {e}");
     }
+    drop(sent);
 }
 
 #[cfg(test)]
