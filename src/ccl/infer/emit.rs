@@ -208,10 +208,9 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
 
         // Builtins with a polymorphic signature (shared type variables across positions) live
         // in the `OperatorSchemes` registry, and each use site instantiates a fresh copy:
-        // `Box`, `CollectionContains`, `Uncurry`, `FinalOrDefault`
-        // (`∀α β. ((α → β), β) → β`), the two `get_prev_*` causal accessors, and `AwaitFinal`
-        // (`∀ν. Mut(ν, Txn) → ν`). All other builtins arrive pre-stamped from lowering and are
-        // converted in place.
+        // `Box`, `CollectionContains`, `Uncurry`, `FinalOrDefault`, the two `get_prev_*` causal
+        // accessors, and `AwaitFinal`. All other builtins arrive pre-stamped from lowering and
+        // are converted in place.
         TypedExprNode::Builtin(b) => {
             if let Some(scheme) = ctx.schemes.builtin(b.clone()) {
                 // Through [`Typing::instantiate`], which stamps the *use site's*
@@ -1002,9 +1001,9 @@ pub(super) fn emit_lambda<C: Typing>(
     //   bound, which *is* "inferred, and no wider than `𝑇`": body usage and call
     //   sites add their own bounds, so the parameter lands on the meet.
     //
-    // Reconciling the slot against the annotation afterwards — what this used to
-    // do — is what made an exact annotation behave as neither reading: it
-    // contributed one upper bound among several instead of being the type.
+    // Reconciling the slot against the annotation afterwards would make an exact
+    // annotation behave as neither reading: it would contribute one upper bound
+    // among several instead of being the type.
     //
     // A Hole (no annotation) turns into a fresh Var accumulating bounds from body
     // usage and call sites. Either way `param.ty` is linked to that type so
