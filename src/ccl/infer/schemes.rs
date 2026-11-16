@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// Operator/projection scheme registry (Step 7b)
+// Operator/projection scheme registry
 // ---------------------------------------------------------------------------
 
 use crate::ccl::F_TIME;
