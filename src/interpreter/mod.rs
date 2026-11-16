@@ -15,6 +15,7 @@ mod scheduler;
 pub mod sinks;
 mod stdio;
 mod stream_buffer;
+mod subscribe_context;
 // Test-only surface: `test_sink()` exists for tests to observe a program through, so it is
 // built only where a test is.
 #[cfg(any(test, feature = "test-helpers"))]
@@ -31,6 +32,7 @@ pub use http_server::HttpServerDataSource;
 pub use scalar_expr::ScalarProgram;
 pub use scheduler::*;
 pub use stdio::*;
+pub use subscribe_context::*;
 #[cfg(any(test, feature = "test-helpers"))]
 pub use test_sink::*;
 pub use test_source::*;

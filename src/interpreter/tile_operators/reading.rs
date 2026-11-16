@@ -11,7 +11,7 @@ use std::{
 use super::*;
 use crate::ccl::ReadingKind;
 use crate::interpreter::operator_graph::value;
-use crate::interpreter::{BaseType, ColumnValue, Consumer, Extent, Scheduler, Value};
+use crate::interpreter::{BaseType, ColumnValue, Consumer, Extent, SubscribeContext, Value};
 
 /// What the run has read at one site ([`Reading::site`](crate::ccl::Reading::site)):
 /// one value per position, taken the first time any reader asks for the position and returned
@@ -356,20 +356,15 @@ impl TileOperator for Readings {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let reader = self.source.borrow_mut().join();
         let input = self
             .input
             .as_mut()
-            .map(|input| input.subscribe(input.tiling().universal_guard(), consumer, scheduler));
+            .map(|input| input.subscribe(input.tiling().universal_guard(), consumer, cx));
         Box::new(ReadingsProducer {
-            base: ProducerBase::new(
-                ReadingsProducer::alloc_id(),
-                self.tiling(),
-                &self.base,
-                scheduler,
-            ),
+            base: ProducerBase::new(ReadingsProducer::alloc_id(), self.tiling(), &self.base, cx),
             input,
             source: Rc::clone(&self.source),
             reader,

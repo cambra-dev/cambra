@@ -9,13 +9,6 @@ more reads its projection with `TileGuard::projection_for`. The `get` wrapper of
 panics on a pull at a level a producer does not restate, and a push beneath the outermost keys lands
 in its reader as a projection at its level (`Dispatcher::land_in`).
 
-## What runs dispatched
-
-A loop nested in another runs in rounds of its own (`src/interpreter/design-dispatcher.md`, "A loop
-in rounds"), and a feed, a loop or a transaction over a live source runs dispatched
-(`src/interpreter/design-dispatcher.md`, "Running a compiled program"). The shapes a dispatched run
-refuses are listed there.
-
 ## Where a region crosses an operator
 
 A region crosses an operator on four paths, and only three need a path.
@@ -140,18 +133,3 @@ pipeline that stands for the range, at any level, or that pipeline reads its inp
 source yields everything (`LivePipeline::poll`). A feed of a collection read from a live source is
 keyed by the sink's one row, so its arrivals reach the pipeline above the source widened, and that
 pipeline reads its input whole.
-
-## Decisions
-
-- One variant spells a projection at every level: `Keys { level, keys }`, with level 0 the
-  outermost collection.
-- A round pushes per position, so the guard algebra has a difference of nested guards rather than
-  pushing only at a finish.
-- A difference closes an arm against the extent of the row it names, so an arm that names no
-  position of its row reads as `Nothing`.
-- A round of a nested loop pulls only operators that restate its level, which the planner asserts;
-  no loop folds into the scope around it.
-- `MapResultToConst` widens every push from its constant: a reader takes a row whose constant
-  streams once the constant is complete, and the constant's keys do not stream beneath the row.
-- A transaction store pushes the commit ticks each consume decides, so a feed inside a transaction
-  streams.

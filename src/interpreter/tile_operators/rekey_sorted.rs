@@ -1,6 +1,8 @@
 use super::*;
 use crate::interpreter::operator_graph::value;
-use crate::interpreter::{BaseType, ColumnValue, Consumer, Extent, Scheduler, Value, tuple_field};
+use crate::interpreter::{
+    BaseType, ColumnValue, Consumer, Extent, SubscribeContext, Value, tuple_field,
+};
 
 /// Re-keys a collection of pairs by each pair's first component, `𝐾 ⤇ (𝐽, 𝑉)` to `𝐽 ⤇ 𝑉`, where
 /// those keys are distinct: the `map` constructor's re-keying (group by the new key, then take the
@@ -107,7 +109,7 @@ impl TileOperator for RekeySorted {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        cx: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let input = BreakerInput::new(consumer, self.input.tiling(), false, cx);
         share_breaker(RekeySortedProducer {
