@@ -1695,8 +1695,11 @@ semantic comparisons are bounded by [the SMT encoding](#semantic-entailment-as-a
 Temporary scaffolding: today the refinement is stated by an experimental `^` sibling of each
 refinable operator (`^+`, `^-`, …, `^not`; `BinOpKind::is_refined`, `refinement_of_binop`), and the
 plain operator computes the same value with no refinement. The split holds the tests that refining
-the plain operators breaks; it goes away once they pass. The design docs write the plain operator
-where the refining one is meant.
+the plain operators breaks; it goes away once they pass. The `refine-ops` Cargo feature
+(`REFINE_OPS` in `src/ccl/ops.rs`) makes each plain operator with a `^` sibling refine its result as
+the sibling does, so a build with it runs those tests against the refining plain operators. The
+feature is off by default, no `ci.sh` gate enables it, and it is removed with the split. The design
+docs write the plain operator where the refining one is meant.
 
 The predicate a `^` operator states names its plain sibling: `𝑎 ^- 𝑏` types as
 `{Int | __elem == 𝑎 - 𝑏}` (`RefinementTemplate::predicate`). A `^` operator still reaches a

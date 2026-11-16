@@ -10,7 +10,9 @@ use crate::ccl::{AggregateKind, FieldKey, Label};
 /// Whether an operator with a `^` sibling refines its result as that sibling does: `+` by
 /// `__elem == 𝑎 + 𝑏`, `<` by `__elem == (𝑎 < 𝑏)`, `not` by `__elem == not 𝑎`
 /// (`refinement_of_binop` in `src/ccl/infer/schemes.rs`). The `^` siblings refine their
-/// result either way. The `refine-ops` feature turns it on.
+/// result either way. The `refine-ops` feature turns it on. It is temporary scaffolding, removed
+/// with the `^` siblings: see `src/ccl/design/type-inference.md`, "An operator is refined by the
+/// operation it computes".
 pub const REFINE_OPS: bool = cfg!(feature = "refine-ops");
 
 /// Primitive base types shared between the CCL type system and the interpreter.
