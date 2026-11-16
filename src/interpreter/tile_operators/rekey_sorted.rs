@@ -126,7 +126,8 @@ impl TileProducer for RekeySortedProducer {
         visit("input", &*self.input);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection_for(self);
         let input = self.input.get(self.input.tiling().universal_guard());
         let Tile::DataFunction {
             row_starts,
@@ -203,6 +204,9 @@ impl TileProducer for RekeySortedProducer {
         if !released.is_empty() {
             out.remove_guarded(released);
         }
+        // The input is read whole, because a key's position is known only once its row
+        // arrives; the answer is cut to the pull's keys.
+        out.restrict_to(&projection, self.tiling());
         out
     }
 
@@ -353,6 +357,26 @@ mod tests {
             *released.borrow(),
             vec![keys(Predicate::at_or_below(uint(7)))]
         );
+    }
+
+    /// A pull at some keys reads the input whole and answers those keys alone.
+    #[test]
+    fn a_pull_at_some_keys_answers_those_keys() {
+        let (mut producer, _, _) = pulled(pairs(
+            &[3, 7, 9],
+            &[0, 1, 2],
+            &[10, 20, 30],
+            Predicate::True,
+        ));
+        let out = producer.get(keys(Predicate::point(uint(1))));
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = out
+        else {
+            panic!("expected a collection")
+        };
+        assert_eq!(domain, ColumnValue::from_uints(vec![1]));
+        assert_eq!(*codomain, Tile::Scalar(ColumnValue::Ints(vec![20])));
     }
 
     #[test]
