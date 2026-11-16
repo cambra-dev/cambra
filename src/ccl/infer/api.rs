@@ -3717,9 +3717,9 @@ fn check_no_nested_mut(
     }
 }
 
-/// Rule 2 (no nested `Mut`) on a single binder slot. `For`, `Case`-pattern,
-/// `LetRec`, `Lambda`, `MutDecl`, and `Let` binder types are unreachable by
-/// `walk_children`, so the caller invokes this on each explicitly.
+/// Rule 2 (no nested `Mut`) on a single binder slot. Binder slots are unreachable by
+/// `walk_children`; the caller enumerates them with
+/// [`TypedExpr::walk_binders`](crate::ccl::TypedExpr::walk_binders).
 ///
 /// There is no longer a rule about an *undeclared* binder holding a `Mut`: only
 /// [`TypedExprNode::MutDecl`] and a pass-by-reference `Lambda` param can bind a
@@ -3776,26 +3776,7 @@ fn check_mut_discipline_go(expr: &Expr, errors: &mut Vec<LocatedInferError>) {
     }
 
     // Rule 2 on the binder slots `walk_children` does not reach.
-    match &expr.node {
-        TypedExprNode::Let { binding, .. } | TypedExprNode::MutDecl { binding, .. } => {
-            check_binder(binding, &mut here)
-        }
-        TypedExprNode::Lambda { param, .. } => check_binder(param, &mut here),
-        TypedExprNode::For { target, .. } => check_binder(target, &mut here),
-        TypedExprNode::LetRec { bindings, .. } => {
-            for (b, _) in bindings {
-                check_binder(b, &mut here);
-            }
-        }
-        TypedExprNode::Case { branches, .. } => {
-            for b in branches {
-                if let Some(p) = &b.pattern {
-                    check_binder(&p.binding, &mut here);
-                }
-            }
-        }
-        _ => {}
-    }
+    expr.walk_binders(|b| check_binder(b, &mut here));
 
     errors.extend(
         here.into_iter()
