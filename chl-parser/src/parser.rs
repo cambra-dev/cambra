@@ -42,7 +42,7 @@ pub use error::*;
 pub fn parse_module(file: FileId, source: &str) -> ParseResult<Module> {
     let lexer::Lexed { tokens, errors } = lexer::tokenize(file, source);
     let eof = Span::new(file, source.len(), source.len());
-    let input = tokens.as_slice().map(eof, |(t, s)| (t, s));
+    let input = token_input(&tokens, eof);
     let (out, errs) = module_parser().parse(input).into_output_errors();
     ParseResult {
         value: out.map(|body| Module { file, body }),
@@ -60,7 +60,7 @@ pub fn parse_module(file: FileId, source: &str) -> ParseResult<Module> {
 pub fn parse_expression(file: FileId, source: &str) -> ParseResult<Spanned<Expr>> {
     let lexer::Lexed { tokens, errors } = lexer::tokenize(file, source);
     let eof = Span::new(file, source.len(), source.len());
-    let input = tokens.as_slice().map(eof, |(t, s)| (t, s));
+    let input = token_input(&tokens, eof);
     let parser = expression()
         .then_ignore(just(Token::Newline).repeated())
         .then_ignore(end());
@@ -75,9 +75,28 @@ pub fn parse_expression(file: FileId, source: &str) -> ParseResult<Spanned<Expr>
 // Parser plumbing
 // ---------------------------------------------------------------------------
 
+/// The token stream every entry point parses, ending at `eof`.
+///
+/// One function, so every entry point hands the grammar the same input type. Each closure is a
+/// type of its own, so two entry points mapping the tokens through two closures would
+/// monomorphize every grammar constructor once per entry point.
+fn token_input<'src>(
+    tokens: &'src [(Token, Span)],
+    eof: Span,
+) -> impl ValueInput<'src, Token = Token, Span = Span> {
+    tokens.map(eof, |(t, s)| (t, s))
+}
+
 /// Shared error type for token-stream parser combinators.
 /// See `chl-parser/design-chl-parser.md`, "Gotchas" for the generic input boundary.
 type PErr<'src> = extra::Err<Rich<'src, Token, Span>>;
+
+/// A parser behind a box. Boxing erases a combinator chain's concrete type, which keeps
+/// the types rustc monomorphizes small (see `chl-parser/design-chl-parser.md`, "Gotchas").
+type BoxedParser<'src, I, O> = Boxed<'src, 'src, I, O, PErr<'src>>;
+
+/// A boxed statement parser, what each family of statement productions answers.
+type StmtParser<'src, I> = BoxedParser<'src, I, Spanned<Stmt>>;
 
 // ---------------------------------------------------------------------------
 // Expression parser
@@ -100,7 +119,8 @@ where
             Token::True => Expr::Lit(Lit::Bool(true)),
             Token::False => Expr::Lit(Lit::Bool(false)),
         }
-        .map_with(|node, e| Spanned::new(e.span(), node));
+        .map_with(|node, e| Spanned::new(e.span(), node))
+        .boxed();
 
         let ident_only = select! { Token::Ident(s) => s }
             .map_with(|s, e| (s, e.span()))
@@ -112,14 +132,16 @@ where
         // so a qualifier is spelled the same in each (`docs/chl-spec.md`, "9.6
         // Qualified references" and "9.12 Field labels and tags belong to a
         // module").
-        let name = qualified_name().map_with(|(qualifier, name), e| {
-            let node = if qualifier.is_empty() {
-                Expr::Name(name.node)
-            } else {
-                Expr::Qualified(QualifiedName { qualifier, name })
-            };
-            Spanned::new(e.span(), node)
-        });
+        let name = qualified_name()
+            .map_with(|(qualifier, name), e| {
+                let node = if qualifier.is_empty() {
+                    Expr::Name(name.node)
+                } else {
+                    Expr::Qualified(QualifiedName { qualifier, name })
+                };
+                Spanned::new(e.span(), node)
+            })
+            .boxed();
 
         // `summon(T)::f`, a function of the instance of the trait type `T`
         // (`docs/chl-spec.md`, "Summoning an instance"). An instance stands only before
@@ -142,7 +164,8 @@ where
                         function,
                     },
                 )
-            });
+            })
+            .boxed();
 
         // ---- One-line `match` (bracketed positions only) --------------
         //
@@ -191,7 +214,8 @@ where
             .clone()
             .separated_by(just(Token::Comma))
             .allow_trailing()
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+            .boxed();
 
         let comp_clauses = {
             let for_clause = just(Token::For)
@@ -209,7 +233,8 @@ where
                 .repeated()
                 .at_least(1)
                 .collect::<Vec<_>>()
-        };
+        }
+        .boxed();
 
         // The span is taken outside `ignore_then`, so it covers the opening `[`.
         let list_or_listcomp = just(Token::LBracket)
@@ -262,7 +287,8 @@ where
                 name_span: name.span,
                 qualifier,
                 value,
-            });
+            })
+            .boxed();
         let paren_record = record_field
             .clone()
             .separated_by(just(Token::Comma))
@@ -270,7 +296,8 @@ where
             .allow_trailing()
             .collect::<Vec<_>>()
             .then_ignore(just(Token::RParen))
-            .map_with(|fields, e| Spanned::new(e.span(), Expr::Record(fields)));
+            .map_with(|fields, e| Spanned::new(e.span(), Expr::Record(fields)))
+            .boxed();
 
         // A binder in a type, `k: K`: a function type's parenthesised domain. A name
         // followed by `:` begins no other expression, so the alternative commits only once
@@ -360,7 +387,8 @@ where
             just(Token::Colon)
                 .ignore_then(bracketed_expr.clone())
                 .or_not(),
-        );
+        )
+        .boxed();
         let brace_group = just(Token::LBrace)
             .ignore_then(
                 brace_item
@@ -557,7 +585,8 @@ where
                 qualifier,
                 form,
                 value,
-            });
+            })
+            .boxed();
         let module_entries = just(Token::LBrace)
             .ignore_then(
                 module_entry
@@ -566,7 +595,8 @@ where
                     .collect::<Vec<_>>(),
             )
             .then_ignore(just(Token::RBrace))
-            .map_with(|entries, e| Spanned::new(e.span(), Expr::ModuleType(entries)));
+            .map_with(|entries, e| Spanned::new(e.span(), Expr::ModuleType(entries)))
+            .boxed();
         let module_type = select! { Token::Ident(s) if s == "Module" => () }
             .ignore_then(choice((
                 module_entries,
@@ -706,7 +736,8 @@ where
         let call_arg = record_field
             .clone()
             .map(CallArg::Named)
-            .or(bracketed_expr.clone().map(CallArg::Positional));
+            .or(bracketed_expr.clone().map(CallArg::Positional))
+            .boxed();
         let call_arg_list = call_arg
             .separated_by(just(Token::Comma))
             .allow_trailing()
@@ -742,8 +773,9 @@ where
                     })
                     .collect();
                 vec![Spanned::new(e.span(), Expr::Record(fields))]
-            });
-        let call_args = call_arg_list.clone().map(PostfixOp::Call);
+            })
+            .boxed();
+        let call_args = call_arg_list.clone().map(PostfixOp::Call).boxed();
         // A subscript index is a comma-separated list: a single element is
         // the index itself (`xs[0]`); several become a tuple (`Mut(Int, Txn)`
         // — the multi-argument type-annotation form), matching Python's
@@ -764,7 +796,8 @@ where
                 Box::new(idx)
             })
             .then(just(Token::Bang).or_not())
-            .map(|(idx, bang)| PostfixOp::Subscript(idx, bang.is_none()));
+            .map(|(idx, bang)| PostfixOp::Subscript(idx, bang.is_none()))
+            .boxed();
         // `.name` or `.0` — one operation, projecting a field keyed by name or by
         // position. A positional key is spelled as an integer literal because an
         // identifier can never begin with a digit, so the two forms cannot collide; the
@@ -782,17 +815,20 @@ where
                 )
             }),
         ))
-        .labelled("field name or index");
+        .labelled("field name or index")
+        .boxed();
         // `.m(args)` is a method call, one postfix rather than an attribute then a call, so
         // it stays apart from calling the function a field holds, `(r.f)(args)`
         // (`docs/chl-spec.md`, "Associated functions and methods").
         let method_call = just(Token::Dot)
             .ignore_then(attr_key.clone())
             .then(call_arg_list)
-            .map(|((qualifier, name), args)| PostfixOp::MethodCall(name, qualifier, args));
+            .map(|((qualifier, name), args)| PostfixOp::MethodCall(name, qualifier, args))
+            .boxed();
         let attribute = just(Token::Dot)
             .ignore_then(attr_key)
-            .map(|(qualifier, name)| PostfixOp::Attribute(name, qualifier));
+            .map(|(qualifier, name)| PostfixOp::Attribute(name, qualifier))
+            .boxed();
 
         let postfix = atom
             .clone()
@@ -984,7 +1020,8 @@ where
             just(Token::CaretLtE).to(CmpOp::LtERefined),
             just(Token::CaretGt).to(CmpOp::GtRefined),
             just(Token::CaretGtE).to(CmpOp::GtERefined),
-        ));
+        ))
+        .boxed();
         let comparison = log_or
             .clone()
             .then(cmp_op.then(log_or.clone()).repeated().collect::<Vec<_>>())
@@ -1103,7 +1140,8 @@ where
                 name_span,
                 annotation,
                 except: Vec::new(),
-            });
+            })
+            .boxed();
         let lambda = just(Token::Backslash)
             .ignore_then(
                 lambda_param
@@ -1141,7 +1179,8 @@ where
                 name_span,
                 annotation,
                 except: except.unwrap_or_default(),
-            });
+            })
+            .boxed();
         let forall = just(Token::Forall)
             .ignore_then(
                 forall_param
@@ -1237,12 +1276,14 @@ where
                         value: Box::new(value),
                     },
                 ),
-            });
+            })
+            .boxed();
 
         // ---- Yield (a top-level expression form) --------------------
         let yield_expr = just(Token::Yield)
             .ignore_then(expr.clone())
-            .map_with(|value, e| Spanned::new(e.span(), Expr::Yield(Box::new(value))));
+            .map_with(|value, e| Spanned::new(e.span(), Expr::Yield(Box::new(value))))
+            .boxed();
 
         // ---- Function types `T => U` and `T |=> U` (annotation-only; §4.1, §6.3) ----
         //
@@ -1255,7 +1296,8 @@ where
         let arrow = choice((
             just(Token::DoubleArrow).to(Arrow::Compute),
             just(Token::DataArrow).to(Arrow::Data),
-        ));
+        ))
+        .boxed();
         // The clauses after the codomain are this arrow's, so in `A => B => C causes E` the
         // codomain `B => C causes E` takes them (`docs/chl-spec.md`, "Writing requirements and
         // effects").
@@ -1288,6 +1330,7 @@ where
             .as_context()
             .boxed()
     })
+    .boxed()
 }
 
 /// Intermediate type used inside `paren_group` so we know what shape to build.
@@ -1401,6 +1444,7 @@ where
                 .map_with(|s, e| (s, e.span()))
                 .labelled("identifier"),
         )
+        .boxed()
 }
 
 /// A name and the `::` qualifier before it: `x` is `([], x)` and
@@ -1421,11 +1465,14 @@ where
     let this = just(Token::This)
         .map_with(|_, e| Spanned::new(e.span(), SmolStr::new_static("this")))
         .then_ignore(just(Token::ColonColon));
-    this.or_not().then(segments).map(|(this, mut segments)| {
-        let name = segments.pop().expect("`at_least(1)` segment");
-        let qualifier = this.into_iter().chain(segments).collect();
-        (qualifier, name)
-    })
+    this.or_not()
+        .then(segments)
+        .map(|(this, mut segments)| {
+            let name = segments.pop().expect("`at_least(1)` segment");
+            let qualifier = this.into_iter().chain(segments).collect();
+            (qualifier, name)
+        })
+        .boxed()
 }
 
 // ---------------------------------------------------------------------------
@@ -1447,6 +1494,7 @@ where
                 .collect::<Vec<_>>(),
         )
         .then_ignore(end())
+        .boxed()
 }
 
 fn statement<'src, I>() -> impl Parser<'src, I, Spanned<Stmt>, PErr<'src>> + Clone
@@ -1454,7 +1502,7 @@ where
     I: ValueInput<'src, Token = Token, Span = Span>,
 {
     recursive(|stmt| {
-        let expr = expression();
+        let expr = expression().boxed();
 
         // Recovery skips a failed statement's whole extent, and every layout
         // token in it in balanced pairs. A layout token left behind closes the
@@ -1465,7 +1513,8 @@ where
         //
         // Recovery must also consume a token before succeeding. Otherwise
         // repeated statements can make no progress.
-        let skip_indented_block = nested_delimiters(Token::Indent, Token::Dedent, [], |_span| ());
+        let skip_indented_block =
+            nested_delimiters(Token::Indent, Token::Dedent, [], |_span| ()).boxed();
         // `pub` is no part of this extent: `pub_stmt` parses the statement
         // after it, whose own recovery starts at the `BlockValueIndent`.
         let skip_block_value = nested_delimiters(
@@ -1473,40 +1522,49 @@ where
             Token::BlockValueDedent,
             [],
             |_span| (),
-        );
+        )
+        .boxed();
         let line_token = none_of([
             Token::Newline,
             Token::Indent,
             Token::Dedent,
             Token::BlockValueIndent,
             Token::BlockValueDedent,
-        ]);
+        ])
+        .boxed();
         let skip_to_newline = line_token
             .clone()
             .repeated()
             .at_least(1)
-            .then_ignore(just(Token::Newline).or_not());
-        let skip_line_and_block = skip_to_newline.then(skip_indented_block.clone().or_not());
+            .then_ignore(just(Token::Newline).or_not())
+            .boxed();
+        let skip_line_and_block = skip_to_newline
+            .then(skip_indented_block.clone().or_not())
+            .boxed();
         let skip_chain = choice((just(Token::Elif), just(Token::Else), just(Token::Except)))
             .then(skip_line_and_block.clone())
-            .repeated();
+            .repeated()
+            .boxed();
         let skip_statement = choice((
             skip_block_value.clone(),
             skip_indented_block.clone(),
             skip_line_and_block.then(skip_chain).ignored(),
-        ));
+        ))
+        .boxed();
         // A production's head has already consumed input. Its tail may stop at a
         // synchronization token without consuming it; the enclosing block owns its closer.
-        let skip_rhs = line_token.repeated().ignored();
+        let skip_rhs = line_token.repeated().ignored().boxed();
         let skip_tail = skip_rhs
             .clone()
             .then_ignore(just(Token::Newline).or_not())
-            .then_ignore(skip_indented_block.or_not());
+            .then_ignore(skip_indented_block.or_not())
+            .boxed();
         let stmt_terminator = choice((
             just(Token::Semi).then_ignore(just(Token::Newline).or_not()),
             just(Token::Newline),
-        ));
-        let statement_end = stmt_terminator.clone().rewind();
+        ))
+        .boxed();
+        let statement_end = stmt_terminator.clone().rewind().boxed();
         let value_expr = expr
             .clone()
             .then_ignore(statement_end.clone())
@@ -1514,7 +1572,8 @@ where
                 skip_rhs
                     .clone()
                     .map_with(|_, e| Spanned::new(e.span(), Expr::Error)),
-            ));
+            ))
+            .boxed();
         let annotation_expr = expr
             .clone()
             .then_ignore(one_of([Token::Eq, Token::ColonEq, Token::Newline, Token::Semi]).rewind())
@@ -1531,7 +1590,8 @@ where
                 ])
                 .repeated()
                 .map_with(|_, e| Spanned::new(e.span(), Expr::Error)),
-            ));
+            ))
+            .boxed();
 
         // A block is either:
         //   - NEWLINE INDENT stmt+ DEDENT     (Python-style indented body)
@@ -1552,131 +1612,13 @@ where
             .then_ignore(just(Token::Dedent))
             .boxed();
 
-        // ---- if / elif / else ---------------------------------------
-        let if_stmt = just(Token::If)
-            .ignore_then(expr.clone())
-            .then_ignore(just(Token::Colon))
-            .then(block.clone())
-            .then(
-                just(Token::Elif)
-                    .ignore_then(expr.clone())
-                    .then_ignore(just(Token::Colon))
-                    .then(block.clone())
-                    .repeated()
-                    .collect::<Vec<_>>(),
-            )
-            .then(
-                just(Token::Else)
-                    .ignore_then(just(Token::Colon))
-                    .ignore_then(block.clone())
-                    .or_not(),
-            )
-            .map_with(|(((first_cond, first_body), elifs), else_body), e| {
-                let mut branches = vec![IfBranch {
-                    cond: first_cond,
-                    body: first_body,
-                }];
-                for (cond, body) in elifs {
-                    branches.push(IfBranch { cond, body });
-                }
-                Spanned::new(
-                    e.span(),
-                    Stmt::If {
-                        branches,
-                        else_body,
-                    },
-                )
-            });
-
-        // ---- try: body / except T as e: body ------------------------
-        let except_binding = just(Token::As)
-            .ignore_then(
-                select! { Token::Ident(s) => s }.map_with(|s, e| Spanned::new(e.span(), s)),
-            )
-            .or_not();
-        let try_stmt = just(Token::Try)
-            .ignore_then(just(Token::Colon))
-            .ignore_then(block.clone())
-            .then(
-                just(Token::Except)
-                    .ignore_then(expr.clone())
-                    .then(except_binding)
-                    .then_ignore(just(Token::Colon))
-                    .then(block.clone())
-                    .map(|((ty, binding), body)| ExceptClause { ty, binding, body })
-                    .repeated()
-                    .at_least(1)
-                    .collect::<Vec<_>>(),
-            )
-            .map_with(|(body, handlers), e| Spanned::new(e.span(), Stmt::Try { body, handlers }));
-
-        // ---- match scrutinee: case `tag(binder): body ---------------
-        //
-        // The arm list is itself an indented block, so a `match` is two levels
-        // of layout: `Indent` for the arms, then each arm's own `block` for its
-        // body. An arm may instead hold one expression on its `case` line, which
-        // its `Newline` ends (`docs/chl-spec.md`, "An arm on its `case` line"). The
-        // arms themselves come from `match_arms`, shared with the one-line form in
-        // `expression()`.
-        let arm_on_its_line = expr
-            .clone()
-            .map_with(|body: Spanned<Expr>, e| vec![Spanned::new(e.span(), Stmt::Expr(body))])
-            .then_ignore(just(Token::Newline).repeated().at_least(1));
-        let match_stmt = just(Token::Match)
-            .ignore_then(expr.clone())
-            .then_ignore(just(Token::Colon))
-            .then_ignore(just(Token::Newline))
-            .then_ignore(just(Token::Indent).labelled("indented `case` arms"))
-            .then(match_arms(choice((
-                block.clone().then_ignore(just(Token::Newline).repeated()),
-                arm_on_its_line,
-            ))))
-            .then_ignore(just(Token::Dedent))
-            .map_with(|(scrutinee, arms), e| {
-                Spanned::new(e.span(), Stmt::Match { scrutinee, arms })
-            });
-
-        // ---- for x in iter: body ------------------------------------
-        let for_stmt = just(Token::For)
-            .ignore_then(bare_target(expr.clone()).try_map(|t, _| {
-                expr_to_assign_target(t).map_err(|bad| Rich::custom(bad, "invalid for-loop target"))
-            }))
-            .then_ignore(just(Token::In))
-            .then(expr.clone())
-            .then_ignore(just(Token::Colon))
-            .then(block.clone())
-            .map_with(|((target, iter), body), e| {
-                Spanned::new(e.span(), Stmt::For { target, iter, body })
-            });
-
-        // ---- with <binding> = begin(): body -------------------------
-        // The transaction form `with t = begin():` binds `t` to the commit
-        // time; the binding prefix backtracks (`.or_not()`) so a bare
-        // `with begin():` still parses. The context is a call expression
-        // (`begin()`); lowering validates it.
-        let with_binding = select! { Token::Ident(s) => s }
-            .then_ignore(just(Token::Eq))
-            .or_not();
-        let with_stmt = just(Token::With)
-            .ignore_then(with_binding)
-            .then(expr.clone())
-            .then_ignore(just(Token::Colon))
-            .then(block.clone())
-            .map_with(|((binding, context), body), e| {
-                Spanned::new(
-                    e.span(),
-                    Stmt::With {
-                        binding,
-                        context,
-                        body,
-                    },
-                )
-            });
-
-        // ---- def name(params): body ---------------------------------
-        // A function type's clause runs on through each capitalized item after it, so one in a
-        // parameter list is parenthesized (`docs/chl-spec.md`, "Writing requirements and
-        // effects").
+        let ControlFlowStatements {
+            if_stmt,
+            try_stmt,
+            match_stmt,
+            for_stmt,
+            with_stmt,
+        } = control_flow_statements(expr.clone().boxed(), block.clone().boxed());
         let param = select! { Token::Ident(s) => s }
             .map_with(|s, e| (s, e.span()))
             .labelled("parameter name")
@@ -1702,772 +1644,42 @@ where
                 name_span,
                 annotation,
                 except: except.unwrap_or_default(),
-            });
-        // ---- module statements: import, run, param ------------------
-        // (`docs/chl-spec.md`, "9.2 Imports", "9.3 Runs", "9.4 Parameters")
-        let binder = select! { Token::Ident(s) => s }.map_with(|s, e| Spanned::new(e.span(), s));
-        let alias_name = binder.validate(|name, _, emitter| {
-            if is_type_name(&name.node) {
-                emitter.emit(Rich::custom(
-                    name.span,
-                    format!(
-                        "`{}` is capitalized, which names a type; a module or run \
-                             name begins with a lowercase letter",
-                        name.node
-                    ),
-                ));
-            }
-            name
-        });
-        let module_alias = just(Token::As).ignore_then(alias_name).or_not();
-        let recovered_alias = just(Token::As)
-            .ignore_then(
-                alias_name
-                    .map(Some)
-                    .recover_with(via_parser(skip_rhs.clone().to(None))),
-            )
-            .or_not();
-        let use_item = binder
-            .then(just(Token::As).ignore_then(binder).or_not())
-            .validate(|(name, alias), _, emitter| {
-                if let Some(alias) = &alias
-                    && is_type_name(&name.node) != is_type_name(&alias.node)
-                {
-                    emitter.emit(Rich::custom(
-                        alias.span,
-                        format!(
-                            "`{}` and `{}` differ in case; a capitalized name is a type, so \
-                             a `use` alias keeps the case of the member it names",
-                            name.node, alias.node
-                        ),
-                    ));
-                }
-                UseItem { name, alias }
-            });
-        let use_clause = just(Token::Use)
-            .ignore_then(choice((
-                use_item
-                    .clone()
-                    .separated_by(just(Token::Comma))
-                    .at_least(1)
-                    .allow_trailing()
-                    .collect::<Vec<_>>()
-                    .delimited_by(just(Token::LParen), just(Token::RParen)),
-                use_item
-                    .separated_by(just(Token::Comma))
-                    .at_least(1)
-                    .collect::<Vec<_>>(),
-            )))
-            .or_not()
-            .map(Option::unwrap_or_default);
-
-        // The keyword arguments of an `import` or a `run`, `(port="8080")`.
-        let module_args = binder
-            .then_ignore(just(Token::Eq))
-            .then(expr.clone())
-            .map(|(name, value)| KeywordArg { name, value })
-            .separated_by(just(Token::Comma))
-            .allow_trailing()
-            .collect::<Vec<_>>()
-            .delimited_by(just(Token::LParen), just(Token::RParen))
-            .map(Ok)
-            .recover_with(via_parser(nested_delimiters(
-                Token::LParen,
-                Token::RParen,
-                [],
-                |_| Err(()),
-            )))
-            .or_not()
-            .map(|args| args.unwrap_or_else(|| Ok(Vec::new())));
-
-        let module_parts = module_path()
-            .then(module_args)
-            .then(recovered_alias)
-            .then(
-                use_clause
-                    .map(Some)
-                    .recover_with(via_parser(skip_rhs.clone().to(None))),
-            )
-            .then(
-                statement_end
-                    .clone()
-                    .to(true)
-                    .recover_with(via_parser(skip_rhs.clone().to(false))),
-            );
-        let module_stmt = one_of([Token::Import, Token::Run])
-            .then(module_parts)
-            .map_with(|(keyword, ((((path, args), alias), uses), ended)), e| {
-                let broken =
-                    args.is_err() || uses.is_none() || !ended || matches!(alias, Some(None));
-                let unknown_alias = matches!(alias, Some(None));
-                let alias = alias.flatten();
-                let stmt = if broken {
-                    let unknown = unknown_alias;
-                    let modules = if unknown {
-                        Vec::new()
-                    } else {
-                        alias
-                            .as_ref()
-                            .map(|a| a.node.clone())
-                            .or_else(|| path.segments.last().map(|s| s.node.clone()))
-                            .into_iter()
-                            .collect()
-                    };
-                    let binds = uses
-                        .unwrap_or_default()
-                        .iter()
-                        .map(|u| u.alias.as_ref().unwrap_or(&u.name).node.clone())
-                        .collect();
-                    failed_statement(binds, false, modules, unknown)
-                } else if keyword == Token::Import {
-                    Stmt::Import {
-                        path,
-                        args: args.unwrap(),
-                        alias,
-                        uses: uses.unwrap(),
-                    }
-                } else {
-                    Stmt::Run {
-                        path,
-                        args: args.unwrap(),
-                        alias,
-                        uses: uses.unwrap(),
-                        renamed_from: None,
-                    }
-                };
-                Spanned::new(e.span(), stmt)
-            });
-
-        let run_stmt = just(Token::Run).rewind().ignore_then(module_stmt.clone());
-
-        // A capitalized parameter is a type parameter, known through a bound
-        // (`<:`); a lowercase one is a value, known through its exact type
-        // (`:`). The case decides which annotation the parameter takes.
-        let param_stmt = just(Token::Param)
-            .ignore_then(binder)
-            .then(
-                annotation_mode()
-                    .then(expr.clone())
-                    .map(|(mode, ty)| TypeAnnotation { mode, ty })
-                    .or_not()
-                    .then(just(Token::Eq).ignore_then(value_expr.clone()).or_not())
-                    .then_ignore(statement_end.clone())
-                    .map(Some)
-                    .recover_with(via_parser(skip_rhs.clone().to(None))),
-            )
-            .validate(|(name, tail), e, emitter| {
-                let Some((annotation, default)) = tail else {
-                    return Spanned::new(
-                        e.span(),
-                        failed_statement(vec![name.node], false, Vec::new(), false),
-                    );
-                };
-                let is_type = is_type_name(&name.node);
-                match annotation.as_ref().map(|a| a.mode) {
-                    Some(AnnotationMode::Bounded) if !is_type => emitter.emit(Rich::custom(
-                        e.span(),
-                        format!(
-                            "a value parameter's type is exact: `param {}: T`; `<:` bounds a \
-                             type parameter, whose name is capitalized",
-                            name.node
-                        ),
-                    )),
-                    Some(AnnotationMode::Exact) if is_type => emitter.emit(Rich::custom(
-                        e.span(),
-                        format!(
-                            "a type parameter is known through a bound: `param {} <: T`",
-                            name.node
-                        ),
-                    )),
-                    _ => {}
-                }
-                Spanned::new(
-                    e.span(),
-                    Stmt::Param {
-                        name,
-                        annotation,
-                        default,
-                        constant: None,
-                    },
-                )
-            });
-
-        // ---- Decorators: @LoadFrom(x), @RenamedFrom(r), @Discard -------
-        //
-        // A decorator and the declaration it decorates are one statement, not a
-        // general decorator grammar attached to an arbitrary one. Each decorator
-        // takes its own declaration form: `@LoadFrom` the only declaration that
-        // may carry an annotation without a value, since the decorator is where
-        // the value comes from, `@RenamedFrom` a `run`, and `@Discard` a
-        // declaration head with neither.
-        // Parsing each pair together is what keeps a bare `y: T` a parse error
-        // everywhere else.
-        //
-        // The decorator name is matched as an identifier and checked once the
-        // declaration has parsed, so an unknown one is reported by name rather
-        // than as a failure to find `@`.
-        let discard_head = choice((
-            just(Token::Run)
-                .ignore_then(module_path())
-                .then(module_alias)
-                .map(|(path, alias)| DiscardHead::Run { path, alias }),
-            binder.map(DiscardHead::Name),
-        ));
-        let decorator_arg = select! { Token::Ident(s) => s }
-            .map_with(|s, e| Spanned::new(e.span(), s))
-            .delimited_by(just(Token::LParen), just(Token::RParen))
-            .then_ignore(just(Token::Newline));
-        // `pub` is refused on a `run`, decorated or not; it is parsed here so the
-        // refusal names it.
-        let renamed_from_tail = decorator_arg
-            .clone()
-            .then(just(Token::Pub).map_with(|_, e| e.span()).or_not())
-            .then(run_stmt.clone())
-            .validate(|((source, keyword), run), _, emitter| {
-                if let Some(keyword) = keyword {
-                    let refused = pub_refusal(&run.node).expect("`pub` is refused on every `run`");
-                    emitter.emit(Rich::custom(keyword, refused));
-                }
-                let Stmt::Run {
-                    path,
-                    args,
-                    alias,
-                    uses,
-                    renamed_from: None,
-                } = run.node
-                else {
-                    unreachable!("`run_stmt` parses an undecorated `Stmt::Run`")
-                };
-                let stmt = Stmt::Run {
-                    path,
-                    args,
-                    alias,
-                    uses,
-                    renamed_from: Some(source),
-                };
-                (None, stmt)
-            });
-        let load_from_tail = decorator_arg
-            // A loaded declaration is an ordinary declaration with no
-            // initializer, so it takes `pub` where any declaration does: at the
-            // head of its own line.
-            .then(just(Token::Pub).map_with(|_, e| e.span()).or_not())
-            .then(
-                select! { Token::Ident(s) => s }
-                    .map_with(|s, e| Spanned::new(e.span(), AssignTarget::Name(s))),
-            )
-            .then(
-                annotation_mode()
-                    .then(expr.clone())
-                    .map(|(mode, ty)| TypeAnnotation { mode, ty }),
-            )
-            .map(|(((source, keyword), target), annotation)| {
-                let stmt = Stmt::LoadFrom {
-                    target,
-                    annotation,
-                    source,
-                };
-                (keyword, stmt)
-            });
-        let discard_tail = just(Token::Newline)
-            .ignore_then(discard_head)
-            .map(|head| (None, Stmt::Discard(head)));
-        let decorated_stmt = just(Token::At)
-            .ignore_then(select! { Token::Ident(s) => s }.map_with(|s, e| (s, e.span())))
-            .then(choice((load_from_tail, renamed_from_tail, discard_tail)))
-            .then_ignore(just(Token::Newline))
-            .try_map_with(|((name, name_span), (keyword, stmt)), e| {
-                let expected = match &stmt {
-                    Stmt::LoadFrom { .. } => "LoadFrom",
-                    Stmt::Run { .. } => "RenamedFrom",
-                    _ => "Discard",
-                };
-                if name == expected {
-                    let stmt = Spanned::new(e.span(), stmt);
-                    return Ok(match keyword {
-                        None => stmt,
-                        Some(keyword) => Spanned::new(
-                            e.span(),
-                            Stmt::Pub {
-                                keyword,
-                                stmt: Box::new(stmt),
-                            },
-                        ),
-                    });
-                }
-                let message = match (name.as_str(), &stmt) {
-                    ("LoadFrom", Stmt::Run { .. }) => "a `run` cannot carry `@LoadFrom`, which \
-                                                       loads one variable; a renamed run is \
-                                                       marked `@RenamedFrom(r)`, naming the run \
-                                                       it was"
-                        .to_string(),
-                    ("LoadFrom", _) => "`@LoadFrom(x)` names the variable it loads from, and \
-                                        decorates a declaration `y: T` on the next line"
-                        .to_string(),
-                    ("RenamedFrom", _) => "`@RenamedFrom(r)` names the run this one was, and \
-                                           decorates a `run` statement on the next line"
-                        .to_string(),
-                    ("Discard", _) => "`@Discard` takes no argument, and decorates a \
-                                       declaration head on the next line: a name, a `run`, or \
-                                       an `import`"
-                        .to_string(),
-                    _ => format!(
-                        "unknown decorator `{name}`; the decorators are `LoadFrom`, \
-                         `RenamedFrom`, `Discard` and `Builtin`"
-                    ),
-                };
-                Err(Rich::custom(name_span, message))
-            });
-
-        // ---- type N(P…): constructors | type N(P…) = R ---------------
-        // (`docs/chl-spec.md`, "Declaring a nominal type")
-        //
-        // A constructor parameter's `name:` prefix is optional, and a parameter type
-        // can itself begin with an identifier, so the prefix is tried and rewound.
-        let ctor_param = binder
-            .then_ignore(just(Token::Colon))
-            .or_not()
-            .then(expr.clone())
-            .map(|(name, ty)| ConstructorParam { name, ty });
-        // Parentheses hold at least one parameter: a constructor that declares none is a
-        // value, written without them.
-        let ctor_line = binder
-            .then(
-                ctor_param
-                    .separated_by(just(Token::Comma))
-                    .at_least(1)
-                    .allow_trailing()
-                    .collect::<Vec<_>>()
-                    .delimited_by(just(Token::LParen), just(Token::RParen))
-                    .or_not()
-                    .map(Option::unwrap_or_default),
-            )
-            .then_ignore(just(Token::Newline))
-            .validate(|(name, params), _, emitter| {
-                if is_type_name(&name.node) {
-                    emitter.emit(Rich::custom(
-                        name.span,
-                        format!(
-                            "constructor `{}` is capitalized, which names a type; a \
-                             constructor begins with a lowercase letter",
-                            name.node
-                        ),
-                    ));
-                }
-                Constructor { name, params }
-            });
-        let type_body = choice((
-            just(Token::Eq)
-                .ignore_then(expr.clone())
-                .then_ignore(just(Token::Newline))
-                .map(TypeDeclBody::Single),
-            just(Token::Colon)
-                .ignore_then(just(Token::Newline))
-                .ignore_then(just(Token::Indent).labelled("indented constructor lines"))
-                .ignore_then(
-                    ctor_line
-                        .then_ignore(just(Token::Newline).repeated())
-                        .repeated()
-                        .at_least(1)
-                        .collect::<Vec<_>>(),
-                )
-                .then_ignore(just(Token::Dedent))
-                .map(TypeDeclBody::Constructors),
-        ));
-        // A parameter with its kind, `T: K`, a family parameter's a kind arrow,
-        // `V: K => Type` (`docs/chl-spec.md`, "Family parameters").
-        let type_decl_param = binder
-            .then(
-                choice((
-                    just(Token::Colon)
-                        .ignore_then(expr.clone())
-                        .map(KindAnnotation::Kind),
-                    just(Token::LtColon)
-                        .ignore_then(expr.clone())
-                        .map(KindAnnotation::Bound),
-                ))
-                .or_not(),
-            )
-            .map(|(name, annotation)| TypeParam {
-                name: name.node,
-                name_span: name.span,
-                annotation,
-                except: Vec::new(),
-            });
-        let type_stmt = just(Token::Type)
-            .ignore_then(binder)
-            .then(
-                type_decl_param
-                    .separated_by(just(Token::Comma))
-                    .at_least(1)
-                    .allow_trailing()
-                    .collect::<Vec<_>>()
-                    .delimited_by(just(Token::LParen), just(Token::RParen))
-                    .or_not()
-                    .map(Option::unwrap_or_default),
-            )
-            .then(type_body)
-            .validate(|((name, params), body), e, emitter| {
-                let heads = std::iter::once((&name.node, name.span, "type name")).chain(
-                    params
-                        .iter()
-                        .map(|p| (&p.name, p.name_span, "type parameter")),
-                );
-                for (head, span, what) in heads {
-                    if !is_type_name(head) {
-                        emitter.emit(Rich::custom(
-                            span,
-                            format!(
-                                "{what} `{head}` begins with a lowercase letter; a type's name \
-                                 is capitalized"
-                            ),
-                        ));
-                    }
-                }
-                Spanned::new(e.span(), Stmt::TypeDecl(TypeDecl { name, params, body }))
-            });
-
-        // `def f` or `def Price::f`: a qualifying type makes the function an associated
-        // function of that type.
-        let def_name = binder.then_ignore(just(Token::ColonColon)).or_not().then(
-            select! { Token::Ident(s) => s }
-                .map_with(|s, e| Spanned::new(e.span(), s))
-                .labelled("function name"),
+            })
+            .boxed();
+        let ModuleStatements {
+            module_stmt,
+            param_stmt,
+            decorated_stmt,
+        } = module_statements(
+            expr.clone().boxed(),
+            skip_rhs.clone().boxed(),
+            statement_end.clone().boxed(),
+            value_expr.clone().boxed(),
         );
-        // The parameters, the result and the clauses.
-        let def_signature = param
-            .clone()
-            .separated_by(just(Token::Comma))
-            .allow_trailing()
-            .collect::<Vec<_>>()
-            .try_map(|items, _| split_params(items))
-            .delimited_by(just(Token::LParen), just(Token::RParen))
-            .then(just(Token::DoubleArrow).ignore_then(expr.clone()).or_not())
-            .then(effect_clauses(expr.clone(), requirement(expr.clone())).boxed());
-        // The signature: `def` through the clauses.
-        let def_head = just(Token::Def)
-            .ignore_then(def_name.clone())
-            .then(def_signature.clone());
-        let def_stmt = just(Token::Def)
-            .ignore_then(def_name)
-            .then(
-                def_signature
-                    .then_ignore(just(Token::Colon))
-                    .then(block.clone())
-                    .map(Some)
-                    .recover_with(via_parser(skip_tail.clone().to(None))),
-            )
-            .map_with(|((owner, name), tail), e| {
-                let Some(((((type_params, params), output), (requires, causes)), body)) = tail
-                else {
-                    let name = owner.map_or_else(
-                        || name.node.clone(),
-                        |owner| format!("{}::{}", owner.node, name.node).into(),
-                    );
-                    return Spanned::new(
-                        e.span(),
-                        failed_statement(vec![name], false, Vec::new(), false),
-                    );
-                };
-                Spanned::new(
-                    e.span(),
-                    Stmt::FunctionDef {
-                        owner,
-                        name,
-                        type_params,
-                        params,
-                        output,
-                        requires: Box::new(requires),
-                        causes: Box::new(causes),
-                        body,
-                        builtin: None,
-                    },
-                )
-            });
-        // ---- @Builtin above a `def` with no body ---------------------
-        // (`docs/chl-spec.md`, "9.16 The std root")
-        //
-        // The decorator and its declaration are one statement, as the other decorators' are,
-        // and the signature ends the declaration. `pub` stands on the line below the
-        // decorator. Lowering refuses it outside a std module.
-        let builtin_def = just(Token::At)
-            .ignore_then(
-                select! { Token::Ident(s) if s == "Builtin" => () }.map_with(|(), e| e.span()),
-            )
-            .then_ignore(just(Token::Newline))
-            .then(just(Token::Pub).map_with(|_, e| e.span()).or_not())
-            .then(
-                def_head
-                    .then_ignore(just(Token::Newline))
-                    .map_with(|head, e| (head, e.span())),
-            )
-            .map_with(
-                |(
-                    (builtin, keyword),
-                    (
-                        ((owner, name), (((type_params, params), output), (requires, causes))),
-                        def_span,
-                    ),
-                ),
-                 e| {
-                    let def = Spanned::new(
-                        def_span,
-                        Stmt::FunctionDef {
-                            owner,
-                            name,
-                            type_params,
-                            params,
-                            output,
-                            requires: Box::new(requires),
-                            causes: Box::new(causes),
-                            body: Vec::new(),
-                            builtin: Some(builtin),
-                        },
-                    );
-                    match keyword {
-                        None => Spanned::new(e.span(), def.node),
-                        Some(keyword) => Spanned::new(
-                            e.span(),
-                            Stmt::Pub {
-                                keyword,
-                                stmt: Box::new(def),
-                            },
-                        ),
-                    }
-                },
-            );
-
-        // ---- impl N(P…): ( [pub] def … | A = T )+ ----------------------
-        // (`docs/chl-spec.md`, "Associated functions and methods" and "Declaring an instance")
-        #[derive(Clone)]
-        enum ImplItem {
-            Def(Box<Spanned<Stmt>>),
-            Assoc(AssocArg),
-        }
-        let impl_def = just(Token::Pub)
-            .map_with(|_, e| e.span())
-            .or_not()
-            .then(def_stmt.clone())
-            .map_with(|(keyword, def), e| match keyword {
-                None => def,
-                Some(keyword) => Spanned::new(
-                    e.span(),
-                    Stmt::Pub {
-                        keyword,
-                        stmt: Box::new(def),
-                    },
-                ),
-            });
-        // An instance defines an associated type its trait declares as a type alias is
-        // written, `Elem = T`.
-        let impl_assoc = select! { Token::Ident(s) => s }
-            .map_with(|s, e| (s, e.span()))
-            .then_ignore(just(Token::Eq))
-            .then(expr.clone())
-            .then_ignore(just(Token::Newline))
-            .map(|((name, name_span), value)| AssocArg {
-                name,
-                name_span,
-                value,
-            });
-        let impl_item = choice((
-            impl_def.map(|d| ImplItem::Def(Box::new(d))),
-            impl_assoc.map(ImplItem::Assoc),
-        ));
-        // `impl` heads a type applied to its parameters, and `instance` a trait applied to the
-        // types an instance is for, spelled as a requirement is. A head with no block is an
-        // instance of a trait with no functions, `instance Equatable(Money, Money)`. An
-        // instance's type variables are declared before its head,
-        // `instance forall (T) Area(Two(T))`; each is a capitalized name.
-        let instance_vars = just(Token::Forall).ignore_then(
-            binder
-                .validate(|name, _, emitter| {
-                    if !is_type_name(&name.node) {
-                        emitter.emit(Rich::custom(
-                            name.span,
-                            format!(
-                                "type variable `{}` begins with a lowercase letter; it names \
-                                 a type, so it is capitalized",
-                                name.node
-                            ),
-                        ));
-                    }
-                    name
-                })
-                .separated_by(just(Token::Comma))
-                .at_least(1)
-                .allow_trailing()
-                .collect::<Vec<_>>()
-                .delimited_by(just(Token::LParen), just(Token::RParen)),
+        let DeclarationStatements {
+            type_stmt,
+            def_stmt,
+            builtin_def,
+            impl_stmt,
+            trait_stmt,
+        } = declaration_statements(
+            expr.clone().boxed(),
+            block.clone().boxed(),
+            param.clone().boxed(),
+            skip_tail.clone().boxed(),
         );
-        let impl_body = just(Token::Colon)
-            .ignore_then(just(Token::Newline))
-            .ignore_then(just(Token::Indent).labelled("indented `def`s"))
-            .ignore_then(
-                impl_item
-                    .then_ignore(just(Token::Newline).repeated())
-                    .repeated()
-                    .at_least(1)
-                    .collect::<Vec<_>>(),
-            )
-            .then_ignore(just(Token::Dedent))
-            .or(just(Token::Newline).to(Vec::new()));
-        let impl_stmt = just(Token::Impl)
-            .to(false)
-            .or(just(Token::Instance).to(true))
-            .then(instance_vars.or_not())
-            .then(trait_type(expr.clone()))
-            .then(requires_clause(expr.clone()).or_not())
-            .then(impl_body)
-            .map_with(|((((instance, vars), head), requires), items), e| {
-                let TraitType {
-                    qualifier,
-                    name,
-                    name_span,
-                    args,
-                    ..
-                } = head.node;
-                let mut defs = Vec::new();
-                let mut assoc = Vec::new();
-                for item in items {
-                    match item {
-                        ImplItem::Def(def) => defs.push(*def),
-                        ImplItem::Assoc(a) => assoc.push(a),
-                    }
-                }
-                let block = ImplBlock {
-                    vars: vars.unwrap_or_default(),
-                    qualifier,
-                    ty: Spanned::new(name_span, name),
-                    args,
-                    assoc,
-                    requires: requires.unwrap_or_default(),
-                    defs,
-                };
-                let stmt = if instance {
-                    Stmt::Instance(block)
-                } else {
-                    Stmt::Impl(block)
-                };
-                Spanned::new(e.span(), stmt)
-            });
-
-        // ---- trait T(P…): ( type A | def f(…) => R requires … )+ -------
-        // (`docs/chl-spec.md`, "Declaring a trait")
-        let fn_signature = just(Token::Def)
-            .ignore_then(
-                select! { Token::Ident(s) => s }
-                    .labelled("function name")
-                    .map_with(|s, e| Spanned::new(e.span(), s)),
-            )
-            .then(
-                param
-                    .separated_by(just(Token::Comma))
-                    .allow_trailing()
-                    .collect::<Vec<_>>()
-                    .try_map(|items, _| split_params(items))
-                    .delimited_by(just(Token::LParen), just(Token::RParen)),
-            )
-            .then(just(Token::DoubleArrow).ignore_then(expr.clone()).or_not())
-            .then(effect_clauses(expr.clone(), requirement(expr.clone())).boxed())
-            .map_with(
-                |(((name, (type_params, params)), output), (requires, causes)), e| {
-                    TraitItem::Function(Box::new(Spanned::new(
-                        e.span(),
-                        FunctionSignature {
-                            name,
-                            type_params,
-                            params,
-                            output,
-                            requires,
-                            causes,
-                        },
-                    )))
-                },
-            );
-        // An associated type is its capitalized name, alone or bounded, `Size <: Int`: it is a
-        // type the instance defines, as an alias, not a nominal type a `type` declaration
-        // introduces. One bounded by `Effect` or `Context` stands for a clause.
-        let trait_item = choice((
-            binder
-                .then(
-                    just(Token::LtColon)
-                        .ignore_then(expr.clone())
-                        .then(except_list(clause_item(expr.clone())).or_not())
-                        .or_not(),
-                )
-                .map(|(name, bounded)| {
-                    let (bound, except) = bounded.map_or((None, None), |(b, e)| (Some(b), e));
-                    TraitItem::AssocType {
-                        name,
-                        bound,
-                        except: except.unwrap_or_default(),
-                    }
-                }),
-            fn_signature,
-        ))
-        .then_ignore(just(Token::Newline));
-        let trait_stmt = just(Token::Trait)
-            .ignore_then(binder)
-            .then(
-                binder
-                    .separated_by(just(Token::Comma))
-                    .at_least(1)
-                    .allow_trailing()
-                    .collect::<Vec<_>>()
-                    .delimited_by(just(Token::LParen), just(Token::RParen)),
-            )
-            .then(requires_clause(expr.clone()).or_not())
-            .then_ignore(just(Token::Colon))
-            .then_ignore(just(Token::Newline))
-            .then_ignore(just(Token::Indent).labelled("indented associated types and signatures"))
-            .then(
-                trait_item
-                    .then_ignore(just(Token::Newline).repeated())
-                    .repeated()
-                    .at_least(1)
-                    .collect::<Vec<_>>(),
-            )
-            .then_ignore(just(Token::Dedent))
-            .validate(|(((name, params), requires), items), e, emitter| {
-                let heads = std::iter::once((&name, "trait name"))
-                    .chain(params.iter().map(|p| (p, "trait operand")))
-                    .chain(items.iter().filter_map(|i| match i {
-                        TraitItem::AssocType { name, .. } => Some((name, "associated type")),
-                        TraitItem::Function(_) => None,
-                    }));
-                for (head, what) in heads {
-                    if !is_type_name(&head.node) {
-                        emitter.emit(Rich::custom(
-                            head.span,
-                            format!(
-                                "{what} `{}` begins with a lowercase letter; it names a type, \
-                                 so it is capitalized",
-                                head.node
-                            ),
-                        ));
-                    }
-                }
-                Spanned::new(
-                    e.span(),
-                    Stmt::TraitDecl(TraitDecl {
-                        name,
-                        params,
-                        requires: requires.unwrap_or_default(),
-                        items,
-                    }),
-                )
-            });
-
-        // ---- simple statements (must end at NEWLINE) ----------------
         let return_stmt = just(Token::Return)
             .ignore_then(expr.clone().or_not())
-            .map_with(|value, e| Spanned::new(e.span(), Stmt::Return(value)));
+            .map_with(|value, e| Spanned::new(e.span(), Stmt::Return(value)))
+            .boxed();
 
-        let pass_stmt = just(Token::Pass).map_with(|_, e| Spanned::new(e.span(), Stmt::Pass));
+        let pass_stmt = just(Token::Pass)
+            .map_with(|_, e| Spanned::new(e.span(), Stmt::Pass))
+            .boxed();
         let raise_stmt = just(Token::Raise)
             .ignore_then(expr.clone())
-            .map_with(|value, e| Spanned::new(e.span(), Stmt::Raise(value)));
+            .map_with(|value, e| Spanned::new(e.span(), Stmt::Raise(value)))
+            .boxed();
 
         // Statement-level rules that begin with an expression. We parse
         // a comma-separated *list* of expressions first (so bare-tuple
@@ -2491,7 +1703,8 @@ where
                 } else {
                     Spanned::new(e.span(), Expr::Tuple(elts))
                 }
-            });
+            })
+            .boxed();
         // `try_map_with` so an LHS that doesn't reduce to a binding pattern
         // (e.g. `1 + 2 = x`) becomes a parse error rather than a lowering-time
         // rejection. Expression statements (`AssignTail::None`) keep the full
@@ -2501,7 +1714,8 @@ where
         // needs an `=` before it.
         let declared = annotation_mode()
             .then(expr.clone())
-            .map(|(mode, ty)| AssignTail::Declared(TypeAnnotation { mode, ty }));
+            .map(|(mode, ty)| AssignTail::Declared(TypeAnnotation { mode, ty }))
+            .boxed();
         let expr_or_assign = bare_tuple
             .clone()
             .then(
@@ -2511,7 +1725,8 @@ where
                     .then_ignore(statement_end.clone())
                     .recover_with(via_parser(skip_rhs.clone().to(AssignTail::Broken))),
             )
-            .try_map_with(|(target, tail), e| assign_stmt(target, tail, e.span()));
+            .try_map_with(|(target, tail), e| assign_stmt(target, tail, e.span()))
+            .boxed();
 
         // `x = if c: … else: …`, `x = match v: …`, `x = try: …` and `x = with begin(): …` —
         // a block statement on the right of an assignment, whose value is the block's own
@@ -2538,7 +1753,8 @@ where
             none_of([Token::BlockValueIndent, Token::BlockValueDedent]).ignored(),
         ))
         .repeated()
-        .then_ignore(just(Token::BlockValueDedent));
+        .then_ignore(just(Token::BlockValueDedent))
+        .boxed();
         let block_value = choice((
             if_stmt.clone(),
             match_stmt.clone(),
@@ -2552,11 +1768,13 @@ where
         })
         .recover_with(via_parser(
             skip_block_tail.map_with(|_, e| Spanned::new(e.span(), Expr::Error)),
-        ));
+        ))
+        .boxed();
         let block_assign = just(Token::BlockValueIndent)
             .ignore_then(bare_tuple.clone())
             .then(assign_tail(block_value, expr.clone()))
-            .try_map_with(|(target, tail), e| assign_stmt(target, tail, e.span()));
+            .try_map_with(|(target, tail), e| assign_stmt(target, tail, e.span()))
+            .boxed();
 
         // A simple statement ends in either `Newline` or `;` (Python-style
         // one-liners: `x = 1; y = 2`). A statement followed by `;` may also
@@ -2570,7 +1788,8 @@ where
             param_stmt,
             expr_or_assign,
         ))
-        .then_ignore(stmt_terminator);
+        .then_ignore(stmt_terminator)
+        .boxed();
 
         // `pub` before the statement it marks. Any statement parses after it, so
         // `pub` on one that introduces no member is reported against that
@@ -2589,7 +1808,8 @@ where
                         stmt: Box::new(inner),
                     },
                 )
-            });
+            })
+            .boxed();
 
         // `const` before the `param` it marks (`docs/chl-spec.md`, "9.19 Constants"). Any
         // statement parses after it, so `const` on one that is no `param` is reported against
@@ -2609,14 +1829,17 @@ where
                     }
                 }
                 Spanned::new(e.span(), inner.node)
-            });
+            })
+            .boxed();
 
-        let stmt_recovery = skip_statement.map_with(|_, e| {
-            Spanned::new(
-                e.span(),
-                failed_statement(Vec::new(), false, Vec::new(), false),
-            )
-        });
+        let stmt_recovery = skip_statement
+            .map_with(|_, e| {
+                Spanned::new(
+                    e.span(),
+                    failed_statement(Vec::new(), false, Vec::new(), false),
+                )
+            })
+            .boxed();
 
         choice((
             if_stmt,
@@ -2640,6 +1863,1004 @@ where
         .recover_with(via_parser(stmt_recovery))
         .boxed()
     })
+    .boxed()
+}
+
+/// The declaration parsers.
+struct DeclarationStatements<'src, I: ValueInput<'src, Token = Token, Span = Span>> {
+    type_stmt: StmtParser<'src, I>,
+    def_stmt: StmtParser<'src, I>,
+    builtin_def: StmtParser<'src, I>,
+    impl_stmt: StmtParser<'src, I>,
+    trait_stmt: StmtParser<'src, I>,
+}
+
+/// Type, function, builtin, `impl`/`instance` and trait declarations.
+fn declaration_statements<'src, I>(
+    expr: BoxedParser<'src, I, Spanned<Expr>>,
+    block: BoxedParser<'src, I, Vec<Spanned<Stmt>>>,
+    param: BoxedParser<'src, I, Param>,
+    skip_tail: BoxedParser<'src, I, ()>,
+) -> DeclarationStatements<'src, I>
+where
+    I: ValueInput<'src, Token = Token, Span = Span> + 'src,
+{
+    let binder = select! { Token::Ident(s) => s }.map_with(|s, e| Spanned::new(e.span(), s));
+    let ctor_param = binder
+        .then_ignore(just(Token::Colon))
+        .or_not()
+        .then(expr.clone())
+        .map(|(name, ty)| ConstructorParam { name, ty })
+        .boxed();
+    // Parentheses hold at least one parameter: a constructor that declares none is a
+    // value, written without them.
+    let ctor_line = binder
+        .then(
+            ctor_param
+                .separated_by(just(Token::Comma))
+                .at_least(1)
+                .allow_trailing()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LParen), just(Token::RParen))
+                .or_not()
+                .map(Option::unwrap_or_default),
+        )
+        .then_ignore(just(Token::Newline))
+        .validate(|(name, params), _, emitter| {
+            if is_type_name(&name.node) {
+                emitter.emit(Rich::custom(
+                    name.span,
+                    format!(
+                        "constructor `{}` is capitalized, which names a type; a \
+                         constructor begins with a lowercase letter",
+                        name.node
+                    ),
+                ));
+            }
+            Constructor { name, params }
+        })
+        .boxed();
+    let type_body = choice((
+        just(Token::Eq)
+            .ignore_then(expr.clone())
+            .then_ignore(just(Token::Newline))
+            .map(TypeDeclBody::Single),
+        just(Token::Colon)
+            .ignore_then(just(Token::Newline))
+            .ignore_then(just(Token::Indent).labelled("indented constructor lines"))
+            .ignore_then(
+                ctor_line
+                    .then_ignore(just(Token::Newline).repeated())
+                    .repeated()
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )
+            .then_ignore(just(Token::Dedent))
+            .map(TypeDeclBody::Constructors),
+    ))
+    .boxed();
+    // A parameter with its kind, `T: K`, a family parameter's a kind arrow,
+    // `V: K => Type` (`docs/chl-spec.md`, "Family parameters").
+    let type_decl_param = binder
+        .then(
+            choice((
+                just(Token::Colon)
+                    .ignore_then(expr.clone())
+                    .map(KindAnnotation::Kind),
+                just(Token::LtColon)
+                    .ignore_then(expr.clone())
+                    .map(KindAnnotation::Bound),
+            ))
+            .or_not(),
+        )
+        .map(|(name, annotation)| TypeParam {
+            name: name.node,
+            name_span: name.span,
+            annotation,
+            except: Vec::new(),
+        })
+        .boxed();
+    let type_stmt = just(Token::Type)
+        .ignore_then(binder)
+        .then(
+            type_decl_param
+                .separated_by(just(Token::Comma))
+                .at_least(1)
+                .allow_trailing()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LParen), just(Token::RParen))
+                .or_not()
+                .map(Option::unwrap_or_default),
+        )
+        .then(type_body)
+        .validate(|((name, params), body), e, emitter| {
+            let heads = std::iter::once((&name.node, name.span, "type name")).chain(
+                params
+                    .iter()
+                    .map(|p| (&p.name, p.name_span, "type parameter")),
+            );
+            for (head, span, what) in heads {
+                if !is_type_name(head) {
+                    emitter.emit(Rich::custom(
+                        span,
+                        format!(
+                            "{what} `{head}` begins with a lowercase letter; a type's name \
+                             is capitalized"
+                        ),
+                    ));
+                }
+            }
+            Spanned::new(e.span(), Stmt::TypeDecl(TypeDecl { name, params, body }))
+        })
+        .boxed();
+
+    // `def f` or `def Price::f`: a qualifying type makes the function an associated
+    // function of that type.
+    let def_name = binder
+        .then_ignore(just(Token::ColonColon))
+        .or_not()
+        .then(
+            select! { Token::Ident(s) => s }
+                .map_with(|s, e| Spanned::new(e.span(), s))
+                .labelled("function name"),
+        )
+        .boxed();
+    // The parameters, the result and the clauses.
+    let def_signature = param
+        .clone()
+        .separated_by(just(Token::Comma))
+        .allow_trailing()
+        .collect::<Vec<_>>()
+        .try_map(|items, _| split_params(items))
+        .delimited_by(just(Token::LParen), just(Token::RParen))
+        .then(just(Token::DoubleArrow).ignore_then(expr.clone()).or_not())
+        .then(effect_clauses(expr.clone(), requirement(expr.clone())).boxed())
+        .boxed();
+    // The signature: `def` through the clauses.
+    let def_head = just(Token::Def)
+        .ignore_then(def_name.clone())
+        .then(def_signature.clone())
+        .boxed();
+    let def_stmt = just(Token::Def)
+        .ignore_then(def_name)
+        .then(
+            def_signature
+                .then_ignore(just(Token::Colon))
+                .then(block.clone())
+                .map(Some)
+                .recover_with(via_parser(skip_tail.clone().to(None))),
+        )
+        .map_with(|((owner, name), tail), e| {
+            let Some(((((type_params, params), output), (requires, causes)), body)) = tail else {
+                let name = owner.map_or_else(
+                    || name.node.clone(),
+                    |owner| format!("{}::{}", owner.node, name.node).into(),
+                );
+                return Spanned::new(
+                    e.span(),
+                    failed_statement(vec![name], false, Vec::new(), false),
+                );
+            };
+            Spanned::new(
+                e.span(),
+                Stmt::FunctionDef {
+                    owner,
+                    name,
+                    type_params,
+                    params,
+                    output,
+                    requires: Box::new(requires),
+                    causes: Box::new(causes),
+                    body,
+                    builtin: None,
+                },
+            )
+        })
+        .boxed();
+    // ---- @Builtin above a `def` with no body ---------------------
+    // (`docs/chl-spec.md`, "9.16 The std root")
+    //
+    // The decorator and its declaration are one statement, as the other decorators' are,
+    // and the signature ends the declaration. `pub` stands on the line below the
+    // decorator. Lowering refuses it outside a std module.
+    let builtin_def = just(Token::At)
+        .ignore_then(select! { Token::Ident(s) if s == "Builtin" => () }.map_with(|(), e| e.span()))
+        .then_ignore(just(Token::Newline))
+        .then(just(Token::Pub).map_with(|_, e| e.span()).or_not())
+        .then(
+            def_head
+                .then_ignore(just(Token::Newline))
+                .map_with(|head, e| (head, e.span())),
+        )
+        .map_with(
+            |(
+                (builtin, keyword),
+                (((owner, name), (((type_params, params), output), (requires, causes))), def_span),
+            ),
+             e| {
+                let def = Spanned::new(
+                    def_span,
+                    Stmt::FunctionDef {
+                        owner,
+                        name,
+                        type_params,
+                        params,
+                        output,
+                        requires: Box::new(requires),
+                        causes: Box::new(causes),
+                        body: Vec::new(),
+                        builtin: Some(builtin),
+                    },
+                );
+                match keyword {
+                    None => Spanned::new(e.span(), def.node),
+                    Some(keyword) => Spanned::new(
+                        e.span(),
+                        Stmt::Pub {
+                            keyword,
+                            stmt: Box::new(def),
+                        },
+                    ),
+                }
+            },
+        )
+        .boxed();
+
+    // ---- impl N(P…): ( [pub] def … | A = T )+ ----------------------
+    // (`docs/chl-spec.md`, "Associated functions and methods" and "Declaring an instance")
+    #[derive(Clone)]
+    enum ImplItem {
+        Def(Box<Spanned<Stmt>>),
+        Assoc(AssocArg),
+    }
+    let impl_def = just(Token::Pub)
+        .map_with(|_, e| e.span())
+        .or_not()
+        .then(def_stmt.clone())
+        .map_with(|(keyword, def), e| match keyword {
+            None => def,
+            Some(keyword) => Spanned::new(
+                e.span(),
+                Stmt::Pub {
+                    keyword,
+                    stmt: Box::new(def),
+                },
+            ),
+        })
+        .boxed();
+    // An instance defines an associated type its trait declares as a type alias is
+    // written, `Elem = T`.
+    let impl_assoc = select! { Token::Ident(s) => s }
+        .map_with(|s, e| (s, e.span()))
+        .then_ignore(just(Token::Eq))
+        .then(expr.clone())
+        .then_ignore(just(Token::Newline))
+        .map(|((name, name_span), value)| AssocArg {
+            name,
+            name_span,
+            value,
+        })
+        .boxed();
+    let impl_item = choice((
+        impl_def.map(|d| ImplItem::Def(Box::new(d))),
+        impl_assoc.map(ImplItem::Assoc),
+    ))
+    .boxed();
+    // `impl` heads a type applied to its parameters, and `instance` a trait applied to the
+    // types an instance is for, spelled as a requirement is. A head with no block is an
+    // instance of a trait with no functions, `instance Equatable(Money, Money)`. An
+    // instance's type variables are declared before its head,
+    // `instance forall (T) Area(Two(T))`; each is a capitalized name.
+    let instance_vars = just(Token::Forall)
+        .ignore_then(
+            binder
+                .validate(|name, _, emitter| {
+                    if !is_type_name(&name.node) {
+                        emitter.emit(Rich::custom(
+                            name.span,
+                            format!(
+                                "type variable `{}` begins with a lowercase letter; it names \
+                             a type, so it is capitalized",
+                                name.node
+                            ),
+                        ));
+                    }
+                    name
+                })
+                .separated_by(just(Token::Comma))
+                .at_least(1)
+                .allow_trailing()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LParen), just(Token::RParen)),
+        )
+        .boxed();
+    let impl_body = just(Token::Colon)
+        .ignore_then(just(Token::Newline))
+        .ignore_then(just(Token::Indent).labelled("indented `def`s"))
+        .ignore_then(
+            impl_item
+                .then_ignore(just(Token::Newline).repeated())
+                .repeated()
+                .at_least(1)
+                .collect::<Vec<_>>(),
+        )
+        .then_ignore(just(Token::Dedent))
+        .or(just(Token::Newline).to(Vec::new()))
+        .boxed();
+    let impl_stmt = just(Token::Impl)
+        .to(false)
+        .or(just(Token::Instance).to(true))
+        .then(instance_vars.or_not())
+        .then(trait_type(expr.clone()))
+        .then(requires_clause(expr.clone()).or_not())
+        .then(impl_body)
+        .map_with(|((((instance, vars), head), requires), items), e| {
+            let TraitType {
+                qualifier,
+                name,
+                name_span,
+                args,
+                ..
+            } = head.node;
+            let mut defs = Vec::new();
+            let mut assoc = Vec::new();
+            for item in items {
+                match item {
+                    ImplItem::Def(def) => defs.push(*def),
+                    ImplItem::Assoc(a) => assoc.push(a),
+                }
+            }
+            let block = ImplBlock {
+                vars: vars.unwrap_or_default(),
+                qualifier,
+                ty: Spanned::new(name_span, name),
+                args,
+                assoc,
+                requires: requires.unwrap_or_default(),
+                defs,
+            };
+            let stmt = if instance {
+                Stmt::Instance(block)
+            } else {
+                Stmt::Impl(block)
+            };
+            Spanned::new(e.span(), stmt)
+        })
+        .boxed();
+
+    // ---- trait T(P…): ( type A | def f(…) => R requires … )+ -------
+    // (`docs/chl-spec.md`, "Declaring a trait")
+    let fn_signature = just(Token::Def)
+        .ignore_then(
+            select! { Token::Ident(s) => s }
+                .labelled("function name")
+                .map_with(|s, e| Spanned::new(e.span(), s)),
+        )
+        .then(
+            param
+                .separated_by(just(Token::Comma))
+                .allow_trailing()
+                .collect::<Vec<_>>()
+                .try_map(|items, _| split_params(items))
+                .delimited_by(just(Token::LParen), just(Token::RParen)),
+        )
+        .then(just(Token::DoubleArrow).ignore_then(expr.clone()).or_not())
+        .then(effect_clauses(expr.clone(), requirement(expr.clone())).boxed())
+        .map_with(
+            |(((name, (type_params, params)), output), (requires, causes)), e| {
+                TraitItem::Function(Box::new(Spanned::new(
+                    e.span(),
+                    FunctionSignature {
+                        name,
+                        type_params,
+                        params,
+                        output,
+                        requires,
+                        causes,
+                    },
+                )))
+            },
+        )
+        .boxed();
+    // An associated type is its capitalized name, alone or bounded, `Size <: Int`: it is a
+    // type the instance defines, as an alias, not a nominal type a `type` declaration
+    // introduces. One bounded by `Effect` or `Context` stands for a clause.
+    let trait_item = choice((
+        binder
+            .then(
+                just(Token::LtColon)
+                    .ignore_then(expr.clone())
+                    .then(except_list(clause_item(expr.clone())).or_not())
+                    .or_not(),
+            )
+            .map(|(name, bounded)| {
+                let (bound, except) = bounded.map_or((None, None), |(b, e)| (Some(b), e));
+                TraitItem::AssocType {
+                    name,
+                    bound,
+                    except: except.unwrap_or_default(),
+                }
+            }),
+        fn_signature,
+    ))
+    .then_ignore(just(Token::Newline))
+    .boxed();
+    let trait_stmt = just(Token::Trait)
+        .ignore_then(binder)
+        .then(
+            binder
+                .separated_by(just(Token::Comma))
+                .at_least(1)
+                .allow_trailing()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LParen), just(Token::RParen)),
+        )
+        .then(requires_clause(expr.clone()).or_not())
+        .then_ignore(just(Token::Colon))
+        .then_ignore(just(Token::Newline))
+        .then_ignore(just(Token::Indent).labelled("indented associated types and signatures"))
+        .then(
+            trait_item
+                .then_ignore(just(Token::Newline).repeated())
+                .repeated()
+                .at_least(1)
+                .collect::<Vec<_>>(),
+        )
+        .then_ignore(just(Token::Dedent))
+        .validate(|(((name, params), requires), items), e, emitter| {
+            let heads = std::iter::once((&name, "trait name"))
+                .chain(params.iter().map(|p| (p, "trait operand")))
+                .chain(items.iter().filter_map(|i| match i {
+                    TraitItem::AssocType { name, .. } => Some((name, "associated type")),
+                    TraitItem::Function(_) => None,
+                }));
+            for (head, what) in heads {
+                if !is_type_name(&head.node) {
+                    emitter.emit(Rich::custom(
+                        head.span,
+                        format!(
+                            "{what} `{}` begins with a lowercase letter; it names a type, \
+                             so it is capitalized",
+                            head.node
+                        ),
+                    ));
+                }
+            }
+            Spanned::new(
+                e.span(),
+                Stmt::TraitDecl(TraitDecl {
+                    name,
+                    params,
+                    requires: requires.unwrap_or_default(),
+                    items,
+                }),
+            )
+        })
+        .boxed();
+
+    // ---- simple statements (must end at NEWLINE) ----------------
+    DeclarationStatements {
+        type_stmt,
+        def_stmt,
+        builtin_def,
+        impl_stmt,
+        trait_stmt,
+    }
+}
+
+/// The module statement parsers.
+struct ModuleStatements<'src, I: ValueInput<'src, Token = Token, Span = Span>> {
+    module_stmt: StmtParser<'src, I>,
+    param_stmt: StmtParser<'src, I>,
+    decorated_stmt: StmtParser<'src, I>,
+}
+
+/// The module statements, `import`, `run`, `use`, `param`, and decorated statements.
+fn module_statements<'src, I>(
+    expr: BoxedParser<'src, I, Spanned<Expr>>,
+    skip_rhs: BoxedParser<'src, I, ()>,
+    statement_end: BoxedParser<'src, I, Token>,
+    value_expr: BoxedParser<'src, I, Spanned<Expr>>,
+) -> ModuleStatements<'src, I>
+where
+    I: ValueInput<'src, Token = Token, Span = Span> + 'src,
+{
+    // ---- module statements: import, run, param ------------------
+    // (`docs/chl-spec.md`, "9.2 Imports", "9.3 Runs", "9.4 Parameters")
+    let binder = select! { Token::Ident(s) => s }.map_with(|s, e| Spanned::new(e.span(), s));
+    let alias_name = binder.validate(|name, _, emitter| {
+        if is_type_name(&name.node) {
+            emitter.emit(Rich::custom(
+                name.span,
+                format!(
+                    "`{}` is capitalized, which names a type; a module or run \
+                         name begins with a lowercase letter",
+                    name.node
+                ),
+            ));
+        }
+        name
+    });
+    let module_alias = just(Token::As).ignore_then(alias_name).or_not().boxed();
+    let recovered_alias = just(Token::As)
+        .ignore_then(
+            alias_name
+                .map(Some)
+                .recover_with(via_parser(skip_rhs.clone().to(None))),
+        )
+        .or_not()
+        .boxed();
+    let use_item = binder
+        .then(just(Token::As).ignore_then(binder).or_not())
+        .validate(|(name, alias), _, emitter| {
+            if let Some(alias) = &alias
+                && is_type_name(&name.node) != is_type_name(&alias.node)
+            {
+                emitter.emit(Rich::custom(
+                    alias.span,
+                    format!(
+                        "`{}` and `{}` differ in case; a capitalized name is a type, so \
+                         a `use` alias keeps the case of the member it names",
+                        name.node, alias.node
+                    ),
+                ));
+            }
+            UseItem { name, alias }
+        })
+        .boxed();
+    let use_clause = just(Token::Use)
+        .ignore_then(choice((
+            use_item
+                .clone()
+                .separated_by(just(Token::Comma))
+                .at_least(1)
+                .allow_trailing()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LParen), just(Token::RParen)),
+            use_item
+                .separated_by(just(Token::Comma))
+                .at_least(1)
+                .collect::<Vec<_>>(),
+        )))
+        .or_not()
+        .map(Option::unwrap_or_default)
+        .boxed();
+
+    // The keyword arguments of an `import` or a `run`, `(port="8080")`.
+    let module_args = binder
+        .then_ignore(just(Token::Eq))
+        .then(expr.clone())
+        .map(|(name, value)| KeywordArg { name, value })
+        .separated_by(just(Token::Comma))
+        .allow_trailing()
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::LParen), just(Token::RParen))
+        .map(Ok)
+        .recover_with(via_parser(nested_delimiters(
+            Token::LParen,
+            Token::RParen,
+            [],
+            |_| Err(()),
+        )))
+        .or_not()
+        .map(|args| args.unwrap_or_else(|| Ok(Vec::new())))
+        .boxed();
+
+    let module_parts = module_path()
+        .then(module_args)
+        .then(recovered_alias)
+        .then(
+            use_clause
+                .map(Some)
+                .recover_with(via_parser(skip_rhs.clone().to(None))),
+        )
+        .then(
+            statement_end
+                .clone()
+                .to(true)
+                .recover_with(via_parser(skip_rhs.clone().to(false))),
+        )
+        .boxed();
+    let module_stmt = one_of([Token::Import, Token::Run])
+        .then(module_parts)
+        .map_with(|(keyword, ((((path, args), alias), uses), ended)), e| {
+            let broken = args.is_err() || uses.is_none() || !ended || matches!(alias, Some(None));
+            let unknown_alias = matches!(alias, Some(None));
+            let alias = alias.flatten();
+            let stmt = if broken {
+                let unknown = unknown_alias;
+                let modules = if unknown {
+                    Vec::new()
+                } else {
+                    alias
+                        .as_ref()
+                        .map(|a| a.node.clone())
+                        .or_else(|| path.segments.last().map(|s| s.node.clone()))
+                        .into_iter()
+                        .collect()
+                };
+                let binds = uses
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|u| u.alias.as_ref().unwrap_or(&u.name).node.clone())
+                    .collect();
+                failed_statement(binds, false, modules, unknown)
+            } else if keyword == Token::Import {
+                Stmt::Import {
+                    path,
+                    args: args.unwrap(),
+                    alias,
+                    uses: uses.unwrap(),
+                }
+            } else {
+                Stmt::Run {
+                    path,
+                    args: args.unwrap(),
+                    alias,
+                    uses: uses.unwrap(),
+                    renamed_from: None,
+                }
+            };
+            Spanned::new(e.span(), stmt)
+        })
+        .boxed();
+
+    let run_stmt = just(Token::Run)
+        .rewind()
+        .ignore_then(module_stmt.clone())
+        .boxed();
+
+    // A capitalized parameter is a type parameter, known through a bound
+    // (`<:`); a lowercase one is a value, known through its exact type
+    // (`:`). The case decides which annotation the parameter takes.
+    let param_stmt = just(Token::Param)
+        .ignore_then(binder)
+        .then(
+            annotation_mode()
+                .then(expr.clone())
+                .map(|(mode, ty)| TypeAnnotation { mode, ty })
+                .or_not()
+                .then(just(Token::Eq).ignore_then(value_expr.clone()).or_not())
+                .then_ignore(statement_end.clone())
+                .map(Some)
+                .recover_with(via_parser(skip_rhs.clone().to(None))),
+        )
+        .validate(|(name, tail), e, emitter| {
+            let Some((annotation, default)) = tail else {
+                return Spanned::new(
+                    e.span(),
+                    failed_statement(vec![name.node], false, Vec::new(), false),
+                );
+            };
+            let is_type = is_type_name(&name.node);
+            match annotation.as_ref().map(|a| a.mode) {
+                Some(AnnotationMode::Bounded) if !is_type => emitter.emit(Rich::custom(
+                    e.span(),
+                    format!(
+                        "a value parameter's type is exact: `param {}: T`; `<:` bounds a \
+                         type parameter, whose name is capitalized",
+                        name.node
+                    ),
+                )),
+                Some(AnnotationMode::Exact) if is_type => emitter.emit(Rich::custom(
+                    e.span(),
+                    format!(
+                        "a type parameter is known through a bound: `param {} <: T`",
+                        name.node
+                    ),
+                )),
+                _ => {}
+            }
+            Spanned::new(
+                e.span(),
+                Stmt::Param {
+                    name,
+                    annotation,
+                    default,
+                    constant: None,
+                },
+            )
+        })
+        .boxed();
+
+    // ---- Decorators: @LoadFrom(x), @RenamedFrom(r), @Discard -------
+    //
+    // A decorator and the declaration it decorates are one statement, not a
+    // general decorator grammar attached to an arbitrary one. Each decorator
+    // takes its own declaration form: `@LoadFrom` the only declaration that
+    // may carry an annotation without a value, since the decorator is where
+    // the value comes from, `@RenamedFrom` a `run`, and `@Discard` a
+    // declaration head with neither.
+    // Parsing each pair together is what keeps a bare `y: T` a parse error
+    // everywhere else.
+    //
+    // The decorator name is matched as an identifier and checked once the
+    // declaration has parsed, so an unknown one is reported by name rather
+    // than as a failure to find `@`.
+    let discard_head = choice((
+        just(Token::Run)
+            .ignore_then(module_path())
+            .then(module_alias)
+            .map(|(path, alias)| DiscardHead::Run { path, alias }),
+        binder.map(DiscardHead::Name),
+    ))
+    .boxed();
+    let decorator_arg = select! { Token::Ident(s) => s }
+        .map_with(|s, e| Spanned::new(e.span(), s))
+        .delimited_by(just(Token::LParen), just(Token::RParen))
+        .then_ignore(just(Token::Newline))
+        .boxed();
+    // `pub` is refused on a `run`, decorated or not; it is parsed here so the
+    // refusal names it.
+    let renamed_from_tail = decorator_arg
+        .clone()
+        .then(just(Token::Pub).map_with(|_, e| e.span()).or_not())
+        .then(run_stmt.clone())
+        .validate(|((source, keyword), run), _, emitter| {
+            if let Some(keyword) = keyword {
+                let refused = pub_refusal(&run.node).expect("`pub` is refused on every `run`");
+                emitter.emit(Rich::custom(keyword, refused));
+            }
+            let Stmt::Run {
+                path,
+                args,
+                alias,
+                uses,
+                renamed_from: None,
+            } = run.node
+            else {
+                unreachable!("`run_stmt` parses an undecorated `Stmt::Run`")
+            };
+            let stmt = Stmt::Run {
+                path,
+                args,
+                alias,
+                uses,
+                renamed_from: Some(source),
+            };
+            (None, stmt)
+        })
+        .boxed();
+    let load_from_tail = decorator_arg
+        // A loaded declaration is an ordinary declaration with no
+        // initializer, so it takes `pub` where any declaration does: at the
+        // head of its own line.
+        .then(just(Token::Pub).map_with(|_, e| e.span()).or_not())
+        .then(
+            select! { Token::Ident(s) => s }
+                .map_with(|s, e| Spanned::new(e.span(), AssignTarget::Name(s))),
+        )
+        .then(
+            annotation_mode()
+                .then(expr.clone())
+                .map(|(mode, ty)| TypeAnnotation { mode, ty }),
+        )
+        .map(|(((source, keyword), target), annotation)| {
+            let stmt = Stmt::LoadFrom {
+                target,
+                annotation,
+                source,
+            };
+            (keyword, stmt)
+        })
+        .boxed();
+    let discard_tail = just(Token::Newline)
+        .ignore_then(discard_head)
+        .map(|head| (None, Stmt::Discard(head)))
+        .boxed();
+    let decorated_stmt = just(Token::At)
+        .ignore_then(select! { Token::Ident(s) => s }.map_with(|s, e| (s, e.span())))
+        .then(choice((load_from_tail, renamed_from_tail, discard_tail)))
+        .then_ignore(just(Token::Newline))
+        .try_map_with(|((name, name_span), (keyword, stmt)), e| {
+            let expected = match &stmt {
+                Stmt::LoadFrom { .. } => "LoadFrom",
+                Stmt::Run { .. } => "RenamedFrom",
+                _ => "Discard",
+            };
+            if name == expected {
+                let stmt = Spanned::new(e.span(), stmt);
+                return Ok(match keyword {
+                    None => stmt,
+                    Some(keyword) => Spanned::new(
+                        e.span(),
+                        Stmt::Pub {
+                            keyword,
+                            stmt: Box::new(stmt),
+                        },
+                    ),
+                });
+            }
+            let message = match (name.as_str(), &stmt) {
+                ("LoadFrom", Stmt::Run { .. }) => "a `run` cannot carry `@LoadFrom`, which \
+                                                   loads one variable; a renamed run is \
+                                                   marked `@RenamedFrom(r)`, naming the run \
+                                                   it was"
+                    .to_string(),
+                ("LoadFrom", _) => "`@LoadFrom(x)` names the variable it loads from, and \
+                                    decorates a declaration `y: T` on the next line"
+                    .to_string(),
+                ("RenamedFrom", _) => "`@RenamedFrom(r)` names the run this one was, and \
+                                       decorates a `run` statement on the next line"
+                    .to_string(),
+                ("Discard", _) => "`@Discard` takes no argument, and decorates a \
+                                   declaration head on the next line: a name, a `run`, or \
+                                   an `import`"
+                    .to_string(),
+                _ => format!(
+                    "unknown decorator `{name}`; the decorators are `LoadFrom`, \
+                     `RenamedFrom`, `Discard` and `Builtin`"
+                ),
+            };
+            Err(Rich::custom(name_span, message))
+        })
+        .boxed();
+
+    // ---- type N(P…): constructors | type N(P…) = R ---------------
+    // (`docs/chl-spec.md`, "Declaring a nominal type")
+    //
+    // A constructor parameter's `name:` prefix is optional, and a parameter type
+    // can itself begin with an identifier, so the prefix is tried and rewound.
+    ModuleStatements {
+        module_stmt,
+        param_stmt,
+        decorated_stmt,
+    }
+}
+
+/// The compound statement parsers.
+struct ControlFlowStatements<'src, I: ValueInput<'src, Token = Token, Span = Span>> {
+    if_stmt: StmtParser<'src, I>,
+    try_stmt: StmtParser<'src, I>,
+    match_stmt: StmtParser<'src, I>,
+    for_stmt: StmtParser<'src, I>,
+    with_stmt: StmtParser<'src, I>,
+}
+
+/// The compound statements: `if`, `try`, `match`, `for` and `with`.
+fn control_flow_statements<'src, I>(
+    expr: BoxedParser<'src, I, Spanned<Expr>>,
+    block: BoxedParser<'src, I, Vec<Spanned<Stmt>>>,
+) -> ControlFlowStatements<'src, I>
+where
+    I: ValueInput<'src, Token = Token, Span = Span> + 'src,
+{
+    // ---- if / elif / else ---------------------------------------
+    let if_stmt = just(Token::If)
+        .ignore_then(expr.clone())
+        .then_ignore(just(Token::Colon))
+        .then(block.clone())
+        .then(
+            just(Token::Elif)
+                .ignore_then(expr.clone())
+                .then_ignore(just(Token::Colon))
+                .then(block.clone())
+                .repeated()
+                .collect::<Vec<_>>(),
+        )
+        .then(
+            just(Token::Else)
+                .ignore_then(just(Token::Colon))
+                .ignore_then(block.clone())
+                .or_not(),
+        )
+        .map_with(|(((first_cond, first_body), elifs), else_body), e| {
+            let mut branches = vec![IfBranch {
+                cond: first_cond,
+                body: first_body,
+            }];
+            for (cond, body) in elifs {
+                branches.push(IfBranch { cond, body });
+            }
+            Spanned::new(
+                e.span(),
+                Stmt::If {
+                    branches,
+                    else_body,
+                },
+            )
+        })
+        .boxed();
+
+    // ---- try: body / except T as e: body ------------------------
+    let except_binding = just(Token::As)
+        .ignore_then(select! { Token::Ident(s) => s }.map_with(|s, e| Spanned::new(e.span(), s)))
+        .or_not()
+        .boxed();
+    let try_stmt = just(Token::Try)
+        .ignore_then(just(Token::Colon))
+        .ignore_then(block.clone())
+        .then(
+            just(Token::Except)
+                .ignore_then(expr.clone())
+                .then(except_binding)
+                .then_ignore(just(Token::Colon))
+                .then(block.clone())
+                .map(|((ty, binding), body)| ExceptClause { ty, binding, body })
+                .repeated()
+                .at_least(1)
+                .collect::<Vec<_>>(),
+        )
+        .map_with(|(body, handlers), e| Spanned::new(e.span(), Stmt::Try { body, handlers }))
+        .boxed();
+
+    // ---- match scrutinee: case `tag(binder): body ---------------
+    //
+    // The arm list is itself an indented block, so a `match` is two levels
+    // of layout: `Indent` for the arms, then each arm's own `block` for its
+    // body. An arm may instead hold one expression on its `case` line, which
+    // its `Newline` ends (`docs/chl-spec.md`, "An arm on its `case` line"). The
+    // arms themselves come from `match_arms`, shared with the one-line form in
+    // `expression()`.
+    let arm_on_its_line = expr
+        .clone()
+        .map_with(|body: Spanned<Expr>, e| vec![Spanned::new(e.span(), Stmt::Expr(body))])
+        .then_ignore(just(Token::Newline).repeated().at_least(1))
+        .boxed();
+    let match_stmt = just(Token::Match)
+        .ignore_then(expr.clone())
+        .then_ignore(just(Token::Colon))
+        .then_ignore(just(Token::Newline))
+        .then_ignore(just(Token::Indent).labelled("indented `case` arms"))
+        .then(match_arms(choice((
+            block.clone().then_ignore(just(Token::Newline).repeated()),
+            arm_on_its_line,
+        ))))
+        .then_ignore(just(Token::Dedent))
+        .map_with(|(scrutinee, arms), e| Spanned::new(e.span(), Stmt::Match { scrutinee, arms }))
+        .boxed();
+
+    // ---- for x in iter: body ------------------------------------
+    let for_stmt = just(Token::For)
+        .ignore_then(bare_target(expr.clone()).try_map(|t, _| {
+            expr_to_assign_target(t).map_err(|bad| Rich::custom(bad, "invalid for-loop target"))
+        }))
+        .then_ignore(just(Token::In))
+        .then(expr.clone())
+        .then_ignore(just(Token::Colon))
+        .then(block.clone())
+        .map_with(|((target, iter), body), e| {
+            Spanned::new(e.span(), Stmt::For { target, iter, body })
+        })
+        .boxed();
+
+    // ---- with <binding> = begin(): body -------------------------
+    // The transaction form `with t = begin():` binds `t` to the commit
+    // time; the binding prefix backtracks (`.or_not()`) so a bare
+    // `with begin():` still parses. The context is a call expression
+    // (`begin()`); lowering validates it.
+    let with_binding = select! { Token::Ident(s) => s }
+        .then_ignore(just(Token::Eq))
+        .or_not()
+        .boxed();
+    let with_stmt = just(Token::With)
+        .ignore_then(with_binding)
+        .then(expr.clone())
+        .then_ignore(just(Token::Colon))
+        .then(block.clone())
+        .map_with(|((binding, context), body), e| {
+            Spanned::new(
+                e.span(),
+                Stmt::With {
+                    binding,
+                    context,
+                    body,
+                },
+            )
+        })
+        .boxed();
+
+    // ---- def name(params): body ---------------------------------
+    // A function type's clause runs on through each capitalized item after it, so one in a
+    // parameter list is parenthesized (`docs/chl-spec.md`, "Writing requirements and
+    // effects").
+    ControlFlowStatements {
+        if_stmt,
+        try_stmt,
+        match_stmt,
+        for_stmt,
+        with_stmt,
+    }
 }
 
 /// A module path, `shop::cart`, holding the rule its segments follow
@@ -2662,6 +2883,7 @@ where
             }
             WrittenPath { segments }
         })
+        .boxed()
 }
 
 /// Why `const` cannot stand on `stmt`, which is not a `param` that `const` is not already
@@ -2788,6 +3010,8 @@ enum AssignTail {
 /// caller succeed. A caller that wants it appends `empty().to(AssignTail::None)`.
 fn assign_tail<'src, I, R, T>(rhs: R, ty: T) -> impl Parser<'src, I, AssignTail, PErr<'src>> + Clone
 where
+    R: 'src,
+    T: 'src,
     I: ValueInput<'src, Token = Token, Span = Span>,
     R: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
     T: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
@@ -2838,6 +3062,7 @@ where
             .ignore_then(rhs)
             .map(AssignTail::Define),
     ))
+    .boxed()
 }
 
 /// `requires R₀, R₁, …`, the clause that ends a `def` signature or a polymorphic
@@ -2850,15 +3075,18 @@ fn requires_clause<'src, I, E>(
     expr: E,
 ) -> impl Parser<'src, I, Vec<Spanned<Requirement>>, PErr<'src>> + Clone
 where
+    E: 'src,
     I: ValueInput<'src, Token = Token, Span = Span>,
     E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone + 'src,
 {
-    just(Token::Requires).ignore_then(
-        requirement(expr)
-            .separated_by(just(Token::Comma))
-            .at_least(1)
-            .collect::<Vec<_>>(),
-    )
+    just(Token::Requires)
+        .ignore_then(
+            requirement(expr)
+                .separated_by(just(Token::Comma))
+                .at_least(1)
+                .collect::<Vec<_>>(),
+        )
+        .boxed()
 }
 
 /// The `requires` and `causes` clauses after a `def` signature or a function type's codomain,
@@ -2871,6 +3099,8 @@ fn effect_clauses<'src, I, E, R>(
     requirement: R,
 ) -> impl Parser<'src, I, (Clause<Requirement>, Clause<TraitType>), PErr<'src>> + Clone
 where
+    E: 'src,
+    R: 'src,
     I: ValueInput<'src, Token = Token, Span = Span>,
     E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
     R: Parser<'src, I, Spanned<Requirement>, PErr<'src>> + Clone,
@@ -2879,6 +3109,7 @@ where
         .or_not()
         .then(bounded_clause(Token::Causes, clause_item(expr)).or_not())
         .map(|(requires, causes)| (requires.unwrap_or_default(), causes.unwrap_or_default()))
+        .boxed()
 }
 
 /// A function type's `requires` item: a [`clause_item`], which binds no instance.
@@ -2892,24 +3123,28 @@ fn type_requirement<'src, I, E>(
     expr: E,
 ) -> impl Parser<'src, I, Spanned<Requirement>, PErr<'src>> + Clone
 where
+    E: 'src,
     I: ValueInput<'src, Token = Token, Span = Span>,
     E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
 {
-    orderable_if_required_by_requirement(expr.clone()).or(clause_item(expr).map(|ty| {
-        Spanned::new(
-            ty.span,
-            Requirement::Trait {
-                binder: None,
-                ty: ty.node,
-            },
-        )
-    }))
+    orderable_if_required_by_requirement(expr.clone())
+        .or(clause_item(expr).map(|ty| {
+            Spanned::new(
+                ty.span,
+                Requirement::Trait {
+                    binder: None,
+                    ty: ty.node,
+                },
+            )
+        }))
+        .boxed()
 }
 
 fn orderable_if_required_by_requirement<'src, I, E>(
     expr: E,
 ) -> impl Parser<'src, I, Spanned<Requirement>, PErr<'src>> + Clone
 where
+    E: 'src,
     I: ValueInput<'src, Token = Token, Span = Span>,
     E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
 {
@@ -2926,12 +3161,14 @@ where
                 Requirement::OrderableIfRequiredBy { positions, effects },
             )
         })
+        .boxed()
 }
 
 /// A clause item: a trait type whose name is capitalized, `Write(x)`, `_`, or a
 /// requirement's associated effect type, `s::Writes`.
 fn clause_item<'src, I, E>(expr: E) -> impl Parser<'src, I, Spanned<TraitType>, PErr<'src>> + Clone
 where
+    E: 'src,
     I: ValueInput<'src, Token = Token, Span = Span>,
     E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
 {
@@ -2963,6 +3200,7 @@ where
                 ))
             }
         })
+        .boxed()
 }
 
 /// A clause item's argument: an expression, or a top's `*`, alone, `Write(*)`, or after the
@@ -2970,6 +3208,7 @@ where
 /// The `*` is a name, `Expr::Name("*")` or an `Expr::Qualified` one, which lowering reads.
 fn clause_arg<'src, I, E>(expr: E) -> impl Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone
 where
+    E: 'src,
     I: ValueInput<'src, Token = Token, Span = Span>,
     E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
 {
@@ -2988,7 +3227,7 @@ where
             };
             Spanned::new(e.span(), node)
         });
-    top.or(expr)
+    top.or(expr).boxed()
 }
 
 /// Whether a clause ends `ty`, a parameter's type written over `written`: the clause of an arrow
@@ -3027,15 +3266,19 @@ fn bounded_clause<'src, I, T, P>(
     item: P,
 ) -> impl Parser<'src, I, Clause<T>, PErr<'src>> + Clone
 where
+    T: 'src,
+    P: 'src,
     I: ValueInput<'src, Token = Token, Span = Span>,
     P: Parser<'src, I, Spanned<T>, PErr<'src>> + Clone,
     T: Clone,
 {
-    just(keyword).ignore_then(clause_contents(item))
+    just(keyword).ignore_then(clause_contents(item)).boxed()
 }
 
 fn clause_contents<'src, I, T, P>(item: P) -> impl Parser<'src, I, Clause<T>, PErr<'src>> + Clone
 where
+    T: 'src,
+    P: 'src,
     I: ValueInput<'src, Token = Token, Span = Span>,
     P: Parser<'src, I, Spanned<T>, PErr<'src>> + Clone,
     T: Clone,
@@ -3072,6 +3315,7 @@ where
                 scoped,
             }
         })
+        .boxed()
 }
 
 /// `except` and what it takes away: one item, or a parenthesized list of them, so that a
@@ -3079,6 +3323,8 @@ where
 /// effects").
 fn except_list<'src, I, T, P>(item: P) -> impl Parser<'src, I, Vec<Spanned<T>>, PErr<'src>> + Clone
 where
+    T: 'src,
+    P: 'src,
     I: ValueInput<'src, Token = Token, Span = Span>,
     P: Parser<'src, I, Spanned<T>, PErr<'src>> + Clone,
     T: Clone,
@@ -3089,7 +3335,9 @@ where
         .at_least(1)
         .collect::<Vec<_>>()
         .delimited_by(just(Token::LParen), just(Token::RParen));
-    just(Token::Except).ignore_then(choice((listed, item.map(|i| vec![i]))))
+    just(Token::Except)
+        .ignore_then(choice((listed, item.map(|i| vec![i]))))
+        .boxed()
 }
 
 /// One requirement: a trait type, `Addable(A, B)`, and before it the name the requirement
@@ -3100,6 +3348,7 @@ fn requirement<'src, I, E>(
     expr: E,
 ) -> impl Parser<'src, I, Spanned<Requirement>, PErr<'src>> + Clone
 where
+    E: 'src,
     I: ValueInput<'src, Token = Token, Span = Span>,
     E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone + 'src,
 {
@@ -3172,6 +3421,7 @@ where
         .map_with(|r, e| Spanned::new(e.span(), r))
         .boxed()
     })
+    .boxed()
 }
 
 /// A trait type, `Addable(A, B)`: a name, optionally applied to its operand types. An
@@ -3179,6 +3429,7 @@ where
 /// instance" and "Summoning an instance").
 fn trait_type<'src, I, E>(expr: E) -> impl Parser<'src, I, Spanned<TraitType>, PErr<'src>> + Clone
 where
+    E: 'src,
     I: ValueInput<'src, Token = Token, Span = Span>,
     E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
 {
@@ -3207,6 +3458,7 @@ where
                 },
             )
         })
+        .boxed()
 }
 
 /// Split a parameter list into its type parameters, the capitalized names, and its
@@ -3286,6 +3538,7 @@ where
         just(Token::Colon).to(AnnotationMode::Exact),
         just(Token::LtColon).to(AnnotationMode::Bounded),
     ))
+    .boxed()
 }
 
 /// Build the statement an assignment target and its [`AssignTail`] denote.
@@ -3404,6 +3657,7 @@ where
             ctor,
             binders,
         })
+        .boxed()
 }
 
 /// Parse one or more `case` arms with a supplied block or expression-body parser.
@@ -3414,6 +3668,7 @@ where
 /// See `docs/chl-spec.md`, "4.10 `match` — tag dispatch".
 fn match_arms<'src, I, B>(body: B) -> impl Parser<'src, I, Vec<MatchArm>, PErr<'src>> + Clone
 where
+    B: 'src,
     I: ValueInput<'src, Token = Token, Span = Span>,
     B: Parser<'src, I, Vec<Spanned<Stmt>>, PErr<'src>> + Clone,
 {
@@ -3469,6 +3724,7 @@ where
         .repeated()
         .at_least(1)
         .collect::<Vec<_>>()
+        .boxed()
 }
 
 /// A `for` binder: one expression, or several separated by commas, which is the tuple
@@ -3476,6 +3732,7 @@ where
 /// patterns"). The binder ends at `in`, so the comma is unambiguous inside brackets too.
 fn bare_target<'src, I, E>(expr: E) -> impl Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone
 where
+    E: 'src,
     I: ValueInput<'src, Token = Token, Span = Span>,
     E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
 {
@@ -3491,6 +3748,7 @@ where
                 Spanned::new(e.span(), Expr::Tuple(elts))
             }
         })
+        .boxed()
 }
 
 /// Convert an [`Expr`] parsed in target position into an [`AssignTarget`].
