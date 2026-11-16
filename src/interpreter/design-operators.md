@@ -495,6 +495,81 @@ without delivering it is a debug assertion failure, except during unwinding; the
 buffered but no consumer has been woken. [The notification contract](#the-notification-contract)
 specifies forwarding and reentrancy.
 
+### Projection guards
+
+A projection guard names the part of a producer's tile that a `get` asks for. The producer
+returns that part and nothing outside it, and states completeness only for that part.
+
+A projection (`Projection`) is everything, nothing, or the keys of one collection level that a
+predicate 𝑝 admits (`Projection::Keys`). At the outermost level its guard is `Domain(𝑝)`. At level 𝑛
+beneath it, 𝑝 admits whole paths ([Qualified predicates](#qualified-predicates)), and its guard
+wraps the domain guard in 𝑛 codomain guards (`CurryLevel::wrap_guard`). Two projections meet at the
+deeper of their levels, where a key above is every path beneath it, and a region of every path
+beneath some keys is spelled at the level of those keys (`Projection::keys_at`). Any other guard is
+a release's shape. Each producer declares the levels whose keys it restates
+(`TileProducer::restates`). `Restates::Outermost`, the default, names the outermost keys only.
+`Restates::Above(𝑛)` names the outermost keys and the levels above 𝑛, for a producer that keeps its
+input's keys above its level 𝑛 and computes the values beneath them. `Restates::Every` names every
+level. A producer that declares more than the outermost keys reads its projection with
+`TileGuard::projection_for`, and any other with `TileGuard::projection`. Either panics with the
+guard on a shape that is no projection or that names keys at a level the producer does not restate,
+as [Guard operations are exact](#guard-operations-are-exact) requires of a restatement with no
+spelling. `Tile::restrict_to_paths` cuts a tile at a level beneath the outermost
+(`src/interpreter/design-path-projections.md`, "Representation").
+
+- **The answer.** `Tile::restrict_to_keys` keeps the outermost keys 𝑝 admits, each with the value
+  under it, and intersects the tile's `domain_predicate` with 𝑝. A group is whole under its key. A
+  producer asked for part of its keys says nothing about the rest.
+- **The input.** An operator whose outermost keys are its input's forwards 𝑝 to the input, so the
+  input produces only that part. Its answer is built from the input's, so it does not cut, and it
+  equals the whole answer cut to 𝑝. An operator that builds its answer from anything else cuts:
+  accumulators held across pulls (`MapAggregate`), arms already released (`UnionOperator`), or a
+  cache read at a wider region (`Memo`, and the `FanOutSlot` of a cyclic fan-out). An operator whose
+  output keys are not its input's keys, such as a `Converse` inverting its outermost collection,
+  pulls the input in full and cuts its own output. An operator that cannot restate 𝑝 for an input
+  pulls the input in full and still cuts its output: pulling more is sound for a `get`, where a
+  release that names more is not.
+- **Completeness between pulls.** The completeness contract compares a producer's answers inside the
+  region pulled, and a pull of one projection states completeness over its keys only, so a pull of
+  another region withdraws nothing it said of the first.
+- **Check.** Every answer lies within the projection it was asked for: it holds no key the
+  projection omits and no cell where the projection names nothing.
+
+Each operator answers a projection as its row of this table states.
+
+| Operator | Projection |
+| --- | --- |
+| `IterateExtent` | A finite range is cut to the admitted interval before it is rendered. Every other extent renders whole and is cut after. |
+| `Constant` | A collection constant answers the admitted keys. A scalar constant answers the whole value or nothing. |
+| `MapResult` | A keyed input is pulled at the projection; a scalar input is a key looked up in the function, has no keys to project, and is read whole. A function operand that is a collection is pulled at the projection too where the input's values are its keys, the arguments stand at the first level, and the operand is a data function; its keys are released with the data's. Any other function operand is read whole. Beneath the outermost keys the input is pulled at a projection above the level the function applies at (`Restates::Above`), and the function operand is read whole. |
+| `MapResultToConst` | The input is pulled at the projection. The constant is read whole, since every row reads all of it. A projection beneath the outermost keys is answered above the constant's level (`Restates::Above`), and one at or beneath it panics. |
+| `MapResultWithSource` | The input is pulled at the projection, at any level (`Restates::Every`), so a morsel reads only its own keys from the source. |
+| `RecordWrap` | The input is pulled at the projection, which beneath the outermost keys is one above the wrapped level (`Restates::Above`). |
+| `SelectField` | A stream of records is pulled at the projection. A product of collections is pulled whole and the selected field is cut. |
+| `Zip` | Every arm is pulled at the projection, since the arms share the pair's keys. The pair is complete only where every arm is. A projection beneath the outermost keys is answered above the record's level (`Restates::Above`). |
+| `MakeRecord` | A record of values has no keys: the projection is the whole record or nothing, and a guard naming keys panics. |
+| `VariantWrap` | A payload stream is pulled at the projection. A payload that is itself a collection becomes one union column and is read whole. A projection beneath the outermost keys is answered above the wrapped level (`Restates::Above`). |
+| `VariantProject` | A union stream is pulled at the projection. A bare union has no keys of its own, so it is read whole and its positions are cut. |
+| `VariantIs` | A union stream is pulled at the projection, since every key in is a key out. A bare union has no keys of its own, so it is read whole and its positions are cut. |
+| `Filter` | A predicate or input that is a collection is pulled at the projection, since they share the keys of the level the mask names. A side that is not a collection is read whole. With a collection predicate it takes a projection at any level down to the masked one (`Restates::Above`). The predicate holds no level beneath that one. With a function predicate, which masks the outermost keys, it takes a projection at any level (`Restates::Every`). |
+| `Restrict` | The predicate is pulled at the projection, since the restricted domain is the predicate's keys that pass. |
+| `MapDomain` | The input is pulled at the projection, since every level's keys stand. |
+| `Uncurry` | Beneath standing levels the input is pulled at the projection. Pairing the whole tile reads the groups whose first component the projection admits, and the pairs are cut after. |
+| `Product` | Both sides are pulled at the projection, since they are aligned row for row. The outer side has no paired level, so a projection at or beneath it pulls both sides at the rows its paths run through (`Projection::above`), and the pairs are cut. |
+| `Converse` | Every level is restated (`Restates::Every`). Beneath standing levels the input is pulled at the standing keys the projection names (`Projection::above`), and the groups are cut to it. Inverting the outermost collection reads the whole input and cuts the groups, and the rows of a group the projection does not name stay unreleased at the input. |
+| `FanOutSlot` | Pulls the shared input at its own projection and cuts its answer to it. A producer states completeness only for the region it returns, so slots at different regions each pull the one input at their own and a pull of one region retracts nothing it said of another (the debug check compares the last output inside the region pulled). A cyclic fan-out reads its input whole, because a sibling that re-enters mid-pull is answered from the cache of the last completed pull, which has to cover whatever region that sibling asks for. A projection beneath the outermost keys is read and cut as one of the outermost keys is. |
+| `Memo` | Reads its input at the projection and caches what it read; a pull over a region it has read answers from the cache cut to the projection, and a region it has not read reaches the input however quiet the input has been. The regions it has read and must read again are projections at any level, so a projection beneath the outermost keys is read and cached as one of the outermost keys is. |
+| `UnionOperator` | A flat union pulls every arm at the projection and cuts the merge to it: the arms are disjoint slices of one collection, and an arm the consumer has released contributes an empty tile that states every key decided, which the cut brings back to the projection. A tagged union keys its rows by arm, admits only `Everything` and `Nothing`, and panics on a key projection. |
+| `CheckedLookup` | A stream of keys, or of `(collection, key)` rows, is pulled at the projection, since each answer sits at its key's position; the collection is read whole, because every key is answered against all of it. One key has no keys to project and admits only `Everything` and `Nothing`. |
+| `ExtractFinal` | Admits `Everything` and `Nothing`. The last position of a stream is not known before the stream ends, so the source is read whole, and the one value or collection it yields is released whole. A key projection panics, a collection-valued final position included. |
+| `PermuteRecordDomain` | Reads its input whole and cuts the answer to the projection over the permuted keys: a region of record keys is componentwise, and the input's fields are renamed, so the projection is not forwarded. |
+| `FlattenTupleDomain` | Reads its input whole and cuts the answer to the projection over the flat keys, as `PermuteRecordDomain` does: the nested keys are restated flat, so the projection is not forwarded. |
+| `Lookup` | Reads its input whole and cuts the answer to the projection: each row's key is looked up in that row's collection, and the answer keeps the input's keys above the rows. |
+| `Aggregate` | Admits `Everything` and `Nothing`: the accumulator has no keys, and the input is read whole whatever the consumer asks. A key projection panics. |
+| `ExtractAggregate` | Admits `Everything` and `Nothing`: one extracted value has no keys. A key projection panics. |
+| `MapAggregate` | Pulls the input at the projection, at any level (`Restates::Every`), and cuts the answer to it: the answer is built from every accumulator held, including those of keys pulled earlier, and each group beneath a key is whole. |
+| `MapExtractAggregate` | Pulls the input at the projection, at any level of the input (`Restates::Above`). The answer keeps the input's keys, and only unfinished groups drop. |
+
 ### Producer attribution and probes
 
 Each `subscribe` returns one producer attributed to the operator that constructs it.
