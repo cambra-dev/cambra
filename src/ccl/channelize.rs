@@ -1402,7 +1402,8 @@ fn check_predicate_defers(
     result
 }
 
-/// Whether `e` binds a `defer` anywhere in its term.
+/// Whether `e` contains a `Defer` node, at `e` or at any descendant expression. Refinement
+/// predicates in type slots are not searched; a caller that needs one passes the predicate itself.
 pub(crate) fn holds_defer(e: &Expr) -> bool {
     matches!(e.node, TypedExprNode::Defer) || e.any_child(holds_defer)
 }
