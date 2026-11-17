@@ -10,19 +10,12 @@ level a producer does not restate by pulling the nearest level above that it res
 the answer. A push beneath the outermost keys lands in its reader as a projection at its level
 (`Dispatcher::land_in`).
 
-## What the gap blocks
-
-Two shapes a dispatched run refuses wait on projections beneath the outermost keys, and pull mode
-runs them instead:
-
-- A feed of a collection read from a live source, `out << [f(x) for x in source1()]`, is keyed by
-  the sink's one row, so a delivery's keys sit one level beneath the sink's.
-- A loop over a live source takes its positions as they arrive. Its rounds name positions of a
-  store, which for a loop nested in another are paths again.
+## What runs dispatched
 
 A loop nested in another runs in rounds of its own (`src/interpreter/design-dispatcher.md`, "A loop
-in rounds"). Removing the scheduler removes pull mode, so every shape a dispatched run refuses has
-to run there first.
+in rounds"), and a feed, a loop or a transaction over a live source runs dispatched
+(`src/interpreter/design-dispatcher.md`, "Running a compiled program"). The shapes a dispatched run
+refuses are listed there.
 
 ## Where a region crosses an operator
 
@@ -146,9 +139,11 @@ operator that does not restate the level a pull names is pulled at the nearest l
 snapshot, and reads them again before the store's next step
 ([A store as a breaker](design-operators.md#a-store-as-a-breaker)).
 
-Stage 4 notifies a live source's keys at the level they reach (`LivePipeline::poll`), the feed of a
-map over a source among them, and lifts the plan-time probe's refusal of an arrival beneath the
-outermost keys.
+A live source's arrivals are notified as the projection of its keys they restate at the entry of the
+pipeline that stands for the range, at any level, or that pipeline reads its input whole once the
+source yields everything (`LivePipeline::poll`). A feed of a collection read from a live source is
+keyed by the sink's one row, so its arrivals reach the pipeline above the source widened, and that
+pipeline reads its input whole.
 
 ## Decisions
 
@@ -159,3 +154,7 @@ outermost keys.
 - A difference closes an arm against the extent of the row it names, so an arm that names no
   position of its row reads as `Nothing`.
 - A nested loop runs in rounds of its own; no loop folds into the scope around it.
+- `MapResultToConst` widens every push from its constant: a reader takes a row whose constant
+  streams once the constant is complete, and the constant's keys do not stream beneath the row.
+- A transaction store pushes the commit ticks each consume decides, so a feed inside a transaction
+  streams.
