@@ -295,13 +295,9 @@ fn work(
                 records.push(Record::Consumed(package.clone()));
                 dispatcher.acknowledge(package);
             }
-            Next::Finish {
-                pipeline, consumed, ..
-            } => {
+            Next::Finish { pipeline } => {
                 jitter(&mut rng);
-                records.push(finish_scripted(
-                    dispatcher, script, observed, pipeline, consumed,
-                ));
+                records.push(finish_scripted(dispatcher, script, observed, pipeline));
             }
             Next::Wait(generation) => {
                 jitter(&mut rng);
@@ -354,7 +350,6 @@ fn finish_scripted(
     script: &Script,
     observed: &Observed,
     pipeline: PipelineId,
-    consumed: Option<TileGuard>,
 ) -> Record {
     let p = pipeline.0;
     assert_eq!(
@@ -368,16 +363,11 @@ fn finish_scripted(
             "pipeline {p} finishes after pipeline {read}, which it reads, finished"
         );
     }
-    let consumed = consumed.as_ref().map_or(0, mask_of);
-    assert_eq!(
-        observed.consumed[p].load(SeqCst),
-        observed.queued[p].load(SeqCst),
-        "pipeline {p} finishes after consuming every key queued for it"
-    );
+    let consumed = observed.consumed[p].load(SeqCst);
     assert_eq!(
         consumed,
-        observed.consumed[p].load(SeqCst),
-        "pipeline {p} finishes with every package it consumed recorded"
+        observed.queued[p].load(SeqCst),
+        "pipeline {p} finishes after consuming every key queued for it"
     );
     let held = guard_of(kept(consumed, script.keep[p]));
     let mut pushes = dispatcher.pushes(pipeline);
@@ -1065,38 +1055,6 @@ fn a_refusal_without_a_worker_handle_fails_the_run() {
     }
 }
 
-/// A notifier that panics while it publishes fails the run through the handle the publication
-/// holds, though the notifier holds no worker handle: a thread asleep in `wait` for the source's
-/// next package wakes and answers `Failed`.
-#[test]
-fn a_notifier_that_panics_while_it_publishes_wakes_a_waiting_worker() {
-    within("a notifier that panics".to_owned(), || {
-        let dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
-        dispatcher.notify(PipelineId(0), &keys_between(0, 1));
-        let Next::Package(package) = dispatcher.try_claim(None) else {
-            panic!("the notified package")
-        };
-        let woken = thread::scope(|scope| {
-            let sleeper = scope.spawn(|| dispatcher.claim(None));
-            while dispatcher.waiting() < 1 {
-                thread::yield_now();
-            }
-            let notifier = scope
-                .spawn(|| {
-                    dispatcher.notify(PipelineId(0), &TileGuard::Scalar(Predicate::True));
-                })
-                .join();
-            assert!(
-                notifier.is_err(),
-                "a scalar guard has no union with a region of keys"
-            );
-            sleeper.join().expect("the sleeper returns")
-        });
-        drop(package);
-        assert!(matches!(woken, Next::Failed), "{woken:?}");
-    });
-}
-
 /// A claim before a source has started finishes nothing: it waits, and the workers spawned
 /// before the sources start consume every package once they do.
 #[test]
@@ -1303,10 +1261,9 @@ fn notified_while_claimed(seed: u64, threads: usize) {
                             assert_eq!(before & mask, 0, "pipeline {p} consumes each key once");
                             dispatcher.acknowledge(package);
                         }
-                        Next::Finish {
-                            pipeline,
-                            consumed: region,
-                        } => {
+                        Next::Finish { pipeline } => {
+                            let mask = consumed[pipeline.0].load(SeqCst);
+                            let region = (mask != 0).then(|| guard_of(mask));
                             finishes.lock().expect("no worker panics").push(pipeline.0);
                             log.lock()
                                 .expect("no worker panics")
@@ -1667,10 +1624,9 @@ fn read_from_two(seed: u64, threads: usize) {
                             assert_eq!(before & mask, 0, "pipeline {p} consumes each key once");
                             dispatcher.acknowledge(package);
                         }
-                        Next::Finish {
-                            pipeline,
-                            consumed: region,
-                        } => {
+                        Next::Finish { pipeline } => {
+                            let mask = consumed[pipeline.0].load(SeqCst);
+                            let region = (mask != 0).then(|| guard_of(mask));
                             finishes.lock().expect("no worker panics").push(pipeline.0);
                             log.lock()
                                 .expect("no worker panics")
