@@ -124,6 +124,10 @@ EXPECTED_EXCEPTIONS = [
     # (`Completion`), which the completed pushes grow under the lock on any thread. What crosses
     # it is guards naming regions, never a tile.
     ("src/interpreter/dispatcher.rs", "cell of `Vec<Completion>`"),
+    # `CompletionTarget`, where the entry in front of a loop's drive records what the drive's source
+    # has completed: the scope's pipeline and the store's input, which the planner writes before
+    # the run. What crosses it is a pipeline's index and a tiling, never a tile.
+    ("src/interpreter/dispatcher.rs", "shared cell of `Option<(PipelineId, Tiling)>`"),
     # The lock a dispatcher's sleeping worker waits under; it guards no data.
     ("src/interpreter/dispatcher.rs", "cell of `()`"),
     # The placement an entry and its breaker share, which the planner writes before a run; what

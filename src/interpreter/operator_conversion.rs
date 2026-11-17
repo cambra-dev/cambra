@@ -5644,7 +5644,11 @@ fn convert_store_settled_read(
     // the levels standing above the stores are the store tiling's collection levels.
     let levels_above = fan.tiling().levels();
     Ok(Box::new(StoreFinalRead::per_row_at(
-        fan.slot(),
+        if levels_above == 0 {
+            fan.current_slot()
+        } else {
+            fan.slot()
+        },
         runtime_key,
         value_extent,
         levels_above,
