@@ -1,6 +1,5 @@
 use super::*;
-/// The shared cell owning one breaker subscription.
-pub(crate) type BreakerHandle = Rc<RefCell<dyn BreakingProducer>>;
+use crate::interpreter::dispatcher::BreakerHandle;
 
 /// Own one breaker subscription in a cell shared by its reader and the execution plan.
 /// The breaker retains only a weak reference to its cell.

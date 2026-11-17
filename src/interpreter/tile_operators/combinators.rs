@@ -790,7 +790,10 @@ impl TileOperator for Uncurry {
                         Box::new(move |region| paired(region, level)),
                         consumer,
                     ),
-                    false => widening(consumer),
+                    false => crate::interpreter::scheduler::widening_restating_complete(
+                        |region| paired(region, CurryLevel::OUTERMOST),
+                        consumer,
+                    ),
                 },
                 scheduler,
             ),
