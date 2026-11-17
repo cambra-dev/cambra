@@ -1,7 +1,7 @@
 //! Loop request control and body graph planning for the run's shared dispatcher.
 //! See `src/interpreter/design-dispatcher.md`, "A loop in rounds".
 
-use super::plan::{Planned, probe, routes_to};
+use super::plan::{Planned, probe, pushes_of, routes_to};
 use super::*;
 use crate::interpreter::commit_operator::InductionStoreProducer;
 #[cfg(test)]
@@ -259,15 +259,7 @@ impl InductionStoreProducer {
         if self.run.is_none() {
             return;
         }
-        let mut target = None;
-        self.reach_local(self.drive(), &mut |breaker, _| {
-            target = breaker
-                .as_producer()
-                .and_then(|producer| producer.completes_through());
-        });
-        if let Some(target) = target {
-            *target.borrow_mut() = None;
-        }
+        self.forget_through_drive();
         for placement in self.seed_placements() {
             placement.set(None);
         }
@@ -322,21 +314,46 @@ impl InductionStoreProducer {
     /// scope's entry otherwise, and the scope would park each round until the source is whole.
     pub(super) fn decide_through_drive(&mut self, pipeline: PipelineId) {
         let input = self.input_tiling(InputId::ONLY);
+        let target = self
+            .drive_target()
+            .expect("a loop's drive records its source's complete pushes");
+        *target.borrow_mut() = Some((pipeline, input));
+    }
+
+    /// Undo [`decide_through_drive`](Self::decide_through_drive): the drive's source's complete
+    /// pushes record nothing.
+    pub(super) fn forget_through_drive(&mut self) {
+        if let Some(target) = self.drive_target() {
+            *target.borrow_mut() = None;
+        }
+    }
+
+    /// Whether the drive's source's complete pushes record at some pipeline.
+    pub(super) fn decides_through_drive(&mut self) -> bool {
+        self.drive_target()
+            .is_some_and(|target| target.borrow().is_some())
+    }
+
+    /// Where the drive's source's complete pushes record ([`CompletionTarget`]).
+    fn drive_target(&mut self) -> Option<CompletionTarget> {
         let mut target = None;
         self.reach_local(self.drive(), &mut |breaker, _| {
             target = breaker
                 .as_producer()
                 .and_then(|producer| producer.completes_through());
         });
-        let target = target.expect("a loop's drive records its source's complete pushes");
-        *target.borrow_mut() = Some((pipeline, input));
+        target
     }
 
-    /// The paths a push from the range in front of `consumer` takes to the drive's entry, as the
-    /// consumers on the way declare them (`Consumer::route`).
-    pub(super) fn routes(&mut self, consumer: &SharedConsumer) -> Vec<Route> {
+    /// The paths the pushes `regions` from the range in front of `consumer` take to the drive's
+    /// entry ([`routes_to`]).
+    pub(super) fn routes(
+        &mut self,
+        consumer: &SharedConsumer,
+        regions: &[Projection],
+    ) -> Vec<Route> {
         let drive = self.drive();
-        self.placed(|_| routes_to(consumer, drive.0))
+        self.placed(|_| routes_to(consumer, regions, drive.0))
     }
 
     /// Where a push of `region` from the range in front of `consumer` lands at the drive's entry,
@@ -577,7 +594,7 @@ impl InductionStoreProducer {
     /// region of its keys: a nested store pushes rows, and a flat store the positions its rounds
     /// decide where it pushes any before it is terminal (`pushes_complete_positions`). Any other
     /// pushes everything, once it is terminal.
-    pub(super) fn pushing_end(&self) -> (SharedConsumer, bool) {
+    pub(super) fn pushing_end(&self) -> (SharedConsumer, bool, Vec<Projection>) {
         let keyed = matches!(self.tiling(), Tiling::DataFunction { .. })
             || crate::interpreter::commit_operator::pushes_complete_positions(self.tiling());
         let downstream = self
@@ -585,7 +602,7 @@ impl InductionStoreProducer {
             .downstream
             .clone()
             .unwrap_or_else(|| panic!("{} is read, so it pushes to a consumer", self.name()));
-        (downstream, keyed)
+        (downstream, keyed, pushes_of(self.tiling()))
     }
 }
 
