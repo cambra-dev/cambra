@@ -730,8 +730,13 @@ nodes to the slot's readers and keeps the earlier ones, for a branch that shares
 **A recurrence resumes past its predecessor's position.** Each slot keeps the last position its
 releases named as a prefix, accumulated or as given. A release of keys absent above the drive's
 cursor is no prefix and leaves it (`a_slots_position_rises_only_on_a_prefix`). `iteration_input`
-resumes a rebuilt store one past the position of the slot its predecessor's drive read. A drive
-whose predecessor released its source whole reads the source as complete and pulls nothing.
+resumes a rebuilt induction store one past the position of the slot its predecessor's drive read. A
+transaction drive finishes items out of order, so a rebuilt one starts from the exact region its
+predecessor's drive released instead (`IterationInput::released`, `TransactDriver::resumed_from`):
+items 0 and 2 finished before a reload leave item 1 to the drive after it, which a resume past
+position 2 would drop (`a_reload_carries_the_items_a_transaction_writer_finished_exactly`,
+`a_reload_carries_a_nested_writers_items_exactly`). A drive whose predecessor released its source
+whole reads the source as complete and pulls nothing.
 
 ### A drive runs one position behind its decision
 
