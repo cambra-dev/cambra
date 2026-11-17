@@ -9700,7 +9700,7 @@ mod tests {
     }
 
     /// A three-tick store: the seed holds both accounts, tick 1 writes only
-    /// `alice`, tick 2 writes only `bob`. Decided through the watermark `w`.
+    /// `alice`, tick 2 writes only `bob`. Completion through the watermark `w`.
     fn skew_store(w: u64) -> Tile {
         store_tile(
             &["alice", "bob"],
