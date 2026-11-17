@@ -95,11 +95,6 @@ impl Scripted {
         Self::new(held, true)
     }
 
-    /// A breaker whose consume releases nothing of its input.
-    fn keeping(held: TileGuard) -> Held<Scripted> {
-        Self::new(held, false)
-    }
-
     fn new(held: TileGuard, releases: bool) -> Held<Scripted> {
         let input = Input::over(&source(0..4));
         let releases = releases.then(|| input.tiling().universal_guard());
@@ -521,27 +516,6 @@ fn finish_twice_panics() {
     finish_pipeline(&dispatcher, &breakers, PipelineId(1));
 }
 
-/// A source finishes once its input has released every region queued for it: one whose input
-/// released less than its queue named would push what rests on rows the input has not stated.
-#[test]
-#[should_panic(
-    expected = "pipeline 0 finishes after its input has released every guard the pipeline consumed"
-)]
-fn a_source_pipeline_finishes_after_its_input_released_what_was_queued() {
-    let memo = memo_over_rows(0..6);
-    let handle: BreakerHandle = memo.clone();
-    let dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
-    dispatcher.start_source(PipelineId(0), &ints(), &ints().empty_guard());
-    let Next::Package(package) = dispatcher.try_claim(None) else {
-        panic!("a started source hands out its package")
-    };
-    memo.borrow_mut().begin_run();
-    memo.borrow_mut()
-        .consume_impl(InputId::ONLY, keys_between(0, 3));
-    dispatcher.acknowledge(package);
-    finish_pipeline(&dispatcher, &[handle], PipelineId(0));
-}
-
 /// An input of `0..2 ⤇ 0..3 ⤇ Int` that answers nothing: a test names what it releases.
 struct Positions {
     base: ProducerBase,
@@ -594,33 +568,6 @@ fn a_pipeline_finishes_once_its_input_released_a_row_through_its_last_position()
     finish_row_released_through(vec![Value::UInt(0), Value::UInt(2)]);
 }
 
-/// An input that released a row short of its last position has not released the row.
-#[test]
-#[should_panic(
-    expected = "pipeline 0 finishes after its input has released every guard the pipeline consumed"
-)]
-fn a_pipeline_does_not_finish_while_its_input_holds_a_position_of_a_row_it_consumed() {
-    finish_row_released_through(vec![Value::UInt(0), Value::UInt(1)]);
-}
-
-/// A reader whose input has not released a guard the reader consumed does not finish: what it
-/// would push could rest on rows its input has not stated.
-#[test]
-#[should_panic(
-    expected = "pipeline 1 finishes after its input has released every guard the pipeline consumed"
-)]
-fn a_reader_finishes_after_its_input_released_what_it_consumed() {
-    let breakers: Vec<BreakerHandle> = vec![
-        Scripted::holding(ints().universal_guard()),
-        Scripted::keeping(ints().universal_guard()),
-    ];
-    wire(&[vec![], vec![0]], &breakers);
-    run(
-        &Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED),
-        &breakers,
-    );
-}
-
 /// A package whose guard is not of the tiling the breaker's input answers is refused.
 #[test]
 #[cfg(debug_assertions)]
@@ -636,35 +583,6 @@ fn a_package_of_another_tiling_is_refused() {
         &Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED),
         &breakers,
     );
-}
-
-/// A pipeline that reads its input whole consumes that input in morsels that partition it once
-/// the pipeline it reads finishes, whatever that pipeline pushes: here a guard of a sum, while
-/// the scripted breaker's input answers rows.
-#[test]
-fn a_pipeline_reading_its_input_whole_consumes_it_in_morsels() {
-    let breakers: Vec<BreakerHandle> = vec![
-        aggregate_over(Box::new(Input::over(&source(0..6))), &sum_tiling()),
-        Scripted::holding(ints().universal_guard()),
-    ];
-    let input = breakers[1].borrow().input_tiling(InputId::ONLY);
-    wire(&[vec![], vec![0]], &breakers);
-    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], 2);
-    dispatcher.read_whole(PipelineId(1), &input);
-    run(&dispatcher, &breakers);
-    let consumed = consumed_by(&dispatcher.into_events(), 1);
-    assert!(
-        consumed.len() > 1,
-        "the rows in morsels of two: {consumed:?}"
-    );
-    assert_eq!(partition_gap(&input.universal_guard(), &consumed), None);
-}
-
-/// A source starts from its input, so it has no pipeline to read whole after.
-#[test]
-#[should_panic(expected = "pipeline 0 reads its input whole only after a pipeline it reads")]
-fn a_source_read_whole_is_refused() {
-    Dispatcher::new(vec![vec![]], UNBOUNDED).read_whole(PipelineId(0), &ints());
 }
 
 #[test]
@@ -1295,29 +1213,6 @@ fn drain(dispatcher: &Dispatcher, pipeline: usize) -> Vec<TileGuard> {
     consumed
 }
 
-/// A source is queued each region it is notified of, cut every `morsel_rows` positions, while it
-/// runs; it finishes only once closed.
-#[test]
-fn a_notified_source_consumes_each_region_and_finishes_once_closed() {
-    let dispatcher = Dispatcher::new(vec![vec![]], 2);
-    dispatcher.notify(PipelineId(0), &keys_between(0, 4));
-    assert_eq!(
-        drain(&dispatcher, 0),
-        vec![keys_between(0, 1), keys_between(2, 3), keys_between(4, 4)]
-    );
-    assert!(
-        matches!(dispatcher.try_claim(None), Next::Wait(_)),
-        "an open source waits for more of its input"
-    );
-    dispatcher.notify(PipelineId(0), &keys_between(5, 6));
-    assert_eq!(drain(&dispatcher, 0), vec![keys_between(5, 6)]);
-    dispatcher.close(PipelineId(0));
-    let Next::Finish { consumed, .. } = dispatcher.try_claim(None) else {
-        panic!("a closed source whose packages are all acknowledged finishes")
-    };
-    assert_eq!(consumed, Some(keys_between(0, 6)));
-}
-
 /// A notified region is cut every `morsel_rows` positions counted across its runs.
 #[test]
 fn a_notified_region_is_cut_every_rows_positions_across_its_runs() {
@@ -1369,16 +1264,6 @@ fn a_second_close_is_refused() {
     let dispatcher = Dispatcher::new(vec![vec![]], 2);
     dispatcher.close(PipelineId(0));
     dispatcher.close(PipelineId(0));
-}
-
-/// A region notified twice would be consumed twice, which a debug build refuses.
-#[cfg(debug_assertions)]
-#[test]
-#[should_panic(expected = "pipeline 0 consumes each region once")]
-fn a_region_notified_twice_is_refused() {
-    let dispatcher = Dispatcher::new(vec![vec![]], 2);
-    dispatcher.notify(PipelineId(0), &keys_between(0, 3));
-    dispatcher.notify(PipelineId(0), &keys_between(3, 4));
 }
 
 /// A limited source takes a notify only while fewer packages than its limit are outstanding,
@@ -1442,28 +1327,6 @@ fn pushes_dropped_with_morsels_are_refused() {
     drop(pushes);
 }
 
-/// A second push of a breaker that holds nothing new carries its completion and no morsel.
-/// Pushes that carry a completion land it, so dropping them unlanded fails the run as dropping
-/// morsels does.
-#[test]
-#[should_panic(expected = "pipeline 0 lands its pushes through Dispatcher::land")]
-fn pushes_dropped_with_only_a_completion_are_refused() {
-    let memo = memo_over_rows(0..6);
-    memo.borrow_mut().begin_run();
-    memo.borrow_mut()
-        .consume_impl(InputId::ONLY, ints().universal_guard());
-    push_to(&mut *memo.borrow_mut(), &[1]);
-    let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    let mut pushes = dispatcher.pushes(PipelineId(0));
-    pushes.push_final(&*memo.borrow());
-    dispatcher.land(pushes);
-    assert!(dispatcher.pop().is_some(), "the first push lands the rows");
-    let mut pushes = dispatcher.pushes(PipelineId(0));
-    pushes.push_final(&*memo.borrow());
-    assert_eq!(dispatcher.pop(), None, "nothing new is queued");
-    drop(pushes);
-}
-
 /// An aggregate read by an extraction pushes its value once, at the consume that makes it final
 /// and before its finish: its accumulator is partial while the memo's morsels arrive one at a
 /// time, and holds nothing until then.
@@ -1502,10 +1365,6 @@ impl Consumer for Boxed {
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
         self.0.notify(region, landing);
-    }
-
-    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
-        self.0.route(routes);
     }
 }
 
@@ -1605,32 +1464,6 @@ fn a_push_naming_every_tag_whole_lands_universal() {
     assert_eq!(queued, vec![input.universal_guard()]);
 }
 
-/// A push that reaches one reader along two paths, as a filter reads one memo for its values and
-/// its predicate, is queued once: what is queued for the reader already is taken out.
-#[test]
-fn a_push_reaching_a_reader_twice_is_queued_once() {
-    let scripted = Scripted::holding(ints().universal_guard());
-    let shared = gated_entry(&ints());
-
-    let paths = vec![
-        forwarding_consumer_keeping_keys(&shared),
-        forwarding_consumer_keeping_keys(&shared),
-    ];
-    scripted
-        .borrow_mut()
-        .base_mut()
-        .pushing_to(Rc::new(RefCell::new(Paths(paths))));
-    let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        scripted.borrow_mut().finish(InputId::ONLY, pushes)
-    });
-    assert_eq!(
-        dispatcher.pop().map(|package| package.guard),
-        Some(ints().universal_guard())
-    );
-    assert_eq!(dispatcher.pop(), None, "one package for two paths");
-}
-
 /// A consumer with several paths to one reader: a push takes each.
 struct Paths(Vec<Box<dyn Consumer>>);
 
@@ -1644,146 +1477,45 @@ impl Consumer for Paths {
             path.notify(region, landing);
         }
     }
-
-    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
-        for path in &mut self.0 {
-            path.route(routes);
-        }
-    }
 }
 
-/// A route declares, per path, whether the consumers on it keep the pushing pipeline's keys: a
-/// path through a widening consumer reaches the entry widened, and one through a consumer that
-/// keeps keys reaches it with them kept. Nothing is pushed.
+/// The routes a push of key 0 takes through `consumer` ([`Landing::route`]).
+fn walk(consumer: &mut dyn Consumer) -> Vec<crate::interpreter::dispatcher::Route> {
+    let mut landing = crate::interpreter::dispatcher::Landing::route();
+    consumer.notify(
+        &Projection::admitting(Predicate::point(Value::UInt(0))),
+        &mut landing,
+    );
+    landing.routes()
+}
+
+/// A route walk records each entry a path reaches, and a probe of the same paths records what
+/// each brings the entry: a path through a widening consumer brings every key, and one through a
+/// consumer that keeps keys brings the pushed key alone. Neither landing queues anything.
 #[test]
-fn a_route_declares_whether_each_path_keeps_its_keys() {
+fn a_route_walk_and_a_probe_record_whether_each_path_keeps_its_keys() {
     let shared = gated_entry(&ints());
 
     let mut paths = Paths(vec![
         forwarding_consumer(&shared),
         forwarding_consumer_keeping_keys(&shared),
     ]);
-    let mut routes = crate::interpreter::dispatcher::Routes::new();
-    paths.route(&mut routes);
-    let reached: Vec<_> = routes
-        .reached()
+    let reached: Vec<_> = walk(&mut paths)
         .into_iter()
-        .map(|route| (route.pipeline, route.keeps_keys))
+        .map(|route| route.pipeline)
         .collect();
-    assert_eq!(reached, [(PipelineId(1), false), (PipelineId(1), true)]);
-}
-
-/// A route declares, per path, whether its decided region names only part of what a row depends
-/// on: a widening path's does, and so does a lookup operand's, which names rows by the key they
-/// read whatever their input holds. A path that keeps its keys does not, and neither does an
-/// outermost `Uncurry`'s, which widens a change but restates a decided region exactly.
-#[test]
-fn a_route_declares_whether_each_path_completes_part_of_a_row() {
-    let shared = gated_entry(&ints());
-
-    let mut paths = Paths(vec![
-        forwarding_consumer(&shared),
-        forwarding_consumer_keeping_keys(&shared),
-        crate::interpreter::notifications::widening_restating_complete(
-            |region| region.clone(),
-            forwarding_consumer_keeping_keys(&shared),
-        ),
-        crate::interpreter::notifications::restating_lookup(
-            Box::new(|region| region.clone()),
-            forwarding_consumer_keeping_keys(&shared),
-        ),
-    ]);
-    let mut routes = crate::interpreter::dispatcher::Routes::new();
-    paths.route(&mut routes);
-    let parts: Vec<_> = routes
-        .reached()
+    assert_eq!(reached, [PipelineId(1), PipelineId(1)]);
+    let mut landing = crate::interpreter::dispatcher::Landing::probe(PipelineId(0));
+    paths.notify(
+        &Projection::admitting(Predicate::point(Value::UInt(0))),
+        &mut landing,
+    );
+    let widened: Vec<bool> = landing
+        .arrivals()
         .into_iter()
-        .map(|route| route.completes_part)
+        .map(|arrival| arrival.guard.is_universal())
         .collect();
-    assert_eq!(parts, [true, false, false, true]);
-}
-
-/// A read that reaches its reader along a path that drops a decided region and one that keeps it
-/// decides the reader's input only once it is whole: a row reached along both depends on rows the
-/// region does not name. Its decided push of some keys records nothing, where the same push of a
-/// read with no such mark records those keys.
-#[cfg(debug_assertions)]
-#[test]
-fn a_read_decided_only_whole_records_no_part() {
-    use crate::interpreter::dispatcher::Completion;
-    let recorded = |whole_only: bool| {
-        let scripted = Scripted::holding(keys_between(0, 1));
-        let shared = gated_entry(&ints());
-
-        let paths = vec![
-            forwarding_consumer(&shared),
-            forwarding_consumer_keeping_keys(&shared),
-        ];
-        scripted
-            .borrow_mut()
-            .base_mut()
-            .pushing_to(Rc::new(RefCell::new(Paths(paths))));
-        let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-        dispatcher.wait_for_inputs(PipelineId(1));
-        if whole_only {
-            dispatcher.completes_whole_only(PipelineId(1), PipelineId(0));
-        }
-        dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-            scripted.borrow_mut().finish(InputId::ONLY, pushes)
-        });
-        dispatcher.complete_of(PipelineId(1), PipelineId(0))
-    };
-    assert!(matches!(recorded(true), Completion::Nothing));
-    assert!(matches!(recorded(false), Completion::Region(_)));
-}
-
-/// A read decided only whole still records its whole push: once the pipeline it reads has decided
-/// everything, each path's region is decided, whatever it was restated to on the way.
-#[cfg(debug_assertions)]
-#[test]
-fn a_read_decided_only_whole_records_its_whole_push() {
-    use crate::interpreter::dispatcher::Completion;
-    let scripted = Scripted::holding(ints().universal_guard());
-    let shared = gated_entry(&ints());
-
-    let paths = vec![
-        forwarding_consumer(&shared),
-        forwarding_consumer_keeping_keys(&shared),
-    ];
-    scripted
-        .borrow_mut()
-        .base_mut()
-        .pushing_to(Rc::new(RefCell::new(Paths(paths))));
-    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.wait_for_inputs(PipelineId(1));
-    dispatcher.completes_whole_only(PipelineId(1), PipelineId(0));
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        scripted.borrow_mut().finish(InputId::ONLY, pushes)
-    });
-    assert!(matches!(
-        dispatcher.complete_of(PipelineId(1), PipelineId(0)),
-        Completion::Whole
-    ));
-}
-
-/// A push widened to `Everything` on its way fails the run, since the reader could not tell which
-/// of its keys it names: a reader reached that way reads the pushing pipeline once it finished.
-#[test]
-#[should_panic(
-    expected = "a push of pipeline 0 is widened to `Everything` on its way to pipeline 1"
-)]
-fn a_push_widened_on_its_way_fails_the_run() {
-    let scripted = Scripted::cutting(keys_between(0, 1), vec![keys_between(0, 1)]);
-    let shared = gated_entry(&ints());
-    let widening = forwarding_consumer(&shared);
-    scripted
-        .borrow_mut()
-        .base_mut()
-        .pushing_to(Rc::new(RefCell::new(Boxed(widening))));
-    let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        scripted.borrow_mut().finish(InputId::ONLY, pushes)
-    });
+    assert_eq!(widened, [true, false]);
 }
 
 /// A push whose chain leads back into a consumer it is passing through fails the run: only a
@@ -1875,50 +1607,22 @@ impl Consumer for Through {
             .expect("the operator was subscribed")
             .notify(region, landing);
     }
-
-    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
-        self.0
-            .borrow_mut()
-            .as_mut()
-            .expect("the operator was subscribed")
-            .route(routes);
-    }
-}
-
-/// A source whose input was released whole, as a scalar a run before a pause or a reload took, is
-/// queued no package when a later run starts it, and finishes once claimed.
-#[test]
-fn a_source_started_over_an_input_released_whole_is_queued_nothing() {
-    let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
-    let dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
-    dispatcher.start_source(PipelineId(0), &scalar, &scalar.universal_guard());
-    assert!(
-        matches!(
-            dispatcher.try_claim(None),
-            Next::Finish { consumed: None, .. }
-        ),
-        "nothing is queued, so the closed source finishes at once"
-    );
 }
 
 #[test]
 fn an_appended_graph_keeps_queued_work_and_follows_its_own_dependencies() {
     let guard = keys_between(3, 3);
+    // The original source stays open, so it cannot finish before the appended graph does.
     let mut dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
-    dispatcher.close(PipelineId(0));
-    dispatcher.hold_pipeline(PipelineId(0), true);
 
     let mut body = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     body.order(PipelineId(0));
     body.follow(PipelineId(1), PipelineId(0));
     body.notify(PipelineId(0), &guard);
-    body.queue_round(PipelineId(1), &guard);
+    body.queue_for(PipelineId(1), &guard);
     body.close(PipelineId(0));
-    body.hold_pipeline(PipelineId(0), true);
     assert_eq!(dispatcher.append_graph(body), 1);
 
-    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
-    dispatcher.hold_pipeline(PipelineId(1), false);
     let Next::Package(source) = dispatcher.try_claim(None) else {
         panic!("the appended source retains its queued package")
     };
@@ -1933,10 +1637,7 @@ fn an_appended_graph_keeps_queued_work_and_follows_its_own_dependencies() {
     assert_eq!(reader.pipeline, PipelineId(2));
     assert_eq!(reader.guard, guard);
     dispatcher.acknowledge(reader);
-    dispatcher.hold_pipeline(PipelineId(1), true);
-    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
 
-    dispatcher.hold_pipeline(PipelineId(1), false);
     for expected in [1, 2] {
         let Next::Finish { pipeline, .. } = dispatcher.try_claim(None) else {
             panic!("the appended source and reader finish in dependency order")
@@ -1945,9 +1646,9 @@ fn an_appended_graph_keeps_queued_work_and_follows_its_own_dependencies() {
         dispatcher.finish(dispatcher.pushes(pipeline));
     }
     assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
-    dispatcher.hold_pipeline(PipelineId(0), false);
+    dispatcher.close(PipelineId(0));
     let Next::Finish { pipeline, .. } = dispatcher.try_claim(None) else {
-        panic!("the original source stays unfinished until its hold is released")
+        panic!("the original source finishes once it is closed")
     };
     assert_eq!(pipeline, PipelineId(0));
     dispatcher.finish(dispatcher.pushes(pipeline));
@@ -1986,79 +1687,47 @@ fn appended_shared_pushes_are_deduplicated_without_reusing_the_original_graphs_r
 }
 
 #[test]
-fn an_added_step_pipeline_waits_for_its_body_and_its_claim_hold() {
+fn an_added_step_pipeline_waits_for_its_body() {
+    // The original source stays open, so it cannot finish before the step does.
     let mut dispatcher = Dispatcher::new(vec![vec![], vec![]], UNBOUNDED);
-    dispatcher.close(PipelineId(0));
-    dispatcher.hold_pipeline(PipelineId(0), true);
     let step = dispatcher.add_pipeline(vec![PipelineId(1)]);
     assert_eq!(step, PipelineId(2));
     dispatcher.order(step);
     dispatcher.follow(step, PipelineId(1));
-    dispatcher.hold_pipeline(step, true);
     let guard = keys_between(0, 0);
     dispatcher.notify(PipelineId(1), &guard);
-    dispatcher.queue_round(step, &guard);
+    dispatcher.queue_for(step, &guard);
     dispatcher.close(PipelineId(1));
 
     let Next::Package(body) = dispatcher.try_claim(None) else {
-        panic!("the body runs while the step is held")
+        panic!("the body runs before the step, which follows it")
     };
     assert_eq!(body.pipeline, PipelineId(1));
+    assert!(
+        dispatcher.claim_of(step).is_none(),
+        "the step waits while its body has a package in flight"
+    );
     dispatcher.acknowledge(body);
-    let Next::Finish { pipeline, .. } = dispatcher.try_claim(None) else {
-        panic!("the body's close is retained")
-    };
-    assert_eq!(pipeline, PipelineId(1));
-    dispatcher.finish(dispatcher.pushes(pipeline));
-    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
 
-    dispatcher.hold_pipeline(step, false);
     let Next::Package(package) = dispatcher.try_claim(None) else {
-        panic!("the settled step becomes claimable after releasing its hold")
+        panic!("the step becomes claimable once its body is quiescent")
     };
     assert_eq!(package.pipeline, step);
     assert_eq!(package.guard, guard);
     dispatcher.acknowledge(package);
-    let Next::Finish { pipeline, .. } = dispatcher.try_claim(None) else {
-        panic!("the step finishes after consuming its package")
-    };
-    assert_eq!(pipeline, step);
-    dispatcher.finish(dispatcher.pushes(pipeline));
+    for expected in [PipelineId(1), step] {
+        let Next::Finish { pipeline, .. } = dispatcher.try_claim(None) else {
+            panic!("the body and then the step finish")
+        };
+        assert_eq!(pipeline, expected);
+        dispatcher.finish(dispatcher.pushes(pipeline));
+    }
     assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
-    dispatcher.hold_pipeline(PipelineId(0), false);
+    dispatcher.close(PipelineId(0));
     let Next::Finish { pipeline, .. } = dispatcher.try_claim(None) else {
         panic!("the original source remains in the shared finish count")
     };
     assert_eq!(pipeline, PipelineId(0));
     dispatcher.finish(dispatcher.pushes(pipeline));
     assert!(matches!(dispatcher.try_claim(None), Next::Done));
-}
-
-#[test]
-fn appended_ingress_keeps_external_pushes_at_the_control_boundary() {
-    let input = ints();
-    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.read_whole(PipelineId(1), &input);
-    let mut body = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    body.restrict_ingress(PipelineId(1), 0..2);
-    assert_eq!(dispatcher.append_graph(body), 2);
-
-    let entry = crate::interpreter::dispatcher::Entry::new(PipelineId(3), input.clone());
-    *entry.complete_target().borrow_mut() = Some((PipelineId(1), input.clone()));
-    let consumer: SharedConsumer = Rc::new(RefCell::new(entry));
-
-    for (pusher, expected_reader) in [(0, 1), (2, 3)] {
-        let breaker = Scripted::holding(input.universal_guard());
-        breaker.borrow_mut().base_mut().pushing_to(consumer.clone());
-        let mut pushes = dispatcher.pushes(PipelineId(pusher));
-        pushes.push_final(&*breaker.borrow());
-        dispatcher.land(pushes);
-        let Next::Package(package) = dispatcher.try_claim(None) else {
-            panic!("external completeness opens the control, and internal output opens the body")
-        };
-        assert_eq!(package.pipeline, PipelineId(expected_reader));
-        assert_eq!(package.guard, input.universal_guard());
-        dispatcher.acknowledge(package);
-        assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
-    }
 }

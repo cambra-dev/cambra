@@ -73,6 +73,11 @@ impl ExtractFinal {
 }
 
 impl TileOperator for ExtractFinal {
+    /// A breaker: its pipeline pushes its output to the pipelines that read it.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -262,9 +267,9 @@ impl TileProducer for ExtractFinalProducer {
     /// whole, so the projection is all of it or none: the source is read whole whatever the
     /// consumer asks, because the last position is not known before the stream ends.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        if projection_of_one_value(&self.name(), "extracts one final value", &projection_guard)
-            == Projection::Nothing
-        {
+        let projection =
+            projection_of_one_value(&self.name(), "extracts one final value", &projection_guard);
+        if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
         // Scalar columns use the declared extent, retaining variant arms absent from the
@@ -274,7 +279,10 @@ impl TileProducer for ExtractFinalProducer {
             return empty;
         }
         if !self.base.reads_input() {
-            return self.final_tile.clone().unwrap_or(empty);
+            // A final record of values is pulled at a part of it as any record is.
+            let mut tile = self.final_tile.clone().unwrap_or(empty);
+            tile.restrict_to(&projection, self.tiling());
+            return tile;
         }
         if let Some(tile) = &self.final_tile {
             return tile.clone();

@@ -397,28 +397,29 @@ fn test_datasource_named_record_join() {
     let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
-    assert!(
-        producer.run().is_empty(),
-        "record-valued join groups await closure"
-    );
+    // The match is answered while both sources are open, and closing them does not bring it twice.
+    let check = |tile: Tile| {
+        let tile = sort_function_by_domain(tile);
+        // Only (id=1, "a") × (id=1, "x") should match
+        let Tile::DataFunction { codomain, .. } = tile else {
+            panic!("expected Function, got {tile:?}");
+        };
+        let Tile::Record { mut fields, .. } = *codomain else {
+            panic!("expected Record codomain");
+        };
+        assert_eq!(
+            scalar_tile_to_column_value(fields.remove(&tuple_field(0)).unwrap()),
+            ColumnValue::strings(&["a"]),
+        );
+        assert_eq!(
+            scalar_tile_to_column_value(fields.remove(&tuple_field(1)).unwrap()),
+            ColumnValue::strings(&["x"]),
+        );
+    };
+    check(producer.run());
     src1.borrow_mut().set_yield_predicate(Predicate::True);
     src2.borrow_mut().set_yield_predicate(Predicate::True);
-    let tile = sort_function_by_domain(producer.run());
-    // Only (id=1, "a") × (id=1, "x") should match
-    let Tile::DataFunction { codomain, .. } = tile else {
-        panic!("expected Function, got {tile:?}");
-    };
-    let Tile::Record { mut fields, .. } = *codomain else {
-        panic!("expected Record codomain");
-    };
-    assert_eq!(
-        scalar_tile_to_column_value(fields.remove(&tuple_field(0)).unwrap()),
-        ColumnValue::strings(&["a"]),
-    );
-    assert_eq!(
-        scalar_tile_to_column_value(fields.remove(&tuple_field(1)).unwrap()),
-        ColumnValue::strings(&["x"]),
-    );
+    check(producer.run());
 }
 
 /// A conditional whose arms are records of **different width**.

@@ -48,15 +48,18 @@ use std::rc::Rc;
 // Consumer Protocol
 // ============================================================================
 
-/// Receives decided regions from a producer and declares their dispatcher routes.
+/// Receives decided regions from a producer and passes each toward its dispatcher entries.
 /// Regions carry no tile data. See `src/interpreter/design-operators.md`,
 /// "The notification contract".
+///
+/// A planner reads a push's routes by walking the same `notify` with a routing landing
+/// ([`dispatcher::Landing::route`]), so planning reads the paths a delivery takes off the code
+/// that takes them. What `notify` does only for a delivery ([`dispatcher::Landing::is_delivery`])
+/// is not walked, and the dispatcher does not check a queued package against the routes
+/// (`src/interpreter/design-dispatcher.md`, "Running a compiled program").
 pub trait Consumer {
     /// Record an announced region and deliver it toward its dispatcher entries.
     fn notify(&mut self, _region: &Projection, _landing: &mut dispatcher::Landing<'_>) {}
-
-    /// Declare the routes a notification follows without delivering work.
-    fn route(&mut self, _routes: &mut dispatcher::Routes) {}
 }
 
 /// Blanket implementation: Rc<RefCell<C>> implements Consumer when C does.
@@ -66,9 +69,6 @@ impl<C: Consumer + ?Sized> Consumer for Rc<RefCell<C>> {
     fn notify(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
         self.borrow_mut().notify(region, landing)
     }
-    fn route(&mut self, routes: &mut dispatcher::Routes) {
-        self.borrow_mut().route(routes)
-    }
 }
 
 /// A boxed consumer is one, so it can be shared behind an `Rc<RefCell<_>>` as a
@@ -76,9 +76,6 @@ impl<C: Consumer + ?Sized> Consumer for Rc<RefCell<C>> {
 impl Consumer for Box<dyn Consumer> {
     fn notify(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
         (**self).notify(region, landing)
-    }
-    fn route(&mut self, routes: &mut dispatcher::Routes) {
-        (**self).route(routes)
     }
 }
 
