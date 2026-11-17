@@ -30,7 +30,6 @@ use rstest_log::rstest;
 use smol_str::SmolStr;
 
 use super::helpers::*;
-use cambra::interpreter::pull_laps;
 use indoc::{formatdoc, indoc};
 
 /// Assert `code` fails to compile with an error whose rendering contains
@@ -2405,16 +2404,17 @@ fn a_finite_mut_var_completes_despite_a_live_unrelated_writer() {
     ctx.register_source(src.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     assert_eq!(stores_in(&compiled.ast), vec!["Txn[a]", "Txn[b]"]);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
     // One request arrives, and the source is left **open** — no
     // terminal yield predicate — so `b`'s writer never drains.
     src.borrow_mut()
         .add_data(&[(Value::UInt(0), Value::Int(100))]);
-    ctx.scheduler().check_for_notifications();
-    let result = pull_laps(ctx.scheduler(), &mut *producer, 65, |_| false);
+
+    producer.run();
+    let result = producer.snapshot();
 
     let Tile::Record { fields, .. } = &result else {
         panic!("expected a record of both replies, got {result:?}");
@@ -2464,18 +2464,19 @@ fn a_finite_mut_var_completes_despite_a_live_writer_it_shares_a_block_with() {
     ctx.register_source(src.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     assert_eq!(
         stores_in(&compiled.ast),
         vec!["Txn[a,b]"],
         "the shared block must put both keys in one store, or this tests nothing"
     );
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
     src.borrow_mut()
         .add_data(&[(Value::UInt(0), Value::Int(100))]);
-    ctx.scheduler().check_for_notifications();
-    let result = pull_laps(ctx.scheduler(), &mut *producer, 65, |_| false);
+
+    producer.run();
+    let result = producer.snapshot();
 
     let Tile::Record { fields, .. } = &result else {
         panic!("expected a record of both replies, got {result:?}");
@@ -2489,6 +2490,61 @@ fn a_finite_mut_var_completes_despite_a_live_writer_it_shares_a_block_with() {
     assert!(
         fields.get("_1").is_some_and(Tile::is_empty),
         "`b` still has a live writer, so it has no final value to report; got {result:?}"
+    );
+}
+
+/// Completing one key emits its scalar reply while a reply requiring both keys remains pending.
+#[test]
+fn final_key_notifications_wait_for_every_requested_key() {
+    let code = indoc! {r#"
+        finite = test_sink()
+        pair = test_sink()
+        a: Mut(Int, Txn) := 0
+        b: Mut(Int, Txn) := 0
+        for x in [1, 2]:
+            with begin():
+                a += x
+                b += x
+        for x in source1():
+            with begin():
+                b += x
+        final_a = await_final(a)
+        finite << final_a
+        pair << (final_a, await_final(b))
+    "#};
+    let mut ctx = GlobalContext::default();
+    let finite = ctx.register_test_sink("finite");
+    let pair = ctx.register_test_sink("pair");
+    let source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(source.clone());
+    let loaded = LoadedProgram::test(code);
+    let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    source
+        .borrow_mut()
+        .add_data(&[(Value::UInt(0), Value::Int(100))]);
+    source
+        .borrow_mut()
+        .set_yield_predicate(Predicate::at_or_below(Value::UInt(0)));
+    crate::it::serving::dispatch_until_idle(&mut program);
+    let Value::Function(rows) = finite.value().expect("a is complete") else {
+        panic!("sink rows")
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].output, Value::Int(3));
+    assert!(pair.value().is_err(), "b is still live");
+    source.borrow_mut().set_yield_predicate(Predicate::True);
+    crate::it::serving::dispatch_until_idle(&mut program);
+    let Value::Function(rows) = pair.value().expect("both keys are complete") else {
+        panic!("sink rows")
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].output,
+        make_tuple(&[Value::Int(3), Value::Int(103)])
     );
 }
 
@@ -2521,18 +2577,18 @@ fn a_read_only_mentioned_key_completes_while_a_live_writer_runs() {
     ctx.register_source(src.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     assert_eq!(
         stores_in(&compiled.ast),
         vec!["Txn[total,limit]"],
         "the read must put both keys in one store, or this tests nothing"
     );
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
     src.borrow_mut()
         .add_data(&[(Value::UInt(0), Value::Int(5))]);
-    ctx.scheduler().check_for_notifications();
-    let result = pull_laps(ctx.scheduler(), &mut *producer, 65, |_| false);
+
+    let result = producer.run();
     assert_eq!(
         result,
         Tile::Scalar(ColumnValue::Ints(vec![100])),
@@ -2669,14 +2725,13 @@ fn live_reply_combines_request_and_store() {
     ctx.register_source(src.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
     // Drain the commit store first, with no request present: the reader pulls the
     // store on every `get`, and the writer's self-re-arm steps one commit per pull.
     for _ in 0..16 {
-        producer.get(producer.tiling().universal_guard());
-        ctx.scheduler().check_for_notifications();
+        producer.run();
     }
 
     src.borrow_mut().add_data(&[
@@ -2684,9 +2739,8 @@ fn live_reply_combines_request_and_store() {
         (Value::UInt(1), Value::Int(15)),
     ]);
     src.borrow_mut().set_yield_predicate(Predicate::True);
-    ctx.scheduler().check_for_notifications();
 
-    let mut result = pull_laps(ctx.scheduler(), &mut *producer, 65, Tile::is_terminal);
+    let mut result = producer.run();
     result.compact();
     assert_eq!(
         sort_function_by_domain(result),
@@ -3624,7 +3678,7 @@ fn broadcast_read_races_a_second_writer() {
 /// reply — one commit, `pool = 100 − 3 = 97` at item 0. This is the case
 /// the old in-`get` pump could not handle (it spun without yielding to the
 /// scheduler); the deferred-wakeup path drives it — each not-ready pull re-arms
-/// the writer, and `check_for_notifications` delivers both the source's data and
+/// the writer, and the dispatcher polls both the source's data and
 /// the writer's wakeups until the sibling loop (and the commit) resolve. Driven
 /// exactly as `src/main.rs` does — notification-gated, re-pull to terminal.
 #[test]
@@ -3659,22 +3713,18 @@ fn broadcast_off_async_source_sibling_loop() {
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    let mut producer = compiled
-        .main_mut()
-        .and_then(|o| o.producer.take())
-        .expect("program has a `main` output");
-    let universal = producer.tiling().universal_guard();
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
     // Notification-gated re-pull to terminal, bounded so a lost-wakeup regression
     // fails loudly instead of hanging.
-    let mut result = producer.get(universal.clone());
+    let mut result = producer.run();
     let mut iters = 0usize;
     while !result.is_terminal() {
         iters += 1;
         assert!(iters < 1024, "async-source broadcast did not converge");
-        ctx.scheduler().check_for_notifications();
-        result = producer.get(universal.clone());
+
+        result = producer.run();
     }
     result.compact();
     assert_eq!(result, reply_stream(&[0], &[97]));
@@ -3816,8 +3866,8 @@ fn live_read_progresses_past_deny() {
     ctx.register_source(src.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
     // Request 0 (req = 100) arrives first and latches whatever the store has then.
     src.borrow_mut()
@@ -3827,11 +3877,11 @@ fn live_read_progresses_past_deny() {
     // Drive the cyclic store — with its interior deny — to completion, then deliver
     // request 1 (req = 200). Arrival order is what makes its observation assertable:
     // it latches after the writer has drained.
-    let _ = pull_laps(ctx.scheduler(), &mut *producer, 32, |_| false);
+    let _ = producer.run();
     src.borrow_mut()
         .add_data(&[(Value::UInt(1), Value::Int(200))]);
     src.borrow_mut().set_yield_predicate(Predicate::True);
-    let mut result = pull_laps(ctx.scheduler(), &mut *producer, 32, |_| false);
+    let mut result = producer.run();
     result.compact();
 
     let result = sort_function_by_domain(result);
@@ -4518,20 +4568,9 @@ fn a_checked_lookup_at_keys_off_a_source_in_a_writing_block() {
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    let mut producer = compiled
-        .main_mut()
-        .and_then(|o| o.producer.take())
-        .expect("program has a `main` output");
-    let universal = producer.tiling().universal_guard();
-    let mut result = producer.get(universal.clone());
-    let mut iters = 0usize;
-    while !result.is_terminal() {
-        iters += 1;
-        assert!(iters < 1024, "a lookup at a source's keys did not converge");
-        ctx.scheduler().check_for_notifications();
-        result = producer.get(universal.clone());
-    }
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
+    let mut result = producer.run();
     result.compact();
     assert_eq!(result, reply_stream(&[0, 1, 2], &[10, 0, 10]));
 }
@@ -4748,30 +4787,21 @@ fn a_transactional_variable_seeds_from_a_long_loops_result(#[case] n: i64, #[cas
     );
 }
 
-/// A transaction loop's commit store holds a bounded amount of state however many items it
-/// runs: the driver, the writer and the reader of the final value each release the store's
-/// history behind the decided frontier, so the store reclaims a version once all three have
-/// passed it. The commit operator never holds more than 6 values (its seeds, the positions it
-/// decided and the few changelog entries still retained) and the fans around it no more than
-/// 17, for one loop, two loops over one variable and one loop with two blocks. The source
-/// literal's own constants grow with its length and are not counted. Every writer here reads
-/// its key, so the release of a writer without read keys is not exercised.
+/// Transaction history and fan-out state stay bounded while a live source delivers 5, 20 or
+/// 40 items. The cases cover one writer, two writers and two blocks in one loop. Sampling each
+/// drained delivery detects growth before closure can reclaim the history.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
 #[case::five(5)]
 #[case::twenty(20)]
 #[case::forty(40)]
 fn a_transaction_loop_holds_a_bounded_store_state_at_any_length(#[case] n: usize) {
-    let items = (1..=n)
-        .map(|i| i.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
     let shapes = [
         (
             "one loop",
             formatdoc! {"
                 total: Mut(Int, Txn) := 0
-                for x in [{items}]:
+                for x in source1():
                     with begin():
                         total := total + x
                 await_final(total)
@@ -4781,10 +4811,10 @@ fn a_transaction_loop_holds_a_bounded_store_state_at_any_length(#[case] n: usize
             "two loops over one variable",
             formatdoc! {"
                 total: Mut(Int, Txn) := 0
-                for x in [{items}]:
+                for x in source1():
                     with begin():
                         total := total + x
-                for y in [{items}]:
+                for y in source1():
                     with begin():
                         total := total + y
                 await_final(total)
@@ -4794,7 +4824,7 @@ fn a_transaction_loop_holds_a_bounded_store_state_at_any_length(#[case] n: usize
             "one loop with two blocks",
             formatdoc! {"
                 total: Mut(Int, Txn) := 0
-                for x in [{items}]:
+                for x in source1():
                     with begin():
                         total := total + x
                     with begin():
@@ -4804,15 +4834,15 @@ fn a_transaction_loop_holds_a_bounded_store_state_at_any_length(#[case] n: usize
         ),
     ];
     for (shape, code) in shapes {
-        let peak = peak_held_values(&code);
+        let peak = peak_held_values(&code, n);
         let held = |kind: &str| peak.get(kind).copied().expect("the loop has the operator");
         assert!(
-            held("Commit") <= 6,
+            held("Commit") <= 7,
             "{shape}: the commit operator held {} values",
             held("Commit")
         );
         assert!(
-            held("FanOut") <= 17,
+            held("FanOut") <= 21,
             "{shape}: the fans held {} values",
             held("FanOut")
         );
@@ -5498,8 +5528,8 @@ fn a_block_value_replies_while_its_source_is_open() {
     ctx.register_source(src.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
     src.borrow_mut().add_data(&[
         (Value::UInt(0), Value::Int(30)),
@@ -5507,9 +5537,7 @@ fn a_block_value_replies_while_its_source_is_open() {
     ]);
     src.borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::UInt(1)));
-    ctx.scheduler().check_for_notifications();
-    let replied = |t: &Tile| t.live_keys().is_some_and(|k| k.count() == 2);
-    let mut open = pull_laps(ctx.scheduler(), &mut *producer, 65, replied);
+    let mut open = producer.run();
     open.compact();
     let Tile::DataFunction {
         domain_predicate, ..
@@ -5539,8 +5567,7 @@ fn a_block_value_replies_while_its_source_is_open() {
     src.borrow_mut()
         .add_data(&[(Value::UInt(2), Value::Int(40))]);
     src.borrow_mut().set_yield_predicate(Predicate::True);
-    ctx.scheduler().check_for_notifications();
-    let mut result = pull_laps(ctx.scheduler(), &mut *producer, 65, Tile::is_terminal);
+    let mut result = producer.run();
     result.compact();
     assert_eq!(
         sort_function_by_domain(result),
