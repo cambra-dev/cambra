@@ -8,6 +8,17 @@ use super::{SourceRegistry, value_probe::ProbeSlot};
 #[derive(Default)]
 pub struct SubscribeContext {
     probes: ProbeSlot,
+    pub(crate) breakers: std::collections::HashMap<
+        crate::ccl::provenance::NodeId,
+        crate::interpreter::dispatcher::BreakerHandle,
+    >,
+    pub(crate) worker: bool,
+    pub(crate) inline: std::collections::HashMap<
+        usize,
+        std::sync::Arc<
+            parking_lot::RwLock<crate::interpreter::tile_operators::fanout::FanOutShared>,
+        >,
+    >,
     /// The source producers registered under each subscription still in progress, innermost last
     /// ([`begin_source_producers`](Self::begin_source_producers)).
     producer_frames: Vec<Vec<String>>,

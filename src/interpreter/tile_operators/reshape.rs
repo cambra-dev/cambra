@@ -15,7 +15,7 @@ use crate::interpreter::{
 /// For now, this only supports record types that represent tuples, but can
 /// be extended if needed.
 pub struct PermuteRecordDomain {
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     base: OperatorBase,
     permutation: Vec<usize>,
 }
@@ -32,7 +32,7 @@ fn permute_record<T>(mut input: HashMap<SmolStr, T>, permutation: &[usize]) -> H
 }
 
 impl PermuteRecordDomain {
-    pub fn new(input: Box<dyn TileOperator>, permutation: Vec<usize>) -> Self {
+    pub fn new(input: Arc<dyn TileOperator>, permutation: Vec<usize>) -> Self {
         let Tiling::DataFunction { domain, codomain } = input.tiling() else {
             panic!(
                 "PermuteRecordDomain requires a collection input, got {}",
@@ -64,8 +64,8 @@ impl TileOperator for PermuteRecordDomain {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe(
-        &mut self,
+    fn subscribe_impl(
+        self: Arc<Self>,
         intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -74,10 +74,10 @@ impl TileOperator for PermuteRecordDomain {
             base: ProducerBase::new(
                 PermuteRecordDomainProducer::alloc_id(),
                 self.tiling(),
-                &self.base,
+                self.clone(),
                 cx,
             ),
-            input: self.input.subscribe(
+            input: self.input.clone().subscribe(
                 intent_guard,
                 {
                     let permutation = self.permutation.clone();
@@ -438,7 +438,7 @@ pub struct FlattenTupleDomain {
     /// standing levels above it.
     base: OperatorBase,
     /// Input operator whose domain is a `Record`.
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     /// Maps output field index `i` to `(outer_field_key, inner_field_key_opt)`.
     ///
     /// `inner_field_key_opt = Some(k)` for flattened fields; `None` for pass-through fields.
@@ -454,7 +454,7 @@ impl FlattenTupleDomain {
     /// be expanded; all other outer fields are passed through as-is. Panics if the input tiling
     /// is not a `DataFunction` with a `Record` domain, or if a field marked for flattening is
     /// not a `Record`.
-    pub fn new(input: Box<dyn TileOperator>, indices_to_flatten: Vec<usize>) -> Self {
+    pub fn new(input: Arc<dyn TileOperator>, indices_to_flatten: Vec<usize>) -> Self {
         Self::new_at(input, indices_to_flatten, CurryLevel::OUTERMOST)
     }
 
@@ -462,7 +462,7 @@ impl FlattenTupleDomain {
     /// collection whose keys are flattened is each enclosing row's group there, as an
     /// [`Uncurry`] beneath standing levels pairs each row's group.
     pub fn new_at(
-        input: Box<dyn TileOperator>,
+        input: Arc<dyn TileOperator>,
         indices_to_flatten: Vec<usize>,
         level: CurryLevel,
     ) -> Self {
@@ -528,8 +528,8 @@ impl TileOperator for FlattenTupleDomain {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe(
-        &mut self,
+    fn subscribe_impl(
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -538,10 +538,10 @@ impl TileOperator for FlattenTupleDomain {
             base: ProducerBase::new(
                 FlattenTupleDomainProducer::alloc_id(),
                 self.tiling(),
-                &self.base,
+                self.clone(),
                 cx,
             ),
-            input: self.input.subscribe(
+            input: self.input.clone().subscribe(
                 self.tiling().universal_guard(),
                 {
                     let field_map = self.field_map.clone();
@@ -786,7 +786,7 @@ mod tests {
     fn flatten_tuple_domain_tiling_is_correct() {
         // IterateExtent produces `outer → outer`; the codomain is irrelevant here —
         // FlattenTupleDomain only inspects the domain.
-        let input = Box::new(IterateExtent::new(nested_outer_extent()));
+        let input = Arc::new(IterateExtent::new(nested_outer_extent()));
         let op = FlattenTupleDomain::new(input, vec![0, 1]);
         let Tiling::DataFunction { domain, .. } = op.tiling() else {
             panic!("expected a collection tiling");
@@ -1760,7 +1760,7 @@ mod projection_tests {
             keyed_rows(&cut),
             (vec![vec![1, 1], vec![0, 1]], vec![11, 13])
         );
-        assert!(pulled.borrow()[0].is_universal());
+        assert!(pulled.read()[0].is_universal());
     }
 
     /// A release names output keys and reaches the input as the same keys under the input's
@@ -1779,7 +1779,7 @@ mod projection_tests {
             permutation: vec![1, 2, 0],
         };
         rotated.release(field_is(0, 1, 3));
-        assert_eq!(*released.borrow(), [field_is(1, 1, 3)]);
+        assert_eq!(*released.read(), [field_is(1, 1, 3)]);
     }
 
     #[test]
@@ -1787,7 +1787,7 @@ mod projection_tests {
         let (mut swapped, pulled) = swapped_pairs();
         let tile = swapped.read_in_pipeline(swapped.tiling().empty_guard());
         assert_eq!(tile, swapped.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.read().is_empty());
     }
 
     /// `((a, b), c)` keys flattened to `(a, b, c)`: the rows `((0,0),0) ((0,1),1) ((1,0),0)`
@@ -1838,7 +1838,7 @@ mod projection_tests {
             keyed_rows(&cut),
             (vec![vec![0, 1], vec![0, 0], vec![0, 0]], vec![10, 12])
         );
-        assert!(pulled.borrow()[0].is_universal());
+        assert!(pulled.read()[0].is_universal());
     }
 
     #[test]
@@ -1846,6 +1846,6 @@ mod projection_tests {
         let (mut flat, pulled) = flattened_triples();
         let tile = flat.read_in_pipeline(flat.tiling().empty_guard());
         assert_eq!(tile, flat.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.read().is_empty());
     }
 }

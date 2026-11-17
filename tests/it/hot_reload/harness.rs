@@ -1050,8 +1050,6 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
     before: &[i64],
     after: &[i64],
 ) -> i64 {
-    use std::{cell::RefCell, rc::Rc};
-
     use cambra::{
         ccl::load::LoadedProgram,
         ccl::{Type, context::GlobalContext},
@@ -1062,11 +1060,11 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
     use super::serving::no_main;
 
     let mut ctx = GlobalContext::default();
-    let source = Rc::new(RefCell::new(TestDataSource::new(
+    let source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(source.clone());
     let rows = |from: usize, values: &[i64]| -> Vec<(Value, Value)> {
         values
@@ -1081,17 +1079,17 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
 
     let mut live =
         LiveProgram::start(&mut ctx, &LoadedProgram::test(v1), &no_main).expect("v1 compiles");
-    source.borrow_mut().add_data(&rows(0, before));
+    source.write().add_data(&rows(0, before));
     source
-        .borrow_mut()
+        .write()
         .set_yield_predicate(Predicate::at_or_below(Value::uint_from_row(
             before.len() - 1,
         )));
     pull(&mut ctx, &mut live);
     live.reload(&mut ctx, MAIN_BRANCH, &LoadedProgram::test(v2), &no_main)
         .expect("v2 replaces v1");
-    source.borrow_mut().add_data(&rows(before.len(), after));
-    source.borrow_mut().set_yield_predicate(Predicate::True);
+    source.write().add_data(&rows(before.len(), after));
+    source.write().set_yield_predicate(Predicate::True);
     let tile = pull(&mut ctx, &mut live);
     assert!(
         tile.is_terminal(),
@@ -1108,33 +1106,33 @@ pub(super) fn source_prefix(
     values: &[Value],
     cut: usize,
     ty: cambra::ccl::BaseType,
-) -> std::rc::Rc<std::cell::RefCell<cambra::interpreter::TestDataSource>> {
+) -> cambra::ccl::SourceDefinition<cambra::interpreter::TestDataSource> {
     use cambra::interpreter::{BaseType, Extent, Predicate, TestDataSource};
-    let source = std::rc::Rc::new(std::cell::RefCell::new(TestDataSource::new(
+    let source = TestDataSource::new(
         "source1",
         cambra::ccl::Type::Base(ty.clone()),
         Extent::Base(match ty {
             cambra::ccl::BaseType::String => BaseType::String,
             _ => BaseType::Int,
         }),
-    )));
+    );
     ctx.register_source(source.clone());
     let rows: Vec<_> = values[..cut]
         .iter()
         .enumerate()
         .map(|(i, value)| (Value::uint_from_row(i), value.clone()))
         .collect();
-    source.borrow_mut().add_data(&rows);
+    source.write().add_data(&rows);
     if cut > 0 {
         source
-            .borrow_mut()
+            .write()
             .set_yield_predicate(Predicate::at_or_below(Value::uint_from_row(cut - 1)));
     }
     source
 }
 
 pub(super) fn finish_source(
-    source: &std::rc::Rc<std::cell::RefCell<cambra::interpreter::TestDataSource>>,
+    source: &cambra::ccl::SourceDefinition<cambra::interpreter::TestDataSource>,
     values: &[Value],
     cut: usize,
 ) {
@@ -1144,8 +1142,8 @@ pub(super) fn finish_source(
         .skip(cut)
         .map(|(i, value)| (Value::uint_from_row(i), value.clone()))
         .collect();
-    source.borrow_mut().add_data(&rows);
+    source.write().add_data(&rows);
     source
-        .borrow_mut()
+        .write()
         .set_yield_predicate(cambra::interpreter::Predicate::True);
 }

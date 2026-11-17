@@ -5,11 +5,26 @@ use crate::interpreter::dispatcher::BreakerHandle;
 /// The breaker retains only a weak reference to its cell.
 pub(crate) fn share_breaker(producer: impl BreakingProducer + 'static) -> Box<dyn TileProducer> {
     let tiling = producer.tiling().clone();
-    let handle: BreakerHandle = Rc::new(RefCell::new(producer));
-    handle.borrow_mut().base_mut().breaker_handle = Some(Rc::downgrade(&handle));
+    let handle: BreakerHandle = Arc::new(RwLock::new(producer));
+    handle.write().base_mut().breaker_handle = Some(Arc::downgrade(&handle));
+    let mut base = ProducerBase::unowned(BreakerReader::alloc_id(), &tiling);
+    base.definition = handle.read().base().definition.clone();
+    Box::new(BreakerReader {
+        base,
+        handle,
+        releases: true,
+    })
+}
+
+/// Worker subscriptions observe a shared breaker through its native reader. The
+/// pipeline's canonical input owns release accounting: the shared output breaker
+/// releases that input only after a worker's contribution has been integrated.
+pub(crate) fn worker_reader(handle: BreakerHandle) -> Box<dyn TileProducer> {
+    let tiling = handle.read().tiling().clone();
     Box::new(BreakerReader {
         base: ProducerBase::unowned(BreakerReader::alloc_id(), &tiling),
         handle,
+        releases: false,
     })
 }
 
@@ -18,6 +33,7 @@ struct BreakerReader {
     base: ProducerBase,
     // shared-state-ok: the producer subscription itself, with all values read through get.
     handle: BreakerHandle,
+    releases: bool,
 }
 
 impl TileProducer for BreakerReader {
@@ -26,25 +42,27 @@ impl TileProducer for BreakerReader {
     fn get(&mut self, guard: TileGuard) -> Tile {
         #[cfg(debug_assertions)]
         pull_levels::check_input_level(pull_levels::address_of(self), || self.name(), &guard);
-        self.handle.borrow_mut().get(guard)
+        self.handle.write().get(guard)
     }
     fn get_impl(&mut self, guard: TileGuard) -> Tile {
-        self.handle.borrow_mut().get(guard)
+        self.handle.write().get(guard)
     }
     fn release_impl(&mut self, guard: TileGuard) {
-        self.handle.borrow_mut().release(guard);
+        if self.releases {
+            self.handle.write().release(guard);
+        }
     }
     fn restates(&self) -> Restates {
-        self.handle.borrow().restates()
+        self.handle.read().restates()
     }
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
-        visit("breaker", &*self.handle.borrow());
+        visit("breaker", &*self.handle.read());
     }
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
-        visit("breaker", &mut *self.handle.borrow_mut());
+        visit("breaker", &mut *self.handle.write());
     }
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        self.handle.borrow().inspect(opts)
+        self.handle.read().inspect(opts)
     }
 }
 
@@ -106,11 +124,11 @@ mod tests {
         let weak = weak.expect("the concrete breaker retains its weak handle");
         let handle = weak.upgrade().expect("the reader owns its breaker");
         handle
-            .borrow_mut()
+            .write()
             .consume_in_pipeline(InputId::ONLY, tiling.universal_guard());
         assert_eq!(reader.get(tiling.universal_guard()), tile);
         reader.release(tiling.universal_guard());
-        assert!(handle.borrow().final_guard().is_empty());
+        assert!(handle.read().final_guard().is_empty());
         drop(reader);
         assert!(
             weak.upgrade().is_some(),

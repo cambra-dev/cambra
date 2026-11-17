@@ -29,7 +29,7 @@ pub struct StdinDataSource {
 
     /// Lines from the background reader thread, then the end of file or the error that stopped
     /// it.
-    receiver: Receiver<StdinMessage>,
+    receiver: parking_lot::Mutex<Receiver<StdinMessage>>,
 }
 
 /// What the stdin reader thread sends.
@@ -75,7 +75,7 @@ impl StdinDataSource {
         thread::spawn(move || read_lines(std::io::BufReader::new(std::io::stdin()), sender));
         Self {
             buf: UIntStreamBuffer::new(),
-            receiver,
+            receiver: parking_lot::Mutex::new(receiver),
         }
     }
 
@@ -111,7 +111,7 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         }
         let mut got_data = false;
         loop {
-            match self.receiver.try_recv() {
+            match self.receiver.get_mut().try_recv() {
                 Ok(StdinMessage::Line(line)) => {
                     self.add(line);
                     got_data = true;
@@ -158,10 +158,6 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         Extent::Base(BaseType::String)
     }
 
-    fn output_type(&self) -> Type {
-        Type::Base(BaseType::String)
-    }
-
     fn release(&mut self, producer: &str, obsolete: Predicate) {
         self.buf.release(producer, obsolete);
     }
@@ -172,6 +168,10 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
 
     fn first_position_for_a_new_producer(&self) -> u64 {
         self.buf.first_index_for_a_new_producer()
+    }
+
+    fn producer_retirement(&self, producer: &str) -> crate::interpreter::SourceReaderRetirement {
+        self.buf.releases.retirement(producer)
     }
 
     fn retire_producer(&mut self, producer: &str) {
@@ -199,7 +199,7 @@ mod tests {
         }
         StdinDataSource {
             buf: UIntStreamBuffer::new(),
-            receiver,
+            receiver: parking_lot::Mutex::new(receiver),
         }
     }
 
@@ -403,14 +403,14 @@ mod tests {
         source.release("producer_a", Predicate::at_or_below(Value::UInt(0)));
 
         // Store the first predicate
-        let pred_after_first = source.buf.releases.of("producer_a").cloned().unwrap();
+        let pred_after_first = source.buf.releases.of("producer_a").unwrap();
 
         // Second release from producer A: index 1
         // This should use union with the existing predicate
         source.release("producer_a", Predicate::at_or_below(Value::UInt(1)));
 
         // The predicate should now be an OR of the two
-        let pred_after_second = source.buf.releases.of("producer_a").cloned().unwrap();
+        let pred_after_second = source.buf.releases.of("producer_a").unwrap();
 
         // The second predicate should be different from the first (should be OR'd)
         assert_ne!(
@@ -468,5 +468,10 @@ mod tests {
             !source.check_for_new_data(),
             "nothing follows the end of file"
         );
+    }
+}
+impl crate::ccl::SourceType for StdinDataSource {
+    fn output_type(&self) -> Type {
+        Type::Base(BaseType::String)
     }
 }

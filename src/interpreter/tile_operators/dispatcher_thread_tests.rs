@@ -6,9 +6,8 @@
 //! Every scenario runs under a watchdog, so a deadlock fails the test instead of hanging it, and
 //! a failing scenario prints its seed and thread count.
 
-use std::cell::RefCell;
+use parking_lot::RwLock;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -466,7 +465,7 @@ fn single_threaded(script: &Script) -> (Outcome, usize) {
                 true => keys_tiling(script.positions[p]),
                 false => keys_tiling(UNIVERSE),
             };
-            let breaker: BreakerHandle = Rc::new(RefCell::new(ScriptBreaker {
+            let breaker: BreakerHandle = Arc::new(RwLock::new(ScriptBreaker {
                 base: ProducerBase::unowned(ScriptBreaker::alloc_id(), &keys_tiling(UNIVERSE)),
                 input,
                 keep: script.keep[p],
@@ -485,7 +484,7 @@ fn single_threaded(script: &Script) -> (Outcome, usize) {
             consumed[pipeline.0].push(guard.clone());
         }
     }
-    let held = breakers.iter().map(|b| b.borrow().complete()).collect();
+    let held = breakers.iter().map(|b| b.read().complete()).collect();
     (Outcome { consumed, held }, events.len())
 }
 

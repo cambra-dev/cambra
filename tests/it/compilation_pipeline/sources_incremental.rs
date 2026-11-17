@@ -4,9 +4,7 @@
 //! group-by aggregates.
 
 use crate::serving::PublishRows as _;
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::time::Duration;
 
 use bit_set::BitSet;
@@ -43,14 +41,14 @@ use smol_str::SmolStr;
 #[case("[(x, 0).0 for x in testsource1() if True]")]
 fn test_test_source(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
-    let data_source = Rc::new(RefCell::new(TestDataSource::new(
+    let data_source = TestDataSource::new(
         "testsource1",
         Type::Base(BaseType::String),
         Extent::Base(BaseType::String),
-    )));
+    );
     ctx.register_source(data_source.clone());
 
-    data_source.borrow_mut().publish_rows(&[
+    data_source.write().publish_rows(&[
         (Value::UInt(10), Value::String("foo".into())),
         (Value::UInt(20), Value::String("bar".into())),
     ]);
@@ -87,14 +85,10 @@ fn test_test_source(#[case] code: &str) {
 
     // Changing the yield guard is news without new data: it closes the source here, which
     // readers holding a cached tile would otherwise never learn.
-    data_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    data_source.write().set_yield_predicate(Predicate::True);
 
     // Restating the guard it already has changes nothing, and must not notify.
-    data_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    data_source.write().set_yield_predicate(Predicate::True);
 }
 
 /// Filtering a data source while in non-terminal state: only elements that
@@ -103,12 +97,12 @@ fn test_test_source(#[case] code: &str) {
 #[test]
 fn test_source_filter_nonterminal() {
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
-    test_source.borrow_mut().publish_rows(&[
+    );
+    test_source.write().publish_rows(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
@@ -156,20 +150,13 @@ fn test_inner_join(#[case] code: &str, #[case] streams: bool) {
         (tuple_field(0), Extent::Base(BaseType::Int)),
         (tuple_field(1), Extent::Base(BaseType::String)),
     ]));
-    let data_source1 = Rc::new(RefCell::new(TestDataSource::new(
-        "testsource1",
-        record_type.clone(),
-        record_extent.clone(),
-    )));
-    let data_source2 = Rc::new(RefCell::new(TestDataSource::new(
-        "testsource2",
-        record_type,
-        record_extent,
-    )));
+    let data_source1 =
+        TestDataSource::new("testsource1", record_type.clone(), record_extent.clone());
+    let data_source2 = TestDataSource::new("testsource2", record_type, record_extent);
     ctx.register_source(data_source1.clone());
     ctx.register_source(data_source2.clone());
 
-    data_source1.borrow_mut().publish_rows(&[(
+    data_source1.write().publish_rows(&[(
         Value::UInt(10),
         Value::Record(HashMap::from([
             (tuple_field(0), Value::Int(100)),
@@ -177,9 +164,9 @@ fn test_inner_join(#[case] code: &str, #[case] streams: bool) {
         ])),
     )]);
     data_source1
-        .borrow_mut()
+        .write()
         .set_yield_predicate(Predicate::at_or_below(Value::from(10u64)));
-    data_source2.borrow_mut().publish_rows(&[(
+    data_source2.write().publish_rows(&[(
         Value::UInt(10),
         Value::Record(HashMap::from([
             (tuple_field(0), Value::Int(100)),
@@ -187,7 +174,7 @@ fn test_inner_join(#[case] code: &str, #[case] streams: bool) {
         ])),
     )]);
     data_source2
-        .borrow_mut()
+        .write()
         .set_yield_predicate(Predicate::at_or_below(Value::from(10u64)));
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -279,7 +266,7 @@ fn test_inner_join(#[case] code: &str, #[case] streams: bool) {
         }
     );
 
-    data_source1.borrow_mut().publish_rows(&[(
+    data_source1.write().publish_rows(&[(
         Value::UInt(20),
         Value::Record(HashMap::from([
             (tuple_field(0), Value::Int(200)),
@@ -287,9 +274,9 @@ fn test_inner_join(#[case] code: &str, #[case] streams: bool) {
         ])),
     )]);
     data_source1
-        .borrow_mut()
+        .write()
         .set_yield_predicate(Predicate::at_or_below(Value::from(20u64)));
-    data_source2.borrow_mut().publish_rows(&[(
+    data_source2.write().publish_rows(&[(
         Value::UInt(20),
         Value::Record(HashMap::from([
             (tuple_field(0), Value::Int(100)),
@@ -297,7 +284,7 @@ fn test_inner_join(#[case] code: &str, #[case] streams: bool) {
         ])),
     )]);
     data_source2
-        .borrow_mut()
+        .write()
         .set_yield_predicate(Predicate::at_or_below(Value::from(20u64)));
 
     let tile = producer.run();
@@ -316,7 +303,7 @@ fn test_inner_join(#[case] code: &str, #[case] streams: bool) {
         }
     );
 
-    data_source1.borrow_mut().publish_rows(&[(
+    data_source1.write().publish_rows(&[(
         Value::UInt(30),
         Value::Record(HashMap::from([
             (tuple_field(0), Value::Int(100)),
@@ -324,15 +311,11 @@ fn test_inner_join(#[case] code: &str, #[case] streams: bool) {
         ])),
     )]);
     data_source1
-        .borrow_mut()
+        .write()
         .set_yield_predicate(Predicate::at_or_below(Value::from(30u64)));
 
-    data_source1
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
-    data_source2
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    data_source1.write().set_yield_predicate(Predicate::True);
+    data_source2.write().set_yield_predicate(Predicate::True);
     let tile = producer.run();
 
     assert_eq!(
@@ -356,26 +339,26 @@ fn test_inner_join(#[case] code: &str, #[case] streams: bool) {
 fn test_incremental_join_simple(#[case] code: &str, #[case] streams: bool) {
     let mut ctx = GlobalContext::default();
 
-    let src1 = Rc::new(RefCell::new(TestDataSource::new(
+    let src1 = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
-    let src2 = Rc::new(RefCell::new(TestDataSource::new(
+    );
+    let src2 = TestDataSource::new(
         "source2",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(src1.clone());
     ctx.register_source(src2.clone());
 
-    src1.borrow_mut()
+    src1.write()
         .publish_rows(&[(Value::UInt(1), Value::Int(100))]);
-    src1.borrow_mut()
+    src1.write()
         .set_yield_predicate(Predicate::at_or_below(Value::from(1u64)));
-    src2.borrow_mut()
+    src2.write()
         .publish_rows(&[(Value::UInt(10), Value::Int(100))]);
-    src2.borrow_mut()
+    src2.write()
         .set_yield_predicate(Predicate::at_or_below(Value::from(10u64)));
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -422,9 +405,9 @@ fn test_incremental_join_simple(#[case] code: &str, #[case] streams: bool) {
     );
 
     // Phase 2: extend src1 with a second element; src2 is unchanged.
-    src2.borrow_mut()
+    src2.write()
         .publish_rows(&[(Value::UInt(20), Value::Int(100))]);
-    src2.borrow_mut()
+    src2.write()
         .set_yield_predicate(Predicate::at_or_below(Value::from(20u64)));
 
     let tile = producer.run();
@@ -440,13 +423,13 @@ fn test_incremental_join_simple(#[case] code: &str, #[case] streams: bool) {
     );
 
     // Phase 3: extend src2 with a second element; src1 is unchanged.
-    src1.borrow_mut()
+    src1.write()
         .publish_rows(&[(Value::UInt(2), Value::Int(100))]);
-    src1.borrow_mut()
+    src1.write()
         .set_yield_predicate(Predicate::at_or_below(Value::from(2u64)));
 
-    src1.borrow_mut().set_yield_predicate(Predicate::True);
-    src2.borrow_mut().set_yield_predicate(Predicate::True);
+    src1.write().set_yield_predicate(Predicate::True);
+    src2.write().set_yield_predicate(Predicate::True);
     let tile = producer.run();
 
     // Cross-product of src1={10, 30} × src2={20}: two pairs.
@@ -468,18 +451,18 @@ fn test_incremental_global_aggregate() {
     let code = "sum(source1())";
     let mut ctx = GlobalContext::default();
 
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(test_source.clone());
     let loaded = LoadedProgram::test(code);
     let compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
     let mut producer = crate::serving::ProgramRunner::new(compiled);
 
     // First batch: 10 + 20 = 30 accumulated so far, but source is not done.
-    test_source.borrow_mut().publish_rows(&[
+    test_source.write().publish_rows(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
@@ -492,7 +475,7 @@ fn test_incremental_global_aggregate() {
 
     // Second batch: adds 30 more; running total 60, still not terminal.
     test_source
-        .borrow_mut()
+        .write()
         .publish_rows(&[(Value::UInt(2), Value::Int(30))]);
     let result = producer.run();
     assert_eq!(
@@ -502,9 +485,7 @@ fn test_incremental_global_aggregate() {
     );
 
     // Signal that the source is exhausted; the accumulated sum should now be emitted.
-    test_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    test_source.write().set_yield_predicate(Predicate::True);
     let result = producer.run();
     assert_eq!(
         result,
@@ -512,10 +493,7 @@ fn test_incremental_global_aggregate() {
         "should emit final sum once source is terminal"
     );
 
-    assert_eq!(
-        test_source.borrow().get_released_predicate(),
-        Predicate::True
-    );
+    assert_eq!(test_source.read().get_released_predicate(), Predicate::True);
 }
 
 /// An extreme with no identity, `min` over `String` or over a tuple holding one, has no value
@@ -526,11 +504,11 @@ fn test_incremental_global_aggregate() {
 #[case::tuples_holding_a_string("min([(s, 1) for s in source1()]).0")]
 fn an_extreme_with_no_identity_pulled_before_its_first_element(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::String),
         Extent::Base(BaseType::String),
-    )));
+    );
     ctx.register_source(test_source.clone());
     let loaded = LoadedProgram::test(code);
     let compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
@@ -538,14 +516,12 @@ fn an_extreme_with_no_identity_pulled_before_its_first_element(#[case] code: &st
     let nothing = producer.tiling().empty_tile();
 
     assert_eq!(producer.run(), nothing);
-    test_source.borrow_mut().publish_rows(&[
+    test_source.write().publish_rows(&[
         (Value::UInt(0), Value::String("b".into())),
         (Value::UInt(1), Value::String("a".into())),
     ]);
     assert_eq!(producer.run(), nothing);
-    test_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    test_source.write().set_yield_predicate(Predicate::True);
     assert_eq!(
         producer.run(),
         Tile::Scalar(ColumnValue::Strings(vec!["a".into()])),
@@ -558,18 +534,16 @@ fn an_extreme_with_no_identity_pulled_before_its_first_element(#[case] code: &st
 #[should_panic(expected = "`min` of an empty collection has no value")]
 fn an_extreme_with_no_identity_of_an_empty_source_stops() {
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::String),
         Extent::Base(BaseType::String),
-    )));
+    );
     ctx.register_source(test_source.clone());
     let loaded = LoadedProgram::test("min(source1())");
     let compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
     let mut producer = crate::serving::ProgramRunner::new(compiled);
-    test_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    test_source.write().set_yield_predicate(Predicate::True);
     producer.run();
 }
 
@@ -584,19 +558,19 @@ fn an_extreme_with_no_identity_of_an_empty_source_stops() {
 fn test_a_projection_after_a_source_is_read_from_the_source() {
     let code = "sum([a + b.0 for a in source2() for b in source3() if a == b.1])";
     let mut ctx = GlobalContext::default();
-    let ints = Rc::new(RefCell::new(TestDataSource::new(
+    let ints = TestDataSource::new(
         "source2",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
-    let pairs = Rc::new(RefCell::new(TestDataSource::new(
+    );
+    let pairs = TestDataSource::new(
         "source3",
         Type::Tuple(vec![Type::Base(BaseType::Int), Type::Base(BaseType::Int)]),
         Extent::Record(HashMap::from([
             (tuple_field(0), Extent::Base(BaseType::Int)),
             (tuple_field(1), Extent::Base(BaseType::Int)),
         ])),
-    )));
+    );
     ctx.register_source(ints.clone());
     ctx.register_source(pairs.clone());
     let int_rows: Vec<(Value, Value)> = (0..12u64)
@@ -614,10 +588,10 @@ fn test_a_projection_after_a_source_is_read_from_the_source() {
             )
         })
         .collect();
-    ints.borrow_mut().publish_rows(&int_rows);
-    pairs.borrow_mut().publish_rows(&pair_rows);
+    ints.write().publish_rows(&int_rows);
+    pairs.write().publish_rows(&pair_rows);
     for source in [&ints, &pairs] {
-        source.borrow_mut().set_yield_predicate(Predicate::True);
+        source.write().set_yield_predicate(Predicate::True);
     }
     let map = LoadedProgram::test(code);
     let compiled = compile_program(&mut ctx, &map, Box::new(|| {})).unwrap_or_render(&map);
@@ -649,13 +623,13 @@ fn test_a_projection_after_a_source_is_read_from_the_source() {
 fn test_two_projections_of_a_source_are_read_from_the_source_together() {
     let code = "sum([b.2 - b.0 for b in source3()])";
     let mut ctx = GlobalContext::default();
-    let triples = Rc::new(RefCell::new(TestDataSource::new(
+    let triples = TestDataSource::new(
         "source3",
         Type::Tuple(vec![Type::Base(BaseType::Int); 3]),
         Extent::Record(HashMap::from(
             [0, 1, 2].map(|n| (tuple_field(n), Extent::Base(BaseType::Int))),
         )),
-    )));
+    );
     ctx.register_source(triples.clone());
     let rows: Vec<(Value, Value)> = (0..8u64)
         .map(|k| {
@@ -667,8 +641,8 @@ fn test_two_projections_of_a_source_are_read_from_the_source_together() {
             )
         })
         .collect();
-    triples.borrow_mut().publish_rows(&rows);
-    triples.borrow_mut().set_yield_predicate(Predicate::True);
+    triples.write().publish_rows(&rows);
+    triples.write().set_yield_predicate(Predicate::True);
     let map = LoadedProgram::test(code);
     let compiled = compile_program(&mut ctx, &map, Box::new(|| {})).unwrap_or_render(&map);
     let algebra = cambra::ccl::symbolic::symbolic(&compiled.ast);
@@ -725,7 +699,7 @@ fn test_a_source_reads_the_fields_its_planned_chain_projects() {
     ];
     for (code, reads, expected) in cases {
         let mut ctx = GlobalContext::default();
-        let source = Rc::new(RefCell::new(TestDataSource::new(
+        let source = TestDataSource::new(
             "source3",
             Type::Tuple(vec![Type::Base(BaseType::Int); width]),
             Extent::Record(
@@ -733,10 +707,10 @@ fn test_a_source_reads_the_fields_its_planned_chain_projects() {
                     .map(|n| (tuple_field(n), Extent::Base(BaseType::Int)))
                     .collect(),
             ),
-        )));
+        );
         ctx.register_source(source.clone());
-        source.borrow_mut().publish_rows(&rows);
-        source.borrow_mut().set_yield_predicate(Predicate::True);
+        source.write().publish_rows(&rows);
+        source.write().set_yield_predicate(Predicate::True);
         let map = LoadedProgram::test(code);
         let compiled = compile_program(&mut ctx, &map, Box::new(|| {})).unwrap_or_render(&map);
         let algebra = cambra::ccl::symbolic::symbolic(&compiled.ast);
@@ -809,7 +783,7 @@ fn test_a_source_reads_the_nested_leaves_its_planned_chain_projects() {
     ];
     for (code, reads, expected) in cases {
         let mut ctx = GlobalContext::default();
-        let source = Rc::new(RefCell::new(TestDataSource::new(
+        let source = TestDataSource::new(
             "nest",
             Type::Tuple(vec![int(), Type::Tuple(vec![int(), int()]), int()]),
             Extent::Record(HashMap::from([
@@ -823,10 +797,10 @@ fn test_a_source_reads_the_nested_leaves_its_planned_chain_projects() {
                 ),
                 (tuple_field(2), extent()),
             ])),
-        )));
+        );
         ctx.register_source(source.clone());
-        source.borrow_mut().publish_rows(&rows);
-        source.borrow_mut().set_yield_predicate(Predicate::True);
+        source.write().publish_rows(&rows);
+        source.write().set_yield_predicate(Predicate::True);
         let map = LoadedProgram::test(code);
         let compiled = compile_program(&mut ctx, &map, Box::new(|| {})).unwrap_or_render(&map);
         let algebra = cambra::ccl::symbolic::symbolic(&compiled.ast);
@@ -861,11 +835,11 @@ fn test_incremental_conditional_mutation_loop() {
                 x := x + i
         x"#};
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(test_source.clone());
 
     let consumer: Box<dyn Consumer> = Box::new(move || {});
@@ -873,14 +847,12 @@ fn test_incremental_conditional_mutation_loop() {
     let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = crate::serving::ProgramRunner::new(compiled);
 
-    test_source.borrow_mut().publish_rows(&[
+    test_source.write().publish_rows(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
         (Value::UInt(2), Value::Int(30)),
     ]);
-    test_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    test_source.write().set_yield_predicate(Predicate::True);
 
     let _empty = Tile::Scalar(ColumnValue::Ints(vec![]));
     let result = producer.run();
@@ -908,24 +880,22 @@ fn test_incremental_tap_loop() {
             o << cnt
         o"#};
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(test_source.clone());
     let loaded = LoadedProgram::test(code);
     let compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
     let mut producer = crate::serving::ProgramRunner::new(compiled);
 
-    test_source.borrow_mut().publish_rows(&[
+    test_source.write().publish_rows(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
         (Value::UInt(2), Value::Int(30)),
     ]);
-    test_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    test_source.write().set_yield_predicate(Predicate::True);
 
     let result = producer.run();
     // Compare as a function (position → value), independent of internal ordering.
@@ -958,11 +928,11 @@ fn test_incremental_mutation_loop() {
         x"#};
     let mut ctx = GlobalContext::default();
 
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(test_source.clone());
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -978,7 +948,7 @@ fn test_incremental_mutation_loop() {
     let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
 
     // First batch: 10 + 20 = 30 accumulated so far, but source is not done.
-    test_source.borrow_mut().publish_rows(&[
+    test_source.write().publish_rows(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
@@ -991,7 +961,7 @@ fn test_incremental_mutation_loop() {
 
     // Second batch: adds 30; running total 60, still not terminal.
     test_source
-        .borrow_mut()
+        .write()
         .publish_rows(&[(Value::UInt(2), Value::Int(30))]);
 
     assert_eq!(
@@ -1003,9 +973,7 @@ fn test_incremental_mutation_loop() {
     // Signal that the source is exhausted; the loop's final accumulator
     // (10 + 20 + 30 = 60) should now be emitted.  Pull until the cycle
     // converges to a non-empty scalar (capped to catch regressions).
-    test_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    test_source.write().set_yield_predicate(Predicate::True);
 
     let result = producer.run();
     assert_eq!(
@@ -1016,10 +984,7 @@ fn test_incremental_mutation_loop() {
 
     // The mutation loop should have released every position back to the
     // source by the end, mirroring `sum(source1())`'s release behaviour.
-    assert_eq!(
-        test_source.borrow().get_released_predicate(),
-        Predicate::True
-    );
+    assert_eq!(test_source.read().get_released_predicate(), Predicate::True);
 }
 
 /// A source that grows while the induction driver is running.
@@ -1039,11 +1004,11 @@ fn test_a_source_growing_under_a_running_induction_driver_is_read_again() {
         x
     "};
     let mut ctx = GlobalContext::default();
-    let source = Rc::new(RefCell::new(TestDataSource::new(
+    let source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(source.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
@@ -1056,14 +1021,14 @@ fn test_a_source_growing_under_a_running_induction_driver_is_read_again() {
             .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
             .collect();
         let through = rows.last().expect("a batch has a row").0;
-        source.borrow_mut().publish_rows(&data);
+        source.write().publish_rows(&data);
         source
-            .borrow_mut()
+            .write()
             .set_yield_predicate(Predicate::at_or_below(Value::UInt(through)));
     };
     let released_through = |key: u64| {
         source
-            .borrow()
+            .read()
             .get_released_predicate()
             .subsumes(&Predicate::at_or_below(Value::UInt(key)))
     };
@@ -1075,12 +1040,12 @@ fn test_a_source_growing_under_a_running_induction_driver_is_read_again() {
     assert!(
         released_through(1),
         "the driver should have run its first positions before the next batch arrives: {:?}",
-        source.borrow().get_released_predicate()
+        source.read().get_released_predicate()
     );
     assert!(
         !released_through(3),
         "nothing past the first batch exists yet: {:?}",
-        source.borrow().get_released_predicate()
+        source.read().get_released_predicate()
     );
 
     // The second batch arrives under a driver that has already emitted. Its positions are
@@ -1090,14 +1055,14 @@ fn test_a_source_growing_under_a_running_induction_driver_is_read_again() {
     assert!(
         released_through(4),
         "the driver should read the rows that arrived after its first iterations: {:?}",
-        source.borrow().get_released_predicate()
+        source.read().get_released_predicate()
     );
 
     // A third batch, to read again once more, and then the source closes.
     deliver(&[(5, 60)]);
     producer.run();
     assert!(released_through(5));
-    source.borrow_mut().set_yield_predicate(Predicate::True);
+    source.write().set_yield_predicate(Predicate::True);
     let mut total = producer.run();
     total.compact();
     assert_eq!(
@@ -1105,7 +1070,7 @@ fn test_a_source_growing_under_a_running_induction_driver_is_read_again() {
         Tile::Scalar(ColumnValue::Ints(vec![10 + 20 + 30 + 40 + 50 + 60])),
         "every batch is summed, including the ones that arrived mid-run"
     );
-    assert_eq!(source.borrow().get_released_predicate(), Predicate::True);
+    assert_eq!(source.read().get_released_predicate(), Predicate::True);
 }
 
 /// A source that grows while the transaction driver is running.
@@ -1125,11 +1090,11 @@ fn test_a_source_growing_under_a_running_transaction_driver_is_read_again() {
         await_final(total)
     "};
     let mut ctx = GlobalContext::default();
-    let source = Rc::new(RefCell::new(TestDataSource::new(
+    let source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(source.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
@@ -1142,14 +1107,14 @@ fn test_a_source_growing_under_a_running_transaction_driver_is_read_again() {
             .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
             .collect();
         let through = rows.last().expect("a batch has a row").0;
-        source.borrow_mut().publish_rows(&data);
+        source.write().publish_rows(&data);
         source
-            .borrow_mut()
+            .write()
             .set_yield_predicate(Predicate::at_or_below(Value::UInt(through)));
     };
     let released_through = |key: u64| {
         source
-            .borrow()
+            .read()
             .get_released_predicate()
             .subsumes(&Predicate::at_or_below(Value::UInt(key)))
     };
@@ -1159,12 +1124,12 @@ fn test_a_source_growing_under_a_running_transaction_driver_is_read_again() {
     assert!(
         released_through(1),
         "the driver should have committed its first items before the next batch arrives: {:?}",
-        source.borrow().get_released_predicate()
+        source.read().get_released_predicate()
     );
     assert!(
         !released_through(3),
         "nothing past the first batch exists yet: {:?}",
-        source.borrow().get_released_predicate()
+        source.read().get_released_predicate()
     );
 
     // The second batch arrives under a driver that has already attempted items. Its items
@@ -1174,10 +1139,10 @@ fn test_a_source_growing_under_a_running_transaction_driver_is_read_again() {
     assert!(
         released_through(4),
         "the driver should read the items that arrived after its first attempts: {:?}",
-        source.borrow().get_released_predicate()
+        source.read().get_released_predicate()
     );
 
-    source.borrow_mut().set_yield_predicate(Predicate::True);
+    source.write().set_yield_predicate(Predicate::True);
     let mut total = producer.run();
     total.compact();
     assert_eq!(
@@ -1188,7 +1153,7 @@ fn test_a_source_growing_under_a_running_transaction_driver_is_read_again() {
     assert!(
         released_through(4),
         "every committed item is released: {:?}",
-        source.borrow().get_released_predicate()
+        source.read().get_released_predicate()
     );
 }
 
@@ -1204,11 +1169,11 @@ fn test_filtered_rows_of_a_live_transaction_source_are_released() {
                 pool := 7
         await_final(pool)"#};
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(test_source.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
@@ -1216,25 +1181,23 @@ fn test_filtered_rows_of_a_live_transaction_source_are_released() {
     let mut producer = crate::serving::ProgramRunner::new(compiled);
     let _empty = Tile::Scalar(ColumnValue::Ints(vec![]));
 
-    test_source.borrow_mut().publish_rows(&[
+    test_source.write().publish_rows(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
     test_source
-        .borrow_mut()
+        .write()
         .set_yield_predicate(Predicate::at_or_below(Value::UInt(1)));
 
     producer.run();
     assert_eq!(
-        test_source.borrow().get_released_predicate(),
+        test_source.read().get_released_predicate(),
         Predicate::at_or_below(Value::UInt(1)),
         "both filtered rows are released while the source is live"
     );
 
     // No block ran, so the store still holds its seed.
-    test_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    test_source.write().set_yield_predicate(Predicate::True);
 
     assert_eq!(producer.run(), Tile::Scalar(ColumnValue::Ints(vec![100])),);
 }
@@ -1251,11 +1214,11 @@ fn test_incremental_constant_mutation_loop() {
             x := 7
         x"#};
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(test_source.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
@@ -1263,7 +1226,7 @@ fn test_incremental_constant_mutation_loop() {
     let mut producer = crate::serving::ProgramRunner::new(compiled);
     let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
 
-    test_source.borrow_mut().publish_rows(&[
+    test_source.write().publish_rows(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
@@ -1274,15 +1237,10 @@ fn test_incremental_constant_mutation_loop() {
         "a source that is not done yields no accumulator"
     );
 
-    test_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    test_source.write().set_yield_predicate(Predicate::True);
 
     assert_eq!(producer.run(), Tile::Scalar(ColumnValue::Ints(vec![7])),);
-    assert_eq!(
-        test_source.borrow().get_released_predicate(),
-        Predicate::True
-    );
+    assert_eq!(test_source.read().get_released_predicate(), Predicate::True);
 }
 
 /// The same loop over a live source that finishes without delivering a row: the write never
@@ -1295,11 +1253,11 @@ fn test_incremental_constant_mutation_loop_over_nothing() {
             x := 7
         x"#};
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(test_source.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
@@ -1307,9 +1265,7 @@ fn test_incremental_constant_mutation_loop_over_nothing() {
     let mut producer = crate::serving::ProgramRunner::new(compiled);
     let _empty = Tile::Scalar(ColumnValue::Ints(vec![]));
 
-    test_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    test_source.write().set_yield_predicate(Predicate::True);
 
     assert_eq!(producer.run(), Tile::Scalar(ColumnValue::Ints(vec![0])),);
 }
@@ -1319,11 +1275,11 @@ fn test_incremental_aggregates() {
     let code = "[sum(x) for x in groupby(source1(), \\x -> x // 10)]";
     let mut ctx = GlobalContext::default();
 
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(test_source.clone());
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -1331,7 +1287,7 @@ fn test_incremental_aggregates() {
     let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = crate::serving::ProgramRunner::new(compiled);
 
-    test_source.borrow_mut().publish_rows(&[
+    test_source.write().publish_rows(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
@@ -1347,7 +1303,7 @@ fn test_incremental_aggregates() {
         )
     );
 
-    test_source.borrow_mut().publish_rows(&[
+    test_source.write().publish_rows(&[
         (Value::UInt(2), Value::Int(10)),
         (Value::UInt(3), Value::Int(30)),
     ]);
@@ -1362,9 +1318,7 @@ fn test_incremental_aggregates() {
         )
     );
 
-    test_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    test_source.write().set_yield_predicate(Predicate::True);
 
     let result = producer.run();
     assert_eq!(
@@ -1377,10 +1331,7 @@ fn test_incremental_aggregates() {
         ))
     );
 
-    assert_eq!(
-        test_source.borrow().get_released_predicate(),
-        Predicate::True
-    );
+    assert_eq!(test_source.read().get_released_predicate(), Predicate::True);
 }
 
 /// A collection component of a product value, read from a **data source** rather
@@ -1401,20 +1352,18 @@ fn test_incremental_aggregates() {
 )]
 fn test_source_backed_collection_component(#[case] code: &str, #[case] expected: i64) {
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
-    test_source.borrow_mut().publish_rows(&[
+    );
+    test_source.write().publish_rows(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
     // The table a product holds is the whole table, so the source states that it
     // has delivered all of it.
-    test_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    test_source.write().set_yield_predicate(Predicate::True);
     ctx.register_source(test_source.clone());
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -1435,26 +1384,28 @@ fn test_source_backed_collection_component(#[case] code: &str, #[case] expected:
 #[case::bare_source("source1()", true)]
 fn test_a_collection_component_grows_with_its_source(#[case] code: &str, #[case] streams: bool) {
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(test_source.clone());
     let loaded = LoadedProgram::from_text("<t>", code);
     let compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
     let mut producer = crate::serving::ProgramRunner::new(compiled);
 
     // Each delivery runs the dispatcher to its drained boundary.
-    let mut pull = |source: &Rc<RefCell<TestDataSource>>, rows: &[(u64, i64)], done: bool| {
-        source.borrow_mut().publish_rows(
+    let mut pull = |source: &cambra::ccl::SourceDefinition<TestDataSource>,
+                    rows: &[(u64, i64)],
+                    done: bool| {
+        source.write().publish_rows(
             &rows
                 .iter()
                 .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
                 .collect::<Vec<_>>(),
         );
         if done {
-            source.borrow_mut().set_yield_predicate(Predicate::True);
+            source.write().set_yield_predicate(Predicate::True);
         }
         let mut tile = producer.run();
         tile.compact();
@@ -1512,18 +1463,18 @@ fn test_a_released_collection_component_is_not_redelivered(
     #[case] streams: bool,
 ) {
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(test_source.clone());
     let loaded = LoadedProgram::from_text("<t>", code);
     let compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
     let mut producer = crate::serving::ProgramRunner::new(compiled);
 
     let mut pull_and_release = |rows: &[(u64, i64)]| {
-        test_source.borrow_mut().publish_rows(
+        test_source.write().publish_rows(
             &rows
                 .iter()
                 .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
@@ -1549,9 +1500,7 @@ fn test_a_released_collection_component_is_not_redelivered(
         assert!(pull_and_release(&[(0, 10), (1, 20)]).is_empty());
         assert!(pull_and_release(&[(2, 30)]).is_empty());
         assert!(pull_and_release(&[(3, 40)]).is_empty());
-        test_source
-            .borrow_mut()
-            .set_yield_predicate(Predicate::True);
+        test_source.write().set_yield_predicate(Predicate::True);
         let mut complete = producer.run();
         complete.compact();
         assert_eq!(
@@ -1585,11 +1534,11 @@ fn test_a_released_collection_component_is_not_redelivered(
 /// Run a source delivery to its drained boundary and return the source region released.
 fn released_by_dispatching_a_source(code: &str, rows: &[i64], close: bool) -> Predicate {
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(test_source.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
@@ -1600,27 +1549,25 @@ fn released_by_dispatching_a_source(code: &str, rows: &[i64], close: bool) -> Pr
         .enumerate()
         .map(|(i, v)| (Value::uint_from_row(i), Value::Int(*v)))
         .collect();
-    test_source.borrow_mut().publish_rows(&rows);
+    test_source.write().publish_rows(&rows);
     test_source
-        .borrow_mut()
+        .write()
         .set_yield_predicate(Predicate::at_or_below(Value::uint_from_row(rows.len() - 1)));
 
     if close {
-        test_source
-            .borrow_mut()
-            .set_yield_predicate(Predicate::True);
+        test_source.write().set_yield_predicate(Predicate::True);
     }
     producer.run();
-    test_source.borrow().get_released_predicate()
+    test_source.read().get_released_predicate()
 }
 
 fn released_by_a_sink_over_a_live_source(code: &str, rows: &[i64]) -> Predicate {
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(test_source.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
@@ -1631,13 +1578,13 @@ fn released_by_a_sink_over_a_live_source(code: &str, rows: &[i64]) -> Predicate 
         .enumerate()
         .map(|(i, v)| (Value::uint_from_row(i), Value::Int(*v)))
         .collect();
-    test_source.borrow_mut().publish_rows(&rows);
+    test_source.write().publish_rows(&rows);
     test_source
-        .borrow_mut()
+        .write()
         .set_yield_predicate(Predicate::at_or_below(Value::uint_from_row(rows.len() - 1)));
 
     producer.run();
-    test_source.borrow().get_released_predicate()
+    test_source.read().get_released_predicate()
 }
 
 /// An induction loop over a live source filtered to nothing releases every row, as the
@@ -1722,11 +1669,11 @@ fn run_in_batches(code: &str, batches: &[(&[(u64, i64)], u64)]) -> Tile {
 /// say what arrived before the source closed.
 fn read_source_in_batches(code: &str, batches: &[(&[(u64, i64)], u64)]) -> (Vec<Tile>, Tile) {
     let mut ctx = GlobalContext::default();
-    let source = Rc::new(RefCell::new(TestDataSource::new(
+    let source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(source.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
@@ -1738,15 +1685,15 @@ fn read_source_in_batches(code: &str, batches: &[(&[(u64, i64)], u64)]) -> (Vec<
             .iter()
             .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
             .collect();
-        source.borrow_mut().publish_rows(&data);
+        source.write().publish_rows(&data);
         source
-            .borrow_mut()
+            .write()
             .set_yield_predicate(Predicate::at_or_below(Value::UInt(*upto)));
         let mut seen = producer.run();
         seen.compact();
         each.push(seen);
     }
-    source.borrow_mut().set_yield_predicate(Predicate::True);
+    source.write().set_yield_predicate(Predicate::True);
     let mut tile = producer.run();
     assert!(
         tile.is_terminal(),
@@ -1758,11 +1705,11 @@ fn read_source_in_batches(code: &str, batches: &[(&[(u64, i64)], u64)]) -> (Vec<
 
 fn run_in_batches_seeing(code: &str, batches: &[(&[(u64, i64)], u64)]) -> (Vec<Tile>, Tile) {
     let mut ctx = GlobalContext::default();
-    let source = Rc::new(RefCell::new(TestDataSource::new(
+    let source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(source.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
@@ -1774,15 +1721,15 @@ fn run_in_batches_seeing(code: &str, batches: &[(&[(u64, i64)], u64)]) -> (Vec<T
             .iter()
             .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
             .collect();
-        source.borrow_mut().publish_rows(&data);
+        source.write().publish_rows(&data);
         source
-            .borrow_mut()
+            .write()
             .set_yield_predicate(Predicate::at_or_below(Value::UInt(*upto)));
         let mut seen = producer.run();
         seen.compact();
         each.push(seen);
     }
-    source.borrow_mut().set_yield_predicate(Predicate::True);
+    source.write().set_yield_predicate(Predicate::True);
     let mut tile = producer.run();
     assert!(
         tile.is_terminal(),
@@ -1966,11 +1913,11 @@ fn a_collection_per_row_over_a_streamed_source() {
 fn a_collection_per_row_released_as_it_is_read() {
     let code = "[[y * x for y in source1()] for x in [1, 2]]";
     let mut ctx = GlobalContext::default();
-    let source = Rc::new(RefCell::new(TestDataSource::new(
+    let source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(source.clone());
     let loaded = LoadedProgram::test(code);
     let compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
@@ -1981,8 +1928,8 @@ fn a_collection_per_row_released_as_it_is_read() {
             .iter()
             .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
             .collect();
-        source.borrow_mut().publish_rows(&data);
-        source.borrow_mut().set_yield_predicate(yielded);
+        source.write().publish_rows(&data);
+        source.write().set_yield_predicate(yielded);
         let mut tile = producer.run();
         tile.compact();
         producer.discard_observed(tile.to_guard());

@@ -2191,22 +2191,19 @@ transitive indices (t1→t3 directly) vs. recompute on demand.
 None of the above algorithms guarantee termination in the presence of cycles in the dataflow
 graph. Detecting convergence (rather than truncating iteration) is an open problem.
 
-## Finite pure runtime descriptions
+## Shared native definitions and worker state
 
-The opt-in [finite pure compiled execution](design-parallel-dispatcher.md#finite-pure-compiled-execution)
-exports shared immutable operator plans and native computation kernels. An explicit worker context
-owns and reuses private input subscriptions, native shape views, caches and release state for every
-pipeline it executes. Kernel methods receive that mutable state explicitly. Native construction
-adapters drop after subscription. Inline fan-out remains private to the owning worker state.
+The [unified dispatcher](design-parallel-dispatcher.md#unified-native-execution) uses the same
+`TileOperator` definitions for compilation, subscription and concurrent execution. Definitions are
+shared immutable `Arc` values; producers hold mutable state. A worker owns and reuses one private
+subscription per admitted pipeline, including its inline aliases and temporary buffers. Native
+operator methods implement computation and receive state explicitly. Declared breaker readers
+resolve to the existing shared native cells during worker subscription.
 
-Sources and declared breaker boundaries hold synchronized shared tiles. Logical reader release
-records cover all workers of a pipeline; their intersection controls reclamation. Regional releases
-follow shared application, including delayed aggregate flushes. Whole operands stay retained until
-their reader finishes. Contributions and completion statements publish atomically before dependent
-claims become ready. Grouped aggregates reuse worker-local full-path maps and merge drained deltas
-without replaying earlier contributions. Finalization waits for queued, active and buffered work.
-
-This path evaluates fresh finite pure state and does not consume or transfer the retained producer
-graph. Live and stateful runtime conversion follows the ownership and retention contracts in the
-parallel dispatcher design. Checked integer `Sum` remains refused because reassociation can change
-overflow behavior.
+A worker integrates its contribution into the shared output breaker before that breaker releases
+its canonical input. The canonical subscription accumulates releases across workers while native
+fan-out intersections retain data for other logical readers. Whole operands stay held until their
+reader finishes. Late deltas discard obsolete output before merging. Grouped aggregates drain
+worker-local maps into the shared native state without replaying earlier contributions. Publication
+follows integration, and finalization waits for every queued and active claim. DOP one uses this
+same path. Operators requiring exclusive state continue on the coordinator within the same plan.

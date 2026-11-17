@@ -43,10 +43,8 @@
 //! does not identify it.
 
 use std::{
-    cell::RefCell,
     collections::{HashMap, HashSet},
     fmt,
-    rc::{Rc, Weak},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -174,7 +172,7 @@ impl Branch {
         self.main_producer = None;
         for output in &self.program.outputs {
             if let Some(consumer) = &output.sink_consumer {
-                consumer.borrow_mut().detach();
+                consumer.write().detach();
             }
         }
         self.program.outputs.clear();
@@ -640,7 +638,7 @@ impl LiveProgram {
             let Some(producer) = branch.main_producer.take() else {
                 continue;
             };
-            let slot: ProducerSlot = Rc::new(RefCell::new(Some(producer)));
+            let slot: ProducerSlot = Arc::new(parking_lot::RwLock::new(Some(producer)));
             let output = Arc::new(MainOutput {
                 print: print(&branch.name),
                 finished: AtomicBool::new(false),
@@ -651,7 +649,7 @@ impl LiveProgram {
         let ended = targets.run(morsel_rows, observer);
         for (at, slot, output) in mains {
             let branch = &mut self.branches[at];
-            branch.main_producer = slot.borrow_mut().take();
+            branch.main_producer = slot.write().take();
             branch.main_finished |= output.finished.load(Ordering::Relaxed);
         }
         ended
@@ -696,7 +694,7 @@ impl LiveProgram {
             }
             for theirs in consumers(other) {
                 debug_assert!(
-                    !own.iter().any(|mine| Rc::ptr_eq(mine, &theirs)),
+                    !own.iter().any(|mine| Arc::ptr_eq(mine, &theirs)),
                     "each sink consumer belongs to exactly one entry, but `{}` and `{}` share one",
                     self.branches[at].name,
                     other.name,
@@ -707,7 +705,7 @@ impl LiveProgram {
 
     /// Every branch, in creation order.
     pub fn branches(&self) -> Vec<BranchSummary> {
-        let held: Vec<Vec<Rc<FanOut>>> = self
+        let held: Vec<Vec<Arc<FanOut>>> = self
             .branches
             .iter()
             .map(|b| b.operator_map.operators())
@@ -720,7 +718,7 @@ impl LiveProgram {
                     .iter()
                     .filter(|fan| {
                         held.iter().enumerate().any(|(other, ops)| {
-                            other != at && ops.iter().any(|o| Rc::ptr_eq(o, fan))
+                            other != at && ops.iter().any(|o| Arc::ptr_eq(o, fan))
                         })
                     })
                     .count();
@@ -763,14 +761,14 @@ impl LiveProgram {
     ///
     /// Weak so that asking keeps nothing alive: a handle that no longer upgrades
     /// is an operator no entry holds, which has been freed.
-    pub fn held_operators(&self, name: &str) -> Option<Vec<Weak<FanOut>>> {
+    pub fn held_operators(&self, name: &str) -> Option<Vec<std::sync::Weak<FanOut>>> {
         let at = self.index_of(name).ok()?;
         Some(
             self.branches[at]
                 .operator_map
                 .operators()
                 .iter()
-                .map(Rc::downgrade)
+                .map(Arc::downgrade)
                 .collect(),
         )
     }

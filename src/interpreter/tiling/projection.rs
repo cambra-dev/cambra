@@ -1464,10 +1464,10 @@ mod tests {
         let rest = spy.read_in_pipeline(tiling.universal_guard());
         assert_eq!(int_entries(&rest), [(0, 10), (3, 40)]);
         assert_eq!(
-            *pulled.borrow(),
+            *pulled.read(),
             [keys_between(1, 2), tiling.universal_guard()]
         );
-        assert_eq!(*released.borrow(), [keys_between(1, 2)]);
+        assert_eq!(*released.read(), [keys_between(1, 2)]);
         // A pull that names nothing states nothing complete, which is withdrawal unless
         // the consumer released what it took.
         spy.release(tiling.universal_guard());

@@ -30,7 +30,7 @@ pub struct RekeySorted {
     /// Output tiling: `DataFunction { domain: 𝐽, codomain: 𝑉 }`.
     base: OperatorBase,
     /// The pairs, `DataFunction { domain: 𝐾, codomain: (𝐽, 𝑉) }`.
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     /// Whether the keys rise with the input's positions.
     order: KeyOrder,
 }
@@ -59,7 +59,7 @@ impl KeyOrder {
 }
 
 impl RekeySorted {
-    pub fn new(input: Box<dyn TileOperator>, order: KeyOrder) -> Self {
+    pub fn new(input: Arc<dyn TileOperator>, order: KeyOrder) -> Self {
         let tiling = rekeyed_tiling(input.tiling());
         Self {
             base: OperatorBase::new(tiling),
@@ -103,8 +103,8 @@ impl TileOperator for RekeySorted {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe(
-        &mut self,
+    fn subscribe_impl(
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -114,13 +114,15 @@ impl TileOperator for RekeySorted {
             base: ProducerBase::new(
                 RekeySortedProducer::alloc_id(),
                 self.tiling(),
-                &self.base,
+                self.clone(),
                 cx,
             )
             .breaking(input.downstream, input.placement),
-            input: self
-                .input
-                .subscribe(self.input.tiling().universal_guard(), input.consumer, cx),
+            input: self.input.clone().subscribe(
+                self.input.tiling().universal_guard(),
+                input.consumer,
+                cx,
+            ),
             output: self.tiling().empty_tile(),
             held: Vec::new(),
             complete: Complete::new(self.order),
@@ -459,7 +461,7 @@ mod tests {
     }
 
     /// A producer over `input`, pulled once, with the guards it forwards upstream.
-    fn pulled(input: Tile) -> (RekeySortedProducer, Tile, Rc<RefCell<Vec<TileGuard>>>) {
+    fn pulled(input: Tile) -> (RekeySortedProducer, Tile, Arc<RwLock<Vec<TileGuard>>>) {
         pulled_in(input, KeyOrder::Rising)
     }
 
@@ -467,7 +469,7 @@ mod tests {
     fn pulled_in(
         input: Tile,
         order: KeyOrder,
-    ) -> (RekeySortedProducer, Tile, Rc<RefCell<Vec<TileGuard>>>) {
+    ) -> (RekeySortedProducer, Tile, Arc<RwLock<Vec<TileGuard>>>) {
         let (spy, released) = ReleaseSpy::new(input, pair_tiling());
         let tiling = rekeyed_tiling(&pair_tiling());
         let mut producer = RekeySortedProducer {
@@ -532,7 +534,7 @@ mod tests {
         );
         assert!(
             releases
-                .borrow()
+                .read()
                 .iter()
                 .all(|guard| guard.is_empty() || *guard == keys(Predicate::at_or_below(uint(1))))
         );
@@ -616,9 +618,9 @@ mod tests {
             pulled(pairs(&[3, 7], &[0, 1], &[10, 20], Predicate::True));
         producer.release(producer.tiling().universal_guard());
         assert!(
-            released.borrow().iter().any(TileGuard::is_universal),
+            released.read().iter().any(TileGuard::is_universal),
             "{:?}",
-            released.borrow()
+            released.read()
         );
     }
     /// The declared input level matches the whole read used to translate output keys.
@@ -631,10 +633,13 @@ mod tests {
             pairs(&[3, 7, 9], &[0, 1, 2], &[10, 20, 30], Predicate::True),
             pair_tiling(),
         );
-        let mut operator = RekeySorted::new(Box::new(input), KeyOrder::Rising);
+        let operator = Arc::new(RekeySorted::new(Arc::new(input), KeyOrder::Rising));
         let tiling = operator.tiling().clone();
         let mut cx = Default::default();
-        let mut producer = operator.subscribe(tiling.universal_guard(), Box::new(|| {}), &mut cx);
+        let mut producer =
+            operator
+                .clone()
+                .subscribe(tiling.universal_guard(), Box::new(|| {}), &mut cx);
         let guard = keys(Predicate::point(uint(1)));
         let level = Projection::of(&guard)
             .expect("a key projection")
@@ -655,7 +660,7 @@ mod tests {
         }
         let declared = leaf_level(&*producer, Some(level));
         let _ = producer.read_in_pipeline(guard);
-        let pulled = pulled.borrow();
+        let pulled = pulled.read();
         assert_eq!(pulled.len(), 1);
         let actual = Projection::of(&pulled[0])
             .expect("an input projection")

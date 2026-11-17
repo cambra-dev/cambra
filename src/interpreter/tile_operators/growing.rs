@@ -59,12 +59,12 @@ impl Source {
 /// is spelled in full like the other test doubles' cells in `test_helpers`, which the
 /// shared-state check reads.
 #[allow(unused_qualifications)]
-pub(crate) type Shared = std::rc::Rc<std::cell::RefCell<Source>>;
+pub(crate) type Shared = std::sync::Arc<parking_lot::RwLock<Source>>;
 
 /// A source that grows: it states complete only the keys it holds until it is closed.
 pub(crate) fn growing_source(keys: impl IntoIterator<Item = u64>) -> Shared {
     let source = source(keys);
-    source.borrow_mut().growing = true;
+    source.write().growing = true;
     source
 }
 
@@ -72,7 +72,7 @@ pub(crate) fn growing_source(keys: impl IntoIterator<Item = u64>) -> Shared {
 pub(crate) fn source_of(keys: impl IntoIterator<Item = u64>, value: fn(u64) -> i64) -> Shared {
     let source = Shared::default();
     for key in keys {
-        source.borrow_mut().rows.insert(key, value(key));
+        source.write().rows.insert(key, value(key));
     }
     source
 }
@@ -80,7 +80,7 @@ pub(crate) fn source_of(keys: impl IntoIterator<Item = u64>, value: fn(u64) -> i
 pub(crate) fn source(keys: impl IntoIterator<Item = u64>) -> Shared {
     let source = Shared::default();
     for key in keys {
-        source.borrow_mut().rows.insert(key, value(key));
+        source.write().rows.insert(key, value(key));
     }
     source
 }
@@ -111,17 +111,17 @@ impl TileProducer for Input {
     }
 
     fn get_impl(&mut self, guard: TileGuard) -> Tile {
-        self.source.borrow_mut().pulled.push(guard.clone());
+        self.source.write().pulled.push(guard.clone());
         if released_whole(&guard, self.obsolete_guard()) {
-            self.source.borrow_mut().wasted += 1;
+            self.source.write().wasted += 1;
         }
-        let rows = self.source.borrow().rows.clone();
+        let rows = self.source.read().rows.clone();
         let mut tile = Tile::data_function(
             ColumnValue::UInts(rows.keys().copied().collect()),
             Box::new(Tile::Scalar(ColumnValue::Ints(
                 rows.values().copied().collect(),
             ))),
-            self.source.borrow().statement(),
+            self.source.read().statement(),
             BitSet::new(),
         );
         tile.remove_guarded(self.obsolete_guard().clone());
@@ -131,7 +131,7 @@ impl TileProducer for Input {
     }
 
     fn release_impl(&mut self, guard: TileGuard) {
-        self.source.borrow_mut().released.push(guard);
+        self.source.write().released.push(guard);
     }
 }
 
@@ -382,7 +382,7 @@ impl InputModel {
     /// The releases that reached `source`, and its pulls of a region it had been released at
     /// whole, against the model.
     pub(crate) fn check(&self, source: &Shared, trace: &str) {
-        let source = source.borrow();
+        let source = source.read();
         assert_eq!(
             source.wasted, self.wasted,
             "{trace}: pulls of a region released whole"
@@ -460,11 +460,11 @@ impl TileProducer for NestedInput {
     }
 
     fn get_impl(&mut self, guard: TileGuard) -> Tile {
-        self.source.borrow_mut().pulled.push(guard.clone());
+        self.source.write().pulled.push(guard.clone());
         if released_whole(&guard, self.obsolete_guard()) {
-            self.source.borrow_mut().wasted += 1;
+            self.source.write().wasted += 1;
         }
-        let source = self.source.borrow();
+        let source = self.source.read();
         let keys: Vec<u64> = source.rows.keys().copied().collect();
         let counts: Vec<usize> = keys
             .iter()
@@ -519,7 +519,7 @@ impl TileProducer for NestedInput {
     }
 
     fn release_impl(&mut self, guard: TileGuard) {
-        self.source.borrow_mut().released.push(guard);
+        self.source.write().released.push(guard);
     }
 }
 
@@ -532,7 +532,7 @@ pub(crate) struct ReadsBreaker {
 
 impl ReadsBreaker {
     pub(crate) fn of(breaker: &crate::interpreter::dispatcher::BreakerHandle) -> Self {
-        let tiling = breaker.borrow().tiling().clone();
+        let tiling = breaker.read().tiling().clone();
         Self {
             base: ProducerBase::unowned(Self::alloc_id(), &tiling),
             breaker: breaker.clone(),
@@ -548,10 +548,10 @@ impl TileProducer for ReadsBreaker {
     }
 
     fn get_impl(&mut self, guard: TileGuard) -> Tile {
-        self.breaker.borrow_mut().get(guard)
+        self.breaker.write().get(guard)
     }
 
     fn release_impl(&mut self, guard: TileGuard) {
-        self.breaker.borrow_mut().release(guard);
+        self.breaker.write().release(guard);
     }
 }

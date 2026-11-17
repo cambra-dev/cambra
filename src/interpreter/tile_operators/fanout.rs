@@ -4,11 +4,11 @@ use crate::interpreter::tile_operators::test_helpers::Announce as _;
 use crate::interpreter::tile_operators::test_helpers::ConsumeInPipeline as _;
 #[cfg(test)]
 use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
+#[cfg(test)]
+use crate::interpreter::tile_operators::test_helpers::SharedCounter as Cell;
 use log::trace;
-use std::{
-    cell::{Cell, RefCell},
-    rc::{Rc, Weak},
-};
+use parking_lot::RwLock;
+use std::sync::{Arc, Weak};
 
 use super::*;
 use crate::interpreter::operator_graph::{share, value};
@@ -51,23 +51,23 @@ struct FanOutReentrancy {
 }
 
 /// Mutable state shared across all slots from the same [`FanOut`] and all
-/// [`FanOutProducer`]s it creates.  Wrapping this in `Rc<RefCell<...>>` and
+/// [`FanOutProducer`]s it creates.  Wrapping this in `Arc<RwLock<...>>` and
 /// creating it eagerly in [`FanOut::new`] ensures that every slot produced by
 /// [`FanOut::slot`] shares the same object from the start — even before any
 /// [`TileOperator::subscribe`] call has initialised the inner producer.
-struct FanOutShared {
+pub(crate) struct FanOutShared {
     /// Instance ID shared by all [`FanOutProducer`]s from the same fan-out group.
     id: usize,
     /// Inner producer, set on the first [`FanOutSlot::subscribe`] call.
     producer: Option<Inner>,
     /// Every consumer registered via [`FanOutSlot::subscribe`], in order.
     ///
-    /// Stored as `Rc<RefCell<...>>` so that the notification closure can clone the
-    /// handles, release the `shared` borrow, and then call each consumer without
+    /// Stored as `Arc<RwLock<...>>` so that the notification closure can clone the
+    /// handles, release the `shared` read, and then call each consumer without
     /// holding `shared` across the notification.  This prevents a re-entrant panic
     /// when a consumer (e.g. `SinkConsumer`) calls back into `FanOutProducer::get_impl`,
-    /// which itself needs `shared.borrow_mut()`.
-    consumers: Vec<Rc<RefCell<Box<dyn Consumer>>>>,
+    /// which itself needs `shared.write()`.
+    consumers: Vec<Arc<RwLock<Box<dyn Consumer>>>>,
     /// Per-subscriber release guards; intersected before passing upstream.
     release_guards: Vec<TileGuard>,
     /// Whether each subscriber reads through a [`recurrence_slot`](FanOut::recurrence_slot),
@@ -116,7 +116,7 @@ struct FanOutShared {
     ///
     /// [`release_guards`]: FanOutShared::release_guards
     /// [`consumers`]: FanOutShared::consumers
-    subscribers: Vec<Weak<Cell<usize>>>,
+    subscribers: Vec<Weak<std::sync::atomic::AtomicUsize>>,
     /// Re-entrancy bookkeeping for cyclic op graphs.  `None` for non-cyclic
     /// fan-outs (the overwhelming majority); `Some` only when constructed
     /// via [`FanOut::new_cyclic`].
@@ -159,7 +159,7 @@ impl FanOutShared {
             return;
         }
         for (next, cell) in live.iter().flatten().enumerate() {
-            cell.set(next);
+            cell.store(next, std::sync::atomic::Ordering::Relaxed);
         }
         let keep: Vec<bool> = live.iter().map(Option::is_some).collect();
         retain_flagged(&mut self.subscribers, &keep);
@@ -185,12 +185,12 @@ enum Inner {
     /// An ordinary fan-out's input, which a slot pulls under the fan-out's shared state.
     Owned(Box<dyn TileProducer>),
     /// A cyclic fan-out's input, a store, in a cell of its own. A slot pulls it under that
-    /// cell's borrow alone, with the fan-out's shared state free, so a pull that re-enters
+    /// cell's read alone, with the fan-out's shared state free, so a pull that re-enters
     /// through the store's recurrence finds the cell borrowed and is answered from the snapshot,
     /// and the store can publish its snapshot through the shared state while it steps itself
     /// ([`Cycle`]).
     // shared-state-ok: a cyclic fan-out's input producer, held apart from the fan-out's state
-    // so the two borrow separately; what crosses it is the producer, never a tile passed
+    // so the two read separately; what crosses it is the producer, never a tile passed
     // between operators.
     Store(StoreCell),
 }
@@ -198,47 +198,45 @@ enum Inner {
 /// The cell a cyclic fan-out holds its store in ([`Inner::Store`]), which a planner reaches.
 // shared-state-ok: the name of the cell `Inner::Store` holds, which a planner reaches to drive
 // the store as a pipeline breaker; what crosses it is the producer, never a tile.
-pub(crate) type StoreCell = Rc<Store>;
+pub(crate) type StoreCell = Arc<Store>;
 
 /// A cyclic store and releases waiting for its current mutable operation to end.
 pub(crate) struct Store {
     // shared-state-ok: the store producer owned by its cyclic fan-out, never a tile channel.
-    producer: RefCell<Box<dyn TileProducer>>,
+    producer: RwLock<Box<dyn TileProducer>>,
     // shared-state-ok: the accumulated release region, never tiles.
-    pending_release: RefCell<Option<TileGuard>>,
+    pending_release: RwLock<Option<TileGuard>>,
 }
 
 impl Store {
     fn new(producer: Box<dyn TileProducer>) -> Self {
         Self {
-            producer: RefCell::new(producer),
-            pending_release: RefCell::new(None),
+            producer: RwLock::new(producer),
+            pending_release: RwLock::new(None),
         }
     }
 
-    pub(crate) fn borrow(&self) -> StoreRef<'_> {
-        self.try_borrow()
+    pub(crate) fn read(&self) -> StoreRef<'_> {
+        self.try_read()
             .expect("a store is not mutably borrowed while read")
     }
 
-    pub(crate) fn try_borrow(&self) -> Result<StoreRef<'_>, std::cell::BorrowError> {
+    pub(crate) fn try_read(&self) -> Result<StoreRef<'_>, ()> {
         Ok(StoreRef {
-            producer: Some(self.producer.try_borrow()?),
+            producer: Some(self.producer.try_read().ok_or(())?),
             store: self,
         })
     }
 
-    pub(crate) fn borrow_mut(&self) -> StoreBorrow<'_, dyn TileProducer> {
-        self.try_borrow_mut()
+    pub(crate) fn write(&self) -> StoreBorrow<'_, dyn TileProducer> {
+        self.try_write()
             .expect("a store has one mutable operation at a time")
     }
 
-    pub(crate) fn try_borrow_mut(
-        &self,
-    ) -> Result<StoreBorrow<'_, dyn TileProducer>, std::cell::BorrowMutError> {
+    pub(crate) fn try_write(&self) -> Result<StoreBorrow<'_, dyn TileProducer>, ()> {
         Ok(StoreBorrow {
-            producer: Some(std::cell::RefMut::map(
-                self.producer.try_borrow_mut()?,
+            producer: Some(parking_lot::RwLockWriteGuard::map(
+                self.producer.try_write().ok_or(())?,
                 |producer| producer.as_mut(),
             )),
             pending_release: &self.pending_release,
@@ -246,20 +244,20 @@ impl Store {
     }
 
     fn release(&self, guard: TileGuard) {
-        let mut pending = self.pending_release.borrow_mut();
+        let mut pending = self.pending_release.write();
         *pending = Some(match pending.take() {
             Some(before) => before.union(&guard),
             None => guard,
         });
         drop(pending);
         // An available store settles now; a borrowed store settles when its operation ends.
-        drop(self.try_borrow_mut());
+        drop(self.try_write());
     }
 }
 
-/// A read borrow settles releases after the last read borrow ends.
+/// A read read settles releases after the last read read ends.
 pub(crate) struct StoreRef<'a> {
-    producer: Option<std::cell::Ref<'a, Box<dyn TileProducer>>>,
+    producer: Option<parking_lot::RwLockReadGuard<'a, Box<dyn TileProducer>>>,
     store: &'a Store,
 }
 
@@ -274,15 +272,15 @@ impl Drop for StoreRef<'_> {
     fn drop(&mut self) {
         drop(self.producer.take());
         if !std::thread::panicking() {
-            drop(self.store.try_borrow_mut());
+            drop(self.store.try_write());
         }
     }
 }
 
-/// A mutable store operation settles deferred releases before relinquishing its borrow.
+/// A mutable store operation settles deferred releases before relinquishing its read.
 pub(crate) struct StoreBorrow<'a, T: TileProducer + ?Sized> {
-    producer: Option<std::cell::RefMut<'a, T>>,
-    pending_release: &'a RefCell<Option<TileGuard>>,
+    producer: Option<parking_lot::MappedRwLockWriteGuard<'a, T>>,
+    pending_release: &'a RwLock<Option<TileGuard>>,
 }
 
 impl<'a, T: TileProducer + ?Sized> StoreBorrow<'a, T> {
@@ -292,7 +290,7 @@ impl<'a, T: TileProducer + ?Sized> StoreBorrow<'a, T> {
         map: impl FnOnce(&mut T) -> &mut U,
     ) -> StoreBorrow<'a, U> {
         StoreBorrow {
-            producer: Some(std::cell::RefMut::map(
+            producer: Some(parking_lot::MappedRwLockWriteGuard::map(
                 self.producer.take().expect("the store is borrowed"),
                 map,
             )),
@@ -316,19 +314,23 @@ impl<T: TileProducer + ?Sized> std::ops::DerefMut for StoreBorrow<'_, T> {
 
 impl<T: TileProducer + ?Sized> Drop for StoreBorrow<'_, T> {
     fn drop(&mut self) {
-        let Some(producer) = self.producer.as_deref_mut() else {
+        if self.producer.is_none() {
             return;
-        };
-        // A failed operation leaves the pending release for a subsequent successful borrow.
+        }
+        // A failed operation leaves the pending release for a subsequent successful read.
         if std::thread::panicking() {
             return;
         }
         loop {
-            let pending = self.pending_release.borrow_mut().take();
-            let Some(guard) = pending else {
-                break;
+            let mut pending = self.pending_release.write();
+            let Some(guard) = pending.take() else {
+                // Hand off atomically: a new release either joins this drain or
+                // observes an unlocked producer and starts its own drain.
+                drop(self.producer.take());
+                return;
             };
-            producer.release(guard);
+            drop(pending);
+            self.producer.as_deref_mut().unwrap().release(guard);
         }
     }
 }
@@ -347,14 +349,14 @@ pub struct StoreRead {
 /// store can have the operators inside its cycle read again before a step.
 #[derive(Clone)]
 pub struct Cycle {
-    shared: Weak<RefCell<FanOutShared>>,
+    shared: Weak<RwLock<FanOutShared>>,
     domain: Option<Extent>,
 }
 
 impl Cycle {
     /// The id of the fan-out, which its recurrence slots answer ([`TileProducer::recurrence_of`]).
     pub(crate) fn fan(&self) -> usize {
-        self.shared.upgrade().expect(DEAD_RECURRENCE).borrow().id
+        self.shared.upgrade().expect(DEAD_RECURRENCE).read().id
     }
 
     /// Make `tile` the snapshot a re-entrant pull of the fan-out is answered from, as a
@@ -362,7 +364,7 @@ impl Cycle {
     pub(crate) fn publish(&self, tile: &Tile) {
         let shared = self.shared.upgrade().expect(DEAD_RECURRENCE);
         {
-            let mut state = shared.borrow_mut();
+            let mut state = shared.write();
             state
                 .reentrancy
                 .as_mut()
@@ -397,7 +399,7 @@ fn retain_flagged<T>(v: &mut Vec<T>, keep: &[bool]) {
 
 /// The consumer a fan-out installs on its input: it forwards each region to every live slot.
 struct FanOutInput {
-    shared: Weak<RefCell<FanOutShared>>,
+    shared: Weak<RwLock<FanOutShared>>,
 }
 
 impl Consumer for FanOutInput {
@@ -410,32 +412,26 @@ impl Consumer for FanOutInput {
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
         for c in &self.reader_consumers() {
-            match c.try_borrow_mut() {
-                Ok(mut consumer) => consumer.notify(region, landing),
-                Err(_) => landing.reentered(),
-            }
+            crate::interpreter::notifications::notify_shared(c, region, landing);
         }
     }
 
     /// A route reaches every consumer a push does.
     fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
         for c in &self.reader_consumers() {
-            match c.try_borrow_mut() {
-                Ok(mut consumer) => consumer.route(routes),
-                Err(_) => routes.reentered(),
-            }
+            crate::interpreter::notifications::route_shared(c, routes);
         }
     }
 }
 
 impl FanOutInput {
     /// The consumers of the live reader slots, which a push reaches, and none of a recurrence
-    /// slot. A clone of each handle, so no borrow of the fan-out is held while a push climbs past.
-    fn reader_consumers(&self) -> Vec<Rc<RefCell<Box<dyn Consumer>>>> {
+    /// slot. A clone of each handle, so no read of the fan-out is held while a push climbs past.
+    fn reader_consumers(&self) -> Vec<Arc<RwLock<Box<dyn Consumer>>>> {
         let Some(shared_rc) = self.shared.upgrade() else {
             return Vec::new();
         };
-        let shared = shared_rc.borrow();
+        let shared = shared_rc.read();
         shared
             .live_indices()
             .filter(|&i| !shared.recurrence[i])
@@ -447,15 +443,15 @@ impl FanOutInput {
 /// RAII guard for the cyclic `FanOut` `subscribing_inner` flag.  Created
 /// when we set the flag `true` to drive the inner `subscribe`; its `Drop`
 /// resets the flag to `false`.  This makes the path panic-safe — if
-/// `input.subscribe(...)` unwinds, the flag is still reset so a later
+/// `input.clone().subscribe(...)` unwinds, the flag is still reset so a later
 /// (re-)subscribe attempt doesn't get silently skipped.
 struct SubscribingInnerGuard<'a> {
-    shared: &'a Rc<RefCell<FanOutShared>>,
+    shared: &'a Arc<RwLock<FanOutShared>>,
 }
 
 impl<'a> Drop for SubscribingInnerGuard<'a> {
     fn drop(&mut self) {
-        if let Some(re) = self.shared.borrow_mut().reentrancy.as_mut() {
+        if let Some(re) = self.shared.write().reentrancy.as_mut() {
             re.subscribing_inner = false;
         }
     }
@@ -468,16 +464,16 @@ pub struct FanOut {
     // shared-state-ok: the fan-out's own input operator, shared with the slots
     // that are views of this one operator. It holds an *operator*, not values
     // passed between operators — the same reason `CycleSlot` is legitimate.
-    input: Rc<RefCell<Box<dyn TileOperator>>>,
+    input: Arc<dyn TileOperator>,
     tiling: Tiling,
     /// All mutable shared state.  Created eagerly so that slots produced by
     /// [`FanOut::slot`] always share the same object.
-    shared: Rc<RefCell<FanOutShared>>,
+    shared: Arc<RwLock<FanOutShared>>,
     /// Whether any slots have been created yet.
     // shared-state-ok: construction-time bookkeeping of the `FanOut` itself, not a
     // channel between operators — it records that `slot` has been called, and no
     // value ever passes through it.
-    used: RefCell<bool>,
+    used: RwLock<bool>,
 }
 
 impl FanOut {
@@ -486,7 +482,7 @@ impl FanOut {
     /// cyclic-mode overhead.  If a slot of this fan-out ends up
     /// feeding back into its own input (e.g. a store recurrence closing
     /// through the fan-out), use [`FanOut::new_cyclic`] instead.
-    pub fn new(input: Box<dyn TileOperator>) -> Self {
+    pub fn new(input: Arc<dyn TileOperator>) -> Self {
         Self::new_with_reentrancy(input, None)
     }
 
@@ -500,7 +496,7 @@ impl FanOut {
     /// the induction store. The slot that closes the cycle is a
     /// [`recurrence_slot`](Self::recurrence_slot), not a
     /// [`slot`](Self::slot).
-    pub fn new_cyclic(input: Box<dyn TileOperator>) -> Self {
+    pub fn new_cyclic(input: Arc<dyn TileOperator>) -> Self {
         let cached_tile = input.tiling().empty_tile();
         Self::new_with_reentrancy(
             input,
@@ -512,11 +508,11 @@ impl FanOut {
     }
 
     fn new_with_reentrancy(
-        input: Box<dyn TileOperator>,
+        input: Arc<dyn TileOperator>,
         reentrancy: Option<FanOutReentrancy>,
     ) -> Self {
         let tiling = input.tiling().clone();
-        let shared = Rc::new(RefCell::new(FanOutShared {
+        let shared = Arc::new(RwLock::new(FanOutShared {
             id: FanOutProducer::alloc_id(),
             producer: None,
             consumers: Vec::new(),
@@ -531,10 +527,10 @@ impl FanOut {
             source_producers: Vec::new(),
         }));
         Self {
-            input: Rc::new(RefCell::new(input)),
+            input,
             tiling,
             shared,
-            used: RefCell::new(false),
+            used: RwLock::new(false),
         }
     }
 
@@ -546,10 +542,10 @@ impl FanOut {
     /// the fan-out. An operator that this fan-out's own input chain contains
     /// takes a [`recurrence_slot`](Self::recurrence_slot) instead — see
     /// [`FanHold`].
-    pub fn slot(&self) -> Box<dyn TileOperator> {
+    pub fn slot(&self) -> Arc<dyn TileOperator> {
         self.slot_holding(
             FanHold::Reader {
-                shared: self.shared.clone(), // shares the Rc — always connected
+                shared: self.shared.clone(), // shares the Arc — always connected
                 input: self.input.clone(),
             },
             false,
@@ -561,18 +557,18 @@ impl FanOut {
     /// A store's driver and its writer read the store they are part of, to
     /// recover each position's prior value. Such a reader must not own the
     /// fan-out — see [`FanHold`].
-    pub fn recurrence_slot(&self) -> Box<dyn TileOperator> {
+    pub fn recurrence_slot(&self) -> Arc<dyn TileOperator> {
         self.slot_holding(
             FanHold::Recurrence {
-                shared: Rc::downgrade(&self.shared),
-                input: Rc::downgrade(&self.input),
+                shared: Arc::downgrade(&self.shared),
+                input: Arc::downgrade(&self.input),
             },
             false,
         )
     }
 
     /// A flat store read that retains each key's current value without retaining its history.
-    pub(crate) fn current_slot(&self) -> Box<dyn TileOperator> {
+    pub(crate) fn current_slot(&self) -> Arc<dyn TileOperator> {
         assert!(
             matches!(self.tiling, Tiling::Store { .. }),
             "current-value retention reads a flat store"
@@ -586,15 +582,15 @@ impl FanOut {
         )
     }
 
-    fn slot_holding(&self, hold: FanHold, current_values: bool) -> Box<dyn TileOperator> {
+    fn slot_holding(&self, hold: FanHold, current_values: bool) -> Arc<dyn TileOperator> {
         let result = FanOutSlot {
             hold,
             current_values,
             base: OperatorBase::new(self.tiling.clone()),
-            primary: !*self.used.borrow(),
+            primary: !*self.used.read(),
         };
-        *self.used.borrow_mut() = true;
-        Box::new(result)
+        *self.used.write() = true;
+        Arc::new(result)
     }
 
     pub fn tiling(&self) -> &Tiling {
@@ -607,7 +603,7 @@ impl FanOut {
     /// is minted fresh on every call, so reaching the input through one would
     /// answer about a node that did not exist a moment ago.
     pub fn with_input<R>(&self, f: impl FnOnce(&dyn TileOperator) -> R) -> R {
-        f(&**self.input.borrow())
+        f(&*self.input)
     }
 
     /// The tile this fan-out most recently served, for a cyclic fan-out;
@@ -620,7 +616,7 @@ impl FanOut {
     /// without a second channel out of the operator.
     pub fn cached_tile(&self) -> Option<Tile> {
         self.shared
-            .borrow()
+            .read()
             .reentrancy
             .as_ref()
             .map(|r| r.cached_tile.clone())
@@ -629,14 +625,14 @@ impl FanOut {
     /// The id every slot's producer of this fan-out names.
     #[cfg(test)]
     pub(crate) fn id(&self) -> usize {
-        self.shared.borrow().id
+        self.shared.read().id
     }
 
     /// A cyclic fan-out's store, which a test drives as a pipeline breaker. `None` for an
     /// ordinary fan-out, and before the store is subscribed.
     #[cfg(test)]
     pub(crate) fn store(&self) -> Option<StoreCell> {
-        match &self.shared.borrow().producer {
+        match &self.shared.read().producer {
             Some(Inner::Store(cell)) => Some(cell.clone()),
             _ => None,
         }
@@ -659,7 +655,7 @@ impl FanOut {
     /// store that can no longer produce still holds the value its variables hand
     /// on.
     pub fn released_in_full(&self) -> bool {
-        self.shared.borrow().released.is_universal()
+        self.shared.read().released.is_universal()
     }
 
     /// The last position this fan-out's subscribers have collectively released,
@@ -677,7 +673,7 @@ impl FanOut {
     /// past the universal release that closed it
     /// ([`FanOutShared::released_position`]).
     pub fn released_position(&self) -> Option<Position> {
-        self.shared.borrow().released_position.clone()
+        self.shared.read().released_position.clone()
     }
 
     /// Whether the slots have released anything of the output.
@@ -686,7 +682,7 @@ impl FanOut {
     /// releases the positions its source cannot hold before the items below them, as a
     /// transaction drive does, releases a region with no upper bound and then the rest.
     pub fn released_any(&self) -> bool {
-        !self.shared.borrow().released.is_empty()
+        !self.shared.read().released.is_empty()
     }
 
     /// Whether every live slot has released the same region.
@@ -697,7 +693,7 @@ impl FanOut {
     /// stopped (`src/ccl/design/program-evolution.md`, "Routes across
     /// branches").
     pub fn live_slots_agree(&self) -> bool {
-        let shared = self.shared.borrow();
+        let shared = self.shared.read();
         let mut guards = shared.live_indices().map(|i| &shared.release_guards[i]);
         let Some(first) = guards.next() else {
             return true;
@@ -709,7 +705,7 @@ impl FanOut {
     /// this fan-out's input chain, nested fan-outs included, when the chain was
     /// subscribed. Empty before the first subscription.
     pub fn source_producers(&self) -> Vec<String> {
-        self.shared.borrow().source_producers.clone()
+        self.shared.read().source_producers.clone()
     }
 
     /// Reopen this fan-out for a fresh set of slots, keeping the inner
@@ -723,8 +719,8 @@ impl FanOut {
     /// reload dropped stops counting on its own, and one the reload carried
     /// forward keeps its guard.
     pub fn reopen(&self) {
-        *self.used.borrow_mut() = false;
-        self.shared.borrow_mut().compact();
+        *self.used.write() = false;
+        self.shared.write().compact();
     }
 }
 
@@ -746,16 +742,16 @@ impl FanOut {
 enum FanHold {
     /// A downstream reader's handle, which owns the fan-out.
     Reader {
-        shared: Rc<RefCell<FanOutShared>>,
+        shared: Arc<RwLock<FanOutShared>>,
         // shared-state-ok: the fan-out's own input operator, the same handle as
         // [`FanOut::input`] — a slot is a view of one fan-out, not a second
         // one. It holds an *operator*, not values passed between operators.
-        input: Rc<RefCell<Box<dyn TileOperator>>>,
+        input: Arc<dyn TileOperator>,
     },
     /// A recurrence's handle on a fan-out whose input chain contains it.
     Recurrence {
-        shared: Weak<RefCell<FanOutShared>>,
-        input: Weak<RefCell<Box<dyn TileOperator>>>,
+        shared: Weak<RwLock<FanOutShared>>,
+        input: Weak<dyn TileOperator>,
     },
 }
 
@@ -764,7 +760,7 @@ const DEAD_RECURRENCE: &str = "a recurrence reads the fan-out whose input chain 
      that read happens only while the fan-out's store is pulled or steps itself";
 
 impl FanHold {
-    fn shared(&self) -> Rc<RefCell<FanOutShared>> {
+    fn shared(&self) -> Arc<RwLock<FanOutShared>> {
         match self {
             FanHold::Reader { shared, .. } => shared.clone(),
             FanHold::Recurrence { shared, .. } => shared.upgrade().expect(DEAD_RECURRENCE),
@@ -775,10 +771,8 @@ impl FanHold {
     /// the one place an operator handle is shared is the `Reader` field.
     fn with_input<R>(&self, f: impl FnOnce(&dyn TileOperator) -> R) -> R {
         match self {
-            FanHold::Reader { input, .. } => f(&**input.borrow()),
-            FanHold::Recurrence { input, .. } => {
-                f(&**input.upgrade().expect(DEAD_RECURRENCE).borrow())
-            }
+            FanHold::Reader { input, .. } => f(&**input),
+            FanHold::Recurrence { input, .. } => f(&*input.upgrade().expect(DEAD_RECURRENCE)),
         }
     }
 
@@ -791,14 +785,13 @@ impl FanHold {
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         match self {
-            FanHold::Reader { input, .. } => {
-                input.borrow_mut().subscribe(intent_guard, consumer, cx)
+            FanHold::Reader { input, .. } => input.clone().subscribe(intent_guard, consumer, cx),
+            FanHold::Recurrence { input, .. } => {
+                input
+                    .upgrade()
+                    .expect(DEAD_RECURRENCE)
+                    .subscribe(intent_guard, consumer, cx)
             }
-            FanHold::Recurrence { input, .. } => input
-                .upgrade()
-                .expect(DEAD_RECURRENCE)
-                .borrow_mut()
-                .subscribe(intent_guard, consumer, cx),
         }
     }
 }
@@ -817,20 +810,14 @@ struct FanOutSlot {
 }
 
 impl FanOutSlot {
-    fn shared(&self) -> Rc<RefCell<FanOutShared>> {
+    fn shared(&self) -> Arc<RwLock<FanOutShared>> {
         self.hold.shared()
     }
 }
 
 impl TileOperator for FanOutSlot {
-    fn runtime_operator(
-        &self,
-        context: &mut crate::interpreter::dispatcher::runtime::RuntimeContext,
-    ) -> Result<crate::interpreter::dispatcher::runtime::RuntimeOperator, String> {
-        if matches!(&self.hold, FanHold::Recurrence { .. }) {
-            return Err("parallel recurrence is not enabled".into());
-        }
-        self.hold.with_input(|op| context.shared(op))
+    fn partitions_at(&self, _: CurryLevel) -> bool {
+        matches!(self.hold, FanHold::Reader { .. })
     }
 
     impl_operator_base!();
@@ -840,7 +827,7 @@ impl TileOperator for FanOutSlot {
     }
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        let id = self.shared().borrow().id;
+        let id = self.shared().read().id;
         if self.primary {
             InspectNode::new(format!("FanOut#{id}"))
                 .with_tiling(self.tiling().to_string())
@@ -850,28 +837,57 @@ impl TileOperator for FanOutSlot {
         }
     }
 
-    fn subscribe(
-        &mut self,
+    fn subscribe_impl(
+        self: Arc<Self>,
         intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
+        let _construction = crate::interpreter::notifications::control_plane();
         // Register the consumer and reserve its release-guard slot. The slot
         // number lives in the cell the producer holds, so `compact` can renumber.
-        let slot = Rc::new(Cell::new(0usize));
-        let shared_rc = self.shared();
+        let slot = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let original = self.shared();
+        let shared_rc = if cx.worker {
+            let identity = Arc::as_ptr(&original) as usize;
+            cx.inline
+                .entry(identity)
+                .or_insert_with(|| {
+                    let template = original.read();
+                    assert!(
+                        template.reentrancy.is_none(),
+                        "cyclic aliases stay in the control path"
+                    );
+                    Arc::new(RwLock::new(FanOutShared {
+                        id: FanOutProducer::alloc_id(),
+                        producer: None,
+                        consumers: Vec::new(),
+                        release_guards: Vec::new(),
+                        recurrence: Vec::new(),
+                        current_values: Vec::new(),
+                        released: self.tiling().empty_guard(),
+                        released_position: None,
+                        subscribers: Vec::new(),
+                        reentrancy: None,
+                        source_producers: Vec::new(),
+                    }))
+                })
+                .clone()
+        } else {
+            original
+        };
         {
-            let mut shared = shared_rc.borrow_mut();
-            slot.set(shared.consumers.len());
-            shared.consumers.push(Rc::new(RefCell::new(consumer)));
+            let mut shared = shared_rc.write();
+            slot.store(shared.consumers.len(), std::sync::atomic::Ordering::Relaxed);
+            shared.consumers.push(Arc::new(RwLock::new(consumer)));
             let carried = shared.released.clone();
             shared.release_guards.push(carried);
             shared.current_values.push(self.current_values);
             shared
                 .recurrence
                 .push(matches!(self.hold, FanHold::Recurrence { .. }));
-            shared.subscribers.push(Rc::downgrade(&slot));
-        } // borrow released here before we might call input.subscribe
+            shared.subscribers.push(Arc::downgrade(&slot));
+        } // read released here before we might call input.subscribe
 
         // Decide whether *this* call should drive the inner subscribe.
         // `producer.is_none()` is the standard "first subscription" check;
@@ -881,7 +897,7 @@ impl TileOperator for FanOutSlot {
         // returns a producer (the outer call will populate `producer`
         // before anyone pulls).
         let should_subscribe = {
-            let mut shared = shared_rc.borrow_mut();
+            let mut shared = shared_rc.write();
             if shared.producer.is_some() {
                 false
             } else if let Some(re) = shared.reentrancy.as_mut() {
@@ -897,17 +913,17 @@ impl TileOperator for FanOutSlot {
         };
 
         // Drive the inner subscribe (first non-reentrant subscriber only).
-        // We must not hold a borrow of `shared` during `input.subscribe`
+        // We must not hold a read of `shared` during `input.subscribe`
         // because that call may synchronously fire the notification closure,
         // which itself borrows `shared`.
         if should_subscribe {
             // RAII: any path out of this block (success or panic) resets
             // `subscribing_inner` to `false`.  Without the guard, a panic
-            // from `input.subscribe(...)` would leave the flag set
+            // from `input.clone().subscribe(...)` would leave the flag set
             // forever and silently skip every future subscribe attempt
             // on this fan-out.
             let _guard = SubscribingInnerGuard { shared: &shared_rc };
-            let shared_weak = Rc::downgrade(&shared_rc);
+            let shared_weak = Arc::downgrade(&shared_rc);
             cx.begin_source_producers();
             let inner = self.hold.subscribe_input(
                 intent_guard,
@@ -917,10 +933,10 @@ impl TileOperator for FanOutSlot {
                 cx,
             );
             let producers = cx.end_source_producers();
-            let mut shared = shared_rc.borrow_mut();
+            let mut shared = shared_rc.write();
             let (held, cell) = match shared.reentrancy.is_some() {
                 true => {
-                    let cell = Rc::new(Store::new(inner));
+                    let cell = Arc::new(Store::new(inner));
                     (Inner::Store(cell.clone()), Some(cell))
                 }
                 false => (Inner::Owned(inner), None),
@@ -929,8 +945,8 @@ impl TileOperator for FanOutSlot {
             shared.source_producers = producers;
             drop(shared);
             if let Some(cell) = cell {
-                cell.borrow_mut().enter_cycle(Cycle {
-                    shared: Rc::downgrade(&shared_rc),
+                cell.write().enter_cycle(Cycle {
+                    shared: Arc::downgrade(&shared_rc),
                     domain: match self.tiling() {
                         Tiling::Store { domain, .. } => Some(domain.clone()),
                         _ => None,
@@ -948,11 +964,23 @@ impl TileOperator for FanOutSlot {
             // component separates them, not the second. Subscribing one slot
             // twice would land both producers in one slot; nothing does, and
             // `FanOut::slot` mints a fresh slot per call.
-            base: ProducerBase::new(shared_rc.borrow().id, self.tiling(), &self.base, cx),
+            base: ProducerBase::new(shared_rc.read().id, self.tiling(), self.clone(), cx),
             // The producer a subscription hands out holds the fan-out the same
             // way this slot does: a recurrence's producer must not own it
             // either.
-            hold: self.hold.clone(),
+            hold: if cx.worker {
+                match &self.hold {
+                    FanHold::Reader { input, .. } => FanHold::Reader {
+                        shared: shared_rc.clone(),
+                        input: input.clone(),
+                    },
+                    FanHold::Recurrence { .. } => {
+                        unreachable!("recurrences remain coordinator owned")
+                    }
+                }
+            } else {
+                self.hold.clone()
+            },
             slot,
         })
     }
@@ -976,16 +1004,16 @@ struct FanOutProducer {
     // tile, tile guard, or program value passes through it; a producer only reads
     // it to index its own release guard, which it would have done with a plain
     // `usize` if dead slots never had to be reclaimed.
-    slot: Rc<Cell<usize>>,
+    slot: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl FanOutProducer {
     /// This producer's current slot number.
     fn index(&self) -> usize {
-        self.slot.get()
+        self.slot.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn shared(&self) -> Rc<RefCell<FanOutShared>> {
+    fn shared(&self) -> Arc<RwLock<FanOutShared>> {
         self.hold.shared()
     }
 }
@@ -1003,13 +1031,13 @@ impl TileProducer for FanOutProducer {
         let Some(shared) = shared else {
             return;
         };
-        let Ok(shared) = shared.try_borrow() else {
+        let Ok(shared) = shared.try_read().ok_or(()) else {
             return;
         };
         match &shared.producer {
             Some(Inner::Owned(input)) => visit("input", &**input),
             Some(Inner::Store(cell)) => {
-                if let Ok(input) = cell.try_borrow() {
+                if let Ok(input) = cell.try_read() {
                     visit("input", &**input);
                 }
             }
@@ -1024,7 +1052,7 @@ impl TileProducer for FanOutProducer {
         let FanHold::Reader { shared, .. } = &self.hold else {
             return;
         };
-        let cell = match &mut shared.borrow_mut().producer {
+        let cell = match &mut shared.write().producer {
             Some(Inner::Owned(input)) => {
                 visit("input", &mut **input);
                 return;
@@ -1032,7 +1060,7 @@ impl TileProducer for FanOutProducer {
             Some(Inner::Store(cell)) => cell.clone(),
             None => return,
         };
-        if let Ok(mut input) = cell.try_borrow_mut() {
+        if let Ok(mut input) = cell.try_write() {
             visit("input", &mut *input);
         }
     }
@@ -1041,7 +1069,7 @@ impl TileProducer for FanOutProducer {
         let FanHold::Reader { shared, .. } = &self.hold else {
             return None;
         };
-        let shared = shared.borrow();
+        let shared = shared.read();
         shared.reentrancy.as_ref()?;
         let Some(Inner::Store(store)) = &shared.producer else {
             return None;
@@ -1054,7 +1082,7 @@ impl TileProducer for FanOutProducer {
 
     fn recurrence_of(&self) -> Option<usize> {
         match &self.hold {
-            FanHold::Recurrence { shared, .. } => shared.upgrade().map(|shared| shared.borrow().id),
+            FanHold::Recurrence { shared, .. } => shared.upgrade().map(|shared| shared.read().id),
             FanHold::Reader { .. } => None,
         }
     }
@@ -1071,7 +1099,7 @@ impl TileProducer for FanOutProducer {
             return ProducerStateInfo::default();
         }
         let shared = self.shared();
-        let shared = shared.borrow();
+        let shared = shared.read();
         ProducerStateInfo::holding(
             shared
                 .reentrancy
@@ -1088,7 +1116,7 @@ impl TileProducer for FanOutProducer {
                 held => node.with_held_values(held),
             };
             let shared = self.shared();
-            let shared = shared.borrow();
+            let shared = shared.read();
             let input = match shared
                 .producer
                 .as_ref()
@@ -1096,7 +1124,7 @@ impl TileProducer for FanOutProducer {
             {
                 Inner::Owned(input) => input.inspect(opts),
                 // A store stepping itself has its cell borrowed, and is drawn as a leaf then.
-                Inner::Store(cell) => match cell.try_borrow() {
+                Inner::Store(cell) => match cell.try_read() {
                     Ok(store) => store.inspect(opts),
                     Err(_) => InspectNode::leaf("store, stepping".to_string()),
                 },
@@ -1114,7 +1142,7 @@ impl TileProducer for FanOutProducer {
     /// A cyclic fan-out reads its input whole ([`get_impl`](Self::get_impl)); any other pulls
     /// it at the level it is pulled at.
     fn input_level(&self, _role: &str, level: CurryLevel) -> Option<CurryLevel> {
-        let cyclic = self.shared().borrow().reentrancy.is_some();
+        let cyclic = self.shared().read().reentrancy.is_some();
         (!cyclic).then_some(level)
     }
 
@@ -1124,7 +1152,7 @@ impl TileProducer for FanOutProducer {
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        let cyclic = shared_rc.borrow().reentrancy.is_some();
+        let cyclic = shared_rc.read().reentrancy.is_some();
         // A sibling that re-enters mid-pull is answered from the cache of the last completed
         // pull, which has to cover whatever region that sibling asks for: a cyclic fan-out reads
         // its input whole.
@@ -1132,23 +1160,23 @@ impl TileProducer for FanOutProducer {
             true => self.tiling().universal_guard(),
             false => projection.guard(self.tiling()),
         };
-        // A cyclic fan-out's store is pulled under its own cell's borrow, with the shared state
+        // A cyclic fan-out's store is pulled under its own cell's read, with the shared state
         // free. A sibling slot that re-enters mid-pull finds the cell borrowed and is served the
         // latest snapshot instead of re-entering the store, which would alias `&mut`; so is a
         // pull while the store steps itself as a pipeline breaker.
-        let store = match &shared_rc.borrow().producer {
+        let store = match &shared_rc.read().producer {
             Some(Inner::Store(cell)) => Some(cell.clone()),
             _ => None,
         };
         let mut result = match store {
-            Some(cell) => match cell.try_borrow_mut() {
+            Some(cell) => match cell.try_write() {
                 Ok(mut producer) => {
                     let tile = producer.get(projection_guard);
                     trace!("{} received {tile:?}", self.name());
                     // Replace, not merge: inner producers like `Memo` already return cumulative
                     // tiles, so each pull supplants the previous snapshot.
                     shared_rc
-                        .borrow_mut()
+                        .write()
                         .reentrancy
                         .as_mut()
                         .expect("a fan-out holding a store is cyclic")
@@ -1157,7 +1185,7 @@ impl TileProducer for FanOutProducer {
                 }
                 Err(_) => {
                     let cached = shared_rc
-                        .borrow()
+                        .read()
                         .reentrancy
                         .as_ref()
                         .expect("a fan-out holding a store is cyclic")
@@ -1168,7 +1196,7 @@ impl TileProducer for FanOutProducer {
                 }
             },
             None => match shared_rc
-                .borrow_mut()
+                .write()
                 .producer
                 .as_mut()
                 .expect("a pulled slot is subscribed")
@@ -1181,7 +1209,7 @@ impl TileProducer for FanOutProducer {
         // Filter by the stored obsolete guard. Because upstream retains data according to the
         // intersection of all obsolete guards, it may have more data than this specific consumer
         // is interested in.
-        let guard = shared_rc.borrow().release_guards[self.index()].clone();
+        let guard = shared_rc.read().release_guards[self.index()].clone();
         trace!("{} removing {guard:?} from {result:?}", self.name());
         result.remove_guarded(guard);
         result.restrict_to(&projection, self.tiling());
@@ -1190,7 +1218,7 @@ impl TileProducer for FanOutProducer {
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         let shared_rc = self.shared();
-        let mut shared = shared_rc.borrow_mut();
+        let mut shared = shared_rc.write();
         // Union with the existing stored guard so that the accumulated set of
         // delivered data grows monotonically.  Replacing (instead of union-ing)
         // would forget previously-released ranges, causing FanOutSlot to
@@ -1208,8 +1236,8 @@ impl TileProducer for FanOutProducer {
     }
 }
 
-fn release_shared(shared_rc: &Rc<RefCell<FanOutShared>>, increment: Option<&TileGuard>) {
-    let mut shared = shared_rc.borrow_mut();
+fn release_shared(shared_rc: &Arc<RwLock<FanOutShared>>, increment: Option<&TileGuard>) {
+    let mut shared = shared_rc.write();
     let mut live = shared.live_indices();
     let Some(first) = live.next() else {
         return;
@@ -1250,26 +1278,26 @@ fn release_shared(shared_rc: &Rc<RefCell<FanOutShared>>, increment: Option<&Tile
 #[derive(Clone)]
 struct DirtyRegion(
     // shared-state-ok: cache invalidation regions shared with the input consumer; no tiles.
-    Rc<RefCell<Projection>>,
+    Arc<RwLock<Projection>>,
 );
 
 impl DirtyRegion {
     fn new() -> Self {
-        Self(Rc::new(RefCell::new(Projection::Everything)))
+        Self(Arc::new(RwLock::new(Projection::Everything)))
     }
 
     fn record(&self, region: &Projection) {
-        let mut dirty = self.0.borrow_mut();
+        let mut dirty = self.0.write();
         *dirty = dirty.union(region);
     }
 
     fn remove(&self, region: &Projection) {
-        let mut dirty = self.0.borrow_mut();
+        let mut dirty = self.0.write();
         *dirty = dirty.minus(region);
     }
 
     fn intersects(&self, region: &Projection) -> bool {
-        self.0.borrow().intersect(region) != Projection::Nothing
+        self.0.read().intersect(region) != Projection::Nothing
     }
 
     fn consumer(&self, downstream: Box<dyn Consumer>) -> Box<dyn Consumer> {
@@ -1307,13 +1335,13 @@ impl Consumer for DirtyConsumer {
 /// This involves storing the current Tile, merging new Tiles in as they arrive,
 /// and immediately releasing upstream according to the received Tiles.
 pub struct Memo {
-    pub input: Box<dyn TileOperator>,
+    pub input: Arc<dyn TileOperator>,
     /// The tiling is `input`'s, forwarded unchanged.
     base: OperatorBase,
 }
 
 impl Memo {
-    pub fn new(input: Box<dyn TileOperator>) -> Self {
+    pub fn new(input: Arc<dyn TileOperator>) -> Self {
         let tiling = input.tiling().clone();
         Self {
             base: OperatorBase::new(tiling),
@@ -1323,21 +1351,14 @@ impl Memo {
 }
 
 impl TileOperator for Memo {
-    fn runtime_operator(
-        &self,
-        context: &mut crate::interpreter::dispatcher::runtime::RuntimeContext,
-    ) -> Result<crate::interpreter::dispatcher::runtime::RuntimeOperator, String> {
-        context.memo(self, |context| self.input.runtime_operator(context))
-    }
-
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe(
-        &mut self,
+    fn subscribe_impl(
+        self: Arc<Self>,
         intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -1347,9 +1368,9 @@ impl TileOperator for Memo {
         let (entry, placement) =
             crate::interpreter::dispatcher::Entry::unplaced(self.input.tiling().clone());
         share_breaker(MemoProducer::new(
-            ProducerBase::new(MemoProducer::alloc_id(), self.tiling(), &self.base, cx)
+            ProducerBase::new(MemoProducer::alloc_id(), self.tiling(), self.clone(), cx)
                 .breaking(consumer.clone(), placement),
-            self.input.subscribe(
+            self.input.clone().subscribe(
                 intent_guard,
                 dirty.consumer(Box::new(
                     entry.inline_through(forwarding_consumer_keeping_keys(&consumer)),
@@ -1469,6 +1490,25 @@ fn close_over_positions(tile: &mut Tile, tiling: &Tiling) {
 }
 
 impl Breaker for MemoProducer {
+    fn finish_worker_input(&mut self) {
+        self.input.release(self.input.tiling().universal_guard());
+    }
+    fn worker_plan(&self) -> Option<WorkerPlan> {
+        Some(WorkerPlan {
+            input: self.input.base().definition.clone()?,
+            fold: WorkerFold::Materialize,
+        })
+    }
+    fn apply_worker(&mut self, delta: WorkerDelta) {
+        let WorkerPayload::Tile(mut tile) = delta.payload else {
+            unreachable!()
+        };
+        tile.remove_guarded(self.obsolete_guard().clone());
+        self.cached_tile.merge(tile);
+        close_over_positions(&mut self.cached_tile, &self.base.tiling);
+        self.input.release(delta.released);
+    }
+
     /// Reads the input at `guard` whether or not the cache holds the region, since the caller asks
     /// for the pipeline to run. It wakes no consumer: a consuming memo's only reader is the
     /// pipeline the dispatcher pushes to, and what the consume merged reaches it through the
@@ -1593,7 +1633,9 @@ impl TileProducer for MemoProducer {
         self.cached_tile.compact();
         // Also release upstream to handle the case where the consumer releases
         // data that was never produced.
-        self.input.release(obsolete_guard.clone());
+        if !self.base.defer_worker_release(&obsolete_guard) {
+            self.input.release(obsolete_guard.clone());
+        }
         trace!("{} now has cached {:?}", self.name(), self.cached_tile);
     }
 }
@@ -1606,14 +1648,14 @@ mod nested_projection_tests {
     };
     use crate::interpreter::{Predicate, Value};
 
-    fn spy() -> Box<dyn TileOperator> {
+    fn spy() -> Arc<dyn TileOperator> {
         let (tile, tiling) = two_levels_of_ints();
-        Box::new(ProjectionSpyOp::new(tile, tiling).0)
+        Arc::new(ProjectionSpyOp::new(tile, tiling).0)
     }
 
     #[test]
     fn a_memo_answers_a_projection_of_paths() {
-        assert_conforms_beneath(|| Box::new(Memo::new(spy())));
+        assert_conforms_beneath(|| Arc::new(Memo::new(spy())));
     }
 
     fn path(k: u64, j: u64) -> TileGuard {
@@ -1630,8 +1672,8 @@ mod nested_projection_tests {
     fn a_memo_reads_each_path_it_is_pulled_at_and_caches_them() {
         let (tile, tiling) = two_levels_of_ints();
         let (input, pulled, _) = ProjectionSpyOp::new(tile.clone(), tiling.clone());
-        let mut memo = Memo::new(Box::new(input));
-        let mut producer = memo.subscribe(
+        let memo = Arc::new(Memo::new(Arc::new(input)));
+        let mut producer = memo.clone().subscribe(
             tiling.universal_guard(),
             Box::new(|| {}),
             &mut SubscribeContext::new(),
@@ -1641,7 +1683,7 @@ mod nested_projection_tests {
             expected.restrict_to(&Projection::of(&path(k, j)).unwrap(), &tiling);
             assert_eq!(producer.read_in_pipeline(path(k, j)), expected);
         }
-        assert_eq!(pulled.borrow()[..2], [path(0, 1), path(1, 0)]);
+        assert_eq!(pulled.read()[..2], [path(0, 1), path(1, 0)]);
         let cells = |tile: &Tile| {
             let mut live = tile.clone();
             live.compact();
@@ -1706,7 +1748,7 @@ mod nested_projection_tests {
         );
         let expected = Predicate::qualified(point(0), every)
             .union(&Predicate::qualified(point(1), point(0).union(&point(1))));
-        let releases = released.borrow();
+        let releases = released.read();
         let Some(Ok(Projection::Keys { level, keys })) = releases.last().map(Projection::of) else {
             panic!("a consume releases paths: {releases:?}")
         };
@@ -1736,9 +1778,11 @@ mod nested_projection_tests {
     fn a_cyclic_fan_out_declares_a_whole_read_of_its_input() {
         let level = CurryLevel::new(1);
         let declared = |fan: FanOut| {
-            let mut slot = fan.slot();
+            let slot = fan.slot();
             let guard = slot.tiling().universal_guard();
-            let producer = slot.subscribe(guard, Box::new(|| {}), &mut Default::default());
+            let producer = slot
+                .clone()
+                .subscribe(guard, Box::new(|| {}), &mut Default::default());
             producer.input_level("input", level)
         };
         assert_eq!(declared(FanOut::new_cyclic(spy())), None);
@@ -1749,9 +1793,10 @@ mod nested_projection_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::{Cell, RefCell};
+    use crate::interpreter::tile_operators::test_helpers::SharedCounter as Cell;
+    use parking_lot::RwLock;
     use std::collections::VecDeque;
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     use bit_set::BitSet;
 
@@ -1769,19 +1814,96 @@ mod tests {
     /// subscribers for that reason — the survivor has to move from slot 1 to slot
     /// 0 and keep the guard it released.
     #[test]
+    fn a_late_worker_tile_does_not_restore_released_output() {
+        use super::test_helpers::{TestTileProducer, ints_by_position, keys_between};
+        let tiling = Tiling::data_function(
+            Extent::uint_range(4),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let tile = ints_by_position(&[10, 20, 30, 40], true);
+        let mut memo = MemoProducer::over(
+            Box::new(TestTileProducer::new(tile.clone(), tiling.clone())),
+            &tiling,
+        );
+        memo.release(keys_between(0, 1));
+        memo.apply_worker(WorkerDelta {
+            released: tile.to_guard(),
+            payload: WorkerPayload::Tile(tile.clone()),
+        });
+        let mut expected = tile;
+        expected.remove_guarded(keys_between(0, 1));
+        assert_eq!(memo.cached_tile, expected);
+    }
+
+    #[test]
+    fn simultaneous_subscribers_initialize_the_shared_input_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counted {
+            input: Arc<dyn TileOperator>,
+            count: Arc<AtomicUsize>,
+        }
+        impl TileOperator for Counted {
+            fn tiling(&self) -> &Tiling {
+                self.input.tiling()
+            }
+            fn visit_inputs(&self, _: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+            fn subscribe_impl(
+                self: Arc<Self>,
+                guard: TileGuard,
+                consumer: Box<dyn Consumer>,
+                cx: &mut SubscribeContext,
+            ) -> Box<dyn TileProducer> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                self.input.clone().subscribe(guard, consumer, cx)
+            }
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let fan = FanOut::new(Arc::new(Counted {
+            input: Arc::new(Constant::new(Value::Int(1), Extent::Base(BaseType::Int))),
+            count: count.clone(),
+        }));
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let readers = std::thread::scope(|scope| {
+            let mut jobs = Vec::new();
+            for _ in 0..8 {
+                let slot = fan.slot();
+                let start = start.clone();
+                jobs.push(scope.spawn(move || {
+                    start.wait();
+                    slot.clone().subscribe(
+                        slot.tiling().universal_guard(),
+                        Box::new(|| {}),
+                        &mut SubscribeContext::new(),
+                    )
+                }));
+            }
+            jobs.into_iter()
+                .map(|job| job.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        drop(readers);
+    }
+
+    #[test]
     fn reopening_a_fan_out_drops_dead_slots_and_renumbers_the_rest() {
         let extent = Extent::Base(BaseType::Int);
-        let fan = FanOut::new(Box::new(Constant::new(Value::Int(1), extent.clone())));
+        let fan = FanOut::new(std::sync::Arc::new(Constant::new(
+            Value::Int(1),
+            extent.clone(),
+        )));
         let mut cx = SubscribeContext::new();
         let tiling = Tiling::Scalar(extent);
 
         let first = fan
             .slot()
+            .clone()
             .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut cx);
-        let mut second = fan
-            .slot()
-            .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut cx);
-        assert_eq!(fan.shared.borrow().subscribers.len(), 2);
+        let mut second =
+            fan.slot()
+                .clone()
+                .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut cx);
+        assert_eq!(fan.shared.read().subscribers.len(), 2);
 
         // Distinguish the survivor's guard from the empty one the dead slot holds.
         let mine = TileGuard::Scalar(Predicate::True);
@@ -1790,13 +1912,13 @@ mod tests {
 
         fan.reopen();
 
-        let shared = fan.shared.borrow();
+        let shared = fan.shared.read();
         assert_eq!(shared.subscribers.len(), 1, "the dead slot is gone");
         assert_eq!(shared.consumers.len(), 1, "consumers stay parallel");
         assert_eq!(shared.release_guards.len(), 1, "guards stay parallel");
         drop(shared);
         assert_eq!(
-            fan.shared.borrow().release_guards[0],
+            fan.shared.read().release_guards[0],
             mine,
             "the survivor's guard moved with it, and it reads its new slot"
         );
@@ -1813,13 +1935,17 @@ mod tests {
     #[test]
     fn a_late_subscriber_starts_at_what_the_fan_out_has_released() {
         let extent = Extent::Base(BaseType::Int);
-        let fan = FanOut::new(Box::new(Constant::new(Value::Int(1), extent.clone())));
+        let fan = FanOut::new(std::sync::Arc::new(Constant::new(
+            Value::Int(1),
+            extent.clone(),
+        )));
         let mut cx = SubscribeContext::new();
         let tiling = Tiling::Scalar(extent);
 
-        let mut first = fan
-            .slot()
-            .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut cx);
+        let mut first =
+            fan.slot()
+                .clone()
+                .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut cx);
         assert!(
             !fan.released_in_full(),
             "nothing has released, so the fan-out still has its value to give"
@@ -1834,9 +1960,10 @@ mod tests {
         );
         let late = fan
             .slot()
+            .clone()
             .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut cx);
         assert_eq!(
-            fan.shared.borrow().release_guards[0],
+            fan.shared.read().release_guards[0],
             TileGuard::Scalar(Predicate::True),
             "the late subscriber inherits the release rather than starting at nothing"
         );
@@ -1851,16 +1978,16 @@ mod tests {
     /// takes the tile standing, leaving nothing new until the next notification.
     struct Scripted {
         base: OperatorBase,
-        tiles: Rc<RefCell<VecDeque<Tile>>>,
-        pulls: Rc<Cell<usize>>,
+        tiles: Arc<RwLock<VecDeque<Tile>>>,
+        pulls: Arc<Cell<usize>>,
         notifier: Notifier,
     }
 
     struct ScriptedProducer {
         base: ProducerBase,
-        tiles: Rc<RefCell<VecDeque<Tile>>>,
-        pulls: Rc<Cell<usize>>,
-        standing: Rc<Cell<bool>>,
+        tiles: Arc<RwLock<VecDeque<Tile>>>,
+        pulls: Arc<Cell<usize>>,
+        standing: Arc<Cell<bool>>,
         /// What the last tile called complete, which a pull with nothing new still states.
         complete: Option<Predicate>,
     }
@@ -1868,16 +1995,16 @@ mod tests {
     impl Scripted {
         /// The operator, the pull counter, and a handle that fires the consumer the
         /// memo installs on it.
-        fn new(tiles: Vec<Tile>, tiling: &Tiling) -> (Self, Rc<Cell<usize>>, Notifier) {
-            let pulls = Rc::new(Cell::new(0usize));
+        fn new(tiles: Vec<Tile>, tiling: &Tiling) -> (Self, Arc<Cell<usize>>, Notifier) {
+            let pulls = Arc::new(Cell::new(0usize));
             let notifier = Notifier {
-                consumer: Rc::new(RefCell::new(None)),
-                standing: Rc::new(Cell::new(true)),
+                consumer: Arc::new(RwLock::new(None)),
+                standing: Arc::new(Cell::new(true)),
             };
             (
                 Self {
                     base: OperatorBase::new(tiling.clone()),
-                    tiles: Rc::new(RefCell::new(tiles.into())),
+                    tiles: Arc::new(RwLock::new(tiles.into())),
                     pulls: pulls.clone(),
                     notifier: notifier.clone(),
                 },
@@ -1891,8 +2018,8 @@ mod tests {
     /// whether a tile stands to be taken.
     #[derive(Clone)]
     struct Notifier {
-        consumer: Rc<RefCell<Option<Box<dyn Consumer>>>>,
-        standing: Rc<Cell<bool>>,
+        consumer: Arc<RwLock<Option<Box<dyn Consumer>>>>,
+        standing: Arc<Cell<bool>>,
     }
 
     /// Bring the input's next tile, and notify.
@@ -1900,7 +2027,7 @@ mod tests {
         notifier.standing.set(true);
         notifier
             .consumer
-            .borrow_mut()
+            .write()
             .as_mut()
             .expect("the memo installed a consumer on its input")
             .announce(&Projection::Everything);
@@ -1911,13 +2038,13 @@ mod tests {
 
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
 
-        fn subscribe(
-            &mut self,
+        fn subscribe_impl(
+            self: std::sync::Arc<Self>,
             _intent_guard: TileGuard,
             consumer: Box<dyn Consumer>,
             _cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
-            *self.notifier.consumer.borrow_mut() = Some(consumer);
+            *self.notifier.consumer.write() = Some(consumer);
             Box::new(ScriptedProducer {
                 base: ProducerBase::unowned(ScriptedProducer::alloc_id(), self.tiling()),
                 tiles: self.tiles.clone(),
@@ -1938,7 +2065,7 @@ mod tests {
         fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
             self.pulls.set(self.pulls.get() + 1);
             let next = match self.standing.replace(false) {
-                true => self.tiles.borrow_mut().pop_front(),
+                true => self.tiles.write().pop_front(),
                 false => None,
             };
             match (next, &self.complete) {
@@ -1996,14 +2123,14 @@ mod tests {
     fn a_fan_out_passes_one_notification_per_pull() {
         let tiling = partial_tiling();
         let (input, _pulls, notifier) = Scripted::new(vec![one_row(0, 7)], &tiling);
-        let fan = FanOut::new(Box::new(input));
+        let fan = FanOut::new(std::sync::Arc::new(input));
         let mut cx = SubscribeContext::new();
-        let counts: Vec<Rc<Cell<u32>>> = (0..2).map(|_| Rc::new(Cell::new(0))).collect();
+        let counts: Vec<Arc<Cell<u32>>> = (0..2).map(|_| Arc::new(Cell::new(0))).collect();
         let mut producers: Vec<Box<dyn TileProducer>> = counts
             .iter()
             .map(|count| {
                 let count = count.clone();
-                fan.slot().subscribe(
+                fan.slot().clone().subscribe(
                     tiling.universal_guard(),
                     Box::new(move || count.set(count.get() + 1)),
                     &mut cx,
@@ -2031,11 +2158,12 @@ mod tests {
         let tiling = partial_tiling();
         let (input, pulls, notifier) =
             Scripted::new(vec![tiling.empty_tile(), one_row(0, 7)], &tiling);
-        let fan = FanOut::new(Box::new(Memo::new(Box::new(input))));
+        let fan = FanOut::new(std::sync::Arc::new(Memo::new(std::sync::Arc::new(input))));
         let mut cx = SubscribeContext::new();
         let mut branches: Vec<Box<dyn TileProducer>> = (0..2)
             .map(|_| {
                 fan.slot()
+                    .clone()
                     .subscribe(tiling.universal_guard(), Box::new(|| {}), &mut cx)
             })
             .collect();
@@ -2070,9 +2198,11 @@ mod tests {
     fn a_memo_reads_its_input_only_after_its_input_notifies() {
         let tiling = partial_tiling();
         let (input, pulls, notifier) = Scripted::new(vec![one_row(0, 7)], &tiling);
-        let mut memo = Memo::new(Box::new(input));
+        let memo = std::sync::Arc::new(Memo::new(std::sync::Arc::new(input)));
         let mut cx = SubscribeContext::new();
-        let mut producer = memo.subscribe(tiling.universal_guard(), Box::new(|| {}), &mut cx);
+        let mut producer =
+            memo.clone()
+                .subscribe(tiling.universal_guard(), Box::new(|| {}), &mut cx);
 
         let first = producer.read_in_pipeline(tiling.universal_guard());
         assert_eq!(pulls.get(), 1, "the first pull reads its input");
@@ -2103,9 +2233,11 @@ mod tests {
         let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
         let complete = Tile::Scalar(ColumnValue::Ints(vec![7]));
         let (input, pulls, notifier) = Scripted::new(vec![complete.clone()], &tiling);
-        let mut memo = Memo::new(Box::new(input));
+        let memo = std::sync::Arc::new(Memo::new(std::sync::Arc::new(input)));
         let mut cx = SubscribeContext::new();
-        let mut producer = memo.subscribe(tiling.universal_guard(), Box::new(|| {}), &mut cx);
+        let mut producer =
+            memo.clone()
+                .subscribe(tiling.universal_guard(), Box::new(|| {}), &mut cx);
         let probe = 0;
 
         assert_eq!(
@@ -2155,9 +2287,11 @@ mod tests {
         let tiling = partial_tiling();
         let (input, pulls, notifier) =
             Scripted::new(vec![tiling.empty_tile(), one_row(0, 7)], &tiling);
-        let mut memo = Memo::new(Box::new(input));
+        let memo = std::sync::Arc::new(Memo::new(std::sync::Arc::new(input)));
         let mut cx = SubscribeContext::new();
-        let mut producer = memo.subscribe(tiling.universal_guard(), Box::new(|| {}), &mut cx);
+        let mut producer =
+            memo.clone()
+                .subscribe(tiling.universal_guard(), Box::new(|| {}), &mut cx);
 
         assert!(
             producer
@@ -2251,13 +2385,15 @@ mod projection_tests {
     fn two_slots() -> (Box<dyn TileProducer>, Box<dyn TileProducer>, GuardLog) {
         let values: Vec<i64> = (0..ROWS as i64).collect();
         let (input, pulled, _) = ProjectionSpyOp::new(ints_by_position(&values, true), ints());
-        let fan = FanOut::new(Box::new(input));
+        let fan = FanOut::new(Arc::new(input));
         let mut cx = SubscribeContext::new();
         let first = fan
             .slot()
+            .clone()
             .subscribe(ints().empty_guard(), Box::new(|| {}), &mut cx);
         let second = fan
             .slot()
+            .clone()
             .subscribe(ints().empty_guard(), Box::new(|| {}), &mut cx);
         (first, second, pulled)
     }
@@ -2276,7 +2412,7 @@ mod projection_tests {
         let two = second.read_in_pipeline(keys_between(4, 7));
         assert_eq!(int_entries(&two), vec![(4, 4), (5, 5), (6, 6), (7, 7)]);
 
-        let pulled = pulled.borrow();
+        let pulled = pulled.read();
         assert_eq!(pulled[0], keys_between(0, 3));
         assert_eq!(
             pulled[1],
@@ -2292,7 +2428,7 @@ mod projection_tests {
         let (mut first, _second, pulled) = two_slots();
         let tile = first.read_in_pipeline(ints().empty_guard());
         assert!(int_entries(&tile).is_empty());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.read().is_empty());
     }
 
     /// A slot that asks for everything after another took a morsel gets everything, and the
@@ -2303,7 +2439,7 @@ mod projection_tests {
         first.read_in_pipeline(keys_between(0, 1));
         let all = second.read_in_pipeline(ints().universal_guard());
         assert_eq!(int_entries(&all).len(), ROWS as usize);
-        assert_eq!(*pulled.borrow().last().unwrap(), ints().universal_guard());
+        assert_eq!(*pulled.read().last().unwrap(), ints().universal_guard());
 
         let again = first.read_in_pipeline(keys_between(0, 1));
         assert_eq!(int_entries(&again), vec![(0, 0), (1, 1)]);
@@ -2324,7 +2460,7 @@ mod projection_tests {
         struct NotifyingInput {
             base: ProducerBase,
             consumer: Box<dyn Consumer>,
-            reads: Rc<Cell<usize>>,
+            reads: Arc<Cell<usize>>,
         }
 
         impl TileProducer for NotifyingInput {
@@ -2343,7 +2479,7 @@ mod projection_tests {
         }
 
         let dirty = DirtyRegion::new();
-        let reads = Rc::new(Cell::new(0));
+        let reads = Arc::new(Cell::new(0));
         let input = NotifyingInput {
             base: ProducerBase::unowned(NotifyingInput::alloc_id(), &ints()),
             consumer: dirty.consumer(Box::new(|| {})),
@@ -2373,7 +2509,7 @@ mod projection_tests {
         let input = address(&*memo.input);
         let is_input = |producer: &dyn TileProducer| (address(producer) == input).then_some(true);
         assert!(read_again_toward(&mut memo, &is_input));
-        assert_eq!(*memo.dirty.0.borrow(), Projection::Everything);
+        assert_eq!(*memo.dirty.0.read(), Projection::Everything);
 
         let (mut other, _, _) = memo_over_stream();
         other.dirty.remove(&Projection::Everything);
@@ -2404,13 +2540,13 @@ mod projection_tests {
 
         let first = memo.read_in_pipeline(keys_between(0, 3));
         assert_eq!(int_entries(&first), vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
-        assert_eq!(pulled.borrow()[0], keys_between(0, 3));
-        assert_eq!(released.borrow()[0], keys_between(0, 3));
+        assert_eq!(pulled.read()[0], keys_between(0, 3));
+        assert_eq!(released.read()[0], keys_between(0, 3));
         memo.release(keys_between(0, 3));
 
         let second = memo.read_in_pipeline(keys_between(4, 7));
         assert_eq!(int_entries(&second), vec![(4, 4), (5, 5), (6, 6), (7, 7)]);
-        assert_eq!(pulled.borrow()[1], keys_between(4, 7));
+        assert_eq!(pulled.read()[1], keys_between(4, 7));
     }
 
     /// A region the memo has read is answered from the cache with no pull, even once the
@@ -2426,16 +2562,16 @@ mod projection_tests {
         assert_eq!(int_entries(&kept), vec![(2, 2), (3, 3)]);
         // A debug build probes a silent input once, at the same region.
         assert!(
-            pulled.borrow()[1..]
+            pulled.read()[1..]
                 .iter()
                 .all(|guard| *guard == keys_between(2, 3)),
             "a read region reaches the input only as a probe: {:?}",
-            pulled.borrow()
+            pulled.read()
         );
 
         let wider = memo.read_in_pipeline(keys_between(2, 5));
         assert_eq!(
-            *pulled.borrow().last().unwrap(),
+            *pulled.read().last().unwrap(),
             keys_between(2, 5),
             "an unread region reaches the input"
         );
@@ -2472,15 +2608,15 @@ mod projection_tests {
         let (mut memo, pulled, released) = memo_over_stream();
         memo.begin_run();
         memo.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
-        assert_eq!(*pulled.borrow(), vec![ints().universal_guard()]);
-        assert_eq!(*released.borrow(), vec![ints().universal_guard()]);
+        assert_eq!(*pulled.read(), vec![ints().universal_guard()]);
+        assert_eq!(*released.read(), vec![ints().universal_guard()]);
 
         for _ in 0..3 {
             memo.get(keys_between(0, 3));
             memo.get(ints().universal_guard());
         }
         assert_eq!(
-            pulled.borrow().len(),
+            pulled.read().len(),
             1,
             "a consuming memo's offer pulls nothing, even in a debug build"
         );
@@ -2493,14 +2629,14 @@ mod projection_tests {
         let (mut memo, pulled, released) = memo_over_stream();
         memo.begin_run();
         memo.consume_in_pipeline(InputId::ONLY, keys_between(0, 3));
-        assert_eq!(*pulled.borrow(), vec![keys_between(0, 3)]);
-        assert_eq!(*released.borrow(), vec![keys_between(0, 3)]);
+        assert_eq!(*pulled.read(), vec![keys_between(0, 3)]);
+        assert_eq!(*released.read(), vec![keys_between(0, 3)]);
 
         let part = memo.get(keys_between(0, 3));
         assert_eq!(int_entries(&part), vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
         let rest = memo.get(keys_between(4, 7));
         assert!(int_entries(&rest).is_empty(), "the rest is not consumed");
-        assert_eq!(pulled.borrow().len(), 1, "and it is not pulled either");
+        assert_eq!(pulled.read().len(), 1, "and it is not pulled either");
     }
 
     /// A placed memo answers a pull before its first consume with nothing and pulls its
@@ -2511,7 +2647,7 @@ mod projection_tests {
         memo.begin_run();
         let tile = memo.get(ints().universal_guard());
         assert!(tile.is_empty() && !tile.is_terminal(), "{tile:?}");
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.read().is_empty());
     }
 
     /// A consume of a memo whose input has already drained pulls nothing.
@@ -2520,10 +2656,10 @@ mod projection_tests {
         let (mut memo, pulled, _) = memo_over_stream();
         memo.begin_run();
         memo.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
-        let pulls = pulled.borrow().len();
+        let pulls = pulled.read().len();
         memo.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
         assert_eq!(memo.final_guard(), ints().universal_guard());
-        assert_eq!(pulled.borrow().len(), pulls);
+        assert_eq!(pulled.read().len(), pulls);
     }
 
     /// `finish` queues no wake. A consume that finds nothing new, on a memo whose input has
@@ -2557,8 +2693,8 @@ mod projection_tests {
         );
         second.begin_run();
         second.consume_in_pipeline(InputId::ONLY, handed.clone());
-        assert_eq!(*pulled.borrow(), vec![handed.clone()]);
-        assert_eq!(*released.borrow(), vec![handed]);
+        assert_eq!(*pulled.read(), vec![handed.clone()]);
+        assert_eq!(*released.read(), vec![handed]);
         let rest = second.get(ints().universal_guard());
         assert_eq!(int_entries(&rest), vec![(4, 4), (5, 5), (6, 6), (7, 7)]);
     }
@@ -2569,7 +2705,7 @@ mod projection_tests {
         let (mut memo, pulled, _) = memo_over_stream();
         memo.begin_run();
         memo.consume_in_pipeline(InputId::ONLY, ints().empty_guard());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.read().is_empty());
         assert!(int_entries(&memo.get(ints().universal_guard())).is_empty());
     }
 
@@ -2579,7 +2715,7 @@ mod projection_tests {
         let (mut memo, pulled, _) = memo_over_stream();
         let tile = memo.read_in_pipeline(ints().empty_guard());
         assert!(int_entries(&tile).is_empty());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.read().is_empty());
     }
 
     /// A `Memo` subscribed over an input whose rows a test writes, with the consumer the input
@@ -2587,12 +2723,12 @@ mod projection_tests {
     fn memo_over_growing_input() -> (
         Box<dyn TileProducer>,
         InputConsumer,
-        Rc<RefCell<Tile>>,
+        Arc<RwLock<Tile>>,
         GuardLog,
     ) {
         let (input, notifier, rows, pulled) =
             NotifyingOp::scripted(ints_by_position(&[], false), ints());
-        let memo = Memo::new(Box::new(input)).subscribe(
+        let memo = Arc::new(Memo::new(Arc::new(input))).subscribe(
             ints().universal_guard(),
             Box::new(|| {}),
             &mut SubscribeContext::new(),
@@ -2628,7 +2764,7 @@ mod projection_tests {
         memo.read_in_pipeline(keys_between(3, 5));
 
         // Rows land at 3..=5 and the input says so; none land at 0..=2.
-        *rows.borrow_mut() = rows_at(3..=5);
+        *rows.write() = rows_at(3..=5);
         notify_keys(&notifier, 3, 5);
         let silent = memo.read_in_pipeline(keys_between(0, 2));
         assert!(int_entries(&silent).is_empty(), "{silent:?}");
@@ -2644,7 +2780,7 @@ mod projection_tests {
         memo.read_in_pipeline(keys_between(0, 2));
         memo.read_in_pipeline(keys_between(3, 5));
 
-        *rows.borrow_mut() = rows_at(0..=5);
+        *rows.write() = rows_at(0..=5);
         notify_input(&notifier, &Projection::Everything);
         assert_eq!(
             int_entries(&memo.read_in_pipeline(keys_between(0, 2))),
@@ -2661,7 +2797,7 @@ mod projection_tests {
     #[test]
     fn a_memo_reads_a_region_nothing_has_read() {
         let (mut memo, notifier, rows, _) = memo_over_growing_input();
-        *rows.borrow_mut() = rows_at(6..=7);
+        *rows.write() = rows_at(6..=7);
         notify_keys(&notifier, 0, 2);
         assert_eq!(
             int_entries(&memo.read_in_pipeline(keys_between(6, 7))),
@@ -2678,9 +2814,9 @@ mod projection_tests {
             memo.read_in_pipeline(keys_between(0, 2));
         }
         assert!(
-            pulled.borrow().len() <= 2,
+            pulled.read().len() <= 2,
             "a read and a probe at most: {:?}",
-            pulled.borrow()
+            pulled.read()
         );
     }
 
@@ -2714,14 +2850,14 @@ mod projection_tests {
                 bit_set::BitSet::new(),
             )
         };
-        *rows.borrow_mut() = rows_at(0..=3);
+        *rows.write() = rows_at(0..=3);
         memo.dirty
             .consumer(Box::new(|| {}))
             .announce(&Projection::Everything);
         memo.read_in_pipeline(keys_between(0, 3));
         memo.release(keys_between(0, 3));
 
-        *rows.borrow_mut() = rows_at(4..=7);
+        *rows.write() = rows_at(4..=7);
         let later = memo.read_in_pipeline(keys_between(4, 7));
         assert_eq!(int_entries(&later), vec![(4, 4), (5, 5), (6, 6), (7, 7)]);
     }
@@ -2739,12 +2875,16 @@ mod projection_tests {
 
         let values = [0i64, 1, 0, 1, 2, 2, 0, 1];
         let (stream, pulled, _) = ProjectionSpyOp::new(ints_by_position(&values, true), ints());
-        let fan = FanOut::new(Box::new(Memo::new(Box::new(stream))));
+        let fan = FanOut::new(Arc::new(Memo::new(Arc::new(stream))));
         let by_value = Converse::new(fan.slot());
-        let mut map = MapResult::new_at(fan.slot(), Box::new(by_value), CurryLevel::new(1));
+        let map = Arc::new(MapResult::new_at(
+            fan.slot(),
+            Arc::new(by_value),
+            CurryLevel::new(1),
+        ));
         let guard = map.tiling().universal_guard();
         let mut cx = SubscribeContext::new();
-        let mut producer = map.subscribe(guard, Box::new(|| {}), &mut cx);
+        let mut producer = map.clone().subscribe(guard, Box::new(|| {}), &mut cx);
 
         let morsel = producer.read_in_pipeline(keys_between(2, 3));
         let Tile::DataFunction { domain, .. } = &morsel else {
@@ -2771,7 +2911,7 @@ mod projection_tests {
         // The memo pulls the stream at the morsel's keys for the argument leg, then whole for the
         // function leg, which `Converse` reads whole.
         assert_eq!(
-            *pulled.borrow(),
+            *pulled.read(),
             vec![keys_between(2, 3), ints().universal_guard()]
         );
     }
@@ -2856,8 +2996,8 @@ mod consuming_tests {
         for outside in [0, 1, 6, 9] {
             assert!(!stated.contains(&Value::UInt(outside)), "key {outside}");
         }
-        assert_eq!(source.borrow().pulled, vec![region.guard()]);
-        assert_eq!(source.borrow().released, vec![region.guard()]);
+        assert_eq!(source.read().pulled, vec![region.guard()]);
+        assert_eq!(source.read().released, vec![region.guard()]);
     }
 
     /// A second region disjoint from the first joins the cache, which then states both.
@@ -2879,7 +3019,7 @@ mod consuming_tests {
             "a key between is not stated"
         );
         assert_eq!(
-            source.borrow().released,
+            source.read().released,
             vec![keys_between(1, 2), keys_between(7, 9)]
         );
     }
@@ -2899,7 +3039,7 @@ mod consuming_tests {
         let stated = statement(&memo);
         assert!(same_region(&stated, &keys_predicate(2, 8)), "{stated:?}");
         assert_eq!(
-            source.borrow().released,
+            source.read().released,
             vec![keys_between(2, 5), keys_between(4, 8)],
             "the input is released at each guard consumed"
         );
@@ -2925,10 +3065,10 @@ mod consuming_tests {
         let source = source(0..10);
         let (mut memo, mut notifier) = memo_over(&source);
         notifier.announce(&Projection::Nothing);
-        assert_eq!(*memo.dirty.0.borrow(), Projection::Everything);
+        assert_eq!(*memo.dirty.0.read(), Projection::Everything);
         memo.begin_run();
         memo.consume_in_pipeline(InputId::ONLY, ints().empty_guard());
-        assert!(source.borrow().pulled.is_empty());
+        assert!(source.read().pulled.is_empty());
         assert!(entries(&memo.cached_tile).is_empty());
     }
 
@@ -2940,17 +3080,17 @@ mod consuming_tests {
         let (mut memo, _) = memo_over(&source);
         memo.begin_run();
         memo.consume_in_pipeline(InputId::ONLY, Keys(0, 5).guard());
-        let first = predicate(&source.borrow().released[0]);
+        let first = predicate(&source.read().released[0]);
         assert!(first.contains(&Value::UInt(2)));
         assert!(
             !first.contains(&Value::UInt(3)),
             "the input did not answer key 3"
         );
 
-        source.borrow_mut().rows.insert(3, value(3));
+        source.write().rows.insert(3, value(3));
         memo.consume_in_pipeline(InputId::ONLY, Keys(0, 5).guard());
         assert_eq!(entries(&memo.cached_tile), rows_of(0..=5));
-        let second = predicate(source.borrow().released.last().unwrap());
+        let second = predicate(source.read().released.last().unwrap());
         assert!(second.contains(&Value::UInt(3)));
     }
 
@@ -3057,7 +3197,7 @@ mod consuming_tests {
         memo.consume_in_pipeline(InputId::ONLY, keys_between(0, 5));
         memo.release(keys_between(2, 3));
 
-        source.borrow_mut().rows.insert(9, value(9));
+        source.write().rows.insert(9, value(9));
         notifier.announce(&Keys(6, 11).projection());
         memo.consume_in_pipeline(InputId::ONLY, All.guard());
 
@@ -3256,7 +3396,7 @@ mod consuming_tests {
     fn notification_is_delivered_once_and_consumption_publishes_packages() {
         use crate::interpreter::notifications::forwarding_consumer_keeping_keys;
 
-        let woken = Rc::new(Cell::new(0));
+        let woken = Arc::new(Cell::new(0));
         let counted = woken.clone();
         let consumer = shared_consumer(Box::new(move || counted.set(counted.get() + 1)));
         let _cx = SubscribeContext::new();
@@ -3296,7 +3436,7 @@ mod consuming_tests {
     fn a_consume_wakes_no_consumer_that_pulled_since_the_notification() {
         use crate::interpreter::notifications::forwarding_consumer_keeping_keys;
 
-        let woken = Rc::new(Cell::new(0));
+        let woken = Arc::new(Cell::new(0));
         let counted = woken.clone();
         let consumer = shared_consumer(Box::new(move || counted.set(counted.get() + 1)));
         let _cx = SubscribeContext::new();
@@ -3395,7 +3535,7 @@ mod consuming_tests {
                 Add(key) => {
                     if self.input.add(key) {
                         for source in [&self.consuming_source, &self.lazy_source] {
-                            source.borrow_mut().rows.insert(key, value(key));
+                            source.write().rows.insert(key, value(key));
                         }
                         self.announce(Keys(key, key).projection());
                     }
@@ -3404,7 +3544,7 @@ mod consuming_tests {
                 Close => {
                     self.input.closed = true;
                     for source in [&self.consuming_source, &self.lazy_source] {
-                        source.borrow_mut().closed = true;
+                        source.write().closed = true;
                     }
                     self.announce(Projection::Everything);
                 }
@@ -3603,7 +3743,7 @@ mod cycle_tests {
     /// consumer it was subscribed with, and what each of its pulls read of its recurrence.
     #[derive(Default)]
     struct Wiring {
-        recurrence: Option<Box<dyn TileOperator>>,
+        recurrence: Option<Arc<dyn TileOperator>>,
         inside: Option<Box<dyn Consumer>>,
         cycle: Option<Cycle>,
         own: Option<SharedConsumer>,
@@ -3613,7 +3753,7 @@ mod cycle_tests {
 
     // shared-state-ok: a test's handle on the double's wiring; no tile passes between
     // operators through it.
-    type Wired = Rc<RefCell<Wiring>>;
+    type Wired = Arc<RwLock<Wiring>>;
 
     /// A store that reads its own fan-out through a recurrence slot on every pull, as a store's
     /// body reads its prior value, and answers `answer`.
@@ -3628,15 +3768,15 @@ mod cycle_tests {
 
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
 
-        fn subscribe(
-            &mut self,
+        fn subscribe_impl(
+            self: Arc<Self>,
             intent_guard: TileGuard,
             consumer: Box<dyn Consumer>,
             cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
-            let own: SharedConsumer = Rc::new(RefCell::new(consumer));
-            let (mut recurrence, inside) = {
-                let mut wiring = self.wiring.borrow_mut();
+            let own: SharedConsumer = Arc::new(RwLock::new(consumer));
+            let (recurrence, inside) = {
+                let mut wiring = self.wiring.write();
                 wiring.own = Some(own);
                 (
                     wiring
@@ -3649,12 +3789,12 @@ mod cycle_tests {
                         .expect("a test wires the cycle's consumer"),
                 )
             };
-            let recurrence = recurrence.subscribe(intent_guard, inside, cx);
+            let recurrence = recurrence.clone().subscribe(intent_guard, inside, cx);
             Box::new(StoreDoubleProducer {
                 base: ProducerBase::new(
                     StoreDoubleProducer::alloc_id(),
                     self.tiling(),
-                    &self.base,
+                    self.clone(),
                     cx,
                 ),
                 wiring: self.wiring.clone(),
@@ -3678,8 +3818,8 @@ mod cycle_tests {
             let read = self
                 .recurrence
                 .get(self.recurrence.tiling().universal_guard());
-            self.wiring.borrow_mut().read.push(read);
-            if self.wiring.borrow().release_recurrence {
+            self.wiring.write().read.push(read);
+            if self.wiring.read().release_recurrence {
                 self.recurrence
                     .release(self.recurrence.tiling().universal_guard());
             }
@@ -3689,7 +3829,7 @@ mod cycle_tests {
         fn release_impl(&mut self, _guard: TileGuard) {}
 
         fn enter_cycle(&mut self, cycle: Cycle) {
-            self.wiring.borrow_mut().cycle = Some(cycle);
+            self.wiring.write().cycle = Some(cycle);
         }
     }
 
@@ -3697,14 +3837,14 @@ mod cycle_tests {
     /// subscription notifies the consumer `inside` builds from the wiring.
     fn cyclic(answer: Tile, inside: impl FnOnce(&Wired) -> Box<dyn Consumer>) -> (FanOut, Wired) {
         let wiring = Wired::default();
-        let fan = FanOut::new_cyclic(Box::new(StoreDouble {
+        let fan = FanOut::new_cyclic(Arc::new(StoreDouble {
             base: OperatorBase::new(ints()),
             wiring: wiring.clone(),
             answer,
         }));
         let consumer = inside(&wiring);
         {
-            let mut wired = wiring.borrow_mut();
+            let mut wired = wiring.write();
             wired.recurrence = Some(fan.recurrence_slot());
             wired.inside = Some(consumer);
         }
@@ -3712,7 +3852,7 @@ mod cycle_tests {
     }
 
     fn cycle_of(wiring: &Wired) -> Cycle {
-        let cycle = wiring.borrow_mut().cycle.take();
+        let cycle = wiring.write().cycle.take();
         cycle.expect("the fan-out hands its store a cycle when the store is subscribed")
     }
 
@@ -3725,19 +3865,20 @@ mod cycle_tests {
         let whole = ints().universal_guard();
         let mut reader = fan
             .slot()
+            .clone()
             .subscribe(whole.clone(), Box::new(|| {}), &mut cx);
         cycle_of(&wiring).publish(&int(1));
         if reentrant_last {
             reader.release(whole.clone());
         }
-        wiring.borrow_mut().release_recurrence = true;
+        wiring.write().release_recurrence = true;
         let store = fan.store().unwrap();
-        let _ = store.borrow_mut().get(whole.clone());
-        // Repeating a release after the borrow ends cannot repair a lost forward.
+        let _ = store.write().get(whole.clone());
+        // Repeating a release after the read ends cannot repair a lost forward.
         reader.release(whole);
-        assert!(fan.shared.borrow().released.is_universal());
+        assert!(fan.shared.read().released.is_universal());
         assert!(
-            store.borrow().obsolete_guard().is_universal(),
+            store.read().obsolete_guard().is_universal(),
             "all slots released everything, but the store never received the release"
         );
     }
@@ -3749,16 +3890,76 @@ mod cycle_tests {
         let whole = ints().universal_guard();
         let mut reader = fan
             .slot()
+            .clone()
             .subscribe(whole.clone(), Box::new(|| {}), &mut cx);
         reader.release(whole.clone());
-        wiring.borrow_mut().release_recurrence = true;
+        wiring.write().release_recurrence = true;
         let store = fan.store().unwrap();
-        let borrow = store.borrow_mut();
-        let mut borrow = if mapped { borrow.map(|p| p) } else { borrow };
-        borrow.get(whole);
-        assert!(!borrow.obsolete_guard().is_universal());
-        drop(borrow);
-        assert!(store.borrow().obsolete_guard().is_universal());
+        let read = store.write();
+        let mut read = if mapped { read.map(|p| p) } else { read };
+        read.get(whole);
+        assert!(!read.obsolete_guard().is_universal());
+        drop(read);
+        assert!(store.read().obsolete_guard().is_universal());
+    }
+
+    #[test]
+    fn concurrent_first_subscriptions_finish_the_same_nested_cycle() {
+        let (fan, _) = cyclic(int(2), |_| Box::new(|| {}));
+        let first = fan.slot();
+        let second = fan.slot();
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let readers = std::thread::scope(|scope| {
+            let jobs = [first, second]
+                .into_iter()
+                .map(|slot| {
+                    let start = start.clone();
+                    scope.spawn(move || {
+                        start.wait();
+                        slot.clone().subscribe(
+                            slot.tiling().universal_guard(),
+                            Box::new(|| {}),
+                            &mut SubscribeContext::new(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            jobs.into_iter()
+                .map(|job| job.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(fan.store().is_some());
+        assert_eq!(readers.len(), 2);
+    }
+
+    #[test]
+    fn a_concurrent_release_is_settled_at_the_mutable_store_handoff() {
+        use super::growing::{Input, source};
+        use super::test_helpers::keys_between;
+        for _ in 0..64 {
+            let source = source(0..4);
+            let store = Arc::new(Store::new(Box::new(Input::over(&source))));
+            let held = store.write();
+            store.release(keys_between(0, 1));
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let worker = {
+                let store = store.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    store.release(keys_between(2, 3));
+                })
+            };
+            start.wait();
+            drop(held);
+            worker.join().unwrap();
+            // Inspect the producer directly: Store::read would itself drain and
+            // conceal a release stranded by the mutable guard's final handoff.
+            assert!(
+                guard_minus(&keys_between(0, 3), store.producer.read().obsolete_guard()).is_empty()
+            );
+            assert!(store.pending_release.read().is_none());
+        }
     }
 
     #[test]
@@ -3768,15 +3969,15 @@ mod cycle_tests {
 
         let source = source(0..10);
         let store = Store::new(Box::new(Input::over(&source)));
-        let first = store.borrow();
-        let last = store.borrow();
+        let first = store.read();
+        let last = store.read();
         store.release(keys_between(1, 2));
         store.release(keys_between(5, 6));
-        assert!(source.borrow().released.is_empty());
+        assert!(source.read().released.is_empty());
         drop(first);
-        assert!(source.borrow().released.is_empty());
+        assert!(source.read().released.is_empty());
         drop(last);
-        let released = source.borrow();
+        let released = source.read();
         assert_eq!(released.released.len(), 1);
         assert_eq!(
             keys_of(&released.released[0]),
@@ -3790,12 +3991,13 @@ mod cycle_tests {
     fn a_pull_that_re_enters_the_store_reads_the_published_snapshot() {
         let (fan, wiring) = cyclic(int(2), |_| Box::new(|| {}));
         let mut cx = SubscribeContext::new();
-        let mut reader = fan
-            .slot()
-            .subscribe(ints().universal_guard(), Box::new(|| {}), &mut cx);
+        let mut reader =
+            fan.slot()
+                .clone()
+                .subscribe(ints().universal_guard(), Box::new(|| {}), &mut cx);
         cycle_of(&wiring).publish(&int(1));
         assert_eq!(reader.read_in_pipeline(ints().universal_guard()), int(2));
-        assert_eq!(wiring.borrow().read, vec![int(1)]);
+        assert_eq!(wiring.read().read, vec![int(1)]);
         assert_eq!(fan.cached_tile(), Some(int(2)));
     }
 
@@ -3805,19 +4007,18 @@ mod cycle_tests {
     fn a_push_through_a_cyclic_fan_out_skips_its_recurrence_slots() {
         let (fan, wiring) = cyclic(int(2), |_| Box::new(Entry::new(PipelineId(2), ints())));
         let mut cx = SubscribeContext::new();
-        let _reader = fan.slot().subscribe(
+        let _reader = fan.slot().clone().subscribe(
             ints().universal_guard(),
             Box::new(Entry::new(PipelineId(1), ints())),
             &mut cx,
         );
-        let own = wiring
-            .borrow()
-            .own
-            .clone()
-            .expect("the store was subscribed");
+        let own = wiring.read().own.clone().expect("the store was subscribed");
         let mut landing = Landing::probe(PipelineId(0));
-        own.borrow_mut()
-            .notify(&Projection::Everything, &mut landing);
+        crate::interpreter::notifications::notify_shared(
+            &own,
+            &Projection::Everything,
+            &mut landing,
+        );
         let reached: Vec<_> = landing
             .arrivals()
             .into_iter()

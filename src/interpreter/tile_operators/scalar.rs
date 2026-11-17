@@ -106,15 +106,8 @@ impl Constant {
 }
 
 impl TileOperator for Constant {
-    fn runtime_operator(
-        &self,
-        _context: &mut crate::interpreter::dispatcher::runtime::RuntimeContext,
-    ) -> Result<crate::interpreter::dispatcher::runtime::RuntimeOperator, String> {
-        Ok(crate::interpreter::dispatcher::runtime::constant(
-            self.tile.clone(),
-            crate::interpreter::dispatcher::runtime::RuntimeBase::freeze(&self.base)?,
-            self.result_correlation(),
-        ))
+    fn partitions_at(&self, _level: CurryLevel) -> bool {
+        true
     }
 
     impl_operator_base!();
@@ -128,15 +121,20 @@ impl TileOperator for Constant {
 
     fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
 
-    fn subscribe(
-        &mut self,
+    fn subscribe_impl(
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         _consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         Box::new(ConstantProducer {
-            base: ProducerBase::new(ConstantProducer::alloc_id(), self.tiling(), &self.base, cx),
-            tile: self.tile.clone(),
+            base: ProducerBase::new(
+                ConstantProducer::alloc_id(),
+                self.tiling(),
+                self.clone(),
+                cx,
+            ),
+            operator: self.clone(),
         })
     }
 
@@ -152,12 +150,12 @@ impl TileOperator for Constant {
 
 struct ConstantProducer {
     base: ProducerBase,
-    tile: Tile,
+    operator: Arc<Constant>,
 }
 
 impl TileProducer for ConstantProducer {
     fn state_info(&self) -> ProducerStateInfo {
-        ProducerStateInfo::holding(self.tile.cell_count())
+        ProducerStateInfo::holding(self.operator.tile.cell_count())
     }
 
     impl_producer_base!();
@@ -185,13 +183,13 @@ impl TileProducer for ConstantProducer {
         // every guard into `obsolete_guard`, and returning released rows is what `get`'s
         // post-condition forbids.
         let mut tile = if self.tiling().is_data_function() {
-            let mut tile = self.tile.clone();
+            let mut tile = self.operator.tile.clone();
             tile.remove_guarded(self.obsolete_guard().clone());
             tile
         } else if self.obsolete_guard().is_universal() {
             self.tiling().empty_tile()
         } else {
-            self.tile.clone()
+            self.operator.tile.clone()
         };
         tile.restrict_to(&projection, self.tiling());
         tile
@@ -229,7 +227,7 @@ impl TileProducer for ConstantProducer {
 ///   `DataFunction { D ⇒ Scalar(Union) }`.
 pub struct VariantWrap {
     /// The payload operator feeding `variants[tag]`.
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     /// The tag being constructed.
     tag: FieldKey,
     /// Per-variant extents of the full union; `input` feeds the `tag` arm.
@@ -248,7 +246,7 @@ impl VariantWrap {
     /// one union column. At level 0 a bare payload yields `Scalar(Union)`; at level 1 a
     /// payload stream `D ⤇ P` yields `D ⤇ Union`, wrapped element by element.
     pub fn new_at(
-        input: Box<dyn TileOperator>,
+        input: Arc<dyn TileOperator>,
         tag: FieldKey,
         variant_extents: TagMap<Extent>,
         level: CurryLevel,
@@ -338,15 +336,15 @@ impl TileOperator for VariantWrap {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe(
-        &mut self,
+    fn subscribe_impl(
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // A payload stream is pulled at the projection; a collection payload is one union column.
         let keeps_keys = self.tiling().is_data_function();
-        let input = self.input.subscribe(
+        let input = self.input.clone().subscribe(
             self.input.tiling().universal_guard(),
             consumer_keeping_keys_if(keeps_keys, consumer),
             cx,
@@ -355,7 +353,7 @@ impl TileOperator for VariantWrap {
             base: ProducerBase::new(
                 VariantWrapProducer::alloc_id(),
                 self.tiling(),
-                &self.base,
+                self.clone(),
                 cx,
             ),
             level: self.level,
@@ -520,7 +518,7 @@ impl TileProducer for VariantWrapProducer {
 pub struct VariantProject {
     /// The scrutinee operator, producing a `Scalar(Union)` tile or a
     /// `DataFunction { D ⇒ Scalar(Union) }` tile.
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     /// The tag to project.
     tag: FieldKey,
     /// The `tag` arm's declared payload extent — the output codomain, kept
@@ -551,7 +549,7 @@ impl VariantProject {
     /// width-subtype of what the `match` was written for simply never produces the
     /// tag, and the projection is empty; the operator still needs a codomain
     /// extent to describe that empty result, and only the type knows it.
-    pub fn new(input: Box<dyn TileOperator>, tag: FieldKey, payload_extent: Extent) -> Self {
+    pub fn new(input: Arc<dyn TileOperator>, tag: FieldKey, payload_extent: Extent) -> Self {
         // The scrutinee is a union, either bare or as the values of a function of any
         // arity. The output keeps that arity and narrows only the codomain, so a union
         // per innermost element projects per innermost element. The output is a function
@@ -603,15 +601,15 @@ impl TileOperator for VariantProject {
         visit(value("scrutinee", &*self.input));
     }
 
-    fn subscribe(
-        &mut self,
+    fn subscribe_impl(
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // A union stream is pulled at the projection; a bare union has no keys of its own.
         let keeps_keys = self.input.tiling().is_data_function();
-        let input = self.input.subscribe(
+        let input = self.input.clone().subscribe(
             self.input.tiling().universal_guard(),
             consumer_keeping_keys_if(keeps_keys, consumer),
             cx,
@@ -620,7 +618,7 @@ impl TileOperator for VariantProject {
             base: ProducerBase::new(
                 VariantProjectProducer::alloc_id(),
                 self.tiling(),
-                &self.base,
+                self.clone(),
                 cx,
             ),
             input,
@@ -861,7 +859,7 @@ impl VariantProjectProducer {
 pub struct VariantIs {
     /// The scrutinee operator, producing a `Scalar(Union)` tile or a
     /// `DataFunction { D ⇒ Scalar(Union) }` tile.
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     /// The tag to test for.
     tag: FieldKey,
     /// Identity and the output tiling — the scrutinee's, with `Bool` in place of the union:
@@ -874,7 +872,7 @@ impl VariantIs {
     /// scrutinee's shape with `Bool` in place of the union: a test answers every position, so
     /// it keeps every key, and a scalar scrutinee gets a scalar answer. [`VariantProject`]
     /// differs on a scalar because a restriction needs a domain to narrow.
-    pub fn new(input: Box<dyn TileOperator>, tag: FieldKey) -> Self {
+    pub fn new(input: Arc<dyn TileOperator>, tag: FieldKey) -> Self {
         let tiling = match input.tiling() {
             Tiling::Scalar(Extent::Union(_)) => Tiling::Scalar(Extent::Base(BaseType::Bool)),
             // The union sits under the levels the scrutinee stands at, however many: a match
@@ -907,8 +905,8 @@ impl TileOperator for VariantIs {
         visit(value("scrutinee", &*self.input));
     }
 
-    fn subscribe(
-        &mut self,
+    fn subscribe_impl(
+        self: Arc<Self>,
         intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -916,7 +914,7 @@ impl TileOperator for VariantIs {
         // The scrutinee is pulled at the projection, so a region of its keys is a region of the
         // result's.
         let keeps_keys = self.input.tiling().is_data_function();
-        let input = self.input.subscribe(
+        let input = self.input.clone().subscribe(
             intent_guard,
             consumer_keeping_keys_if(keeps_keys, consumer),
             cx,
@@ -925,7 +923,7 @@ impl TileOperator for VariantIs {
             base: ProducerBase::new(
                 VariantIsProducer::alloc_id(),
                 &self.base.tiling,
-                &self.base,
+                self.clone(),
                 cx,
             ),
             input,
@@ -1031,8 +1029,8 @@ mod nested_projection_tests {
     fn a_variant_wrap_beneath_two_levels_answers_a_projection_of_paths() {
         assert_conforms_beneath(|| {
             let (tile, tiling) = two_levels_of_ints();
-            Box::new(VariantWrap::new_at(
-                Box::new(ProjectionSpyOp::new(tile, tiling).0),
+            Arc::new(VariantWrap::new_at(
+                Arc::new(ProjectionSpyOp::new(tile, tiling).0),
                 FieldKey::Index(0),
                 TagMap::from_arms(vec![(FieldKey::Index(0), Extent::Base(BaseType::Int))]),
                 CurryLevel::new(2),
@@ -1059,8 +1057,8 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
-        fn subscribe(
-            &mut self,
+        fn subscribe_impl(
+            self: Arc<Self>,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
             _cx: &mut SubscribeContext,
@@ -1091,9 +1089,15 @@ mod tests {
     #[test]
     fn variant_project_commit_arm() {
         let scrut = Box::new(commit_abort_scrutinee());
-        let mut op = VariantProject::new(scrut, FieldKey::Index(0), Extent::Base(BaseType::Int));
+        let op = Arc::new(VariantProject::new(
+            Arc::new(*scrut),
+            FieldKey::Index(0),
+            Extent::Base(BaseType::Int),
+        ));
         let mut cx = SubscribeContext::new();
-        let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut cx);
+        let mut producer =
+            op.clone()
+                .subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut cx);
         let tile = producer.read_in_pipeline(producer.tiling().universal_guard());
 
         let Tile::DataFunction {
@@ -1111,9 +1115,15 @@ mod tests {
     #[test]
     fn variant_project_abort_arm() {
         let scrut = Box::new(commit_abort_scrutinee());
-        let mut op = VariantProject::new(scrut, FieldKey::Index(1), Extent::Base(BaseType::Unit));
+        let op = Arc::new(VariantProject::new(
+            Arc::new(*scrut),
+            FieldKey::Index(1),
+            Extent::Base(BaseType::Unit),
+        ));
         let mut cx = SubscribeContext::new();
-        let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut cx);
+        let mut producer =
+            op.clone()
+                .subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut cx);
         let tile = producer.read_in_pipeline(producer.tiling().universal_guard());
 
         let Tile::DataFunction {
@@ -1152,13 +1162,15 @@ mod tests {
             (abort, Extent::Base(BaseType::Unit)),
         ])));
 
-        let mut op = VariantProject::new(
-            Box::new(FixedOp { tile, tiling }),
+        let op = Arc::new(VariantProject::new(
+            Arc::new(FixedOp { tile, tiling }),
             commit,
             Extent::Base(BaseType::Int),
-        );
+        ));
         let mut cx = SubscribeContext::new();
-        let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut cx);
+        let mut producer =
+            op.clone()
+                .subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut cx);
         let out = producer.read_in_pipeline(producer.tiling().universal_guard());
 
         let Tile::DataFunction {
@@ -1197,24 +1209,29 @@ mod tests {
             Extent::Base(BaseType::Int),
         ])));
 
-        let arm0: Box<dyn TileOperator> = Box::new(VariantProject::new(
-            Box::new(FixedOp {
+        let arm0: Arc<dyn TileOperator> = Arc::new(VariantProject::new(
+            Arc::new(FixedOp {
                 tile: tile.clone(),
                 tiling: tiling.clone(),
             }),
             FieldKey::Index(0),
             Extent::Base(BaseType::Int),
         ));
-        let arm1: Box<dyn TileOperator> = Box::new(VariantProject::new(
-            Box::new(FixedOp { tile, tiling }),
+        let arm1: Arc<dyn TileOperator> = Arc::new(VariantProject::new(
+            Arc::new(FixedOp { tile, tiling }),
             FieldKey::Index(1),
             Extent::Base(BaseType::Int),
         ));
 
-        let mut union = UnionOperator::new_flat(vec![arm0, arm1], Extent::Base(BaseType::Int));
+        let union = Arc::new(UnionOperator::new_flat(
+            vec![arm0, arm1],
+            Extent::Base(BaseType::Int),
+        ));
         let mut cx = SubscribeContext::new();
         let mut producer =
-            union.subscribe(union.tiling().universal_guard(), Box::new(|| {}), &mut cx);
+            union
+                .clone()
+                .subscribe(union.tiling().universal_guard(), Box::new(|| {}), &mut cx);
         let out = producer.read_in_pipeline(producer.tiling().universal_guard());
 
         let Tile::DataFunction {
@@ -1262,7 +1279,7 @@ mod tests {
 
         // ``VariantProject(`commit)`` keeps the *actual* keys 10 and 12.
         let vp = VariantProject::new(
-            Box::new(FixedOp {
+            Arc::new(FixedOp {
                 tile: union_stream_tile.clone(),
                 tiling: union_stream_tiling.clone(),
             }),
@@ -1291,20 +1308,22 @@ mod tests {
 
         // ⟨outer, x.decision ≫ variant_project(`commit)⟩ — the Zip joins
         // the full outer collection with the tag-restricted payload on shared keys.
-        let ops: Vec<Box<dyn TileOperator>> = vec![
-            Box::new(FixedOp {
+        let ops: Vec<Arc<dyn TileOperator>> = vec![
+            Arc::new(FixedOp {
                 tile: outer_tile,
                 tiling: outer_tiling,
             }),
-            Box::new(vp),
+            Arc::new(vp),
         ];
-        let mut fan = Zip::new_at(
+        let fan = Arc::new(Zip::new_at(
             (0..2).map(crate::interpreter::tuple_field).collect(),
             ops,
             CurryLevel::new(1),
-        );
+        ));
         let mut cx = SubscribeContext::new();
-        let mut producer = fan.subscribe(fan.tiling().universal_guard(), Box::new(|| {}), &mut cx);
+        let mut producer =
+            fan.clone()
+                .subscribe(fan.tiling().universal_guard(), Box::new(|| {}), &mut cx);
         let out = producer.read_in_pipeline(producer.tiling().universal_guard());
 
         let Tile::DataFunction {
@@ -1377,7 +1396,7 @@ mod tests {
         producer.release(prefix.clone());
 
         assert_eq!(
-            released.borrow().as_slice(),
+            released.read().as_slice(),
             &[prefix],
             "a domain release must reach the scrutinee unchanged"
         );
@@ -1426,7 +1445,7 @@ mod tests {
         producer.release(prefix.clone());
 
         assert_eq!(
-            released.borrow().as_slice(),
+            released.read().as_slice(),
             &[prefix],
             "a domain release must reach the payload unchanged, not be swallowed \
              as a whole-input read would"
@@ -1453,7 +1472,7 @@ mod projection_tests {
         );
         ConstantProducer {
             base: ProducerBase::unowned(ConstantProducer::alloc_id(), &tiling),
-            tile,
+            operator: Arc::new(Constant::collection(tile, tiling)),
         }
     }
 
@@ -1512,7 +1531,7 @@ mod projection_tests {
         let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
         let mut seven = ConstantProducer {
             base: ProducerBase::unowned(ConstantProducer::alloc_id(), &tiling),
-            tile: Tile::Scalar(ColumnValue::Ints(vec![7])),
+            operator: Arc::new(Constant::new(Value::Int(7), Extent::Base(BaseType::Int))),
         };
         assert_eq!(
             seven.read_in_pipeline(tiling.universal_guard()),
@@ -1721,7 +1740,7 @@ mod variant_projection_tests {
         let (mut wrap, pulled) = wrapped_payloads();
         let morsel = wrap.read_in_pipeline(keys_between(2, 4));
         assert_eq!(keys(&morsel), ColumnValue::UInts(vec![2, 3, 4]));
-        assert_eq!(*pulled.borrow(), [keys_between(2, 4)]);
+        assert_eq!(*pulled.read(), [keys_between(2, 4)]);
     }
 
     #[test]
@@ -1792,7 +1811,7 @@ mod variant_projection_tests {
         };
         assert_eq!(*domain, ColumnValue::UInts(vec![2, 4]));
         assert_eq!(**codomain, Tile::Scalar(ColumnValue::Ints(vec![20, 40])));
-        assert_eq!(*pulled.borrow(), [keys_between(2, 5)]);
+        assert_eq!(*pulled.read(), [keys_between(2, 5)]);
     }
 
     /// The tags partition the stream, so the arms of one `match` pulled at one morsel hold
@@ -1859,7 +1878,7 @@ mod variant_projection_tests {
             panic!("a collection")
         };
         assert_eq!(*domain, ColumnValue::UInts(vec![2, 4]));
-        assert_eq!(*pulled.borrow(), [bare_tiling.universal_guard()]);
+        assert_eq!(*pulled.read(), [bare_tiling.universal_guard()]);
         assert_conforms(|| Box::new(make().0), keys_between(1, 4));
 
         // The consumer releases a morsel. The scrutinee has no keys to take the release, and a
@@ -1876,7 +1895,7 @@ mod variant_projection_tests {
             "no released position"
         );
         assert!(
-            released.borrow().is_empty(),
+            released.read().is_empty(),
             "a morsel's release names no key of a bare union"
         );
         // With the morsel released above, these two releases name every position, though no one
@@ -1885,7 +1904,7 @@ mod variant_projection_tests {
         commits.release(TileGuard::Function(FunctionGuard::Domain(
             Predicate::True.minus(&Predicate::at_or_below(Value::UInt(4))),
         )));
-        assert_eq!(*released.borrow(), [bare_tiling.universal_guard()]);
+        assert_eq!(*released.read(), [bare_tiling.universal_guard()]);
     }
 
     /// `variant_is(commit)` over the decision stream: the gate a `match` arm is filtered by.
@@ -1926,9 +1945,9 @@ mod variant_projection_tests {
         assert_eq!(answers.len(), ROWS as usize);
         is_commit.release(out.universal_guard());
         assert!(
-            released.borrow().iter().any(TileGuard::is_universal),
+            released.read().iter().any(TileGuard::is_universal),
             "the scrutinee is released whole: {:?}",
-            released.borrow()
+            released.read()
         );
     }
 
@@ -1947,7 +1966,7 @@ mod variant_projection_tests {
             **codomain,
             Tile::Scalar(ColumnValue::Bools(vec![true, false, true, false]))
         );
-        assert_eq!(*pulled.borrow(), [keys_between(2, 5)]);
+        assert_eq!(*pulled.read(), [keys_between(2, 5)]);
     }
 
     #[test]
@@ -1962,7 +1981,7 @@ mod variant_projection_tests {
         let (mut is_commit, pulled) = is_commit();
         let nothing = is_commit.tiling().empty_guard();
         assert_eq!(is_commit.get(nothing), is_commit.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.read().is_empty());
     }
 
     #[test]
@@ -1970,7 +1989,7 @@ mod variant_projection_tests {
         let (mut commits, pulled) = commit_arm();
         let nothing = commits.tiling().empty_guard();
         assert_eq!(commits.get(nothing), commits.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.read().is_empty());
     }
 
     #[test]
@@ -1978,6 +1997,6 @@ mod variant_projection_tests {
         let (mut wrap, pulled) = wrapped_payloads();
         let nothing = wrap.tiling().empty_guard();
         assert_eq!(wrap.get(nothing), wrap.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.read().is_empty());
     }
 }

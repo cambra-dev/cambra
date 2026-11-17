@@ -16,10 +16,10 @@ use crate::{
 /// [`StoreFinalRead`](crate::interpreter::commit_operator::StoreFinalRead) instead.
 pub struct ExtractFinal {
     /// Operator producing the `DataFunction` tiling to extract from.
-    source: Box<dyn TileOperator>,
+    source: Arc<dyn TileOperator>,
     /// Fallback for a terminal source with no live positions. Its extent must be included
     /// in the source codomain. `None` requires a source that cannot finish empty.
-    default: Option<Box<dyn TileOperator>>,
+    default: Option<Arc<dyn TileOperator>>,
     /// Output tiling — what one position of the source holds.
     base: OperatorBase,
 }
@@ -29,7 +29,7 @@ impl ExtractFinal {
     ///
     /// Panics if `source` is not a collection. Debug-asserts that its codomain extent includes
     /// the default's extent. The output has the source's codomain tiling.
-    pub fn new(source: Box<dyn TileOperator>, default: Box<dyn TileOperator>) -> Self {
+    pub fn new(source: Arc<dyn TileOperator>, default: Arc<dyn TileOperator>) -> Self {
         let tiling = Self::source_codomain_tiling(source.as_ref());
         // Non-collection defaults are normalized through `scalar_tile_to_column_value`.
         // Record layouts may differ, and a variant default may carry fewer arms than the
@@ -51,7 +51,7 @@ impl ExtractFinal {
     ///
     /// Exhaustive tag partitions satisfy this precondition. A terminal empty source panics
     /// during extraction. Construction panics if `source` is not a collection.
-    pub fn without_default(source: Box<dyn TileOperator>) -> Self {
+    pub fn without_default(source: Arc<dyn TileOperator>) -> Self {
         let tiling = Self::source_codomain_tiling(source.as_ref());
         Self {
             base: OperatorBase::new(tiling),
@@ -82,8 +82,8 @@ impl TileOperator for ExtractFinal {
         }
     }
 
-    fn subscribe(
-        &mut self,
+    fn subscribe_impl(
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -91,18 +91,20 @@ impl TileOperator for ExtractFinal {
         let input = BreakerInput::new(consumer, self.source.tiling(), false);
         // Only source notifications reach the consumer. The default is subscribed eagerly
         // but pulled only after a terminal source has no live positions.
-        let source_producer =
-            self.source
-                .subscribe(self.source.tiling().universal_guard(), input.consumer, cx);
-        let default_producer = self
-            .default
-            .as_mut()
-            .map(|d| d.subscribe(d.tiling().universal_guard(), Box::new(|| {}), cx));
+        let source_producer = self.source.clone().subscribe(
+            self.source.tiling().universal_guard(),
+            input.consumer,
+            cx,
+        );
+        let default_producer = self.default.as_ref().map(|d| {
+            d.clone()
+                .subscribe(d.tiling().universal_guard(), Box::new(|| {}), cx)
+        });
         share_breaker(ExtractFinalProducer::new(
             ProducerBase::new(
                 ExtractFinalProducer::alloc_id(),
                 self.tiling(),
-                &self.base,
+                self.clone(),
                 cx,
             )
             .breaking(input.downstream, input.placement),
@@ -134,7 +136,7 @@ pub(crate) fn extract_final_of(
     default: Option<Box<dyn TileProducer>>,
     tiling: &Tiling,
 ) -> crate::interpreter::dispatcher::BreakerHandle {
-    Rc::new(RefCell::new(ExtractFinalProducer::new(
+    Arc::new(RwLock::new(ExtractFinalProducer::new(
         ProducerBase::unowned(ExtractFinalProducer::alloc_id(), tiling),
         source,
         default,
@@ -474,8 +476,9 @@ fn greatest_live_key(domain: &ColumnValue, deleted: &bit_set::BitSet) -> Option<
 
 #[cfg(test)]
 mod tests {
-    use std::cell::{Cell, RefCell};
-    use std::rc::Rc;
+    use crate::interpreter::tile_operators::test_helpers::SharedCounter as Cell;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
 
     use super::*;
     use crate::interpreter::tile_operators::{FunctionGuard, Predicate};
@@ -486,12 +489,12 @@ mod tests {
     /// exercises `ExtractFinal`'s incremental (pre-terminal) release path.
     struct PartialSource {
         tiling: Tiling,
-        releases: Rc<RefCell<Vec<u64>>>,
+        releases: Arc<RwLock<Vec<u64>>>,
     }
 
     struct PartialSourceProducer {
         base: ProducerBase,
-        releases: Rc<RefCell<Vec<u64>>>,
+        releases: Arc<RwLock<Vec<u64>>>,
     }
 
     impl TileOperator for PartialSource {
@@ -500,8 +503,8 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
-        fn subscribe(
-            &mut self,
+        fn subscribe_impl(
+            self: std::sync::Arc<Self>,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
             _cx: &mut SubscribeContext,
@@ -527,7 +530,7 @@ mod tests {
             if let TileGuard::Function(FunctionGuard::Domain(released)) = &obsolete_guard
                 && let Some(Value::UInt(w)) = released.as_at_or_below()
             {
-                self.releases.borrow_mut().push(w);
+                self.releases.write().push(w);
             }
         }
     }
@@ -552,8 +555,8 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
-        fn subscribe(
-            &mut self,
+        fn subscribe_impl(
+            self: std::sync::Arc<Self>,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
             _cx: &mut SubscribeContext,
@@ -590,13 +593,13 @@ mod tests {
     /// A scalar default whose availability and notifications are controlled by the test.
     struct DelayedDefault {
         tiling: Tiling,
-        ready: Rc<Cell<bool>>,
-        consumer: Rc<RefCell<Option<Box<dyn Consumer>>>>,
+        ready: Arc<Cell<bool>>,
+        consumer: Arc<RwLock<Option<Box<dyn Consumer>>>>,
     }
 
     struct DelayedDefaultProducer {
         base: ProducerBase,
-        ready: Rc<Cell<bool>>,
+        ready: Arc<Cell<bool>>,
     }
 
     impl TileOperator for DelayedDefault {
@@ -604,13 +607,13 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
-        fn subscribe(
-            &mut self,
+        fn subscribe_impl(
+            self: std::sync::Arc<Self>,
             _intent_guard: TileGuard,
             consumer: Box<dyn Consumer>,
             _cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
-            *self.consumer.borrow_mut() = Some(consumer);
+            *self.consumer.write() = Some(consumer);
             Box::new(DelayedDefaultProducer {
                 base: ProducerBase::unowned(DelayedDefaultProducer::alloc_id(), &self.tiling),
                 ready: self.ready.clone(),
@@ -646,20 +649,23 @@ mod tests {
     /// keeps returning an empty result. Convert this pin when repaired.
     #[test]
     fn bug_delayed_default_does_not_wake_a_memoized_consumer() {
-        let ready = Rc::new(Cell::new(false));
-        let consumer = Rc::new(RefCell::new(None));
+        let ready = Arc::new(Cell::new(false));
+        let consumer = Arc::new(RwLock::new(None));
         let default = DelayedDefault {
             tiling: Tiling::Scalar(Extent::Base(BaseType::Int)),
             ready: ready.clone(),
             consumer: consumer.clone(),
         };
-        let extract = ExtractFinal::new(Box::new(int_source(vec![], vec![])), Box::new(default));
+        let extract = ExtractFinal::new(
+            std::sync::Arc::new(int_source(vec![], vec![])),
+            std::sync::Arc::new(default),
+        );
         // Memo will not retry an incomplete upstream unless it receives a notification.
-        let mut op = Memo::new(Box::new(extract));
+        let op = std::sync::Arc::new(Memo::new(std::sync::Arc::new(extract)));
         let guard = op.tiling().universal_guard();
-        let notifications = Rc::new(Cell::new(0));
+        let notifications = Arc::new(Cell::new(0));
         let observed = notifications.clone();
-        let mut producer = op.subscribe(
+        let mut producer = op.clone().subscribe(
             guard.clone(),
             Box::new(move || observed.set(observed.get() + 1)),
             &mut SubscribeContext::new(),
@@ -668,7 +674,7 @@ mod tests {
 
         ready.set(true);
         consumer
-            .borrow_mut()
+            .write()
             .as_mut()
             .unwrap()
             .announce(&Projection::Everything);
@@ -700,10 +706,14 @@ mod tests {
                 int_source(vec![0], vec![42])
             };
             let default = Constant::new(Value::Int(42), Extent::Base(BaseType::Int));
-            let mut op = ExtractFinal::new(Box::new(source), Box::new(default));
+            let op = std::sync::Arc::new(ExtractFinal::new(
+                std::sync::Arc::new(source),
+                std::sync::Arc::new(default),
+            ));
             let guard = op.tiling().universal_guard();
             let mut producer =
-                op.subscribe(guard.clone(), Box::new(|| {}), &mut SubscribeContext::new());
+                op.clone()
+                    .subscribe(guard.clone(), Box::new(|| {}), &mut SubscribeContext::new());
             assert!(producer.read_in_pipeline(guard.clone()).is_terminal());
             assert!(retained(&*producer) > 0);
             producer.release(guard.clone());
@@ -716,11 +726,13 @@ mod tests {
     /// Pin the current result until the ordering policy is fixed; the value at key 2 is 20.
     #[test]
     fn bug_unsorted_final_selection_uses_row_order() {
-        let mut op =
-            ExtractFinal::without_default(Box::new(int_source(vec![2, 0, 1], vec![20, 0, 10])));
+        let op = std::sync::Arc::new(ExtractFinal::without_default(std::sync::Arc::new(
+            int_source(vec![2, 0, 1], vec![20, 0, 10]),
+        )));
         let guard = op.tiling().universal_guard();
         let mut producer =
-            op.subscribe(guard.clone(), Box::new(|| {}), &mut SubscribeContext::new());
+            op.clone()
+                .subscribe(guard.clone(), Box::new(|| {}), &mut SubscribeContext::new());
         let Tile::Scalar(result) = producer.read_in_pipeline(guard) else {
             panic!("expected a scalar final value");
         };
@@ -771,9 +783,14 @@ mod tests {
             union_value("neg", Value::Int(0)),
             named_variant(&[("neg", Extent::Base(BaseType::Int))]),
         );
-        let mut op = ExtractFinal::new(Box::new(source), Box::new(default));
+        let op = std::sync::Arc::new(ExtractFinal::new(
+            std::sync::Arc::new(source),
+            std::sync::Arc::new(default),
+        ));
         let guard = op.tiling().universal_guard();
-        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
+        let mut producer =
+            op.clone()
+                .subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
         let tile = producer.read_in_pipeline(producer.tiling().universal_guard());
 
         let Tile::Scalar(cv) = tile else {
@@ -807,9 +824,14 @@ mod tests {
             union_value("neg", Value::Int(7)),
             named_variant(&[("neg", Extent::Base(BaseType::Int))]),
         );
-        let mut op = ExtractFinal::new(Box::new(source), Box::new(default));
+        let op = std::sync::Arc::new(ExtractFinal::new(
+            std::sync::Arc::new(source),
+            std::sync::Arc::new(default),
+        ));
         let guard = op.tiling().universal_guard();
-        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
+        let mut producer =
+            op.clone()
+                .subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
         let tile = producer.read_in_pipeline(producer.tiling().universal_guard());
 
         let Tile::Scalar(cv) = tile else {
@@ -829,15 +851,20 @@ mod tests {
     #[test]
     fn extract_final_releases_below_the_running_max() {
         let value_tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
-        let releases = Rc::new(RefCell::new(Vec::<u64>::new()));
+        let releases = Arc::new(RwLock::new(Vec::<u64>::new()));
         let source = PartialSource {
             tiling: Tiling::data_function(Extent::Base(BaseType::UInt), value_tiling.clone()),
             releases: releases.clone(),
         };
         let default = Constant::new(Value::Int(0), Extent::Base(BaseType::Int));
-        let mut op = ExtractFinal::new(Box::new(source), Box::new(default));
+        let op = std::sync::Arc::new(ExtractFinal::new(
+            std::sync::Arc::new(source),
+            std::sync::Arc::new(default),
+        ));
         let guard = op.tiling().universal_guard();
-        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
+        let mut producer =
+            op.clone()
+                .subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
 
         // Non-terminal source → ExtractFinal emits empty but releases `[0, max)`.
         let tile = producer.read_in_pipeline(producer.tiling().universal_guard());
@@ -846,7 +873,7 @@ mod tests {
             "a non-terminal source stays non-terminal"
         );
         assert_eq!(
-            releases.borrow().last().copied(),
+            releases.read().last().copied(),
             Some(1),
             "ExtractFinal must release below the running max (positions 0, 1), keeping position 2"
         );
@@ -873,12 +900,14 @@ mod projection_tests {
             bit_set::BitSet::new(),
         );
         let (stream, pulled, _) = ProjectionSpyOp::new(finished, tiling);
-        let mut op = ExtractFinal::new(
-            Box::new(stream),
-            Box::new(Constant::new(Value::Int(0), int())),
-        );
+        let op = Arc::new(ExtractFinal::new(
+            Arc::new(stream),
+            Arc::new(Constant::new(Value::Int(0), int())),
+        ));
         let guard = op.tiling().universal_guard();
-        let producer = op.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
+        let producer = op
+            .clone()
+            .subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
         (producer, pulled)
     }
 
@@ -888,8 +917,8 @@ mod projection_tests {
         let (mut last, pulled) = final_of_finished_stream();
         let tile = last.read_in_pipeline(last.tiling().universal_guard());
         assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![30])));
-        assert_eq!(pulled.borrow().len(), 1);
-        assert!(pulled.borrow()[0].is_universal());
+        assert_eq!(pulled.read().len(), 1);
+        assert!(pulled.read()[0].is_universal());
     }
 
     #[test]
@@ -897,7 +926,7 @@ mod projection_tests {
         let (mut last, pulled) = final_of_finished_stream();
         let tile = last.read_in_pipeline(last.tiling().empty_guard());
         assert_eq!(tile, last.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.read().is_empty());
     }
 
     #[test]
@@ -975,7 +1004,7 @@ mod consuming_tests {
         // The rows below arrive after the row at key 11, which stays final.
         extract.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
         assert_eq!(offer(&mut extract), Some(value(11)));
-        assert_eq!(source.borrow().pulled.len(), 2);
+        assert_eq!(source.read().pulled.len(), 2);
     }
 
     /// Pending source rows are counted, and completed extraction retains only its result.
@@ -1037,13 +1066,13 @@ mod consuming_tests {
         let mut extract = final_over(&source, None);
         extract.begin_run();
         extract.consume_in_pipeline(InputId::ONLY, keys_between(2, 5));
-        assert_eq!(source.borrow().pulled, vec![keys_between(2, 5)]);
-        assert_eq!(source.borrow().released, vec![keys_between(2, 5)]);
+        assert_eq!(source.read().pulled, vec![keys_between(2, 5)]);
+        assert_eq!(source.read().released, vec![keys_between(2, 5)]);
         assert_eq!(offer(&mut extract), None);
         extract.consume_in_pipeline(InputId::ONLY, keys_between(7, 9));
         extract.consume_in_pipeline(InputId::ONLY, keys_between(4, 8));
         assert_eq!(
-            source.borrow().released,
+            source.read().released,
             vec![keys_between(2, 5), keys_between(7, 9), keys_between(4, 8)]
         );
     }
@@ -1054,7 +1083,7 @@ mod consuming_tests {
         let mut extract = final_over(&source, None);
         extract.begin_run();
         extract.consume_in_pipeline(InputId::ONLY, ints().empty_guard());
-        assert!(source.borrow().pulled.is_empty());
+        assert!(source.read().pulled.is_empty());
     }
 
     /// An empty source that has drained falls back to the default, read once.
@@ -1084,7 +1113,7 @@ mod consuming_tests {
             "nothing is held yet"
         );
 
-        *cell.borrow_mut() = Tile::Scalar(ColumnValue::Ints(vec![7]));
+        *cell.write() = Tile::Scalar(ColumnValue::Ints(vec![7]));
         extract.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
         assert_eq!(offer(&mut extract), Some(7));
         assert_eq!(extract.final_guard(), int().universal_guard());
@@ -1152,11 +1181,11 @@ mod consuming_tests {
         let mut extract = final_over(&source, None);
         extract.begin_run();
         extract.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
-        let pulls = source.borrow().pulled.len();
+        let pulls = source.read().pulled.len();
         for _ in 0..3 {
             offer(&mut extract);
         }
-        assert_eq!(source.borrow().pulled.len(), pulls);
+        assert_eq!(source.read().pulled.len(), pulls);
     }
 
     /// A growing source withholds a key it does not hold yet: the release leaves it, and a row
@@ -1167,9 +1196,9 @@ mod consuming_tests {
         let mut extract = final_over(&source, None);
         extract.begin_run();
         extract.consume_in_pipeline(InputId::ONLY, keys_between(0, 5));
-        assert!(!predicate(&source.borrow().released[0]).contains(&Value::UInt(3)));
-        source.borrow_mut().rows.insert(3, value(3));
-        source.borrow_mut().closed = true;
+        assert!(!predicate(&source.read().released[0]).contains(&Value::UInt(3)));
+        source.write().rows.insert(3, value(3));
+        source.write().closed = true;
         extract.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
         assert_eq!(offer(&mut extract), Some(value(3)));
     }
@@ -1182,10 +1211,10 @@ mod consuming_tests {
         extract.begin_run();
         extract.consume_in_pipeline(InputId::ONLY, keys_between(0, 1));
         extract.release(int().universal_guard());
-        let pulls = source.borrow().pulled.len();
+        let pulls = source.read().pulled.len();
         extract.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
-        assert_eq!(source.borrow().pulled.len(), pulls);
-        assert_eq!(source.borrow().wasted, 0);
+        assert_eq!(source.read().pulled.len(), pulls);
+        assert_eq!(source.read().wasted, 0);
     }
 
     /// An extraction placed in a pipeline answers a pull before its first consume with nothing and
@@ -1196,7 +1225,7 @@ mod consuming_tests {
         let mut extract = final_over(&source, None);
         extract.begin_run();
         assert_eq!(scalar_of(&extract.get(int().universal_guard())), None);
-        assert!(source.borrow().pulled.is_empty());
+        assert!(source.read().pulled.is_empty());
     }
 
     /// The model of a run over a growing source: the keys answered, whether the output was
@@ -1236,12 +1265,12 @@ mod consuming_tests {
             match step {
                 Add(key) => {
                     if self.input.add(key) {
-                        self.sut_source.borrow_mut().rows.insert(key, value(key));
+                        self.sut_source.write().rows.insert(key, value(key));
                     }
                 }
                 Close => {
                     self.input.closed = true;
-                    self.sut_source.borrow_mut().closed = true;
+                    self.sut_source.write().closed = true;
                 }
                 Notify(_) => unreachable!("an extraction listens to no region"),
                 Consume(region) => {

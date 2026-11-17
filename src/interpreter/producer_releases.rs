@@ -13,7 +13,7 @@ use crate::interpreter::tiling::Predicate;
 /// carrying the agreement across a version handover a property of a source rather
 /// than of whichever ones happen to store their releases alike.
 #[derive(Debug)]
-pub(crate) struct ProducerReleases {
+struct ReleaseRecords {
     /// What each producer has released, accumulated by union across its releases.
     per_producer: HashMap<String, Predicate>,
     /// What a producer registering from now on is recorded as having already
@@ -26,7 +26,7 @@ pub(crate) struct ProducerReleases {
     on_registration: Predicate,
 }
 
-impl Default for ProducerReleases {
+impl Default for ReleaseRecords {
     fn default() -> Self {
         Self {
             per_producer: HashMap::new(),
@@ -35,7 +35,7 @@ impl Default for ProducerReleases {
     }
 }
 
-impl ProducerReleases {
+impl ReleaseRecords {
     /// Accumulate `obsolete` into `producer`'s record, registering it at
     /// [`on_registration`](Self::on_registration) if this is its first release.
     pub(crate) fn record(&mut self, producer: &str, obsolete: &Predicate) {
@@ -121,6 +121,53 @@ impl ProducerReleases {
     }
 }
 
+/// A source reader's registration, retired without acquiring the source's data lock.
+/// Its callback must only touch independent release bookkeeping.
+pub struct SourceReaderRetirement(Option<Box<dyn FnOnce() + Send + Sync>>);
+
+impl SourceReaderRetirement {
+    pub fn new(retire: impl FnOnce() + Send + Sync + 'static) -> Self {
+        Self(Some(Box::new(retire)))
+    }
+}
+
+impl Drop for SourceReaderRetirement {
+    fn drop(&mut self) {
+        if let Some(retire) = self.0.take() {
+            retire();
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProducerReleases(std::sync::Arc<parking_lot::RwLock<ReleaseRecords>>);
+
+impl ProducerReleases {
+    pub(crate) fn record(&mut self, producer: &str, obsolete: &Predicate) {
+        self.0.write().record(producer, obsolete);
+    }
+    pub(crate) fn retire(&mut self, producer: &str) {
+        self.0.write().retire(producer);
+    }
+    pub(crate) fn retirement(&self, producer: &str) -> SourceReaderRetirement {
+        let mut releases = self.clone();
+        let producer = producer.to_owned();
+        SourceReaderRetirement::new(move || releases.retire(&producer))
+    }
+    pub(crate) fn of(&self, producer: &str) -> Option<Predicate> {
+        self.0.read().of(producer).cloned()
+    }
+    pub(crate) fn agreed(&self) -> Predicate {
+        self.0.read().agreed()
+    }
+    pub(crate) fn carry_to_new_producers(&mut self, predecessor: &HashSet<String>) {
+        self.0.write().carry_to_new_producers(predecessor);
+    }
+    pub(crate) fn on_registration(&self) -> Predicate {
+        self.0.read().on_registration().clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,12 +200,12 @@ mod tests {
     fn a_producer_registering_after_the_carry_starts_at_the_agreement() {
         let mut releases = ProducerReleases::default();
         releases.record("a", &Predicate::at_or_below(Value::UInt(2)));
-        assert_eq!(releases.on_registration(), &Predicate::False);
+        assert_eq!(releases.on_registration(), Predicate::False);
 
         releases.carry_to_new_producers(&HashSet::from(["a".to_string()]));
         assert_eq!(
             releases.on_registration(),
-            &Predicate::at_or_below(Value::UInt(2))
+            Predicate::at_or_below(Value::UInt(2))
         );
 
         // The newcomer counts as having released the agreement even before it
@@ -181,7 +228,7 @@ mod tests {
         releases.carry_to_new_producers(&HashSet::from(["mine".to_string()]));
         assert_eq!(
             releases.on_registration(),
-            &Predicate::at_or_below(Value::UInt(5))
+            Predicate::at_or_below(Value::UInt(5))
         );
         releases.record("replacement", &Predicate::False);
         assert_eq!(releases.agreed(), Predicate::at_or_below(Value::UInt(1)));
@@ -196,7 +243,7 @@ mod tests {
         releases.carry_to_new_producers(&HashSet::new());
         assert_eq!(
             releases.on_registration(),
-            &Predicate::at_or_below(Value::UInt(3))
+            Predicate::at_or_below(Value::UInt(3))
         );
     }
 }

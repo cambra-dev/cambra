@@ -90,7 +90,7 @@ impl Drop for InductionRun {
 pub(super) fn induction(
     store: &StoreCell,
 ) -> crate::interpreter::tile_operators::StoreBorrow<'_, InductionStoreProducer> {
-    store.borrow_mut().map(|producer| {
+    store.write().map(|producer| {
         producer
             .as_induction_store_mut()
             .expect("a loop store has concrete induction state")
@@ -266,7 +266,7 @@ impl InductionStoreProducer {
                 .and_then(|producer| producer.completes_through());
         });
         if let Some(target) = target {
-            *target.borrow_mut() = None;
+            *target.write() = None;
         }
         for placement in self.seed_placements() {
             placement.set(None);
@@ -329,7 +329,7 @@ impl InductionStoreProducer {
                 .and_then(|producer| producer.completes_through());
         });
         let target = target.expect("a loop's drive records its source's complete pushes");
-        *target.borrow_mut() = Some((pipeline, input));
+        *target.write() = Some((pipeline, input));
     }
 
     /// The paths a push from the range in front of `consumer` takes to the drive's entry, as the
@@ -392,7 +392,7 @@ impl InductionStoreProducer {
         let region = Projection::of(guard)
             .unwrap_or_else(|why| panic!("a loop's round names a row of its store: {why}"));
         let mut landing = Landing::probe(self.pipeline(drive));
-        consumer.borrow_mut().notify(&region, &mut landing);
+        crate::interpreter::notifications::notify_shared(&consumer, &region, &mut landing);
         let arrivals = landing.arrivals();
         readers
             .iter()
@@ -568,7 +568,7 @@ impl InductionStoreProducer {
 pub(super) fn reach_member(member: &Member, call: &mut Call<'_>) {
     match member {
         Member::Scope(store) => call(&mut *induction(store), InputId::ONLY),
-        Member::Chain(handle) => call(&mut *handle.borrow_mut(), InputId::ONLY),
+        Member::Chain(handle) => call(&mut *handle.write(), InputId::ONLY),
     }
 }
 

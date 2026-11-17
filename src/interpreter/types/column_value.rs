@@ -396,7 +396,7 @@ impl ColumnValue {
                 ColumnValue::Records(fields)
             }
             Extent::DataSourceDomain(d) => {
-                ColumnValue::from_values(values, &d.borrow().element_extent())
+                ColumnValue::from_values(values, &d.read().element_extent())
             }
             Extent::Union(sub_extents) => {
                 // Bucket each row by its tag, keeping the row index alongside the
@@ -522,7 +522,7 @@ impl ColumnValue {
     /// before comparison.
     pub fn is_compatible_with_extent(&self, extent: &Extent) -> bool {
         let extent = match extent {
-            Extent::DataSourceDomain(source) => source.borrow().element_extent(),
+            Extent::DataSourceDomain(source) => source.read().element_extent(),
             Extent::Restricted { base, .. } => *base.clone(),
             other => other.clone(),
         };

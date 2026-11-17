@@ -341,14 +341,14 @@ impl LoweringContext {
             }
             Endpoints::Open => {
                 let server = self.bind_port(*port, args_span)?;
-                let source_obj = Rc::new(RefCell::new(HttpServerDataSource::new(
+                let source_obj = Arc::new(parking_lot::RwLock::new(HttpServerDataSource::new(
                     &server,
                     method.clone(),
                     path.clone(),
                     source_name.clone(),
                 )));
-                let sink: Arc<dyn DataSink> = source_obj.borrow().sink();
-                self.sources.insert(source_name.clone(), source_obj);
+                let sink: Arc<dyn DataSink> = source_obj.read().sink();
+                self.sources.insert(source_name.clone(), source_obj.into());
                 self.http_routes.insert(
                     source_name.clone(),
                     LoweredRoute {
@@ -385,7 +385,9 @@ impl LoweringContext {
     /// Give the route named `source_name` an [`UnopenedRoute`] as its source, which no listener's
     /// routing table names.
     fn declare_unopened_route(&mut self, source_name: &str) {
-        let source = Rc::new(RefCell::new(UnopenedRoute::new(source_name.to_string())));
-        self.sources.insert(source_name.to_string(), source);
+        let source = Arc::new(parking_lot::RwLock::new(UnopenedRoute::new(
+            source_name.to_string(),
+        )));
+        self.sources.insert(source_name.to_string(), source.into());
     }
 }

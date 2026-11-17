@@ -656,108 +656,72 @@ those accumulators when a snapshot is built or a release removes a group.
 | `FanOut` | Subscriber identities, release guards, their intersection, current-value retention and the published cyclic snapshot are shared. Slot compaction and subscription changes occur only after active reads and writes drain. |
 | Sources | Buffers, logical positions, yielded/closed progress and `ProducerReleases` are shared by reads, polling and reclamation. Polling can retain one owner while synchronized access protects the buffer and its retention. |
 
-## Initial runtime prototype
+## Unified native execution
 
-The test-only harness in [parallel.rs](dispatcher/parallel.rs) executes exclusive transferable
-pipeline instances on a bounded scoped worker pool. It uses the existing dispatcher claims,
-completion and finish accounting. Workers traverse a positional reader and an owned integer map,
-write a shared memo directly, and forward exact positional releases. A dependent pipeline reads
-that memo and updates a shared group sum. Only claim metadata returns to the coordinator, which
-publishes after the corresponding state update and input releases.
+The production [planner](dispatcher/plan.rs) builds the only execution graph. Its
+[worker pool](dispatcher/workers.rs) executes admitted pipelines at every local degree of
+parallelism, including one. `CAMBRA_PARALLEL_WORKERS` selects a positive worker count, defaulting to
+one; `CAMBRA_MORSEL_ROWS` selects the input claim size. Inspector and control modes use this same
+path. No separate runtime graph, shape conversion, expression interpreter or fresh-evaluation
+engine remains.
 
-The harness supports finite contiguous unsigned positional ranges, one logical reader per retained
-row source, and disjoint input claims. It returns all instances on handled worker or publication
-failure and stops admission after dispatcher failure. Tests force overlap between different
-pipelines with one instance each and between claims of one pipeline with several instances.
+`TileOperator: Send + Sync` is the shared immutable definition. Subscriptions take `Arc<Self>`;
+producers retain that definition and contain mutable execution state. Computation and release
+methods live on the native operators and receive their producer state explicitly. Each admitted
+pipeline has one reusable subscription per worker. All subscriptions are constructed before work
+admission. Inline aliases have private fan-out state in the subscription context, while declared
+breaker boundaries resolve to the existing native shared breaker cells. Workers pull those cells
+themselves. Operator chains are neither reconstructed per claim nor found through thread-local
+storage.
 
-The compiled-program planner does not select this harness. Its transferable input trait and small
-integer operators exercise the proposed ownership boundary; they do not replace `TileProducer`,
-`MemoProducer` or `MapAggregateProducer`. Arbitrary source adapters, fan-out subscriptions,
-notifications, output-driven deferred releases, cyclic stores and retained pause/reload remain
-implementation work under the contracts above. Prototype finalization has no finish-time input
-read; production integration must implement the specified finish phases before enabling those
-chains. Benchmark results describe this harness, including setup and thread startup, and do not
-measure compiled CHL program speed.
+The planner checks partition coordinates through the native definitions between breaker
+boundaries. Pointwise finite maps, filters, record operations and supported aggregate input chains
+can execute concurrently. A converse can partition original input positions beneath its groups.
+Operators without a partition contract, source polling, transaction control and loop scopes retain
+exclusive coordinator execution inside the same graph. Checked `Sum` and its producing dependency
+paths retain their original order, because changing either contribution order or reassociation can
+change overflow behavior. Scope dependency paths also remain coordinator-owned initially.
 
-## Finite pure compiled execution
+Workers integrate contributions directly under their native output breaker's lock. A bounded batch
+contains at most four claims. Grouped aggregation reuses a worker-local map keyed by full paths,
+then drains its new contributions into the shared map while preserving local allocation. The
+coordinator publishes completed native regions and acknowledges claims after integration. A
+completion carries claim metadata, not a result tile or map. Dependent pipelines can run while
+upstream queues remain open. Input-position guards never stand in for output-group completion.
 
-`run_program_parallel` in [compiled_parallel.rs](dispatcher/compiled_parallel.rs) evaluates an
-eligible pure `main` from a compiled program's operator descriptions. The plain CLI selects it
-when `CAMBRA_PARALLEL_WORKERS` is a positive worker count. `CAMBRA_MORSEL_ROWS` sets the claim size.
-Inspector and control modes reject this opt-in. The ordinary driver remains the default.
+The canonical input subscription of each shared output breaker owns its logical reader releases.
+Worker readers do not forward releases into shared inputs. Instead, integration releases the
+canonical input at the statement of the tile consumed by that worker. Its accumulated release
+therefore combines applied claims from all workers. Existing fan-out intersections protect other
+logical readers, and native release transformations retain whole operands until the pipeline no
+longer needs them. Both memo and grouped output integration remove already obsolete payload from
+late deltas under the output lock, preventing released values from reappearing.
 
-[Runtime descriptions](dispatcher/runtime.rs) contain structural source-free shapes, provenance
-identities and immutable operator configuration. Their factory handles are `Send + Sync`. Export
-interns declared `Memo`, `Aggregate`, `ExtractAggregate` and `MapAggregate` boundaries by operator
-identity. Each boundary has one shared output and one input pipeline. Dependencies refer to these
-outputs, so separate branches reuse a common intermediate result.
+Queue closure and acknowledgement of every claim precede worker-input finalization. That step
+releases the canonical input whole and records final aggregate/group completeness before the
+native breaker finishes. Finite main outputs merge contributions and restore positional order
+within each enclosing row, preserving deletion masks. Live outputs retain their existing ordered
+package delivery. A drained live boundary waits for active worker contributions before polling,
+pausing or reloading. Worker failures stop admission, join the pool and propagate the failure;
+applied contributions are not retried.
 
-Immutable operator plans are shared across workers, including frozen shapes and correlation
-metadata. Native maps, filters, record operators, zip, converse and aggregate extraction share
-`Arc` kernels containing their configuration and computation. Kernel methods take explicit mutable
-producer state. An explicit `WorkerContext` owns that state for every pipeline it executes.
-The first claim initializes native shape views, input subscriptions and caches through temporary
-operator adapters. Later claims reuse the state. Construction, execution, release and destruction
-occur on its owning worker. No native state crosses threads, and no thread-local storage locates it.
+Runtime handles use `Arc` and synchronized state. Compiler-only source types stay in
+`SourceDefinition`; runtime source handles contain no inference graph. Source release records have
+an independent synchronized ledger. Reader teardown captures its retirement handle during
+subscription, so destruction does not need the source data lock. Notifications and recursive
+construction share a reentrant control-plane gate, with explicit cycle detection. Tile computation
+holds no such gate.
 
-Inline `FanOut` aliases remain private and preserve lazy operand reads. Their subscription owners
-live in the pipeline's worker state; retained adapters reference that state weakly to avoid cycles.
-They introduce no publication dependency. `MapExtractAggregate` also remains inline.
+Each reported pipeline records `worker_claims`, `worker_instances`, `workers_used`, `delta_flushes`
+and `incremental_claims`. These distinguish configured state, executed work, actual worker use and
+claims admitted before an upstream finish. The ignored `benchmark_unified_dispatcher` test measures
+fresh compiled CHL programs at DOP 1, 2 and 4, with compilation outside the measured interval.
 
-Sources, constants and intermediate outputs use synchronized shared held tiles. Every logical
-pipeline reader registers before execution. Its release record combines all claims, including
-claims assigned to different workers. Reclamation follows the intersection of those logical
-records. A worker's private input release does not release the shared source until its contribution
-has reached the shared output. Whole operands remain held until their reader pipeline finishes.
-Release tombstones also remove released regions from later deltas, preventing resurrection.
-
-Workers apply pointwise contributions directly under the output mutex. Aggregate workers retain
-private maps keyed by full group paths across morsels. Flushing drains only their new contributions
-into the shared aggregate state and preserves the local map's allocation. The shared merge updates
-values and completion statements under the same mutex. No accumulated value is sent twice.
-Flush commands are separate from data claims. A buffer flushes after four claims or a bounded
-scheduling budget; an idle pool flushes pending buffers before waiting for completion. Dispatcher
-claims remain outstanding until their buffers reach shared state. Finish commands assert that each
-local buffer has drained before releasing terminal input state and destroying private state.
-
-The coordinator publishes regions after shared application and then acknowledges their claims.
-Eligible dependent pipelines execute before the producer closes. Native completion statements
-govern grouped publication; an input-position guard is never reused as an output-group guard.
-Non-indexed groups may partition their original inner row positions when the input chain supports
-that projection. Multiple workers can contribute to the same group. Scalar aggregates remain
-nonterminal until every queued, active and buffered contribution has drained. Source closure alone
-does not finalize an aggregate. Final output closure follows all worker finish commands.
-
-Positional shared readers gather requested rows before copying the codomain and apply native
-projection and completion rules. Publication restores positional key order within each enclosing
-row. Ordinary non-indexed collection readers wait for whole output to preserve binding order;
-mergeable aggregate readers can consume completed groups incrementally. Region metadata permits
-early reads and releases only through operators that preserve the corresponding coordinates.
-Whole-input operands suppress region readiness for their dependencies.
-
-`pipeline_claims` and `pipeline_instances` report admitted work and worker-state initialization
-counts in dependency order. `incremental_claims` counts claims admitted before an upstream pipeline
-finishes. `aggregate_claims` and `aggregate_flushes` distinguish local accumulation from shared
-integration. Completion messages carry metadata rather than result maps.
-
-The conversion admits supported finite pure maps, scalar functions, filters, records, selectors,
-grouping and aggregate boundaries. Native finite iteration accepts `Unit`, bounded index ranges
-and products or unions of finite iterable extents. Unsupported operators, dynamic or restricted
-extent handles, live sources, sinks, recurrence and external readings refuse before workers start.
-`Sum` also refuses because buffered reassociation can change checked integer overflow behavior.
-Other nonpartitionable chains execute as one whole claim. The native kernels perform computation;
-this path adds no separate expression interpreter.
-
-The retained serial producer graph, its consumption state and its probe observations stay with the
-caller. This API evaluates fresh pure instances; it cannot resume those instances after a pause or
-reload. Converting stateful programs requires the shared breaker, notification, logical reader and
-restoration protocols above. Worker failure stops admission, drains active commands, joins the
-pool and discards this run's output without retrying applied contributions.
-
-For example, a file named `example.cambra` containing the following finite program can run with
-`CAMBRA_PARALLEL_WORKERS=4 CAMBRA_MORSEL_ROWS=1 cambra example.cambra`:
+For example:
 
 ```cambra
 xs = [1, 2, 3, 4, 5, 6]
 [x * 3 + 1 for x in xs if x > 2]
 ```
+
+Run it with `CAMBRA_PARALLEL_WORKERS=4 CAMBRA_MORSEL_ROWS=1 cambra example.cambra`.

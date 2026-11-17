@@ -247,16 +247,18 @@ A waiter observes a generation before scanning for work. Every transition that c
 claimable or end the run advances that generation and wakes sleepers. A change between scanning and
 waiting therefore cannot be lost. A worker failure wakes waiters and stops further claims.
 
-These guarantees concern scheduling. Breakers use `Rc<RefCell<_>>`, and the production driver runs
-them serially. Several pipelines can share one breaker, whose consumes, offers and finishes would
-need additional coordination before parallel execution. Atomic-ordering proofs and queue storage
-mechanics are documented beside their implementation in `dispatcher.rs`.
+The production planner uses native `Arc` operator definitions and synchronized shared breakers.
+The coordinator owns publication, finish transitions, source polling and scope control. Workers
+own reusable private subscriptions, read shared breakers and integrate contributions directly under
+those breakers' locks. No queue lock covers tile execution. Several pipelines targeting one store
+retain their existing coordinator arbitration. Atomic ordering and queue storage mechanics are
+documented beside their implementation in `dispatcher.rs`.
 
+### Whole-pipeline workers
 
-### Whole-pipeline worker prototype
-
-The [parallel execution proposal](design-parallel-dispatcher.md#initial-runtime-prototype) includes
-an isolated worker harness and an inventory of the runtime thread-safety changes. The default
-compiled-program driver remains serial. The opt-in
-[finite pure compiled execution](design-parallel-dispatcher.md#finite-pure-compiled-execution)
-constructs eligible native chains on workers and merges their output through shared tile state.
+The [unified native execution](design-parallel-dispatcher.md#unified-native-execution) uses one
+compiled-program planner and execution loop for DOP one and higher. Native partition contracts
+admit independent pipeline regions to the worker pool. Exclusive operators remain coordinator-owned
+inside that same plan. Incremental publication follows shared integration; drained boundaries and
+finalization wait for outstanding work. Live sources, stores, loops and reloads retain their
+existing native runtime state.

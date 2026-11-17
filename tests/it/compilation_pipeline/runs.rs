@@ -189,17 +189,17 @@ fn two_runs_of_a_module_each_read_all_of_its_source() {
     use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
     use cambra::interpreter::{Extent, Predicate, TestDataSource};
     let mut ctx = GlobalContext::default();
-    let source = std::rc::Rc::new(std::cell::RefCell::new(TestDataSource::new(
+    let source = TestDataSource::new(
         "nums",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
-    source.borrow_mut().add_data(&[
+    );
+    source.write().add_data(&[
         (Value::UInt(0), Value::Int(1)),
         (Value::UInt(1), Value::Int(2)),
         (Value::UInt(2), Value::Int(3)),
     ]);
-    source.borrow_mut().set_yield_predicate(Predicate::True);
+    source.write().set_yield_predicate(Predicate::True);
     ctx.register_source(source);
     let program = program(
         indoc! {"

@@ -50,6 +50,40 @@ enum Hands {
 }
 
 impl SinkBreaker {
+    pub(crate) fn may_reorder(&self) -> bool {
+        matches!(
+            self.hands,
+            Hands::Main {
+                each_package: false,
+                loop_beneath: false,
+                ..
+            }
+        )
+    }
+    fn deliver(&mut self, tile: Tile) {
+        match &mut self.hands {
+            Hands::EachPackage => self.sink.process(&tile),
+            Hands::Main {
+                each_package,
+                answer,
+                handed_terminal,
+                ..
+            } => {
+                if *each_package {
+                    *handed_terminal |= tile.is_terminal();
+                    self.sink.process(&tile);
+                    if !cfg!(debug_assertions) {
+                        return;
+                    }
+                }
+                match answer {
+                    None => *answer = Some(Box::new(tile)),
+                    Some(answer) => answer.merge(tile),
+                }
+            }
+        }
+    }
+
     /// The breaker of the sink that hands what it pulls of `producer`, which `subscribe` has
     /// filled, to `sink`, one answer per package.
     pub(crate) fn new(producer: ProducerSlot, sink: Arc<dyn DataSink>) -> Self {
@@ -93,15 +127,19 @@ impl SinkBreaker {
         }
     }
 
-    fn input(producer: &ProducerSlot) -> std::cell::RefMut<'_, Box<dyn TileProducer>> {
-        std::cell::RefMut::map(producer.borrow_mut(), |slot| {
+    fn input(
+        producer: &ProducerSlot,
+    ) -> parking_lot::MappedRwLockWriteGuard<'_, Box<dyn TileProducer>> {
+        parking_lot::RwLockWriteGuard::map(producer.write(), |slot| {
             slot.as_mut()
                 .expect("a sink's producer is filled once its output subscribed")
         })
     }
 
-    fn reading(producer: &ProducerSlot) -> std::cell::Ref<'_, Box<dyn TileProducer>> {
-        std::cell::Ref::map(producer.borrow(), |slot| {
+    fn reading(
+        producer: &ProducerSlot,
+    ) -> parking_lot::MappedRwLockReadGuard<'_, Box<dyn TileProducer>> {
+        parking_lot::RwLockReadGuard::map(producer.read(), |slot| {
             slot.as_ref()
                 .expect("a sink's producer is filled once its output subscribed")
         })
@@ -109,33 +147,36 @@ impl SinkBreaker {
 }
 
 impl Breaker for SinkBreaker {
+    fn finish_worker_input(&mut self) {
+        let mut input = Self::input(&self.producer);
+        let whole = input.tiling().universal_guard();
+        input.release(whole);
+    }
+    fn worker_plan(&self) -> Option<WorkerPlan> {
+        if !self.may_reorder() {
+            return None;
+        }
+        Some(WorkerPlan {
+            input: Self::reading(&self.producer).base().definition.clone()?,
+            fold: WorkerFold::Materialize,
+        })
+    }
+    fn apply_worker(&mut self, delta: WorkerDelta) {
+        let WorkerPayload::Tile(tile) = delta.payload else {
+            unreachable!()
+        };
+        self.deliver(tile);
+        Self::input(&self.producer).release(delta.released);
+    }
+
     /// A sink's breaker keeps no mode: it pulls its producer at each consume, in a dispatched run
     /// only.
     fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
         let mut producer = Self::input(&self.producer);
         let tile = producer.get(guard);
         producer.release(tile.to_guard());
-        match &mut self.hands {
-            Hands::EachPackage => self.sink.process(&tile),
-            Hands::Main {
-                each_package,
-                answer,
-                handed_terminal,
-                ..
-            } => {
-                if *each_package {
-                    *handed_terminal |= tile.is_terminal();
-                    self.sink.process(&tile);
-                    if !cfg!(debug_assertions) {
-                        return;
-                    }
-                }
-                match answer {
-                    None => *answer = Some(Box::new(tile)),
-                    Some(answer) => answer.merge(tile),
-                }
-            }
-        }
+        drop(producer);
+        self.deliver(tile);
     }
 
     fn finish(&mut self, _input: InputId, _: &mut Pushes<'_>) {
@@ -178,7 +219,8 @@ impl Breaker for SinkBreaker {
             }
             return;
         }
-        let answer = merged.unwrap_or(rest);
+        let mut answer = merged.unwrap_or(rest);
+        order_positions(&mut answer, &tiling);
         debug_assert!(
             answer.is_terminal(),
             "a `main` output is handed a terminal answer at its finish"
@@ -201,8 +243,8 @@ impl Breaker for SinkBreaker {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -223,7 +265,7 @@ mod tests {
     fn sink_over(tile: Tile) -> (SinkBreaker, Arc<Counting>) {
         let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
         let (spy, _, _) = ProjectionSpy::new(tile, tiling);
-        let producer: ProducerSlot = Rc::new(RefCell::new(Some(Box::new(spy))));
+        let producer: ProducerSlot = Arc::new(RwLock::new(Some(Box::new(spy))));
         let sink = Arc::new(Counting::default());
         (SinkBreaker::new(producer, sink.clone()), sink)
     }
@@ -255,7 +297,7 @@ mod tests {
             bit_set::BitSet::new(),
         );
         let (spy, _, _) = ProjectionSpy::new(tile, tiling);
-        let producer: ProducerSlot = Rc::new(RefCell::new(Some(Box::new(spy))));
+        let producer: ProducerSlot = Arc::new(RwLock::new(Some(Box::new(spy))));
         let sink = Arc::new(Counting::default());
         let mut breaker = SinkBreaker::new(producer, sink.clone());
         let one = Predicate::from_column_value(&ColumnValue::Ints(vec![1]));
@@ -301,13 +343,13 @@ mod tests {
 
     /// A `main` output over the scripted producer, its sink, and the producer's script: key 0
     /// complete through 0, then keys 0, 2 and 3 complete.
-    fn main_over() -> (SinkBreaker, Arc<Recording>, Rc<RefCell<Tile>>) {
+    fn main_over() -> (SinkBreaker, Arc<Recording>, Arc<RwLock<Tile>>) {
         let tiling = Tiling::data_function(
             Extent::Base(BaseType::Int),
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         );
         let (spy, script) = ProjectionSpy::scripted(input(vec![0], through(0)), tiling);
-        let producer: ProducerSlot = Rc::new(RefCell::new(Some(Box::new(spy))));
+        let producer: ProducerSlot = Arc::new(RwLock::new(Some(Box::new(spy))));
         let sink = Arc::new(Recording::default());
         (SinkBreaker::main(producer, sink.clone()), sink, script)
     }
@@ -337,10 +379,10 @@ mod tests {
     fn handed(
         mut breaker: SinkBreaker,
         sink: &Recording,
-        script: &RefCell<Tile>,
+        script: &RwLock<Tile>,
     ) -> Vec<(Vec<i64>, bool)> {
         breaker.consume_in_pipeline(InputId::ONLY, keys(vec![0]));
-        *script.borrow_mut() = input(vec![0, 2, 3], Predicate::True);
+        *script.write() = input(vec![0, 2, 3], Predicate::True);
         breaker.consume_in_pipeline(InputId::ONLY, keys(vec![2]));
         breaker.consume_in_pipeline(InputId::ONLY, keys(vec![3]));
         let dispatcher = crate::interpreter::dispatcher::Dispatcher::new(vec![vec![]], 1);

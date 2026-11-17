@@ -2634,8 +2634,6 @@ fn a_rejected_reload_leaves_the_program_serving() {
 /// register, so its recompile fails while the new version compiles.
 #[test]
 fn a_running_version_that_no_longer_compiles_renders_against_its_own_file() {
-    use std::{cell::RefCell, rc::Rc};
-
     use cambra::{
         ccl::Type,
         ccl::load::LoadedProgram,
@@ -2650,11 +2648,11 @@ fn a_running_version_that_no_longer_compiles_renders_against_its_own_file() {
         total
     "};
     let mut ctx = GlobalContext::default();
-    ctx.register_source(Rc::new(RefCell::new(TestDataSource::new(
+    ctx.register_source(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    ))));
+    ));
     let live = LiveProgram::start(
         &mut ctx,
         &LoadedProgram::from_text("running.cambra", running),
@@ -3658,7 +3656,7 @@ fn a_version_installed_before_a_fold_runs_needs_no_new_arrival() {
     loop {
         let mut buffered = false;
         for (_, source) in ctx.source_registry().sources() {
-            let mut source = source.borrow_mut();
+            let mut source = source.write();
             if source.check_for_new_data() {
                 assert!(
                     source.get_yield_predicate().contains(&Value::UInt(0)),

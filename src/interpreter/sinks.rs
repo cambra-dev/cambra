@@ -5,14 +5,11 @@
 //! dispatcher runs.
 
 use crate::interpreter::Projection;
-use std::{
-    cell::RefCell,
-    rc::Rc,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-        mpsc::{self, Receiver, Sender},
-    },
+use parking_lot::RwLock;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+    mpsc::{self, Receiver, Sender},
 };
 
 use crate::interpreter::{Consumer, DataSink, tile_operators::TileProducer};
@@ -25,7 +22,7 @@ use crate::interpreter::{
 ///
 /// [`SinkConsumer::new`] hands one clone to the consumer and returns the other
 /// to the caller so it can be filled once [`crate::interpreter::tile_operators::TileOperator::subscribe`] completes.
-pub type ProducerSlot = Rc<RefCell<Option<Box<dyn TileProducer>>>>;
+pub type ProducerSlot = Arc<RwLock<Option<Box<dyn TileProducer>>>>;
 
 // ---------------------------------------------------------------------------
 // Completion notification
@@ -87,7 +84,7 @@ pub struct SinkConsumer {
 impl SinkConsumer {
     /// Pair `sink` and `done` with an empty producer slot for the caller to fill after subscription.
     pub fn new(sink: Arc<dyn DataSink>, done: DoneNotifier) -> (Self, ProducerSlot) {
-        let producer = Rc::new(RefCell::new(None));
+        let producer = Arc::new(RwLock::new(None));
         (
             Self {
                 producer: producer.clone(),
@@ -104,7 +101,7 @@ impl SinkConsumer {
         if self.done.is_none() {
             return;
         }
-        let mut slot = self.producer.borrow_mut();
+        let mut slot = self.producer.write();
         let producer = slot.as_mut().expect("a compiled sink holds its producer");
         let tile = producer
             .get(producer.tiling().universal_guard())
@@ -126,7 +123,7 @@ impl SinkConsumer {
     /// slot prevents those references from retaining the retired producer graph. Paused or refused
     /// runs remove their placement separately with [`unplace`](Self::unplace).
     pub fn detach(&mut self) {
-        *self.producer.borrow_mut() = None;
+        *self.producer.write() = None;
     }
 
     /// The slot holding the producer this consumer pulls, which a dispatched run walks.

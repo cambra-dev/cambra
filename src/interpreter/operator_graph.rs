@@ -11,8 +11,8 @@
 //!
 //! [`TileOperator::visit_inputs`]: crate::interpreter::tile_operators::TileOperator::visit_inputs
 
+use parking_lot::RwLock;
 use smol_str::SmolStr;
-use std::cell::RefCell;
 
 use crate::ccl::provenance::NodeId;
 use crate::interpreter::tile_operators::TileOperator;
@@ -21,7 +21,7 @@ use crate::interpreter::tiling::Tiling;
 /// How a downstream operator holds one of its inputs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EdgeKind {
-    /// An exclusively owned `Box<dyn TileOperator>`.
+    /// An exclusively owned `std::sync::Arc<dyn TileOperator>`.
     ///
     /// `deferred` marks an input wired through a [`CycleSlot`] after its owner was constructed.
     /// It does not change exclusive ownership.
@@ -280,7 +280,7 @@ thread_local! {
     // once at the macro, once at the `static` — and its upward scan stops at
     // `thread_local! {`, which is neither a comment nor an attribute, so the
     // note above does not reach this line.
-    static BOUNDARIES: RefCell<Option<Boundaries>> = const { RefCell::new(None) };
+    static BOUNDARIES: RwLock<Option<Boundaries>> = const { RwLock::new(None) };
 }
 
 /// Per-compilation sink identities and the set of reused operators already attributed.
@@ -306,7 +306,7 @@ impl BoundarySession {
     /// Install a fresh boundary record for the extent of this value.
     pub(crate) fn install() -> Self {
         BOUNDARIES.with(|slot| {
-            let mut slot = slot.borrow_mut();
+            let mut slot = slot.write();
             debug_assert!(
                 slot.is_none(),
                 "a boundary session is already installed; sessions are per-compile and \
@@ -324,9 +324,12 @@ impl BoundarySession {
     /// only the inputs they still hold.
     ///
     /// [`CycleSlot`]: crate::interpreter::tile_operators::CycleSlot
-    pub(crate) fn into_graph(self, outputs: &[(SmolStr, Box<dyn TileOperator>)]) -> OperatorGraph {
+    pub(crate) fn into_graph(
+        self,
+        outputs: &[(SmolStr, std::sync::Arc<dyn TileOperator>)],
+    ) -> OperatorGraph {
         let boundaries = BOUNDARIES
-            .with(|slot| slot.borrow_mut().take())
+            .with(|slot| slot.write().take())
             .unwrap_or_default();
         let mut nodes = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -359,7 +362,7 @@ impl BoundarySession {
 
 impl Drop for BoundarySession {
     fn drop(&mut self) {
-        BOUNDARIES.with(|slot| *slot.borrow_mut() = None);
+        BOUNDARIES.with(|slot| *slot.write() = None);
     }
 }
 
@@ -417,7 +420,7 @@ pub(crate) fn record_kept_operators(op: &dyn TileOperator) {
     let Some(id) = op.operator_id() else {
         return;
     };
-    let fresh = BOUNDARIES.with(|slot| match slot.borrow_mut().as_mut() {
+    let fresh = BOUNDARIES.with(|slot| match slot.write().as_mut() {
         Some(boundaries) => boundaries.rowed_kept.insert(id),
         None => false,
     });
@@ -462,7 +465,7 @@ pub fn source_nodes(graph: &OperatorGraph) -> std::collections::HashMap<String, 
             continue;
         };
         domain.for_each_source(&mut |source| {
-            let ids = out.entry(source.borrow().get_id().to_string()).or_default();
+            let ids = out.entry(source.read().get_id().to_string()).or_default();
             if !ids.contains(id) {
                 ids.push(*id);
             }
@@ -476,7 +479,7 @@ pub(crate) fn record_sink(name: &str) {
     let id = NodeId::fresh();
     crate::ccl::provenance::on_mint(id);
     BOUNDARIES.with(|slot| {
-        if let Some(boundaries) = slot.borrow_mut().as_mut() {
+        if let Some(boundaries) = slot.write().as_mut() {
             boundaries.sinks.push((SmolStr::new(name), id));
         }
     });

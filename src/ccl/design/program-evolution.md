@@ -669,6 +669,14 @@ subscriber has said so. Reuse, resumption and retirement all follow from that ru
 
 ### Retention is the agreement, and a record dies with its producer
 
+Compiler source registries retain a `SourceDefinition`: the exact compiler `Type` beside an
+`Arc<RwLock<dyn DataSourceDomainExtentImpl>>`. Lowering and inference use the former; native operator
+conversion receives only the latter. This keeps inference ownership on the coordinator while
+runtime source reads, polling and release can synchronize independently. A producer captures a
+`SourceReaderRetirement` during registration. Its destruction removes the reader from an
+independent release ledger without acquiring the source data lock, including during concurrent
+reads or teardown by an operation already holding that lock.
+
 `retire_producer` is called from a producer's own `Drop`, so a record lasts exactly as long as the
 producer that made it. A record left behind would hold the agreement where a dead producer stopped
 for the life of the process. The input would then retain everything above that point, and hand each
