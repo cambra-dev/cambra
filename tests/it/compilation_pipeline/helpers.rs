@@ -38,9 +38,8 @@ use cambra::ccl::load::LoadedProgram;
 use cambra::ccl::{Expr, FieldKey, Label, TagMap};
 use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
 use cambra::interpreter::{
-    ColumnValue, Consumer, Predicate, Tile, Value, pull_laps, sort_function_by_domain, tuple_field,
+    ColumnValue, Consumer, Predicate, Tile, Value, sort_function_by_domain, tuple_field,
 };
-use cambra::pretty_graph::VizOptions;
 use cambra::pretty_tree::InspectNode;
 
 use super::panic_message::panic_message;
@@ -83,13 +82,9 @@ pub(crate) fn operator_kinds_over_source1(code: &str) -> Vec<&'static str> {
     kinds
 }
 
-/// The most values each kind of operator held at any lap of running `code` to its end, by
-/// the operator's name less its instance (`InductionStore`, `Memo`, …), summed over the
-/// instances of that kind at each lap ([`TileProducer::state_info`]).
-///
-/// What a test of how much state a program keeps reads: a count that grows with how far
-/// the program has run, where its data does not, is state it never gives back.
-pub(crate) fn peak_held_values(code: &str) -> HashMap<String, usize> {
+/// Peak held values per operator kind while `source1()` delivers `rows` items one at a time.
+/// Counts are sampled at drained dispatcher boundaries, before source closure.
+pub(crate) fn peak_held_values(code: &str, rows: usize) -> HashMap<String, usize> {
     fn held(node: &InspectNode, by_kind: &mut HashMap<String, usize>) {
         if let Some(values) = node.held_values {
             let kind = node.label.split('#').next().unwrap_or(&node.label);
@@ -99,30 +94,40 @@ pub(crate) fn peak_held_values(code: &str) -> HashMap<String, usize> {
             held(child, by_kind);
         }
     }
+    use cambra::ccl::{BaseType, Type};
+    use cambra::interpreter::{Extent, Predicate, TestDataSource, Value};
     let mut ctx = GlobalContext::default();
+    let source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(source.clone());
     let loaded = LoadedProgram::test(code);
-    let mut compiled =
-        compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
-    let producer = compiled
-        .main_mut()
-        .and_then(|o| o.producer.as_mut())
-        .expect("a `main` output");
-    let universal = producer.tiling().universal_guard();
+    let compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let mut runner = crate::it::serving::ProgramRunner::new(compiled);
     let mut peak: HashMap<String, usize> = HashMap::new();
-    for _ in 0..4096 {
-        ctx.scheduler().check_for_notifications();
-        let tile = producer.get(universal.clone());
+    for i in 0..rows {
+        source
+            .borrow_mut()
+            .add_data(&[(Value::uint_from_row(i), Value::Int(i as i64 + 1))]);
+        source
+            .borrow_mut()
+            .set_yield_predicate(Predicate::at_or_below(Value::uint_from_row(i)));
+        runner.run();
         let mut now = HashMap::new();
-        held(&producer.inspect(&VizOptions::default()), &mut now);
+        held(&runner.inspect(), &mut now);
         for (kind, values) in now {
             let at = peak.entry(kind).or_default();
             *at = (*at).max(values);
         }
-        if tile.is_terminal() {
-            return peak;
-        }
     }
-    panic!("{code}: stopped short of a terminal tile");
+    source.borrow_mut().set_yield_predicate(Predicate::True);
+    assert!(
+        runner.run().is_terminal(),
+        "{code}: completes after source closure"
+    );
+    peak
 }
 
 /// Lower `code` through the CCL pipeline (parse → `ccl::lower` → `ccl::infer`
@@ -147,38 +152,34 @@ pub(crate) fn run_program_with_ctx(
     ctx: &mut GlobalContext,
     loaded: &LoadedProgram,
 ) -> (Expr, Tile) {
-    let notified = Rc::new(RefCell::new(false));
-    let notified_clone = notified.clone();
-    let consumer: Box<dyn Consumer> = Box::new(move || {
-        *notified_clone.borrow_mut() = true;
-    });
-    let mut compiled = compile_program(ctx, loaded, consumer).unwrap_or_render(loaded);
-    ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow(), "expected notification (pipeline path)");
+    let mut compiled = compile_program(ctx, loaded, Box::new(|| {})).unwrap_or_render(loaded);
+    let tiling = compiled
+        .main_mut()
+        .and_then(|o| o.producer.as_ref())
+        .expect("pipeline test expects main")
+        .tiling()
+        .clone();
+    let run = cambra::interpreter::dispatcher::run_program(&mut compiled, 1)
+        .unwrap_or_else(|why| panic!("dispatcher refused pipeline test: {why}"));
+    // The run releases `main`'s producer whole and hands it back. A released region never comes
+    // back out, so a read of it after the run answers empty or trips the release assertion in
+    // `TileProducer::get`.
     let producer = compiled
         .main_mut()
         .and_then(|o| o.producer.as_mut())
-        .expect("pipeline test expects a `main` output");
-    // A single `get` is not always enough to drain a producer: a mutation loop's
-    // store/drive cycle decides one more position of the recurrence per pass, and
-    // re-arms by asking the scheduler to wake its consumer. The cap catches a cycle
-    // that stops converging without reaching a terminal tile.
-    let universal = producer.tiling().universal_guard();
-    let mut result = pull_laps(ctx.scheduler(), &mut **producer, 1024, Tile::is_terminal);
+        .expect("the run hands `main`'s producer back");
     assert!(
-        result.is_terminal(),
-        "pipeline path: producer stopped short of a terminal tile, quiescent or after 1024 \
-         laps: {result:?}"
+        producer.obsolete_guard().is_universal(),
+        "the run releases `main`'s producer whole: {:?}",
+        producer.obsolete_guard()
     );
-    result.compact();
-    // Release everything, then pull once more: a released region must never come
-    // back out, so this answers empty or trips the contract assertion.
-    producer.release(universal.clone());
-    let after = producer.get(universal.clone());
+    let after = producer.get(tiling.universal_guard());
     assert!(
         after.is_empty(),
-        "pull after a universal release returned {after:?}"
+        "a read after the run's universal release returned {after:?}"
     );
+    let result =
+        sort_function_by_domain(run.main.expect("pipeline main output").closed_over(&tiling));
     (*compiled.ast, result)
 }
 
