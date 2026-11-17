@@ -1,7 +1,7 @@
 use super::*;
 use crate::interpreter::operator_graph::value;
 use crate::interpreter::{
-    ColumnValue, Consumer, Extent, Projection, Scheduler, Value, tuple_field,
+    BaseType, ColumnValue, Consumer, Extent, Projection, Scheduler, Value, tuple_field,
 };
 
 /// Re-keys a collection of pairs by each pair's first component, `𝐾 ⤇ (𝐽, 𝑉)` to `𝐽 ⤇ 𝑉`, where
@@ -47,6 +47,20 @@ pub enum KeyOrder {
     Rising,
     /// The keys come in any order.
     Any,
+}
+
+impl KeyOrder {
+    /// The order a site commits its items in, from its source's positions. A stream's positions,
+    /// `UInt`s or a range of them, are delivered in their own order, so its items commit rising.
+    /// Any other source's need not be: a product's, a record of its dimensions' positions, and a
+    /// concatenation's, a union of its parts', deliver their parts independently, and a keyed
+    /// collection's keys, a group-by's say, arrive as their groups complete.
+    pub fn of_items(positions: &Extent) -> KeyOrder {
+        match positions {
+            Extent::Base(BaseType::UInt) | Extent::UIntRange(_) => KeyOrder::Rising,
+            _ => KeyOrder::Any,
+        }
+    }
 }
 
 impl RekeySorted {

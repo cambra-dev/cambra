@@ -263,6 +263,7 @@ impl Tiling {
                 )),
                 terminal: false,
                 closed_keys: Vec::new(),
+                writer_takes: Vec::new(),
             },
         }
     }

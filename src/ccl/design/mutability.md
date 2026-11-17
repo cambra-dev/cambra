@@ -1260,9 +1260,10 @@ recognition.
   runs its pure body, and proposes `{reads, writes}`; the operator validates the read set against
   the current store (backward / optimistic concurrency) ahead of allocating a timestamp — a valid
   proposal commits and consumes a tick, a stale one is skipped and retries against the advanced
-  snapshot. Disjoint footprints commit concurrently; overlapping ones serialize. `release` is the
-  commit acknowledgment (the retry signal rides the existing producer/consumer channel). The store
-  compacts by the MVCC law and GCs the released prefix.
+  snapshot. Disjoint footprints commit concurrently; overlapping ones serialize. The store's
+  `release` to a writer transfers ownership of a decision when the store takes it, before it
+  validates it; the store states which decisions settled (`WriterTakes`), and a stale one retries
+  from the item the drive keeps. The store compacts by the MVCC law and GCs the released prefix.
 - **`StoreValueStream`** — projects one key's commit-value stream, commit time ⇀ `V`, by folding the
   store changelog, on the axis the key's registration fixes: a mutable variable's **carry** stream
   gains a position at every commit tick; an **in-block reply tap**
@@ -1414,8 +1415,12 @@ what each transaction read, and the key says which iteration replied.
 At runtime the store keys the tap by commit tick, as it keys every write. The `TransactWriter`
 commits each tap value as the pair of the item's source position, which the `TransactDriver`'s rows
 carry, and the value, and op-conversion reads the tap through `RekeySorted`, which re-keys the
-pairs by position. That re-keying rests on a site committing its items once each and in its
-source's order, which the `TransactDriver` guarantees by driving one item at a time
+pairs by position. A site commits each item once. A stream's positions are delivered in their own
+order, so a site over a stream commits its items in that order: an item's reply settles every key up
+to the item's own, a denied item's below it included, and the read completes each reply as it
+commits. A product, a concatenation or a keyed collection delivers its items in no fixed order, so a
+site over one can commit a smaller item after a larger one: the read settles each item's key at that
+item's reply, and the key of an item that replied nothing once the site finishes
 ([design-operators.md](../../interpreter/design-operators.md#the-commit-operator-interpretercommit_operatorrs),
 `RekeySorted`).
 
