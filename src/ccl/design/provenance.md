@@ -775,11 +775,12 @@ The environment switches are read by the accessors in `context.rs`:
 | Variable | Behavior |
 |---|---|
 | `CAMBRA_PROVENANCE=0` | Disable ordinary phase-table capture; snapshots and diagnostic projections remain. |
-| `CAMBRA_PROVENANCE_GATE` | A set value other than `0` enables pair materialization/checking, provided ordinary capture is enabled. |
+| `CAMBRA_PROVENANCE_GATE` | `0` disables pair materialization/checking; any other set value enables it. Unset, a debug test build checks and any other build does not. Checking requires ordinary capture. |
 | `CAMBRA_PROVENANCE_AUDIT` | Select a named audit span and disable ordinary phase scopes. |
 | `CAMBRA_PROVENANCE_PREDICATES=0` | Exclude predicate interiors from audit ID sets only. |
 
-An unset gate variable leaves per-compile pair checking off. CI's test job sets it to `1`.
+An unset gate variable leaves per-compile pair checking on in a debug test build, so every
+test compile is in the gate's corpus, and off in any other build.
 Disabling capture or setting an audit variable suppresses that gate even if its variable is set.
 An unrecognized audit name still disables ordinary capture but matches no audit span.
 

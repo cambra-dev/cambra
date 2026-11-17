@@ -1677,7 +1677,8 @@ const PROVENANCE_ENV: &str = "CAMBRA_PROVENANCE";
 const PROVENANCE_AUDIT_ENV: &str = "CAMBRA_PROVENANCE_AUDIT";
 
 /// Gates [`MaterializedPanes::gated_pane_pairs`]'s leak classes on **every**
-/// compile (`=1`), making the gate's corpus whatever the caller compiles.
+/// compile, making the gate's corpus whatever the caller compiles: on by default in a debug
+/// test build, off there with `=0`, and on in any other build with `=1`.
 const PROVENANCE_GATE_ENV: &str = "CAMBRA_PROVENANCE_GATE";
 
 /// Narrows an audit's live set to the main tree, excluding refinement-predicate
@@ -1713,12 +1714,21 @@ pub(crate) fn provenance_capture_enabled() -> bool {
     !std::env::var(PROVENANCE_ENV).is_ok_and(|v| v == "0") && provenance_audit_span().is_none()
 }
 
-/// Enable per-compile pane checking when the gate variable is set to a value
-/// other than `0` and ordinary capture is enabled. Otherwise only explicit
-/// callers, including corpus tests, materialize and check pairs.
-/// `gate_leaks` itself asserts only in debug/test builds.
+/// Enable per-compile pane checking when ordinary capture is enabled and the gate variable
+/// allows it. A debug test build checks unless the variable is `0`; any other build checks only
+/// when the variable is set to a value other than `0`. Otherwise only explicit callers,
+/// including corpus tests, materialize and check pairs.
+///
+/// A debug test build checks by default so that every test compile is in the gate's corpus.
+/// `gate_leaks` asserts only in debug and test builds, so a build without debug assertions would
+/// materialize pairs and check nothing.
 fn provenance_gate_every_compile() -> bool {
-    std::env::var(PROVENANCE_GATE_ENV).is_ok_and(|v| v != "0") && provenance_capture_enabled()
+    let default = cfg!(all(debug_assertions, any(test, feature = "test-helpers")));
+    let gated = match std::env::var(PROVENANCE_GATE_ENV) {
+        Ok(v) => v != "0",
+        Err(_) => default,
+    };
+    gated && provenance_capture_enabled()
 }
 
 /// Run `f` under the supplied phase when capture is enabled, otherwise call it
@@ -2029,6 +2039,7 @@ fn run_frontend(
     // lowering can run on and report its own errors against, so the user sees
     // everything at once. The tree is inferred past parse, load and lowering errors too
     // when a placeholder stands for every lowering error; the compile stops after inference.
+    let _order = crate::ccl::ty::ProgramOrder::enter(program.sources());
     let mut errors: Vec<CompileError> = Vec::new();
 
     // Keep the table across phase scopes and possible audits. Early returns drop

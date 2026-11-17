@@ -90,7 +90,8 @@ debug = "line-tables-only"
 # build compiles, without paying release codegen. `debug-assertions` is a codegen
 # flag rather than a runtime one, so this is its own build tree and shares no
 # artifacts with `debug`. Optimization is beside the point for what the gate that
-# uses it checks (`ci_test_no_assertions`), and stays at `dev`'s.
+# uses it checks (`ci_test_no_assertions`): it stays at `dev`'s, and GitHub's job
+# raises it to `opt-level=1` for speed alone.
 [profile.no-assertions]
 inherits = "dev"
 debug-assertions = false
