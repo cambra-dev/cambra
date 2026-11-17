@@ -3197,6 +3197,152 @@ fn a_finished_transaction_over_a_fixed_collection_does_not_replay() {
     );
 }
 
+/// What a transaction writer over a live `source1()` leaves when its items arrive in batches
+/// with reloads between them: the pool after every item, which the registered sink `total`
+/// takes, and the items whose transaction replied to the registered sink `out`.
+///
+/// `source` is the writer's iteration, over `source1()`; `step` is its body, which reads `x`.
+/// `deliveries` are `(position, item)` batches. The first arrives before any reload and settles
+/// with the source still open; a reload that edits the writer, carrying `pool`, comes before
+/// each later batch, and the source closes after the last.
+fn transactions_across_reloads(
+    source: &str,
+    step: &str,
+    deliveries: &[Vec<(usize, i64)>],
+) -> (i64, Vec<i64>) {
+    use cambra::ccl::Type;
+    use cambra::interpreter::{BaseType, Extent, Predicate, TestDataSource, Value};
+    use std::{cell::RefCell, rc::Rc};
+
+    let program = |mark: usize| {
+        format!(
+            indoc! {r#"
+                out = test_sink()
+                total = test_sink()
+                pool: Mut(Int, Txn) := 100
+                for x in {source}:
+                    with begin():
+                        pool := pool - ({step}) + {mark}
+                        out << x
+                total << await_final(pool)
+            "#},
+            source = source,
+            step = step,
+            mark = "0".repeat(mark + 1),
+        )
+    };
+    let mut ctx = GlobalContext::default();
+    let sink = ctx.register_test_sink("out");
+    let total = ctx.register_test_sink("total");
+    let source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(source.clone());
+    let mut delivered = Predicate::False;
+    let mut deliver = |batch: &[(usize, i64)]| {
+        let rows: Vec<(Value, Value)> = batch
+            .iter()
+            .map(|&(at, item)| (Value::uint_from_row(at), Value::Int(item)))
+            .collect();
+        for (at, _) in &rows {
+            delivered = delivered.union(&Predicate::point(at.clone()));
+        }
+        let mut source = source.borrow_mut();
+        source.add_data(&rows);
+        source.set_yield_predicate(delivered.clone());
+    };
+    // The sinks pull what they are notified of.
+    let settle = |ctx: &mut GlobalContext| {
+        for _ in 0..200 {
+            ctx.scheduler().check_for_notifications();
+        }
+    };
+    let mut live = LiveProgram::start_text(&mut ctx, &program(0), &no_main).expect("v1 compiles");
+    for (version, batch) in deliveries.iter().enumerate() {
+        if version > 0 {
+            live.reload_text(&mut ctx, MAIN_BRANCH, &program(version), &no_main)
+                .expect("`pool` is still declared, at the same type");
+        }
+        deliver(batch);
+        settle(&mut ctx);
+    }
+    source.borrow_mut().set_yield_predicate(Predicate::True);
+    settle(&mut ctx);
+    let pool = match total.value() {
+        Ok(Value::Function(bindings)) if bindings.len() == 1 => match bindings[0].output {
+            Value::Int(pool) => pool,
+            ref other => panic!("the pool is an integer, got {other:?}"),
+        },
+        other => panic!("`total` holds the settled pool once the source closes, got {other:?}"),
+    };
+    let replies = match sink.written_so_far() {
+        Ok(Value::Function(entries)) => entries
+            .into_iter()
+            .map(|binding| match binding.output {
+                Value::Int(item) => item,
+                other => panic!("a reply is an item, got {other:?}"),
+            })
+            .collect(),
+        Ok(other) => panic!("`out` holds the replies by commit tick, got {other:?}"),
+        Err(_) => Vec::new(),
+    };
+    (pool, replies)
+}
+
+/// A reload carries the exact items a transaction writer finished, holes included, and every
+/// item commits once across the cuts: once in `pool`, and once in the replies its transaction
+/// wrote to `out`. Over a concatenation the items are tagged positions, and the list arm's
+/// item is in flight when the live arm's items arrive below it. The rebuilt drive starts at the release of the drive it replaces, `{0, 2}`
+/// in the first case, not at the prefix through 2, which would drop item 1.
+#[rstest::rstest]
+#[case::the_hole_after_the_reload(vec![vec![(0, 1), (2, 4)], vec![(1, 2)]])]
+#[case::the_hole_and_items_above_it(vec![vec![(0, 1), (2, 4)], vec![(1, 2), (3, 8)]])]
+#[case::a_middle_item_finished(vec![vec![(1, 2)], vec![(0, 1), (2, 4)]])]
+#[case::nothing_finished(vec![vec![], vec![(0, 1), (1, 2)]])]
+#[case::everything_finished(vec![vec![(0, 1), (1, 2), (2, 4)], vec![]])]
+#[case::two_reloads_each_with_a_hole(vec![
+    vec![(0, 1), (3, 8)],
+    vec![(2, 4)],
+    vec![(1, 2), (4, 16)],
+])]
+fn a_reload_carries_the_items_a_transaction_writer_finished_exactly(
+    #[case] deliveries: Vec<Vec<(usize, i64)>>,
+    #[values(("source1()", &[][..]), ("source1() ++ [32]", &[32][..]))] source: (&str, &[i64]),
+) {
+    let (source, listed) = source;
+    let mut items: Vec<i64> = deliveries.iter().flatten().map(|&(_, x)| x).collect();
+    items.extend(listed);
+    let (pool, mut replies) = transactions_across_reloads(source, "x", &deliveries);
+    assert_eq!(pool, 100 - items.iter().sum::<i64>(), "replies {replies:?}");
+    replies.sort_unstable();
+    items.sort_unstable();
+    assert_eq!(replies, items, "each item's transaction replies once");
+}
+
+/// A writer inside a loop nested under the live source names its items by path, an item and
+/// its inner position, and a reload carries those exactly as it does flat positions.
+#[rstest::rstest]
+#[case::the_hole_after_the_reload(vec![vec![(0, 1), (2, 4)], vec![(1, 2)]])]
+#[case::two_reloads(vec![vec![(1, 2)], vec![(0, 1)], vec![(2, 4)]])]
+fn a_reload_carries_a_nested_writers_items_exactly(#[case] deliveries: Vec<Vec<(usize, i64)>>) {
+    let items: i64 = deliveries.iter().flatten().map(|&(_, x)| x).sum();
+    let (pool, replies) = transactions_across_reloads(
+        "[x * 10 + y for x in source1() for y in [0, 1]]",
+        "x",
+        &deliveries,
+    );
+    // Each item `x` yields `10x` and `10x + 1`.
+    let count = deliveries.iter().flatten().count() as i64;
+    assert_eq!(pool, 100 - (20 * items + count), "replies {replies:?}");
+    assert_eq!(
+        replies.len() as i64,
+        2 * count,
+        "each inner item's transaction replies once: {replies:?}"
+    );
+}
+
 /// Two writers to one transactional variable each keep their own place across an
 /// reload.
 ///
