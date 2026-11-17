@@ -780,20 +780,14 @@ impl TileOperator for Uncurry {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        // Beneath standing levels the input's outermost keys are the result's, and a region at or
-        // beneath the paired level names the pairs it heads. Pairing the whole tile re-keys, so a
-        // change widens, and an outer key decides every pair whose first field it is.
+        // Above the paired level the input's keys are the result's, and a region at or beneath it
+        // names the pairs it heads, the outermost level's included: a change of outer keys is a
+        // change of the pairs whose first field they are, and a decided region decides them.
         let level = self.level;
-        let consumer = match level == CurryLevel::OUTERMOST {
-            true => crate::interpreter::notifications::widening_restating_complete(
-                |region| paired(region, CurryLevel::OUTERMOST),
-                consumer,
-            ),
-            false => crate::interpreter::notifications::restating(
-                Box::new(move |region| paired(region, level)),
-                consumer,
-            ),
-        };
+        let consumer = crate::interpreter::notifications::restating(
+            Box::new(move |region| paired(region, level)),
+            consumer,
+        );
         Box::new(UncurryProducer {
             base: ProducerBase::new(UncurryProducer::alloc_id(), self.tiling(), &self.base, cx),
             input: self
@@ -1869,6 +1863,18 @@ fn level_beneath(tiling: &Tiling, at: usize, domain: Extent, codomain: Tiling) -
 impl TileOperator for Product {
     impl_operator_base!();
 
+    /// A pair's second field holds the key it pairs, or the inner side's value under it, which
+    /// equals what the inner side's values equal: the inner side is aligned with the pairs.
+    fn field_correlation(&self, field: &str) -> Option<Vec<TilePathStep>> {
+        if field != tuple_field(1).as_str() {
+            return None;
+        }
+        match self.second {
+            Paired::Key => Some(vec![TilePathStep::Codomain; self.paired.index()]),
+            Paired::Value => self.inner.result_correlation(),
+        }
+    }
+
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("outer", &*self.outer));
         visit(value("inner", &*self.inner));
@@ -1886,20 +1892,44 @@ impl TileOperator for Product {
             .enclosing()
             .unwrap_or_else(|| unreachable!("the paired level is beneath a row"));
         let empty_level = self.tiling().values_at(level).empty_at_no_rows();
-        let outer_consumer = forwarding_consumer_keeping_keys(&shared);
-        let outer_consumer = crate::interpreter::notifications::through_values(
-            CurryLevel::new(level.index() + 1),
-            self.tiling(),
-            outer_consumer,
+        // A pair exists once its row has reached the outer side and the pair the inner side, so
+        // each side's delta is restated as the pairs it completes with what the other side has
+        // delivered (`notifications::Delivered`): a row reaching the outer side names only the
+        // pairs the inner side already holds under it.
+        use crate::interpreter::notifications::{
+            PairingSide, Partners, nothing_delivered, pairing,
+        };
+        let delivered = nothing_delivered(
+            self.outer.keys_arrive_by_push(),
+            self.inner.keys_arrive_by_push(),
         );
-        let outer = self
-            .outer
-            .subscribe(self.outer.tiling().universal_guard(), outer_consumer, cx);
+        let paired = CurryLevel::new(level.index() + 1);
+        let outer = self.outer.subscribe(
+            self.outer.tiling().universal_guard(),
+            pairing(
+                PairingSide::Rows(Partners::Paths),
+                paired,
+                delivered.clone(),
+                forwarding_consumer_keeping_keys(&shared),
+            ),
+            cx,
+        );
+        let inner_universal = self.inner.tiling().universal_guard();
+        let inner = self.inner.subscribe(
+            inner_universal,
+            pairing(
+                PairingSide::Paths,
+                paired,
+                delivered,
+                forwarding_consumer_keeping_keys(&shared),
+            ),
+            cx,
+        );
         Box::new(ProductProducer {
             base: ProducerBase::new(ProductProducer::alloc_id(), self.tiling(), &self.base, cx),
             // Both sides are pulled at the projection, aligned row for row.
             outer,
-            inner: subscribe_forwarding_keeping_keys(&mut *self.inner, &shared, cx),
+            inner,
             level,
             empty_level,
             pair: self.tiling().deepest_values().clone(),
@@ -2003,6 +2033,18 @@ impl TileProducer for ProductProducer {
                 unreachable!("the levels above the pair are collections")
             };
             *domain_predicate = complete;
+        }
+        // `regroup_beneath` states the paired level's completeness only under the enclosing rows
+        // the outer side holds. A row both sides state complete and neither holds is complete
+        // and empty.
+        let rows_complete = outer_tile
+            .completion_at(self.level)
+            .intersect(&inner_tile.completion_at(self.level));
+        if let Tile::DataFunction {
+            domain_predicate, ..
+        } = tile.values_at_mut(self.level)
+        {
+            *domain_predicate = domain_predicate.union(&rows_complete);
         }
         tile.remove_guarded(self.obsolete_guard().clone());
         // The completeness intersected above is each side's, which a side states over the region
@@ -2166,6 +2208,124 @@ mod nested_projection_tests {
                 CurryLevel::new(1),
             ))
         });
+    }
+}
+
+#[cfg(test)]
+mod correlation_tests {
+    use super::*;
+    use crate::interpreter::tile_operators::test_helpers::{
+        ProjectionSpyOp, ints_by_position, two_levels_of_ints,
+    };
+    use crate::interpreter::tile_operators::{
+        Constant, FanOut, IterateExtent, MapResult, MapResultToConst, MapResultToConstMode, Memo,
+    };
+    use crate::interpreter::{BaseType, Extent, FunctionDef, Value};
+
+    /// Two rows of `Int`, the outer side of a product.
+    fn rows() -> Box<dyn TileOperator> {
+        let tiling = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        Box::new(ProjectionSpyOp::new(ints_by_position(&[5, 6], true), tiling).0)
+    }
+
+    /// Two levels of `Int`, a collection per row, the inner side of a product of keys.
+    fn groups() -> Box<dyn TileOperator> {
+        let (tile, tiling) = two_levels_of_ints();
+        Box::new(ProjectionSpyOp::new(tile, tiling).0)
+    }
+
+    /// Each row's collection of positions `0..2`, whose values are its own keys: a constant
+    /// collection placed beneath the rows.
+    fn positions_beneath_rows() -> Box<dyn TileOperator> {
+        Box::new(MapResultToConst::new_at(
+            rows(),
+            Box::new(IterateExtent::new(Extent::uint_range(2))),
+            MapResultToConstMode::Replace,
+            CurryLevel::new(1),
+        ))
+    }
+
+    /// A pair of keys holds the key it pairs in its second field, the key at the pairing's
+    /// level, and the outer row's value, which equals no key, in its first.
+    #[test]
+    fn a_pair_of_keys_states_its_second_field_as_the_paired_key() {
+        let product = Product::per_row_at(rows(), groups(), CurryLevel::new(1));
+        assert_eq!(
+            product.field_correlation("_1"),
+            Some(vec![TilePathStep::Codomain])
+        );
+        assert_eq!(product.field_correlation("_0"), None);
+    }
+
+    /// A constant whose values are its own keys, placed as the collection at a level, states
+    /// its values as the keys of that level.
+    #[test]
+    fn a_constant_of_positions_beneath_rows_states_its_values_as_their_keys() {
+        assert_eq!(
+            positions_beneath_rows().result_correlation(),
+            Some(vec![TilePathStep::Codomain])
+        );
+    }
+
+    /// A pair of values holds the inner side's value in its second field, which equals what the
+    /// inner side's values equal.
+    #[test]
+    fn a_pair_of_values_states_its_second_field_as_the_inner_values() {
+        let product =
+            Product::per_row_values_at(rows(), positions_beneath_rows(), CurryLevel::new(1));
+        assert_eq!(
+            product.field_correlation("_1"),
+            Some(vec![TilePathStep::Codomain])
+        );
+    }
+
+    /// A memo and a fan-out slot answer what their input answers, field by field.
+    #[test]
+    fn a_memo_and_a_slot_pass_a_field_correlation_through() {
+        let product: Box<dyn TileOperator> =
+            Box::new(Product::per_row_at(rows(), groups(), CurryLevel::new(1)));
+        let memo: Box<dyn TileOperator> = Box::new(Memo::new(product));
+        assert_eq!(
+            memo.field_correlation("_1"),
+            Some(vec![TilePathStep::Codomain])
+        );
+        let slot = FanOut::new(memo).slot();
+        assert_eq!(
+            slot.field_correlation("_1"),
+            Some(vec![TilePathStep::Codomain])
+        );
+    }
+
+    /// A function selecting a field of the input's record values answers what that field
+    /// equals: `.1` of a product of keys is the paired key, which a lookup at a row's own key
+    /// reads (`MapResult`, `looked_up_at_keys`).
+    #[test]
+    fn a_selected_field_states_what_the_field_equals() {
+        let product: Box<dyn TileOperator> =
+            Box::new(Product::per_row_at(rows(), groups(), CurryLevel::new(1)));
+        let record = Extent::Record(
+            [
+                ("_0".into(), Extent::Base(BaseType::Int)),
+                ("_1".into(), Extent::uint_range(3)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let select = Constant::new(
+            Value::ComputableFunction(FunctionDef::RecordField("_1".into())),
+            Extent::Function {
+                domain: Box::new(record),
+                codomain: Box::new(Extent::uint_range(3)),
+            },
+        );
+        let second = MapResult::new_at(product, Box::new(select), CurryLevel::new(2));
+        assert_eq!(
+            second.result_correlation(),
+            Some(vec![TilePathStep::Codomain])
+        );
     }
 }
 
@@ -3054,7 +3214,7 @@ mod tests {
         let path = [Value::Int(1), Value::Int(0)];
         let guard =
             Projection::keys_at(CurryLevel::new(1), Predicate::exactly(&path)).guard(map.tiling());
-        let out = map.get(guard);
+        let out = map.read_in_pipeline(guard);
         assert_eq!(out.paths_at(CurryLevel::new(1)), vec![path.to_vec()]);
         assert_eq!(
             out.deepest_values(),
@@ -3736,6 +3896,75 @@ mod tests {
             !domain_predicate.contains(&Value::UInt(0)),
             "row 0's inner collection is still arriving, so row 0 is not complete: \
              {domain_predicate:?}"
+        );
+    }
+
+    /// Both sides state row 0 complete under every enclosing row and hold it under enclosing row
+    /// 0 alone. The product states row 0 complete under every enclosing row too, including those
+    /// neither side holds, so a pull at row 0 is released whole.
+    #[test]
+    fn product_states_rows_complete_under_enclosing_rows_neither_side_holds() {
+        let uint = || Extent::Base(BaseType::UInt);
+        let int = || Extent::Base(BaseType::Int);
+        let outer_tiling =
+            Tiling::data_function(uint(), Tiling::data_function(uint(), Tiling::Scalar(int())));
+        let outer = Tile::data_function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(Tile::grouped(
+                vec![0],
+                ColumnValue::from_uints(vec![0]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1]))),
+                Predicate::point(Value::UInt(0)),
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let inner_tiling = Tiling::data_function(
+            uint(),
+            Tiling::data_function(uint(), Tiling::data_function(uint(), Tiling::Scalar(int()))),
+        );
+        let inner = Tile::data_function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(Tile::grouped(
+                vec![0],
+                ColumnValue::from_uints(vec![0]),
+                Box::new(Tile::grouped(
+                    vec![0],
+                    ColumnValue::from_uints(vec![0]),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(vec![7]))),
+                    Predicate::True,
+                    BitSet::new(),
+                )),
+                Predicate::point(Value::UInt(0)),
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let out_tiling = outer_tiling.append_level(
+            uint(),
+            Tiling::Scalar(Extent::Record(HashMap::from([
+                (tuple_field(0), int()),
+                (tuple_field(1), uint()),
+            ]))),
+        );
+        let mut producer = ProductProducer {
+            base: ProducerBase::unowned(ProductProducer::alloc_id(), &out_tiling),
+            outer: Box::new(TestTileProducer::new(outer, outer_tiling)),
+            inner: Box::new(TestTileProducer::new(inner, inner_tiling)),
+            level: CurryLevel::new(1),
+            empty_level: out_tiling.empty_at_no_rows(),
+            pair: out_tiling.deepest_values().clone(),
+            second: Paired::Key,
+        };
+        let row_zero = TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+            FunctionGuard::Domain(Predicate::point(Value::UInt(0))),
+        ))));
+        let out = producer.read_in_pipeline(row_zero.clone());
+        assert!(
+            guard_covers(&out.to_guard(), &row_zero),
+            "both sides state row 0 complete under every enclosing row: {out:?}"
         );
     }
 

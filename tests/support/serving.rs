@@ -289,30 +289,6 @@ impl ProgramRunner {
         }
     }
 
-    pub fn snapshot(&mut self) -> cambra::interpreter::Tile {
-        if self
-            .root
-            .borrow()
-            .as_ref()
-            .unwrap()
-            .obsolete_guard()
-            .is_universal()
-        {
-            return self
-                .output
-                .0
-                .lock()
-                .unwrap()
-                .clone()
-                .unwrap_or_else(|| self.tiling.empty_tile());
-        }
-        self.root
-            .borrow_mut()
-            .as_mut()
-            .unwrap()
-            .get(self.tiling.universal_guard())
-    }
-
     pub fn inspect(&self) -> cambra::pretty_tree::InspectNode {
         self.root
             .borrow()

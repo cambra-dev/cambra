@@ -877,8 +877,11 @@ impl TileProducer for UnionProducer {
     /// projection reaches each arm as what it names under that arm's tag, as a release does, and
     /// an arm it names nothing of is not pulled.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        // Closed first, so a pull of every arm reads as the pull of everything it is.
-        let projection_guard = projection_guard.closed_over(self.tiling());
+        // Closed over the tags first, so a pull of every arm reads as the pull of everything it
+        // is. The levels stay open, so a pull of a row's keys past its last position reaches the
+        // arms, which state those keys complete. Closing over the levels would drop that pull, and
+        // the keys would stay open.
+        let projection_guard = projection_guard.closed_over_tags(self.tiling());
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -1076,9 +1079,13 @@ mod tests {
         for (depth, keys) in regions {
             let tagged =
                 match Projection::keys_at(CurryLevel::new(depth), keys.clone()).tagged(&tag) {
+                    part @ (Projection::Within { .. } | Projection::Or(_)) => {
+                        Projection::refuse_part_of_values("the round trip through a tag", &part)
+                    }
                     Projection::Keys { keys, .. } => keys,
                     Projection::Everything => Predicate::True,
                     Projection::Nothing => Predicate::False,
+                    Projection::Fields { .. } => unreachable!("a tagged region names keys"),
                 };
             assert_eq!(under_arm(&tagged, depth, &tag), keys, "{depth}: {tagged:?}");
             // A tagged union reads its outermost keys as one union predicate.
@@ -1090,6 +1097,56 @@ mod tests {
                 "{depth}: {tagged:?}"
             );
         }
+    }
+
+    /// A pull of a row's keys past the last position of a finite range reaches the arms, which
+    /// state those keys complete; the union's answer states them complete too, so a reader closing
+    /// the row learns it has ended.
+    #[test]
+    fn a_pull_past_a_rows_last_position_answers_it_complete() {
+        let positions = Extent::uint_range(3);
+        let arm_tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::data_function(
+                positions.clone(),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        let arm = |values: Vec<i64>| {
+            Tile::data_function(
+                ColumnValue::UInts(vec![0]),
+                Box::new(Tile::grouped(
+                    vec![0],
+                    ColumnValue::UInts(vec![0, 1, 2]),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+                    Predicate::True,
+                    BitSet::new(),
+                )),
+                Predicate::True,
+                BitSet::new(),
+            )
+        };
+        let (input, _, _) = ProjectionSpy::new(arm(vec![1, 2, 3]), arm_tiling.clone());
+        let (sibling, _, _) = ProjectionSpy::new(arm(vec![4, 5, 6]), arm_tiling.clone());
+        let mut union = UnionProducer {
+            base: ProducerBase::unowned(UnionProducer::alloc_id(), &arm_tiling),
+            inputs: vec![Box::new(input), Box::new(sibling)],
+            tags: positional(2),
+            flat: true,
+            level: CurryLevel::new(1),
+        };
+        let past_the_end = Predicate::qualified(
+            Predicate::point(Value::UInt(0)),
+            Predicate::True.minus(&Predicate::at_or_below(Value::UInt(2))),
+        );
+        let guard = Projection::keys_at(CurryLevel::new(1), past_the_end).guard(&arm_tiling);
+        let answer = union.read_in_pipeline(guard);
+        assert!(
+            answer
+                .completion_at(CurryLevel::new(1))
+                .contains_path(&[Value::UInt(0), Value::UInt(3)]),
+            "{answer:?}"
+        );
     }
 
     #[rstest::rstest]
