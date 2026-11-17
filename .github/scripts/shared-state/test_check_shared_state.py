@@ -219,6 +219,49 @@ class TestCode(unittest.TestCase):
         )
         self.assertEqual(findings(src), ["shared cell of `Rows`"])
 
+    def test_skips_a_cfg_test_field_and_no_more(self) -> None:
+        src = (
+            "struct S {\n"
+            "    #[cfg(test)]\n"
+            "    spy: Rc<RefCell<Vec<Guard>>>,\n"
+            "    b: Rc<RefCell<Rows>>,\n"
+            "}\n"
+        )
+        self.assertEqual(findings(src), ["shared cell of `Rows`"])
+
+    def test_skips_a_cfg_test_struct_literal_entry_and_no_more(self) -> None:
+        src = (
+            "let s = S {\n"
+            "    #[cfg(test)]\n"
+            "    spy: Spy::<Rc<RefCell<Vec<Guard>>>>::new(0, 1),\n"
+            "    b: Vec::new(),\n"
+            "};\n"
+            "b: Rc<RefCell<Rows>>,\n"
+        )
+        self.assertEqual(findings(src), ["shared cell of `Rows`"])
+
+    def test_a_last_cfg_test_entry_stops_at_the_closing_brace(self) -> None:
+        src = (
+            "let s = S {\n"
+            "    #[cfg(test)]\n"
+            "    spy: Spy::<Rc<RefCell<Vec<Guard>>>>::new()\n"
+            "};\n"
+            "b: Rc<RefCell<Rows>>,\n"
+        )
+        self.assertEqual(findings(src), ["shared cell of `Rows`"])
+
+    def test_an_arrow_closes_no_bracket(self) -> None:
+        # Counting the `>` of `->` as a close would end the gated function at the comma
+        # after `u8`, and leave its body, and the cell in it, unblanked.
+        src = (
+            "#[cfg(test)]\n"
+            "fn f(g: impl Fn() -> u8, h: u8) {\n"
+            "    let _: Rc<RefCell<Vec<Guard>>>;\n"
+            "}\n"
+            "b: Rc<RefCell<Rows>>,\n"
+        )
+        self.assertEqual(findings(src), ["shared cell of `Rows`"])
+
     def test_skips_a_cfg_test_use(self) -> None:
         src = "#[cfg(test)]\nuse foo::Rc;\nb: Rc<RefCell<Rows>>,\n"
         self.assertEqual(findings(src), ["shared cell of `Rows`"])
