@@ -203,7 +203,9 @@ Normalization returns a universal arm if one is present. Otherwise it removes em
 retaining the first if every arm is empty. Arms with the same nesting and leaf shape combine
 through `union_in_place`; record fields combine independently. `without_covered_arms` then
 prunes deeper domain arms where `Predicate::without_covered` can subtract keys already covered
-by shallower domain arms. If that helper cannot express a subtraction, the arm is retained.
+by shallower domain arms. If that helper cannot express a subtraction, the arm is retained. An arm
+ending in a record or a keyless leaf loses the paths the shallower domain arms cover, field by field
+and leaf by leaf (`without_covered_beneath`), and is dropped once it names nothing.
 One remaining arm is returned directly; several become `Or`. An empty input list panics.
 This is the implemented normalization procedure, not a guarantee of structural equality for
 every pair of semantically equivalent guards.
@@ -691,10 +693,27 @@ then releases the region upstream. Open collection groups and join-combined
 aggregate or store state can remain unreleased. A debug check uses `holds_a_plain_value` to
 reject an input whose release would leave ordinary values available for duplicate delivery.
 
-`to_guard` includes complete keys by full path and scalar cells at their enclosing rows,
-including cells whose enclosing key is still open. A universal input release latches
-`upstream_drained`. Release builds then return the cache without pulling that input again;
-debug builds continue pulling to exercise its post-release checks.
+`to_guard` includes complete keys by full path and scalar cells at their enclosing rows, including
+cells whose enclosing key is still open. A nested tile whose held keys form a prefix is released as
+one staircase (`domain_prefix`) and, at each level whose statement calls keys complete above the
+last key held, an arm naming those keys. For such a tile the guard names exactly what the statement
+makes releasable, and its size grows with the tile's depth, not with the keys it holds. A statement
+that is itself a prefix reaching above the last key held ends the staircase at its greatest key
+instead of adding an arm. A last key the statement calls whole, or whose group's statement calls
+every key complete, ends the staircase at that key. A tile whose held keys form no prefix is
+released key by key (`Tile::held_guard`). At a nested level that guard names each key held and each
+key the level's statement calls complete under a row the tile holds, both by whole path, so a key
+stated absent under an open row is released at that row. Every statement the tile carries, at every
+level and in every field of a record, is also named as it is spelled under rows the tile does not
+hold (`Tile::statements_guard`). A part qualified by whole paths names its rows, so it releases
+nothing under any other. A part unqualified at a level above states its keys complete under every
+row there, those not yet delivered included, so it is named under every one: an inverse states its
+input's keys so, since each stands beneath one value ([Converse](#converse)). Three tiles whose held
+keys form a prefix still take that path: a last key whose group holds nothing, an earlier key whose
+own group's statement calls every key complete, and a statement about the keys beneath an enclosing
+key the tile does not hold. The guard names all three exactly, the third by path. A universal input
+release latches `upstream_drained`. Release builds then return the cache without pulling that input
+again; debug builds continue pulling to exercise its post-release checks.
 
 ### What a producer holds
 

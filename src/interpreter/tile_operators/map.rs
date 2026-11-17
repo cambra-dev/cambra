@@ -470,6 +470,7 @@ impl MapResultProducer {
             input_tile = Tile::Scalar(argument.select_indices(std::iter::empty(), 0));
         }
         if let Tile::DataFunction {
+            domain: f_keys,
             domain_predicate: f_domain_predicate,
             ..
         } = &function_tile
@@ -491,15 +492,19 @@ impl MapResultProducer {
                 .checked_sub(1)
                 .unwrap_or_else(|| unreachable!("the input was matched as a collection"));
             let paths = input_tile.row_paths_at(innermost + 1);
+            let defined: std::collections::HashSet<Value> =
+                (0..f_keys.len()).map(|i| f_keys.index_at(i)).collect();
             let mut keep = vec![true; arguments.len()];
             let mut withheld: Vec<&[Value]> = Vec::new();
             for (i, path) in paths.iter().enumerate() {
                 if !f_domain_predicate.contains(&arguments.index_at(i)) {
                     keep[i] = false;
                     withheld.push(path);
+                } else if !defined.contains(&arguments.index_at(i)) {
+                    keep[i] = false;
                 }
             }
-            if !withheld.is_empty() {
+            if keep.iter().any(|keep| !keep) {
                 input_tile.withhold(CurryLevel::new(innermost), &keep, &withheld);
             }
         }
