@@ -89,6 +89,12 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/mod.rs", "shared cell of `C`"),
     # `Notified::Flag`, the one-bit input-notified flag; see its type doc.
     ("src/interpreter/tile_operators/mod.rs", "shared cell of `bool`"),
+    # `Arrivals`, the regions an input has notified since a `Memo` last took them; see its
+    # type doc. The notification carries a region, which a one-bit flag cannot hold.
+    ("src/interpreter/tile_operators/mod.rs", "shared cell of `Projection`"),
+    # `Admission`'s region passed since the last pull, shared by an operator's gate and the
+    # forwarders that read it on reentry, while the consumer behind the gate is borrowed.
+    ("src/interpreter/scheduler.rs", "shared cell of `Projection`"),
     # The operator-graph recorder, twice: the `thread_local!` and the cell inside
     # it each match the ambient-state shape. Necessary because `OperatorBase::new`
     # runs inside operator constructors, which take no context parameter; what
