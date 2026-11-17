@@ -1175,7 +1175,15 @@ impl Tile {
         // complete, by its path, and within an open key whatever of it has keys of its own.
         // A field with no keys of its own goes with its key rather than separately
         // (`src/interpreter/design-operators.md`, "The release contract").
-        self.to_guard_impl(&[Vec::new()])
+        let guard = self.to_guard_impl(&[Vec::new()]);
+        // Every statement the tile carries is releasable, whether or not a held row reaches it.
+        debug_assert!(
+            guard.subsumes(&self.statements_guard(0)),
+            "the guard {guard:?} of {self:?} does not name every statement the tile carries: \
+             {:?}",
+            self.statements_guard(0)
+        );
+        guard
     }
 
     /// `to_guard`, with the path reaching each of this tile's rows — what a completion

@@ -210,6 +210,12 @@ One remaining arm is returned directly; several become `Or`. An empty input list
 This is the implemented normalization procedure, not a guarantee of structural equality for
 every pair of semantically equivalent guards.
 
+`TileGuard::subsumes` answers whether one guard names every region another names, exactly. Leaves
+compare as their predicates do (`Predicate::subsumes`), a record field by field, and a `Codomain`
+guard one level in. A domain arm names its keys whole, so the paths beneath them are taken out of
+what the other guard names deeper before the arms at that depth are compared; an `Or` is the union
+of its arms, so a region two arms cover together is covered.
+
 `TileGuard::union` and `intersect` require compatible guard shapes. Record operands must have
 identical field sets; mismatches panic. A record guard selects independent field regions,
 unlike `Predicate::Record`, which tests a conjunction over a record value's components.
@@ -705,15 +711,17 @@ released key by key (`Tile::held_guard`). At a nested level that guard names eac
 key the level's statement calls complete under a row the tile holds, both by whole path, so a key
 stated absent under an open row is released at that row. Every statement the tile carries, at every
 level and in every field of a record, is also named as it is spelled under rows the tile does not
-hold (`Tile::statements_guard`). A part qualified by whole paths names its rows, so it releases
-nothing under any other. A part unqualified at a level above states its keys complete under every
-row there, those not yet delivered included, so it is named under every one: an inverse states its
-input's keys so, since each stands beneath one value ([Converse](#converse)). Three tiles whose held
-keys form a prefix still take that path: a last key whose group holds nothing, an earlier key whose
-own group's statement calls every key complete, and a statement about the keys beneath an enclosing
-key the tile does not hold. The guard names all three exactly, the third by path. A universal input
-release latches `upstream_drained`. Release builds then return the cache without pulling that input
-again; debug builds continue pulling to exercise its post-release checks.
+hold (`Tile::statements_guard`), and a debug build checks that `to_guard` subsumes them
+(`TileGuard::subsumes`). Below the root the guard names them by construction, so the check binds the
+root's statement against the held keys' guard. A part qualified by whole paths names its rows, so it
+releases nothing under any other. A part unqualified at a level above states its keys complete under
+every row there, those not yet delivered included, so it is named under every one: an inverse states
+its input's keys so, since each stands beneath one value ([Converse](#converse)). Three tiles whose
+held keys form a prefix still take that path: a last key whose group holds nothing, an earlier key
+whose own group's statement calls every key complete, and a statement about the keys beneath an
+enclosing key the tile does not hold. The guard names all three exactly, the third by path. A
+universal input release latches `upstream_drained`. Release builds then return the cache without
+pulling that input again; debug builds continue pulling to exercise its post-release checks.
 
 ### What a producer holds
 
