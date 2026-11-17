@@ -73,6 +73,7 @@ struct FanOutShared {
     /// parallel to [`consumers`](Self::consumers): an operator inside the store's cycle, which a
     /// push skips.
     recurrence: Vec<bool>,
+    current_values: Vec<bool>,
     /// What every live and retired subscriber had agreed to release the last time one
     /// released, and so what this fan-out has already passed upstream.
     ///
@@ -225,6 +226,7 @@ impl FanOutShared {
         retain_flagged(&mut self.recurrence, &keep);
         retain_flagged(&mut self.readers, &keep);
         retain_flagged(&mut self.positions, &keep);
+        retain_flagged(&mut self.current_values, &keep);
         debug_assert_eq!(
             self.consumers.len(),
             self.subscribers.len(),
@@ -406,6 +408,7 @@ pub struct StoreRead {
 #[derive(Clone)]
 pub struct Cycle {
     shared: Weak<RefCell<FanOutShared>>,
+    domain: Option<Extent>,
 }
 
 impl Cycle {
@@ -418,12 +421,30 @@ impl Cycle {
     /// completed pull of the store does.
     pub(crate) fn publish(&self, tile: &Tile) {
         let shared = self.shared.upgrade().expect(DEAD_RECURRENCE);
-        shared
-            .borrow_mut()
-            .reentrancy
-            .as_mut()
-            .expect("a store's fan-out is cyclic")
-            .cached_tile = tile.clone();
+        {
+            let mut state = shared.borrow_mut();
+            state
+                .reentrancy
+                .as_mut()
+                .expect("a store's fan-out is cyclic")
+                .cached_tile = tile.clone();
+            if state.live_indices().any(|i| state.current_values[i])
+                && let Some(frontier) = crate::interpreter::commit_operator::store_frontier(tile)
+            {
+                let prefix = crate::interpreter::tiling::domain_prefix_over(
+                    vec![frontier.into_value()],
+                    std::slice::from_ref(self.domain.as_ref().expect("a flat store has a domain")),
+                );
+                let current: Vec<usize> = state
+                    .live_indices()
+                    .filter(|&i| state.current_values[i])
+                    .collect();
+                for i in current {
+                    state.release_guards[i] = state.release_guards[i].union(&prefix);
+                }
+            }
+        }
+        release_shared(&shared);
     }
 }
 
@@ -474,23 +495,38 @@ impl Consumer for FanOutInput {
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
-        let Some(shared_rc) = self.shared.upgrade() else {
-            return;
-        };
-        let consumers = {
-            let shared = shared_rc.borrow();
-            shared
-                .live_indices()
-                .filter(|&i| !shared.recurrence[i])
-                .map(|i| shared.consumers[i].clone())
-                .collect::<Vec<_>>()
-        };
-        for c in &consumers {
+        for c in &self.reader_consumers() {
             match c.try_borrow_mut() {
                 Ok(mut consumer) => consumer.push(region, landing),
                 Err(_) => landing.reentered(),
             }
         }
+    }
+
+    /// A route reaches every consumer a push does.
+    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
+        for c in &self.reader_consumers() {
+            match c.try_borrow_mut() {
+                Ok(mut consumer) => consumer.route(routes),
+                Err(_) => routes.reentered(),
+            }
+        }
+    }
+}
+
+impl FanOutInput {
+    /// The consumers of the live reader slots, which a push reaches, and none of a recurrence
+    /// slot. A clone of each handle, so no borrow of the fan-out is held while a push climbs past.
+    fn reader_consumers(&self) -> Vec<Rc<RefCell<Box<dyn Consumer>>>> {
+        let Some(shared_rc) = self.shared.upgrade() else {
+            return Vec::new();
+        };
+        let shared = shared_rc.borrow();
+        shared
+            .live_indices()
+            .filter(|&i| !shared.recurrence[i])
+            .map(|i| shared.consumers[i].clone())
+            .collect()
     }
 }
 
@@ -572,6 +608,7 @@ impl FanOut {
             consumers: Vec::new(),
             release_guards: Vec::new(),
             recurrence: Vec::new(),
+            current_values: Vec::new(),
             released: tiling.empty_guard(),
             readers: Vec::new(),
             positions: Vec::new(),
@@ -603,6 +640,7 @@ impl FanOut {
                 shared: self.shared.clone(), // shares the Rc — always connected
                 input: self.input.clone(),
             },
+            false,
             None,
         )
     }
@@ -623,6 +661,7 @@ impl FanOut {
                 shared: self.shared.clone(),
                 input: self.input.clone(),
             },
+            false,
             Some((reader, predecessor)),
         )
     }
@@ -638,6 +677,23 @@ impl FanOut {
                 shared: Rc::downgrade(&self.shared),
                 input: Rc::downgrade(&self.input),
             },
+            false,
+            None,
+        )
+    }
+
+    /// A flat store read that retains each key's current value without retaining its history.
+    pub(crate) fn current_slot(&self) -> Box<dyn TileOperator> {
+        assert!(
+            matches!(self.tiling, Tiling::Store { .. }),
+            "current-value retention reads a flat store"
+        );
+        self.slot_holding(
+            FanHold::Reader {
+                shared: self.shared.clone(),
+                input: self.input.clone(),
+            },
+            true,
             None,
         )
     }
@@ -645,10 +701,12 @@ impl FanOut {
     fn slot_holding(
         &self,
         hold: FanHold,
+        current_values: bool,
         reader: Option<(SlotReader, Option<SlotReader>)>,
     ) -> Box<dyn TileOperator> {
         let result = FanOutSlot {
             hold,
+            current_values,
             base: OperatorBase::new(self.tiling.clone()),
             primary: !*self.used.borrow(),
             reader,
@@ -892,6 +950,7 @@ struct FanOutSlot {
     primary: bool,
     /// The reader this slot serves and the one it replaces ([`FanOut::slot_read_by`]).
     reader: Option<(SlotReader, Option<SlotReader>)>,
+    current_values: bool,
 }
 
 impl FanOutSlot {
@@ -963,6 +1022,7 @@ impl TileOperator for FanOutSlot {
             shared.release_guards.push(seed.clone());
             shared.readers.push(reader.into_iter().collect());
             shared.positions.push(position);
+            shared.current_values.push(self.current_values);
             shared
                 .recurrence
                 .push(matches!(self.hold, FanHold::Recurrence { .. }));
@@ -1028,6 +1088,10 @@ impl TileOperator for FanOutSlot {
             if let Some(cell) = cell {
                 cell.borrow_mut().enter_cycle(Cycle {
                     shared: Rc::downgrade(&shared_rc),
+                    domain: match self.tiling() {
+                        Tiling::Store { domain, .. } => Some(domain.clone()),
+                        _ => None,
+                    },
                 });
             }
             // `_guard` drops here, resetting `subscribing_inner`.
@@ -1319,50 +1383,43 @@ impl TileProducer for FanOutProducer {
         let position = through(&accumulated).max(through(&obsolete_guard));
         shared.positions[index] = shared.positions[index].clone().max(position);
         shared.release_guards[index] = accumulated;
-        // Live subscribers and the retired ones a handover still holds constrain the release.
-        // A subscriber whose producer has been dropped otherwise never releases again, so
-        // counting its guard would hold the intersection wherever that subscriber left it and
-        // the input would retain everything from there on.
-        let intersection = shared
-            .live_indices()
-            .map(|i| &shared.release_guards[i])
-            .chain(shared.retired.iter().map(|r| &r.guard))
-            .fold(self.tiling().universal_guard(), |acc, guard| {
-                acc.intersect(guard)
-            });
-        trace!(
-            "{} releasing: {intersection:?} from slots {:?} live {:?}",
-            self.name(),
-            shared.release_guards,
-            shared.live_indices().collect::<Vec<_>>()
-        );
-        // The match is total for a fan-out a recurrence reads, rather than a
-        // shape test with a fallthrough. Every function tiling's empty and
-        // universal guards are `Function(Domain(_))` (`Tiling::empty_guard`,
-        // including a nested one), which supplies both the seed each
-        // `release_guards` entry starts at and this fold's identity; `Domain` is
-        // closed under the union and intersection applied to it; and both drives
-        // release only `Domain` to an iteration source — `InductionDriver`
-        // constructs it at each of its two release sites, and `TransactDriver`
-        // forwards to its trigger only inside the same match. A `Codomain` guard
-        // arriving here would fail the intersect rather than land in the `else`
-        // ([`FunctionGuard::intersect`] has no mixed arm), so the position cannot
-        // be silently lost.
-        shared.released = intersection.clone();
-        let cell = match shared
-            .producer
-            .as_mut()
-            .expect("a released slot is subscribed")
-        {
-            Inner::Owned(producer) => {
-                producer.release(intersection);
-                return;
-            }
-            Inner::Store(cell) => cell.clone(),
-        };
         drop(shared);
-        cell.release(intersection);
+        release_shared(&shared_rc);
     }
+}
+
+/// Release upstream what every live slot, and every slot a handover still retires, has
+/// released ([`FanOutShared::released`]).
+fn release_shared(shared_rc: &Rc<RefCell<FanOutShared>>) {
+    let mut shared = shared_rc.borrow_mut();
+    // Live subscribers and the retired ones a handover still holds constrain the release.
+    // A subscriber whose producer has been dropped otherwise never releases again, so
+    // counting its guard would hold the intersection wherever that subscriber left it and
+    // the input would retain everything from there on.
+    let mut guards = shared
+        .live_indices()
+        .map(|i| &shared.release_guards[i])
+        .chain(shared.retired.iter().map(|r| &r.guard));
+    let Some(first) = guards.next() else {
+        return;
+    };
+    let intersection = guards.fold(first.clone(), |guard, other| guard.intersect(other));
+    if intersection == shared.released {
+        return;
+    }
+    shared.released = intersection.clone();
+    let Some(inner) = shared.producer.as_mut() else {
+        return;
+    };
+    let cell = match inner {
+        Inner::Owned(producer) => {
+            producer.release(intersection);
+            return;
+        }
+        Inner::Store(cell) => cell.clone(),
+    };
+    drop(shared);
+    cell.release(intersection);
 }
 
 /// Regions a memo must read: initially everything, then unread or notified regions.
@@ -1423,6 +1480,10 @@ impl Consumer for DirtyConsumer {
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
         self.downstream.push(region, landing);
+    }
+
+    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
+        self.downstream.route(routes);
     }
 }
 

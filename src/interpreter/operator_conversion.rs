@@ -5733,10 +5733,11 @@ fn convert_store_settled_read(
     // the levels standing above the stores are the store tiling's collection levels.
     let levels_above = fan.tiling().levels();
     Ok(Box::new(StoreFinalRead::per_row_at(
-        // A scalar read takes the store's value once in each version, so its slot replaces no
-        // reader; a read per row reads the rows its predecessor left.
+        // A scalar read takes the store's current value, which the fan-out retains for it, once in
+        // each version, so its slot replaces no reader; a read per row reads the rows its
+        // predecessor left.
         match levels_above {
-            0 => fan.slot(),
+            0 => fan.current_slot(),
             _ => ctx.slot_read_by(&fan, reader),
         },
         runtime_key,
