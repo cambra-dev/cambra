@@ -44,10 +44,14 @@
 
 use crate::interpreter::Projection;
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     fmt,
     rc::{Rc, Weak},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crate::ccl::load::LoadedProgram;
@@ -62,9 +66,12 @@ use crate::ccl::{
 use crate::chl_parser::SourceMap;
 use crate::control_port::phase_spelling;
 use crate::interpreter::{
-    Consumer, Value,
+    Consumer, DataSink, Value,
+    dispatcher::{Ended, Refused, RunObserver, Targets},
     operator_conversion::{OperatorMap, ReuseTally, StateConflict, UnreadableInput, VarPath},
+    sinks::ProducerSlot,
     tile_operators::{FanOut, TileProducer},
+    tiling::Tile,
 };
 
 /// The branch a request that names none addresses: a control-port verb without
@@ -212,6 +219,47 @@ fn branch_main_consumer(
         notified.set(true);
         wake.notify(&Projection::Everything);
     })
+}
+
+/// The `main` producers a run takes out of its branches, each in the slot the run reads it
+/// through, which it puts back into their branches when it drops: when the run returns, and when it
+/// unwinds, so a panic in the run loses no branch's `main`.
+struct TakenMains<'b> {
+    branches: &'b mut [Branch],
+    mains: Vec<(usize, ProducerSlot, Arc<MainOutput>)>,
+}
+
+impl Drop for TakenMains<'_> {
+    fn drop(&mut self) {
+        for (at, slot, output) in self.mains.drain(..) {
+            let branch = &mut self.branches[at];
+            // The run's frames have dropped before this one, so nothing borrows the slot; a borrow
+            // that still did would make a second panic while unwinding, which aborts.
+            let Ok(mut slot) = slot.try_borrow_mut() else {
+                debug_assert!(false, "no frame of a finished run borrows a `main` slot");
+                continue;
+            };
+            branch.main_producer = slot.take();
+            branch.main_finished |= output.finished.load(Ordering::Relaxed);
+        }
+    }
+}
+
+/// A branch's `main` output in a dispatched run ([`LiveProgram::run`]): it hands each answer to
+/// the branch's printer and records whether one was terminal, after which no run pulls the output
+/// again.
+struct MainOutput {
+    print: Arc<dyn DataSink>,
+    finished: AtomicBool,
+}
+
+impl DataSink for MainOutput {
+    fn process(&self, tile: &Tile) {
+        if tile.is_terminal() {
+            self.finished.store(true, Ordering::Relaxed);
+        }
+        self.print.process(tile);
+    }
 }
 
 /// One row of [`LiveProgram::branches`], rendered as `/branches` prints it.
@@ -611,6 +659,65 @@ impl LiveProgram {
             }
         }
         pulled
+    }
+
+    /// Run every branch through one dispatcher until `observer` breaks or every live source
+    /// yields everything: one plan over each branch's sink outputs and each branch's `main` output
+    /// that has not delivered its terminal answer. `print` builds the sink a branch's `main`
+    /// answers go to, from the branch's name.
+    ///
+    /// One run plans every branch together because branches share operators: a store or a `Memo`
+    /// two branches hold is one breaker, which one plan places once.
+    ///
+    /// # Errors
+    ///
+    /// Where the planner refuses the table ([`run_program`](crate::interpreter::dispatcher::run_program)). The run then ran nothing
+    /// and placed nothing.
+    ///
+    /// # Panics
+    ///
+    /// Where the run panics. Each branch keeps its `main` producer, and what else an unwind leaves
+    /// is in `src/interpreter/design-dispatcher.md`, "A run that unwinds".
+    pub fn run(
+        &mut self,
+        morsel_rows: usize,
+        print: &dyn Fn(&str) -> Arc<dyn DataSink>,
+        observer: &mut dyn RunObserver,
+    ) -> Result<Ended, Refused> {
+        let mut targets = Targets::default();
+        let mut taken = TakenMains {
+            branches: &mut self.branches,
+            mains: Vec::new(),
+        };
+        for at in 0..taken.branches.len() {
+            let branch = &taken.branches[at];
+            targets.add_sinks(&branch.program);
+            if branch.main_finished || branch.main_producer.is_none() {
+                continue;
+            }
+            let output = Arc::new(MainOutput {
+                print: print(&branch.name),
+                finished: AtomicBool::new(false),
+            });
+            // Held by `taken` from the moment it leaves its branch.
+            let producer = taken.branches[at].main_producer.take();
+            let slot: ProducerSlot = Rc::new(RefCell::new(producer));
+            taken.mains.push((at, slot.clone(), output.clone()));
+            targets.add_main(&taken.branches[at].program, slot, output);
+        }
+        targets.run(morsel_rows, observer)
+    }
+
+    /// Pull every branch's sinks once, as a compile that does not defer its sink pulls does
+    /// (`GlobalContext::defer_sink_pulls`): what a driver falling back to pull mode does first.
+    pub fn pull_sinks(&self) {
+        for branch in &self.branches {
+            for output in branch.program.sinks() {
+                if let Some(consumer) = &output.sink_consumer {
+                    consumer.borrow().pull_now();
+                }
+            }
+        }
     }
 
     /// Whether some branch has a `main` output it has not finished.
