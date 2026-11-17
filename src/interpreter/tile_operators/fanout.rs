@@ -538,6 +538,11 @@ pub struct Cycle {
 }
 
 impl Cycle {
+    /// The consumers of the fan-out's live reader slots, which the store's pushes reach.
+    pub(crate) fn readers(&self) -> Vec<Rc<RefCell<Box<dyn Consumer>>>> {
+        reader_consumers(&self.shared)
+    }
+
     /// The id of the fan-out, which its recurrence slots answer ([`TileProducer::recurrence_of`]).
     pub(crate) fn fan(&self) -> usize {
         self.shared.upgrade().expect(DEAD_RECURRENCE).borrow().id
@@ -595,7 +600,7 @@ impl Consumer for FanOutInput {
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
-        for c in &self.reader_consumers() {
+        for c in &reader_consumers(&self.shared) {
             match c.try_borrow_mut() {
                 Ok(mut consumer) => consumer.notify(region, landing),
                 Err(_) => landing.reentered(),
@@ -604,20 +609,18 @@ impl Consumer for FanOutInput {
     }
 }
 
-impl FanOutInput {
-    /// The consumers of the live reader slots, which a push reaches, and none of a recurrence
-    /// slot. A clone of each handle, so no borrow of the fan-out is held while a push climbs past.
-    fn reader_consumers(&self) -> Vec<Rc<RefCell<Box<dyn Consumer>>>> {
-        let Some(shared_rc) = self.shared.upgrade() else {
-            return Vec::new();
-        };
-        let shared = shared_rc.borrow();
-        shared
-            .live_indices()
-            .filter(|&i| !shared.recurrence[i])
-            .map(|i| shared.consumers[i].clone())
-            .collect()
-    }
+/// The consumers of the live reader slots, which a push reaches, and none of a recurrence slot. A
+/// clone of each handle, so no borrow of the fan-out is held while a push climbs past.
+fn reader_consumers(fan: &Weak<RefCell<FanOutShared>>) -> Vec<Rc<RefCell<Box<dyn Consumer>>>> {
+    let Some(shared_rc) = fan.upgrade() else {
+        return Vec::new();
+    };
+    let shared = shared_rc.borrow();
+    shared
+        .live_indices()
+        .filter(|&i| !shared.recurrence[i])
+        .map(|i| shared.consumers[i].clone())
+        .collect()
 }
 
 /// RAII guard for the cyclic `FanOut` `subscribing_inner` flag.  Created
@@ -1074,6 +1077,11 @@ impl FanOutSlot {
 
 impl TileOperator for FanOutSlot {
     impl_operator_base!();
+
+    /// A slot's record fields equal what its shared input's do.
+    fn field_correlation(&self, field: &str) -> Option<Vec<TilePathStep>> {
+        self.hold.with_input(|op| op.field_correlation(field))
+    }
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         self.hold.with_input(|op| visit(share(op)));
@@ -1623,6 +1631,10 @@ struct AnnounceInherited {
 }
 
 impl Consumer for AnnounceInherited {
+    fn completion_key(&self) -> Option<&Value> {
+        self.consumer.completion_key()
+    }
+
     fn notify(
         &mut self,
         region: &Projection,
@@ -1758,7 +1770,17 @@ impl Memo {
 }
 
 impl TileOperator for Memo {
+    /// A breaker: its pipeline pushes its output to the pipelines that read it.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
+
+    /// A memo's record fields equal what its input's do.
+    fn field_correlation(&self, field: &str) -> Option<Vec<TilePathStep>> {
+        self.input.field_correlation(field)
+    }
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("input", &*self.input));
@@ -1940,20 +1962,44 @@ fn holds_the_same(a: &Tile, b: &Tile) -> bool {
 /// beneath a level of its own states that level complete only where the collection states
 /// `True`, so the cache states it once it can.
 fn close_over_positions(tile: &mut Tile, tiling: &Tiling) {
-    if let (
-        Some(Extent::UIntRange(positions)),
-        Tile::DataFunction {
-            domain_predicate, ..
-        },
-    ) = (tiling.domain_extent(), tile)
-        && !domain_predicate.is_true()
-        && domain_predicate.covers_positions(&positions)
+    let Tile::DataFunction {
+        domain,
+        codomain,
+        domain_predicate,
+        ..
+    } = tile
+    else {
+        return;
+    };
+    // A level beneath that states every key complete under every row makes each held row whole.
+    if let Some(beneath) = tiling.codomain() {
+        close_over_positions(codomain, &beneath);
+    }
+    if !domain_predicate.is_true()
+        && let Tile::DataFunction {
+            domain_predicate: rows_beneath,
+            ..
+        } = codomain.as_ref()
+        && rows_beneath.is_true()
     {
+        *domain_predicate = domain_predicate.union(&Predicate::from_column_value(domain));
+    }
+    let covered = match tiling.domain_extent() {
+        Some(Extent::UIntRange(positions)) => domain_predicate.covers_positions(&positions),
+        // A level of one key, as a value's outermost level is, is complete once that key is.
+        Some(Extent::Base(crate::interpreter::BaseType::Unit)) => {
+            domain_predicate.contains(&Value::Unit)
+        }
+        _ => false,
+    };
+    if covered {
         *domain_predicate = Predicate::True;
     }
 }
 
 impl Breaker for MemoProducer {
+    /// A consume caches the answer and releases what it states ([`MemoProducer::read_input`]).
+    ///
     /// Reads the input at `guard` whether or not the cache holds the region, since the caller asks
     /// for the pipeline to run. It wakes no consumer: a consuming memo's only reader is the
     /// pipeline the dispatcher pushes to, and what the consume merged reaches it through the
@@ -1964,7 +2010,7 @@ impl Breaker for MemoProducer {
             "{} consumes a guard of its input's tiling: {guard:?}",
             self.name()
         );
-        if guard_minus(&guard, self.input.obsolete_guard()).is_empty() {
+        if guard_covers(self.input.obsolete_guard(), &guard) {
             return;
         }
         let projection = guard.projection_for(self);
@@ -1983,6 +2029,22 @@ impl Breaker for MemoProducer {
                 self.input.release(read);
             }
         }
+    }
+
+    fn finish(&mut self, _: InputId, pushes: &mut Pushes<'_>) {
+        // Every input pipeline is closed and every claim is integrated, so the input adds no key
+        // and no reader asks for more of a value than the cache took: the cache holds every key
+        // complete. A reader of one field of a record leaves the others unconsumed, so the
+        // input itself need not be released whole. The statement is spelled `True` because a
+        // union of per-key statements need not simplify to it, as for nominal keys whose values
+        // are records.
+        if let Tile::DataFunction {
+            domain_predicate, ..
+        } = &mut self.cached_tile
+        {
+            *domain_predicate = Predicate::True;
+        }
+        pushes.push_final(self);
     }
 
     fn input_tiling(&self, _: InputId) -> Tiling {
@@ -4469,9 +4531,10 @@ mod consuming_tests {
     }
 
     /// A memo released position by position through the last position of a row, over a finite
-    /// range of positions, holds the row no more (`BreakingProducer::final_guard` closes it).
+    /// range of positions, holds none of the row's positions, and its final guard names the row's
+    /// remainder past them, which states the row's end (`BreakingProducer::final_guard`).
     #[test]
-    fn a_row_released_through_its_last_position_is_held_no_more() {
+    fn a_row_released_through_its_last_position_keeps_only_its_end() {
         use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
         use crate::interpreter::{BaseType, ColumnValue, Extent};
         use bit_set::BitSet;
@@ -4509,12 +4572,21 @@ mod consuming_tests {
                 ))),
             ))));
         }
-        let held = Projection::of(&memo.final_guard()).expect("a region of keys");
-        assert_eq!(held.level(), Some(CurryLevel::OUTERMOST), "{held:?}");
-        assert_eq!(
-            held.intersect(&Projection::admitting(Predicate::point(Value::UInt(0)))),
-            Projection::Nothing,
-            "row 0 is released through its last position"
+        let row_0 = |here: Predicate| {
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+                FunctionGuard::Domain(Predicate::qualified(Predicate::point(Value::UInt(0)), here)),
+            ))))
+        };
+        let held = memo.final_guard();
+        let positions = row_0(Predicate::at_or_below(Value::UInt(1)));
+        assert!(
+            held.intersect(&positions).is_empty(),
+            "row 0 is released through its last position: {held:?}"
+        );
+        let end = guard_minus(&row_0(Predicate::True), &positions);
+        assert!(
+            guard_minus(&end, &held).is_empty(),
+            "the final guard names row 0's remainder, its end: {held:?}"
         );
     }
 

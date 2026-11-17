@@ -835,8 +835,9 @@ impl TileGuard {
     /// only where its payload predicate is `True`.
     ///
     /// An arm naming keys beneath the outermost collection is dropped where it names no key of
-    /// its level's extent, a finite range of positions: the paths of a row past its last
-    /// position, which a difference of nested guards leaves (`guard_minus`). A guard every arm of
+    /// its level's extent. Over a finite range of positions those are the paths of a row past its
+    /// last position, which a difference of nested guards leaves (`guard_minus`). Over a union's
+    /// tags they are the keys under no tag of the union. A guard every arm of
     /// which is dropped is the empty guard. Any other guard is answered as it is.
     pub fn closed_over(self, tiling: &Tiling) -> TileGuard {
         self.closed_over_tags(tiling).closed_over_levels(tiling)
@@ -862,7 +863,7 @@ impl TileGuard {
         }
     }
 
-    fn closed_over_tags(self, tiling: &Tiling) -> TileGuard {
+    pub(crate) fn closed_over_tags(self, tiling: &Tiling) -> TileGuard {
         let TileGuard::Function(FunctionGuard::Domain(keys @ Predicate::Union { .. })) = &self
         else {
             return self;
@@ -1007,7 +1008,8 @@ impl TileGuard {
 }
 
 /// Whether `arm`, a guard `depth` levels beneath the outermost collection of `tiling`, is a domain
-/// guard beneath it that names no key of its level's extent, a finite range of positions.
+/// guard beneath it that names no key of its level's extent: no position of a finite range of
+/// positions, or no tag of a union's tags.
 fn names_no_key_of_its_level(arm: &TileGuard, tiling: &Tiling, depth: usize) -> bool {
     match arm {
         TileGuard::Function(FunctionGuard::Codomain(inner)) => tiling
@@ -1028,6 +1030,10 @@ fn names_no_key_of_its_level(arm: &TileGuard, tiling: &Tiling, depth: usize) -> 
                         }),
                     )))
                     .is_false(),
+                // A predicate qualified by an enclosing path answers no part per tag, and is kept.
+                Some(Extent::Union(tags)) => tags
+                    .keys()
+                    .all(|tag| keys.under_tag(tag).is_some_and(|under| under.is_false())),
                 _ => false,
             }
         }
