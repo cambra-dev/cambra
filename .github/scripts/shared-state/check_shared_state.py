@@ -128,6 +128,13 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `usize`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),
+    # A cyclic fan-out's store (`Store`, shared as `StoreCell`): its producer, held in a cell apart
+    # from the fan-out's state so a pull that re-enters through the store's recurrence finds it
+    # borrowed and reads the snapshot, and the release region that waits for the current
+    # operation's borrow to end. What crosses them is the producer and a guard naming a region,
+    # never a tile passed between operators.
+    ("src/interpreter/tile_operators/fanout.rs", "cell of `Box<dyn TileProducer>`"),
+    ("src/interpreter/tile_operators/fanout.rs", "cell of `Option<TileGuard>`"),
     ("src/interpreter/tile_operators/mod.rs", "ambient mutable state"),
     # The record of pulls in progress that the `get` wrapper checks each input's pull
     # against, twice: the `thread_local!` and the cell inside it. A debug build only;
