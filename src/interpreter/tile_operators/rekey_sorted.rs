@@ -1,8 +1,6 @@
 use super::*;
 use crate::interpreter::operator_graph::value;
-use crate::interpreter::{
-    BaseType, ColumnValue, Consumer, Extent, Projection, SubscribeContext, Value, tuple_field,
-};
+use crate::interpreter::{BaseType, ColumnValue, Consumer, Extent, Projection, Value, tuple_field};
 
 /// Re-keys a collection of pairs by each pair's first component, `𝐾 ⤇ (𝐽, 𝑉)` to `𝐽 ⤇ 𝑉`, where
 /// those keys are distinct: the `map` constructor's re-keying (group by the new key, then take the
@@ -111,7 +109,7 @@ impl TileOperator for RekeySorted {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        let input = BreakerInput::new(consumer, self.input.tiling(), false, cx);
+        let input = BreakerInput::new(consumer, self.input.tiling(), false);
         share_breaker(RekeySortedProducer {
             base: ProducerBase::new(
                 RekeySortedProducer::alloc_id(),
@@ -128,7 +126,6 @@ impl TileOperator for RekeySorted {
             complete: Complete::new(self.order),
             released_through: None,
             consumed: Predicate::False,
-            consuming: false,
         })
     }
 }
@@ -149,7 +146,6 @@ struct RekeySortedProducer {
     /// from `held` without calling it complete. A row that arrives later carries a key above it.
     released_through: Option<Value>,
     consumed: Predicate,
-    consuming: bool,
 }
 
 impl TileProducer for RekeySortedProducer {
@@ -177,7 +173,7 @@ impl TileProducer for RekeySortedProducer {
     }
 
     fn answers_from_state(&self) -> bool {
-        self.consuming
+        !self.base.reads_input()
     }
 
     fn get_impl(&mut self, guard: TileGuard) -> Tile {
@@ -185,20 +181,27 @@ impl TileProducer for RekeySortedProducer {
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        if !self.consuming {
+        if self.base.reads_input() {
             // A key's position is known only once its row arrives, so the input is read whole
             // and the answer cut to the pull's keys.
             let mut tile = self.read_input(self.input.tiling().universal_guard());
             tile.restrict_to(&projection, self.tiling());
             tile
         } else {
-            self.offer_impl(guard)
+            let mut tile = self.output.clone();
+            tile.restrict_to(&projection, self.tiling());
+            tile
         }
     }
 
     fn release_impl(&mut self, _obsolete_guard: TileGuard) {
         self.output.remove_guarded(self.obsolete_guard().clone());
-        if self.consuming {
+        if self
+            .base
+            .placement
+            .as_ref()
+            .is_some_and(|at| at.get().is_some())
+        {
             return;
         }
         let released = self.obsolete_guard().clone();
@@ -404,9 +407,6 @@ impl RekeySortedProducer {
 }
 
 impl Breaker for RekeySortedProducer {
-    fn enter_consuming_mode(&mut self) {
-        self.consuming = true;
-    }
     fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
         let tile = self.read_input(guard.clone());
         self.output.merge(tile);
@@ -435,11 +435,7 @@ impl BreakingProducer for RekeySortedProducer {
     fn complete(&self) -> TileGuard {
         self.output.to_guard()
     }
-    fn offer_impl(&mut self, guard: TileGuard) -> Tile {
-        let mut tile = self.output.clone();
-        tile.restrict_to(&guard.projection_for(self), self.tiling());
-        tile
-    }
+
     fn morsels(&self, guard: &TileGuard, rows: usize) -> Vec<TileGuard> {
         cut_at_keys(
             guard,
@@ -547,16 +543,15 @@ mod tests {
             complete: Complete::new(order),
             released_through: None,
             consumed: Predicate::False,
-            consuming: false,
         };
-        producer.enter_consuming_mode();
-        producer.consume_impl(InputId::ONLY, pair_tiling().universal_guard());
+        producer.consume_in_pipeline(InputId::ONLY, pair_tiling().universal_guard());
         let out = producer.get(tiling.universal_guard());
         (producer, out, released)
     }
 
     /// A producer over rising keys that reads `input` whole, pulled once, and the guards it
-    /// forwards upstream: the path a breaker takes outside consuming mode.
+    /// forwards upstream: the path a breaker takes inside a run where no dispatcher places it
+    /// ([`ProducerBase::reads_input`]).
     fn read_whole(input: Tile) -> (RekeySortedProducer, Tile, Rc<RefCell<Vec<TileGuard>>>) {
         // An input that answers nothing it released, as every producer does.
         use crate::interpreter::tile_operators::test_helpers::ProjectionSpy;
@@ -570,9 +565,9 @@ mod tests {
             complete: Complete::new(KeyOrder::Rising),
             released_through: None,
             consumed: Predicate::False,
-            consuming: false,
         };
-        let out = producer.get(tiling.universal_guard());
+        let out =
+            crate::interpreter::dispatcher::in_a_run(|| producer.get(tiling.universal_guard()));
         (producer, out, released)
     }
 
@@ -603,10 +598,8 @@ mod tests {
             complete: Complete::new(KeyOrder::Rising),
             released_through: None,
             consumed: Predicate::False,
-            consuming: false,
         };
-        producer.enter_consuming_mode();
-        producer.consume_impl(InputId::ONLY, keys(Predicate::point(uint(1))));
+        producer.consume_in_pipeline(InputId::ONLY, keys(Predicate::point(uint(1))));
         assert_eq!(
             producer.input.obsolete_guard(),
             &keys(Predicate::point(uint(1)))
@@ -619,8 +612,7 @@ mod tests {
         };
         assert!(!domain_predicate.contains(&uint(0)));
         producer.release(keys(Predicate::point(uint(1))));
-        producer.enter_consuming_mode();
-        producer.consume_impl(InputId::ONLY, keys(Predicate::point(uint(0))));
+        producer.consume_in_pipeline(InputId::ONLY, keys(Predicate::point(uint(0))));
         assert!(
             producer
                 .complete
@@ -724,7 +716,9 @@ mod tests {
         // The input answers what arrived since, without the released position 0.
         let (grown, _) = ReleaseSpy::new(pairs(&[1], &[5], &[2], Predicate::False), pair_tiling());
         producer.input = Box::new(grown);
-        producer.get(producer.tiling().universal_guard());
+        crate::interpreter::dispatcher::in_a_run(|| {
+            producer.get(producer.tiling().universal_guard())
+        });
     }
 
     #[test]
@@ -764,17 +758,19 @@ mod tests {
             complete: Complete::new(KeyOrder::Rising),
             released_through: None,
             consumed: Predicate::False,
-            consuming: false,
         };
-        assert_eq!(producer.get(tiling.empty_guard()), tiling.empty_tile());
-        assert!(pulled.borrow().is_empty(), "{:?}", pulled.borrow());
-        assert!(producer.held.is_empty());
-        producer.get(keys(Predicate::point(uint(1))));
-        let held = producer.held.clone();
-        assert_eq!(held.len(), 3);
-        assert_eq!(producer.get(tiling.empty_guard()), tiling.empty_tile());
-        assert_eq!(pulled.borrow().len(), 1, "{:?}", pulled.borrow());
-        assert_eq!(producer.held, held);
+        // A producer reads its input only inside a run, while no pipeline holds it.
+        crate::interpreter::dispatcher::in_a_run(|| {
+            assert_eq!(producer.get(tiling.empty_guard()), tiling.empty_tile());
+            assert!(pulled.borrow().is_empty(), "{:?}", pulled.borrow());
+            assert!(producer.held.is_empty());
+            producer.get(keys(Predicate::point(uint(1))));
+            let held = producer.held.clone();
+            assert_eq!(held.len(), 3);
+            assert_eq!(producer.get(tiling.empty_guard()), tiling.empty_tile());
+            assert_eq!(pulled.borrow().len(), 1, "{:?}", pulled.borrow());
+            assert_eq!(producer.held, held);
+        });
     }
 
     /// A breaker over rising keys, whose input holds `row_keys` at positions 0, 1, …, consuming
@@ -796,11 +792,9 @@ mod tests {
             complete: Complete::new(KeyOrder::Rising),
             released_through: None,
             consumed: Predicate::False,
-            consuming: false,
         };
-        producer.enter_consuming_mode();
         for &at in positions {
-            producer.consume_impl(InputId::ONLY, keys(Predicate::point(uint(at))));
+            producer.consume_in_pipeline(InputId::ONLY, keys(Predicate::point(uint(at))));
         }
         producer
     }
@@ -889,7 +883,9 @@ mod tests {
     /// The declared input level matches the whole read used to translate output keys.
     #[test]
     fn a_projected_rekey_declares_the_input_level_it_reads() {
-        use crate::interpreter::tile_operators::test_helpers::ProjectionSpyOp;
+        use crate::interpreter::tile_operators::test_helpers::{
+            ProjectionSpyOp, ReadInPipeline as _,
+        };
         let (input, pulled, _) = ProjectionSpyOp::new(
             pairs(&[3, 7, 9], &[0, 1, 2], &[10, 20, 30], Predicate::True),
             pair_tiling(),
@@ -917,7 +913,7 @@ mod tests {
             leaf
         }
         let declared = leaf_level(&*producer, Some(level));
-        let _ = producer.get(guard);
+        let _ = producer.read_in_pipeline(guard);
         let pulled = pulled.borrow();
         assert_eq!(pulled.len(), 1);
         let actual = Projection::of(&pulled[0])

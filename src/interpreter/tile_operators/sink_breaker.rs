@@ -1,6 +1,8 @@
 //! A sink as a pipeline breaker, for `crate::interpreter::dispatcher::run_program`.
 //! See `src/interpreter/design-dispatcher.md`, "Running a compiled program".
 
+#[cfg(test)]
+use crate::interpreter::tile_operators::test_helpers::ConsumeInPipeline as _;
 use std::sync::Arc;
 
 use super::*;
@@ -8,14 +10,13 @@ use crate::interpreter::DataSink;
 use crate::interpreter::sinks::ProducerSlot;
 
 /// The pipeline breaker of a sink or a `main` output: it consumes a package by pulling the
-/// producer at the package's guard and releasing it at what the answer states, as a sink's pull
-/// in pull mode does at the universal guard, and hands the answers to the sink ([`Hands`]). No
+/// producer at the package's guard, releasing what the answer states, and handing the answer
+/// to the sink ([`Hands`]). No
 /// pipeline reads it, so it is no producer: it offers nothing and pushes nothing.
 ///
 /// A package's answer states only its own region complete, so it is terminal only where the
 /// package is the producer's whole input. The sink is done once its producer is released whole
-/// ([`input_released`]), however many packages that took, where pull mode is done at the first
-/// terminal answer.
+/// ([`input_released`]), however many packages that took.
 ///
 /// [`input_released`]: Breaker::input_released
 pub(crate) struct SinkBreaker {
@@ -28,14 +29,13 @@ pub(crate) struct SinkBreaker {
 enum Hands {
     /// Each package's answer, as the package is consumed: a sink output's breaker.
     EachPackage,
-    /// A `main` output's breaker, whose driver prints each answer as pull mode prints each
-    /// pull's. Its pipeline is ordered (`Dispatcher::order`). At its finish it pulls the producer
+    /// A `main` output's breaker, whose driver prints each answer. Its pipeline is ordered (`Dispatcher::order`). At its finish it pulls the producer
     /// at the universal guard, which states what the producer states complete.
     Main {
         /// Whether it hands each package's answer as it consumes it, and at its finish the answer
         /// that states it complete where no answer before was terminal
         /// ([`SinkBreaker::hand_each_package`]); otherwise it merges the answers and hands them
-        /// once, at its finish, as pull mode's one pull does.
+        /// once, at its finish.
         each_package: bool,
         /// The answers of the packages consumed, merged: all of them, or, where it hands each
         /// package's answer, in a debug build only, for the check that they add up to a terminal
@@ -85,7 +85,7 @@ impl SinkBreaker {
     }
 
     /// Record that this `main` output reads a loop's scope: the pull at its finish reads, through
-    /// that scope's store in pull mode, rows the loop's rounds have written. Each is final as it
+    /// that scope's store, rows the loop's rounds have written. Each is final as it
     /// is written, and the producer states it complete.
     pub(crate) fn reads_a_loop(&mut self) {
         if let Hands::Main { loop_beneath, .. } = &mut self.hands {
@@ -111,8 +111,6 @@ impl SinkBreaker {
 impl Breaker for SinkBreaker {
     /// A sink's breaker keeps no mode: it pulls its producer at each consume, in a dispatched run
     /// only.
-    fn enter_consuming_mode(&mut self) {}
-
     fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
         let mut producer = Self::input(&self.producer);
         let tile = producer.get(guard);
@@ -140,7 +138,7 @@ impl Breaker for SinkBreaker {
         }
     }
 
-    fn finish(&mut self, _: &mut Pushes<'_>) {
+    fn finish(&mut self, _input: InputId, _: &mut Pushes<'_>) {
         let Hands::Main {
             each_package,
             answer,
@@ -235,7 +233,7 @@ mod tests {
     #[test]
     fn a_package_reaches_the_sink_and_releases_what_it_answered() {
         let (mut breaker, sink) = sink_over(Tile::Scalar(ColumnValue::Ints(vec![3])));
-        breaker.consume_impl(
+        breaker.consume_in_pipeline(
             InputId::ONLY,
             breaker.input_tiling(InputId::ONLY).universal_guard(),
         );
@@ -262,12 +260,12 @@ mod tests {
         let mut breaker = SinkBreaker::new(producer, sink.clone());
         let one = Predicate::from_column_value(&ColumnValue::Ints(vec![1]));
         let domain = |keys: Predicate| TileGuard::Function(FunctionGuard::Domain(keys));
-        breaker.consume_impl(InputId::ONLY, domain(one.clone()));
+        breaker.consume_in_pipeline(InputId::ONLY, domain(one.clone()));
         assert!(
             !breaker.input_released(InputId::ONLY).is_universal(),
             "one package of two"
         );
-        breaker.consume_impl(InputId::ONLY, domain(Predicate::True.minus(&one)));
+        breaker.consume_in_pipeline(InputId::ONLY, domain(Predicate::True.minus(&one)));
         assert!(
             breaker.input_released(InputId::ONLY).is_universal(),
             "both packages"
@@ -280,7 +278,7 @@ mod tests {
     fn an_answer_stating_nothing_releases_nothing() {
         let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
         let (mut breaker, sink) = sink_over(tiling.empty_tile());
-        breaker.consume_impl(
+        breaker.consume_in_pipeline(
             InputId::ONLY,
             breaker.input_tiling(InputId::ONLY).universal_guard(),
         );
@@ -341,12 +339,15 @@ mod tests {
         sink: &Recording,
         script: &RefCell<Tile>,
     ) -> Vec<(Vec<i64>, bool)> {
-        breaker.consume_impl(InputId::ONLY, keys(vec![0]));
+        breaker.consume_in_pipeline(InputId::ONLY, keys(vec![0]));
         *script.borrow_mut() = input(vec![0, 2, 3], Predicate::True);
-        breaker.consume_impl(InputId::ONLY, keys(vec![2]));
-        breaker.consume_impl(InputId::ONLY, keys(vec![3]));
+        breaker.consume_in_pipeline(InputId::ONLY, keys(vec![2]));
+        breaker.consume_in_pipeline(InputId::ONLY, keys(vec![3]));
         let dispatcher = crate::interpreter::dispatcher::Dispatcher::new(vec![vec![]], 1);
-        breaker.finish(&mut dispatcher.pushes(crate::interpreter::dispatcher::PipelineId(0)));
+        breaker.finish(
+            InputId::ONLY,
+            &mut dispatcher.pushes(crate::interpreter::dispatcher::PipelineId(0)),
+        );
         assert!(breaker.input_released(InputId::ONLY).is_universal());
         let handed = sink.0.lock().expect("no hand-off panics");
         handed

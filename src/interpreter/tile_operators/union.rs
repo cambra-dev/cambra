@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use bit_set::BitSet;
 
 use super::*;
@@ -444,7 +446,7 @@ impl TileOperator for UnionOperator {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        let (shared, gate) = shared_consumer(consumer);
+        let shared = shared_consumer(consumer);
         // The arms of a flat union are disjoint slices of one collection, pulled at the
         // projection. A tagged union keys an arm's rows by the arm's keys under its tag.
         let flat = self.flat;
@@ -455,18 +457,14 @@ impl TileOperator for UnionOperator {
             .map(|(op, tag)| match flat {
                 true => subscribe_forwarding_keeping_keys(&mut **op, &shared, cx),
                 false => {
-                    let consumer = crate::interpreter::forwarding_consumer_tagging(
-                        &shared,
-                        &cx.scheduler().wakeup_queue(),
-                        tag.clone(),
-                    );
+                    let consumer =
+                        crate::interpreter::forwarding_consumer_tagging(&shared, tag.clone());
                     op.subscribe(op.tiling().universal_guard(), consumer, cx)
                 }
             })
             .collect();
         Box::new(UnionProducer {
-            base: ProducerBase::new(UnionProducer::alloc_id(), self.tiling(), &self.base, cx)
-                .sharing(gate),
+            base: ProducerBase::new(UnionProducer::alloc_id(), self.tiling(), &self.base, cx),
             inputs: input_producers,
             tags: self.tags.clone(),
             flat: self.flat,
@@ -1081,7 +1079,7 @@ mod tests {
             let path = vec![outer(0), Value::UInt(key)];
             let projection = Projection::keys_at(CurryLevel::new(1), Predicate::exactly(&path));
             let guard = projection.guard(&tiling);
-            let answer = union.get(guard.clone());
+            let answer = union.read_in_pipeline(guard.clone());
             assert_eq!(
                 answer.paths_at(CurryLevel::new(1)),
                 std::slice::from_ref(&path)
@@ -1120,7 +1118,7 @@ mod tests {
                 Value::UInt(0),
             ];
             let projection = Projection::keys_at(CurryLevel::new(1), Predicate::exactly(&path));
-            let answer = union.get(projection.guard(&tiling));
+            let answer = union.read_in_pipeline(projection.guard(&tiling));
             assert_eq!(answer.paths_at(CurryLevel::new(1)), [path]);
             assert_eq!(
                 answer.deepest_values(),
@@ -1613,7 +1611,7 @@ mod tests {
                 Predicate::False,
             ])),
         )));
-        let tile = producer.get(union_tiling.universal_guard());
+        let tile = producer.read_in_pipeline(union_tiling.universal_guard());
 
         let Tile::DataFunction { domain, .. } = tile else {
             panic!("a union of functions is a function");
@@ -1777,8 +1775,8 @@ mod tests {
             level: CurryLevel::OUTERMOST,
             base: ProducerBase::unowned(UnionProducer::alloc_id(), &union_tiling),
             inputs: vec![Box::new(arm0), Box::new(arm1)],
-            flat: false,
             tags: positional(2),
+            flat: false,
         };
         (producer, [pulled0, pulled1], [released0, released1])
     }
@@ -1862,7 +1860,7 @@ mod tests {
     #[test]
     fn tagged_pulls_of_each_arm_answer_what_everything_does() {
         let (mut whole, _, _) = union_logging_pulls();
-        let everything = whole.get(whole.tiling().universal_guard());
+        let everything = whole.read_in_pipeline(whole.tiling().universal_guard());
         let (mut by_arm, _, _) = union_logging_pulls();
         let mut entries =
             entries_of(&by_arm.get(tagged_guard(vec![Predicate::True, Predicate::False])));
@@ -1919,7 +1917,7 @@ mod tests {
         ] {
             let (mut producer, _, _) = union_logging_pulls();
             for guard in &order {
-                let answered = producer.get(guard.clone()).to_guard();
+                let answered = producer.read_in_pipeline(guard.clone()).to_guard();
                 producer.release(answered);
             }
             assert!(
@@ -1953,7 +1951,7 @@ mod tests {
     #[should_panic(expected = "a projection reaches an arm only as a guard of its outermost keys")]
     fn a_pull_at_keys_no_tag_names_is_refused() {
         let (mut producer, _, _) = union_logging_pulls();
-        producer.get(TileGuard::Function(FunctionGuard::Domain(
+        producer.read_in_pipeline(TileGuard::Function(FunctionGuard::Domain(
             Predicate::from_column_value(&ColumnValue::Ints(vec![1])),
         )));
     }
@@ -2035,7 +2033,7 @@ mod tests {
             tags: positional(2),
             flat: true,
         };
-        let out = producer.get(tiling.universal_guard());
+        let out = producer.read_in_pipeline(tiling.universal_guard());
         let Tile::DataFunction {
             domain_predicate: rows,
             codomain,
@@ -2117,8 +2115,8 @@ mod projection_tests {
             base: ProducerBase::unowned(UnionProducer::alloc_id(), &stream_tiling()),
             level: CurryLevel::OUTERMOST,
             inputs: vec![Box::new(even), Box::new(odd)],
-            flat,
             tags: positional(2),
+            flat,
         };
         (producer, even_pulled, odd_pulled)
     }
@@ -2128,7 +2126,7 @@ mod projection_tests {
     #[test]
     fn a_morsel_of_merged_branches_pulls_each_branch_at_the_morsel() {
         let (mut union, even_pulled, odd_pulled) = merged_branches(true);
-        let morsel = union.get(keys_between(2, 5));
+        let morsel = union.read_in_pipeline(keys_between(2, 5));
         assert_eq!(int_entries(&morsel), vec![(2, 20), (3, 3), (4, 40), (5, 5)]);
         assert_eq!(*even_pulled.borrow(), vec![keys_between(2, 5)]);
         assert_eq!(*odd_pulled.borrow(), vec![keys_between(2, 5)]);
@@ -2139,9 +2137,9 @@ mod projection_tests {
     #[test]
     fn successive_morsels_of_merged_branches_are_disjoint() {
         let (mut union, even_pulled, _) = merged_branches(true);
-        union.get(keys_between(0, 3));
+        union.read_in_pipeline(keys_between(0, 3));
         union.release(keys_between(0, 3));
-        let next = union.get(keys_between(4, 7));
+        let next = union.read_in_pipeline(keys_between(4, 7));
         assert_eq!(int_entries(&next), vec![(4, 40), (5, 5), (6, 60), (7, 7)]);
         assert_eq!(even_pulled.borrow()[1], keys_between(4, 7));
     }
@@ -2158,9 +2156,9 @@ mod projection_tests {
     #[test]
     fn a_morsel_after_every_arm_is_released_states_completeness_over_the_morsel() {
         let (mut union, _, _) = merged_branches(true);
-        union.get(keys_between(0, 3));
+        union.read_in_pipeline(keys_between(0, 3));
         union.release(stream_tiling().universal_guard());
-        let next = union.get(keys_between(4, 7));
+        let next = union.read_in_pipeline(keys_between(4, 7));
         let Tile::DataFunction {
             domain_predicate, ..
         } = &next
@@ -2192,11 +2190,11 @@ mod projection_tests {
             base: ProducerBase::unowned(UnionProducer::alloc_id(), &stream_tiling()),
             level: CurryLevel::OUTERMOST,
             inputs: vec![Box::new(even), Box::new(odd)],
-            flat: true,
             tags: positional(2),
+            flat: true,
         };
 
-        let first = union.get(keys_between(0, 7));
+        let first = union.read_in_pipeline(keys_between(0, 7));
         assert_eq!(
             int_entries(&first),
             vec![(0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (6, 6)]
@@ -2213,7 +2211,7 @@ mod projection_tests {
         );
 
         *odd_cell.borrow_mut() = int_column(vec![1, 3, 5, 7], Predicate::True);
-        let second = union.get(keys_between(0, 7));
+        let second = union.read_in_pipeline(keys_between(0, 7));
         assert_eq!(
             int_entries(&second),
             (0..8).map(|k| (k, k as i64)).collect::<Vec<_>>()
@@ -2243,7 +2241,7 @@ mod projection_tests {
         };
         let (mut union, odd_cell) = scripted_union(int_column(vec![1, 3], through_3.clone()));
 
-        let first = union.get(keys_between(0, ROWS - 1));
+        let first = union.read_in_pipeline(keys_between(0, ROWS - 1));
         assert_eq!(
             int_entries(&first),
             vec![(0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (6, 6)]
@@ -2252,19 +2250,19 @@ mod projection_tests {
 
         // Nothing new has arrived, so nothing comes back, and the statement is still the odd
         // arm's decided prefix.
-        let idle = union.get(keys_between(0, ROWS - 1));
+        let idle = union.read_in_pipeline(keys_between(0, ROWS - 1));
         assert!(int_entries(&idle).is_empty());
         assert_eq!(stated(&idle), through_3);
 
         // The odd arm delivers some of what is left without finishing: row 5 arrives, the
         // range stays open, and row 5 is the only row delivered.
         *odd_cell.borrow_mut() = int_column(vec![1, 3, 5], Predicate::exactly(&[Value::UInt(5)]));
-        let partial = union.get(keys_between(0, ROWS - 1));
+        let partial = union.read_in_pipeline(keys_between(0, ROWS - 1));
         assert_eq!(int_entries(&partial), vec![(5, 5)]);
         union.release(partial.to_guard());
 
         *odd_cell.borrow_mut() = int_column(vec![1, 3, 5, 7], Predicate::True);
-        let last = union.get(keys_between(0, ROWS - 1));
+        let last = union.read_in_pipeline(keys_between(0, ROWS - 1));
         assert_eq!(int_entries(&last), vec![(7, 7)]);
         let TileGuard::Function(FunctionGuard::Domain(asked)) = keys_between(0, ROWS - 1) else {
             unreachable!("keys_between names a key region")
@@ -2299,7 +2297,7 @@ mod projection_tests {
     #[should_panic(expected = "claimed by more than one arm")]
     fn arms_that_deliver_one_key_in_the_same_pull_are_rejected() {
         let (mut union, _) = scripted_union(int_column(vec![1, 3, 6], Predicate::True));
-        union.get(keys_between(0, ROWS - 1));
+        union.read_in_pipeline(keys_between(0, ROWS - 1));
     }
 
     /// An arm that delivers a key a sibling delivered earlier, after the consumer released it,
@@ -2313,7 +2311,7 @@ mod projection_tests {
     #[test]
     fn a_key_a_sibling_already_delivered_is_dropped_from_the_arm_after_release() {
         let (mut union, odd_cell) = scripted_union(int_column(vec![1, 3], Predicate::True));
-        let first = union.get(keys_between(0, ROWS - 1));
+        let first = union.read_in_pipeline(keys_between(0, ROWS - 1));
         assert_eq!(
             int_entries(&first),
             vec![(0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (6, 6)]
@@ -2327,7 +2325,7 @@ mod projection_tests {
             **codomain = Tile::Scalar(ColumnValue::Ints(vec![1, 3, 600]));
         }
         *odd_cell.borrow_mut() = tile;
-        let second = union.get(keys_between(0, ROWS - 1));
+        let second = union.read_in_pipeline(keys_between(0, ROWS - 1));
         assert!(
             int_entries(&second).is_empty(),
             "neither the odd arm's 6 nor anything released comes back"
@@ -2348,6 +2346,6 @@ mod projection_tests {
     #[should_panic(expected = "keys its rows by arm")]
     fn a_tagged_union_rejects_a_key_projection() {
         let (mut union, _, _) = merged_branches(false);
-        union.get(keys_between(0, 3));
+        union.read_in_pipeline(keys_between(0, 3));
     }
 }
