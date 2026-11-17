@@ -101,6 +101,12 @@ EXPECTED_EXCEPTIONS = [
     # crosses the cell is graph structure, never a tile.
     ("src/interpreter/operator_graph.rs", "ambient mutable state"),
     ("src/interpreter/operator_graph.rs", "ambient mutable state"),
+    # The flag that a thread is in a compiled program's dispatched run, twice: the
+    # `thread_local!` and the cell inside it. A debug build checks against it that no consumer
+    # is notified in the run, and the consumers a notification passes take no context
+    # parameter to carry it; what crosses it is one bit, never a tile.
+    ("src/interpreter/dispatcher.rs", "ambient mutable state"),
+    ("src/interpreter/dispatcher.rs", "ambient mutable state"),
     ("src/interpreter/tile_operators/cycle_slot.rs", "shared cell of `Option<Box<T>>`"),
     # `BreakerHandle`, the dispatcher's handle on a pipeline's breaker; see its type doc. The
     # driver calls the breaker through it, and what crosses it is a call, never a tile.
