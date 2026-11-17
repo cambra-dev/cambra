@@ -100,6 +100,8 @@ impl InferArena {
     }
 
     fn exit() {
+        // Compaction's shared results hold the run's variables.
+        crate::ccl::infer::solver::compact::clear_shared_results();
         let vars = crate::ccl::arena_exit();
         // Solving has ended, so every scope `Subst::acting_on` read has reached its final
         // size. A panicking run may have stopped mid-solve, with scopes still to grow.

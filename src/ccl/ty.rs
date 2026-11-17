@@ -733,6 +733,11 @@ thread_local! {
     static KIND_FACTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// The [`KIND_FACTS`] count.
+pub(crate) fn kind_facts() -> u64 {
+    KIND_FACTS.with(std::cell::Cell::get)
+}
+
 fn kind_fact_written() {
     KIND_FACTS.with(|n| n.set(n.get() + 1));
 }

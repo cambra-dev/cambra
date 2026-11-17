@@ -741,6 +741,17 @@ before it. It is stored only where each such cut was spurious, and it records th
 (`Memoized::cuts`); it is reused only where each is again being walked and on the bound chain,
 so the walk would cut it again. A result naming a recursive placeholder is not stored.
 
+A walk's memo ends with the walk, and resolving every node of a tree compacts the variables their
+types share once per node. A result is shared across walks (`across` in `compact.rs`) while the
+graph stands still: every write to a variable's state counts as a fact (`FactCell`, beside the
+kind and capability variables' own counts), and a shared result is reused only while no fact has
+been written since it was computed. Its key adds the walk's settings to the memo key. It is
+shared only where its walk read nothing of the walk around it: the walk held no join entries,
+candidate widening or held variable and ran inside no read of a sum (`READING`), it cut no cycle
+and met no barrier again below the variable, and it recorded no join violation
+(`CompactState::events`). What is reused is then what the
+walk's own memo would hold for the variable.
+
 #### Binder-slot resolution
 
 Binder types are not expression-node types. Resolving every `expr.ty` does not resolve a
@@ -1045,7 +1056,8 @@ deposit demands before the argument is read.
 The ordering invariant requires specialization not to invalidate types already read by the walk.
 Debug builds log `ReadRecord` snapshots that retain the live variables and their resolved
 results. At the end of a successful coalesce pass, `assert_reads_stable` resolves them against
-the final graph.
+the final graph. A read made with no fact written since resolves as it did, so only reads a later
+write could have changed are resolved again.
 
 The comparison is bounded:
 
