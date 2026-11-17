@@ -68,6 +68,13 @@ pub trait Consumer {
     /// through the dispatcher, `notify`, its gates (`GatedConsumer`) and `WakeupQueue` go, and
     /// this method takes `notify`'s place.
     fn push(&mut self, _region: &Projection, _landing: &mut dispatcher::Landing<'_>) {}
+
+    /// Declare where a push through this consumer goes and how, in `routes`, without pushing: a
+    /// consumer that passes a push on walks on to the consumers it passes it to, one that widens
+    /// it walks them through [`Routes::widened`](dispatcher::Routes::widened), and the
+    /// [`dispatcher::Entry`] of a placed breaker records its pipeline. It mirrors
+    /// [`push`](Self::push): a consumer that ignores a push declares nothing, which is the default.
+    fn route(&mut self, _routes: &mut dispatcher::Routes) {}
 }
 
 /// Blanket implementation: Rc<RefCell<C>> implements Consumer when C does.
@@ -80,6 +87,9 @@ impl<C: Consumer> Consumer for Rc<RefCell<C>> {
 
     fn push(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
         self.borrow_mut().push(region, landing)
+    }
+    fn route(&mut self, routes: &mut dispatcher::Routes) {
+        self.borrow_mut().route(routes)
     }
 }
 
@@ -98,6 +108,12 @@ impl<C: Consumer> Consumer for Weak<RefCell<C>> {
             consumer.borrow_mut().push(region, landing);
         }
     }
+
+    fn route(&mut self, routes: &mut dispatcher::Routes) {
+        if let Some(consumer) = self.upgrade() {
+            consumer.borrow_mut().route(routes);
+        }
+    }
 }
 
 /// A boxed consumer is one, so it can be shared behind an `Rc<RefCell<_>>` as a
@@ -109,6 +125,9 @@ impl Consumer for Box<dyn Consumer> {
 
     fn push(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
         (**self).push(region, landing)
+    }
+    fn route(&mut self, routes: &mut dispatcher::Routes) {
+        (**self).route(routes)
     }
 }
 
