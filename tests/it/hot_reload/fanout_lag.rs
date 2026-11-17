@@ -12,7 +12,7 @@
 //! the feed's tap off the store. The loop is unchanged, so the store and its fan-out
 //! are kept.
 //!
-//! Every test here is a pinned failure: it asserts the wrong output the runtime
+//! Except for the real-binary pull-reader regression, each test is a pinned failure: it asserts the wrong output the runtime
 //! produces today, so it passes now and turns red on any change to that output. Each
 //! test's doc comment gives the correct output. A change that fixes the bug should
 //! replace the pinned value with the correct one and rename the test to state the
@@ -227,26 +227,18 @@ fn a_feed_repeats_the_position_the_recurrence_still_reads() {
     assert_cuts_pinned(&emitted_at_each_cut(false), &pinned);
 }
 
-/// PINNED FAILURE through the real binary. The new version prints again the last value
-/// the old version printed.
+/// A real-binary reload preserves the pull reader's release at the cut. A deferred release
+/// from the store's recurrence settles before its mutable borrow ends, so the new version
+/// starts after the last value the old version printed.
 ///
-/// With `a` and `b` sent before the reload and `c` after, correct:
-///
-/// ```text
-/// ["a", "ab", "abc"]
-/// ```
-///
-/// Pinned:
-///
-/// ```text
-/// ["a", "ab", "ab", "abc"]
-/// ```
+/// With `a` and `b` sent before the reload and `c` after, the output is
+/// `["a", "ab", "abc"]`.
 ///
 /// The program of
 /// [`a_feed_read_by_a_sibling_that_takes_nothing_repeats_the_position_at_the_cut`], over
 /// `stdin`, reloaded through `--control` at a quiet point between lines.
 #[test]
-fn a_stdin_feed_repeats_the_value_at_the_cut_when_its_other_writer_is_edited() {
+fn a_stdin_feed_preserves_its_release_when_its_other_writer_is_edited() {
     let (reply, out) = stdin_across_reload(
         &feed("stdin()", true, ""),
         &feed("stdin()", true, "!"),
@@ -276,9 +268,8 @@ fn a_stdin_feed_repeats_the_value_at_the_cut_when_its_other_writer_is_edited() {
         .collect();
     assert_eq!(
         printed,
-        vec!["a", "ab", "ab", "abc"],
-        "the printed values changed. If the replay was fixed, pin the correct \
-         [\"a\", \"ab\", \"abc\"] instead: {out}"
+        vec!["a", "ab", "abc"],
+        "the rebuilt pull reader resumes after the cut: {out}"
     );
 }
 
