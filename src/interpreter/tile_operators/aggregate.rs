@@ -6,6 +6,7 @@ use bit_set::BitSet;
 use log::trace;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::*;
 use crate::interpreter::nest_levels;
@@ -45,6 +46,36 @@ impl Aggregate {
 }
 
 impl TileOperator for Aggregate {
+    fn runtime_operator(
+        &self,
+        context: &mut crate::interpreter::dispatcher::runtime::RuntimeContext,
+    ) -> Result<crate::interpreter::dispatcher::runtime::RuntimeOperator, String> {
+        if let Some(reader) = context.get(self.base.id) {
+            return Ok(reader);
+        }
+        if matches!(
+            &self.base.tiling,
+            Tiling::Aggregation {
+                kind: AggregateKind::Sum,
+                ..
+            }
+        ) {
+            return Err(
+                "parallel Sum requires preserved serial batching and is not enabled".into(),
+            );
+        }
+        let input = self.input.runtime_operator(context)?;
+        context.aggregate(
+            self,
+            input,
+            self.input.tiling(),
+            match self.tiling() {
+                Tiling::Aggregation { kind, .. } => *kind,
+                _ => unreachable!(),
+            },
+        )
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -103,7 +134,10 @@ pub(crate) fn extract_aggregate_over(
     Rc::new(RefCell::new(ExtractAggregateProducer::new(
         ProducerBase::unowned(ExtractAggregateProducer::alloc_id(), tiling),
         input,
-        kind,
+        Arc::new(ExtractAggregateKernel {
+            kind,
+            only_terminal: true,
+        }),
     )))
 }
 
@@ -307,10 +341,9 @@ impl BreakingProducer for AggregateProducer {
 
 /// Extracts a terminal result from an aggregation. Partial-result extraction is unsupported.
 pub struct ExtractAggregate {
+    kernel: Arc<ExtractAggregateKernel>,
     input: Box<dyn TileOperator>,
     base: OperatorBase,
-    kind: AggregateKind,
-    only_terminal: bool,
 }
 
 impl ExtractAggregate {
@@ -321,15 +354,53 @@ impl ExtractAggregate {
             todo!("functions on partial aggregates")
         };
         Self {
+            kernel: Arc::new(ExtractAggregateKernel {
+                kind,
+                only_terminal,
+            }),
             base: OperatorBase::new(tiling),
             input,
-            kind,
-            only_terminal,
         }
     }
 }
 
 impl TileOperator for ExtractAggregate {
+    fn runtime_operator(
+        &self,
+        context: &mut crate::interpreter::dispatcher::runtime::RuntimeContext,
+    ) -> Result<crate::interpreter::dispatcher::runtime::RuntimeOperator, String> {
+        use crate::interpreter::dispatcher::runtime::{RuntimeBase, RuntimeOperator};
+        if let Some(reader) = context.get(self.base.id) {
+            return Ok(reader);
+        }
+        if self.kernel.kind == AggregateKind::Sum {
+            return Err(
+                "parallel Sum requires preserved serial batching and is not enabled".into(),
+            );
+        }
+        let kernel = self.kernel.clone();
+        let base = RuntimeBase::freeze(&self.base)?;
+        let input = self.input.runtime_operator(context)?;
+        let partitionable = false;
+        let reads = RuntimeOperator::dependencies([&input]);
+        let sources = RuntimeOperator::sources([&input]);
+        let factory = RuntimeOperator::new(
+            base,
+            self.result_correlation(),
+            move |base, build| {
+                Box::new(Self {
+                    kernel: kernel.clone(),
+                    base: base.thaw(),
+                    input: input.input(build),
+                })
+            },
+            partitionable,
+            reads,
+        )
+        .with_sources(sources);
+        context.materialize(self, factory)
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -343,7 +414,7 @@ impl TileOperator for ExtractAggregate {
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let input = BreakerInput::new(consumer, self.input.tiling(), false);
-        let mut producer = ExtractAggregateProducer::new(
+        let producer = ExtractAggregateProducer::new(
             ProducerBase::new(
                 ExtractAggregateProducer::alloc_id(),
                 self.tiling(),
@@ -353,18 +424,21 @@ impl TileOperator for ExtractAggregate {
             .breaking(input.downstream, input.placement),
             self.input
                 .subscribe(self.input.tiling().universal_guard(), input.consumer, cx),
-            self.kind,
+            self.kernel.clone(),
         );
-        producer.only_terminal = self.only_terminal;
         share_breaker(producer)
     }
 }
 
-struct ExtractAggregateProducer {
-    base: ProducerBase,
-    input: Box<dyn TileProducer>,
+struct ExtractAggregateKernel {
     kind: AggregateKind,
     only_terminal: bool,
+}
+
+struct ExtractAggregateProducer {
+    kernel: Arc<ExtractAggregateKernel>,
+    base: ProducerBase,
+    input: Box<dyn TileProducer>,
     /// The value a consume extracted from a terminal input, until the consumer releases the
     /// output. Empty before then.
     extracted: Tile,
@@ -373,13 +447,16 @@ struct ExtractAggregateProducer {
 }
 
 impl ExtractAggregateProducer {
-    fn new(base: ProducerBase, input: Box<dyn TileProducer>, kind: AggregateKind) -> Self {
+    fn new(
+        base: ProducerBase,
+        input: Box<dyn TileProducer>,
+        kernel: Arc<ExtractAggregateKernel>,
+    ) -> Self {
         let extracted = base.tiling.empty_tile();
         Self {
             base,
             input,
-            kind,
-            only_terminal: true,
+            kernel,
             extracted,
             complete: false,
         }
@@ -387,30 +464,7 @@ impl ExtractAggregateProducer {
 
     /// The value `input_result` extracts to, or nothing while the input is not terminal.
     fn extract(&self, input_result: Tile) -> Tile {
-        let Tile::Aggregation {
-            kind: _,
-            accumulator,
-            terminal,
-        } = input_result
-        else {
-            panic!(
-                "ExtractAggregate expected Aggregation tiling, got {:?}",
-                self.input.tiling()
-            );
-        };
-        // An empty tile has no terminal flag; it is not the completed fold of an empty input.
-        if terminal.is_empty() {
-            return self.tiling().empty_tile();
-        }
-        if self.only_terminal {
-            if terminal.index_at(0).as_bool() {
-                self.kind.extract(*accumulator)
-            } else {
-                self.tiling().empty_tile()
-            }
-        } else {
-            todo!()
-        }
+        self.kernel.extract(self, input_result)
     }
 }
 
@@ -430,22 +484,60 @@ impl TileProducer for ExtractAggregateProducer {
     }
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let projection =
-            projection_of_one_value(&self.name(), "extracts one value", &projection_guard);
-        if projection == Projection::Nothing {
-            return self.tiling().empty_tile();
-        }
-        if !self.base.reads_input() {
-            return self.extracted.clone();
-        }
-        let input_result = self.input.get(self.input.tiling().universal_guard());
-        self.extract(input_result)
+        let kernel = self.kernel.clone();
+        kernel.execute(self, projection_guard)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        if obsolete_guard.expect_universal_or_empty(&self.name()) {
-            self.extracted = self.tiling().empty_tile();
-            self.input.release(self.input.tiling().universal_guard());
+        let kernel = self.kernel.clone();
+        kernel.release(self, obsolete_guard)
+    }
+}
+
+impl ExtractAggregateKernel {
+    fn execute(&self, state: &mut ExtractAggregateProducer, projection_guard: TileGuard) -> Tile {
+        let projection =
+            projection_of_one_value(&state.name(), "extracts one value", &projection_guard);
+        if projection == Projection::Nothing {
+            return state.tiling().empty_tile();
+        }
+        if !state.base.reads_input() {
+            return state.extracted.clone();
+        }
+        let input_result = state.input.get(state.input.tiling().universal_guard());
+        self.extract(state, input_result)
+    }
+    fn release(&self, state: &mut ExtractAggregateProducer, obsolete_guard: TileGuard) {
+        if obsolete_guard.expect_universal_or_empty(&state.name()) {
+            state.extracted = state.tiling().empty_tile();
+            state.input.release(state.input.tiling().universal_guard());
+        }
+    }
+
+    fn extract(&self, state: &ExtractAggregateProducer, input_result: Tile) -> Tile {
+        let Tile::Aggregation {
+            kind: _,
+            accumulator,
+            terminal,
+        } = input_result
+        else {
+            panic!(
+                "ExtractAggregate expected Aggregation tiling, got {:?}",
+                state.input.tiling()
+            );
+        };
+        // An empty tile has no terminal flag; it is not the completed fold of an empty input.
+        if terminal.is_empty() {
+            return state.tiling().empty_tile();
+        }
+        if self.only_terminal {
+            if terminal.index_at(0).as_bool() {
+                self.kind.extract(*accumulator)
+            } else {
+                state.tiling().empty_tile()
+            }
+        } else {
+            todo!()
         }
     }
 }
@@ -505,9 +597,8 @@ impl BreakingProducer for ExtractAggregateProducer {
 /// Preserves the enclosing levels and removes innermost keys whose aggregation is not terminal.
 /// See `src/interpreter/design-operators.md`, "Aggregation and extraction".
 pub struct MapExtractAggregate {
+    kernel: Arc<MapExtractAggregateKernel>,
     input: Box<dyn TileOperator>,
-    /// The aggregation operation used to extract final values from accumulators.
-    kind: AggregateKind,
     base: OperatorBase,
 }
 
@@ -524,9 +615,9 @@ impl MapExtractAggregate {
         );
         let tiling = extract_innermost(input.tiling());
         Self {
+            kernel: Arc::new(MapExtractAggregateKernel { kind }),
             base: OperatorBase::new(tiling),
             input,
-            kind,
         }
     }
 }
@@ -544,6 +635,42 @@ fn extract_innermost(tiling: &Tiling) -> Tiling {
 }
 
 impl TileOperator for MapExtractAggregate {
+    fn runtime_operator(
+        &self,
+        context: &mut crate::interpreter::dispatcher::runtime::RuntimeContext,
+    ) -> Result<crate::interpreter::dispatcher::runtime::RuntimeOperator, String> {
+        use crate::interpreter::dispatcher::runtime::{RuntimeBase, RuntimeOperator};
+        if self.kernel.kind == AggregateKind::Sum {
+            return Err(
+                "parallel Sum requires preserved serial batching and is not enabled".into(),
+            );
+        }
+        let kernel = self.kernel.clone();
+        let base = RuntimeBase::freeze(&self.base)?;
+        let input = self.input.runtime_operator(context)?;
+        let partitionable = input.partitionable;
+        let reads = RuntimeOperator::dependencies([&input]);
+        let sources = RuntimeOperator::sources([&input]);
+        let regions = RuntimeOperator::regions([&input]);
+        let region_sources = RuntimeOperator::regional_sources([&input]);
+        Ok(RuntimeOperator::new(
+            base,
+            self.result_correlation(),
+            move |base, build| {
+                Box::new(Self {
+                    kernel: kernel.clone(),
+                    base: base.thaw(),
+                    input: input.input(build),
+                })
+            },
+            partitionable,
+            reads,
+        )
+        .with_regions(regions)
+        .with_sources(sources)
+        .with_region_sources(region_sources))
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -561,6 +688,7 @@ impl TileOperator for MapExtractAggregate {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, cx);
         Box::new(MapExtractAggregateProducer {
+            kernel: self.kernel.clone(),
             base: ProducerBase::new(
                 MapExtractAggregateProducer::alloc_id(),
                 self.tiling(),
@@ -568,18 +696,20 @@ impl TileOperator for MapExtractAggregate {
                 cx,
             ),
             input: input_producer,
-            kind: self.kind,
         })
     }
 }
 
 /// Producer for [`MapExtractAggregate`].
+struct MapExtractAggregateKernel {
+    kind: AggregateKind,
+}
+
 struct MapExtractAggregateProducer {
+    kernel: Arc<MapExtractAggregateKernel>,
     base: ProducerBase,
     /// The subscribed input producer.
     input: Box<dyn TileProducer>,
-    /// The aggregation operation used to extract final values.
-    kind: AggregateKind,
 }
 
 impl TileProducer for MapExtractAggregateProducer {
@@ -603,11 +733,29 @@ impl TileProducer for MapExtractAggregateProducer {
     /// Every level keeps the input's keys and only the unfinished ones drop, so the input is
     /// pulled at the projection, and the answer keeps its keys.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let projection = projection_guard.projection_for(self);
+        let kernel = self.kernel.clone();
+        kernel.execute(self, projection_guard)
+    }
+
+    /// Restates releases through the unchanged collection levels. Releasing part of an
+    /// extracted value does not release its input aggregation.
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        let kernel = self.kernel.clone();
+        kernel.release(self, obsolete_guard)
+    }
+}
+
+impl MapExtractAggregateKernel {
+    fn execute(
+        &self,
+        state: &mut MapExtractAggregateProducer,
+        projection_guard: TileGuard,
+    ) -> Tile {
+        let projection = projection_guard.projection_for(state);
         if projection == Projection::Nothing {
-            return self.tiling().empty_tile();
+            return state.tiling().empty_tile();
         }
-        let mut output = self.input.get(projection.guard(self.input.tiling()));
+        let mut output = state.input.get(projection.guard(state.input.tiling()));
         // Every level passes through; only what sits under the innermost changes, and the
         // non-terminal keys of that level go. Keeping the levels is what leaves a deeper
         // fold's grouping intact for the fold above it.
@@ -628,11 +776,11 @@ impl TileProducer for MapExtractAggregateProducer {
         *slot = self.kind.extract(*accumulator);
         // One bool per accumulator, so the mask is over the innermost collection's keys.
         output
-            .values_at_mut(CurryLevel::new(self.input.tiling().levels() - 1))
+            .values_at_mut(CurryLevel::new(state.input.tiling().levels() - 1))
             .retain_keys(mask);
         // Extracted collections are a column over the groups kept, so their statements name
         // only those paths. The input's enclosing completion statements remain unchanged.
-        let values = CurryLevel::new(self.input.tiling().levels());
+        let values = CurryLevel::new(state.input.tiling().levels());
         if output.values_at(values).holds_a_level() {
             let rows = Predicate::union_all(
                 output
@@ -647,17 +795,14 @@ impl TileProducer for MapExtractAggregateProducer {
         }
         output
     }
-
-    /// Restates releases through the unchanged collection levels. Releasing part of an
-    /// extracted value does not release its input aggregation.
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        self.input.release(match obsolete_guard {
-            g if g.is_universal() => self.input.tiling().universal_guard(),
-            g if g.is_empty() => self.input.tiling().empty_guard(),
+    fn release(&self, state: &mut MapExtractAggregateProducer, obsolete_guard: TileGuard) {
+        state.input.release(match obsolete_guard {
+            g if g.is_universal() => state.input.tiling().universal_guard(),
+            g if g.is_empty() => state.input.tiling().empty_guard(),
             // What sits under the innermost level is the extract, not the input's
             // aggregation, so only a release of all of it reaches the input's values.
             g @ (TileGuard::Function(_) | TileGuard::Or(_)) => {
-                let input = self.input.tiling();
+                let input = state.input.tiling();
                 crate::interpreter::tiling::through_shared_levels(g, input.levels(), input)
             }
             g => unreachable!("MapExtractAggregate's tiling is a collection, released by {g:?}"),
@@ -826,6 +971,22 @@ fn folded_shape(tiling: &Tiling) -> (Vec<Extent>, Tiling) {
 }
 
 impl TileOperator for MapAggregate {
+    fn runtime_operator(
+        &self,
+        context: &mut crate::interpreter::dispatcher::runtime::RuntimeContext,
+    ) -> Result<crate::interpreter::dispatcher::runtime::RuntimeOperator, String> {
+        if let Some(reader) = context.get(self.base.id) {
+            return Ok(reader);
+        }
+        if self.kind == AggregateKind::Sum {
+            return Err(
+                "parallel Sum requires preserved serial batching and is not enabled".into(),
+            );
+        }
+        let input = self.input.runtime_operator(context)?;
+        context.aggregate(self, input, self.input.tiling(), self.kind)
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -860,19 +1021,20 @@ impl TileOperator for MapAggregate {
 /// Producer for [`MapAggregate`].
 struct MapAggregateProducer {
     base: ProducerBase,
-    /// The subscribed lookup-function producer.
     input: Box<dyn TileProducer>,
-    /// The aggregation operation.
-    kind: AggregateKind,
-    /// Running accumulators indexed by complete paths, outermost key first.
+    state: MapAggregateState,
+}
+
+/// Shared group-fold computation. Accumulators and completeness live in separate state.
+pub(crate) struct MapAggregateKernel {
+    pub(crate) kind: AggregateKind,
+}
+
+/// Accumulator data can be private to a worker or protected by a shared breaker lock.
+pub(crate) struct MapAggregateState {
+    kernel: Arc<MapAggregateKernel>,
     accumulators: HashMap<Vec<Value>, Tile>,
-    /// Keys above the accumulators that hold none, by path. Such a key arrives with nothing
-    /// beneath it, an empty collection of groups. Or a release takes every accumulator beneath
-    /// it without the key itself, which leaves the key in place holding nothing unreleased
-    /// (`src/interpreter/design-operators.md`, "The completeness contract"). No accumulator's
-    /// path names either kind, so the output keeps them from here.
     keys_with_nothing_beneath: HashSet<Vec<Value>>,
-    /// What the answers consumed state about completeness, together.
     stated: Option<Stated>,
 }
 
@@ -896,10 +1058,7 @@ impl MapAggregateProducer {
         Self {
             base,
             input,
-            kind,
-            accumulators: HashMap::new(),
-            keys_with_nothing_beneath: HashSet::new(),
-            stated: None,
+            state: MapAggregateState::new(Arc::new(MapAggregateKernel { kind })),
         }
     }
 
@@ -918,7 +1077,146 @@ impl MapAggregateProducer {
 
     /// Fold the groups of `input_tile` into the accumulators.
     fn fold(&mut self, input_tile: &Tile) -> Stated {
-        let obsolete = self.obsolete_guard().clone();
+        self.state.fold(
+            input_tile,
+            &self.base.tiling,
+            self.base.obsolete_guard.clone(),
+        )
+    }
+
+    /// The output over every accumulator held, with the completeness `stated` names, cut to
+    /// `projection`.
+    fn build(&self, stated: &Stated, projection: &Projection) -> Tile {
+        self.state
+            .kernel
+            .build(&self.state, stated, projection, self.tiling())
+    }
+}
+
+impl MapAggregateState {
+    pub(crate) fn new(kernel: Arc<MapAggregateKernel>) -> Self {
+        Self {
+            kernel,
+            accumulators: HashMap::new(),
+            keys_with_nothing_beneath: HashSet::new(),
+            stated: None,
+        }
+    }
+    fn fold(&mut self, tile: &Tile, tiling: &Tiling, obsolete: TileGuard) -> Stated {
+        let kernel = self.kernel.clone();
+        kernel.fold(self, tile, tiling, &obsolete)
+    }
+    pub(crate) fn apply(&mut self, tile: &Tile, tiling: &Tiling) {
+        let next = self.fold(tile, tiling, tiling.empty_guard());
+        self.stated = Some(match self.stated.take() {
+            Some(before) => before.union(&next).settled(self.accumulators.keys()),
+            None => next,
+        });
+    }
+    pub(crate) fn is_drained(&self) -> bool {
+        self.stated.is_none()
+    }
+    pub(crate) fn drain(&mut self) -> Self {
+        Self {
+            kernel: self.kernel.clone(),
+            accumulators: self.accumulators.drain().collect(),
+            keys_with_nothing_beneath: self.keys_with_nothing_beneath.drain().collect(),
+            stated: self.stated.take(),
+        }
+    }
+    pub(crate) fn merge(&mut self, mut delta: Self) {
+        assert_eq!(self.kernel.kind, delta.kernel.kind);
+        for (path, acc) in delta.accumulators.drain() {
+            match self.accumulators.entry(path) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(acc);
+                }
+                std::collections::hash_map::Entry::Occupied(mut v) => {
+                    self.kernel
+                        .kind
+                        .accumulate(v.get_mut(), &acc, 0, acc.rows());
+                }
+            }
+        }
+        self.keys_with_nothing_beneath
+            .extend(delta.keys_with_nothing_beneath.drain());
+        if let Some(next) = delta.stated.take() {
+            self.stated = Some(match self.stated.take() {
+                Some(before) => before.union(&next).settled(self.accumulators.keys()),
+                None => next,
+            });
+        }
+    }
+    pub(crate) fn release(&mut self, obsolete: &TileGuard) {
+        let removed: Vec<_> = self
+            .accumulators
+            .keys()
+            .filter(|path| obsolete.covers_path(path))
+            .cloned()
+            .collect();
+        self.accumulators
+            .retain(|path, _| !obsolete.covers_path(path));
+        for path in removed {
+            for len in 1..path.len() {
+                if !obsolete.covers_path(&path[..len]) {
+                    self.keys_with_nothing_beneath.insert(path[..len].to_vec());
+                }
+            }
+        }
+        self.keys_with_nothing_beneath
+            .retain(|path| !obsolete.covers_path(path));
+    }
+    pub(crate) fn completed_roots(&self) -> TileGuard {
+        let keys = self.stated.as_ref().map_or(Predicate::False, |stated| {
+            Predicate::union_all(
+                self.accumulators
+                    .keys()
+                    .filter(|path| path.len() == 1 && stated.complete.contains_path(path))
+                    .map(|path| Predicate::exactly(path))
+                    .collect(),
+            )
+        });
+        crate::interpreter::Projection::keys_at(CurryLevel::OUTERMOST, keys).collection_guard()
+    }
+    pub(crate) fn render_finished(&self, tiling: &Tiling) -> Tile {
+        let Some(stated) = &self.stated else {
+            return tiling.empty_tile();
+        };
+        let complete = Stated {
+            level_predicates: vec![Predicate::True; stated.level_predicates.len()],
+            elements: Predicate::True,
+            complete: Predicate::True,
+        };
+        self.kernel
+            .build(self, &complete, &Projection::Everything, tiling)
+    }
+    pub(crate) fn render(&self, tiling: &Tiling, finalized: bool) -> Tile {
+        let Some(stated) = &self.stated else {
+            return tiling.empty_tile();
+        };
+        if finalized {
+            return self
+                .kernel
+                .build(self, stated, &Projection::Everything, tiling);
+        }
+        let open = Stated {
+            level_predicates: vec![Predicate::False; stated.level_predicates.len()],
+            elements: Predicate::False,
+            complete: Predicate::False,
+        };
+        self.kernel
+            .build(self, &open, &Projection::Everything, tiling)
+    }
+}
+
+impl MapAggregateKernel {
+    fn fold(
+        &self,
+        state: &mut MapAggregateState,
+        input_tile: &Tile,
+        tiling: &Tiling,
+        obsolete: &TileGuard,
+    ) -> Stated {
         let Tile::DataFunction {
             domain_predicate,
             absent_keys,
@@ -930,14 +1228,10 @@ impl MapAggregateProducer {
         // A group known absent is complete: it has no element to fold, in any region.
         let domain_predicate = domain_predicate.union(absent_keys);
 
-        // The collection being folded is the innermost one, and the rows it stands over
-        // are the groups: `parent_paths` names them, one path per group.
-        //
-        // Every level above it states its own completion, which is collected here: a level
-        // says which of *its* keys are closed, and no other level says it for it.
-        let depth = input_tile.innermost_depth().unwrap_or_else(|| {
-            panic!("MapAggregate folds a collection of collections, got {input_tile:?}")
-        });
+        // The output's levels above Aggregation name the groups. Its accumulator may itself
+        // contain collections (Sole), whose levels belong to the value rather than this fold.
+        let (group_extents, output_tiling) = folded_shape(tiling);
+        let depth = group_extents.len();
         assert!(
             depth >= 1,
             "MapAggregate folds a collection of collections, so the fold sits under a \
@@ -949,7 +1243,7 @@ impl MapAggregateProducer {
             for (row, path) in input_tile.row_paths_at(level).into_iter().enumerate() {
                 let (from, to) = children.row_run(row);
                 if from == to && !obsolete.covers_path(&path) {
-                    self.keys_with_nothing_beneath.insert(path);
+                    state.keys_with_nothing_beneath.insert(path);
                 }
             }
         }
@@ -981,12 +1275,11 @@ impl MapAggregateProducer {
         // element the folded level calls complete.
         let complete = input_tile.completion_at(CurryLevel::new(depth - 1));
         let values = (**codomain).clone();
-        let (_, output_tiling) = folded_shape(self.tiling());
 
         // Fold each group into its row's accumulator. A group is a contiguous run of the
         // folded collection's values, so the fold stays vectorized.
         let kind = &self.kind;
-        let accumulators = &mut self.accumulators;
+        let accumulators = &mut state.accumulators;
         for (row, path) in parent_paths.iter().enumerate() {
             if obsolete.covers_path(path) {
                 continue;
@@ -1006,7 +1299,7 @@ impl MapAggregateProducer {
             for (row, key) in keys.into_iter().enumerate() {
                 let (start, end) = beneath.row_run(row);
                 if start == end && !obsolete.covers_path(&key) {
-                    self.keys_with_nothing_beneath.insert(key);
+                    state.keys_with_nothing_beneath.insert(key);
                 }
             }
         }
@@ -1016,22 +1309,25 @@ impl MapAggregateProducer {
             elements,
             complete,
         }
-        .settled(self.accumulators.keys())
+        .settled(state.accumulators.keys())
     }
-
-    /// The output over every accumulator held, with the completeness `stated` names, cut to
-    /// `projection`.
-    fn build(&self, stated: &Stated, projection: &Projection) -> Tile {
+    fn build(
+        &self,
+        state: &MapAggregateState,
+        stated: &Stated,
+        projection: &Projection,
+        tiling: &Tiling,
+    ) -> Tile {
         let Stated {
             level_predicates,
             complete,
             ..
         } = stated;
-        let (extents, output_tiling) = folded_shape(self.tiling());
+        let (extents, output_tiling) = folded_shape(tiling);
         let kind = &self.kind;
         // Completion is per path. An inner group can be complete while its enclosing
         // collections remain open; `complete` combines the statements at every level.
-        let mut entries: Vec<(Vec<Value>, Tile)> = self
+        let mut entries: Vec<(Vec<Value>, Tile)> = state
             .accumulators
             .iter()
             .map(|(path, acc)| (path.clone(), acc.clone()))
@@ -1067,7 +1363,8 @@ impl MapAggregateProducer {
         };
         let mut paths: Vec<&[Value]> = entries.iter().map(|(path, _)| path.as_slice()).collect();
         paths.extend(
-            self.keys_with_nothing_beneath
+            state
+                .keys_with_nothing_beneath
                 .iter()
                 .filter(|key| !entries.iter().any(|(path, _)| path.starts_with(key)))
                 .map(Vec::as_slice),
@@ -1086,7 +1383,7 @@ impl MapAggregateProducer {
                 *domain_predicate = stated.clone();
             }
         }
-        out.restrict_to(projection, self.tiling());
+        out.restrict_to(projection, tiling);
         out
     }
 }
@@ -1154,11 +1451,12 @@ impl Stated {
 impl TileProducer for MapAggregateProducer {
     fn state_info(&self) -> ProducerStateInfo {
         let accumulators: usize = self
+            .state
             .accumulators
             .iter()
             .map(|(path, acc)| path.len() + acc.cell_count())
             .sum();
-        ProducerStateInfo::holding(accumulators + self.keys_with_nothing_beneath.len())
+        ProducerStateInfo::holding(accumulators + self.state.keys_with_nothing_beneath.len())
     }
 
     impl_producer_base!();
@@ -1192,18 +1490,20 @@ impl TileProducer for MapAggregateProducer {
             return self.tiling().empty_tile();
         }
         if !self.base.reads_input() {
-            return match &self.stated {
+            return match &self.state.stated {
                 None => self.tiling().empty_tile(),
                 Some(stated) => self.build(stated, &projection),
             };
         }
         let stated = self.read_input(projection.guard(self.input.tiling()));
-        let stated = match self.stated.take() {
-            Some(before) => before.union(&stated).settled(self.accumulators.keys()),
+        let stated = match self.state.stated.take() {
+            Some(before) => before
+                .union(&stated)
+                .settled(self.state.accumulators.keys()),
             None => stated,
         };
         let answer = self.build(&stated, &projection);
-        self.stated = Some(stated);
+        self.state.stated = Some(stated);
         answer
     }
 
@@ -1213,8 +1513,8 @@ impl TileProducer for MapAggregateProducer {
         match obsolete_guard {
             g if g.is_empty() => {}
             g if g.is_universal() => {
-                self.accumulators.clear();
-                self.keys_with_nothing_beneath.clear();
+                self.state.accumulators.clear();
+                self.state.keys_with_nothing_beneath.clear();
                 self.input.release(self.input.tiling().universal_guard());
             }
             // Preserve unreleased ancestor keys even when their last accumulator is removed.
@@ -1222,22 +1522,25 @@ impl TileProducer for MapAggregateProducer {
             // the guard through their shared levels rather than forwarding it unchanged.
             g => {
                 let released: Vec<Vec<Value>> = self
+                    .state
                     .accumulators
                     .keys()
                     .filter(|path| obsolete.covers_path(path))
                     .cloned()
                     .collect();
-                self.accumulators
+                self.state
+                    .accumulators
                     .retain(|path, _| !obsolete.covers_path(path));
                 for path in released {
                     for len in 1..path.len() {
                         let key = &path[..len];
                         if !obsolete.covers_path(key) {
-                            self.keys_with_nothing_beneath.insert(key.to_vec());
+                            self.state.keys_with_nothing_beneath.insert(key.to_vec());
                         }
                     }
                 }
-                self.keys_with_nothing_beneath
+                self.state
+                    .keys_with_nothing_beneath
                     .retain(|key| !obsolete.covers_path(key));
                 let levels = self.tiling().levels();
                 let input = self.input.tiling();
@@ -1264,8 +1567,10 @@ impl Breaker for MapAggregateProducer {
             return;
         }
         let stated = self.read_input(guard);
-        self.stated = Some(match self.stated.take() {
-            Some(before) => before.union(&stated).settled(self.accumulators.keys()),
+        self.state.stated = Some(match self.state.stated.take() {
+            Some(before) => before
+                .union(&stated)
+                .settled(self.state.accumulators.keys()),
             None => stated,
         });
     }
@@ -1296,21 +1601,25 @@ impl BreakingProducer for MapAggregateProducer {
     /// a push names it once its input is complete, and a reader that read it before reads it again
     /// then (`Pushes::push_final` pushes each region once).
     fn complete(&self) -> TileGuard {
-        let Some(stated) = &self.stated else {
+        let Some(stated) = &self.state.stated else {
             return self.tiling().empty_guard();
         };
         let built = self.build(stated, &Projection::Everything).to_guard();
         let folding: Vec<Predicate> = self
+            .state
             .accumulators
             .keys()
             .filter(|path| !stated.complete.contains_path(path))
             .map(|path| Predicate::exactly(path))
             .collect();
-        let Some(depth) = self.accumulators.keys().next().map(Vec::len) else {
+        let Some(depth) = self.state.accumulators.keys().next().map(Vec::len) else {
             return built;
         };
         debug_assert!(
-            self.accumulators.keys().all(|path| path.len() == depth),
+            self.state
+                .accumulators
+                .keys()
+                .all(|path| path.len() == depth),
             "every group of a map aggregate is keyed at the same depth"
         );
         match Projection::keys_at(CurryLevel::new(depth - 1), Predicate::union_all(folding)) {
@@ -1321,7 +1630,7 @@ impl BreakingProducer for MapAggregateProducer {
 
     /// Cut at the groups the accumulators hold.
     fn morsels(&self, guard: &TileGuard, rows: usize) -> Vec<TileGuard> {
-        let Some(stated) = &self.stated else {
+        let Some(stated) = &self.state.stated else {
             return vec![guard.clone()];
         };
         let output = self.build(stated, &Projection::Everything);
@@ -1332,6 +1641,30 @@ impl BreakingProducer for MapAggregateProducer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn draining_a_worker_group_map_keeps_its_allocation_for_later_morsels() {
+        let kernel = Arc::new(MapAggregateKernel {
+            kind: AggregateKind::Max,
+        });
+        let mut state = MapAggregateState::new(kernel);
+        for key in 0..32 {
+            state.accumulators.insert(
+                vec![Value::UInt(key)],
+                Tile::Scalar(ColumnValue::Ints(vec![key as i64])),
+            );
+        }
+        let capacity = state.accumulators.capacity();
+        let delta = state.drain();
+        assert_eq!(delta.accumulators.len(), 32);
+        assert_eq!(state.accumulators.capacity(), capacity);
+        assert!(state.accumulators.is_empty());
+        state.accumulators.insert(
+            vec![Value::UInt(40)],
+            Tile::Scalar(ColumnValue::Ints(vec![40])),
+        );
+        assert_eq!(state.accumulators.capacity(), capacity);
+    }
+
     use super::*;
     use crate::interpreter::tile_operators::test_helpers::{QuietSpy, ReleaseSpy};
     use crate::interpreter::{BaseType, Extent, Predicate, Tile};
@@ -2128,7 +2461,10 @@ mod extract_aggregate_projection_tests {
             ExtractAggregateProducer::new(
                 ProducerBase::unowned(ExtractAggregateProducer::alloc_id(), &tiling),
                 Box::new(input),
-                AggregateKind::Sum,
+                Arc::new(ExtractAggregateKernel {
+                    kind: AggregateKind::Sum,
+                    only_terminal: true,
+                }),
             ),
             pulled,
         )
@@ -2375,12 +2711,14 @@ mod map_extract_aggregate_nested_projection_tests {
         );
         let (spy, _, _) = ProjectionSpy::new(in_tiling.empty_tile(), in_tiling.clone());
         let producer = MapExtractAggregateProducer {
+            kernel: Arc::new(MapExtractAggregateKernel {
+                kind: AggregateKind::Sole,
+            }),
             base: ProducerBase::unowned(
                 MapExtractAggregateProducer::alloc_id(),
                 &extract_innermost(&in_tiling),
             ),
             input: Box::new(spy),
-            kind: AggregateKind::Sole,
         };
         assert!(producer.restates().refuses(CurryLevel::new(1)));
         assert!(!producer.restates().refuses(CurryLevel::OUTERMOST));
@@ -2596,12 +2934,14 @@ mod map_extract_aggregate_projection_tests {
         );
         let (input, _, _) = ProjectionSpy::new(source, input_tiling.clone());
         let mut extract = MapExtractAggregateProducer {
+            kernel: Arc::new(MapExtractAggregateKernel {
+                kind: AggregateKind::Sole,
+            }),
             base: ProducerBase::unowned(
                 MapExtractAggregateProducer::alloc_id(),
                 &extract_innermost(&input_tiling),
             ),
             input: Box::new(input),
-            kind: AggregateKind::Sole,
         };
         for key in 0..2 {
             let guard = keys_between(key, key);
@@ -2655,9 +2995,11 @@ mod map_extract_aggregate_projection_tests {
         let out_tiling = Tiling::data_function(Extent::uint_range(GROUPS), Tiling::Scalar(int()));
         (
             MapExtractAggregateProducer {
+                kernel: Arc::new(MapExtractAggregateKernel {
+                    kind: AggregateKind::Sum,
+                }),
                 base: ProducerBase::unowned(MapExtractAggregateProducer::alloc_id(), &out_tiling),
                 input: Box::new(input),
-                kind: AggregateKind::Sum,
             },
             pulled,
         )
@@ -3152,7 +3494,10 @@ mod aggregate_consuming_tests {
         ExtractAggregateProducer::new(
             ProducerBase::unowned(ExtractAggregateProducer::alloc_id(), &scalar_tiling()),
             input,
-            AggregateKind::Sum,
+            Arc::new(ExtractAggregateKernel {
+                kind: AggregateKind::Sum,
+                only_terminal: true,
+            }),
         )
     }
 
@@ -3517,7 +3862,8 @@ mod map_aggregate_consuming_tests {
 
     /// The group sums the accumulators hold, by key.
     fn held(map: &MapAggregateProducer) -> BTreeMap<u64, i64> {
-        map.accumulators
+        map.state
+            .accumulators
             .iter()
             .map(|(path, accumulator)| {
                 let Value::UInt(key) = path[0] else {

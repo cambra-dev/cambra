@@ -823,6 +823,16 @@ impl FanOutSlot {
 }
 
 impl TileOperator for FanOutSlot {
+    fn runtime_operator(
+        &self,
+        context: &mut crate::interpreter::dispatcher::runtime::RuntimeContext,
+    ) -> Result<crate::interpreter::dispatcher::runtime::RuntimeOperator, String> {
+        if matches!(&self.hold, FanHold::Recurrence { .. }) {
+            return Err("parallel recurrence is not enabled".into());
+        }
+        self.hold.with_input(|op| context.shared(op))
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -1313,6 +1323,13 @@ impl Memo {
 }
 
 impl TileOperator for Memo {
+    fn runtime_operator(
+        &self,
+        context: &mut crate::interpreter::dispatcher::runtime::RuntimeContext,
+    ) -> Result<crate::interpreter::dispatcher::runtime::RuntimeOperator, String> {
+        context.memo(self, |context| self.input.runtime_operator(context))
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {

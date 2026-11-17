@@ -4,6 +4,7 @@ use bit_set::BitSet;
 use log::trace;
 use std::collections::HashMap;
 use std::iter::repeat_n;
+use std::sync::Arc;
 
 use super::*;
 use crate::interpreter::operator_graph::value;
@@ -18,13 +19,12 @@ use crate::interpreter::{
 /// `DataFunction { domain: codomain, codomain: domain }`.  Each codomain
 /// value maps to the list of domain values that produce it.
 pub struct Converse {
+    kernel: Arc<ConverseKernel>,
     /// Output tiling: `DataFunction { domain: input.codomain, codomain: input.domain }`,
     /// beneath the standing levels above `level`.
     base: OperatorBase,
     /// The function input to invert.
     input: Box<dyn TileOperator>,
-    /// The level inverted — see [`Converse::new_at`].
-    level: CurryLevel,
 }
 
 impl Converse {
@@ -55,14 +55,43 @@ impl Converse {
             }),
         };
         Self {
+            kernel: Arc::new(ConverseKernel { level }),
             base: OperatorBase::new(with_values_at(input.tiling(), level, inverted)),
             input,
-            level,
         }
     }
 }
 
 impl TileOperator for Converse {
+    fn runtime_operator(
+        &self,
+        context: &mut crate::interpreter::dispatcher::runtime::RuntimeContext,
+    ) -> Result<crate::interpreter::dispatcher::runtime::RuntimeOperator, String> {
+        use crate::interpreter::dispatcher::runtime::{RuntimeBase, RuntimeOperator};
+        let kernel = self.kernel.clone();
+        let base = RuntimeBase::freeze(&self.base)?;
+        let input = self.input.runtime_operator(context)?;
+        let partitionable = input.partitionable;
+        let reads = RuntimeOperator::dependencies([&input]);
+        let sources = RuntimeOperator::sources([&input]);
+        let inner = kernel.level == CurryLevel::OUTERMOST && input.partitionable;
+        Ok(RuntimeOperator::new(
+            base,
+            self.result_correlation(),
+            move |base, build| {
+                Box::new(Self {
+                    base: base.thaw(),
+                    input: input.input(build),
+                    kernel: kernel.clone(),
+                })
+            },
+            partitionable,
+            reads,
+        )
+        .with_sources(sources)
+        .with_inner_partitions(inner))
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -84,16 +113,18 @@ impl TileOperator for Converse {
         let input = self.input.subscribe(
             self.input.tiling().universal_guard(),
             crate::interpreter::notifications::one_level_in(
-                self.level,
+                self.kernel.level,
                 forwarding_consumer_keeping_keys(&shared),
             ),
             cx,
         );
-        Box::new(ConverseProducer::new(
+        Box::new(ConverseProducer::with_kernel(
             ProducerBase::new(ConverseProducer::alloc_id(), self.tiling(), &self.base, cx),
             input,
-            self.level,
-            self.tiling().values_at(self.level).empty_at_no_rows(),
+            self.kernel.clone(),
+            self.tiling()
+                .values_at(self.kernel.level)
+                .empty_at_no_rows(),
         ))
     }
 
@@ -110,7 +141,12 @@ impl TileOperator for Converse {
 /// first holds it (`release_late_rows`). An input guard names rows by key, so it cannot name a
 /// group before its rows are read (`src/interpreter/design-operators.md`, "A release of a converse
 /// group").
+struct ConverseKernel {
+    level: CurryLevel,
+}
+
 struct ConverseProducer {
+    kernel: Arc<ConverseKernel>,
     base: ProducerBase,
     /// The upstream producer whose output is inverted.
     input: Box<dyn TileProducer>,
@@ -126,8 +162,6 @@ struct ConverseProducer {
     /// key is complete a value never seen has no group: it is stated absent.
     read: Predicate,
     seen: Predicate,
-    /// The level inverted — see [`Converse::new_at`].
-    level: CurryLevel,
     /// The inverted level to answer with where no enclosing row has been reached.
     empty_level: Tile,
 }
@@ -137,10 +171,19 @@ struct ConverseProducer {
 type HeldRow = (Vec<Value>, Vec<Value>);
 
 impl ConverseProducer {
+    #[cfg(test)]
     fn new(
         base: ProducerBase,
         input: Box<dyn TileProducer>,
         level: CurryLevel,
+        empty_level: Tile,
+    ) -> Self {
+        Self::with_kernel(base, input, Arc::new(ConverseKernel { level }), empty_level)
+    }
+    fn with_kernel(
+        base: ProducerBase,
+        input: Box<dyn TileProducer>,
+        kernel: Arc<ConverseKernel>,
         empty_level: Tile,
     ) -> Self {
         Self {
@@ -149,7 +192,7 @@ impl ConverseProducer {
             held: Vec::new(),
             read: Predicate::False,
             seen: Predicate::False,
-            level,
+            kernel,
             empty_level,
         }
     }
@@ -170,19 +213,22 @@ impl ConverseProducer {
         debug_assert!(
             paths
                 .iter()
-                .all(|path| path.len() == self.level.index() + 1),
+                .all(|path| path.len() == self.kernel.level.index() + 1),
             "an input row's path runs through the standing levels to its key: {paths:?}"
         );
         let rows = paths.iter().fold(Predicate::False, |all, path| {
             all.union(&Predicate::exactly(path))
         });
-        beneath_standing(self.level, TileGuard::Function(FunctionGuard::Domain(rows)))
+        beneath_standing(
+            self.kernel.level,
+            TileGuard::Function(FunctionGuard::Domain(rows)),
+        )
     }
 
     /// The input rows of `input` inverted at [`Self::level`], with the rows read: each
     /// enclosing row's group is inverted on its own, as it is for `Uncurry`.
     fn invert(&self, input: Tile) -> (Tile, Vec<HeldRow>) {
-        let Some(enclosing) = self.level.enclosing() else {
+        let Some(enclosing) = self.kernel.level.enclosing() else {
             debug_assert!(
                 matches!(&input, Tile::DataFunction { row_starts, .. } if row_starts.len() == 1),
                 "converse inverts one mapping, so its input is one collection: {input:?}"
@@ -196,10 +242,8 @@ impl ConverseProducer {
         };
         let paths = input.paths_at(enclosing);
         let mut held = Vec::new();
-        let out =
-            input.regroup_beneath(self.level, self.empty_level.clone(), &mut |row| match input
-                .group_at(self.level, row)
-            {
+        let out = input.regroup_beneath(self.kernel.level, self.empty_level.clone(), &mut |row| {
+            match input.group_at(self.kernel.level, row) {
                 Some(group) => {
                     debug_assert!(
                         row < paths.len(),
@@ -218,7 +262,8 @@ impl ConverseProducer {
                     out
                 }
                 None => self.empty_level.clone(),
-            });
+            }
+        });
         (out, held)
     }
 
@@ -436,10 +481,10 @@ impl TileProducer for ConverseProducer {
     /// the inverted level is the outermost. A pull beneath it can name the input's keys at the
     /// inverted level, and reads no deeper.
     fn input_level(&self, _role: &str, level: CurryLevel) -> Option<CurryLevel> {
-        match level.cmp(&self.level) {
+        match level.cmp(&self.kernel.level) {
             std::cmp::Ordering::Less => Some(level),
-            std::cmp::Ordering::Equal => self.level.enclosing(),
-            std::cmp::Ordering::Greater => Some(self.level),
+            std::cmp::Ordering::Equal => self.kernel.level.enclosing(),
+            std::cmp::Ordering::Greater => Some(self.kernel.level),
         }
     }
 
@@ -451,9 +496,25 @@ impl TileProducer for ConverseProducer {
     /// groups are cut to the projection, and the rows a cut group does not name stay unreleased
     /// at the input, so a later pull reads them again.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let projection = projection_guard.projection_for(self);
+        let kernel = self.kernel.clone();
+        kernel.execute(self, projection_guard)
+    }
+
+    /// The levels above the inverted one stand, so a guard naming their keys names the same
+    /// input rows. Beneath them a guard names groups by value, and an input row is released
+    /// where the output path it stands at is: the rows held now, and a row arriving later
+    /// through the late-row release in `get_impl`, once its value says which group it joins.
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        let kernel = self.kernel.clone();
+        kernel.release(self, obsolete_guard)
+    }
+}
+
+impl ConverseKernel {
+    fn execute(&self, state: &mut ConverseProducer, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection_for(state);
         if projection == Projection::Nothing {
-            return self.tiling().empty_tile();
+            return state.tiling().empty_tile();
         }
         // The input's keys at the inverted level stand one level in, beneath every value: a
         // projection that admits any value there pulls the input at the same paths without it.
@@ -465,11 +526,11 @@ impl TileProducer for ConverseProducer {
             _ => None,
         };
         let input_guard = match (at_input_keys, self.level.enclosing()) {
-            (Some(keys), _) => keys.guard(self.input.tiling()),
-            (None, None) => self.input.tiling().universal_guard(),
-            (None, Some(_)) => projection.above(self.level).guard(self.input.tiling()),
+            (Some(keys), _) => keys.guard(state.input.tiling()),
+            (None, None) => state.input.tiling().universal_guard(),
+            (None, Some(_)) => projection.above(self.level).guard(state.input.tiling()),
         };
-        let input_tile = self.input.get(input_guard);
+        let input_tile = state.input.get(input_guard);
         if self.level == CurryLevel::OUTERMOST
             && let Tile::DataFunction {
                 codomain,
@@ -478,41 +539,36 @@ impl TileProducer for ConverseProducer {
             } = &input_tile
             && let Tile::Scalar(values) = &**codomain
         {
-            self.read = self.read.union(domain_predicate);
-            self.seen = self.seen.union(&Predicate::from_column_value(values));
+            state.read = state.read.union(domain_predicate);
+            state.seen = state.seen.union(&Predicate::from_column_value(values));
         }
-        let (mut out, read) = self.invert(input_tile);
-        self.remember(read);
+        let (mut out, read) = state.invert(input_tile);
+        state.remember(read);
         // `release_impl` frees the rows held, the standing keys named, and the input keys
         // named under every group, so a group can be released while the input still grows. A
         // row arriving later with a released value would put the group back into a region the
         // consumer has let go; it is released upstream on the pull that first holds it, since
         // the release reached `release_impl` before the row arrived.
-        if !self.base.obsolete_guard.is_empty() {
-            let released = self.base.obsolete_guard.clone();
-            self.release_late_rows(&released);
+        if !state.base.obsolete_guard.is_empty() {
+            let released = state.base.obsolete_guard.clone();
+            state.release_late_rows(&released);
             out.remove_guarded(released);
         }
-        out.restrict_to(&projection, self.tiling());
+        out.restrict_to(&projection, state.tiling());
         // A value never seen once every input key is complete has no group anywhere: it is
         // absent in every region, so it is recorded apart from the statement, which the cut
         // and every later cut keep to the region pulled.
-        if self.read.is_true()
+        if state.read.is_true()
             && let Tile::DataFunction { absent_keys, .. } = &mut out
         {
-            *absent_keys = Predicate::True.minus(&self.seen);
+            *absent_keys = Predicate::True.minus(&state.seen);
         }
         out
     }
-
-    /// The levels above the inverted one stand, so a guard naming their keys names the same
-    /// input rows. Beneath them a guard names groups by value, and an input row is released
-    /// where the output path it stands at is: the rows held now, and a row arriving later
-    /// through the late-row release in `get_impl`, once its value says which group it joins.
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release(&self, state: &mut ConverseProducer, obsolete_guard: TileGuard) {
         if obsolete_guard.is_universal() {
-            self.held.clear();
-            return self.input.release(self.input.tiling().universal_guard());
+            state.held.clear();
+            return state.input.release(state.input.tiling().universal_guard());
         }
         // A member `[𝑠…, value, key]` is the smallest region an input row stands at, so a guard
         // naming a strict part of one covers no held path: releasing it would forward nothing,
@@ -534,7 +590,7 @@ impl TileProducer for ConverseProducer {
             !names_beneath_a_member(&obsolete_guard),
             "{}: a release names whole members or regions above them; one beneath a member \
              names no input row exactly: {obsolete_guard:?}",
-            self.name()
+            state.name()
         );
         // This adds the rows a guard names without waiting for their values: a statement
         // beneath the groups that names no group, and no enclosing path, says the same under
@@ -558,15 +614,20 @@ impl TileProducer for ConverseProducer {
         let standing = crate::interpreter::tiling::through_standing_levels(
             obsolete_guard.clone(),
             self.level.index(),
-            self.input.tiling(),
+            state.input.tiling(),
             &mut |inverted| {
                 TileGuard::Function(FunctionGuard::Domain(under_every_group(&inverted)))
             },
         );
-        let held = self.input_rows(Self::held_rows_covered(&self.held, &obsolete_guard));
-        self.held
+        let held = state.input_rows(ConverseProducer::held_rows_covered(
+            &state.held,
+            &obsolete_guard,
+        ));
+        state
+            .held
             .retain(|(output, _)| !obsolete_guard.covers_path(output));
-        self.input
+        state
+            .input
             .release(TileGuard::flatten_or(vec![standing, held]));
     }
 }
@@ -577,13 +638,12 @@ impl TileProducer for ConverseProducer {
 /// Takes a `DataFunction(domain → codomain)` and produces `DataFunction(domain → Scalar(domain))`.
 /// The output domain is unchanged; the codomain becomes a scalar version of the same domain values.
 pub struct MapDomain {
+    kernel: Arc<MapDomainKernel>,
     /// Output tiling: `DataFunction { domain, codomain: Scalar(domain) }`, beneath the
     /// standing levels above `level`.
     base: OperatorBase,
     /// The function input.
     input: Box<dyn TileOperator>,
-    /// The level whose values are replaced — see [`MapDomain::new_at`].
-    level: CurryLevel,
 }
 
 impl MapDomain {
@@ -608,14 +668,41 @@ impl MapDomain {
             Tiling::data_function(domain.clone(), Tiling::Scalar(domain)),
         );
         Self {
+            kernel: Arc::new(MapDomainKernel { level }),
             base: OperatorBase::new(tiling),
             input,
-            level,
         }
     }
 }
 
 impl TileOperator for MapDomain {
+    fn runtime_operator(
+        &self,
+        context: &mut crate::interpreter::dispatcher::runtime::RuntimeContext,
+    ) -> Result<crate::interpreter::dispatcher::runtime::RuntimeOperator, String> {
+        use crate::interpreter::dispatcher::runtime::{RuntimeBase, RuntimeOperator};
+        let kernel = self.kernel.clone();
+        let base = RuntimeBase::freeze(&self.base)?;
+        let input = self.input.runtime_operator(context)?;
+        let partitionable = input.partitionable;
+        let reads = RuntimeOperator::dependencies([&input]);
+        let sources = RuntimeOperator::sources([&input]);
+        Ok(RuntimeOperator::new(
+            base,
+            self.result_correlation(),
+            move |base, build| {
+                Box::new(Self {
+                    kernel: kernel.clone(),
+                    base: base.thaw(),
+                    input: input.input(build),
+                })
+            },
+            partitionable,
+            reads,
+        )
+        .with_sources(sources))
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -630,11 +717,11 @@ impl TileOperator for MapDomain {
     ) -> Box<dyn TileProducer> {
         // Every level's keys stand.
         Box::new(MapDomainProducer {
+            kernel: self.kernel.clone(),
             base: ProducerBase::new(MapDomainProducer::alloc_id(), self.tiling(), &self.base, cx),
             input: self
                 .input
                 .subscribe(self.tiling().universal_guard(), consumer, cx),
-            level: self.level,
         })
     }
 
@@ -644,12 +731,15 @@ impl TileOperator for MapDomain {
 }
 
 /// Producer for [`MapDomain`]: replaces a function's codomain with its domain.
+struct MapDomainKernel {
+    level: CurryLevel,
+}
+
 struct MapDomainProducer {
+    kernel: Arc<MapDomainKernel>,
     base: ProducerBase,
     /// The upstream producer whose codomain is replaced.
     input: Box<dyn TileProducer>,
-    /// The level whose values are replaced — see [`MapDomain::new_at`].
-    level: CurryLevel,
 }
 
 impl TileProducer for MapDomainProducer {
@@ -665,11 +755,23 @@ impl TileProducer for MapDomainProducer {
 
     /// Every level's keys stand, so the input is pulled at the projection.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let projection = projection_guard.projection(&self.name());
+        let kernel = self.kernel.clone();
+        kernel.execute(self, projection_guard)
+    }
+
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        let kernel = self.kernel.clone();
+        kernel.release(self, obsolete_guard)
+    }
+}
+
+impl MapDomainKernel {
+    fn execute(&self, state: &mut MapDomainProducer, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&state.name());
         if projection == Projection::Nothing {
-            return self.tiling().empty_tile();
+            return state.tiling().empty_tile();
         }
-        let mut tile = self.input.get(projection.guard(self.input.tiling()));
+        let mut tile = state.input.get(projection.guard(state.input.tiling()));
         // The keys stand, so only the values at the level are replaced, in place.
         let Tile::DataFunction {
             domain, codomain, ..
@@ -680,19 +782,18 @@ impl TileProducer for MapDomainProducer {
         **codomain = Tile::Scalar(domain.clone());
         tile
     }
-
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release(&self, state: &mut MapDomainProducer, obsolete_guard: TileGuard) {
         // The keys at 𝐿 stand as well as the levels above it: only the values beneath them
         // are replaced.
         let input_guard = crate::interpreter::tiling::through_standing_levels(
             obsolete_guard,
             self.level.index() + 1,
-            self.input.tiling(),
+            state.input.tiling(),
             &mut |values| {
                 todo!("MapDomain cannot yet release part of the keys it made values: {values:?}")
             },
         );
-        self.input.release(input_guard);
+        state.input.release(input_guard);
     }
 }
 
@@ -1108,14 +1209,13 @@ impl UncurryProducer {
 /// on a function of the domain, rather than this which filters based on a function of the
 /// codomain.
 pub struct Filter {
+    kernel: Arc<FilterKernel>,
     /// Output tiling, equal to the input tiling (filtering preserves the type).
     base: OperatorBase,
     /// The function input to filter.
     input: Box<dyn TileOperator>,
     /// The boolean predicate applied to each domain element.
     predicate: Box<dyn TileOperator>,
-    /// The level whose keys the mask names.
-    level: CurryLevel,
 }
 
 impl Filter {
@@ -1150,15 +1250,55 @@ impl Filter {
             ),
         }
         Self {
+            kernel: Arc::new(FilterKernel { level }),
             base: OperatorBase::new(tiling),
             input,
             predicate,
-            level,
         }
     }
 }
 
 impl TileOperator for Filter {
+    fn runtime_operator(
+        &self,
+        context: &mut crate::interpreter::dispatcher::runtime::RuntimeContext,
+    ) -> Result<crate::interpreter::dispatcher::runtime::RuntimeOperator, String> {
+        use crate::interpreter::dispatcher::runtime::{RuntimeBase, RuntimeOperator};
+        let kernel = self.kernel.clone();
+        let base = RuntimeBase::freeze(&self.base)?;
+        let input = self.input.runtime_operator(context)?;
+        let predicate = self.predicate.runtime_operator(context)?;
+        let partitionable = input.partitionable && predicate.partitionable;
+        let reads = RuntimeOperator::dependencies([&input, &predicate]);
+        let sources = RuntimeOperator::sources([&input, &predicate]);
+        let mut regions = RuntimeOperator::regions([&input]);
+        regions.retain(|r| !predicate.reads.contains(r));
+        let mut region_sources = RuntimeOperator::regional_sources([&input]);
+        region_sources.retain(|source| {
+            !predicate
+                .sources
+                .iter()
+                .any(|other| Arc::ptr_eq(source, other))
+        });
+        Ok(RuntimeOperator::new(
+            base,
+            self.result_correlation(),
+            move |base, build| {
+                Box::new(Self {
+                    kernel: kernel.clone(),
+                    base: base.thaw(),
+                    input: input.input(build),
+                    predicate: predicate.input(build),
+                })
+            },
+            partitionable,
+            reads,
+        )
+        .with_regions(regions)
+        .with_sources(sources)
+        .with_region_sources(region_sources))
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -1188,10 +1328,10 @@ impl TileOperator for Filter {
             cx,
         );
         Box::new(FilterProducer {
+            kernel: self.kernel.clone(),
             base: ProducerBase::new(FilterProducer::alloc_id(), self.tiling(), &self.base, cx),
             input: input_producer,
             predicate: predicate_producer,
-            level: self.level,
         })
     }
 
@@ -1200,11 +1340,15 @@ impl TileOperator for Filter {
     }
 }
 
+struct FilterKernel {
+    level: CurryLevel,
+}
+
 struct FilterProducer {
+    kernel: Arc<FilterKernel>,
     base: ProducerBase,
     input: Box<dyn TileProducer>,
     predicate: Box<dyn TileProducer>,
-    level: CurryLevel,
 }
 
 impl TileProducer for FilterProducer {
@@ -1229,10 +1373,10 @@ impl TileProducer for FilterProducer {
             true => {
                 debug_assert_eq!(
                     CurryLevel::innermost_of(self.predicate.tiling()),
-                    Some(self.level),
+                    Some(self.kernel.level),
                     "a filter's collection predicate answers each key at its masked level"
                 );
-                Restates::Above(CurryLevel::new(self.level.index() + 1))
+                Restates::Above(CurryLevel::new(self.kernel.level.index() + 1))
             }
             false => Restates::Every,
         }
@@ -1251,44 +1395,47 @@ impl TileProducer for FilterProducer {
     /// The input, and a predicate that is a collection, share the keys of the level the mask
     /// names, so both are pulled at the projection; a function predicate is read whole.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let projection = projection_guard.projection_for(self);
-        if projection == Projection::Nothing {
-            return self.tiling().empty_tile();
-        }
-
-        self.filtered(&projection)
+        let kernel = self.kernel.clone();
+        kernel.execute(self, projection_guard)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        if self.predicate_is_a_collection() {
+        let kernel = self.kernel.clone();
+        kernel.release(self, obsolete_guard)
+    }
+}
+
+impl FilterKernel {
+    fn execute(&self, state: &mut FilterProducer, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection_for(state);
+        if projection == Projection::Nothing {
+            return state.tiling().empty_tile();
+        }
+
+        self.filtered(state, &projection)
+    }
+    fn release(&self, state: &mut FilterProducer, obsolete_guard: TileGuard) {
+        if state.predicate_is_a_collection() {
             // Both predicate and input share the same underlying domain source, so both
             // must be released together; releasing only one leaves the other's upstream
             // FanOutProducer release-guard stale, causing it to re-deliver already-consumed
             // data while the other side returns nothing on the next get().
-            let keys = predicate_release(obsolete_guard.clone(), self.predicate.tiling());
-            self.predicate.release(keys);
+            let keys = predicate_release(obsolete_guard.clone(), state.predicate.tiling());
+            state.predicate.release(keys);
         }
-        self.input.release(obsolete_guard);
-    }
-}
-
-impl FilterProducer {
-    /// Whether the predicate is a collection over the input's levels down to the masked one,
-    /// rather than a function applied to the outermost keys.
-    fn predicate_is_a_collection(&self) -> bool {
-        self.predicate.tiling().is_data_function()
+        state.input.release(obsolete_guard);
     }
 
     /// The input's rows the predicate keeps, for the keys `projection` names.
-    fn filtered(&mut self, projection: &Projection) -> Tile {
+    fn filtered(&self, state: &mut FilterProducer, projection: &Projection) -> Tile {
         let guard_for = |tiling: &Tiling| match tiling.is_data_function() {
             true => projection.guard(tiling),
             false => tiling.universal_guard(),
         };
-        let pred_guard = guard_for(self.predicate.tiling());
-        let i_guard = guard_for(self.input.tiling());
-        let predicate_result = self.predicate.get(pred_guard);
-        let input_result = self.input.get(i_guard);
+        let pred_guard = guard_for(state.predicate.tiling());
+        let i_guard = guard_for(state.input.tiling());
+        let predicate_result = state.predicate.get(pred_guard);
+        let input_result = state.input.get(i_guard);
 
         match (predicate_result, input_result) {
             // Scalar predicate applied element-wise to a collection's keys.
@@ -1358,6 +1505,14 @@ impl FilterProducer {
             }
             _ => panic!("Invalid Filter input tiles"),
         }
+    }
+}
+
+impl FilterProducer {
+    /// Whether the predicate is a collection over the input's levels down to the masked one,
+    /// rather than a function applied to the outermost keys.
+    fn predicate_is_a_collection(&self) -> bool {
+        self.predicate.tiling().is_data_function()
     }
 }
 
@@ -1477,6 +1632,35 @@ impl Restrict {
 }
 
 impl TileOperator for Restrict {
+    fn runtime_operator(
+        &self,
+        context: &mut crate::interpreter::dispatcher::runtime::RuntimeContext,
+    ) -> Result<crate::interpreter::dispatcher::runtime::RuntimeOperator, String> {
+        use crate::interpreter::dispatcher::runtime::{RuntimeBase, RuntimeOperator};
+        let base = RuntimeBase::freeze(&self.base)?;
+        let predicate = self.predicate.runtime_operator(context)?;
+        let partitionable = predicate.partitionable;
+        let reads = RuntimeOperator::dependencies([&predicate]);
+        let sources = RuntimeOperator::sources([&predicate]);
+        let regions = RuntimeOperator::regions([&predicate]);
+        let region_sources = RuntimeOperator::regional_sources([&predicate]);
+        Ok(RuntimeOperator::new(
+            base,
+            self.result_correlation(),
+            move |base, build| {
+                Box::new(Self {
+                    base: base.thaw(),
+                    predicate: predicate.input(build),
+                })
+            },
+            partitionable,
+            reads,
+        )
+        .with_regions(regions)
+        .with_sources(sources)
+        .with_region_sources(region_sources))
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -2295,10 +2479,12 @@ mod tests {
     fn filter_by(predicate: TestTileProducer, input: Tile, levels: usize) -> Tile {
         let tiling = uint_tiling(levels);
         let mut filter = FilterProducer {
+            kernel: Arc::new(FilterKernel {
+                level: CurryLevel::new(1),
+            }),
             base: ProducerBase::unowned(FilterProducer::alloc_id(), &tiling),
             input: Box::new(TestTileProducer::new(input, tiling.clone())),
             predicate: Box::new(predicate),
-            level: CurryLevel::new(1),
         };
         filter.read_in_pipeline(filter.tiling().universal_guard())
     }
@@ -3002,9 +3188,11 @@ mod tests {
     fn nested_map_domain() -> MapDomainProducer {
         let (tile, tiling) = two_rows();
         MapDomainProducer {
+            kernel: Arc::new(MapDomainKernel {
+                level: CurryLevel::new(1),
+            }),
             base: ProducerBase::unowned(MapDomainProducer::alloc_id(), &tiling),
             input: Box::new(TestTileProducer::new(tile, tiling)),
-            level: CurryLevel::new(1),
         }
     }
 
@@ -3819,10 +4007,12 @@ mod filter_projection_tests {
         let (predicate, predicate_pulled, _) = ProjectionSpy::new(answers, pred_tiling);
         (
             FilterProducer {
+                kernel: Arc::new(FilterKernel {
+                    level: CurryLevel::OUTERMOST,
+                }),
                 base: ProducerBase::unowned(FilterProducer::alloc_id(), &in_tiling),
                 input: Box::new(input),
                 predicate: Box::new(predicate),
-                level: CurryLevel::OUTERMOST,
             },
             input_pulled,
             predicate_pulled,
@@ -3948,10 +4138,12 @@ mod filter_projection_tests {
             pred_tiling,
         );
         let mut filter = FilterProducer {
+            kernel: Arc::new(FilterKernel {
+                level: CurryLevel::OUTERMOST,
+            }),
             base: ProducerBase::unowned(FilterProducer::alloc_id(), &in_tiling),
             input: Box::new(input),
             predicate: Box::new(predicate),
-            level: CurryLevel::OUTERMOST,
         };
 
         let first = filter.read_in_pipeline(keys_between(0, ROWS - 1));
@@ -4030,10 +4222,12 @@ mod filter_projection_tests {
             two_level_tiling(BaseType::Bool),
         );
         FilterProducer {
+            kernel: Arc::new(FilterKernel {
+                level: CurryLevel::new(1),
+            }),
             base: ProducerBase::unowned(FilterProducer::alloc_id(), &tiling),
             input: Box::new(input),
             predicate: Box::new(predicate),
-            level: CurryLevel::new(1),
         }
     }
 
@@ -4080,10 +4274,12 @@ mod filter_projection_tests {
                 level(level(level(Tiling::Scalar(Extent::Base(BaseType::Bool))))),
             );
             Box::new(FilterProducer {
+                kernel: Arc::new(FilterKernel {
+                    level: CurryLevel::new(2),
+                }),
                 base: ProducerBase::unowned(FilterProducer::alloc_id(), &tiling),
                 input: Box::new(input),
                 predicate: Box::new(predicate),
-                level: CurryLevel::new(2),
             }) as Box<dyn TileProducer>
         };
         let point = |k: u64| Predicate::point(Value::UInt(k));
@@ -4111,10 +4307,12 @@ mod filter_projection_tests {
             Tiling::Scalar(Extent::Base(BaseType::Bool)),
         );
         let by_function = FilterProducer {
+            kernel: Arc::new(FilterKernel {
+                level: CurryLevel::OUTERMOST,
+            }),
             base: ProducerBase::unowned(FilterProducer::alloc_id(), &tiling),
             input: Box::new(input),
             predicate: Box::new(predicate),
-            level: CurryLevel::OUTERMOST,
         };
         assert!(matches!(by_function.restates(), Restates::Every));
         assert_eq!(
@@ -4238,9 +4436,11 @@ mod map_domain_projection_tests {
         let (input, pulled, _) = ProjectionSpy::new(ints_by_position(&values, true), tiling);
         (
             MapDomainProducer {
+                kernel: Arc::new(MapDomainKernel {
+                    level: CurryLevel::OUTERMOST,
+                }),
                 base: ProducerBase::unowned(MapDomainProducer::alloc_id(), &out),
                 input: Box::new(input),
-                level: CurryLevel::OUTERMOST,
             },
             pulled,
         )
@@ -4290,9 +4490,11 @@ mod map_domain_projection_tests {
         let (input, pulled, _) = ProjectionSpy::new(groups, in_tiling);
         (
             MapDomainProducer {
+                kernel: Arc::new(MapDomainKernel {
+                    level: CurryLevel::new(1),
+                }),
                 base: ProducerBase::unowned(MapDomainProducer::alloc_id(), &out),
                 input: Box::new(input),
-                level: CurryLevel::new(1),
             },
             pulled,
         )

@@ -106,6 +106,17 @@ impl Constant {
 }
 
 impl TileOperator for Constant {
+    fn runtime_operator(
+        &self,
+        _context: &mut crate::interpreter::dispatcher::runtime::RuntimeContext,
+    ) -> Result<crate::interpreter::dispatcher::runtime::RuntimeOperator, String> {
+        Ok(crate::interpreter::dispatcher::runtime::constant(
+            self.tile.clone(),
+            crate::interpreter::dispatcher::runtime::RuntimeBase::freeze(&self.base)?,
+            self.result_correlation(),
+        ))
+    }
+
     impl_operator_base!();
 
     fn inspect_annotation(&self) -> Option<String> {

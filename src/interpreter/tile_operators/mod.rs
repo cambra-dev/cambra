@@ -47,6 +47,7 @@ use crate::{
 };
 
 mod aggregate;
+pub(crate) use aggregate::{MapAggregateKernel, MapAggregateState};
 mod breaker_reader;
 pub(crate) use breaker_reader::share_breaker;
 mod combinators;
@@ -100,6 +101,19 @@ pub use union::*;
 /// [`TileProducer`] by subscribing a [`Consumer`].  Operators are
 /// constructed at compile time; producers are created on demand at runtime.
 pub trait TileOperator {
+    /// Freeze a finite pure operator description for construction on an execution worker.
+    /// Unsupported operators refuse before workers or subscriptions are created.
+    #[doc(hidden)]
+    fn runtime_operator(
+        &self,
+        _context: &mut crate::interpreter::dispatcher::runtime::RuntimeContext,
+    ) -> Result<crate::interpreter::dispatcher::runtime::RuntimeOperator, String> {
+        Err(format!(
+            "parallel runtime conversion is not implemented for {}",
+            self.kind()
+        ))
+    }
+
     /// Get the extent (type) of this operator.
     fn extent(&self) -> Extent {
         self.tiling().extent()

@@ -77,6 +77,19 @@ fn run_dispatched(loaded: &LoadedProgram) -> Result<(), ()> {
             return Err(());
         }
     };
+    if let Ok(workers) = std::env::var("CAMBRA_PARALLEL_WORKERS") {
+        let workers = workers
+            .parse::<usize>()
+            .ok()
+            .filter(|workers| *workers > 0)
+            .ok_or_else(|| {
+                eprintln!("error: CAMBRA_PARALLEL_WORKERS must be a positive worker count")
+            })?;
+        let result = dispatcher::run_program_parallel(&program, workers, rows)
+            .map_err(|error| eprintln!("error: {error}"))?;
+        PrintedMain.process(&result.main);
+        return Ok(());
+    }
     if let Err(refused) = dispatcher::run_program_into(
         &mut program,
         rows,
@@ -709,6 +722,12 @@ fn main() {
             control_port,
         } => {
             let served = inspect_port.is_some() || control_port.is_some();
+            if served && std::env::var_os("CAMBRA_PARALLEL_WORKERS").is_some() {
+                eprintln!(
+                    "error: parallel execution is not enabled with inspector or control mode"
+                );
+                std::process::exit(1);
+            }
             let result = if served {
                 run_program(&loaded, inspect_port, control_port, morsel_rows())
             } else {

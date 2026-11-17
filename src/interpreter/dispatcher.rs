@@ -32,8 +32,13 @@ use crate::interpreter::{
     Consumer, Extent, Predicate, Projection, SharedConsumer, TileGuard, Value,
 };
 
+mod compiled_parallel;
 pub(crate) mod loop_scope;
+#[cfg(test)]
+mod parallel;
 mod plan;
+pub mod runtime;
+pub use compiled_parallel::{ParallelRun, run_program_parallel};
 
 pub use plan::{
     Ended, Planned, Refused, Run, RunObserver, Targets, run_program, run_program_into,

@@ -251,3 +251,12 @@ These guarantees concern scheduling. Breakers use `Rc<RefCell<_>>`, and the prod
 them serially. Several pipelines can share one breaker, whose consumes, offers and finishes would
 need additional coordination before parallel execution. Atomic-ordering proofs and queue storage
 mechanics are documented beside their implementation in `dispatcher.rs`.
+
+
+### Whole-pipeline worker prototype
+
+The [parallel execution proposal](design-parallel-dispatcher.md#initial-runtime-prototype) includes
+an isolated worker harness and an inventory of the runtime thread-safety changes. The default
+compiled-program driver remains serial. The opt-in
+[finite pure compiled execution](design-parallel-dispatcher.md#finite-pure-compiled-execution)
+constructs eligible native chains on workers and merges their output through shared tile state.

@@ -2,6 +2,7 @@
 use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use bit_set::BitSet;
 
@@ -21,14 +22,11 @@ use crate::interpreter::{
 ///
 /// Output fields are named `_0`, `_1`, … matching the input order.
 pub struct Zip {
+    kernel: Arc<ZipKernel>,
     /// Output tiling: the standing levels, with a `Record` where the operands' values sat.
     base: OperatorBase,
-    /// Field names in input order, used when producing the output Record tile.
-    names: Vec<SmolStr>,
     /// The input collections to pair.
     inputs: Vec<Box<dyn TileOperator>>,
-    /// The level the record sits at — the values every standing level is over.
-    level: CurryLevel,
 }
 
 /// `tiling`'s levels above `level`, with `inner` at it.
@@ -92,10 +90,10 @@ impl Zip {
         );
         let tiling = with_values_at(ops[0].tiling(), level, record);
         Self {
+            kernel: Arc::new(ZipKernel { names, level }),
             base: OperatorBase::new(tiling),
-            names,
+
             inputs: ops,
-            level,
         }
     }
 }
@@ -144,12 +142,10 @@ pub fn zip_arms_named_at(
 /// An input that is a bare value, with no collection above `level`, is a [`MakeRecord`]'s to
 /// wrap, which [`zip_arms_named_at`] checks first.
 pub struct RecordWrap {
+    kernel: Arc<RecordWrapKernel>,
     /// Output tiling: the standing levels, with a one-field `Record` where the values sat.
     base: OperatorBase,
-    name: SmolStr,
     input: Box<dyn TileOperator>,
-    /// The level the record sits at — the values every standing level is over.
-    level: CurryLevel,
 }
 
 impl RecordWrap {
@@ -166,19 +162,53 @@ impl RecordWrap {
         );
         let tiling = with_values_at(input.tiling(), level, record);
         Self {
+            kernel: Arc::new(RecordWrapKernel { name, level }),
             base: OperatorBase::new(tiling),
-            name,
+
             input,
-            level,
         }
     }
 }
 
 impl TileOperator for RecordWrap {
+    fn runtime_operator(
+        &self,
+        context: &mut crate::interpreter::dispatcher::runtime::RuntimeContext,
+    ) -> Result<crate::interpreter::dispatcher::runtime::RuntimeOperator, String> {
+        use crate::interpreter::dispatcher::runtime::{RuntimeBase, RuntimeOperator};
+        let kernel = self.kernel.clone();
+        let base = RuntimeBase::freeze(&self.base)?;
+        let input = self.input.runtime_operator(context)?;
+        let partitionable = input.partitionable;
+        let reads = RuntimeOperator::dependencies([&input]);
+        let sources = RuntimeOperator::sources([&input]);
+        let regions = RuntimeOperator::regions([&input]);
+        let region_sources = RuntimeOperator::regional_sources([&input]);
+        let inner = kernel.level.index() > 1 && input.inner_partitionable;
+        Ok(RuntimeOperator::new(
+            base,
+            self.result_correlation(),
+            move |base, build| {
+                Box::new(Self {
+                    kernel: kernel.clone(),
+                    base: base.thaw(),
+
+                    input: input.input(build),
+                })
+            },
+            partitionable,
+            reads,
+        )
+        .with_regions(regions)
+        .with_sources(sources)
+        .with_region_sources(region_sources)
+        .with_inner_partitions(inner))
+    }
+
     impl_operator_base!();
 
     fn inspect_annotation(&self) -> Option<String> {
-        Some(format!("field {}", self.name))
+        Some(format!("field {}", self.kernel.name))
     }
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -191,29 +221,36 @@ impl TileOperator for RecordWrap {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        let consumer =
-            crate::interpreter::notifications::through_values(self.level, self.tiling(), consumer);
+        let consumer = crate::interpreter::notifications::through_values(
+            self.kernel.level,
+            self.tiling(),
+            consumer,
+        );
         let input = self
             .input
             .subscribe(self.input.tiling().universal_guard(), consumer, cx);
         Box::new(RecordWrapProducer {
+            kernel: self.kernel.clone(),
             base: ProducerBase::new(
                 RecordWrapProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
                 cx,
             ),
-            name: self.name.clone(),
-            level: self.level,
+
             input,
         })
     }
 }
 
-struct RecordWrapProducer {
-    base: ProducerBase,
+struct RecordWrapKernel {
     name: SmolStr,
     level: CurryLevel,
+}
+
+struct RecordWrapProducer {
+    kernel: Arc<RecordWrapKernel>,
+    base: ProducerBase,
     input: Box<dyn TileProducer>,
 }
 
@@ -230,16 +267,28 @@ impl TileProducer for RecordWrapProducer {
 
     /// It keeps its input's keys above its level and computes the values beneath it.
     fn restates(&self) -> Restates {
-        Restates::Above(self.level)
+        Restates::Above(self.kernel.level)
     }
 
     /// Wrapping keeps the input's keys, so the input is pulled at the projection.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let projection = projection_guard.projection_for(self);
+        let kernel = self.kernel.clone();
+        kernel.execute(self, projection_guard)
+    }
+
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        let kernel = self.kernel.clone();
+        kernel.release(self, obsolete_guard)
+    }
+}
+
+impl RecordWrapKernel {
+    fn execute(&self, state: &mut RecordWrapProducer, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection_for(state);
         if projection == Projection::Nothing {
-            return self.tiling().empty_tile();
+            return state.tiling().empty_tile();
         }
-        let mut tile = self.input.get(projection.guard(self.input.tiling()));
+        let mut tile = state.input.get(projection.guard(state.input.tiling()));
         assert!(
             tile.is_data_function(),
             "RecordWrap: the input must be a function tile, got {tile:?}"
@@ -250,25 +299,63 @@ impl TileProducer for RecordWrapProducer {
         *slot = Tile::record(HashMap::from([(self.name.clone(), values)]));
         tile
     }
-
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release(&self, state: &mut RecordWrapProducer, obsolete_guard: TileGuard) {
         let guard = match &obsolete_guard {
-            g if g.is_universal() => self.input.tiling().universal_guard(),
-            g if g.is_empty() => self.input.tiling().empty_guard(),
+            g if g.is_universal() => state.input.tiling().universal_guard(),
+            g if g.is_empty() => state.input.tiling().empty_guard(),
             // The standing levels name the same keys of the input; at `level` the input is the
             // one field of the record and takes that field's part.
             g => crate::interpreter::tiling::onto_record_field(
                 g.clone(),
                 self.level.index(),
                 &self.name,
-                self.input.tiling(),
+                state.input.tiling(),
             ),
         };
-        self.input.release(guard);
+        state.input.release(guard);
     }
 }
 
 impl TileOperator for Zip {
+    fn runtime_operator(
+        &self,
+        context: &mut crate::interpreter::dispatcher::runtime::RuntimeContext,
+    ) -> Result<crate::interpreter::dispatcher::runtime::RuntimeOperator, String> {
+        use crate::interpreter::dispatcher::runtime::{RuntimeBase, RuntimeOperator};
+        let kernel = self.kernel.clone();
+        let base = RuntimeBase::freeze(&self.base)?;
+        let inputs = self
+            .inputs
+            .iter()
+            .map(|op| op.runtime_operator(context))
+            .collect::<Result<Vec<_>, _>>()?;
+        let partitionable = inputs.iter().all(|op| op.partitionable);
+        let reads = RuntimeOperator::dependencies(&inputs);
+        let sources = RuntimeOperator::sources(&inputs);
+        let regions = RuntimeOperator::regions(&inputs);
+        let region_sources = RuntimeOperator::regional_sources(&inputs);
+        let inner =
+            kernel.level.index() > 1 && inputs.iter().all(|input| input.inner_partitionable);
+        Ok(RuntimeOperator::new(
+            base,
+            self.result_correlation(),
+            move |base, build| {
+                Box::new(Self {
+                    kernel: kernel.clone(),
+                    base: base.thaw(),
+
+                    inputs: inputs.iter().map(|op| op.input(build)).collect(),
+                })
+            },
+            partitionable,
+            reads,
+        )
+        .with_regions(regions)
+        .with_sources(sources)
+        .with_region_sources(region_sources)
+        .with_inner_partitions(inner))
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -283,13 +370,16 @@ impl TileOperator for Zip {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        let consumer =
-            crate::interpreter::notifications::through_values(self.level, self.tiling(), consumer);
+        let consumer = crate::interpreter::notifications::through_values(
+            self.kernel.level,
+            self.tiling(),
+            consumer,
+        );
         let shared = shared_consumer(consumer);
         Box::new(ZipProducer {
+            kernel: self.kernel.clone(),
             base: ProducerBase::new(ZipProducer::alloc_id(), self.tiling(), &self.base, cx),
-            names: self.names.clone(),
-            level: self.level,
+
             held: vec![HashSet::new(); self.inputs.len()],
             emitted: Predicate::False,
             inputs: self
@@ -321,14 +411,16 @@ fn qualify_beneath(tile: &mut Tile, rows: &Predicate) {
 }
 
 /// Producer for [`Zip`]: pulls each input and assembles a record-codomain tile.
-struct ZipProducer {
-    base: ProducerBase,
-    /// Field names in input order, used when producing the output Record tile.
+struct ZipKernel {
     names: Vec<SmolStr>,
+    level: CurryLevel,
+}
+
+struct ZipProducer {
+    kernel: Arc<ZipKernel>,
+    base: ProducerBase,
     /// Live input producers, in field order.
     inputs: Vec<Box<dyn TileProducer>>,
-    /// The level the record sits at ([`Zip`]).
-    level: CurryLevel,
     /// The paths of the rows each arm has held at the pair's enclosing level, on any pull: an
     /// arm gives back only a row it held.
     held: Vec<HashSet<Vec<Value>>>,
@@ -354,14 +446,26 @@ impl TileProducer for ZipProducer {
 
     /// It keeps its input's keys above its level and computes the values beneath it.
     fn restates(&self) -> Restates {
-        Restates::Above(self.level)
+        Restates::Above(self.kernel.level)
     }
 
     /// The arms share the pair's keys, so each arm is pulled at the projection.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let projection = projection_guard.projection_for(self);
+        let kernel = self.kernel.clone();
+        kernel.execute(self, projection_guard)
+    }
+
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        let kernel = self.kernel.clone();
+        kernel.release(self, obsolete_guard)
+    }
+}
+
+impl ZipKernel {
+    fn execute(&self, state: &mut ZipProducer, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection_for(state);
         if projection == Projection::Nothing {
-            return self.tiling().empty_tile();
+            return state.tiling().empty_tile();
         }
         // The presence intersection below runs on every pull, inputs that already agree
         // included: N predicate intersections, N `to_remove` minuses and one `remove_guarded`
@@ -370,7 +474,7 @@ impl TileProducer for ZipProducer {
         // An input's own deleted rows are dropped here and reach no consumer, so each input is
         // released through its own (below); a row only absent from another input may still
         // arrive there, so it is not.
-        let (mut tiles, dropped): (Vec<Tile>, Vec<Option<TileGuard>>) = self
+        let (mut tiles, dropped): (Vec<Tile>, Vec<Option<TileGuard>>) = state
             .inputs
             .iter_mut()
             .map(|i| {
@@ -389,13 +493,13 @@ impl TileProducer for ZipProducer {
         let released: Vec<Option<TileGuard>> = self
             .names
             .iter()
-            .zip(self.inputs.iter())
+            .zip(state.inputs.iter())
             .map(|(name, input)| {
                 // In canonical form, where a release of every cell under a key names the
                 // key, which is what a path is read against.
                 (!input.tiling().values_at(self.level).holds_a_level()).then(|| {
                     TileGuard::flatten_or(vec![crate::interpreter::tiling::onto_record_field(
-                        self.obsolete_guard().clone(),
+                        state.obsolete_guard().clone(),
                         self.level.index(),
                         name,
                         input.tiling(),
@@ -405,7 +509,7 @@ impl TileProducer for ZipProducer {
             .collect();
         // A release covering a row the arm never held, one its input never had, gives
         // nothing back: the row is absent from that arm, and so from the pair.
-        let mut held = std::mem::take(&mut self.held);
+        let mut held = std::mem::take(&mut state.held);
         if let Some(rows_level) = self.level.enclosing() {
             for (arm, tile) in tiles.iter().enumerate() {
                 if tile.is_data_function() {
@@ -667,7 +771,7 @@ impl TileProducer for ZipProducer {
                 };
                 // A row an arm deleted reaches no consumer, so no consumer releases it: the arm
                 // gives it back here and stops tracking it.
-                for (arm, (input, dropped)) in self.inputs.iter_mut().zip(dropped).enumerate() {
+                for (arm, (input, dropped)) in state.inputs.iter_mut().zip(dropped).enumerate() {
                     if let Some(dropped) = dropped {
                         held[arm].retain(|path| !dropped.covers_path(path));
                         input.release(dropped);
@@ -704,7 +808,7 @@ impl TileProducer for ZipProducer {
                 // yet (`src/interpreter/design-operators.md`, "The completeness contract").
                 // So each level beneath the pair is complete only beneath the rows the pair
                 // holds or calls complete.
-                if self
+                if state
                     .inputs
                     .iter()
                     .any(|i| i.tiling().values_at(self.level).holds_a_level())
@@ -729,28 +833,27 @@ impl TileProducer for ZipProducer {
                     let vouched = held.union(domain_predicate);
                     qualify_beneath(out.values_at_mut(self.level), &vouched);
                 }
-                self.held = held;
+                state.held = held;
                 // The arms keep the rows a consumer released only a field of
                 // ([`ZipProducer::release_impl`]), so those cells are taken back out here.
-                if !self.base.obsolete_guard.is_empty() {
-                    out.remove_guarded(self.base.obsolete_guard.clone());
+                if !state.base.obsolete_guard.is_empty() {
+                    out.remove_guarded(state.base.obsolete_guard.clone());
                 }
                 if let (1, Tile::DataFunction { domain, .. }) = (self.level.index(), &out) {
-                    self.emitted = self.emitted.union(&Predicate::from_column_value(domain));
+                    state.emitted = state.emitted.union(&Predicate::from_column_value(domain));
                 }
                 // The completeness intersected above is each arm's, which an arm restating fewer
                 // levels than the projection's states over the region it was pulled at, so it is
                 // cut to the projection.
-                out.restrict_to(&projection, self.tiling());
+                out.restrict_to(&projection, state.tiling());
                 out
             }
             other => panic!("Zip: every input must be a function tile, got {other:?}"),
         }
     }
-
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release(&self, state: &mut ZipProducer, obsolete_guard: TileGuard) {
         let level = self.level.index();
-        let pair = self.base.tiling.values_at(self.level).empty_guard();
+        let pair = state.base.tiling.values_at(self.level).empty_guard();
         // An arm takes the pairs released whole, and a field of a pair it has emitted. A
         // consumer done with one field may be done with it at every row, the rows the pair
         // has not paired yet included, and an arm releasing a row's cells gives the row back:
@@ -759,18 +862,18 @@ impl TileProducer for ZipProducer {
         // levels only whole pairs are passed on.
         let delivered = match level {
             1 => obsolete_guard.intersect(&TileGuard::Function(FunctionGuard::Domain(
-                self.emitted.clone(),
+                state.emitted.clone(),
             ))),
-            _ => self.base.tiling.empty_guard(),
+            _ => state.base.tiling.empty_guard(),
         };
         let whole = TileGuard::flatten_or(vec![whole_pair_rows(
-            self.obsolete_guard().clone(),
+            state.obsolete_guard().clone(),
             0,
             level,
             &pair,
         )]);
         let released = TileGuard::flatten_or(vec![whole.clone(), delivered]);
-        for (name, input) in self.names.iter().zip(self.inputs.iter_mut()) {
+        for (name, input) in self.names.iter().zip(state.inputs.iter_mut()) {
             let guard = match &released {
                 g if g.is_universal() => input.tiling().universal_guard(),
                 g if g.is_empty() => input.tiling().empty_guard(),
@@ -786,13 +889,13 @@ impl TileProducer for ZipProducer {
             };
             input.release(guard);
         }
-        for paths in &mut self.held {
+        for paths in &mut state.held {
             paths.retain(|path| !whole.covers_path(path));
         }
         if whole.is_universal() {
-            self.emitted = Predicate::False;
+            state.emitted = Predicate::False;
         } else if let TileGuard::Function(FunctionGuard::Domain(keys)) = &whole {
-            self.emitted = self.emitted.minus(keys);
+            state.emitted = state.emitted.minus(keys);
         }
     }
 }
@@ -866,9 +969,8 @@ fn align_keyless(values: Tile, cells: &[Option<usize>]) -> (Tile, Option<BitSet>
 /// [`SelectField`] is the eliminator. See `src/interpreter/design-operators.md`, "A product
 /// value is a record of tiles".
 pub struct MakeRecord {
+    kernel: Arc<MakeRecordKernel>,
     base: OperatorBase,
-    /// Field names in input order, used when producing `Tile::Record` tiles.
-    names: Vec<SmolStr>,
     inputs: Vec<Box<dyn TileOperator>>,
 }
 
@@ -901,14 +1003,47 @@ impl MakeRecord {
                 .collect(),
         );
         Self {
+            kernel: Arc::new(MakeRecordKernel { names }),
             base: OperatorBase::new(tiling),
-            names,
+
             inputs,
         }
     }
 }
 
 impl TileOperator for MakeRecord {
+    fn runtime_operator(
+        &self,
+        context: &mut crate::interpreter::dispatcher::runtime::RuntimeContext,
+    ) -> Result<crate::interpreter::dispatcher::runtime::RuntimeOperator, String> {
+        use crate::interpreter::dispatcher::runtime::{RuntimeBase, RuntimeOperator};
+        let kernel = self.kernel.clone();
+        let base = RuntimeBase::freeze(&self.base)?;
+        let inputs = self
+            .inputs
+            .iter()
+            .map(|op| op.runtime_operator(context))
+            .collect::<Result<Vec<_>, _>>()?;
+        let partitionable = inputs.iter().all(|op| op.partitionable);
+        let reads = RuntimeOperator::dependencies(&inputs);
+        let sources = RuntimeOperator::sources(&inputs);
+        Ok(RuntimeOperator::new(
+            base,
+            self.result_correlation(),
+            move |base, build| {
+                Box::new(Self {
+                    kernel: kernel.clone(),
+                    base: base.thaw(),
+
+                    inputs: inputs.iter().map(|op| op.input(build)).collect(),
+                })
+            },
+            partitionable,
+            reads,
+        )
+        .with_sources(sources))
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -925,13 +1060,14 @@ impl TileOperator for MakeRecord {
     ) -> Box<dyn TileProducer> {
         let shared = shared_consumer(consumer);
         Box::new(MakeRecordProducer {
+            kernel: self.kernel.clone(),
             base: ProducerBase::new(
                 MakeRecordProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
                 cx,
             ),
-            names: self.names.clone(),
+
             inputs: self
                 .inputs
                 .iter_mut()
@@ -943,9 +1079,13 @@ impl TileOperator for MakeRecord {
 
 /// Producer for [`MakeRecord`]: pulls every operand and builds a `Tile::Record` of their
 /// tiles.
-struct MakeRecordProducer {
-    base: ProducerBase,
+struct MakeRecordKernel {
     names: Vec<SmolStr>,
+}
+
+struct MakeRecordProducer {
+    kernel: Arc<MakeRecordKernel>,
+    base: ProducerBase,
     inputs: Vec<Box<dyn TileProducer>>,
 }
 
@@ -967,21 +1107,33 @@ impl TileProducer for MakeRecordProducer {
     /// A record of values has no keys to project: the projection is the whole record or
     /// nothing, and a guard naming keys is a consumer's bug.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        match projection_guard.projection(&self.name()) {
+        let kernel = self.kernel.clone();
+        kernel.execute(self, projection_guard)
+    }
+
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        let kernel = self.kernel.clone();
+        kernel.release(self, obsolete_guard)
+    }
+}
+
+impl MakeRecordKernel {
+    fn execute(&self, state: &mut MakeRecordProducer, projection_guard: TileGuard) -> Tile {
+        match projection_guard.projection(&state.name()) {
             Projection::Everything => {}
-            Projection::Nothing => return self.tiling().empty_tile(),
+            Projection::Nothing => return state.tiling().empty_tile(),
             Projection::Keys { .. } => panic!(
                 "{} is a record of values, which has no keys to project: {projection_guard:?}",
-                self.name()
+                state.name()
             ),
         }
         // Every operand is pulled whole ([`SelectFieldProducer`] says why a pull naming one
-        // field is unsound). An operand withholds what [`Self::release_impl`] told it a
+        // field is unsound). An operand withholds what [`MakeRecordProducer::release_impl`] told it a
         // consumer finished with, so a field that settled early is not re-delivered.
         let fields: HashMap<SmolStr, Tile> = self
             .names
             .iter()
-            .zip(self.inputs.iter_mut())
+            .zip(state.inputs.iter_mut())
             .map(|(name, input)| {
                 let tile = input.get(input.tiling().universal_guard());
                 (name.clone(), tile)
@@ -989,27 +1141,26 @@ impl TileProducer for MakeRecordProducer {
             .collect();
         Tile::record(fields)
     }
-
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release(&self, state: &mut MakeRecordProducer, obsolete_guard: TileGuard) {
         // A record guard names one guard per field, and each goes to that field's operand.
         // A later pull re-reads every operand, and each withholds what it was told.
         match &obsolete_guard {
             g if g.is_empty() => {}
             TileGuard::Record(fields) => {
-                for (name, input) in self.names.iter().zip(self.inputs.iter_mut()) {
+                for (name, input) in self.names.iter().zip(state.inputs.iter_mut()) {
                     if let Some(field) = fields.get(name) {
                         input.release(field.clone());
                     }
                 }
             }
             g if g.is_universal() => {
-                for input in self.inputs.iter_mut() {
+                for input in state.inputs.iter_mut() {
                     input.release(input.tiling().universal_guard());
                 }
             }
             other => panic!(
                 "{} cannot honor the release guard {other:?}, which does not name its fields",
-                self.name()
+                state.name()
             ),
         }
     }
@@ -1022,11 +1173,10 @@ impl TileProducer for MakeRecordProducer {
 /// at a time, so every field must fit in a column. See
 /// `src/interpreter/design-operators.md`, "A product value is a record of tiles".
 pub struct SelectField {
+    kernel: Arc<SelectFieldKernel>,
     base: OperatorBase,
     /// The product whose field this selects.
     input: Box<dyn TileOperator>,
-    /// The field's name — `_0`, `_1`, … for a tuple.
-    name: SmolStr,
 }
 
 /// Restate a selector's release at field `name` in the product `tiling`.
@@ -1112,14 +1262,52 @@ impl SelectField {
         let name = name.into();
         let tiling = select_field_tiling(input.tiling(), &name);
         Self {
+            kernel: Arc::new(SelectFieldKernel { name }),
             base: OperatorBase::new(tiling),
             input,
-            name,
         }
     }
 }
 
 impl TileOperator for SelectField {
+    fn runtime_operator(
+        &self,
+        context: &mut crate::interpreter::dispatcher::runtime::RuntimeContext,
+    ) -> Result<crate::interpreter::dispatcher::runtime::RuntimeOperator, String> {
+        use crate::interpreter::dispatcher::runtime::{RuntimeBase, RuntimeOperator};
+        let kernel = self.kernel.clone();
+        let base = RuntimeBase::freeze(&self.base)?;
+        let input = self.input.runtime_operator(context)?;
+        let partitionable = input.partitionable;
+        let reads = RuntimeOperator::dependencies([&input]);
+        let sources = RuntimeOperator::sources([&input]);
+        let mut regions = RuntimeOperator::regions([&input]);
+        if !self.input.tiling().is_data_function() {
+            regions.clear();
+        }
+        let mut region_sources = RuntimeOperator::regional_sources([&input]);
+        if !self.input.tiling().is_data_function() {
+            region_sources.clear();
+        }
+        Ok(RuntimeOperator::new(
+            base,
+            self.result_correlation(),
+            move |base, build| {
+                Box::new(Self {
+                    kernel: kernel.clone(),
+                    base: base.thaw(),
+
+                    input: input.input(build),
+                })
+            },
+            partitionable,
+            reads,
+        )
+        .with_regions(regions)
+        .with_sources(sources)
+        .with_region_sources(region_sources))
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -1143,6 +1331,7 @@ impl TileOperator for SelectField {
             cx,
         );
         Box::new(SelectFieldProducer {
+            kernel: self.kernel.clone(),
             base: ProducerBase::new(
                 SelectFieldProducer::alloc_id(),
                 self.tiling(),
@@ -1150,7 +1339,7 @@ impl TileOperator for SelectField {
                 cx,
             ),
             input: input_producer,
-            name: self.name.clone(),
+
             input_tiling,
         })
     }
@@ -1159,7 +1348,7 @@ impl TileOperator for SelectField {
     /// application reports for the same projection.
     fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
         let mut correlation = self.input.result_correlation()?;
-        correlation.push(TilePathStep::Record(self.name.clone()));
+        correlation.push(TilePathStep::Record(self.kernel.name.clone()));
         Some(correlation)
     }
 }
@@ -1173,17 +1362,21 @@ impl TileOperator for SelectField {
 /// of the stream the field sits under, since a key brings every field of its record. A
 /// release names this field's part; enclosing keys release their whole records
 /// ([`guard_at_field`]).
+struct SelectFieldKernel {
+    name: SmolStr,
+}
+
 struct SelectFieldProducer {
+    kernel: Arc<SelectFieldKernel>,
     base: ProducerBase,
     input: Box<dyn TileProducer>,
-    name: SmolStr,
     /// The product's tiling, for naming this field in a guard travelling upward.
     input_tiling: Tiling,
 }
 
 impl SelectFieldProducer {
     fn at_field(&self, guard: TileGuard) -> TileGuard {
-        guard_at_field(&self.input_tiling, &self.name, guard)
+        guard_at_field(&self.input_tiling, &self.kernel.name, guard)
     }
 }
 
@@ -1212,15 +1405,27 @@ impl TileProducer for SelectFieldProducer {
     /// projection. A product of collections has no projection guard of its own: it is pulled
     /// whole, and the field cut after.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let projection = projection_guard.projection_for(self);
+        let kernel = self.kernel.clone();
+        kernel.execute(self, projection_guard)
+    }
+
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        let kernel = self.kernel.clone();
+        kernel.release(self, obsolete_guard)
+    }
+}
+
+impl SelectFieldKernel {
+    fn execute(&self, state: &mut SelectFieldProducer, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection_for(state);
         if projection == Projection::Nothing {
-            return self.tiling().empty_tile();
+            return state.tiling().empty_tile();
         }
-        let input_guard = match self.input.tiling().is_data_function() {
-            true => projection.guard(self.input.tiling()),
-            false => self.input.tiling().universal_guard(),
+        let input_guard = match state.input.tiling().is_data_function() {
+            true => projection.guard(state.input.tiling()),
+            false => state.input.tiling().universal_guard(),
         };
-        let mut tile = self.input.get(input_guard);
+        let mut tile = state.input.get(input_guard);
         // A row holding no cell of this field gave that cell back to this reader's release
         // (`Tile::Record`'s `absent`), and the field is the whole value here, so the row
         // leaves with it. The record gathers its other fields' cells along.
@@ -1230,7 +1435,7 @@ impl TileProducer for SelectFieldProducer {
         };
         if let Some(missing) = missing {
             let rows = tile.deepest_values().rows();
-            let level = CurryLevel::innermost_of(self.input.tiling())
+            let level = CurryLevel::innermost_of(state.input.tiling())
                 .expect("only a record beneath a level holds no cell at a row");
             tile.values_at_mut(level).retain_keys(
                 &(0..rows)
@@ -1255,19 +1460,18 @@ impl TileProducer for SelectFieldProducer {
         // ([`guard_at_field`]), so it can still hold what this consumer released. The
         // field's own deleted rows are dropped too and reach no consumer, so they are released.
         let dropped = tile.deleted_keys_guard();
-        tile.remove_guarded(self.obsolete_guard().clone());
+        tile.remove_guarded(state.obsolete_guard().clone());
         tile.compact();
         if let Some(dropped) = dropped {
-            let at_field = self.at_field(dropped);
-            self.input.release(at_field);
+            let at_field = state.at_field(dropped);
+            state.input.release(at_field);
         }
-        tile.restrict_to(&projection, self.tiling());
+        tile.restrict_to(&projection, state.tiling());
         tile
     }
-
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        let released = self.at_field(obsolete_guard);
-        self.input.release(released);
+    fn release(&self, state: &mut SelectFieldProducer, obsolete_guard: TileGuard) {
+        let released = state.at_field(obsolete_guard);
+        state.input.release(released);
     }
 }
 
@@ -1326,9 +1530,12 @@ mod tests {
         );
         let out_tiling = with_values_at(&input_tiling, level, record);
         let producer = RecordWrapProducer {
+            kernel: Arc::new(RecordWrapKernel {
+                name: SmolStr::new(name),
+                level,
+            }),
             base: ProducerBase::unowned(RecordWrapProducer::alloc_id(), &out_tiling),
-            name: SmolStr::new(name),
-            level,
+
             input: Box::new(spy),
         };
         (producer, log)
@@ -1441,8 +1648,11 @@ mod tests {
         }
         let out_tiling = Tiling::Record((0..2).map(|i| (tuple_field(i), tiling.clone())).collect());
         let mut producer = MakeRecordProducer {
+            kernel: Arc::new(MakeRecordKernel {
+                names: (0..2).map(tuple_field).collect(),
+            }),
             base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out_tiling),
-            names: (0..2).map(tuple_field).collect(),
+
             inputs,
         };
 
@@ -1463,8 +1673,11 @@ mod tests {
         let (spy, log) = ReleaseSpy::new(Tile::Scalar(ColumnValue::Ints(vec![1])), tiling.clone());
         let out_tiling = Tiling::Record([(tuple_field(0), tiling.clone())].into_iter().collect());
         let mut producer = MakeRecordProducer {
+            kernel: Arc::new(MakeRecordKernel {
+                names: vec![tuple_field(0)],
+            }),
             base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out_tiling),
-            names: vec![tuple_field(0)],
+
             inputs: vec![Box::new(spy)],
         };
 
@@ -1499,8 +1712,11 @@ mod tests {
         let out_tiling =
             Tiling::Record(names.iter().map(|n| (n.clone(), tiling.clone())).collect());
         let mut producer = MakeRecordProducer {
+            kernel: Arc::new(MakeRecordKernel {
+                names: names.clone(),
+            }),
             base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out_tiling),
-            names: names.clone(),
+
             inputs,
         };
 
@@ -1602,9 +1818,10 @@ mod tests {
         );
         let output_tiling = select_field_tiling(&input_tiling, "a");
         let mut producer = SelectFieldProducer {
+            kernel: Arc::new(SelectFieldKernel { name: "a".into() }),
             base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &output_tiling),
             input: Box::new(spy),
-            name: "a".into(),
+
             input_tiling,
         };
         let rows = TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(Value::UInt(
@@ -1700,9 +1917,10 @@ mod tests {
             input_tiling.clone(),
         );
         let mut producer = SelectFieldProducer {
+            kernel: Arc::new(SelectFieldKernel { name: "xs".into() }),
             base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &field_tiling),
             input: Box::new(spy),
-            name: "xs".into(),
+
             input_tiling,
         };
         producer.read_in_pipeline(producer.tiling().universal_guard());
@@ -1754,9 +1972,10 @@ mod tests {
             BitSet::new(),
         );
         let mut producer = SelectFieldProducer {
+            kernel: Arc::new(SelectFieldKernel { name: "a".into() }),
             base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &field_tiling),
             input: Box::new(TestTileProducer::new(input, input_tiling.clone())),
-            name: "a".into(),
+
             input_tiling,
         };
         let out = producer.read_in_pipeline(producer.tiling().universal_guard());
@@ -1788,11 +2007,15 @@ mod tests {
         let (spy_a, log_a) = ReleaseSpy::new(filtered_collection(), input_tiling.clone());
         let (spy_b, log_b) = ReleaseSpy::new(filtered_collection(), input_tiling);
         let mut zip = ZipProducer {
-            level: CurryLevel::new(1),
+            kernel: Arc::new(ZipKernel {
+                names: vec!["a".into(), "b".into()],
+                level: CurryLevel::new(1),
+            }),
+
             held: vec![HashSet::new(); 2],
             emitted: Predicate::False,
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &output_tiling),
-            names: vec!["a".into(), "b".into()],
+
             inputs: vec![Box::new(spy_a), Box::new(spy_b)],
         };
         zip.read_in_pipeline(zip.tiling().universal_guard());
@@ -1838,11 +2061,15 @@ mod tests {
             ])),
         );
         let mut zip = ZipProducer {
-            level: CurryLevel::new(1),
+            kernel: Arc::new(ZipKernel {
+                names: vec!["a".into(), "b".into()],
+                level: CurryLevel::new(1),
+            }),
+
             held: vec![HashSet::new(); 2],
             emitted: Predicate::False,
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &output_tiling),
-            names: vec!["a".into(), "b".into()],
+
             inputs: vec![
                 Box::new(TestTileProducer::new(tile_a, input_tiling.clone())),
                 Box::new(TestTileProducer::new(tile_b, input_tiling)),
@@ -1918,10 +2145,14 @@ mod tests {
         );
         let (spy1, _) = QuietSpy::new(arm(vec![50, 60], Predicate::False), arm_tiling);
         let mut zip = ZipProducer {
+            kernel: Arc::new(ZipKernel {
+                names: vec![tuple_field(0), tuple_field(1)],
+                level: CurryLevel::new(1),
+            }),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
-            names: vec![tuple_field(0), tuple_field(1)],
+
             inputs: vec![Box::new(spy0), Box::new(spy1)],
-            level: CurryLevel::new(1),
+
             emitted: Predicate::False,
             held: vec![HashSet::new(); 2],
         };
@@ -1974,10 +2205,14 @@ mod tests {
         let (spy0, released0) = QuietSpy::new(arm0, arm0_tiling.clone());
         let (spy1, released1) = QuietSpy::new(arm1, arm1_tiling.clone());
         let mut zip = ZipProducer {
+            kernel: Arc::new(ZipKernel {
+                names: vec![tuple_field(0), tuple_field(1)],
+                level: CurryLevel::new(1),
+            }),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
-            names: vec![tuple_field(0), tuple_field(1)],
+
             inputs: vec![Box::new(spy0), Box::new(spy1)],
-            level: CurryLevel::new(1),
+
             held: vec![HashSet::new(); 2],
             emitted: Predicate::False,
         };
@@ -2069,10 +2304,14 @@ mod tests {
         let (spy0, released0) = QuietSpy::new(arm0, arm_tiling.clone());
         let (spy1, _) = QuietSpy::new(arm1, arm_tiling);
         let mut zip = ZipProducer {
+            kernel: Arc::new(ZipKernel {
+                names: vec![tuple_field(0), tuple_field(1)],
+                level: CurryLevel::new(1),
+            }),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
-            names: vec![tuple_field(0), tuple_field(1)],
+
             inputs: vec![Box::new(spy0), Box::new(spy1)],
-            level: CurryLevel::new(1),
+
             held: vec![HashSet::new(); 2],
             emitted: Predicate::False,
         };
@@ -2182,10 +2421,14 @@ mod tests {
             })
         };
         let mut zip = ZipProducer {
+            kernel: Arc::new(ZipKernel {
+                names: vec![tuple_field(0), tuple_field(1)],
+                level: CurryLevel::new(1),
+            }),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
-            names: vec![tuple_field(0), tuple_field(1)],
+
             inputs: vec![scripted(&arm0), scripted(&arm1)],
-            level: CurryLevel::new(1),
+
             held: vec![HashSet::new(); 2],
             emitted: Predicate::False,
         };
@@ -2251,10 +2494,14 @@ mod tests {
         let (spy0, _) = QuietSpy::new(arm0_tiling.empty_tile(), arm0_tiling.clone());
         let (spy1, _) = QuietSpy::new(arm1, arm1_tiling);
         let mut zip = ZipProducer {
+            kernel: Arc::new(ZipKernel {
+                names: vec![tuple_field(0), tuple_field(1)],
+                level: CurryLevel::new(2),
+            }),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
-            names: vec![tuple_field(0), tuple_field(1)],
+
             inputs: vec![Box::new(spy0), Box::new(spy1)],
-            level: CurryLevel::new(2),
+
             emitted: Predicate::False,
             // Arm `_0` held both rows before the consumer released its field, so it gives them
             // back rather than lacking them.
@@ -2372,10 +2619,14 @@ mod tests {
         let (spy0, _) = QuietSpy::new(arm0, arm0_tiling);
         let (spy1, _) = QuietSpy::new(arm1, arm1_tiling);
         let mut zip = ZipProducer {
+            kernel: Arc::new(ZipKernel {
+                names: vec![tuple_field(0), tuple_field(1)],
+                level: CurryLevel::new(2),
+            }),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
-            names: vec![tuple_field(0), tuple_field(1)],
+
             inputs: vec![Box::new(spy0), Box::new(spy1)],
-            level: CurryLevel::new(2),
+
             emitted: Predicate::False,
             held: vec![HashSet::new(); 2],
         };
@@ -2433,9 +2684,12 @@ mod projection_tests {
         );
         (
             RecordWrapProducer {
+                kernel: Arc::new(RecordWrapKernel {
+                    name: SmolStr::new("a"),
+                    level: CurryLevel::new(1),
+                }),
                 base: ProducerBase::unowned(RecordWrapProducer::alloc_id(), &out),
-                name: SmolStr::new("a"),
-                level: CurryLevel::new(1),
+
                 input: Box::new(input),
             },
             pulled,
@@ -2496,9 +2750,12 @@ mod projection_tests {
         let (input, pulled, _) = ProjectionSpy::new(rows, in_tiling.clone());
         (
             SelectFieldProducer {
+                kernel: Arc::new(SelectFieldKernel {
+                    name: SmolStr::new("amount"),
+                }),
                 base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &ints()),
                 input: Box::new(input),
-                name: SmolStr::new("amount"),
+
                 input_tiling: in_tiling,
             },
             pulled,
@@ -2544,9 +2801,12 @@ mod projection_tests {
             let (input, pulled, _) = ProjectionSpy::new(product, product_tiling.clone());
             (
                 SelectFieldProducer {
+                    kernel: Arc::new(SelectFieldKernel {
+                        name: SmolStr::new("a"),
+                    }),
                     base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &ints()),
                     input: Box::new(input),
-                    name: SmolStr::new("a"),
+
                     input_tiling: product_tiling.clone(),
                 },
                 pulled,
@@ -2577,10 +2837,14 @@ mod projection_tests {
         );
         (
             ZipProducer {
+                kernel: Arc::new(ZipKernel {
+                    names: vec![tuple_field(0), tuple_field(1)],
+                    level: CurryLevel::new(1),
+                }),
                 base: ProducerBase::unowned(ZipProducer::alloc_id(), &out),
-                names: vec![tuple_field(0), tuple_field(1)],
+
                 inputs: vec![Box::new(a), Box::new(b)],
-                level: CurryLevel::new(1),
+
                 emitted: Predicate::False,
                 held: vec![HashSet::new(); 2],
             },
@@ -2664,8 +2928,11 @@ mod projection_tests {
         );
         (
             MakeRecordProducer {
+                kernel: Arc::new(MakeRecordKernel {
+                    names: vec![SmolStr::new("a"), SmolStr::new("b")],
+                }),
                 base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out),
-                names: vec![SmolStr::new("a"), SmolStr::new("b")],
+
                 inputs: vec![Box::new(a), Box::new(b)],
             },
             a_pulled,

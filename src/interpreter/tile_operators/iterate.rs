@@ -47,6 +47,32 @@ impl IterateExtent {
 }
 
 impl TileOperator for IterateExtent {
+    fn runtime_operator(
+        &self,
+        _context: &mut crate::interpreter::dispatcher::runtime::RuntimeContext,
+    ) -> Result<crate::interpreter::dispatcher::runtime::RuntimeOperator, String> {
+        use crate::interpreter::dispatcher::runtime::{
+            RuntimeBase, RuntimeExtent, RuntimeOperator,
+        };
+        let base = RuntimeBase::freeze(&self.base)?;
+        let extent = RuntimeExtent::freeze(&self.extent)?;
+        if !extent.finite_iteration() {
+            return Err("parallel iteration requires an enumerable finite extent".into());
+        }
+        Ok(RuntimeOperator::new(
+            base,
+            self.result_correlation(),
+            move |base, _build| {
+                Box::new(Self {
+                    base: base.thaw(),
+                    extent: extent.thaw(),
+                })
+            },
+            true,
+            Vec::new(),
+        ))
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
