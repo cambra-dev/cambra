@@ -12,7 +12,7 @@ use super::serving::{compile_sink, exchange, http_post, reserve_test_port};
 fn http_accumulator() {
     let port = reserve_test_port();
     let source = include_str!("program.cambra").replace("{PORT}", &port.to_string());
-    let (mut ctx, _program) = compile_sink(&source);
+    let mut ctx = compile_sink(&source);
 
     // Each POST adds an entry; the response is the full guestbook so far.
     let actual = exchange(&mut ctx, move || {

@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
 
@@ -190,8 +192,7 @@ impl TileOperator for RecordWrap {
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let consumer =
-            crate::interpreter::scheduler::through_values(self.level, self.tiling(), consumer);
-        // The input is pulled at the projection.
+            crate::interpreter::notifications::through_values(self.level, self.tiling(), consumer);
         let input = self
             .input
             .subscribe(self.input.tiling().universal_guard(), consumer, cx);
@@ -283,11 +284,10 @@ impl TileOperator for Zip {
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let consumer =
-            crate::interpreter::scheduler::through_values(self.level, self.tiling(), consumer);
-        let (shared, gate) = shared_consumer(consumer);
+            crate::interpreter::notifications::through_values(self.level, self.tiling(), consumer);
+        let shared = shared_consumer(consumer);
         Box::new(ZipProducer {
-            base: ProducerBase::new(ZipProducer::alloc_id(), self.tiling(), &self.base, cx)
-                .sharing(gate),
+            base: ProducerBase::new(ZipProducer::alloc_id(), self.tiling(), &self.base, cx),
             names: self.names.clone(),
             level: self.level,
             held: vec![HashSet::new(); self.inputs.len()],
@@ -993,15 +993,14 @@ impl TileOperator for MakeRecord {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        let (shared, gate) = shared_consumer(consumer);
+        let shared = shared_consumer(consumer);
         Box::new(MakeRecordProducer {
             base: ProducerBase::new(
                 MakeRecordProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
                 cx,
-            )
-            .sharing(gate),
+            ),
             names: self.names.clone(),
             inputs: self
                 .inputs
@@ -1361,6 +1360,66 @@ mod nested_projection_tests {
         });
     }
 
+    /// A `Zip` pairing beneath its outermost level passes what an arm notifies through
+    /// `through_values`: a change of an inner row reaches its consumer as that row's group, and a
+    /// complete region passes only the groups it names whole. `through_values` itself is tested in
+    /// `notifications.rs`; this pins that the `Zip` subscribes its arms through it. Forwarded
+    /// unchanged, an inner row's region names keys beneath the pair, which are no keys of the
+    /// `Zip` (`a_tuple_of_a_fold_and_a_collection_the_filter_empties_for_some_groups`).
+    #[test]
+    fn a_zip_restates_an_arms_inner_rows_as_the_groups_it_pairs() {
+        use crate::interpreter::tile_operators::test_helpers::{
+            InputConsumer, NotifyingOp, RegionLog, notify_input,
+        };
+        use crate::interpreter::{Predicate, Value};
+        let (tile, tiling) = two_levels_of_ints();
+        let (left, left_consumer) = NotifyingOp::new(tile.clone(), tiling.clone());
+        let (right, _) = NotifyingOp::new(tile, tiling.clone());
+        let mut zip = Zip::new_at(
+            vec!["a".into(), "b".into()],
+            vec![Box::new(left), Box::new(right)],
+            CurryLevel::new(1),
+        );
+        let (log, regions) = RegionLog::new();
+        let mut cx = SubscribeContext::new();
+        let _producer = zip.subscribe(tiling.empty_guard(), Box::new(log), &mut cx);
+        let row = Projection::of_path(&[Value::UInt(0), Value::UInt(1)]);
+        let group = Projection::admitting(Predicate::point(Value::UInt(0)));
+
+        regions.borrow_mut().clear();
+        notify_input(&left_consumer, &row);
+        assert_eq!(
+            *regions.borrow(),
+            std::slice::from_ref(&group),
+            "a change of a row names its group"
+        );
+
+        let complete = |consumer: &InputConsumer, region: &Projection| {
+            let mut landing = crate::interpreter::dispatcher::Landing::probe_complete(
+                crate::interpreter::dispatcher::PipelineId(0),
+            );
+            consumer
+                .borrow_mut()
+                .as_mut()
+                .expect("the arm was subscribed")
+                .notify(region, &mut landing);
+        };
+        regions.borrow_mut().clear();
+        complete(&left_consumer, &row);
+        assert_eq!(
+            *regions.borrow(),
+            [Projection::Nothing],
+            "a complete row of a group completes no group"
+        );
+        regions.borrow_mut().clear();
+        complete(&left_consumer, &group);
+        assert_eq!(
+            *regions.borrow(),
+            [group],
+            "a complete group completes the pair's group"
+        );
+    }
+
     #[test]
     fn a_zip_beneath_two_levels_answers_a_projection_of_paths() {
         assert_conforms_beneath(|| {
@@ -1422,7 +1481,7 @@ mod tests {
     fn record_wrap_keeps_the_keys_and_wraps_the_values() {
         let (tile, tiling) = keyed_ints();
         let (mut producer, _) = record_wrap_over(tile, tiling, "f");
-        let wrapped = producer.get(producer.tiling().universal_guard());
+        let wrapped = producer.read_in_pipeline(producer.tiling().universal_guard());
         let Tile::DataFunction {
             domain, codomain, ..
         } = &wrapped
@@ -1776,7 +1835,7 @@ mod tests {
             name: "xs".into(),
             input_tiling,
         };
-        producer.get(producer.tiling().universal_guard());
+        producer.read_in_pipeline(producer.tiling().universal_guard());
         assert!(
             log.borrow()
                 .iter()
@@ -1830,7 +1889,7 @@ mod tests {
             name: "a".into(),
             input_tiling,
         };
-        let out = producer.get(producer.tiling().universal_guard());
+        let out = producer.read_in_pipeline(producer.tiling().universal_guard());
         let Tile::DataFunction {
             domain, codomain, ..
         } = &out
@@ -1866,7 +1925,7 @@ mod tests {
             names: vec!["a".into(), "b".into()],
             inputs: vec![Box::new(spy_a), Box::new(spy_b)],
         };
-        zip.get(zip.tiling().universal_guard());
+        zip.read_in_pipeline(zip.tiling().universal_guard());
         for log in [log_a, log_b] {
             assert!(
                 log.borrow().iter().any(|g| names_key(g, 1, 0)),
@@ -1920,7 +1979,7 @@ mod tests {
             ],
         };
 
-        let result = zip.get(zip.tiling().universal_guard());
+        let result = zip.read_in_pipeline(zip.tiling().universal_guard());
         let Tile::DataFunction {
             domain, codomain, ..
         } = result
@@ -1996,7 +2055,9 @@ mod tests {
             emitted: Predicate::False,
             held: vec![HashSet::new(); 2],
         };
-        let Tile::DataFunction { absent_keys, .. } = zip.get(out_tiling.universal_guard()) else {
+        let Tile::DataFunction { absent_keys, .. } =
+            zip.read_in_pipeline(out_tiling.universal_guard())
+        else {
             panic!("the zip is a collection")
         };
         assert!(absent_keys.contains(&Value::UInt(7)), "{absent_keys:?}");
@@ -2050,7 +2111,7 @@ mod tests {
             held: vec![HashSet::new(); 2],
             emitted: Predicate::False,
         };
-        let out = zip.get(out_tiling.universal_guard());
+        let out = zip.read_in_pipeline(out_tiling.universal_guard());
         let guard = out.to_guard();
         zip.release(guard.clone());
         // Key 0 is open, since the collection arm can still grow under it. The scalar arm's
@@ -2075,7 +2136,7 @@ mod tests {
         // The row stays while its collection is open, holding no cell of the scalar field.
         let Tile::DataFunction {
             domain, codomain, ..
-        } = zip.get(out_tiling.universal_guard())
+        } = zip.read_in_pipeline(out_tiling.universal_guard())
         else {
             panic!("the zip is a collection")
         };
@@ -2145,7 +2206,7 @@ mod tests {
             held: vec![HashSet::new(); 2],
             emitted: Predicate::False,
         };
-        zip.get(out_tiling.universal_guard());
+        zip.read_in_pipeline(out_tiling.universal_guard());
         // A consumer done with field `_0` at every row.
         zip.release(TileGuard::Function(FunctionGuard::Codomain(Box::new(
             TileGuard::Record(HashMap::from([
@@ -2258,11 +2319,11 @@ mod tests {
             held: vec![HashSet::new(); 2],
             emitted: Predicate::False,
         };
-        zip.get(out_tiling.universal_guard());
+        zip.read_in_pipeline(out_tiling.universal_guard());
         assert!(zip.held[0].contains(&vec![Value::UInt(1)]));
         // Arm 0 deletes row 1, and the consumer releases row 0, the pair it saw.
         *arm0.borrow_mut() = rows(vec![0, 1], BitSet::from_iter([1]));
-        zip.get(out_tiling.universal_guard());
+        zip.read_in_pipeline(out_tiling.universal_guard());
         zip.release(TileGuard::Function(FunctionGuard::Domain(
             Predicate::exactly(&[Value::UInt(0)]),
         )));
@@ -2414,7 +2475,7 @@ mod tests {
                 TileGuard::Function(FunctionGuard::Domain(Predicate::False)),
             ),
         ]))));
-        let out = zip.get(out_tiling.universal_guard());
+        let out = zip.read_in_pipeline(out_tiling.universal_guard());
         let Tile::DataFunction { domain, .. } = &out else {
             panic!("the zip is a collection")
         };
@@ -2514,7 +2575,8 @@ mod tests {
             emitted: Predicate::False,
             held: vec![HashSet::new(); 2],
         };
-        let Tile::DataFunction { domain, .. } = zip.get(out_tiling.universal_guard()) else {
+        let Tile::DataFunction { domain, .. } = zip.read_in_pipeline(out_tiling.universal_guard())
+        else {
             panic!("the zip is a collection")
         };
         assert_eq!(
@@ -2579,7 +2641,7 @@ mod projection_tests {
     #[test]
     fn a_wrapped_stream_pulls_its_input_at_the_morsel() {
         let (mut wrap, pulled) = wrapped();
-        let morsel = wrap.get(keys_between(2, 4));
+        let morsel = wrap.read_in_pipeline(keys_between(2, 4));
         let Tile::DataFunction { domain, .. } = &morsel else {
             panic!("a collection")
         };
@@ -2642,7 +2704,7 @@ mod projection_tests {
     #[test]
     fn a_field_of_a_record_stream_is_read_at_the_morsel() {
         let (mut select, pulled) = amounts_of_records();
-        let morsel = select.get(keys_between(1, 3));
+        let morsel = select.read_in_pipeline(keys_between(1, 3));
         assert_eq!(int_entries(&morsel), [(1, 101), (2, 102), (3, 103)]);
         assert_eq!(*pulled.borrow(), [keys_between(1, 3)]);
     }
@@ -2687,7 +2749,7 @@ mod projection_tests {
             )
         };
         let (mut select, pulled) = make();
-        let morsel = select.get(keys_between(2, 3));
+        let morsel = select.read_in_pipeline(keys_between(2, 3));
         assert_eq!(int_entries(&morsel), [(2, 2), (3, 3)]);
         assert_eq!(*pulled.borrow(), [product_tiling.universal_guard()]);
         assert_conforms(|| Box::new(make().0), keys_between(2, 3));
@@ -2727,7 +2789,7 @@ mod projection_tests {
     #[test]
     fn a_pair_of_streams_pulls_each_arm_at_the_morsel() {
         let (mut zip, a_pulled, b_pulled) = pair(ROWS as usize);
-        let morsel = zip.get(keys_between(2, 4));
+        let morsel = zip.read_in_pipeline(keys_between(2, 4));
         let Tile::DataFunction {
             domain,
             domain_predicate,
@@ -2750,7 +2812,7 @@ mod projection_tests {
     #[test]
     fn a_morsel_past_a_lagging_arm_pairs_the_common_keys_and_states_them_complete() {
         let (mut zip, _, _) = pair(4);
-        let morsel = zip.get(keys_between(2, 6));
+        let morsel = zip.read_in_pipeline(keys_between(2, 6));
         let Tile::DataFunction {
             domain,
             domain_predicate,
@@ -2833,7 +2895,7 @@ mod projection_tests {
     #[should_panic(expected = "a record of values, which has no keys to project")]
     fn a_projection_of_keys_is_refused_by_a_record_of_values() {
         let (mut record, _, _) = two_values();
-        record.get(keys_between(0, 1));
+        record.read_in_pipeline(keys_between(0, 1));
     }
 
     #[test]

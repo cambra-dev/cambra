@@ -1515,6 +1515,60 @@ fn a_tuple_of_a_collection_and_a_fold_over_each_group() {
     );
 }
 
+/// A tuple of a filtered collection and a fold over each group, where the filter empties the
+/// collection of two groups: `east` and `north` keep no row of it, and with the fold filtered too
+/// they sum to 0. A group itself is never empty; an emptied inner collection is the nearest case.
+/// The pipeline helper runs each `sales` row as its own morsel (`run_pipeline`), so the collection
+/// arm's rows reach the tuple's `Zip` one at a time, beneath the group keys it pairs at
+/// (`src/interpreter/notifications.rs`, `through_values`).
+#[rstest]
+#[case::a_filtered_collection(
+    "sum([s.amount for s in g])",
+    vec![50, 7, 300],
+)]
+#[case::a_filtered_collection_and_fold(
+    "sum([s.amount for s in g if s.qty > 1])",
+    vec![0, 0, 300],
+)]
+fn a_tuple_of_a_fold_and_a_collection_the_filter_empties_for_some_groups(
+    #[case] fold: &str,
+    #[case] sums: Vec<i64>,
+) {
+    check_tile(
+        &formatdoc! {r#"
+            sales = [
+                (region="west", amount=100, qty=2),
+                (region="east", amount=50,  qty=1),
+                (region="west", amount=200, qty=4),
+                (region="north", amount=7,  qty=0),
+            ]
+            [([s.qty for s in g if s.qty > 1], {fold}) for g in groupby(sales, \r -> r.region)]
+        "#},
+        Tile::data_function(
+            ColumnValue::strings(&["east", "north", "west"]),
+            Box::new(Tile::record(HashMap::from([
+                (
+                    "_0".into(),
+                    // The groups' rows state no completeness of their own. Every group key is
+                    // complete, and a complete key is complete beneath it (`Tile::completion_at`),
+                    // so this `False` is a detail of how the answer states it, not of what is
+                    // complete.
+                    Tile::grouped(
+                        vec![0, 0, 0],
+                        ColumnValue::from_uints(vec![0, 2]),
+                        Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 4]))),
+                        Predicate::False,
+                        BitSet::new(),
+                    ),
+                ),
+                ("_1".into(), Tile::Scalar(ColumnValue::Ints(sums))),
+            ]))),
+            Predicate::True,
+            BitSet::new(),
+        ),
+    );
+}
+
 /// Three `sales` rows over two regions, then `rest`.
 fn sales_program(rest: &str) -> String {
     formatdoc! {r#"

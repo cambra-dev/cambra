@@ -48,7 +48,8 @@ fn extract_final_releases_below_the_highest_live_position() {
         Box::new(|| {}),
         &mut SubscribeContext::new(),
     );
-    producer.get(producer.tiling().universal_guard());
+    let guard = producer.tiling().universal_guard();
+    cambra::interpreter::dispatcher::read_for_test(&mut *producer, guard);
     assert_eq!(
         src.borrow().get_released_predicate(),
         Predicate::at_or_below(Value::UInt(0)),
@@ -66,7 +67,8 @@ fn converse_holds_no_deleted_row() {
         Box::new(|| {}),
         &mut SubscribeContext::new(),
     );
-    producer.get(producer.tiling().universal_guard());
+    let guard = producer.tiling().universal_guard();
+    cambra::interpreter::dispatcher::read_for_test(&mut *producer, guard);
     let value_two = Predicate::from_column_value(&ColumnValue::from_uints(vec![2]));
     producer.release(TileGuard::Function(FunctionGuard::Domain(value_two)));
     assert_eq!(src.borrow().get_released_predicate(), Predicate::False);
