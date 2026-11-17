@@ -92,6 +92,24 @@ impl<C: Consumer> Consumer for Weak<RefCell<C>> {
             consumer.borrow_mut().notify(arrived);
         }
     }
+
+    fn push(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
+        if let Some(consumer) = self.upgrade() {
+            consumer.borrow_mut().push(region, landing);
+        }
+    }
+}
+
+/// A boxed consumer is one, so it can be shared behind an `Rc<RefCell<_>>` as a
+/// [`SharedConsumer`].
+impl Consumer for Box<dyn Consumer> {
+    fn notify(&mut self, arrived: &Projection) {
+        (**self).notify(arrived)
+    }
+
+    fn push(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
+        (**self).push(region, landing)
+    }
 }
 
 /// Blanket implementation: FnMut() implements Consumer, ignoring the region.
