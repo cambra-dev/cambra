@@ -103,6 +103,15 @@ released  = Or [ Domain(k = 0), Codomain(Record { _0: ∅, _1: Domain(Qualified 
 held − released = Domain(k ≠ 0)
 ```
 
+An arm of cells that names part of what is left leaves a record guard beneath the held keys, which
+is no region of keys, and `guard_minus` panics on it. A push names a region of keys
+(`Dispatcher::land_in` reads it with `Projection::of`), so a breaker's final guard is its held keys
+less the keys its readers released whole (`keys_released_whole`, `BreakingProducer::final_guard`). A
+key some of whose cells a reader released stays held, and the push names it. `SelectField` restates
+every level above the record: a selector pulled at a path leaves the inner loop's drive holding the
+other fields' cells of the path released, the drive's push names the path, and the selector takes
+its field there.
+
 A round pushes per position, so it needs the difference, where a push at a finish only names the
 breaker's whole held region.
 
@@ -124,7 +133,10 @@ emits, and a round at the row closes it.
 
 A round of a nested loop pulls each operator at the round's paths, beneath the outermost keys. An
 operator that does not restate the level a pull names is pulled at the nearest level it restates
-(`Projection::restated_by`), and the answer is cut to the round's paths (`TileProducer::get`).
+(`Projection::restated_by`), and the answer is cut to the round's paths (`TileProducer::get`). A
+`Memo` beneath it on a path to a recurrence slot caches positions of later rounds from the store's
+snapshot, and reads them again before the store's next step
+([A store as a breaker](design-operators.md#a-store-as-a-breaker)).
 
 ## Decisions
 
