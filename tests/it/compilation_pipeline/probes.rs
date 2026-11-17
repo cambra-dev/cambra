@@ -2,6 +2,7 @@
 //! `/api/live`, checked against the operator graph it serves on
 //! `/api/snapshot`.
 
+use crate::it::serving::PublishRows as _;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -33,7 +34,7 @@ fn every_probed_node_is_an_operator_of_the_served_graph() {
         Type::Base(BaseType::String),
         Extent::Base(BaseType::String),
     )));
-    lines.borrow_mut().add_data(&[
+    lines.borrow_mut().publish_rows(&[
         (Value::UInt(0), Value::String("hello".into())),
         (Value::UInt(1), Value::String("world".into())),
     ]);
@@ -46,19 +47,18 @@ fn every_probed_node_is_an_operator_of_the_served_graph() {
     // After the subscribe, as `/api/live` switches it: every producer already
     // holds the slot this fills.
     ctx.subscribe_context().probes().enable();
-    let producer = compiled
-        .main_mut()
-        .and_then(|output| output.producer.as_mut())
-        .expect("the program has a `main` output");
-    for _ in 0..100 {
-        ctx.scheduler().check_for_notifications();
-        if producer
-            .get(producer.tiling().universal_guard())
-            .is_terminal()
-        {
-            break;
-        }
-    }
+    let result = cambra::interpreter::dispatcher::run_program(&mut compiled, 1)
+        .expect("the probe fixture dispatches")
+        .main
+        .expect("the program has a main output");
+    assert!(result.is_terminal(), "the fixture completes: {result:?}");
+    let cambra::interpreter::Tile::Scalar(values) = result else {
+        panic!("the fixture produces a scalar")
+    };
+    assert_eq!(
+        values.as_single(),
+        Some(Value::String("hello;world;".into()))
+    );
 
     let operators: HashSet<NodeId> = compiled
         .operator_graph
