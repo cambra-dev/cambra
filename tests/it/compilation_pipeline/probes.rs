@@ -3,9 +3,8 @@
 //! `/api/snapshot`.
 
 use crate::serving::PublishRows as _;
-use std::cell::RefCell;
 use std::collections::HashSet;
-use std::rc::Rc;
+use std::sync::PoisonError;
 
 use cambra::ccl::Type;
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
@@ -29,16 +28,22 @@ fn every_probed_node_is_an_operator_of_the_served_graph() {
         seen
     "#};
     let mut ctx = GlobalContext::default();
-    let lines = Rc::new(RefCell::new(TestDataSource::new(
+    let lines = TestDataSource::new(
         "lines",
         Type::Base(BaseType::String),
         Extent::Base(BaseType::String),
-    )));
-    lines.borrow_mut().publish_rows(&[
-        (Value::UInt(0), Value::String("hello".into())),
-        (Value::UInt(1), Value::String("world".into())),
-    ]);
-    lines.borrow_mut().set_yield_predicate(Predicate::True);
+    );
+    lines
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .publish_rows(&[
+            (Value::UInt(0), Value::String("hello".into())),
+            (Value::UInt(1), Value::String("world".into())),
+        ]);
+    lines
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_yield_predicate(Predicate::True);
     ctx.register_source(lines.clone());
 
     let loaded = LoadedProgram::test(code);

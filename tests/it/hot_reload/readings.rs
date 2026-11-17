@@ -5,8 +5,6 @@
 //! Each program's value is a collection over the live source `source1()`, which no consumer
 //! releases, so the replacement pulls again every position its predecessor delivered.
 
-use std::{cell::RefCell, rc::Rc};
-
 use cambra::{
     ccl::{
         Type,
@@ -17,6 +15,7 @@ use cambra::{
     live_program::{LiveProgram, MAIN_BRANCH},
 };
 use indoc::indoc;
+use std::sync::PoisonError;
 
 use super::serving::no_main;
 
@@ -52,27 +51,31 @@ fn values(tile: &Tile) -> Vec<i64> {
 /// and answer the program's value before the reload and after it.
 fn across_a_reload(v1: &str, v2: &str) -> (Vec<i64>, Vec<i64>) {
     let mut ctx = GlobalContext::default();
-    let source = Rc::new(RefCell::new(TestDataSource::new(
+    let source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(source.clone());
     let mut live = LiveProgram::start(&mut ctx, &program(v1), &no_main).expect("v1 compiles");
     source
-        .borrow_mut()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
         .add_data(&[(Value::uint_from_row(0), Value::Int(1))]);
     source
-        .borrow_mut()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
         .set_yield_predicate(Predicate::at_or_below(Value::uint_from_row(0)));
     let before = values(&crate::serving::run_branch_to_idle(&mut live, MAIN_BRANCH));
     live.reload(&mut ctx, MAIN_BRANCH, &program(v2), &no_main)
         .expect("v2 replaces v1");
     source
-        .borrow_mut()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
         .add_data(&[(Value::uint_from_row(1), Value::Int(2))]);
     source
-        .borrow_mut()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
         .set_yield_predicate(Predicate::at_or_below(Value::uint_from_row(1)));
     let after = values(&crate::serving::run_branch_to_idle(&mut live, MAIN_BRANCH));
     (before, after)

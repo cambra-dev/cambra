@@ -1,5 +1,6 @@
 #[cfg(test)]
 use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
+use std::sync::PoisonError;
 mod cartesian;
 
 use cartesian::CartesianIteration;
@@ -10,7 +11,8 @@ use intervalsets::{
     ops::{Difference, Intersection},
 };
 use smol_str::SmolStr;
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::sync::RwLock;
+use std::{collections::HashMap, sync::Arc};
 
 use super::*;
 use crate::ccl::TagMap;
@@ -52,7 +54,7 @@ impl TileOperator for IterateExtent {
     fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -60,17 +62,18 @@ impl TileOperator for IterateExtent {
         if let Extent::Record(fields) = &self.extent
             && self.extent.reads_a_source()
         {
-            return cartesian::subscribe(self, fields, consumer, cx);
+            return cartesian::subscribe(self.clone(), fields, consumer, cx);
         }
         let leaf = shared_consumer(consumer);
         let mut producer = Box::new(IterateExtentProducer {
             base: ProducerBase::new(
                 IterateExtentProducer::alloc_id(),
                 self.tiling(),
-                &self.base,
+                self.clone(),
                 cx,
             )
             .leaf(leaf.clone()),
+            _retirements: Vec::new(),
             iteration: Iteration::Direct(DirectIteration {
                 extent: self.extent.clone(),
                 released: Predicate::False,
@@ -86,6 +89,14 @@ impl TileOperator for IterateExtent {
                 unreachable!("a source subscription iterates its extent directly")
             };
             release_extent(&mut direct.extent, &Predicate::False, &name);
+            self.extent.for_each_source(&mut |source| {
+                producer._retirements.push(
+                    source
+                        .read()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .producer_retirement(&name),
+                );
+            });
             cx.note_source_producer(name);
         }
 
@@ -97,29 +108,11 @@ impl TileOperator for IterateExtent {
     }
 }
 
-/// Tell every source in `extent` that `producer` is gone, so its release record
-/// goes with it ([`DataSourceDomainExtentImpl::retire_producer`]).
-fn retire_producer_from_extent(extent: &Extent, producer: &str) {
-    extent.for_each_source(&mut |source| {
-        // A drop runs wherever the last owner goes, so the source may already
-        // be borrowed by a call further up that stack. Keeping the record is
-        // the conservative outcome — the source retains more than it must —
-        // and the borrow succeeding is the case worth knowing about.
-        match source.try_borrow_mut() {
-            Ok(mut source) => source.retire_producer(producer),
-            Err(_) => debug_assert!(
-                false,
-                "{producer} dropped while its source was borrowed, so its \
-release record outlives it",
-            ),
-        }
-    });
-}
-
 /// Producer for [`IterateExtent`]: emits an identity function tile.
 struct IterateExtentProducer {
     base: ProducerBase,
     iteration: Iteration,
+    _retirements: Vec<crate::interpreter::SourceReaderRetirement>,
 }
 
 enum Iteration {
@@ -208,7 +201,10 @@ fn release_extent(extent: &mut Extent, pred: &Predicate, releaser: &str) {
             }
         },
         Extent::DataSourceDomain(source) => {
-            source.borrow_mut().release(releaser, pred.clone());
+            source
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .release(releaser, pred.clone());
         }
         Extent::UIntRange(remaining) => match pred {
             Predicate::True => {
@@ -275,7 +271,10 @@ fn iterate_extent(extent: &Extent, producer: &str) -> ColumnValue {
                 .collect();
             ColumnValue::from_uints(values)
         }
-        Extent::DataSourceDomain(source_impl) => source_impl.borrow_mut().get_elements(producer),
+        Extent::DataSourceDomain(source_impl) => source_impl
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_elements(producer),
         Extent::Record(fields) => iterate_record(fields, producer),
         Extent::Union(arms) => iterate_union(arms, producer),
         Extent::Restricted { .. } => {
@@ -308,24 +307,6 @@ fn iterate_record(fields: &HashMap<SmolStr, Extent>, producer: &str) -> ColumnVa
     ColumnValue::cartesian_product(data)
 }
 
-impl Drop for IterateExtentProducer {
-    /// Hand back the release record this producer registered.
-    ///
-    /// The record has to last exactly as long as the producer: a source outlives
-    /// every version reading it, and its release agreement is an intersection
-    /// over the records it holds, so one left behind pins that agreement where a
-    /// dropped producer stopped. Dropping it here rather than at the version
-    /// handover is what distinguishes the two cases — an operator the reload
-    /// rebuilt goes and takes its record with it, and one the reload carried
-    /// forward keeps both, which is what stops the source dropping data that
-    /// operator has not finished with.
-    fn drop(&mut self) {
-        if let Iteration::Direct(direct) = &self.iteration {
-            retire_producer_from_extent(&direct.extent, &self.name());
-        }
-    }
-}
-
 impl TileProducer for IterateExtentProducer {
     impl_producer_base!();
 
@@ -336,7 +317,7 @@ impl TileProducer for IterateExtentProducer {
         }
     }
 
-    fn data_sources(&self) -> Vec<Rc<RefCell<dyn DataSourceDomainExtentImpl>>> {
+    fn data_sources(&self) -> Vec<Arc<RwLock<dyn DataSourceDomainExtentImpl>>> {
         let mut sources = Vec::new();
         self.tiling()
             .domain_extent()
@@ -412,6 +393,49 @@ mod tests {
     use intervalsets::MaybeEmpty;
     use intervalsets::ops::Contains;
 
+    #[rstest::rstest]
+    fn dropping_a_reader_retires_it_while_another_worker_holds_the_source(
+        #[values(false, true)] product: bool,
+    ) {
+        let source = crate::interpreter::TestDataSource::new(
+            "retirement",
+            crate::ccl::Type::Base(BaseType::UInt),
+            Extent::Base(BaseType::UInt),
+        );
+        source
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .release("other", Predicate::True);
+        let domain = Extent::DataSourceDomain(source.runtime());
+        let extent = if product {
+            Extent::Record(HashMap::from([
+                ("source".into(), domain),
+                ("unit".into(), Extent::Base(BaseType::Unit)),
+            ]))
+        } else {
+            domain
+        };
+        let op = Arc::new(IterateExtent::new(extent));
+        let reader = op.clone().subscribe(
+            op.tiling().universal_guard(),
+            Box::new(|| {}),
+            &mut SubscribeContext::new(),
+        );
+        let held = source.write().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(held.get_released_predicate(), Predicate::False);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            drop(reader);
+            done_tx.send(()).unwrap();
+        });
+        let retired = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        let agreement = held.get_released_predicate();
+        drop(held);
+        worker.join().unwrap();
+        retired.expect("reader retirement must not wait for the source data lock");
+        assert_eq!(agreement, Predicate::True);
+    }
+
     /// A producer's release record is retired from a source reached through a
     /// `Union` arm, not only from one reached directly or through a `Record`.
     ///
@@ -424,28 +448,41 @@ mod tests {
         use crate::ccl::FieldKey;
         use crate::interpreter::{DataSourceDomainExtentImpl, test_source::TestDataSource};
 
-        let src = Rc::new(RefCell::new(TestDataSource::new(
+        let src = TestDataSource::new(
             "s",
             crate::ccl::Type::Base(BaseType::Int),
             Extent::Base(BaseType::Int),
-        )));
-        let as_domain: Rc<RefCell<dyn DataSourceDomainExtentImpl>> = src.clone();
+        );
+        let as_domain: Arc<RwLock<dyn DataSourceDomainExtentImpl>> = src.runtime();
         let extent = Extent::Union(TagMap::from_arms(vec![(
             FieldKey::Name("only".into()),
             Extent::DataSourceDomain(as_domain),
         )]));
 
-        src.borrow_mut().release("p", Predicate::True);
+        src.write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .release("p", Predicate::True);
         assert_eq!(
-            src.borrow().get_released_predicate(),
+            src.read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_released_predicate(),
             Predicate::True,
             "`p` holds a record for the retire to find"
         );
 
-        retire_producer_from_extent(&extent, "p");
+        extent.for_each_source(&mut |source| {
+            drop(
+                source
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .producer_retirement("p"),
+            );
+        });
 
         assert_eq!(
-            src.borrow().get_released_predicate(),
+            src.read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_released_predicate(),
             Predicate::False,
             "`p` is gone, so its record is gone: an empty agreement, not `p`'s last one"
         );
@@ -561,6 +598,7 @@ mod tests {
         let tiling = Tiling::data_function(extent.clone(), Tiling::Scalar(extent.clone()));
         let mut producer = IterateExtentProducer {
             base: ProducerBase::unowned(0, &tiling),
+            _retirements: Vec::new(),
             iteration: Iteration::Direct(DirectIteration {
                 extent,
                 released: Predicate::False,
@@ -636,6 +674,7 @@ mod projection_tests {
         let tiling = Tiling::data_function(extent.clone(), Tiling::Scalar(extent.clone()));
         IterateExtentProducer {
             base: ProducerBase::unowned(0, &tiling),
+            _retirements: Vec::new(),
             iteration: Iteration::Direct(DirectIteration {
                 extent,
                 released: Predicate::False,
@@ -727,23 +766,30 @@ mod projection_tests {
     /// head says nothing about positions that may still arrive in the morsel.
     #[test]
     fn a_live_source_head_is_complete_only_over_what_has_arrived() {
-        let source = Rc::new(RefCell::new(TestDataSource::new(
+        let source = TestDataSource::new(
             "s",
             crate::ccl::Type::Base(BaseType::Int),
             Extent::Base(BaseType::Int),
-        )));
-        let as_domain: Rc<RefCell<dyn DataSourceDomainExtentImpl>> = source.clone();
+        );
+        let as_domain: Arc<RwLock<dyn DataSourceDomainExtentImpl>> = source.runtime();
         let mut head = head(Extent::DataSourceDomain(as_domain));
-        source.borrow_mut().release(&head.name(), Predicate::False);
-        source.borrow_mut().add_data(&[
-            (Value::UInt(0), Value::Int(10)),
-            (Value::UInt(1), Value::Int(20)),
-            (Value::UInt(2), Value::Int(30)),
-            (Value::UInt(3), Value::Int(40)),
-            (Value::UInt(4), Value::Int(50)),
-        ]);
         source
-            .borrow_mut()
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .release(&head.name(), Predicate::False);
+        source
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .add_data(&[
+                (Value::UInt(0), Value::Int(10)),
+                (Value::UInt(1), Value::Int(20)),
+                (Value::UInt(2), Value::Int(30)),
+                (Value::UInt(3), Value::Int(40)),
+                (Value::UInt(4), Value::Int(50)),
+            ]);
+        source
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
             .set_yield_predicate(Predicate::at_or_below(Value::UInt(4)));
 
         let inside = head.read_in_pipeline(keys_between(1, 2));

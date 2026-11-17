@@ -27,10 +27,9 @@
 //! Most tests get 10s; the three heaviest compiles get 30s.
 
 use smol_str::SmolStr;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
-use std::rc::Rc;
+use std::sync::PoisonError;
 
 use bit_set::BitSet;
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
@@ -57,11 +56,11 @@ pub(crate) fn operator_kinds_over_source1(code: &str) -> Vec<&'static str> {
     use cambra::interpreter::{BaseType, Extent, TestDataSource};
 
     let mut ctx = GlobalContext::default();
-    ctx.register_source(Rc::new(RefCell::new(TestDataSource::new(
+    ctx.register_source(TestDataSource::new(
         "source1",
         Type::Base(cambra::ccl::BaseType::Int),
         Extent::Base(BaseType::Int),
-    ))));
+    ));
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let program = LoadedProgram::test(code);
     let compiled = compile_program(&mut ctx, &program, consumer).unwrap_or_render(&program);
@@ -97,11 +96,11 @@ pub(crate) fn peak_held_values(code: &str, rows: usize) -> HashMap<String, usize
     use cambra::ccl::{BaseType, Type};
     use cambra::interpreter::{Extent, Predicate, TestDataSource, Value};
     let mut ctx = GlobalContext::default();
-    let source = Rc::new(RefCell::new(TestDataSource::new(
+    let source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(cambra::interpreter::BaseType::Int),
-    )));
+    );
     ctx.register_source(source.clone());
     let loaded = LoadedProgram::test(code);
     let compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
@@ -109,10 +108,12 @@ pub(crate) fn peak_held_values(code: &str, rows: usize) -> HashMap<String, usize
     let mut peak: HashMap<String, usize> = HashMap::new();
     for i in 0..rows {
         source
-            .borrow_mut()
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
             .add_data(&[(Value::uint_from_row(i), Value::Int(i as i64 + 1))]);
         source
-            .borrow_mut()
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
             .set_yield_predicate(Predicate::at_or_below(Value::uint_from_row(i)));
         runner.run();
         let mut now = HashMap::new();
@@ -122,7 +123,10 @@ pub(crate) fn peak_held_values(code: &str, rows: usize) -> HashMap<String, usize
             *at = (*at).max(values);
         }
     }
-    source.borrow_mut().set_yield_predicate(Predicate::True);
+    source
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_yield_predicate(Predicate::True);
     assert!(
         runner.run().is_terminal(),
         "{code}: completes after source closure"

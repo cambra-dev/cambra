@@ -5,13 +5,14 @@
 //! See `src/interpreter/design-operators.md`, "The notification contract".
 
 use smol_str::SmolStr;
+use std::sync::PoisonError;
 
 use super::test_helpers::{InputConsumer, NotifyingOp, RegionLog, keys_between, notify_input};
 use super::*;
 use crate::interpreter::{BaseType, CurryLevel, Extent, Projection, SubscribeContext, Tiling};
 
 /// An operator and the consumers it installed on its inputs, which a test notifies through.
-type Built = (Box<dyn TileOperator>, Vec<InputConsumer>);
+type Built = (Arc<dyn TileOperator>, Vec<InputConsumer>);
 
 /// A stream of integers keyed by position.
 fn ints() -> Tiling {
@@ -22,9 +23,9 @@ fn ints() -> Tiling {
 }
 
 /// An operator that keeps the consumer it is subscribed with, for the test to notify through.
-fn feed(tiling: Tiling) -> (Box<dyn TileOperator>, InputConsumer) {
+fn feed(tiling: Tiling) -> (Arc<dyn TileOperator>, InputConsumer) {
     let (op, consumer) = NotifyingOp::new(tiling.empty_tile(), tiling);
-    (Box::new(op), consumer)
+    (Arc::new(op), consumer)
 }
 
 fn region() -> Projection {
@@ -39,14 +40,19 @@ fn another_region() -> Projection {
 /// its input `notified`. A gate passes a region once between pulls, so each call builds an
 /// operator of its own.
 fn received(build: &dyn Fn() -> Built, notified: usize, region: &Projection) -> Vec<Projection> {
-    let (mut operator, inputs) = build();
+    let (operator, inputs) = build();
     let (log, regions) = RegionLog::new();
     let guard = operator.tiling().universal_guard();
-    let _producer = operator.subscribe(guard, Box::new(log), &mut SubscribeContext::new());
+    let _producer = operator
+        .clone()
+        .subscribe(guard, Box::new(log), &mut SubscribeContext::new());
     // Some inputs notify when they are subscribed.
-    regions.borrow_mut().clear();
+    regions
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
     notify_input(&inputs[notified], region);
-    let seen = regions.borrow_mut();
+    let seen = regions.write().unwrap_or_else(PoisonError::into_inner);
     seen.clone()
 }
 
@@ -71,7 +77,7 @@ fn assert_keeps_without_state(build: &dyn Fn() -> Built, notified: usize) {
 fn record_wrap() -> Built {
     let (input, consumer) = feed(ints());
     let op = RecordWrap::new_at(SmolStr::new("a"), input, CurryLevel::new(1));
-    (Box::new(op), vec![consumer])
+    (Arc::new(op), vec![consumer])
 }
 
 #[test]
@@ -86,7 +92,7 @@ fn record_wrap_carries_no_region_between_notifications() {
 
 fn map_domain() -> Built {
     let (input, consumer) = feed(ints());
-    (Box::new(MapDomain::new(input)), vec![consumer])
+    (Arc::new(MapDomain::new(input)), vec![consumer])
 }
 
 #[test]
@@ -108,7 +114,7 @@ fn bools() -> Tiling {
 
 fn restrict() -> Built {
     let (predicate, consumer) = feed(bools());
-    (Box::new(Restrict::new(predicate)), vec![consumer])
+    (Arc::new(Restrict::new(predicate)), vec![consumer])
 }
 
 #[test]
@@ -123,16 +129,16 @@ fn restrict_carries_no_region_between_notifications() {
 
 fn map_result_with_source() -> Built {
     use crate::interpreter::TestDataSource;
-    use std::{cell::RefCell, rc::Rc};
-    let source = Rc::new(RefCell::new(TestDataSource::new(
+
+    let source = TestDataSource::new(
         "source1",
         crate::ccl::Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
-    let domain = IterateExtent::new(Extent::DataSourceDomain(source.clone()));
+    );
+    let domain = IterateExtent::new(Extent::DataSourceDomain(source.runtime()));
     let (input, consumer) = feed(domain.tiling().clone());
-    let op = MapResultWithSource::new(source, input);
-    (Box::new(op), vec![consumer])
+    let op = MapResultWithSource::new(source.runtime(), input);
+    (Arc::new(op), vec![consumer])
 }
 
 #[test]
@@ -152,7 +158,7 @@ fn nested() -> Tiling {
 fn map_aggregate() -> Built {
     let (input, consumer) = feed(nested());
     let op = MapAggregate::new(input, crate::ccl::AggregateKind::Sum);
-    (Box::new(op), vec![consumer])
+    (Arc::new(op), vec![consumer])
 }
 
 #[test]
@@ -169,8 +175,8 @@ fn map_aggregate_carries_no_region_between_notifications() {
 fn map_extract_aggregate() -> Built {
     let (input, consumer) = feed(nested());
     let fold = MapAggregate::new(input, crate::ccl::AggregateKind::Sum);
-    let op = MapExtractAggregate::new(Box::new(fold), crate::ccl::AggregateKind::Sum);
-    (Box::new(op), vec![consumer])
+    let op = MapExtractAggregate::new(Arc::new(fold), crate::ccl::AggregateKind::Sum);
+    (Arc::new(op), vec![consumer])
 }
 
 #[test]
@@ -185,7 +191,7 @@ fn map_extract_aggregate_carries_no_region_between_notifications() {
 
 fn memo() -> Built {
     let (input, consumer) = feed(ints());
-    (Box::new(Memo::new(input)), vec![consumer])
+    (Arc::new(Memo::new(input)), vec![consumer])
 }
 
 #[test]
@@ -205,9 +211,9 @@ fn a_region_crosses_a_chain_of_operators_that_keep_keys() {
     let chain = || {
         let (input, consumer) = feed(ints());
         let domain = MapDomain::new(input);
-        let wrapped = RecordWrap::new_at(SmolStr::new("a"), Box::new(domain), CurryLevel::new(1));
+        let wrapped = RecordWrap::new_at(SmolStr::new("a"), Arc::new(domain), CurryLevel::new(1));
         (
-            Box::new(Memo::new(Box::new(wrapped))) as Box<dyn TileOperator>,
+            Arc::new(Memo::new(Arc::new(wrapped))) as Arc<dyn TileOperator>,
             vec![consumer],
         )
     };
@@ -222,7 +228,7 @@ fn zip() -> Built {
         vec![a, b],
         CurryLevel::new(1),
     );
-    (Box::new(op), vec![first, second])
+    (Arc::new(op), vec![first, second])
 }
 
 #[test]
@@ -240,7 +246,7 @@ fn product() -> Built {
     let (outer, first) = feed(ints());
     let (inner, second) = feed(nested());
     let op = Product::per_row_at(outer, inner, CurryLevel::new(1));
-    (Box::new(op), vec![first, second])
+    (Arc::new(op), vec![first, second])
 }
 
 #[test]
@@ -273,9 +279,9 @@ fn union(flat: bool) -> Built {
     let (a, first) = feed(ints());
     let (b, second) = feed(ints());
     let arms = vec![a, b];
-    let op: Box<dyn TileOperator> = match flat {
-        true => Box::new(UnionOperator::new_flat(arms, int())),
-        false => Box::new(UnionOperator::new(arms, int())),
+    let op: Arc<dyn TileOperator> = match flat {
+        true => Arc::new(UnionOperator::new_flat(arms, int())),
+        false => Arc::new(UnionOperator::new(arms, int())),
     };
     (op, vec![first, second])
 }
@@ -324,15 +330,20 @@ fn a_tagged_union_forwards_the_region_of_each_arm_under_its_tag() {
 /// keys of the union under each arm's tag, so the union's gate passes both.
 #[test]
 fn a_tagged_union_passes_the_regions_of_two_arms_between_pulls() {
-    let (mut operator, inputs) = union(false);
+    let (operator, inputs) = union(false);
     let (log, regions) = RegionLog::new();
     let guard = operator.tiling().universal_guard();
-    let _producer = operator.subscribe(guard, Box::new(log), &mut SubscribeContext::new());
-    regions.borrow_mut().clear();
+    let _producer = operator
+        .clone()
+        .subscribe(guard, Box::new(log), &mut SubscribeContext::new());
+    regions
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
     notify_input(&inputs[0], &region());
     notify_input(&inputs[1], &region());
     assert_eq!(
-        *regions.borrow_mut(),
+        *regions.write().unwrap_or_else(PoisonError::into_inner),
         [
             under_arm(0, keys_of(&region())),
             under_arm(1, keys_of(&region()))
@@ -347,20 +358,28 @@ fn a_region_crosses_a_fan_out_slot_and_a_tagged_union() {
     let (input, consumer) = feed(ints());
     let fan = FanOut::new(input);
     let (other, _) = feed(ints());
-    let mut union = UnionOperator::new(vec![other, fan.slot()], int());
+    let union = Arc::new(UnionOperator::new(vec![other, fan.slot()], int()));
     let (log, regions) = RegionLog::new();
     let guard = union.tiling().universal_guard();
-    let _producer = union.subscribe(guard, Box::new(log), &mut SubscribeContext::new());
-    regions.borrow_mut().clear();
+    let _producer = union
+        .clone()
+        .subscribe(guard, Box::new(log), &mut SubscribeContext::new());
+    regions
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
     notify_input(&consumer, &region());
-    assert_eq!(*regions.borrow_mut(), [under_arm(1, keys_of(&region()))]);
+    assert_eq!(
+        *regions.write().unwrap_or_else(PoisonError::into_inner),
+        [under_arm(1, keys_of(&region()))]
+    );
 }
 
 fn lookup(keys: Tiling) -> Built {
     let (collection, table) = feed(ints());
     let (keys, stream) = feed(keys);
     let op = CheckedLookup::split(collection, keys, int());
-    (Box::new(op), vec![table, stream])
+    (Arc::new(op), vec![table, stream])
 }
 
 fn lookup_of_a_stream() -> Built {
@@ -408,7 +427,7 @@ fn paired_lookup() -> Built {
     );
     let (input, consumer) = feed(pairs);
     let op = CheckedLookup::paired(input, int()).expect("a stream of pairs");
-    (Box::new(op), vec![consumer])
+    (Arc::new(op), vec![consumer])
 }
 
 #[test]
@@ -425,7 +444,7 @@ fn filter(predicate: Tiling) -> Built {
     let (input, data) = feed(ints());
     let (predicate, mask) = feed(predicate);
     let op = Filter::new_at(input, predicate, CurryLevel::OUTERMOST);
-    (Box::new(op), vec![data, mask])
+    (Arc::new(op), vec![data, mask])
 }
 
 #[test]
@@ -456,7 +475,7 @@ fn map_result_to_const(level: CurryLevel) -> Built {
     });
     let (constant, constant_consumer) = feed(Tiling::Scalar(int()));
     let op = MapResultToConst::new_at(input, constant, MapResultToConstMode::Replace, level);
-    (Box::new(op), vec![data, constant_consumer])
+    (Arc::new(op), vec![data, constant_consumer])
 }
 
 fn beneath_a_level() -> Built {
@@ -484,7 +503,7 @@ fn map_result_to_const_at_the_outermost_level_sends_everything_for_its_inputs_re
 
 fn select_field(input: Tiling) -> Built {
     let (input, consumer) = feed(input);
-    (Box::new(SelectField::new(input, "a")), vec![consumer])
+    (Arc::new(SelectField::new(input, "a")), vec![consumer])
 }
 
 fn a_stream_of_records() -> Built {
@@ -524,7 +543,7 @@ fn variant_wrap(input: Tiling, level: CurryLevel) -> Built {
         crate::ccl::TagMap::from_arms(vec![(crate::ccl::FieldKey::Index(0), int())]),
         level,
     );
-    (Box::new(wrap), vec![consumer])
+    (Arc::new(wrap), vec![consumer])
 }
 
 fn wrapped_stream() -> Built {
@@ -560,7 +579,7 @@ fn union_stream() -> Tiling {
 fn variant_project(input: Tiling) -> Built {
     let (input, consumer) = feed(input);
     let op = VariantProject::new(input, crate::ccl::FieldKey::Index(0), int());
-    (Box::new(op), vec![consumer])
+    (Arc::new(op), vec![consumer])
 }
 
 #[test]
@@ -578,7 +597,7 @@ fn variant_project_over_a_bare_union_sends_everything() {
 fn variant_is(input: Tiling) -> Built {
     let (input, consumer) = feed(input);
     let op = VariantIs::new(input, crate::ccl::FieldKey::Index(0));
-    (Box::new(op), vec![consumer])
+    (Arc::new(op), vec![consumer])
 }
 
 #[test]
@@ -598,7 +617,7 @@ fn converse(level: CurryLevel) -> Built {
         true => ints(),
         false => nested(),
     });
-    (Box::new(Converse::new_at(input, level)), vec![consumer])
+    (Arc::new(Converse::new_at(input, level)), vec![consumer])
 }
 
 #[test]
@@ -634,7 +653,7 @@ fn uncurry(level: CurryLevel) -> Built {
         true => nested(),
         false => Tiling::data_function(Extent::uint_range(8), nested()),
     });
-    (Box::new(Uncurry::new_at(input, level)), vec![consumer])
+    (Arc::new(Uncurry::new_at(input, level)), vec![consumer])
 }
 
 #[test]
@@ -653,7 +672,7 @@ fn uncurry_at_the_outermost_level_sends_everything() {
 fn aggregate() -> Built {
     let (input, consumer) = feed(ints());
     let op = Aggregate::new(input, crate::ccl::AggregateKind::Sum);
-    (Box::new(op), vec![consumer])
+    (Arc::new(op), vec![consumer])
 }
 
 /// The accumulator has no keys.
@@ -673,7 +692,7 @@ fn an_aggregate_sends_everything_for_a_later_region() {
 fn extract_aggregate() -> Built {
     let (input, consumer) = feed(ints());
     let op = ExtractAggregate::new(input, crate::ccl::AggregateKind::Sum, true);
-    (Box::new(op), vec![consumer])
+    (Arc::new(op), vec![consumer])
 }
 
 /// The accumulator has no keys.
@@ -694,7 +713,7 @@ fn extract_final() -> Built {
     let (source, keys) = feed(ints());
     let (default, fallback) = feed(Tiling::Scalar(int()));
     let op = ExtractFinal::new(source, default);
-    (Box::new(op), vec![keys, fallback])
+    (Arc::new(op), vec![keys, fallback])
 }
 
 /// The final value is the last position's, which a region of keys does not name.
@@ -725,7 +744,7 @@ fn two_keys() -> Extent {
 fn permute_record_domain() -> Built {
     let (input, consumer) = feed(Tiling::data_function(two_keys(), Tiling::Scalar(int())));
     let op = PermuteRecordDomain::new(input, vec![1, 0]);
-    (Box::new(op), vec![consumer])
+    (Arc::new(op), vec![consumer])
 }
 
 /// Tuple keys named field by field: field `i` admits the key `fields[i]`.
@@ -765,7 +784,7 @@ fn flatten_tuple_domain() -> Built {
     );
     let (input, consumer) = feed(Tiling::data_function(outer, Tiling::Scalar(int())));
     let op = FlattenTupleDomain::new(input, vec![0]);
-    (Box::new(op), vec![consumer])
+    (Arc::new(op), vec![consumer])
 }
 
 /// The keys are the input's with the flattened field's fields spliced in, so a region of the
@@ -797,7 +816,7 @@ fn make_record() -> Built {
     let (a, first) = feed(ints());
     let (b, second) = feed(ints());
     let op = MakeRecord::new(vec![a, b]);
-    (Box::new(op), vec![first, second])
+    (Arc::new(op), vec![first, second])
 }
 
 /// A record of values has no keys of its own.
@@ -842,13 +861,16 @@ macro_rules! fan_out_with_two_slots {
             let mut producers = Vec::new();
             for _ in 0..2 {
                 let (log, regions) = RegionLog::new();
-                let mut slot = fan.slot();
+                let slot = fan.slot();
                 let guard = slot.tiling().universal_guard();
-                producers.push(slot.subscribe(guard, Box::new(log), &mut cx));
+                producers.push(slot.clone().subscribe(guard, Box::new(log), &mut cx));
                 logs.push(regions);
             }
             for regions in &logs {
-                regions.borrow_mut().clear();
+                regions
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clear();
             }
             (logs, producers, consumer)
         };
@@ -860,7 +882,10 @@ fn a_fan_out_forwards_a_region_to_every_live_slot_unchanged() {
     fan_out_with_two_slots!(logs, _producers, consumer);
     notify_input(&consumer, &region());
     for regions in &logs {
-        assert_eq!(*regions.borrow_mut(), [region()]);
+        assert_eq!(
+            *regions.write().unwrap_or_else(PoisonError::into_inner),
+            [region()]
+        );
     }
 }
 
@@ -873,14 +898,14 @@ fn a_fan_out_passes_each_notification_to_its_readers() {
     notify_input(&consumer, &region());
     notify_input(&consumer, &another_region());
     assert_eq!(
-        *logs[0].borrow_mut(),
+        *logs[0].write().unwrap_or_else(PoisonError::into_inner),
         [region(), region(), another_region()]
     );
     let guard = producers[0].tiling().universal_guard();
     producers[0].get(guard);
     notify_input(&consumer, &region());
     assert_eq!(
-        *logs[0].borrow_mut(),
+        *logs[0].write().unwrap_or_else(PoisonError::into_inner),
         [region(), region(), another_region(), region()]
     );
 }
@@ -889,26 +914,42 @@ fn a_fan_out_passes_each_notification_to_its_readers() {
 /// above it marks both regions dirty.
 #[test]
 fn a_zip_passes_the_regions_of_two_arms_between_pulls() {
-    let (mut operator, inputs) = zip();
+    let (operator, inputs) = zip();
     let (log, regions) = RegionLog::new();
     let guard = operator.tiling().universal_guard();
-    let _producer = operator.subscribe(guard, Box::new(log), &mut SubscribeContext::new());
-    regions.borrow_mut().clear();
+    let _producer = operator
+        .clone()
+        .subscribe(guard, Box::new(log), &mut SubscribeContext::new());
+    regions
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
     notify_input(&inputs[0], &region());
     notify_input(&inputs[1], &another_region());
-    assert_eq!(*regions.borrow_mut(), [region(), another_region()]);
+    assert_eq!(
+        *regions.write().unwrap_or_else(PoisonError::into_inner),
+        [region(), another_region()]
+    );
 }
 
 /// A flat union's arms notify different keys between pulls, and the union's consumer hears of
 /// each: a memo above it marks both regions dirty.
 #[test]
 fn a_union_passes_the_regions_of_two_arms_between_pulls() {
-    let (mut operator, inputs) = union(true);
+    let (operator, inputs) = union(true);
     let (log, regions) = RegionLog::new();
     let guard = operator.tiling().universal_guard();
-    let _producer = operator.subscribe(guard, Box::new(log), &mut SubscribeContext::new());
-    regions.borrow_mut().clear();
+    let _producer = operator
+        .clone()
+        .subscribe(guard, Box::new(log), &mut SubscribeContext::new());
+    regions
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
     notify_input(&inputs[0], &region());
     notify_input(&inputs[1], &another_region());
-    assert_eq!(*regions.borrow_mut(), [region(), another_region()]);
+    assert_eq!(
+        *regions.write().unwrap_or_else(PoisonError::into_inner),
+        [region(), another_region()]
+    );
 }

@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::PoisonError;
 
 use log::trace;
 
@@ -15,7 +17,6 @@ use crate::{
 /// as well as reading the obsolete predicates pushed back to it.
 pub struct TestDataSource {
     name: String,
-    output_type: Type,
     output_extent: Extent,
     yield_predicate: Predicate,
     has_data: bool,
@@ -24,16 +25,22 @@ pub struct TestDataSource {
 }
 
 impl TestDataSource {
-    pub fn new(name: &str, output_type: Type, output_extent: Extent) -> Self {
-        Self {
-            name: name.to_string(),
+    pub fn new(
+        name: &str,
+        output_type: Type,
+        output_extent: Extent,
+    ) -> crate::ccl::SourceDefinition<Self> {
+        crate::ccl::SourceDefinition::new(
+            Self {
+                name: name.to_string(),
+                output_extent,
+                yield_predicate: Predicate::False,
+                has_data: false,
+                data: HashMap::new(),
+                releases: ProducerReleases::default(),
+            },
             output_type,
-            output_extent,
-            yield_predicate: Predicate::False,
-            has_data: false,
-            data: HashMap::new(),
-            releases: ProducerReleases::default(),
-        }
+        )
     }
 
     /// Set the yield predicate, describing the region of domain values currently available.
@@ -87,7 +94,7 @@ impl DataSourceDomainExtentImpl for TestDataSource {
         ColumnValue::from_values(
             self.data
                 .keys()
-                .filter(|k| !key_matches_predicate(k, filter))
+                .filter(|k| !key_matches_predicate(k, &filter))
                 .cloned()
                 .collect(),
             &self.element_extent(),
@@ -157,10 +164,6 @@ impl DataSourceDomainExtentImpl for TestDataSource {
         self.output_extent.clone()
     }
 
-    fn output_type(&self) -> Type {
-        self.output_type.clone()
-    }
-
     fn get_yield_predicate(&self) -> Predicate {
         self.yield_predicate.clone()
     }
@@ -186,6 +189,10 @@ impl DataSourceDomainExtentImpl for TestDataSource {
         // at `0` and reads whatever the source still offers a new producer, which
         // the carry above bounds.
         0
+    }
+
+    fn producer_retirement(&self, producer: &str) -> crate::interpreter::SourceReaderRetirement {
+        self.releases.retirement(producer)
     }
 
     fn retire_producer(&mut self, producer: &str) {
@@ -215,7 +222,7 @@ mod tests {
     #[test]
     fn get_fields_is_the_projection_of_get() {
         use crate::interpreter::tuple_field;
-        let mut source = TestDataSource::new(
+        let source = TestDataSource::new(
             "triples",
             Type::Tuple(vec![Type::Base(BaseType::Int); 3]),
             Extent::Record(HashMap::from(
@@ -227,30 +234,56 @@ mod tests {
                 [0, 1, 2].map(|n| (tuple_field(n), Value::Int(a * 10 + n as i64))),
             ))
         };
-        source.add_data(&[
-            (Value::UInt(0), triple(1)),
-            (Value::UInt(1), triple(2)),
-            (Value::UInt(2), triple(3)),
-        ]);
+        source
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .add_data(&[
+                (Value::UInt(0), triple(1)),
+                (Value::UInt(1), triple(2)),
+                (Value::UInt(2), triple(3)),
+            ]);
         let keys = || ColumnValue::UInts(vec![2, 0]);
-        let ColumnValue::Records(whole) = source.get(keys()) else {
+        let ColumnValue::Records(whole) = source
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(keys())
+        else {
             panic!("a source of triples yields records")
         };
         let at = |n: usize| vec![tuple_field(n)];
-        assert_eq!(source.get_fields(keys(), &[]), source.get(keys()));
+        assert_eq!(
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_fields(keys(), &[]),
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(keys())
+        );
         for n in 0..3 {
             assert_eq!(
-                source.get_fields(keys(), &[at(n)]),
+                source
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get_fields(keys(), &[at(n)]),
                 whole[&tuple_field(n)],
                 "field {n} alone"
             );
         }
         assert_eq!(
-            source.get_fields(keys(), &[at(1)]),
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_fields(keys(), &[at(1)]),
             ColumnValue::Ints(vec![31, 11])
         );
         let paths = [at(2), at(0)];
-        let ColumnValue::Records(columns) = source.get_fields(keys(), &paths) else {
+        let ColumnValue::Records(columns) = source
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_fields(keys(), &paths)
+        else {
             panic!("several fields of a source yield records")
         };
         assert_eq!(columns.len(), paths.len());
@@ -265,7 +298,7 @@ mod tests {
     fn get_fields_steps_through_nested_records() {
         use crate::interpreter::{project_leaves, tuple_field};
         let ints = || Extent::Base(BaseType::Int);
-        let mut source = TestDataSource::new(
+        let source = TestDataSource::new(
             "nested",
             Type::Tuple(vec![
                 Type::Base(BaseType::Int),
@@ -294,17 +327,26 @@ mod tests {
                 ),
             ]))
         };
-        source.add_data(&[
-            (Value::UInt(0), row(1, 2, 3)),
-            (Value::UInt(1), row(4, 5, 6)),
-        ]);
+        source
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .add_data(&[
+                (Value::UInt(0), row(1, 2, 3)),
+                (Value::UInt(1), row(4, 5, 6)),
+            ]);
         let keys = || ColumnValue::UInts(vec![1, 0]);
         let inner = vec![tuple_field(1), tuple_field(0)];
         assert_eq!(
-            source.get_fields(keys(), std::slice::from_ref(&inner)),
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_fields(keys(), std::slice::from_ref(&inner)),
             ColumnValue::Ints(vec![5, 2])
         );
-        let ColumnValue::Records(both) = source.get_fields(keys(), &[vec![tuple_field(0)], inner])
+        let ColumnValue::Records(both) = source
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_fields(keys(), &[vec![tuple_field(0)], inner])
         else {
             panic!("two leaves yield records")
         };
@@ -315,14 +357,44 @@ mod tests {
         // the whole value.
         let paths = [vec![tuple_field(0)], vec![tuple_field(1), tuple_field(0)]];
         assert_eq!(
-            project_leaves(source.get(keys()), &paths),
-            source.get_fields(keys(), &paths)
+            project_leaves(
+                source
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(keys()),
+                &paths
+            ),
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_fields(keys(), &paths)
         );
         assert_eq!(
-            project_leaves(source.get(keys()), &paths[1..]),
-            source.get_fields(keys(), &paths[1..])
+            project_leaves(
+                source
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(keys()),
+                &paths[1..]
+            ),
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_fields(keys(), &paths[1..])
         );
-        assert_eq!(project_leaves(source.get(keys()), &[]), source.get(keys()));
+        assert_eq!(
+            project_leaves(
+                source
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(keys()),
+                &[]
+            ),
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(keys())
+        );
     }
 
     #[test]
@@ -330,12 +402,12 @@ mod tests {
         // Test that multiple releases from the same producer accumulate
         // their predicates using union (OR) instead of overwriting.
 
-        let mut source = TestDataSource::new(
+        let source = TestDataSource::new(
             "test",
             Type::Base(BaseType::Int),
             Extent::Base(BaseType::Int),
         );
-        source.data = vec![
+        source.write().unwrap_or_else(PoisonError::into_inner).data = vec![
             (Value::UInt(0), Value::Int(100)),
             (Value::UInt(1), Value::Int(200)),
             (Value::UInt(2), Value::Int(300)),
@@ -344,31 +416,70 @@ mod tests {
         .collect();
 
         // First release from producer A: value 0 is obsolete
-        source.release("producer_a", Predicate::at_or_below(Value::UInt(0)));
+        source
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .release("producer_a", Predicate::at_or_below(Value::UInt(0)));
 
         // Verify data has been updated
-        assert_eq!(source.data.len(), 2, "One entry should be removed");
+        assert_eq!(
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .data
+                .len(),
+            2,
+            "One entry should be removed"
+        );
         assert!(
-            source.data.iter().all(|(k, _)| k != &Value::UInt(0)),
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .data
+                .iter()
+                .all(|(k, _)| k != &Value::UInt(0)),
             "Value 0 should be removed"
         );
 
         // Second release from producer A: value 1 is obsolete
         // This should union with the existing predicate for producer_a
-        source.release("producer_a", Predicate::at_or_below(Value::UInt(1)));
+        source
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .release("producer_a", Predicate::at_or_below(Value::UInt(1)));
 
         // Verify the second predicate was added
-        assert_eq!(source.data.len(), 1, "Another entry should be removed");
+        assert_eq!(
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .data
+                .len(),
+            1,
+            "Another entry should be removed"
+        );
         assert!(
-            source.data.contains_key(&Value::UInt(2)),
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .data
+                .contains_key(&Value::UInt(2)),
             "Value 2 should remain"
         );
         assert!(
-            !source.data.contains_key(&Value::UInt(0)),
+            !source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .data
+                .contains_key(&Value::UInt(0)),
             "Value 0 should still be removed"
         );
         assert!(
-            !source.data.contains_key(&Value::UInt(1)),
+            !source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .data
+                .contains_key(&Value::UInt(1)),
             "Value 1 should be removed"
         );
     }
@@ -380,12 +491,12 @@ mod tests {
         // Each release call should accumulate its predicate and then intersect
         // all producer predicates to determine what to retain.
 
-        let mut source = TestDataSource::new(
+        let source = TestDataSource::new(
             "test",
             Type::Base(BaseType::Int),
             Extent::Base(BaseType::Int),
         );
-        source.data = vec![
+        source.write().unwrap_or_else(PoisonError::into_inner).data = vec![
             (Value::UInt(0), Value::Int(100)),
             (Value::UInt(1), Value::Int(200)),
             (Value::UInt(2), Value::Int(300)),
@@ -395,29 +506,57 @@ mod tests {
         .collect();
 
         // Release from producer A
-        source.release("producer_a", Predicate::at_or_below(Value::UInt(1)));
+        source
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .release("producer_a", Predicate::at_or_below(Value::UInt(1)));
 
         // Verify producer_a's predicate is stored
         assert!(
-            source.releases.of("producer_a").is_some(),
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .releases
+                .of("producer_a")
+                .is_some(),
             "producer_a predicate should be recorded"
         );
 
         // Release from producer B
-        source.release("producer_b", Predicate::at_or_below(Value::UInt(2)));
+        source
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .release("producer_b", Predicate::at_or_below(Value::UInt(2)));
 
         // Verify both predicates are stored
         assert!(
-            source.releases.of("producer_a").is_some(),
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .releases
+                .of("producer_a")
+                .is_some(),
             "producer_a should still be recorded"
         );
         assert!(
-            source.releases.of("producer_b").is_some(),
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .releases
+                .of("producer_b")
+                .is_some(),
             "producer_b should be recorded"
         );
 
         // Verify some data has been retained (not all removed)
-        assert!(!source.data.is_empty(), "Some data should remain");
+        assert!(
+            !source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .data
+                .is_empty(),
+            "Some data should remain"
+        );
     }
 
     #[test]
@@ -425,12 +564,12 @@ mod tests {
         // Test that when calling release multiple times, existing predicates
         // from other producers are preserved and used in intersection logic.
 
-        let mut source = TestDataSource::new(
+        let source = TestDataSource::new(
             "test",
             Type::Base(BaseType::Int),
             Extent::Base(BaseType::Int),
         );
-        source.data = vec![
+        source.write().unwrap_or_else(PoisonError::into_inner).data = vec![
             (Value::UInt(0), Value::Int(100)),
             (Value::UInt(1), Value::Int(200)),
             (Value::UInt(2), Value::Int(300)),
@@ -439,33 +578,63 @@ mod tests {
         .collect();
 
         // First release from producer A
-        source.release("producer_a", Predicate::at_or_below(Value::UInt(0)));
+        source
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .release("producer_a", Predicate::at_or_below(Value::UInt(0)));
 
         // Verify producer_a has a record
         assert!(
-            source.releases.of("producer_a").is_some(),
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .releases
+                .of("producer_a")
+                .is_some(),
             "producer_a should be recorded"
         );
 
-        let after_first_release = source.data.len();
+        let after_first_release = source
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .data
+            .len();
 
         // Second release from producer B
-        source.release("producer_b", Predicate::at_or_below(Value::UInt(1)));
+        source
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .release("producer_b", Predicate::at_or_below(Value::UInt(1)));
 
         // Verify both are recorded
         assert!(
-            source.releases.of("producer_a").is_some(),
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .releases
+                .of("producer_a")
+                .is_some(),
             "producer_a should still be recorded"
         );
         assert!(
-            source.releases.of("producer_b").is_some(),
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .releases
+                .of("producer_b")
+                .is_some(),
             "producer_b should be recorded"
         );
 
         // Data should be progressively filtered as more predicates are released
         // The second release should further filter the remaining data
         assert!(
-            source.data.len() <= after_first_release,
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .data
+                .len()
+                <= after_first_release,
             "Data should be progressively filtered or stay the same"
         );
     }

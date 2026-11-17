@@ -1,3 +1,4 @@
+use std::sync::PoisonError;
 use std::{collections::HashMap, ops::ControlFlow, path::Path, thread, time::Duration};
 
 use cambra::{
@@ -40,7 +41,7 @@ fn service_inspected(
             .shared
             .windows
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
     });
     let reply = service(request, ctx, live, main_consumer);
     if let Some(inspection) = inspection
@@ -238,7 +239,7 @@ impl Publisher {
             .shared
             .windows
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = windows;
+            .unwrap_or_else(PoisonError::into_inner) = windows;
     }
 
     fn followed(&self) {
@@ -272,10 +273,7 @@ impl Published {
         // ticks (`Driver::polled`), which starts a fresh table as a switch here does.
         let mut was_enabled = self.probes.is_enabled();
         while !self.stop.load(Ordering::Acquire) {
-            let mut windows = self
-                .windows
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut windows = self.windows.lock().unwrap_or_else(PoisonError::into_inner);
             if self.followed.swap(false, Ordering::AcqRel) {
                 published_through = None;
             }
@@ -541,7 +539,7 @@ impl Inspection {
         sources
             .sources()
             .filter_map(|(name, handle)| {
-                let source = handle.borrow();
+                let source = handle.read().unwrap_or_else(PoisonError::into_inner);
                 let window = source.retained_window()?;
                 let keys = ColumnValue::from_uints(
                     window_tail(window.clone(), ROWS_PER_READING).collect(),
@@ -709,6 +707,7 @@ fn main() {
             control_port,
         } => {
             let served = inspect_port.is_some() || control_port.is_some();
+
             let result = if served {
                 run_program(&loaded, inspect_port, control_port, morsel_rows())
             } else {

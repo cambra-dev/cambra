@@ -2,6 +2,9 @@
 use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::PoisonError;
 
 use bit_set::BitSet;
 
@@ -21,14 +24,12 @@ use crate::interpreter::{
 ///
 /// Output fields are named `_0`, `_1`, … matching the input order.
 pub struct Zip {
+    names: Vec<SmolStr>,
+    level: CurryLevel,
     /// Output tiling: the standing levels, with a `Record` where the operands' values sat.
     base: OperatorBase,
-    /// Field names in input order, used when producing the output Record tile.
-    names: Vec<SmolStr>,
     /// The input collections to pair.
-    inputs: Vec<Box<dyn TileOperator>>,
-    /// The level the record sits at — the values every standing level is over.
-    level: CurryLevel,
+    inputs: Vec<Arc<dyn TileOperator>>,
 }
 
 /// `tiling`'s levels above `level`, with `inner` at it.
@@ -52,7 +53,7 @@ impl Zip {
     /// are the ones the operands were applied over. Two arms that agree beneath them (two
     /// projections of one grouped row, say) look pairable all the way down, and two that
     /// differ there are the collection-valued component case.
-    pub fn new_at(names: Vec<SmolStr>, ops: Vec<Box<dyn TileOperator>>, level: CurryLevel) -> Self {
+    pub fn new_at(names: Vec<SmolStr>, ops: Vec<Arc<dyn TileOperator>>, level: CurryLevel) -> Self {
         assert!(!ops.is_empty(), "Zip requires at least one input");
         assert!(
             level != CurryLevel::OUTERMOST,
@@ -92,10 +93,11 @@ impl Zip {
         );
         let tiling = with_values_at(ops[0].tiling(), level, record);
         Self {
-            base: OperatorBase::new(tiling),
             names,
-            inputs: ops,
             level,
+            base: OperatorBase::new(tiling),
+
+            inputs: ops,
         }
     }
 }
@@ -109,29 +111,29 @@ impl Zip {
 /// them. See the "CCL types vs. tilings" section of
 /// [`design-operators.md`](./design-operators.md) for why the same CCL-level `zip` compiles
 /// to two different tile operators.
-pub fn zip_arms_at(inputs: Vec<Box<dyn TileOperator>>, level: CurryLevel) -> Box<dyn TileOperator> {
+pub fn zip_arms_at(inputs: Vec<Arc<dyn TileOperator>>, level: CurryLevel) -> Arc<dyn TileOperator> {
     if inputs.iter().all(|op| op.tiling().is_scalar()) {
-        return Box::new(MakeRecord::new(inputs));
+        return Arc::new(MakeRecord::new(inputs));
     }
     let names = (0..inputs.len()).map(tuple_field).collect();
-    Box::new(Zip::new_at(names, inputs, level))
+    Arc::new(Zip::new_at(names, inputs, level))
 }
 
 /// Named-field variant of [`zip_arms_at`], for record literals.
 pub fn zip_arms_named_at(
-    inputs: Vec<(SmolStr, Box<dyn TileOperator>)>,
+    inputs: Vec<(SmolStr, Arc<dyn TileOperator>)>,
     level: CurryLevel,
-) -> Box<dyn TileOperator> {
+) -> Arc<dyn TileOperator> {
     if inputs.iter().all(|(_, op)| op.tiling().is_scalar()) {
-        return Box::new(MakeRecord::new_named(inputs));
+        return Arc::new(MakeRecord::new_named(inputs));
     }
     // A lone arm over a collection has nothing to pair with, so its values are wrapped in place.
     let inputs = match <[_; 1]>::try_from(inputs) {
-        Ok([(name, input)]) => return Box::new(RecordWrap::new_at(name, input, level)),
+        Ok([(name, input)]) => return Arc::new(RecordWrap::new_at(name, input, level)),
         Err(inputs) => inputs,
     };
     let (names, ops) = inputs.into_iter().unzip();
-    Box::new(Zip::new_at(names, ops, level))
+    Arc::new(Zip::new_at(names, ops, level))
 }
 
 /// The values at `level` of its input, wrapped in a one-field record, under the levels
@@ -144,17 +146,16 @@ pub fn zip_arms_named_at(
 /// An input that is a bare value, with no collection above `level`, is a [`MakeRecord`]'s to
 /// wrap, which [`zip_arms_named_at`] checks first.
 pub struct RecordWrap {
+    name: SmolStr,
+    level: CurryLevel,
     /// Output tiling: the standing levels, with a one-field `Record` where the values sat.
     base: OperatorBase,
-    name: SmolStr,
-    input: Box<dyn TileOperator>,
-    /// The level the record sits at — the values every standing level is over.
-    level: CurryLevel,
+    input: Arc<dyn TileOperator>,
 }
 
 impl RecordWrap {
     /// Wrap the values `input` holds at `level` as the field `name`.
-    pub fn new_at(name: SmolStr, input: Box<dyn TileOperator>, level: CurryLevel) -> Self {
+    pub fn new_at(name: SmolStr, input: Arc<dyn TileOperator>, level: CurryLevel) -> Self {
         assert!(
             level != CurryLevel::OUTERMOST,
             "RecordWrap wraps the values of a collection, beneath at least one standing level"
@@ -166,10 +167,11 @@ impl RecordWrap {
         );
         let tiling = with_values_at(input.tiling(), level, record);
         Self {
-            base: OperatorBase::new(tiling),
             name,
-            input,
             level,
+            base: OperatorBase::new(tiling),
+
+            input,
         }
     }
 }
@@ -186,34 +188,34 @@ impl TileOperator for RecordWrap {
     }
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let consumer =
             crate::interpreter::notifications::through_values(self.level, self.tiling(), consumer);
-        let input = self
-            .input
-            .subscribe(self.input.tiling().universal_guard(), consumer, cx);
+        let input =
+            self.input
+                .clone()
+                .subscribe(self.input.tiling().universal_guard(), consumer, cx);
         Box::new(RecordWrapProducer {
+            operator: self.clone(),
             base: ProducerBase::new(
                 RecordWrapProducer::alloc_id(),
                 self.tiling(),
-                &self.base,
+                self.clone(),
                 cx,
             ),
-            name: self.name.clone(),
-            level: self.level,
+
             input,
         })
     }
 }
 
 struct RecordWrapProducer {
+    operator: Arc<RecordWrap>,
     base: ProducerBase,
-    name: SmolStr,
-    level: CurryLevel,
     input: Box<dyn TileProducer>,
 }
 
@@ -230,7 +232,7 @@ impl TileProducer for RecordWrapProducer {
 
     /// It keeps its input's keys above its level and computes the values beneath it.
     fn restates(&self) -> Restates {
-        Restates::Above(self.level)
+        Restates::Above(self.operator.level)
     }
 
     /// Wrapping keeps the input's keys, so the input is pulled at the projection.
@@ -245,9 +247,9 @@ impl TileProducer for RecordWrapProducer {
             "RecordWrap: the input must be a function tile, got {tile:?}"
         );
         // Lift the values out, as `Zip` does, and put them back as the one field.
-        let slot = tile.values_at_mut(self.level);
+        let slot = tile.values_at_mut(self.operator.level);
         let values = std::mem::replace(slot, Tile::record(HashMap::new()));
-        *slot = Tile::record(HashMap::from([(self.name.clone(), values)]));
+        *slot = Tile::record(HashMap::from([(self.operator.name.clone(), values)]));
         tile
     }
 
@@ -259,8 +261,8 @@ impl TileProducer for RecordWrapProducer {
             // one field of the record and takes that field's part.
             g => crate::interpreter::tiling::onto_record_field(
                 g.clone(),
-                self.level.index(),
-                &self.name,
+                self.operator.level.index(),
+                &self.operator.name,
                 self.input.tiling(),
             ),
         };
@@ -278,7 +280,7 @@ impl TileOperator for Zip {
     }
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -287,16 +289,16 @@ impl TileOperator for Zip {
             crate::interpreter::notifications::through_values(self.level, self.tiling(), consumer);
         let shared = shared_consumer(consumer);
         Box::new(ZipProducer {
-            base: ProducerBase::new(ZipProducer::alloc_id(), self.tiling(), &self.base, cx),
-            names: self.names.clone(),
-            level: self.level,
+            operator: self.clone(),
+            base: ProducerBase::new(ZipProducer::alloc_id(), self.tiling(), self.clone(), cx),
+
             held: vec![HashSet::new(); self.inputs.len()],
             emitted: Predicate::False,
             inputs: self
                 .inputs
-                .iter_mut()
+                .iter()
                 // Every arm is pulled at the projection: the arms share the pair's keys.
-                .map(|i| subscribe_forwarding_keeping_keys(&mut **i, &shared, cx))
+                .map(|i| subscribe_forwarding_keeping_keys(i, &shared, cx))
                 .collect(),
         })
     }
@@ -322,13 +324,10 @@ fn qualify_beneath(tile: &mut Tile, rows: &Predicate) {
 
 /// Producer for [`Zip`]: pulls each input and assembles a record-codomain tile.
 struct ZipProducer {
+    operator: Arc<Zip>,
     base: ProducerBase,
-    /// Field names in input order, used when producing the output Record tile.
-    names: Vec<SmolStr>,
     /// Live input producers, in field order.
     inputs: Vec<Box<dyn TileProducer>>,
-    /// The level the record sits at ([`Zip`]).
-    level: CurryLevel,
     /// The paths of the rows each arm has held at the pair's enclosing level, on any pull: an
     /// arm gives back only a row it held.
     held: Vec<HashSet<Vec<Value>>>,
@@ -354,7 +353,7 @@ impl TileProducer for ZipProducer {
 
     /// It keeps its input's keys above its level and computes the values beneath it.
     fn restates(&self) -> Restates {
-        Restates::Above(self.level)
+        Restates::Above(self.operator.level)
     }
 
     /// The arms share the pair's keys, so each arm is pulled at the projection.
@@ -387,16 +386,21 @@ impl TileProducer for ZipProducer {
         // "The release contract"). Such a row stays, holding no cell of that field; only a
         // row an arm lacks without having released it is one the arms disagree on.
         let released: Vec<Option<TileGuard>> = self
+            .operator
             .names
             .iter()
             .zip(self.inputs.iter())
             .map(|(name, input)| {
                 // In canonical form, where a release of every cell under a key names the
                 // key, which is what a path is read against.
-                (!input.tiling().values_at(self.level).holds_a_level()).then(|| {
+                (!input
+                    .tiling()
+                    .values_at(self.operator.level)
+                    .holds_a_level())
+                .then(|| {
                     TileGuard::flatten_or(vec![crate::interpreter::tiling::onto_record_field(
                         self.obsolete_guard().clone(),
-                        self.level.index(),
+                        self.operator.level.index(),
                         name,
                         input.tiling(),
                     )])
@@ -406,7 +410,7 @@ impl TileProducer for ZipProducer {
         // A release covering a row the arm never held, one its input never had, gives
         // nothing back: the row is absent from that arm, and so from the pair.
         let mut held = std::mem::take(&mut self.held);
-        if let Some(rows_level) = self.level.enclosing() {
+        if let Some(rows_level) = self.operator.level.enclosing() {
             for (arm, tile) in tiles.iter().enumerate() {
                 if tile.is_data_function() {
                     held[arm].extend(tile.paths_at(rows_level));
@@ -436,7 +440,7 @@ impl TileProducer for ZipProducer {
         // the flat case, which the presence intersection below already aligns over the
         // outermost keys; the paths each arm holds are recorded for every zip above, flat or
         // not, for what a release gives back.
-        if let Some(above) = self.level.enclosing()
+        if let Some(above) = self.operator.level.enclosing()
             && above.index() >= 1
             && tiles[0].is_data_function()
         {
@@ -535,14 +539,18 @@ impl TileProducer for ZipProducer {
                 // Filter each tile to the intersection of present positions
                 // (compute "to_remove" as that tile's domain minus the
                 // intersection, then drop those rows).
-                let rows_level = self.level.enclosing().expect("a pair stands beneath a row");
+                let rows_level = self
+                    .operator
+                    .level
+                    .enclosing()
+                    .expect("a pair stands beneath a row");
                 let mut filtered_tiles: Vec<Tile> = Vec::with_capacity(tiles.len());
                 // A pair is complete where every arm's key is: each level above the pair
                 // states the meet of the arms' statements, not the skeleton arm's alone,
                 // which calls a row complete that another arm is still filling.
                 let mut standing: Vec<Predicate> = Vec::new();
                 for mut filtered in tiles.into_iter() {
-                    for depth in 1..self.level.index() {
+                    for depth in 1..self.operator.level.index() {
                         let Tile::DataFunction {
                             domain_predicate, ..
                         } = filtered.values_at(CurryLevel::new(depth))
@@ -584,7 +592,7 @@ impl TileProducer for ZipProducer {
                     );
                 }
                 let skeleton_levels: Vec<(Vec<RowIndex>, ColumnValue)> =
-                    filtered_tiles[skeleton_at].key_levels()[..self.level.index()]
+                    filtered_tiles[skeleton_at].key_levels()[..self.operator.level.index()]
                         .iter()
                         .map(|(starts, keys)| (starts.to_vec(), (*keys).clone()))
                         .collect();
@@ -595,7 +603,7 @@ impl TileProducer for ZipProducer {
                     // Lift the values out, leaving the chain of keys behind: what stays is
                     // the output's own shape, and every input has to agree on it.
                     let values = std::mem::replace(
-                        filtered.values_at_mut(self.level),
+                        filtered.values_at_mut(self.operator.level),
                         Tile::record(HashMap::new()),
                     );
                     if held == rows {
@@ -603,13 +611,13 @@ impl TileProducer for ZipProducer {
                         // disagree beneath them would pair one arm's values under another's
                         // keys.
                         assert!(
-                            filtered.key_levels()[..self.level.index()]
+                            filtered.key_levels()[..self.operator.level.index()]
                                 .iter()
                                 .map(|(starts, keys)| (starts.to_vec(), (*keys).clone()))
                                 .eq(skeleton_levels.iter().cloned()),
                             "Zip: inputs disagree on the {} levels above the pair, after \
                              aligning them: {skeleton_levels:?} against {filtered:?}",
-                            self.level.index(),
+                            self.operator.level.index(),
                         );
                         codomains.push(values);
                         continue;
@@ -633,13 +641,13 @@ impl TileProducer for ZipProducer {
                     }
                     let (aligned, missing) = align_keyless(values, &cells);
                     if let Some(missing) = missing {
-                        absent.insert(self.names[arm].clone(), missing);
+                        absent.insert(self.operator.names[arm].clone(), missing);
                     }
                     codomains.push(aligned);
                 }
                 // A key an arm knows absent is absent from the pair, which holds a row only where
                 // every arm does, so each level above the pair knows absent what any arm does.
-                let absent_keys: Vec<Predicate> = (0..self.level.index())
+                let absent_keys: Vec<Predicate> = (0..self.operator.level.index())
                     .map(|depth| {
                         Predicate::union_all(
                             filtered_tiles
@@ -656,7 +664,7 @@ impl TileProducer for ZipProducer {
                     .collect();
                 let skeleton = filtered_tiles.swap_remove(skeleton_at);
 
-                let names = &self.names;
+                let names = &self.operator.names;
                 let codomain_record = Tile::Record {
                     fields: codomains
                         .into_iter()
@@ -674,7 +682,7 @@ impl TileProducer for ZipProducer {
                     }
                 }
                 let mut out = skeleton;
-                *out.values_at_mut(self.level) = codomain_record;
+                *out.values_at_mut(self.operator.level) = codomain_record;
                 for (depth, known) in absent_keys.into_iter().enumerate() {
                     if let Tile::DataFunction { absent_keys, .. } =
                         out.values_at_mut(CurryLevel::new(depth))
@@ -707,7 +715,7 @@ impl TileProducer for ZipProducer {
                 if self
                     .inputs
                     .iter()
-                    .any(|i| i.tiling().values_at(self.level).holds_a_level())
+                    .any(|i| i.tiling().values_at(self.operator.level).holds_a_level())
                 {
                     let Tile::DataFunction {
                         domain,
@@ -727,7 +735,7 @@ impl TileProducer for ZipProducer {
                         ),
                     };
                     let vouched = held.union(domain_predicate);
-                    qualify_beneath(out.values_at_mut(self.level), &vouched);
+                    qualify_beneath(out.values_at_mut(self.operator.level), &vouched);
                 }
                 self.held = held;
                 // The arms keep the rows a consumer released only a field of
@@ -735,7 +743,8 @@ impl TileProducer for ZipProducer {
                 if !self.base.obsolete_guard.is_empty() {
                     out.remove_guarded(self.base.obsolete_guard.clone());
                 }
-                if let (1, Tile::DataFunction { domain, .. }) = (self.level.index(), &out) {
+                if let (1, Tile::DataFunction { domain, .. }) = (self.operator.level.index(), &out)
+                {
                     self.emitted = self.emitted.union(&Predicate::from_column_value(domain));
                 }
                 // The completeness intersected above is each arm's, which an arm restating fewer
@@ -749,8 +758,12 @@ impl TileProducer for ZipProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        let level = self.level.index();
-        let pair = self.base.tiling.values_at(self.level).empty_guard();
+        let level = self.operator.level.index();
+        let pair = self
+            .base
+            .tiling
+            .values_at(self.operator.level)
+            .empty_guard();
         // An arm takes the pairs released whole, and a field of a pair it has emitted. A
         // consumer done with one field may be done with it at every row, the rows the pair
         // has not paired yet included, and an arm releasing a row's cells gives the row back:
@@ -770,7 +783,7 @@ impl TileProducer for ZipProducer {
             &pair,
         )]);
         let released = TileGuard::flatten_or(vec![whole.clone(), delivered]);
-        for (name, input) in self.names.iter().zip(self.inputs.iter_mut()) {
+        for (name, input) in self.operator.names.iter().zip(self.inputs.iter_mut()) {
             let guard = match &released {
                 g if g.is_universal() => input.tiling().universal_guard(),
                 g if g.is_empty() => input.tiling().empty_guard(),
@@ -866,17 +879,16 @@ fn align_keyless(values: Tile, cells: &[Option<usize>]) -> (Tile, Option<BitSet>
 /// [`SelectField`] is the eliminator. See `src/interpreter/design-operators.md`, "A product
 /// value is a record of tiles".
 pub struct MakeRecord {
-    base: OperatorBase,
-    /// Field names in input order, used when producing `Tile::Record` tiles.
     names: Vec<SmolStr>,
-    inputs: Vec<Box<dyn TileOperator>>,
+    base: OperatorBase,
+    inputs: Vec<Arc<dyn TileOperator>>,
 }
 
 impl MakeRecord {
     /// Construct a `MakeRecord` whose fields are `inputs`, named `_0`, `_1`, … in order.
     ///
     /// Each field keeps its input's tiling, whatever that is.
-    pub fn new(inputs: Vec<Box<dyn TileOperator>>) -> Self {
+    pub fn new(inputs: Vec<Arc<dyn TileOperator>>) -> Self {
         assert!(!inputs.is_empty(), "MakeRecord requires at least one input");
         let names = (0..inputs.len()).map(tuple_field).collect();
         Self::new_impl(names, inputs)
@@ -886,13 +898,13 @@ impl MakeRecord {
     ///
     /// Like [`Self::new`] but uses the caller-supplied field names instead of
     /// the synthetic `_0`, `_1`, … names used for tuples.
-    pub fn new_named(inputs: Vec<(SmolStr, Box<dyn TileOperator>)>) -> Self {
+    pub fn new_named(inputs: Vec<(SmolStr, Arc<dyn TileOperator>)>) -> Self {
         assert!(!inputs.is_empty(), "MakeRecord requires at least one input");
         let (names, ops) = inputs.into_iter().unzip();
         Self::new_impl(names, ops)
     }
 
-    fn new_impl(names: Vec<SmolStr>, inputs: Vec<Box<dyn TileOperator>>) -> Self {
+    fn new_impl(names: Vec<SmolStr>, inputs: Vec<Arc<dyn TileOperator>>) -> Self {
         let tiling = Tiling::Record(
             names
                 .iter()
@@ -901,8 +913,9 @@ impl MakeRecord {
                 .collect(),
         );
         Self {
-            base: OperatorBase::new(tiling),
             names,
+            base: OperatorBase::new(tiling),
+
             inputs,
         }
     }
@@ -918,24 +931,25 @@ impl TileOperator for MakeRecord {
     }
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let shared = shared_consumer(consumer);
         Box::new(MakeRecordProducer {
+            operator: self.clone(),
             base: ProducerBase::new(
                 MakeRecordProducer::alloc_id(),
                 self.tiling(),
-                &self.base,
+                self.clone(),
                 cx,
             ),
-            names: self.names.clone(),
+
             inputs: self
                 .inputs
-                .iter_mut()
-                .map(|i| subscribe_forwarding(&mut **i, &shared, cx))
+                .iter()
+                .map(|i| subscribe_forwarding(i, &shared, cx))
                 .collect(),
         })
     }
@@ -944,8 +958,8 @@ impl TileOperator for MakeRecord {
 /// Producer for [`MakeRecord`]: pulls every operand and builds a `Tile::Record` of their
 /// tiles.
 struct MakeRecordProducer {
+    operator: Arc<MakeRecord>,
     base: ProducerBase,
-    names: Vec<SmolStr>,
     inputs: Vec<Box<dyn TileProducer>>,
 }
 
@@ -976,9 +990,10 @@ impl TileProducer for MakeRecordProducer {
             ),
         }
         // Every operand is pulled whole ([`SelectFieldProducer`] says why a pull naming one
-        // field is unsound). An operand withholds what [`Self::release_impl`] told it a
+        // field is unsound). An operand withholds what [`MakeRecordProducer::release_impl`] told it a
         // consumer finished with, so a field that settled early is not re-delivered.
         let fields: HashMap<SmolStr, Tile> = self
+            .operator
             .names
             .iter()
             .zip(self.inputs.iter_mut())
@@ -996,7 +1011,7 @@ impl TileProducer for MakeRecordProducer {
         match &obsolete_guard {
             g if g.is_empty() => {}
             TileGuard::Record(fields) => {
-                for (name, input) in self.names.iter().zip(self.inputs.iter_mut()) {
+                for (name, input) in self.operator.names.iter().zip(self.inputs.iter_mut()) {
                     if let Some(field) = fields.get(name) {
                         input.release(field.clone());
                     }
@@ -1022,11 +1037,10 @@ impl TileProducer for MakeRecordProducer {
 /// at a time, so every field must fit in a column. See
 /// `src/interpreter/design-operators.md`, "A product value is a record of tiles".
 pub struct SelectField {
+    name: SmolStr,
     base: OperatorBase,
     /// The product whose field this selects.
-    input: Box<dyn TileOperator>,
-    /// The field's name — `_0`, `_1`, … for a tuple.
-    name: SmolStr,
+    input: Arc<dyn TileOperator>,
 }
 
 /// Restate a selector's release at field `name` in the product `tiling`.
@@ -1108,13 +1122,13 @@ impl SelectField {
     /// # Panics
     ///
     /// Panics unless `input`'s deepest values are a `Tiling::Record` holding `name`.
-    pub fn new(input: Box<dyn TileOperator>, name: impl Into<SmolStr>) -> Self {
+    pub fn new(input: Arc<dyn TileOperator>, name: impl Into<SmolStr>) -> Self {
         let name = name.into();
         let tiling = select_field_tiling(input.tiling(), &name);
         Self {
+            name,
             base: OperatorBase::new(tiling),
             input,
-            name,
         }
     }
 }
@@ -1127,7 +1141,7 @@ impl TileOperator for SelectField {
     }
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -1137,20 +1151,21 @@ impl TileOperator for SelectField {
         // An intent may only widen on its way upstream, so the input is asked for all of
         // it. [`guard_at_field`] narrows, which is sound for a release and not here.
         let input_tiling = self.input.tiling().clone();
-        let input_producer = self.input.subscribe(
+        let input_producer = self.input.clone().subscribe(
             input_tiling.universal_guard(),
             consumer_keeping_keys_if(keeps_keys, consumer),
             cx,
         );
         Box::new(SelectFieldProducer {
+            operator: self.clone(),
             base: ProducerBase::new(
                 SelectFieldProducer::alloc_id(),
                 self.tiling(),
-                &self.base,
+                self.clone(),
                 cx,
             ),
             input: input_producer,
-            name: self.name.clone(),
+
             input_tiling,
         })
     }
@@ -1174,16 +1189,16 @@ impl TileOperator for SelectField {
 /// release names this field's part; enclosing keys release their whole records
 /// ([`guard_at_field`]).
 struct SelectFieldProducer {
+    operator: Arc<SelectField>,
     base: ProducerBase,
     input: Box<dyn TileProducer>,
-    name: SmolStr,
     /// The product's tiling, for naming this field in a guard travelling upward.
     input_tiling: Tiling,
 }
 
 impl SelectFieldProducer {
     fn at_field(&self, guard: TileGuard) -> TileGuard {
-        guard_at_field(&self.input_tiling, &self.name, guard)
+        guard_at_field(&self.input_tiling, &self.operator.name, guard)
     }
 }
 
@@ -1225,7 +1240,7 @@ impl TileProducer for SelectFieldProducer {
         // (`Tile::Record`'s `absent`), and the field is the whole value here, so the row
         // leaves with it. The record gathers its other fields' cells along.
         let missing = match tile.deepest_values() {
-            Tile::Record { absent, .. } => absent.get(&self.name).cloned(),
+            Tile::Record { absent, .. } => absent.get(&self.operator.name).cloned(),
             _ => None,
         };
         if let Some(missing) = missing {
@@ -1243,12 +1258,12 @@ impl TileProducer for SelectFieldProducer {
         let slot = tile.deepest_values_mut();
         let Tile::Record { mut fields, .. } = std::mem::replace(slot, Tile::record(HashMap::new()))
         else {
-            panic!("SelectField({}) expected a record tile", self.name);
+            panic!("SelectField({}) expected a record tile", self.operator.name);
         };
-        *slot = fields.remove(&self.name).unwrap_or_else(|| {
+        *slot = fields.remove(&self.operator.name).unwrap_or_else(|| {
             panic!(
                 "SelectField({}) over a record tile with no such field",
-                self.name
+                self.operator.name
             )
         });
         // The input is released only where every reader of it has released
@@ -1278,22 +1293,22 @@ mod nested_projection_tests {
         ProjectionSpyOp, assert_conforms_beneath, two_levels_of_ints,
     };
 
-    fn spy() -> Box<dyn TileOperator> {
+    fn spy() -> Arc<dyn TileOperator> {
         let (tile, tiling) = two_levels_of_ints();
-        Box::new(ProjectionSpyOp::new(tile, tiling).0)
+        Arc::new(ProjectionSpyOp::new(tile, tiling).0)
     }
 
     #[test]
     fn a_wrap_beneath_two_levels_answers_a_projection_of_paths() {
         assert_conforms_beneath(|| {
-            Box::new(RecordWrap::new_at("a".into(), spy(), CurryLevel::new(2)))
+            Arc::new(RecordWrap::new_at("a".into(), spy(), CurryLevel::new(2)))
         });
     }
 
     #[test]
     fn a_zip_beneath_two_levels_answers_a_projection_of_paths() {
         assert_conforms_beneath(|| {
-            Box::new(Zip::new_at(
+            Arc::new(Zip::new_at(
                 vec!["a".into(), "b".into()],
                 vec![spy(), spy()],
                 CurryLevel::new(2),
@@ -1310,13 +1325,13 @@ mod tests {
     };
     use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
     use bit_set::BitSet;
-    use std::cell::RefCell;
+    use std::sync::RwLock;
 
     fn record_wrap_over(
         input_tile: Tile,
         input_tiling: Tiling,
         name: &str,
-    ) -> (RecordWrapProducer, Rc<RefCell<Vec<TileGuard>>>) {
+    ) -> (RecordWrapProducer, Arc<RwLock<Vec<TileGuard>>>) {
         let (spy, log) = ReleaseSpy::new(input_tile, input_tiling.clone());
         let level = CurryLevel::new(1);
         let record = Tiling::Record(
@@ -1326,9 +1341,9 @@ mod tests {
         );
         let out_tiling = with_values_at(&input_tiling, level, record);
         let producer = RecordWrapProducer {
+            operator: RecordWrap::state_definition(SmolStr::new(name), level),
             base: ProducerBase::unowned(RecordWrapProducer::alloc_id(), &out_tiling),
-            name: SmolStr::new(name),
-            level,
+
             input: Box::new(spy),
         };
         (producer, log)
@@ -1376,9 +1391,12 @@ mod tests {
         let (mut producer, log) = record_wrap_over(tile, tiling, "f");
         producer.release(producer.tiling().universal_guard());
         assert!(
-            log.borrow().iter().any(|g| g.is_universal()),
+            log.read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .any(|g| g.is_universal()),
             "the universal release reaches the input, saw {:?}",
-            log.borrow()
+            log.read().unwrap_or_else(PoisonError::into_inner)
         );
     }
 
@@ -1390,7 +1408,7 @@ mod tests {
         let key_zero = Predicate::at_or_below(Value::UInt(0));
         producer.release(TileGuard::Function(FunctionGuard::Domain(key_zero.clone())));
         assert_eq!(
-            *log.borrow(),
+            *log.read().unwrap_or_else(PoisonError::into_inner),
             vec![TileGuard::Function(FunctionGuard::Domain(key_zero))],
             "key 0 of the record is key 0 of the input"
         );
@@ -1416,7 +1434,7 @@ mod tests {
             field,
         ))));
         assert_eq!(
-            *log.borrow(),
+            *log.read().unwrap_or_else(PoisonError::into_inner),
             vec![TileGuard::Function(FunctionGuard::Codomain(Box::new(
                 key_zero.clone()
             )))],
@@ -1441,14 +1459,15 @@ mod tests {
         }
         let out_tiling = Tiling::Record((0..2).map(|i| (tuple_field(i), tiling.clone())).collect());
         let mut producer = MakeRecordProducer {
+            operator: MakeRecord::state_definition((0..2).map(tuple_field).collect()),
             base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out_tiling),
-            names: (0..2).map(tuple_field).collect(),
+
             inputs,
         };
 
         producer.release(out_tiling.universal_guard());
         for (i, log) in logs.iter().enumerate() {
-            let seen = log.borrow();
+            let seen = log.read().unwrap_or_else(PoisonError::into_inner);
             assert!(
                 seen.iter().any(|g| g.is_universal()),
                 "operand {i} should have been released universally, saw {seen:?}"
@@ -1463,14 +1482,17 @@ mod tests {
         let (spy, log) = ReleaseSpy::new(Tile::Scalar(ColumnValue::Ints(vec![1])), tiling.clone());
         let out_tiling = Tiling::Record([(tuple_field(0), tiling.clone())].into_iter().collect());
         let mut producer = MakeRecordProducer {
+            operator: MakeRecord::state_definition(vec![tuple_field(0)]),
             base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out_tiling),
-            names: vec![tuple_field(0)],
+
             inputs: vec![Box::new(spy)],
         };
 
         producer.release(out_tiling.empty_guard());
         assert!(
-            log.borrow().is_empty(),
+            log.read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
             "an empty release names nothing to free, so nothing is forwarded"
         );
     }
@@ -1499,8 +1521,9 @@ mod tests {
         let out_tiling =
             Tiling::Record(names.iter().map(|n| (n.clone(), tiling.clone())).collect());
         let mut producer = MakeRecordProducer {
+            operator: MakeRecord::state_definition(names.clone()),
             base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out_tiling),
-            names: names.clone(),
+
             inputs,
         };
 
@@ -1516,14 +1539,18 @@ mod tests {
         producer.release(partial);
 
         assert_eq!(
-            *logs[0].borrow(),
+            *logs[0].read().unwrap_or_else(PoisonError::into_inner),
             vec![TileGuard::Scalar(Predicate::True)],
             "the named field's operand is released",
         );
         assert!(
-            logs[1].borrow().iter().all(TileGuard::is_empty),
+            logs[1]
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .all(TileGuard::is_empty),
             "the other operand is not, got {:?}",
-            logs[1].borrow(),
+            logs[1].read().unwrap_or_else(PoisonError::into_inner),
         );
     }
 
@@ -1558,7 +1585,7 @@ mod tests {
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
 
         fn subscribe(
-            &mut self,
+            self: Arc<Self>,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
             _cx: &mut SubscribeContext,
@@ -1576,7 +1603,7 @@ mod tests {
     #[test]
     fn select_field_extends_its_input_correlation_by_the_field() {
         let select = SelectField::new(
-            Box::new(Correlated {
+            Arc::new(Correlated {
                 tiling: record_under_a_level(),
                 correlation: vec![TilePathStep::Codomain],
             }),
@@ -1602,16 +1629,20 @@ mod tests {
         );
         let output_tiling = select_field_tiling(&input_tiling, "a");
         let mut producer = SelectFieldProducer {
+            operator: SelectField::state_definition("a".into()),
             base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &output_tiling),
             input: Box::new(spy),
-            name: "a".into(),
+
             input_tiling,
         };
         let rows = TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(Value::UInt(
             0,
         ))));
         producer.release(rows.clone());
-        assert_eq!(*log.borrow(), vec![rows]);
+        assert_eq!(
+            *log.read().unwrap_or_else(PoisonError::into_inner),
+            vec![rows]
+        );
     }
 
     #[test]
@@ -1700,19 +1731,21 @@ mod tests {
             input_tiling.clone(),
         );
         let mut producer = SelectFieldProducer {
+            operator: SelectField::state_definition("xs".into()),
             base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &field_tiling),
             input: Box::new(spy),
-            name: "xs".into(),
+
             input_tiling,
         };
         producer.read_in_pipeline(producer.tiling().universal_guard());
         assert!(
-            log.borrow()
+            log.read()
+                .unwrap_or_else(PoisonError::into_inner)
                 .iter()
                 .any(|g| matches!(g, TileGuard::Record(fields)
                 if fields.get("xs").is_some_and(|g| names_key(g, 1, 0)))),
             "the field's row 1 is released: {:?}",
-            log.borrow(),
+            log.read().unwrap_or_else(PoisonError::into_inner),
         );
     }
 
@@ -1754,9 +1787,10 @@ mod tests {
             BitSet::new(),
         );
         let mut producer = SelectFieldProducer {
+            operator: SelectField::state_definition("a".into()),
             base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &field_tiling),
             input: Box::new(TestTileProducer::new(input, input_tiling.clone())),
-            name: "a".into(),
+
             input_tiling,
         };
         let out = producer.read_in_pipeline(producer.tiling().universal_guard());
@@ -1788,19 +1822,23 @@ mod tests {
         let (spy_a, log_a) = ReleaseSpy::new(filtered_collection(), input_tiling.clone());
         let (spy_b, log_b) = ReleaseSpy::new(filtered_collection(), input_tiling);
         let mut zip = ZipProducer {
-            level: CurryLevel::new(1),
+            operator: Zip::state_definition(vec!["a".into(), "b".into()], CurryLevel::new(1)),
+
             held: vec![HashSet::new(); 2],
             emitted: Predicate::False,
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &output_tiling),
-            names: vec!["a".into(), "b".into()],
+
             inputs: vec![Box::new(spy_a), Box::new(spy_b)],
         };
         zip.read_in_pipeline(zip.tiling().universal_guard());
         for log in [log_a, log_b] {
             assert!(
-                log.borrow().iter().any(|g| names_key(g, 1, 0)),
+                log.read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .iter()
+                    .any(|g| names_key(g, 1, 0)),
                 "each input's row 1 is released: {:?}",
-                log.borrow(),
+                log.read().unwrap_or_else(PoisonError::into_inner),
             );
         }
     }
@@ -1838,11 +1876,12 @@ mod tests {
             ])),
         );
         let mut zip = ZipProducer {
-            level: CurryLevel::new(1),
+            operator: Zip::state_definition(vec!["a".into(), "b".into()], CurryLevel::new(1)),
+
             held: vec![HashSet::new(); 2],
             emitted: Predicate::False,
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &output_tiling),
-            names: vec!["a".into(), "b".into()],
+
             inputs: vec![
                 Box::new(TestTileProducer::new(tile_a, input_tiling.clone())),
                 Box::new(TestTileProducer::new(tile_b, input_tiling)),
@@ -1918,10 +1957,14 @@ mod tests {
         );
         let (spy1, _) = QuietSpy::new(arm(vec![50, 60], Predicate::False), arm_tiling);
         let mut zip = ZipProducer {
+            operator: Zip::state_definition(
+                vec![tuple_field(0), tuple_field(1)],
+                CurryLevel::new(1),
+            ),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
-            names: vec![tuple_field(0), tuple_field(1)],
+
             inputs: vec![Box::new(spy0), Box::new(spy1)],
-            level: CurryLevel::new(1),
+
             emitted: Predicate::False,
             held: vec![HashSet::new(); 2],
         };
@@ -1974,10 +2017,14 @@ mod tests {
         let (spy0, released0) = QuietSpy::new(arm0, arm0_tiling.clone());
         let (spy1, released1) = QuietSpy::new(arm1, arm1_tiling.clone());
         let mut zip = ZipProducer {
+            operator: Zip::state_definition(
+                vec![tuple_field(0), tuple_field(1)],
+                CurryLevel::new(1),
+            ),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
-            names: vec![tuple_field(0), tuple_field(1)],
+
             inputs: vec![Box::new(spy0), Box::new(spy1)],
-            level: CurryLevel::new(1),
+
             held: vec![HashSet::new(); 2],
             emitted: Predicate::False,
         };
@@ -1988,20 +2035,21 @@ mod tests {
         // value there is whole once delivered, so it is released at its row — for that arm,
         // its key 0 — and the collection arm is released the inner key it delivered beneath
         // key 0.
-        let covers = |log: &Rc<RefCell<Vec<TileGuard>>>, path: &[Value]| {
-            log.borrow()
+        let covers = |log: &Arc<RwLock<Vec<TileGuard>>>, path: &[Value]| {
+            log.read()
+                .unwrap_or_else(PoisonError::into_inner)
                 .iter()
                 .any(|g| TileGuard::flatten_or(vec![g.clone()]).covers_path(path))
         };
         assert!(
             covers(&released0, &[Value::UInt(0)]),
             "the scalar arm was not released its taken value: {:?}, from {guard:?}",
-            released0.borrow()
+            released0.read().unwrap_or_else(PoisonError::into_inner)
         );
         assert!(
             covers(&released1, &[Value::UInt(0), Value::UInt(3)]),
             "the collection arm was not released its inner key: {:?}, from {guard:?}",
-            released1.borrow()
+            released1.read().unwrap_or_else(PoisonError::into_inner)
         );
         // The row stays while its collection is open, holding no cell of the scalar field.
         let Tile::DataFunction {
@@ -2024,7 +2072,7 @@ mod tests {
             Predicate::point(Value::UInt(0)),
         )));
         for (log, tiling) in [(&released0, &arm0_tiling), (&released1, &arm1_tiling)] {
-            for g in log.borrow().iter() {
+            for g in log.read().unwrap_or_else(PoisonError::into_inner).iter() {
                 assert!(
                     g.check_from(tiling),
                     "{g:?} is not a guard over the arm's tiling {tiling}"
@@ -2033,7 +2081,7 @@ mod tests {
             assert!(
                 covers(log, &[Value::UInt(0)]),
                 "an arm was not released key 0: {:?}",
-                log.borrow()
+                log.read().unwrap_or_else(PoisonError::into_inner)
             );
         }
     }
@@ -2069,10 +2117,14 @@ mod tests {
         let (spy0, released0) = QuietSpy::new(arm0, arm_tiling.clone());
         let (spy1, _) = QuietSpy::new(arm1, arm_tiling);
         let mut zip = ZipProducer {
+            operator: Zip::state_definition(
+                vec![tuple_field(0), tuple_field(1)],
+                CurryLevel::new(1),
+            ),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
-            names: vec![tuple_field(0), tuple_field(1)],
+
             inputs: vec![Box::new(spy0), Box::new(spy1)],
-            level: CurryLevel::new(1),
+
             held: vec![HashSet::new(); 2],
             emitted: Predicate::False,
         };
@@ -2086,19 +2138,20 @@ mod tests {
         ))));
         let covers = |path: &[Value]| {
             released0
-                .borrow()
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
                 .iter()
                 .any(|g| TileGuard::flatten_or(vec![g.clone()]).covers_path(path))
         };
         assert!(
             covers(&[Value::UInt(0)]),
             "arm 0 was not released the row the pair emitted: {:?}",
-            released0.borrow()
+            released0.read().unwrap_or_else(PoisonError::into_inner)
         );
         assert!(
             !covers(&[Value::UInt(1)]),
             "arm 0 was released row 1, which arm 1 has not reached: {:?}",
-            released0.borrow()
+            released0.read().unwrap_or_else(PoisonError::into_inner)
         );
         let other_field = TileGuard::Function(FunctionGuard::Codomain(Box::new(
             TileGuard::Record(HashMap::from([
@@ -2132,7 +2185,7 @@ mod tests {
     /// included.
     struct Scripted {
         base: ProducerBase,
-        tile: Rc<RefCell<Tile>>,
+        tile: Arc<RwLock<Tile>>,
     }
 
     impl TileProducer for Scripted {
@@ -2143,7 +2196,10 @@ mod tests {
         }
 
         fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-            self.tile.borrow().clone()
+            self.tile
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
         }
 
         fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
@@ -2166,8 +2222,8 @@ mod tests {
             )
         };
         // Arm 0 holds rows 0 and 1, arm 1 row 0.
-        let arm0 = Rc::new(RefCell::new(rows(vec![0, 1], BitSet::new())));
-        let arm1 = Rc::new(RefCell::new(rows(vec![0], BitSet::new())));
+        let arm0 = Arc::new(RwLock::new(rows(vec![0, 1], BitSet::new())));
+        let arm1 = Arc::new(RwLock::new(rows(vec![0], BitSet::new())));
         let out_tiling = Tiling::data_function(
             uint(),
             Tiling::Record(HashMap::from([
@@ -2175,24 +2231,29 @@ mod tests {
                 (tuple_field(1), Tiling::Scalar(int())),
             ])),
         );
-        let scripted = |tile: &Rc<RefCell<Tile>>| -> Box<dyn TileProducer> {
+        let scripted = |tile: &Arc<RwLock<Tile>>| -> Box<dyn TileProducer> {
             Box::new(Scripted {
                 base: ProducerBase::unowned(Scripted::alloc_id(), &arm_tiling),
-                tile: Rc::clone(tile),
+                tile: Arc::clone(tile),
             })
         };
         let mut zip = ZipProducer {
+            operator: Zip::state_definition(
+                vec![tuple_field(0), tuple_field(1)],
+                CurryLevel::new(1),
+            ),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
-            names: vec![tuple_field(0), tuple_field(1)],
+
             inputs: vec![scripted(&arm0), scripted(&arm1)],
-            level: CurryLevel::new(1),
+
             held: vec![HashSet::new(); 2],
             emitted: Predicate::False,
         };
         zip.read_in_pipeline(out_tiling.universal_guard());
         assert!(zip.held[0].contains(&vec![Value::UInt(1)]));
         // Arm 0 deletes row 1, and the consumer releases row 0, the pair it saw.
-        *arm0.borrow_mut() = rows(vec![0, 1], BitSet::from_iter([1]));
+        *arm0.write().unwrap_or_else(PoisonError::into_inner) =
+            rows(vec![0, 1], BitSet::from_iter([1]));
         zip.read_in_pipeline(out_tiling.universal_guard());
         zip.release(TileGuard::Function(FunctionGuard::Domain(
             Predicate::exactly(&[Value::UInt(0)]),
@@ -2251,10 +2312,14 @@ mod tests {
         let (spy0, _) = QuietSpy::new(arm0_tiling.empty_tile(), arm0_tiling.clone());
         let (spy1, _) = QuietSpy::new(arm1, arm1_tiling);
         let mut zip = ZipProducer {
+            operator: Zip::state_definition(
+                vec![tuple_field(0), tuple_field(1)],
+                CurryLevel::new(2),
+            ),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
-            names: vec![tuple_field(0), tuple_field(1)],
+
             inputs: vec![Box::new(spy0), Box::new(spy1)],
-            level: CurryLevel::new(2),
+
             emitted: Predicate::False,
             // Arm `_0` held both rows before the consumer released its field, so it gives them
             // back rather than lacking them.
@@ -2372,10 +2437,14 @@ mod tests {
         let (spy0, _) = QuietSpy::new(arm0, arm0_tiling);
         let (spy1, _) = QuietSpy::new(arm1, arm1_tiling);
         let mut zip = ZipProducer {
+            operator: Zip::state_definition(
+                vec![tuple_field(0), tuple_field(1)],
+                CurryLevel::new(2),
+            ),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
-            names: vec![tuple_field(0), tuple_field(1)],
+
             inputs: vec![Box::new(spy0), Box::new(spy1)],
-            level: CurryLevel::new(2),
+
             emitted: Predicate::False,
             held: vec![HashSet::new(); 2],
         };
@@ -2433,9 +2502,9 @@ mod projection_tests {
         );
         (
             RecordWrapProducer {
+                operator: RecordWrap::state_definition(SmolStr::new("a"), CurryLevel::new(1)),
                 base: ProducerBase::unowned(RecordWrapProducer::alloc_id(), &out),
-                name: SmolStr::new("a"),
-                level: CurryLevel::new(1),
+
                 input: Box::new(input),
             },
             pulled,
@@ -2450,7 +2519,10 @@ mod projection_tests {
             panic!("a collection")
         };
         assert_eq!(domain.len(), 3);
-        assert_eq!(*pulled.borrow(), [keys_between(2, 4)]);
+        assert_eq!(
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
+            [keys_between(2, 4)]
+        );
     }
 
     #[test]
@@ -2496,9 +2568,10 @@ mod projection_tests {
         let (input, pulled, _) = ProjectionSpy::new(rows, in_tiling.clone());
         (
             SelectFieldProducer {
+                operator: SelectField::state_definition(SmolStr::new("amount")),
                 base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &ints()),
                 input: Box::new(input),
-                name: SmolStr::new("amount"),
+
                 input_tiling: in_tiling,
             },
             pulled,
@@ -2510,7 +2583,10 @@ mod projection_tests {
         let (mut select, pulled) = amounts_of_records();
         let morsel = select.read_in_pipeline(keys_between(1, 3));
         assert_eq!(int_entries(&morsel), [(1, 101), (2, 102), (3, 103)]);
-        assert_eq!(*pulled.borrow(), [keys_between(1, 3)]);
+        assert_eq!(
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
+            [keys_between(1, 3)]
+        );
     }
 
     #[test]
@@ -2544,9 +2620,10 @@ mod projection_tests {
             let (input, pulled, _) = ProjectionSpy::new(product, product_tiling.clone());
             (
                 SelectFieldProducer {
+                    operator: SelectField::state_definition(SmolStr::new("a")),
                     base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &ints()),
                     input: Box::new(input),
-                    name: SmolStr::new("a"),
+
                     input_tiling: product_tiling.clone(),
                 },
                 pulled,
@@ -2555,7 +2632,10 @@ mod projection_tests {
         let (mut select, pulled) = make();
         let morsel = select.read_in_pipeline(keys_between(2, 3));
         assert_eq!(int_entries(&morsel), [(2, 2), (3, 3)]);
-        assert_eq!(*pulled.borrow(), [product_tiling.universal_guard()]);
+        assert_eq!(
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
+            [product_tiling.universal_guard()]
+        );
         assert_conforms(|| Box::new(make().0), keys_between(2, 3));
     }
 
@@ -2577,10 +2657,14 @@ mod projection_tests {
         );
         (
             ZipProducer {
+                operator: Zip::state_definition(
+                    vec![tuple_field(0), tuple_field(1)],
+                    CurryLevel::new(1),
+                ),
                 base: ProducerBase::unowned(ZipProducer::alloc_id(), &out),
-                names: vec![tuple_field(0), tuple_field(1)],
+
                 inputs: vec![Box::new(a), Box::new(b)],
-                level: CurryLevel::new(1),
+
                 emitted: Predicate::False,
                 held: vec![HashSet::new(); 2],
             },
@@ -2607,8 +2691,14 @@ mod projection_tests {
             unreachable!("a morsel is a domain guard")
         };
         assert_eq!(*domain_predicate, stated);
-        assert_eq!(*a_pulled.borrow(), [keys_between(2, 4)]);
-        assert_eq!(*b_pulled.borrow(), [keys_between(2, 4)]);
+        assert_eq!(
+            *a_pulled.read().unwrap_or_else(PoisonError::into_inner),
+            [keys_between(2, 4)]
+        );
+        assert_eq!(
+            *b_pulled.read().unwrap_or_else(PoisonError::into_inner),
+            [keys_between(2, 4)]
+        );
     }
 
     /// An arm that has delivered less pairs only the keys both hold, and the pair is complete
@@ -2646,7 +2736,16 @@ mod projection_tests {
         let (mut zip, a_pulled, b_pulled) = pair(ROWS as usize);
         let nothing = zip.tiling().empty_guard();
         assert_eq!(zip.get(nothing), zip.tiling().empty_tile());
-        assert!(a_pulled.borrow().is_empty() && b_pulled.borrow().is_empty());
+        assert!(
+            a_pulled
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+                && b_pulled
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_empty()
+        );
     }
 
     /// `(a: 1, b: 2)`: a record of two values, each pulled whole.
@@ -2664,8 +2763,9 @@ mod projection_tests {
         );
         (
             MakeRecordProducer {
+                operator: MakeRecord::state_definition(vec![SmolStr::new("a"), SmolStr::new("b")]),
                 base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out),
-                names: vec![SmolStr::new("a"), SmolStr::new("b")],
+
                 inputs: vec![Box::new(a), Box::new(b)],
             },
             a_pulled,
@@ -2683,8 +2783,14 @@ mod projection_tests {
         };
         assert_eq!(fields.len(), 2);
         let scalar = Tiling::Scalar(Extent::Base(BaseType::Int)).universal_guard();
-        assert_eq!(*a_pulled.borrow(), std::slice::from_ref(&scalar));
-        assert_eq!(*b_pulled.borrow(), [scalar]);
+        assert_eq!(
+            *a_pulled.read().unwrap_or_else(PoisonError::into_inner),
+            std::slice::from_ref(&scalar)
+        );
+        assert_eq!(
+            *b_pulled.read().unwrap_or_else(PoisonError::into_inner),
+            [scalar]
+        );
     }
 
     #[test]
@@ -2692,7 +2798,16 @@ mod projection_tests {
         let (mut record, a_pulled, b_pulled) = two_values();
         let nothing = record.tiling().empty_guard();
         assert_eq!(record.get(nothing), record.tiling().empty_tile());
-        assert!(a_pulled.borrow().is_empty() && b_pulled.borrow().is_empty());
+        assert!(
+            a_pulled
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+                && b_pulled
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_empty()
+        );
     }
 
     #[test]
@@ -2707,6 +2822,71 @@ mod projection_tests {
         let (mut wrap, pulled) = wrapped();
         let nothing = wrap.tiling().empty_guard();
         assert_eq!(wrap.get(nothing), wrap.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(
+            pulled
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
+    }
+}
+
+#[cfg(test)]
+impl RecordWrap {
+    fn state_definition(name: SmolStr, level: CurryLevel) -> Arc<Self> {
+        Arc::new(Self {
+            name,
+            level,
+            base: OperatorBase::new(Tiling::Scalar(Extent::Base(
+                crate::interpreter::BaseType::Unit,
+            ))),
+            input: Arc::new(Constant::new(
+                crate::interpreter::Value::Unit,
+                Extent::Base(crate::interpreter::BaseType::Unit),
+            )),
+        })
+    }
+}
+
+#[cfg(test)]
+impl Zip {
+    fn state_definition(names: Vec<SmolStr>, level: CurryLevel) -> Arc<Self> {
+        Arc::new(Self {
+            names,
+            level,
+            base: OperatorBase::new(Tiling::Scalar(Extent::Base(
+                crate::interpreter::BaseType::Unit,
+            ))),
+            inputs: Vec::new(),
+        })
+    }
+}
+
+#[cfg(test)]
+impl MakeRecord {
+    fn state_definition(names: Vec<SmolStr>) -> Arc<Self> {
+        Arc::new(Self {
+            names,
+            base: OperatorBase::new(Tiling::Scalar(Extent::Base(
+                crate::interpreter::BaseType::Unit,
+            ))),
+            inputs: Vec::new(),
+        })
+    }
+}
+
+#[cfg(test)]
+impl SelectField {
+    fn state_definition(name: SmolStr) -> Arc<Self> {
+        Arc::new(Self {
+            name,
+            base: OperatorBase::new(Tiling::Scalar(Extent::Base(
+                crate::interpreter::BaseType::Unit,
+            ))),
+            input: Arc::new(Constant::new(
+                crate::interpreter::Value::Unit,
+                Extent::Base(crate::interpreter::BaseType::Unit),
+            )),
+        })
     }
 }

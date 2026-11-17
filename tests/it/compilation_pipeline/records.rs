@@ -2,9 +2,8 @@
 //! comprehensions, and joins producing record outputs.
 
 use crate::serving::PublishRows as _;
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::PoisonError;
 use std::time::Duration;
 
 use bit_set::BitSet;
@@ -340,55 +339,53 @@ fn test_datasource_named_record_join() {
         ("id".into(), Extent::Base(BaseType::Int)),
         ("label".into(), Extent::Base(BaseType::String)),
     ]));
-    let src1 = Rc::new(RefCell::new(TestDataSource::new(
-        "src1",
-        record_type.clone(),
-        record_extent.clone(),
-    )));
-    let src2 = Rc::new(RefCell::new(TestDataSource::new(
-        "src2",
-        record_type,
-        record_extent,
-    )));
+    let src1 = TestDataSource::new("src1", record_type.clone(), record_extent.clone());
+    let src2 = TestDataSource::new("src2", record_type, record_extent);
     ctx.register_source(src1.clone());
     ctx.register_source(src2.clone());
 
-    src1.borrow_mut().publish_rows(&[
-        (
-            Value::UInt(0),
-            Value::Record(HashMap::from([
-                ("id".into(), Value::Int(1)),
-                ("label".into(), Value::String("a".into())),
-            ])),
-        ),
-        (
-            Value::UInt(1),
-            Value::Record(HashMap::from([
-                ("id".into(), Value::Int(2)),
-                ("label".into(), Value::String("b".into())),
-            ])),
-        ),
-    ]);
-    src1.borrow_mut()
+    src1.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .publish_rows(&[
+            (
+                Value::UInt(0),
+                Value::Record(HashMap::from([
+                    ("id".into(), Value::Int(1)),
+                    ("label".into(), Value::String("a".into())),
+                ])),
+            ),
+            (
+                Value::UInt(1),
+                Value::Record(HashMap::from([
+                    ("id".into(), Value::Int(2)),
+                    ("label".into(), Value::String("b".into())),
+                ])),
+            ),
+        ]);
+    src1.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .set_yield_predicate(Predicate::at_or_below(Value::from(1u64)));
 
-    src2.borrow_mut().publish_rows(&[
-        (
-            Value::UInt(0),
-            Value::Record(HashMap::from([
-                ("id".into(), Value::Int(1)),
-                ("label".into(), Value::String("x".into())),
-            ])),
-        ),
-        (
-            Value::UInt(1),
-            Value::Record(HashMap::from([
-                ("id".into(), Value::Int(3)),
-                ("label".into(), Value::String("y".into())),
-            ])),
-        ),
-    ]);
-    src2.borrow_mut()
+    src2.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .publish_rows(&[
+            (
+                Value::UInt(0),
+                Value::Record(HashMap::from([
+                    ("id".into(), Value::Int(1)),
+                    ("label".into(), Value::String("x".into())),
+                ])),
+            ),
+            (
+                Value::UInt(1),
+                Value::Record(HashMap::from([
+                    ("id".into(), Value::Int(3)),
+                    ("label".into(), Value::String("y".into())),
+                ])),
+            ),
+        ]);
+    src2.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .set_yield_predicate(Predicate::at_or_below(Value::from(1u64)));
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -401,8 +398,12 @@ fn test_datasource_named_record_join() {
         producer.run().is_empty(),
         "record-valued join groups await closure"
     );
-    src1.borrow_mut().set_yield_predicate(Predicate::True);
-    src2.borrow_mut().set_yield_predicate(Predicate::True);
+    src1.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_yield_predicate(Predicate::True);
+    src2.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_yield_predicate(Predicate::True);
     let tile = sort_function_by_domain(producer.run());
     // Only (id=1, "a") × (id=1, "x") should match
     let Tile::DataFunction { codomain, .. } = tile else {

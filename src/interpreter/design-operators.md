@@ -2190,3 +2190,15 @@ transitive indices (t1→t3 directly) vs. recompute on demand.
 ### Cycles
 None of the above algorithms guarantee termination in the presence of cycles in the dataflow
 graph. Detecting convergence (rather than truncating iteration) is an open problem.
+
+## Shared native operator definitions
+
+Operator definitions use `Arc` and immutable subscription methods. Producers retain mutable
+execution state and implement `get_impl` and `release_impl` directly. Shared definitions provide
+immutable configuration.
+Runtime source, consumer and breaker handles use standard-library locks. Compiler source types
+remain in `SourceDefinition`, separate from the runtime source trait.
+
+Construction and notifications share a mutex with per-thread nesting and cycle identities.
+Poisoned guards are recovered to preserve the existing unwind behavior. Store guards retain the
+whole producer slot and settle pending releases when the operation ends.
