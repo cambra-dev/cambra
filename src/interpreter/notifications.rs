@@ -2,9 +2,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use crate::ccl::FieldKey;
 use crate::interpreter::CurryLevel;
-use crate::interpreter::{
-    Consumer, DataSourceDomainExtentImpl, Projection, dispatcher::Landing, dispatcher::Routes,
-};
+use crate::interpreter::{Consumer, DataSourceDomainExtentImpl, Projection, dispatcher::Landing};
 
 /// A consumer handle shared by notification forwarders.
 /// It carries notifications, not tile data.
@@ -91,29 +89,21 @@ impl Consumer for ThroughValues {
             self.downstream.notify(&region, landing);
         }
     }
-
-    fn route(&mut self, routes: &mut Routes) {
-        self.downstream.route(routes);
-    }
 }
 
 struct Widening(Box<dyn Consumer>);
 
 impl Consumer for Widening {
     /// A change widens to every key. A complete region passes as every key where its source is
-    /// wholly complete, and not at all otherwise: each output key depends on every input key.
+    /// wholly complete, and not at all otherwise: each output key depends on every input key, so
+    /// the path completes only part of what a row depends on.
     fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
-        match region {
+        landing.completing_part(|landing| match region {
             Projection::Everything => self.0.notify(region, landing),
             _ if landing.is_wholly_complete() => self.0.notify(&Projection::Everything, landing),
             _ if landing.is_complete() => {}
             _ => landing.widened(|landing| self.0.notify(&Projection::Everything, landing)),
-        }
-    }
-
-    /// A change widens, and a complete region that is not whole passes as nothing.
-    fn route(&mut self, routes: &mut Routes) {
-        routes.widened(|routes| routes.completing_part(|routes| self.0.route(routes)));
+        });
     }
 }
 
@@ -140,16 +130,11 @@ impl Consumer for WideningRestatingComplete {
             _ => landing.widened(|landing| self.1.notify(&Projection::Everything, landing)),
         }
     }
-
-    /// A change widens, so the path widens.
-    fn route(&mut self, routes: &mut Routes) {
-        routes.widened(|routes| self.1.route(routes));
-    }
 }
 
 /// [`restating`] for a lookup's collection operand: the rows a key of the operand names read that
 /// key and also their input's value, so the complete region it passes names only part of what
-/// those rows depend on ([`Routes::completing_part`]).
+/// those rows depend on ([`Landing::completing_part`]).
 pub fn restating_lookup(
     restate: Box<dyn Fn(&Projection) -> Projection>,
     consumer: Box<dyn Consumer>,
@@ -161,11 +146,7 @@ struct RestatingLookup(Restating);
 
 impl Consumer for RestatingLookup {
     fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
-        self.0.notify(region, landing);
-    }
-
-    fn route(&mut self, routes: &mut Routes) {
-        routes.completing_part(|routes| self.0.route(routes));
+        landing.completing_part(|landing| self.0.notify(region, landing));
     }
 }
 
@@ -185,11 +166,6 @@ impl Consumer for Restating {
     fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
         self.1.notify(&(self.0)(region), landing);
     }
-
-    /// The path keeps the keys, under another spelling.
-    fn route(&mut self, routes: &mut Routes) {
-        self.1.route(routes);
-    }
 }
 
 /// `consumer` behind a consumer that forwards each notification as the same keys under `tag`
@@ -204,11 +180,6 @@ struct Tagging(FieldKey, Box<dyn Consumer>);
 impl Consumer for Tagging {
     fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
         self.1.notify(&region.tagged(&self.0), landing);
-    }
-
-    /// The arm's keys under its tag are the union's keys, so the path keeps them.
-    fn route(&mut self, routes: &mut Routes) {
-        self.1.route(routes);
     }
 }
 
@@ -226,13 +197,6 @@ impl Consumer for Forwarding {
         match self.shared.try_borrow_mut() {
             Ok(mut consumer) => consumer.notify(region, landing),
             Err(_) => landing.reentered(),
-        }
-    }
-
-    fn route(&mut self, routes: &mut Routes) {
-        match self.shared.try_borrow_mut() {
-            Ok(mut consumer) => consumer.route(routes),
-            Err(_) => routes.reentered(),
         }
     }
 }
@@ -264,14 +228,9 @@ impl OneLevelIn {
             standing => Some(standing.clone()),
         }
     }
-}
 
-impl Consumer for OneLevelIn {
-    /// A complete region of the standing levels passes as it is. One that names keys at or beneath
-    /// level `at` passes as every key where its source is wholly complete, and not at all
-    /// otherwise: which output keys an input row stands beneath depends on its values, which no
-    /// region carries.
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    /// [`notify`](Consumer::notify) inside the path's completes-part mark.
+    fn pass_on(&mut self, region: &Projection, landing: &mut Landing<'_>) {
         if landing.is_complete() {
             match region {
                 Projection::Keys { level, .. } if *level >= self.at => {
@@ -290,11 +249,15 @@ impl Consumer for OneLevelIn {
             }
         }
     }
+}
 
-    /// The input's keys stand one level in, so the path keeps them. A complete region beneath the
-    /// standing levels that is not whole passes as nothing.
-    fn route(&mut self, routes: &mut Routes) {
-        routes.completing_part(|routes| self.consumer.route(routes));
+impl Consumer for OneLevelIn {
+    /// A complete region of the standing levels passes as it is. One that names keys at or beneath
+    /// level `at` passes as every key where its source is wholly complete, and not at all
+    /// otherwise: which output keys an input row stands beneath depends on its values, which no
+    /// region carries, so the path completes only part of what a row depends on.
+    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        landing.completing_part(|landing| self.pass_on(region, landing));
     }
 }
 
@@ -334,24 +297,64 @@ mod tests {
     use crate::interpreter::tile_operators::test_helpers::{RegionLog, keys_between};
 
     #[test]
-    fn a_replaced_whole_value_declares_a_widened_route() {
+    fn a_replaced_whole_value_walks_a_widened_route() {
         use crate::interpreter::dispatcher::PipelineId;
         use crate::interpreter::{BaseType, Extent, Tiling};
         struct Entry;
         impl Consumer for Entry {
-            fn notify(&mut self, _: &Projection, _: &mut Landing<'_>) {}
-            fn route(&mut self, routes: &mut Routes) {
-                routes.reach(PipelineId(0));
+            fn notify(&mut self, _: &Projection, landing: &mut Landing<'_>) {
+                landing.queue(
+                    PipelineId(0),
+                    &crate::interpreter::TileGuard::Scalar(crate::interpreter::Predicate::True),
+                );
             }
         }
         let output = Tiling::Scalar(Extent::Base(BaseType::Int));
         let mut consumer = through_values(CurryLevel::OUTERMOST, &output, Box::new(Entry));
-        let mut routes = Routes::new();
-        consumer.route(&mut routes);
-        let reached = routes.reached();
+        let mut landing = Landing::route();
+        consumer.notify(
+            &Projection::admitting(crate::interpreter::Predicate::point(
+                crate::interpreter::Value::UInt(0),
+            )),
+            &mut landing,
+        );
+        let reached = landing.routes();
         assert_eq!(reached.len(), 1);
         assert!(!reached[0].keeps_keys);
         assert!(reached[0].completes_part);
+    }
+
+    /// A value replaced beneath the outermost level widens a change only where it names keys of
+    /// that level: a route walk of a path through it keeps the keys of a push of one outer key, and
+    /// widens a push of an inner key beneath every outer one, as a group's row is pushed.
+    #[test]
+    fn a_replaced_inner_value_widens_only_a_push_beneath_its_level() {
+        use crate::interpreter::dispatcher::PipelineId;
+        use crate::interpreter::{BaseType, Extent, Predicate, TileGuard, Tiling, Value};
+        struct Entry;
+        impl Consumer for Entry {
+            fn notify(&mut self, _: &Projection, landing: &mut Landing<'_>) {
+                landing.queue(PipelineId(0), &TileGuard::Scalar(Predicate::True));
+            }
+        }
+        let uint = || Extent::Base(BaseType::UInt);
+        let output = Tiling::data_function(
+            uint(),
+            Tiling::data_function(uint(), Tiling::Scalar(Extent::Base(BaseType::Int))),
+        );
+        let mut consumer = through_values(CurryLevel::new(1), &output, Box::new(Entry));
+        let keeps = |region: Projection, consumer: &mut Box<dyn Consumer>| {
+            let mut landing = Landing::route();
+            consumer.notify(&region, &mut landing);
+            let routes = landing.routes();
+            assert_eq!(routes.len(), 1, "{region:?}");
+            routes[0].keeps_keys
+        };
+        assert!(keeps(Projection::of_path(&[Value::UInt(0)]), &mut consumer));
+        assert!(!keeps(
+            Projection::keys_at(CurryLevel::new(1), Predicate::point(Value::UInt(0))),
+            &mut consumer
+        ));
     }
 
     #[test]
