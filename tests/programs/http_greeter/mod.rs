@@ -11,7 +11,7 @@ use super::serving::{compile_sink, exchange, http_get, http_post, reserve_test_p
 fn http_greeter() {
     let port = reserve_test_port();
     let source = include_str!("program.cambra").replace("{PORT}", &port.to_string());
-    let (mut ctx, _program) = compile_sink(&source);
+    let mut ctx = compile_sink(&source);
 
     let actual = exchange(&mut ctx, move || {
         vec![

@@ -1,92 +1,25 @@
-//! The CLI driver contract: a notification-gated drive loop (as in
-//! `src/main.rs`) must converge a mutation-loop accumulator, whose store/drive
-//! cycle advances one position per pull and requests its own re-pull through the
-//! scheduler's deferred-wakeup queue.
-//!
-//! Before that mechanism existed, the first `get` returned an empty
-//! (non-terminal) tile and no further notification arrived — the domain source
-//! (a finite literal) had already fired — so the driver spun in
-//! `while !new_data { check_for_notifications() }` forever. These tests replicate
-//! the driver with **bounded** waits, so a lost-wakeup regression fails the test
-//! rather than hanging it.
-
-use std::cell::RefCell;
-use std::rc::Rc;
+//! Finite mutation-loop programs converge under the CLI's dispatcher driver. Each test is bounded
+//! by a timeout, so a dispatcher that stalls fails the test rather than hanging the run.
 
 use cambra::ccl::context::{GlobalContext, compile_program};
 use cambra::ccl::load::LoadedProgram;
-use cambra::interpreter::{
-    ColumnValue, Consumer, Tile, TileGuard, Value, tile_operators::FunctionGuard,
-};
+use cambra::interpreter::{ColumnValue, Tile, Value};
+use rstest::rstest;
+use std::time::Duration;
 
-/// Drive a program's `main` output exactly as `src/main.rs` does — pull only
-/// after a notification, stop on a universal release — but with iteration caps
-/// that convert a hang into a panic. Returns every tile pulled, the last one terminal: an
-/// entry the output states complete is released on the pull that delivers it, so a later
-/// tile no longer holds it.
-fn drive_main_output(code: &str) -> Vec<Tile> {
-    const CAP: usize = 1000;
-
-    let new_data = Rc::new(RefCell::new(false));
-    let nd = new_data.clone();
-    let consumer: Box<dyn Consumer> = Box::new(move || *nd.borrow_mut() = true);
-
+fn drive_main_output(code: &str) -> Tile {
     let mut ctx = GlobalContext::default();
-    let mut compiled = match compile_program(&mut ctx, &LoadedProgram::test(code), consumer) {
-        Ok(c) => c,
-        Err(e) => panic!("compile failed: {e:?}"),
-    };
-    let mut producer = compiled
-        .main_mut()
-        .and_then(|o| o.producer.take())
-        .expect("program has a `main` output");
-    let universal = producer.tiling().universal_guard();
-
-    let mut pulls = 0;
-    let mut tiles = Vec::new();
-    loop {
-        pulls += 1;
-        assert!(
-            pulls < CAP,
-            "driver did not converge within {CAP} pulls (hang regression)"
-        );
-
-        // Wait for data — bounded, so a never-arriving wakeup fails loudly
-        // instead of spinning forever.
-        let mut waited = 0;
-        while !*new_data.borrow() {
-            waited += 1;
-            assert!(
-                waited < CAP,
-                "stalled waiting for a notification (lost-wakeup regression)"
-            );
-            ctx.scheduler().check_for_notifications();
-        }
-        *new_data.borrow_mut() = false;
-
-        let tile = producer.get(universal.clone());
-        let release_guard = match &tile {
-            Tile::Scalar(cv) => TileGuard::Scalar(TileGuard::leaf(!cv.is_empty())),
-            Tile::DataFunction {
-                domain_predicate, ..
-            } => TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
-            other => panic!("unexpected top-level tile shape: {other:?}"),
-        };
-        let done = release_guard.is_universal();
-        producer.release(release_guard);
-        tiles.push(tile);
-        if done {
-            break tiles;
-        }
-    }
+    let mut compiled = compile_program(&mut ctx, &LoadedProgram::test(code), Box::new(|| {}))
+        .expect("program compiles");
+    cambra::interpreter::dispatcher::run_program(&mut compiled, 1)
+        .expect("program dispatches")
+        .main
+        .expect("main output")
 }
 
 /// Extract the single integer a scalar `main` output resolved to.
 fn drive_scalar_int(code: &str) -> i64 {
-    match drive_main_output(code)
-        .pop()
-        .expect("a driven output ends in a terminal tile")
-    {
+    match drive_main_output(code) {
         Tile::Scalar(cv) => match cv.as_single() {
             Some(Value::Int(n)) => n,
             other => panic!("expected a single Int, got {other:?}"),
@@ -95,12 +28,11 @@ fn drive_scalar_int(code: &str) -> i64 {
     }
 }
 
-/// The reported bug: a finite induction accumulator must converge through the
-/// notification-gated driver. Its store/drive cycle self-requests re-pulls until
-/// terminal — without the wakeup queue nothing would re-pull it, since a
-/// non-terminal tile alone does not make the driver come back.
-#[test]
-fn accumulator_converges_via_notification_gated_driver() {
+/// A finite induction accumulator converges: its loop runs a round per position until its store
+/// is terminal.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn accumulator_converges() {
     assert_eq!(
         drive_scalar_int(indoc::indoc! {r#"
             x := 0
@@ -113,7 +45,8 @@ fn accumulator_converges_via_notification_gated_driver() {
 
 /// A loop-carried sum (`x += i`) — the accumulator reads its own previous value,
 /// so it genuinely exercises the cycle, not just a counter.
-#[test]
+#[rstest]
+#[timeout(Duration::from_secs(10))]
 fn loop_carried_sum_converges() {
     assert_eq!(
         drive_scalar_int(indoc::indoc! {r#"
@@ -125,10 +58,10 @@ fn loop_carried_sum_converges() {
     );
 }
 
-/// An empty iteration source: the recurrence is immediately drained (terminal on
-/// the first productive pull), so the driver must return the initial value
-/// without stalling.
-#[test]
+/// An empty iteration source: the loop runs no round, and the run answers the initial value without
+/// stalling.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
 fn empty_loop_returns_init() {
     assert_eq!(
         drive_scalar_int(indoc::indoc! {r#"
@@ -140,43 +73,35 @@ fn empty_loop_returns_init() {
     );
 }
 
-/// Control: an aggregate converges in a single pull (no cycle), so it must keep
-/// working under the same driver — guards against the wakeup change perturbing
-/// the ordinary one-pull path.
-#[test]
-fn aggregate_converges_in_one_pull() {
+/// Control: an aggregate, which has no cycle, converges under the same driver.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn aggregate_converges() {
     assert_eq!(drive_scalar_int("sum([1, 2, 3, 4, 5])"), 15);
 }
 
-/// The one integer a `main` output stream holds across every pull (a trailing standalone
-/// block's reply).
+/// The one integer a `main` output stream holds (a trailing standalone block's reply).
 fn drive_single_int(code: &str) -> i64 {
-    let values: Vec<i64> = drive_main_output(code)
-        .into_iter()
-        .flat_map(|tile| match tile {
-            Tile::DataFunction { codomain, .. } => match *codomain {
-                Tile::Scalar(ColumnValue::Ints(v)) => v,
-                other => panic!("expected an Ints stream, got {other:?}"),
-            },
-            other => panic!("expected a Function stream, got {other:?}"),
-        })
-        .collect();
+    let values: Vec<i64> = match drive_main_output(code) {
+        Tile::DataFunction { codomain, .. } => match *codomain {
+            Tile::Scalar(ColumnValue::Ints(v)) => v,
+            other => panic!("expected an Ints stream, got {other:?}"),
+        },
+        other => panic!("expected a Function stream, got {other:?}"),
+    };
     match values.as_slice() {
         [v] => *v,
         other => panic!("expected one value across the stream, got {other:?}"),
     }
 }
 
-/// A commit store whose writer stream **leads with a deny** must converge through
-/// the notification-gated driver. A denied transaction advances the writer without
-/// growing the commit frontier, so it is invisible in the store tile; the writer's
-/// one-step-per-pull self-re-arm (not a reader-side drive-to-fixpoint) is what
-/// keeps stepping the store past the deny. Before that re-arm, removing the drive
-/// loop would strand the driver in `while !new_data` (a lost wakeup) — this test
-/// turns that hang into a `drive_main_output` cap panic. The trailing block is a
-/// transaction unordered against the loop's, so `out << q` replies the seed `0` or a
-/// committed `q`: membership is the guarantee.
-#[test]
+/// A commit store whose writer stream **leads with a deny** converges. A denied transaction
+/// advances the writer without growing the commit frontier, so it is invisible in the store tile,
+/// and the run must still step the store past it; a run that stalls there fails at the timeout.
+/// The trailing block is a transaction unordered against the loop's, so `out << q` replies the seed
+/// `0` or a committed `q`: membership is the guarantee.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
 fn leading_deny_converges_no_stall() {
     // r=0 denies (guard `r != 0` false); r=1 commits q:=2; r=2 commits q:=3.
     let v = drive_single_int(indoc::indoc! {r#"
@@ -198,7 +123,8 @@ fn leading_deny_converges_no_stall() {
 /// As `leading_deny_converges_no_stall`, but the deny sits in the **middle** of
 /// the writer stream (`[1, 0, 2]`): r=1 commits q:=2, r=0 denies, r=2
 /// commits q:=3. The store must still step past the interior deny to terminal.
-#[test]
+#[rstest]
+#[timeout(Duration::from_secs(10))]
 fn middle_deny_converges_no_stall() {
     let v = drive_single_int(indoc::indoc! {r#"
             out: Feed(_)

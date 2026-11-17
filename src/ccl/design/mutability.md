@@ -1386,19 +1386,10 @@ read, `𝑛′` declared around the loop, and the read renamed to `𝑛′`. `�
 nowhere else, so its view holds the value at the read, before the loop's later writes, between two
 of them, or after them all.
 
-The one engine subtlety is **driving** that broadcast to convergence. The final's `StoreFinalRead`
-is empty until the sibling loop's `InductionStore` drains (one position per body pull), and nothing
-external re-pulls the writer: the store's own convergence loop stops once the commit frontier
-stalls, and the frontier cannot advance until this writer commits, which needs the value still
-converging. The writer resolves this the same way it resolves its own one-step-per-pull convergence:
-when its decision body is not ready, it re-arms itself on the scheduler's **deferred-wakeup queue**
-(`WakeupQueue::request`) and returns non-terminal, keeping its pending body-input row so a re-pull
-reuses it (a re-push would duplicate a buffer position against the body's `Memo`). Each
-demand-driven re-pull advances the sibling loop one step until the decision is ready — no blocking
-loop inside `get`, and it composes with an async sibling source (the source's own notification
-drives the re-pulls). A reply of the result mutable variable rides a commit, which demand-drives
-this convergence: each committed reply pulls the writer, which advances the sibling loop. The
-co-indexed and non-cross paths are untouched.
+The writer pipeline waits for the pipelines that produce the broadcast value. Dispatcher packages
+advance the sibling loop and publish its final value before the transaction body reads it. A live
+sibling source leaves the dependent work pending until that source decides the required region.
+No read advances the sibling store, and no deferred wakeup schedules another attempt.
 
 (The asymmetry: the broadcast **source** — the sibling induction loop's accumulator — has a final,
 read via `StoreFinalRead`, because an induction loop terminates and its final value is denotable. A

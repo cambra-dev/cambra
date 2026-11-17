@@ -4,6 +4,8 @@
 use super::plan::{Planned, probe, routes_to};
 use super::*;
 use crate::interpreter::commit_operator::InductionStoreProducer;
+#[cfg(test)]
+use crate::interpreter::tile_operators::test_helpers::ConsumeInPipeline as _;
 use crate::interpreter::tile_operators::{StoreCell, TileProducer};
 
 /// Where a loop scope finds the breaker of one of its inner pipelines.
@@ -272,13 +274,11 @@ impl InductionStoreProducer {
         self.run = None;
     }
 
-    pub(crate) fn enter_loop_consuming(&mut self) {
+    pub(crate) fn begin_loop_run(&mut self) {
         let Some(run) = &self.run else { return };
         let count = run.members.len();
         for local in 0..count {
-            self.reach_local(PipelineId(local), &mut |breaker, _| {
-                breaker.enter_consuming_mode()
-            });
+            self.reach_local(PipelineId(local), &mut |breaker, _| breaker.begin_run());
         }
     }
 
@@ -316,10 +316,10 @@ impl InductionStoreProducer {
         self.run().drive
     }
 
-    /// Have the entry in front of the drive's source record a decided push of the source's keys
-    /// at `pipeline`, this scope's pipeline in the dispatcher around it, as decided positions of
+    /// Have the entry in front of the drive's source record a complete push of the source's keys
+    /// at `pipeline`, this scope's pipeline in the dispatcher around it, as complete positions of
     /// the store's input: the drive reads its source by pull, so no push of the source reaches the
-    /// scope's entry otherwise, and the scope would wait_for_inputs each round until the source is whole.
+    /// scope's entry otherwise, and the scope would park each round until the source is whole.
     pub(super) fn decide_through_drive(&mut self, pipeline: PipelineId) {
         let input = self.input_tiling(InputId::ONLY);
         let mut target = None;
@@ -328,7 +328,7 @@ impl InductionStoreProducer {
                 .as_producer()
                 .and_then(|producer| producer.completes_through());
         });
-        let target = target.expect("a loop's drive records its source's decided pushes");
+        let target = target.expect("a loop's drive records its source's complete pushes");
         *target.borrow_mut() = Some((pipeline, input));
     }
 
@@ -392,7 +392,7 @@ impl InductionStoreProducer {
         let region = Projection::of(guard)
             .unwrap_or_else(|why| panic!("a loop's round names a row of its store: {why}"));
         let mut landing = Landing::probe(self.pipeline(drive));
-        consumer.borrow_mut().push(&region, &mut landing);
+        consumer.borrow_mut().notify(&region, &mut landing);
         let arrivals = landing.arrivals();
         readers
             .iter()
@@ -563,7 +563,8 @@ impl InductionStoreProducer {
     }
 }
 
-/// Call the breaker held by the member's shared cell or nested scope.
+/// Call `call` with `member`'s breaker, the inner pipeline `pipeline`'s: in `store`'s chain, or
+/// a nested loop's scope.
 pub(super) fn reach_member(member: &Member, call: &mut Call<'_>) {
     match member {
         Member::Scope(store) => call(&mut *induction(store), InputId::ONLY),
@@ -665,7 +666,6 @@ mod tests {
     impl Compiled {
         fn of(source: &str) -> Self {
             let mut ctx = GlobalContext::default();
-            ctx.defer_sink_pulls();
             let _sink = ctx.register_test_sink("out");
             let loaded = LoadedProgram::test(source);
             let program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
@@ -685,7 +685,7 @@ mod tests {
             assert_eq!(planner.scopes.len(), 1, "an induction store runs in rounds");
             let mut runs = InductionRuns::new();
             let scope = planner.build_scope(0, usize::MAX, &mut runs);
-            induction(&scope).enter_consuming_mode();
+            induction(&scope).begin_run();
             let mut dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
             dispatcher.order(PipelineId(0));
             let execution = Execution::new(&[Some(scope.clone())], &mut dispatcher);
@@ -765,7 +765,7 @@ mod tests {
         fn snapshot(&self) -> Tile {
             let mut store = induction(&self.scope);
             let guard = store.tiling().universal_guard();
-            store.offer_impl(guard)
+            store.get(guard)
         }
 
         /// The value the store holds for its one variable.
@@ -777,7 +777,7 @@ mod tests {
     }
 
     /// A morsel of one position is one round, which decides the position; the round of the last
-    /// position leaves the store terminal, holding what pull mode writes, and its body released.
+    /// position leaves the store terminal, holding the expected writes, and its body released.
     #[test]
     fn a_round_decides_its_position() {
         let compiled = Compiled::of(SUM);
@@ -928,19 +928,19 @@ mod tests {
         assert_eq!(compiled.value(), Value::Int(5));
     }
 
-    /// The store holds the positions its rounds decided before it is terminal, and everything
+    /// The store holds the positions its rounds complete before it is terminal, and everything
     /// after.
     #[test]
     fn the_store_holds_its_complete_positions_then_everything_once_terminal() {
         let compiled = Compiled::of(SUM);
         compiled.consume(keys_between(0, 0));
-        let (held, decided) = {
+        let (held, complete) = {
             let store = induction(&compiled.scope);
             (store.final_guard(), store.complete())
         };
         assert!(
-            !held.is_empty() && !held.is_universal() && held == decided,
-            "{held:?}, deciding {decided:?}"
+            !held.is_empty() && !held.is_universal() && held == complete,
+            "{held:?}, deciding {complete:?}"
         );
         compiled.consume(keys_between(1, 2));
         assert!(induction(&compiled.scope).final_guard().is_universal());
@@ -971,7 +971,7 @@ mod tests {
         let mut pulls = 0;
         drive.visit_input_producers(&mut |role, input| {
             if role == "source" {
-                pulls = input.base().pulls;
+                pulls = input.base().reads;
             }
         });
         pulls
@@ -988,7 +988,7 @@ mod tests {
         {
             let mut store = induction(&compiled.scope);
             let none = store.input_tiling(InputId::ONLY).empty_guard();
-            store.consume_impl(InputId::ONLY, none);
+            store.consume_in_pipeline(InputId::ONLY, none);
         }
         let held = |drive: &mut dyn TileProducer| {
             drive
@@ -1001,8 +1001,8 @@ mod tests {
             let breaker = drive
                 .as_breaking_mut()
                 .expect("the drive is a pipeline breaker");
-            breaker.consume_impl(InputId::ONLY, keys_between(1, 1));
-            breaker.consume_impl(
+            breaker.consume_in_pipeline(InputId::ONLY, keys_between(1, 1));
+            breaker.consume_in_pipeline(
                 InputId::ONLY,
                 breaker.input_tiling(InputId::ONLY).empty_guard(),
             );
@@ -1013,7 +1013,7 @@ mod tests {
             let breaker = drive
                 .as_breaking_mut()
                 .expect("the drive is a pipeline breaker");
-            breaker.consume_impl(InputId::ONLY, keys_between(0, 0));
+            breaker.consume_in_pipeline(InputId::ONLY, keys_between(0, 0));
             assert!(
                 held(drive).covers_path(&[Value::UInt(0)]),
                 "position 0 emitted"

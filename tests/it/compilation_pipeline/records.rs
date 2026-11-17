@@ -1,6 +1,7 @@
 //! Records: literals, computed fields, field access, records inside list
 //! comprehensions, and joins producing record outputs.
 
+use crate::it::serving::PublishRows as _;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -352,7 +353,7 @@ fn test_datasource_named_record_join() {
     ctx.register_source(src1.clone());
     ctx.register_source(src2.clone());
 
-    src1.borrow_mut().add_data(&[
+    src1.borrow_mut().publish_rows(&[
         (
             Value::UInt(0),
             Value::Record(HashMap::from([
@@ -371,7 +372,7 @@ fn test_datasource_named_record_join() {
     src1.borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::from(1u64)));
 
-    src2.borrow_mut().add_data(&[
+    src2.borrow_mut().publish_rows(&[
         (
             Value::UInt(0),
             Value::Record(HashMap::from([
@@ -390,19 +391,19 @@ fn test_datasource_named_record_join() {
     src2.borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::from(1u64)));
 
-    let notified = Rc::new(RefCell::new(false));
-    let notified_clone = notified.clone();
-    let consumer: Box<dyn Consumer> = Box::new(move || {
-        *notified_clone.borrow_mut() = true;
-    });
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
     let code = "[(x.label, y.label) for x in src1() for y in src2() if x.id == y.id]";
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow());
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
-    let tile = sort_function_by_domain(producer.get(producer.tiling().universal_guard()));
+    assert!(
+        producer.run().is_empty(),
+        "record-valued join groups await closure"
+    );
+    src1.borrow_mut().set_yield_predicate(Predicate::True);
+    src2.borrow_mut().set_yield_predicate(Predicate::True);
+    let tile = sort_function_by_domain(producer.run());
     // Only (id=1, "a") × (id=1, "x") should match
     let Tile::DataFunction { codomain, .. } = tile else {
         panic!("expected Function, got {tile:?}");
@@ -539,7 +540,7 @@ fn test_list_of_records_holding_collections() {
                             vec![0, 2],
                             ColumnValue::UInts(vec![0, 1, 0, 1]),
                             Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 4, 5]))),
-                            Predicate::True,
+                            Predicate::False,
                             BitSet::new(),
                         ),
                     ),

@@ -2,6 +2,8 @@
 //! See `src/interpreter/design-operators.md`, "Projection guards".
 
 use crate::ccl::{FieldKey, TagMap};
+#[cfg(test)]
+use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use crate::interpreter::{
     CurryLevel, Extent, FunctionGuard, Predicate, Tile, TileGuard, Tiling, Value,
 };
@@ -1548,10 +1550,10 @@ mod tests {
         let tiling = ints_tiling(4);
         let (mut spy, pulled, released) =
             ProjectionSpy::new(ints_by_position(&[10, 20, 30, 40], true), tiling.clone());
-        let middle = spy.get(keys_between(1, 2));
+        let middle = spy.read_in_pipeline(keys_between(1, 2));
         assert_eq!(int_entries(&middle), [(1, 20), (2, 30)]);
         spy.release(keys_between(1, 2));
-        let rest = spy.get(tiling.universal_guard());
+        let rest = spy.read_in_pipeline(tiling.universal_guard());
         assert_eq!(int_entries(&rest), [(0, 10), (3, 40)]);
         assert_eq!(
             *pulled.borrow(),
@@ -1561,7 +1563,10 @@ mod tests {
         // A pull that names nothing states nothing complete, which is withdrawal unless
         // the consumer released what it took.
         spy.release(tiling.universal_guard());
-        assert_eq!(spy.get(tiling.empty_guard()), tiling.empty_tile());
+        assert_eq!(
+            spy.read_in_pipeline(tiling.empty_guard()),
+            tiling.empty_tile()
+        );
     }
 
     #[test]
@@ -1644,6 +1649,6 @@ mod tests {
         use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
         let mut ignoring =
             TestTileProducer::new(ints_by_position(&[10, 20, 30, 40], true), ints_tiling(4));
-        ignoring.get(keys_between(1, 2));
+        ignoring.read_in_pipeline(keys_between(1, 2));
     }
 }
