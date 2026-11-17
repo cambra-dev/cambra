@@ -478,7 +478,9 @@ chain into one map, whose values are one column of records, `Tiling::Scalar` of 
 ([Element-wise chains](../ccl/design/optimization.md#element-wise-chains)).
 
 Fields can complete and release independently. A scalar field can be released while a sibling
-collection continues to grow; see [The release contract](#the-release-contract). Collections
+collection continues to grow; see [The release contract](#the-release-contract). A field is also
+read and notified on its own: a region of a field reaches the record's readers as that part of the
+record (`Projection::Fields`), and a selector of another field drops it. Collections
 retain the incremental representation described below rather than becoming successive scalar
 cells on each delivery.
 
@@ -554,23 +556,28 @@ Source arrivals update cached reads through `Consumer::notify`; placed entries q
 A projection guard names the part of a producer's tile that a `get` asks for. The producer
 returns that part and nothing outside it, and states completeness only for that part.
 
-A projection (`Projection`) is everything, nothing, or the keys of one collection level that a
-predicate 𝑝 admits (`Projection::Keys`). At the outermost level its guard is `Domain(𝑝)`. At level 𝑛
-beneath it, 𝑝 admits whole paths ([Qualified predicates](#qualified-predicates)), and its guard
-wraps the domain guard in 𝑛 codomain guards (`CurryLevel::wrap_guard`). Two projections meet at the
-deeper of their levels, where a key above is every path beneath it, and a region of every path
-beneath some keys is spelled at the level of those keys (`Projection::keys_at`). Any other guard is
-a release's shape. Each producer declares the levels whose keys it restates
-(`TileProducer::restates`). `Restates::Outermost`, the default, names the outermost keys only.
-`Restates::Above(𝑛)` names the outermost keys and the levels above 𝑛, for a producer that keeps its
-input's keys above its level 𝑛 and computes the values beneath them. `Restates::Every` names every
-level. A producer that declares more than the outermost keys reads its projection with
-`TileGuard::projection_for`, and any other with `TileGuard::projection`. Either panics with the
-guard on a shape that is no projection or that names keys at a level the producer does not restate,
-as [Guard operations are exact](#guard-operations-are-exact) requires of a restatement with no
-spelling. A debug build's `get` panics on a pull at such a level. `Tile::restrict_to_paths` cuts a
-tile at a level beneath the outermost (`src/interpreter/design-path-projections.md`,
-"Representation").
+A projection (`Projection`) is everything, nothing, the keys of one collection level that a
+predicate 𝑝 admits (`Projection::Keys`), or a projection per field of a record of values
+(`Projection::Fields`). At the outermost level its guard is `Domain(𝑝)`. At level 𝑛 beneath it, 𝑝
+admits whole paths ([Qualified predicates](#qualified-predicates)), and its guard wraps the domain
+guard in 𝑛 codomain guards (`CurryLevel::wrap_guard`). Two projections meet at the deeper of their
+levels, where a key above is every path beneath it, and a region of every path beneath some keys is
+spelled at the level of those keys (`Projection::keys_at`). A record of values has no keys, so a
+region of it names each field's part: the projections of the fields it lists, and one projection,
+`rest`, for every field it does not list. Its guard is a record guard naming every field of the
+tiling. Two projections of fields meet field by field, `rest` with `rest`, so the algebra needs no
+field list; a projection naming every field whole is `Everything` only once normalized against the
+record's fields (`Projection::over_fields`). Any other guard is a release's shape. Each producer
+declares the levels whose keys it restates (`TileProducer::restates`). `Restates::Outermost`, the
+default, names the outermost keys only. `Restates::Above(𝑛)` names the outermost keys and the levels
+above 𝑛, for a producer that keeps its input's keys above its level 𝑛 and computes the values
+beneath them. `Restates::Every` names every level. A producer that declares more than the outermost
+keys reads its projection with `TileGuard::projection_for`, and any other with
+`TileGuard::projection`. Either panics with the guard on a shape that is no projection or that names
+keys at a level the producer does not restate, as [Guard operations are
+exact](#guard-operations-are-exact) requires of a restatement with no spelling. A debug build's
+`get` panics on a pull at such a level. `Tile::restrict_to_paths` cuts a tile at a level beneath the
+outermost (`src/interpreter/design-path-projections.md`, "Representation").
 
 Each producer also declares, for each input, the deepest level a pull at the keys of level 𝑛 pulls
 that input at, or a whole read (`TileProducer::input_level`). The declaration is monotone in 𝑛. A
@@ -612,9 +619,9 @@ Each operator answers a projection as its row of this table states.
 | `MapResultToConst` | A collection input is pulled at the projection where the constant applies one level in or deeper. At the outermost level the constant replaces the whole input, so the input is read whole. The constant is read whole, since every row reads all of it. A projection beneath the outermost keys is answered above the constant's level (`Restates::Above`), and one at or beneath it panics. |
 | `MapResultWithSource` | The input is pulled at the projection, at any level (`Restates::Every`), so a morsel reads only its own keys from the source. |
 | `RecordWrap` | The input is pulled at the projection, which beneath the outermost keys is one above the wrapped level (`Restates::Above`). |
-| `SelectField` | A stream of records is pulled at the projection, which beneath the outermost keys is one above the record's level (`Restates::Above`). A product of collections is pulled whole and the selected field is cut. Releasing enclosing keys releases those records only; partial cell releases retain collection-valued sibling fields for later rows, while unused keyless fields can be released whole. A bare product releases unused fields whole. A breaker's final guard names each key under which a cell is still held ([Differences of nested guards](design-path-projections.md#differences-of-nested-guards)). |
+| `SelectField` | A stream of records is pulled at the projection, which beneath the outermost keys is one above the record's level (`Restates::Above`). A product of collections is pulled at the projection as the part of the selected field it names (`Projection::of_field`), and the selected field is cut. Releasing enclosing keys releases those records only; partial cell releases retain collection-valued sibling fields for later rows, while unused keyless fields can be released whole. A bare product releases unused fields whole. A breaker's final guard names each key under which a cell is still held ([Differences of nested guards](design-path-projections.md#differences-of-nested-guards)). |
 | `Zip` | Every arm is pulled at the projection, since the arms share the pair's keys. The pair is complete only where every arm is. A projection beneath the outermost keys is answered above the record's level (`Restates::Above`). |
-| `MakeRecord` | A record of values has no keys: the projection is the whole record or nothing, and a guard naming keys panics. |
+| `MakeRecord` | A record of values has no keys: the projection names each field's part, and each operand is pulled at its field's part. A field it names nothing of is not pulled. A guard naming keys panics. |
 | `VariantWrap` | A payload stream is pulled at the projection. A payload that is itself a collection becomes one union column and is read whole. A projection beneath the outermost keys is answered above the wrapped level (`Restates::Above`). |
 | `VariantProject` | A union stream is pulled at the projection. A bare union has no keys of its own, so it is read whole and its positions are cut. |
 | `VariantIs` | A union stream is pulled at the projection, since every key in is a key out. A bare union has no keys of its own, so it is read whole and its positions are cut. |
@@ -823,18 +830,18 @@ pulls.
 | Operator | Input | Notification | Reason |
 | --- | --- | --- | --- |
 | `MapResult` | the input | keeps if applied one level in to a collection, else widens | A keyed input is pulled at the projection; applied at the outermost level or to a scalar, the function's keys are the result's. |
-| `MapResult` | the function operand | widens | Its keys are the values looked up, not the result's keys. |
+| `MapResult` | the function operand | widens, but keeps for a lookup at its rows' own keys | Its keys are the values looked up, not the result's keys. Where the input's values equal the keys of the level above the one the function applies at, a key of the operand names the rows whose last key it is. The input states that equality (`TileOperator::result_correlation`), and a field of record values states it field by field (`TileOperator::field_correlation`), as a `Product` pair's second field equals the key it pairs. |
 | `MapResultToConst` | the input | keeps where the constant applies one level in or deeper to a collection, widens at the outermost level or for a scalar | At the outermost level the constant replaces the whole input, so the output's keys are the constant's. |
 | `MapResultToConst` | the constant | widens | Every row reads all of it. |
 | `MapResultWithSource` | the input | keeps | Pulled at the projection, so its keys are the output's. |
 | `RecordWrap`, `MapDomain`, `Restrict` | the input, the predicate | keeps | Pulled at the projection; a restricted domain is the predicate's keys that pass. |
-| `SelectField` | the input | keeps for a stream of records, widens for a product of collections | The product is read whole and the field cut. |
+| `SelectField` | the input | keeps for a stream of records, and for a product of collections keeps the selected field's part of a region and drops a region naming none of it (`notifications::selecting_field`) | A region of another field says nothing of the selected one. |
 | `VariantWrap` | the payload | keeps where the result is a collection (applied at level 1 or beyond), widens at level 0 | The values at the level become one union column, which has no keys of its own at level 0. |
 | `VariantProject`, `VariantIs` | the input | keeps for a stream, widens for a bare union | A bare union has no keys of its own. |
 | `Zip`, `Product` | every arm, both sides | keeps | Pulled at the projection and aligned row for row. |
-| `MakeRecord` | every field | widens | A record of values has no keys. |
+| `MakeRecord` | every field | restates a field's region as that part of the record (`notifications::fielding`) | A record of values has no keys, so a region of it names it field by field. |
 | `Filter` | the predicate, the input | keeps for a side that is a collection, else widens | A collection side shares the mask's keys; the other is read whole. |
-| `Uncurry` | the input | restates beneath a standing level, widens at the outermost | A region at or beneath the paired level names the pairs it heads; pairing the outermost collection re-keys it, and a decided region of outer keys names every pair they head. |
+| `Uncurry` | the input | restates | A region at or beneath the paired level names the pairs it heads, a region of outer keys every pair whose first field they are. |
 | `Converse` | the input | keeps the standing keys, and restates the inverted level's keys one level in, beneath every value (`notifications::one_level_in`) | Each input key stands beneath exactly one value. |
 | `UnionOperator` | every arm | keeps for a flat union, restates under the arm's tag for a tagged one | Flat arms are disjoint slices of one collection; a tagged union keys an arm's rows by the arm's keys under its tag, and `Everything` of an arm is every key under that tag. A region beneath the outermost keys keeps its path, its outermost key under the tag. |
 | `CheckedLookup` | a stream of keys, or the pairs | keeps | Each answer sits at its key's position. |
@@ -1078,9 +1085,9 @@ decided it (below). A transaction store with seed streams reads them as its inpu
 of its writers' sources, which are its inputs from 1: each seed is subscribed behind an entry placed
 in input 0's pipeline, a push of any seed queues that input whole, and the store's consume of it
 opens the store. A store opens before it steps, so each writer's pipeline reads input 0's, its
-sibling, and takes no package before input 0's has finished. Once input 0's pipeline
-has consumed its package, each writer's records it wholly decided, which releases its waiting inputs
-(`Dispatcher::opens_before`, [Waiting for input completion](design-dispatcher.md#waiting-for-input-completion)). A store's decided push that reaches its own
+sibling, and takes no package before input 0's has finished
+([Waiting for input completion](design-dispatcher.md#waiting-for-input-completion)). A store's
+decided push that reaches its own
 pipelines around its recurrence is no read and records nothing. An induction store runs in a loop's
 scope instead ([A loop in rounds](design-dispatcher.md#a-loop-in-rounds)). A reader of a store reads every pipeline of
 it, so its queue closes once the last of them has finished. The pipelines of
@@ -1100,13 +1107,14 @@ has](../ccl/design/mutability.md#how-many-commit-stores-a-program-has)).
 #### Ready transaction decisions
 
 A consuming transaction store attempts ready decisions without comparing different writers' source
-positions. Each writer has a pipeline whose packages make its source rows ready. A step of that
-pipeline pulls its writer and takes the decisions it brings (`CommitProducer::take`), then attempts
-held decisions in rotating writer order (`CommitProducer::commit_ready`). An idle writer holds no
-other writer back. The dispatcher orders packages within each writer's pipeline; product deliveries
-need not arrive in source-key order. Commit ticks, allocated only for successful proposals, define
-the serialization. Arbitration guarantees no particular winner among independent transactions
-([8.5 Ordering and concurrency](../../docs/chl-spec.md#85-ordering-and-concurrency)).
+positions. Each writer has a pipeline whose packages make its source rows ready. The request opens
+an attempt whose driver, body and writer run as ordinary dispatcher pipelines. The attempt's step
+takes the resulting proposals (`CommitProducer::take`), then attempts held decisions in rotating
+writer order (`CommitProducer::commit_ready`). An idle writer holds no other writer back. The
+dispatcher orders packages within each writer's pipeline; product deliveries need not arrive in
+source-key order. Commit ticks, allocated only for successful proposals, define the serialization.
+Arbitration guarantees no particular winner among independent transactions ([8.5 Ordering and
+concurrency](../../docs/chl-spec.md#85-ordering-and-concurrency)).
 
 The store, its writers and their drives speak through tiles. Each body-input row carries its item's
 source position after the read slots and the item (`item_position_field`, `_{r+1}`). The body reads
@@ -1114,13 +1122,14 @@ no position (`transaction_body_domain`, `src/ccl/infer/emit.rs`). Its writer cop
 into the proposal `{snap, reads, writes, pos}` (`proposal_stream_tiling`). A source position
 identifies an item to retry; it is not a priority among writers.
 
-A drive and its writer each output `{rows, decided}` (`transact_stream_tiling`). `decided` is a
-collection holding no key, whose predicate states the exact acknowledged or decided-absent source
-region (`decided_tile`). The statement grows and becomes universal once the source is exhausted.
-Acknowledging a product key releases that key alone; a later delivery may contain a smaller key.
-The drive caches source rows between notifications, removes an acknowledged row by key, and releases
-decided-absent positions when it reads a new source tile. An induction drive retains its prefix
-ordering instead.
+A drive outputs its attempt-row collection and a writer outputs its proposal-row collection.
+The attempt row carries `item_position` and `attempt_snapshot` beside the body's slots. The latter
+is the frontier the driver sampled, so a body that runs while a sibling commits still proposes
+against its original snapshot. The writer reads its read set as of that frontier. Source progress
+is the driver's release guard; no separate stream-level statement duplicates it. Acknowledging a
+product key releases that key alone; a later delivery may contain a smaller key. The drive caches
+source rows between notifications, removes acknowledged rows by key, and releases decided-absent
+positions when it reads source news. An induction drive retains its prefix ordering instead.
 
 From its first step a consuming store states `WriterTakes` for each writer in the store tile's
 `writer_takes`: `settled`, the exact region whose decisions committed or stood, and `again`, the
@@ -1131,10 +1140,14 @@ Taking a decision releases its proposal step to the writer, which acknowledges i
 drive releases the source item and keeps its own copy until `settled` includes it. Every decision
 is a proposal whose read set the engine validates, including a deny or grant that writes nothing.
 Each validated proposal takes one commit tick. A stale decision is named in `again`; the store
-publishes its current tile, pulls the writer and takes the fresh decision
+publishes its current tile, and the transaction request queues another dispatched attempt
 (`CommitProducer::drive_again`). The drive retries from its kept item before choosing another
-source item. A missing retry panics. Retried decisions resolve during the arbitration pass, whose
-end asserts that no retry remains. An induction store states no takes.
+source item. Consecutive attempts are counted across the store's writers. Once more consecutive
+attempts than the store has writers change neither the store, an input's release nor the decisions
+to retry, the request ends, and the positions it has not decided wait for inputs
+(`CommitProducer::finish_request`).
+At the store's finish no decision is queued or named for retry (`CommitProducer::settle_ready`).
+An induction store states no takes.
 
 The planner places the transaction drive's source entry in its writer's store pipeline. Source
 pushes therefore reach that entry in source keys, before the drive converts them to attempt
@@ -1233,12 +1246,12 @@ derived from the edges on both sides of the wire rather than serialized separate
 | `IterateExtent` | None | `DataFunction(extent → Scalar(extent))` | Enumerates all values in an `Extent`, producing an identity-mapping function (domain = codomain = extent). A live record extent retains each field ([Cartesian iteration](#cartesian-iteration)). Other extents enumerate directly and register a wake-up against each source they reach (`Extent::for_each_source`). |
 | `MapResultWithSource` | `DataFunction(DataSourceDomain → Scalar(DataSourceDomain))` | `DataFunction(DataSourceDomain → Scalar)` | Looks up each key of a data-source domain via `DataSourceDomainExtentImpl::get` to produce a function from keys to their output values.  Built with paths (`MapResultWithSource::projecting`, from `Source(name, paths)`: an empty list reads the whole value), it returns the leaf at the one path, or the tuple of the leaves in the order named, and its output extent is that of the leaf or tuple. |
 | `Zip` | `N` inputs of `DataFunction(shared_extent → *)` tilings |  `DataFunction(shared_domain → Record(_0, … _N))` | Merges N function operators that share a domain into one function whose codomain is a Record Tiling of all their codomains. Prefer the free `zip_arms_at` factory at op-conversion call sites: it dispatches to `Zip` (function-tiled arms) or `MakeRecord` (scalar arms) based on the compiled arms' tilings, since the same CCL-level `zip` maps to either tile shape depending on upstream `input`. A row stands where every arm holds it, and a level beneath the pair is complete only beneath the rows the pair holds or calls complete: an arm may call its own collection under a row complete before another arm reaches that row ([qualified predicates](#qualified-predicates)). |
-| `MakeRecord` | `N` inputs at any tilings | `Record(name: input's own tiling, …)` | Builds a product value ([A product value is a record of tiles](#a-product-value-is-a-record-of-tiles)). Pulls every operand whole, and forwards each field's release to that field's operand. |
+| `MakeRecord` | `N` inputs at any tilings | `Record(name: input's own tiling, …)` | Builds a product value ([A product value is a record of tiles](#a-product-value-is-a-record-of-tiles)). Pulls each operand at its field's part of the projection, and forwards each field's release to that field's operand. |
 | `MapResult` | Function: any tiling of type `A → B`<br>Data: any tiling whose deepest codomain is `Scalar(A)` | The data's levels, then the function's below the one applied, over the function's codomain | Applies a function to the data's **deepest codomain**, element-wise. Application consumes the function's outermost level, and whatever sits below that level becomes further levels of the output, because a tile holds one flat level list. So a one-level function leaves the data's shape alone and changes only its deepest codomain, while the two-level lookup a keyed collection presents contributes its inner level: a collection of keys yields one group per key, and a `Scalar` key yields just that key's group — the single-key lookup `groupby(c, k)(v)`, one level shallower because the scalar contributes none of its own. A key absent from a *settled* grouping is the empty group; absent from an unsettled one it is simply not answered yet, which the function's `domain_predicate` distinguishes. Construction asserts that the function's domain extent includes the data's value extent, with one exception: a `UInt` or range value extent at a `0..𝑛` domain, the erasure of a refined `UInt` or range that inference proved inside the range. A row whose key the function has not answered is **withheld** — dropped from the output, and its outermost-level owner subtracted from the output's `domain_predicate` — and answered on a later pull. Keys beneath more than one level of the data are looked up the same way: each key's group stands in its place beneath the data's levels, an unanswered key is withheld (`Tile::withhold`, so no level calls a prefix of its path complete), a key the function settled without holding is dropped, and each group is complete beneath a complete path. A one-level function drops such a row too, beneath any level of the data: the function is read with its deleted keys removed, which are the keys a gated leg's `Restrict` rejected. The **data** input tracks the consumer's release; the **function** operand is re-read whole on every pull, so it is released only on a universal release. |
 | `MapResultToConst` | `DataFunction(extent → *)` | `DataFunction(extent → C)`, `C` the constant's tiling | Replaces each value of a function input at the level op-conversion states with the same constant (or zips it in, per its mode), preserving the levels above it. A value at that level may itself be a collection, which the constant replaces or pairs with whole. A scalar constant must be present (terminal) before it can be broadcast: a still-absent one (e.g. a scalar read from a sibling induction loop that has not yet converged) yields an empty, non-terminal output rather than fabricating a value for the unknown positions. A collection constant streams: each row holds what has arrived of it and is left open until it is complete, and the constant is released once everything is. |
 | `Readings` | `DataFunction(extent → *)`, or none | `DataFunction(extent → Int)`, or `Int` | Replaces each value of a function input at the level op-conversion states with the reading at that value's position, the key path above it; with no input, the reading at the one position with no keys. Every `Readings` of one call path reads one `ReadingSource`, boundary state like a data source's arrival state, which holds the value taken the first time any of them asks for a position and returns it to each after, so copies of one call agree and a position's value never changes (`docs/chl-spec.md`, "Inputs from outside the program"). The source drops a position once every reader has released it, a reader whose producer is gone counting as having released everything, and a row the input marks deleted takes no reading. The input's values are not read. |
 | `RecordWrap` | `DataFunction(… → T)` | `DataFunction(… → Record(name: T))` | The values of the input at one level as a one-field record, keeping the input's keys: `Zip` with one arm. `zip_arms_named_at` builds it for a record literal with one field over a collection; a lone scalar field is a `MakeRecord`. Forwards a release to the input, naming the field's part at its level. |
-| `SelectField` | `Record{name: T, …}` | `T` | Hands back one field's tile, the eliminator for `MakeRecord`. Pulls the product whole, and releases what its consumer released of the field it selects and every other field whole (`guard_at_field`). |
+| `SelectField` | `Record{name: T, …}` | `T` | Hands back one field's tile, the eliminator for `MakeRecord`. Pulls the product at its field's part, and releases what its consumer released of the field it selects and every other field whole (`guard_at_field`). |
 | `Converse` | `DataFunction(domain → Scalar(codomain))` | `DataFunction(codomain → domain)` | Inverts a function operator: each codomain value maps to the list of domain values that produced it. |
 | `Uncurry` | `A ⤇ B ⤇ C` | `{_0: A, _1: B} ⤇ C` | Flattens a collection of collections into one keyed by pairs: the two key extents pack into a record key and the values stand as they were. |
 | `MapDomain` | `DataFunction(A → *)` | `DataFunction(A → Scalar(A))` | Replaces the codomain of a function with a copy of the domain values (identity codomain), producing an identity mapping from domain to itself. |
@@ -1248,7 +1261,7 @@ derived from the edges on both sides of the wire rather than serialized separate
 | `ExtractAggregate` | `Aggregation` | `Scalar` | Extracts a terminal result. Partial-result extraction is unsupported. |
 | `MapAggregate` | Collection chain of at least two levels | Enclosing levels ending in `Aggregation` | Folds the innermost collection, preserving the levels above it. |
 | `MapExtractAggregate` | Collection chain ending in `Aggregation` | Enclosing levels ending in the accumulator tiling | Extracts terminal results and removes innermost keys whose aggregates are not terminal. |
-| `FanOut` | `*` | Same as input | Allows multiple operators to consume the output of the same operator. Each consumer subscribes via a `FanOut::slot()` handle; the fan-out forwards `get` requests and tracks the intersection of release guards across slots. Constructed via either `FanOut::new` (no cyclic-mode overhead — the common case) or `FanOut::new_cyclic` (for fan-outs whose slots feed back into their own input, e.g. a commit/induction store whose writer reads the store back before proposing, or a mutation-loop body whose other slot is wired to the cyclic prev-accumulator stream). Cyclic mode adds a per-pull tile-cache and a subscribe-in-progress flag so re-entrant subscribes / pulls skip redundant inner work and serve from the cached snapshot instead of re-entering the inner producer. |
+| `FanOut` | `*` | Same as input | Allows multiple operators to consume the output of the same operator. Each consumer subscribes via a `FanOut::slot()` handle; the fan-out forwards `get` requests, pulling a non-cyclic input at the nearest level at or above the request that the input restates (`Projection::restated_by`) and cutting the answer after, and tracks the intersection of release guards across slots. Constructed via either `FanOut::new` (no cyclic-mode overhead — the common case) or `FanOut::new_cyclic` (for fan-outs whose slots feed back into their own input, e.g. a commit/induction store whose writer reads the store back before proposing, or a mutation-loop body whose other slot is wired to the cyclic prev-accumulator stream). Cyclic mode adds a per-pull tile-cache and a subscribe-in-progress flag so re-entrant subscribes / pulls skip redundant inner work and serve from the cached snapshot instead of re-entering the inner producer. |
 | `Memo` | `*` | Same as input | Caches input tiles and releases the regions consumed. A placed memo answers its cache; an unplaced memo reads regions marked dirty by notifications or `read_again`. See [Memo](#memo). |
 | `ExtractFinal` | Collection source and optional default | Source codomain | Extracts the last live position's value after source completion; see [Final-value extraction](#final-value-extraction). |
 | `UnionOperator` | N inputs of `DataFunction(dᵢ → 𝑇ᵢ)` tilings | `DataFunction(Union(d₀,…,dₙ₋₁) → Scalar(C'))`, or `DataFunction(Union(d₀,…,dₙ₋₁) → DataFunction(𝐵 → 𝑇))` for jagged rows | Merges N function operators into one. The domain is the discriminated union of the arms' domains, each arm under its operand's tag (`new_tagged`): a position for `++`, a site's tag for a channel ([sites.md](../ccl/design/sites.md#channel-tags)). The codomain is one the caller declares. The domain keeps the arms apart, and `final_or_default` dispatches on the arm a row came from. The codomain is the arms' join, because the arms are alternative values at one row. A union node is typed `D ⤇ V`, with `V` the join inference computed in the full type lattice, and op-conversion reads `V` off the node and passes its extent in. The operator does not join the operand tilings: `Extent`'s lattice has variant and range rules but no record rule, so it would join two arms at different record widths to an anonymous positional sum where the type is `{a: Int}`, a shape no row holds. Arms that agree on a tiling keep it, because a `Tiling` carries a layout (struct-of-arrays for a record) that an `Extent` cannot express. Arms whose codomains are collections over different domains, the rows of a jagged collection, merge at the bound `𝐵` the declared codomain gives their domains, beneath which they share the tiling `𝑇`, as a list literal of boxed rows has it (`OpConversionContext::witness_domain_extent`). Arms whose rows agree on a domain the declared codomain bounds by something else merge there too: which keys a row has is its value's, so a type stating rows of a sum states the bound. Other arms whose codomain tilings differ must each fit in one column (`Tiling::is_scalar`: a `Scalar`, or a `Record` of such at any depth), and each is rebuilt as one column, keeping its own record fields, before the arms merge. A flat union (`new_flat`) collapses the arms' domain to the one they share whatever each row holds, a collection included. A realized conditional's legs are over different domains and disjoint only by their gates, so they flat-merge under the domain bound the sum's type declares (`new_flat_over`), which must include every leg's domain. A flat union keeps no record of which arm delivered a key, so its arms are disjoint by how they were built: first-match gates, one per conditional for a realized product, distinct tags of one scrutinee, or a tag the scrutinee's closed type does not carry. A debug build checks the legs' shapes at operator conversion (`ccl_utils::disjoint_join_gap`), and simplification keeps a `zip` half that narrows its keys, by `filter_values` or `variant_project`, although the arm reads nothing of it (`simplify::is_product_beta_window`). Release is per arm: an incoming `Predicate::Union` guard splits into per-variant predicates, so one arm can be released in full while its siblings still produce. |
@@ -1432,7 +1445,15 @@ The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md
   attempts; retries do not by themselves discard the decoded source. It also releases the store
   below the decided frontier, through the last change strictly below it, so the commit store can
   reclaim its changelog.
-- **`TransactWriter` / `TransactWriterProducer`** — one *fused* writer per site (fused, not fanned: a stateful append-only proposal stream cannot be split across fanned slots without desyncing). Each pull it decides the driver's newest live position and appends a `{snap, reads, writes, pos}` proposal of what the body's decision writes, which may be nothing; `pos` is the item's source position, copied from the driver's row (`F_ITEM_POSITION`). When the decision also reads an induction accumulator, that value arrives co-iterated in the writer *source* or broadcast as a constant — see [mutability.md](../ccl/design/mutability.md#reading-an-induction-accumulator-in-a-commit-decision), "Reading an induction accumulator in a commit decision".
+- **`TransactWriter` / `TransactWriterProducer`** — one *fused* writer per site (fused, not fanned:
+  a stateful append-only proposal stream cannot be split across fanned slots without desyncing).
+  Each consumption decides the driver's newest live position and appends a `{snap, reads, writes,
+  pos}` proposal of what the body's decision writes, which may be nothing; `pos` is the item's
+  source position, copied from the driver's row (`F_ITEM_POSITION`). When the decision also reads an
+  induction accumulator, that value arrives co-iterated in the writer *source* or broadcast as a
+  constant — see
+  [mutability.md](../ccl/design/mutability.md#reading-an-induction-accumulator-in-a-commit-decision),
+  "Reading an induction accumulator in a commit decision".
 
   **The ack is a release intersection.** The driver sits behind a `FanOut` with two slots — the body and the writer — and acknowledges its source item on what they *both* release. A body releases a row as soon as it has consumed it, which says nothing about commitment; the writer releases it when the attempt has committed. Only the intersection means "this item is done", which is why the writer holds a driver slot it barely reads: that slot is the ack channel.
 
@@ -1487,8 +1508,9 @@ A writer body returns one **decision record** per transaction, `{writes: {𝑘: 
 
 ### Transaction progress
 
-Dispatcher packages drive writers from their source positions. The store takes decisions and
-arbitrates ready proposals as specified in [Ready transaction
+Dispatcher request packages retain their source regions until their attempts settle. The driver,
+body breakers and proposal writer consume through ordinary pipelines on the shared dispatcher; the
+transaction step takes proposals and arbitrates ready decisions as specified in [Ready transaction
 decisions](#ready-transaction-decisions). Readers sample the committed snapshot; they do not drive
 the store to completion. A drained live writer waits for its source to gain items.
 

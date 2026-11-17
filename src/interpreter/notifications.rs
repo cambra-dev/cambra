@@ -1,3 +1,4 @@
+use std::sync::{Arc, PoisonError};
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use crate::ccl::FieldKey;
@@ -7,6 +8,19 @@ use crate::interpreter::{Consumer, DataSourceDomainExtentImpl, Projection, dispa
 /// A consumer handle shared by notification forwarders.
 /// It carries notifications, not tile data.
 pub type SharedConsumer = Rc<RefCell<dyn Consumer>>;
+
+/// Notify `shared`, or fail the push where `shared` is notifying already: a push that re-enters a
+/// consumer it is passing through closes a cycle, which only a store closes.
+pub(crate) fn notify_shared(
+    shared: &SharedConsumer,
+    region: &Projection,
+    landing: &mut Landing<'_>,
+) {
+    match shared.try_borrow_mut() {
+        Ok(mut consumer) => consumer.notify(region, landing),
+        Err(_) => landing.reentered(),
+    }
+}
 
 /// Share a consumer between its input paths. Pipeline entries end notification propagation.
 pub fn shared_consumer(consumer: Box<dyn Consumer>) -> SharedConsumer {
@@ -47,112 +61,41 @@ pub fn widening(consumer: Box<dyn Consumer>) -> Box<dyn Consumer> {
     Box::new(Widening(consumer))
 }
 
-/// Preserve notifications above `level` when the value at that level changes shape.
-/// Changes below it name their enclosing rows; completion passes only for whole values.
+/// Preserve notifications above `level` when the value at that level changes shape. A change
+/// below it names its enclosing rows.
 pub(crate) fn through_values(
     level: CurryLevel,
-    output: &crate::interpreter::Tiling,
     downstream: Box<dyn Consumer>,
 ) -> Box<dyn Consumer> {
     if level == CurryLevel::OUTERMOST {
         return widening(downstream);
     }
-    Box::new(ThroughValues {
-        level,
-        output: output.clone(),
-        downstream,
-    })
+    Box::new(ThroughValues { level, downstream })
 }
 
 struct ThroughValues {
     level: CurryLevel,
-    output: crate::interpreter::Tiling,
     downstream: Box<dyn Consumer>,
 }
 
 impl Consumer for ThroughValues {
     fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
-        let already_whole = *region == Projection::Everything;
-        let region = if landing.is_complete() {
-            let guard = crate::interpreter::tiling::through_shared_levels(
-                region.collection_guard(),
-                self.level.index(),
-                &self.output,
-            );
-            Projection::of(&guard).expect("completed shared rows name output rows")
-        } else {
-            region.above(self.level)
-        };
-        if !landing.is_complete() && !already_whole && region == Projection::Everything {
-            landing.widened(|landing| self.downstream.notify(&region, landing));
-        } else {
-            self.downstream.notify(&region, landing);
-        }
+        self.downstream.notify(&region.above(self.level), landing);
     }
 }
 
 struct Widening(Box<dyn Consumer>);
 
 impl Consumer for Widening {
-    /// A change widens to every key. A complete region passes as every key where its source is
-    /// wholly complete, and not at all otherwise: each output key depends on every input key, so
-    /// the path completes only part of what a row depends on.
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
-        landing.completing_part(|landing| match region {
-            Projection::Everything => self.0.notify(region, landing),
-            _ if landing.is_wholly_complete() => self.0.notify(&Projection::Everything, landing),
-            _ if landing.is_complete() => {}
-            _ => landing.widened(|landing| self.0.notify(&Projection::Everything, landing)),
-        });
+    /// A change widens to every key.
+    fn notify(&mut self, _region: &Projection, landing: &mut Landing<'_>) {
+        self.0.notify(&Projection::Everything, landing);
     }
 }
 
-/// `consumer` behind a consumer that widens like [`widening`] except for a complete region, which it
-/// passes as `restate` names it: the region of the operator's keys each of whose values the input
-/// region decides. An operator that re-keys its input knows which of its keys an input key
-/// contributes to, as `Uncurry` pairs an outer key with each inner key beneath it, so a complete
-/// region of its input decides that region of its own keys, which [`widening`] would hold back
-/// until the input is wholly complete.
-pub fn widening_restating_complete(
-    restate: fn(&Projection) -> Projection,
-    consumer: Box<dyn Consumer>,
-) -> Box<dyn Consumer> {
-    Box::new(WideningRestatingComplete(restate, consumer))
-}
-
-struct WideningRestatingComplete(fn(&Projection) -> Projection, Box<dyn Consumer>);
-
-impl Consumer for WideningRestatingComplete {
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
-        match region {
-            Projection::Everything => self.1.notify(region, landing),
-            _ if landing.is_complete() => self.1.notify(&(self.0)(region), landing),
-            _ => landing.widened(|landing| self.1.notify(&Projection::Everything, landing)),
-        }
-    }
-}
-
-/// [`restating`] for a lookup's collection operand: the rows a key of the operand names read that
-/// key and also their input's value, so the complete region it passes names only part of what
-/// those rows depend on ([`Landing::completing_part`]).
-pub fn restating_lookup(
-    restate: Box<dyn Fn(&Projection) -> Projection>,
-    consumer: Box<dyn Consumer>,
-) -> Box<dyn Consumer> {
-    Box::new(RestatingLookup(Restating(restate, consumer)))
-}
-
-struct RestatingLookup(Restating);
-
-impl Consumer for RestatingLookup {
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
-        landing.completing_part(|landing| self.0.notify(region, landing));
-    }
-}
-
-/// `consumer` behind a consumer that passes each region on as `restate` names it, a change as a
-/// complete region: an operator that keeps its input's keys under another spelling, as `Uncurry`
-/// beneath a standing level names an outer and an inner key as one pair, restates both exactly.
+/// `consumer` behind a consumer that passes each region on as `restate` names it: an operator that
+/// keeps its input's keys under another spelling, as `Uncurry`
+/// names an outer and an inner key as one pair, restates both exactly.
 pub fn restating(
     restate: Box<dyn Fn(&Projection) -> Projection>,
     consumer: Box<dyn Consumer>,
@@ -165,6 +108,48 @@ struct Restating(Box<dyn Fn(&Projection) -> Projection>, Box<dyn Consumer>);
 impl Consumer for Restating {
     fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
         self.1.notify(&(self.0)(region), landing);
+    }
+}
+
+/// `consumer` behind a consumer that forwards each region of the field `name` of a record of
+/// values whose fields are `names` as that part of the record ([`Projection::of_field`],
+/// normalized by [`Projection::over_fields`]): `MakeRecord` passes this to each operand, since a
+/// record of values has no keys and its fields' regions name it field by field.
+pub fn fielding(
+    name: smol_str::SmolStr,
+    names: Vec<smol_str::SmolStr>,
+    consumer: Box<dyn Consumer>,
+) -> Box<dyn Consumer> {
+    Box::new(Fielding(name, names, consumer))
+}
+
+struct Fielding(smol_str::SmolStr, Vec<smol_str::SmolStr>, Box<dyn Consumer>);
+
+impl Consumer for Fielding {
+    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        if *region != Projection::Nothing {
+            let record = Projection::of_field(&self.0, region.clone()).over_fields(&self.1);
+            self.2.notify(&record, landing);
+        }
+    }
+}
+
+/// `consumer` behind a consumer that forwards the part of each region of a record of values that
+/// names its field `name` ([`Projection::field`]), and nothing for a region naming none of it:
+/// `SelectField` passes this to a record of values, whose other fields' regions say nothing of
+/// the selected one.
+pub fn selecting_field(name: smol_str::SmolStr, consumer: Box<dyn Consumer>) -> Box<dyn Consumer> {
+    Box::new(SelectingField(name, consumer))
+}
+
+struct SelectingField(smol_str::SmolStr, Box<dyn Consumer>);
+
+impl Consumer for SelectingField {
+    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        let field = region.field(&self.0);
+        if field != Projection::Nothing {
+            self.1.notify(&field, landing);
+        }
     }
 }
 
@@ -228,36 +213,17 @@ impl OneLevelIn {
             standing => Some(standing.clone()),
         }
     }
-
-    /// [`notify`](Consumer::notify) inside the path's completes-part mark.
-    fn pass_on(&mut self, region: &Projection, landing: &mut Landing<'_>) {
-        if landing.is_complete() {
-            match region {
-                Projection::Keys { level, .. } if *level >= self.at => {
-                    if landing.is_wholly_complete() {
-                        self.consumer.notify(&Projection::Everything, landing);
-                    }
-                }
-                standing => self.consumer.notify(standing, landing),
-            }
-            return;
-        }
-        match self.restated(region) {
-            Some(restated) => self.consumer.notify(&restated, landing),
-            None => {
-                landing.widened(|landing| self.consumer.notify(&Projection::Everything, landing))
-            }
-        }
-    }
 }
 
 impl Consumer for OneLevelIn {
-    /// A complete region of the standing levels passes as it is. One that names keys at or beneath
-    /// level `at` passes as every key where its source is wholly complete, and not at all
-    /// otherwise: which output keys an input row stands beneath depends on its values, which no
-    /// region carries, so the path completes only part of what a row depends on.
+    /// A region of the standing levels passes as it is, and one of the keys at level `at` passes
+    /// one level in. One that names keys beneath level `at` passes as every key: which output
+    /// keys an input row stands beneath depends on its values, which no region carries.
     fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
-        landing.completing_part(|landing| self.pass_on(region, landing));
+        match self.restated(region) {
+            Some(restated) => self.consumer.notify(&restated, landing),
+            None => self.consumer.notify(&Projection::Everything, landing),
+        }
     }
 }
 
@@ -299,7 +265,6 @@ mod tests {
     #[test]
     fn a_replaced_whole_value_walks_a_widened_route() {
         use crate::interpreter::dispatcher::PipelineId;
-        use crate::interpreter::{BaseType, Extent, Tiling};
         struct Entry;
         impl Consumer for Entry {
             fn notify(&mut self, _: &Projection, landing: &mut Landing<'_>) {
@@ -309,8 +274,7 @@ mod tests {
                 );
             }
         }
-        let output = Tiling::Scalar(Extent::Base(BaseType::Int));
-        let mut consumer = through_values(CurryLevel::OUTERMOST, &output, Box::new(Entry));
+        let mut consumer = through_values(CurryLevel::OUTERMOST, Box::new(Entry));
         let mut landing = Landing::route();
         consumer.notify(
             &Projection::admitting(crate::interpreter::Predicate::point(
@@ -320,80 +284,6 @@ mod tests {
         );
         let reached = landing.routes();
         assert_eq!(reached.len(), 1);
-        assert!(!reached[0].keeps_keys);
-        assert!(reached[0].completes_part);
-    }
-
-    /// A value replaced beneath the outermost level widens a change only where it names keys of
-    /// that level: a route walk of a path through it keeps the keys of a push of one outer key, and
-    /// widens a push of an inner key beneath every outer one, as a group's row is pushed.
-    #[test]
-    fn a_replaced_inner_value_widens_only_a_push_beneath_its_level() {
-        use crate::interpreter::dispatcher::PipelineId;
-        use crate::interpreter::{BaseType, Extent, Predicate, TileGuard, Tiling, Value};
-        struct Entry;
-        impl Consumer for Entry {
-            fn notify(&mut self, _: &Projection, landing: &mut Landing<'_>) {
-                landing.queue(PipelineId(0), &TileGuard::Scalar(Predicate::True));
-            }
-        }
-        let uint = || Extent::Base(BaseType::UInt);
-        let output = Tiling::data_function(
-            uint(),
-            Tiling::data_function(uint(), Tiling::Scalar(Extent::Base(BaseType::Int))),
-        );
-        let mut consumer = through_values(CurryLevel::new(1), &output, Box::new(Entry));
-        let keeps = |region: Projection, consumer: &mut Box<dyn Consumer>| {
-            let mut landing = Landing::route();
-            consumer.notify(&region, &mut landing);
-            let routes = landing.routes();
-            assert_eq!(routes.len(), 1, "{region:?}");
-            routes[0].keeps_keys
-        };
-        assert!(keeps(Projection::of_path(&[Value::UInt(0)]), &mut consumer));
-        assert!(!keeps(
-            Projection::keys_at(CurryLevel::new(1), Predicate::point(Value::UInt(0))),
-            &mut consumer
-        ));
-    }
-
-    #[test]
-    fn replaced_values_pass_changes_but_only_whole_value_completion() {
-        use crate::interpreter::dispatcher::PipelineId;
-        use crate::interpreter::{BaseType, Extent, Predicate, Tiling, Value};
-        struct Received(Rc<RefCell<Vec<Projection>>>);
-        impl Consumer for Received {
-            fn notify(&mut self, region: &Projection, _: &mut Landing<'_>) {
-                self.0.borrow_mut().push(region.clone());
-            }
-        }
-        let received = Rc::new(RefCell::new(Vec::new()));
-        let tiling = Tiling::data_function(
-            Extent::Base(BaseType::UInt),
-            Tiling::Scalar(Extent::Base(BaseType::Int)),
-        );
-        let mut consumer = through_values(
-            CurryLevel::new(1),
-            &tiling,
-            Box::new(Received(received.clone())),
-        );
-        let row = Predicate::point(Value::UInt(4));
-        let part = Projection::keys_at(
-            CurryLevel::new(1),
-            Predicate::qualified(row.clone(), Predicate::point(Value::UInt(7))),
-        );
-        consumer.notify(&part, &mut Landing::probe(PipelineId(0)));
-        consumer.notify(&part, &mut Landing::probe_complete(PipelineId(0)));
-        let whole = Projection::keys_at(
-            CurryLevel::new(1),
-            Predicate::qualified(row.clone(), Predicate::True),
-        );
-        consumer.notify(&whole, &mut Landing::probe_complete(PipelineId(0)));
-        let outer = Projection::admitting(row);
-        assert_eq!(
-            *received.borrow(),
-            vec![outer.clone(), Projection::Nothing, outer]
-        );
     }
 
     #[test]
@@ -407,5 +297,654 @@ mod tests {
         );
         crate::interpreter::dispatcher::notify_for_test(&mut *forwarding_consumer(&shared), &keys);
         assert_eq!(*received.borrow(), [keys, Projection::Everything]);
+    }
+}
+
+/// What each input of a pairing operator has delivered, which its notifications restate a delta
+/// against: the rows a pair hangs under, and what pairs them with those rows.
+///
+/// A pairing operator's output path `(𝑟, 𝑘)` exists once both its halves have arrived, so a
+/// delivery on one input creates exactly the pairs of its delta with what the other input has
+/// delivered: Δ𝑅 × 𝐾 ∪ 𝑅 × Δ𝐾. Each pair is announced once, by the delivery that completes
+/// it, so no announcement names a pair before both halves exist. `rows` admits paths of the
+/// level above the pairs; `partners` admits the constant's keys for a broadcast
+/// ([`Partners::ConstantKeys`]) and the pairs' own paths for a row-aligned pairing
+/// ([`Partners::Paths`]). Both grow only on a delivery ([`Landing::is_delivery`]): a planner's
+/// walk restates as though every partner had arrived, so the route it reads keeps keys.
+pub(crate) struct Delivered {
+    rows: crate::interpreter::Predicate,
+    partners: crate::interpreter::Predicate,
+}
+
+/// What a delivery adds to a pairing's [`Delivered`], applied once its pairs are announced.
+type RecordDelivery = Box<dyn FnOnce(&mut Delivered)>;
+
+/// [`Delivered`], shared by the consumers in front of one pairing operator's inputs.
+pub(crate) type SharedDelivered = Arc<std::sync::Mutex<Delivered>>;
+
+/// A [`Delivered`] with nothing delivered yet of a side whose keys arrive by a push, and
+/// everything of a side no push reaches, which holds all its keys from the start
+/// ([`TileOperator::keys_arrive_by_push`](crate::interpreter::tile_operators::TileOperator::keys_arrive_by_push)).
+pub(crate) fn nothing_delivered(rows_arrive: bool, partners_arrive: bool) -> SharedDelivered {
+    let held = |arrive: bool| match arrive {
+        true => crate::interpreter::Predicate::False,
+        false => crate::interpreter::Predicate::True,
+    };
+    Arc::new(std::sync::Mutex::new(Delivered {
+        rows: held(rows_arrive),
+        partners: held(partners_arrive),
+    }))
+}
+
+/// What a pairing's partner side holds ([`Delivered::partners`]).
+#[derive(Clone, Copy)]
+pub(crate) enum Partners {
+    /// The keys of a constant broadcast beneath every row (`MapResultToConst`): a pair is a
+    /// row with one constant key, so the pairs are every delivered row by every delivered key.
+    ConstantKeys,
+    /// The pairs' own paths, delivered by a side aligned with the rows (`Product`'s inner side):
+    /// a pair exists where that side holds it and the row side has delivered its row.
+    Paths,
+}
+
+/// Which input of a pairing a consumer sits in front of.
+#[derive(Clone, Copy)]
+pub(crate) enum PairingSide {
+    /// The rows: a region of rows announces those rows' pairs with the partners delivered.
+    Rows(Partners),
+    /// A constant's keys (`Partners::ConstantKeys`): a region of keys announces every
+    /// delivered row's pair with them. A region beneath the constant's outermost keys widens.
+    ConstantKeys,
+    /// The aligned side's pairs (`Partners::Paths`): a region of pairs announces those whose
+    /// row has been delivered. A region beneath the pairs passes on as it is.
+    Paths,
+}
+
+/// `consumer` behind a consumer that restates a delta of one input of a pairing operator as the
+/// pairs it creates, at level `at` ([`Delivered`]).
+pub(crate) fn pairing(
+    side: PairingSide,
+    at: CurryLevel,
+    delivered: SharedDelivered,
+    consumer: Box<dyn Consumer>,
+) -> Box<dyn Consumer> {
+    Box::new(Pairing {
+        side,
+        at,
+        delivered,
+        consumer,
+    })
+}
+
+struct Pairing {
+    side: PairingSide,
+    at: CurryLevel,
+    delivered: SharedDelivered,
+    consumer: Box<dyn Consumer>,
+}
+
+/// What each arm of a row-aligned operator has delivered of the keys its arms share, as paths of
+/// that level. A row of the output exists once every arm has delivered it, so a delivery on one
+/// arm announces the part of its region under the rows every other arm has delivered: Δ𝑅ᵢ ∩
+/// ⋂ⱼ≠ᵢ 𝑅ⱼ. The arm that delivers a row last announces it. An arm no push reaches holds every
+/// row from the start
+/// ([`TileOperator::keys_arrive_by_push`](crate::interpreter::tile_operators::TileOperator::keys_arrive_by_push)).
+/// Each arm's record grows only on a delivery ([`Landing::is_delivery`]).
+pub(crate) struct AlignedDelivered {
+    arms: Vec<crate::interpreter::Predicate>,
+}
+
+/// [`AlignedDelivered`], shared by the consumers in front of one operator's arms.
+pub(crate) type SharedAligned = Arc<std::sync::Mutex<AlignedDelivered>>;
+
+/// An [`AlignedDelivered`] with nothing delivered of each arm whose keys arrive from a source, and
+/// every row of each arm that reads none, in arm order.
+pub(crate) fn nothing_aligned(arrive: impl IntoIterator<Item = bool>) -> SharedAligned {
+    let arms = arrive
+        .into_iter()
+        .map(|arrives| match arrives {
+            true => crate::interpreter::Predicate::False,
+            false => crate::interpreter::Predicate::True,
+        })
+        .collect();
+    Arc::new(std::sync::Mutex::new(AlignedDelivered { arms }))
+}
+
+/// `consumer` behind a consumer that passes on a delivery of arm `arm` only under the rows of
+/// level `at` that every other arm has delivered ([`AlignedDelivered`]).
+pub(crate) fn aligned(
+    arm: usize,
+    at: CurryLevel,
+    delivered: SharedAligned,
+    consumer: Box<dyn Consumer>,
+) -> Box<dyn Consumer> {
+    Box::new(Aligned {
+        arm,
+        at,
+        delivered,
+        consumer,
+    })
+}
+
+struct Aligned {
+    arm: usize,
+    at: CurryLevel,
+    delivered: SharedAligned,
+    consumer: Box<dyn Consumer>,
+}
+
+/// The rows of level `at` that `region` reaches, as paths of that level: its keys at `at`, the
+/// paths beneath its keys above `at`, and the paths its keys beneath `at` run through. `None` where
+/// the region names fields of a record, which name no row.
+fn rows_reached(region: &Projection, at: CurryLevel) -> Option<crate::interpreter::Predicate> {
+    use crate::interpreter::Predicate;
+    match region {
+        Projection::Everything => Some(Predicate::True),
+        Projection::Nothing => Some(Predicate::False),
+        Projection::Fields { .. } => None,
+        Projection::Or(arms) => arms.iter().try_fold(Predicate::False, |rows, arm| {
+            Some(rows.union(&rows_reached(arm, at)?))
+        }),
+        Projection::Keys { level, keys } | Projection::Within { level, keys, .. } => {
+            match *level > at {
+                true => rows_reached(
+                    &Projection::keys_at(*level, keys.clone())
+                        .above(CurryLevel::new(at.index() + 1)),
+                    at,
+                ),
+                false => paths_at(&Projection::keys_at(*level, keys.clone()), at),
+            }
+        }
+    }
+}
+
+impl Consumer for Aligned {
+    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        // A landing that queues nothing states what is decided rather than what arrived, so it is
+        // cut by nothing.
+        if !landing.is_delivery() {
+            self.consumer.notify(region, landing);
+            return;
+        }
+        let Some(delta) = rows_reached(region, self.at) else {
+            self.consumer.notify(region, landing);
+            return;
+        };
+        // The other arms are read and the delta recorded under one lock, so of two deliveries on
+        // different threads the later one announces each row they complete.
+        let mut delivered = self
+            .delivered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let others = delivered
+            .arms
+            .iter()
+            .enumerate()
+            .filter(|(arm, _)| *arm != self.arm)
+            .fold(crate::interpreter::Predicate::True, |rows, (_, arm)| {
+                rows.intersect(arm)
+            });
+        let own = &mut delivered.arms[self.arm];
+        *own = own.union(&delta);
+        drop(delivered);
+        let restated = match others.is_true() {
+            true => region.clone(),
+            false => region.intersect(&Projection::keys_at(self.at, others)),
+        };
+        if restated == Projection::Nothing {
+            return;
+        }
+        self.consumer.notify(&restated, landing);
+    }
+}
+
+/// `consumer` behind a consumer that forwards a region of a stream of records as the region of the
+/// selected field `name`: the same keys, and of a region within the records' values the part of
+/// the field `name` ([`Projection::field`]), and nothing for a part naming none of it.
+/// `SelectField` passes this to a stream of records, whose keys are the selected field's.
+pub fn selecting_field_beneath_keys(
+    name: smol_str::SmolStr,
+    consumer: Box<dyn Consumer>,
+) -> Box<dyn Consumer> {
+    Box::new(SelectingFieldBeneathKeys(name, consumer))
+}
+
+struct SelectingFieldBeneathKeys(smol_str::SmolStr, Box<dyn Consumer>);
+
+impl SelectingFieldBeneathKeys {
+    fn restated(&self, region: &Projection) -> Projection {
+        match region {
+            Projection::Within {
+                level,
+                keys,
+                values,
+            } => Projection::within(*level, keys.clone(), values.field(&self.0)),
+            Projection::Or(arms) => Projection::any_of(arms.iter().map(|arm| self.restated(arm))),
+            whole => whole.clone(),
+        }
+    }
+}
+
+impl Consumer for SelectingFieldBeneathKeys {
+    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        let restated = self.restated(region);
+        if restated == Projection::Nothing
+            && *region != Projection::Nothing
+            && landing.is_delivery()
+        {
+            return;
+        }
+        self.1.notify(&restated, landing);
+    }
+}
+
+/// `consumer` behind a consumer that forwards a region of a record's field `name`, the record
+/// standing at `level` beneath rows, as that field of the rows it reaches: the rows a region of the
+/// field's keys runs through, within the field `name`'s part, and nothing of the other fields.
+/// `Zip` passes this to each arm, whose rows are the pair's and whose values are one field of it,
+/// so a push on one arm names no part of another arm's field.
+pub fn field_beneath_rows(
+    name: smol_str::SmolStr,
+    level: CurryLevel,
+    consumer: Box<dyn Consumer>,
+) -> Box<dyn Consumer> {
+    let rows = level
+        .enclosing()
+        .expect("a field beneath rows stands beneath a level of rows");
+    Box::new(FieldBeneathRows {
+        name,
+        rows,
+        consumer,
+    })
+}
+
+struct FieldBeneathRows {
+    name: smol_str::SmolStr,
+    rows: CurryLevel,
+    consumer: Box<dyn Consumer>,
+}
+
+impl FieldBeneathRows {
+    /// The region of the record's rows `region`, a region of the field's own tiling, names.
+    fn restated(&self, region: &Projection) -> Projection {
+        let of_field = |part: Projection| {
+            Projection::fields(
+                [(self.name.clone(), part)].into_iter().collect(),
+                Projection::Nothing,
+            )
+        };
+        match region {
+            Projection::Nothing => Projection::Nothing,
+            Projection::Everything => Projection::within(
+                self.rows,
+                crate::interpreter::Predicate::True,
+                of_field(Projection::Everything),
+            ),
+            // Keys at or above the rows name the field of every row beneath them.
+            Projection::Keys { level, keys } if *level <= self.rows => Projection::within(
+                self.rows,
+                keys.descend(self.rows.index() - level.index()),
+                of_field(Projection::Everything),
+            ),
+            Projection::Keys { level, keys } => {
+                let relative = level.index() - self.rows.index() - 1;
+                Projection::any_of(split_beneath_rows(keys, relative).into_iter().map(
+                    |(rows, part)| {
+                        Projection::within(
+                            self.rows,
+                            rows,
+                            of_field(Projection::keys_at(CurryLevel::new(relative), part)),
+                        )
+                    },
+                ))
+            }
+            Projection::Or(arms) => Projection::any_of(arms.iter().map(|arm| self.restated(arm))),
+            // A part of the field's values beneath its own keys: those keys are the rows' where they
+            // stand at the rows' level, and keys within the field's values beneath them otherwise.
+            Projection::Within {
+                level,
+                keys,
+                values,
+            } if *level == self.rows => {
+                Projection::within(self.rows, keys.clone(), of_field((**values).clone()))
+            }
+            Projection::Within {
+                level,
+                keys,
+                values,
+            } if *level > self.rows => {
+                let relative = level.index() - self.rows.index() - 1;
+                Projection::any_of(split_beneath_rows(keys, relative).into_iter().map(
+                    |(rows, part)| {
+                        Projection::within(
+                            self.rows,
+                            rows,
+                            of_field(Projection::within(
+                                CurryLevel::new(relative),
+                                part,
+                                (**values).clone(),
+                            )),
+                        )
+                    },
+                ))
+            }
+            other => panic!("{other:?} names a part this field's rows have no spelling for"),
+        }
+    }
+}
+
+impl FieldBeneathRows {}
+
+impl Consumer for FieldBeneathRows {
+    /// A notification names keys, and what of each row's value is final is stated in the tiles
+    /// the row's reader pulls. A change of one field names the rows it runs through. A complete
+    /// region names the rows whose field it completes whole, which says this arm's part of those
+    /// rows is final; the reader joins it with the other inputs it reads.
+    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        let restated = self.restated(region);
+        let rows = restated.rows();
+        if rows == Projection::Nothing && landing.is_delivery() {
+            return;
+        }
+        self.consumer.notify(&rows, landing);
+    }
+}
+
+/// The pairs of rows and paths beneath them `paths` admits, `paths` being over paths `relative`
+/// levels beneath the rows' level: each arm split into the rows above and the paths beneath them.
+/// An unqualified arm stands beneath every row.
+fn split_beneath_rows(
+    paths: &crate::interpreter::Predicate,
+    relative: usize,
+) -> Vec<(crate::interpreter::Predicate, crate::interpreter::Predicate)> {
+    use crate::interpreter::Predicate;
+    match paths {
+        Predicate::False => Vec::new(),
+        Predicate::Or(arms) => arms
+            .iter()
+            .flat_map(|arm| split_beneath_rows(arm, relative))
+            .collect(),
+        Predicate::Qualified { enclosing, here } if relative == 0 => {
+            vec![((**enclosing).clone(), (**here).clone())]
+        }
+        Predicate::Qualified { enclosing, here } => split_beneath_rows(enclosing, relative - 1)
+            .into_iter()
+            .map(|(rows, above)| (rows, Predicate::qualified(above, (**here).clone())))
+            .collect(),
+        unqualified => vec![(Predicate::True, unqualified.clone())],
+    }
+}
+
+/// `consumer` behind a consumer in front of the input of an operator that computes each value
+/// anew from the input's value at the same key, as `MapResult` applies its function: a region of
+/// keys passes on unchanged, and a region naming part of some values as the rows it runs through.
+pub fn whole_values_at(consumer: Box<dyn Consumer>) -> Box<dyn Consumer> {
+    Box::new(WholeValuesAt(consumer))
+}
+
+struct WholeValuesAt(Box<dyn Consumer>);
+
+impl Consumer for WholeValuesAt {
+    /// A region of keys passes on unchanged: the function keeps the input's keys and computes the
+    /// values beneath them. A region naming part of some values names the input's values, which
+    /// the function replaces, so it passes on as the rows it runs through: the value there is
+    /// read again whole, and what of it is final is stated in the tile the reader pulls.
+    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        match region.names_part_of_values() {
+            false => self.0.notify(region, landing),
+            true => self.0.notify(&region.rows(), landing),
+        }
+    }
+}
+
+/// The outermost keys the paths `keys`, `levels` levels beneath them, run through.
+fn outermost_keys(
+    keys: &crate::interpreter::Predicate,
+    levels: usize,
+) -> crate::interpreter::Predicate {
+    use crate::interpreter::Predicate;
+    match keys {
+        _ if levels == 0 => keys.clone(),
+        Predicate::Or(arms) => arms
+            .iter()
+            .map(|arm| outermost_keys(arm, levels))
+            .fold(Predicate::False, |all, arm| all.union(&arm)),
+        Predicate::Qualified { enclosing, .. } => outermost_keys(enclosing, levels - 1),
+        _ => Predicate::True,
+    }
+}
+
+/// The arms of `region`, which an `Or` holds and any other region is one of.
+fn region_arms(region: &Projection) -> Vec<Projection> {
+    match region {
+        Projection::Or(arms) => arms.clone(),
+        single => vec![single.clone()],
+    }
+}
+
+/// `region`'s keys as a predicate over the paths of level `to`, `None` where the region names
+/// keys beneath it. A region above `to` admits every path beneath its keys.
+fn paths_at(region: &Projection, to: CurryLevel) -> Option<crate::interpreter::Predicate> {
+    use crate::interpreter::Predicate;
+    let (mut level, mut keys) = match region {
+        part @ (Projection::Within { .. } | Projection::Or(_)) => {
+            Projection::refuse_part_of_values("paths_at", part)
+        }
+        Projection::Everything => return Some(Predicate::True),
+        Projection::Nothing => return Some(Predicate::False),
+        Projection::Keys { level, keys } => (level.index(), keys.clone()),
+        // A region of a record's fields names no keys of the rows.
+        Projection::Fields { .. } => return None,
+    };
+    if level > to.index() {
+        return None;
+    }
+    while level < to.index() {
+        keys = Predicate::qualified(keys, Predicate::True);
+        level += 1;
+    }
+    Some(keys)
+}
+
+impl Pairing {
+    /// The pairs `region` creates and what it adds to [`Delivered`], `None` where the region
+    /// names keys beneath what the side restates. `recorded` says the region is a delivery.
+    fn pairs(
+        &self,
+        region: &Projection,
+        recorded: bool,
+        delivered: &Delivered,
+    ) -> Option<(crate::interpreter::Predicate, RecordDelivery)> {
+        use crate::interpreter::Predicate;
+        let rows_level = self
+            .at
+            .enclosing()
+            .expect("a pairing pairs beneath a level of rows");
+        let (rows, partners) = match recorded {
+            true => (delivered.rows.clone(), delivered.partners.clone()),
+            false => (Predicate::True, Predicate::True),
+        };
+        Some(match self.side {
+            PairingSide::Rows(against) => {
+                let delta = paths_at(&region.above(self.at), rows_level)?;
+                let pairs = match against {
+                    Partners::ConstantKeys => Predicate::qualified(delta.clone(), partners),
+                    Partners::Paths => {
+                        Predicate::qualified(delta.clone(), Predicate::True).intersect(&partners)
+                    }
+                };
+                let record: RecordDelivery =
+                    Box::new(move |seen| seen.rows = seen.rows.union(&delta));
+                (pairs, record)
+            }
+            PairingSide::ConstantKeys => {
+                let delta = paths_at(region, CurryLevel::OUTERMOST)?;
+                let pairs = Predicate::qualified(rows, delta.clone());
+                let record: RecordDelivery =
+                    Box::new(move |seen| seen.partners = seen.partners.union(&delta));
+                (pairs, record)
+            }
+            PairingSide::Paths => {
+                let delta = paths_at(region, self.at)?;
+                let pairs = delta.intersect(&Predicate::qualified(rows, Predicate::True));
+                let record: RecordDelivery =
+                    Box::new(move |seen| seen.partners = seen.partners.union(&delta));
+                (pairs, record)
+            }
+        })
+    }
+}
+
+impl Pairing {
+    /// Pass `restated` on. A change of one input names pairs whose other half may still change,
+    /// so it completes part of what a pair depends on. A complete
+    /// region is passed on unmarked: both inputs of a pairing read what one push brings in the
+    /// same landing, so each pair's halves complete together, and halves from different
+    /// pipelines are joined by the reader's record per read.
+    fn pass_on(&mut self, restated: &Projection, landing: &mut Landing<'_>) {
+        self.consumer.notify(restated, landing);
+    }
+}
+
+impl Consumer for Pairing {
+    /// Restates a region of one input as the pairs it reaches ([`Delivered`]), passed on as
+    /// [`pass_on`](Self::pass_on) says.
+    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        // A delivery grows what has been delivered and is cut by it: a landing that queues
+        // packages, a breaker's push or a range's arrival ([`Landing::is_delivery`]). Any other
+        // landing states what is decided rather than what arrived, so it is cut by nothing and
+        // takes every pair it decides.
+        let delivery = landing.is_delivery();
+        // The pairs are read and the delta recorded under one lock, so of two deliveries on
+        // different threads the later one announces each pair they complete, and once. The lock
+        // is released before the region is passed on.
+        let mut delivered = self
+            .delivered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // A row side's values are no part of the pairs' values the pairing spells, so a part of a
+        // row's values is restated through the whole row: a change names the row's pairs whole,
+        // which names more than changed, and a complete part completes no pair.
+        let whole_rows;
+        let region = match (self.side, region.names_part_of_values()) {
+            (PairingSide::Rows(_), true) => {
+                whole_rows = region.rows();
+                &whole_rows
+            }
+            _ => region,
+        };
+        // A region within some values, or a union with one: each arm's keys pair as keys do, and
+        // the part of the values it names stands under each pair it announces. A part is new
+        // information under every pair it reaches, so it is announced under every pair whose other
+        // half has arrived, not only under the pairs its keys complete.
+        if region.names_part_of_values() {
+            let mut restated = Vec::new();
+            for arm in region_arms(region) {
+                let (keys_only, values) = match &arm {
+                    Projection::Within {
+                        level,
+                        keys,
+                        values,
+                    } => (
+                        Projection::keys_at(*level, keys.clone()),
+                        Some((**values).clone()),
+                    ),
+                    whole => (whole.clone(), None),
+                };
+                let Some((_, record)) = self.pairs(&keys_only, delivery, &delivered) else {
+                    panic!("{arm:?} names keys beneath what a pairing restates");
+                };
+                let every = self.pairs(&keys_only, false, &delivered);
+                let (rows, partners) = match delivery {
+                    true => (delivered.rows.clone(), delivered.partners.clone()),
+                    false => (
+                        crate::interpreter::Predicate::True,
+                        crate::interpreter::Predicate::True,
+                    ),
+                };
+                if delivery {
+                    record(&mut delivered);
+                }
+                let pairs = match (&values, every) {
+                    (None, _) => {
+                        let (pairs, _) = self
+                            .pairs(&keys_only, false, &Delivered { rows, partners })
+                            .expect("read above");
+                        Projection::keys_at(self.at, pairs)
+                    }
+                    (Some(values), Some((all, _))) => {
+                        let reached = match self.side {
+                            PairingSide::ConstantKeys => {
+                                all.intersect(&crate::interpreter::Predicate::qualified(
+                                    rows,
+                                    crate::interpreter::Predicate::True,
+                                ))
+                            }
+                            PairingSide::Paths => {
+                                all.intersect(&crate::interpreter::Predicate::qualified(
+                                    rows,
+                                    crate::interpreter::Predicate::True,
+                                ))
+                            }
+                            PairingSide::Rows(_) => panic!(
+                                "{arm:?}: a row side names its rows whole, not part of their values"
+                            ),
+                        };
+                        Projection::within(self.at, reached, values.clone())
+                    }
+                    (Some(_), None) => unreachable!("read above"),
+                };
+                restated.push(pairs);
+            }
+            drop(delivered);
+            let restated = Projection::any_of(restated);
+            if landing.is_delivery() && restated == Projection::Nothing {
+                return;
+            }
+            self.pass_on(&restated, landing);
+            return;
+        }
+        // A region beneath a constant's outermost keys names paths inside the values of keys
+        // that have already arrived, beneath every row: the same paths under each delivered row,
+        // `level` levels further down, and its outermost keys as delivered.
+        if let (PairingSide::ConstantKeys, Projection::Keys { level, keys }) = (self.side, region)
+            && *level > CurryLevel::OUTERMOST
+        {
+            let rows = match delivery {
+                true => delivered.rows.clone(),
+                false => crate::interpreter::Predicate::True,
+            };
+            if delivery {
+                let outermost = outermost_keys(keys, level.index());
+                delivered.partners = delivered.partners.union(&outermost);
+            }
+            drop(delivered);
+            let paths = crate::interpreter::tiling::beneath_keys(keys, &rows, level.index());
+            let restated =
+                Projection::keys_at(CurryLevel::new(self.at.index() + level.index()), paths);
+            if landing.is_delivery() && restated == Projection::Nothing {
+                return;
+            }
+            self.pass_on(&restated, landing);
+            return;
+        }
+        let Some((pairs, record)) = self.pairs(region, delivery, &delivered) else {
+            drop(delivered);
+            match self.side {
+                // A constant's region beneath its outermost keys names no key of the pairs.
+                PairingSide::ConstantKeys => self.consumer.notify(&Projection::Everything, landing),
+                _ => self.consumer.notify(region, landing),
+            }
+            return;
+        };
+        if delivery {
+            record(&mut delivered);
+        }
+        drop(delivered);
+        if landing.is_delivery() && pairs.is_false() {
+            return;
+        }
+        let restated = Projection::keys_at(self.at, pairs);
+        self.pass_on(&restated, landing);
     }
 }

@@ -4329,12 +4329,7 @@ fn build_commit_store(
         // domain, whatever the `Transact` sits in.
         let body_op = convert_at(
             &w.body,
-            // The drive's stream is its rows and what it has decided of its source; the body
-            // reads the rows.
-            Some(Box::new(Memo::new(Box::new(SelectField::new(
-                driver_fan.slot(),
-                crate::interpreter::commit_operator::TRANSACT_ROWS,
-            ))))),
+            Some(Box::new(Memo::new(driver_fan.slot()))),
             CurryLevel::new(1),
             ctx,
         )?;

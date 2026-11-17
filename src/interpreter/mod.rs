@@ -55,9 +55,8 @@ use std::rc::Rc;
 /// A planner reads a push's routes by walking the same `notify` with a routing landing
 /// ([`dispatcher::Landing::route`]), so planning reads the paths a delivery takes off the code
 /// that takes them. What `notify` does only for a delivery ([`dispatcher::Landing::is_delivery`])
-/// is not walked: a package it queues, or a complete region it records, fails the run unless a
-/// walk took the same path (`src/interpreter/design-dispatcher.md`, "Running a compiled
-/// program").
+/// is not walked. A delivery that reaches a reader the walk of its pipeline did not reach fails
+/// the run (`src/interpreter/design-dispatcher.md`, "Running a compiled program").
 pub trait Consumer {
     /// Record an announced region and deliver it toward its dispatcher entries.
     fn notify(&mut self, _region: &Projection, _landing: &mut dispatcher::Landing<'_>) {}

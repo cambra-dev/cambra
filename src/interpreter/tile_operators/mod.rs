@@ -105,6 +105,21 @@ pub trait TileOperator {
         self.tiling().extent()
     }
 
+    /// Whether keys of this operator's output reach its readers by a push during a run: an
+    /// iteration over an extent that reads a source, a breaker, whose output its pipeline pushes
+    /// to the pipelines that read it, or an operator with such an input. An output reached by no
+    /// push holds all its keys from the start, which a pairing reads as delivered
+    /// (`notifications::Delivered`). A deferred input closes a recurrence and is not read.
+    fn keys_arrive_by_push(&self) -> bool {
+        let mut arrives = false;
+        self.visit_inputs(&mut |edge| {
+            if !matches!(edge.kind, EdgeKind::Value { deferred: true }) {
+                arrives |= edge.target.keys_arrive_by_push();
+            }
+        });
+        arrives
+    }
+
     /// Return the [`Tiling`] that describes this operator's output shape.
     /// If the operator has unbound arguments, the tiling will be a curried function
     /// from inputs to the output.
@@ -192,6 +207,13 @@ pub trait TileOperator {
     /// Other operators like [`FanOut`] and [`Memo`] preserve structure, so they pass the value through from their
     /// input
     fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
+        None
+    }
+
+    /// [`result_correlation`](Self::result_correlation) of field `field` of a result that is a
+    /// record: the part of the domain that field equals. A [`Product`] pair's second field is
+    /// the key it pairs, for example.
+    fn field_correlation(&self, _field: &str) -> Option<Vec<TilePathStep>> {
         None
     }
 }
@@ -916,14 +938,29 @@ pub struct ProducerBase {
     /// For a pipeline breaker, the pipeline the [`Entry`](crate::interpreter::dispatcher::Entry)
     /// at its input queues for, which a planner sets. `None` for every other producer.
     pub(crate) placement: Option<crate::interpreter::dispatcher::Placement>,
+    /// The id of the last dispatched run that consumed this breaker, `0` before any
+    /// ([`reads_input`](Self::reads_input)).
+    consumed_in_run: std::cell::Cell<u64>,
 }
 
 impl ProducerBase {
     /// A breaker reads its input directly only inside another scheduled pipeline. Its own
     /// placement delegates execution to consume; outside execution a read observes held state.
+    /// A breaker the run consumes runs in a pipeline of its own even where its entry is unplaced,
+    /// as a source of a scope's body is (`Body::activate`), so it also answers from held
+    /// state.
     pub(crate) fn reads_input(&self) -> bool {
-        crate::interpreter::dispatcher::is_in_a_run()
+        let run = crate::interpreter::dispatcher::current_run();
+        run != 0
             && self.placement.as_ref().is_none_or(|at| at.get().is_none())
+            && self.consumed_in_run.get() != run
+    }
+
+    /// Record that the current dispatched run consumes this breaker
+    /// ([`reads_input`](Self::reads_input)).
+    pub(crate) fn consumed_in_this_run(&self) {
+        self.consumed_in_run
+            .set(crate::interpreter::dispatcher::current_run());
     }
 
     /// Initialize a producer for `owner`'s operator.
@@ -946,6 +983,7 @@ impl ProducerBase {
             last_output: None,
             downstream: None,
             placement: None,
+            consumed_in_run: std::cell::Cell::new(0),
         }
     }
 
@@ -989,7 +1027,8 @@ impl ProducerBase {
             reads: 0,
             last_output: None,
             downstream: None,
-            placement: Some(Rc::new(std::cell::Cell::new(None))),
+            placement: Some(crate::interpreter::dispatcher::Placement::default()),
+            consumed_in_run: std::cell::Cell::new(0),
         }
     }
 }
@@ -1113,8 +1152,13 @@ mod pull_levels {
     fn pulled_level(guard: &TileGuard) -> Option<Option<CurryLevel>> {
         use crate::interpreter::Projection;
         match Projection::of(guard) {
-            Ok(Projection::Keys { level, .. }) => Some(Some(level)),
-            Ok(Projection::Everything) => Some(None),
+            Ok(Projection::Keys { level, .. } | Projection::Within { level, .. }) => {
+                Some(Some(level))
+            }
+            Ok(or @ Projection::Or(_)) => Some(or.level()),
+            // A record of values has no level of keys, so a pull of part of its fields is held to
+            // the declaration of a whole read.
+            Ok(Projection::Everything | Projection::Fields { .. }) => Some(None),
             Ok(Projection::Nothing) | Err(_) => None,
         }
     }
@@ -1285,10 +1329,25 @@ pub(crate) fn guard_minus(held: &TileGuard, released: &TileGuard) -> TileGuard {
             (Ok(held_keys), Ok(released_keys))
                 if names_collection_keys(held) && names_collection_keys(released) =>
             {
-                held_keys.minus(&released_keys).collection_guard()
+                let left = held_keys.minus(&released_keys);
+                match left.names_part_of_values() {
+                    // Part of some values is spelled over their shape, which the record guards of
+                    // the two guards name field by field.
+                    true => match crate::interpreter::tiling::skeleton(&[held, released]) {
+                        Some(shape) => left.guard(&shape),
+                        None => panic!(
+                            "the guard algebra has no difference of {held:?} and {released:?}: \
+                             they name no one shape"
+                        ),
+                    },
+                    false => left.collection_guard(),
+                }
             }
             (Ok(_), Err(_)) if names_collection_keys(held) && names_collection_keys(released) => {
                 minus_disjoint_arms(held, released)
+            }
+            (Err(_), Ok(_)) if names_collection_keys(held) && names_collection_keys(released) => {
+                minus_outermost_keys(held, released)
             }
             _ => panic!("the guard algebra has no difference of {held:?} and {released:?}"),
         },
@@ -1316,7 +1375,7 @@ fn minus_disjoint_arms(held: &TileGuard, released: &TileGuard) -> TileGuard {
         TileGuard::Or(arms) => arms.as_slice(),
         single => std::slice::from_ref(single),
     };
-    for arm in arms.iter().filter(|arm| Projection::of(arm).is_err()) {
+    for arm in arms.iter().filter(|arm| !names_whole_keys(arm)) {
         assert!(
             left.intersect(arm).is_empty(),
             "the guard algebra has no difference of {held:?} and {released:?} that is a region \
@@ -1324,6 +1383,113 @@ fn minus_disjoint_arms(held: &TileGuard, released: &TileGuard) -> TileGuard {
         );
     }
     left
+}
+
+/// `held`, a guard of a collection's keys with an arm naming cells beneath some keys, less
+/// `released`, a region of the collection's outermost keys. An arm of keys loses them as
+/// projections do ([`guard_minus`]); an arm of cells keeps the cells beneath every other key
+/// ([`cells_outside_keys`]) (`src/interpreter/design-path-projections.md`, "Differences of
+/// nested guards").
+///
+/// # Panics
+///
+/// Where `released` names keys beneath the outermost level, as a release up to a path in a round
+/// does, where an arm of `held` is no projection and no codomain guard, and where
+/// [`cells_outside_keys`] panics.
+fn minus_outermost_keys(held: &TileGuard, released: &TileGuard) -> TileGuard {
+    let keys = match released {
+        TileGuard::Function(FunctionGuard::Domain(keys)) if !keys.qualifies() => keys,
+        _ => panic!(
+            "the guard algebra has no difference of {held:?} and {released:?}: a release of \
+             cells beneath keys is taken out of keys of the outermost level only"
+        ),
+    };
+    let arms = match held {
+        TileGuard::Or(arms) => arms.as_slice(),
+        single => std::slice::from_ref(single),
+    };
+    let left: Vec<TileGuard> = arms
+        .iter()
+        .map(|arm| match Projection::of(arm) {
+            Ok(_) => guard_minus(arm, released),
+            Err(_) => {
+                assert!(
+                    matches!(arm, TileGuard::Function(FunctionGuard::Codomain(_))),
+                    "the guard algebra has no difference of {held:?} and {released:?}: the arm \
+                     {arm:?} is no projection and no codomain guard"
+                );
+                cells_outside_keys(arm, keys)
+            }
+        })
+        .filter(|arm| !arm.is_empty())
+        .collect();
+    match left.is_empty() {
+        true => TileGuard::Function(FunctionGuard::Domain(Predicate::False)),
+        false => TileGuard::flatten_or(left),
+    }
+}
+
+/// `cells`, a codomain guard naming cells one level beneath the keys of a collection, less every
+/// cell beneath the outermost keys `keys` admits. There a predicate of a field reads the path of
+/// its row: one qualified by enclosing keys (`Predicate::Qualified`) keeps the keys `keys` does not
+/// admit, and one that names its cells under every key is qualified by every key but those.
+///
+/// # Panics
+///
+/// Where a predicate names cells deeper than one level beneath the keys, is an `Or`, or qualifies
+/// its enclosing keys in turn: the predicate then reads no single outermost key, and this
+/// difference has no spelling of it.
+fn cells_outside_keys(cells: &TileGuard, keys: &Predicate) -> TileGuard {
+    fn beneath(predicate: &Predicate, keys: &Predicate, deep: bool) -> Predicate {
+        let unspelled = || -> ! {
+            panic!(
+                "the guard algebra has no difference of cells named by {predicate:?} and the \
+                 outermost keys {keys:?}: it is spelled one level beneath the keys, under one \
+                 qualification and with no `Or`"
+            )
+        };
+        match predicate {
+            Predicate::False => Predicate::False,
+            _ if deep => unspelled(),
+            Predicate::Qualified { enclosing, here } => {
+                if enclosing.qualifies() || matches!(**enclosing, Predicate::Or(_)) {
+                    unspelled()
+                }
+                Predicate::qualified(enclosing.minus(keys), (**here).clone())
+            }
+            Predicate::Or(_) => unspelled(),
+            here => Predicate::qualified(Predicate::True.minus(keys), here.clone()),
+        }
+    }
+    fn walk(guard: &TileGuard, keys: &Predicate, deep: bool) -> TileGuard {
+        match guard {
+            TileGuard::Scalar(predicate) => TileGuard::Scalar(beneath(predicate, keys, deep)),
+            TileGuard::Aggregation(predicate) => {
+                TileGuard::Aggregation(beneath(predicate, keys, deep))
+            }
+            TileGuard::Record(fields) => TileGuard::Record(
+                fields
+                    .iter()
+                    .map(|(name, field)| (name.clone(), walk(field, keys, deep)))
+                    .collect(),
+            ),
+            TileGuard::Function(FunctionGuard::Domain(predicate)) => {
+                TileGuard::Function(FunctionGuard::Domain(beneath(predicate, keys, deep)))
+            }
+            TileGuard::Function(FunctionGuard::Codomain(inner)) => {
+                TileGuard::Function(FunctionGuard::Codomain(Box::new(walk(inner, keys, true))))
+            }
+            TileGuard::Or(arms) => {
+                TileGuard::flatten_or(arms.iter().map(|arm| walk(arm, keys, deep)).collect())
+            }
+        }
+    }
+    match cells {
+        TileGuard::Function(FunctionGuard::Codomain(inner)) => {
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(walk(inner, keys, false))))
+        }
+        other => panic!("cells beneath keys are named by a codomain guard, not {other:?}"),
+    }
 }
 
 /// The keys `released`, a guard of a collection's keys, names whole: its arms that are regions of
@@ -1344,10 +1510,8 @@ pub(crate) fn keys_released_whole(released: &TileGuard) -> Option<TileGuard> {
         TileGuard::Or(arms) => arms.as_slice(),
         single => std::slice::from_ref(single),
     };
-    let (keys, cells): (Vec<TileGuard>, Vec<TileGuard>) = arms
-        .iter()
-        .cloned()
-        .partition(|arm| Projection::of(arm).is_ok());
+    let (keys, cells): (Vec<TileGuard>, Vec<TileGuard>) =
+        arms.iter().cloned().partition(names_whole_keys);
     for arm in &cells {
         assert!(
             matches!(arm, TileGuard::Function(FunctionGuard::Codomain(_))),
@@ -1356,6 +1520,76 @@ pub(crate) fn keys_released_whole(released: &TileGuard) -> Option<TileGuard> {
         );
     }
     (!keys.is_empty()).then(|| TileGuard::flatten_or(keys))
+}
+
+/// Whether `released` covers all of `held`, both guards of one tiling. Where `released` names
+/// cells beneath some keys besides whole keys ([`keys_released_whole`]), only its whole keys cover:
+/// a key whose every cell `released` names one arm at a time counts as not covered, so a reader
+/// asking whether to read `held` reads it, and the read answers nothing of that key. The guard
+/// algebra has no difference of keys with cells beneath them, which a reader would take to say
+/// which cells of a key remain; it needs none to say whether any key remains.
+pub(crate) fn guard_covers(released: &TileGuard, held: &TileGuard) -> bool {
+    if released.is_universal() || held.is_empty() {
+        return true;
+    }
+    if names_whole_keys(released) || !names_collection_keys(released) {
+        return guard_minus(held, released).is_empty();
+    }
+    keys_released_whole(released).is_some_and(|keys| guard_minus(held, &keys).is_empty())
+}
+
+/// The part of `guard` a projection spells: all of it where a projection does, its arms that name
+/// collection keys where it also holds cells beneath a row ([`keys_released_whole`]), and `None`
+/// where no part is spelled so, as a record whose collection field is complete through some rows.
+pub(crate) fn spelled_part(guard: &TileGuard) -> Option<TileGuard> {
+    // A push names what is final: rows whose whole value is, at any level, and the fields of a
+    // record under rows where some of its fields are and others still grow.
+    if Projection::of(guard).is_ok() {
+        return Some(guard.clone());
+    }
+    names_collection_keys(guard)
+        .then(|| keys_released_whole(guard))
+        .flatten()
+}
+
+/// Whether `guard` names whole keys: a projection with no arm within some values. A guard of cells
+/// beneath keys has a projection too ([`Projection::Within`]), but it names part of each row, and the
+/// guard algebra's difference of keys is with whole keys alone.
+fn names_whole_keys(guard: &TileGuard) -> bool {
+    Projection::of(guard).is_ok_and(|projection| !projection.names_part_of_values())
+}
+
+/// `guard`, a guard of `tiling`, closed over it ([`TileGuard::closed_over`]) one `Or` arm at a
+/// time, keeping each arm whose closure names nothing as it is. Such an arm lies wholly past the
+/// positions `tiling` ranges over: it is a row's remainder, and it states the row's end, which a
+/// push carries to the readers.
+pub(crate) fn closed_keeping_row_ends(guard: TileGuard, tiling: &Tiling) -> TileGuard {
+    if let TileGuard::Or(arms) = guard {
+        return TileGuard::flatten_or(
+            arms.into_iter()
+                .map(|arm| closed_keeping_row_ends(arm, tiling))
+                .collect(),
+        );
+    }
+    let closed = guard.clone().closed_over(tiling);
+    match closed.is_empty() {
+        true => guard,
+        false => closed,
+    }
+}
+
+/// [`BreakingProducer::final_guard`]'s default.
+fn held_final_guard<P: BreakingProducer + ?Sized>(producer: &P) -> TileGuard {
+    let held = producer.complete();
+    let obsolete = producer.obsolete_guard();
+    let left = match names_collection_keys(obsolete) {
+        true => match keys_released_whole(obsolete) {
+            Some(released) if !held.is_empty() => guard_minus(&held, &released),
+            _ => held,
+        },
+        false => guard_minus(&held, obsolete),
+    };
+    closed_keeping_row_ends(left, producer.tiling())
 }
 
 /// Whether `guard` is spelled of a collection's keys: a domain or a codomain guard, or an `Or` of
@@ -1477,7 +1711,8 @@ pub(crate) fn partition_gap(guard: &TileGuard, morsels: &[TileGuard]) -> Option<
 }
 
 /// The projection of a pull of a producer whose output is one value, which has no keys to project:
-/// all of it or none. `what` completes "`name` ..." in the panic: "is one accumulator".
+/// all of it, none, or a part of each field of a record of values, which the producer cuts its
+/// answer to. `what` completes "`name` ..." in the panic: "is one accumulator".
 ///
 /// # Panics
 ///
@@ -1580,22 +1815,19 @@ pub trait Breaker {
 /// the dispatcher calls [`Breaker::finish`].
 /// A placed producer's [`get_impl`](TileProducer::get_impl) reads state without pulling its input.
 pub trait BreakingProducer: TileProducer + Breaker {
-    /// Store keys whose writers have all completed. Other breakers declare none.
-    fn completed_keys(&self) -> &[Value] {
-        &[]
-    }
-
     /// The complete output region, including keys known absent and output already released.
     /// This statement comes from the breaker's state. Publication and downstream readiness
     /// derive from it; reclaiming payloads must preserve the statement.
     fn complete(&self) -> TileGuard;
 
-    /// The keys under which the producer holds a cell: [`complete`](Self::complete) less the keys its
-    /// readers have released whole ([`keys_released_whole`]), closed over the producer's tiling
-    /// (`TileGuard::closed_over`), so a row released through its last position is held no more. A
-    /// key some of whose cells a reader released, as a selector releases the fields it does not
-    /// read, is still held, so a push of the final guard names it. A release of a record, a scalar
-    /// or an aggregation is taken out of what is held as [`guard_minus`] takes it.
+    /// The keys under which the producer holds a cell, and the ends of the rows it completed:
+    /// [`complete`](Self::complete) less the keys its readers have released whole
+    /// ([`keys_released_whole`]), closed over the producer's tiling
+    /// ([`closed_keeping_row_ends`]). A row released through its last position holds no cell, and
+    /// its remainder past the positions stays, so a push names the row's end. A key some of whose
+    /// cells a reader released, as a selector releases the fields it does not read, is still held,
+    /// so a push of the final guard names it. A release of a record, a scalar or an aggregation is
+    /// taken out of what is held as [`guard_minus`] takes it.
     ///
     /// # Panics
     ///
@@ -1603,16 +1835,7 @@ pub trait BreakingProducer: TileProducer + Breaker {
     /// ([`guard_minus`]), or a release of a collection's keys has an arm that is no region of keys
     /// and no codomain guard ([`keys_released_whole`]).
     fn final_guard(&self) -> TileGuard {
-        let held = self.complete();
-        let obsolete = self.obsolete_guard();
-        let left = match names_collection_keys(obsolete) {
-            true => match keys_released_whole(obsolete) {
-                Some(released) if !held.is_empty() => guard_minus(&held, &released),
-                _ => held,
-            },
-            false => guard_minus(&held, obsolete),
-        };
-        left.closed_over(self.tiling())
+        held_final_guard(self)
     }
 
     /// `guard`, a guard of this producer's tiling it pushes, cut into morsels that target `rows`
@@ -1741,6 +1964,14 @@ pub trait TileProducer {
     /// projection names keys at a level [`restates`](Self::restates) refuses.
     /// See `src/interpreter/design-operators.md`, "The producer protocol".
     fn get(&mut self, projection_guard: TileGuard) -> Tile {
+        // A pull of part of some values, as a record whose collection field is complete through
+        // some rows, pulls the rows holding it: pulling more is sound for a `get`
+        // (`src/interpreter/design-operators.md`, "Projection guards").
+        if let Ok(asked) = Projection::of(&projection_guard)
+            && asked.names_part_of_values()
+        {
+            return self.get(asked.rows().guard(self.tiling()));
+        }
         #[cfg(test)]
         {
             self.base_mut().reads += 1;
@@ -1991,6 +2222,13 @@ pub trait TileProducer {
     /// The cyclic fan-out this producer reads through a reader slot, where it is one: a reader
     /// of that fan-out's store.
     fn store_read(&self) -> Option<StoreRead> {
+        None
+    }
+
+    /// The transaction state behind a cyclic store cell, for dispatcher control.
+    fn as_transaction_store_mut(
+        &mut self,
+    ) -> Option<&mut crate::interpreter::commit_operator::CommitProducer> {
         None
     }
 
@@ -3332,7 +3570,7 @@ mod tests {
 
     /// The difference of two guards of a breaker's state, where the algebra can spell it exactly.
     mod guard_difference {
-        use super::super::{TileGuard, guard_minus, keys_released_whole};
+        use super::super::{TileGuard, guard_covers, guard_minus, keys_released_whole};
         use crate::interpreter::{FunctionGuard, Predicate, Value};
         use intervalsets::{Interval, IntervalSet};
         use std::collections::HashMap;
@@ -3444,10 +3682,9 @@ mod tests {
         }
 
         /// A release of one field's cells under keys still held leaves those keys' other cells,
-        /// which a record guard beneath the keys names and a guard of keys does not.
+        /// which a record guard beneath the keys names.
         #[test]
-        #[should_panic(expected = "that is a region of keys")]
-        fn a_release_of_cells_of_a_held_key_has_no_difference() {
+        fn a_release_of_cells_of_a_held_key_leaves_its_other_cells() {
             let released = TileGuard::Or(vec![
                 domain(keys(0, 0)),
                 record_cells(
@@ -3455,7 +3692,13 @@ mod tests {
                     TileGuard::Scalar(Predicate::False),
                 ),
             ]);
-            guard_minus(&domain(keys(0, 1)), &released);
+            assert_eq!(
+                guard_minus(&domain(keys(0, 1)), &released),
+                record_cells(
+                    TileGuard::Scalar(Predicate::False),
+                    TileGuard::Scalar(Predicate::qualified(keys(1, 1), Predicate::True)),
+                )
+            );
         }
 
         /// A release's arms of keys, at any level, are the keys it names whole; an arm of cells
@@ -3522,15 +3765,117 @@ mod tests {
             );
         }
 
+        /// A held region with cells beneath keys still open, as a breaker over rows whose
+        /// collection field grows completes it, less keys released whole, keeps the cells beneath
+        /// every other key.
+        #[test]
+        fn held_cells_less_released_keys_keep_the_cells_beneath_the_other_keys() {
+            let under = |rows: Predicate| {
+                record_cells(
+                    TileGuard::Scalar(Predicate::qualified(rows.clone(), Predicate::True)),
+                    domain(Predicate::qualified(rows, keys(0, 1))),
+                )
+            };
+            let above_one = Predicate::True.minus(&keys(0, 1));
+            let held = TileGuard::Or(vec![domain(above_one.clone()), under(keys(0, 1))]);
+            assert_eq!(
+                guard_minus(&held, &domain(keys(0, 0))),
+                TileGuard::Or(vec![domain(above_one), under(keys(1, 1))])
+            );
+            assert!(guard_minus(&under(keys(0, 1)), &domain(keys(0, 1))).is_empty());
+        }
+
+        /// Cells named under every key keep those beneath the keys not released.
+        #[test]
+        fn cells_under_every_key_less_released_keys_are_qualified_by_the_rest() {
+            let cells = record_cells(
+                TileGuard::Scalar(Predicate::True),
+                TileGuard::Scalar(Predicate::False),
+            );
+            let held = TileGuard::Or(vec![domain(keys(5, 5)), cells]);
+            let rest = Predicate::True.minus(&keys(0, 0));
+            // An `Or` drops the cells beneath a key another arm names whole (`flatten_or`).
+            assert_eq!(
+                guard_minus(&held, &domain(keys(0, 0))),
+                TileGuard::flatten_or(vec![
+                    domain(keys(5, 5)),
+                    record_cells(
+                        TileGuard::Scalar(Predicate::qualified(rest, Predicate::True)),
+                        TileGuard::Scalar(Predicate::False),
+                    ),
+                ])
+            );
+        }
+
+        /// Cells two levels beneath the keys name paths whose outermost key no predicate reads,
+        /// so the difference with outermost keys panics rather than subtract at the wrong level.
+        #[test]
+        #[should_panic(expected = "spelled one level beneath the keys")]
+        fn cells_two_levels_beneath_the_keys_have_no_difference_with_keys() {
+            let deep = TileGuard::Function(FunctionGuard::Codomain(Box::new(record_cells(
+                TileGuard::Scalar(Predicate::qualified(keys(0, 3), Predicate::True)),
+                TileGuard::Scalar(Predicate::False),
+            ))));
+            let held = TileGuard::Or(vec![
+                domain(keys(5, 5)),
+                record_cells(deep, TileGuard::Scalar(Predicate::False)),
+            ]);
+            guard_minus(&held, &domain(keys(0, 0)));
+        }
+
+        /// A field predicate that is an `Or` of differently qualified arms loses the arms whose
+        /// outermost keys are released and keeps the others.
+        #[test]
+        fn cells_named_by_an_or_lose_the_arms_of_released_keys() {
+            let either = Predicate::Or(vec![
+                Predicate::qualified(keys(0, 0), keys(0, 4)),
+                Predicate::qualified(keys(1, 1), keys(0, 2)),
+            ]);
+            let held = TileGuard::Or(vec![
+                domain(keys(5, 5)),
+                record_cells(TileGuard::Scalar(Predicate::False), domain(either)),
+            ]);
+            assert_eq!(
+                guard_minus(&held, &domain(keys(0, 0))),
+                TileGuard::Or(vec![
+                    domain(keys(5, 5)),
+                    record_cells(
+                        TileGuard::Scalar(Predicate::False),
+                        domain(Predicate::qualified(keys(1, 1), keys(0, 2))),
+                    ),
+                ])
+            );
+        }
+
+        /// A release with cells beneath keys covers only the keys it names whole.
+        #[test]
+        fn a_release_with_cells_covers_the_keys_it_names_whole() {
+            let cells = record_cells(
+                TileGuard::Scalar(Predicate::qualified(keys(1, 1), Predicate::True)),
+                TileGuard::Scalar(Predicate::False),
+            );
+            let released = TileGuard::Or(vec![domain(keys(0, 0)), cells]);
+            assert!(guard_covers(&released, &domain(keys(0, 0))));
+            assert!(!guard_covers(&released, &domain(keys(0, 1))));
+            assert!(guard_covers(&domain(Predicate::True), &domain(keys(0, 9))));
+            assert!(!guard_covers(&domain(keys(0, 0)), &domain(keys(0, 1))));
+        }
+
         /// A release of a field's cells beneath a held path leaves that path's other cells.
         #[test]
-        #[should_panic(expected = "that is a region of keys")]
-        fn a_release_of_cells_beneath_a_held_path_has_no_difference() {
+        fn a_release_of_cells_beneath_a_held_path_leaves_its_other_cells() {
             let path = |j| beneath(Predicate::qualified(keys(0, 0), keys(j, j)));
             let released = TileGuard::Or(vec![path(0), first_field_beneath(&path(1))]);
-            guard_minus(
-                &beneath(Predicate::qualified(keys(0, 0), keys(0, 1))),
-                &released,
+            let qualified = Predicate::qualified(keys(0, 0), keys(1, 1));
+            assert_eq!(
+                guard_minus(
+                    &beneath(Predicate::qualified(keys(0, 0), keys(0, 1))),
+                    &released,
+                ),
+                TileGuard::Function(FunctionGuard::Codomain(Box::new(record_cells(
+                    TileGuard::Scalar(Predicate::False),
+                    TileGuard::Scalar(Predicate::qualified(qualified, Predicate::True)),
+                ))))
             );
         }
     }
