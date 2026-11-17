@@ -862,7 +862,7 @@ impl TileGuard {
         }
     }
 
-    fn closed_over_tags(self, tiling: &Tiling) -> TileGuard {
+    pub(crate) fn closed_over_tags(self, tiling: &Tiling) -> TileGuard {
         let TileGuard::Function(FunctionGuard::Domain(keys @ Predicate::Union { .. })) = &self
         else {
             return self;
