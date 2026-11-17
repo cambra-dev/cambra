@@ -558,6 +558,7 @@ impl Telescope {
     /// Record `binder` as opaque, in this scope and in every other telescope
     /// sharing this root — including those already stamped on variables.
     pub fn enter_opaque(&self, binder: &Name) {
+        infer_fact_written();
         self.opaque.borrow_mut().insert(binder.clone());
     }
 
@@ -743,6 +744,61 @@ pub enum StandsFor {
     ConstantFamily(smol_str::SmolStr),
 }
 
+thread_local! {
+    /// How many facts have been written to inference and barrier variables on this thread: their
+    /// bounds, levels, scopes and the rest of the state a read of the graph consults
+    /// ([`FactCell`]). Every write bumps it, so an answer computed from the graph at the current
+    /// count is still the answer, as [`crate::ccl::ty::FunKindVar`]'s and
+    /// [`crate::ccl::capabilities::CapabilityVar`]'s counts are for theirs.
+    static INFER_FACTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn infer_fact_written() {
+    INFER_FACTS.with(|n| n.set(n.get() + 1));
+}
+
+/// The counts of facts written to inference, kind and capability variables on this thread
+/// ([`INFER_FACTS`], and [`crate::ccl::ty::FunKindVar`]'s and
+/// [`crate::ccl::capabilities::CapabilityVar`]'s counts): an answer computed from the graph
+/// while they read one value is the answer for as long as they do.
+pub(crate) fn graph_facts() -> GraphFacts {
+    (
+        INFER_FACTS.with(std::cell::Cell::get),
+        crate::ccl::ty::kind_facts(),
+        crate::ccl::capabilities::capability_facts(),
+    )
+}
+
+/// [`graph_facts`]' counts.
+pub(crate) type GraphFacts = (u64, u64, u64);
+
+/// A variable's mutable state, every write to which is a fact ([`INFER_FACTS`]). The only way to
+/// write it is [`borrow_mut`](Self::borrow_mut), which counts the write, so no state a read of
+/// the graph consults changes without the count changing.
+pub struct FactCell<T>(RefCell<T>);
+
+impl<T> FactCell<T> {
+    pub fn new(value: T) -> Self {
+        FactCell(RefCell::new(value))
+    }
+
+    pub fn borrow(&self) -> std::cell::Ref<'_, T> {
+        self.0.borrow()
+    }
+
+    /// Write access, counted as a fact whether or not the caller changes anything.
+    pub fn borrow_mut(&self) -> std::cell::RefMut<'_, T> {
+        infer_fact_written();
+        self.0.borrow_mut()
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for FactCell<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// A type inference variable: an unknown type the solver pins down by
 /// accumulating subtyping bounds.
 ///
@@ -763,7 +819,7 @@ pub struct InferVar {
     /// recorded bound must close against.
     pub telescope: Telescope,
     /// Mutable lower/upper bound lists.
-    pub bounds: RefCell<InferBounds>,
+    pub bounds: FactCell<InferBounds>,
     /// **The kind of the function this variable may turn out to be.**
     ///
     /// A variable can stand for a function, and a function has a kind — so it carries one,
@@ -788,13 +844,13 @@ pub struct InferVar {
     /// hand. Like [`bounds`](Self::bounds) it is severed at arena teardown: an
     /// obligation holds its output `Type`, which holds a variable, which holds the
     /// obligation.
-    pub watches: RefCell<Vec<(Rc<crate::ccl::infer::solver::traits::TraitObligation>, u8)>>,
+    pub watches: FactCell<Vec<(Rc<crate::ccl::infer::solver::traits::TraitObligation>, u8)>>,
     /// The variables standing for this one under a substitution, one per substitution
     /// (`Subst::suspended`): `𝛼[σ]` is one type, so every occurrence of `𝛼` under `σ` is
     /// the one variable. Two variables for it would each take their own bounds and could
     /// resolve apart. Severed at arena teardown with [`bounds`](Self::bounds): a held
     /// variable's bound holds this one.
-    pub suspensions: RefCell<Vec<(subst::Subst, Rc<InferVar>)>>,
+    pub suspensions: FactCell<Vec<(subst::Subst, Rc<InferVar>)>>,
     /// Whether the variable **names one data domain**: it was minted for a
     /// [`Type::SharedHole`] written as a function annotation's domain, which is how lowering
     /// claims that the positions annotated with that id are one domain. A data domain is
@@ -809,7 +865,7 @@ pub struct InferVar {
     /// a hole in a constant family when normalization reads the annotation that writes the
     /// family (`mark_constant_family_holes`), and a proxy or suspension when it is minted, with
     /// its original's mark.
-    stands_for: RefCell<Option<StandsFor>>,
+    stands_for: FactCell<Option<StandsFor>>,
     /// **The witness binders this variable sits under**: the functions it was minted as a part
     /// of, by their kind, or the one it copies was.
     ///
@@ -819,7 +875,7 @@ pub struct InferVar {
     /// ([`subst::Subst`]). Placed where the variable is minted, like the
     /// [`telescope`](Self::telescope) the name half reads; [`enforce_bound_scope`] rejects a
     /// bound naming a witness free that no scope here binds.
-    witness_scopes: RefCell<Vec<WitnessScope>>,
+    witness_scopes: FactCell<Vec<WitnessScope>>,
 }
 
 /// A function a variable is a part of, as what binds its witnesses: a funkind variable, whose
@@ -1088,12 +1144,12 @@ impl InferVar {
             fun_kind,
             level: std::cell::Cell::new(level),
             telescope: telescope.clone(),
-            bounds: RefCell::new(InferBounds::default()),
-            watches: RefCell::new(Vec::new()),
-            suspensions: RefCell::new(Vec::new()),
+            bounds: FactCell::new(InferBounds::default()),
+            watches: FactCell::new(Vec::new()),
+            suspensions: FactCell::new(Vec::new()),
             named_domain: std::cell::Cell::new(false),
-            stands_for: RefCell::new(None),
-            witness_scopes: RefCell::new(Vec::new()),
+            stands_for: FactCell::new(None),
+            witness_scopes: FactCell::new(Vec::new()),
         });
         ACTIVE_ARENA.with(|slot| {
             if let Some(vars) = slot.borrow_mut().as_mut() {
@@ -1203,6 +1259,7 @@ impl InferVar {
 
     /// Mark the variable as naming one data domain ([`InferVar::named_domain`]).
     pub(crate) fn mark_named_domain(&self) {
+        infer_fact_written();
         self.named_domain.set(true);
     }
 
@@ -1229,6 +1286,7 @@ impl InferVar {
     /// ([`lower_levels`](crate::ccl::infer::solver::constrain::lower_levels)).
     pub(crate) fn lower_level(&self, level: Level) {
         if self.level.get() > level {
+            infer_fact_written();
             self.level.set(level);
         }
     }
@@ -1271,21 +1329,21 @@ pub struct BarrierVar {
     /// The gathered lower bounds. The variable resolves to their join with the
     /// refinements at its positive positions dropped (the `BarrierVar` arm of
     /// `solver::compact::compact_go`).
-    pub lowers: RefCell<Vec<Bound>>,
+    pub lowers: FactCell<Vec<Bound>>,
     /// The gathered upper bounds. Each is checked against the resolution from
     /// `lowers` by `solver::barrier::solve_barrier_vars`, not closed against the
     /// lowers as they arrive.
-    pub uppers: RefCell<Vec<BarrierUpper>>,
+    pub uppers: FactCell<Vec<BarrierUpper>>,
     /// Trait obligations watching an inference variable this barrier variable is a lower
     /// bound of, with the operand position each watches. Every lower bound recorded here
     /// is delivered to them (`notify_barrier_lower` in `src/ccl/infer/solver/traits.rs`):
     /// the resolution's base is a lower bound's base, so the watched variable resolves to
     /// it. Severed at arena teardown, as [`InferVar::watches`] is.
-    pub watches: RefCell<Vec<(Rc<crate::ccl::infer::solver::traits::TraitObligation>, u8)>>,
+    pub watches: FactCell<Vec<(Rc<crate::ccl::infer::solver::traits::TraitObligation>, u8)>>,
     /// What `solver::barrier::solve_barrier_vars` last checked: `None` before the
     /// first check. Severed at arena teardown with the bounds, since the resolution
     /// holds types that can reach this variable.
-    pub checked: RefCell<Option<BarrierCheck>>,
+    pub checked: FactCell<Option<BarrierCheck>>,
 }
 
 /// An upper bound of a [`BarrierVar`], with the error a failed check of it reports.
@@ -1336,10 +1394,10 @@ impl BarrierVar {
             uid: fresh_barrier_var_id(),
             reading_level: std::cell::Cell::new(false),
             opaque,
-            lowers: RefCell::new(lowers),
-            uppers: RefCell::new(uppers),
-            watches: RefCell::new(Vec::new()),
-            checked: RefCell::new(None),
+            lowers: FactCell::new(lowers),
+            uppers: FactCell::new(uppers),
+            watches: FactCell::new(Vec::new()),
+            checked: FactCell::new(None),
         });
         BARRIER_ARENA.with(|slot| {
             if let Some(arena) = slot.borrow_mut().as_mut() {

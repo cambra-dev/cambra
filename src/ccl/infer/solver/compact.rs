@@ -798,6 +798,19 @@ fn denotes_a_uint_range(ct: &CompactType) -> bool {
         })
 }
 
+thread_local! {
+    /// The variables whose sums [`projects_a_uint_range`] is reading, so a cycle through them
+    /// answers no. A walk run while one is being read can answer differently from the same walk
+    /// run outside, so nothing it computes is shared across walks ([`across`]).
+    static READING: std::cell::RefCell<HashSet<InferVarId>> =
+        std::cell::RefCell::new(HashSet::new());
+}
+
+/// Whether a variable's sum is being read ([`READING`]).
+fn reading_a_sum() -> bool {
+    READING.with(|r| !r.borrow().is_empty())
+}
+
 /// Whether `p` projects a dense range: its sum ranges over dense ranges alone. A term typed by
 /// a variable is read through the variable's compaction, at the binder `p` projects.
 fn projects_a_uint_range(p: &crate::ccl::ty::WitnessProjection) -> bool {
@@ -807,11 +820,6 @@ fn projects_a_uint_range(p: &crate::ccl::ty::WitnessProjection) -> bool {
     let Type::Infer(v) = p.term.ty.peel_refinements() else {
         return false;
     };
-    thread_local! {
-        /// The variables whose sums are being read, so a cycle through them answers no.
-        static READING: std::cell::RefCell<HashSet<InferVarId>> =
-            std::cell::RefCell::new(HashSet::new());
-    }
     /// Removes its variable from `READING` on drop, so a `compact_type` that unwinds leaves no
     /// entry behind for a later read on the same thread.
     struct Reading(InferVarId);
@@ -3039,9 +3047,25 @@ struct CompactState {
     /// type compacts, and the question is asked of a variable once per bound each time the walk
     /// reaches it.
     own_content: Rc<std::cell::RefCell<ContentWalk>>,
+    /// How many times the walk has read or written something of the walk around the variable
+    /// it is in: a cycle cut against the path, a barrier met again, a join violation recorded.
+    /// A variable's result is the same in another walk only where this did not move while it
+    /// was walked ([`across`]).
+    events: usize,
 }
 
 impl CompactState {
+    /// Whether a variable's result here depends only on the graph and [`across::Key`]: the walk
+    /// holds no join entries, no candidate widening and no variable held elsewhere, which a
+    /// variable's walk reads or writes and the key leaves out, and it does not run inside a
+    /// read of a sum ([`READING`]), which outlives the walk.
+    fn walk_is_shareable(&self) -> bool {
+        self.held_elsewhere.is_none()
+            && self.candidate_widened.is_none()
+            && self.join_entries.is_empty()
+            && !reading_a_sum()
+    }
+
     fn new(collapse: bool) -> Self {
         CompactState {
             in_process: HashMap::new(),
@@ -3066,6 +3090,7 @@ impl CompactState {
             join_entries: BTreeMap::new(),
             join_violations: Vec::new(),
             own_content: Default::default(),
+            events: 0,
         }
     }
 }
@@ -3111,6 +3136,7 @@ fn join_barrier_lowers(
     st: &mut CompactState,
 ) -> (CompactType, Vec<Name>) {
     if st.barriers_in_process.contains(&barrier.uid) {
+        st.events += 1;
         let placeholder = *st
             .barrier_recursive
             .entry(barrier.uid)
@@ -3715,6 +3741,7 @@ fn compact_go_inner(
                         None => None,
                     };
                     if let Some((binders, position)) = violation {
+                        st.events += 1;
                         st.join_violations.push(JoinViolation {
                             site: subst_acc.join_site(&binders),
                             binders,
@@ -4051,6 +4078,7 @@ fn compact_go_inner(
                 })
             {
                 let done = done.clone();
+                st.events += done.cuts.len();
                 st.cuts.extend(done.cuts.iter().map(|cut| Cut {
                     key: *cut,
                     entered: st.in_process[cut],
@@ -4059,6 +4087,7 @@ fn compact_go_inner(
                 return done.ty;
             }
             if let Some(&entered) = st.in_process.get(&key) {
+                st.events += 1;
                 let spurious = pos.parents.is_some_and(|p| p.contains(uid));
                 st.cuts.push(Cut {
                     key,
@@ -4079,6 +4108,28 @@ fn compact_go_inner(
                 let placeholder = *st.recursive.entry(key).or_insert_with(fresh_infer_var_id);
                 return CompactType::from_var(placeholder);
             }
+            // Another walk's result for this variable, where the graph has not changed since and
+            // neither walk read anything of the walk around it ([`across`]).
+            let shared = (memoizable && st.walk_is_shareable()).then(|| across::Key {
+                at: memo_key.clone(),
+                collapse: st.collapse,
+                capability_vars: st.capability_vars,
+                data_domain_depth: st.data_domain_depth,
+            });
+            if let Some(shared) = &shared
+                && let Some(ty) = across::get(shared)
+            {
+                st.memo.insert(
+                    memo_key,
+                    Memoized {
+                        ty: ty.clone(),
+                        cuts: Vec::new(),
+                    },
+                );
+                return ty;
+            }
+            let events_before = st.events;
+            let facts_before = across::facts();
             let depth = st.in_process.len();
             st.in_process.insert(key, depth);
             let cuts_before = st.cuts.len();
@@ -4414,6 +4465,13 @@ fn compact_go_inner(
                     cuts: assumed.iter().map(|cut| cut.key).collect(),
                 };
                 if memoizable {
+                    if let Some(shared) = shared
+                        && st.events == events_before
+                        && st.walk_is_shareable()
+                        && across::facts() == facts_before
+                    {
+                        across::put(shared, facts_before, &done.ty);
+                    }
                     st.memo.insert(memo_key, done);
                 } else {
                     st.memo_under
@@ -5596,4 +5654,79 @@ mod refinement_slot_tests {
         };
         assert!(!refinement_slot_present(&outer));
     }
+}
+
+/// Compaction's results across walks, while the graph stands still.
+///
+/// A walk memoizes each variable it compacts, and the next walk starts over: resolving every
+/// node of a tree compacts the variables their types share once per node. A variable's result
+/// is a function of the graph and the walk's settings, so it is the same in another walk while
+/// nothing has been written to any variable since ([`graph_facts`]). It is shared only where it is also free of the walk around
+/// it: no cycle was cut against the path and no barrier met again below it, so the result
+/// assumes nothing of where the walk came from, and nothing was recorded for the walk to report
+/// ([`CompactState::events`]). Such a result is what a walk's own memo would hold for the
+/// variable, so reusing it is what that memo does within a walk.
+///
+/// [`graph_facts`]: crate::ccl::infer_var::graph_facts
+mod across {
+    use super::{CompactType, MemoKey};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    /// A variable's result, with what the walk it was computed in read besides the graph.
+    #[derive(PartialEq, Eq, Hash)]
+    pub(super) struct Key {
+        pub at: MemoKey,
+        pub collapse: bool,
+        pub capability_vars: bool,
+        pub data_domain_depth: u32,
+    }
+
+    use crate::ccl::infer_var::{GraphFacts as Facts, graph_facts as facts_now};
+
+    thread_local! {
+        static SHARED: RefCell<(Facts, HashMap<Key, CompactType>)> =
+            RefCell::new(((0, 0, 0), HashMap::new()));
+    }
+
+    /// The counts of facts written to inference, kind and capability variables.
+    pub(super) fn facts() -> Facts {
+        facts_now()
+    }
+
+    /// The result shared under `key`, if the graph is still the one it was computed from.
+    pub(super) fn get(key: &Key) -> Option<CompactType> {
+        let now = facts();
+        SHARED.with(|shared| {
+            let mut shared = shared.borrow_mut();
+            if shared.0 != now {
+                shared.1.clear();
+                shared.0 = now;
+            }
+            shared.1.get(key).cloned()
+        })
+    }
+
+    /// Share `ty` under `key`, computed from the graph as it stood at `at`.
+    pub(super) fn put(key: Key, at: Facts, ty: &CompactType) {
+        SHARED.with(|shared| {
+            let mut shared = shared.borrow_mut();
+            if shared.0 != at {
+                shared.1.clear();
+                shared.0 = at;
+            }
+            shared.1.insert(key, ty.clone());
+        });
+    }
+
+    /// Drop every shared result, holding no variable past the inference that minted it.
+    pub(super) fn clear() {
+        SHARED.with(|shared| shared.borrow_mut().1.clear());
+    }
+}
+
+/// Drop the results compaction shares across walks ([`across`]): at the end of an inference,
+/// whose variables they hold.
+pub(crate) fn clear_shared_results() {
+    across::clear();
 }

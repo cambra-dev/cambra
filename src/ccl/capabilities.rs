@@ -1976,6 +1976,11 @@ thread_local! {
     static CAPABILITY_FACTS: Cell<u64> = const { Cell::new(0) };
 }
 
+/// The [`CAPABILITY_FACTS`] count.
+pub(crate) fn capability_facts() -> u64 {
+    CAPABILITY_FACTS.with(Cell::get)
+}
+
 fn capability_fact_written() {
     CAPABILITY_FACTS.with(|n| n.set(n.get() + 1));
 }

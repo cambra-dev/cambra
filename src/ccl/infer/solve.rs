@@ -322,6 +322,7 @@ impl CoalesceCtx {
             unresolved: unresolved.clone(),
             resolved: resolved.clone(),
             label: label(),
+            facts: crate::ccl::infer_var::graph_facts(),
         });
         #[cfg(not(debug_assertions))]
         {
@@ -381,6 +382,9 @@ struct ReadRecord {
     unresolved: Type,
     resolved: Type,
     label: String,
+    /// The graph's facts when the read was made: a graph no later write changed resolves it
+    /// as it did then ([`assert_reads_stable`]).
+    facts: crate::ccl::infer_var::GraphFacts,
 }
 
 /// End-of-pass check of the integrated-monomorphization ordering invariant —
@@ -393,7 +397,10 @@ struct ReadRecord {
 /// design exists to rule out.
 #[cfg(debug_assertions)]
 fn assert_reads_stable(reads: &[ReadRecord]) {
-    for r in reads {
+    let facts = crate::ccl::infer_var::graph_facts();
+    // A read nothing was written after resolves as it did: the same graph gives the same
+    // answer, so only a read a later write could have changed is checked.
+    for r in reads.iter().filter(|r| r.facts != facts) {
         let now = resolve_var_type(&r.unresolved);
         debug_assert!(
             matches!(&now, Ok(t) if types_agree_modulo_unread(&r.resolved, t, r.purpose == ReadPurpose::Stamp)),
