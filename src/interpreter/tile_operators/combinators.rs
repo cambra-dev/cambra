@@ -672,9 +672,15 @@ impl TileProducer for MapDomainProducer {
         visit("input", &mut *self.input);
     }
 
+    /// It restates every level: the keys at and above the level it rewrites are its input's, and
+    /// its output holds no level beneath that one.
+    fn restates(&self) -> Restates {
+        Restates::Every
+    }
+
     /// Every level's keys stand, so the input is pulled at the projection.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let projection = projection_guard.projection(&self.name());
+        let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
@@ -3062,6 +3068,29 @@ mod tests {
         assert_eq!(
             **values,
             Tile::Scalar(ColumnValue::Ints(vec![0, 1, 2, 0])),
+            "{out:?}"
+        );
+    }
+
+    /// A nested `MapDomain` restates its own level's keys, so a pull of one row's key answers that
+    /// key with itself as its value.
+    #[test]
+    fn a_nested_map_domain_answers_a_pull_of_its_own_level() {
+        let (tile, tiling) = two_rows();
+        let (input, _, _) = test_helpers::ProjectionSpy::new(tile, tiling.clone());
+        let mut map = MapDomainProducer {
+            base: ProducerBase::unowned(MapDomainProducer::alloc_id(), &tiling),
+            input: Box::new(input),
+            level: CurryLevel::new(1),
+        };
+        let path = [Value::Int(1), Value::Int(0)];
+        let guard =
+            Projection::keys_at(CurryLevel::new(1), Predicate::exactly(&path)).guard(map.tiling());
+        let out = map.get(guard);
+        assert_eq!(out.paths_at(CurryLevel::new(1)), vec![path.to_vec()]);
+        assert_eq!(
+            out.deepest_values(),
+            &Tile::Scalar(ColumnValue::Ints(vec![0])),
             "{out:?}"
         );
     }
