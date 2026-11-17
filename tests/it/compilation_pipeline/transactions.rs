@@ -2542,8 +2542,7 @@ fn a_finite_mut_var_completes_despite_a_live_unrelated_writer() {
     src.borrow_mut()
         .add_data(&[(Value::UInt(0), Value::Int(100))]);
 
-    producer.run();
-    let result = producer.snapshot();
+    let result = producer.run();
 
     let Tile::Record { fields, .. } = &result else {
         panic!("expected a record of both replies, got {result:?}");
@@ -2604,8 +2603,7 @@ fn a_finite_mut_var_completes_despite_a_live_writer_it_shares_a_block_with() {
     src.borrow_mut()
         .add_data(&[(Value::UInt(0), Value::Int(100))]);
 
-    producer.run();
-    let result = producer.snapshot();
+    let result = producer.run();
 
     let Tile::Record { fields, .. } = &result else {
         panic!("expected a record of both replies, got {result:?}");

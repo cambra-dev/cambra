@@ -852,7 +852,6 @@ pub(crate) fn one_key_store(
         ))),
         terminal,
         closed_keys: Vec::new(),
-        writer_takes: Vec::new(),
     }
 }
 
