@@ -3,17 +3,14 @@
 //!
 //! The compiler's side of both differential suites, the hand-written cases
 //! (`tests/it/differential_interp.rs`) and the generated grid (`tests/it/generated_pairs.rs`), is
-//! a dispatched run ([`dispatch`]). [`run_compiled`] runs a program in pull mode, for the
-//! compilation-pipeline tests' `check_sink`.
+//! a dispatched run ([`dispatch`]). [`run_compiled`] also dispatches the compilation-pipeline
+//! tests' `check_sink`.
 
 use cambra::ccl::Type;
 use cambra::ccl::context::{CompiledProgram, GlobalContext, compile_program};
 use cambra::interpreter::dispatcher::run_program;
 use cambra::interpreter::{Consumer, SinkReadError, TestSink, Value as TileValue};
 use chl_interp::{Collection, Value};
-
-/// How many scheduler pulls a program gets to complete before it counts as not finishing.
-const CAP: usize = 10_000;
 
 /// What the compiler made of a program.
 #[derive(Debug)]
@@ -23,8 +20,7 @@ pub enum Compiled {
     Rejected(String),
     /// The program completed and its sink could not state a value.
     Unreadable(SinkReadError),
-    /// The program did not complete: within [`CAP`] pulls in pull mode, or by the end of a
-    /// dispatched run.
+    /// The dispatched run ended without completing the program.
     DidNotFinish,
 }
 
@@ -39,23 +35,16 @@ impl std::fmt::Display for Compiled {
     }
 }
 
-/// Compile and run `source` in pull mode, answering what sink `out` observed.
+/// Compile and dispatch `source`, answering what sink `out` observed.
 pub fn run_compiled(source: &str) -> Compiled {
     let mut ctx = GlobalContext::default();
     let sink = ctx.register_test_sink("out");
-    let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = cambra::ccl::load::LoadedProgram::test(source);
-    let program = match compile_program(&mut ctx, &loaded, consumer) {
-        Ok(p) => p,
-        Err(errs) => return Compiled::Rejected(format!("{errs:?}")),
+    let mut program = match compile_program(&mut ctx, &loaded, Box::new(|| {})) {
+        Ok(program) => program,
+        Err(errors) => return Compiled::Rejected(format!("{errors:?}")),
     };
-    let completed = (0..CAP).any(|_| {
-        ctx.scheduler().check_for_notifications();
-        program.done.try_recv().is_ok()
-    });
-    if !completed {
-        return Compiled::DidNotFinish;
-    }
+    run_program(&mut program, 1).unwrap_or_else(|why| panic!("dispatcher refused: {why}"));
     read_out(&program, &sink)
 }
 
@@ -108,7 +97,6 @@ impl std::fmt::Display for Dispatched {
 /// (`cambra::interpreter::dispatcher::run_program`), answering what sink `out` observed.
 fn run_dispatched(source: &str, rows: usize) -> Dispatched {
     let mut ctx = GlobalContext::default();
-    ctx.defer_sink_pulls();
     let sink = ctx.register_test_sink("out");
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = cambra::ccl::load::LoadedProgram::test(source);

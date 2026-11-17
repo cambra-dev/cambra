@@ -2,6 +2,8 @@
 //! See `src/interpreter/design-operators.md`, "Projection guards".
 
 use crate::ccl::{FieldKey, TagMap};
+#[cfg(test)]
+use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use crate::interpreter::{
     CurryLevel, Extent, FunctionGuard, Predicate, Tile, TileGuard, Tiling, Value,
 };
@@ -74,6 +76,44 @@ impl Projection {
         arms.iter().try_fold(Projection::Nothing, |all, arm| {
             Ok(all.union(&Projection::of_arm(arm, guard)?))
         })
+    }
+
+    /// The keys `guard` names whole: the union of the arms of its normal form
+    /// (`TileGuard::flatten_or`) that are domain guards, each inside the codomain guards that step
+    /// to its level. A domain arm that qualifies its keys by more enclosing levels than those
+    /// codomain guards step into is malformed, and the call panics.
+    ///
+    /// Every other arm names cells beneath keys or a keyless value and contributes no key. The
+    /// fields of a record released before their row are such cells
+    /// (`src/interpreter/design-operators.md`, "The release contract"). The answer is contained in
+    /// `guard`, and is `Nothing` where no arm names keys.
+    pub fn keys_named_whole(guard: &TileGuard) -> Self {
+        if guard.is_universal() {
+            return Projection::Everything;
+        }
+        if guard.is_empty() {
+            return Projection::Nothing;
+        }
+        let normal = TileGuard::flatten_or(vec![guard.clone()]);
+        let arms = match &normal {
+            TileGuard::Or(arms) => arms.as_slice(),
+            single => std::slice::from_ref(single),
+        };
+        let names_keys = |arm: &&TileGuard| {
+            let mut node = *arm;
+            while let TileGuard::Function(FunctionGuard::Codomain(inner)) = node {
+                node = inner;
+            }
+            matches!(node, TileGuard::Function(FunctionGuard::Domain(_)))
+        };
+        arms.iter()
+            .filter(names_keys)
+            .map(|arm| {
+                Projection::of_arm(arm, &normal).unwrap_or_else(|reason| {
+                    panic!("every domain arm of a release names the keys of a level: {reason}")
+                })
+            })
+            .fold(Projection::Nothing, |all, keys| all.union(&keys))
     }
 
     /// Whether [`of`](Self::of) may answer the keys of a level beneath the outermost for
@@ -1548,10 +1588,10 @@ mod tests {
         let tiling = ints_tiling(4);
         let (mut spy, pulled, released) =
             ProjectionSpy::new(ints_by_position(&[10, 20, 30, 40], true), tiling.clone());
-        let middle = spy.get(keys_between(1, 2));
+        let middle = spy.read_in_pipeline(keys_between(1, 2));
         assert_eq!(int_entries(&middle), [(1, 20), (2, 30)]);
         spy.release(keys_between(1, 2));
-        let rest = spy.get(tiling.universal_guard());
+        let rest = spy.read_in_pipeline(tiling.universal_guard());
         assert_eq!(int_entries(&rest), [(0, 10), (3, 40)]);
         assert_eq!(
             *pulled.borrow(),
@@ -1561,7 +1601,10 @@ mod tests {
         // A pull that names nothing states nothing complete, which is withdrawal unless
         // the consumer released what it took.
         spy.release(tiling.universal_guard());
-        assert_eq!(spy.get(tiling.empty_guard()), tiling.empty_tile());
+        assert_eq!(
+            spy.read_in_pipeline(tiling.empty_guard()),
+            tiling.empty_tile()
+        );
     }
 
     #[test]
@@ -1644,6 +1687,6 @@ mod tests {
         use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
         let mut ignoring =
             TestTileProducer::new(ints_by_position(&[10, 20, 30, 40], true), ints_tiling(4));
-        ignoring.get(keys_between(1, 2));
+        ignoring.read_in_pipeline(keys_between(1, 2));
     }
 }

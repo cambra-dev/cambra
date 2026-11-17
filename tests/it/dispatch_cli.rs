@@ -1,138 +1,152 @@
-//! The binary's dispatched run (`CAMBRA_DISPATCH`): a pure program prints what pull mode prints, a
-//! program over stdin prints each line's answer as the line arrives, and a product of stdin
-//! with a static collection runs dispatched.
+//! CLI output, incremental stdin delivery, and HTTP execution through the dispatcher.
 
+use indoc::indoc;
 use std::io::Write;
 use std::process::{Output, Stdio};
 
-use indoc::indoc;
-
-/// Run the binary on `source`, written to a file of its own, with `CAMBRA_DISPATCH` set to
-/// `dispatch`.
-fn run(name: &str, source: &str, dispatch: &str) -> Output {
-    run_reading(name, source, dispatch, "")
-}
-
-/// [`run`] with `input` on the binary's stdin, read from a file.
-fn run_reading(name: &str, source: &str, dispatch: &str, input: &str) -> Output {
-    run_with(name, source, dispatch, None, input)
-}
-
-/// [`run_reading`] with `CAMBRA_MORSEL_ROWS` set to `rows`, where it is `Some`.
-fn run_with(name: &str, source: &str, dispatch: &str, rows: Option<&str>, input: &str) -> Output {
-    let dir = std::env::temp_dir().join(format!(
-        "cambra-dispatch-cli-{}-{name}-{dispatch}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).expect("the temporary directory is writable");
-    let path = dir.join(format!("{name}.cambra"));
-    std::fs::write(&path, source).expect("the program file is writable");
+fn run_with(name: &str, source: &str, rows: Option<&str>, input: &str) -> Output {
+    let dir =
+        std::env::temp_dir().join(format!("cambra-dispatch-cli-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch directory");
+    let path = dir.join("program.cambra");
+    std::fs::write(&path, source).expect("program");
+    let input_path = dir.join("input");
+    std::fs::write(&input_path, input).expect("input");
     let mut command = crate::it::cli::command();
-    command.arg(&path).env("CAMBRA_DISPATCH", dispatch);
+    command.arg(&path);
     if let Some(rows) = rows {
         command.env("CAMBRA_MORSEL_ROWS", rows);
     }
-    // Stdin is a file holding the whole input. The run's first poll starts the stdin reader, so
-    // how many lines each poll finds, and so how many answers carry them, depends on timing.
-    let input_path = dir.join("input");
-    std::fs::write(&input_path, input).expect("the input file is writable");
     let output = command
-        .stdin(std::fs::File::open(&input_path).expect("the input file is readable"))
+        .stdin(std::fs::File::open(input_path).expect("input file"))
         .output()
-        .expect("the binary runs to its end");
-    std::fs::remove_dir_all(&dir).expect("the temporary directory is removable");
+        .expect("run binary");
+    std::fs::remove_dir_all(dir).expect("remove scratch directory");
     assert!(
         output.status.success(),
-        "{name} runs: {}",
+        "{name}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     output
 }
 
-/// A pure program's `main` prints the same value dispatched as in pull mode.
+/// Integer value columns, excluding UInt domain keys, across printed output tiles.
+fn printed_ints(output: &Output) -> Vec<i64> {
+    let flat: String = String::from_utf8_lossy(&output.stdout)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    flat.match_indices("Ints([")
+        .filter(|(at, _)| *at == 0 || flat.as_bytes()[at - 1] != b'U')
+        .flat_map(|(at, _)| {
+            flat[at + 6..]
+                .split(']')
+                .next()
+                .unwrap()
+                .split(',')
+                .filter(|v| !v.is_empty())
+                .map(|v| v.parse::<i64>().expect("integer value"))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+fn printed_strings(output: &Output) -> Vec<String> {
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix('"')?
+                .strip_suffix("\",")
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
 #[rstest::rstest]
-#[case::a_scalar("a_scalar", "1 + 2\n")]
-#[case::a_loop("a_loop", indoc! {"
-    xs = [1, 2, 3]
+#[case::scalar("scalar", "1 + 2", 3)]
+#[case::loop_sum("loop", indoc! {"
     total := 0
-    for x in xs:
+    for x in [1, 2, 3]:
         total += x
     total * 2
-"})]
-#[case::a_sum("a_sum", "sum([x * x for x in [1, 2, 3, 4]])\n")]
-fn a_pure_program_prints_what_pull_mode_prints(#[case] name: &str, #[case] source: &str) {
-    let pulled = run(name, source, "0");
-    let dispatched = run(name, source, "1");
-    assert_eq!(
-        String::from_utf8_lossy(&dispatched.stdout),
-        String::from_utf8_lossy(&pulled.stdout),
-        "{name}: the dispatched run prints what pull mode prints"
-    );
-    assert!(
-        !String::from_utf8_lossy(&dispatched.stderr).contains("running in pull mode"),
-        "{name} runs dispatched: {}",
-        String::from_utf8_lossy(&dispatched.stderr)
-    );
+"}, 12)]
+#[case::sum("sum", "sum([x * x for x in [1, 2, 3, 4]])", 30)]
+fn a_pure_program_prints_its_value(
+    #[case] name: &str,
+    #[case] source: &str,
+    #[case] expected: i64,
+) {
+    assert_eq!(printed_ints(&run_with(name, source, None, "")), [expected]);
 }
 
-/// A pure collection cut into several morsels prints what pull mode prints: the `main` output
-/// merges the answers of its packages and hands over one answer at its finish.
 #[rstest::rstest]
-#[case::at_morsels_of_one_row("at_one_row", "[x * 10 for x in [1, 2, 3]]\n".to_string(), Some("1"))]
-#[case::over_more_than_one_morsel(
-    "over_one_morsel",
-    format!(
-        "[x * 10 for x in [{}]]\n",
-        (0..1100).map(|x| x.to_string()).collect::<Vec<_>>().join(", ")
-    ),
-    None
-)]
-fn a_collection_in_several_morsels_prints_what_pull_mode_prints(
+#[case::small("small", vec![1, 2, 3], Some("1"))]
+#[case::large("large", (0..1100).collect(), None)]
+fn morsels_preserve_every_output_value(
     #[case] name: &str,
-    #[case] source: String,
+    #[case] input: Vec<i64>,
     #[case] rows: Option<&str>,
 ) {
-    let pulled = run_with(name, &source, "0", rows, "");
-    let dispatched = run_with(name, &source, "1", rows, "");
-    assert_eq!(
-        String::from_utf8_lossy(&dispatched.stdout),
-        String::from_utf8_lossy(&pulled.stdout),
-        "{name}: the dispatched run prints what pull mode prints"
+    let source = format!(
+        "[x * 10 for x in [{}]]",
+        input
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
     );
-    assert!(
-        !String::from_utf8_lossy(&dispatched.stderr).contains("running in pull mode"),
-        "{name} runs dispatched: {}",
-        String::from_utf8_lossy(&dispatched.stderr)
+    assert_eq!(
+        printed_ints(&run_with(name, &source, rows, "")),
+        input.iter().map(|x| x * 10).collect::<Vec<_>>()
     );
 }
 
-/// A live source paired with a static collection runs through the dispatcher.
 #[test]
 fn a_live_product_runs_dispatched() {
-    let source = "sum([1 for line in stdin() for s in [1, 2]])\n";
-    let input = "a\nb\n";
-    let pulled = run_reading("a_live_product", source, "0", input);
-    let dispatched = run_reading("a_live_product", source, "1", input);
-    assert_eq!(dispatched.stdout, pulled.stdout);
-    let stderr = String::from_utf8_lossy(&dispatched.stderr);
-    assert!(
-        !stderr.contains("running in pull mode"),
-        "the product runs dispatched: {stderr}"
+    assert_eq!(
+        printed_ints(&run_with(
+            "live-product",
+            "sum([1 for line in stdin() for s in [1, 2]])",
+            None,
+            "a\nb\n"
+        )),
+        [4]
     );
+}
+
+#[rstest::rstest]
+#[case::map("stdin_map", "[\"> \" + line for line in stdin()]", &[], &["> a", "> b", "> c"])]
+#[case::filter("stdin_filter", "sum([1 for line in stdin() if line != \"b\"])", &[2], &[])]
+#[case::sum("stdin_sum", "sum([1 for line in stdin()])", &[3], &[])]
+#[case::loop_count("stdin_loop", indoc! {"
+    count := 0
+    for line in stdin():
+        count += 1
+    count
+"}, &[3], &[])]
+fn stdin_programs_print_expected_values(
+    #[case] name: &str,
+    #[case] source: &str,
+    #[case] ints: &[i64],
+    #[case] strings: &[&str],
+) {
+    let output = run_with(name, source, None, "a\nb\nc\n");
+    assert_eq!(printed_ints(&output), ints);
+    assert_eq!(printed_strings(&output), strings);
 }
 
 /// A map over stdin at the `main` output prints each line's answer before the next line arrives,
-/// dispatched as in pull mode: each line is written to the binary's stdin once the answer to the
+/// each line is written to the binary's stdin once the answer to the
 /// line before it is printed.
 #[rstest::rstest]
-fn a_map_over_stdin_prints_each_line_as_it_arrives(#[values("0", "1")] dispatch: &str) {
+fn a_map_over_stdin_prints_each_line_as_it_arrives() {
     use std::io::{BufRead, BufReader};
     use std::sync::mpsc;
     use std::time::Duration;
 
     let source = "[\"> \" + line for line in stdin()]\n";
     let dir = std::env::temp_dir().join(format!(
-        "cambra-dispatch-cli-{}-stdin-stream-{dispatch}",
+        "cambra-dispatch-cli-{}-stdin-stream",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).expect("the temporary directory is writable");
@@ -140,7 +154,6 @@ fn a_map_over_stdin_prints_each_line_as_it_arrives(#[values("0", "1")] dispatch:
     std::fs::write(&path, source).expect("the program file is writable");
     let mut child = crate::it::cli::command()
         .arg(&path)
-        .env("CAMBRA_DISPATCH", dispatch)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -189,154 +202,6 @@ fn a_map_over_stdin_prints_each_line_as_it_arrives(#[values("0", "1")] dispatch:
         strings.try_iter().collect::<Vec<_>>(),
         Vec::<String>::new(),
         "nothing prints after the last answer"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !stderr.contains("running in pull mode"),
-        "the program runs dispatched: {stderr}"
-    );
-}
-
-/// The answers a run printed, read from their `{:#?}` rendering, with the cut of the input into
-/// polls factored out.
-///
-/// Each mode prints an answer when one holds rows or is terminal, and which rows each answer holds
-/// depends on when the stdin reader sends the lines ([`run_with`]). Two runs over the same input
-/// print the same rows in the same order and end on their one terminal answer, however their
-/// answers cut the rows.
-#[derive(Debug, PartialEq)]
-struct Printed {
-    /// The `(key, value)` row of every printed function answer, in print order, each answer's
-    /// `deleted` rows left out.
-    rows: Vec<(String, String)>,
-    /// Every printed answer that is not a function, whole.
-    others: Vec<String>,
-    /// Whether exactly one printed answer states its domain complete (`domain_predicate: True`),
-    /// and it is the last.
-    ends_on_its_one_terminal_answer: bool,
-}
-
-impl Printed {
-    fn of(output: &Output) -> Self {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let answers: Vec<&str> = stdout.split("Got value: ").skip(1).collect();
-        let mut rows = Vec::new();
-        let mut others = Vec::new();
-        for answer in &answers {
-            if !answer.starts_with("DataFunction {") {
-                others.push(answer.to_string());
-                continue;
-            }
-            let lines: Vec<&str> = answer.lines().map(str::trim).collect();
-            let keys = elements_after(&lines, "domain: ");
-            let values = elements_after(&lines, "codomain: ");
-            let deleted = elements_after(&lines, "deleted: ");
-            assert_eq!(keys.len(), values.len(), "one value per key in {answer}");
-            rows.extend(
-                keys.into_iter()
-                    .zip(values)
-                    .enumerate()
-                    .filter(|(row, _)| !deleted.contains(&row.to_string().as_str()))
-                    .map(|(_, (key, value))| (key.to_string(), value.to_string())),
-            );
-        }
-        let terminal: Vec<usize> = (0..answers.len())
-            .filter(|&at| {
-                answers[at]
-                    .lines()
-                    .any(|l| l.trim() == "domain_predicate: True,")
-            })
-            .collect();
-        Self {
-            rows,
-            others,
-            ends_on_its_one_terminal_answer: terminal == [answers.len().wrapping_sub(1)],
-        }
-    }
-}
-
-/// The elements of the first list or set opened at or after the line in `lines` that starts
-/// with `label`, in a `{:#?}` rendering: one element per line, without its trailing comma.
-fn elements_after<'a>(lines: &[&'a str], label: &str) -> Vec<&'a str> {
-    let start = lines
-        .iter()
-        .position(|line| line.starts_with(label))
-        .unwrap_or_else(|| panic!("a line starts with `{label}` in {lines:?}"));
-    let mut elements = Vec::new();
-    let mut open = false;
-    for line in &lines[start..] {
-        if open {
-            if line.starts_with(']') || line.starts_with('}') {
-                return elements;
-            }
-            elements.push(line.strip_suffix(',').unwrap_or(line));
-        } else if ["[]", "{}"]
-            .iter()
-            .any(|empty| line.trim_end_matches(',').ends_with(empty))
-        {
-            return elements;
-        } else {
-            open = line.ends_with('[') || line.ends_with('{');
-        }
-    }
-    panic!("the list after `{label}` closes in {lines:?}")
-}
-
-/// A program over stdin at the `main` output prints what pull mode prints, dispatched, the last
-/// terminal answer included. A collection's printed rows are `rows`, as `{:#?}` renders each key
-/// and value, and its answers end on one terminal answer.
-#[rstest::rstest]
-#[case::a_map(
-    "stdin_map",
-    "[\"> \" + line for line in stdin()]\n",
-    &[("0", "\"> a\""), ("1", "\"> b\""), ("2", "\"> c\"")],
-)]
-#[case::a_filter(
-    "stdin_filter",
-    "[line for line in stdin() if line != \"b\"]\n",
-    &[("0", "\"a\""), ("2", "\"c\"")],
-)]
-#[case::a_sum("stdin_sum", "sum([1 for line in stdin()])\n", &[])]
-#[case::a_loop("stdin_loop", indoc! {"
-    count := 0
-    for line in stdin():
-        count += 1
-    count
-"}, &[])]
-fn a_program_over_stdin_prints_what_pull_mode_prints(
-    #[case] name: &str,
-    #[case] source: &str,
-    #[case] rows: &[(&str, &str)],
-) {
-    let input = "a\nb\nc\n";
-    let pulled = run_reading(name, source, "0", input);
-    let dispatched = run_reading(name, source, "1", input);
-    let printed = Printed::of(&pulled);
-    assert_eq!(
-        printed.rows,
-        rows.iter()
-            .map(|&(key, value)| (key.to_string(), value.to_string()))
-            .collect::<Vec<_>>(),
-        "{name}: pull mode prints the rows of its input\n{}",
-        String::from_utf8_lossy(&pulled.stdout),
-    );
-    assert!(
-        rows.is_empty() || printed.ends_on_its_one_terminal_answer,
-        "{name}: pull mode ends on one terminal answer\n{}",
-        String::from_utf8_lossy(&pulled.stdout),
-    );
-    assert_eq!(
-        Printed::of(&dispatched),
-        Printed::of(&pulled),
-        "{name}: the dispatched run prints what pull mode prints\n\
-         dispatched:\n{}\npulled:\n{}",
-        String::from_utf8_lossy(&dispatched.stdout),
-        String::from_utf8_lossy(&pulled.stdout),
-    );
-    let stderr = String::from_utf8_lossy(&dispatched.stderr);
-    assert!(
-        !stderr.contains("running in pull mode"),
-        "{name} runs dispatched: {stderr}"
     );
 }
 
@@ -390,7 +255,6 @@ fn an_http_server_answers_requests_dispatched() {
         child: Some(
             crate::it::cli::command()
                 .arg(&path)
-                .env("CAMBRA_DISPATCH", "1")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -434,11 +298,6 @@ fn an_http_server_answers_requests_dispatched() {
         left();
         std::thread::sleep(Duration::from_millis(50));
     };
-    let output = server.stop();
+    server.stop();
     assert!(answer.contains("Hello, stranger!"), "the answer: {answer}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !stderr.contains("running in pull mode"),
-        "the server runs dispatched: {stderr}"
-    );
 }
