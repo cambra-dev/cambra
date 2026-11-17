@@ -790,7 +790,8 @@ no further restriction.
 
 `Consumer::notify(region, landing)` announces a region and marks cached reads of that region
 dirty. `Arrivals` records delivered notifications before forwarding them. Planning probes and
-`Consumer::route` describe paths without changing caches or executing reads.
+route walks pass a region through the same `notify` into a landing that records where it arrives
+(`Landing::probe`, `Landing::route`), without changing caches or executing reads.
 
 A placed pipeline entry queues the announced work and ends propagation. An unplaced entry inside
 another scheduled pipeline forwards the notification to that pipeline's caches. Operators restate

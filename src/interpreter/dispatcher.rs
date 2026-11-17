@@ -36,6 +36,8 @@ use crate::interpreter::{
 pub(crate) mod loop_scope;
 mod plan;
 
+#[cfg(test)]
+pub(crate) use plan::walk_routes;
 pub use plan::{
     Ended, Planned, Refused, Run, RunObserver, Targets, run_program, run_program_into,
     run_program_polling,
@@ -361,7 +363,29 @@ struct PipelineInfo {
     /// it is whole ([`completes_whole_only`](Dispatcher::completes_whole_only)).
     whole_only: Vec<bool>,
     required_keys: Vec<Vec<Value>>,
+    /// Per pipeline it reads, in the order of its `reads`, the routes a push of that pipeline
+    /// takes to its entry, as the planner walked them through the pusher's consumer
+    /// ([`plan_routes`](Dispatcher::plan_routes)); `None` where no planner walked them. A push
+    /// queued, or a complete region recorded, along no planned route fails the run
+    /// ([`Landing::queue`]).
+    routes: Option<Vec<ReadRoutes>>,
     ingress: Option<std::ops::Range<usize>>,
+}
+
+/// What the operators on a push's path have marked it with ([`Landing`]), as a push carries them
+/// to the entry it reaches.
+struct PathMarks {
+    widened: bool,
+    completes_part: bool,
+    final_key: Option<Value>,
+}
+
+/// The routes a push of one pipeline takes to a reader's entry, as [`Dispatcher::plan_routes`]
+/// records them: those of a change, and those of a complete region.
+#[derive(Default)]
+struct ReadRoutes {
+    changes: Vec<Route>,
+    completions: Vec<Route>,
 }
 
 /// A region awaiting input completion ([`Dispatcher::wait_for_inputs`]), and whether a release may hand out the part
@@ -563,6 +587,7 @@ impl Dispatcher {
                 reach: Vec::new(),
                 whole_only: Vec::new(),
                 required_keys: Vec::new(),
+                routes: None,
                 ingress: None,
             })
             .collect();
@@ -659,6 +684,7 @@ impl Dispatcher {
             reach: Vec::new(),
             whole_only: Vec::new(),
             required_keys: Vec::new(),
+            routes: None,
             ingress: None,
         });
         *self.unfinished.get_mut() += 1;
@@ -883,7 +909,7 @@ impl Dispatcher {
 
     /// Record that `read`, a pipeline `reader` reads, completes `reader`'s input only once it is
     /// whole: one path from it completes only part of what a row depends on, and another passes a
-    /// complete region on ([`Routes::completing_part`]), so the union of what they pass names rows
+    /// complete region on ([`Landing::completing_part`]), so the union of what they pass names rows
     /// the other path has not completed. A complete push of it that is not whole records nothing.
     ///
     /// # Panics
@@ -900,6 +926,97 @@ impl Dispatcher {
             info.whole_only.resize(info.reads.len(), false);
         }
         info.whole_only[at] = true;
+    }
+
+    /// Whether `source`'s complete push of `guard`, `None` where it is whole, reaches `reader`
+    /// around a store's recurrence, which is no read and records nothing: a store's complete push
+    /// reaches its own pipelines, and a pipeline of a store reads a sibling only for its seed
+    /// input's consume ([`opens_before`](Self::opens_before)), which records it whole.
+    fn passes_around_recurrence(
+        &self,
+        reader: usize,
+        source: usize,
+        guard: Option<&TileGuard>,
+    ) -> bool {
+        guard.is_some()
+            && source != reader
+            && self.infos[source].pushes_with == self.infos[reader].pushes_with
+    }
+
+    /// Record the routes a push of `read`, a pipeline `reader` reads, takes to the entry of
+    /// `reader`, as the planner walked them through the pusher's consumer ([`Landing::route`]):
+    /// `changes` for a change pushed, and `completions` for a complete region stated.
+    ///
+    /// # Panics
+    ///
+    /// When `reader` does not read `read`.
+    pub(crate) fn plan_routes(
+        &mut self,
+        reader: PipelineId,
+        read: PipelineId,
+        changes: Vec<Route>,
+        completions: Vec<Route>,
+    ) {
+        let info = &mut self.infos[reader.0];
+        let at = info
+            .reads
+            .iter()
+            .position(|&r| r == read.0)
+            .unwrap_or_else(|| panic!("pipeline {} reads pipeline {}", reader.0, read.0));
+        let len = info.reads.len();
+        let routes = info
+            .routes
+            .get_or_insert_with(|| (0..len).map(|_| ReadRoutes::default()).collect());
+        routes[at] = ReadRoutes {
+            changes,
+            completions,
+        };
+    }
+
+    /// Whether a push of `from` that reaches the entry of `reader` with the marks `marked` takes a
+    /// route the planner walked ([`plan_routes`](Self::plan_routes)): one with the same
+    /// completes-part mark and final key, and for a change widened exactly as the push is. A
+    /// reader no planner walked the routes of, as in a dispatcher a test builds by hand, takes any
+    /// push.
+    fn planned_route(
+        &self,
+        from: usize,
+        reader: usize,
+        marked: &PathMarks,
+        complete: bool,
+    ) -> bool {
+        let info = &self.infos[reader];
+        let Some(routes) = &info.routes else {
+            return true;
+        };
+        let Some(at) = info.reads.iter().position(|&r| r == from) else {
+            return false;
+        };
+        let routes = match complete {
+            true => &routes[at].completions,
+            false => &routes[at].changes,
+        };
+        routes.iter().any(|route| {
+            route.completes_part == marked.completes_part
+                && route.final_key == marked.final_key
+                && (complete || route.keeps_keys != marked.widened)
+        })
+    }
+
+    /// Fail the run where a push of `from` reaches `reader`'s entry along no route its planner
+    /// walked ([`planned_route`](Self::planned_route)).
+    fn ensure_planned(&self, from: usize, reader: usize, marked: &PathMarks, complete: bool) {
+        self.ensure(self.planned_route(from, reader, marked, complete), || {
+            format!(
+                "a {} of pipeline {from} reaches pipeline {reader} along a path its planner's \
+                     route walk did not take (widened: {}, completes part: {}, final key: {:?}): \
+                     a consumer on the way passes it on otherwise than the walk",
+                if complete { "complete region" } else { "push" },
+                marked.widened,
+                marked.completes_part,
+                marked.final_key
+            )
+        });
     }
 
     /// Record that the pushes of `read`, a pipeline `reader` reads, reach `region` of its input
@@ -1143,13 +1260,7 @@ impl Dispatcher {
     /// in its own chain.
     fn record_complete(&self, reader: usize, source: usize, guard: Option<&TileGuard>) {
         let reads = &self.infos[reader].reads;
-        // A store's complete push reaches its own pipelines around its recurrence, which is no
-        // read: a pipeline of a store reads a sibling only for its seed input's consume
-        // ([`opens_before`](Self::opens_before)), which records it whole.
-        if guard.is_some()
-            && source != reader
-            && self.infos[source].pushes_with == self.infos[reader].pushes_with
-        {
+        if self.passes_around_recurrence(reader, source, guard) {
             return;
         }
         self.ensure(source == reader || reads.contains(&source), || {
@@ -1853,16 +1964,15 @@ impl Dispatcher {
             return;
         }
         let whole = *complete == Projection::Everything;
-        let mut landing = Landing {
-            target: Target::Completion {
+        let mut landing = Landing::new(
+            Target::Completion {
                 dispatcher: self,
                 whole,
                 reached: Vec::new(),
                 range: !pulled,
             },
-            from: pipeline,
-            widened: false,
-        };
+            pipeline,
+        );
         to.borrow_mut().notify(complete, &mut landing);
         let Target::Completion { reached, .. } = landing.target else {
             unreachable!("a complete landing stays one");
@@ -1908,11 +2018,7 @@ impl Dispatcher {
         if morsels.is_empty() {
             return;
         }
-        let mut landing = Landing {
-            target: Target::Queue { dispatcher: self },
-            from: pipeline,
-            widened: false,
-        };
+        let mut landing = Landing::new(Target::Queue { dispatcher: self }, pipeline);
         match to {
             Some(to) => {
                 for morsel in morsels {
@@ -2315,6 +2421,12 @@ pub struct Landing<'d> {
     target: Target<'d>,
     from: usize,
     widened: bool,
+    /// Whether an operator on the path passes on a complete region that names only part of what a
+    /// row it reaches depends on ([`completing_part`](Self::completing_part)).
+    completes_part: bool,
+    /// The key an operator on the path reads only once final
+    /// ([`requiring_final_key`](Self::requiring_final_key)).
+    final_key: Option<Value>,
 }
 
 /// What a [`Landing`] does with the regions that reach an [`Entry`].
@@ -2322,11 +2434,18 @@ enum Target<'d> {
     /// Queues each in the reader's queue.
     Queue { dispatcher: &'d Dispatcher },
     /// Records each, for a planner that probes which region of a reader's input a pipeline's push
-    /// names; which edges keep keys the planner reads off [`Routes`].
+    /// names; which edges keep keys the planner reads off a route walk ([`Landing::route`]).
     Probe(Vec<Arrival>),
     /// Records each, as `Probe` does, for a push restated as a wholly complete region is: the
     /// region of a reader's input a pipeline can ever decide ([`Dispatcher::reaches`]).
     ProbeCompletion(Vec<Arrival>),
+    /// Records each entry the push reaches, with what the path declares of it, for a planner that
+    /// reads a pusher's routes ([`Landing::route`]). `complete` is `None` for a change, and for a
+    /// complete region whether its source is wholly complete.
+    Route {
+        routes: Vec<Route>,
+        complete: Option<bool>,
+    },
     /// Grows, for each, what the pushing pipeline has completed of the reader's input
     /// ([`Dispatcher::complete_of`]), and queues nothing. `whole` says the pushing pipeline is
     /// wholly complete, and `reached` lists the readers whose entry the push reached.
@@ -2356,7 +2475,7 @@ impl Landing<'_> {
                 .ingress
                 .as_ref()
                 .is_none_or(|from| from.contains(&self.from)),
-            Target::Probe(_) | Target::ProbeCompletion(_) => true,
+            Target::Probe(_) | Target::ProbeCompletion(_) | Target::Route { .. } => true,
         }
     }
 
@@ -2367,32 +2486,68 @@ impl Landing<'_> {
         )
     }
 
+    fn new(target: Target<'_>, from: usize) -> Landing<'_> {
+        Landing {
+            target,
+            from,
+            widened: false,
+            completes_part: false,
+            final_key: None,
+        }
+    }
+
     /// A landing that records where `from`'s push arrives, and queues nothing.
     pub(crate) fn probe(from: PipelineId) -> Landing<'static> {
-        Landing {
-            target: Target::Probe(Vec::new()),
-            from: from.0,
-            widened: false,
-        }
+        Landing::new(Target::Probe(Vec::new()), from.0)
     }
 
     /// A landing that records where `from`'s push of a wholly complete region arrives, and queues
     /// nothing.
     pub(crate) fn probe_complete(from: PipelineId) -> Landing<'static> {
-        Landing {
-            target: Target::ProbeCompletion(Vec::new()),
-            from: from.0,
-            widened: false,
-        }
+        Landing::new(Target::ProbeCompletion(Vec::new()), from.0)
+    }
+
+    /// A landing that records the routes a push takes: each entry it reaches, whether the path
+    /// keeps the pushed keys, and what the operators on the path declare of it. A planner walks a
+    /// pusher's consumer with it ([`Consumer::notify`]), so the routes it plans are the paths a
+    /// push takes, and [`queue`](Self::queue) checks every push against them.
+    pub(crate) fn route() -> Landing<'static> {
+        Landing::new(
+            Target::Route {
+                routes: Vec::new(),
+                complete: None,
+            },
+            usize::MAX,
+        )
+    }
+
+    /// A routing landing for a complete region, which takes the paths a complete region does
+    /// ([`is_complete`](Self::is_complete)); `whole` says its source is wholly complete.
+    pub(crate) fn route_complete(whole: bool) -> Landing<'static> {
+        Landing::new(
+            Target::Route {
+                routes: Vec::new(),
+                complete: Some(whole),
+            },
+            usize::MAX,
+        )
     }
 
     /// What a probing landing recorded.
     pub(crate) fn arrivals(self) -> Vec<Arrival> {
         match self.target {
             Target::Probe(arrivals) | Target::ProbeCompletion(arrivals) => arrivals,
-            Target::Queue { .. } | Target::Completion { .. } => {
+            Target::Queue { .. } | Target::Completion { .. } | Target::Route { .. } => {
                 panic!("only a probing landing records arrivals")
             }
+        }
+    }
+
+    /// What a routing landing recorded.
+    pub(crate) fn routes(self) -> Vec<Route> {
+        match self.target {
+            Target::Route { routes, .. } => routes,
+            _ => panic!("only a routing landing records routes"),
         }
     }
 
@@ -2403,7 +2558,12 @@ impl Landing<'_> {
     pub fn is_complete(&self) -> bool {
         matches!(
             self.target,
-            Target::Completion { .. } | Target::ProbeCompletion(_)
+            Target::Completion { .. }
+                | Target::ProbeCompletion(_)
+                | Target::Route {
+                    complete: Some(_),
+                    ..
+                }
         )
     }
 
@@ -2414,7 +2574,12 @@ impl Landing<'_> {
     pub fn is_wholly_complete(&self) -> bool {
         matches!(
             self.target,
-            Target::Completion { whole: true, .. } | Target::ProbeCompletion(_)
+            Target::Completion { whole: true, .. }
+                | Target::ProbeCompletion(_)
+                | Target::Route {
+                    complete: Some(true),
+                    ..
+                }
         )
     }
 
@@ -2431,15 +2596,30 @@ impl Landing<'_> {
     ///
     /// When `reader` does not read the pipeline that pushed, or has begun to finish;
     /// when the push was widened on its way to a reader that neither waits for inputs nor reads its input
-    /// whole; and where the
+    /// whole; when a push queued, or a complete region a read states, reached the entry along a path
+    /// its planner's route walk did not take ([`Dispatcher::plan_routes`]); and where the
     /// guard algebra has no exact difference of `guard` and what is queued ([`guard_minus`]).
     pub fn queue(&mut self, reader: PipelineId, guard: &TileGuard) {
+        let marked = PathMarks {
+            widened: self.widened,
+            completes_part: self.completes_part,
+            final_key: self.final_key.clone(),
+        };
         let dispatcher = match &mut self.target {
             Target::Queue { dispatcher } => *dispatcher,
             Target::Probe(arrivals) | Target::ProbeCompletion(arrivals) => {
                 arrivals.push(Arrival {
                     pipeline: reader,
                     guard: guard.clone(),
+                });
+                return;
+            }
+            Target::Route { routes, .. } => {
+                routes.push(Route {
+                    pipeline: reader,
+                    keeps_keys: !self.widened,
+                    completes_part: self.completes_part,
+                    final_key: self.final_key.clone(),
                 });
                 return;
             }
@@ -2460,6 +2640,9 @@ impl Landing<'_> {
                 // whatever its push was restated to on the way, as an arm of a union restates it
                 // under its tag.
                 let guard = (!(*whole || guard.is_universal())).then_some(guard);
+                if !*range && !dispatcher.passes_around_recurrence(reader.0, source, guard) {
+                    dispatcher.ensure_planned(source, reader.0, &marked, true);
+                }
                 return dispatcher.record_complete(reader.0, source, guard);
             }
         };
@@ -2483,6 +2666,7 @@ impl Landing<'_> {
         // the complete pushes release them ([`Dispatcher::wait_for_inputs`]).
         if info.waits_for_inputs {
             if !info.arrivals || (!self.widened && info.pushed_rows.contains(&from)) {
+                dispatcher.ensure_planned(from, r, &marked, false);
                 dispatcher.queue_or_wait_for_inputs(r, guard, false);
             }
             return;
@@ -2493,6 +2677,7 @@ impl Landing<'_> {
                  which neither waits for inputs nor reads its input whole"
             )
         });
+        dispatcher.ensure_planned(from, r, &marked, false);
         dispatcher.ensure(queue.queue.append_unqueued(guard), || {
             format!("pipeline {r} receives packages before the last pipeline it reads finishes")
         });
@@ -2507,6 +2692,24 @@ impl Landing<'_> {
         self.widened = was;
     }
 
+    /// Push on through `push` as a path whose complete region names only part of what a row it
+    /// reaches depends on: a widening passes a region that is not whole on as nothing complete,
+    /// and a lookup's operand names the rows that read a complete key, whatever their input holds.
+    /// The planner reads it off a route walk ([`Landing::route`]).
+    pub(crate) fn completing_part(&mut self, push: impl FnOnce(&mut Self)) {
+        let was = std::mem::replace(&mut self.completes_part, true);
+        push(self);
+        self.completes_part = was;
+    }
+
+    /// Push on through `push` as a path whose reader reads `key` only once it is final. The
+    /// planner reads it off a route walk ([`Landing::route`]).
+    pub(crate) fn requiring_final_key(&mut self, key: &Value, push: impl FnOnce(&mut Self)) {
+        let was = self.final_key.replace(key.clone());
+        push(self);
+        self.final_key = was;
+    }
+
     /// Fail the run: the push re-entered a consumer it is passing through, so its chain is a
     /// cycle, which only a store closes.
     pub fn reentered(&mut self) {
@@ -2518,22 +2721,14 @@ impl Landing<'_> {
             Target::Queue { dispatcher, .. } | Target::Completion { dispatcher, .. } => {
                 dispatcher.ensure(false, || message)
             }
-            Target::Probe(_) | Target::ProbeCompletion(_) => panic!("{message}"),
+            Target::Probe(_) | Target::ProbeCompletion(_) | Target::Route { .. } => {
+                panic!("{message}")
+            }
         }
     }
 }
 
-/// The entries a push of one pipeline's keys reaches, and whether each path keeps those keys, as
-/// the consumers on the way declare ([`Consumer::route`]). Nothing is pushed: each consumer states
-/// how it passes any push on.
-pub struct Routes {
-    widened: bool,
-    completes_part: bool,
-    final_key: Option<Value>,
-    reached: Vec<Route>,
-}
-
-/// One path of a push to the entry of a pipeline ([`Routes`]).
+/// One path of a push to the entry of a pipeline, as a route walk records it ([`Landing::route`]).
 pub(crate) struct Route {
     /// The pipeline whose entry the path reaches.
     pub(crate) pipeline: PipelineId,
@@ -2541,66 +2736,9 @@ pub(crate) struct Route {
     /// or under a tag, so that a push of some keys reaches the entry as those keys.
     pub(crate) keeps_keys: bool,
     /// Whether the complete region the path passes on names only part of what a row it reaches
-    /// depends on ([`Routes::completing_part`]).
+    /// depends on ([`Landing::completing_part`]).
     pub(crate) completes_part: bool,
     pub(crate) final_key: Option<Value>,
-}
-
-impl Routes {
-    /// No path walked yet.
-    pub(crate) fn new() -> Self {
-        Routes {
-            widened: false,
-            completes_part: false,
-            final_key: None,
-            reached: Vec::new(),
-        }
-    }
-
-    /// The paths walked, each to the entry it reaches.
-    pub(crate) fn reached(self) -> Vec<Route> {
-        self.reached
-    }
-
-    /// Record that the path walked reaches the entry of `pipeline`.
-    pub fn reach(&mut self, pipeline: PipelineId) {
-        self.reached.push(Route {
-            pipeline,
-            keeps_keys: !self.widened,
-            completes_part: self.completes_part,
-            final_key: self.final_key.clone(),
-        });
-    }
-
-    pub(crate) fn requiring_final_key(&mut self, key: &Value, route: impl FnOnce(&mut Self)) {
-        let was = self.final_key.replace(key.clone());
-        route(self);
-        self.final_key = was;
-    }
-
-    /// Walk on through `route` as widened: the operator declares that it reads its input's keys
-    /// as none of its own, so a push of some of them reaches it as `Everything`. A sibling path
-    /// walked after `route` returns is not widened by this one.
-    pub fn widened(&mut self, route: impl FnOnce(&mut Self)) {
-        let was = std::mem::replace(&mut self.widened, true);
-        route(self);
-        self.widened = was;
-    }
-
-    /// Walk on through `route` as a path whose complete region names only part of what a row it
-    /// reaches depends on: a widening passes a region that is not whole on as nothing complete,
-    /// and a lookup's operand names the rows that read a complete key, whatever their input holds.
-    pub fn completing_part(&mut self, route: impl FnOnce(&mut Self)) {
-        let was = std::mem::replace(&mut self.completes_part, true);
-        route(self);
-        self.completes_part = was;
-    }
-
-    /// Refuse the walk: it re-entered a consumer it is passing through, so its chain is a cycle,
-    /// which only a store closes.
-    pub fn reentered(&mut self) {
-        panic!("a push's route re-enters a consumer it is passing through");
-    }
 }
 
 /// The consumer at the input of a pipeline's breaker: a push that reaches it is queued as a work
@@ -2728,11 +2866,6 @@ impl Consumer for Entry {
                 "a drive's source completes positions of its store's input: {region:?}"
             );
             landing.queue(*pipeline, &guard);
-        }
-    }
-    fn route(&mut self, routes: &mut Routes) {
-        if let Some(pipeline) = self.pipeline.get() {
-            routes.reach(pipeline);
         }
     }
 }
@@ -3005,13 +3138,12 @@ pub fn read_for_test<P: crate::interpreter::tile_operators::TileProducer + ?Size
 #[cfg(test)]
 pub(crate) fn notify_for_test<C: Consumer + ?Sized>(consumer: &mut C, region: &Projection) {
     let dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
-    let mut landing = Landing {
-        target: Target::Queue {
+    let mut landing = Landing::new(
+        Target::Queue {
             dispatcher: &dispatcher,
         },
-        from: 0,
-        widened: false,
-    };
+        0,
+    );
     consumer.notify(region, &mut landing);
 }
 
