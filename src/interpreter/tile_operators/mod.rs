@@ -461,6 +461,9 @@ impl Consumer for FlaggingConsumer {
     ) {
         self.downstream.push(region, landing);
     }
+    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
+        self.downstream.route(routes);
+    }
 }
 
 /// One collection level of a tile, keyed in [`completion_view`]'s map by the record fields
@@ -1635,6 +1638,11 @@ pub trait Breaker {
 /// [`finish`]: Breaker::finish
 /// [`offer_impl`]: Self::offer_impl
 pub trait BreakingProducer: TileProducer + Breaker {
+    /// Store keys whose final values are complete while other keys may remain live.
+    fn completed_keys(&self) -> &[Value] {
+        &[]
+    }
+
     /// The complete output region, including keys known absent and output already released.
     /// Reclaiming payloads preserves this statement. Publication excludes released output.
     fn complete(&self) -> TileGuard;
@@ -1694,6 +1702,20 @@ pub trait BreakingProducer: TileProducer + Breaker {
             self.name()
         );
         self.base().placement.clone()
+    }
+
+    /// The placements of the entries the producer's seeds are subscribed behind, which a planner
+    /// sets to the pipeline of the loop's scope that runs it: an induction store's. Empty for
+    /// every other producer.
+    fn seed_placements(&self) -> Vec<crate::interpreter::dispatcher::Placement> {
+        Vec::new()
+    }
+
+    /// The placements of every entry at input `input`, which a planner sets to that input's
+    /// pipeline: an input read through several entries, as a transaction store reads one per
+    /// seed, has one per entry. The default answers [`entry_placement`](Self::entry_placement).
+    fn entry_placements(&self, input: InputId) -> Vec<crate::interpreter::dispatcher::Placement> {
+        self.entry_placement(input).into_iter().collect()
     }
 }
 
@@ -2074,6 +2096,13 @@ pub trait TileProducer {
         None
     }
 
+    /// Where this producer is a loop's drive, the target the entry in front of its source records
+    /// a decided push at while the drive reads the source by pull, and `None` for any other
+    /// producer ([`CompletionTarget`](crate::interpreter::dispatcher::CompletionTarget)).
+    fn completes_through(&self) -> Option<crate::interpreter::dispatcher::CompletionTarget> {
+        None
+    }
+
     /// Take `cycle`, the handle on the cyclic fan-out whose input this producer is. A store
     /// keeps it to publish its snapshot and have its cycle read again while it steps itself as a
     /// pipeline breaker; every other producer ignores it. A cyclic fan-out calls this once, when
@@ -2204,6 +2233,12 @@ pub(crate) mod test_helpers {
         ) {
             for entry in &mut self.0 {
                 crate::interpreter::Consumer::push(entry, region, landing);
+            }
+        }
+
+        fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
+            for entry in &mut self.0 {
+                crate::interpreter::Consumer::route(entry, routes);
             }
         }
     }
@@ -2387,6 +2422,18 @@ pub(crate) mod test_helpers {
                 pulled,
                 released,
             )
+        }
+
+        /// A spy that answers what the returned cell holds, which a test rewrites between pulls to
+        /// grow the input.
+        pub(crate) fn scripted(
+            tile: Tile,
+            tiling: Tiling,
+        ) -> (Self, std::rc::Rc<std::cell::RefCell<Tile>>) {
+            let (mut spy, _, _) = Self::new(tile.clone(), tiling);
+            let cell = std::rc::Rc::new(std::cell::RefCell::new(tile));
+            spy.script = Some(cell.clone());
+            (spy, cell)
         }
     }
 
