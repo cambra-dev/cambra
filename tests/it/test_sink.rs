@@ -703,3 +703,49 @@ fn a_sink_below_a_type_alias_is_read() {
     "#});
     assert_eq!(format!("{}", v.expect("a value")), "Function [ () -> 3 ]");
 }
+
+/// A `LiveProgram` run that unwinds puts each branch's `main` producer back into its branch, where
+/// a later run takes it again: here the observer panics once the run's first pass drains.
+#[test]
+fn a_run_that_unwinds_keeps_the_main_producer() {
+    use cambra::interpreter::dispatcher::RunObserver;
+    use cambra::interpreter::{DataSink, Tile};
+    use std::ops::ControlFlow;
+    use std::sync::Arc;
+
+    struct Ignored;
+    impl DataSink for Ignored {
+        fn process(&self, _tile: &Tile) {}
+    }
+    struct PanicsWhenDrained;
+    impl RunObserver for PanicsWhenDrained {
+        fn drained(&mut self, _changed: bool) -> ControlFlow<()> {
+            panic!("the observer panics mid-run")
+        }
+    }
+
+    let mut ctx = GlobalContext::default();
+    // A source that has yielded nothing keeps the run open, so its first pass drains.
+    let src = Rc::new(RefCell::new(TestDataSource::new(
+        "nums",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(src);
+    let consumer = || -> Box<dyn Consumer> { Box::new(|| {}) };
+    let program = indoc! {"
+        [x * 2 for x in nums()]
+    "};
+    let mut live = LiveProgram::start(&mut ctx, &LoadedProgram::test(program), &consumer)
+        .expect("the program compiles");
+    assert!(live.main_producer_mut(MAIN_BRANCH).is_some());
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let print = |_: &str| -> Arc<dyn DataSink> { Arc::new(Ignored) };
+        let _ = live.run(usize::MAX, &print, &mut PanicsWhenDrained);
+    }));
+    assert!(unwound.is_err(), "the observer panics");
+    assert!(
+        live.main_producer_mut(MAIN_BRANCH).is_some(),
+        "the run put the branch's `main` producer back"
+    );
+}

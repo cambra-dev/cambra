@@ -12,7 +12,7 @@
 //! the feed's tap off the store. The loop is unchanged, so the store and its fan-out
 //! are kept.
 //!
-//! Except for the real-binary pull-reader regression, each test is a pinned failure: it asserts the wrong output the runtime
+//! Every test here is a pinned failure: it asserts the wrong output the runtime
 //! produces today, so it passes now and turns red on any change to that output. Each
 //! test's doc comment gives the correct output. A change that fixes the bug should
 //! replace the pinned value with the correct one and rename the test to state the
@@ -227,23 +227,36 @@ fn a_feed_repeats_the_position_the_recurrence_still_reads() {
     assert_cuts_pinned(&emitted_at_each_cut(false), &pinned);
 }
 
-/// A real-binary reload preserves the pull reader's release at the cut. A deferred release
-/// from the store's recurrence settles before its mutable borrow ends, so the new version
-/// starts after the last value the old version printed.
+/// A real-binary reload preserves the pull reader's release at the cut. A deferred release from
+/// the store's recurrence settles before its mutable borrow ends, so the new version starts
+/// after the last value the old version printed.
 ///
-/// With `a` and `b` sent before the reload and `c` after, the output is
-/// `["a", "ab", "abc"]`.
+/// With `a` and `b` sent before the reload and `c` after, correct, and observed in pull mode:
+///
+/// ```text
+/// ["a", "ab", "abc"]
+/// ```
+///
+/// Pinned dispatched, which repeats the last value before the cut: the rebuilt tap reader's
+/// slot starts at the intersection of every slot's release, behind its retired predecessor.
+///
+/// ```text
+/// ["a", "ab", "ab", "abc"]
+/// ```
 ///
 /// The program of
 /// [`a_feed_read_by_a_sibling_that_takes_nothing_repeats_the_position_at_the_cut`], over
 /// `stdin`, reloaded through `--control` at a quiet point between lines.
-#[test]
-fn a_stdin_feed_preserves_its_release_when_its_other_writer_is_edited() {
+#[rstest::rstest]
+fn a_stdin_feed_repeats_the_value_at_the_cut_when_its_other_writer_is_edited(
+    #[values("0", "1")] dispatch: &str,
+) {
     let (reply, out) = stdin_across_reload(
         &feed("stdin()", true, ""),
         &feed("stdin()", true, "!"),
         "a\nb",
         "c",
+        dispatch,
     );
     assert!(
         reply.contains("reloaded"),
@@ -266,10 +279,14 @@ fn a_stdin_feed_preserves_its_release_when_its_other_writer_is_edited() {
                 .flatten()
         })
         .collect();
+    let expected = match dispatch {
+        "1" => vec!["a", "ab", "ab", "abc"],
+        _ => vec!["a", "ab", "abc"],
+    };
     assert_eq!(
-        printed,
-        vec!["a", "ab", "abc"],
-        "the rebuilt pull reader resumes after the cut: {out}"
+        printed, expected,
+        "the printed values changed. If the replay was fixed, pin the correct \
+         [\"a\", \"ab\", \"abc\"] in both modes: {out}"
     );
 }
 
