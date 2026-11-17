@@ -599,7 +599,7 @@ impl UnionProducer {
         let mut combined_deleted = BitSet::new();
         let mut domain_offset: usize = 0;
 
-        for tile in tiles {
+        for (tile, tag) in tiles.into_iter().zip(&self.tags) {
             match tile {
                 Tile::DataFunction {
                     domain,
@@ -613,8 +613,36 @@ impl UnionProducer {
                         combined_deleted.insert(idx + domain_offset);
                     }
                     domain_offset += domain.len();
+                    let mut codomain = *codomain;
+                    if codomain.holds_a_level() {
+                        // Nested statements name paths through this arm's outer keys. Tag
+                        // those keys and confine unqualified statements to this arm's rows.
+                        let live: Vec<_> = (0..domain.len())
+                            .filter(|i| !deleted.contains(*i))
+                            .collect();
+                        let held = Predicate::tagged(
+                            TagMap::from_arms(vec![(
+                                tag.clone(),
+                                Predicate::from_column_value(
+                                    &domain.select_indices(live.iter().copied(), live.len()),
+                                ),
+                            )]),
+                            false,
+                        );
+                        codomain.map_level_predicates(&mut |depth, stated| {
+                            stated
+                                .with_component_restated(depth + 1, 0, &|key| match key {
+                                    Predicate::True | Predicate::False => key.clone(),
+                                    _ => Predicate::tagged(
+                                        TagMap::from_arms(vec![(tag.clone(), key.clone())]),
+                                        false,
+                                    ),
+                                })
+                                .intersect(&Predicate::True.qualified_by(&held, depth))
+                        });
+                    }
                     domains.push(domain);
-                    codomains.push(*codomain);
+                    codomains.push(codomain);
                     domain_predicates.push(dp);
                 }
                 other => panic!("UnionProducer: expected a collection tile, got {other:?}"),
@@ -703,7 +731,7 @@ fn under_arm(keys: &Predicate, depth: usize, tag: &FieldKey) -> Predicate {
             Predicate::qualified(under_arm(enclosing, depth - 1, tag), (**here).clone())
         }
         unqualified if depth > 0 => unqualified.clone(),
-        Predicate::True => Predicate::True,
+        Predicate::True | Predicate::False => keys.clone(),
         tagged @ Predicate::Union { .. } => tagged
             .under_tag(tag)
             .unwrap_or_else(|| unreachable!("matched as a union predicate")),
@@ -753,7 +781,11 @@ impl TileProducer for UnionProducer {
                 .zip(&self.tags)
                 .map(|(p, tag)| match under_arm(keys, level.index(), tag) {
                     under if under.is_false() => p.tiling().empty_tile(),
-                    under => p.get(Projection::keys_at(*level, under).guard(p.tiling())),
+                    under => p.get(
+                        Projection::keys_at(*level, under)
+                            .restated_by(&p.restates())
+                            .guard(p.tiling()),
+                    ),
                 })
                 .collect();
             let mut merged = self.combine(tiles);
@@ -801,8 +833,10 @@ impl TileProducer for UnionProducer {
                     }
                     return released;
                 }
+                // An arm may compute values beneath a shallower level. Read at the nearest
+                // level it restates, then cut the combined answer to the requested projection.
                 match &tags {
-                    None => p.get(projection.guard(p.tiling())),
+                    None => p.get(projection.restated_by(&p.restates()).guard(p.tiling())),
                     Some(pred) => {
                         let under = pred
                             .under_tag(&self.tags[arm])
@@ -830,18 +864,13 @@ impl TileProducer for UnionProducer {
                     input.release(input.tiling().universal_guard());
                 }
             }
-            // Split the per-variant predicates and forward each to the input that
-            // produced that variant's data. Only a tagged union's domain is its arms' tags; a
-            // flat union's is the one domain its arms share, which may itself be keyed by a
-            // union (a loop over a concatenation), and forwards whole below.
-            TileGuard::Function(FunctionGuard::Domain(pred @ Predicate::Union { .. }))
-                if !self.flat =>
-            {
+            // Strip the outer arm tag from every qualified path, including releases
+            // beneath the outermost keys and inside record fields.
+            g if !self.flat => {
                 for (tag, input) in self.tags.iter().zip(self.inputs.iter_mut()) {
-                    let pred = pred
-                        .under_tag(tag)
-                        .unwrap_or_else(|| unreachable!("matched as a union predicate"));
-                    input.release(TileGuard::Function(FunctionGuard::Domain(pred)));
+                    input.release(
+                        g.map_level_predicates(&mut |depth, pred| under_arm(pred, depth, tag)),
+                    );
                 }
             }
             // A **flat** union has one flat domain (not per-variant tags), so a released
@@ -897,6 +926,135 @@ mod tests {
             Predicate::qualified(point(2), point(5))
         );
         assert_eq!(under_arm(&point(5), 1, &FieldKey::Index(0)), point(5));
+    }
+
+    #[rstest::rstest]
+    #[case::flat(true)]
+    #[case::tagged(false)]
+    fn a_nested_projection_widens_only_the_arm_read(#[case] flat: bool) {
+        struct OuterOnly {
+            base: ProducerBase,
+            input: ProjectionSpy,
+        }
+
+        impl TileProducer for OuterOnly {
+            impl_producer_base!();
+
+            fn get_impl(&mut self, guard: TileGuard) -> Tile {
+                self.input.get(guard)
+            }
+
+            fn release_impl(&mut self, guard: TileGuard) {
+                self.input.release(guard);
+            }
+        }
+
+        let uint = Extent::Base(BaseType::UInt);
+        let inner = Tiling::data_function(uint.clone(), Tiling::Scalar(uint.clone()));
+        let arm_tiling = Tiling::data_function(uint.clone(), inner.clone());
+        let tile = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                vec![0, 2],
+                ColumnValue::UInts(vec![0, 1, 0, 1]),
+                Box::new(Tile::Scalar(ColumnValue::UInts(vec![10, 11, 20, 21]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let mut sibling = tile.clone();
+        if flat && let Tile::DataFunction { domain, .. } = &mut sibling {
+            *domain = ColumnValue::UInts(vec![2, 3]);
+        }
+        let (sibling, sibling_pulled, _) = ProjectionSpy::new(sibling, arm_tiling.clone());
+        let (input, pulled, _) = ProjectionSpy::new(tile, arm_tiling.clone());
+        let tiling = Tiling::data_function(
+            if flat {
+                uint
+            } else {
+                Extent::Union(TagMap::from_positional(vec![uint.clone(), uint]))
+            },
+            inner,
+        );
+        let mut union = UnionProducer {
+            base: ProducerBase::unowned(UnionProducer::alloc_id(), &tiling),
+            inputs: vec![
+                Box::new(OuterOnly {
+                    base: ProducerBase::unowned(OuterOnly::alloc_id(), &arm_tiling),
+                    input,
+                }),
+                Box::new(OuterOnly {
+                    base: ProducerBase::unowned(OuterOnly::alloc_id(), &arm_tiling),
+                    input: sibling,
+                }),
+            ],
+            tags: positional(2),
+            flat,
+            level: CurryLevel::OUTERMOST,
+        };
+        let outer = |key| {
+            if flat {
+                Value::UInt(key)
+            } else {
+                Value::Union {
+                    tag: FieldKey::Index(0),
+                    inner: Box::new(Value::UInt(key)),
+                }
+            }
+        };
+        for key in [0, 1] {
+            let path = vec![outer(0), Value::UInt(key)];
+            let projection = Projection::keys_at(CurryLevel::new(1), Predicate::exactly(&path));
+            let guard = projection.guard(&tiling);
+            let answer = union.read_in_pipeline(guard.clone());
+            assert_eq!(answer.paths_at(CurryLevel::new(1)), [path.clone()]);
+            assert_eq!(
+                answer.deepest_values(),
+                &Tile::Scalar(ColumnValue::UInts(vec![10 + key]))
+            );
+            let complete = answer.completion_at(CurryLevel::new(1));
+            assert!(complete.contains_path(&path));
+            assert!(!complete.contains_path(&[outer(0), Value::UInt(1 - key)]));
+            assert!(!complete.contains_path(&[outer(1), Value::UInt(key)]));
+            assert_eq!(
+                pulled.borrow().last(),
+                Some(
+                    &Projection::keys_at(CurryLevel::OUTERMOST, Predicate::point(Value::UInt(0)))
+                        .guard(&arm_tiling)
+                ),
+            );
+            union.release(guard);
+        }
+        assert_eq!(pulled.borrow().len(), 2);
+        if !flat {
+            assert!(sibling_pulled.borrow().is_empty());
+            let path = vec![
+                Value::Union {
+                    tag: FieldKey::Index(1),
+                    inner: Box::new(Value::UInt(0)),
+                },
+                Value::UInt(0),
+            ];
+            let projection = Projection::keys_at(CurryLevel::new(1), Predicate::exactly(&path));
+            let answer = union.read_in_pipeline(projection.guard(&tiling));
+            assert_eq!(answer.paths_at(CurryLevel::new(1)), [path]);
+            assert_eq!(
+                answer.deepest_values(),
+                &Tile::Scalar(ColumnValue::UInts(vec![10]))
+            );
+            assert!(
+                !answer
+                    .completion_at(CurryLevel::new(1))
+                    .contains_path(&[outer(0), Value::UInt(0)])
+            );
+            assert_eq!(
+                pulled.borrow().len(),
+                2,
+                "the first arm is not read for its sibling"
+            );
+        }
     }
 
     // ── UnionProducer::release_impl ───────────────────────────────────────────
