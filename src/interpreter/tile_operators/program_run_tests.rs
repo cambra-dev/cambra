@@ -330,7 +330,7 @@ fn a_sum_over_a_list_concatenated_with_a_literal() {
     assert!(
         planned
             .iter()
-            .any(|plan| plan.name.starts_with("Aggregate") && !plan.whole && plan.started),
+            .any(|plan| plan.name.starts_with("Aggregate") && plan.started),
         "the sum reads the memo's pushes and the literal's region: {planned:?}"
     );
 }
@@ -411,7 +411,7 @@ fn a_group_by() {
     assert!(
         planned
             .iter()
-            .any(|plan| plan.name.starts_with("Memo") && !plan.whole && plan.held),
+            .any(|plan| plan.name.starts_with("Memo") && plan.held),
         "the group-by's memo holds its rows until their inputs complete: {planned:?}"
     );
 }
@@ -429,10 +429,9 @@ fn a_sum_over_two_concatenated_comprehensions() {
     answers(source, "15", &["Memo", "Aggregate"]);
     let (_, planned) = dispatched(source, 1);
     assert!(
-        planned.iter().any(|plan| plan.name.starts_with("Aggregate")
-            && !plan.whole
-            && plan.held
-            && !plan.started),
+        planned
+            .iter()
+            .any(|plan| plan.name.starts_with("Aggregate") && plan.held && !plan.started),
         "the sum reads both arms' pushes: {planned:?}"
     );
 }
@@ -465,8 +464,8 @@ fn a_comprehension_reading_a_sum(#[values(1, usize::MAX)] rows: usize) {
         rows,
     );
     assert!(
-        planned.iter().any(|plan| plan.held) && !planned.iter().any(|plan| plan.whole),
-        "the outer sum holds its rows until their inputs complete, and no pipeline reads its input whole: {planned:?}"
+        planned.iter().any(|plan| plan.held),
+        "the outer sum holds its rows until their inputs complete: {planned:?}"
     );
 }
 
@@ -481,7 +480,7 @@ fn a_sink_reads_the_pushes_of_a_values_output_memo() {
     answers(source, "3", &["Memo", "SinkBreaker"]);
     let (_, planned) = dispatched(source, 1);
     let sink = sink_of(&planned);
-    assert!(!sink.whole && sink.held, "{sink:?}");
+    assert!(sink.held, "{sink:?}");
 }
 
 /// The sink of a collection reads the pushes of the collection's output memo.
@@ -495,7 +494,7 @@ fn a_sink_of_a_collection() {
     answers(source, "Function [ 2, 3, 4 ]", &["Memo", "SinkBreaker"]);
     let (_, planned) = dispatched(source, 1);
     let sink = sink_of(&planned);
-    assert!(!sink.whole && sink.held, "{sink:?}");
+    assert!(sink.held, "{sink:?}");
 }
 
 /// Two sinks each run as a pipeline of their own, and the program is done once both are.
@@ -657,13 +656,6 @@ fn a_loop_over_a_let_bound_list() {
         out << total
     "};
     answers(source, "6", &["Memo", "InductionRequest", "SinkBreaker"]);
-    let (_, planned) = dispatched(source, 1);
-    assert!(
-        planned
-            .iter()
-            .any(|plan| plan.name.starts_with("InductionRequest") && plan.whole),
-        "the loop's scope reads the list's memo whole: {planned:?}"
-    );
 }
 
 /// A loop's total and a sum both feed the sink.
@@ -700,8 +692,8 @@ fn a_reader_inside_a_loops_scope_waits_for_inputs() {
     let (_, planned) = dispatched(source, 1);
     let inner = rounds(&planned);
     assert!(
-        inner.iter().any(|plan| plan.held) && !inner.iter().any(|plan| plan.whole),
-        "a reader in the outer loop's scope waits_for_inputs, and none reads whole: {planned:?}"
+        inner.iter().any(|plan| plan.held),
+        "a reader in the outer loop's scope waits_for_inputs: {planned:?}"
     );
 }
 
@@ -1640,6 +1632,21 @@ fn deliveries() -> [(&'static str, Vec<Batch>); 3] {
     with_absent_keys(),
     81,
 )]
+#[case::absent_keys_in_a_transaction_beside_a_ready_writer(
+    indoc! {"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for r in [10, 20]:
+            with begin():
+                pool := pool - r
+        for r in source1():
+            with begin():
+                pool := pool - r
+        out << await_final(pool)
+    "},
+    with_absent_keys(),
+    51,
+)]
 #[case::an_item_ahead_of_its_completion(
     indoc! {"
         out = test_sink()
@@ -1715,10 +1722,7 @@ fn a_loop_over_a_let_bound_map_of_a_live_source(
     assert!(
         planned
             .iter()
-            .any(|plan| plan.name.starts_with("InductionRequest")
-                && plan.live
-                && !plan.whole
-                && plan.held),
+            .any(|plan| plan.name.starts_with("InductionRequest") && plan.live && plan.held),
         "the loop's scope takes the deliveries as rounds, waiting for inputs on the `Memo`: {planned:?}"
     );
 }
@@ -1969,6 +1973,180 @@ fn a_live_product_writer_beside_an_independent_ready_writer(
         ),
         923
     );
+}
+
+/// Live `TestDataSource`s named `names`, registered with `ctx`, each of `Int`s keyed by `UInt`.
+fn live_int_sources(
+    ctx: &mut GlobalContext,
+    names: &[&str],
+) -> Vec<std::rc::Rc<std::cell::RefCell<crate::interpreter::TestDataSource>>> {
+    use crate::interpreter::{BaseType, Extent, TestDataSource};
+    names
+        .iter()
+        .map(|name| {
+            let source = std::rc::Rc::new(std::cell::RefCell::new(TestDataSource::new(
+                name,
+                crate::ccl::Type::Base(BaseType::Int),
+                Extent::Base(BaseType::Int),
+            )));
+            ctx.register_source(source.clone());
+            source
+        })
+        .collect()
+}
+
+/// Hand `source` the value `value` at `key`, with every key through `key` called complete.
+fn deliver_one(
+    source: &std::cell::RefCell<crate::interpreter::TestDataSource>,
+    key: u64,
+    value: i64,
+) {
+    let mut source = source.borrow_mut();
+    source.add_data(&[(Value::UInt(key), Value::Int(value))]);
+    source.set_yield_predicate(crate::interpreter::Predicate::at_or_below(Value::UInt(key)));
+}
+
+/// A ready writer commits its whole source while its sibling's live source is idle, and the
+/// store stays unsettled: `await_final` writes nothing until the sibling's source yields
+/// everything. The sibling's delivery and close then commit the rest and settle the store.
+#[rstest_log::rstest]
+fn a_ready_writer_commits_beside_an_idle_sibling_and_the_last_to_finish_settles_the_store(
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let mut ctx = GlobalContext::default();
+    let feeds = live_int_sources(&mut ctx, &["source1"]);
+    let commits = ctx.register_test_sink("out");
+    let settled = ctx.register_test_sink("settled");
+    let text = indoc! {"
+        out = test_sink()
+        settled = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for r in [10, 20]:
+            with begin():
+                pool := pool - r
+                out << pool
+        for r in source1():
+            with begin():
+                pool := pool - r
+                out << pool
+        settled << await_final(pool)
+    "};
+    let mut program = compile_program(&mut ctx, &LoadedProgram::test(text), Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{text} compiles: {errors:?}"));
+    let _operators = ctx.take_operator_map();
+    let mut idle = 0;
+    crate::interpreter::dispatcher::run_program_polling(&mut program, rows, &mut || {
+        match idle {
+            0 => {
+                let written = commits
+                    .written_so_far()
+                    .expect("the ready writer commits while its sibling is idle");
+                let mut pools: Vec<_> = written
+                    .as_function()
+                    .iter()
+                    .map(|binding| binding.output.as_int())
+                    .collect();
+                pools.sort();
+                assert_eq!(pools, [70, 90], "{written:?}");
+                // The store is not final while a writer's source is open, so `await_final` has
+                // nothing complete to write.
+                assert_eq!(
+                    settled.written_so_far().map(|written| written.to_string()),
+                    Err(crate::interpreter::SinkReadError::NothingWritten),
+                    "the store is not settled while a writer's source is open"
+                );
+                deliver_one(&feeds[0], 0, 5);
+            }
+            1 => feeds[0]
+                .borrow_mut()
+                .set_yield_predicate(crate::interpreter::Predicate::True),
+            _ => panic!("the run waits after the source closes"),
+        }
+        idle += 1;
+    })
+    .unwrap();
+    assert_eq!(idle, 2);
+    let Value::Function(bindings) = settled.value().expect("the store settles") else {
+        panic!("a keyed sink")
+    };
+    assert_eq!(bindings[0].output, Value::Int(65));
+}
+
+/// Three live writers draw from one pool through one key, their items delivered one at a time
+/// and interleaved, while a sink in each writer's block reads every commit and releases it. Each
+/// withdrawal lands once, in one serial history, and the pool settles at 100 less the 118
+/// withdrawn.
+#[rstest_log::rstest]
+fn interleaved_live_writers_keep_every_withdrawal(#[values(1, usize::MAX)] rows: usize) {
+    let mut ctx = GlobalContext::default();
+    let feeds = live_int_sources(&mut ctx, &["source1", "source2", "source3"]);
+    let commits = ctx.register_test_sink("out");
+    let settled = ctx.register_test_sink("settled");
+    let text = indoc! {"
+        out = test_sink()
+        settled = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for r in source1():
+            with begin():
+                pool := pool - r
+                out << pool
+        for r in source2():
+            with begin():
+                pool := pool - r
+                out << pool
+        for r in source3():
+            with begin():
+                pool := pool - r
+                out << pool
+        settled << await_final(pool)
+    "};
+    let mut program = compile_program(&mut ctx, &LoadedProgram::test(text), Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{text} compiles: {errors:?}"));
+    let _operators = ctx.take_operator_map();
+    // (source, key, amount), in delivery order: writer 1 takes 10, 20, 30 and 40, writer 2 takes
+    // 1, 2 and 3, writer 3 takes 5 and 7.
+    let deliveries = [
+        (0, 0, 10),
+        (0, 1, 20),
+        (1, 0, 1),
+        (2, 0, 5),
+        (0, 2, 30),
+        (1, 1, 2),
+        (2, 1, 7),
+        (0, 3, 40),
+        (1, 2, 3),
+    ];
+    let (first, rest) = deliveries.split_first().expect("a delivery");
+    deliver_one(&feeds[first.0], first.1, first.2);
+    let mut next = rest.iter();
+    let mut closed = false;
+    crate::interpreter::dispatcher::run_program_polling(&mut program, rows, &mut || match next
+        .next()
+    {
+        Some(&(source, key, amount)) => deliver_one(&feeds[source], key, amount),
+        None => {
+            assert!(!closed, "the run waits after every source closes");
+            closed = true;
+            for feed in &feeds {
+                feed.borrow_mut()
+                    .set_yield_predicate(crate::interpreter::Predicate::True);
+            }
+        }
+    })
+    .unwrap();
+    let written = commits.value().expect("every commit is written");
+    assert_eq!(
+        assert_serial_withdrawals(
+            &written,
+            100,
+            &[vec![10, 20, 30, 40], vec![1, 2, 3], vec![5, 7]]
+        ),
+        -18
+    );
+    let Value::Function(bindings) = settled.value().expect("the store settles") else {
+        panic!("a keyed sink")
+    };
+    assert_eq!(bindings[0].output, Value::Int(-18));
 }
 
 /// A concatenation writer progresses beside a live writer without comparing their keys.
@@ -2375,6 +2553,42 @@ fn two_batches() -> Vec<Batch> {
     ]
 }
 
+/// Three deliveries of `source1`: keys 0 and 1, keys 2 and 3, then key 4 with everything called
+/// complete, each value one more than its key.
+fn three_batches() -> Vec<Batch> {
+    let entries = |keys: std::ops::Range<u64>| {
+        keys.map(|key| (Value::UInt(key), Value::Int(key as i64 + 1)))
+            .collect::<Vec<_>>()
+    };
+    vec![
+        (
+            entries(0..2),
+            crate::interpreter::Predicate::at_or_below(Value::UInt(1)),
+        ),
+        (
+            entries(2..4),
+            crate::interpreter::Predicate::at_or_below(Value::UInt(3)),
+        ),
+        (entries(4..5), crate::interpreter::Predicate::True),
+    ]
+}
+
+/// Deliveries of `source1` that start with none: an open source with no key, then keys 0 and 1,
+/// keys 2 and 3, and key 4 with everything called complete, each value one more than its key.
+fn an_empty_delivery_then_three() -> Vec<Batch> {
+    let mut batches = three_batches();
+    batches.insert(0, (Vec::new(), crate::interpreter::Predicate::False));
+    batches
+}
+
+/// The value written under a sink's one row.
+fn single_value(written: &Value) -> Value {
+    let [binding] = written.as_function().as_slice() else {
+        panic!("the sink holds one row: {written:?}")
+    };
+    binding.output.clone()
+}
+
 /// Two deliveries whose first yields keys 0 and 2 but not 1, so the first yield is not a prefix of
 /// the source's keys, which every live source's yield is.
 fn out_of_order_batches() -> Vec<Batch> {
@@ -2471,7 +2685,7 @@ fn a_loop_over_a_source_completed_in_one_delivery(#[values(1, usize::MAX)] rows:
     assert!(
         planned
             .iter()
-            .any(|plan| plan.live && !plan.whole && plan.name.starts_with("InductionRequest")),
+            .any(|plan| plan.live && plan.name.starts_with("InductionRequest")),
         "the loop's scope is the live source pipeline, read in rounds: {planned:?}"
     );
 }
@@ -2635,14 +2849,15 @@ fn a_let_bound_map_over_a_live_source(#[values(1, usize::MAX)] rows: usize) {
     assert!(
         planned
             .iter()
-            .any(|plan| !plan.live && !plan.whole && plan.held && plan.name.starts_with("Memo")),
+            .any(|plan| !plan.live && plan.held && plan.name.starts_with("Memo")),
         "the feed's `Memo` holds its rows until their inputs complete: {planned:?}"
     );
 }
 
 /// A feed of a map over a live source is keyed by the sink's one row, which holds the whole map, so
 /// a delivery's keys reach the pipeline above the source widened. The pipeline reads its input
-/// whole once the source yields everything.
+/// again after each delivery, so the sink holds each delivery's rows before the next, and once more
+/// after the source yields everything.
 #[rstest_log::rstest]
 #[case::every_key(
     indoc! {"
@@ -2663,12 +2878,59 @@ fn a_feed_of_a_map_over_a_live_source(
     #[case] expected: Vec<(u64, i64)>,
     #[values(1, usize::MAX)] rows: usize,
 ) {
-    let (value, planned) = dispatched_live(source, rows, two_batches());
-    assert_eq!(keyed_ints(&value), expected);
-    assert!(
-        planned.iter().any(|plan| plan.live && plan.whole),
-        "a live pipeline reads its input whole: {planned:?}"
+    let mut written_before_next_delivery = Vec::new();
+    let (value, _) = dispatched_live_observed(source, rows, three_batches(), |sink, _| {
+        assert_eq!(
+            sink.value(),
+            Err(crate::interpreter::SinkReadError::Incomplete),
+            "the feed stays open until the source ends"
+        );
+        let partial = sink
+            .written_so_far()
+            .map(|written| keyed_ints(&single_value(&written)))
+            .unwrap_or_default();
+        written_before_next_delivery.push(partial);
+    });
+    assert_eq!(keyed_ints(&single_value(&value)), expected);
+    // The rows of the keys delivered before each idle, keys 0 and 1, then keys 0 to 3.
+    let delivered_through = |last: u64| -> Vec<(u64, i64)> {
+        expected
+            .iter()
+            .copied()
+            .filter(|&(key, _)| key <= last)
+            .collect()
+    };
+    assert_eq!(
+        written_before_next_delivery,
+        vec![delivered_through(1), delivered_through(3)],
+        "each delivery's rows reach the sink before the next, each once"
     );
+}
+
+/// A filter that reads a sum over the same live source holds its rows until the sum is decided: the
+/// sum of the first delivery passes the filter and the sum of every delivery does not, so the sink
+/// holds no row at any idle and none at the end.
+#[rstest_log::rstest]
+fn a_filter_over_an_undecided_sum_writes_nothing_before_the_sum_is_decided(
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let source = indoc! {"
+        out = test_sink()
+        out << [x for x in source1() if sum(source1()) < 10]
+    "};
+    let mut idles = 0;
+    let (value, _) = dispatched_live_observed(source, rows, three_batches(), |sink, _| {
+        idles += 1;
+        assert_eq!(
+            sink.written_so_far()
+                .map(|written| keyed_ints(&single_value(&written)))
+                .unwrap_or_default(),
+            Vec::new(),
+            "a row of an undecided filter reaches no sink"
+        );
+    });
+    assert_eq!(idles, 2);
+    assert_eq!(keyed_ints(&single_value(&value)), Vec::new());
 }
 
 /// A feed written in a loop over a live source, at the `main` output: the output is handed each
@@ -3052,7 +3314,7 @@ fn a_reader_of_a_live_pipeline_through_a_build_edge(
 }
 
 /// A breaker whose chain reads a live source and a pipeline takes the source's arrivals and holds
-/// them (`Dispatcher::wait_for_inputs`): each row adds the sum of `ys`, and a row arriving before the sum is
+/// them: each row adds the sum of `ys`, and a row arriving before the sum is
 /// decided waits for it.
 #[rstest_log::rstest]
 fn a_reader_of_a_live_source_and_a_pipeline(#[values(1, usize::MAX)] rows: usize) {
@@ -3242,6 +3504,28 @@ impl crate::interpreter::dispatcher::RunObserver for PauseAtOnce {
             total += x * y
     total
 "}, "45")]
+#[case::an_equality_join(
+    "[x for x in source1() for y in [2, 4] if x == y]",
+    "[(_0: u1, _1: u0) -> 2, (_0: u3, _1: u1) -> 4]"
+)]
+#[case::a_collection_per_row(
+    "[[y * x for y in source1()] for x in [1, 2]]",
+    "[u0 -> [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5], \
+      u1 -> [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10]]"
+)]
+#[case::a_record_component(indoc! {"
+    r = (n=1, xs=source1())
+    r.xs
+"}, "[u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]")]
+#[case::a_field_of_a_bound_tuple_row(indoc! {"
+    xs = [(x, [y * x for y in source1()]) for x in [1, 2]]
+    [p.0 for p in xs]
+"}, "[u0 -> 1, u1 -> 2]")]
+#[case::a_bound_tuple_row(indoc! {"
+    xs = [(x, [y * x for y in source1()]) for x in [1, 2]]
+    [p.1 for p in xs]
+"}, "[u0 -> [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5], \
+      u1 -> [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10]]")]
 fn a_run_paused_at_every_boundary_answers_each_arrival_once(
     #[case] source: &str,
     #[case] expected: &str,
@@ -3303,7 +3587,7 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
         "the first delivery's run pauses, and the run after the last delivery ends"
     );
     let value = main.kept.value().expect("the `main` output's value");
-    assert_eq!(rendered_in_key_order(&value), expected, "{source}");
+    assert_eq!(canonical(&value), expected, "{source}");
 }
 
 /// [`one_key_batches`] with a last delivery that adds no key and calls the source complete.
@@ -3388,7 +3672,7 @@ fn a_map_over_a_live_source_at_main(
     assert!(
         planned
             .iter()
-            .any(|plan| plan.live && !plan.whole && plan.name.starts_with("SinkBreaker")),
+            .any(|plan| plan.live && plan.name.starts_with("SinkBreaker")),
         "the `main` output's pipeline is notified of each delivery: {planned:?}"
     );
 }
@@ -3417,7 +3701,7 @@ fn an_aggregate_per_row_over_a_live_source_at_main(#[values(1, usize::MAX)] rows
 }
 
 /// A filter over a live source that reads a sum takes the source's arrivals and holds them
-/// (`Dispatcher::wait_for_inputs`). A sum over a literal is decided before the first delivery, so the first
+/// until the sum is decided. A sum over a literal is decided before the first delivery, so the first
 /// delivery's rows are answered as they arrive. A sum over the live source is decided only at the
 /// last delivery, so the first delivery's rows stay waiting for inputs until then.
 #[rstest_log::rstest]
@@ -3444,10 +3728,9 @@ fn a_filter_over_a_live_source_reading_a_sum(
         "the `main` output is handed the first delivery's rows once the sum is final"
     );
     assert!(
-        planned.iter().any(|plan| plan.live
-            && !plan.whole
-            && plan.held
-            && plan.name.starts_with("SinkBreaker")),
+        planned
+            .iter()
+            .any(|plan| plan.live && plan.held && plan.name.starts_with("SinkBreaker")),
         "the `main` output's pipeline takes arrivals and holds them until their inputs complete: {planned:?}"
     );
 }
@@ -3465,10 +3748,6 @@ fn readers_over_a_live_pipeline_wait_for_inputs(#[values(1, usize::MAX)] rows: u
     "};
     let (value, planned) = dispatched_live(source, rows, two_batches());
     assert_eq!(keyed_ints(&value), vec![(0, 15), (1, 30)]);
-    assert!(
-        !planned.iter().any(|plan| plan.whole),
-        "no pipeline reads its input whole: {planned:?}"
-    );
     assert!(
         planned
             .iter()
@@ -3520,10 +3799,6 @@ fn a_sum_over_rows_carrying_a_constant_reading_a_live_list(
     let (value, planned) = dispatched_live(source, rows, two_batches());
     assert_eq!(keyed_ints(&value), expected);
     assert!(
-        !planned.iter().any(|plan| plan.whole),
-        "no pipeline reads its input whole: {planned:?}"
-    );
-    assert!(
         planned
             .iter()
             .any(|plan| plan.held && plan.name.starts_with("MapAggregate")),
@@ -3567,31 +3842,36 @@ fn a_sum_over_live_rows_carrying_a_constant(
             .any(|plan| plan.live && plan.name.starts_with("Memo")),
         "the source's `Memo` is the live pipeline: {planned:?}"
     );
-    assert!(
-        !planned.iter().any(|plan| plan.whole),
-        "no pipeline reads its input whole: {planned:?}"
-    );
 }
 
 /// The same filter fed to a sink. The comprehension is the constant of the `()` row above it, so
-/// a delivery's keys reach the sink's pipeline widened, and that pipeline reads its input whole
-/// once the source yields everything, waiting for inputs until the sum is decided.
+/// a delivery's keys reach the sink's pipeline widened, named as the rows of its input. That
+/// pipeline holds the rows until the sum is decided and takes each delivery's rows once, so the
+/// sink holds each delivery's rows before the next.
 #[rstest_log::rstest]
 fn a_filter_over_a_live_source_reading_a_sum_into_a_sink(#[values(1, usize::MAX)] rows: usize) {
     let source = indoc! {"
         out = test_sink()
         out << [x for x in source1() if sum([1, 2, 3]) > 5]
     "};
-    let (value, planned) = dispatched_live(source, rows, two_batches());
-    assert_eq!(
-        keyed_ints(&value),
-        (0..5).map(|key| (key, key as i64 + 1)).collect::<Vec<_>>()
-    );
+    let mut written_before_next_delivery = Vec::new();
+    let (value, planned) = dispatched_live_observed(source, rows, three_batches(), |sink, _| {
+        let partial = sink
+            .written_so_far()
+            .map(|written| keyed_ints(&single_value(&written)))
+            .unwrap_or_default();
+        written_before_next_delivery.push(partial);
+    });
+    let through = |last: u64| {
+        (0..=last)
+            .map(|key| (key, key as i64 + 1))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(written_before_next_delivery, vec![through(1), through(3)]);
+    assert_eq!(keyed_ints(&single_value(&value)), through(4));
     assert!(
-        planned
-            .iter()
-            .any(|plan| plan.live && plan.whole && plan.held),
-        "a pipeline over the source reads it whole and holds its rows until their inputs complete: {planned:?}"
+        planned.iter().any(|plan| plan.live && plan.held),
+        "a pipeline over the source holds its rows until their inputs complete: {planned:?}"
     );
 }
 
@@ -3779,7 +4059,7 @@ fn rendered_in_key_order(value: &Value) -> String {
         with begin():
             pool := pool - r
     out << await_final(pool)
-"}, Value::Int(-5), &["whole"])]
+"}, Value::Int(-5), &["held"])]
 #[case::two_writers_one_reading_a_sum_of_the_source(indoc! {"
     out = test_sink()
     pool: Mut(Int, Txn) := 100
@@ -3817,14 +4097,232 @@ fn a_store_over_a_live_source_reading_a_pipeline(
     assert_eq!(
         following
             .iter()
-            .map(|plan| match (plan.whole, plan.held) {
-                (true, _) => "whole",
-                (false, true) => "held",
-                (false, false) => "neither",
+            .map(|plan| match plan.held {
+                true => "held",
+                false => "neither",
             })
             .collect::<Vec<_>>(),
         plans,
         "how each live store or scope takes its deliveries: {planned:?}"
+    );
+}
+
+/// A loop over a live source read through another pipeline, whose seed another pipeline computes,
+/// takes its positions by pull: the entry in front of its drive's source queues nothing, and the
+/// scope is not offered its positions by its reads. A request that ends before the source
+/// delivers a position leaves its undecided positions waiting, and the delivery wakes the scope,
+/// which runs it (`InductionStoreProducer::keep_undecided`). With an empty first delivery the
+/// run's first request ends with nothing delivered; in both deliveries the last rows and the
+/// source's end arrive in one poll.
+#[rstest_log::rstest]
+#[case::seeded_from_a_sum(indoc! {"
+    out = test_sink()
+    xs = [x for x in source1()]
+    total := sum([1, 2]) - 3
+    for y in xs:
+        total := total + y
+    out << total
+"})]
+#[case::a_record(indoc! {"
+    out = test_sink()
+    xs = [x for x in source1()]
+    n := (tag=\"x\", count=0)
+    for r in xs:
+        n := (tag=n.tag, count=n.count + r)
+    out << n.count
+"})]
+fn a_loop_over_a_pulled_live_source_runs_what_arrives_after_its_first_request(
+    #[case] source: &str,
+    #[values(true, false)] empty_first: bool,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let mut batches = two_batches();
+    if empty_first {
+        batches.insert(0, (Vec::new(), crate::interpreter::Predicate::False));
+    }
+    let (value, _) = dispatched_live(source, rows, batches);
+    assert_eq!(value, Value::Int(15), "{source}");
+}
+
+/// A writer whose decision reads a sum over the live source it iterates decides no item before the
+/// source closes. Its attempts change nothing, so its request ends with the items waiting for
+/// inputs (`CommitProducer::finish_request`), and the push of the source's last delivery offers
+/// them again, which decides them: 100 less the sum, once per item.
+#[rstest_log::rstest]
+fn a_writer_reading_a_sum_of_its_live_source_waits_for_the_source(
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    use crate::interpreter::dispatcher::transaction_scope::STALLS;
+    STALLS.with(|stalls| stalls.set(0));
+    let (value, _) = dispatched_live(
+        indoc! {"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 100
+            for x in source1():
+                with begin():
+                    pool := pool - sum(source1())
+            out << await_final(pool)
+        "},
+        rows,
+        two_batches(),
+    );
+    assert_eq!(value, Value::Int(100 - 5 * 15));
+    assert!(
+        STALLS.with(std::cell::Cell::get) >= 1,
+        "no request ended with its items waiting for the source"
+    );
+}
+
+/// A writer parks on an unfinished sum. Closing its only source must publish its final value
+/// at the next drained boundary, while a disconnected source is still open and idle.
+#[rstest_log::rstest]
+fn a_parked_writer_finishes_while_an_unrelated_live_source_stays_open(
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    use crate::interpreter::dispatcher::transaction_scope::STALLS;
+    use crate::interpreter::{Predicate, SinkReadError};
+    let mut ctx = GlobalContext::default();
+    let feeds = live_int_sources(&mut ctx, &["source1", "source2"]);
+    let settled = ctx.register_test_sink("settled");
+    let _other = ctx.register_test_sink("other");
+    let source = indoc! {"
+        settled = test_sink()
+        other = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for x in source1():
+            with begin():
+                pool := pool - sum(source1())
+        settled << await_final(pool)
+        other << sum(source2())
+    "};
+    let mut program = compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {}))
+        .expect("two independent sinks compile");
+    let _operators = ctx.take_operator_map();
+    deliver_one(&feeds[0], 0, 7);
+    STALLS.with(|stalls| stalls.set(0));
+    let mut boundaries = 0;
+    crate::interpreter::dispatcher::run_program_polling(&mut program, rows, &mut || {
+        match boundaries {
+            0 => {
+                assert!(STALLS.with(std::cell::Cell::get) > 0, "the writer parked");
+                assert_eq!(settled.written_so_far(), Err(SinkReadError::NothingWritten));
+            }
+            1 => assert_eq!(
+                single_value(
+                    &settled
+                        .value()
+                        .expect("writer finished before source2 closed")
+                ),
+                Value::Int(93)
+            ),
+            _ => panic!("both sources have closed"),
+        }
+        feeds[boundaries]
+            .borrow_mut()
+            .set_yield_predicate(Predicate::True);
+        boundaries += 1;
+    })
+    .unwrap();
+    assert_eq!(boundaries, 2);
+}
+
+/// Closing the first writer without another commit completes its scalar and reply stream
+/// while the other writer can still commit to the same store.
+#[test]
+fn closing_a_key_without_a_new_commit_notifies_its_readers() {
+    use crate::interpreter::{Predicate, SinkReadError};
+    let mut ctx = GlobalContext::default();
+    let feeds = live_int_sources(&mut ctx, &["source1", "source2"]);
+    let a = ctx.register_test_sink("final_a");
+    let b = ctx.register_test_sink("final_b");
+    let replies = ctx.register_test_sink("reply_sum");
+    let code = indoc! {"
+        final_a = test_sink()
+        final_b = test_sink()
+        reply_sum = test_sink()
+        replies: Feed(_)
+        a: Mut(Int, Txn) := 0
+        b: Mut(Int, Txn) := 0
+        for x in source1():
+            with begin():
+                a += x
+                b += x
+                replies << x
+        for x in source2():
+            with begin():
+                b += x
+        final_a << await_final(a)
+        final_b << await_final(b)
+        reply_sum << sum(replies)
+    "};
+    let mut program =
+        compile_program(&mut ctx, &LoadedProgram::test(code), Box::new(|| {})).unwrap();
+    deliver_one(&feeds[0], 0, 3);
+    deliver_one(&feeds[1], 0, 100);
+    let close = |i: usize| feeds[i].borrow_mut().set_yield_predicate(Predicate::True);
+    let mut boundary = 0;
+    crate::interpreter::dispatcher::run_program_polling(&mut program, 1, &mut || {
+        assert_eq!(b.written_so_far(), Err(SinkReadError::NothingWritten));
+        match boundary {
+            0 => {
+                assert_eq!(a.written_so_far(), Err(SinkReadError::NothingWritten));
+                assert_eq!(replies.written_so_far(), Err(SinkReadError::NothingWritten));
+                close(0);
+            }
+            1 | 2 => {
+                assert_eq!(single_value(&a.value().unwrap()), Value::Int(3));
+                assert_eq!(single_value(&replies.value().unwrap()), Value::Int(3));
+                if boundary == 1 {
+                    deliver_one(&feeds[1], 1, 5);
+                } else {
+                    close(1);
+                }
+            }
+            _ => panic!("both writers have closed"),
+        }
+        boundary += 1;
+    })
+    .unwrap();
+    assert_eq!(boundary, 3);
+    assert_eq!(single_value(&b.value().unwrap()), Value::Int(108));
+}
+
+/// A writer's attempt that waits for its input keeps the snapshot it read while another writer
+/// commits past it. The waiting writer's store-slot release stops below that snapshot
+/// (`TransactWriterProducer::consume_impl`), so its proposal still reads the store there, which a
+/// debug build checks (`CommitEngine::attempt`). The driver retries the item at the newer frontier, whether
+/// its old proposal reached the store or its body was still waiting: 100 less the sum for each item of the first writer, and less each item of the second.
+#[rstest_log::rstest]
+fn a_waiting_attempt_reads_the_store_at_its_snapshot(#[values(1, usize::MAX)] rows: usize) {
+    use crate::interpreter::commit_operator::RETRIES;
+    use crate::interpreter::dispatcher::transaction_scope::STALLS;
+    STALLS.with(|stalls| stalls.set(0));
+    RETRIES.with(|retries| retries.set(0));
+    // The finite writer can park before the first live item. Later deliveries advance the
+    // competing writer while the sum still needs EOF.
+    let (value, _) = dispatched_live(
+        indoc! {"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 100
+            for x in [1, 2, 3, 4, 5]:
+                with begin():
+                    pool := pool - sum(source1())
+            for y in source1():
+                with begin():
+                    pool := pool - y
+            out << await_final(pool)
+        "},
+        rows,
+        an_empty_delivery_then_three(),
+    );
+    assert_eq!(value, Value::Int(100 - 5 * 15 - 15));
+    assert!(
+        STALLS.with(std::cell::Cell::get) >= 1,
+        "no attempt waited for its input"
+    );
+    assert!(
+        RETRIES.with(std::cell::Cell::get) >= 1,
+        "no waiting attempt fell behind the frontier"
     );
 }
 
@@ -3851,8 +4349,8 @@ fn a_writer_over_a_concatenation_with_a_live_source(#[values(1, usize::MAX)] row
     assert!(
         planned
             .iter()
-            .any(|plan| plan.live && plan.whole && plan.name.starts_with("Commit")),
-        "the store takes its input whole: {planned:?}"
+            .any(|plan| plan.live && plan.name.starts_with("Commit")),
+        "the store is a live pipeline: {planned:?}"
     );
 }
 
@@ -4369,4 +4867,99 @@ fn small_morsels_refresh_transaction_sources(
     #[values(1, 2, usize::MAX)] rows: usize,
 ) {
     assert_eq!(dispatched(source, rows).0, expected);
+}
+
+/// `value` with every collection's rows sorted, so two values compare equal whatever order their
+/// rows arrived in.
+fn canonical(value: &Value) -> String {
+    match value {
+        Value::Function(bindings) => {
+            let mut rows: Vec<String> = bindings
+                .iter()
+                .map(|binding| {
+                    format!(
+                        "{} -> {}",
+                        canonical(&binding.input),
+                        canonical(&binding.output)
+                    )
+                })
+                .collect();
+            rows.sort();
+            format!("[{}]", rows.join(", "))
+        }
+        Value::Record(fields) => {
+            let mut fields: Vec<String> = fields
+                .iter()
+                .map(|(name, value)| format!("{name}: {}", canonical(value)))
+                .collect();
+            fields.sort();
+            format!("({})", fields.join(", "))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// A registered sink reading a live source through a widened pipeline holds each delivery's rows
+/// before the next delivery, once each, at every morsel size: through an equality join, a
+/// collection per row, a record component, and a collection inside a tuple row. The value at each
+/// idle is the source's keys 0 and 1, then keys 0 to 3, and the final value all five.
+#[rstest_log::rstest]
+#[case::equality_join(
+    "out << [x for x in source1() for y in [2, 4] if x == y]",
+    &[
+        "[(_0: u1, _1: u0) -> 2]",
+        "[(_0: u1, _1: u0) -> 2, (_0: u3, _1: u1) -> 4]",
+        "[(_0: u1, _1: u0) -> 2, (_0: u3, _1: u1) -> 4]",
+    ],
+)]
+#[case::collection_per_row(
+    "out << [[y * x for y in source1()] for x in [1, 2]]",
+    &[
+        "[u0 -> [u0 -> 1, u1 -> 2], u1 -> [u0 -> 2, u1 -> 4]]",
+        "[u0 -> [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4], u1 -> [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8]]",
+        "[u0 -> [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5], \
+          u1 -> [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10]]",
+    ],
+)]
+#[case::record_component(
+    indoc! {"
+        r = (n=1, xs=source1())
+        out << r.xs
+    "},
+    &[
+        "[u0 -> 1, u1 -> 2]",
+        "[u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4]",
+        "[u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]",
+    ],
+)]
+#[case::a_field_of_a_bound_tuple_row(
+    indoc! {"
+        xs = [(x, [y * x for y in source1()]) for x in [1, 2]]
+        out << [p.0 for p in xs]
+    "},
+    &["[u0 -> 1, u1 -> 2]", "[u0 -> 1, u1 -> 2]", "[u0 -> 1, u1 -> 2]"],
+)]
+fn a_sink_over_a_widened_live_read_holds_each_delivery_before_the_next(
+    #[case] body: &str,
+    #[case] expected: &[&str],
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let source = formatdoc! {"
+        out = test_sink()
+        {body}
+    "};
+    let mut written = Vec::new();
+    let (value, _) = dispatched_live_observed(&source, rows, three_batches(), |sink, _| {
+        assert_eq!(
+            sink.value(),
+            Err(crate::interpreter::SinkReadError::Incomplete),
+            "the feed stays open until the source ends"
+        );
+        let partial = sink
+            .written_so_far()
+            .unwrap_or_else(|error| panic!("{body}: the delivery's rows reach the sink: {error}"));
+        written.push(canonical(&single_value(&partial)));
+    });
+    written.push(canonical(&single_value(&value)));
+    assert_eq!(written, expected, "{body}");
 }

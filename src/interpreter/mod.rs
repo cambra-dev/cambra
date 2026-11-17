@@ -55,10 +55,15 @@ use std::rc::{Rc, Weak};
 /// A planner reads a push's routes by walking the same `notify` with a routing landing
 /// ([`dispatcher::Landing::route`]), so planning reads the paths a delivery takes off the code
 /// that takes them. What `notify` does only for a delivery ([`dispatcher::Landing::is_delivery`])
-/// is not walked: a package it queues, or a complete region it records, fails the run unless a
-/// walk took the same path (`src/interpreter/design-dispatcher.md`, "Running a compiled
-/// program").
+/// is not walked. A delivery that reaches a reader the walk of its pipeline did not reach fails
+/// the run (`src/interpreter/design-dispatcher.md`, "Running a compiled program").
 pub trait Consumer {
+    /// The transaction store key whose closure completes this direct subscription of the store,
+    /// if any.
+    fn completion_key(&self) -> Option<&Value> {
+        None
+    }
+
     /// Record an announced region and deliver it toward its dispatcher entries.
     fn notify(&mut self, _region: &Projection, _landing: &mut dispatcher::Landing<'_>) {}
 }
@@ -86,6 +91,10 @@ impl<C: Consumer + ?Sized> Consumer for Weak<RefCell<C>> {
 /// A boxed consumer is one, so it can be shared behind an `Rc<RefCell<_>>` as a
 /// [`SharedConsumer`].
 impl Consumer for Box<dyn Consumer> {
+    fn completion_key(&self) -> Option<&Value> {
+        (**self).completion_key()
+    }
+
     fn notify(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
         (**self).notify(region, landing)
     }
