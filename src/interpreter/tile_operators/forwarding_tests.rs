@@ -148,6 +148,40 @@ fn nested() -> Tiling {
     Tiling::data_function(Extent::uint_range(8), ints())
 }
 
+fn map_aggregate() -> Built {
+    let (input, consumer) = feed(nested());
+    let op = MapAggregate::new(input, crate::ccl::AggregateKind::Sum);
+    (Box::new(op), vec![consumer])
+}
+
+#[test]
+fn map_aggregate_forwards_its_inputs_outermost_region() {
+    assert_keeps(&map_aggregate, 0);
+}
+
+#[test]
+fn map_aggregate_carries_no_region_between_notifications() {
+    assert_keeps_without_state(&map_aggregate, 0);
+}
+
+/// The extract reads the groups a `MapAggregate` folds, so the region passes both.
+fn map_extract_aggregate() -> Built {
+    let (input, consumer) = feed(nested());
+    let fold = MapAggregate::new(input, crate::ccl::AggregateKind::Sum);
+    let op = MapExtractAggregate::new(Box::new(fold), crate::ccl::AggregateKind::Sum);
+    (Box::new(op), vec![consumer])
+}
+
+#[test]
+fn map_extract_aggregate_forwards_its_inputs_outermost_region() {
+    assert_keeps(&map_extract_aggregate, 0);
+}
+
+#[test]
+fn map_extract_aggregate_carries_no_region_between_notifications() {
+    assert_keeps_without_state(&map_extract_aggregate, 0);
+}
+
 fn memo() -> Built {
     let (input, consumer) = feed(ints());
     (Box::new(Memo::new(input)), vec![consumer])
@@ -537,6 +571,46 @@ fn uncurry_beneath_a_standing_level_forwards_the_region() {
 #[test]
 fn uncurry_at_the_outermost_level_sends_everything() {
     assert_widens(&|| uncurry(CurryLevel::OUTERMOST), 0);
+}
+
+fn aggregate() -> Built {
+    let (input, consumer) = feed(ints());
+    let op = Aggregate::new(input, crate::ccl::AggregateKind::Sum);
+    (Box::new(op), vec![consumer])
+}
+
+/// The accumulator has no keys.
+#[test]
+fn an_aggregate_sends_everything_for_a_region_of_its_input() {
+    assert_widens(&aggregate, 0);
+}
+
+#[test]
+fn an_aggregate_sends_everything_for_a_later_region() {
+    assert_eq!(
+        received(&aggregate, 0, &another_region()),
+        [Projection::Everything]
+    );
+}
+
+fn extract_aggregate() -> Built {
+    let (input, consumer) = feed(ints());
+    let op = ExtractAggregate::new(input, crate::ccl::AggregateKind::Sum, true);
+    (Box::new(op), vec![consumer])
+}
+
+/// The accumulator has no keys.
+#[test]
+fn an_extract_aggregate_sends_everything_for_a_region_of_its_input() {
+    assert_widens(&extract_aggregate, 0);
+}
+
+#[test]
+fn an_extract_aggregate_sends_everything_for_a_later_region() {
+    assert_eq!(
+        received(&extract_aggregate, 0, &another_region()),
+        [Projection::Everything]
+    );
 }
 
 fn extract_final() -> Built {
