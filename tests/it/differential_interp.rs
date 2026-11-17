@@ -12,14 +12,19 @@
 use crate::differential;
 
 use chl_interp::{Collection, Value};
-use differential::{Compiled, run_compiled, run_interpreted};
+use differential::{Compiled, check_dispatched, run_compiled, run_interpreted};
 use indoc::indoc;
 use rstest::rstest;
 
-/// What sink `out` observed under the compiler, for a program it compiles and completes.
+/// What sink `out` observed under the compiler, for a program it compiles and completes. A
+/// dispatched run of the program observes the same, or the planner refuses it as
+/// `tests/it/dispatch_refused.txt` pins ([`check_dispatched`]).
 fn compiled(source: &str) -> Value {
     match run_compiled(source) {
-        Compiled::Value(v) => v,
+        Compiled::Value(v) => {
+            check_dispatched(source, &v);
+            v
+        }
         other => panic!("the compiled program produced no value: {other}"),
     }
 }

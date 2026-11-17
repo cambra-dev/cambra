@@ -1498,6 +1498,35 @@ impl Tile {
         path
     }
 
+    /// This tile with its outermost statement closed over `tiling`, as [`TileGuard::closed_over`]
+    /// closes a guard. Completion of every nested value and every absent outer key states the
+    /// whole collection complete. Statements under all tags of a union close the same way.
+    pub fn closed_over(mut self, tiling: &Tiling) -> Tile {
+        if self.is_data_function()
+            && !self.is_terminal()
+            && self.to_guard().closed_over(tiling).is_universal()
+        {
+            if let Tile::DataFunction {
+                domain_predicate, ..
+            } = &mut self
+            {
+                *domain_predicate = Predicate::True;
+            }
+            return self;
+        }
+        if let Tile::DataFunction {
+            domain_predicate, ..
+        } = &mut self
+            && matches!(domain_predicate, Predicate::Union { .. })
+            && let TileGuard::Function(FunctionGuard::Domain(closed)) =
+                TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone()))
+                    .closed_over(tiling)
+        {
+            *domain_predicate = closed;
+        }
+        self
+    }
+
     /// Whole outer keys: those stated complete, and held keys whose values are complete.
     /// A statement beneath the keys can finish a held row without asserting that an
     /// enclosing key which has not arrived will never arrive.
@@ -6907,6 +6936,39 @@ mod tests {
                 .contains_path(&[Value::UInt(7), Value::UInt(3)])
         );
         assert!(!tile.complete_keys().contains(&Value::UInt(0)));
+    }
+
+    #[test]
+    fn released_groups_and_absent_keys_close_the_collection() {
+        use crate::interpreter::BaseType;
+        let mut tile = groups_with_absent_keys();
+        if let Tile::DataFunction {
+            absent_keys,
+            codomain,
+            ..
+        } = &mut tile
+        {
+            *absent_keys = Predicate::True
+                .minus(&Predicate::point(Value::UInt(0)).union(&Predicate::point(Value::UInt(1))));
+            if let Tile::DataFunction {
+                domain_predicate, ..
+            } = &mut **codomain
+            {
+                *domain_predicate = Predicate::True;
+            }
+        }
+        tile.remove_guarded(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::point(Value::UInt(0)).union(&Predicate::point(Value::UInt(1))),
+        )));
+        tile.compact();
+        let tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::data_function(
+                Extent::Base(BaseType::UInt),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        assert!(tile.closed_over(&tiling).is_terminal());
     }
 
     /// A cut beneath the outermost keys keeps the keys recorded absent: they have no path in any
