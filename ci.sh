@@ -29,31 +29,34 @@ ci_clippy_release() { cargo clippy -p cambra -p chl-parser -p chl-interp -p camb
 # and fails `cargo build --lib`. A configuration nothing compiles is a
 # configuration that rots.
 ci_clippy_lib() { cargo clippy -p cambra --lib -- -D warnings; }
-# `CAMBRA_REFINEMENT_ORDER=reverse` (read at runtime, debug builds only) flips
-# the physical order of every refinement set. The workflow runs the suite
-# both ways: set semantics makes that order meaningless by contract, but a
-# consumer that lets it become observable — or a dedup keeping the
-# first-inserted of two `eq`-equal refinements — compiles clean either way. It
-# reaches planning too, which recovers the order a nested filter's predicate
-# implies rather than reading it off the storage this reverses. Same argument as
-# `ci_clippy_lib`: a configuration nothing runs is a configuration that rots.
+# `CAMBRA_REFINEMENT_ORDER` (read at runtime, in debug and test builds) sets the physical
+# order refinement sets are built in: `forward` (unset), `reverse`, or `random:<seed>`, which
+# draws one order per compiled program from the seed (`src/ccl/ty.rs`, `refinement_order`).
+# Set semantics makes that order meaningless by contract, but a consumer that lets it become
+# observable — or a dedup keeping the first-inserted of two `eq`-equal refinements — compiles
+# clean either way. It reaches planning too, which recovers the order a nested filter's
+# predicate implies rather than reading it off the storage this reverses. The workflow runs
+# both test gates under `random`, seeded per commit and per gate, so each run puts about half
+# the programs in each order and a rerun of the job draws the same ones. On a failure,
+# `order_followup.py` reruns each failing test forward and reversed and reports which order
+# it fails in. Same argument as `ci_clippy_lib`: a configuration nothing runs is a
+# configuration that rots.
 # Every workspace member: `-p cambra` alone does not reach the parser's or the
 # interpreter's tests, and a member left out of this list passes by not running.
 #
 # `--no-fail-fast` because the suite is many binaries: without it the first failing binary
 # ends the run and the rest never execute, so a red run reports the failure it found plus
 # an unknown number it did not look for.
-ci_test() { cargo test -p cambra -p chl-parser -p chl-interp -p cambra-lsp -q --no-fail-fast; }
+ci_test() { .github/scripts/order-followup/order_followup.py cargo test -p cambra -p chl-parser -p chl-interp -p cambra-lsp -q --no-fail-fast; }
 # The suite with `debug_assertions` off, which no other gate runs: `ci_test`
 # runs it on, and `ci_clippy_release` lints that configuration without running
 # it. A check compiled out here and nowhere else makes two compilers, and the
 # failure is silent in the direction that matters — a `#[should_panic]` test
 # pinning a `debug_assert!` passes in the build where the assert fires and only
 # there, and a debug-only path that mints a `NodeId` shifts every id after it.
-# Behavior that depends on *optimization* is out of scope, which is what lets
-# `profile.no-assertions` keep `dev`'s `opt-level` and this gate cost about what
-# `ci_test` costs.
-ci_test_no_assertions() { cargo test -p cambra -p chl-parser -p chl-interp -p cambra-lsp -q --no-fail-fast --profile no-assertions; }
+# Behavior that depends on *optimization* is out of scope: `profile.no-assertions`
+# keeps `dev`'s `opt-level`, and GitHub raises it for speed alone.
+ci_test_no_assertions() { .github/scripts/order-followup/order_followup.py cargo test -p cambra -p chl-parser -p chl-interp -p cambra-lsp -q --no-fail-fast --profile no-assertions; }
 # The formal model (`formal/`): building it is what elaborates every theorem,
 # evaluates every `#guard`, and checks every headline result's axiom list
 # (`CclFormal/Axioms.lean`) in the Lean development, and the differential tests
