@@ -32,7 +32,17 @@ use std::path::Path;
 
 /// The std root's modules, by path and source text (`docs/chl-spec.md`, "9.16
 /// The std root"): each module under `stdlib/src/` that compiles (`stdlib/README.md`).
-const STD_MODULES: &[(&str, &str)] = &[("std", include_str!("../../../stdlib/src/std.cambra"))];
+const STD_MODULES: &[(&str, &str)] = &[
+    ("std", include_str!("../../../stdlib/src/std.cambra")),
+    (
+        "std::random",
+        include_str!("../../../stdlib/src/std/random.cambra"),
+    ),
+    (
+        "std::time",
+        include_str!("../../../stdlib/src/std/time.cambra"),
+    ),
+];
 
 /// The prelude's source: the `import` statements whose `use` items every module outside
 /// the std root reaches without writing them (`docs/chl-spec.md`, "9.16 The std root").

@@ -4985,9 +4985,6 @@ filtered box is not a `List(T)`, because a filtered range of positions has gaps:
 
 ### 7.5 Time [Decided]
 
-**[Decided]** — the rules of this section. **[Planned]** — `std::time` as a module of the std
-root ([9.16 The std root](#916-the-std-root)).
-
 `std::time` provides a reading of the wall clock, `time::now()`, and an alarm source and sink,
 `time::alarms()`. Its other members are library functions over the two types it declares:
 `time::Instant`, a point on the UTC timeline counted in nanoseconds since the Unix epoch, and
@@ -5020,6 +5017,8 @@ position in the commit order ([6. Types (informal sketch)](#6-types-informal-ske
   ([9.7 Importing asserts a shareable module](#97-importing-asserts-a-shareable-module)).
 
 #### `time::alarms()`
+
+**[Decided]** — the rules of this section; `std::time` does not declare `alarms` yet.
 
 `time::alarms()` returns a source and a sink. Each row fed to the sink is held, and comes out of
 the source once the clock reads at or after the row's `time::at` field. `std::time` declares it as:
@@ -6387,6 +6386,8 @@ modules are CHL source the compiler embeds (`stdlib/src/`). A diagnostic in one 
 | Module | Holds |
 | -- | -- |
 | `std` | `Option`, `Set`, `Map`, `FullMap`, and the traits and instances used by operators, loops, aggregates and subscripts |
+| `std::random` | `next()`, a random `Int` read once per position and call path ([Inputs from outside the program](#inputs-from-outside-the-program)) |
+| `std::time` | `Instant`, `Duration`, `now()`, durations, and conversions to integer counts and Unix time ([7.5 Time [Decided]](#75-time-decided)) |
 
 **The prelude** is a list of `import` statements of std modules (`stdlib/prelude.cambra`). Every
 module outside the std root reaches each of their `use` items by its name, without an import, and
@@ -6429,10 +6430,10 @@ instance Addable(Int, Int):
 Checked lookup `c[k]` returns `std`'s `Option` even in a module that declares its own
 `Option`. See [Subscript and unwrap syntax](#subscript-and-unwrap-syntax).
 
-**[Planned]** — `std::http` and `std::time`:
+**[Planned]** — `std::http` and the alarm source and sink in `std::time`:
 `import std::http` binds `http`, then `http::serve(…)` and `http::ok(…)` ([7.3
-Sources](#73-sources)), and `import std::time` binds `time`, then `time::now()` and
-`time::alarms()` ([7.5 Time [Decided]](#75-time-decided)). A builtin source, sink, or
+Sources](#73-sources)), and `import std::time` binds `time`, then the implemented `time::now()` and
+the planned `time::alarms()` ([7.5 Time [Decided]](#75-time-decided)). A builtin source, sink, or
 special form a std module provides is recognized by what a name resolves to, not by how it is spelled.
 After
 `import std::http as web`, `reqs, resps = web::serve(…)` is the same form as `http::serve(…)`, and
