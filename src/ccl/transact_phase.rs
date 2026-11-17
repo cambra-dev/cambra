@@ -65,7 +65,7 @@
 use crate::ccl::Label;
 use crate::ccl::Occurrence;
 use crate::ccl::RecordEntry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::ccl::{
     BaseType, BinOpKind, Builtin, Expr, F_DECISION, F_TIME, F_WRITE, F_WRITE_TARGETS, FieldKey,
@@ -285,13 +285,34 @@ fn compile_blocks(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Loca
     if txn_mut_vars.is_empty() && !contains_begin(&expr) {
         return Ok(expr);
     }
-    // A write inside a `Case` bound by a `Let` is off the statement spine, so its
-    // advance would be scoped to the branch and dropped. The writer walk merges the
-    // `Case` inside a `with begin():` block, and the letrec phase merges it at the top
-    // level; the binding is pushed into the branches only where neither does, the
-    // same normalization the letrec phase applies through `flatten_spine`.
+    // Move the writes a function call makes out into the statements around the call. When a
+    // call to a function that writes its argument is inlined, the write ends up inside the value
+    // of the binding that holds the call's result:
+    //
+    //     def bump(p: Mut(Int)):
+    //         p := p + 1
+    //         p * 10
+    //
+    //     y = bump(c)     is inlined as     y = (c := c + 1; c * 10)
+    //
+    // This phase finds a loop's writes by looking at its statements, so it would not see that
+    // write, and a block in the loop that reads `c` would read it as if the loop never wrote it.
+    // The letrec phase (`crate::ccl::mut_elim::run`) runs the same normalization, which turns the
+    // binding into
+    //
+    //     c := c + 1
+    //     y = c * 10
+    //
+    // Running it here first lets this phase see the write too. A write in one branch of an `if`
+    // cannot move out ahead of the `if`; the binding moves into the branches instead, except
+    // where a later pass handles the `if` where it stands.
     let expr = flatten_begin_bodies(expr);
-    let expr = crate::ccl::mut_elim::push_bindings_into_writing_cases(expr);
+    let expr = crate::ccl::mut_elim::flatten_spine(
+        crate::ccl::mut_elim::push_bindings_into_writing_cases(
+            crate::ccl::mut_elim::peel_effectful_outputs(expr),
+        ),
+        crate::ccl::mut_elim::Spine::OutsideLoops,
+    );
     // A statement whose effect is a `Let` hides that binding from the rest of
     // the spine, which is where this phase places the stores' `Transact`s that
     // read it. Lift it onto the spine first.
@@ -939,9 +960,19 @@ impl Snapshot<'_> {
         snapshots: &mut Vec<(Name, Name)>,
     ) -> (Vec<(Name, Name)>, Expr) {
         let mut writes = Vec::new();
-        // What a block writes of an accumulator is moved after it (`partition_block`), which
-        // orders its own reads of that accumulator.
+        // A block's reads of a loop variable it writes itself get their snapshots inside the
+        // block ([`Snapshot::snapshot_reads_of_its_own_writes`]). The snapshots below are taken
+        // ahead of the block.
         let own = loop_induction_writes(&e, self.txn_mut_vars);
+        if let TypedExprNode::Begin { body, .. } = &mut e.node {
+            let own: HashSet<Name> = own.intersection(accumulators).cloned().collect();
+            if !own.is_empty() {
+                let taken = std::mem::take(&mut **body);
+                **body = self
+                    .snapshot_reads_of_its_own_writes(taken, &own, after, snapshots)
+                    .0;
+            }
+        }
         let mut snapshot = |e: &mut Expr, writes: &mut Vec<(Name, Name)>| {
             for n in free_names_in_value(e) {
                 if accumulators.contains(&n) && after.contains(&n) && !own.contains(&n) {
@@ -1003,6 +1034,117 @@ impl Snapshot<'_> {
             _ => {}
         }
         (writes, e.absorbing_children_capabilities())
+    }
+
+    /// Make each read in a block of a loop variable the block itself writes see the variable's
+    /// value at the read. `e` is the block's statements, `own` the loop variables the block
+    /// writes, and `after` the loop variables the iteration writes after the block.
+    ///
+    /// A block reads a loop variable's value at the end of the iteration. A read followed by
+    /// another write of the variable, in the block or later in the iteration, would see that
+    /// write, so the read is renamed to a snapshot written just before it inside the block:
+    ///
+    /// ```text
+    /// with begin():                      with begin():
+    ///     pool := pool - n                   __n_at0 := n
+    ///     n := n + r          becomes        pool := pool - __n_at0
+    ///                                        n := n + r
+    /// ```
+    ///
+    /// [`partition_block`] then moves `__n_at0 := n` and `n := n + r` out of the block, onto the
+    /// loop just after it, in that order. `__n_at0` holds `n` as the read saw it. A read that only
+    /// feeds one of the moved writes, such as the `n` in `n := n + r`, moves with that write and
+    /// needs no snapshot.
+    ///
+    /// Returns the rewritten statements and the names free in the part of them
+    /// [`partition_block`] keeps in the block. A binding outside that part feeds only moved writes.
+    fn snapshot_reads_of_its_own_writes(
+        &self,
+        e: Expr,
+        own: &HashSet<Name>,
+        after: &HashSet<Name>,
+        snapshots: &mut Vec<(Name, Name)>,
+    ) -> (Expr, BTreeSet<Name>) {
+        let node_id = e.node_id();
+        let ty = e.ty.clone();
+        let later = |rest: &Expr| -> HashSet<Name> {
+            loop_induction_writes(rest, self.txn_mut_vars)
+                .into_iter()
+                .chain(after.iter().cloned())
+                .filter(|n| own.contains(n))
+                .collect()
+        };
+        match e.node {
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } => {
+                let later = later(&body);
+                let (body, mut kept) =
+                    self.snapshot_reads_of_its_own_writes(*body, own, after, snapshots);
+                let mut bound_expr = *bound_expr;
+                let mut writes = Vec::new();
+                if kept.remove(&binding.name) {
+                    writes = self.rename_reads_to_snapshots(&mut bound_expr, &later, snapshots);
+                    kept.extend(free_names_in_value(&bound_expr));
+                }
+                let stmt = Expr::let_in_preserving(node_id, binding, bound_expr, body)
+                    .with_ty(ty)
+                    .absorbing_children_capabilities();
+                (self.prepend(writes, stmt, node_id), kept)
+            }
+            TypedExprNode::ExprStmt { expr: effect, body } => {
+                let later = later(&body);
+                let (body, mut kept) =
+                    self.snapshot_reads_of_its_own_writes(*body, own, after, snapshots);
+                let mut effect = *effect;
+                let mut writes = Vec::new();
+                let lifted = matches!(&effect.node, TypedExprNode::MutWrite { name, .. }
+                    if !self.txn_mut_vars.contains(name));
+                if !lifted {
+                    writes = self.rename_reads_to_snapshots(&mut effect, &later, snapshots);
+                    kept.extend(free_names_in_value(&effect));
+                }
+                let stmt = Expr::expr_stmt_preserving(node_id, effect, body)
+                    .with_ty(ty)
+                    .absorbing_children_capabilities();
+                (self.prepend(writes, stmt, node_id), kept)
+            }
+            TypedExprNode::MutDecl { .. } => {
+                unreachable!("lowering declares no mutable variable inside a `with begin():` block")
+            }
+            node => {
+                let mut e = Expr { node, ..e };
+                let later = own.intersection(after).cloned().collect();
+                let writes = self.rename_reads_to_snapshots(&mut e, &later, snapshots);
+                let kept = free_names_in_value(&e);
+                (
+                    self.prepend(writes, e.absorbing_children_capabilities(), node_id),
+                    kept,
+                )
+            }
+        }
+    }
+
+    /// Rename each read in `e` of a loop variable in `later` to a fresh snapshot of it, and return
+    /// the snapshot writes that go just before `e`.
+    fn rename_reads_to_snapshots(
+        &self,
+        e: &mut Expr,
+        later: &HashSet<Name>,
+        snapshots: &mut Vec<(Name, Name)>,
+    ) -> Vec<(Name, Name)> {
+        let mut writes = Vec::new();
+        for n in free_names_in_value(e) {
+            if later.contains(&n) {
+                let fresh = self.fresh(&n);
+                rename_var_uses(e, &n, &fresh);
+                snapshots.push((fresh.clone(), n.clone()));
+                writes.push((fresh, n));
+            }
+        }
+        writes
     }
 
     /// `stmt` after a write of each snapshot in `writes`, in order.
