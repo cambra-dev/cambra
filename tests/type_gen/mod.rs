@@ -2,10 +2,10 @@
 //! fuzz the solver. Deterministic and dependency-free, so a failing case
 //! replays from its seed.
 //!
-//! Two test binaries include it: `it`, for the constraint-order fuzz and the
-//! subtype-transitivity fuzz, and `differential_oracle`. Each compiles the whole
-//! module and leaves some items unused; those items carry an `allow(dead_code)`
-//! naming the binary that uses them.
+//! Two compiles include it: the suite's `it` module, for the constraint-order fuzz
+//! and the subtype-transitivity fuzz, and the `differential_oracle` test binary.
+//! Each compiles the whole module and leaves some items unused; those items carry
+//! an `allow(dead_code)` naming the one that uses them.
 
 use cambra::ccl::Occurrence;
 use std::rc::Rc;

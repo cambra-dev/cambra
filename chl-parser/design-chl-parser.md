@@ -763,4 +763,4 @@ cannot exhaust the stack. The grammar does not specify a portable maximum nestin
   assert the AST shape only at the level required to catch regressions.
 
 Run with `cargo test -p chl-parser` for the unit tests and
-`cargo test --test it chl_parser_roundtrip::` for the integration tests.
+`cargo test -p cambra --lib chl_parser_roundtrip::` for the integration tests.

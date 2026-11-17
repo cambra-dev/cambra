@@ -142,16 +142,11 @@ jobs:
         if: success() || failure()
         run: ./ci.sh fmt
 
-      - name: Clippy (lib only)
-        # Both passes above use `--all-targets`, which unifies the *self*
-        # dev-dependency's `test-helpers` feature into the lib under test — so
-        # they only ever compile the library with that feature ON, and the
-        # feature-off configuration a consumer builds is compiled by nothing.
-        # Resolver 3 keeps the feature out of a plain lib build, so the gap is
-        # silent: ungated code calling a gated item passes both and fails
-        # `cargo build --lib`.
+      - name: Clippy (oracle)
+        # The library with `test-helpers` on, and the differential oracle that turns
+        # it on: the `--all-targets` passes compile neither (`ci.sh`, `ci_clippy_oracle`).
         if: success() || failure()
-        run: ./ci.sh clippy_lib
+        run: ./ci.sh clippy_oracle
 
       - name: Doc
         # Builds rustdoc with broken intra-doc links denied, which is what makes
@@ -221,9 +216,9 @@ jobs:
 
   # The golden wire fixtures: regenerate into a temp dir and diff against the
   # committed corpus, plus the orphan-fixture check. Its own job because
-  # `regen-fixtures.sh` drives a bare `cargo run`, which resolves without the
-  # self dev-dependency and so builds the `test-helpers`-off configuration —
-  # a different build from the one the suite compiles, sharing nothing with it.
+  # `regen-fixtures.sh` drives a bare `cargo run`, which builds the library and
+  # executable as a consumer does — a build the suite, compiling only the
+  # library's test build, shares nothing with.
   fixtures:
     needs: repo_checks
     if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}

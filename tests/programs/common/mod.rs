@@ -65,7 +65,7 @@ use std::{
     cell::RefCell,
     io::Write,
     panic::{self, AssertUnwindSafe},
-    process::{Command, Stdio},
+    process::Stdio,
     rc::Rc,
 };
 
@@ -191,8 +191,8 @@ pub fn expect_scalar_currently_buggy(source: &str, current_buggy_output: &str) {
 /// descriptor.
 ///
 /// `program_name` is the test-programs subdirectory name (e.g.
-/// `"streaming_echo"`).  The binary path is resolved via
-/// `CARGO_BIN_EXE_cambra`, which Cargo populates for integration tests.
+/// `"streaming_echo"`).  The command line runs as the test executable
+/// ([`crate::it::cli`]).
 ///
 /// Output verification is substring-based because the binary prints
 /// `Got value: <Debug-formatted Tile>` for each scheduler tick; the final
@@ -201,11 +201,10 @@ pub fn expect_scalar_currently_buggy(source: &str, current_buggy_output: &str) {
 /// detect regressions (a missing or misformatted line breaks the
 /// assertion) without coupling to the Debug layout.
 pub fn expect_stdin_program(program_name: &str, stdin_input: &str, expected_substrings: &[&str]) {
-    let cambra = env!("CARGO_BIN_EXE_cambra");
     let manifest = env!("CARGO_MANIFEST_DIR");
     let program_path = format!("{manifest}/tests/programs/{program_name}/program.cambra");
 
-    let mut child = Command::new(cambra)
+    let mut child = crate::it::cli::command()
         .arg(&program_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

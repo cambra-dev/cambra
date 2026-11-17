@@ -6078,7 +6078,7 @@ pub struct RefinementSet(Vec<Refinement>);
 ///
 /// The knob is compiled into debug builds and test builds only, so a shipped compiler cannot be
 /// perturbed by the environment.
-#[cfg(any(debug_assertions, test, feature = "test-helpers"))]
+#[cfg(any(debug_assertions, test))]
 mod refinement_order {
     use std::cell::Cell;
     use std::hash::{DefaultHasher, Hash, Hasher};
@@ -6166,7 +6166,7 @@ mod refinement_order {
     }
 }
 
-#[cfg(not(any(debug_assertions, test, feature = "test-helpers")))]
+#[cfg(not(any(debug_assertions, test)))]
 mod refinement_order {
     use chl_parser::source_map::SourceMap;
 

@@ -27,7 +27,7 @@ fn with_random_and(root: &str, modules: &[(&str, &str)]) -> LoadedProgram {
         module: None,
         text: root.to_owned(),
     };
-    crate::std_root::load_against_std(root, &mut files)
+    crate::it::std_root::load_against_std(root, &mut files)
 }
 
 #[rstest]

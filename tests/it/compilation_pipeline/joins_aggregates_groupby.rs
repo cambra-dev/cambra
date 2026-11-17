@@ -1655,12 +1655,13 @@ fn a_nested_for_over_a_groups_rows() {
     let mut child = std::process::Command::new("sh")
         .arg("-c")
         .arg(format!("ulimit -v {ADDRESS_SPACE_KIB}; exec \"$0\" \"$1\""))
-        .arg(env!("CARGO_BIN_EXE_cambra"))
+        .arg(crate::it::cli::executable())
         .arg(&path)
+        .env(crate::it::cli::AS_CLI, "1")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("the cambra binary spawns");
+        .expect("the command line spawns");
     // Drained while the child runs, so a child that fills the pipe is not blocked writing it.
     let mut stderr = child.stderr.take().expect("stderr is piped");
     let reader = std::thread::spawn(move || {

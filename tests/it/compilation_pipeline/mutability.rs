@@ -1030,7 +1030,7 @@ fn the_exact_mut_spelling_the_diagnostic_names_compiles() {
             y += 5
             y
         "#},
-        cambra::interpreter::Value::Int(5),
+        Value::Int(5),
     );
 }
 
@@ -1104,7 +1104,7 @@ fn per_iteration_value_binding_inside_a_loop_is_allowed() {
                 t += y
             t
         "#},
-        cambra::interpreter::Value::Int(6),
+        Value::Int(6),
     );
 }
 
@@ -1163,7 +1163,7 @@ fn plain_assignment_off_a_mutable_is_a_value_read() {
             b = a
             b
         "#},
-        cambra::interpreter::Value::Int(5),
+        Value::Int(5),
     );
 }
 
@@ -1243,7 +1243,7 @@ fn an_equal_width_mut_parameter_still_accepts_a_mut_var() {
                 bump(x)
             x
         "#},
-        cambra::interpreter::Value::Int(3),
+        Value::Int(3),
     );
 }
 
@@ -1439,7 +1439,7 @@ fn a_programs_tail_read_of_its_accumulator_is_a_value() {
             y = 1
             x
         "#},
-        cambra::interpreter::Value::Int(6),
+        Value::Int(6),
     );
 }
 
@@ -1524,7 +1524,7 @@ fn mut_registry_does_not_leak_into_a_shadowing_param() {
                 n = n + 1
                 n
             h(10)"#},
-        cambra::interpreter::Value::Int(11),
+        Value::Int(11),
     );
 }
 #[test]
@@ -1536,7 +1536,7 @@ fn mut_collection_as_for_source_derefs() {
             for i in xs:
                 total := total + i
             total"#},
-        cambra::interpreter::Value::Int(6),
+        Value::Int(6),
     );
 }
 // Multi-parameter pass-by-reference: a `Mut` parameter alongside a plain one is
@@ -1552,7 +1552,7 @@ fn multi_param_pass_by_ref_assign_works() {
             cnt: Mut(Int) := 0
             add_to(cnt, 5)
             cnt"#},
-        cambra::interpreter::Value::Int(5),
+        Value::Int(5),
     );
 }
 #[test]
@@ -1564,7 +1564,7 @@ fn multi_param_pass_by_ref_augassign_works() {
             cnt: Mut(Int) := 0
             f(cnt, 7)
             cnt"#},
-        cambra::interpreter::Value::Int(7),
+        Value::Int(7),
     );
 }
 #[test]
@@ -1591,7 +1591,7 @@ fn nonmut_param_reads_mut_arg_current_value() {
             def g(a: Int):
                 a + 1
             g(cnt)"#},
-        cambra::interpreter::Value::Int(6),
+        Value::Int(6),
     );
 }
 // The enforced annotation has force even when the argument is a mutable
@@ -1635,7 +1635,7 @@ fn single_param_pass_by_ref_still_works() {
                 c := c + 1
             bump(cnt)
             cnt"#},
-        cambra::interpreter::Value::Int(1),
+        Value::Int(1),
     );
 }
 // Regression: a pass-by-reference writer that computes an *intermediate* binding
@@ -1654,7 +1654,7 @@ fn pass_by_ref_writer_with_intermediate_value_position() {
             cnt: Mut(Int) := 0
             y = f(cnt)
             cnt"#},
-        cambra::interpreter::Value::Int(1),
+        Value::Int(1),
     );
 }
 #[test]
@@ -1668,7 +1668,7 @@ fn pass_by_ref_writer_with_intermediate_in_loop() {
             for i in [1, 2, 3]:
                 y = f(cnt)
             cnt"#},
-        cambra::interpreter::Value::Int(3),
+        Value::Int(3),
     );
 }
 // The writer applied as a *bare statement* (not `y = …`) with several
@@ -1686,7 +1686,7 @@ fn pass_by_ref_writer_with_intermediates_bare_statement_loop() {
             for i in [1, 2, 3]:
                 f(cnt)
             cnt"#},
-        cambra::interpreter::Value::Int(33),
+        Value::Int(33),
     );
 }
 /// A bare `_` declares nothing, so `b: _ = a` is exactly `b = a`: a value read,
@@ -1702,7 +1702,7 @@ fn wildcard_annotated_copy_of_a_mutable_is_a_value_read() {
             b: _ = a
             b
         "#},
-        cambra::interpreter::Value::Int(5),
+        Value::Int(5),
     );
     expect_mut_discipline_error(
         indoc! {r#"
@@ -1721,7 +1721,7 @@ fn typed_deref_copy_of_mut_still_works() {
             a: Mut(Int) := 5
             b: Int = a
             b"#},
-        cambra::interpreter::Value::Int(5),
+        Value::Int(5),
     );
 }
 
@@ -1741,7 +1741,7 @@ fn deref_copy_snapshots_the_value_at_its_position() {
             y: Int = x
             x += 4
             y"#},
-        cambra::interpreter::Value::Int(1),
+        Value::Int(1),
     );
 }
 
@@ -1756,7 +1756,7 @@ fn mutable_reads_are_positional() {
             x += 4
             y: Int = x
             y"#},
-        cambra::interpreter::Value::Int(5),
+        Value::Int(5),
     );
     check_scalar(
         indoc::indoc! {r#"
@@ -1764,7 +1764,7 @@ fn mutable_reads_are_positional() {
             y: Int = x
             x += 4
             x"#},
-        cambra::interpreter::Value::Int(5),
+        Value::Int(5),
     );
 }
 
@@ -1781,7 +1781,7 @@ fn deref_copy_is_a_value_not_a_mutable_alias() {
             y: Int = x
             z = y
             z"#},
-        cambra::interpreter::Value::Int(1),
+        Value::Int(1),
     );
 }
 
@@ -1830,7 +1830,7 @@ fn deref_copy_is_a_value_not_a_mutable_alias() {
     inc(x)
 "#})]
 fn a_mut_var_passed_to_a_value_parameter_reads_its_value(#[case] code: &str) {
-    check_scalar(code, cambra::interpreter::Value::Int(5));
+    check_scalar(code, Value::Int(5));
 }
 
 /// The same read from *inside* the loop that writes the mutable variable — the combination the
@@ -1848,7 +1848,7 @@ fn a_mut_var_read_through_a_udf_inside_its_own_loop() {
                 x += id(x)
             x
         "#},
-        cambra::interpreter::Value::Int(40),
+        Value::Int(40),
     );
 }
 
@@ -1876,7 +1876,7 @@ fn genuine_mutable_still_accumulates() {
             for i in [1, 2, 3]:
                 x += i
             x"#},
-        cambra::interpreter::Value::Int(6),
+        Value::Int(6),
     );
 }
 
@@ -1901,7 +1901,7 @@ fn non_mut_redef_shadows_mut_param_fn_lowers_tupled() {
             def f(a, b):
                 a + b
             f(10, 20)"#},
-        cambra::interpreter::Value::Int(30),
+        Value::Int(30),
     );
 }
 
@@ -1926,7 +1926,7 @@ fn nested_mut_param_fn_does_not_leak_to_outer_same_named_call() {
                 bump(y)
                 y + z
             r + outer(100)"#},
-        cambra::interpreter::Value::Int(108),
+        Value::Int(108),
     );
 }
 
@@ -2140,7 +2140,7 @@ fn a_mut_param_still_binds_a_mut_var() {
             bump(x)
             x
         "#},
-        cambra::interpreter::Value::Int(1),
+        Value::Int(1),
     );
 }
 
@@ -3298,7 +3298,7 @@ fn a_mut_loop_over_a_map_carries_its_accumulator() {
                 total += v
             total
         "#},
-        cambra::interpreter::Value::Int(3),
+        Value::Int(3),
     );
 }
 
@@ -3352,7 +3352,7 @@ fn a_mut_loop_over_a_groupby_carries_its_accumulator() {
                 total += sum([s.amount for s in g])
             total
         "#},
-        cambra::interpreter::Value::Int(150),
+        Value::Int(150),
     );
 }
 
@@ -3367,7 +3367,7 @@ fn a_mut_loop_inside_a_groupby_loop() {
                     n += i
             n
         "#},
-        cambra::interpreter::Value::Int(9),
+        Value::Int(9),
     );
 }
 
@@ -3416,7 +3416,7 @@ fn a_later_accumulator_seeds_from_a_long_loops_result(#[case] n: i64, #[case] ex
             "#},
             items = items,
         ),
-        cambra::interpreter::Value::Int(expected),
+        Value::Int(expected),
     );
 }
 
@@ -3440,7 +3440,7 @@ fn a_loop_that_runs_no_position_answers_with_a_late_seed(#[case] source: &str) {
             "#},
             source = source,
         ),
-        cambra::interpreter::Value::Int(6),
+        Value::Int(6),
     );
 }
 
@@ -3464,7 +3464,7 @@ fn a_store_waits_for_every_accumulators_seed() {
                 c += y
             b + c
         "#},
-        cambra::interpreter::Value::Int(58 + 103),
+        Value::Int(58 + 103),
     );
 }
 

@@ -1614,12 +1614,12 @@ fn duplicate_node_ids(expr: &Expr) -> Vec<(NodeId, &'static str)> {
 /// make two nodes share one provenance row and one attribution.
 /// The assertions name the checked `boundary`.
 ///
-/// Checks run only under `cfg!(any(debug_assertions, test))`. The function remains
+/// Checks run only under `cfg!(debug_assertions)`. The function remains
 /// compiled in every configuration so ungated callers compile in release builds.
 /// It checks the tree at this boundary, independently of pipeline phase order.
 /// See `src/ccl/design/provenance.md`, "Walking the ids".
 pub(crate) fn assert_unique_node_ids(expr: &Expr, boundary: &str) {
-    if !cfg!(any(debug_assertions, test)) {
+    if !cfg!(debug_assertions) {
         return;
     }
     let dups = duplicate_node_ids(expr);
@@ -1720,10 +1720,10 @@ pub(crate) fn provenance_capture_enabled() -> bool {
 /// including corpus tests, materialize and check pairs.
 ///
 /// A debug test build checks by default so that every test compile is in the gate's corpus.
-/// `gate_leaks` asserts only in debug and test builds, so a build without debug assertions would
+/// `gate_leaks` asserts only in debug builds, so a build without debug assertions would
 /// materialize pairs and check nothing.
 fn provenance_gate_every_compile() -> bool {
-    let default = cfg!(all(debug_assertions, any(test, feature = "test-helpers")));
+    let default = cfg!(all(debug_assertions, test));
     let gated = match std::env::var(PROVENANCE_GATE_ENV) {
         Ok(v) => v != "0",
         Err(_) => default,

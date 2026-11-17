@@ -94,8 +94,8 @@ Building checks those declarations and evaluates their `#guard` assertions.
 `./ci.sh formal` builds the model and then names the Rust integration target explicitly:
 
 ```bash
-cargo test --test differential_oracle -- --nocapture
-CAMBRA_DIFF_N=20000 CAMBRA_DIFF_SEED=7 cargo test --test differential_oracle -- --nocapture
+cargo test --features test-helpers --test differential_oracle -- --nocapture
+CAMBRA_DIFF_N=20000 CAMBRA_DIFF_SEED=7 cargo test --features test-helpers --test differential_oracle -- --nocapture
 ```
 
 `Cargo.toml` sets `test = false` for this target, so a plain `cargo test` does not run it.

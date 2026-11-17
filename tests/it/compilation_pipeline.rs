@@ -61,4 +61,4 @@ mod type_parameters;
 mod variants;
 
 // Shared with the other suites that catch a panic, so it lives under `tests/support/`.
-use crate::panic_message;
+use crate::it::panic_message;

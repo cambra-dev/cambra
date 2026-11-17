@@ -845,7 +845,7 @@ fn a_statement_calling_a_parameter_is_kept() {
             "},
             &[],
         ),
-        cambra::interpreter::Value::Int(2),
+        Value::Int(2),
     );
 }
 
@@ -1101,7 +1101,7 @@ fn an_inferred_requirement_does_what_each_use_selects(
     );
     let loaded = program(&root, &[("lib", INFERRED_LIB)]);
     match refused {
-        None => super::helpers::check_program_scalar(&loaded, cambra::interpreter::Value::Int(3)),
+        None => super::helpers::check_program_scalar(&loaded, Value::Int(3)),
         Some(needle) => {
             let errors = super::modules::compile_errors(&loaded);
             assert!(errors.contains(needle), "{errors}");
@@ -1118,7 +1118,7 @@ fn an_inferred_requirement_does_what_each_use_selects(
 fn a_trait_whose_instance_writes_state_runs(#[case] call: &str) {
     super::helpers::check_program_scalar(
         &program(&format!("{TAKE}\n{call}\n"), &[]),
-        cambra::interpreter::Value::Int(3),
+        Value::Int(3),
     );
 }
 
@@ -1320,7 +1320,7 @@ fn a_function_handed_to_an_outer_variable_is_refused(#[case] code: &str, #[case]
     f(2)
 "})]
 fn a_returned_closure_over_what_outlives_it_is_kept(#[case] root: &str) {
-    super::helpers::check_program_scalar(&program(root, &[]), cambra::interpreter::Value::Int(3));
+    super::helpers::check_program_scalar(&program(root, &[]), Value::Int(3));
 }
 
 /// A program whose `in_txn` calls its parameter inside a block.
@@ -1370,7 +1370,7 @@ fn a_pure_function_through_a_polymorphic_block_runs() {
             &format!("{IN_TXN}\nin_txn(\\x -> x, 1)\nawait_final(stock)\n"),
             &[],
         ),
-        cambra::interpreter::Value::Int(9),
+        Value::Int(9),
     );
 }
 

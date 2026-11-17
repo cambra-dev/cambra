@@ -29,7 +29,7 @@ fn labels(code: &str) -> (String, Vec<(String, String)>) {
     let [CompileError::Infer { span, related, .. }] = errs.as_slice() else {
         panic!("expected one located inference error, got {errs:?}");
     };
-    let text = |s: &cambra::chl_parser::ast::Span| code[s.start..s.end].to_string();
+    let text = |s: &chl_parser::ast::Span| code[s.start..s.end].to_string();
     (
         text(span),
         related
