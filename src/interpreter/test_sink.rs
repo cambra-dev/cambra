@@ -42,6 +42,8 @@ impl std::fmt::Display for SinkReadError {
 /// successive tiles carry disjoint parts of one value and this accumulates them with
 /// [`Tile::merge`], the tiling's own combining operation. `merge` validates its result only
 /// in a debug build, so [`Self::value`] validates the accumulated tile before reading it.
+/// The tiles arrive in the order their packages land, which with more than one worker is not
+/// key order, so the value read is in key order ([`Value::in_key_order`]).
 ///
 /// A sink outlives a version, so a reload's replacement keeps writing to the same one and it
 /// accumulates across the reload (`a_sink_accumulates_across_a_reload`).
@@ -63,7 +65,7 @@ impl TestSink {
         if !validate_tile(tile) {
             return Err(SinkReadError::Malformed(format!("{tile:?}")));
         }
-        Ok(tile_rows(tile, 1)?.remove(0))
+        Ok(tile_rows(tile, 1)?.remove(0).in_key_order())
     }
 
     /// What the program wrote, once it is complete.
@@ -76,7 +78,7 @@ impl TestSink {
         if !validate_tile(tile) {
             return Err(SinkReadError::Malformed(format!("{tile:?}")));
         }
-        Ok(tile_rows(tile, 1)?.remove(0))
+        Ok(tile_rows(tile, 1)?.remove(0).in_key_order())
     }
 }
 
