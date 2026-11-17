@@ -1402,8 +1402,12 @@ what each transaction read, and the key says which iteration replied.
 At runtime the store keys the tap by commit tick, as it keys every write. The `TransactWriter`
 commits each tap value as the pair of the item's source position, which the `TransactDriver`'s rows
 carry, and the value, and op-conversion reads the tap through `RekeySorted`, which re-keys the
-pairs by position. That re-keying rests on a site committing its items once each and in its
-source's order, which the `TransactDriver` guarantees by driving one item at a time
+pairs by position. A site commits each item once. A stream's positions are delivered in their own
+order, so a site over a stream commits its items in that order: an item's reply settles every key up
+to the item's own, a denied item's below it included, and the read completes each reply as it
+commits. A product, a concatenation or a keyed collection delivers its items in no fixed order, so a
+site over one can commit a smaller item after a larger one: the read settles each item's key at that
+item's reply, and the key of an item that replied nothing once the site finishes
 ([design-operators.md](../../interpreter/design-operators.md#the-commit-operator-interpretercommit_operatorrs),
 `RekeySorted`).
 
