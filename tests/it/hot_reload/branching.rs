@@ -28,7 +28,7 @@ use cambra::{
         context::{GlobalContext, Phase},
     },
     control_port::{ControlReply, ControlRequest, service},
-    interpreter::{BaseType, Extent, Predicate, TestDataSource, Value, pull_laps},
+    interpreter::{BaseType, Extent, Predicate, TestDataSource, Value},
     live_program::{BranchError, LiveProgram, MAIN_BRANCH},
 };
 
@@ -106,8 +106,8 @@ fn log_of(live: &LiveProgram, name: &str) -> String {
 /// `main` running `running-log`, with `/set a` and `/set b` committed.
 fn running_log_with_ab() -> (u16, GlobalContext, LiveProgram) {
     let port = reserve_test_port();
-    let (mut ctx, live) = start_sink(&source("running-log", port));
-    let replies = exchange(&mut ctx, move || {
+    let (ctx, mut live) = start_sink(&source("running-log", port));
+    let replies = exchange(&mut live, move || {
         vec![http_post(port, "/set", "a"), http_post(port, "/set", "b")]
     });
     assert_eq!(replies, vec!["ok\n", "ok\n"]);
@@ -160,9 +160,11 @@ fn branch_and_reload_creates_a_branch_forked_from_its_parent() {
         "{}",
         reply.body
     );
+    // A store opens once its branch runs, so the branch holds its value only after a run.
+    crate::it::serving::dispatch_until_idle(&mut live);
     assert_eq!(log_of(&live, "staging"), "ab", "forked from main's value");
 
-    let replies = exchange(&mut ctx, move || {
+    let replies = exchange(&mut live, move || {
         vec![
             http_post(port, "/set", "c"),
             http_get(port, "/get"),
@@ -256,6 +258,7 @@ fn a_duplicate_name_is_refused_and_an_unknown_parent_is_not_found() {
     assert_eq!(orphan.status, 404, "{}", orphan.body);
 
     assert_eq!(list(&mut ctx, &mut live), before);
+    crate::it::serving::dispatch_until_idle(&mut live);
     assert_eq!(
         log_of(&live, "staging"),
         "ab",
@@ -277,7 +280,7 @@ fn a_parents_reload_leaves_its_child_untouched() {
         .status,
         200
     );
-    let _ = exchange(&mut ctx, move || vec![http_post(port, "/set", "c")]);
+    let _ = exchange(&mut live, move || vec![http_post(port, "/set", "c")]);
     let staging_ops = live.held_operators("staging").expect("exists");
 
     let reply = ask(
@@ -299,7 +302,7 @@ fn a_parents_reload_leaves_its_child_untouched() {
         "every operator the child holds is alive"
     );
 
-    let replies = exchange(&mut ctx, move || {
+    let replies = exchange(&mut live, move || {
         vec![
             http_post(port, "/set", "d"),
             http_get(port, "/get"),
@@ -324,7 +327,7 @@ fn a_childs_reload_keeps_its_own_accumulated_value() {
         .status,
         200
     );
-    let _ = exchange(&mut ctx, move || vec![http_post(port, "/set", "c")]);
+    let _ = exchange(&mut live, move || vec![http_post(port, "/set", "c")]);
     assert_eq!(log_of(&live, MAIN_BRANCH), "abc");
     assert_eq!(log_of(&live, "staging"), "ab-c");
 
@@ -334,13 +337,14 @@ fn a_childs_reload_keeps_its_own_accumulated_value() {
         reload("staging", with_port(PLUSSED_LOG, port)),
     );
     assert_eq!(reply.status, 200, "{}", reply.body);
+    crate::it::serving::dispatch_until_idle(&mut live);
     assert_eq!(
         log_of(&live, "staging"),
         "ab-c",
         "seeded from its own value"
     );
 
-    let replies = exchange(&mut ctx, move || {
+    let replies = exchange(&mut live, move || {
         vec![
             http_post(port, "/set", "d"),
             http_get(port, "/get"),
@@ -631,6 +635,7 @@ fn a_recreated_name_continues_its_tombstones_numbering() {
         ["3"],
         "the tombstone's versions are not the new entry's"
     );
+    crate::it::serving::dispatch_until_idle(&mut live);
     assert_eq!(log_of(&live, "staging"), "ab", "forked afresh from main");
 }
 
@@ -671,7 +676,7 @@ fn deleting_a_branch_frees_only_what_no_other_entry_holds() {
         );
     }
     assert_eq!(live.branches()[0].shared, 0, "main now shares nothing");
-    let replies = exchange(&mut ctx, move || {
+    let replies = exchange(&mut live, move || {
         vec![http_post(port, "/set", "c"), http_get(port, "/get")]
     });
     assert_eq!(replies, vec!["ok\n", "abc"], "main keeps serving");
@@ -710,7 +715,7 @@ fn the_last_branch_cannot_be_deleted() {
         response.lines().next().unwrap_or_default().to_string()
     };
     assert_eq!(
-        exchange(&mut ctx, move || get_status(port)),
+        exchange(&mut live, move || get_status(port)),
         "HTTP/1.1 200 OK",
         "main serves `/get` while it runs"
     );
@@ -754,7 +759,7 @@ fn the_last_branch_cannot_be_deleted() {
     }
     assert!(live.program(MAIN_BRANCH).is_none());
 
-    let replies = exchange(&mut ctx, move || {
+    let replies = exchange(&mut live, move || {
         vec![http_post(port, "/set", "c"), http_get(port, "/get2")]
     });
     assert_eq!(
@@ -822,11 +827,8 @@ fn add(src: &Rc<RefCell<TestDataSource>>, from: u64, values: &[i64]) {
 }
 
 /// Deliver and pull branch `name`'s `main` output until its fold settles.
-fn pull(ctx: &mut GlobalContext, live: &mut LiveProgram, name: &str) {
-    let producer = live
-        .main_producer_mut(name)
-        .expect("the program's value is `x`");
-    pull_laps(ctx.scheduler(), &mut **producer, 8, |_| false);
+fn pull(_ctx: &mut GlobalContext, live: &mut LiveProgram, name: &str) {
+    crate::it::serving::run_branch_to_idle(live, name);
 }
 
 fn x_of(live: &LiveProgram, name: &str) -> i64 {
@@ -1082,13 +1084,11 @@ fn a_lagging_branch_does_not_make_a_new_branch_fold_twice() {
 /// producer starts where `main`'s stopped: it transforms the second line and
 /// never the first.
 #[rstest::rstest]
-fn the_driver_pulls_every_branch_and_exits_when_all_have_finished(
-    #[values("0", "1")] dispatch: &str,
-) {
+fn the_driver_pulls_every_branch_and_exits_when_all_have_finished() {
     use std::io::Write;
     use std::time::Duration;
 
-    let mut launched = launch_under_control("[\"A\" + line for line in stdin()]\n", dispatch);
+    let mut launched = launch_under_control("[\"A\" + line for line in stdin()]\n");
     let control = launched.control;
     let mut input = launched.spawned.input.take().expect("piped stdin");
     let reader = launched.spawned.reader.take().expect("reader thread");
