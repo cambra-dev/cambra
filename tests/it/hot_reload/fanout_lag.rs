@@ -216,23 +216,31 @@ fn a_feed_reloaded_twice_resumes_after_each_cut() {
     }
 }
 
-/// A real-binary reload preserves the pull reader's release at the cut. A deferred release
-/// from the store's recurrence settles before its mutable borrow ends, so the new version
-/// starts after the last value the old version printed.
+/// A real-binary reload starts the rebuilt tap reader after the last value the old version
+/// printed, in pull mode and dispatched. With `a` and `b` sent before the reload and `c` after,
+/// the output is:
 ///
-/// With `a` and `b` sent before the reload and `c` after, the output is
-/// `["a", "ab", "abc"]`.
+/// ```text
+/// ["a", "ab", "abc"]
+/// ```
+///
+/// Dispatched, the store's recurrence has not released the last position when `--control`
+/// reloads, so the intersection of every slot's release trails the tap reader's own; the
+/// rebuilt reader starts at its predecessor's release, not at the intersection.
 ///
 /// The program of
 /// [`a_feed_read_by_a_sibling_that_takes_nothing_resumes_after_the_cut`], over
 /// `stdin`, reloaded through `--control` at a quiet point between lines.
-#[test]
-fn a_stdin_feed_preserves_its_release_when_its_other_writer_is_edited() {
+#[rstest::rstest]
+fn a_stdin_feed_resumes_after_the_cut_when_its_other_writer_is_edited(
+    #[values("0", "1")] dispatch: &str,
+) {
     let (reply, out) = stdin_across_reload(
         &feed("stdin()", true, ""),
         &feed("stdin()", true, "!"),
         "a\nb",
         "c",
+        dispatch,
     );
     assert!(
         reply.contains("reloaded"),
@@ -258,7 +266,7 @@ fn a_stdin_feed_preserves_its_release_when_its_other_writer_is_edited() {
     assert_eq!(
         printed,
         vec!["a", "ab", "abc"],
-        "the rebuilt pull reader resumes after the cut: {out}"
+        "each value prints once (dispatch {dispatch}): {out}"
     );
 }
 
