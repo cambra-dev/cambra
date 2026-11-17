@@ -405,8 +405,11 @@ impl Consumer for FlaggingConsumer {
 /// walked through to reach it and its collection depth. `complete` is the
 /// region of paths reaching this level the tile calls complete — its own statement, and
 /// the one above read a level further in, since a complete key is complete beneath.
+/// `absent` is the paths the level records absent in every region (`absent_keys`), kept apart
+/// from `complete` because an answer may leave it out.
 struct CompletionNode {
     complete: Predicate,
+    absent: Predicate,
 }
 
 /// One key or value of a tile, at the path that reaches it, so two outputs compare entry by
@@ -448,8 +451,10 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                 codomain,
                 domain_predicate,
                 deleted,
+                absent_keys,
             } => {
-                // The rule `Tile::completion_at` states.
+                // The rule `Tile::completion_at` states, without `absent_keys`, which `absent`
+                // holds.
                 let complete = match level {
                     0 => domain_predicate.clone(),
                     _ => above.descend(1).union(domain_predicate),
@@ -477,7 +482,13 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                     }
                 }
                 walk(codomain, label, level + 1, &keys, &complete, nodes, entries);
-                nodes.insert((label.to_vec(), level), CompletionNode { complete });
+                nodes.insert(
+                    (label.to_vec(), level),
+                    CompletionNode {
+                        complete,
+                        absent: absent_keys.clone(),
+                    },
+                );
             }
             Tile::Record { fields, .. } => {
                 for (field, field_tile) in fields {
@@ -700,7 +711,9 @@ fn released_cells_at(guard: &TileGuard, label: &[SmolStr]) -> Predicate {
 
 /// How `result` changes something `last` called complete, apart from removing what
 /// `released` has released since: the two rules of `src/interpreter/design-operators.md`,
-/// "The completeness contract". `None` where it changes nothing.
+/// "The completeness contract". `None` where it changes nothing. A key at a path `last` recorded
+/// absent breaks it too, released or not: the record holds in every region, and an answer that
+/// leaves the record out withdraws nothing.
 ///
 /// A statement covers every path at its level, including paths under rows that have not
 /// arrived, so the second rule applies to them too: a key appearing under a row called
@@ -773,17 +786,21 @@ fn completeness_violation(
         }
     }
     for (label, path) in result_entries.keys() {
+        if path.is_empty() {
+            continue;
+        }
+        if collection_of(&last_nodes, label, path).is_some_and(|n| n.absent.contains_path(path)) {
+            return Some(format!(
+                "{name} holds {label:?} at {path:?}, which it had recorded absent: {last:?} then \
+                 {result:?}"
+            ));
+        }
+    }
+    for (label, path) in result_entries.keys() {
         if last_entries.contains_key(&(label.clone(), path.clone())) || path.is_empty() {
             continue;
         }
-        // The collection an entry sits in: a key's own label, or for a value in a record's
-        // field, the label that record's collection was reached by.
-        let level = path.len() - 1;
-        let was_complete = (0..=label.len())
-            .rev()
-            .find_map(|n| last_nodes.get(&(label[..n].to_vec(), level)))
-            .is_some_and(|n| n.complete.contains_path(path));
-        if was_complete {
+        if collection_of(&last_nodes, label, path).is_some_and(|n| n.complete.contains_path(path)) {
             return Some(format!(
                 "{name} added {label:?} at {path:?}, beneath a path it had called complete: \
                  {last:?} then {result:?}"
@@ -791,6 +808,57 @@ fn completeness_violation(
         }
     }
     None
+}
+
+/// The collection level of `nodes` an entry at `label` and the non-empty `path` sits in: a key's
+/// own label, or for a value in a record's field, the label that record's collection was reached
+/// by. A key and the scalar value at its path are one entry.
+fn collection_of<'a>(
+    nodes: &'a HashMap<NodeKey, CompletionNode>,
+    label: &[SmolStr],
+    path: &[Value],
+) -> Option<&'a CompletionNode> {
+    let level = path.len() - 1;
+    (0..=label.len())
+        .rev()
+        .find_map(|n| nodes.get(&(label[..n].to_vec(), level)))
+}
+
+/// `stated` with every level's `absent_keys` united with `last`'s at the same level, so a record of
+/// absence outlives an answer that leaves it out. `stated` holds no key at a path `last` records
+/// absent: `completeness_violation` has checked it.
+fn keep_recorded_absence(last: &Tile, stated: &mut Tile) {
+    match (last, stated) {
+        (
+            Tile::DataFunction {
+                codomain: last_codomain,
+                absent_keys: last_absent,
+                ..
+            },
+            Tile::DataFunction {
+                codomain,
+                absent_keys,
+                ..
+            },
+        ) => {
+            *absent_keys = absent_keys.union(last_absent);
+            keep_recorded_absence(last_codomain, codomain);
+        }
+        (
+            Tile::Record {
+                fields: last_fields,
+                ..
+            },
+            Tile::Record { fields, .. },
+        ) => {
+            for (field, tile) in fields {
+                if let Some(last_field) = last_fields.get(field) {
+                    keep_recorded_absence(last_field, tile);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Identity, output shape, release state and notification/probe handles for a producer.
@@ -1480,7 +1548,12 @@ pub trait TileProducer {
                     last.merge(answered);
                     last
                 }
-                _ => result.clone(),
+                (_, Some(last)) => {
+                    let mut stated = result.clone();
+                    keep_recorded_absence(&last, &mut stated);
+                    stated
+                }
+                (_, None) => result.clone(),
             };
             self.base_mut().last_output = Some(stated);
         }
@@ -2234,6 +2307,7 @@ pub(crate) mod test_helpers {
                 ]))),
                 domain_predicate: Predicate::True,
                 deleted: BitSet::new(),
+                absent_keys: Predicate::False,
             }
         };
         let last = with_n(ColumnValue::Ints(vec![]));
@@ -2274,6 +2348,118 @@ pub(crate) mod test_helpers {
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         );
         (tile, tiling)
+    }
+
+    /// `tile`, an answer of [`answered`], recording the keys `absent` absent in every region.
+    fn recording_absent(mut tile: Tile, absent: &[u64]) -> Tile {
+        use crate::interpreter::{Predicate, Value};
+        let Tile::DataFunction { absent_keys, .. } = &mut tile else {
+            unreachable!("a collection")
+        };
+        *absent_keys = absent.iter().fold(Predicate::False, |all, &key| {
+            all.union(&Predicate::point(Value::UInt(key)))
+        });
+        tile
+    }
+
+    /// A producer that records a key absent and later holds it, in the region it was pulled at
+    /// when it recorded it, has broken the record.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "which it had recorded absent")]
+    fn a_producer_that_holds_a_key_it_recorded_absent_is_reported() {
+        use crate::interpreter::tile_operators::test_helpers::ScriptedProducer;
+        let (first, tiling) = answered(0, 1, (0, 1));
+        let (mut producer, answer) = ScriptedProducer::new(recording_absent(first, &[5]), tiling);
+        producer.get(producer.tiling().universal_guard());
+        *answer.borrow_mut() = answered(0, 5, (0, 1)).0;
+        producer.get(producer.tiling().universal_guard());
+    }
+
+    /// The record of absence holds in every region: a pull of another region that holds a key
+    /// recorded absent at the first breaks it.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "which it had recorded absent")]
+    fn a_key_recorded_absent_at_one_region_and_held_at_another_is_reported() {
+        use crate::interpreter::tile_operators::test_helpers::{ScriptedProducer, keys_between};
+        let (first, tiling) = answered(0, 1, (0, 1));
+        let (mut producer, answer) = ScriptedProducer::new(recording_absent(first, &[5]), tiling);
+        producer.get(keys_between(0, 1));
+        *answer.borrow_mut() = answered(4, 7, (4, 7)).0;
+        producer.get(keys_between(4, 7));
+    }
+
+    /// An answer may leave out the keys recorded absent: the record is not withdrawn by it.
+    #[test]
+    fn an_answer_that_leaves_out_the_record_of_absence_withdraws_nothing() {
+        use crate::interpreter::tile_operators::test_helpers::ScriptedProducer;
+        let (first, tiling) = answered(0, 1, (0, 1));
+        let (mut producer, answer) =
+            ScriptedProducer::new(recording_absent(first.clone(), &[5]), tiling);
+        producer.get(producer.tiling().universal_guard());
+        *answer.borrow_mut() = first;
+        producer.get(producer.tiling().universal_guard());
+    }
+
+    /// The record of absence outlives an answer that leaves it out: a third answer holding the key
+    /// breaks it.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "which it had recorded absent")]
+    fn a_key_held_after_an_answer_that_left_out_its_absence_is_reported() {
+        use crate::interpreter::tile_operators::test_helpers::ScriptedProducer;
+        let (first, tiling) = answered(0, 1, (0, 1));
+        let (mut producer, answer) =
+            ScriptedProducer::new(recording_absent(first.clone(), &[5]), tiling);
+        producer.get(producer.tiling().universal_guard());
+        *answer.borrow_mut() = first;
+        producer.get(producer.tiling().universal_guard());
+        *answer.borrow_mut() = answered(0, 5, (0, 1)).0;
+        producer.get(producer.tiling().universal_guard());
+    }
+
+    /// A key held beneath an enclosing key at a path recorded absent there breaks the record,
+    /// which is read at the whole path.
+    #[test]
+    fn a_key_held_at_a_nested_path_recorded_absent_is_reported() {
+        use crate::interpreter::{ColumnValue, Predicate, Value};
+        use bit_set::BitSet;
+        // Outer keys `0` and `1`, holding `inner` beneath `0` and nothing beneath `1`.
+        let groups = |inner: Vec<u64>, absent: Predicate| Tile::DataFunction {
+            row_starts: vec![0],
+            domain: ColumnValue::UInts(vec![0, 1]),
+            codomain: Box::new(Tile::DataFunction {
+                row_starts: vec![0, inner.len()],
+                domain: ColumnValue::UInts(inner.clone()),
+                codomain: Box::new(Tile::Scalar(ColumnValue::Ints(
+                    inner.iter().map(|&v| v as i64).collect(),
+                ))),
+                domain_predicate: Predicate::False,
+                deleted: BitSet::new(),
+                absent_keys: absent,
+            }),
+            domain_predicate: Predicate::False,
+            deleted: BitSet::new(),
+            absent_keys: Predicate::False,
+        };
+        let four_under_zero = Predicate::qualified(
+            Predicate::point(Value::UInt(0)),
+            Predicate::point(Value::UInt(4)),
+        );
+        let last = groups(vec![3], four_under_zero);
+        let result = groups(vec![3, 4], Predicate::False);
+        let violation = super::completeness_violation(
+            "groups",
+            &last,
+            &result,
+            &TileGuard::Function(FunctionGuard::Domain(Predicate::False)),
+        )
+        .expect("a key at a nested path recorded absent is reported");
+        assert!(
+            violation.contains("which it had recorded absent"),
+            "{violation}"
+        );
     }
 
     /// A producer pulled at one region after another keeps what it stated of each: a pull of a

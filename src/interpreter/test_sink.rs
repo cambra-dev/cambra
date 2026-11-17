@@ -276,6 +276,7 @@ mod tests {
             codomain: ints(vec![1, 2]),
             domain_predicate: Predicate::True,
             deleted: BitSet::new(),
+            absent_keys: Predicate::False,
         };
         assert!(matches!(read(tile), Err(SinkReadError::Malformed(_))));
     }
