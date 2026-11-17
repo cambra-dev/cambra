@@ -20,6 +20,11 @@ use crate::interpreter::{
     scheduler::{SharedConsumer, WakeupQueue},
     tile_operators::TileProducer,
 };
+#[cfg(test)]
+use crate::interpreter::{
+    dispatcher::{Landing, PipelineId, pushed_guard},
+    tile_operators::Tiling,
+};
 
 /// Shared slot for injecting the producer after `subscribe` returns.
 ///
@@ -96,6 +101,10 @@ pub struct SinkConsumer {
     pull: SharedConsumer,
     /// Where a notification schedules [`pull`](Self::pull).
     wakeups: WakeupQueue,
+    /// The sink's pipeline in a test's program run, and the tiling of the producer it pulls,
+    /// which a push names regions of ([`place`](Self::place)).
+    #[cfg(test)]
+    placed: Option<(PipelineId, Tiling)>,
 }
 
 impl SinkConsumer {
@@ -130,6 +139,8 @@ impl SinkConsumer {
                 producer: slot.clone(),
                 pull,
                 wakeups,
+                #[cfg(test)]
+                placed: None,
             },
             slot,
         )
@@ -155,6 +166,19 @@ impl SinkConsumer {
     pub fn detach(&mut self) {
         *self.producer.borrow_mut() = None;
     }
+
+    /// The slot holding the producer this consumer pulls, which a test driver walks.
+    #[cfg(test)]
+    pub(crate) fn producer_slot(&self) -> &ProducerSlot {
+        &self.producer
+    }
+
+    /// Place the sink in `pipeline` of a test's program run, whose breaker pulls a producer of
+    /// `input`: a push that reaches the sink queues for that pipeline what it names of `input`.
+    #[cfg(test)]
+    pub(crate) fn place(&mut self, pipeline: PipelineId, input: Tiling) {
+        self.placed = Some((pipeline, input));
+    }
 }
 
 impl Consumer for SinkConsumer {
@@ -162,5 +186,14 @@ impl Consumer for SinkConsumer {
     /// path from where it happened, and the queue holds a pull once however many arrive.
     fn notify(&mut self, _arrived: &Projection) {
         self.wakeups.request(self.pull.clone());
+    }
+
+    #[cfg(test)]
+    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        if let Some((pipeline, input)) = &self.placed
+            && let Some(guard) = pushed_guard(region, input)
+        {
+            landing.queue(*pipeline, &guard);
+        }
     }
 }
