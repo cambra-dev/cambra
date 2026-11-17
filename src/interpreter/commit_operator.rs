@@ -4270,10 +4270,7 @@ impl Consumer for FinalKeyConsumer {
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
-        self.downstream.notify(region, landing);
-    }
-    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
-        routes.requiring_final_key(&self.key, |routes| self.downstream.route(routes));
+        landing.requiring_final_key(&self.key, |landing| self.downstream.notify(region, landing));
     }
 }
 
