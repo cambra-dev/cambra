@@ -43,8 +43,8 @@ use crate::{
         scalar_expr,
         tile_operators::{
             Aggregate, CheckedLookup, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut,
-            Filter, FlattenTupleDomain, IterateExtent, Lookup, MakeRecord, MapAggregate, MapDomain,
-            MapExtractAggregate, MapResult, MapResultToConst, MapResultToConstMode,
+            Filter, FlattenTupleDomain, IterateExtent, KeyOrder, Lookup, MakeRecord, MapAggregate,
+            MapDomain, MapExtractAggregate, MapResult, MapResultToConst, MapResultToConstMode,
             MapResultWithSource, Memo, PermuteRecordDomain, Product, ReadingSource, Readings,
             RekeySorted, Restrict, SelectField, TileOperator, Tiling, Uncurry, UnionOperator,
             VariantIs, VariantProject, VariantWrap, zip_arms_at, zip_arms_named_at,
@@ -4204,7 +4204,10 @@ fn build_commit_store(
                 info.value_extent.clone(),
                 false,
             ));
-            let fan = Rc::new(FanOut::new(Box::new(RekeySorted::new(stream))));
+            let fan = Rc::new(FanOut::new(Box::new(RekeySorted::new(
+                stream,
+                KeyOrder::Rising,
+            ))));
             scope.rebuilt.insert(fed.name.clone());
             let binding = LetBinding {
                 fan,
@@ -5676,7 +5679,7 @@ fn convert_store_read(
             // A tap keyed by item holds `(item position, value)` at each commit, and its site
             // commits its items in its source's order.
             Ok(if by_item {
-                Box::new(RekeySorted::new(stream))
+                Box::new(RekeySorted::new(stream, KeyOrder::Rising))
             } else {
                 stream
             })
