@@ -675,9 +675,13 @@ fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expe
 
     let (expr, result) = run_pipeline_with_ctx(&mut ctx, code);
     assert_eq!(format!("{}:{}", symbolic(&expr), expr.ty), expected_ccl);
-    assert_eq!(
+    let (result, expected_result) = (
         sort_function_by_domain(result),
-        sort_function_by_domain(expected_result)
+        sort_function_by_domain(expected_result),
+    );
+    assert!(
+        same_tile(&result, &expected_result),
+        "{result:?}\n  is not\n{expected_result:?}"
     );
 }
 
@@ -1469,15 +1473,13 @@ fn a_tuple_of_a_fold_and_a_collection_the_filter_empties_for_some_groups(
             Box::new(Tile::record(HashMap::from([
                 (
                     "_0".into(),
-                    // The groups' rows state no completeness of their own. Every group key is
-                    // complete, and a complete key is complete beneath it (`Tile::completion_at`),
-                    // so this `False` is a detail of how the answer states it, not of what is
-                    // complete.
+                    // The groups' rows are stated complete, the two rows the filter emptied
+                    // included.
                     Tile::grouped(
                         vec![0, 0, 0],
                         ColumnValue::from_uints(vec![0, 2]),
                         Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 4]))),
-                        Predicate::False,
+                        Predicate::True,
                         BitSet::new(),
                     ),
                 ),
