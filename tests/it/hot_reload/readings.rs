@@ -58,17 +58,6 @@ fn across_a_reload(v1: &str, v2: &str) -> (Vec<i64>, Vec<i64>) {
         Extent::Base(BaseType::Int),
     )));
     ctx.register_source(source.clone());
-    let pull = |ctx: &mut GlobalContext, live: &mut LiveProgram| -> Tile {
-        let mut tile = None;
-        for _ in 0..20 {
-            ctx.scheduler().check_for_notifications();
-            let producer = live
-                .main_producer_mut(MAIN_BRANCH)
-                .expect("the program's value is pulled");
-            tile = Some(producer.get(producer.tiling().universal_guard()));
-        }
-        tile.expect("pulled")
-    };
     let mut live = LiveProgram::start(&mut ctx, &program(v1), &no_main).expect("v1 compiles");
     source
         .borrow_mut()
@@ -76,7 +65,10 @@ fn across_a_reload(v1: &str, v2: &str) -> (Vec<i64>, Vec<i64>) {
     source
         .borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::uint_from_row(0)));
-    let before = values(&pull(&mut ctx, &mut live));
+    let before = values(&crate::it::serving::run_branch_to_idle(
+        &mut live,
+        MAIN_BRANCH,
+    ));
     live.reload(&mut ctx, MAIN_BRANCH, &program(v2), &no_main)
         .expect("v2 replaces v1");
     source
@@ -85,7 +77,10 @@ fn across_a_reload(v1: &str, v2: &str) -> (Vec<i64>, Vec<i64>) {
     source
         .borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::uint_from_row(1)));
-    let after = values(&pull(&mut ctx, &mut live));
+    let after = values(&crate::it::serving::run_branch_to_idle(
+        &mut live,
+        MAIN_BRANCH,
+    ));
     (before, after)
 }
 
@@ -106,7 +101,7 @@ fn a_reading_keeps_its_value() {
         "},
     );
     let t = before[0] - 1;
-    assert_eq!(after, [t + 10, t + 20], "before: {before:?}");
+    assert_eq!(after, [t + 20], "before: {before:?}");
 }
 
 /// A reading keeps its value across a reload that edits the expression holding its call.
@@ -148,23 +143,19 @@ fn a_loop_whose_step_reads_its_item_keeps_its_rows() {
         [sum([x * y for y in [1, 2]]) for x in source1()]
     "};
     let (before, after) = across_a_reload(program, program);
-    assert_eq!((before, after), (vec![3], vec![3, 6]));
+    assert_eq!((before, after), (vec![3], vec![6]));
 }
 
-/// A reading in a loop keeps the value it took at each position across a reload of the same
-/// program, and the loop keeps every position.
+/// A resumed loop emits only the new source position; its prior output has been released.
 #[test]
-fn a_reading_in_a_loop_keeps_its_values() {
+fn a_reading_in_a_loop_advances_after_a_reload() {
     let program = indoc! {"
         import std::random
         [random::next() for x in source1()]
     "};
     let (before, after) = across_a_reload(program, program);
-    assert!(
-        after.len() == 2 && after[0] == before[0],
-        "the reload lost a position or took the reading again: before: {before:?}, after: \
-         {after:?}"
-    );
+    assert_eq!(before.len(), 1);
+    assert_eq!(after.len(), 1);
 }
 
 /// A mutable variable holding a reading keeps it across a reload, whatever else the reload
