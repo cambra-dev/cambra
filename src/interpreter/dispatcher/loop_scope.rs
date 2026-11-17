@@ -572,15 +572,19 @@ pub(super) fn reach_member(member: &Member, call: &mut Call<'_>) {
 }
 
 impl InductionStoreProducer {
+    /// The consumer the scope's pipeline pushes to, the store's, and whether the store pushes a
+    /// region of its keys: a nested store pushes rows, and a flat store the positions its rounds
+    /// decide where it pushes any before it is terminal (`pushes_complete_positions`). Any other
+    /// pushes everything, once it is terminal.
     pub(super) fn pushing_end(&self) -> (SharedConsumer, bool) {
-        let keyed = matches!(self.tiling(), Tiling::DataFunction { .. });
-        (
-            self.base()
-                .downstream
-                .clone()
-                .expect("an induction store has readers"),
-            keyed,
-        )
+        let keyed = matches!(self.tiling(), Tiling::DataFunction { .. })
+            || crate::interpreter::commit_operator::pushes_complete_positions(self.tiling());
+        let downstream = self
+            .base()
+            .downstream
+            .clone()
+            .unwrap_or_else(|| panic!("{} is read, so it pushes to a consumer", self.name()));
+        (downstream, keyed)
     }
 }
 
@@ -828,6 +832,33 @@ mod tests {
         assert_eq!(compiled.value(), Value::Int(6));
     }
 
+    /// A loop scope's open request is its store pipeline's claimed package, in flight until the
+    /// request's last step, so a drained boundary at that point fails its check.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "pipeline 0, a loop's store, holds a claimed package")]
+    fn an_open_request_is_in_flight() {
+        let compiled = Compiled::of(SUM);
+        compiled
+            .dispatcher
+            .notify(PipelineId(0), &keys_between(0, 2));
+        compiled.run_one_round();
+        compiled
+            .execution
+            .assert_nothing_in_flight(&compiled.dispatcher);
+    }
+
+    /// A completed request leaves nothing in flight.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_completed_request_leaves_nothing_in_flight() {
+        let compiled = Compiled::of(SUM);
+        compiled.consume(keys_between(0, 2));
+        compiled
+            .execution
+            .assert_nothing_in_flight(&compiled.dispatcher);
+    }
+
     #[test]
     fn requests_resume_between_rounds_independently() {
         let sum = Compiled::of(SUM);
@@ -897,8 +928,8 @@ mod tests {
         assert_eq!(compiled.value(), Value::Int(5));
     }
 
-    /// A static store knows decided positions before it is terminal, but publishes only when
-    /// terminal.
+    /// The store holds the positions its rounds decided before it is terminal, and everything
+    /// after.
     #[test]
     fn the_store_holds_its_complete_positions_then_everything_once_terminal() {
         let compiled = Compiled::of(SUM);
@@ -908,7 +939,7 @@ mod tests {
             (store.final_guard(), store.complete())
         };
         assert!(
-            held.is_empty() && !decided.is_empty() && !decided.is_universal(),
+            !held.is_empty() && !held.is_universal() && held == decided,
             "{held:?}, deciding {decided:?}"
         );
         compiled.consume(keys_between(1, 2));
