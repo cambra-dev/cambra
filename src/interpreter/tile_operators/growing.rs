@@ -1,5 +1,5 @@
 //! A scripted input that grows, drops what it holds released, and notifies, with the regions,
-//! steps and generator the consuming-mode tests of the pipeline breakers share.
+//! steps and generator the dispatcher tests of the pipeline breakers share.
 
 use std::collections::{BTreeMap, BTreeSet};
 

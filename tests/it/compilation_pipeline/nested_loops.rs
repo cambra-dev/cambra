@@ -1718,18 +1718,14 @@ fn a_match_arm_that_reads_only_the_loop_variable_keeps_its_tag() {
 #[timeout(Duration::from_secs(30))]
 fn a_long_nest_holds_the_same_store_state_at_any_length() {
     let held = |n: usize| {
-        let xs: Vec<String> = (1..=n).map(|i| i.to_string()).collect();
-        let code = format!(
-            indoc! {"
+        let code = indoc! {"
                 total := 0
-                for x in [{}]:
+                for x in source1():
                     for y in [1, 2]:
                         total += x * y
                 total
-            "},
-            xs.join(", ")
-        );
-        peak_held_values(&code)
+            "};
+        peak_held_values(code, n)
             .get("InductionStore")
             .copied()
             .expect("the nest has stores")

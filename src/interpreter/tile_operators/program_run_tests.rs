@@ -24,8 +24,7 @@ fn dispatched(source: &str, rows: usize) -> (Value, Vec<Planned>) {
 /// dispatcher at morsels of `rows`, the sinks' among them: the value each sink receives, in the
 /// order of `names`, and what the run planned for each pipeline.
 ///
-/// Each sink's producer is released whole by the run's end. A pull of each sink afterwards, in
-/// pull mode, reaches no producer beneath a breaker, since the breakers answer from what they
+/// Each sink's producer is released whole by the run's end. A pull of each sink afterwards, after completion, reaches no producer beneath a breaker, since the breakers answer from what they
 /// consumed; it changes no sink's value, and it finds every sink done.
 fn dispatched_into(source: &str, rows: usize, names: &[&str]) -> (Vec<Value>, Vec<Planned>) {
     dispatched_with(source, rows, names, |_| {})
@@ -40,7 +39,6 @@ fn dispatched_with(
     setup: impl FnOnce(&mut GlobalContext),
 ) -> (Vec<Value>, Vec<Planned>) {
     let mut ctx = GlobalContext::default();
-    ctx.defer_sink_pulls();
     setup(&mut ctx);
     let sinks: Vec<_> = names
         .iter()
@@ -98,10 +96,6 @@ fn dispatched_with(
     };
     let delivered = values("holds a value once the run returns");
     let beneath = pulls_beneath_breakers(&roots);
-    for consumer in &consumers {
-        consumer.borrow().pull_now();
-    }
-    ctx.scheduler().check_for_notifications();
     assert_eq!(
         pulls_beneath_breakers(&roots),
         beneath,
@@ -115,7 +109,7 @@ fn dispatched_with(
 /// breakers' inputs answered.
 fn pulls_beneath_breakers(roots: &[crate::interpreter::sinks::ProducerSlot]) -> u64 {
     fn walk(producer: &mut dyn TileProducer, beneath: bool) -> u64 {
-        let own = if beneath { producer.base().pulls } else { 0 };
+        let own = if beneath { producer.base().reads } else { 0 };
         let breaker = beneath || producer.as_breaking_mut().is_some();
         let mut total = own;
         producer.visit_input_producers_mut(&mut |_, input| total += walk(input, breaker));
@@ -403,7 +397,7 @@ fn two_aggregates_of_one_binding() {
 
 /// A group-by's memo reads its input's memo and the `Converse` keying the groups, which reads that
 /// memo too and is no breaker. The input memo's push reaches the group-by's memo widened, so it
-/// waits_for_inputs its rows until that memo has decided them.
+/// holds its rows until that memo has decided them.
 #[test]
 fn a_group_by() {
     let source = indoc! {"
@@ -418,12 +412,12 @@ fn a_group_by() {
         planned
             .iter()
             .any(|plan| plan.name.starts_with("Memo") && !plan.whole && plan.held),
-        "the group-by's memo waits_for_inputs its rows: {planned:?}"
+        "the group-by's memo holds its rows until their inputs complete: {planned:?}"
     );
 }
 
 /// The two arms of a concatenation of comprehensions push under their own tags, so the sum reads
-/// both pipelines' pushes, waiting_for_inputs until each arm has decided its rows, and no region at the start.
+/// both pipelines' pushes, waiting for inputs until each arm has decided its rows, and no region at the start.
 #[test]
 fn a_sum_over_two_concatenated_comprehensions() {
     let source = indoc! {"
@@ -445,7 +439,7 @@ fn a_sum_over_two_concatenated_comprehensions() {
 
 /// A sum read inside another comprehension: the outer sum's pipeline reads the inner sum's and the
 /// list's. The inner sum's push names every key of the outer sum's input, which the list's pushes
-/// name too, so the outer sum waits_for_inputs the rows the list's pushes bring until the inner sum is
+/// name too, so the outer sum holds the rows the list's pushes bring until the inner sum is
 /// decided, and reads each once.
 #[rstest_log::rstest]
 fn a_comprehension_reading_a_sum(#[values(1, usize::MAX)] rows: usize) {
@@ -472,7 +466,7 @@ fn a_comprehension_reading_a_sum(#[values(1, usize::MAX)] rows: usize) {
     );
     assert!(
         planned.iter().any(|plan| plan.held) && !planned.iter().any(|plan| plan.whole),
-        "the outer sum waits_for_inputs its rows, and no pipeline reads its input whole: {planned:?}"
+        "the outer sum holds its rows until their inputs complete, and no pipeline reads its input whole: {planned:?}"
     );
 }
 
@@ -689,11 +683,11 @@ fn a_loop_beside_a_sum() {
     );
 }
 
-/// A reader inside a loop's scope whose pushes can name one row twice waits_for_inputs its rows until the
+/// A reader inside a loop's scope whose pushes can name one row twice holds its rows until the
 /// pipelines it reads have decided them, as one in the run's dispatcher does, and reads no input
-/// whole in pull mode.
+/// whole outside its scheduled packages.
 #[test]
-fn a_reader_inside_a_loops_scope_parks() {
+fn a_reader_inside_a_loops_scope_waits_for_inputs() {
     let source = indoc! {"
         out = test_sink()
         total := 0
@@ -1107,7 +1101,6 @@ fn a_store_per_row_of_a_comprehension(
 ) {
     let loaded = LoadedProgram::test(source);
     let mut ctx = GlobalContext::default();
-    ctx.defer_sink_pulls();
     let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
         .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
     let _operators = ctx.take_operator_map();
@@ -1127,29 +1120,23 @@ fn a_store_per_row_of_a_comprehension(
     assert_eq!(value.to_string(), expected, "{source} at morsels of {rows}");
 }
 
-/// A compile without `GlobalContext::defer_sink_pulls` pulls each sink, which runs part of the
-/// program in pull mode before the run starts, so the planner refuses the program.
+/// Compilation subscribes sinks without running them; the dispatcher delivers their values.
 #[test]
-fn a_program_compiled_with_its_sinks_pulled_is_refused() {
-    let source = indoc! {"
-        out = test_sink()
-        out << sum([1, 2])
-    "};
+fn compiling_a_program_does_not_execute_its_sinks() {
     let mut ctx = GlobalContext::default();
-    ctx.register_test_sink("out");
-    let mut program = compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {}))
-        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
-    let _operators = ctx.take_operator_map();
-    let refused = match run_program(&mut program, 1) {
-        Err(refused) => refused,
-        Ok(_) => panic!("{source} is refused"),
-    };
-    assert!(
-        refused
-            .to_string()
-            .contains("was compiled with its sinks pulled"),
-        "{refused}"
-    );
+    let sink = ctx.register_test_sink("out");
+    let mut program = compile_program(
+        &mut ctx,
+        &LoadedProgram::test("out = test_sink()\nout << 3\n"),
+        Box::new(|| {}),
+    )
+    .unwrap();
+    assert!(matches!(
+        sink.value(),
+        Err(crate::interpreter::test_sink::SinkReadError::NothingWritten)
+    ));
+    run_program(&mut program, 1).unwrap();
+    assert!(sink.value().is_ok());
 }
 
 /// Of two loops in one loop's body, the first runs in the scope of the second, which reads its
@@ -1509,7 +1496,6 @@ fn two_ready_writers_over_sources_of_different_lengths(#[values(1, 2, usize::MAX
                 b << pool
     "};
     let mut ctx = GlobalContext::default();
-    ctx.defer_sink_pulls();
     let sinks = [ctx.register_test_sink("a"), ctx.register_test_sink("b")];
     let loaded = LoadedProgram::test(source);
     let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
@@ -1701,7 +1687,7 @@ fn a_drive_over_a_live_source_reads_past_empty_positions(
 
 /// A loop over a let-bound map of a live source reads the map's `Memo`, the pipeline the run
 /// notifies of each delivery. The map's keys reach the loop's drive as its positions, so the loop's
-/// scope is notified of each delivery as rounds too, and waits_for_inputs it until the `Memo` has decided it.
+/// scope is notified of each delivery as rounds too, and holds it until the `Memo` has decided it.
 #[rstest_log::rstest]
 #[case::two_batches(two_batches(), 30)]
 #[case::one_key_batches(one_key_batches(10), 110)]
@@ -1733,7 +1719,7 @@ fn a_loop_over_a_let_bound_map_of_a_live_source(
                 && plan.live
                 && !plan.whole
                 && plan.held),
-        "the loop's scope takes the deliveries as rounds, waiting_for_inputs on the `Memo`: {planned:?}"
+        "the loop's scope takes the deliveries as rounds, waiting for inputs on the `Memo`: {planned:?}"
     );
 }
 
@@ -1914,7 +1900,6 @@ fn a_live_product_writer_beside_an_independent_ready_writer(
 ) {
     use crate::interpreter::{BaseType, Extent, Predicate, TestDataSource};
     let mut ctx = GlobalContext::default();
-    ctx.defer_sink_pulls();
     let feeds: Vec<_> = ["source1", "source2"]
         .into_iter()
         .map(|name| {
@@ -2201,7 +2186,6 @@ fn a_sink_fed_from_two_sites(#[values(1, usize::MAX)] rows: usize) {
         out << s
     "#};
     let mut ctx = GlobalContext::default();
-    ctx.defer_sink_pulls();
     let sink = ctx.register_test_sink("out");
     let loaded = LoadedProgram::test(source);
     let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
@@ -2249,7 +2233,6 @@ fn dispatched_live_observed(
     mut idle: impl FnMut(&crate::interpreter::TestSink, &crate::interpreter::sinks::ProducerSlot),
 ) -> (Value, Vec<Planned>) {
     let mut ctx = GlobalContext::default();
-    ctx.defer_sink_pulls();
     let feed = std::rc::Rc::new(std::cell::RefCell::new(
         crate::interpreter::TestDataSource::new(
             "source1",
@@ -2653,7 +2636,7 @@ fn a_let_bound_map_over_a_live_source(#[values(1, usize::MAX)] rows: usize) {
         planned
             .iter()
             .any(|plan| !plan.live && !plan.whole && plan.held && plan.name.starts_with("Memo")),
-        "the feed's `Memo` waits_for_inputs its rows: {planned:?}"
+        "the feed's `Memo` holds its rows until their inputs complete: {planned:?}"
     );
 }
 
@@ -2846,7 +2829,6 @@ fn a_cartesian_product_of_two_live_sources(
 ) {
     use crate::interpreter::{BaseType, Extent, Predicate, TestDataSource};
     let mut ctx = GlobalContext::default();
-    ctx.defer_sink_pulls();
     let feeds: Vec<_> = ["source1", "source2"]
         .into_iter()
         .map(|name| {
@@ -2989,7 +2971,6 @@ fn a_live_product_as_a_loop_source(#[case] pairs: &str, #[values(1, usize::MAX)]
 fn a_loop_over_two_open_product_dimensions(#[values(1, usize::MAX)] rows: usize) {
     use crate::interpreter::{BaseType, Extent, Predicate};
     let mut ctx = GlobalContext::default();
-    ctx.defer_sink_pulls();
     let a = std::rc::Rc::new(std::cell::RefCell::new(
         crate::interpreter::TestDataSource::new(
             "source1",
@@ -3070,7 +3051,7 @@ fn a_reader_of_a_live_pipeline_through_a_build_edge(
     assert_eq!(value, Value::Int(expected));
 }
 
-/// A breaker whose chain reads a live source and a pipeline takes the source's arrivals and waits_for_inputs
+/// A breaker whose chain reads a live source and a pipeline takes the source's arrivals and holds
 /// them (`Dispatcher::wait_for_inputs`): each row adds the sum of `ys`, and a row arriving before the sum is
 /// decided waits for it.
 #[rstest_log::rstest]
@@ -3087,12 +3068,12 @@ fn a_reader_of_a_live_source_and_a_pipeline(#[values(1, usize::MAX)] rows: usize
     assert_eq!(value, Value::Int(30));
     assert!(
         planned.iter().any(|plan| plan.live && plan.held),
-        "the pipeline over the source waits_for_inputs its rows: {planned:?}"
+        "the pipeline over the source holds its rows until their inputs complete: {planned:?}"
     );
 }
 
 /// What a dispatched run hands a `main` output: it keeps each answer as a test sink does, counts
-/// the outermost keys the answers have held, and lists the answers pull mode would print.
+/// the outermost keys the answers have held, and lists the expected output.
 #[derive(Default)]
 struct MainAnswers {
     kept: crate::interpreter::TestSink,
@@ -3144,7 +3125,6 @@ struct LiveMain {
 /// dispatcher at morsels of `rows`, the source fed `batches` as [`dispatched_live`] feeds them.
 fn dispatched_live_main(source: &str, rows: usize, batches: Vec<Batch>) -> LiveMain {
     let mut ctx = GlobalContext::default();
-    ctx.defer_sink_pulls();
     let feed = std::rc::Rc::new(std::cell::RefCell::new(
         crate::interpreter::TestDataSource::new(
             "source1",
@@ -3269,7 +3249,6 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
 ) {
     use crate::interpreter::dispatcher::{Ended, Targets};
     let mut ctx = GlobalContext::default();
-    ctx.defer_sink_pulls();
     let feed = std::rc::Rc::new(std::cell::RefCell::new(
         crate::interpreter::TestDataSource::new(
             "source1",
@@ -3327,50 +3306,6 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
     assert_eq!(rendered_in_key_order(&value), expected, "{source}");
 }
 
-/// `source`, whose `main` output reads the live source `source1`, compiled and run in pull mode,
-/// the source fed `batches` one at a time, the `main` output pulled at the universal guard and
-/// released at its answer once the scheduler has run out of work after each: the answers the
-/// driver prints ([`is_printed`]).
-fn pulled_live_main(source: &str, batches: Vec<Batch>) -> Vec<crate::interpreter::Tile> {
-    let mut ctx = GlobalContext::default();
-    let feed = std::rc::Rc::new(std::cell::RefCell::new(
-        crate::interpreter::TestDataSource::new(
-            "source1",
-            crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
-            crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
-        ),
-    ));
-    ctx.register_source(feed.clone());
-    let mut program = compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {}))
-        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
-    let mut producer = program
-        .outputs
-        .iter_mut()
-        .find(|output| output.is_main())
-        .and_then(|output| output.producer.take())
-        .unwrap_or_else(|| panic!("{source} has a `main` output"));
-    let mut printed = Vec::new();
-    for (entries, complete) in batches {
-        feed.borrow_mut().add_data(&entries);
-        feed.borrow_mut().set_yield_predicate(complete);
-        for _ in 0..1000 {
-            ctx.scheduler().check_for_notifications();
-        }
-        let tile = producer.get(producer.tiling().universal_guard());
-        producer.release(tile.to_guard());
-        if is_printed(&tile) {
-            printed.push(tile);
-        }
-    }
-    assert!(
-        printed
-            .last()
-            .is_some_and(crate::interpreter::Tile::is_terminal),
-        "{source}: pull mode's last pull answers a terminal tile"
-    );
-    printed
-}
-
 /// [`one_key_batches`] with a last delivery that adds no key and calls the source complete.
 fn one_key_batches_then_empty(batches: u64) -> Vec<Batch> {
     let mut all = one_key_batches(batches);
@@ -3380,48 +3315,39 @@ fn one_key_batches_then_empty(batches: u64) -> Vec<Batch> {
     all
 }
 
-/// The answers the `main` output is handed add up to what pull mode prints, in key order, and the
-/// last is terminal: a key the filter drops and a delivery of no key add nothing, a sum is handed
-/// once its source is complete, and a row that reads a sum is answered once the sum is final. The
-/// answers' boundaries are not compared: a run hands each package's answer as it consumes it,
-/// where pull mode prints one answer per pull.
+/// Main-output packages produce the expected values and a terminal completion statement.
 #[rstest_log::rstest]
-#[case::a_map("[x * 10 for x in source1()]")]
-#[case::a_filter_dropping_a_key("[x for x in source1() if x != 2]")]
-#[case::a_sum("sum(source1())")]
-#[case::a_filter_reading_a_sum("[x for x in source1() if sum([1, 2, 3]) > 5]")]
-#[case::a_map_reading_a_sum("[x + sum([1, 2]) for x in source1()]")]
-#[case::a_filter_reading_a_live_sum("[x for x in source1() if sum(source1()) > 2]")]
-fn the_main_output_prints_what_pull_mode_prints(
+#[case::a_map("[x * 10 for x in source1()]", "[u0 -> 10, u1 -> 20, u2 -> 30]")]
+#[case::a_filter_dropping_a_key("[x for x in source1() if x != 2]", "[u0 -> 1, u2 -> 3]")]
+#[case::a_sum("sum(source1())", "6")]
+#[case::a_filter_reading_a_sum(
+    "[x for x in source1() if sum([1, 2, 3]) > 5]",
+    "[u0 -> 1, u1 -> 2, u2 -> 3]"
+)]
+#[case::a_map_reading_a_sum("[x + sum([1, 2]) for x in source1()]", "[u0 -> 4, u1 -> 5, u2 -> 6]")]
+#[case::a_filter_reading_a_live_sum(
+    "[x for x in source1() if sum(source1()) > 2]",
+    "[u0 -> 1, u1 -> 2, u2 -> 3]"
+)]
+fn the_main_output_delivers_its_complete_value(
     #[case] source: &str,
+    #[case] expected: &str,
     #[values(one_key_batches(3), one_key_batches_then_empty(3))] batches: Vec<Batch>,
     #[values(1, usize::MAX)] rows: usize,
 ) {
-    let merged = |answers: Vec<crate::interpreter::Tile>| {
-        answers
-            .into_iter()
-            .reduce(|mut merged, answer| {
-                merged.merge(answer);
-                merged
-            })
-            .map(crate::interpreter::sort_function_by_domain)
-    };
-    let pulled = pulled_live_main(source, batches.clone());
     let dispatched = dispatched_live_main(source, rows, batches);
-    assert!(
-        dispatched
-            .printed
-            .last()
-            .is_some_and(crate::interpreter::Tile::is_terminal)
-            || merged(dispatched.printed.clone()).is_some_and(|merged| merged.is_terminal()),
-        "{source}: the answers handed add up to a terminal one"
-    );
-    let value = |tile: Option<crate::interpreter::Tile>| {
-        tile.map(|tile| rendered_in_key_order(&super::helpers::materialized_row(tile)))
-    };
+    let merged = dispatched
+        .printed
+        .into_iter()
+        .reduce(|mut held, tile| {
+            held.merge(tile);
+            held
+        })
+        .expect("main emits");
+    assert!(merged.is_terminal(), "{source}: main completes");
     assert_eq!(
-        value(merged(dispatched.printed)),
-        value(merged(pulled)),
+        rendered_in_key_order(&super::helpers::materialized_row(merged)),
+        expected,
         "{source}"
     );
 }
@@ -3490,10 +3416,10 @@ fn an_aggregate_per_row_over_a_live_source_at_main(#[values(1, usize::MAX)] rows
     );
 }
 
-/// A filter over a live source that reads a sum takes the source's arrivals and waits_for_inputs them
+/// A filter over a live source that reads a sum takes the source's arrivals and holds them
 /// (`Dispatcher::wait_for_inputs`). A sum over a literal is decided before the first delivery, so the first
 /// delivery's rows are answered as they arrive. A sum over the live source is decided only at the
-/// last delivery, so the first delivery's rows stay waiting_for_inputs until then.
+/// last delivery, so the first delivery's rows stay waiting for inputs until then.
 #[rstest_log::rstest]
 #[case::a_sum_over_a_literal("[x for x in source1() if sum([1, 2, 3]) > 5]", 3)]
 #[case::a_sum_over_the_source("[x for x in source1() if sum(source1()) > 2]", 0)]
@@ -3522,16 +3448,16 @@ fn a_filter_over_a_live_source_reading_a_sum(
             && !plan.whole
             && plan.held
             && plan.name.starts_with("SinkBreaker")),
-        "the `main` output's pipeline takes arrivals and waits_for_inputs them: {planned:?}"
+        "the `main` output's pipeline takes arrivals and holds them until their inputs complete: {planned:?}"
     );
 }
 
 /// The readers of a pipeline with a live source beneath it read no input whole: the inner
-/// comprehension's memo, the per-row sum and the outer comprehension's memo each wait_for_inputs their rows
-/// until the pipelines they read have decided them (`src/interpreter/design-dispatcher.md`,
+/// comprehension's memo, the per-row sum and the outer comprehension's memo each hold their rows
+/// until the pipelines they read have completed them (`src/interpreter/design-dispatcher.md`,
 /// "Waiting for input completion").
 #[rstest_log::rstest]
-fn readers_over_a_live_pipeline_park_their_rows(#[values(1, usize::MAX)] rows: usize) {
+fn readers_over_a_live_pipeline_wait_for_inputs(#[values(1, usize::MAX)] rows: usize) {
     let source = indoc! {"
         out = test_sink()
         ys = [y for y in source1()]
@@ -3547,7 +3473,7 @@ fn readers_over_a_live_pipeline_park_their_rows(#[values(1, usize::MAX)] rows: u
         planned
             .iter()
             .any(|plan| plan.held && plan.name.starts_with("MapAggregate")),
-        "the per-row sum waits_for_inputs its rows: {planned:?}"
+        "the per-row sum holds its rows until their inputs complete: {planned:?}"
     );
     assert_eq!(
         planned
@@ -3555,11 +3481,11 @@ fn readers_over_a_live_pipeline_park_their_rows(#[values(1, usize::MAX)] rows: u
             .filter(|plan| plan.held && !plan.name.starts_with("SinkBreaker"))
             .count(),
         3,
-        "the two memos and the sum wait_for_inputs their rows: {planned:?}"
+        "the two memos and the sum hold their rows until their inputs complete: {planned:?}"
     );
 }
 
-/// The sums of `a_sum_over_rows_carrying_a_constant` over a live list. The sum's pipeline waits_for_inputs
+/// The sums of `a_sum_over_rows_carrying_a_constant` over a live list. The sum's pipeline holds
 /// each row until the constant is decided and reads it once at its outermost key, above the level
 /// the constant applies at, where `MapResultToConst` panics on a pull at or beneath that level, so
 /// the values check it (`src/interpreter/design-dispatcher.md`, "Waiting for input completion").
@@ -3601,7 +3527,7 @@ fn a_sum_over_rows_carrying_a_constant_reading_a_live_list(
         planned
             .iter()
             .any(|plan| plan.held && plan.name.starts_with("MapAggregate")),
-        "the per-row sum waits_for_inputs its rows: {planned:?}"
+        "the per-row sum holds its rows until their inputs complete: {planned:?}"
     );
 }
 
@@ -3649,7 +3575,7 @@ fn a_sum_over_live_rows_carrying_a_constant(
 
 /// The same filter fed to a sink. The comprehension is the constant of the `()` row above it, so
 /// a delivery's keys reach the sink's pipeline widened, and that pipeline reads its input whole
-/// once the source yields everything, waiting_for_inputs until the sum is decided.
+/// once the source yields everything, waiting for inputs until the sum is decided.
 #[rstest_log::rstest]
 fn a_filter_over_a_live_source_reading_a_sum_into_a_sink(#[values(1, usize::MAX)] rows: usize) {
     let source = indoc! {"
@@ -3665,12 +3591,12 @@ fn a_filter_over_a_live_source_reading_a_sum_into_a_sink(#[values(1, usize::MAX)
         planned
             .iter()
             .any(|plan| plan.live && plan.whole && plan.held),
-        "a pipeline over the source reads it whole and waits_for_inputs its rows: {planned:?}"
+        "a pipeline over the source reads it whole and holds its rows until their inputs complete: {planned:?}"
     );
 }
 
 /// A sum whose rows read a sum over the same live source: the outer sum's pipeline takes the
-/// source's arrivals and waits_for_inputs them until the inner sum is decided, at the last delivery.
+/// source's arrivals and holds them until the inner sum is decided, at the last delivery.
 #[rstest_log::rstest]
 fn a_sum_over_a_live_source_reading_a_sum_over_it(#[values(1, usize::MAX)] rows: usize) {
     let (value, _) = dispatched_live(
@@ -3985,7 +3911,6 @@ fn a_store_over_a_live_source_reading_a_sum_of_another(
     #[values(1, usize::MAX)] rows: usize,
 ) {
     let mut ctx = GlobalContext::default();
-    ctx.defer_sink_pulls();
     let feed = |name: &str| {
         std::rc::Rc::new(std::cell::RefCell::new(
             crate::interpreter::TestDataSource::new(
@@ -4081,7 +4006,6 @@ fn a_transaction_takes_each_delivery_once_its_seed_is_final(#[values(1, usize::M
         out << await_final(pool)
     "};
     let mut ctx = GlobalContext::default();
-    ctx.defer_sink_pulls();
     let feed = |name: &str| {
         std::rc::Rc::new(std::cell::RefCell::new(
             crate::interpreter::TestDataSource::new(
@@ -4164,7 +4088,6 @@ fn a_loop_seeded_from_a_static_store_takes_each_delivery(#[values(1, usize::MAX)
         out << last
     "};
     let mut ctx = GlobalContext::default();
-    ctx.defer_sink_pulls();
     let items = std::rc::Rc::new(std::cell::RefCell::new(
         crate::interpreter::TestDataSource::new(
             "source1",
@@ -4217,7 +4140,7 @@ fn a_loop_seeded_from_a_static_store_takes_each_delivery(#[values(1, usize::MAX)
 }
 
 /// A comprehension over a live source whose rows read a value another pipeline decides: a
-/// transaction store's final value, a sum, a loop's final value. Each delivery's rows wait_for_inputs until
+/// transaction store's final value, a sum, a loop's final value. Each delivery's rows wait until
 /// that pipeline has decided it, whether its push reaches the comprehension or the comprehension
 /// reads it by pull.
 #[rstest_log::rstest]
@@ -4252,7 +4175,7 @@ fn a_live_comprehension_reading_a_decided_value(
 }
 
 /// A sum whose rows read a live list and a sum over a second live source that becomes decided
-/// between the list's two deliveries. Each row the list brings waits_for_inputs until the sum is decided; the
+/// between the list's two deliveries. Each row the list brings waits for inputs until the sum is decided; the
 /// sum's decided push brings no row the list's already brought, so the outer sum reads each once.
 #[rstest_log::rstest]
 #[case::a_sum_in_the_row(indoc! {"
@@ -4271,7 +4194,6 @@ fn a_reader_of_two_pipelines_decided_apart(
     #[values(1, usize::MAX)] rows: usize,
 ) {
     let mut ctx = GlobalContext::default();
-    ctx.defer_sink_pulls();
     let feed = |name: &str| {
         std::rc::Rc::new(std::cell::RefCell::new(
             crate::interpreter::TestDataSource::new(
