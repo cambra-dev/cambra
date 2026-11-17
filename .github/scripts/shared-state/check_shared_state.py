@@ -93,10 +93,6 @@ EXPECTED_EXCEPTIONS = [
     # notification marks the region at once, and a notification carries a region, which a one-bit
     # flag cannot hold.
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Projection`"),
-    # `BreakerHandle`, the cell owning one breaker subscription, shared by the breaker's reader,
-    # which pulls it, and the plan that drives its consumes; see its type doc. What crosses it is
-    # a call, and every value reaches the reader through `get`.
-    ("src/interpreter/tile_operators/breaker_reader.rs", "shared cell of `dyn BreakingProducer`"),
     # `Admission`'s region passed since the last pull, shared by an operator's gate and the
     # forwarders that read it on reentry, while the consumer behind the gate is borrowed.
     ("src/interpreter/scheduler.rs", "shared cell of `Projection`"),
@@ -107,6 +103,27 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/operator_graph.rs", "ambient mutable state"),
     ("src/interpreter/operator_graph.rs", "ambient mutable state"),
     ("src/interpreter/tile_operators/cycle_slot.rs", "shared cell of `Option<Box<T>>`"),
+    # `BreakerHandle`, the dispatcher's handle on a pipeline's breaker; see its type doc. The
+    # driver calls the breaker through it, and what crosses it is a call, never a tile.
+    ("src/interpreter/dispatcher.rs", "shared cell of `dyn BreakingProducer`"),
+    # A pipeline's queue: its unclaimed and in-flight packages and the region they partition, which
+    # appends grow and claims and acknowledgements take from under the lock, on any thread. What
+    # crosses it is guards naming regions of the pipeline's input, never a tile.
+    ("src/interpreter/dispatcher.rs", "cell of `QueueState`"),
+    # The region a pipeline's breaker has pushed to its reader. A push of the breaker's final
+    # guard pushes what is not in it and grows it in one step, so two threads pushing for one
+    # pipeline push disjoint regions. What crosses it is a guard naming a region, never a tile.
+    ("src/interpreter/dispatcher.rs", "cell of `Option<TileGuard>`"),
+    # Per pipeline a reader reads, the region of the reader's input that pipeline has completed
+    # (`Completion`), which the completed pushes grow under the lock on any thread. What crosses
+    # it is guards naming regions, never a tile.
+    ("src/interpreter/dispatcher.rs", "cell of `Vec<Completion>`"),
+    # The lock a dispatcher's sleeping worker waits under; it guards no data.
+    ("src/interpreter/dispatcher.rs", "cell of `()`"),
+    # The dispatcher tests' typed handle on a breaker they also pass to the driver. The file is
+    # a `#[cfg(test)] mod` declared in `tile_operators/mod.rs`, which `_blank_test_items` does
+    # not see.
+    ("src/interpreter/tile_operators/dispatcher_tests.rs", "shared cell of `T`"),
     ("src/interpreter/tile_operators/fanout.rs", "cell of `bool`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `usize`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),
