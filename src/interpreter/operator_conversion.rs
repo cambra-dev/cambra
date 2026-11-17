@@ -377,10 +377,8 @@ struct KeyReadInfo {
     /// The per-commit value extent for [`StoreValueStream`] (`commit` stores
     /// only; the accumulator value extent for induction stores).
     value_extent: Extent,
-    /// Whether the key is a commit store's reply tap, read keyed by the item each value was
-    /// committed for: it holds `(item position, value)` pairs, and a read re-keys them by
-    /// position ([`RekeySorted`]).
-    by_item: bool,
+    /// A reply tap's item order; other store keys are read by commit position.
+    by_item: Option<KeyOrder>,
     /// Whether the variable's declared type mentions a nominal type, whose value no
     /// reload carries over yet ([`StateConflict::NominalState`]). Read only for a
     /// `carried` key.
@@ -831,6 +829,10 @@ struct IterationInput {
     /// The last position a predecessor drive reached over this input, or `None`
     /// where it offers everything from the beginning. A drive resumes after it.
     resumed_after: Option<Position>,
+    /// The positions a predecessor drive released over this input, exactly, or `None` where
+    /// it offers everything from the beginning. A drive that finishes items out of order
+    /// resumes from it rather than past a position.
+    released: Option<Predicate>,
 }
 
 /// How much of the previous version's graph a compilation kept.
@@ -1380,12 +1382,15 @@ records one and the only site a `Transact` reaches"
             // term minted, so that slot's release is where it got to.
             let predecessor = self.correspondence.previous(node).map(SlotReader::new);
             let released = predecessor.and_then(|p| kept.fan().released_position_of(p));
+            let released_region = predecessor.and_then(|p| kept.fan().released_by(p));
             // A recurrence that carries nothing reads its input from the
             // beginning, which a rebuild supplies for a recomputable term. Where
             // it is not recomputable the kept iteration is the whole of what is
             // available, so it is taken and the loop is reported as beginning
             // above its input ([`unreadable_inputs`](Self::unreadable_inputs)).
-            if continues || released.is_none() || !self.recomputable(term) {
+            // A kept iteration the predecessor released nothing of still offers its beginning.
+            let released_any = released_region.as_ref().is_some_and(|g| !g.is_empty());
+            if continues || !released_any || !self.recomputable(term) {
                 self.reuse.kept += 1;
                 self.keep_region(term, kept.fan());
                 let fan = kept.fan().clone();
@@ -1399,6 +1404,7 @@ records one and the only site a `Transact` reaches"
                 return Ok(IterationInput {
                     op: self.slot_read_by(&fan, term),
                     resumed_after,
+                    released: released_region.map(|guard| guard.whole_keys()),
                 });
             }
         }
@@ -1408,6 +1414,7 @@ records one and the only site a `Transact` reaches"
         Ok(IterationInput {
             op: self.slot_read_by(&fan, term),
             resumed_after: fresh_start,
+            released: None,
         })
     }
 
@@ -4142,7 +4149,7 @@ fn build_commit_store(
         let prior = keys_map.insert(
             field,
             KeyReadInfo {
-                by_item: false,
+                by_item: None,
                 carry_forward: true,
                 carried: Some(paths[i].clone()),
                 runtime_key,
@@ -4211,7 +4218,12 @@ fn build_commit_store(
         .collect();
     let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
 
-    for ((set_writer, w), taps) in setters.into_iter().zip(writers.iter()).zip(per_writer_taps) {
+    for (writer_index, ((set_writer, w), taps)) in setters
+        .into_iter()
+        .zip(writers.iter())
+        .zip(per_writer_taps)
+        .enumerate()
+    {
         // Attribute this writer's operators to the writer, not to the binding
         // the whole store hangs off. Without this every operator of a
         // transaction resolves to one span, since each is minted after its
@@ -4224,12 +4236,8 @@ fn build_commit_store(
             ))
         })?;
         let item_extent = ctx.extent_of(&item_ty)?;
-        // A drive counts commits against the positions its source offers, so
-        // where it starts is whatever the source it is handed still has. A source
-        // this version keeps has already passed some of them. A freshly-built one
-        // starts at `0` whatever the source has done: this drive finds its next
-        // item by scanning up from its cursor, so an advanced source costs it a
-        // comparison, where the induction drive's window would stall.
+        // A transaction drive attempts the source items still offered, acknowledges each key
+        // separately, and resumes with its predecessor's released prefix where one is supplied.
         // A source reading an earlier writer's item tap reads it back from this store through
         // the recurrence slot, as the writers read their snapshots: the source is in the
         // store's own input chain. Its value at an item is final at that writer's commit for
@@ -4243,17 +4251,14 @@ fn build_commit_store(
                     "a writer source reads the tap `{field}` of no earlier writer of its store"
                 ))
             })?;
-            debug_assert!(info.by_item, "a fed-back tap is keyed by item");
+            let order = info.by_item.expect("a fed-back tap is keyed by item");
             let stream = Box::new(StoreValueStream::new(
                 store_fan.recurrence_slot(),
                 info.runtime_key.clone(),
                 info.value_extent.clone(),
                 false,
             ));
-            let fan = Rc::new(FanOut::new(Box::new(RekeySorted::new(
-                stream,
-                KeyOrder::Rising,
-            ))));
+            let fan = Rc::new(FanOut::new(Box::new(RekeySorted::new(stream, order))));
             scope.rebuilt.insert(fed.name.clone());
             let binding = LetBinding {
                 fan,
@@ -4266,7 +4271,8 @@ fn build_commit_store(
         }
         let IterationInput {
             op: source_op,
-            resumed_after: drive_resume,
+            released: drive_resume,
+            ..
         } = scope.iteration_input(&w.source, None, continues, |ctx| {
             convert_impl(&w.source, None, ctx)
         })?;
@@ -4285,6 +4291,18 @@ fn build_commit_store(
                     })
             })
             .collect::<Result<_, _>>()?;
+        // The source's positions, which the drive's rows and the writer's proposals carry each
+        // item's in.
+        let Tiling::DataFunction {
+            domain: item_positions,
+            ..
+        } = source_op.tiling().clone()
+        else {
+            return Err(ConversionError::TypeError(format!(
+                "a transaction source is a collection, got {}",
+                source_op.tiling()
+            )));
+        };
         let driver = TransactDriver::new(
             // The driver is placed inside this store by `set_writer` below, so
             // its read of the store is a recurrence rather than a reader.
@@ -4294,13 +4312,11 @@ fn build_commit_store(
             read_extents,
             item_extent,
             drive_resume,
-            // A tap commits with its item's position, which the driver's rows carry for the
-            // writer.
-            !taps.is_empty(),
+            writer_index,
         );
         // Two slots of the driver: the body consumes rows, and the writer acks
-        // finished attempts. The driver advances its item cursor on the release
-        // *intersection*, so a body's consume-release cannot advance it past an
+        // finished attempts. The driver removes its source item on the release
+        // *intersection*, so a body's consume-release cannot acknowledge an
         // attempt still in flight — and so this is the one fan whose input is **not**
         // memoized. A `Memo` releases its input as soon as it caches, which reaches the
         // driver as an ack for an attempt no slot has finished.
@@ -4313,7 +4329,12 @@ fn build_commit_store(
         // domain, whatever the `Transact` sits in.
         let body_op = convert_at(
             &w.body,
-            Some(Box::new(Memo::new(driver_fan.slot()))),
+            // The drive's stream is its rows and what it has decided of its source; the body
+            // reads the rows.
+            Some(Box::new(Memo::new(Box::new(SelectField::new(
+                driver_fan.slot(),
+                crate::interpreter::commit_operator::TRANSACT_ROWS,
+            ))))),
             CurryLevel::new(1),
             ctx,
         )?;
@@ -4327,10 +4348,15 @@ fn build_commit_store(
         for (field, tap_ty) in taps {
             let tap_value_extent = stored_tap_extent(w, &tap_ty, ctx)?;
             write_keys.push(store_key(&field));
+            let Extent::Record(pair) = &tap_value_extent else {
+                unreachable!("a tap keyed by item stores `(item position, value)` pairs")
+            };
+            let positions = pair[&tuple_field(0)].clone();
+            let order = KeyOrder::of_items(&positions);
             let prior = keys_map.insert(
                 field.clone(),
                 KeyReadInfo {
-                    by_item: true,
+                    by_item: Some(order),
                     // A reply tap is a per-commit event, not a persistent value:
                     // emit it only at the tick that wrote it, so two writers'
                     // taps to one defer don't smear across the shared clock. It
@@ -4363,6 +4389,7 @@ fn build_commit_store(
             tap_fields.iter().map(Label::runtime_key).collect(),
             key_extent.clone(),
             value_extent.clone(),
+            item_positions,
         );
         set_writer(Box::new(writer));
     }
@@ -5243,7 +5270,7 @@ fn store_parts(
         let prior = keys_map.insert(
             field.clone(),
             KeyReadInfo {
-                by_item: false,
+                by_item: None,
                 carry_forward: false, // a tap fires only at its own position
                 carried: None,
                 runtime_key,
@@ -5429,7 +5456,7 @@ fn build_nested_induction_store(
         let prior = keys_map.insert(
             field.clone(),
             KeyReadInfo {
-                by_item: false,
+                by_item: None,
                 // An accumulator, so it carries within an enclosing position. It hands nothing
                 // across versions of its own: the *enclosing* store holds this variable,
                 // and two stores claiming one identity is what `live_state` asserts
@@ -5571,7 +5598,7 @@ fn build_induction_store_single(
         let prior = keys_map.insert(
             field.clone(),
             KeyReadInfo {
-                by_item: false,
+                by_item: None,
                 // An accumulator persists across positions. A literal init is the
                 // leading-carry fold default; a *conditional* single-writer loop
                 // does have leading carries (positions before the first
@@ -5618,9 +5645,12 @@ resolves to the other's value",
     // Both the store's decided frontier and the drive's window base come from this:
     // a store based below every position its input will offer waits for an element
     // that is not coming.
+    // An induction drive releases its source in order, so it resumes past a position and not
+    // from a region.
     let IterationInput {
         op: source_op,
         resumed_after,
+        ..
     } = ctx.iteration_input(&w.source, source_start(&domain, ctx), continues, |ctx| {
         convert_impl(&w.source, None, ctx)
     })?;
@@ -5758,16 +5788,15 @@ fn convert_store_read(
         (StoreReadKind::Commit, Some((runtime_key, value_extent, carry_forward, by_item))) => {
             let stream = Box::new(StoreValueStream::new(
                 ctx.slot_read_by(&fan, reader),
-                runtime_key,
+                runtime_key.clone(),
                 value_extent,
                 carry_forward,
             ));
             // A tap keyed by item holds `(item position, value)` at each commit, and its site
             // commits its items in its source's order.
-            Ok(if by_item {
-                Box::new(RekeySorted::new(stream, KeyOrder::Rising))
-            } else {
-                stream
+            Ok(match by_item {
+                Some(order) => Box::new(RekeySorted::new(stream, order)),
+                None => stream,
             })
         }
         // An `InductionChangelog` key read off the changelog by [`StoreDenseRead`],

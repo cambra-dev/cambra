@@ -76,19 +76,15 @@ fn a_pure_program_prints_what_pull_mode_prints(#[case] name: &str, #[case] sourc
 /// A program the planner refuses runs in pull mode, after a note naming the refusal.
 #[test]
 fn a_refused_program_runs_in_pull_mode() {
-    // A transaction store of two writers has no consuming mode.
+    // A pipeline's reader that also reads a live source is refused: the sum reads the let-bound
+    // list's sum, a pipeline, beside the lines of stdin.
     let source = indoc! {"
-        pool: Mut(Int, Txn) := 100
-        for r in [10]:
-            with begin():
-                pool := pool - r
-        for r in [5]:
-            with begin():
-                pool := pool - r
-        await_final(pool)
+        xs = [1, 2]
+        sum([x + sum(xs) for x in [1 for line in stdin()]])
     "};
-    let pulled = run("a_refused_program", source, "0");
-    let dispatched = run("a_refused_program", source, "1");
+    let input = "a\nb\n";
+    let pulled = run_reading("a_refused_program", source, "0", input);
+    let dispatched = run_reading("a_refused_program", source, "1", input);
     assert_eq!(dispatched.stdout, pulled.stdout);
     let stderr = String::from_utf8_lossy(&dispatched.stderr);
     assert!(
