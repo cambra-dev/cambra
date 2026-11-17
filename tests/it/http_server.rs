@@ -699,17 +699,17 @@ fn a_retired_route_answers_a_request_it_had_accepted() {
     );
 }
 
-/// Compile `code`, send one request with `request`, and return the reply body, failing after five
-/// seconds without one.
-fn reply_to(code: &str, request: impl FnOnce() -> String + Send + 'static) -> String {
+/// Compile `code`, send its requests with `requests`, and return what `requests` returns, failing
+/// after five seconds without it.
+fn reply_to<T: Send + 'static>(code: &str, requests: impl FnOnce() -> T + Send + 'static) -> T {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(code);
     let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
-    let (tx, rx) = mpsc::channel::<String>();
+    let (tx, rx) = mpsc::channel::<T>();
     thread::spawn(move || {
-        let _ = tx.send(request());
+        let _ = tx.send(requests());
     });
     drive_until(&mut ctx, &rx, Duration::from_secs(5))
 }
@@ -766,21 +766,47 @@ fn a_reply_inside_a_writing_block_answers_each_request_with_its_own_value() {
                 seen := seen + req
                 resps << seen
     "#};
-    let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let mut ctx = GlobalContext::default();
-    let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-
-    let (tx, rx) = mpsc::channel::<Vec<String>>();
-    thread::spawn(move || {
+    let replies = reply_to(&code, move || {
         let a = http_post(port, "/hit", "a");
         let b = http_post(port, "/hit", "b");
-        tx.send(vec![a, b]).unwrap();
+        vec![a, b]
     });
-    assert_eq!(
-        drive_until(&mut ctx, &rx, Duration::from_secs(5)),
-        vec!["a", "ab"]
-    );
+    assert_eq!(replies, vec!["a", "ab"]);
+}
+
+/// A response channel fed from two `<<` sites answers each request from the site its branch takes.
+/// The channel is the copairing of the sites' contributions (`src/ccl/design/sites.md`, "Channel
+/// tags"), and the sink reads each request's index through its site's arm.
+#[test]
+fn a_reply_fed_from_two_sites_answers_each_request() {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        reqs, resps = http_serve("{port}", "POST", "/pick")
+        for req in reqs:
+            if req == "5":
+                resps << "big"
+            else:
+                resps << "small"
+    "#};
+    let replies = reply_to(&code, move || {
+        ["5", "1"].map(|body| http_post(port, "/pick", body))
+    });
+    assert_eq!(replies, ["big", "small"]);
+}
+
+/// Two sites that answer one request reply once, from the first in tag order: `resps<<` sorts
+/// before `resps<<#1` (`src/interpreter/design-http-server.md`, "Request/response matching").
+#[test]
+fn a_request_two_sites_answer_is_answered_once() {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        reqs, resps = http_serve("{port}", "POST", "/twice")
+        for req in reqs:
+            resps << "first"
+            resps << "second"
+    "#};
+    let reply = reply_to(&code, move || http_post(port, "/twice", "x"));
+    assert_eq!(reply, "first");
 }
 
 /// A module whose route takes its address from `const` parameters serves, in each run, the

@@ -78,6 +78,10 @@ copairing with its recorded tags (`emit_copair`). Operator conversion reads them
 (`copair_tags`), and `UnionOperator` keys each arm by its operand's tag. A `++` copairing keeps
 positional `FieldKey::Index` tags.
 
+The HTTP response sink answers each row's request by the index its arm carries, and reads the tag
+only to name the site in an error
+([Request/response matching](../../interpreter/design-http-server.md#requestresponse-matching)).
+
 ## Stability
 
 A site moves only when one of its places moves. A place moves only when the program gains or loses

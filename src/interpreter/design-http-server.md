@@ -77,7 +77,32 @@ The TCP socket is bound synchronously in `SharedHttpServer::new` (not inside the
 
 ## Request/response matching
 
-Each request is assigned a monotonically-increasing integer index by `UIntStreamBuffer`.  The CCL program iterates over that index domain.  `SinkConsumer` pulls tiles from the responses producer and calls `HttpServerSharedState::process`, which matches `(index, response-body)` pairs against the `pending` map and sends each HTTP response outside the lock.
+`UIntStreamBuffer` gives each request the next integer index, and the CCL program iterates over that
+index domain. `SinkConsumer` pulls tiles from the responses producer and calls
+`HttpServerSharedState::process`. For each row, `process` reads the index of the request the row
+answers (`reply_keys`), takes that request from the `pending` map, and sends the response outside
+the lock.
+
+A response channel fed from one site keys each row by its request's index. A channel fed from
+several sites is the copairing of their contributions
+([Channel tags](../ccl/design/sites.md#channel-tags)). Its domain column is a `ColumnValue::Union`
+with one arm per site, and an arm's payload at a row is the index of the request that row answers.
+`reply_keys` reads the index through the arm and drops the tag, so a client receives one reply
+whichever site fed it.
+
+A request is answered once. Every branch serving a route shares its sink
+([Routes across branches](../ccl/design/program-evolution.md#routes-across-branches)), and each
+branch's version calls `process` with its own replies. The first reply to reach a request answers
+it, and `process` skips a row whose request has left `pending`. Two rows of one tile that name one
+request are two sites of one version answering it. `process` answers the first in tag order, logs
+the second as an error naming the route, the request and the site, and drops it
+(`a_request_two_sites_answer_is_answered_once`).
+
+> **Open: two sites answering one request is reported only within one tile.** When a version's two
+> sites answer one request in different pulls, the second reply finds the request gone from
+> `pending`, as another branch's reply would, and is skipped without an error. A program whose sites
+> both feed one request compiles. A compile-time refusal needs a proof that the contributions'
+> domains are disjoint, which `channelize` does not attempt.
 
 `UIntStreamBuffer` drops a request body once every registered producer has released its index, which
 bounds a long-lived server's memory to the requests still in flight. Bodies are dropped from the

@@ -11,7 +11,7 @@
 //! monotonically-increasing uint index.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
@@ -20,11 +20,11 @@ use std::{
     thread,
 };
 
-use log::debug;
+use log::{debug, error};
 use smol_str::SmolStr;
 use tiny_http::{Header, Response, Server};
 
-use crate::ccl::Type;
+use crate::ccl::{FieldKey, Type};
 use crate::interpreter::{
     BaseType, ColumnValue, DataSink, DataSourceDomainExtentImpl, Extent,
     stream_buffer::UIntStreamBuffer,
@@ -282,7 +282,7 @@ impl DataSourceDomainExtentImpl for UnopenedRoute {
         )
     }
 
-    fn carry_release_to_new_producers(&mut self, _predecessor: &std::collections::HashSet<String>) {
+    fn carry_release_to_new_producers(&mut self, _predecessor: &HashSet<String>) {
         unreachable!(
             "`{}` was never opened, so it has no release to carry",
             self.id
@@ -452,6 +452,8 @@ pub fn reserve_test_port() -> u16 {
 /// Holds the live `tiny_http::Request` objects (one per pending request) until
 /// the CCL program produces a response for them.
 pub struct HttpServerSharedState {
+    /// The route's method and path, which name it in an error.
+    route: String,
     /// Map from request index to the still-open `tiny_http::Request`.
     // shared-state-ok: the external-world boundary, where side effects live by
     // design. It holds the *socket* a request arrived on, not a value the program
@@ -461,8 +463,9 @@ pub struct HttpServerSharedState {
 }
 
 impl HttpServerSharedState {
-    fn new() -> Self {
+    fn new(route: String) -> Self {
         Self {
+            route,
             pending: Mutex::new(HashMap::new()),
         }
     }
@@ -501,7 +504,14 @@ fn respond_not_found(request: tiny_http::Request) {
 }
 
 impl DataSink for HttpServerSharedState {
-    /// Dispatch HTTP responses for all live `(UInt index, String body)` entries in `tile`.
+    /// Answer each live row of `tile` with its body, at the request [`reply_keys`] reads off its
+    /// key.
+    ///
+    /// A request is answered once. Every branch serving the route calls this sink with its own
+    /// replies, so a row whose request has left `pending` is skipped: another branch's reply, or
+    /// an earlier tile's, answered it. Two rows of one tile that name one request are two sites of
+    /// one version answering it. The first answers, and the second is logged as an error and
+    /// dropped.
     ///
     /// Collects `(request, body)` pairs from the pending map while holding the
     /// lock, then releases the lock and sends each response outside of it so that
@@ -517,8 +527,8 @@ impl DataSink for HttpServerSharedState {
             debug!("HttpServerSharedState::process: expected a collection, got {tile:?}");
             return;
         };
-        let ColumnValue::UInts(indices) = domain else {
-            debug!("HttpServerSharedState::process: expected UInt keys, got {domain:?}");
+        let Some(keys) = reply_keys(domain) else {
+            debug!("HttpServerSharedState::process: expected request keys, got {domain:?}");
             return;
         };
         let Tile::Scalar(ColumnValue::Strings(responses)) = codomain.as_ref() else {
@@ -531,15 +541,22 @@ impl DataSink for HttpServerSharedState {
         // Collect (request, body) while the lock is held.
         let to_send: Vec<_> = {
             let mut pending = self.pending.lock().unwrap();
-            indices
-                .iter()
-                .zip(responses.iter())
-                .enumerate()
-                .filter_map(|(j, (idx, body))| {
-                    if deleted.contains(j) {
+            let mut answered = HashSet::new();
+            keys.into_iter()
+                .filter(|key| !deleted.contains(key.row))
+                .filter_map(|key| {
+                    if !answered.insert(key.request) {
+                        let site = key
+                            .site
+                            .map_or(String::new(), |site| format!(" from site `{site}`"));
+                        error!(
+                            "route `{}`: request {} is answered twice; dropping the reply {:?}{site}",
+                            self.route, key.request, responses[key.row],
+                        );
                         return None;
                     }
-                    pending.remove(idx).map(|req| (req, body.clone()))
+                    let request = pending.remove(&key.request)?;
+                    Some((request, responses[key.row].clone()))
                 })
                 .collect()
         };
@@ -553,6 +570,59 @@ impl DataSink for HttpServerSharedState {
                 debug!("HTTP respond error: {e}");
             }
         }
+    }
+}
+
+/// A row of a reply tile, the request it answers, and the site that fed it when the channel has
+/// several.
+struct ReplyKey<'a> {
+    /// The row's position in the tile, which indexes its body and `deleted`.
+    row: usize,
+    /// The index of the request the row answers, its key in `pending`.
+    request: u64,
+    /// The tag of the site that fed the row, for a channel fed from several sites.
+    site: Option<&'a FieldKey>,
+}
+
+/// The request each row of a reply tile's `domain` answers, or `None` when `domain` keys no
+/// requests.
+///
+/// A channel fed from several sites is the copairing of their contributions
+/// (`src/ccl/design/sites.md`, "Channel tags"): its domain has one arm per site, and an arm's
+/// payload at a row is the index of the request that row answers.
+fn reply_keys(domain: &ColumnValue) -> Option<Vec<ReplyKey<'_>>> {
+    match domain {
+        ColumnValue::UInts(requests) => Some(
+            requests
+                .iter()
+                .enumerate()
+                .map(|(row, &request)| ReplyKey {
+                    row,
+                    request,
+                    site: None,
+                })
+                .collect(),
+        ),
+        ColumnValue::Union(arms) => {
+            let mut keys = Vec::new();
+            for (site, arm) in arms.iter() {
+                let ColumnValue::UInts(requests) = arm.values() else {
+                    return None;
+                };
+                keys.extend(
+                    arm.rows()
+                        .iter()
+                        .zip(requests)
+                        .map(|(&row, &request)| ReplyKey {
+                            row,
+                            request,
+                            site: Some(site),
+                        }),
+                );
+            }
+            Some(keys)
+        }
+        _ => None,
     }
 }
 
@@ -589,8 +659,8 @@ impl HttpServerDataSource {
     /// Registers the route with the provided [`SharedHttpServer`] instead of
     /// spawning a new server.  `id` is the canonical source name (used by `get_id`).
     pub fn new(server: &SharedHttpServer, method: String, path: String, id: String) -> Self {
+        let shared = Arc::new(HttpServerSharedState::new(format!("{method} {path}")));
         let receiver = server.register(method, path);
-        let shared = Arc::new(HttpServerSharedState::new());
 
         Self {
             buf: UIntStreamBuffer::new(),
@@ -697,7 +767,7 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
         self.buf.release(producer, obsolete);
     }
 
-    fn carry_release_to_new_producers(&mut self, predecessor: &std::collections::HashSet<String>) {
+    fn carry_release_to_new_producers(&mut self, predecessor: &HashSet<String>) {
         self.buf.carry_release_to_new_producers(predecessor);
     }
 
@@ -730,7 +800,7 @@ mod tests {
         HttpServerDataSource {
             buf: UIntStreamBuffer::new(),
             receiver,
-            shared: Arc::new(HttpServerSharedState::new()),
+            shared: Arc::new(HttpServerSharedState::new("GET /route".to_string())),
             id: "route".to_string(),
         }
     }
