@@ -792,7 +792,8 @@ no further restriction.
 
 `Consumer::notify(region, landing)` announces a region and marks cached reads of that region
 dirty. `Arrivals` records delivered notifications before forwarding them. Planning probes and
-`Consumer::route` describe paths without changing caches or executing reads.
+route walks pass a region through the same `notify` into a landing that records where it arrives
+(`Landing::probe`, `Landing::route`), without changing caches or executing reads.
 
 A placed pipeline entry queues the announced work and ends propagation. An unplaced entry inside
 another scheduled pipeline forwards the notification to that pipeline's caches. Operators restate
@@ -1148,8 +1149,11 @@ engine can still validate that proposal's reads at its snapshot. The last input 
 attempts all remaining decisions until every writer is terminal (`CommitProducer::settle_ready`).
 
 A reload pauses at a drained arbitration boundary, after every taken decision has been validated
-and published. A resuming drive releases the settled source prefix on its new subscription before
-reading new items ([Running a compiled program](design-dispatcher.md#running-a-compiled-program)).
+and published. A resuming transaction drive releases the exact settled source region its
+predecessor's slot holds, holes included, on its new subscription before reading new items
+([Running a compiled program](design-dispatcher.md#running-a-compiled-program)). An induction drive
+resumes one past its predecessor's position instead
+([Where a rebuilt reader picks up](../ccl/design/program-evolution.md#where-a-rebuilt-reader-picks-up)).
 
 Dispatcher planning, execution, pause and reload are specified in
 [Pipeline dispatch](design-dispatcher.md).

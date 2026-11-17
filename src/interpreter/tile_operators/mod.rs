@@ -425,9 +425,6 @@ impl Consumer for RecordingConsumer {
         }
         self.downstream.notify(region, landing);
     }
-    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
-        self.downstream.route(routes);
-    }
 }
 
 /// One collection level of a tile, keyed in [`completion_view`]'s map by the record fields
@@ -2199,12 +2196,6 @@ pub(crate) mod test_helpers {
         ) {
             for entry in &mut self.0 {
                 crate::interpreter::Consumer::notify(entry, region, landing);
-            }
-        }
-
-        fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
-            for entry in &mut self.0 {
-                crate::interpreter::Consumer::route(entry, routes);
             }
         }
     }
