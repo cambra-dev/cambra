@@ -190,7 +190,7 @@ pub enum Tile {
         closed_keys: Vec<Value>,
         /// Per writer of a transaction store that takes its writers' decisions ahead of their
         /// commits, what it says to that writer of the decisions it took ([`WriterTakes`]).
-        /// Empty for a store in pull mode and for an induction store. The level's, as
+        /// Empty before a transaction store opens and for an induction store. The level's, as
         /// `closed_keys` is, and it grows by join.
         writer_takes: Vec<WriterTakes>,
     },

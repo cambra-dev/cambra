@@ -62,18 +62,16 @@
 //! ```
 
 use std::{
-    cell::RefCell,
     io::Write,
     panic::{self, AssertUnwindSafe},
     process::{Command, Stdio},
-    rc::Rc,
 };
 
 use cambra::ccl::load::LoadedProgram;
 use cambra::{
     ccl::context::{CompileResultExt, GlobalContext, compile_program},
     interpreter::{
-        ColumnValue, Consumer, FuncBinding, Tile, Value, bindings_are_list,
+        ColumnValue, FuncBinding, Tile, Value, bindings_are_list,
         tile_operators::scalar_tile_to_column_value,
     },
 };
@@ -254,31 +252,13 @@ pub fn expect_stdin_program(program_name: &str, stdin_input: &str, expected_subs
 /// (e.g. a sink-only program — those use [`compile_sink`] instead).
 pub(crate) fn run_to_tile(source: &str) -> Tile {
     let mut ctx = GlobalContext::default();
-    let notified = Rc::new(RefCell::new(false));
-    let notified_clone = notified.clone();
-    let consumer: Box<dyn Consumer> = Box::new(move || {
-        *notified_clone.borrow_mut() = true;
-    });
     let loaded = LoadedProgram::test(source);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    ctx.scheduler().check_for_notifications();
-    assert!(
-        *notified.borrow(),
-        "expected consumer notification after compile_program"
-    );
-    let producer = compiled
-        .main_mut()
-        .and_then(|o| o.producer.as_mut())
-        .expect("program has no `main` output — use `compile_sink` for sink programs");
-    let mut result = producer.tiling().empty_tile();
-    for _ in 0..100 {
-        result = producer.get(producer.tiling().universal_guard());
-        if result.is_terminal() {
-            break;
-        }
-        ctx.scheduler().check_for_notifications();
-    }
-
+    let mut compiled =
+        compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let mut result = cambra::interpreter::dispatcher::run_program(&mut compiled, 1)
+        .expect("program dispatches")
+        .main
+        .expect("program has a main output");
     result.compact();
     result
 }

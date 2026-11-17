@@ -11,7 +11,7 @@ use std::{
 use super::*;
 use crate::ccl::ReadingKind;
 use crate::interpreter::operator_graph::value;
-use crate::interpreter::{BaseType, ColumnValue, Consumer, Extent, SubscribeContext, Value};
+use crate::interpreter::{BaseType, ColumnValue, Consumer, Extent, Value};
 
 /// What the run has read at one site ([`Reading::site`](crate::ccl::Reading::site)):
 /// one value per position, taken the first time any reader asks for the position and returned

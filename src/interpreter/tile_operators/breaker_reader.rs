@@ -51,7 +51,9 @@ impl TileProducer for BreakerReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::tile_operators::test_helpers::{TestTileProducer, two_levels_of_ints};
+    use crate::interpreter::tile_operators::test_helpers::{
+        ConsumeInPipeline, TestTileProducer, two_levels_of_ints,
+    };
 
     #[cfg(debug_assertions)]
     #[test]
@@ -103,13 +105,12 @@ mod tests {
         });
         let weak = weak.expect("the concrete breaker retains its weak handle");
         let handle = weak.upgrade().expect("the reader owns its breaker");
-        handle.borrow_mut().enter_consuming_mode();
         handle
             .borrow_mut()
-            .consume_impl(InputId::ONLY, tiling.universal_guard());
+            .consume_in_pipeline(InputId::ONLY, tiling.universal_guard());
         assert_eq!(reader.get(tiling.universal_guard()), tile);
         reader.release(tiling.universal_guard());
-        assert!(handle.borrow().obsolete_guard().is_universal());
+        assert!(handle.borrow().final_guard().is_empty());
         drop(reader);
         assert!(
             weak.upgrade().is_some(),

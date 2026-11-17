@@ -1,92 +1,22 @@
-//! The CLI driver contract: a notification-gated drive loop (as in
-//! `src/main.rs`) must converge a mutation-loop accumulator, whose store/drive
-//! cycle advances one position per pull and requests its own re-pull through the
-//! scheduler's deferred-wakeup queue.
-//!
-//! Before that mechanism existed, the first `get` returned an empty
-//! (non-terminal) tile and no further notification arrived — the domain source
-//! (a finite literal) had already fired — so the driver spun in
-//! `while !new_data { check_for_notifications() }` forever. These tests replicate
-//! the driver with **bounded** waits, so a lost-wakeup regression fails the test
-//! rather than hanging it.
-
-use std::cell::RefCell;
-use std::rc::Rc;
+//! Finite mutation-loop programs converge under the CLI's dispatcher driver.
 
 use cambra::ccl::context::{GlobalContext, compile_program};
 use cambra::ccl::load::LoadedProgram;
-use cambra::interpreter::{
-    ColumnValue, Consumer, Tile, TileGuard, Value, tile_operators::FunctionGuard,
-};
+use cambra::interpreter::{ColumnValue, Tile, Value};
 
-/// Drive a program's `main` output exactly as `src/main.rs` does — pull only
-/// after a notification, stop on a universal release — but with iteration caps
-/// that convert a hang into a panic. Returns every tile pulled, the last one terminal: an
-/// entry the output states complete is released on the pull that delivers it, so a later
-/// tile no longer holds it.
-fn drive_main_output(code: &str) -> Vec<Tile> {
-    const CAP: usize = 1000;
-
-    let new_data = Rc::new(RefCell::new(false));
-    let nd = new_data.clone();
-    let consumer: Box<dyn Consumer> = Box::new(move || *nd.borrow_mut() = true);
-
+fn drive_main_output(code: &str) -> Tile {
     let mut ctx = GlobalContext::default();
-    let mut compiled = match compile_program(&mut ctx, &LoadedProgram::test(code), consumer) {
-        Ok(c) => c,
-        Err(e) => panic!("compile failed: {e:?}"),
-    };
-    let mut producer = compiled
-        .main_mut()
-        .and_then(|o| o.producer.take())
-        .expect("program has a `main` output");
-    let universal = producer.tiling().universal_guard();
-
-    let mut pulls = 0;
-    let mut tiles = Vec::new();
-    loop {
-        pulls += 1;
-        assert!(
-            pulls < CAP,
-            "driver did not converge within {CAP} pulls (hang regression)"
-        );
-
-        // Wait for data — bounded, so a never-arriving wakeup fails loudly
-        // instead of spinning forever.
-        let mut waited = 0;
-        while !*new_data.borrow() {
-            waited += 1;
-            assert!(
-                waited < CAP,
-                "stalled waiting for a notification (lost-wakeup regression)"
-            );
-            ctx.scheduler().check_for_notifications();
-        }
-        *new_data.borrow_mut() = false;
-
-        let tile = producer.get(universal.clone());
-        let release_guard = match &tile {
-            Tile::Scalar(cv) => TileGuard::Scalar(TileGuard::leaf(!cv.is_empty())),
-            Tile::DataFunction {
-                domain_predicate, ..
-            } => TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
-            other => panic!("unexpected top-level tile shape: {other:?}"),
-        };
-        let done = release_guard.is_universal();
-        producer.release(release_guard);
-        tiles.push(tile);
-        if done {
-            break tiles;
-        }
-    }
+    let mut compiled = compile_program(&mut ctx, &LoadedProgram::test(code), Box::new(|| {}))
+        .expect("program compiles");
+    cambra::interpreter::dispatcher::run_program(&mut compiled, 1)
+        .expect("program dispatches")
+        .main
+        .expect("main output")
 }
 
 /// Extract the single integer a scalar `main` output resolved to.
 fn drive_scalar_int(code: &str) -> i64 {
-    match drive_main_output(code)
-        .pop()
-        .expect("a driven output ends in a terminal tile")
-    {
+    match drive_main_output(code) {
         Tile::Scalar(cv) => match cv.as_single() {
             Some(Value::Int(n)) => n,
             other => panic!("expected a single Int, got {other:?}"),
@@ -148,19 +78,15 @@ fn aggregate_converges_in_one_pull() {
     assert_eq!(drive_scalar_int("sum([1, 2, 3, 4, 5])"), 15);
 }
 
-/// The one integer a `main` output stream holds across every pull (a trailing standalone
-/// block's reply).
+/// The one integer a `main` output stream holds (a trailing standalone block's reply).
 fn drive_single_int(code: &str) -> i64 {
-    let values: Vec<i64> = drive_main_output(code)
-        .into_iter()
-        .flat_map(|tile| match tile {
-            Tile::DataFunction { codomain, .. } => match *codomain {
-                Tile::Scalar(ColumnValue::Ints(v)) => v,
-                other => panic!("expected an Ints stream, got {other:?}"),
-            },
-            other => panic!("expected a Function stream, got {other:?}"),
-        })
-        .collect();
+    let values: Vec<i64> = match drive_main_output(code) {
+        Tile::DataFunction { codomain, .. } => match *codomain {
+            Tile::Scalar(ColumnValue::Ints(v)) => v,
+            other => panic!("expected an Ints stream, got {other:?}"),
+        },
+        other => panic!("expected a Function stream, got {other:?}"),
+    };
     match values.as_slice() {
         [v] => *v,
         other => panic!("expected one value across the stream, got {other:?}"),

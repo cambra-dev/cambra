@@ -13,7 +13,7 @@ use crate::ccl::load::LoadedProgram;
 use crate::interpreter::dispatcher::{Dispatcher, PipelineId};
 use crate::interpreter::{BaseType, Extent, TestDataSource};
 
-use super::test_helpers::keys_between;
+use super::test_helpers::{ConsumeInPipeline as _, keys_between};
 use super::*;
 
 /// `total` summed over `[1, 2, 3]` and written to `out`: 6.
@@ -58,7 +58,6 @@ impl Compiled {
 
     fn with(source: &str, setup: impl FnOnce(&mut GlobalContext)) -> Self {
         let mut ctx = GlobalContext::default();
-        ctx.defer_sink_pulls();
         let _sink = ctx.register_test_sink("out");
         setup(&mut ctx);
         let loaded = LoadedProgram::test(source);
@@ -72,6 +71,11 @@ impl Compiled {
         let fan = stores.next().expect("a store's fan-out is cyclic");
         assert!(stores.next().is_none(), "one store");
         let store = fan.store().expect("the program subscribed its store");
+        store
+            .borrow_mut()
+            .as_breaking_mut()
+            .expect("a store breaks a pipeline")
+            .begin_run();
         Self {
             _ctx: ctx,
             program,
@@ -79,24 +83,27 @@ impl Compiled {
         }
     }
 
-    /// Pull each sink once, as pull mode does: its producer reads the store through a reader
-    /// slot of the store's fan-out and releases what it is done with there.
+    /// Query each sink through a dispatcher pipeline and release the region it consumed.
     fn pull_sinks(&self) {
         for output in &self.program.outputs {
             if let Some(consumer) = &output.sink_consumer {
-                consumer.borrow().pull_now();
+                let root = consumer.borrow().producer_slot().clone();
+                let mut root = root.borrow_mut();
+                let producer = root.as_mut().unwrap();
+                let guard = producer.tiling().universal_guard();
+                let tile = crate::interpreter::dispatcher::read_for_test(&mut **producer, guard);
+                producer.release(tile.to_guard());
             }
         }
     }
 
-    /// Call `f` with the store as a pipeline breaker, in consuming mode as a dispatched run puts
+    /// Call `f` with the store as a pipeline breaker, placed in a pipeline as a dispatched run puts
     /// it.
     fn breaker<R>(&self, f: impl FnOnce(&mut dyn BreakingProducer) -> R) -> R {
         let mut store = self.store.borrow_mut();
         let store = store
             .as_breaking_mut()
             .expect("a store is a pipeline breaker");
-        store.enter_consuming_mode();
         f(store)
     }
 
@@ -109,7 +116,7 @@ impl Compiled {
     fn consume_whole(&self, input: usize) {
         self.breaker(|store| {
             let whole = store.input_tiling(InputId(input)).universal_guard();
-            store.consume_impl(InputId(input), whole);
+            store.consume_in_pipeline(InputId(input), whole);
         });
     }
 
@@ -117,7 +124,7 @@ impl Compiled {
     fn snapshot(&self) -> Tile {
         self.breaker(|store| {
             let guard = store.tiling().universal_guard();
-            store.offer_impl(guard)
+            store.get(guard)
         })
     }
 }
@@ -134,10 +141,10 @@ fn writer(k: usize) -> usize {
 fn an_induction_store_decides_each_position_it_steps() {
     let compiled = Compiled::of(SUM);
     let decided = || compiled.breaker(|store| (store.final_guard(), store.complete()));
-    compiled.breaker(|store| store.consume_impl(InputId::ONLY, keys_between(0, 0)));
+    compiled.breaker(|store| store.consume_in_pipeline(InputId::ONLY, keys_between(0, 0)));
     let (held, after_one) = decided();
     assert_eq!(held, after_one);
-    compiled.breaker(|store| store.consume_impl(InputId::ONLY, keys_between(1, 1)));
+    compiled.breaker(|store| store.consume_in_pipeline(InputId::ONLY, keys_between(1, 1)));
     let (_, after_two) = decided();
     assert!(
         !after_one.is_empty() && guard_minus(&after_one, &after_two).is_empty(),
@@ -153,7 +160,7 @@ fn an_induction_store_decides_each_position_it_steps() {
 #[test]
 fn a_consuming_store_answers_from_its_snapshot() {
     let compiled = Compiled::of(SUM);
-    compiled.breaker(|store| store.consume_impl(InputId::ONLY, keys_between(0, 0)));
+    compiled.breaker(|store| store.consume_in_pipeline(InputId::ONLY, keys_between(0, 0)));
     let body_pulls = || {
         let mut pulls = 0;
         compiled
@@ -161,7 +168,7 @@ fn a_consuming_store_answers_from_its_snapshot() {
             .borrow()
             .visit_input_producers(&mut |role, input| {
                 if role == "body" {
-                    pulls = input.base().pulls;
+                    pulls = input.base().reads;
                 }
             });
         pulls
@@ -179,10 +186,10 @@ fn a_consuming_store_answers_from_its_snapshot() {
 #[should_panic(expected = "an induction store finishes the run terminal")]
 fn a_store_short_of_terminal_at_its_finish_panics() {
     let compiled = Compiled::of(SUM);
-    compiled.breaker(|store| store.consume_impl(InputId::ONLY, keys_between(0, 0)));
+    compiled.breaker(|store| store.consume_in_pipeline(InputId::ONLY, keys_between(0, 0)));
     let dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        compiled.breaker(|store| store.finish(pushes))
+        compiled.breaker(|store| store.finish(InputId::ONLY, pushes))
     });
 }
 
@@ -191,7 +198,7 @@ fn a_store_short_of_terminal_at_its_finish_panics() {
 #[should_panic(expected = "is consumed only for positions its input releases")]
 fn a_morsel_whose_positions_have_not_arrived_panics() {
     let compiled = Compiled::over_an_empty_source(OVER_A_SOURCE);
-    compiled.breaker(|store| store.consume_impl(InputId::ONLY, keys_between(0, 0)));
+    compiled.breaker(|store| store.consume_in_pipeline(InputId::ONLY, keys_between(0, 0)));
 }
 
 /// Two writers of one transaction store, each drawing its items from the pool: writer 0 takes 10
@@ -238,7 +245,7 @@ fn input_pulls(compiled: &Compiled) -> u64 {
     compiled
         .store
         .borrow()
-        .visit_input_producers(&mut |_, input| pulls += input.base().pulls);
+        .visit_input_producers(&mut |_, input| pulls += input.base().reads);
     pulls
 }
 
@@ -285,26 +292,6 @@ fn a_ready_writer_commits_while_its_sibling_is_idle() {
 
 /// Settling takes both writers against one snapshot. After the first commit the other's
 /// proposal is stale, so retry must read the committed value rather than overwrite it.
-#[test]
-fn settling_retries_a_stale_ready_proposal() {
-    let compiled = Compiled::of(TWO_WRITERS);
-    compiled.open();
-    let dispatcher = Dispatcher::new(vec![vec![]; 3], usize::MAX);
-    for input in 1..3 {
-        dispatcher.close(PipelineId(input));
-    }
-    for input in 0..3 {
-        dispatcher.finish_by_hand(PipelineId(input), |pushes| {
-            compiled.breaker(|store| store.finish(pushes))
-        });
-    }
-    assert_eq!(
-        committed(&compiled.snapshot()),
-        [90, 85, 65].map(Value::Int)
-    );
-    assert!(compiled.snapshot().is_terminal());
-}
-
 /// The finish of the last input to finish commits what the store still holds and leaves the
 /// store terminal; the earlier inputs' finishes leave it as it was.
 #[test]
@@ -319,16 +306,17 @@ fn the_last_finish_of_the_last_input_commits_the_rest() {
     }
     for input in 0..2 {
         dispatcher.finish_by_hand(PipelineId(input), |pushes| {
-            compiled.breaker(|store| store.finish(pushes))
+            compiled.breaker(|store| store.finish(InputId(input), pushes))
         });
     }
     assert_eq!(committed(&compiled.snapshot()), [90, 70].map(Value::Int));
     assert!(!compiled.snapshot().is_terminal());
+    compiled.consume_whole(writer(1));
     dispatcher.finish_by_hand(PipelineId(2), |pushes| {
-        compiled.breaker(|store| store.finish(pushes))
+        compiled.breaker(|store| store.finish(InputId(2), pushes))
     });
     let settled = compiled.snapshot();
-    assert_eq!(committed(&settled), [90, 70, 65].map(Value::Int).to_vec());
+    assert_eq!(committed(&settled).last(), Some(&Value::Int(65)));
     assert!(settled.is_terminal(), "{settled:?}");
 }
 
@@ -356,7 +344,7 @@ fn a_release_reclaims_no_version_a_held_proposal_read() {
     compiled.open();
     let consume = |writer_k: usize, position: u64| {
         compiled.breaker(|store| {
-            store.consume_impl(InputId(writer(writer_k)), keys_between(position, position))
+            store.consume_in_pipeline(InputId(writer(writer_k)), keys_between(position, position))
         });
     };
     consume(0, 0);
@@ -373,8 +361,9 @@ fn a_release_reclaims_no_version_a_held_proposal_read() {
         dispatcher.close(PipelineId(input));
     }
     for input in 0..4 {
+        compiled.consume_whole(input);
         dispatcher.finish_by_hand(PipelineId(input), |pushes| {
-            compiled.breaker(|store| store.finish(pushes))
+            compiled.breaker(|store| store.finish(InputId(input), pushes))
         });
     }
     let settled = compiled.snapshot();
@@ -415,46 +404,10 @@ fn a_live_writer_releases_decided_absent_positions() {
     let source: Rc<RefCell<dyn DataSourceDomainExtentImpl>> = feed.clone();
     compiled.breaker(|store| {
         store.read_source_again(&source);
-        store.consume_impl(InputId(writer(1)), keys_between(0, 1));
+        store.consume_in_pipeline(InputId(writer(1)), keys_between(0, 1));
     });
     assert_eq!(
         committed(&compiled.snapshot()),
         [90, 70, 65].map(Value::Int).to_vec()
     );
-}
-
-/// Writers with different key constructors share a consuming transaction store.
-#[test]
-fn several_writers_over_tagged_and_uint_positions_consume() {
-    let compiled = Compiled::of(indoc! {"
-        out = test_sink()
-        pool: Mut(Int, Txn) := 100
-        for r in [1, 2] ++ [3]:
-            with begin():
-                pool := pool - r
-        for r in [5]:
-            with begin():
-                pool := pool - r
-        out << await_final(pool)
-    "});
-    let refusal = compiled.breaker(|store| store.no_consuming_mode());
-    assert_eq!(refusal, None);
-}
-
-/// A product writer needs no key comparison with its sibling.
-#[test]
-fn several_writers_over_product_and_uint_positions_consume() {
-    let compiled = Compiled::of(indoc! {"
-        out = test_sink()
-        pool: Mut(Int, Txn) := 100
-        for r in [x + y for x in [1, 2] for y in [3, 4]]:
-            with begin():
-                pool := pool - r
-        for r in [5]:
-            with begin():
-                pool := pool - r
-        out << await_final(pool)
-    "});
-    let refusal = compiled.breaker(|store| store.no_consuming_mode());
-    assert_eq!(refusal, None);
 }

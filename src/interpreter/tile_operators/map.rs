@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use bit_set::BitSet;
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
@@ -220,7 +222,7 @@ impl TileOperator for MapResult {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        let (shared, gate) = shared_consumer(consumer);
+        let shared = shared_consumer(consumer);
         let values_are_keys = self
             .input
             .result_correlation()
@@ -271,17 +273,14 @@ impl TileOperator for MapResult {
             );
         }
         let function_producer = match looked_up_at_keys {
-            Some(at) => {
-                let wakeups = cx.scheduler().wakeup_queue();
-                self.function.subscribe(
-                    self.function.tiling().universal_guard(),
-                    crate::interpreter::scheduler::restating_lookup(
-                        Box::new(move |region| keys_looked_up(region, at)),
-                        forwarding_consumer_keeping_keys(&shared, &wakeups),
-                    ),
-                    cx,
-                )
-            }
+            Some(at) => self.function.subscribe(
+                self.function.tiling().universal_guard(),
+                crate::interpreter::notifications::restating_lookup(
+                    Box::new(move |region| keys_looked_up(region, at)),
+                    forwarding_consumer_keeping_keys(&shared),
+                ),
+                cx,
+            ),
             None => subscribe_forwarding(&mut *self.function, &shared, cx),
         };
         // The result's outermost keys are the input's where the function applies to the input's
@@ -296,8 +295,7 @@ impl TileOperator for MapResult {
         let input_producer =
             subscribe_forwarding_keeping_keys_if(keeps_keys, &mut *self.input, &shared, cx);
         Box::new(MapResultProducer {
-            base: ProducerBase::new(MapResultProducer::alloc_id(), self.tiling(), &self.base, cx)
-                .sharing(gate),
+            base: ProducerBase::new(MapResultProducer::alloc_id(), self.tiling(), &self.base, cx),
             input: input_producer,
             function: function_producer,
             values_are_keys,
@@ -852,27 +850,30 @@ impl TileOperator for MapResultToConst {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        let (shared, gate) = shared_consumer(consumer);
+        let shared = shared_consumer(consumer);
         let constant_producer = subscribe_forwarding(&mut *self.constant, &shared, cx);
         // The constant is read whole, since every row reads all of it, so its notification
         // widens; the input is pulled at the projection.
-        let keeps_keys =
-            self.level != CurryLevel::OUTERMOST && self.input.tiling().is_data_function();
+        let input_consumer = forwarding_consumer_keeping_keys(&shared);
+        let input_consumer = crate::interpreter::notifications::through_values(
+            self.level,
+            self.tiling(),
+            input_consumer,
+        );
         let input_producer =
-            subscribe_forwarding_keeping_keys_if(keeps_keys, &mut *self.input, &shared, cx);
+            self.input
+                .subscribe(self.input.tiling().universal_guard(), input_consumer, cx);
         Box::new(MapResultToConstProducer {
             base: ProducerBase::new(
                 MapResultToConstProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
                 cx,
-            )
-            .sharing(gate),
+            ),
             input: input_producer,
             constant: constant_producer,
             mode: self.mode,
             level: self.level,
-            constant_unread: false,
         })
     }
 }
@@ -883,9 +884,6 @@ struct MapResultToConstProducer {
     constant: Box<dyn TileProducer>,
     mode: MapResultToConstMode,
     level: CurryLevel,
-    /// Whether the last pull found no live row and so did not read the constant. The next
-    /// pull that finds one reads it, and only the input's notification brings that pull.
-    constant_unread: bool,
 }
 
 impl MapResultToConstProducer {
@@ -955,10 +953,6 @@ impl TileProducer for MapResultToConstProducer {
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("input", &*self.input);
         visit("constant", &*self.constant);
-    }
-
-    fn answered_without(&self, role: &str) -> bool {
-        role == "constant" && self.constant_unread
     }
 
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
@@ -1047,10 +1041,10 @@ impl MapResultToConstProducer {
             if let Some(dropped) = input_tile.deleted_keys_guard() {
                 self.input.release(dropped);
             }
-            self.constant_unread = true;
+
             return self.empty_beneath_live_rows(&input_tile);
         }
-        self.constant_unread = false;
+
         let streams = c_tiling.is_data_function();
         let constant_guard = c_tiling.universal_guard();
         let constant_tile = self.constant.get(constant_guard);
@@ -1551,7 +1545,7 @@ mod nested_projection_tests {
             &mut Default::default(),
         );
         let projection = Projection::admitting(Predicate::point(Value::UInt(1)));
-        let actual = producer.get(projection.guard(&tiling));
+        let actual = producer.read_in_pipeline(projection.guard(&tiling));
         let mut expected = ints_by_position(&[7, 8], true);
         expected.restrict_to(&projection, &tiling);
         assert_eq!(actual, expected);
@@ -1585,6 +1579,7 @@ mod nested_projection_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::interpreter::tile_operators::test_helpers::{
         ProjectionSpy, ReleaseSpy, TestTileProducer,
     };
@@ -1755,7 +1750,7 @@ mod tests {
         };
 
         // Get the result from MapResultProducer
-        let result = map_result.get(map_result.tiling().universal_guard());
+        let result = map_result.read_in_pipeline(map_result.tiling().universal_guard());
 
         // Verify the result
         match result {
@@ -1878,7 +1873,7 @@ mod tests {
             level: CurryLevel::new(1),
         };
 
-        let result = map_result.get(map_result.tiling().universal_guard());
+        let result = map_result.read_in_pipeline(map_result.tiling().universal_guard());
 
         let Tile::DataFunction {
             domain,
@@ -1950,7 +1945,7 @@ mod tests {
             values_are_keys: false,
             level: CurryLevel::new(1),
         };
-        let result = map_result.get(map_result.tiling().universal_guard());
+        let result = map_result.read_in_pipeline(map_result.tiling().universal_guard());
         let Tile::DataFunction {
             domain_predicate: out_pred,
             ..
@@ -2020,7 +2015,7 @@ mod tests {
             values_are_keys: false,
             level: CurryLevel::new(1),
         };
-        let out = producer.get(producer.tiling().universal_guard());
+        let out = producer.read_in_pipeline(producer.tiling().universal_guard());
         let Tile::DataFunction { codomain, .. } = &out else {
             panic!("expected a collection, got {out:?}")
         };
@@ -2044,7 +2039,7 @@ mod tests {
         );
         // The debug completeness check in `get` compares this pull with the last.
         *next.borrow_mut() = input_at(vec![0, 1], 1);
-        let _ = producer.get(producer.tiling().universal_guard());
+        let _ = producer.read_in_pipeline(producer.tiling().universal_guard());
     }
 
     /// An argument the function has not answered is withheld, and its row arrives later
@@ -2104,7 +2099,7 @@ mod tests {
             values_are_keys: false,
             level: CurryLevel::new(2),
         };
-        let out = producer.get(producer.tiling().universal_guard());
+        let out = producer.read_in_pipeline(producer.tiling().universal_guard());
         let Tile::DataFunction { codomain, .. } = &out else {
             panic!("expected a collection, got {out:?}")
         };
@@ -2120,7 +2115,7 @@ mod tests {
             "[0, 1] was withheld, yet the inner level calls it complete: {out:?}"
         );
         *next.borrow_mut() = f_at(vec![5, 6]);
-        let _ = producer.get(producer.tiling().universal_guard());
+        let _ = producer.read_in_pipeline(producer.tiling().universal_guard());
     }
 
     /// At a level above the innermost, `MapResultToConst` replaces each value there whole:
@@ -2163,9 +2158,8 @@ mod tests {
             )),
             mode: MapResultToConstMode::Replace,
             level: CurryLevel::new(1),
-            constant_unread: false,
         };
-        let out = producer.get(producer.tiling().universal_guard());
+        let out = producer.read_in_pipeline(producer.tiling().universal_guard());
         assert_eq!(
             out,
             Tile::data_function(
@@ -2219,7 +2213,7 @@ mod tests {
             values_are_keys: false,
             level: CurryLevel::new(1),
         };
-        let out = producer.get(producer.tiling().universal_guard());
+        let out = producer.read_in_pipeline(producer.tiling().universal_guard());
         assert!(out.is_empty(), "no argument, no result: {out:?}");
     }
 
@@ -2261,13 +2255,12 @@ mod tests {
             )),
             mode: MapResultToConstMode::Replace,
             level: CurryLevel::new(1),
-            constant_unread: false,
         };
-        let first = producer.get(producer.tiling().universal_guard());
+        let first = producer.read_in_pipeline(producer.tiling().universal_guard());
         assert_eq!(stated(&first), Predicate::at_or_below(Value::UInt(0)));
         // Pull 2: key 1 arrives live, and the constant is still not terminal.
         *next.borrow_mut() = input_at(vec![0, 1], vec![1, 10], 1);
-        let second = producer.get(producer.tiling().universal_guard());
+        let second = producer.read_in_pipeline(producer.tiling().universal_guard());
         assert!(second.is_empty(), "no row before the constant: {second:?}");
         assert_eq!(
             stated(&second),
@@ -2321,7 +2314,7 @@ mod tests {
             Vec::new(),
             Some(vec![TilePathStep::Codomain]),
         );
-        let _ = producer.get(producer.tiling().universal_guard());
+        let _ = producer.read_in_pipeline(producer.tiling().universal_guard());
         let beneath = |outer: u64| {
             TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
                 FunctionGuard::Domain(Predicate::qualified(
@@ -2389,7 +2382,7 @@ mod tests {
             Vec::new(),
             Some(vec![TilePathStep::Codomain]),
         );
-        let _ = producer.get(producer.tiling().universal_guard());
+        let _ = producer.read_in_pipeline(producer.tiling().universal_guard());
         releases
             .into_iter()
             .map(|release| {
@@ -2663,7 +2656,7 @@ mod projection_tests {
     #[test]
     fn a_stream_of_positions_looks_up_only_its_morsel() {
         let (mut map, logs) = lookup_over_positions();
-        let morsel = map.get(keys_between(2, 4));
+        let morsel = map.read_in_pipeline(keys_between(2, 4));
         assert_eq!(int_entries(&morsel), [(2, 120), (3, 130), (4, 140)]);
         assert_eq!(*logs.input_pulled.borrow(), [keys_between(2, 4)]);
         assert_eq!(*logs.function_pulled.borrow(), [keys_between(2, 4)]);
@@ -2684,11 +2677,11 @@ mod projection_tests {
     #[test]
     fn releasing_a_morsel_retires_the_table_keys_it_looked_up() {
         let (mut map, logs) = lookup_over_positions();
-        map.get(keys_between(0, 3));
+        map.read_in_pipeline(keys_between(0, 3));
         map.release(keys_between(0, 3));
         assert_eq!(*logs.input_released.borrow(), [keys_between(0, 3)]);
         assert_eq!(*logs.function_released.borrow(), [keys_between(0, 3)]);
-        let next = map.get(keys_between(4, 9));
+        let next = map.read_in_pipeline(keys_between(4, 9));
         assert_eq!(
             int_entries(&next),
             (4..10)
@@ -2716,7 +2709,7 @@ mod projection_tests {
             false,
             CurryLevel::new(1),
         );
-        let morsel = map.get(keys_between(0, 1));
+        let morsel = map.read_in_pipeline(keys_between(0, 1));
         assert_eq!(int_entries(&morsel), [(0, 190), (1, 180)]);
         assert_eq!(*logs.input_pulled.borrow(), [keys_between(0, 1)]);
         assert_eq!(
@@ -2737,9 +2730,15 @@ mod projection_tests {
             false,
             CurryLevel::new(1),
         );
-        assert_eq!(int_entries(&map.get(keys_between(0, 0))), [(0, 180)]);
+        assert_eq!(
+            int_entries(&map.read_in_pipeline(keys_between(0, 0))),
+            [(0, 180)]
+        );
         map.release(keys_between(0, 0));
-        assert_eq!(int_entries(&map.get(keys_between(1, 1))), [(1, 180)]);
+        assert_eq!(
+            int_entries(&map.read_in_pipeline(keys_between(1, 1))),
+            [(1, 180)]
+        );
         assert!(logs.function_released.borrow().is_empty());
         assert_eq!(
             *logs.function_pulled.borrow(),
@@ -2768,7 +2767,7 @@ mod projection_tests {
             false,
             CurryLevel::new(1),
         );
-        let morsel = map.get(keys_between(3, 5));
+        let morsel = map.read_in_pipeline(keys_between(3, 5));
         assert_eq!(int_entries(&morsel), [(3, -4), (4, -5), (5, -6)]);
         assert_eq!(*logs.input_pulled.borrow(), [keys_between(3, 5)]);
         assert_eq!(
@@ -2862,7 +2861,7 @@ mod projection_tests {
             false,
             CurryLevel::OUTERMOST,
         );
-        let answer = map.get(keys_between(0, 1));
+        let answer = map.read_in_pipeline(keys_between(0, 1));
         let Tile::DataFunction { domain, .. } = &answer else {
             panic!("a collection, got {answer:?}")
         };
@@ -2962,7 +2961,6 @@ mod const_projection_tests {
                 constant: Box::new(constant),
                 mode,
                 level: CurryLevel::new(1),
-                constant_unread: false,
             },
             input_pulled,
             constant_pulled,
@@ -2975,7 +2973,7 @@ mod const_projection_tests {
     fn a_replaced_stream_reads_the_morsel_and_the_constant_whole() {
         let (mut map, input_pulled, constant_pulled) =
             broadcast(MapResultToConstMode::Replace, seven(true));
-        let morsel = map.get(keys_between(2, 4));
+        let morsel = map.read_in_pipeline(keys_between(2, 4));
         assert_eq!(int_entries(&morsel), [(2, 7), (3, 7), (4, 7)]);
         assert_eq!(*input_pulled.borrow(), [keys_between(2, 4)]);
         assert_eq!(
@@ -3001,7 +2999,7 @@ mod const_projection_tests {
     #[test]
     fn a_constant_that_has_not_landed_answers_nothing_for_any_morsel() {
         let (mut map, _, _) = broadcast(MapResultToConstMode::Replace, seven(false));
-        let morsel = map.get(keys_between(0, 3));
+        let morsel = map.read_in_pipeline(keys_between(0, 3));
         assert!(int_entries(&morsel).is_empty());
     }
 
@@ -3073,7 +3071,7 @@ mod source_projection_tests {
     #[test]
     fn a_morsel_reads_only_its_rows_of_the_source() {
         let (mut read, pulled) = read_source();
-        let morsel = read.get(keys_between(1, 3));
+        let morsel = read.read_in_pipeline(keys_between(1, 3));
         assert_eq!(int_entries(&morsel), [(1, 20), (2, 30), (3, 40)]);
         assert_eq!(*pulled.borrow(), [keys_between(1, 3)]);
     }

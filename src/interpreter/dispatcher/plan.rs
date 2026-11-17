@@ -16,9 +16,8 @@ use crate::interpreter::tile_operators::StoreCell;
 use crate::interpreter::tiling::Tile;
 use crate::interpreter::{BaseType, DataSink, DataSourceDomainExtentImpl, Extent};
 
-/// Run `program`'s pipelines through a dispatcher of `morsel_rows` on the calling thread, the
-/// program compiled with its sinks unpulled (`GlobalContext::defer_sink_pulls`). The breakers are
-/// the producers in the chains under its sinks' producers and its `main` output's that are pipeline
+/// Run `program`'s pipelines through a dispatcher of `morsel_rows` on the calling thread.
+/// The breakers are the producers in the chains under its sinks' producers and its `main` output's that are pipeline
 /// breakers (`TileProducer::as_breaking_mut`), each store a reader slot reaches, and each sink's
 /// own and the `main` output's ([`SinkBreaker`]), whose pipeline no pipeline reads. A breaker's
 /// pipeline reads the pipelines of the nearest breakers beneath it, and the consumer at the
@@ -55,7 +54,7 @@ use crate::interpreter::{BaseType, DataSink, DataSourceDomainExtentImpl, Extent}
 /// # Errors
 ///
 /// Where planning encounters an unsupported program shape, before execution and with no entry or
-/// sink left placed: sinks compiled in pull mode; live ranges whose arrivals cannot be routed to
+/// sink left placed: live ranges whose arrivals cannot be routed to
 /// a supported input projection; incompatible direct shared reads; a breaker with no consuming
 /// mode; or a store refused by [`Planner::store_pipeline`].
 ///
@@ -93,7 +92,7 @@ pub fn run_program_polling(
 
 /// [`run_program_polling`] handing `main` the answers of the `main` output (`SinkBreaker::main`):
 /// with no live source, one answer at the output pipeline's finish, its packages' answers merged
-/// with what the producer states complete, the answer pull mode's one pull makes; over a live
+/// with what the producer states complete; over a live
 /// source, each package's answer as it is consumed, and at the finish the answer that states the
 /// output complete. The answers add up to a terminal one. The driver of a program that reads a live
 /// source prints each delivery's part of the `main` output as it arrives. It answers what it
@@ -116,13 +115,6 @@ pub fn run_program_into(
     main: Arc<dyn DataSink>,
     on_idle: &mut dyn FnMut(),
 ) -> Result<Vec<Planned>, Refused> {
-    if !program.sink_pulls_deferred() {
-        return Err(Refused(
-            "the program was compiled with its sinks pulled, which runs part of it in pull mode \
-             (`GlobalContext::defer_sink_pulls`)"
-                .to_string(),
-        ));
-    }
     // A `main` output's producer is the driver's to pull; the run takes it into a slot, as a
     // sink's sits in one, and hands it back after. A program has at most one.
     let mut taken = None;
@@ -163,17 +155,16 @@ pub fn run_program_into(
         program.outputs[*at].producer = producer;
     }
     let planned = result?;
-    pull_sinks(&targets);
+    complete_sinks(&targets);
     Ok(planned)
 }
 
-/// The run's last pull of each sink of `targets`, as pull mode's last: its producer answers from
-/// what the breakers consumed and is released whole, so the pull hands the sink nothing new and
-/// finds it done, which signals `CompiledProgram::done` once every sink has.
-fn pull_sinks(targets: &[RunTarget]) {
+/// Reconcile terminal output after every pipeline finishes and signal each sink's completion.
+/// Producers answer from completed breakers and are released whole.
+fn complete_sinks(targets: &[RunTarget]) {
     for (_, _, entry) in targets {
         if let TargetEntry::Sink(consumer) = entry {
-            consumer.borrow().pull_now();
+            consumer.borrow_mut().complete();
         }
     }
 }
@@ -262,7 +253,7 @@ impl Targets {
     ) -> Result<Ended, Refused> {
         let ended = run_targets(&self.0, morsel_rows, observer)?;
         if let Ended::Done(_) = ended {
-            pull_sinks(&self.0);
+            complete_sinks(&self.0);
         }
         Ok(ended)
     }
@@ -644,8 +635,8 @@ fn run_targets(
                         // A keyed breaker's push arrives as keys along a route that keeps them. A
                         // breaker of one value brings rows where its push names rows no arrival
                         // brings, as a let-bound record's collection field does; where it names
-                        // only rows the arrivals bring, those rows read it, and wait held for its
-                        // completed push.
+                        // only rows the arrivals bring, those rows read it, and wait for its
+                        // complete push.
                         let as_keys = match keyed {
                             true => routes_to(&pusher, pipeline)
                                 .iter()
@@ -696,7 +687,7 @@ fn run_targets(
     // Over a live source a `main` output hands each package's answer as it consumes it, since
     // the run finishes it only once every source yields everything. A run with no live source
     // finishes it once its input is whole, so it merges its packages' answers until then and
-    // hands one, as pull mode's one pull does.
+    // hands one terminal answer.
     if !live.is_empty() {
         for ((_, _, entry), breaker) in targets.iter().zip(&sink_breakers) {
             if let TargetEntry::Main(_) = entry {
@@ -704,12 +695,9 @@ fn run_targets(
             }
         }
     }
-    // The run drives every breaker it planned, so each takes its consuming mode here, before any
-    // package, and keeps it for the run.
+    // Initialize every planned breaker before any package executes.
     for pipeline in 0..members.names.len() {
-        reach(PipelineId(pipeline), &mut |breaker, _| {
-            breaker.enter_consuming_mode()
-        });
+        reach(PipelineId(pipeline), &mut |breaker, _| breaker.begin_run());
     }
     let execution = Execution::new(&scopes, &mut dispatcher);
     let mut root_reach = reach;
@@ -736,7 +724,7 @@ fn run_targets(
         }
     });
     // Every breaker and range is terminal at the run's end, so each pipeline has recorded as
-    // completed by each of its sources all that a push of the source's every key lands as at its
+    // complete by each of its sources all that a push of the source's every key lands as at its
     // entry. A run that pauses stops at a drained boundary before its end, and checks nothing.
     #[cfg(debug_assertions)]
     if done {
@@ -752,7 +740,7 @@ fn run_targets(
                 let complete = dispatcher.complete_of(PipelineId(reader), PipelineId(source));
                 debug_assert!(
                     complete.covers(&reached),
-                    "{name} has complete all it reaches of {}'s input, {reached:?}, at the run's end, \
+                    "{name} has completed all it reaches of {}'s input, {reached:?}, at the run's end, \
                      which records {complete:?}",
                     members.names[reader]
                 );
@@ -925,6 +913,7 @@ impl Execution {
             followers_released: false,
             finishing: None,
         });
+        induction(store).decide_through_drive(pipeline);
     }
 
     pub(super) fn reach(&self, pipeline: PipelineId, root: &mut Reach<'_>, call: &mut Call<'_>) {
@@ -1085,7 +1074,7 @@ fn reads_a_scope(located: &[&Located], reads: &[Vec<usize>], pipeline: usize) ->
 }
 
 /// Unplace every entry `placements` holds and every sink consumer of `targets`: a refused run
-/// runs nothing, so it leaves nothing placed. A later run in pull mode pushes nothing, but a
+/// runs nothing and leaves nothing placed. A later run can place the graph again, and a
 /// placed entry claims a pipeline that no dispatcher holds.
 fn unplace(placements: &[Vec<Placement>], targets: &[RunTarget]) {
     for placement in placements.iter().flatten() {
@@ -1099,7 +1088,7 @@ fn unplace(placements: &[Vec<Placement>], targets: &[RunTarget]) {
     }
 }
 
-/// Why the planner refuses a program: a shape no pipeline runs yet, which pull mode runs.
+/// Why the planner refuses a program before any pipeline runs.
 #[derive(Debug)]
 pub struct Refused(String);
 
@@ -1126,11 +1115,11 @@ pub(super) enum Consumes {
 }
 
 /// The dispatcher over the pipelines `reads` describes, with every pipeline that reads another
-/// parking the rows its pushes bring until the pipelines it reads have completed them, reading its
+/// holding the rows its pushes bring until the pipelines it reads have completed them, reading its
 /// input whole where a pipeline it reads reaches it along no route, and queued at the start the
 /// regions no push names ([`run_program`] says how). `arrivals` says whether a
 /// pipeline takes a live source's arrivals beside the pipelines it reads
-/// ([`Dispatcher::take_arrivals`]), which it holds ([`Dispatcher::wait_for_inputs`]). `opens` says the
+/// ([`Dispatcher::take_arrivals`]), which wait for input completion ([`Dispatcher::wait_for_inputs`]). `opens` says the
 /// dispatcher is the run's, where a store or a loop's scope holds its deliveries; in a loop's
 /// scope it follows the pipelines it reads, round by round. `kinds` says how each
 /// pipeline takes its packages; `pushes_with` names, for each pipeline, the first pipeline of its
@@ -1157,7 +1146,7 @@ pub(super) fn plan_edges(
             dispatcher.opens_before(PipelineId(pipeline));
         }
     }
-    // A store completes its positions in order; a scope steps its store in order.
+    // A store decides its positions in order; a scope steps its store in order.
     for (pipeline, kind) in kinds.iter().enumerate() {
         if *kind != Consumes::Pushes {
             dispatcher.order(PipelineId(pipeline));
@@ -1195,7 +1184,7 @@ pub(super) fn plan_edges(
         }
         if arrivals[reader] {
             match kinds[reader] {
-                // A pipeline that pushes takes each delivery, held until the pipelines it reads
+                // A pipeline that pushes takes each delivery, waiting for inputs until the pipelines it reads
                 // have completed it.
                 Consumes::Pushes => {
                     dispatcher.take_arrivals(PipelineId(reader));
@@ -1259,8 +1248,8 @@ pub(super) fn plan_edges(
                 unreached = true;
                 continue;
             }
-            // A row reached along a path that passes a completed region on and along one that drops
-            // it depends on rows the region does not name, so the read completes it only once whole.
+            // A row reached along a path that passes a complete region on and along one that drops
+            // it depends on rows the region does not name, so the read decides it only once whole.
             if routes.iter().any(|route| route.completes_part)
                 && routes.iter().any(|route| !route.completes_part)
             {
@@ -1271,7 +1260,7 @@ pub(super) fn plan_edges(
                     dispatcher.completes_whole_only(PipelineId(reader), PipelineId(shared));
                 }
             }
-            // A read along a route reaches what a push of its every key, wholly completed, lands
+            // A read along a route reaches what a push of its every key, wholly complete, lands
             // as: a row elsewhere waits for nothing of it. One read by pull reaches all of it.
             let region = complete_reach(&pusher, PipelineId(read), reader)
                 .iter()
@@ -1378,7 +1367,7 @@ pub struct Planned {
     pub rounds: Vec<Planned>,
     /// Whether the run notifies it of what a live source yields.
     pub live: bool,
-    /// Whether it holds its arrivals until the pipelines it reads have completed them
+    /// Whether arrivals wait until the pipelines it reads have completed them
     /// ([`Dispatcher::wait_for_inputs`]).
     pub held: bool,
 }
@@ -1394,7 +1383,7 @@ fn pushing_end(reach: &mut Reach<'_>, pipeline: PipelineId) -> (SharedConsumer, 
                 pipeline.0
             )
         });
-        // A store is keyed by its positions, which a transaction store pushes as it completes them.
+        // A store is keyed by its positions, which a transaction store pushes as it decides them.
         let keyed = matches!(
             producer.tiling(),
             Tiling::DataFunction { .. } | Tiling::Store { .. }
@@ -1431,7 +1420,7 @@ pub(super) fn probe(
     reader: usize,
 ) -> Vec<Arrival> {
     let mut landing = Landing::probe(from);
-    consumer.borrow_mut().push(region, &mut landing);
+    consumer.borrow_mut().notify(region, &mut landing);
     landing
         .arrivals()
         .into_iter()
@@ -1440,7 +1429,7 @@ pub(super) fn probe(
 }
 
 /// The region of `reader`'s input a push of `from`'s every key reaches through `consumer` when
-/// it is restated as a wholly completed region is: all `from` can ever decide of that input.
+/// it is restated as a wholly complete region is: all `from` can ever decide of that input.
 pub(super) fn complete_reach(
     consumer: &SharedConsumer,
     from: PipelineId,
@@ -1449,7 +1438,7 @@ pub(super) fn complete_reach(
     let mut landing = Landing::probe_complete(from);
     consumer
         .borrow_mut()
-        .push(&Projection::Everything, &mut landing);
+        .notify(&Projection::Everything, &mut landing);
     landing
         .arrivals()
         .into_iter()
@@ -1563,7 +1552,7 @@ struct Beneath {
     live: Vec<LiveLeaf>,
 }
 
-/// A live iteration range: its consumer and the full extent whose completed region is announced.
+/// A live iteration range: its consumer and the full extent whose complete region is announced.
 #[derive(Clone)]
 pub(super) struct LiveLeaf {
     pub(super) consumer: SharedConsumer,
@@ -1717,17 +1706,13 @@ impl Planner {
             (leaf, _) => (leaf, None),
         };
         below.live.extend(live);
-        let Some(breaker) = producer.as_breaking_mut() else {
+        let Some(_) = producer.as_breaking_mut() else {
             below.leaves.extend(leaf);
             for (_, direct) in &mut below.pipelines {
                 *direct = false;
             }
             return below;
         };
-        if let Some(why) = breaker.no_consuming_mode() {
-            self.refuse(why);
-            return Beneath::default();
-        }
         let within = self.scope_of(&*producer);
         let name = producer.name();
         let placement =
@@ -1764,11 +1749,11 @@ impl Planner {
     /// and otherwise the store's own, one per input (`Breaker::inputs`), a transaction store's
     /// writers each the input of one. The store's pipeline of an input reads the pipelines
     /// beneath the store's cycle under that input; the operators inside the cycle, its own
-    /// breakers among them, stay in pull mode within it.
+    /// breakers among them, read their inputs within that pipeline.
     ///
     /// Empty where the planner refuses the store ([`refuse`](Self::refuse)): a nested
     /// transaction store reached outside the scope of the loop around it; a store with no
-    /// consuming mode; and a store inside the cycle of a store that steps itself.
+    /// breaker implementation; and a store inside the cycle of a store that steps itself.
     pub(super) fn store_pipeline(
         &mut self,
         read: crate::interpreter::tile_operators::StoreRead,
@@ -1810,10 +1795,6 @@ impl Planner {
         let breaker = store
             .as_breaking_mut()
             .unwrap_or_else(|| panic!("{name} is a pipeline breaker"));
-        if let Some(why) = breaker.no_consuming_mode() {
-            self.refuse(why);
-            return Vec::new();
-        }
         let inputs = breaker.inputs();
         // What each input holds beneath the store's cycle. A store with seeds reads them as its
         // input 0, and its writers' sources as the inputs after, in the order it visits them; one
@@ -1830,6 +1811,11 @@ impl Planner {
             }
             false => writers.push(self.beneath_cycle(producer, read.fan)),
         });
+        assert!(
+            !writers.is_empty(),
+            "a dispatched transaction store has a writer: its keys are the footprints of its \
+             `with begin():` blocks"
+        );
         assert_eq!(
             writers.len() + usize::from(seeded),
             inputs,
@@ -2205,7 +2191,7 @@ impl Planner {
     }
 
     /// The loop scope of the planner's scope `scope`.
-    /// Each scope's address and the breakers it keeps are added to `kept`: the inner pipelines
+    /// Each scope's index and the breaker handles it keeps are added to `kept`: the inner pipelines
     /// its rounds queue or push packages to ([`unrestated_in_rounds`](Self::unrestated_in_rounds)).
     pub(super) fn build_scope(
         &self,
@@ -2353,8 +2339,8 @@ impl Planner {
     /// nested loop's, or one per row of a comprehension. `kept` holds each scope's breakers, as
     /// [`build_scope`](Self::build_scope) gathers them. The walk starts at each breaker such a
     /// scope keeps, at the level of its rounds, and ends at every consuming breaker, whose
-    /// consume pulls its inputs. A breaker left in pull mode because its pipeline would read
-    /// whole passes the pull on.
+    /// consume pulls its own inputs. A breaker removed from its body graph because it would read
+    /// whole remains inline and passes the read on.
     fn unrestated_in_rounds(&self, kept: &[(usize, Vec<BreakerHandle>)]) -> Option<String> {
         let consuming: Vec<BreakerHandle> = (0..self.located.len())
             .filter(|&pipeline| self.within[pipeline].is_none())
@@ -2481,6 +2467,7 @@ fn reaches_recurrence(
     reaches
 }
 
+/// The region of a range's keys a source's yield `yielded` decides.
 fn complete_region(yielded: &Predicate) -> Projection {
     match yielded.is_true() {
         true => Projection::Everything,
@@ -2514,6 +2501,7 @@ struct LivePipeline {
     /// The regions the pipeline's own ranges bring, which no live source yields and no arrival
     /// names: notified with the first poll, and empty after.
     starts: Vec<TileGuard>,
+    announced: TileGuard,
     closed: bool,
 }
 
@@ -2532,6 +2520,7 @@ impl LivePipeline {
                 .map(|leaf| (leaf, Predicate::False))
                 .collect(),
             notifies,
+            announced: input.empty_guard(),
             input,
             starts,
             closed: false,
@@ -2547,8 +2536,9 @@ impl LivePipeline {
             return false;
         }
         let mut changed = !self.starts.is_empty();
+        let mut arrivals = self.input.empty_guard();
         for start in std::mem::take(&mut self.starts) {
-            notify_unreleased(dispatcher, reach, self.pipeline, &start);
+            arrivals = arrivals.union(&start);
         }
         let mut complete = true;
         // Several ranges can read one source, so a scope or a store is notified of the positions
@@ -2575,7 +2565,7 @@ impl LivePipeline {
                         &Projection::admitting(fresh),
                         self.pipeline.0,
                     ) {
-                        notify_unreleased(dispatcher, reach, self.pipeline, &arrival.guard);
+                        arrivals = arrivals.union(&arrival.guard);
                     }
                 }
                 Notifies::Whole => {}
@@ -2599,13 +2589,18 @@ impl LivePipeline {
                     positions = positions.union(&fresh);
                 }
             }
-            // The keys the source yields are completed: it yields a key once for good.
+            // The keys the source yields are complete: it yields a key once for good.
             dispatcher.land_range_complete(
                 self.pipeline,
                 &complete_region(&yielded),
                 &leaf.consumer,
             );
             *notified = yielded;
+        }
+        let fresh = guard_minus(&arrivals, &self.announced);
+        if !fresh.is_empty() {
+            self.announced = self.announced.union(&fresh);
+            notify_unreleased(dispatcher, reach, self.pipeline, &fresh);
         }
         if !positions.is_false() {
             if matches!(self.notifies, Notifies::Items) {
@@ -2683,8 +2678,7 @@ fn drive_live(
         }
     }
     // A run after a pause or a reload starts over breakers that hold what an earlier run consumed,
-    // and the run has no finish before its sources close, so each pushes what it holds first, as
-    // a compile's pull of each sink does in pull mode.
+    // and the run has no finish before its sources close, so each pushes what it holds first.
     execution.push_held(dispatcher, reach);
     loop {
         let mut sources: Vec<LiveSource> = Vec::new();
@@ -2738,7 +2732,6 @@ fn drive_live(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::Tile;
     use crate::interpreter::tile_operators::test_helpers::{TestTileProducer, two_levels_of_ints};
     use crate::interpreter::tile_operators::{
         MemoProducer, ProducerBase, TileProducer, impl_producer_base,
@@ -2750,7 +2743,6 @@ mod tests {
         use crate::ccl::load::LoadedProgram;
         use indoc::indoc;
         let mut ctx = GlobalContext::default();
-        ctx.defer_sink_pulls();
         let _sink = ctx.register_test_sink("out");
         let program = compile_program(
             &mut ctx,
@@ -2826,7 +2818,6 @@ mod tests {
             "},
         ] {
             let mut ctx = GlobalContext::default();
-            ctx.defer_sink_pulls();
             let _sink = ctx.register_test_sink("out");
             let program = compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {}))
                 .expect("the loop compiles");
@@ -2865,7 +2856,7 @@ mod tests {
                 .expect("a reader of the scope");
             reader_placements.push(members.placements[reader].clone());
             let scope = planner.build_scope(0, usize::MAX, &mut Vec::new(), &mut runs);
-            induction(&scope).enter_consuming_mode();
+            induction(&scope).begin_run();
             scopes.push(Some(scope));
             contexts.push(ctx);
             operators.push(map);
@@ -2926,7 +2917,7 @@ mod tests {
                         let snapshot = {
                             let mut store = induction(scopes[index].as_ref().unwrap());
                             let guard = store.tiling().universal_guard();
-                            store.offer_impl(guard)
+                            store.get(guard)
                         };
                         assert_eq!(
                             store_frontier(&snapshot),

@@ -419,8 +419,6 @@ impl TileProducer for ScriptBreaker {
 }
 
 impl Breaker for ScriptBreaker {
-    fn enter_consuming_mode(&mut self) {}
-
     fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
         self.consumed |= mask_of(&guard);
     }
@@ -450,10 +448,6 @@ impl BreakingProducer for ScriptBreaker {
     /// The workers push a pipeline's held keys at its finish, so the single-threaded run does too.
     fn pushes_while_consuming(&self) -> bool {
         false
-    }
-
-    fn offer_impl(&mut self, _guard: TileGuard) -> Tile {
-        self.tiling().empty_tile()
     }
 }
 
@@ -1494,8 +1488,6 @@ impl TileProducer for SharedHeld {
 }
 
 impl Breaker for SharedHeld {
-    fn enter_consuming_mode(&mut self) {}
-
     fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
         self.consumed.fetch_or(mask_of(&guard), SeqCst);
     }
@@ -1521,16 +1513,12 @@ impl BreakingProducer for SharedHeld {
     fn morsels(&self, guard: &TileGuard, rows: usize) -> Vec<TileGuard> {
         cut(guard, rows)
     }
-
-    fn offer_impl(&mut self, _guard: TileGuard) -> Tile {
-        self.tiling().empty_tile()
-    }
 }
 
 /// A source whose workers each push what the breaker holds after every consume, on several threads
 /// at once, and once more at its finish: each push names the held keys less what any push named
 /// before, which `Pushes::record` asserts in a debug build, and the reader consumes every key once.
-/// The reader waits_for_inputs nothing, so its queue would take a key pushed twice only once: the assertion
+/// The reader parks nothing, so its queue would take a key pushed twice only once: the assertion
 /// in `record` is what catches two pushes of one key.
 #[test]
 fn pushes_of_one_pipeline_from_several_threads_push_each_key_once() {

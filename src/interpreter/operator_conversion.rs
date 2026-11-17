@@ -1,5 +1,7 @@
 use crate::ccl::Label;
 use crate::ccl::RecordEntry;
+#[cfg(test)]
+use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use bit_set::BitSet;
 use log::trace;
 use smol_str::SmolStr;
@@ -6547,12 +6549,12 @@ mod variant_ctor_tests {
     use crate::ccl::{
         BaseType as CclBase, BindingTransparency, Lit, Type, TypedExpr, TypedExprNode,
     };
+    use crate::interpreter::UnionArm;
     use crate::interpreter::tile_operators::{
         ProducerBase, Tile, TileProducer, impl_producer_base,
     };
     use crate::interpreter::tiling::{Predicate, TileGuard};
     use crate::interpreter::{ColumnValue, Consumer, SubscribeContext, Value};
-    use crate::interpreter::{Projection, UnionArm};
     use crate::pretty_graph::VizOptions;
     use crate::pretty_tree::InspectNode;
     use bit_set::BitSet;
@@ -6576,7 +6578,7 @@ mod variant_ctor_tests {
         let mut op = op;
         let mut cx = SubscribeContext::new();
         let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut cx);
-        producer.get(producer.tiling().universal_guard())
+        producer.read_in_pipeline(producer.tiling().universal_guard())
     }
 
     /// A scalar `` `commit(7) `` op-converts to a `Scalar(Union)` tile whose single
@@ -6722,10 +6724,9 @@ mod variant_ctor_tests {
         fn subscribe(
             &mut self,
             _intent_guard: TileGuard,
-            mut consumer: Box<dyn Consumer>,
+            _consumer: Box<dyn Consumer>,
             _cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
-            consumer.notify(&Projection::Everything);
             Box::new(FixedStreamProducer {
                 base: ProducerBase::unowned(FixedStreamProducer::alloc_id(), &self.tiling),
                 tile: self.tile.clone(),
