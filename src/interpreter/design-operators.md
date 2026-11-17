@@ -316,6 +316,12 @@ never recorded absent: `validate_tile` reads the record at the path of each key 
 above give, and at the key alone otherwise, where only a record naming no enclosing path can be
 read.
 
+Absent keys contribute to completion at their level and every level beneath it. A tile assembled
+from completed nested values and absent outer keys can therefore state the whole collection
+complete even when its outer `domain_predicate` alone does not. Operators combining rows derive
+completion from held whole values and explicit absence; completion of a held group's value does
+not establish that an enclosing key which has not arrived is absent.
+
 ### Qualified predicates
 
 `Qualified { enclosing, here }` admits a path when `enclosing` admits its prefix and `here`
@@ -515,7 +521,7 @@ that producer with an intent guard, a consumer notification handle and a `Subscr
 | Call | Contract |
 | --- | --- |
 | `subscribe(intent, consumer, cx)` | Establish the subscription for the requested region of the output tiling. |
-| `Consumer::notify(region)` | Signal that the consumer should pull again. It carries no tile and does not count individual changes. |
+| `Consumer::notify(region, landing)` | Mark cached reads dirty and deliver the region through dispatcher routes. |
 | `get(projection)` | Request the current tile for a projection. Tile values cross the edge only through this call. |
 | `release(obsolete)` | Permanently relinquish a region; see [The release contract](#the-release-contract). |
 
@@ -538,17 +544,10 @@ not with the entire accumulated guard. When the closure makes the accumulated gu
 calls `release_impl` with the universal guard instead, which overlaps the pieces released before
 it: a `release_impl` reclaims everything only on a universal guard.
 
-Sources are polled separately from producers. `Scheduler::poll_sources` buffers source arrivals
-and returns a `Delivery` without notifying consumers. `Scheduler::deliver` notifies those
-consumers, drains deferred wakeups, then runs queued sink pulls. `check_for_notifications`
-performs both operations. The deferred queue deduplicates consumers by handle identity; a wake
-requested during its drain remains for the next drain.
-
-The poll/delivery split permits inspection of buffered arrivals before a sink pulls and releases
-them. A `Delivery` retains its consumers strongly until delivery. Dropping a nonempty delivery
-without delivering it is a debug assertion failure, except during unwinding; the data remains
-buffered but no consumer has been woken. [The notification contract](#the-notification-contract)
-specifies forwarding and reentrancy.
+The dispatcher polls physical sources and announces newly decided regions through the subscribed
+consumer graph. `SourceRegistry` retains source handles for inspection and route retirement.
+Source arrivals update cached reads through `Consumer::notify`; placed entries queue pipeline work.
+[The notification contract](#the-notification-contract) specifies forwarding and reentrancy.
 
 ### Projection guards
 
@@ -645,9 +644,11 @@ Each `subscribe` returns one producer attributed to the operator that constructs
 Input producers are constructed by their own operators' subscriptions.
 
 A breaking operator subscribes one concrete producer in a shared breaker cell and returns a
-forwarding reader. `ProducerBase` retains a weak handle to that cell. The reader delegates `get`
-and `release` to the concrete producer, which owns tile validation and probes. The cell is dropped
-when its last reader or execution handle is dropped.
+forwarding reader. The planner obtains the same cell through a weak handle in `ProducerBase`.
+`get` and `release` reach that producer through the reader; dispatcher consumes reach it directly.
+The reader owns no cached tiles or probe. Its input visitor exposes the concrete producer once,
+so planning and graph inspection retain the breaker's input contracts. A kept subscription keeps
+its cell across reload; rebuilding the subscription allocates a fresh one.
 
 Probe keys are `(node_id, producer_id)`. `alloc_id` counts by producer display name, so two
 producer types built for one operator could collide; `ProbeTable` checks conflicting names
@@ -737,11 +738,11 @@ every row there, those not yet delivered included, so it is named under every on
 its input's keys so, since each stands beneath one value ([Converse](#converse)). Three tiles whose
 held keys form a prefix still take that path: a last key whose group holds nothing, an earlier key
 whose own group's statement calls every key complete, and a statement about the keys beneath an
-enclosing key the tile does not hold. The guard names all three exactly, the third by path. A
-universal input release latches `upstream_drained`. Until the input notifies again, release builds
-then return the cache without pulling it, and debug builds probe it once to exercise its
-post-release checks. A drained input inside a loop's cycle delivers again where a round has it read
-again (`read_again`), and every build reads the region it notified.
+enclosing key the tile does not hold. The guard names all three exactly, the third by path. A memo
+answers a region its input has not notified since it read it from its cache, in every build. A debug
+build also probes the input once per read (`MemoProducer::probe`): outside the dirty region the
+input answers what the cache holds, and the probe's pull runs the release-contract assertion at the
+input, so a released input that answers again fails there.
 
 ### What a producer holds
 
@@ -787,21 +788,22 @@ no further restriction.
 
 ## The notification contract
 
-An output change discovered during a pull must wake readers that may still hold the previous
-result. That wake is deferred through `WakeupQueue`, not delivered synchronously inside
-`get`: a feedback path could re-enter a producer while its `RefCell` is borrowed.
+`Consumer::notify(region, landing)` announces a region and marks cached reads of that region
+dirty. `Arrivals` records delivered notifications before forwarding them. Planning probes and
+`Consumer::route` describe paths without changing caches or executing reads.
 
-A notification carries the region of the notifying producer's outermost keys that changed:
-`Consumer::notify(arrived: &Projection)`. A producer that cannot name the region sends `Everything`,
-and none sends `Nothing`. A closure consumer ignores the region. A consumer that pulls on
-notification has no use for it, since its pull reads whatever arrived. A consumer that does not pull
-acts on the region instead.
+A placed pipeline entry queues the announced work and ends propagation. An unplaced entry inside
+another scheduled pipeline forwards the notification to that pipeline's caches. Operators restate
+the region in their output's keys or widen it to `Everything` when no exact restatement is known.
+Repeated notifications are delivered; the dispatcher deduplicates queued regions. No gate or
+wakeup queue participates in execution. A notification that reenters a consumer is a cycle error.
+Stores close cycles by publishing snapshots through their fan-out.
 
-A component that merges notifications to one consumer unites their regions with
-`Projection::union` and narrows none. A gate passes the first notification after a pull, and after
-it each one that names a key no notification passed since that pull named (`scheduler::Admission`).
-It drops the rest, whose keys its consumer has already heard of: a consumer that pulls reads them in
-its next pull, and one that acts on the region, as a memo marks it dirty, has marked them.
+Direct reads schedule no continuation. Dispatcher packages and loop rounds advance execution.
+`release` declares which values a reader no longer needs; it does not announce new input.
+
+A store also announces the keys whose writers have all finished. Final-read routes declare the
+keys they require. The dispatcher admits a receiver only once every required key is complete.
 
 **Forwarding.** An operator keeps an input's keys, forwarding its region unchanged, only if its row
 of the "Projection guards" table pulls that input at the projection and the input's keys are the
@@ -832,13 +834,13 @@ pulls.
 | `MakeRecord` | every field | widens | A record of values has no keys. |
 | `Filter` | the predicate, the input | keeps for a side that is a collection, else widens | A collection side shares the mask's keys; the other is read whole. |
 | `Uncurry` | the input | restates beneath a standing level, widens at the outermost | A region at or beneath the paired level names the pairs it heads; pairing the outermost collection re-keys it, and a decided region of outer keys names every pair they head. |
-| `Converse` | the input | keeps the standing keys, and restates the inverted level's keys one level in, beneath every value (`scheduler::one_level_in`) | Each input key stands beneath exactly one value. |
+| `Converse` | the input | keeps the standing keys, and restates the inverted level's keys one level in, beneath every value (`notifications::one_level_in`) | Each input key stands beneath exactly one value. |
 | `UnionOperator` | every arm | keeps for a flat union, restates under the arm's tag for a tagged one | Flat arms are disjoint slices of one collection; a tagged union keys an arm's rows by the arm's keys under its tag, and `Everything` of an arm is every key under that tag. A region beneath the outermost keys keeps its path, its outermost key under the tag. |
 | `CheckedLookup` | a stream of keys, or the pairs | keeps | Each answer sits at its key's position. |
 | `CheckedLookup` | one key | widens | One key has no keys to project. |
 | `CheckedLookup` | the collection | widens | Every key is answered against all of it. |
 | `Memo` | the input | keeps | Read at the projection, and its keys are the input's. |
-| `FanOutSlot` | the shared input | keeps | The fan-out forwards the input's region to every live slot. Between pulls it passes only a notification naming a key it has not passed since the last pull, as a gate does, and drops the rest, whose keys every slot consumer has heard of. |
+| `FanOutSlot` | the shared input | keeps | The fan-out forwards every notification to every live slot. |
 | `ExtractFinal` | the input | widens | Read whole; the keys are the last position. |
 | `PermuteRecordDomain`, `FlattenTupleDomain` | the input | restates | The keys are the input's with their fields renamed or spliced, so a region of the input's keys is the same keys renamed or spliced. |
 | `Aggregate`, `ExtractAggregate` | the input | widens | The accumulator has no keys. |
@@ -846,61 +848,20 @@ pulls.
 | `MapAggregate`, `MapExtractAggregate` | the input | keeps | The groups keep the input's outermost keys. |
 | Stores, recurrences and the commit operators (`commit_operator.rs`) | every input | widens | A recurrence re-keys its inputs by its own positions. |
 
-`GatedConsumer` forwards a notification between pulls only where it names a key not passed since the
-last pull. `shared_consumer` constructs it with `Notified::clear()`, so the first notification
-passes, including one sent during `subscribe`. Forwarding sets the flag and grows the region passed;
-`ProducerBase::sharing` holds the `Gate` token that clears the flag before each pull, which starts
-the region afresh. A notification of keys already passed behind a closed gate is not delivered, and
-the consumer's next pull reads the change. `Notified::flag()` instead starts set to permit an
-initial input read. A `Notified::Flag` is set by notification and cleared by `take()`.
-`FanOutShared::admission` gates forwarding to fan-out slots. Clearing does not depend on whether
-the pull reads the notifying input. Without this suppression, a change can reach a sink once per
-path through the graph, and cyclic notification paths can continue indefinitely.
-
-`forwarding_consumer` delivers through the gate when its consumer can be borrowed. On reentry,
-it drops the notification where the gate would stop it: the gate is set, and the notifications
-passed since the last pull name every key it names (`Admission::covers`). Otherwise it queues the
-consumer on the wakeup queue, because a pull during the current cascade may have missed the new
-change. The queue holds handles, not regions, so the deferred notification is delivered as
-`Everything`. Sharing notification handles does not share tile data; tiles still pass through
-`get`.
-
-A consumer woken by an operator must pull that operator if it still reads it. Until then, the
-operator's gate stops every later notification from its inputs that names only keys already passed.
-Finished reads, settled seeds,
-recurrences with no remaining reader and wholly released operators need no further pull. Nor
-does an input the consumer's answer does not depend on until another input's notification
-brings a pull that reads it again: `MapResultToConst` over no live row leaves its constant
-unread, since a constant may be the partial arm its gate guards, and the input's next row
-wakes it. `TileProducer::answered_without` names such an input. When `pull_laps` reaches
-quiescence, a debug check walks `TileProducer::visit_input_producers` and rejects an input
-whose forwarding flag remains set after its reader was pulled that lap, unless its reader
-answered without it.
-
-A sink does not pull when notified. It queues its pull on a queue of its own, which holds it
-once however many notifications arrive. `Scheduler::check_for_notifications` delivers its wakes
-first and then runs the sink pulls queued so far, so each sink is pulled once per call, in the
-call that delivered the change. Installing a version pulls its sinks at once, because a version
-a reload replaces hands its state to its successor only if it was pulled.
-
-- `ChangeNotifier` compares successive store outputs and queues a wake when they differ,
-  including initialization, decided positions, commits and closure.
-- `Memo` keeps a dirty region of its input: what it has not read, and what its input has notified
-  since. A pull that overlaps it reads the whole projection and removes it from the dirty region.
-  A pull outside it answers from the cache, even when the cache is empty, preventing fan-out slots
-  from repeatedly pulling their shared input.
-  A debug build probes once after each read when no wakeup is pending, checking for new cells
-  or completeness without notification. It also continues probing drained inputs; if such a
-  pull changes the cache without a notification, `Memo` queues a wake for its consumer.
+`Memo` and its input consumer share one dirty region containing unread keys and keys announced
+since the last read. The consumer adds notifications directly. A read removes its projection before
+calling the input, so notifications raised during that call remain dirty for the next read.
+Within a scheduled pipeline it reads the query when that query overlaps the dirty region, then
+answers from its cached tile. A placed memo is advanced by its own pipeline's consumes. Notifications
+perform no reads and no sink effects.
 
 `RekeySorted` consumes committed pairs before publishing the request keys they contain. Commit
 ticks and request positions are different domains. It accumulates consumed tick regions and
 releases only their continuous prefix. Pending position-to-key mappings survive output releases
 above an input gap; closing the gap advances output completeness through those keys.
 
-`Memo` and its input consumer share one dirty region containing unread keys and keys announced
-since the last read. The consumer adds notifications directly. A read removes its projection before
-calling the input, so notifications raised during that call remain dirty for the next read.
+A sink's entry queues work in its dispatcher pipeline. `SinkConsumer::complete` reconciles
+terminal output and signals completion after every pipeline finishes.
 
 ## Pipeline breakers
 
@@ -911,7 +872,7 @@ consumes one input per pipeline it is the breaker of: `inputs` answers how many,
 transaction store, which consumes one per writer. `consume_impl`, `input_tiling` and
 `input_released` name the input (`InputId`). A breaker that other pipelines read is also a producer,
 which answers pulls from that state: `BreakingProducer`, a subtrait of `TileProducer` and `Breaker`,
-adds `complete`, `final_guard`, `morsels`, `pushes_while_consuming`, `offer_impl` and `entry_placement`,
+adds `complete`, `final_guard`, `morsels`, `pushes_while_consuming` and `entry_placement`,
 the placement of the entry at an input, which a planner sets to that input's pipeline. Its
 `as_producer` answers itself, and the driver's push after each consume and `Breaker`'s default
 `finish` push through that producer. A sink's breaker is no producer, so its `as_producer` answers
@@ -920,21 +881,19 @@ the placement of the entry at an input, which a planner sets to that input's pip
 | Call | What it does |
 |---|---|
 | `consume_impl(input, guard)` | Pulls the input `input` at `guard`, a guard of the tiling the input answers, merges the answer into the breaker's state, and releases the input at the guard the answer states once it has taken delivery of the answer. The caller handles no tile. |
-| `enter_consuming_mode()` | Puts the breaker in consuming mode for a dispatched run, before its first `consume_impl`; nothing else changes the mode. |
+| `begin_run()` | Initializes per-run publication and loop control before any package executes. |
 | `as_producer()` | The breaker as a `BreakingProducer`, or `None` for a breaker that is no producer. |
-| `finish(pushes)` | Finishes once the pipeline has consumed every package and nothing more can be queued for it, the breaker's last call. The default pushes, through `as_producer`, what the breaker holds and no push named before, one morsel of its outermost keys per work package, through its consumer to the pipelines that read it; a breaker that is no producer pushes nothing. An empty guard pushes nothing. It wakes no one. |
+| `finish(input, pushes)` | Finishes once the pipeline has consumed every package and nothing more can be queued for it, the breaker's last call. The default pushes, through `as_producer`, what the breaker holds and no push named before, one morsel of its outermost keys per work package, through its consumer to the pipelines that read it; a breaker that is no producer pushes nothing. An empty guard pushes nothing. It wakes no one. |
 | `morsels(guard, rows)` | Partitions a pushed guard, targeting `rows` held keys where the shape supports cutting. Other shapes remain whole. |
 | `pushes_while_consuming()` | Whether newly complete output may be published after each consume rather than waiting for the pipeline to finish. The default answers `true`. |
-| `offer_impl(guard)` | Answers from the state `consume_impl` built and pulls nothing. The breaker's own `get_impl` calls it once the breaker is consuming. A debug build's `get` wrapper panics on a pull that starts while a consuming breaker's pull is the innermost one in progress (`TileProducer::answers_from_state`). |
+| `get_impl(guard)` | A placed breaker answers from the state `consume_impl` built and pulls nothing. An inline breaker may read its input within the containing pipeline. A debug build's `get` wrapper panics on a pull that starts while a breaker answering from its state is the innermost pull in progress (`TileProducer::answers_from_state`). |
 
 An operator that consumes its input into state of its own is a breaker. One that answers pulls from
 that state is a producer; `SinkBreaker`, the breaker of a sink's pipeline and of the `main`
-output's, is one that is not. A breaker is in the pull mode described in [The producer
-protocol](#the-producer-protocol) for a whole run, or consuming for a whole run. A dispatched run
-puts every breaker it drives in consuming mode once its plan stands, before any package
-(`Breaker::enter_consuming_mode`), and a pull-mode run never does, so no consume changes the mode. A
-consuming breaker pulled before its first consume answers what it has consumed, which is nothing,
-and steps nothing. `final_guard` is provided over `complete()`: it is `complete()` less the guard released
+output's, is one that is not. The planner assigns each breaker it drives a pipeline. Its reads
+answer held state, including an empty answer before its first consume. Operators kept inside
+another pipeline read their inputs within that pipeline's execution.
+`final_guard` is provided over `complete()`: it is `complete()` less the guard released
 to the breaker, and the driver pushes the part of it no earlier push named, after each consume and
 at its `finish`. When a pipeline may finish is the dispatcher's to check ([The
 dispatcher](design-dispatcher.md#the-dispatcher)). A release removes rows from the state and leaves the statement of the
@@ -956,13 +915,11 @@ its level ([The dispatcher](design-dispatcher.md#the-dispatcher)).
 
 ### Memo
 
-A consuming memo answers from its cache, and the cache's statement says which region that answer
-covers. A consume over a memo whose input has drained pulls nothing. A consuming memo is woken by no
-notification. Its reader takes what it holds from the pushes after each consume, and the memo reads
-its input again where a store steps or a live source yields more (`TileProducer::read_again`). A
-consuming memo's only reader is the pipeline the dispatcher pushes to, so a consume wakes no
-consumer and a push queues no wake: what the memo holds reaches its reader through the packages the
-driver pushes after each consume.
+A placed memo answers from its cache. `consume_impl` reads its input at the package's guard,
+merges the answer, and releases the region the answer states complete. A consume entirely within
+an already released region reads nothing. The dispatcher publishes the cached region after each
+consume. An unplaced memo inside another pipeline reads only dirty regions; notifications and
+`read_again` mark those regions dirty. There is no notification gate or deferred wakeup queue.
 
 ### Aggregate
 
@@ -998,7 +955,7 @@ The guard it pushes is the guard of the output built from the accumulators, less
 accumulator is not terminal, less the guard released. The dispatcher pushes each region once
 (`Pushes::push_final`), so a group still folding at one finish is pushed at the finish where it is
 final, and a reader that kept the row open reads it again then. A release of the output drops the
-accumulators it covers and forwards to the input, as in pull mode.
+accumulators it covers and forwards to the input.
 
 ### Converse
 
@@ -1006,7 +963,7 @@ accumulators it covers and forwards to the input, as in pull mode.
 the input's keys at that level one level in, beneath the values that become the keys there, and each
 input key stands beneath exactly one value. So a region of the input's keys names exactly the output
 paths it changed, with the value step admitting anything: `Converse` passes its input a consumer
-that restates the region there (`scheduler::one_level_in`), and a pull at such a region pulls the
+that restates the region there (`notifications::one_level_in`), and a pull at such a region pulls the
 input at the same keys (`Predicate::without_open_level`) and inverts only those rows. A region of
 the standing keys above the inverted level passes through as it is. It keeps the input rows it read
 and has not released, which a release of a group names by their values. At the outermost level it
@@ -1029,21 +986,20 @@ before its rows are read. The two parts together release exactly the region name
 A consuming `ExtractFinal` merges the source rows it answers at the guard and keeps the row at the
 greatest key, where the values are a column of scalars; any other shape of value keeps every merged
 row. Merged rows are in arrival order, so the last row is not the final one and the key says which
-is. Pull mode takes the last row of a source it reads whole and assumes the source is sorted by key,
-which a consuming `ExtractFinal` does not. Keys of one collection are totally ordered, and a
+is. Keys of one collection are totally ordered, and a
 collection whose keys do not compare panics. The value is extracted once the source has been
 released whole. A source that held nothing falls back to the default, which `consume_impl` reads
 when the source drains and reads again at each later `consume_impl` until it has converged; until
 then nothing is held. The dispatcher issues no `consume_impl` after the finish, so `finish` panics
 when the output is unreleased and no value has been extracted rather than push nothing. A source
-declared total that held nothing panics as it does in pull mode. The value is final from then, and
+declared total that held nothing panics. The value is final from then, and
 stays until the consumer releases the output, which is all or nothing.
 
 ### A store as a breaker
 
 A transaction store (`CommitProducer`, `commit_operator.rs`) is the breaker of one pipeline per
 writer (`Breaker::inputs`): a writer's cycle, the store, the writer and its drive, is the pipeline
-of the writer's input, and the operators inside it stay in pull mode. An induction store
+of the writer's input. Operators inside that pipeline read their inputs during its execution. An induction store
 (`InductionStoreProducer`) owns both accumulator state and optional per-run control. Its request and
 ordered step pipelines target that same producer. The loop runs in rounds
 ([A loop in rounds](design-dispatcher.md#a-loop-in-rounds)), and its store steps once per round. A nested request covers
@@ -1065,13 +1021,10 @@ the store has the operators inside its cycle read again (`read_cycle_again`, `co
 every producer in its chain on a path to a recurrence slot of its fan-out reads that input again at
 its next pull (`TileProducer::read_again`, through `read_again_toward`). A `Memo` there reads every
 region again, as after a notification of `Everything`, and a drive reads its source again where that
-input is on such a path. The store then clears its gate, as a pull does
-(`ProducerBase::clear_gate`): no pull of the store clears it while the store steps itself, since a
-read through the recurrence is answered from the snapshot. After the step the store publishes its
+input is on such a path. Reads through the recurrence answer the published snapshot. After the step the store publishes its
 snapshot (`Cycle::publish`). A store is queued a morsel only for positions its input can release, so
 a step that changes neither the store nor its input's release panics, and so does a store not
-terminal at its finish. A transaction's deny commits nothing and progresses through its
-source's release alone.
+terminal at its finish. A transaction's deny validates its read set and commits an empty write set.
 
 An induction store with no rows above it holds the positions it has run and decided, its decided
 region (`Tile::to_guard`), and everything once it is terminal, so its loop's scope pushes them at
@@ -1090,12 +1043,12 @@ reads no more and removes nothing from the store tile; a nested store's offer cu
 readers released ([A loop in rounds](design-dispatcher.md#a-loop-in-rounds)). A consuming store answers a pull from its
 snapshot. Its first consume opens it, and a pull before that answers the unopened store, which
 states nothing final. It steps only at its pipeline's consumes, or its scope's. A transaction
-store's writers decide only against a tile it published. In pull mode a store steps itself at a
-pull.
+store's writers decide only against a tile it published.
 
-In pull mode an induction store releases its body whole once the body is terminal and every decision
-is stepped, and a transaction drive releases its source whole once it is done. A nested induction
-drive releases each row of its source it calls complete, in either mode. A consuming nested store
+An induction store releases its body whole once every decision is stepped and the body is terminal
+or its consumed prefix covers the finite input extent. A transaction drive releases its source
+whole once it is done. A nested induction drive releases each row of its source it calls complete.
+A nested store
 releases its body a position at a time, and whole each row the body calls complete once its every
 decision is stepped, at every level above its positions: the release through the decided path names
 the row's positions only, not its paths past the last of them. A consuming store wakes no reader
@@ -1125,9 +1078,8 @@ of its writers' sources, which are its inputs from 1: each seed is subscribed be
 in input 0's pipeline, a push of any seed queues that input whole, and the store's consume of it
 opens the store. A store opens before it steps, so each writer's pipeline reads input 0's, its
 sibling, and takes no package before input 0's has finished. Once input 0's pipeline
-has consumed its package, each writer's records it wholly decided, which releases what it waiting_for_inputs
-(`Dispatcher::opens_before`, [Parking arrivals until a read is
-decided](design-dispatcher.md#waiting-for-input-completion)). A store's decided push that reaches its own
+has consumed its package, each writer's records it wholly decided, which releases its waiting inputs
+(`Dispatcher::opens_before`, [Waiting for input completion](design-dispatcher.md#waiting-for-input-completion)). A store's decided push that reaches its own
 pipelines around its recurrence is no read and records nothing. An induction store runs in a loop's
 scope instead ([A loop in rounds](design-dispatcher.md#a-loop-in-rounds)). A reader of a store reads every pipeline of
 it, so its queue closes once the last of them has finished. The pipelines of
@@ -1152,8 +1104,7 @@ pipeline pulls its writer and takes the decisions it brings (`CommitProducer::ta
 held decisions in rotating writer order (`CommitProducer::commit_ready`). An idle writer holds no
 other writer back. The dispatcher orders packages within each writer's pipeline; product deliveries
 need not arrive in source-key order. Commit ticks, allocated only for successful proposals, define
-the serialization. Pull mode rotates its initial writer on each drain. Neither mode guarantees a
-particular winner among independent transactions
+the serialization. Arbitration guarantees no particular winner among independent transactions
 ([8.5 Ordering and concurrency](../../docs/chl-spec.md#85-ordering-and-concurrency)).
 
 The store, its writers and their drives speak through tiles. Each body-input row carries its item's
@@ -1177,16 +1128,16 @@ items already settled. The drive and writer read these statements through the re
 
 Taking a decision releases its proposal step to the writer, which acknowledges its attempt. The
 drive releases the source item and keeps its own copy until `settled` includes it. Every decision
-commits only after read-set validation, a deny or a grant that writes nothing included, and takes a
-tick ([mutability.md](../ccl/design/mutability.md#every-transaction-takes-a-tick)). A stale decision
-is named in `again`; the store publishes its current tile, pulls the writer and takes the fresh
-decision (`CommitProducer::drive_again`). The drive retries from its kept item before choosing
-another source item. A missing retry panics. Retried decisions resolve during the arbitration pass,
-whose end asserts that no retry remains. A store in pull mode and an induction store state no takes.
+is a proposal whose read set the engine validates, including a deny or grant that writes nothing.
+Each validated proposal takes one commit tick. A stale decision is named in `again`; the store
+publishes its current tile, pulls the writer and takes the fresh decision
+(`CommitProducer::drive_again`). The drive retries from its kept item before choosing another
+source item. A missing retry panics. Retried decisions resolve during the arbitration pass, whose
+end asserts that no retry remains. An induction store states no takes.
 
 The planner places the transaction drive's source entry in its writer's store pipeline. Source
 pushes therefore reach that entry in source keys, before the drive converts them to attempt
-counters. A transaction over a memoized product inherits that product's live regions, waits_for_inputs them
+counters. A transaction over a memoized product inherits that product's live regions, holds them
 until the memo decides them, and consumes them without waiting for either source to close.
 
 The store reclaims its changelog where every fan-out slot has released it
@@ -1194,9 +1145,9 @@ The store reclaims its changelog where every fan-out slot has released it
 engine can still validate that proposal's reads at its snapshot. The last input finish takes and
 attempts all remaining decisions until every writer is terminal (`CommitProducer::settle_ready`).
 
-A dispatched run runs no program that another takes over
-([Running a compiled program](design-dispatcher.md#running-a-compiled-program)). A resuming drive under a store that
-states `writer_takes` panics: a source release can include an item taken but not yet committed.
+A reload pauses at a drained arbitration boundary, after every taken decision has been validated
+and published. A resuming drive releases the settled source prefix on its new subscription before
+reading new items ([Running a compiled program](design-dispatcher.md#running-a-compiled-program)).
 
 Dispatcher planning, execution, pause and reload are specified in
 [Pipeline dispatch](design-dispatcher.md).
@@ -1262,8 +1213,8 @@ through `take`. An empty `take` cannot distinguish a never-filled slot from an a
 the subscribing caller must reject either case when it requires an input. Each setter closure is
 `FnOnce`, but separate setters can be obtained; a debug assertion rejects filling an occupied cell.
 
-A data source is not a graph node. `IterateExtent` enumerates its domain and registers scheduler
-wake-ups; `MapResultWithSource` reads values at supplied keys. A source lookup descends from an
+A data source is not a graph node. `IterateExtent` enumerates its domain and registers its source
+handle with `SourceRegistry`; `MapResultWithSource` reads values at supplied keys. A source lookup descends from an
 iteration of that source, since inference admits no literal source-domain key. The invariant is
 pinned by `a_source_read_descends_from_an_iteration_of_that_source` in
 `tests/it/inspector_goldens.rs`. Neither operator adds an edge to the source itself.
@@ -1297,7 +1248,7 @@ derived from the edges on both sides of the wire rather than serialized separate
 | `MapAggregate` | Collection chain of at least two levels | Enclosing levels ending in `Aggregation` | Folds the innermost collection, preserving the levels above it. |
 | `MapExtractAggregate` | Collection chain ending in `Aggregation` | Enclosing levels ending in the accumulator tiling | Extracts terminal results and removes innermost keys whose aggregates are not terminal. |
 | `FanOut` | `*` | Same as input | Allows multiple operators to consume the output of the same operator. Each consumer subscribes via a `FanOut::slot()` handle; the fan-out forwards `get` requests and tracks the intersection of release guards across slots. Constructed via either `FanOut::new` (no cyclic-mode overhead — the common case) or `FanOut::new_cyclic` (for fan-outs whose slots feed back into their own input, e.g. a commit/induction store whose writer reads the store back before proposing, or a mutation-loop body whose other slot is wired to the cyclic prev-accumulator stream). Cyclic mode adds a per-pull tile-cache and a subscribe-in-progress flag so re-entrant subscribes / pulls skip redundant inner work and serve from the cached snapshot instead of re-entering the inner producer. |
-| `Memo` | `*` | Same as input | Caches the output of an operator so it can be repeatedly read without recomputation. Releases each region as it takes delivery of it, so the input can clear its state; once the input is drained the cache is the sole source of the value. Until the input notifies again, release builds then skip the upstream pull, and a debug build probes the drained input once after it drains, so an input that answers with released data trips the release-contract check at the input; probing on every pull would re-read a shared subgraph once per path to it. After a notification of a region the pull reads, every build reads it: a drained input inside a loop's cycle delivers again where a round has it read again (`read_again`). A `Memo` keeps a dirty region of its input, which starts as everything and records each region the input notifies in its shared `DirtyRegion`: a pull outside the dirty region answers from the cache and no pull goes below, in every build, apart from that probe, and a pull inside it reads the input and removes what it read. A `Memo` is also a [pipeline breaker](#pipeline-breakers): a consuming memo answers from its cache and pulls nothing. |
+| `Memo` | `*` | Same as input | Caches input tiles and releases the regions consumed. A placed memo answers its cache; an unplaced memo reads regions marked dirty by notifications or `read_again`. See [Memo](#memo). |
 | `ExtractFinal` | Collection source and optional default | Source codomain | Extracts the last live position's value after source completion; see [Final-value extraction](#final-value-extraction). |
 | `UnionOperator` | N inputs of `DataFunction(dᵢ → 𝑇ᵢ)` tilings | `DataFunction(Union(d₀,…,dₙ₋₁) → Scalar(C'))`, or `DataFunction(Union(d₀,…,dₙ₋₁) → DataFunction(𝐵 → 𝑇))` for jagged rows | Merges N function operators into one. The domain is the discriminated union of the arms' domains, each arm under its operand's tag (`new_tagged`): a position for `++`, a site's tag for a channel ([sites.md](../ccl/design/sites.md#channel-tags)). The codomain is one the caller declares. The domain keeps the arms apart, and `final_or_default` dispatches on the arm a row came from. The codomain is the arms' join, because the arms are alternative values at one row. A union node is typed `D ⤇ V`, with `V` the join inference computed in the full type lattice, and op-conversion reads `V` off the node and passes its extent in. The operator does not join the operand tilings: `Extent`'s lattice has variant and range rules but no record rule, so it would join two arms at different record widths to an anonymous positional sum where the type is `{a: Int}`, a shape no row holds. Arms that agree on a tiling keep it, because a `Tiling` carries a layout (struct-of-arrays for a record) that an `Extent` cannot express. Arms whose codomains are collections over different domains, the rows of a jagged collection, merge at the bound `𝐵` the declared codomain gives their domains, beneath which they share the tiling `𝑇`, as a list literal of boxed rows has it (`OpConversionContext::witness_domain_extent`). Other arms whose codomain tilings differ must each fit in one column (`Tiling::is_scalar`: a `Scalar`, or a `Record` of such at any depth), and each is rebuilt as one column, keeping its own record fields, before the arms merge. A flat union (`new_flat`) collapses the arms' domain to the one they share whatever each row holds, a collection included. A realized conditional's legs are over different domains and disjoint only by their gates, so they flat-merge under the domain bound the sum's type declares (`new_flat_over`), which must include every leg's domain. A flat union keeps no record of which arm delivered a key, so its arms are disjoint by how they were built: first-match gates, one per conditional for a realized product, distinct tags of one scrutinee, or a tag the scrutinee's closed type does not carry. A debug build checks the legs' shapes at operator conversion (`ccl_utils::disjoint_join_gap`), and simplification keeps a `zip` half that narrows its keys, by `filter_values` or `variant_project`, although the arm reads nothing of it (`simplify::is_product_beta_window`). Release is per arm: an incoming `Predicate::Union` guard splits into per-variant predicates, so one arm can be released in full while its siblings still produce. |
 | `VariantWrap` | Payload: `Scalar(Pₜ)` or `DataFunction(D → Scalar(Pₜ))` | `Scalar(Union(P₀,…,Pₙ))` or `DataFunction(D → Scalar(Union))` | **Sum introduction — dual of `VariantProject`.** Wraps the payload under tag `tag`, so that arm holds the payload and every other arm is empty. Arms are keyed by [`FieldKey`], not by position: a tag's *position* is not stable under width subtyping (``{`b} <: {`a | `b}`` renumbers `b`), and an arm set is part of a union column's layout, so a position-keyed arm would need a renumbering coercion at every subsumption. A bare `Scalar` payload (a scalar `VariantCtor`) yields `Scalar(Union)`; a payload *stream* (a `VariantCtor` inside a lambda, `Builtin::VariantWrap(tag)`) is wrapped element-wise **preserving the domain** `D`, so the constructor composes as the RHS of a `≫`. Because the domain is preserved, a domain release forwards to the payload verbatim. A payload that is a collection is one value, held materialized in its arm's cell: an applied `VariantCtor` wraps its whole payload, and a composed one each row's. A cell cannot grow, so a row's cell is emitted once that row's collection is complete. |
@@ -1452,7 +1403,15 @@ evaluate the operation, so an empty division by a constant zero does not fault.
 The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md#transact--the-domain-parameterized-recurrence-carrier) store: concurrent writers propose transactions against a shared multi-key mutable variable, and the operator serializes them onto one monotonic commit-time clock with optimistic-concurrency validation (allocate-on-validate + backward validation + serialize-and-retry). Op-conversion's `build_commit_store` assembles it. The design splits into a **pure engine** and its **tile adapters**:
 
 - **`CommitEngine`** (tile-free, unit-tested) — the serialization logic. The store is `Position ⇀ {key: value}`, held as one changelog per key. `attempt(proposal)` allocates the next tick and commits iff no read key was overwritten after the proposal's snapshot (else `Stale`, and the writer retries at the advanced watermark). `read_as_of(t, key)` folds the key's changelog.
-- **`CommitOperator` / `CommitProducer`** — the store's tile adapter. It owns the engine, publishes its history as one [`Tile::Store`] output, drains each writer's new proposals in writer-index order in pull mode (the serialization order, rotated per pull so no writer is starved), and acknowledges a commit by `release`ing that step back to its writer. Writer inputs are wired *after* construction, so the operator sits inside a cyclic `FanOut` and every writer reads the store back before proposing — the cyclic-`FanOut` feedback idiom, one writer per key. A consuming store takes each decision ahead of its commit and arbitrates ready decisions instead ([Ready transaction decisions](#ready-transaction-decisions)), and each proposal carries its item's source position (`pos`) for it. A writer's source may read an earlier writer's item-keyed tap (`WriterSite::fed_back`): `build_commit_store` binds it, before converting that source, to a `RekeySorted` over a `StoreValueStream` on the store's `recurrence_slot`, so the source is a second edge back into the store. The tap's value at an item is final at that writer's commit for it, `RekeySorted` releases an item to the source once its key is complete, which under rising keys is once every item before it is decided, and the tap's key closes when that writer finishes, independent of the reading writer.
+- **`CommitOperator` / `CommitProducer`** — the store's tile adapter. It owns the engine and
+  publishes its history as one `Tile::Store` output. Each writer's pipeline submits proposals;
+  ready proposals are validated and serialized without comparing different writers' source keys
+  ([Ready transaction decisions](#ready-transaction-decisions)). A release acknowledges the store's
+  take of a decision, and the proposal retains its source position for retries. Writer inputs are
+  wired after construction through a cyclic `FanOut`, so every writer reads the published store
+  snapshot. A writer's source may read another writer's item-keyed tap (`WriterSite::fed_back`):
+  `build_commit_store` binds it to `RekeySorted` over `StoreValueStream` on the store's recurrence
+  slot. The tap's key closes when that writer finishes, independent of the reading writer.
 - **`TransactDriver` / `TransactDriverProducer`** — one per `with begin():` site: it owns the
   transaction source, folds `(frontier, snapshot)` for the site's read keys out of the cyclic store,
   and produces the decision body's `(snap…, item)` input. A row is emitted once per `(item,
@@ -1464,14 +1423,14 @@ The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md
   already acknowledged. It attempts one item at a time: the item whose rows its window holds is
   attempted until its ack, and then the smallest delivered item goes next. An item delivered below
   the one in flight waits, as a concatenation's live arm delivers below its whole list arm, since
-  the writer supersedes every attempt older than the newest and would abandon one of two items.
-  Under a consuming store an ack is the store's take of the attempt's decision, and the drive keeps
-  the item, to emit it again, until the store lets go of it. It decodes the source after a
-  notification or a source delivery consumed by its store, and answers other pulls from the last
-  decode (`DecodedSource`, with each position a path of one component). A consuming delivery
-  invalidates the source once before its attempts; retries do not by themselves discard the decoded
-  source. It also releases the store below the decided frontier, through the last change strictly
-  below it, so the commit store can reclaim its changelog.
+  the writer supersedes every attempt older than the newest and would abandon one of two items. An
+  ack is the store's take of the attempt's decision, and the drive keeps the item, to emit it again,
+  until the store lets go of it. It decodes the source after a notification or a source delivery
+  consumed by its store, and answers other pulls from the last decode (`DecodedSource`, with each
+  position a path of one component). A source delivery marks the source dirty once before its
+  attempts; retries do not by themselves discard the decoded source. It also releases the store
+  below the decided frontier, through the last change strictly below it, so the commit store can
+  reclaim its changelog.
 - **`TransactWriter` / `TransactWriterProducer`** — one *fused* writer per site (fused, not fanned: a stateful append-only proposal stream cannot be split across fanned slots without desyncing). Each pull it decides the driver's newest live position and appends a `{snap, reads, writes, pos}` proposal of what the body's decision writes, which may be nothing; `pos` is the item's source position, copied from the driver's row (`F_ITEM_POSITION`). When the decision also reads an induction accumulator, that value arrives co-iterated in the writer *source* or broadcast as a constant — see [mutability.md](../ccl/design/mutability.md#reading-an-induction-accumulator-in-a-commit-decision), "Reading an induction accumulator in a commit decision".
 
   **The ack is a release intersection.** The driver sits behind a `FanOut` with two slots — the body and the writer — and acknowledges its source item on what they *both* release. A body releases a row as soon as it has consumed it, which says nothing about commitment; the writer releases it when the attempt has committed. Only the intersection means "this item is done", which is why the writer holds a driver slot it barely reads: that slot is the ack channel.
@@ -1525,9 +1484,14 @@ only the taps that fired. A read set omits a key the store holds no value for ye
 
 A writer body returns one **decision record** per transaction, `{writes: {𝑘: …}, __to_<defer>*}` (`ccl_utils::writer_decision`): one entry per variable the writer may write, keyed by the variable, and one per reply tap. Each entry is `` {`fired{𝑉} | `idle} `` — the value on the positions its own control-flow path admits, `` `idle `` on the rest (see [mutability.md](../ccl/design/mutability.md#general-in-transaction-conditionals-and-conditional-writes), "General in-transaction conditionals (and conditional writes)"). The proposal carries the entries that fire, so a deny proposes an empty write set and a routed reply fires only on its own route; an `` `idle `` write carries no value, so nothing reads a write the transaction did not make. `body_decision_at` decodes each tag by name, so the two ends agree without a canonical arm position. Carrying the gate as the value's tag is what lets a value be domain-restricted: a value beside a separate `Bool` gate would have to answer wherever the record exists.
 
-### Convergence: the writer re-arms, one step per pull
+### Transaction progress
 
-A writer processes **one source item per pull** and re-arms itself on the scheduler's deferred-wakeup queue whenever an item remains, returning non-terminal — the same one-step-per-pull idiom the induction and commit stores share. That single re-arm covers every continuation uniformly: a **commit** (the commit-ack `release` advances it, so the next pull takes the next item), a **deny** (it proposes an empty write set and advances on the commit-ack, as a grant does), and a **not-ready** decision (it does not advance, and reuses the pending body-input row). It is the *writer's* re-arm, not any reader's, that converges the store: the wakeup fans through the cyclic `FanOut` to re-pull the `StoreValueStream` readers as commits land, so no reader drives a store to fixpoint. A writer **drained but live** does not re-arm, so an idle live server does not busy-poll — a future arrival wakes it through its source-forwarding consumer.
+Dispatcher packages drive writers from their source positions. The store takes decisions and
+arbitrates ready proposals as specified in [Ready transaction
+decisions](#ready-transaction-decisions). Readers sample the committed snapshot; they do not drive
+the store to completion. A drained live writer waits for its source to gain items.
+
+### Every fed-out mutable variable read is an as-of sample
 
 ### Every read of a transactional variable is a transaction's
 
@@ -2028,6 +1992,11 @@ with every path before it. Releasing a prefix the source has not called
 complete would name a position still to arrive, and a drive placed across a reload resumes past
 whatever its predecessor released. A transaction driver releases exact decided-absent regions without requiring a prefix.
 
+A flat induction driver also releases keys the source proves absent beyond its consumed prefix.
+It records that absence independently of the next item to execute. Such keys require no decision
+and do not permit a delivered item to run out of order. Completion of a whole child domain closes
+its enclosing row, including when the source states completion only at the child level.
+
 A **nested drive** is the same driver at a deeper path, carrying two additions in `NestedDrive`.
 It **reseeds** at each enclosing position: a boundary is a position whose enclosing components
 differ from the last one emitted, and there the previous accumulator comes from the accumulator's
@@ -2141,6 +2110,12 @@ commit store shares all three, so a `Mut((Int, Int), Txn)` or `Mut({x: Int}, Txn
 through the same seed decode and decision merge.
 
 ### Reclaiming the changelog
+
+The compiler subscribes a flat store's final reads through `FanOut::current_slot`. On publication,
+these slots release history through the current frontier. The release meet still includes every
+historical reader, and the store preserves the carry values needed to read its current state.
+A final read therefore retains its eventual value without pinning every preceding change while
+its source stays open.
 
 An induction store reclaims its changelog as it runs, at any depth. Each reader releases what its
 consumer has taken; the drive releases through the frontier; the `FanOut` in front of the store
