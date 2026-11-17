@@ -1,6 +1,8 @@
 use super::*;
 use crate::interpreter::operator_graph::value;
-use crate::interpreter::{ColumnValue, Consumer, Extent, Scheduler, Value, tuple_field};
+use crate::interpreter::{
+    ColumnValue, Consumer, Extent, Projection, Scheduler, Value, tuple_field,
+};
 
 /// Re-keys a collection of pairs by each pair's first component, `𝐾 ⤇ (𝐽, 𝑉)` to `𝐽 ⤇ 𝑉`, where
 /// those keys are distinct and rise with the input's own key order: the `map` constructor's
@@ -116,6 +118,11 @@ struct RekeySortedProducer {
 }
 
 impl TileProducer for RekeySortedProducer {
+    /// Output keys name different positions; the input is read whole.
+    fn input_level(&self, _role: &str, _level: CurryLevel) -> Option<CurryLevel> {
+        None
+    }
+
     fn state_info(&self) -> ProducerStateInfo {
         ProducerStateInfo::holding(self.held.len())
     }
@@ -126,7 +133,11 @@ impl TileProducer for RekeySortedProducer {
         visit("input", &*self.input);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection_for(self);
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
         let input = self.input.get(self.input.tiling().universal_guard());
         let Tile::DataFunction {
             row_starts,
@@ -203,6 +214,9 @@ impl TileProducer for RekeySortedProducer {
         if !released.is_empty() {
             out.remove_guarded(released);
         }
+        // The input is read whole, because a key's position is known only once its row
+        // arrives; the answer is cut to the pull's keys.
+        out.restrict_to(&projection, self.tiling());
         out
     }
 
@@ -355,6 +369,54 @@ mod tests {
         );
     }
 
+    /// A pull at some keys reads the input whole and answers those keys alone.
+    #[test]
+    fn a_pull_at_some_keys_answers_those_keys() {
+        let (mut producer, _, _) = pulled(pairs(
+            &[3, 7, 9],
+            &[0, 1, 2],
+            &[10, 20, 30],
+            Predicate::True,
+        ));
+        let out = producer.get(keys(Predicate::point(uint(1))));
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = out
+        else {
+            panic!("expected a collection")
+        };
+        assert_eq!(domain, ColumnValue::from_uints(vec![1]));
+        assert_eq!(*codomain, Tile::Scalar(ColumnValue::Ints(vec![20])));
+    }
+
+    /// A pull of nothing answers the empty tile without pulling the input, and keeps the rows
+    /// the last pull held.
+    #[test]
+    fn a_pull_of_nothing_reads_no_input() {
+        use crate::interpreter::tile_operators::test_helpers::ProjectionSpy;
+        let (spy, pulled, _) = ProjectionSpy::new(
+            pairs(&[3, 7, 9], &[0, 1, 2], &[10, 20, 30], Predicate::True),
+            pair_tiling(),
+        );
+        let (tiling, key) = rekeyed_tiling(&pair_tiling());
+        let mut producer = RekeySortedProducer {
+            base: ProducerBase::unowned(RekeySortedProducer::alloc_id(), &tiling),
+            input: Box::new(spy),
+            held: Vec::new(),
+            complete_through: None,
+            key,
+        };
+        assert_eq!(producer.get(tiling.empty_guard()), tiling.empty_tile());
+        assert!(pulled.borrow().is_empty(), "{:?}", pulled.borrow());
+        assert!(producer.held.is_empty());
+        producer.get(keys(Predicate::point(uint(1))));
+        let held = producer.held.clone();
+        assert_eq!(held.len(), 3);
+        assert_eq!(producer.get(tiling.empty_guard()), tiling.empty_tile());
+        assert_eq!(pulled.borrow().len(), 1, "{:?}", pulled.borrow());
+        assert_eq!(producer.held, held);
+    }
+
     #[test]
     fn a_universal_release_releases_the_input() {
         let (mut producer, _, released) =
@@ -365,5 +427,44 @@ mod tests {
             "{:?}",
             released.borrow()
         );
+    }
+    /// The declared input level matches the whole read used to translate output keys.
+    #[test]
+    fn a_projected_rekey_declares_the_input_level_it_reads() {
+        use crate::interpreter::tile_operators::test_helpers::ProjectionSpyOp;
+        let (input, pulled, _) = ProjectionSpyOp::new(
+            pairs(&[3, 7, 9], &[0, 1, 2], &[10, 20, 30], Predicate::True),
+            pair_tiling(),
+        );
+        let mut operator = RekeySorted::new(Box::new(input));
+        let tiling = operator.tiling().clone();
+        let mut cx = Default::default();
+        let mut producer = operator.subscribe(tiling.universal_guard(), Box::new(|| {}), &mut cx);
+        let guard = keys(Predicate::point(uint(1)));
+        let level = Projection::of(&guard)
+            .expect("a key projection")
+            .level()
+            .unwrap();
+        fn leaf_level(
+            producer: &dyn TileProducer,
+            level: Option<CurryLevel>,
+        ) -> Option<CurryLevel> {
+            let mut leaf = level;
+            producer.visit_input_producers(&mut |role, input| {
+                leaf = leaf_level(
+                    input,
+                    level.and_then(|level| producer.input_level(role, level)),
+                );
+            });
+            leaf
+        }
+        let declared = leaf_level(&*producer, Some(level));
+        let _ = producer.get(guard);
+        let pulled = pulled.borrow();
+        assert_eq!(pulled.len(), 1);
+        let actual = Projection::of(&pulled[0])
+            .expect("an input projection")
+            .level();
+        assert_eq!(declared, actual);
     }
 }
