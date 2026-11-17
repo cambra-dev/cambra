@@ -25,15 +25,18 @@ use super::serving::{raw_http, reserve_test_port};
 /// Driven as a subprocess because a `main` output belongs to the binary's own
 /// loop, not to a sink a test can pump. Such a program is not short-lived: its
 /// source is unbounded, so it keeps running and is as reloadable as any other.
+/// `dispatch` is the binary's `CAMBRA_DISPATCH`: `"1"` runs the program
+/// dispatched, `"0"` in pull mode.
 pub(crate) fn stdin_across_reload(
     program: &str,
     reloaded: &str,
     before: &str,
     after: &str,
+    dispatch: &str,
 ) -> (String, String) {
     use std::io::Write;
 
-    let mut launched = launch_under_control(program);
+    let mut launched = launch_under_control(program, dispatch);
     let control = launched.control;
     let v2 = launched.spawned.program.dir.join("v2.cambra");
     std::fs::write(&v2, reloaded).expect("write v2");
@@ -155,16 +158,22 @@ impl Launched {
 ///
 /// The wait is not optional: the program binds its control port during
 /// compilation, so a request sent before then is refused rather than served.
-pub(crate) fn launch_under_control(program: &str) -> Launched {
-    launch_under_control_with(program, &[])
+/// `dispatch` sets the binary's `CAMBRA_DISPATCH`, as [`stdin_across_reload`]
+/// says.
+pub(crate) fn launch_under_control(program: &str, dispatch: &str) -> Launched {
+    launch_under_control_with(program, &[], dispatch)
 }
 
 /// [`launch_under_control`], passing `extra` to the binary as well.
-pub(crate) fn launch_under_control_with(program: &str, extra: &[String]) -> Launched {
+pub(crate) fn launch_under_control_with(
+    program: &str,
+    extra: &[String],
+    dispatch: &str,
+) -> Launched {
     let control = reserve_test_port();
     let mut args = vec![format!("--control={control}")];
     args.extend_from_slice(extra);
-    let spawned = launch_with(program, &args);
+    let spawned = launch_with(program, &args, dispatch);
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while std::net::TcpStream::connect(("127.0.0.1", control)).is_err() {
@@ -176,8 +185,9 @@ pub(crate) fn launch_under_control_with(program: &str, extra: &[String]) -> Laun
 }
 
 /// Spawn `program` as the `cambra` binary with `args`, from a scratch directory
-/// of its own.
-pub(crate) fn launch_with(program: &str, args: &[String]) -> Spawned {
+/// of its own. `dispatch` sets the binary's `CAMBRA_DISPATCH`, as
+/// [`stdin_across_reload`] says.
+pub(crate) fn launch_with(program: &str, args: &[String], dispatch: &str) -> Spawned {
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
 
@@ -193,13 +203,26 @@ pub(crate) fn launch_with(program: &str, args: &[String]) -> Spawned {
         child: Command::new(env!("CARGO_BIN_EXE_cambra"))
             .args(args)
             .arg(&v1)
+            .env("CAMBRA_DISPATCH", dispatch)
+            .env("CAMBRA_MORSEL_ROWS", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("spawn cambra"),
         dir,
+        stderr: None,
+        dispatched: dispatch != "0" && !dispatch.is_empty(),
     };
+    let stderr = program.child.stderr.take().expect("piped stderr");
+    program.stderr = Some(thread::spawn(move || {
+        use std::io::Read;
+        let mut text = String::new();
+        BufReader::new(stderr)
+            .read_to_string(&mut text)
+            .expect("read stderr");
+        text
+    }));
 
     let input = program.child.stdin.take().expect("piped stdin");
     let out = program.child.stdout.take().expect("piped stdout");
@@ -229,9 +252,21 @@ pub(crate) fn launch_with(program: &str, args: &[String]) -> Spawned {
 pub(crate) struct RunningProgram {
     pub(crate) child: std::process::Child,
     pub(crate) dir: std::path::PathBuf,
+    stderr: Option<thread::JoinHandle<String>>,
+    dispatched: bool,
 }
 
 impl RunningProgram {
+    /// A dispatched program a test spawned itself, reading its stderr on its own.
+    pub(crate) fn from_child(child: std::process::Child, dir: std::path::PathBuf) -> Self {
+        Self {
+            child,
+            dir,
+            stderr: None,
+            dispatched: true,
+        }
+    }
+
     /// Give the program `within` to exit on its own once its input has closed.
     ///
     /// Polled rather than waited on: a program that never exits fails the test
@@ -255,7 +290,27 @@ impl Drop for RunningProgram {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.dir);
+        let stderr = self
+            .stderr
+            .take()
+            .map(|reader| reader.join().expect("stderr reader"));
+        if self.dispatched && !thread::panicking() {
+            assert_dispatched(stderr.as_deref().unwrap_or_default());
+        }
     }
+}
+
+fn assert_dispatched(stderr: &str) {
+    assert!(
+        !stderr.contains("running in pull mode"),
+        "a dispatched reload test must not fall back to pull mode: {stderr}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "must not fall back")]
+fn a_reload_test_rejects_dispatcher_fallback() {
+    assert_dispatched("note: CAMBRA_DISPATCH: unsupported shape; running in pull mode");
 }
 
 /// Wait for `port` to stop accepting connections.
