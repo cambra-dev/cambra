@@ -40,6 +40,10 @@ impl TileProducer for BreakerReader {
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("breaker", &*self.handle.borrow());
     }
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("breaker", &mut *self.handle.borrow_mut());
+    }
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         self.handle.borrow().inspect(opts)
     }
