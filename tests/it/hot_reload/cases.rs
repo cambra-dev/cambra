@@ -671,12 +671,12 @@ fn reuse_does_not_depend_on_how_many_reloads_came_before() {
 /// `OneFile::diff_text`), so this is what covers the wire: both ways of carrying
 /// the source, the leading `phase=`, and the main loop servicing a `Diff`
 /// between ticks.
-#[test]
-fn the_control_port_answers_a_diff_request() {
+#[rstest::rstest]
+fn the_control_port_answers_a_diff_request(#[values("0", "1")] dispatch: &str) {
     const V1: &str = "[\"> \" + line for line in stdin()]\n";
     const V2: &str = "[\">> \" + line for line in stdin()]\n";
 
-    let launched = launch_under_control(V1);
+    let launched = launch_under_control(V1, dispatch);
     let control = launched.control;
 
     // The source is the body here, which is how a client sends a file. A space in
@@ -753,7 +753,7 @@ fn the_control_port_refuses_a_request_from_a_web_page() {
     const V1: &str = "[\"> \" + line for line in stdin()]\n";
     const V2: &str = "[\">> \" + line for line in stdin()]\n";
 
-    let launched = launch_under_control(V1);
+    let launched = launch_under_control(V1, "1");
     let control = launched.control;
     let reload = |headers: &str| {
         raw_http_response(
@@ -790,6 +790,7 @@ fn a_finished_program_answers_a_control_request_with_409() {
     let launched = launch_under_control_with(
         "[x + 1 for x in [1, 2, 3]]\n",
         &[format!("--inspect={}", reserve_test_port())],
+        "1",
     );
     let response = launched.wait_until_finished(Duration::from_secs(30));
     assert!(response.starts_with("HTTP/1.1 409"), "{response}");
@@ -802,13 +803,14 @@ fn a_finished_program_answers_a_control_request_with_409() {
 /// the binary's own driver loop services the control port between pulls. The
 /// line written before the swap is answered by the old version and the one after
 /// by the new.
-#[test]
-fn a_main_output_program_over_stdin_reloads() {
+#[rstest::rstest]
+fn a_main_output_program_over_stdin_reloads(#[values("0", "1")] dispatch: &str) {
     let (reply, out) = stdin_across_reload(
         "[\"> \" + line for line in stdin()]\n",
         "[\">> \" + line for line in stdin()]\n",
         "one",
         "two",
+        dispatch,
     );
     assert!(
         reply.contains("reloaded"),
@@ -834,13 +836,14 @@ fn a_main_output_program_over_stdin_reloads() {
 /// Eight lines with the swap after the fourth. Nothing here holds state, so what
 /// is being checked is the seam itself — that the stream is neither replayed
 /// through the new version nor has elements dropped at the handover.
-#[test]
-fn an_element_wise_transformation_splits_exactly_at_the_swap() {
+#[rstest::rstest]
+fn an_element_wise_transformation_splits_exactly_at_the_swap(#[values("0", "1")] dispatch: &str) {
     let (reply, out) = stdin_across_reload(
         "[\"A\" + line for line in stdin()]\n",
         "[\"B\" + line for line in stdin()]\n",
         "L1\nL2\nL3\nL4",
         "L5\nL6\nL7\nL8",
+        dispatch,
     );
     assert!(
         reply.contains("reloaded"),
@@ -865,8 +868,8 @@ fn an_element_wise_transformation_splits_exactly_at_the_swap() {
 /// applied retroactively). Nothing about a `main` output makes its state less
 /// live than a sink program's — what a value like `n` here reports is decided by
 /// when it is read, and reading it at the tail of the program means EOF.
-#[test]
-fn a_main_output_accumulator_carries_across_the_swap() {
+#[rstest::rstest]
+fn a_main_output_accumulator_carries_across_the_swap(#[values("0", "1")] dispatch: &str) {
     let (reply, out) = stdin_across_reload(
         indoc! {r#"
             n := 0
@@ -882,6 +885,7 @@ fn a_main_output_accumulator_carries_across_the_swap() {
         "#},
         "a\nb",
         "c\nd",
+        dispatch,
     );
     assert!(
         reply.contains("reloaded"),
@@ -900,8 +904,8 @@ fn a_main_output_accumulator_carries_across_the_swap() {
 ///
 /// Each line pairs with both of `[1, 2]`. Two lines before the swap count four positions at
 /// `+1`, and two after count four at `+2`: `4 + 8`.
-#[test]
-fn an_accumulator_over_a_product_carries_across_the_swap() {
+#[rstest::rstest]
+fn an_accumulator_over_a_product_carries_across_the_swap(#[values("0", "1")] dispatch: &str) {
     let (reply, out) = stdin_across_reload(
         indoc! {r#"
             n := 0
@@ -917,6 +921,7 @@ fn an_accumulator_over_a_product_carries_across_the_swap() {
         "#},
         "a\nb",
         "c\nd",
+        dispatch,
     );
     assert!(
         reply.contains("reloaded"),
@@ -935,8 +940,8 @@ fn an_accumulator_over_a_product_carries_across_the_swap() {
 /// `out << n` per line makes each step observable rather than only the value at
 /// EOF, so the sequence `1, 2, 4, 6` is the accumulator itself: two steps of `+1`,
 /// then the swap, then two of `+2` continuing from `2` rather than restarting.
-#[test]
-fn a_fed_accumulator_is_observable_across_the_swap() {
+#[rstest::rstest]
+fn a_fed_accumulator_is_observable_across_the_swap(#[values("0", "1")] dispatch: &str) {
     let (reply, out) = stdin_across_reload(
         indoc! {r#"
             out: Feed(_)
@@ -956,16 +961,34 @@ fn a_fed_accumulator_is_observable_across_the_swap() {
         "#},
         "a\nb",
         "c\nd",
+        dispatch,
     );
     assert!(
         reply.contains("reloaded"),
         "the reload should be accepted: {reply}"
     );
-    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
     // `4` is the step that can only happen if the swap resumed from `2`; a
-    // restart would report `2` again.
-    assert!(flat.contains("Ints([4,],)"), "want a step to 4: {out}");
-    assert!(flat.contains("Ints([6,],)"), "want a step to 6: {out}");
+    // restart would report `2` again. Pull mode prints a step per line and a
+    // dispatched run a delivery's steps together, so the values are read in
+    // order across the printed tiles.
+    assert_eq!(printed_ints(&out), [1, 2, 4, 6], "{out}");
+}
+
+/// The integers of every value column `out` prints, `codomain: Scalar(Ints(…))`, in the order
+/// printed.
+fn printed_ints(out: &str) -> Vec<i64> {
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    flat.split("codomain:Scalar(Ints([")
+        .skip(1)
+        .flat_map(|column| {
+            let column = column.split(']').next().unwrap_or_default();
+            column
+                .split(',')
+                .filter(|cell| !cell.is_empty())
+                .map(|cell| cell.parse::<i64>().expect("an `Ints` cell is an integer"))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// A channel fed from several sites keeps its sites' tags when a version adds a site in
@@ -997,29 +1020,54 @@ fn a_site_added_elsewhere_keeps_a_channels_tags() {
         "#},
         "a\nb",
         "c",
+        "1",
     );
     assert!(
         reply.contains("reloaded"),
         "the reload should be accepted: {reply}"
     );
-    // The driver prints each tile's `Debug` form. Before the swap the two arms are `out<<` and
-    // `out<<#1`. After it the same two arms hold the third line's `3` and `30`, beside the
-    // added site's `300`, the codomain listing the arms in tag order.
+    // The driver prints each tile's `Debug` form, and a dispatched run delivers each package's
+    // tile, so an arm's values can arrive in a tile of their own. Before the swap the two arms
+    // are `out<<` and `out<<#1`. After it the same two arms hold the third line's `3` and `30`,
+    // beside the added site's `300`.
     let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
     for tag in [r#"Name("out<<",)"#, r#"Name("out<<#1",)"#] {
         assert!(flat.contains(tag), "want the arm {tag}: {out}");
     }
     assert!(
-        flat.contains("Ints([1,10,],)"),
-        "want the first line's arms: {out}"
-    );
-    assert!(
         flat.contains(r#"Name("note()/note.out<<",)"#),
         "want the added site's arm: {out}"
     );
+    let printed: Vec<i64> = flat
+        .split("Ints([")
+        .skip(1)
+        .flat_map(|values| {
+            values
+                .split(']')
+                .next()
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|n| n.parse().ok())
+        })
+        .collect();
+    let at = |value: i64, what: &str| {
+        printed
+            .iter()
+            .position(|printed| *printed == value)
+            .unwrap_or_else(|| panic!("want {what}, {value}: {out}"))
+    };
+    let before = [
+        at(1, "the first line's first arm"),
+        at(10, "the first line's second arm"),
+    ];
+    let after = [
+        at(3, "the third line's first arm, `n` carried across the swap"),
+        at(30, "the third line's second arm"),
+        at(300, "the added site's arm"),
+    ];
     assert!(
-        flat.contains("Ints([300,3,30,],)"),
-        "want the third line's arms, `n` carried across the swap: {out}"
+        before.iter().max() < after.iter().min(),
+        "the third line's arms print after the first line's: {out}"
     );
 }
 
@@ -1030,8 +1078,8 @@ fn a_site_added_elsewhere_keeps_a_channels_tags() {
 /// The value never reaches the program's output (a scalar read of an
 /// accumulator over an unbounded source never finalizes), which is exactly why
 /// the guard has to catch the change rather than leaving it to be noticed.
-#[test]
-fn the_state_guard_covers_a_stdin_sourced_loop() {
+#[rstest::rstest]
+fn the_state_guard_covers_a_stdin_sourced_loop(#[values("0", "1")] dispatch: &str) {
     let (reply, _) = stdin_across_reload(
         indoc! {r#"
             n := ""
@@ -1047,6 +1095,7 @@ fn the_state_guard_covers_a_stdin_sourced_loop() {
         "#},
         "a",
         "b",
+        dispatch,
     );
     assert!(
         reply.contains("`n` is now Int"),
@@ -1057,8 +1106,8 @@ fn the_state_guard_covers_a_stdin_sourced_loop() {
 /// A variable holding a nominal value does not carry over a reload yet. A renamed type has
 /// the representation of the old one, so comparing extents would let the value through
 /// where the spec refuses it (`docs/chl-spec.md`, "Reloading a nominal type").
-#[test]
-fn a_reload_refuses_a_variable_of_a_nominal_type() {
+#[rstest::rstest]
+fn a_reload_refuses_a_variable_of_a_nominal_type(#[values("0", "1")] dispatch: &str) {
     let (reply, _) = stdin_across_reload(
         indoc! {r#"
             type Price = Int
@@ -1078,6 +1127,7 @@ fn a_reload_refuses_a_variable_of_a_nominal_type() {
         "#},
         "a",
         "b",
+        dispatch,
     );
     assert!(
         reply.contains("`n` holds a value of a nominal type"),
@@ -1087,8 +1137,10 @@ fn a_reload_refuses_a_variable_of_a_nominal_type() {
 
 /// The refusal reads the running program's type too: a structural variant with the
 /// representation of the nominal type it replaces does not take the value over.
-#[test]
-fn a_reload_refuses_a_nominal_value_retyped_to_its_representation() {
+#[rstest::rstest]
+fn a_reload_refuses_a_nominal_value_retyped_to_its_representation(
+    #[values("0", "1")] dispatch: &str,
+) {
     let (reply, _) = stdin_across_reload(
         indoc! {r#"
             type Price = Int
@@ -1106,6 +1158,7 @@ fn a_reload_refuses_a_nominal_value_retyped_to_its_representation() {
         "#},
         "a",
         "b",
+        dispatch,
     );
     assert!(
         reply.contains("`n` holds a value of a nominal type"),
@@ -2732,8 +2785,10 @@ fn diffing_a_running_http_program_leaves_it_untouched() {
 /// exactly what the edit changes. Their identities are the spelling plus an index
 /// among the variables of that spelling, which is why the edit carries and the
 /// two do not cross.
-#[test]
-fn two_instantiations_of_one_function_keep_their_accumulators_apart() {
+#[rstest::rstest]
+fn two_instantiations_of_one_function_keep_their_accumulators_apart(
+    #[values("0", "1")] dispatch: &str,
+) {
     let v1 = indoc::indoc! {r#"
         def count_by(src, step) => Int:
             total := 0
@@ -2747,7 +2802,7 @@ fn two_instantiations_of_one_function_keep_their_accumulators_apart() {
         a * 1000 + b
         "#};
     let v2 = v1.replace("total + step", "total + step * 2");
-    let (reply, out) = stdin_across_reload(v1, &v2, "m\nn", "o\np");
+    let (reply, out) = stdin_across_reload(v1, &v2, "m\nn", "o\np", dispatch);
     assert!(
         reply.contains("reloaded"),
         "the reload should be accepted: {reply}"

@@ -8,7 +8,7 @@ use crate::ccl::FieldKey;
 use crate::interpreter::CurryLevel;
 use crate::interpreter::{
     Consumer, DataSourceDomainExtentImpl, Projection, dispatcher::Landing, dispatcher::Routes,
-    tile_operators::Notified, value_probe::ProbeSlot,
+    tile_operators::Notified,
 };
 
 /// A consumer handle shared by notification forwarders and deferred wakeups.
@@ -517,10 +517,6 @@ impl WakeupQueue {
 pub struct Scheduler {
     source_handles: HashMap<String, SourceHandle>,
     wakeups: WakeupQueue,
-    probes: ProbeSlot,
-    /// The source producers registered under each subscription still in progress,
-    /// innermost last — see [`begin_source_producers`](Self::begin_source_producers).
-    producer_frames: Vec<Vec<String>>,
     /// Sinks' pulls, run after the wakes that queued them in the same call.
     sink_pulls: WakeupQueue,
 }
@@ -545,55 +541,6 @@ impl Scheduler {
         self.source_handles
             .iter()
             .map(|(name, (handle, _))| (name.as_str(), handle))
-    }
-
-    /// The probe slot every producer subscribed under this scheduler holds.
-    ///
-    /// The scheduler carries it because every `subscribe` already receives
-    /// the scheduler, so a producer takes the slot at construction with no
-    /// ambient state.
-    pub fn probes(&self) -> &ProbeSlot {
-        &self.probes
-    }
-
-    /// Open a frame recording every producer that registers with a data source
-    /// until the matching [`end_source_producers`](Self::end_source_producers).
-    ///
-    /// A source producer is attributed to whatever subscribed it, so the branch
-    /// table can say which producers a branch holds: a fan-out records the
-    /// producers its input chain registered, and a compilation the producers its
-    /// outputs registered (`src/ccl/design/program-evolution.md`, "Routes across
-    /// branches"). Frames nest, because a fan-out's input is subscribed from
-    /// inside a compilation's.
-    pub fn begin_source_producers(&mut self) {
-        self.producer_frames.push(Vec::new());
-    }
-
-    /// Close the innermost frame and return the producers registered in it.
-    ///
-    /// The producers are also added to the enclosing frame, so a frame's record
-    /// covers every producer registered below it, including those under a nested
-    /// fan-out.
-    pub fn end_source_producers(&mut self) -> Vec<String> {
-        let producers = self
-            .producer_frames
-            .pop()
-            .expect("`end_source_producers` closes a frame `begin_source_producers` opened");
-        if let Some(outer) = self.producer_frames.last_mut() {
-            outer.extend(producers.iter().cloned());
-        }
-        producers
-    }
-
-    /// Record that the producer named `producer` registered with a data source.
-    ///
-    /// A registration outside every frame is attributed to nothing. Only a
-    /// subscription made outside a compilation does that, which a test that
-    /// subscribes an operator by hand is.
-    pub fn note_source_producer(&mut self, producer: String) {
-        if let Some(frame) = self.producer_frames.last_mut() {
-            frame.push(producer);
-        }
     }
 
     /// Register `consumer` to be notified when `handle` has new data.

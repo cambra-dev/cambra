@@ -10,7 +10,7 @@ use crate::interpreter::Prefix;
 use crate::interpreter::operator_graph::{share, value};
 use crate::{
     interpreter::{
-        Consumer, Position, Projection, Scheduler,
+        Consumer, Position, Projection, SubscribeContext,
         scheduler::{
             GatedConsumer, WakeupQueue, forwarding_consumer_keeping_keys, shared_consumer,
         },
@@ -1016,19 +1016,17 @@ impl FanHold {
         &self,
         intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         match self {
             FanHold::Reader { input, .. } => {
-                input
-                    .borrow_mut()
-                    .subscribe(intent_guard, consumer, scheduler)
+                input.borrow_mut().subscribe(intent_guard, consumer, cx)
             }
             FanHold::Recurrence { input, .. } => input
                 .upgrade()
                 .expect(DEAD_RECURRENCE)
                 .borrow_mut()
-                .subscribe(intent_guard, consumer, scheduler),
+                .subscribe(intent_guard, consumer, cx),
         }
     }
 }
@@ -1077,7 +1075,7 @@ impl TileOperator for FanOutSlot {
         &mut self,
         intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // Register the consumer and reserve its release-guard slot. The slot
         // number lives in the cell the producer holds, so `compact` can renumber.
@@ -1164,15 +1162,15 @@ impl TileOperator for FanOutSlot {
             // on this fan-out.
             let _guard = SubscribingInnerGuard { shared: &shared_rc };
             let shared_weak = Rc::downgrade(&shared_rc);
-            scheduler.begin_source_producers();
+            cx.begin_source_producers();
             let inner = self.hold.subscribe_input(
                 intent_guard,
                 Box::new(FanOutInput {
                     shared: shared_weak,
                 }),
-                scheduler,
+                cx,
             );
-            let producers = scheduler.end_source_producers();
+            let producers = cx.end_source_producers();
             let mut shared = shared_rc.borrow_mut();
             let (held, cell) = match shared.reentrancy.is_some() {
                 true => {
@@ -1196,8 +1194,7 @@ impl TileOperator for FanOutSlot {
             // `_guard` drops here, resetting `subscribing_inner`.
         }
 
-        let mut base =
-            ProducerBase::new(shared_rc.borrow().id, self.tiling(), &self.base, scheduler);
+        let mut base = ProducerBase::new(shared_rc.borrow().id, self.tiling(), &self.base, cx);
         base.obsolete_guard = seed;
         Box::new(FanOutProducer {
             base,
@@ -1626,7 +1623,7 @@ impl TileOperator for Memo {
         &mut self,
         intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let dirty = DirtyRegion::new();
         let (consumer, gate) = shared_consumer(consumer);
@@ -1634,23 +1631,17 @@ impl TileOperator for Memo {
             self.input.tiling().clone(),
             dirty.consumer(forwarding_consumer_keeping_keys(
                 &consumer,
-                &scheduler.wakeup_queue(),
+                &cx.scheduler().wakeup_queue(),
             )),
         );
         share_breaker(MemoProducer::new(
-            ProducerBase::new(
-                MemoProducer::alloc_id(),
-                self.tiling(),
-                &self.base,
-                scheduler,
-            )
-            .sharing(gate)
-            .breaking(consumer.shared().clone(), placement),
-            self.input
-                .subscribe(intent_guard, Box::new(entry), scheduler),
+            ProducerBase::new(MemoProducer::alloc_id(), self.tiling(), &self.base, cx)
+                .sharing(gate)
+                .breaking(consumer.shared().clone(), placement),
+            self.input.subscribe(intent_guard, Box::new(entry), cx),
             dirty,
             consumer,
-            scheduler.wakeup_queue(),
+            cx.scheduler().wakeup_queue(),
         ))
     }
 
@@ -2087,7 +2078,7 @@ mod nested_projection_tests {
         let mut producer = memo.subscribe(
             tiling.universal_guard(),
             Box::new(|| {}),
-            &mut Scheduler::new(),
+            &mut SubscribeContext::new(),
         );
         for (k, j) in [(0, 1), (1, 0)] {
             let mut expected = tile.clone();
@@ -2209,7 +2200,7 @@ mod tests {
     use bit_set::BitSet;
 
     use crate::interpreter::tile_operators::test_helpers::QuietSpy;
-    use crate::interpreter::tile_operators::{Constant, Scheduler};
+    use crate::interpreter::tile_operators::{Constant, SubscribeContext};
     use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
 
     /// Reopening a fan-out drops the slots whose subscribers are gone and tells
@@ -2225,15 +2216,15 @@ mod tests {
     fn reopening_a_fan_out_drops_dead_slots_and_renumbers_the_rest() {
         let extent = Extent::Base(BaseType::Int);
         let fan = FanOut::new(Box::new(Constant::new(Value::Int(1), extent.clone())));
-        let mut sched = Scheduler::new();
+        let mut cx = SubscribeContext::new();
         let tiling = Tiling::Scalar(extent);
 
         let first = fan
             .slot()
-            .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut sched);
+            .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut cx);
         let mut second = fan
             .slot()
-            .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut sched);
+            .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut cx);
         assert_eq!(fan.shared.borrow().subscribers.len(), 2);
 
         // Distinguish the survivor's guard from the empty one the dead slot holds.
@@ -2299,9 +2290,9 @@ mod tests {
         fan: &FanOut,
         reader: SlotReader,
         predecessor: Option<SlotReader>,
-        sched: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        HELD.with(|version| read_in(fan, reader, predecessor, version, sched))
+        HELD.with(|version| read_in(fan, reader, predecessor, version, cx))
     }
 
     /// [`read_by`] in `version`.
@@ -2310,12 +2301,12 @@ mod tests {
         reader: SlotReader,
         predecessor: Option<SlotReader>,
         version: &Version,
-        sched: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         fan.slot_read_by(reader, predecessor, version).subscribe(
             positions().empty_guard(),
             Box::new(|| {}),
-            sched,
+            cx,
         )
     }
 
@@ -2324,7 +2315,7 @@ mod tests {
     #[test]
     fn a_rebuilt_reader_starts_at_its_predecessors_release_not_a_lagging_siblings() {
         let fan = keyed_fan();
-        let mut sched = Scheduler::new();
+        let mut sched = SubscribeContext::new();
         let (fast, lagging) = (a_reader(), a_reader());
         let mut fast_read = read_by(&fan, fast, None, &mut sched);
         let mut lagging_read = read_by(&fan, lagging, None, &mut sched);
@@ -2352,7 +2343,7 @@ mod tests {
     #[test]
     fn two_rebuilt_readers_each_start_at_their_own_predecessors_release() {
         let fan = keyed_fan();
-        let mut sched = Scheduler::new();
+        let mut sched = SubscribeContext::new();
         let (fast, slow) = (a_reader(), a_reader());
         let mut fast_read = read_by(&fan, fast, None, &mut sched);
         let mut slow_read = read_by(&fan, slow, None, &mut sched);
@@ -2374,7 +2365,7 @@ mod tests {
     #[test]
     fn a_release_with_holes_is_carried_exactly() {
         let fan = keyed_fan();
-        let mut sched = Scheduler::new();
+        let mut sched = SubscribeContext::new();
         let first = a_reader();
         let mut read = read_by(&fan, first, None, &mut sched);
         read.release(released_points(&[0, 2]));
@@ -2391,7 +2382,7 @@ mod tests {
     #[test]
     fn a_reader_with_no_predecessor_starts_at_what_the_fan_out_reclaimed() {
         let fan = keyed_fan();
-        let mut sched = Scheduler::new();
+        let mut sched = SubscribeContext::new();
         let mut read = read_by(&fan, a_reader(), None, &mut sched);
         read.release(released_through(3));
         drop(read);
@@ -2408,7 +2399,7 @@ mod tests {
     #[test]
     fn retired_slots_hold_reclamation_back_until_the_handover_settles() {
         let fan = keyed_fan();
-        let mut sched = Scheduler::new();
+        let mut sched = SubscribeContext::new();
         let mut retiring = read_by(&fan, a_reader(), None, &mut sched);
         let mut live = read_by(&fan, a_reader(), None, &mut sched);
         retiring.release(released_through(4));
@@ -2430,7 +2421,7 @@ mod tests {
     #[test]
     fn a_slot_that_dies_during_the_handover_holds_reclamation_back_until_it_settles() {
         let fan = keyed_fan();
-        let mut sched = Scheduler::new();
+        let mut sched = SubscribeContext::new();
         let (ahead, behind) = (a_reader(), a_reader());
         let mut ahead_read = read_by(&fan, ahead, None, &mut sched);
         let mut behind_read = read_by(&fan, behind, None, &mut sched);
@@ -2457,7 +2448,7 @@ mod tests {
     #[test]
     fn a_slots_position_rises_only_on_a_prefix() {
         let fan = keyed_fan();
-        let mut sched = Scheduler::new();
+        let mut sched = SubscribeContext::new();
         let reader = a_reader();
         let mut read = read_by(&fan, reader, None, &mut sched);
         let at = |fan: &FanOut| fan.released_position_of(reader).map(|p| p.into_value());
@@ -2484,7 +2475,7 @@ mod tests {
     #[test]
     fn a_slot_answers_to_the_nodes_its_reader_is_renamed_to() {
         let fan = keyed_fan();
-        let mut sched = Scheduler::new();
+        let mut sched = SubscribeContext::new();
         let reader = a_reader();
         let mut read = read_by(&fan, reader, None, &mut sched);
         read.release(released_through(2));
@@ -2505,7 +2496,7 @@ mod tests {
     #[test]
     fn a_kept_slot_answers_only_to_the_names_of_versions_still_held() {
         let fan = keyed_fan();
-        let mut sched = Scheduler::new();
+        let mut sched = SubscribeContext::new();
         let (v1, v2, v3) = (Version::default(), Version::default(), Version::default());
         let first = a_reader();
         let mut read = read_in(&fan, first, None, &v1, &mut sched);
@@ -2545,10 +2536,10 @@ mod tests {
     #[test]
     fn a_slot_that_died_before_the_handover_retires_covering_what_was_reclaimed() {
         let fan = keyed_fan();
-        let mut sched = Scheduler::new();
+        let mut cx = SubscribeContext::new();
         let early = a_reader();
-        let mut early_read = read_by(&fan, early, None, &mut sched);
-        let mut live = read_by(&fan, a_reader(), None, &mut sched);
+        let mut early_read = read_by(&fan, early, None, &mut cx);
+        let mut live = read_by(&fan, a_reader(), None, &mut cx);
         early_read.release(released_through(2));
         drop(early_read);
         live.release(released_through(9));
@@ -2558,7 +2549,7 @@ mod tests {
         live.release(released_through(10));
         assert_eq!(fan.shared.borrow().released, released_through(9));
         let successor = a_reader();
-        let _read = read_by(&fan, successor, Some(early), &mut sched);
+        let _read = read_by(&fan, successor, Some(early), &mut cx);
         assert_eq!(fan.released_by(successor), Some(released_through(9)));
     }
 
@@ -2569,7 +2560,7 @@ mod tests {
     #[should_panic(expected = "one live slot of a fan-out serves each reader")]
     fn a_reader_with_two_live_slots_on_one_fan_out_is_refused() {
         let fan = keyed_fan();
-        let mut sched = Scheduler::new();
+        let mut sched = SubscribeContext::new();
         let reader = a_reader();
         let _first = read_by(&fan, reader, None, &mut sched);
         let _second = read_by(&fan, reader, None, &mut sched);
@@ -2587,12 +2578,12 @@ mod tests {
     fn a_late_subscriber_starts_at_what_the_fan_out_has_released() {
         let extent = Extent::Base(BaseType::Int);
         let fan = FanOut::new(Box::new(Constant::new(Value::Int(1), extent.clone())));
-        let mut sched = Scheduler::new();
+        let mut cx = SubscribeContext::new();
         let tiling = Tiling::Scalar(extent);
 
         let mut first = fan
             .slot()
-            .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut sched);
+            .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut cx);
         assert!(
             !fan.released_in_full(),
             "nothing has released, so the fan-out still has its value to give"
@@ -2607,7 +2598,7 @@ mod tests {
         );
         let late = fan
             .slot()
-            .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut sched);
+            .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut cx);
         assert_eq!(
             fan.shared.borrow().release_guards[0],
             TileGuard::Scalar(Predicate::True),
@@ -2688,7 +2679,7 @@ mod tests {
             &mut self,
             _intent_guard: TileGuard,
             consumer: Box<dyn Consumer>,
-            _scheduler: &mut Scheduler,
+            _cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             *self.notifier.consumer.borrow_mut() = Some(consumer);
             Box::new(ScriptedProducer {
@@ -2777,7 +2768,7 @@ mod tests {
         let tiling = partial_tiling();
         let (input, _pulls, notifier) = Scripted::new(vec![one_row(0, 7)], &tiling);
         let fan = FanOut::new(Box::new(input));
-        let mut sched = Scheduler::new();
+        let mut cx = SubscribeContext::new();
         let counts: Vec<Rc<Cell<u32>>> = (0..2).map(|_| Rc::new(Cell::new(0))).collect();
         let mut producers: Vec<Box<dyn TileProducer>> = counts
             .iter()
@@ -2786,7 +2777,7 @@ mod tests {
                 fan.slot().subscribe(
                     tiling.universal_guard(),
                     Box::new(move || count.set(count.get() + 1)),
-                    &mut sched,
+                    &mut cx,
                 )
             })
             .collect();
@@ -2830,22 +2821,22 @@ mod tests {
         let (input, _pulls, notifier) = Scripted::new(vec![one_row(0, 7), one_row(1, 8)], &tiling);
         let fan = FanOut::new(Box::new(Memo::new(Box::new(input))));
         let mut record = MakeRecord::new(vec![fan.slot(), fan.slot()]);
-        let mut sched = Scheduler::new();
+        let mut cx = SubscribeContext::new();
         let sink = Arc::new(Counting::default());
         let (done, _finished) = DoneNotifier::create(1);
         let (consumer, slot) = SinkConsumer::new(
             sink.clone(),
             done.into_iter().next().expect("one notifier"),
-            sched.sink_pull_queue(),
+            cx.scheduler().sink_pull_queue(),
         );
         let universal = record.tiling().universal_guard();
-        let producer = record.subscribe(universal, Box::new(consumer), &mut sched);
+        let producer = record.subscribe(universal, Box::new(consumer), &mut cx);
         *slot.borrow_mut() = Some(producer);
         let processed = || *sink.0.lock().unwrap();
 
         for call in 1..=2 {
             notify(&notifier);
-            sched.check_for_notifications();
+            cx.scheduler().check_for_notifications();
             assert_eq!(
                 processed(),
                 call,
@@ -2864,11 +2855,11 @@ mod tests {
         let (input, pulls, notifier) =
             Scripted::new(vec![tiling.empty_tile(), one_row(0, 7)], &tiling);
         let fan = FanOut::new(Box::new(Memo::new(Box::new(input))));
-        let mut sched = Scheduler::new();
+        let mut cx = SubscribeContext::new();
         let mut branches: Vec<Box<dyn TileProducer>> = (0..2)
             .map(|_| {
                 fan.slot()
-                    .subscribe(tiling.universal_guard(), Box::new(|| {}), &mut sched)
+                    .subscribe(tiling.universal_guard(), Box::new(|| {}), &mut cx)
             })
             .collect();
         let pull_both = |branches: &mut Vec<Box<dyn TileProducer>>| {
@@ -2903,8 +2894,8 @@ mod tests {
         let tiling = partial_tiling();
         let (input, pulls, notifier) = Scripted::new(vec![one_row(0, 7)], &tiling);
         let mut memo = Memo::new(Box::new(input));
-        let mut sched = Scheduler::new();
-        let mut producer = memo.subscribe(tiling.universal_guard(), Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = memo.subscribe(tiling.universal_guard(), Box::new(|| {}), &mut cx);
 
         let first = producer.get(tiling.universal_guard());
         assert_eq!(pulls.get(), 1, "the first pull reads its input");
@@ -2940,8 +2931,8 @@ mod tests {
         let complete = Tile::Scalar(ColumnValue::Ints(vec![7]));
         let (input, pulls, notifier) = Scripted::new(vec![complete.clone()], &tiling);
         let mut memo = Memo::new(Box::new(input));
-        let mut sched = Scheduler::new();
-        let mut producer = memo.subscribe(tiling.universal_guard(), Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = memo.subscribe(tiling.universal_guard(), Box::new(|| {}), &mut cx);
         let probe = usize::from(cfg!(debug_assertions));
 
         assert_eq!(producer.get(tiling.universal_guard()), complete);
@@ -2980,8 +2971,8 @@ mod tests {
         let (input, pulls, notifier) =
             Scripted::new(vec![tiling.empty_tile(), one_row(0, 7)], &tiling);
         let mut memo = Memo::new(Box::new(input));
-        let mut sched = Scheduler::new();
-        let mut producer = memo.subscribe(tiling.universal_guard(), Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = memo.subscribe(tiling.universal_guard(), Box::new(|| {}), &mut cx);
 
         assert!(
             producer.get(tiling.universal_guard()).is_empty(),
@@ -3095,7 +3086,7 @@ mod projection_tests {
 
     use super::*;
     use crate::interpreter::dispatcher::{Dispatcher, PipelineId};
-    use crate::interpreter::tile_operators::Scheduler;
+    use crate::interpreter::tile_operators::SubscribeContext;
     use crate::interpreter::tile_operators::test_helpers::push_to;
     use crate::interpreter::tile_operators::test_helpers::{
         GuardLog, InputConsumer, NotifyingOp, ProjectionSpy, ProjectionSpyOp, int_entries,
@@ -3117,13 +3108,13 @@ mod projection_tests {
         let values: Vec<i64> = (0..ROWS as i64).collect();
         let (input, pulled, _) = ProjectionSpyOp::new(ints_by_position(&values, true), ints());
         let fan = FanOut::new(Box::new(input));
-        let mut sched = Scheduler::new();
+        let mut cx = SubscribeContext::new();
         let first = fan
             .slot()
-            .subscribe(ints().empty_guard(), Box::new(|| {}), &mut sched);
+            .subscribe(ints().empty_guard(), Box::new(|| {}), &mut cx);
         let second = fan
             .slot()
-            .subscribe(ints().empty_guard(), Box::new(|| {}), &mut sched);
+            .subscribe(ints().empty_guard(), Box::new(|| {}), &mut cx);
         (first, second, pulled)
     }
 
@@ -3428,7 +3419,7 @@ mod projection_tests {
         let memo = Memo::new(Box::new(input)).subscribe(
             ints().universal_guard(),
             Box::new(|| {}),
-            &mut Scheduler::new(),
+            &mut SubscribeContext::new(),
         );
         (memo, notifier, rows, pulled)
     }
@@ -3654,8 +3645,8 @@ mod projection_tests {
         let by_value = Converse::new(fan.slot());
         let mut map = MapResult::new_at(fan.slot(), Box::new(by_value), CurryLevel::new(1));
         let guard = map.tiling().universal_guard();
-        let mut sched = Scheduler::new();
-        let mut producer = map.subscribe(guard, Box::new(|| {}), &mut sched);
+        let mut cx = SubscribeContext::new();
+        let mut producer = map.subscribe(guard, Box::new(|| {}), &mut cx);
 
         let morsel = producer.get(keys_between(2, 3));
         let Tile::DataFunction { domain, .. } = &morsel else {
@@ -3704,7 +3695,7 @@ mod consuming_tests {
     use std::collections::BTreeSet;
 
     use crate::interpreter::dispatcher::{Dispatcher, PipelineId};
-    use crate::interpreter::tile_operators::Scheduler;
+    use crate::interpreter::tile_operators::SubscribeContext;
     use crate::interpreter::tile_operators::growing::{
         Input, InputModel, KEYS, Region, Released, Rng, Shared, Step, entries, growing_source,
         ints, keys_of, keys_predicate, predicate, rows_of, same_region, source, value,
@@ -4173,8 +4164,8 @@ mod consuming_tests {
         let woken = Rc::new(Cell::new(0));
         let counted = woken.clone();
         let (consumer, gate) = shared_consumer(Box::new(move || counted.set(counted.get() + 1)));
-        let mut sched = Scheduler::new();
-        let wakeups = sched.wakeup_queue();
+        let mut cx = SubscribeContext::new();
+        let wakeups = cx.scheduler().wakeup_queue();
         let dirty = DirtyRegion::new();
         let mut notifier = dirty.consumer(forwarding_consumer_keeping_keys(&consumer, &wakeups));
         let (mut memo, _) = memo_over(&source(0..4));
@@ -4185,7 +4176,7 @@ mod consuming_tests {
         memo.base = ProducerBase::unowned(MemoProducer::alloc_id(), &ints()).sharing(gate);
 
         notifier.notify(&All.projection());
-        sched.check_for_notifications();
+        cx.scheduler().check_for_notifications();
         assert_eq!(
             woken.get(),
             1,
@@ -4194,7 +4185,7 @@ mod consuming_tests {
 
         memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, All.guard());
-        sched.check_for_notifications();
+        cx.scheduler().check_for_notifications();
         assert_eq!(
             woken.get(),
             1,
@@ -4218,8 +4209,8 @@ mod consuming_tests {
         let woken = Rc::new(Cell::new(0));
         let counted = woken.clone();
         let (consumer, gate) = shared_consumer(Box::new(move || counted.set(counted.get() + 1)));
-        let mut sched = Scheduler::new();
-        let wakeups = sched.wakeup_queue();
+        let mut cx = SubscribeContext::new();
+        let wakeups = cx.scheduler().wakeup_queue();
         let dirty = DirtyRegion::new();
         let mut notifier = dirty.consumer(forwarding_consumer_keeping_keys(&consumer, &wakeups));
         let (mut memo, _) = memo_over(&source(0..4));
@@ -4232,7 +4223,7 @@ mod consuming_tests {
         memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, Keys(0, 1).guard());
         notifier.notify(&Keys(2, 3).projection());
-        sched.check_for_notifications();
+        cx.scheduler().check_for_notifications();
         assert_eq!(woken.get(), 1, "the notification wakes the consumer");
 
         let pulled = memo.get(All.guard());
@@ -4243,7 +4234,7 @@ mod consuming_tests {
         );
 
         memo.consume_impl(InputId::ONLY, Keys(2, 3).guard());
-        sched.check_for_notifications();
+        cx.scheduler().check_for_notifications();
         assert_eq!(woken.get(), 1, "a consuming memo wakes no consumer");
         assert_eq!(
             entries(&memo.get(All.guard())),
@@ -4509,7 +4500,7 @@ mod cycle_tests {
     use super::*;
     use crate::interpreter::dispatcher::{Entry, Landing, PipelineId};
     use crate::interpreter::scheduler::SharedConsumer;
-    use crate::interpreter::tile_operators::Scheduler;
+    use crate::interpreter::tile_operators::SubscribeContext;
     use crate::interpreter::{BaseType, ColumnValue, Extent};
 
     fn ints() -> Tiling {
@@ -4554,7 +4545,7 @@ mod cycle_tests {
             &mut self,
             intent_guard: TileGuard,
             consumer: Box<dyn Consumer>,
-            scheduler: &mut Scheduler,
+            cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             let own: SharedConsumer = Rc::new(RefCell::new(consumer));
             let (mut recurrence, inside) = {
@@ -4571,13 +4562,13 @@ mod cycle_tests {
                         .expect("a test wires the cycle's consumer"),
                 )
             };
-            let recurrence = recurrence.subscribe(intent_guard, inside, scheduler);
+            let recurrence = recurrence.subscribe(intent_guard, inside, cx);
             Box::new(StoreDoubleProducer {
                 base: ProducerBase::new(
                     StoreDoubleProducer::alloc_id(),
                     self.tiling(),
                     &self.base,
-                    scheduler,
+                    cx,
                 ),
                 wiring: self.wiring.clone(),
                 recurrence,
@@ -4643,7 +4634,7 @@ mod cycle_tests {
         #[values(false, true)] reentrant_last: bool,
     ) {
         let (fan, wiring) = cyclic(int(2), |_| Box::new(|| {}));
-        let mut cx = Scheduler::new();
+        let mut cx = SubscribeContext::new();
         let whole = ints().universal_guard();
         let mut reader = fan
             .slot()
@@ -4667,7 +4658,7 @@ mod cycle_tests {
     #[rstest::rstest]
     fn a_mapped_store_borrow_retains_the_reentrant_release(#[values(false, true)] mapped: bool) {
         let (fan, wiring) = cyclic(int(2), |_| Box::new(|| {}));
-        let mut cx = Scheduler::new();
+        let mut cx = SubscribeContext::new();
         let whole = ints().universal_guard();
         let mut reader = fan
             .slot()
@@ -4711,10 +4702,10 @@ mod cycle_tests {
     #[test]
     fn a_pull_that_re_enters_the_store_reads_the_published_snapshot() {
         let (fan, wiring) = cyclic(int(2), |_| Box::new(|| {}));
-        let mut scheduler = Scheduler::new();
-        let mut reader =
-            fan.slot()
-                .subscribe(ints().universal_guard(), Box::new(|| {}), &mut scheduler);
+        let mut cx = SubscribeContext::new();
+        let mut reader = fan
+            .slot()
+            .subscribe(ints().universal_guard(), Box::new(|| {}), &mut cx);
         cycle_of(&wiring).publish(&int(1));
         assert_eq!(reader.get(ints().universal_guard()), int(2));
         assert_eq!(wiring.borrow().read, vec![int(1)]);
@@ -4728,11 +4719,11 @@ mod cycle_tests {
         let (fan, wiring) = cyclic(int(2), |_| {
             Box::new(Entry::new(PipelineId(2), ints(), Box::new(|| {})))
         });
-        let mut scheduler = Scheduler::new();
+        let mut cx = SubscribeContext::new();
         let _reader = fan.slot().subscribe(
             ints().universal_guard(),
             Box::new(Entry::new(PipelineId(1), ints(), Box::new(|| {}))),
-            &mut scheduler,
+            &mut cx,
         );
         let own = wiring
             .borrow()
