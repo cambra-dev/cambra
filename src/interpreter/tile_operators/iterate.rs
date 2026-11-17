@@ -58,7 +58,7 @@ impl TileOperator for IterateExtent {
         let NotifyOrSubscribeResult { notify, subscribe } =
             self.extent.subscribe_to_iteration_action();
         if notify {
-            consumer.notify();
+            consumer.notify(&Projection::Everything);
         }
         // The producer owns the registration: the scheduler holds only a `Weak`, so this
         // handle is what keeps the source waking this producer, and dropping the producer

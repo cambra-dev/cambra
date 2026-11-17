@@ -398,7 +398,6 @@ mod tests {
     /// The declared input level matches the whole read used to translate output keys.
     #[test]
     fn a_projected_rekey_declares_the_input_level_it_reads() {
-        use crate::interpreter::Projection;
         use crate::interpreter::tile_operators::test_helpers::ProjectionSpyOp;
         let (input, pulled, _) = ProjectionSpyOp::new(
             pairs(&[3, 7, 9], &[0, 1, 2], &[10, 20, 30], Predicate::True),

@@ -121,7 +121,7 @@ impl TileOperator for Constant {
         mut consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        consumer.notify();
+        consumer.notify(&Projection::Everything);
         Box::new(ConstantProducer {
             base: ProducerBase::new(
                 ConstantProducer::alloc_id(),
@@ -322,9 +322,11 @@ impl TileOperator for VariantWrap {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let input =
-            self.input
-                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+        let input = self.input.subscribe(
+            self.input.tiling().universal_guard(),
+            widening(consumer),
+            scheduler,
+        );
         Box::new(VariantWrapProducer {
             base: ProducerBase::new(
                 VariantWrapProducer::alloc_id(),
@@ -574,9 +576,11 @@ impl TileOperator for VariantProject {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let input =
-            self.input
-                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+        let input = self.input.subscribe(
+            self.input.tiling().universal_guard(),
+            widening(consumer),
+            scheduler,
+        );
         Box::new(VariantProjectProducer {
             base: ProducerBase::new(
                 VariantProjectProducer::alloc_id(),
@@ -869,7 +873,9 @@ impl TileOperator for VariantIs {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let input = self.input.subscribe(intent_guard, consumer, scheduler);
+        let input = self
+            .input
+            .subscribe(intent_guard, widening(consumer), scheduler);
         Box::new(VariantIsProducer {
             base: ProducerBase::new(
                 VariantIsProducer::alloc_id(),
@@ -1010,7 +1016,7 @@ mod tests {
             mut consumer: Box<dyn Consumer>,
             _scheduler: &mut Scheduler,
         ) -> Box<dyn TileProducer> {
-            consumer.notify();
+            consumer.notify(&Projection::Everything);
             Box::new(TestTileProducer::new(
                 self.tile.clone(),
                 self.tiling.clone(),
