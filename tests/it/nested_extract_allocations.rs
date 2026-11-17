@@ -11,13 +11,11 @@
 //!
 //! Allocation count is the probe rather than wall-clock: it is deterministic, so the
 //! guard can be a hard bound instead of a flaky timing threshold. The counter is
-//! `tests/alloc_probe/mod.rs`. Comparing two depths of one program, rather than one
+//! `tests/it/alloc_probe.rs`. Comparing two depths of one program, rather than one
 //! count against a fixed number, keeps the bound from moving with the inference cost
 //! every program pays.
 
-mod alloc_probe;
-
-use alloc_probe::allocations;
+use crate::it::alloc_probe::allocations;
 use cambra::ccl::{
     comprehension,
     infer::{TypeInferenceContext, infer},

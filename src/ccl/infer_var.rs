@@ -80,7 +80,7 @@ pub(crate) fn fresh_infer_var_id() -> InferVarId {
 /// For use in tests that need predictable `InferVarId` values in output.
 /// Not safe to call concurrently — run such tests with `--test-threads=1`
 /// or use `serial_test` if order matters.
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(test)]
 pub fn reset_infer_var_counter() {
     INFER_VAR_COUNTER.store(0, Ordering::Relaxed);
 }
@@ -109,7 +109,7 @@ pub(crate) fn fresh_barrier_var_id() -> BarrierVarId {
 
 /// Reset the barrier-variable counter to zero. Test-only, under the same
 /// concurrency caveat as [`reset_infer_var_counter`].
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(test)]
 pub fn reset_barrier_var_counter() {
     BARRIER_VAR_COUNTER.store(0, Ordering::Relaxed);
 }
@@ -374,7 +374,7 @@ impl Bound {
 
     /// The bound type expressed in the holder's context — see
     /// [`render_subst`](Self::render_subst).
-    #[cfg(any(test, feature = "test-helpers"))]
+    #[cfg(test)]
     pub fn materialize(&self) -> Type {
         self.render_subst().apply_type(&self.ty)
     }

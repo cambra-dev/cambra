@@ -251,7 +251,7 @@ impl LoweringContext {
                         self.declare_unopened_route(&route.source_name);
                     }
                 }
-                #[cfg(any(test, feature = "test-helpers"))]
+                #[cfg(test)]
                 DeclaredSink::Test { .. } => {}
             }
         }

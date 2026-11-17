@@ -1,7 +1,8 @@
 //! The test tree's placement rules, checked. Cargo builds every top-level `tests/*.rs` and
 //! `tests/*/main.rs` as a test binary of its own, and rustc compiles only the module files a
-//! `mod` line names. A misplaced test file is therefore an extra binary, each of which
-//! statically links the whole library, or a file nothing compiles; neither fails a build.
+//! `mod` line names. A misplaced test file is therefore an extra binary, each of which needs
+//! the library compiled again outside its test build, or a file nothing compiles; neither
+//! fails a build.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -50,13 +51,14 @@ fn every_top_level_test_file_is_a_declared_target() {
     let declared = declared_test_targets(&manifest);
     let undeclared: Vec<String> = autodiscovered_targets(&tests_dir())
         .into_iter()
-        .filter(|name| name != "it" && !declared.contains(name))
+        .filter(|name| !declared.contains(name))
         .collect();
     assert!(
         undeclared.is_empty(),
-        "{undeclared:?} build as test binaries of their own, and each links the whole library. \
-         Move the file under `tests/it/` and add a `mod` line to `tests/it/main.rs`, or, if it \
-         cannot share a process, declare it as a `[[test]]` in `Cargo.toml` saying why."
+        "{undeclared:?} build as test binaries of their own, and each needs the library compiled \
+         again. Move the file under `tests/it/` and add a `mod` line to `tests/it/mod.rs`, or, \
+         if it cannot be part of the suite, declare it as a `[[test]]` in `Cargo.toml` saying \
+         why."
     );
 }
 
@@ -94,14 +96,14 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// Every `.rs` file in each module tree whose parent module has no `mod` line for it.
 ///
-/// The trees are `it`'s and the gallery's. The support modules under `tests/support/`,
-/// `tests/type_gen/` and `tests/alloc_probe/` are mounted with `#[path]` from several roots,
-/// which this textual walk does not follow.
+/// The trees are `it`'s and the gallery's. The support modules under `tests/support/` and
+/// `tests/type_gen/` are mounted with `#[path]` from several roots, which this textual walk does
+/// not follow.
 #[test]
 fn every_module_file_is_declared_by_its_parent() {
     let tests = tests_dir();
     let trees = [
-        (tests.join("it"), tests.join("it/main.rs")),
+        (tests.join("it"), tests.join("it/mod.rs")),
         (tests.join("programs"), tests.join("programs/mod.rs")),
     ];
     let mut orphans = Vec::new();

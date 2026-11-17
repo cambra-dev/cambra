@@ -84,7 +84,7 @@ pub(crate) use infer_var::{
 /// Reset all IDs allocated by ccl module counters. Test-only convenience for
 /// differential harnesses that re-run lowering + inference and need stable
 /// IDs across the runs. Not safe to call concurrently.
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(test)]
 pub fn reset_all_id_counters() {
     reset_infer_var_counter();
     reset_barrier_var_counter();

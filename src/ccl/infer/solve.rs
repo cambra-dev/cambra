@@ -3774,6 +3774,8 @@ pub(super) fn specialize_use(
     } else {
         Vec::new()
     };
+    #[cfg(test)]
+    clone_probe::record();
     // A monomorphization name carrying the source binding as provenance and a
     // globally-fresh uid for identity — so it can neither capture nor be
     // captured (the uid is what the old `__mono{N}` counter hand-rolled).
@@ -4743,6 +4745,31 @@ fn collect_param_spelling(
     });
 }
 
+/// Counts the clones [`specialize_use`] makes of a generalized definition, one per memo miss,
+/// so a test can bound how they grow with a program's shape
+/// (`a_dead_call_chain_clones_once_per_definition`).
+///
+/// Thread-local, because `cargo test` runs tests concurrently in one process.
+#[cfg(test)]
+mod clone_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CLONES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub fn record() {
+        CLONES.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Run `body`, returning how many clones it made.
+    pub fn count(body: impl FnOnce()) -> usize {
+        CLONES.with(|c| c.set(0));
+        body();
+        CLONES.with(Cell::get)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -5119,6 +5146,60 @@ mod tests {
             "the two identical `Int` uses share one specialization"
         );
         assert_eq!(used_names.len(), 2);
+    }
+
+    /// Clones `infer` makes of generalized definitions in `code`.
+    fn inference_clones(code: &str) -> usize {
+        let mut lctx = crate::ccl::lower::LoweringContext::default();
+        let module = chl_parser::parse_module(chl_parser::FileId::ROOT, code)
+            .into_result()
+            .expect("parse");
+        let lowered = crate::ccl::lower::lower_stmts(&module, &mut lctx)
+            .into_result()
+            .expect("lower");
+        let mut expr = crate::ccl::opaque_output::run(crate::ccl::comprehension::run(
+            crate::ccl::uniquify::run(lowered),
+            lctx.shared_holes(),
+        ));
+        let mut ictx = crate::ccl::infer::TypeInferenceContext::new();
+        let mut typed = false;
+        let clones = super::clone_probe::count(|| {
+            typed = crate::ccl::infer::infer(&mut expr, &mut ictx).is_ok();
+        });
+        assert!(typed, "the chain type-checks");
+        clones
+    }
+
+    /// A never-called call chain is cloned once per definition, so its clones grow with its
+    /// length, not with its call sites.
+    ///
+    /// A use inside a discarded subtree specializes like any other, and the memo is what stops
+    /// it re-cloning the callee. That memo is separate from the decision of what to splice
+    /// ([`Specialization::referenced`](super::Specialization)), and declining to register a
+    /// specialization whose use is about to be dropped makes a clone per dead call site. The
+    /// chain `aᵢ = λx. aᵢ₋₁(x) + aᵢ₋₁(x)` doubles the call sites at every level, so that clones
+    /// exponentially in its length.
+    #[test]
+    fn a_dead_call_chain_clones_once_per_definition() {
+        // `a1 … a{depth}`, each calling its predecessor twice, and `f` calling the last, never
+        // applied.
+        let chain = |depth: usize| {
+            let mut s = String::from("a1 = \\x -> x + 1\n");
+            for i in 2..=depth {
+                s.push_str(&format!("a{i} = \\x -> a{p}(x) + a{p}(x)\n", p = i - 1));
+            }
+            s.push_str(&format!("f = \\q -> a{depth}(q)\n1\n"));
+            s
+        };
+        for depth in [3, 6] {
+            let clones = inference_clones(&chain(depth));
+            assert_eq!(
+                clones, depth,
+                "typechecking a never-called chain {depth} deep made {clones} clones: the \
+                 specialization memo is not being shared across uses inside the discarded \
+                 subtree"
+            );
+        }
     }
 
     /// `x : history := 10 in λ y → body`, inferred, as the type its lambda has.

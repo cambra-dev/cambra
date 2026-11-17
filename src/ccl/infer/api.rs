@@ -1412,16 +1412,14 @@ pub enum EscapeTarget {
     Feed { channel: String },
 }
 
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(test)]
 impl LocatedInferError {
     /// The bare errors of a located list, dropping the blame nodes.
     ///
     /// **Test-only.** Tests assert on error *payloads* and have no projection to
     /// resolve ids against; a diagnostic path must never discard the pairing, so
-    /// there is no production affordance for doing it. Gated on `test` for this
-    /// crate's own tests and on the default-off `test-helpers` feature for
-    /// integration tests, which are separate crates — that feature is what keeps
-    /// one implementation instead of a local copy per test file.
+    /// there is no production affordance for doing it. Gated on `test`: the suite is
+    /// this crate's test build.
     pub fn bare(located: Vec<Self>) -> Vec<InferError> {
         located.into_iter().map(|l| l.error).collect()
     }

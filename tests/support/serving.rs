@@ -59,7 +59,7 @@ pub fn start_sink(source: &str) -> (GlobalContext, LiveProgram) {
 }
 
 /// Port allocation for the `{PORT}` placeholder in sink programs.  Lives in the
-/// library, behind `test-helpers`, so this crate and `tests/it/http_server.rs`
+/// library, under `cfg(test)`, so this module and `tests/it/http_server.rs`
 /// share one implementation — see [`reserve_test_port`] for why the naive
 /// "bind `:0` and close" allocator is not safe here.
 pub use cambra::interpreter::http_server::reserve_test_port;

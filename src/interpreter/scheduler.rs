@@ -359,7 +359,7 @@ impl Drop for Delivery {
 /// the result is unchanged and both wakeup and sink-pull queues are empty.
 /// With zero laps, return an empty tile.
 /// See `src/interpreter/design-operators.md`, "The notification contract".
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(test)]
 pub fn pull_laps(
     scheduler: &mut Scheduler,
     producer: &mut dyn crate::interpreter::tile_operators::TileProducer,
@@ -404,7 +404,7 @@ pub fn pull_laps(
 /// Hand `each` every producer reachable from `root` through
 /// [`TileProducer::visit_input_producers`], once: a fan-out's input is reached from each of its
 /// slots, and a recurrence's from inside itself.
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(test)]
 fn each_producer(
     root: &dyn crate::interpreter::tile_operators::TileProducer,
     each: &mut dyn FnMut(&dyn crate::interpreter::tile_operators::TileProducer),
@@ -424,7 +424,7 @@ fn each_producer(
 }
 
 /// How often each producer reachable from `root` has been pulled, by name.
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(test)]
 fn pull_counts(
     root: &dyn crate::interpreter::tile_operators::TileProducer,
 ) -> HashMap<String, u64> {
@@ -444,7 +444,7 @@ fn pull_counts(
 /// longer reads the operator owes it nothing (a finished read, a settled seed, a recurrence
 /// whose last reader retired), so only one still pulled counts, and an operator released whole
 /// is never pulled again.
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(test)]
 fn ignored_inputs(
     root: &dyn crate::interpreter::tile_operators::TileProducer,
     before: &HashMap<String, u64>,

@@ -1167,7 +1167,7 @@ impl fmt::Debug for FunKindVar {
 }
 
 /// Reset the kind-variable counter to zero (test-only, for predictable output).
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(test)]
 pub fn reset_fun_kind_var_counter() {
     FUN_KIND_VAR_COUNTER.store(0, Ordering::Relaxed);
 }
@@ -4144,7 +4144,7 @@ impl Type {
     /// Canonicalization is by **de Bruijn index**, not by erasure: replacing every binder with
     /// one constant would make `Σ 𝑤₁. Σ 𝑤₂. 𝑤₁` and `Σ 𝑤₁. Σ 𝑤₂. 𝑤₂` compare equal, which is
     /// the distinction the ids exist to keep.
-    #[cfg(any(test, feature = "test-helpers"))]
+    #[cfg(test)]
     pub fn without_witness_binders(&self) -> Type {
         fn go(ty: &Type, scope: &mut Vec<WitnessId>) -> Type {
             use crate::ccl::infer_var::WitnessBinderId;
@@ -6087,7 +6087,7 @@ mod refinement_order {
     use chl_parser::source_map::SourceMap;
 
     /// Whether this build reads `CAMBRA_REFINEMENT_ORDER`. Otherwise every set is built forward.
-    pub(super) const ENABLED: bool = cfg!(any(debug_assertions, test, feature = "test-helpers"));
+    pub(super) const ENABLED: bool = cfg!(any(debug_assertions, test));
 
     enum Setting {
         Forward,

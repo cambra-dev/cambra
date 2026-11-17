@@ -33,7 +33,8 @@
 pub mod live;
 pub mod reload;
 mod serve;
-pub mod wire_check;
+#[cfg(test)]
+pub(crate) mod wire_check;
 
 pub use serve::{ServedSnapshot, serve, serve_compiled, snapshot_body_pretty};
 

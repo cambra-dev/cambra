@@ -32,11 +32,11 @@
 //! - `full_grid` is ignored by default. It runs every cell and reports the failures grouped by
 //!   cause, with a count, sample cells and the first sample's detail, and lists the
 //!   [`UNDEFINED`] cells apart:
-//!   `cargo test --test it generated_pairs::full_grid -- --ignored --nocapture`.
+//!   `cargo test -p cambra --lib generated_pairs::full_grid -- --ignored --nocapture`.
 
-use crate::differential;
-use crate::panic_message;
-use crate::quiet_panics;
+use crate::it::differential;
+use crate::it::panic_message;
+use crate::it::quiet_panics;
 
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};

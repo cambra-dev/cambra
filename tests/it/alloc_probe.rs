@@ -1,10 +1,8 @@
-//! A per-thread allocation counter for integration tests, plus its own tests.
+//! A per-thread allocation counter for the suite, plus its own tests.
 //!
-//! Include it with `mod alloc_probe;` and measure with
-//! [`allocations`](alloc_probe::allocations). Including the module installs a
-//! `#[global_allocator]` for that test binary — which is why this is a module rather
-//! than a library: an allocator is per-binary, so each test binary needs its own
-//! instance of it, but they can share the code.
+//! Measure with [`allocations`]. This module installs the test executable's
+//! `#[global_allocator]`, so every allocation any test makes goes through it; outside a
+//! measurement window that costs one read of a thread-local flag.
 //!
 //! # The window is per-thread, and has to be
 //!

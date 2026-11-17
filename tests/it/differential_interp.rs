@@ -9,7 +9,7 @@
 //! A case the two are known to disagree on pins both answers, so a change to either side
 //! fails the pin.
 
-use crate::differential;
+use crate::it::differential;
 
 use chl_interp::{Collection, Value};
 use differential::{Compiled, run_compiled, run_interpreted};

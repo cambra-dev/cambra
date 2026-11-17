@@ -42,7 +42,6 @@
 //! program, naming the source it dumped when one fails.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde_json::Value;
 
@@ -101,11 +100,11 @@ fn corpus() -> Vec<CorpusEntry> {
 /// stdout — exactly what `regen-fixtures.sh` writes to a fixture.
 fn dump(example: &str) -> Vec<u8> {
     let prog = program_path(example);
-    let output = Command::new(env!("CARGO_BIN_EXE_cambra"))
+    let output = crate::it::cli::command()
         .current_dir(repo_root())
         .args([prog.as_str(), "--dump-snapshot"])
         .output()
-        .expect("the cambra binary spawns");
+        .expect("the command line spawns");
     assert!(
         output.status.success(),
         "--dump-snapshot failed for {example}: {}",
@@ -753,14 +752,14 @@ fn dump_source(path: &Path) -> Option<Vec<u8>> {
         std::fs::write(&substituted, text.replace("{PORT}", "8080")).expect("writing the source");
         spawn_path = substituted;
     }
-    let output = Command::new(env!("CARGO_BIN_EXE_cambra"))
+    let output = crate::it::cli::command()
         .current_dir(repo_root())
         .args([
             spawn_path.to_str().expect("a UTF-8 path"),
             "--dump-snapshot",
         ])
         .output()
-        .expect("the cambra binary spawns");
+        .expect("the command line spawns");
     output.status.success().then_some(output.stdout)
 }
 
