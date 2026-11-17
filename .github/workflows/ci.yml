@@ -160,81 +160,32 @@ jobs:
         if: success() || failure()
         run: ./ci.sh doc
 
-  # Both test orders use the same binaries. Optimizing the workspace crates
-  # adds compile time once and reduces execution time in both jobs.
-  build_tests:
+  # The suite with debug assertions on. A debug test build checks the provenance gate on every
+  # compile, and `random` draws each compiled program's refinement order from the commit and
+  # this job's name (`ci.sh`, `ci_test`). Both test jobs build at `opt-level=1` here only: an
+  # unoptimized suite runs about three times as long, while a local edit-and-rerun loop wants
+  # the cheaper unoptimized rebuild. They also turn off the crate-local ThinLTO an optimized
+  # build otherwise runs, which costs a third of the build for about 7% of the suite's run.
+  test:
     needs: repo_checks
     if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
     runs-on: ubuntu-latest
-    outputs:
-      artifact_id: ${{ steps.upload.outputs.artifact-id }}
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: ./.github/actions/rust
-        with:
-          # Reuse the dependency cache populated under the `test` job ID.
-          cache-key: test
-          shared-tests: "true"
-
-      - name: Build optimized tests
-        run: cargo --config "$RUNNER_TEMP/cambra-test-profile.toml" test --workspace --no-run
-
-      - name: Pack Cargo build
-        run: |
-          tar --use-compress-program='zstd -T0 -1' -cf "$RUNNER_TEMP/test-build.tar.zst" \
-            --exclude=target/debug/incremental Cargo.lock target/debug target/.rustc_info.json
-
-      - name: Upload Cargo build
-        id: upload
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: rust-test-build-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/test-build.tar.zst
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 2
-
-  # The normal suite checks provenance throughout the corpus. The reversed
-  # suite checks that refinement-set insertion order stays unobservable.
-  test:
-    name: ${{ matrix.job }}
-    needs: build_tests
-    if: ${{ !cancelled() && needs.build_tests.outputs.artifact_id != '' }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - job: test
-            gate: CAMBRA_PROVENANCE_GATE=1
-          - job: test_reversed
-            gate: CAMBRA_REFINEMENT_ORDER=reverse
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/rust
         with:
           cache-key: test
-          shared-tests: "true"
-
-      - name: Download Cargo build
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          artifact-ids: ${{ needs.build_tests.outputs.artifact_id }}
-          merge-multiple: true
-          path: ${{ runner.temp }}
-
-      - name: Unpack Cargo build
-        run: tar --zstd -xf "$RUNNER_TEMP/test-build.tar.zst"
 
       - name: Test
         env:
-          TEST_GATE: ${{ matrix.gate }}
-        run: |
-          env "$TEST_GATE" cargo --config "$RUNNER_TEMP/cambra-test-profile.toml" test \
-            --workspace --locked -q --no-fail-fast
+          CAMBRA_REFINEMENT_ORDER: random:${{ github.sha }}-test
+          CARGO_PROFILE_TEST_OPT_LEVEL: "1"
+          CARGO_PROFILE_TEST_LTO: "off"
+        run: ./ci.sh test
 
   # The no-assertions profile compiles with `debug_assertions` disabled and
-  # has its own build and cache entry.
+  # has its own build and cache entry. Its refinement orders are drawn
+  # independently of `test`'s.
   test_no_assertions:
     needs: repo_checks
     if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
@@ -244,6 +195,10 @@ jobs:
       - uses: ./.github/actions/rust
 
       - name: Test (no debug assertions)
+        env:
+          CAMBRA_REFINEMENT_ORDER: random:${{ github.sha }}-no-assertions
+          CARGO_PROFILE_NO_ASSERTIONS_OPT_LEVEL: "1"
+          CARGO_PROFILE_NO_ASSERTIONS_LTO: "off"
         run: ./ci.sh test_no_assertions
 
   # The Lean model: `lake build` elaborates every theorem and evaluates every
@@ -338,7 +293,7 @@ jobs:
   # Keeping that name on a job that only collects results is what lets the gates
   # above be split, renamed, or added to without a ruleset edit.
   check:
-    needs: [repo_checks, lint, clippy, clippy_release, build_tests, test, test_no_assertions, formal, fixtures, web, editors]
+    needs: [repo_checks, lint, clippy, clippy_release, test, test_no_assertions, formal, fixtures, web, editors]
     # `always()` so this runs when a gate failed; without it the job would be
     # skipped and the required check would never report.
     if: always()

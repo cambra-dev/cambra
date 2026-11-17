@@ -5090,7 +5090,7 @@ mod tests {
         }
         // Assert through the real checker rather than a local copy of its walk:
         // uniqueness within a tree is one invariant with one implementation.
-        crate::ccl::context::assert_unique_node_ids(&out, "discharge_env_in_place");
+        crate::ccl::context::check_unique_node_ids(&out, "discharge_env_in_place");
     }
 
     /// A `Compose`'s *ends* are derived from its elements, so a

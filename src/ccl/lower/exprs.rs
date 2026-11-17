@@ -1201,7 +1201,7 @@ mod tests {
     /// (the freshened copy resolves as a `Copy` mirroring its origin's image).
     #[test]
     fn chained_compare_freshens_shared_operands() {
-        use crate::ccl::context::{assert_unique_node_ids, collect_tree_ids};
+        use crate::ccl::context::{check_unique_node_ids, collect_tree_ids};
         use crate::ccl::provenance::{LoweringSession, fold_lowering};
 
         let expr = parse_expr("1 < x < 3");
@@ -1212,7 +1212,7 @@ mod tests {
 
         // The same tripwire the pipeline runs at every pass boundary — this test
         // is the crafted program for the class it guards.
-        assert_unique_node_ids(&ccl, "chained-compare lowering");
+        check_unique_node_ids(&ccl, "chained-compare lowering");
         let seen = collect_tree_ids(&ccl);
         // The lowering fold explains every tree node (the freshened
         // middle-operand copy included) with no leak — the successor to the

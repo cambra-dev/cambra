@@ -176,8 +176,10 @@ not a separate uniqueness assertion there. The required lowering passes are spec
 [Planning a lifted term](optimization.md#planning-a-lifted-term).
 
 `compile_program` checks uniqueness after lowering and at the later boundaries handled by
-`settle`. `assert_unique_node_ids` and `gate_leaks` return without asserting when neither
-`debug_assertions` nor `test` is enabled. A passing boundary check establishes the invariant
+`settle`. `assert_unique_node_ids` and `gate_leaks` return without asserting when
+`debug_assertions` is off. A test whose check is node-id uniqueness calls
+`check_unique_node_ids`, the checker `assert_unique_node_ids` runs, which asserts in every build.
+A passing boundary check establishes the invariant
 for that checked tree, not for every intermediate tree built within the phase.
 
 ## Name occurrences
@@ -757,8 +759,8 @@ Its last-write-wins attribution and copy ordering are specified under [The seam]
 
 ### Gate and audit coverage
 
-`gate_leaks` asserts that a fold's leak vector is empty when either `debug_assertions` or
-`test` is enabled. It returns without asserting otherwise. Lowering always computes its
+`gate_leaks` asserts that a fold's leak vector is empty when `debug_assertions` is on. It returns
+without asserting otherwise. Lowering always computes its
 projection and calls this gate at the handoff.
 
 Later pair checking has two entry points:
@@ -775,11 +777,12 @@ The environment switches are read by the accessors in `context.rs`:
 | Variable | Behavior |
 |---|---|
 | `CAMBRA_PROVENANCE=0` | Disable ordinary phase-table capture; snapshots and diagnostic projections remain. |
-| `CAMBRA_PROVENANCE_GATE` | A set value other than `0` enables pair materialization/checking, provided ordinary capture is enabled. |
+| `CAMBRA_PROVENANCE_GATE` | `0` disables pair materialization/checking; any other set value enables it. Unset, a debug test build checks and any other build does not. Checking requires ordinary capture. |
 | `CAMBRA_PROVENANCE_AUDIT` | Select a named audit span and disable ordinary phase scopes. |
 | `CAMBRA_PROVENANCE_PREDICATES=0` | Exclude predicate interiors from audit ID sets only. |
 
-An unset gate variable leaves per-compile pair checking off. CI's test job sets it to `1`.
+An unset gate variable leaves per-compile pair checking on in a debug test build, so every
+test compile is in the gate's corpus, and off in any other build.
 Disabling capture or setting an audit variable suppresses that gate even if its variable is set.
 An unrecognized audit name still disables ordinary capture but matches no audit span.
 

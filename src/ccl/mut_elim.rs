@@ -4804,7 +4804,7 @@ mod tests {
         );
         // Assert through the real checker rather than a local copy of its walk:
         // uniqueness within a tree is one invariant with one implementation.
-        crate::ccl::context::assert_unique_node_ids(&out, "flatten_spine");
+        crate::ccl::context::check_unique_node_ids(&out, "flatten_spine");
     }
 
     /// **An accumulator's cross-domain view is recorded against the statement

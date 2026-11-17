@@ -1892,10 +1892,12 @@ An in-place rewrite uses that mapping rather than zipping application-order type
 physical-order walk. The mapping uses the identity of borrowed slice members; type-blind equality
 would not distinguish all occurrences reliably.
 
-The debug-only `CAMBRA_REFINEMENT_ORDER=reverse` setting reverses physical set order. CI exercises
-both orders using the same binaries. It checks order-sensitive consumers and deduplication of
-equal predicate terms carrying different embedded types; it does not establish a global theorem
-that every future consumer ignores physical order.
+`CAMBRA_REFINEMENT_ORDER`, read in debug and test builds, sets physical set order: `forward`,
+`reverse`, or `random:<seed>`, which draws one order per compiled program from the seed. CI runs
+both test gates under `random`, so each run builds about half the programs' sets in each order.
+It checks order-sensitive consumers and deduplication of equal predicate terms carrying different
+embedded types; it does not establish a global theorem that every future consumer ignores physical
+order.
 
 #### Refinement-aware shape and post-inference checks
 

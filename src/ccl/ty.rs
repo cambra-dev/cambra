@@ -6057,11 +6057,11 @@ impl std::hash::Hash for Refinement {
 #[derive(Debug, Clone, Default)]
 pub struct RefinementSet(Vec<Refinement>);
 
-/// Whether to build refinement sets in reversed physical order — the
-/// order-independence **stress knob**, driven by `CAMBRA_REFINEMENT_ORDER=reverse`.
+/// The physical order refinement sets are built in: the order-independence **stress knob**,
+/// set by `CAMBRA_REFINEMENT_ORDER` to `forward` (the default), `reverse`, or `random:<seed>`.
 ///
 /// Set semantics makes the backing `Vec`'s order meaningless by contract, and flipping it
-/// globally is what exercises that: a consumer letting the order reach something
+/// is what exercises that: a consumer letting the order reach something
 /// observable, or a dedup keeping the first-inserted of two `eq`-equal members whose
 /// (type-blind-equal) predicate terms carry different embedded type slots.
 ///
@@ -6071,21 +6071,108 @@ pub struct RefinementSet(Vec<Refinement>);
 /// predicates rather than from the storage this knob reverses
 /// ([`application_order`]). The compiled term is expected to be identical either way.
 ///
-/// Reading it once into a `LazyLock` keeps the check to a cached bool, and it is
-/// `debug_assertions`-only so a release compiler cannot be perturbed by the
-/// environment.
-#[cfg(debug_assertions)]
-fn stress_reversed() -> bool {
-    static REVERSED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var("CAMBRA_REFINEMENT_ORDER").as_deref() == Ok("reverse")
+/// Under `random:<seed>`, a compile builds every set in one order, drawn from the seed and the
+/// program's sources ([`ProgramOrder::enter`]). A set built outside a compile takes the order
+/// drawn from the seed and the current thread's name, which the test harness sets to the test's.
+/// One seed therefore makes the same choices on every run.
+///
+/// The knob is read in debug builds and test builds only (`ENABLED`), so a shipped compiler cannot
+/// be perturbed by the environment. It is compiled into every build, so every configuration CI
+/// compiles type-checks it.
+mod refinement_order {
+    use std::cell::Cell;
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    use std::sync::LazyLock;
+
+    use chl_parser::source_map::SourceMap;
+
+    /// Whether this build reads `CAMBRA_REFINEMENT_ORDER`. Otherwise every set is built forward.
+    pub(super) const ENABLED: bool = cfg!(any(debug_assertions, test, feature = "test-helpers"));
+
+    enum Setting {
+        Forward,
+        Reverse,
+        Random(String),
+    }
+
+    static SETTING: LazyLock<Setting> = LazyLock::new(|| {
+        let Ok(value) = std::env::var("CAMBRA_REFINEMENT_ORDER") else {
+            return Setting::Forward;
+        };
+        match value.as_str() {
+            "forward" => Setting::Forward,
+            "reverse" => Setting::Reverse,
+            _ => match value.strip_prefix("random:") {
+                Some(seed) => Setting::Random(seed.to_owned()),
+                None => panic!(
+                    "CAMBRA_REFINEMENT_ORDER is `forward`, `reverse` or `random:<seed>`, not \
+                     `{value}`"
+                ),
+            },
+        }
     });
-    *REVERSED
+
+    thread_local! {
+        /// Under `random`, the order of the compile running on this thread.
+        static PROGRAM: Cell<Option<bool>> = const { Cell::new(None) };
+        /// Under `random`, the order drawn from this thread's name, once drawn.
+        static THREAD: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    fn draw(seed: &str, key: impl Hash) -> bool {
+        let mut hasher = DefaultHasher::new();
+        seed.hash(&mut hasher);
+        key.hash(&mut hasher);
+        hasher.finish() & 1 == 1
+    }
+
+    /// Whether a set built now goes in reversed order.
+    pub(super) fn reversed() -> bool {
+        if !ENABLED {
+            return false;
+        }
+        match &*SETTING {
+            Setting::Forward => false,
+            Setting::Reverse => true,
+            Setting::Random(seed) => PROGRAM.get().unwrap_or_else(|| {
+                THREAD.get().unwrap_or_else(|| {
+                    let drawn = draw(seed, std::thread::current().name());
+                    THREAD.set(Some(drawn));
+                    drawn
+                })
+            }),
+        }
+    }
+
+    /// The order a compile builds its sets in, from [`ProgramOrder::enter`] until dropped.
+    pub struct ProgramOrder {
+        outer: Option<bool>,
+    }
+
+    impl ProgramOrder {
+        /// Under `random`, draw this compile's order from the seed and `sources`, every file's
+        /// path and text in order. Under `forward` and `reverse` the order is already fixed.
+        pub fn enter(sources: &SourceMap) -> Self {
+            let outer = PROGRAM.get();
+            if ENABLED && let Setting::Random(seed) = &*SETTING {
+                let files: Vec<(&str, &str)> = sources
+                    .files()
+                    .map(|file| (sources.path(file), sources.text(file)))
+                    .collect();
+                PROGRAM.set(Some(draw(seed, files)));
+            }
+            ProgramOrder { outer }
+        }
+    }
+
+    impl Drop for ProgramOrder {
+        fn drop(&mut self) {
+            PROGRAM.set(self.outer);
+        }
+    }
 }
 
-#[cfg(not(debug_assertions))]
-fn stress_reversed() -> bool {
-    false
-}
+pub(crate) use refinement_order::ProgramOrder;
 
 impl RefinementSet {
     /// The empty set — an unrefined position.
@@ -6112,7 +6199,7 @@ impl RefinementSet {
             }
             return false;
         }
-        if stress_reversed() {
+        if refinement_order::reversed() {
             self.0.insert(0, r);
         } else {
             self.0.push(r);

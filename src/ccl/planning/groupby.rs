@@ -425,7 +425,7 @@ fn side_extracts_element(e: &Expr) -> bool {
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
-    use crate::ccl::context::assert_unique_node_ids;
+    use crate::ccl::context::check_unique_node_ids;
     use crate::ccl::{Name, Refinement};
     use std::rc::Rc;
 
@@ -490,7 +490,7 @@ mod tests {
             "the recognizer must have rewritten the source: {}",
             symbolic(&expr)
         );
-        assert_unique_node_ids(&expr, "planning::groupby");
+        check_unique_node_ids(&expr, "planning::groupby");
     }
 
     // --- `partition_key_of`: the durable half ---------------------------------
