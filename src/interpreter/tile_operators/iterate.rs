@@ -1,3 +1,7 @@
+mod cartesian;
+
+use cartesian::CartesianIteration;
+
 use bit_set::BitSet;
 use intervalsets::{
     Bounding, Interval, IntervalSet,
@@ -9,8 +13,8 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use super::*;
 use crate::ccl::TagMap;
 use crate::interpreter::{
-    BaseType, ColumnValue, Consumer, Extent, NotifyOrSubscribeResult, Projection, Scheduler,
-    SharedConsumer, UnionArm, Value, scheduler::shared_consumer,
+    BaseType, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, NotifyOrSubscribeResult,
+    Projection, Scheduler, SharedConsumer, UnionArm, Value, scheduler::shared_consumer,
 };
 
 /// Produces a function tile whose domain and codomain both equal `extent`.
@@ -33,13 +37,9 @@ impl IterateExtent {
         }
     }
 
-    fn add_all_source_handles(
-        extent: &Extent,
-        consumer: SharedConsumer,
-        scheduler: &mut Scheduler,
-    ) {
+    fn add_all_source_handles(extent: &Extent, consumer: SharedConsumer, cx: &mut Scheduler) {
         extent.for_each_source(&mut |source| {
-            scheduler.add_source_handle(source.clone(), Rc::downgrade(&consumer));
+            cx.add_source_handle(source.clone(), Rc::downgrade(&consumer));
         });
     }
 }
@@ -53,8 +53,13 @@ impl TileOperator for IterateExtent {
         &mut self,
         _intent_guard: TileGuard,
         mut consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        if let Extent::Record(fields) = &self.extent
+            && self.extent.reads_a_source()
+        {
+            return cartesian::subscribe(self, fields, consumer, cx);
+        }
         let NotifyOrSubscribeResult { notify, subscribe } =
             self.extent.subscribe_to_iteration_action();
         if notify {
@@ -63,27 +68,38 @@ impl TileOperator for IterateExtent {
         // The producer owns the registration: the scheduler holds only a `Weak`, so this
         // handle is what keeps the source waking this producer, and dropping the producer
         // deregisters it.
-        let (source_wakeup, gate) = subscribe.then(|| shared_consumer(consumer)).unzip();
+        let (source_wakeup, gate) = match subscribe {
+            true => {
+                let (wakeup, gate) = shared_consumer(consumer);
+                (Some(wakeup), Some(gate))
+            }
+            false => (None, None),
+        };
         let mut producer = Box::new(IterateExtentProducer {
             base: ProducerBase::new(
                 IterateExtentProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             )
             .sharing(gate),
-            extent: self.extent.clone(),
-            released: Predicate::False,
-            _source_wakeup: source_wakeup.as_ref().map(|w| w.shared().clone()),
+            iteration: Iteration::Direct(DirectIteration {
+                extent: self.extent.clone(),
+                released: Predicate::False,
+                _source_wakeup: source_wakeup.as_ref().map(|w| w.shared().clone()),
+            }),
         });
         if let Some(source_wakeup) = source_wakeup {
-            Self::add_all_source_handles(&self.extent, source_wakeup.shared().clone(), scheduler);
+            Self::add_all_source_handles(&self.extent, source_wakeup.shared().clone(), cx);
             let name = producer.name();
             // Register this producer with any data sources in the extent by calling release with
             // a false predicate.  This way the sources knows about all producers that read it
             //before execution starts.
-            release_extent(&mut producer.extent, &Predicate::False, &name);
-            scheduler.note_source_producer(name);
+            let Iteration::Direct(direct) = &mut producer.iteration else {
+                unreachable!("a source subscription iterates its extent directly")
+            };
+            release_extent(&mut direct.extent, &Predicate::False, &name);
+            cx.note_source_producer(name);
         }
 
         producer
@@ -116,6 +132,15 @@ release record outlives it",
 /// Producer for [`IterateExtent`]: emits an identity function tile.
 struct IterateExtentProducer {
     base: ProducerBase,
+    iteration: Iteration,
+}
+
+enum Iteration {
+    Direct(DirectIteration),
+    Cartesian(Box<CartesianIteration>),
+}
+
+struct DirectIteration {
     /// The extent being iterated.
     ///
     /// For `UIntRange` extents this is an `IntervalSet<u64>` that shrinks
@@ -139,33 +164,6 @@ struct IterateExtentProducer {
     /// [`check_for_notifications`](Scheduler::check_for_notifications).
     /// `None` when the extent needs no source subscription.
     _source_wakeup: Option<Rc<RefCell<dyn Consumer>>>,
-}
-
-fn get_iterate_extent_predicate(extent: &Extent) -> Predicate {
-    match extent {
-        Extent::DataSourceDomain(source) => source.borrow().get_yield_predicate(),
-        // For a cross-product, the domain_predicate must be the conjunction (AND / Record) of
-        // each field's predicate.  Only pairs where EVERY field's value has already been
-        // committed by its source can be guaranteed to have already been delivered; a pair
-        // where even one field comes from a source that can still grow might be new next time.
-        //
-        // An OR would over-claim: e.g. arm {_1:≤u0, _0:True} says "(x,0) for any x has
-        // already been seen", but if source0 later adds key 1 then (1,0) is genuinely new.
-        Extent::Record(fields) => Predicate::Record(
-            fields
-                .iter()
-                .map(|(f, e)| (f.clone(), get_iterate_extent_predicate(e)))
-                .collect(),
-        ),
-        // For a disjoint union, each variant contributes its own predicate over
-        // its own tag; the arms stay keyed by tag so a downstream consumer can
-        // split per-variant releases back to their source sub-extents by name
-        // rather than relying on two arm vectors staying in the same order.
-        Extent::Union(arms) => {
-            Predicate::over_every_tag(arms.map(|_, e| get_iterate_extent_predicate(e)))
-        }
-        _ => Predicate::True,
-    }
 }
 
 /// Convert a `IntervalSet<Value::UInt>` values into an
@@ -344,23 +342,39 @@ impl Drop for IterateExtentProducer {
     /// forward keeps both, which is what stops the source dropping data that
     /// operator has not finished with.
     fn drop(&mut self) {
-        retire_producer_from_extent(&self.extent, &self.name());
+        if let Iteration::Direct(direct) = &self.iteration {
+            retire_producer_from_extent(&direct.extent, &self.name());
+        }
     }
 }
 
 impl TileProducer for IterateExtentProducer {
     impl_producer_base!();
 
-    /// The extent's positions inside the projection. A finite range is cut before it is
-    /// rendered, so a morsel costs the morsel's size; every other extent renders whole and is
-    /// cut after, since a source's arrivals and a cross product's keys are not an interval of
-    /// positions.
+    fn state_info(&self) -> ProducerStateInfo {
+        match &self.iteration {
+            Iteration::Direct(_) => ProducerStateInfo::holding(0),
+            Iteration::Cartesian(cartesian) => cartesian.state_info(),
+        }
+    }
+
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        if matches!(&self.iteration, Iteration::Cartesian(_)) {
+            let tiling = self.tiling().clone();
+            let obsolete = self.obsolete_guard().clone();
+            let Iteration::Cartesian(cartesian) = &mut self.iteration else {
+                unreachable!()
+            };
+            return cartesian.get(projection_guard, &tiling, &obsolete);
+        }
+        let Iteration::Direct(direct) = &self.iteration else {
+            unreachable!()
+        };
         let projection = projection_guard.projection(&self.name());
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        let extent = match (&self.extent, &projection) {
+        let extent = match (&direct.extent, &projection) {
             (
                 Extent::UIntRange(remaining),
                 Projection::Keys {
@@ -371,7 +385,7 @@ impl TileProducer for IterateExtentProducer {
             (extent, _) => extent.clone(),
         };
         let values = iterate_extent(&extent, &self.name());
-        let domain_predicate = get_iterate_extent_predicate(&extent);
+        let domain_predicate = extent.decided_region();
         let mut tile = Tile::data_function(
             values.clone(),
             Box::new(Tile::Scalar(values)),
@@ -383,22 +397,24 @@ impl TileProducer for IterateExtentProducer {
         // Values may also be removed from underlying sources for efficiency, but
         // this filter here is ultimately responsible for not returning released data.
         tile.remove_guarded(TileGuard::Function(FunctionGuard::Domain(
-            self.released.clone(),
+            direct.released.clone(),
         )));
         tile
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         let name = self.name();
-        let TileGuard::Function(FunctionGuard::Domain(pred)) = obsolete_guard else {
-            panic!("IterateExtent::release expected Domain guard, got {obsolete_guard:?}")
-        };
-        // Accumulate so get_impl can filter already-released rows.
-        self.released = self.released.union(&pred);
-        // Also propagate to sub-extents where safe (e.g. full-slice UIntRange
-        // shrinks, or single-dimension DataSourceDomain releases when all other
-        // dimensions are unconstrained).
-        release_extent(&mut self.extent, &pred, &name);
+        let obsolete = self.obsolete_guard().clone();
+        match &mut self.iteration {
+            Iteration::Cartesian(cartesian) => cartesian.release(&obsolete),
+            Iteration::Direct(direct) => {
+                let TileGuard::Function(FunctionGuard::Domain(pred)) = obsolete_guard else {
+                    panic!("IterateExtent::release expected Domain guard, got {obsolete_guard:?}")
+                };
+                direct.released = direct.released.union(&pred);
+                release_extent(&mut direct.extent, &pred, &name);
+            }
+        }
     }
 }
 
@@ -558,9 +574,11 @@ mod tests {
         let tiling = Tiling::data_function(extent.clone(), Tiling::Scalar(extent.clone()));
         let mut producer = IterateExtentProducer {
             base: ProducerBase::unowned(0, &tiling),
-            extent,
-            released: Predicate::False,
-            _source_wakeup: None,
+            iteration: Iteration::Direct(DirectIteration {
+                extent,
+                released: Predicate::False,
+                _source_wakeup: None,
+            }),
         };
         let tile = producer.get(producer.tiling().universal_guard());
         let Tile::DataFunction { domain, .. } = tile else {
@@ -574,13 +592,7 @@ mod tests {
 
     #[test]
     fn iterate_extent_predicate_with_record() {
-        // Test that get_iterate_extent_predicate generates correct OR predicates for records
-        //
-        // When iterating over a record extent with multiple fields, the predicate
-        // should be the union of field-specific predicates (one predicate per field
-        // with that field's predicate true and others true, then OR'd together).
-
-        // Create a test extent with a record of base types
+        // A record is decided where every field is decided.
         let extent = Extent::Record(
             [
                 (tuple_field(0), Extent::Base(BaseType::UInt)),
@@ -590,16 +602,10 @@ mod tests {
             .collect(),
         );
 
-        let predicate = get_iterate_extent_predicate(&extent);
+        let predicate = extent.decided_region();
 
-        // For a record extent with base-type fields, the predicate should be
-        // a union of field predicates. Since each field's predicate is True
-        // for base types, the resulting Record predicates are all identical
-        // {_0: True, _1: True} and may collapse.
         match predicate {
             Predicate::Record(fields) => {
-                // When two identical record predicates with all True union,
-                // they may collapse to a single Record
                 assert_eq!(fields.len(), 2, "Record should have 2 fields");
                 assert_eq!(
                     fields.get(&tuple_field(0)),
@@ -644,9 +650,11 @@ mod projection_tests {
         let tiling = Tiling::data_function(extent.clone(), Tiling::Scalar(extent.clone()));
         IterateExtentProducer {
             base: ProducerBase::unowned(0, &tiling),
-            extent,
-            released: Predicate::False,
-            _source_wakeup: None,
+            iteration: Iteration::Direct(DirectIteration {
+                extent,
+                released: Predicate::False,
+                _source_wakeup: None,
+            }),
         }
     }
 
