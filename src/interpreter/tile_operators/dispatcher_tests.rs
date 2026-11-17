@@ -1471,10 +1471,6 @@ impl Consumer for Boxed {
     ) {
         self.0.notify(region, landing);
     }
-
-    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
-        self.0.route(routes);
-    }
 }
 
 /// The entry of pipeline 1 behind a gated consumer, as an operator between two breakers shares
@@ -1612,41 +1608,161 @@ impl Consumer for Paths {
             path.notify(region, landing);
         }
     }
-
-    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
-        for path in &mut self.0 {
-            path.route(routes);
-        }
-    }
 }
 
-/// A route declares, per path, whether the consumers on it keep the pushing pipeline's keys: a
+/// The routes a push of key 0 takes through `consumer` ([`Landing::route`]).
+fn walk(consumer: &mut dyn Consumer) -> Vec<crate::interpreter::dispatcher::Route> {
+    let mut landing = crate::interpreter::dispatcher::Landing::route();
+    consumer.notify(
+        &Projection::admitting(Predicate::point(Value::UInt(0))),
+        &mut landing,
+    );
+    landing.routes()
+}
+
+/// A route walk records, per path, whether the consumers on it keep the pushing pipeline's keys: a
 /// path through a widening consumer reaches the entry widened, and one through a consumer that
-/// keeps keys reaches it with them kept. Nothing is pushed.
+/// keeps keys reaches it with them kept. Nothing is queued.
 #[test]
-fn a_route_declares_whether_each_path_keeps_its_keys() {
+fn a_route_walk_records_whether_each_path_keeps_its_keys() {
     let shared = gated_entry(&ints());
 
     let mut paths = Paths(vec![
         forwarding_consumer(&shared),
         forwarding_consumer_keeping_keys(&shared),
     ]);
-    let mut routes = crate::interpreter::dispatcher::Routes::new();
-    paths.route(&mut routes);
-    let reached: Vec<_> = routes
-        .reached()
+    let reached: Vec<_> = walk(&mut paths)
         .into_iter()
         .map(|route| (route.pipeline, route.keeps_keys))
         .collect();
     assert_eq!(reached, [(PipelineId(1), false), (PipelineId(1), true)]);
 }
 
-/// A route declares, per path, whether its decided region names only part of what a row depends
-/// on: a widening path's does, and so does a lookup operand's, which names rows by the key they
+/// A consumer that passes a route walk's push on with its keys kept and widens every push it
+/// delivers: deliberately inconsistent, as a consumer is whose `notify` passes a region the walk
+/// does not send otherwise than the ones it does.
+struct WidensDeliveries(Box<dyn Consumer>);
+
+impl Consumer for WidensDeliveries {
+    fn notify(
+        &mut self,
+        region: &Projection,
+        landing: &mut crate::interpreter::dispatcher::Landing<'_>,
+    ) {
+        match landing.is_delivery() {
+            true => landing.widened(|landing| self.0.notify(&Projection::Everything, landing)),
+            false => self.0.notify(region, landing),
+        }
+    }
+}
+
+/// Pipeline 1 reading pipeline 0, with the routes the planner walks of `walked` for a push of key
+/// 0 planned as pipeline 0's ([`walk_routes`](crate::interpreter::dispatcher::walk_routes)), and
+/// pipeline 0's breaker pushing `held` through `pushed` once it finishes. With `waits`, pipeline 1
+/// waits for its inputs, so it takes a widened push.
+fn planned_through(
+    walked: Box<dyn Consumer>,
+    pushed: Box<dyn Consumer>,
+    held: TileGuard,
+    waits: bool,
+) -> Dispatcher {
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    if waits {
+        dispatcher.wait_for_inputs(PipelineId(1));
+    }
+    let walked: SharedConsumer = Rc::new(RefCell::new(Boxed(walked)));
+    let (changes, completions) = crate::interpreter::dispatcher::walk_routes(
+        &walked,
+        &[Projection::admitting(Predicate::point(Value::UInt(0)))],
+        1,
+    );
+    dispatcher.plan_routes(PipelineId(1), PipelineId(0), changes, completions);
+    let scripted = Scripted::holding(held);
+    scripted
+        .borrow_mut()
+        .base_mut()
+        .pushing_to(Rc::new(RefCell::new(Boxed(pushed))));
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+        scripted.borrow_mut().finish(InputId::ONLY, pushes)
+    });
+    dispatcher
+}
+
+/// A push lands along a route its planner walked: the walk of a consumer that keeps keys plans the
+/// route its push then takes.
+#[test]
+fn a_push_lands_along_the_route_its_planner_walked() {
+    let shared = gated_entry(&ints());
+    let dispatcher = planned_through(
+        forwarding_consumer_keeping_keys(&shared),
+        forwarding_consumer_keeping_keys(&shared),
+        keys_between(0, 1),
+        false,
+    );
+    assert_eq!(
+        dispatcher.pop().map(|package| package.guard),
+        Some(keys_between(0, 1))
+    );
+}
+
+/// A widening passes a push of every key on unwidened, and the planner walks a push of every key
+/// too, so that push lands along the unwidened route the walk found.
+#[test]
+fn a_push_of_every_key_lands_unwidened_through_a_widening() {
+    let shared = gated_entry(&ints());
+    let dispatcher = planned_through(
+        forwarding_consumer(&shared),
+        forwarding_consumer(&shared),
+        ints().universal_guard(),
+        false,
+    );
+    assert_eq!(
+        dispatcher.pop().map(|package| package.guard),
+        Some(ints().universal_guard())
+    );
+}
+
+/// A consumer whose delivery takes a path its walk did not fails the run where the push is queued:
+/// the walk plans a route that keeps keys, and the delivery arrives widened at a reader that waits
+/// for its inputs, which takes a widened push.
+#[test]
+#[should_panic(
+    expected = "a push of pipeline 0 reaches pipeline 1 along a path its planner's route walk did \
+                not take (widened: true"
+)]
+fn a_push_along_a_route_its_planner_did_not_walk_fails_the_run() {
+    let shared = gated_entry(&ints());
+    planned_through(
+        Box::new(WidensDeliveries(forwarding_consumer_keeping_keys(&shared))),
+        Box::new(WidensDeliveries(forwarding_consumer_keeping_keys(&shared))),
+        keys_between(0, 1),
+        true,
+    );
+}
+
+/// A complete region that reaches a reader whose walk reached no entry of it fails the run where
+/// the read records it.
+#[test]
+#[should_panic(
+    expected = "a complete region of pipeline 0 reaches pipeline 1 along a path its planner's route \
+                walk did not take"
+)]
+fn a_complete_region_for_a_reader_its_walk_did_not_reach_fails_the_run() {
+    let shared = gated_entry(&ints());
+    planned_through(
+        Box::new(|| {}),
+        forwarding_consumer_keeping_keys(&shared),
+        keys_between(0, 1),
+        false,
+    );
+}
+
+/// A route walk records, per path, whether its decided region names only part of what a row
+/// depends on: a widening path's does, and so does a lookup operand's, which names rows by the key they
 /// read whatever their input holds. A path that keeps its keys does not, and neither does an
 /// outermost `Uncurry`'s, which widens a change but restates a decided region exactly.
 #[test]
-fn a_route_declares_whether_each_path_completes_part_of_a_row() {
+fn a_route_walk_records_whether_each_path_completes_part_of_a_row() {
     let shared = gated_entry(&ints());
 
     let mut paths = Paths(vec![
@@ -1661,10 +1777,7 @@ fn a_route_declares_whether_each_path_completes_part_of_a_row() {
             forwarding_consumer_keeping_keys(&shared),
         ),
     ]);
-    let mut routes = crate::interpreter::dispatcher::Routes::new();
-    paths.route(&mut routes);
-    let parts: Vec<_> = routes
-        .reached()
+    let parts: Vec<_> = walk(&mut paths)
         .into_iter()
         .map(|route| route.completes_part)
         .collect();
@@ -1842,14 +1955,6 @@ impl Consumer for Through {
             .as_mut()
             .expect("the operator was subscribed")
             .notify(region, landing);
-    }
-
-    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
-        self.0
-            .borrow_mut()
-            .as_mut()
-            .expect("the operator was subscribed")
-            .route(routes);
     }
 }
 

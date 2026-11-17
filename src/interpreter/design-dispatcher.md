@@ -54,6 +54,26 @@ or widen a change to the whole input. A widened change supplies no claim that ou
 The planner records both the dependencies and the part of the input each dependency can decide.
 Operators without their own pipeline read their inputs inside a scheduled pipeline's chain.
 
+A route is what `Consumer::notify` does to a push. The planner walks each read's pushing consumer
+with a routing landing (`Landing::route`) over the regions `pushes_of` builds from the pusher's
+output: at each collection level the path of one key per level, and beneath the outermost level one
+key under every key above it. It walks them as changes, adding a change of every key, and twice as
+complete regions, of a source not yet wholly complete and of one that is, adding `Everything` of the
+latter (`walk_routes`). The
+landing records each entry a walk reaches, whether a consumer on the way widened the push, and the
+two marks a consumer sets inside `notify`: a complete region naming only part of what a row depends
+on (`Landing::completing_part`), and a key read only once final (`Landing::requiring_final_key`).
+The dispatcher keeps the routes per read (`Dispatcher::plan_routes`). A nested loop's drive records
+its source's complete regions at the loop's pipeline; the walks of the body around the loop pass it
+while they run (`build_scope`).
+
+Each package the dispatcher queues must match a change route with the same marks, widened exactly
+as the package's push is, and each complete region a read records must match a complete route with
+the same marks (`Landing::queue`). A push that queues nothing is not checked, and nor is a store's
+complete region that reaches its own pipelines around its recurrence. A consumer that delivers a
+push along a path its walk did not take fails the run where the push is queued
+(`a_push_along_a_route_its_planner_did_not_walk_fails_the_run`).
+
 Compilation builds the subscribed graph without executing its outputs. A planning refusal occurs
 before execution consumes anything. Refusals include an unsupported store shape,
 a shared producer without the required fan-out, and a live source whose arrivals cannot reach its
