@@ -499,16 +499,6 @@ impl Consumer for FanOutInput {
             }
         }
     }
-
-    /// A route reaches every consumer a push does.
-    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
-        for c in &self.reader_consumers() {
-            match c.try_borrow_mut() {
-                Ok(mut consumer) => consumer.route(routes),
-                Err(_) => routes.reentered(),
-            }
-        }
-    }
 }
 
 impl FanOutInput {
@@ -1470,10 +1460,6 @@ impl Consumer for DirtyConsumer {
             self.dirty.record(region);
         }
         self.downstream.notify(region, landing);
-    }
-
-    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
-        self.downstream.route(routes);
     }
 }
 
