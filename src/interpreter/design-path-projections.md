@@ -11,6 +11,14 @@ in its reader as a projection at its level (`Dispatcher::land_in`).
 
 ## What the gap blocks
 
+Two shapes a dispatched run refuses wait on projections beneath the outermost keys, and pull mode
+runs them instead:
+
+- A feed of a collection read from a live source, `out << [f(x) for x in source1()]`, is keyed by
+  the sink's one row, so a delivery's keys sit one level beneath the sink's.
+- A loop over a live source takes its positions as they arrive. Its rounds name positions of a
+  store, which for a loop nested in another are paths again.
+
 A loop nested in another runs in rounds of its own (`src/interpreter/design-dispatcher.md`, "A loop
 in rounds"). Removing the scheduler removes pull mode, so every shape a dispatched run refuses has
 to run there first.
@@ -141,6 +149,10 @@ An operator may pull an input above the round's level, at the nearest level that
 path to a recurrence slot caches positions of later rounds from the store's snapshot, and reads them
 again before the store's next step
 ([A store as a breaker](design-operators.md#a-store-as-a-breaker)).
+
+Stage 4 notifies a live source's keys at the level they reach (`LivePipeline::poll`), the feed of a
+map over a source among them, and lifts the plan-time probe's refusal of an arrival beneath the
+outermost keys.
 
 ## Decisions
 
