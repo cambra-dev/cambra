@@ -13,7 +13,7 @@ use cambra::chl_parser::{FileId, SourceMap, parse_expression, parse_module};
 use indoc::indoc;
 
 /// Parse `src` as a module, the root of its own one-file map.
-fn parse_mod(src: &str) -> ParseResult<cambra::chl_parser::Module> {
+fn parse_mod(src: &str) -> ParseResult<chl_parser::Module> {
     parse_module(FileId::ROOT, src)
 }
 

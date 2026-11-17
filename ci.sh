@@ -18,17 +18,12 @@ ci_clippy() { cargo clippy -p cambra -p chl-parser -p chl-interp -p cambra-lsp -
 # (e.g. a test calling a debug-only fn) only breaks here. `-- -D warnings` is
 # scoped to our crate, not deps.
 ci_clippy_release() { cargo clippy -p cambra -p chl-parser -p chl-interp -p cambra-lsp --release --all-targets -- -D warnings; }
-# The library alone, with no features unified in. Every pass above uses
-# `--all-targets`, which pulls in the dev-dependencies — including the *self*
-# dev-dependency that enables `test-helpers`. Cargo unifies that feature into the
-# lib under test, so those passes only ever compile the library with
-# `test-helpers` ON, and the feature-off configuration a consumer actually builds
-# is compiled by nothing. Edition 2024 / resolver 3 keeps the feature out of a
-# plain `cargo build --lib`, which is what makes the gap silent rather than loud:
-# ungated library code calling a `test-helpers`-gated item passes the whole gate
-# and fails `cargo build --lib`. A configuration nothing compiles is a
-# configuration that rots.
-ci_clippy_lib() { cargo clippy -p cambra --lib -- -D warnings; }
+# The library with `test-helpers` on, and the differential oracle, the one target that turns
+# it on. The passes above compile the library without features, as a consumer builds it, and
+# under `cfg(test)`, as the suite does; neither turns the feature on, and the oracle is
+# `test = false`, which `--all-targets` leaves out. `ci_formal` builds this configuration
+# but lints nothing. A configuration nothing compiles is a configuration that rots.
+ci_clippy_oracle() { cargo clippy -p cambra --features test-helpers --lib --test differential_oracle -- -D warnings; }
 # `CAMBRA_REFINEMENT_ORDER` (read at runtime, in debug and test builds) sets the physical
 # order refinement sets are built in: `forward` (unset), `reverse`, or `random:<seed>`, which
 # draws one order per compiled program from the seed (`src/ccl/ty.rs`, `refinement_order`).
@@ -39,7 +34,7 @@ ci_clippy_lib() { cargo clippy -p cambra --lib -- -D warnings; }
 # both test gates under `random`, seeded per commit and per gate, so each run puts about half
 # the programs in each order and a rerun of the job draws the same ones. On a failure,
 # `order_followup.py` reruns each failing test forward and reversed and reports which order
-# it fails in. Same argument as `ci_clippy_lib`: a configuration nothing runs is a
+# it fails in. Same argument as `ci_clippy_oracle`: a configuration nothing runs is a
 # configuration that rots.
 # Every workspace member: `-p cambra` alone does not reach the parser's or the
 # interpreter's tests, and a member left out of this list passes by not running.
@@ -63,7 +58,7 @@ ci_test_no_assertions() { .github/scripts/order-followup/order_followup.py cargo
 # then diff the model's verdicts against the solver's. Those tests skip
 # themselves when the oracle binary is absent, so without this gate nothing
 # notices the model drifting from the solver — the same rot argument as
-# `ci_clippy_lib`, and the drift is silent in both directions. A machine with
+# `ci_clippy_oracle`, and the drift is silent in both directions. A machine with
 # no Lean toolchain skips, loudly; under CI a missing toolchain is a broken gate
 # rather than a local convenience, so it fails instead.
 ci_formal() {
@@ -78,13 +73,13 @@ ci_formal() {
   (cd formal && lake build) || return 1
   # This gate is the differential tests' only caller: their target is
   # `test = false` in Cargo.toml, so a bare `cargo test` skips it and `ci_test`
-  # needs no Lean toolchain to run the suite. Naming the target explicitly is
-  # what still builds and runs it.
+  # needs no Lean toolchain to run the suite. Naming the target explicitly, with the
+  # `test-helpers` feature it requires, is what still builds and runs it.
   #
   # `--nocapture` so each oracle's case count reaches the log. Without it a run
   # that compared nothing is indistinguishable from one that compared
   # everything: the test line reports neither.
-  cargo test -q --test differential_oracle -- --nocapture
+  cargo test -q --features test-helpers --test differential_oracle -- --nocapture
 }
 # Refinement subtyping decides a structural deficit by asking `z3`
 # (`src/ccl/infer/solver/smt.rs`), spawned as a subprocess. Without the binary
@@ -422,7 +417,7 @@ ci_all() {
   ci_clippy_release || failed="${failed} clippy_release"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
-  ci_clippy_lib || failed="${failed} clippy_lib"
+  ci_clippy_oracle || failed="${failed} clippy_oracle"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_doc || failed="${failed} doc"

@@ -820,11 +820,11 @@ fn cambra_check_prints_an_interface_or_errors() {
     )
     .expect("writing bad");
     let check = |args: &[&std::path::Path]| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_cambra"))
+        crate::it::cli::command()
             .arg("check")
             .args(args)
             .output()
-            .expect("the cambra binary spawns")
+            .expect("the command line spawns")
     };
 
     let checked = check(&[&dir.join("lib.cambra")]);

@@ -82,8 +82,9 @@ pub fn fmt_variant_arms(
 /// [`bind`](Self::bind) records a name→value mapping in the innermost scope;
 /// [`lookup`](Self::lookup) searches from innermost to outermost, returning the first match.
 ///
-/// This type is generic over the key `K` and the stored value `V`:
-/// ```
+/// This type is generic over the key `K` and the stored value `V` (the example runs as
+/// `tests::a_scope_shadows_and_pops_on_drop`; the library builds no doctests, `Cargo.toml`):
+/// ```ignore
 /// use cambra::util::ScopeStack;
 ///
 /// let mut stack: ScopeStack<String, i32> = ScopeStack::new();
@@ -369,6 +370,26 @@ pub(crate) fn bound_port(server: &tiny_http::Server, requested: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::cyclic_components;
+
+    #[test]
+    fn a_scope_shadows_and_pops_on_drop() {
+        use super::ScopeStack;
+
+        let mut stack: ScopeStack<String, i32> = ScopeStack::new();
+        {
+            let mut scope = stack.enter_scope();
+            scope.bind("x".to_string(), 1);
+            assert_eq!(scope.lookup("x"), Some(&1));
+
+            // Inner scope shadows "x".
+            let mut inner = scope.enter_scope();
+            inner.bind("x".to_string(), 2);
+            assert_eq!(inner.lookup("x"), Some(&2));
+            // `inner` drops here, popping the inner scope.
+        }
+        // `scope` drops here, popping the outer scope.
+        // The stack is now empty; `stack` can be dropped cleanly.
+    }
 
     /// `0 ↔ 1` is a two-vertex cycle, `2` a self-loop, and `3` a vertex on no
     /// cycle.

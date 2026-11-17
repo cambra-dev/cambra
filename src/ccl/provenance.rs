@@ -50,7 +50,7 @@ impl NodeId {
     ///
     /// Zero is never allocated by the counter. Construction at this ID and the
     /// mint/copy hooks record no birth. It must not remain in the main tree;
-    /// `assert_unique_node_ids` checks that condition in debug/test builds.
+    /// `assert_unique_node_ids` checks that condition in debug builds.
     pub(crate) const PLACEHOLDER: NodeId = NodeId(0);
 
     /// Allocate a fresh identity without calling the expression construction hooks.

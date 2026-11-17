@@ -109,8 +109,8 @@ to confirm that it fails against the change and passes against its parent.
 
 Run that test with `cargo test`, scoped to the one binary that holds it:
 
-- `cargo test -p <crate> --lib <name>` for a unit test;
-- `cargo test --test it <name>` for an integration test under `tests/it/`.
+- `cargo test -p <crate> --lib <name>` for a unit test, and in `cambra` for an integration test
+  under `tests/it/` too, which is part of the library's test build.
 
 A bare `cargo test <name>` builds every test binary of every default member before it filters, and
 `./ci.sh fast` also runs the full suite and the frontend's checks.

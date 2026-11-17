@@ -35,9 +35,9 @@ CI lints in **three configurations**, because each one compiles code the others 
 |---|---|
 | `ci_clippy` | debug, all targets — the baseline |
 | `ci_clippy_release` | release: `#[cfg(debug_assertions)]`-gated items referenced by ungated code |
-| `ci_clippy_lib` | the library with **no** features: the other two unify the self dev-dependency's `test-helpers` into the lib, so only this one compiles the configuration a consumer builds |
+| `ci_clippy_oracle` | the library with `test-helpers` on, and the differential oracle that requires it: `--all-targets` leaves out the oracle (`test = false`), and nothing else turns the feature on |
 
-The pattern is the same in each case: a configuration that nothing compiles is a configuration that rots, and the failure is silent rather than loud — `--all-targets` hides the `test-helpers` gap the way a default-off feature would hide a gated impl.
+The pattern is the same in each case: a configuration that nothing compiles is a configuration that rots, and the failure is silent rather than loud — a default-off feature hides a gated impl from every pass that leaves it off.
 
 ### Debug symbols
 

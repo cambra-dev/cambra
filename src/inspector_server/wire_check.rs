@@ -10,12 +10,9 @@
 //! `inspector_model::frame`'s golden test compares against the committed
 //! fixture `web/src/__fixtures__/probe_frame.json`.
 //!
-//! **Public, not `#[cfg(test)]`.** `tests/it/inspector_goldens.rs` is a separate
-//! crate linking the library as a consumer does, so a `#[cfg(test)]` item is
-//! invisible to it — and the committed golden corpus is the payload set that
-//! most needs validating, being the one the frontend reads. Gating this behind a
-//! feature instead would add a build configuration no CI pass compiles, which is
-//! the failure mode `ci_clippy_lib` exists to prevent.
+//! **Test-only.** Its callers are the inspector's unit tests and the golden corpus
+//! (`tests/it/inspector_goldens.rs`), the payload set that most needs validating,
+//! being the one the frontend reads; all are part of the library's test build.
 
 use serde_json::Value;
 
