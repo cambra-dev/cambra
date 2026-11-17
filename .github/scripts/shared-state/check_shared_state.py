@@ -119,14 +119,25 @@ EXPECTED_EXCEPTIONS = [
     # guard pushes what is not in it and grows it in one step, so two threads pushing for one
     # pipeline push disjoint regions. What crosses it is a guard naming a region, never a tile.
     ("src/interpreter/dispatcher.rs", "cell of `Option<TileGuard>`"),
-    # Per pipeline a reader reads, the region of the reader's input that pipeline has completed
-    # (`Completion`), which the completed pushes grow under the lock on any thread. What crosses
-    # it is guards naming regions, never a tile.
-    ("src/interpreter/dispatcher.rs", "cell of `Vec<Completion>`"),
-    # `CompletionTarget`, where the entry in front of a loop's drive records what the drive's source
-    # has completed: the scope's pipeline and the store's input, which the planner writes before
-    # the run. What crosses it is a pipeline's index and a tiling, never a tile.
-    ("src/interpreter/dispatcher.rs", "shared cell of `Option<(PipelineId, Tiling)>`"),
+    # A debug build's record of the packages a pipeline acknowledged, grown under the queue's lock
+    # and read at the finish to check its breaker's input released them. What crosses it is a
+    # guard naming a region, never a tile.
+    ("src/interpreter/dispatcher.rs", "cell of `Option<TileGuard>`"),
+    # `Offers`, a scope's intake: what its input has offered and the scope has not queued, and the
+    # positions waiting for inputs. The scope and the entries in its body hold it, and a push the
+    # entries' pipelines do not take wakes the scope through it. What crosses it is guards of the
+    # scope's input, never a tile.
+    ("src/interpreter/dispatcher.rs", "shared cell of `Offered`"),
+    # `CompletionTarget`, the scope an unplaced entry in front of a loop's drive offers a push to,
+    # with the store's input, which the planner writes before the run. What crosses it is a scope's
+    # intake and a tiling, never a tile.
+    ("src/interpreter/dispatcher.rs", "shared cell of `Option<(Offers, Tiling)>`"),
+    # `Placement`'s scope: the intake of the scope an entry sits in, which the scope's run sets and
+    # clears. What crosses it is guards of the scope's input, never a tile.
+    ("src/interpreter/dispatcher.rs", "shared cell of `Option<Offers>`"),
+    # `Placement`'s rows: the tiling of the input the pipeline consumes, which the planner writes
+    # before the run. What crosses it is a tiling, never a tile.
+    ("src/interpreter/dispatcher.rs", "shared cell of `Option<Tiling>`"),
     # The lock a dispatcher's sleeping worker waits under; it guards no data.
     ("src/interpreter/dispatcher.rs", "cell of `()`"),
     # The placement an entry and its breaker share, which the planner writes before a run; what

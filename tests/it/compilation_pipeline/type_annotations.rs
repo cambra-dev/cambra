@@ -1290,7 +1290,7 @@ ys
         Box::new(Tile::data_function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![4, 5]))),
-            Predicate::False,
+            Predicate::True,
             BitSet::new(),
         )),
         Predicate::True,

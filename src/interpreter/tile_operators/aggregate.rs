@@ -45,6 +45,11 @@ impl Aggregate {
 }
 
 impl TileOperator for Aggregate {
+    /// A breaker: its pipeline pushes its output to the pipelines that read it.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -334,6 +339,11 @@ impl ExtractAggregate {
 }
 
 impl TileOperator for ExtractAggregate {
+    /// A breaker: its pipeline pushes its output to the pipelines that read it.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -443,11 +453,17 @@ impl TileProducer for ExtractAggregateProducer {
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        if !self.base.reads_input() {
-            return self.extracted.clone();
-        }
-        let input_result = self.input.get(self.input.tiling().universal_guard());
-        self.extract(input_result)
+        // An extracted record of values is pulled at a part of it as any record is, whether it is
+        // answered from the state or extracted inline.
+        let mut tile = match self.base.reads_input() {
+            false => self.extracted.clone(),
+            true => {
+                let input_result = self.input.get(self.input.tiling().universal_guard());
+                self.extract(input_result)
+            }
+        };
+        tile.restrict_to(&projection, self.tiling());
+        tile
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -834,6 +850,11 @@ fn folded_shape(tiling: &Tiling) -> (Vec<Extent>, Tiling) {
 }
 
 impl TileOperator for MapAggregate {
+    /// A breaker: its pipeline pushes its output to the pipelines that read it.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -1145,7 +1166,10 @@ impl Stated {
                 })
                 .map(|path| Predicate::exactly(path))
                 .collect(),
-        );
+        )
+        // A group holding no element, as a row past the last of a finite range of rows, is
+        // complete once the elements' statement covers every element under it too.
+        .union(&self.elements.rows_whole_beneath());
         if whole.is_false() {
             return self;
         }

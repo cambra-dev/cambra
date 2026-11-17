@@ -4220,12 +4220,7 @@ fn build_commit_store(
         .collect();
     let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
 
-    for (writer_index, ((set_writer, w), taps)) in setters
-        .into_iter()
-        .zip(writers.iter())
-        .zip(per_writer_taps)
-        .enumerate()
-    {
+    for ((set_writer, w), taps) in setters.into_iter().zip(writers.iter()).zip(per_writer_taps) {
         // Attribute this writer's operators to the writer, not to the binding
         // the whole store hangs off. Without this every operator of a
         // transaction resolves to one span, since each is minted after its
@@ -4314,7 +4309,6 @@ fn build_commit_store(
             read_extents,
             item_extent,
             drive_resume,
-            writer_index,
         );
         // Two slots of the driver: the body consumes rows, and the writer acks
         // finished attempts. The driver removes its source item on the release
@@ -4331,12 +4325,7 @@ fn build_commit_store(
         // domain, whatever the `Transact` sits in.
         let body_op = convert_at(
             &w.body,
-            // The drive's stream is its rows and what it has decided of its source; the body
-            // reads the rows.
-            Some(Box::new(Memo::new(Box::new(SelectField::new(
-                driver_fan.slot(),
-                crate::interpreter::commit_operator::TRANSACT_ROWS,
-            ))))),
+            Some(Box::new(Memo::new(driver_fan.slot()))),
             CurryLevel::new(1),
             ctx,
         )?;

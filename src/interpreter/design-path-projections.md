@@ -21,16 +21,18 @@ A region crosses an operator through reads, notifications and releases.
 | Release (`TileProducer::release`) | the region read no more | yes |
 
 `Consumer::notify` marks cached reads dirty and forwards the region through the dispatcher routes.
-A dispatcher notification names a region its reader's pipeline consumes once in the run
-(`Pushes::record`), so notifying `k` for a decided position at `(k, j)` would consume the row `k`
-at its first position. A pull at a package's region answers
-that region and no more (`Tile::within`), and the breaker releases its input at what the answer
-states, which a finish checks covers the package (`finish_with`).
+A breaker pushes each region of its output once (`Pushes::push_final`), so pushing `k` for a decided
+position at `(k, j)` would hand the reader the row `k` at its first position. A pull at a package's
+region answers that region and no more (`Tile::within`). The breaker releases its input at what the
+answer states, and in a debug build a finish checks that the release covers every package the
+pipeline acknowledged (`finish_with`).
 
 ## Representation
 
 A projection at level 𝑛 names keys of level 𝑛, each under the path of keys above it. Level 0 is
-the outermost collection, and one variant spells every level:
+the outermost collection, and one variant spells every level. A record of values has no keys, so a
+projection of one names a part per field, and a projection within values names keys with part of the
+value under each:
 
 ```rust
 pub enum Projection {
@@ -38,8 +40,20 @@ pub enum Projection {
     Nothing,
     /// Keys of level `level`, beneath the paths `keys` qualifies them by.
     Keys { level: CurryLevel, keys: Predicate },
+    /// A record of values: `fields` for the fields listed, `rest` for every other field.
+    Fields { fields: BTreeMap<SmolStr, Projection>, rest: Box<Projection> },
+    /// Keys of `level` that `keys` admits, and the part `values` names of the value under each.
+    Within { level: CurryLevel, keys: Predicate, values: Box<Projection> },
+    /// A union no one projection names: keys of one level with different parts of their values.
+    Or(Vec<Projection>),
 }
 ```
+
+`Projection::any_of` normalizes a union: it merges arms of keys at one level, arms within the same
+values or within the values of the same keys, and projections of a record field by field. An `Or`
+therefore holds arms of keys and arms within values, and never a projection of a record.
+Operations on projections of a record go field by field (`Projection::field_by_field`); operations
+on arms within values go arm by arm (`Projection::intersect_parts`, `Projection::minus_parts`).
 
 At level 0, `keys` names no enclosing path. Beneath it, `keys` is a predicate over whole paths,
 spelled with `Predicate::Qualified`, which already names keys under enclosing paths
@@ -96,21 +110,41 @@ released  = Or [ Domain(k = 0), Codomain(Record { _0: ∅, _1: Domain(Qualified 
 held − released = Domain(k ≠ 0)
 ```
 
-An arm of cells that names part of what is left leaves a record guard beneath the held keys, which
-is no region of keys, and `guard_minus` panics on it. A push names a region of keys
-(`Dispatcher::land_in` reads it with `Projection::of`), so a breaker's final guard is its held keys
-less the keys its readers released whole (`keys_released_whole`, `BreakingProducer::final_guard`). A
-key some of whose cells a reader released stays held, and the push names it. `SelectField` restates
+Where both guards read as projections, an arm of cells beneath keys reads as part of the values at
+those keys (`Projection::Within`), and the difference is the projections' difference. That
+difference is spelled over the shape the two guards name (`tiling::skeleton`). `minus_disjoint_arms`
+takes the difference only where the release reads as no projection, and it panics where such an arm
+names part of what is left. A breaker's final guard is its held keys less the keys its readers
+released whole (`keys_released_whole`, `BreakingProducer::final_guard`). A key some of whose cells a
+reader released stays held, and the push names it. A push names the part of the final guard a
+projection spells (`spelled_part`): keys, and the fields of a record under rows where some fields are
+final and others still grow. `SelectField` restates
 every level above the record: a selector pulled at a path leaves the inner loop's drive holding the
 other fields' cells of the path released, the drive's push names the path, and the selector takes
 its field there.
 
+A breaker's held region can also carry an arm of cells beneath rows still open. Taking keys of
+the outermost level out of it keeps the cells beneath every other key: each enclosing path the arm
+names loses the released keys, and an arm named under every path is qualified by the rest
+(`minus_outermost_keys`). The difference is spelled for cells one level beneath the keys, named
+under one qualification and with no `Or`; any other arm reads no single outermost key, and
+`cells_outside_keys` panics on it. So does a release of keys beneath the outermost level:
+
+```
+held      = Or [ Domain(k > 1), Codomain(Record { _0: Qualified { enclosing: k ∈ {0, 1}, here: True }, … }) ]
+released  = Domain(k = 0)
+held − released = Or [ Domain(k > 1), Codomain(Record { _0: Qualified { enclosing: k = 1, here: True }, … }) ]
+```
+
+Whether a release covers a guard needs no difference (`guard_covers`): with an arm of cells, only
+its keys released whole cover, so a key whose every cell is released one arm at a time counts as
+not covered, and a read of it answers nothing.
+
 A round pushes per position, so it needs the difference, where a push at a finish only names the
 breaker's whole held region.
 
-`Pushes::record`, `Queue::append_unqueued` and the finish's release check (`finish_with`) compute
-their regions with `guard_minus`, `union` and `intersect` over `TileGuard`, so they take nested
-regions.
+`Pushes::record` and the finish's release check (`finish_with`) compute their regions with
+`guard_minus`, `union` and `intersect` over `TileGuard`, so they take nested regions.
 
 ## Operator rows
 
@@ -131,8 +165,7 @@ operator that does not restate the level a pull names is pulled at the nearest l
 snapshot, and reads them again before the store's next step
 ([A store as a breaker](design-operators.md#a-store-as-a-breaker)).
 
-A live source's arrivals are notified as the projection of its keys they restate at the entry of the
-pipeline that stands for the range, at any level, or that pipeline reads its input whole once the
-source yields everything (`LivePipeline::poll`). A feed of a collection read from a live source is
-keyed by the sink's one row, so its arrivals reach the pipeline above the source widened, and that
-pipeline reads its input whole.
+A live source's arrivals are notified as the region they restate at the entry of the pipeline that
+stands for the range, at any level (`LivePipeline::poll`). A feed of a collection read from a live
+source is keyed by the sink's one row, so its arrivals reach the pipeline above the source widened,
+as every key of its input.
