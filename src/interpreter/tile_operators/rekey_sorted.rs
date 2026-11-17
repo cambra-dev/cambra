@@ -1,7 +1,7 @@
 use super::*;
 use crate::interpreter::operator_graph::value;
 use crate::interpreter::{
-    BaseType, ColumnValue, Consumer, Extent, Projection, Scheduler, Value, tuple_field,
+    BaseType, ColumnValue, Consumer, Extent, Projection, SubscribeContext, Value, tuple_field,
 };
 
 /// Re-keys a collection of pairs by each pair's first component, `𝐾 ⤇ (𝐽, 𝑉)` to `𝐽 ⤇ 𝑉`, where
@@ -112,7 +112,7 @@ impl TileOperator for RekeySorted {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        cx: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let input = BreakerInput::new(consumer, self.input.tiling(), false, cx);
         share_breaker(RekeySortedProducer {
