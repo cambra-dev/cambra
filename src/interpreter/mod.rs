@@ -83,6 +83,18 @@ impl<C: Consumer> Consumer for Rc<RefCell<C>> {
     }
 }
 
+/// A boxed consumer is one, so it can be shared behind an `Rc<RefCell<_>>` as a
+/// [`SharedConsumer`].
+impl Consumer for Box<dyn Consumer> {
+    fn notify(&mut self, arrived: &Projection) {
+        (**self).notify(arrived)
+    }
+
+    fn push(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
+        (**self).push(region, landing)
+    }
+}
+
 /// Blanket implementation: FnMut() implements Consumer, ignoring the region.
 /// This allows closures to be used as consumers.
 impl<F> Consumer for F
