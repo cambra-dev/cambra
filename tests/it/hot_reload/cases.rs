@@ -3197,6 +3197,230 @@ fn a_finished_transaction_over_a_fixed_collection_does_not_replay() {
     );
 }
 
+/// What a transaction writer's sinks hold at one point of a run: the items whose transactions
+/// replied to `out`, sorted, and the pool each transaction left, highest first. Every
+/// transaction lowers the pool, so highest first is commit order, whatever the reply sink is
+/// keyed by.
+#[derive(Debug, PartialEq)]
+struct Held {
+    replies: Vec<i64>,
+    pools: Vec<i64>,
+}
+
+/// What a transaction writer over a live `source1()` leaves when its items arrive in batches
+/// with reloads between them: what its sinks hold after each batch settles and right after each
+/// reload, with the source still open, and the pool `total` takes once the source closes.
+///
+/// `source` is the writer's iteration, over `source1()`; `step` is its body, which reads `x`.
+/// `deliveries` are `(position, item)` batches. The first arrives before any reload and settles
+/// with the source still open; a reload that edits the writer, carrying `pool`, comes before
+/// each later batch, and the source closes after the last. Each transaction replies its item to
+/// `out` and the pool it leaves to `pools`.
+fn transactions_across_reloads(
+    source: &str,
+    step: &str,
+    deliveries: &[Vec<(usize, i64)>],
+) -> (Vec<Held>, i64) {
+    use cambra::ccl::Type;
+    use cambra::interpreter::{BaseType, Extent, Predicate, TestDataSource, Value};
+    use std::{cell::RefCell, rc::Rc};
+
+    let program = |mark: usize| {
+        format!(
+            indoc! {r#"
+                out = test_sink()
+                pools = test_sink()
+                total = test_sink()
+                pool: Mut(Int, Txn) := 100
+                for x in {source}:
+                    with begin():
+                        pool := pool - ({step}) + {mark}
+                        out << x
+                        pools << pool
+                total << await_final(pool)
+            "#},
+            source = source,
+            step = step,
+            mark = "0".repeat(mark + 1),
+        )
+    };
+    let mut ctx = GlobalContext::default();
+    let out = ctx.register_test_sink("out");
+    let pools = ctx.register_test_sink("pools");
+    let total = ctx.register_test_sink("total");
+    let source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(source.clone());
+    let mut delivered = Predicate::False;
+    let mut deliver = |batch: &[(usize, i64)]| {
+        let rows: Vec<(Value, Value)> = batch
+            .iter()
+            .map(|&(at, item)| (Value::uint_from_row(at), Value::Int(item)))
+            .collect();
+        for (at, _) in &rows {
+            delivered = delivered.union(&Predicate::point(at.clone()));
+        }
+        let mut source = source.borrow_mut();
+        source.add_data(&rows);
+        source.set_yield_predicate(delivered.clone());
+    };
+    // The sinks pull what they are notified of.
+    let settle = |ctx: &mut GlobalContext| {
+        for _ in 0..200 {
+            ctx.scheduler().check_for_notifications();
+        }
+    };
+    let ints = |sink: &TestSink| -> Vec<i64> {
+        match sink.written_so_far() {
+            Ok(Value::Function(entries)) => entries
+                .into_iter()
+                .map(|binding| match binding.output {
+                    Value::Int(value) => value,
+                    other => panic!("a reply is an integer, got {other:?}"),
+                })
+                .collect(),
+            Ok(other) => panic!("a reply sink holds its replies by commit tick, got {other:?}"),
+            Err(_) => Vec::new(),
+        }
+    };
+    let held = || {
+        let mut replies = ints(&out);
+        replies.sort_unstable();
+        let mut pools = ints(&pools);
+        pools.sort_unstable_by(|a, b| b.cmp(a));
+        Held { replies, pools }
+    };
+    let mut cuts = Vec::new();
+    let mut live = LiveProgram::start_text(&mut ctx, &program(0), &no_main).expect("v1 compiles");
+    for (version, batch) in deliveries.iter().enumerate() {
+        if version > 0 {
+            live.reload_text(&mut ctx, MAIN_BRANCH, &program(version), &no_main)
+                .expect("`pool` is still declared, at the same type");
+            settle(&mut ctx);
+            cuts.push(held());
+        }
+        deliver(batch);
+        settle(&mut ctx);
+        cuts.push(held());
+    }
+    source.borrow_mut().set_yield_predicate(Predicate::True);
+    settle(&mut ctx);
+    cuts.push(held());
+    let pool = match total.value() {
+        Ok(Value::Function(bindings)) if bindings.len() == 1 => match bindings[0].output {
+            Value::Int(pool) => pool,
+            ref other => panic!("the pool is an integer, got {other:?}"),
+        },
+        other => panic!("`total` holds the settled pool once the source closes, got {other:?}"),
+    };
+    (cuts, pool)
+}
+
+/// Assert that `cuts`, from [`transactions_across_reloads`] over `deliveries`, hold at every
+/// point exactly the transactions of the items delivered so far, each committed once.
+/// `identities` maps a delivered item to the items its transactions reply, and each transaction
+/// subtracts its reply from the pool. `listed` are items the source lists beside `source1()`,
+/// which commit with the first batch. At each cut the replies are those items, the pools are one
+/// per reply, each the one before less a reply, and a reload commits nothing and loses nothing.
+fn assert_each_cut_holds(
+    cuts: &[Held],
+    pool: i64,
+    deliveries: &[Vec<(usize, i64)>],
+    listed: &[i64],
+    identities: impl Fn(i64) -> Vec<i64>,
+) {
+    let mut expected = Vec::new();
+    let mut committed: Vec<i64> = listed.to_vec();
+    for (version, batch) in deliveries.iter().enumerate() {
+        if version > 0 {
+            expected.push(committed.clone());
+        }
+        committed.extend(batch.iter().flat_map(|&(_, item)| identities(item)));
+        expected.push(committed.clone());
+    }
+    expected.push(committed.clone());
+    assert_eq!(
+        cuts.len(),
+        expected.len(),
+        "one cut per batch, reload and close"
+    );
+    let mut before: Vec<i64> = Vec::new();
+    for (at, (held, items)) in cuts.iter().zip(&expected).enumerate() {
+        let mut items = items.clone();
+        items.sort_unstable();
+        assert_eq!(
+            held.replies, items,
+            "cut {at}: the replies are the items so far: {cuts:?}"
+        );
+        assert!(
+            held.pools.starts_with(&before),
+            "cut {at}: no transaction commits again or is lost: {cuts:?}"
+        );
+        let mut taken: Vec<i64> = std::iter::once(&100)
+            .chain(&held.pools)
+            .zip(&held.pools)
+            .map(|(was, is)| was - is)
+            .collect();
+        taken.sort_unstable();
+        assert_eq!(
+            taken, items,
+            "cut {at}: each pool is the one before less a reply: {cuts:?}"
+        );
+        before = held.pools.clone();
+    }
+    assert_eq!(
+        pool,
+        100 - committed.iter().sum::<i64>(),
+        "`total` settles at the last pool"
+    );
+}
+
+/// A reload carries the exact items a transaction writer finished, holes included. At every cut,
+/// with the source still open, the replies to `out` are the items delivered so far and the pools
+/// are one per reply, so a reload commits nothing again and loses nothing
+/// ([`assert_each_cut_holds`]). Over a concatenation the items are tagged positions, and the list
+/// arm's item commits with the first batch. The rebuilt drive starts at the release of the drive
+/// it replaces, `{0, 2}` in the first case, not at the prefix through 2, which would drop item 1.
+#[rstest::rstest]
+#[case::the_hole_after_the_reload(vec![vec![(0, 1), (2, 4)], vec![(1, 2)]])]
+#[case::the_hole_and_items_above_it(vec![vec![(0, 1), (2, 4)], vec![(1, 2), (3, 8)]])]
+#[case::a_middle_item_finished(vec![vec![(1, 2)], vec![(0, 1), (2, 4)]])]
+#[case::nothing_finished(vec![vec![], vec![(0, 1), (1, 2)]])]
+#[case::everything_finished(vec![vec![(0, 1), (1, 2), (2, 4)], vec![]])]
+#[case::two_reloads_each_with_a_hole(vec![
+    vec![(0, 1), (3, 8)],
+    vec![(2, 4)],
+    vec![(1, 2), (4, 16)],
+])]
+fn a_reload_carries_the_items_a_transaction_writer_finished_exactly(
+    #[case] deliveries: Vec<Vec<(usize, i64)>>,
+    #[values(("source1()", &[][..]), ("source1() ++ [32]", &[32][..]))] source: (&str, &[i64]),
+) {
+    let (source, listed) = source;
+    let (cuts, pool) = transactions_across_reloads(source, "x", &deliveries);
+    assert_each_cut_holds(&cuts, pool, &deliveries, listed, |item| vec![item]);
+}
+
+/// A writer inside a loop nested under the live source names its items by path, an item and
+/// its inner position, and a reload carries those exactly as it does flat positions: at every
+/// cut the replies are the identities `10x` and `10x + 1` of the items delivered so far.
+#[rstest::rstest]
+#[case::the_hole_after_the_reload(vec![vec![(0, 1), (2, 4)], vec![(1, 2)]])]
+#[case::two_reloads(vec![vec![(1, 2)], vec![(0, 1)], vec![(2, 4)]])]
+fn a_reload_carries_a_nested_writers_items_exactly(#[case] deliveries: Vec<Vec<(usize, i64)>>) {
+    let (cuts, pool) = transactions_across_reloads(
+        "[x * 10 + y for x in source1() for y in [0, 1]]",
+        "x",
+        &deliveries,
+    );
+    assert_each_cut_holds(&cuts, pool, &deliveries, &[], |item| {
+        vec![10 * item, 10 * item + 1]
+    });
+}
+
 /// Two writers to one transactional variable each keep their own place across an
 /// reload.
 ///
