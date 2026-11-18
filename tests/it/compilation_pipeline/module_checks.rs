@@ -5,9 +5,11 @@
 use std::time::Duration;
 
 use cambra::ccl::context::{GlobalContext, check_program};
+use cambra::interpreter::Value;
 use indoc::indoc;
 use rstest_log::rstest;
 
+use super::helpers::check_program_scalar;
 use super::modules::{compile_errors, program, report_count};
 
 /// A module that adds an `Int` to a value of its type parameter's type.
@@ -934,4 +936,83 @@ fn checking_unavailable_use_members_preserves_only_established_contracts(
     ] {
         assert!(!interface.contains(absent), "{interface}");
     }
+}
+
+/// A module that `LEDGER` imports.
+const PRICING: &str = indoc! {"
+    pub def with_fee(a: Int, fee: Int) => Int:
+        a + fee
+"};
+
+/// A module that reads `pricing`'s member in each of its transactions.
+const LEDGER: &str = indoc! {"
+    import pricing
+    param fee: Int
+    pub balance: Mut(Int, Txn) := 0
+    for amount in [100, 250]:
+        with begin():
+            balance += pricing::with_fee(amount, fee)
+"};
+
+/// A module that runs `ledger`, so that a run of it runs `ledger` in turn.
+const WALLET: &str = indoc! {"
+    run ledger(fee=1) as eu
+    pub total = await_final(eu::balance)
+"};
+
+/// The modules a root reaches through `wallet` or `ledger`.
+const RUN_MODULES: [(&str, &str); 3] =
+    [("pricing", PRICING), ("ledger", LEDGER), ("wallet", WALLET)];
+
+/// A check holds the shared imports of each module it runs, at any depth: the copy of `ledger`
+/// that a run creates reads `pricing`, which the checked module does not import.
+#[rstest]
+#[case::directly(indoc! {"
+    run ledger(fee=1) as eu
+    await_final(eu::balance)
+"})]
+#[case::through_another_run(indoc! {"
+    run wallet as w
+    w::total
+"})]
+#[timeout(Duration::from_secs(10))]
+fn a_check_reaches_the_imports_of_each_module_it_runs(#[case] root: &str) {
+    check_program(&mut GlobalContext::default(), &program(root, &RUN_MODULES))
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+}
+
+/// Compiling checks `wallet` on its own, and the root when it has a parameter. Each of those
+/// checks runs `ledger`, which reads `pricing`.
+#[rstest]
+#[case::through_another_run(indoc! {"
+    run wallet as w
+    w::total
+"})]
+#[case::from_a_root_with_a_parameter(indoc! {"
+    param base: Int = 0
+    run ledger(fee=1) as eu
+    await_final(eu::balance) + base
+"})]
+#[timeout(Duration::from_secs(10))]
+fn a_program_runs_a_module_that_imports_another(#[case] root: &str) {
+    check_program_scalar(&program(root, &RUN_MODULES), Value::Int(352));
+}
+
+/// An import of a module that runs another is refused, and the refusal is the only error: the
+/// importer's check also holds the shared imports of the modules that `wallet` runs.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn importing_a_module_that_runs_another_reports_only_the_refusal() {
+    let root = indoc! {"
+        import wallet
+        wallet::total
+    "};
+    let result =
+        check_program(&mut GlobalContext::default(), &program(root, &RUN_MODULES)).unwrap_err();
+    let messages: Vec<_> = result.errors.iter().map(|error| error.message()).collect();
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(
+        messages[0].contains("module `wallet` is run, since it runs another module"),
+        "{messages:?}"
+    );
 }

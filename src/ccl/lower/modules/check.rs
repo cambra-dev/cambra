@@ -220,14 +220,9 @@ impl<'a> ProgramLowering<'a> {
     /// ([`ProgramLowering::nested`]).
     pub(super) fn check(&mut self, file: FileId, ctx: &mut LoweringContext) -> Option<ModuleCheck> {
         let lowered = self.lowered.get(&file).cloned().flatten()?;
-        // The shared imports it reaches, each after the ones it reaches.
+        // The shared imports it and the modules it runs reach, each after the ones it reaches.
         let mut reached = HashSet::new();
-        let mut pending: Vec<SharedImport> = self.program.ast(file).map_or_else(Vec::new, |ast| {
-            ast.body
-                .iter()
-                .filter_map(|stmt| Some(self.imports.get(&stmt.span)?.shared.clone()))
-                .collect()
-        });
+        let mut pending: Vec<SharedImport> = self.imports_reached(file);
         while let Some(shared) = pending.pop() {
             if reached.insert(shared.clone()) {
                 pending.extend(

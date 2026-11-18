@@ -58,7 +58,7 @@ root file
              link order, and the root's run, which creates each run it declares at its `run`
              statement; each run a uniquified copy of its module's chain
   → check    once per module: its check tree, its chain with its parameters abstract, its runs,
-             the shared imports it reaches, and its arguments' checks, inferred alone, as
+             the shared imports it and its runs reach, and its arguments' checks, inferred alone, as
              chl-spec.md's "9.14 Checking a module on its own" requires; once every module is
              checked, an import of a module that is run, or a run of one that is imported, is
              refused
@@ -690,6 +690,9 @@ linked as though it were the root, with its own parameters abstract:
 - **Its runs and imports** are created as linking creates them, bodies included, registering no
   sink or route. An exactly annotated member is bound at its annotation, so a use sees no body. An
   unannotated or `<:` member is inferred with the module's uses of it.
+- **The shared imports its copies read.** A run's copy reads its module's shared imports, so the
+  tree holds the shared imports of the module's own imports and of every module it runs, at any
+  depth, each after the shared imports it reaches (`ProgramLowering::imports_reached`).
 - **Its run-site checks.** Each type argument, and each type member of a module argument, is
   compared with what its parameter states, as the declaring module writes both (`TypeCheck`): an
   `Abstract` at the argument's type flows into a `let` at the bound, and for an exact entry the

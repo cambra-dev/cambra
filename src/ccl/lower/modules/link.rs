@@ -784,8 +784,8 @@ pub(super) struct ProgramLowering<'a> {
     /// Each shared import's chain, as linking created it, in the order created,
     /// which a module's check copies ([`ProgramLowering::check`]).
     pub(super) shared_chains: Vec<(SharedImport, Expr)>,
-    /// The shared imports each shared import reaches: its arguments' and its
-    /// module's imports'.
+    /// The shared imports each shared import reaches: its arguments', and those
+    /// its module reads ([`ProgramLowering::imports_reached`]).
     pub(super) shared_reached: HashMap<SharedImport, Vec<SharedImport>>,
     /// Whether runs are being created for a module's check, which registers no
     /// sink or route.
@@ -1109,6 +1109,42 @@ impl<'a> ProgramLowering<'a> {
         chains
     }
 
+    /// The shared imports a copy of the module in `file` reads: those of its own `import`
+    /// statements and of each module it runs, at any depth through runs. The walk stops at
+    /// imports; the shared imports those imports reach are in `shared_reached`. A created run
+    /// reads its module's shared imports ([`ProgramLowering::create`]).
+    pub(super) fn imports_reached(&self, file: FileId) -> Vec<SharedImport> {
+        let mut reached = Vec::new();
+        let mut visited = HashSet::new();
+        let mut pending = vec![file];
+        while let Some(at) = pending.pop() {
+            if !visited.insert(at) {
+                continue;
+            }
+            let Some(ast) = self.program.ast(at) else {
+                continue;
+            };
+            for stmt in &ast.body {
+                match &stmt.node {
+                    ChlStmt::Import { .. } => {
+                        if let Some(imported) = self.imports.get(&stmt.span) {
+                            reached.push(imported.shared.clone());
+                        }
+                    }
+                    ChlStmt::Run { path, .. } => {
+                        if let Some(target) =
+                            path.to_path().and_then(|path| self.program.file_of(&path))
+                        {
+                            pending.push(target);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        reached
+    }
+
     /// Lower the module in `file` once, recording it, or `None` when it has no
     /// syntax tree or has uncontained lowering errors.
     pub(super) fn lower(&mut self, file: FileId, ctx: &mut LoweringContext) {
@@ -1204,13 +1240,7 @@ impl<'a> ProgramLowering<'a> {
                 KeyArgument::Lit(_) | KeyArgument::Type(_) => None,
             })
             .collect();
-        if let Some(ast) = self.program.ast(*file) {
-            reached.extend(
-                ast.body
-                    .iter()
-                    .filter_map(|stmt| Some(self.imports.get(&stmt.span)?.shared.clone())),
-            );
-        }
+        reached.extend(self.imports_reached(*file));
         for reached in &reached {
             if sites.contains_key(reached) {
                 self.ensure_shared_import(reached, sites, chains, ctx);
