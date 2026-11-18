@@ -106,8 +106,8 @@ impl TileOperator for Converse {
 ///
 /// The groups released are `base.obsolete_guard`, a region of output paths named by value. A
 /// release names that region exactly and is forwarded upstream in two parts: the held input rows
-/// it covers at once (`release_impl`), and each later row of a released group on the read that
-/// first holds it (`release_late_rows`). An input guard names rows by key, so it cannot name a
+/// it covers at once (`release_impl`), and each later row of a released group on the next
+/// release after a read first holds it. An input guard names rows by key, so it cannot name a
 /// group before its rows are read (`src/interpreter/design-operators.md`, "A release of a converse
 /// group").
 struct ConverseProducer {
@@ -120,12 +120,18 @@ struct ConverseProducer {
     /// row is released once the path it stands at is, which takes its value to read. A pull reads
     /// only the rows a region names, so the rows of earlier pulls are kept: a release of a group
     /// names rows no later pull may read again.
-    held: Vec<HeldRow>,
+    // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`;
+    // no other operator holds it.
+    held: RefCell<Vec<HeldRow>>,
     /// At the outermost level, the input keys the answers read state complete, together, and the
     /// values those answers held. A group is the rows whose value is its key, so once every input
     /// key is complete a value never seen has no group: it is stated absent.
-    read: Predicate,
-    seen: Predicate,
+    // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`;
+    // no other operator holds it.
+    read: RefCell<Predicate>,
+    // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`;
+    // no other operator holds it.
+    seen: RefCell<Predicate>,
     /// The level inverted — see [`Converse::new_at`].
     level: CurryLevel,
     /// The inverted level to answer with where no enclosing row has been reached.
@@ -146,9 +152,9 @@ impl ConverseProducer {
         Self {
             base,
             input,
-            held: Vec::new(),
-            read: Predicate::False,
-            seen: Predicate::False,
+            held: RefCell::new(Vec::new()),
+            read: RefCell::new(Predicate::False),
+            seen: RefCell::new(Predicate::False),
             level,
             empty_level,
         }
@@ -224,25 +230,13 @@ impl ConverseProducer {
 
     /// Keep `read`, the rows a pull read, in place of what the same input rows held before: a
     /// row read again stands at the path its value now gives.
-    fn remember(&mut self, read: Vec<HeldRow>) {
+    fn remember(&self, read: Vec<HeldRow>) {
         let again: std::collections::HashSet<&Vec<Value>> =
             read.iter().map(|(_, input)| input).collect();
-        self.held.retain(|(_, input)| !again.contains(input));
-        self.held.extend(read);
-    }
-
-    /// Release at the input the held rows `released`, a region the consumer let go of, covers.
-    /// A row that arrives after its group was released is freed here, on the read that first
-    /// holds it.
-    fn release_late_rows(&mut self, released: &TileGuard) {
-        let late = Self::held_rows_covered(&self.held, released);
-        if late.is_empty() {
-            return;
-        }
-        let rows = self.input_rows(late);
         self.held
-            .retain(|(output, _)| !released.covers_path(output));
-        self.input.release(rows);
+            .borrow_mut()
+            .retain(|(_, input)| !again.contains(input));
+        self.held.borrow_mut().extend(read);
     }
 }
 
@@ -412,7 +406,7 @@ fn converse_collection(input_tile: Tile) -> (Tile, Vec<(Value, Value)>) {
 
 impl TileProducer for ConverseProducer {
     fn state_info(&self) -> ProducerStateInfo {
-        ProducerStateInfo::holding(2 * self.held.len())
+        ProducerStateInfo::holding(2 * self.held.borrow().len())
     }
 
     impl_producer_base!();
@@ -450,7 +444,7 @@ impl TileProducer for ConverseProducer {
     /// names ([`Projection::above`]), and at the outermost level it is read whole. Either way the
     /// groups are cut to the projection, and the rows a cut group does not name stay unreleased
     /// at the input, so a later pull reads them again.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -478,8 +472,13 @@ impl TileProducer for ConverseProducer {
             } = &input_tile
             && let Tile::Scalar(values) = &**codomain
         {
-            self.read = self.read.union(domain_predicate);
-            self.seen = self.seen.union(&Predicate::from_column_value(values));
+            let read = self.read.borrow().union(domain_predicate);
+            *self.read.borrow_mut() = read;
+            let seen = self
+                .seen
+                .borrow()
+                .union(&Predicate::from_column_value(values));
+            *self.seen.borrow_mut() = seen;
         }
         let (mut out, read) = self.invert(input_tile);
         self.remember(read);
@@ -490,17 +489,16 @@ impl TileProducer for ConverseProducer {
         // the release reached `release_impl` before the row arrived.
         if !self.base.obsolete_guard.is_empty() {
             let released = self.base.obsolete_guard.clone();
-            self.release_late_rows(&released);
             out.remove_guarded(released);
         }
         out.restrict_to(&projection, self.tiling());
         // A value never seen once every input key is complete has no group anywhere: it is
         // absent in every region, so it is recorded apart from the statement, which the cut
         // and every later cut keep to the region pulled.
-        if self.read.is_true()
+        if self.read.borrow().is_true()
             && let Tile::DataFunction { absent_keys, .. } = &mut out
         {
-            *absent_keys = Predicate::True.minus(&self.seen);
+            *absent_keys = Predicate::True.minus(&self.seen.borrow());
         }
         out
     }
@@ -508,10 +506,11 @@ impl TileProducer for ConverseProducer {
     /// The levels above the inverted one stand, so a guard naming their keys names the same
     /// input rows. Beneath them a guard names groups by value, and an input row is released
     /// where the output path it stands at is: the rows held now, and a row arriving later
-    /// through the late-row release in `get_impl`, once its value says which group it joins.
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    /// on a later release delivery, once a read identifies which group it joins.
+    fn release_impl(&mut self, _obsolete_guard: TileGuard) {
+        let obsolete_guard = self.obsolete_guard().clone();
         if obsolete_guard.is_universal() {
-            self.held.clear();
+            self.held.get_mut().clear();
             return self.input.release(self.input.tiling().universal_guard());
         }
         // A member `[𝑠…, value, key]` is the smallest region an input row stands at, so a guard
@@ -541,7 +540,7 @@ impl TileProducer for ConverseProducer {
         // every group of every enclosing row, so it names those input keys whatever group they
         // land in, arrived or not. Every other shape beneath the standing levels names an
         // input row only through its group, so `False` here leaves it to the `held` release
-        // and `release_late_rows` rather than dropping it.
+        // on the next release delivery rather than dropping it.
         fn under_every_group(guard: &TileGuard) -> Predicate {
             match guard {
                 TileGuard::Or(arms) => arms
@@ -563,8 +562,12 @@ impl TileProducer for ConverseProducer {
                 TileGuard::Function(FunctionGuard::Domain(under_every_group(&inverted)))
             },
         );
-        let held = self.input_rows(Self::held_rows_covered(&self.held, &obsolete_guard));
+        let held = self.input_rows(Self::held_rows_covered(
+            &self.held.borrow(),
+            &obsolete_guard,
+        ));
         self.held
+            .get_mut()
             .retain(|(output, _)| !obsolete_guard.covers_path(output));
         self.input
             .release(TileGuard::flatten_or(vec![standing, held]));
@@ -671,7 +674,7 @@ impl TileProducer for MapDomainProducer {
 
     /// Every level's keys stand, so the input is pulled at the projection, or at the nearest level
     /// above that the input restates ([`Projection::restated_by`]).
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -908,7 +911,7 @@ impl TileProducer for UncurryProducer {
 
     /// Projections above the paired level keep their keys. At and beneath that level,
     /// each pair is restated as its outer key and inner key on successive input levels.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -1258,7 +1261,7 @@ impl TileProducer for FilterProducer {
 
     /// The input, and a predicate that is a collection, share the keys of the level the mask
     /// names, so both are pulled at the projection; a function predicate is read whole.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -1288,7 +1291,7 @@ impl FilterProducer {
     }
 
     /// The input's rows the predicate keeps, for the keys `projection` names.
-    fn filtered(&mut self, projection: &Projection) -> Tile {
+    fn filtered(&self, projection: &Projection) -> Tile {
         let guard_for = |tiling: &Tiling| match tiling.is_data_function() {
             true => projection.guard(tiling),
             false => tiling.universal_guard(),
@@ -1530,7 +1533,7 @@ impl TileProducer for RestrictProducer {
 
     /// A restricted domain is the predicate's keys that pass, so the predicate is pulled at the
     /// projection.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection(&self.name());
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -1994,7 +1997,7 @@ impl TileProducer for ProductProducer {
 
     /// The two sides are aligned row for row, so a projection of the rows is a projection of
     /// each side.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -2139,7 +2142,7 @@ mod nested_projection_tests {
                 pulled,
             )
         };
-        let (mut producer, pulled) = make();
+        let (producer, pulled) = make();
         producer.get(at_one.clone());
         assert_eq!(
             *pulled.borrow(),
@@ -2172,7 +2175,7 @@ mod nested_projection_tests {
             CurryLevel::new(1),
         );
         let guard = product.tiling().universal_guard();
-        let mut producer = product.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
+        let producer = product.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
         producer.get(paths_guard(Predicate::qualified(
             Predicate::point(Value::UInt(0)),
             Predicate::point(Value::UInt(1)),
@@ -3081,8 +3084,10 @@ mod tests {
             panic!("converse yields a collection: {out:?}")
         };
         assert_eq!(domain, &ColumnValue::Ints(vec![20]), "{out:?}");
-        // The release of group 10 reached `release_impl` before row 1 arrived, so the pull
-        // that first holds row 1 is what releases it, and row 2's group is still live.
+        // A repeated release reclaims row 1 discovered by the later read, leaving group 20 live.
+        producer.release(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::point(Value::Int(10)),
+        )));
         let upstream = producer.input.obsolete_guard();
         assert!(
             upstream.covers_path(&[Value::Int(1)]) && !upstream.covers_path(&[Value::Int(2)]),
@@ -3316,8 +3321,8 @@ mod tests {
         assert!(!released([1, 2]), "{upstream:?}");
     }
 
-    /// A row that arrives after its group was released is released at the input by the pull
-    /// that first holds it: row 1's key 3 joins its released group 10.
+    /// A row that arrives after its group was released is reclaimed on the next release:
+    /// row 1's key 3 joins its released group 10.
     #[test]
     fn a_nested_converse_releases_a_row_that_joins_a_released_group() {
         let (mut converse, next) = growing_nested_converse();
@@ -3333,6 +3338,9 @@ mod tests {
                 .contains(&[1, 10, 3].map(Value::Int).to_vec()),
             "{out:?}"
         );
+        converse.release(under_a_row(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::exactly(&[Value::Int(1), Value::Int(10)]),
+        ))));
         let upstream = converse.input.obsolete_guard();
         let released = |path: [i64; 2]| upstream.covers_path(&path.map(Value::Int));
         assert!(released([1, 3]), "{upstream:?}");
@@ -4168,7 +4176,7 @@ mod filter_projection_tests {
 
     #[test]
     fn nothing_filters_nothing() {
-        let (mut filter, input_pulled, predicate_pulled) = keep_even_positions();
+        let (filter, input_pulled, predicate_pulled) = keep_even_positions();
         let nothing = filter.tiling().empty_guard();
         assert_eq!(filter.get(nothing), filter.tiling().empty_tile());
         assert!(input_pulled.borrow().is_empty() && predicate_pulled.borrow().is_empty());
@@ -4388,7 +4396,7 @@ mod restrict_projection_tests {
 
     #[test]
     fn nothing_restricts_nothing() {
-        let (mut restrict, pulled) = every_third();
+        let (restrict, pulled) = every_third();
         let nothing = restrict.tiling().empty_guard();
         assert_eq!(restrict.get(nothing), restrict.tiling().empty_tile());
         assert!(pulled.borrow().is_empty());
@@ -4491,7 +4499,7 @@ mod map_domain_projection_tests {
 
     #[test]
     fn a_projection_of_groups_reaches_the_groups() {
-        let (mut members, pulled) = members_of_groups();
+        let (members, pulled) = members_of_groups();
         let answer = members.get(groups_one_and_three());
         let Tile::DataFunction { domain, .. } = &answer else {
             panic!("a collection")
@@ -4508,7 +4516,7 @@ mod map_domain_projection_tests {
 
     #[test]
     fn nothing_maps_nothing() {
-        let (mut keys, pulled) = keys_of_a_stream();
+        let (keys, pulled) = keys_of_a_stream();
         let nothing = keys.tiling().empty_guard();
         assert_eq!(keys.get(nothing), keys.tiling().empty_tile());
         assert!(pulled.borrow().is_empty());
@@ -4703,7 +4711,7 @@ mod uncurry_projection_tests {
                 .union(&Predicate::qualified(point(1), pair(1, 0))),
         )
         .guard(&out);
-        let (mut uncurry, pulled) = make();
+        let (uncurry, pulled) = make();
         let morsel = uncurry.get(guard.clone());
         assert_eq!(
             *pulled.borrow(),
@@ -4781,7 +4789,7 @@ mod uncurry_projection_tests {
     impl TileProducer for OutermostSpy {
         impl_producer_base!();
 
-        fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, projection_guard: TileGuard) -> Tile {
             self.pulled.borrow_mut().push(projection_guard.clone());
             let mut tile = self.tile.clone();
             tile.remove_guarded(self.obsolete_guard().clone());
@@ -4797,7 +4805,7 @@ mod uncurry_projection_tests {
     /// pair is cut from it: `(1, 2)` of group 1's `(1, 0)` and `(1, 2)`.
     #[test]
     fn a_grouping_that_restates_outermost_keys_is_pulled_at_the_groups_of_the_pairs() {
-        let (mut uncurry, pulled) = paired_outermost_groups();
+        let (uncurry, pulled) = paired_outermost_groups();
         let group_one = Predicate::point(Value::Int(1));
         let morsel = uncurry.get(pairs(group_one.clone(), Predicate::point(Value::UInt(2))));
         assert_eq!(
@@ -4816,7 +4824,7 @@ mod uncurry_projection_tests {
             Predicate::point(Value::Int(1)),
             Predicate::point(Value::UInt(2)),
         );
-        for ((mut uncurry, pulled), level) in [
+        for ((uncurry, pulled), level) in [
             (paired_groups(), CurryLevel::new(1)),
             (paired_outermost_groups(), CurryLevel::OUTERMOST),
         ] {
@@ -4954,7 +4962,7 @@ mod uncurry_projection_tests {
         );
         let guard = pairs(Predicate::True, Predicate::point(Value::UInt(1)));
         let morsel = producer.read_in_pipeline(guard.clone());
-        let (mut whole, _) = paired_groups();
+        let (whole, _) = paired_groups();
         let mut expected = whole.get(out.universal_guard());
         expected.restrict_to(&Projection::of(&guard).unwrap(), &out);
         assert_eq!(morsel, expected);
@@ -4977,7 +4985,7 @@ mod uncurry_projection_tests {
 
     #[test]
     fn nothing_pairs_nothing() {
-        let (mut uncurry, pulled) = paired_groups();
+        let (uncurry, pulled) = paired_groups();
         let nothing = uncurry.tiling().empty_guard();
         assert_eq!(uncurry.get(nothing), uncurry.tiling().empty_tile());
         assert!(pulled.borrow().is_empty());
@@ -5266,7 +5274,7 @@ mod product_projection_tests {
 
     #[test]
     fn nothing_pairs_nothing() {
-        let (mut product, outer_pulled, inner_pulled) = rows_and_their_keys();
+        let (product, outer_pulled, inner_pulled) = rows_and_their_keys();
         let nothing = product.tiling().empty_guard();
         assert_eq!(product.get(nothing), product.tiling().empty_tile());
         assert!(outer_pulled.borrow().is_empty() && inner_pulled.borrow().is_empty());
@@ -5365,7 +5373,7 @@ mod converse_projection_tests {
     /// the groups outside the range are cut.
     #[test]
     fn a_range_of_groups_reads_the_whole_key_stream_and_cuts_the_groups() {
-        let (mut converse, pulled, _) = bucketize();
+        let (converse, pulled, _) = bucketize();
         let answer = converse.get(groups(&[1, 3]));
         assert_eq!(
             members_by_group(&answer),
@@ -5453,7 +5461,7 @@ mod converse_projection_tests {
 
     #[test]
     fn nothing_inverts_nothing() {
-        let (mut converse, pulled, _) = bucketize();
+        let (converse, pulled, _) = bucketize();
         let nothing = converse.tiling().empty_guard();
         assert_eq!(converse.get(nothing), converse.tiling().empty_tile());
         assert!(pulled.borrow().is_empty());
@@ -5554,15 +5562,21 @@ mod converse_pull_tests {
     }
 
     /// A released group stays released across pulls: each row of it a later pull reads is
-    /// released at the input on that pull and left out of its answer.
+    /// omitted from the answer, then reclaimed by the next release.
     #[test]
-    fn rows_of_a_released_group_in_later_pulls_are_released_by_their_pull() {
+    fn rows_of_a_released_group_in_later_pulls_are_reclaimed_on_release() {
         let source = source_of(0..9, group_of);
         let mut converse = converse_over(&source);
         converse.get(keys_one_level_in(0, 2));
         converse.release(group(1));
         assert_eq!(released_keys(&source), BTreeSet::from([1]));
         let answer = converse.get(keys_one_level_in(3, 5));
+        assert_eq!(
+            released_keys(&source),
+            BTreeSet::from([1]),
+            "read does not release"
+        );
+        converse.release(group(1));
         assert_eq!(released_keys(&source), BTreeSet::from([1, 4]));
         assert!(
             !answer.contains_guarded(&group(1)),

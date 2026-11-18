@@ -700,6 +700,7 @@ impl InductionStoreProducer {
         let drive = self.drive();
         self.reach_local(drive, &mut |breaker, input| {
             let none = breaker.input_tiling(input).empty_guard();
+
             breaker.consume_impl(input, none);
         });
     }
@@ -813,15 +814,6 @@ impl InductionStoreProducer {
     fn wait_for_inputs(&mut self, waiting: TileGuard) {
         let entry = self.base().placement.clone();
         self.run().body.set_waiting(Some(waiting), entry.as_ref());
-    }
-
-    /// Mark the entry in front of the store's input as the scope's, so a push that reaches it
-    /// and that the scope's pipeline does not take offers the scope its waiting positions, from
-    /// the run's start ([`Entry::wake`](crate::interpreter::dispatcher::Entry)).
-    pub(super) fn mark_entry_scope(&mut self) {
-        if let Some(entry) = self.base().placement.clone() {
-            entry.set_scope(Some(self.run().body.offers.clone()));
-        }
     }
 
     /// End a request over `covers`. Where positions waited for inputs before it, the positions of
@@ -1203,7 +1195,7 @@ mod tests {
 
         /// The store as a consuming breaker answers it.
         fn snapshot(&self) -> Tile {
-            let mut store = induction(&self.scope);
+            let store = induction(&self.scope);
             let guard = store.tiling().universal_guard();
             store.get(guard)
         }
@@ -1412,7 +1404,7 @@ mod tests {
         let mut pulls = 0;
         drive.visit_input_producers(&mut |role, input| {
             if role == "source" {
-                pulls = input.base().reads;
+                pulls = input.base().reads.get();
             }
         });
         pulls

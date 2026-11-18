@@ -93,6 +93,26 @@ impl Compiled {
         f(store)
     }
 
+    /// The breaker the store's body reads: an induction store's drive.
+    fn drive(&self) -> crate::interpreter::dispatcher::BreakerHandle {
+        test_helpers::drive_of(&**self.store.borrow())
+    }
+
+    /// Step an induction store to `position` as its loop's scope does: open the store with a
+    /// consume at no position, consume the drive at the position, which emits it into the body
+    /// once the store has decided the position before, then consume the store at it.
+    fn step_to(&self, position: u64) {
+        self.breaker(|store| {
+            let none = store.input_tiling(InputId::ONLY).empty_guard();
+            store.consume_in_pipeline(InputId::ONLY, none);
+        });
+        let guard = keys_between(position, position);
+        self.drive()
+            .borrow_mut()
+            .consume_in_pipeline(InputId::ONLY, guard.clone());
+        self.breaker(|store| store.consume_in_pipeline(InputId::ONLY, guard));
+    }
+
     /// The store as a consuming breaker answers it.
     fn snapshot(&self) -> Tile {
         self.breaker(|store| {
@@ -108,10 +128,10 @@ impl Compiled {
 fn an_induction_store_decides_each_position_it_steps() {
     let compiled = Compiled::of(SUM);
     let decided = || compiled.breaker(|store| (store.final_guard(), store.complete()));
-    compiled.breaker(|store| store.consume_in_pipeline(InputId::ONLY, keys_between(0, 0)));
+    compiled.step_to(0);
     let (held, after_one) = decided();
     assert_eq!(held, after_one);
-    compiled.breaker(|store| store.consume_in_pipeline(InputId::ONLY, keys_between(1, 1)));
+    compiled.step_to(1);
     let (_, after_two) = decided();
     assert!(
         !after_one.is_empty() && guard_minus(&after_one, &after_two).is_empty(),
@@ -127,7 +147,7 @@ fn an_induction_store_decides_each_position_it_steps() {
 #[test]
 fn a_consuming_store_answers_from_its_snapshot() {
     let compiled = Compiled::of(SUM);
-    compiled.breaker(|store| store.consume_in_pipeline(InputId::ONLY, keys_between(0, 0)));
+    compiled.step_to(0);
     let body_pulls = || {
         let mut pulls = 0;
         compiled
@@ -135,7 +155,7 @@ fn a_consuming_store_answers_from_its_snapshot() {
             .borrow()
             .visit_input_producers(&mut |role, input| {
                 if role == "body" {
-                    pulls = input.base().reads;
+                    pulls = input.base().reads.get();
                 }
             });
         pulls
@@ -153,7 +173,7 @@ fn a_consuming_store_answers_from_its_snapshot() {
 #[should_panic(expected = "an induction store finishes the run terminal")]
 fn a_store_short_of_terminal_at_its_finish_panics() {
     let compiled = Compiled::of(SUM);
-    compiled.breaker(|store| store.consume_in_pipeline(InputId::ONLY, keys_between(0, 0)));
+    compiled.step_to(0);
     let dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
         compiled.breaker(|store| store.finish(InputId::ONLY, pushes))
@@ -194,7 +214,7 @@ fn input_pulls(compiled: &Compiled) -> u64 {
     compiled
         .store
         .borrow()
-        .visit_input_producers(&mut |_, input| pulls += input.base().reads);
+        .visit_input_producers(&mut |_, input| pulls += input.base().reads.get());
     pulls
 }
 

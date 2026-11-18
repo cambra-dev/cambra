@@ -916,7 +916,7 @@ fn a_lookup_sends_everything_for_a_later_region_at_its_collection() {
 /// the feed notifies through.
 macro_rules! fan_out_with_two_slots {
     ($logs:ident, $producers:ident, $consumer:ident) => {
-        let ($logs, mut $producers, $consumer) = {
+        let ($logs, $producers, $consumer) = {
             let (input, consumer) = feed(ints());
             let fan = FanOut::new(input);
             let mut cx = SubscribeContext::new();
