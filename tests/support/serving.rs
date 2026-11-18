@@ -8,6 +8,7 @@
 //! (`expect_scalar` and its siblings) stay in `tests/programs/common/mod.rs`,
 //! which nothing else wants.
 
+use std::sync::PoisonError;
 use std::{
     io::{Read, Write},
     net::TcpStream,
@@ -242,8 +243,8 @@ pub fn no_main() -> Box<dyn Consumer> {
 /// Releasing the observation drops it from the test's view; the dispatcher owns graph releases.
 pub struct ProgramRunner {
     program: cambra::ccl::context::CompiledProgram,
-    root: std::rc::Rc<
-        std::cell::RefCell<Option<Box<dyn cambra::interpreter::tile_operators::TileProducer>>>,
+    root: std::sync::Arc<
+        std::sync::RwLock<Option<Box<dyn cambra::interpreter::tile_operators::TileProducer>>>,
     >,
     tiling: cambra::interpreter::Tiling,
     output: std::sync::Arc<ObservedMain>,
@@ -271,7 +272,7 @@ impl ProgramRunner {
         let tiling = producer.tiling().clone();
         Self {
             program,
-            root: std::rc::Rc::new(std::cell::RefCell::new(Some(producer))),
+            root: std::sync::Arc::new(std::sync::RwLock::new(Some(producer))),
             tiling,
             output: std::sync::Arc::new(ObservedMain(std::sync::Mutex::new(None))),
         }
@@ -290,7 +291,8 @@ impl ProgramRunner {
 
     pub fn inspect(&self) -> cambra::pretty_tree::InspectNode {
         self.root
-            .borrow()
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .unwrap()
             .inspect(&cambra::pretty_graph::VizOptions::default())
@@ -305,7 +307,8 @@ impl ProgramRunner {
         }
         if !self
             .root
-            .borrow()
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .unwrap()
             .obsolete_guard()
