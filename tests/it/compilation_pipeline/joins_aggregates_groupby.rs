@@ -723,6 +723,34 @@ fn a_conditional_between_groups_at_two_keys_has_no_join() {
     );
 }
 
+/// Groups read at the keys of nested loops: the lookup of each group stands beneath every
+/// enclosing loop's key (`src/interpreter/design-operators.md`, `MapResult`).
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::two_keys("sum([sum([sum(g1) + sum(g2) for g2 in g]) for g1 in g])", 24)]
+#[case::three_keys(
+    "sum([sum([sum([sum(g1) + sum(g2) + sum(g3) for g3 in g]) for g2 in g]) for g1 in g])",
+    72
+)]
+#[case::their_elements(
+    "sum([sum([sum([x for x in g1]) + sum([y for y in g2]) for g2 in g]) for g1 in g])",
+    24
+)]
+#[case::beneath_a_list("sum([sum([sum(g2) + a for g2 in g]) for a in [1, 2]])", 18)]
+#[case::a_boxed_group_at_the_inner_key(
+    indoc! {"
+        c = 1 > 2
+        sum([sum([sum([x for x in (box(g1) if c else box(g2))]) for g2 in g]) for g1 in g])
+    "},
+    12
+)]
+fn groups_read_at_the_keys_of_nested_loops(#[case] body: &str, #[case] expected: i64) {
+    check_scalar(
+        &format!("g = groupby([1, 2, 3], \\x -> x > 1)\n{body}"),
+        Value::Int(expected),
+    );
+}
+
 /// The sharing [`test_shared_grouping`] *describes*, pinned.
 ///
 /// Those value assertions hold whether the partition is bucketized once or
