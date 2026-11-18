@@ -731,6 +731,11 @@ input notifies again, release builds then return the cache without pulling it, a
 probe it once to exercise its post-release checks. A drained input inside a loop's cycle delivers
 again where a round has it read again (`read_again`), and every build reads the region it notified.
 
+At a nested level, the statement supplies completed members and known absences. Held-key guard
+construction excludes members already covered by that row's statement before qualifying the
+remainder. The union names the same exact region while avoiding one qualified held-key predicate
+per group where a shared statement already covers those members.
+
 ### What a producer holds
 
 `TileProducer::state_info` reports values retained by that producer between pulls, excluding
