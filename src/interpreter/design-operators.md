@@ -1100,8 +1100,8 @@ has](../ccl/design/mutability.md#how-many-commit-stores-a-program-has)).
 #### Ready transaction decisions
 
 A consuming transaction store attempts ready decisions without comparing different writers' source
-positions. Each writer has a pipeline whose packages make its source rows ready. A step of that
-pipeline pulls its writer and takes the decisions it brings (`CommitProducer::take`), then attempts
+positions. Each writer has a pipeline whose packages make its source rows ready. The request opens an attempt whose driver, body and writer run as ordinary dispatcher pipelines.
+The attempt's step takes the resulting proposals (`CommitProducer::take`), then attempts
 held decisions in rotating writer order (`CommitProducer::commit_ready`). An idle writer holds no
 other writer back. The dispatcher orders packages within each writer's pipeline; product deliveries
 need not arrive in source-key order. Commit ticks, allocated only for successful proposals, define
@@ -1114,13 +1114,14 @@ no position (`transaction_body_domain`, `src/ccl/infer/emit.rs`). Its writer cop
 into the proposal `{snap, reads, writes, pos}` (`proposal_stream_tiling`). A source position
 identifies an item to retry; it is not a priority among writers.
 
-A drive and its writer each output `{rows, decided}` (`transact_stream_tiling`). `decided` is a
-collection holding no key, whose predicate states the exact acknowledged or decided-absent source
-region (`decided_tile`). The statement grows and becomes universal once the source is exhausted.
-Acknowledging a product key releases that key alone; a later delivery may contain a smaller key.
-The drive caches source rows between notifications, removes an acknowledged row by key, and releases
-decided-absent positions when it reads a new source tile. An induction drive retains its prefix
-ordering instead.
+A drive outputs its attempt-row collection and a writer outputs its proposal-row collection.
+The attempt row carries `item_position` and `attempt_snapshot` beside the body's slots. The latter
+is the frontier the driver sampled, so a body that runs while a sibling commits still proposes
+against its original snapshot. The writer reads its read set as of that frontier. Source progress
+is the driver's release guard; no separate stream-level statement duplicates it. Acknowledging a
+product key releases that key alone; a later delivery may contain a smaller key. The drive caches
+source rows between notifications, removes acknowledged rows by key, and releases decided-absent
+positions when it reads source news. An induction drive retains its prefix ordering instead.
 
 From its first step a consuming store states `WriterTakes` for each writer in the store tile's
 `writer_takes`: `settled`, the exact region whose decisions committed or stood, and `again`, the
@@ -1131,7 +1132,7 @@ Taking a decision releases its proposal step to the writer, which acknowledges i
 drive releases the source item and keeps its own copy until `settled` includes it. Every decision
 is a proposal whose read set the engine validates, including a deny or grant that writes nothing.
 Each validated proposal takes one commit tick. A stale decision is named in `again`; the store
-publishes its current tile, pulls the writer and takes the fresh decision
+publishes its current tile, and the transaction request queues another dispatched attempt
 (`CommitProducer::drive_again`). The drive retries from its kept item before choosing another
 source item. A missing retry panics. Retried decisions resolve during the arbitration pass, whose
 end asserts that no retry remains. An induction store states no takes.
@@ -1428,7 +1429,7 @@ The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md
   source delivery marks the source dirty once before its attempts; retries do not by themselves
   discard the decoded source. It also releases the store below the decided frontier, through the
   last change strictly below it, so the commit store can reclaim its changelog.
-- **`TransactWriter` / `TransactWriterProducer`** — one *fused* writer per site (fused, not fanned: a stateful append-only proposal stream cannot be split across fanned slots without desyncing). Each pull it decides the driver's newest live position and appends a `{snap, reads, writes, pos}` proposal of what the body's decision writes, which may be nothing; `pos` is the item's source position, copied from the driver's row (`F_ITEM_POSITION`). When the decision also reads an induction accumulator, that value arrives co-iterated in the writer *source* or broadcast as a constant — see [mutability.md](../ccl/design/mutability.md#reading-an-induction-accumulator-in-a-commit-decision), "Reading an induction accumulator in a commit decision".
+- **`TransactWriter` / `TransactWriterProducer`** — one *fused* writer per site (fused, not fanned: a stateful append-only proposal stream cannot be split across fanned slots without desyncing). Each consumption decides the driver's newest live position and appends a `{snap, reads, writes, pos}` proposal of what the body's decision writes, which may be nothing; `pos` is the item's source position, copied from the driver's row (`F_ITEM_POSITION`). When the decision also reads an induction accumulator, that value arrives co-iterated in the writer *source* or broadcast as a constant — see [mutability.md](../ccl/design/mutability.md#reading-an-induction-accumulator-in-a-commit-decision), "Reading an induction accumulator in a commit decision".
 
   **The ack is a release intersection.** The driver sits behind a `FanOut` with two slots — the body and the writer — and acknowledges its source item on what they *both* release. A body releases a row as soon as it has consumed it, which says nothing about commitment; the writer releases it when the attempt has committed. Only the intersection means "this item is done", which is why the writer holds a driver slot it barely reads: that slot is the ack channel.
 
@@ -1483,8 +1484,9 @@ A writer body returns one **decision record** per transaction, `{writes: {𝑘: 
 
 ### Transaction progress
 
-Dispatcher packages drive writers from their source positions. The store takes decisions and
-arbitrates ready proposals as specified in [Ready transaction
+Dispatcher request packages retain their source regions until their attempts settle. The driver,
+body breakers and proposal writer consume through ordinary pipelines on the shared dispatcher;
+the transaction step takes proposals and arbitrates ready decisions as specified in [Ready transaction
 decisions](#ready-transaction-decisions). Readers sample the committed snapshot; they do not drive
 the store to completion. A drained live writer waits for its source to gain items.
 

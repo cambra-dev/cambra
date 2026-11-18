@@ -171,8 +171,8 @@ every round of a loop request it opened run before a control request is seen. `C
 bounds a package, not a pass, and no live run sets a source's limit on outstanding packages
 (`Dispatcher::limit`).
 
-Between two claims the serial driver has no package in flight except a loop scope's open request.
-That request's state is `InductionRun::request`, which lives on the store producer and which run
+Between two claims the serial driver may retain a loop or transaction scope's open request.
+A loop request's state is `InductionRun::request`, which lives on the store producer and which run
 cleanup drops (`InductionStoreProducer::clear_run`). A pause between claims would have to keep it on
 the store and re-key its package, which names a queue index in the old plan, to a region of the
 store's input. This is a conjecture; nothing implements a pause between claims.
@@ -266,6 +266,30 @@ Ordered pipelines claim only while the queue's in-flight map is empty. Acknowled
 consumption and updates its counter before removing the entry and unlocking the next claim.
 Graph composition requires every reserved package to remain ready, so neither an in-flight nor
 an acknowledged package can enter a newly composed graph.
+
+## Transaction requests and attempts
+
+A writer's request retains the delivered source region while an attempt runs. As for a loop
+scope, request and step handlers bound the recurrence: both kinds of scope sit behind
+`Handler::Request` and `Handler::Step` as a `Scope`, and both record where their inner pipelines sit
+in a `SharedScope`. The driver, body breakers and writer are ordinary pipelines planned by the same
+dependency and notification rules as other pipelines. Their graphs are attached to the run's shared
+dispatcher. The main claim loop consumes them; transaction control queues work and never claims or
+consumes a body pipeline itself.
+
+The driver samples the committed store and publishes attempt rows. Each row carries its source
+item's position and the sampled frontier. Body pipelines publish the decision, and the writer
+publishes a proposal against that same frontier. The step follows the body's pipelines and waits
+for their output to settle before collecting proposals and validating them. A stale proposal
+records a retry in the store tile and queues another attempt against the new snapshot. A parent
+request is acknowledged only after its source region is released and its decisions are settled.
+
+Completing a writer includes a closing attempt so its body observes source completion. Source
+pipelines then close; normal finishes drain the body graph before the request pipeline finishes. A
+writer's attempts are for no request, one request, the finish, or the closing that waits for the
+body to drain (`Attempt` in `transaction_scope.rs`).
+Run cleanup removes the transaction metadata and its placements, as it does for loop scopes.
+Transaction control retains no dispatcher handle and constructs no additional producer instances.
 
 ## A loop in rounds
 
