@@ -387,7 +387,11 @@ uninterpreted sort with an uninterpreted `is_some` and `value` (`Sort::Option` i
   derives a type without the `option_value` conjunct inference recorded.
 - `bind_unwrap` and `bind_unwrap_or` state their results through `asserting`, which applies an
   `id` stamped `𝑇 ⇒ {𝑇 | predicate}`. Inference takes the stamp as given, since no typing rule
-  derives the predicate from the `match` that computes the result. `unwrap`'s parameter is
+  derives the predicate from the `match` that computes the result.
+- `unwrap_or` is `(𝑝: (Option(𝑇₁), 𝑇₂)) ⇒ {𝑇₃ | predicate}`, polymorphic over `𝑇₃`, `𝑇₁ <: 𝑇₃`
+  and `𝑇₂ <: 𝑇₃` rather than over `Option`'s own parameter. The payload and the default each have
+  their own parameter, so a call does not equate their types. Only the result's parameter lies
+  above both. `unwrap`'s parameter is
   `{Option(𝑇) | not (__elem ▷ option_is_none)}`, so its `match` has no `none` arm. Its scrutinee
   is the parameter through an `id` stamped ``{Option(𝑇) | …} ⇒ {`some{𝑇}}``, and the arm names the
   tag `` `some ``: `lambda_elim` checks a `match` against its scrutinee's tags with refinements

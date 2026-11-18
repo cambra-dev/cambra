@@ -1879,19 +1879,40 @@ fn bind_unwrap(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) -> 
 }
 
 /// `Option::unwrap_or`, the function
-/// `λ 𝑝 : (Option(𝑇), 𝑇) → match 𝑝.0 { Option::some(𝑣) → 𝑣; Option::none → 𝑝.1 }`, its result
-/// asserted `{𝑇 | (𝑝.0 ▷ option_is_none and __elem == 𝑝.1) or (not (𝑝.0 ▷ option_is_none) and
-/// __elem == (𝑝.0 ▷ option_value))}` ([`asserting`]).
+/// `λ 𝑝 : (Option(𝑇₁), 𝑇₂) → match 𝑝.0 { Option::some(𝑣) → 𝑣; Option::none → 𝑝.1 }`, polymorphic
+/// over `𝑇₃`, `𝑇₁ <: 𝑇₃` and `𝑇₂ <: 𝑇₃`, its result asserted `{𝑇₃ | (𝑝.0 ▷ option_is_none and
+/// __elem == 𝑝.1) or (not (𝑝.0 ▷ option_is_none) and __elem == (𝑝.0 ▷ option_value))}`
+/// ([`asserting`]).
+///
+/// The option's payload and the default each have their own parameter, so a call does not
+/// equate their types. Only the result's parameter, `𝑇₃`, lies above both.
 fn bind_unwrap_or(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) -> Expr {
     use crate::ccl::nominal::{option_is_none, option_value};
     use crate::ccl::{BinOpKind, CompareKind, LogicKind, UnaryOpKind};
     let label = "lower.option_unwrap_or";
     let span = decl.span;
     let arg = "__unwrap_or_arg";
-    let t = option_payload_param(decl);
-    let option_ty = decl
-        .applied_to_params(&mut |n, ty| ctx.tag_machinery(Expr::var(n).with_ty(ty), span, label));
-    let param_ty = Type::Tuple(vec![option_ty.clone(), t.clone()]);
+    debug_assert!(
+        !decl.has_family_params(),
+        "`Option`'s one type parameter is not a family, so `Option(𝑇₁)` is its application"
+    );
+    let result = TypeParam::declared("T3");
+    let below_result = |spelling: &str| {
+        PolyParam::with_bound(
+            TypeParam::declared(spelling),
+            Some(Type::Param(Rc::clone(&result))),
+            None,
+        )
+    };
+    let params = vec![
+        PolyParam::with_bound(Rc::clone(&result), None, None),
+        below_result("T1"),
+        below_result("T2"),
+    ];
+    let [t3, t1, t2] =
+        [&params[0], &params[1], &params[2]].map(|p| Type::Param(Rc::clone(&p.param)));
+    let option_ty = Type::Nominal(Rc::clone(decl), vec![t1.clone()]);
+    let param_ty = Type::Tuple(vec![option_ty.clone(), t2.clone()]);
     let bool_ty = Type::Base(crate::ccl::BaseType::Bool);
 
     let read = |i: usize, ty: &Type| {
@@ -1902,22 +1923,22 @@ fn bind_unwrap_or(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) 
         .with_ty(ty.clone())
     };
     let option = || read(0, &option_ty);
-    let elem = || Expr::var(Name::elem()).with_ty(t.clone());
+    let elem = || Expr::var(Name::elem()).with_ty(t3.clone());
     let equals = |l: Expr, r: Expr| {
         Expr::binop(l, BinOpKind::Compare(CompareKind::Equals), r).with_ty(bool_ty.clone())
     };
     let and = |l: Expr, r: Expr| {
         Expr::binop(l, BinOpKind::BoolLogic(LogicKind::And), r).with_ty(bool_ty.clone())
     };
-    let is_none = || option_is_none(option(), &t);
-    let when_none = and(is_none(), equals(elem(), read(1, &t)));
+    let is_none = || option_is_none(option(), &t1);
+    let when_none = and(is_none(), equals(elem(), read(1, &t2)));
     let when_some = and(
         Expr::unary(UnaryOpKind::Not, is_none()).with_ty(bool_ty.clone()),
-        equals(elem(), option_value(option(), &t)),
+        equals(elem(), option_value(option(), &t1)),
     );
     let predicate = Expr::binop(when_none, BinOpKind::BoolLogic(LogicKind::Or), when_some)
         .with_ty(bool_ty.clone());
-    let result_ty = refined_by(&t, predicate, span, label, ctx);
+    let result_ty = refined_by(&t3, predicate, span, label, ctx);
 
     let component = |i: usize, ctx: &mut LoweringContext| {
         let read = Expr::apply(
@@ -1936,8 +1957,18 @@ fn bind_unwrap_or(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) 
     let value = asserting(case, &result_ty, span, label, ctx);
     let name = member_binding(decl, UNWRAP_OR);
     let binder = Occurrence::mint();
-    bind_function(
-        decl, name, binder, arg, param_ty, value, acc, span, label, ctx,
+    bind_function_over(
+        params,
+        Vec::new(),
+        name,
+        binder,
+        arg,
+        param_ty,
+        value,
+        acc,
+        span,
+        label,
+        ctx,
     )
 }
 
@@ -2063,6 +2094,43 @@ fn bind_function(
     label: crate::ccl::provenance::RewriteLabel,
     ctx: &mut LoweringContext,
 ) -> Expr {
+    // A constructor states the declaration's `requires` clause, so a call is checked
+    // against it at its own types, and `extract` assumes it.
+    let (params, requires) = match decl.requirements() {
+        Some(r) => (r.params.clone(), r.requires.clone()),
+        None => (
+            decl.params
+                .iter()
+                .map(|p| PolyParam {
+                    param: Rc::clone(p),
+                    kind: TypeKind::Type,
+                    bound_at: None,
+                })
+                .collect(),
+            Vec::new(),
+        ),
+    };
+    bind_function_over(
+        params, requires, name, binder, arg, param_ty, value, acc, span, label, ctx,
+    )
+}
+
+/// `let name = λ arg : param_ty → value in acc`, polymorphic over `params` under `requires`
+/// when there are any parameters. `binder` is the occurrence of `name` in the binding.
+#[allow(clippy::too_many_arguments)]
+fn bind_function_over(
+    params: Vec<PolyParam>,
+    requires: Vec<Rc<crate::ccl::ty::TraitRequirement>>,
+    name: String,
+    binder: Occurrence,
+    arg: &str,
+    param_ty: Type,
+    value: Expr,
+    acc: Expr,
+    span: Span,
+    label: crate::ccl::provenance::RewriteLabel,
+    ctx: &mut LoweringContext,
+) -> Expr {
     // The function and its parameter are the compiler's own, so their occurrences record
     // where the function is tagged, as does `binder` unless the caller recorded it.
     let mut function = Expr::lambda(arg, Occurrence::mint(), Type::Hole, value);
@@ -2070,25 +2138,9 @@ fn bind_function(
         param.declare(Annotation::new(param_ty, Occurrence::mint()));
     }
     let function = ctx.tag_machinery(function, span, label);
-    let binding = if decl.params.is_empty() {
+    let binding = if params.is_empty() {
         Expr::let_bind(name, binder, function, acc)
     } else {
-        // A constructor states the declaration's `requires` clause, so a call is checked
-        // against it at its own types, and `extract` assumes it.
-        let (params, requires) = match decl.requirements() {
-            Some(r) => (r.params.clone(), r.requires.clone()),
-            None => (
-                decl.params
-                    .iter()
-                    .map(|p| PolyParam {
-                        param: Rc::clone(p),
-                        kind: TypeKind::Type,
-                        bound_at: None,
-                    })
-                    .collect(),
-                Vec::new(),
-            ),
-        };
         let poly = Type::Poly(Rc::new(PolyType {
             params,
             requires,

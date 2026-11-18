@@ -1091,7 +1091,7 @@ fn pin_unobservable_ctor_args(value_ty: &Type, ctx: &mut CoalesceCtx) {
             // A demand alone determines the argument, and the walk reads it from that demand.
             // The pin makes the reading a value, so a join the argument flows into covers it:
             // `y.unwrap_or(2)` with `y = Option::none` and the result demanded `Int` reads
-            // `y : Option(Int)`, and `unwrap_or`'s `T` joins `Int` with `Int@2`.
+            // `y : Option(Int)`, and `unwrap_or`'s `T3` lies above `Int` and `Int@2`.
             Ok(read) => Some(read),
             Err(_) => None,
         };

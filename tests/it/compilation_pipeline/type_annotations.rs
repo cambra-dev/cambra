@@ -2295,9 +2295,9 @@ fn a_data_function_type_is_no_value() {
 /// produces a value with type `{Option(T) where _.is_none()}`, with
 /// no constraint on `_.value()` in that case.
 ///
-/// The `o.unwrap_or(w)` method, for `o: Option(T)` and `w: T`,
-/// produces a value with refinement `{T where if (o.is_none()) then
-/// (_ == w) else (_ == o.value())}.`
+/// The `o.unwrap_or(w)` method, for `o: Option(T1)` and `w: T2`,
+/// produces a value with refinement `{T3 where if (o.is_none()) then
+/// (_ == w) else (_ == o.value())}`, where `T1 <: T3` and `T2 <: T3`.
 #[test]
 fn unwrap_or_follows_the_option_constructor() {
     check_scalar(
@@ -2310,6 +2310,53 @@ x1 == 1 and y1 == 2
         "#},
         Value::Bool(true),
     )
+}
+
+/// `unwrap_or`'s default need not have the option's payload type: the payload is `T1`, the
+/// default `T2`, and the result `T3` lies above both.
+#[rstest]
+#[case::refined_payload_plain_default_none(
+    indoc! {"
+        def f(o: Option({Int where _ > 0}), d: Int) => Int:
+            o.unwrap_or(d)
+        f(Option::none, -3)
+    "},
+    Value::Int(-3),
+)]
+#[case::refined_payload_plain_default_some(
+    indoc! {"
+        def f(o: Option({Int where _ > 0}), d: Int) => Int:
+            o.unwrap_or(d)
+        f(Option::some(4), -3)
+    "},
+    Value::Int(4),
+)]
+#[case::bounded_payload(
+    indoc! {"
+        def f(T <: Int, o: Option(T), d: Int) => Int:
+            o.unwrap_or(d)
+        f(Option::some(4), 9)
+    "},
+    Value::Int(4),
+)]
+#[case::bounded_default(
+    indoc! {"
+        def f(T <: Int, o: Option(Int), d: T) => Int:
+            o.unwrap_or(d)
+        f(Option::none, 9)
+    "},
+    Value::Int(9),
+)]
+#[case::none_with_record_default(
+    indoc! {"
+        y = Option::none
+        r = y.unwrap_or((a=5))
+        r.a
+    "},
+    Value::Int(5),
+)]
+fn unwrap_or_default_differs_from_payload(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
 }
 
 /// `!` is a unary operator, acting as a function with type `(o:
