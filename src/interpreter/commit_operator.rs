@@ -2563,7 +2563,7 @@ impl TileProducer for CommitProducer {
         true
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
         if self.breaker.snapshot.is_none() {
             return CommitEngine::unopened().render_full_store_tile(self.tiling());
         }
@@ -3718,7 +3718,7 @@ impl TileProducer for InductionStoreProducer {
         true
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
         if self.breaker.snapshot.is_none() {
             return render_engines(
                 &Engines::unopened(self.tiling()),
@@ -3939,7 +3939,7 @@ impl TileProducer for StoreValueStreamProducer {
     fn base_mut(&mut self) -> &mut ProducerBase {
         &mut self.base
     }
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         // Read the published store without advancing its writers.
         let sg = self.store_producer.tiling().universal_guard();
         let store = self.store_producer.get(sg);
@@ -4124,6 +4124,7 @@ impl TileOperator for StoreFinalRead {
             self.store_op
                 .subscribe(self.store_op.tiling().universal_guard(), forward, cx);
         Box::new(StoreFinalReadProducer {
+            read_frontier: Default::default(),
             base: ProducerBase::new(
                 StoreFinalReadProducer::alloc_id(),
                 self.tiling(),
@@ -4139,6 +4140,7 @@ impl TileOperator for StoreFinalRead {
 }
 
 struct StoreFinalReadProducer {
+    read_frontier: crate::interpreter::tile_operators::DroppedRows,
     base: ProducerBase,
     store_producer: Box<dyn TileProducer>,
     key: Value,
@@ -4168,7 +4170,7 @@ impl TileProducer for StoreFinalReadProducer {
     fn input_level(&self, _: &str, _: CurryLevel) -> Option<CurryLevel> {
         None
     }
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         if self.obsolete_guard().is_universal() {
             return self.tiling().empty_tile();
         }
@@ -4181,15 +4183,14 @@ impl TileProducer for StoreFinalReadProducer {
         }
         let sg = self.store_producer.tiling().universal_guard();
         let store = self.store_producer.get(sg);
-        // Release through the frontier. This read wants the key's value as the store
-        // stands, and `gc_released_prefix` keeps each key's carry source where nothing above
-        // the boundary supersedes it, so the fold below is never stranded. Without this
-        // release the `FanOut`'s meet cannot advance past this slot until the read retires,
-        // which holds every version of every key for the length of the loop.
+        // Record the frontier, which `release_impl` releases when the consumer releases. This
+        // read wants the key's value as the store stands, and `gc_released_prefix` keeps each
+        // key's carry source where nothing above the boundary supersedes it, so the fold below
+        // is never stranded.
         if let Some(frontier) = store_frontier(&store) {
             let levels = path_levels(self.store_producer.tiling());
-            self.store_producer
-                .release(domain_prefix_over(vec![frontier.into_value()], &levels));
+            self.read_frontier
+                .remember(domain_prefix_over(vec![frontier.into_value()], &levels));
         }
         let settled = match &store {
             Tile::Store {
@@ -4216,6 +4217,7 @@ impl TileProducer for StoreFinalReadProducer {
         tile
     }
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        self.read_frontier.release_to(&mut *self.store_producer);
         // Under rows the output's levels are the store's, so a release of rows names the
         // same rows of the store, whose stores those rows' readers are then done with.
         // Beneath the rows the output holds a value where the store holds a store, so only a
@@ -4246,7 +4248,7 @@ impl StoreFinalReadProducer {
     /// stands, its seed where its inner loop ran no position. A row still running is left
     /// out, as a scalar read leaves out a store still running, and the induction store's statement
     /// of which rows are complete is the output's.
-    fn per_row(&mut self) -> Tile {
+    fn per_row(&self) -> Tile {
         let tile = self
             .store_producer
             .get(self.store_producer.tiling().universal_guard());
@@ -4445,7 +4447,7 @@ impl StoreDenseReadProducer {
     /// than to the previous row's last write. The enclosing level's `domain_predicate`
     /// comes straight from the store, which knows it because the drive is sequential: a
     /// row can gain no further position once the next row has one.
-    fn read_per_row(&mut self, store: &Tile) -> Tile {
+    fn read_per_row(&self, store: &Tile) -> Tile {
         // Standing levels stand above the induction store and are kept as they are; only the level
         // holding the stores becomes a level of histories. Beneath a standing level the
         // stores are one collection whose groups belong to different enclosing positions, and
@@ -4579,7 +4581,7 @@ impl TileProducer for StoreDenseReadProducer {
 
     impl_producer_base!();
 
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         // Sample the store (consumer-driven; no producer-side drive-to-fixpoint) and
         // fold `key` at each position it has decided. The cycle advances one position
@@ -5850,18 +5852,14 @@ impl TileProducer for InductionDriverProducer {
     }
 
     fn answers_from_state(&self) -> bool {
-        !(self.base.reads_input() && self.decides.borrow().is_none())
+        true
     }
 
-    fn get_impl(&mut self, guard: TileGuard) -> Tile {
-        if self.base.reads_input() && self.decides.borrow().is_none() {
-            self.step(&guard.projection_for(self))
-        } else {
-            let mut tile = self.rendered.clone();
-            tile.remove_guarded(self.obsolete_guard().clone());
-            tile.restrict_to(&guard.projection_for(self), self.tiling());
-            tile
-        }
+    fn get_impl(&self, guard: TileGuard) -> Tile {
+        let mut tile = self.rendered.clone();
+        tile.remove_guarded(self.obsolete_guard().clone());
+        tile.restrict_to(&guard.projection_for(self), self.tiling());
+        tile
     }
 
     fn next_position(&self) -> Option<Option<Vec<Value>>> {
@@ -6806,7 +6804,7 @@ impl TileProducer for TransactDriverProducer {
 
     impl_producer_base!();
 
-    fn get_impl(&mut self, guard: TileGuard) -> Tile {
+    fn get_impl(&self, guard: TileGuard) -> Tile {
         let mut tile = self.rendered.clone();
         tile.restrict_to(&guard.projection(&self.name()), self.tiling());
         tile.remove_guarded(self.obsolete_guard().clone());
@@ -7842,7 +7840,7 @@ impl TileProducer for TransactWriterProducer {
     fn base_mut(&mut self) -> &mut ProducerBase {
         &mut self.base
     }
-    fn get_impl(&mut self, guard: TileGuard) -> Tile {
+    fn get_impl(&self, guard: TileGuard) -> Tile {
         // A release naming part of a proposal rather than the proposal leaves it in the
         // window (`release_impl`), so what it names is withheld here.
         let mut tile = self.render();
@@ -8010,7 +8008,7 @@ mod tests {
 
         fn snapshot(&mut self) -> Tile {
             let mut reader = self.fan.slot();
-            let mut producer = reader.subscribe(
+            let producer = reader.subscribe(
                 reader.tiling().universal_guard(),
                 Box::new(|| {}),
                 &mut SubscribeContext::new(),
@@ -8027,6 +8025,75 @@ mod tests {
             .as_breaking_mut()
             .unwrap()
             .consume_in_pipeline(InputId(input), guard);
+    }
+
+    /// Consume the breaker `reader` shares at the whole of its input, as the pipeline feeding it
+    /// does, then read it: a breaker read inside a run answers from what it has consumed.
+    fn consume_and_read(reader: &mut Box<dyn TileProducer>) -> Tile {
+        consume_shared(&mut **reader, &mut |_| {});
+        reader.get(reader.tiling().universal_guard())
+    }
+
+    /// Consume a nested drive `reader` shares as its pipelines do: first the memo over its
+    /// enclosing parameter and over each reseed, each a breaker of a pipeline of its own, then
+    /// the drive. Read it after.
+    fn consume_nested_drive_and_read(reader: &mut Box<dyn TileProducer>) -> Tile {
+        consume_shared(&mut **reader, &mut |drive| {
+            drive.visit_input_producers_mut(&mut |role, input| {
+                if role == "pairs" || role == "reseed" {
+                    consume_shared(input, &mut |_| {});
+                }
+            });
+        });
+        reader.get(reader.tiling().universal_guard())
+    }
+
+    /// Consume the breaker `reader` shares at the whole of its input, after `first` has run on
+    /// the breaker.
+    fn consume_shared(reader: &mut dyn TileProducer, first: &mut dyn FnMut(&mut dyn TileProducer)) {
+        let mut reached = false;
+        reader.visit_input_producers_mut(&mut |role, breaker| {
+            assert_eq!(role, "breaker", "the reader shares a breaker");
+            first(&mut *breaker);
+            let breaker = breaker
+                .as_breaking_mut()
+                .expect("a shared breaker breaks a pipeline");
+            let whole = breaker.input_tiling(InputId::ONLY).universal_guard();
+            breaker.consume_in_pipeline(InputId::ONLY, whole);
+            reached = true;
+        });
+        assert!(reached, "the reader shares a breaker");
+    }
+
+    /// The drive an induction store's body reads.
+    fn drive_of(fan: &Rc<FanOut>) -> crate::interpreter::dispatcher::BreakerHandle {
+        let cell = fan.store().expect("the store is subscribed");
+        crate::interpreter::tile_operators::test_helpers::drive_of(&**cell.borrow())
+    }
+
+    /// Step an induction store through `positions` as its loop's scope does: open the store with
+    /// a consume at no position, then at each position consume the drive, which emits it into the
+    /// body once the store has decided the position before, and then the store.
+    fn step_induction(fan: &Rc<FanOut>, positions: std::ops::Range<u64>) {
+        let none = fan
+            .store()
+            .expect("the store is subscribed")
+            .borrow_mut()
+            .as_breaking_mut()
+            .unwrap()
+            .input_tiling(InputId::ONLY)
+            .empty_guard();
+        consume_input(fan, 0, none);
+        let drive = drive_of(fan);
+        for position in positions {
+            let guard = TileGuard::Function(FunctionGuard::Domain(Predicate::point(Value::UInt(
+                position,
+            ))));
+            drive
+                .borrow_mut()
+                .consume_in_pipeline(InputId::ONLY, guard.clone());
+            consume_input(fan, 0, guard);
+        }
     }
 
     mod induction_run_lifecycle {
@@ -8622,7 +8689,7 @@ mod tests {
         }
         // A `Restrict` keeps a filtered row's key, marked deleted, in every tile it
         // emits, so this offers the tile as built.
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             self.tile.clone()
         }
         fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -8662,13 +8729,7 @@ mod tests {
         let guard = op.tiling().universal_guard();
         let mut cx = SubscribeContext::new();
         let _producer = op.subscribe(guard, Box::new(|| {}), &mut cx);
-        consume_input(
-            &fan,
-            0,
-            TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(Value::UInt(
-                1,
-            )))),
-        );
+        step_induction(&fan, 0..2);
         let both = |g: &TileGuard| (0..2).all(|p| g.covers_path(&[Value::UInt(p)]));
         assert!(
             released.borrow().iter().any(both),
@@ -8790,7 +8851,7 @@ mod tests {
         }
 
         impl_producer_base!();
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             let in_tile = self.input.get(self.input.tiling().universal_guard());
             let Tile::DataFunction {
                 domain,
@@ -10224,7 +10285,7 @@ mod tests {
     fn store_reads_do_not_advance_execution(#[case] source: &str) {
         let mut fixture = DispatchedStore::new(source);
         let mut reader = fixture.slot();
-        let mut reader = reader.subscribe(
+        let reader = reader.subscribe(
             reader.tiling().universal_guard(),
             Box::new(|| {}),
             &mut SubscribeContext::new(),
@@ -10402,7 +10463,7 @@ mod tests {
         fn base_mut(&mut self) -> &mut ProducerBase {
             &mut self.base
         }
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             let store = self
                 .store_producer
                 .get(self.store_producer.tiling().universal_guard());
@@ -10619,7 +10680,7 @@ mod tests {
         fn base_mut(&mut self) -> &mut ProducerBase {
             &mut self.base
         }
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             honoring_release(&self.tile, self.obsolete_guard())
         }
         fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
@@ -10788,7 +10849,7 @@ mod tests {
             crate::interpreter::tile_operators::ExtractFinal::new(Box::new(stream), default);
         let g = extract.tiling().universal_guard();
         let mut p = extract.subscribe(g, Box::new(|| {}), &mut SubscribeContext::new());
-        let t = p.read_in_pipeline(p.tiling().universal_guard());
+        let t = consume_and_read(&mut p);
         let Tile::Scalar(cv) = &t else { panic!() };
         assert_eq!(cv.as_single(), Some(int(60)));
     }
@@ -10950,9 +11011,10 @@ mod tests {
         }
     }
 
-    /// A settled read reclaims the history below the store's frontier on every pull.
+    /// A settled read reclaims the history below the frontier of the store it read, on the
+    /// release its consumer delivers after the read.
     ///
-    /// It reads the key's value as the store *stands*, so it needs the latest write and
+    /// It reads the key's value as the store stands, so it needs the latest write and
     /// nothing before it. The store's release watermark is the `FanOut` intersection over
     /// its readers, so a reader that holds its slot until it retires keeps every version
     /// of every key for the length of the run — measured at 180 retained entries over a
@@ -10978,13 +11040,18 @@ mod tests {
         );
         let g = read.tiling().universal_guard();
         let mut producer = read.subscribe(g, Box::new(|| {}), &mut cx);
-        let _ = producer.read_in_pipeline(producer.tiling().universal_guard());
+        let read = producer.read_in_pipeline(producer.tiling().universal_guard());
+        assert!(
+            recorder.borrow().is_empty(),
+            "the read holds the history until its consumer releases"
+        );
+        producer.release(read.to_guard());
         assert_eq!(
             recorder.borrow().as_slice(),
             [TileGuard::Function(FunctionGuard::Domain(
                 Predicate::at_or_below(Value::UInt(2))
             ))],
-            "the read releases through the frontier it folded at"
+            "the release after the read releases through the frontier the read folded at"
         );
     }
 
@@ -11024,7 +11091,7 @@ mod tests {
         fn base_mut(&mut self) -> &mut ProducerBase {
             &mut self.base
         }
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             self.tile.clone()
         }
         fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -11439,36 +11506,35 @@ mod tests {
         };
         let mut lagging = subscribe(&mut cx);
         let mut leading = subscribe(&mut cx);
-        let guard = lagging.tiling().universal_guard();
 
         // Both readers pull each lap, in the order under test, until the one pulled
         // second closes the cycle.
         fan.run();
-        let mut closing = leading.read_in_pipeline(guard.clone());
+        let mut closing = consume_and_read(&mut leading);
         for _ in 0..MAX_CYCLE_PULLS {
             if closing.is_terminal() {
                 break;
             }
 
             if laggard_first {
-                let _ = lagging.read_in_pipeline(guard.clone());
-                closing = leading.read_in_pipeline(guard.clone());
+                let _ = consume_and_read(&mut lagging);
+                closing = consume_and_read(&mut leading);
             } else {
-                closing = leading.read_in_pipeline(guard.clone());
-                let _ = lagging.read_in_pipeline(guard.clone());
+                closing = consume_and_read(&mut leading);
+                let _ = consume_and_read(&mut lagging);
             }
         }
         assert!(closing.is_terminal(), "the closing reader converged");
 
         // The sibling now gets only what the runtime would deliver — no further pull of
         // the other reader to drive the cycle on its behalf.
-        let mut lagged = lagging.read_in_pipeline(guard.clone());
+        let mut lagged = consume_and_read(&mut lagging);
         for _ in 0..MAX_CYCLE_PULLS {
             if lagged.is_terminal() {
                 break;
             }
 
-            lagged = lagging.read_in_pipeline(guard.clone());
+            lagged = consume_and_read(&mut lagging);
         }
         assert_eq!(
             dense_values(&lagged),
@@ -11511,7 +11577,9 @@ mod tests {
         let guard = memo.tiling().universal_guard();
         let mut cx = SubscribeContext::new();
         let mut producer = memo.subscribe(guard, Box::new(|| {}), &mut cx);
-        let tile = snapshot_after_run(&mut fan, &mut producer);
+        fan.run();
+        let tile = consume_and_read(&mut producer);
+        assert!(tile.is_terminal(), "the dispatched fixture finishes");
         let Tile::DataFunction { codomain, .. } = &tile else {
             panic!("dense read is a Function");
         };
@@ -11564,7 +11632,7 @@ mod tests {
         fn base_mut(&mut self) -> &mut ProducerBase {
             &mut self.base
         }
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             honoring_release(&self.tile.borrow(), self.obsolete_guard())
         }
         fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
@@ -11809,7 +11877,7 @@ mod tests {
                 .map(|(p, _)| p.to_vec())
                 .collect()
         };
-        let first = producer.read_in_pipeline(producer.tiling().universal_guard());
+        let first = consume_nested_drive_and_read(&mut producer);
         assert_eq!(emitted(&first), vec![vec![Value::UInt(0), Value::UInt(0)]]);
         // The store decides (0, 0).
         engines
@@ -11819,7 +11887,7 @@ mod tests {
             .step(pos(0), Some(HashMap::from([(acc.clone(), int(1))])));
         *store.borrow_mut() = render(&engines);
 
-        let second = producer.read_in_pipeline(producer.tiling().universal_guard());
+        let second = consume_nested_drive_and_read(&mut producer);
         let paths = emitted(&second);
         assert!(
             !paths.contains(&vec![Value::UInt(1), Value::UInt(0)]),
@@ -11926,7 +11994,7 @@ mod tests {
         let g = driver.tiling().universal_guard();
         let mut cx = SubscribeContext::new();
         let mut producer = driver.subscribe(g, Box::new(|| {}), &mut cx);
-        let first = producer.read_in_pipeline(producer.tiling().universal_guard());
+        let first = consume_nested_drive_and_read(&mut producer);
         assert!(
             decided_paths(&first).is_empty(),
             "the drive ran a position whose reseed is part of a collection: {first:?}"
@@ -11972,7 +12040,7 @@ mod tests {
         fn base_mut(&mut self) -> &mut ProducerBase {
             &mut self.base
         }
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             *self.gets.borrow_mut() += 1;
             if self.obsolete_guard().is_universal() {
                 return self.tiling().empty_tile();
@@ -12032,15 +12100,8 @@ mod tests {
         let mut op = fan.slot();
         let guard = op.tiling().universal_guard();
         let mut cx = SubscribeContext::new();
-        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut cx);
-        let cell = fan.store().expect("the store is subscribed");
-        let whole = cell
-            .borrow_mut()
-            .as_breaking_mut()
-            .unwrap()
-            .input_tiling(InputId::ONLY)
-            .universal_guard();
-        consume_input(&fan, 0, whole);
+        let producer = op.subscribe(guard, Box::new(|| {}), &mut cx);
+        step_induction(&fan, 0..items.len() as u64);
         let gets_at_open = *gets.borrow();
         for _ in 0..4 {
             assert!(

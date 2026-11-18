@@ -1,7 +1,11 @@
 #[cfg(test)]
 use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use bit_set::BitSet;
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 use super::*;
 use crate::interpreter::operator_graph::value;
@@ -214,8 +218,7 @@ fn withhold_unanswered(
             .checked_sub(1)
             .unwrap_or_else(|| unreachable!("the input was matched as a collection")),
     );
-    let defined: std::collections::HashSet<Value> =
-        (0..defined.len()).map(|i| defined.index_at(i)).collect();
+    let defined: HashSet<Value> = (0..defined.len()).map(|i| defined.index_at(i)).collect();
     let unanswered: Vec<bool> = (0..arguments.len())
         .map(|i| !answered.contains(&arguments.index_at(i)))
         .collect();
@@ -380,6 +383,7 @@ impl TileOperator for MapResult {
             false => subscribe_forwarding(&mut *self.input, &shared, cx),
         };
         Box::new(MapResultProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::new(MapResultProducer::alloc_id(), self.tiling(), &self.base, cx),
             input: input_producer,
             function: function_producer,
@@ -407,6 +411,7 @@ impl TileOperator for MapResult {
 }
 
 struct MapResultProducer {
+    dropped_rows: DroppedRows,
     base: ProducerBase,
     input: Box<dyn TileProducer>,
     function: Box<dyn TileProducer>,
@@ -474,7 +479,7 @@ impl MapResultProducer {
     }
 
     /// The function applied at every argument the input holds, for the keys `projection` names.
-    fn apply(&mut self, projection: &Projection) -> Tile {
+    fn apply(&self, projection: &Projection) -> Tile {
         let f_tiling = self.function.tiling().clone();
         assert!(
             f_tiling.has_domain(),
@@ -498,11 +503,11 @@ impl MapResultProducer {
         // yields a domain and codomain of different lengths, which is not a valid
         // tile. `Restrict` upstream produces the same shape. Mapping a filtered row
         // could evaluate the partial expression the filter guards, so the rows are
-        // dropped rather than carried; no consumer sees them, so this releases them.
+        // dropped rather than carried; retain their guard for native release handling.
         let dropped = input_tile.deleted_keys_guard();
         input_tile.compact();
         if let Some(dropped) = dropped {
-            self.input.release(dropped);
+            self.dropped_rows.remember(dropped);
         }
         // The function's deleted keys are keys it does not hold: `Restrict` marks the keys its
         // predicate rejects deleted rather than dropping them, and an argument at one of them
@@ -843,7 +848,7 @@ impl TileProducer for MapResultProducer {
         }
     }
 
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -862,6 +867,7 @@ impl TileProducer for MapResultProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        self.dropped_rows.release_to(&mut *self.input);
         // A guard is shaped by the tiling it is handed to, so the input's is built
         // from the input's tiling — never from the function's, whose tiling is
         // unrelated (a function tiling, against the input's stream).
@@ -1033,6 +1039,7 @@ impl TileOperator for MapResultToConst {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), input_consumer, cx);
         Box::new(MapResultToConstProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::new(
                 MapResultToConstProducer::alloc_id(),
                 self.tiling(),
@@ -1048,6 +1055,7 @@ impl TileOperator for MapResultToConst {
 }
 
 struct MapResultToConstProducer {
+    dropped_rows: DroppedRows,
     base: ProducerBase,
     input: Box<dyn TileProducer>,
     constant: Box<dyn TileProducer>,
@@ -1150,7 +1158,7 @@ impl TileProducer for MapResultToConstProducer {
     /// takes the input's place, and the projection names that collection's keys
     /// (`an_outermost_constant_answers_only_the_requested_keys`). The constant is read whole:
     /// every row reads all of it.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -1167,6 +1175,7 @@ impl TileProducer for MapResultToConstProducer {
     /// every pull, and a row the input gave back could not be rebuilt for what of it is still
     /// held here.
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        self.dropped_rows.release_to(&mut *self.input);
         let upstream = crate::interpreter::tiling::through_shared_levels(
             obsolete_guard,
             self.level.index(),
@@ -1185,7 +1194,7 @@ impl TileProducer for MapResultToConstProducer {
 
 impl MapResultToConstProducer {
     /// The output for the keys `projection` names.
-    fn apply(&mut self, projection: &Projection) -> Tile {
+    fn apply(&self, projection: &Projection) -> Tile {
         let c_tiling = self.constant.tiling();
         assert!(
             !matches!(c_tiling, Tiling::Aggregation { .. } | Tiling::Store { .. }),
@@ -1211,9 +1220,9 @@ impl MapResultToConstProducer {
         // iterated); this brings the scalar form in line.
         if input_tile.is_data_function() && input_tile.is_empty() {
             // The empty tile below drops the input's deleted rows, which no consumer then
-            // sees, so this releases them.
+            // sees, so retain their guard for native release handling.
             if let Some(dropped) = input_tile.deleted_keys_guard() {
-                self.input.release(dropped);
+                self.dropped_rows.remember(dropped);
             }
 
             return self.empty_beneath_live_rows(&input_tile);
@@ -1408,7 +1417,9 @@ struct MapResultWithSourceProducer {
     /// What the input last read holds, where it holds a level beneath its keys: a release
     /// naming paths beneath particular keys is read against it
     /// ([`Self::released_beneath_every_key`]).
-    last_nested_input: Option<HeldBeneathKeys>,
+    // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`;
+    // no other operator holds it.
+    nested_input: RefCell<Option<HeldBeneathKeys>>,
 }
 
 /// The parts of a two-level input a release beneath particular keys is read against, kept
@@ -1420,10 +1431,13 @@ struct HeldBeneathKeys {
     inner_stated: Predicate,
     /// Which inner paths are complete, from any level on the path ([`Tile::completion_at`]).
     complete: Predicate,
-    /// The outermost keys, each as its one-component path.
-    outer_keys: Vec<Vec<Value>>,
-    /// The path of every inner key.
-    inner_paths: Vec<Vec<Value>>,
+    /// Outer rows still requiring occurrence-completeness checks, as one-component paths.
+    outer_keys: HashSet<Vec<Value>>,
+    /// Unreleased paths through source keys, retained across overlapping or disjoint reads.
+    inner_paths: HashSet<Vec<Value>>,
+    /// Keys remain candidates after their current paths are released, until completeness proves
+    /// that no future occurrence can need their source values.
+    inner_keys: HashSet<Value>,
 }
 
 impl HeldBeneathKeys {
@@ -1444,13 +1458,66 @@ impl HeldBeneathKeys {
         else {
             return None;
         };
+        let inner_paths: HashSet<Vec<Value>> =
+            input.paths_at(CurryLevel::new(1)).into_iter().collect();
+        let inner_keys = inner_paths
+            .iter()
+            .map(|path| path.last().unwrap().clone())
+            .collect();
         Some(HeldBeneathKeys {
             outer_stated: outer_stated.clone(),
             inner_stated: inner_stated.clone(),
             complete: input.completion_at(CurryLevel::new(1)),
-            outer_keys: input.paths_at(CurryLevel::OUTERMOST),
-            inner_paths: input.paths_at(CurryLevel::new(1)),
+            outer_keys: input.paths_at(CurryLevel::OUTERMOST).into_iter().collect(),
+            inner_paths,
+            inner_keys,
         })
+    }
+    fn merge(&mut self, other: Self) {
+        self.outer_stated = self.outer_stated.union(&other.outer_stated);
+        self.inner_stated = self.inner_stated.union(&other.inner_stated);
+        self.complete = self.complete.union(&other.complete);
+        self.outer_keys.extend(other.outer_keys);
+        self.inner_paths.extend(other.inner_paths);
+        self.inner_keys.extend(other.inner_keys);
+    }
+
+    fn releasable(&self, released: &TileGuard) -> Predicate {
+        let everywhere_complete = self.inner_stated.unqualified_arms();
+        self.inner_keys
+            .iter()
+            .filter(|key| {
+                let all_released = self
+                    .inner_paths
+                    .iter()
+                    .filter(|path| path.last() == Some(*key))
+                    .all(|path| released.covers_path(path));
+                all_released
+                    && (everywhere_complete.contains(key)
+                        || (self.outer_stated.is_true()
+                            && self.outer_keys.iter().all(|outer| {
+                                released.covers_path(outer)
+                                    || self
+                                        .complete
+                                        .contains_path(&[outer[0].clone(), (*key).clone()])
+                            })))
+            })
+            .fold(Predicate::False, |all, key| {
+                all.union(&Predicate::point(key.clone()))
+            })
+    }
+
+    fn reclaim(&mut self, released: &TileGuard, freed: &Predicate) {
+        self.inner_paths
+            .retain(|path| !released.covers_path(path) && !freed.contains(path.last().unwrap()));
+        let complete = &self.outer_stated;
+        let pending = &self.inner_paths;
+        self.outer_keys.retain(|path| {
+            !released.covers_path(path)
+                && (!complete.contains_path(path)
+                    || pending.iter().any(|inner| inner.starts_with(path)))
+        });
+        self.inner_keys.retain(|key| !freed.contains(key));
     }
 }
 
@@ -1468,7 +1535,7 @@ impl MapResultWithSourceProducer {
             source,
             fields,
             result_correlation,
-            last_nested_input: None,
+            nested_input: RefCell::new(None),
         };
         // Register this producer with the source by calling release with a false predicate.
         // This way the source knows about all producers that read it before execution starts.
@@ -1494,43 +1561,14 @@ impl MapResultWithSourceProducer {
     /// level ([`Tile::completion_at`]).
     fn released_beneath_every_key(&self, pred: &Predicate) -> Predicate {
         let everywhere = pred.unqualified_arms();
-        if !pred.qualifies() {
-            return everywhere;
-        }
-        let Some(HeldBeneathKeys {
-            outer_stated,
-            inner_stated,
-            complete,
-            outer_keys,
-            inner_paths,
-        }) = &self.last_nested_input
-        else {
-            // Nothing pulled yet, so nothing is held beneath a key for a qualified arm to name.
+        let mut held = self.nested_input.borrow_mut();
+        let Some(held) = &mut *held else {
             return everywhere;
         };
-        let complete_under_every_key = inner_stated.unqualified_arms();
         let released = &self.base.obsolete_guard;
-        let mut all_released: Vec<(Value, bool)> = Vec::new();
-        for path in inner_paths {
-            let key = path[path.len() - 1].clone();
-            let covered = released.covers_path(path);
-            match all_released.iter_mut().find(|(k, _)| *k == key) {
-                Some((_, all)) => *all &= covered,
-                None => all_released.push((key, covered)),
-            }
-        }
-        all_released
-            .into_iter()
-            .filter(|(key, all)| {
-                *all && (complete_under_every_key.contains(key)
-                    || (outer_stated.is_true()
-                        && outer_keys
-                            .iter()
-                            .all(|outer| complete.contains_path(&[outer[0].clone(), key.clone()]))))
-            })
-            .fold(everywhere, |all, (key, _)| {
-                all.union(&Predicate::point(key))
-            })
+        let freed = everywhere.union(&held.releasable(released));
+        held.reclaim(released, &freed);
+        freed
     }
 }
 
@@ -1616,14 +1654,25 @@ impl TileProducer for MapResultWithSourceProducer {
 
     /// The source is read at the keys the input answers, and the input is pulled at the
     /// projection, so a morsel reads only its own rows from the source.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
         let input_tile = self.input.get(projection.guard(self.input.tiling()));
-        if self.input.tiling().levels() > 1 {
-            self.last_nested_input = HeldBeneathKeys::of(&input_tile);
+        if matches!(
+            self.result_correlation.as_deref(),
+            Some([TilePathStep::Codomain, ..])
+        ) && let Some(next) = HeldBeneathKeys::of(&input_tile)
+        {
+            let mut held = self.nested_input.borrow_mut();
+            match &mut *held {
+                Some(held) => held.merge(next),
+                None => *held = Some(next),
+            }
+            held.as_mut()
+                .unwrap()
+                .reclaim(self.obsolete_guard(), &Predicate::False);
         }
         let source = self.source.borrow();
         let fields = &self.fields;
@@ -1827,6 +1876,7 @@ mod tests {
             in_tiling.clone(),
         );
         let producer = MapResultProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), &in_tiling),
             input: Box::new(input),
             function: Box::new(fn_spy),
@@ -1920,6 +1970,7 @@ mod tests {
         );
 
         let mut map_result = MapResultProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), &output_tiling),
             input: Box::new(input_producer),
             function: Box::new(function_producer),
@@ -2044,6 +2095,7 @@ mod tests {
             ),
         );
         let mut map_result = MapResultProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), &output_tiling),
             input: Box::new(TestTileProducer::new(one_level_fn_tile, input_tiling)),
             function: Box::new(TestTileProducer::new(two_level_fn_tile, function_tiling)),
@@ -2117,6 +2169,7 @@ mod tests {
             ),
         );
         let mut map_result = MapResultProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), &output_tiling),
             input: Box::new(TestTileProducer::new(one_level_fn_tile, input_tiling)),
             function: Box::new(ProjectionSpy::new(two_level_fn_tile, function_tiling).0),
@@ -2187,6 +2240,7 @@ mod tests {
         };
         let (input, next) = ScriptedProducer::new(input_at(vec![0], 0), in_tiling);
         let mut producer = MapResultProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), &out_tiling),
             input: Box::new(input),
             function: Box::new(ProjectionSpy::new(f, fn_tiling).0),
@@ -2271,6 +2325,7 @@ mod tests {
         };
         let (function, next) = ScriptedProducer::new(f_at(vec![5]), fn_tiling);
         let mut producer = MapResultProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), &out_tiling),
             input: Box::new(TestTileProducer::new(input, in_tiling)),
             function: Box::new(function),
@@ -2333,12 +2388,13 @@ mod tests {
         );
         // Group 0 is answered, and group 1 is held but not answered.
         let function = two_groups(&[0]);
-        let mut producer = MapResultProducer {
+        let producer = MapResultProducer {
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), &out_tiling),
             input: Box::new(TestTileProducer::new(input, in_tiling)),
             function: Box::new(TestTileProducer::new(function, fn_tiling)),
             values_are_keys: false,
             level: CurryLevel::new(2),
+            dropped_rows: Default::default(),
         };
         let out = producer.get(producer.tiling().universal_guard());
         let paths = out.row_paths_at(3);
@@ -2420,7 +2476,7 @@ mod tests {
             Predicate::True,
             BitSet::new(),
         );
-        let mut producer = MapResultProducer {
+        let producer = MapResultProducer {
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), &out_tiling),
             input: Box::new(TestTileProducer::new(input, in_tiling)),
             function: Box::new(
@@ -2428,6 +2484,7 @@ mod tests {
             ),
             values_are_keys: false,
             level: CurryLevel::new(2),
+            dropped_rows: Default::default(),
         };
         let out = producer.get(producer.tiling().universal_guard());
         assert!(
@@ -2468,6 +2525,7 @@ mod tests {
             &Tiling::data_function(uint(), Tiling::Scalar(int()))
         );
         let mut producer = MapResultToConstProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(MapResultToConstProducer::alloc_id(), operator.tiling()),
             input: Box::new(TestTileProducer::new(groups, in_tiling)),
             constant: Box::new(TestTileProducer::new(
@@ -2522,6 +2580,7 @@ mod tests {
         let fn_tiling = operator.function.tiling().clone();
         let fn_tile = Tile::Scalar(ColumnValue::single(Value::Function(Vec::new())));
         let mut producer = MapResultProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), operator.tiling()),
             input: Box::new(TestTileProducer::new(
                 in_tiling.empty_at_no_rows(),
@@ -2565,6 +2624,7 @@ mod tests {
         // Pull 1: only the filtered key, so the constant is not pulled.
         let (input, next) = ScriptedProducer::new(input_at(vec![0], vec![1], 0), in_tiling);
         let mut producer = MapResultToConstProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(MapResultToConstProducer::alloc_id(), &out_tiling),
             input: Box::new(input),
             constant: Box::new(TestTileProducer::new(
@@ -2943,6 +3003,7 @@ mod projection_tests {
             ProjectionSpy::new(function.0, function.1);
         (
             MapResultProducer {
+                dropped_rows: Default::default(),
                 base: ProducerBase::unowned(MapResultProducer::alloc_id(), &out),
                 input: Box::new(input),
                 function: Box::new(function),
@@ -3096,7 +3157,7 @@ mod projection_tests {
 
     #[test]
     fn nothing_pulls_nothing() {
-        let (mut map, logs) = lookup_over_positions();
+        let (map, logs) = lookup_over_positions();
         let nothing = map.tiling().empty_guard();
         assert_eq!(map.get(nothing), map.tiling().empty_tile());
         assert!(logs.input_pulled.borrow().is_empty());
@@ -3195,7 +3256,7 @@ mod projection_tests {
 
     #[test]
     fn a_projection_of_groups_reads_only_their_members_from_the_table() {
-        let (mut map, logs) = lookup_over_groups();
+        let (map, logs) = lookup_over_groups();
         let answer = map.get(groups_one_and_three());
         let Tile::DataFunction { domain, .. } = &answer else {
             panic!("a collection")
@@ -3274,6 +3335,7 @@ mod const_projection_tests {
         };
         (
             MapResultToConstProducer {
+                dropped_rows: Default::default(),
                 base: ProducerBase::unowned(MapResultToConstProducer::alloc_id(), &out),
                 input: Box::new(input),
                 constant: Box::new(constant),
@@ -3323,7 +3385,7 @@ mod const_projection_tests {
 
     #[test]
     fn nothing_pulls_nothing() {
-        let (mut map, input_pulled, constant_pulled) =
+        let (map, input_pulled, constant_pulled) =
             broadcast(MapResultToConstMode::Replace, seven(true));
         let nothing = map.tiling().empty_guard();
         assert_eq!(map.get(nothing), map.tiling().empty_tile());
@@ -3380,7 +3442,7 @@ mod source_projection_tests {
                 source,
                 fields: Vec::new(),
                 result_correlation: None,
-                last_nested_input: None,
+                nested_input: RefCell::new(None),
             },
             pulled,
         )
@@ -3403,7 +3465,7 @@ mod source_projection_tests {
 
     #[test]
     fn nothing_reads_nothing() {
-        let (mut read, pulled) = read_source();
+        let (read, pulled) = read_source();
         let nothing = read.tiling().empty_guard();
         assert_eq!(read.get(nothing), read.tiling().empty_tile());
         assert!(pulled.borrow().is_empty());

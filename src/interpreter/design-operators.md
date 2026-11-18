@@ -750,10 +750,7 @@ its input's keys so, since each stands beneath one value ([Converse](#converse))
 held keys form a prefix still take that path: a last key whose group holds nothing, an earlier key
 whose own group's statement calls every key complete, and a statement about the keys beneath an
 enclosing key the tile does not hold. The guard names all three exactly, the third by path. A memo
-answers a region its input has not notified since it read it from its cache, in every build. A debug
-build also probes the input once per read (`MemoProducer::probe`): outside the dirty region the
-input answers what the cache holds, and the probe's pull runs the release-contract assertion at the
-input, so a released input that answers again fails there.
+answers every pull from its cache and reads its input only in `consume_impl` ([Memo](#memo)).
 
 ### What a producer holds
 
@@ -867,12 +864,9 @@ pulls.
 | `MapAggregate`, `MapExtractAggregate` | the input | keeps | The groups keep the input's outermost keys. |
 | Stores, recurrences and the commit operators (`commit_operator.rs`) | every input | widens | A recurrence re-keys its inputs by its own positions. |
 
-`Memo` and its input consumer share one dirty region containing unread keys and keys announced
-since the last read. The consumer adds notifications directly. A read removes its projection before
-calling the input, so notifications raised during that call remain dirty for the next read.
-Within a scheduled pipeline it reads the query when that query overlaps the dirty region, then
-answers from its cached tile. A placed memo is advanced by its own pipeline's consumes. Notifications
-perform no reads and no sink effects.
+A `Memo` reads its input only in `consume_impl`, at the guard its pipeline consumes, and every
+pull answers from its cached tile. Its input's notifications reach its pipeline's entry, which
+queues the consume. Notifications perform no reads and no sink effects.
 
 `RekeySorted` consumes committed pairs before publishing the request keys they contain. Commit
 ticks and request positions are different domains. It accumulates consumed tick regions and
@@ -934,11 +928,10 @@ its level ([The dispatcher](design-dispatcher.md#the-dispatcher)).
 
 ### Memo
 
-A placed memo answers from its cache. `consume_impl` reads its input at the package's guard,
+A memo answers every pull from its cache. `consume_impl` reads its input at the package's guard,
 merges the answer, and releases the region the answer states complete. A consume entirely within
 an already released region reads nothing. The dispatcher publishes the cached region after each
-consume. An unplaced memo inside another pipeline reads only dirty regions; notifications and
-`read_again` mark those regions dirty. There is no notification gate or deferred wakeup queue.
+consume. There is no notification gate or deferred wakeup queue.
 
 ### Aggregate
 
@@ -995,7 +988,7 @@ hold.
 
 A release of a `Converse` names its output region exactly. Upstream it is forwarded in two parts:
 the input rows the region covers among those it holds, at once, and each later row of a released
-group on the read that first holds it (`ConverseProducer::release_late_rows`). An input guard names
+group on the next release after a read first holds it. An input guard names
 rows by key, and a group is the rows whose value is the group's key, so no input guard names a group
 before its rows are read. The two parts together release exactly the region named, as
 [Guard operations are exact](#guard-operations-are-exact) requires.
@@ -1038,12 +1031,12 @@ positions are the loop's, and a transaction store's input 𝑘, writer 𝑘's so
 its items. `consume_impl` steps the store until the input has released the morsel. Before each step
 the store has the operators inside its cycle read again (`read_cycle_again`, `commit_operator.rs`):
 every producer in its chain on a path to a recurrence slot of its fan-out reads that input again at
-its next pull (`TileProducer::read_again`, through `read_again_toward`). A `Memo` there reads every
-region again, as after a notification of `Everything`, and a drive reads its source again where that
-input is on such a path. Reads through the recurrence answer the published snapshot. After the step the store publishes its
-snapshot (`Cycle::publish`). A store is queued a morsel only for positions its input can release, so
-a step that changes neither the store nor its input's release panics, and so does a store not
-terminal at its finish. A transaction's deny validates its read set and commits an empty write set.
+its next pull (`TileProducer::read_again`, through `read_again_toward`). A drive reads its source
+again where that input is on such a path. Reads through the recurrence answer the published
+snapshot. After the step the store publishes its snapshot (`Cycle::publish`). A store is queued a
+morsel only for positions its input can release, so a step that changes neither the store nor its
+input's release panics, and so does a store not terminal at its finish. A transaction's deny
+validates its read set and commits an empty write set.
 
 An induction store with no rows above it holds the positions it has run and decided, its decided
 region (`Tile::to_guard`), and everything once it is terminal, so its loop's scope pushes them at
@@ -1278,7 +1271,7 @@ derived from the edges on both sides of the wire rather than serialized separate
 | `MapAggregate` | Collection chain of at least two levels | Enclosing levels ending in `Aggregation` | Folds the innermost collection, preserving the levels above it. |
 | `MapExtractAggregate` | Collection chain ending in `Aggregation` | Enclosing levels ending in the accumulator tiling | Extracts terminal results and removes innermost keys whose aggregates are not terminal. |
 | `FanOut` | `*` | Same as input | Allows multiple operators to consume the output of the same operator. Each consumer subscribes via a `FanOut::slot()` handle; the fan-out forwards `get` requests and tracks the intersection of release guards across slots. Constructed via either `FanOut::new` (no cyclic-mode overhead — the common case) or `FanOut::new_cyclic` (for fan-outs whose slots feed back into their own input, e.g. a commit/induction store whose writer reads the store back before proposing, or a mutation-loop body whose other slot is wired to the cyclic prev-accumulator stream). Cyclic mode adds a per-pull tile-cache and a subscribe-in-progress flag so re-entrant subscribes / pulls skip redundant inner work and serve from the cached snapshot instead of re-entering the inner producer. |
-| `Memo` | `*` | Same as input | Caches input tiles and releases the regions consumed. A placed memo answers its cache; an unplaced memo reads regions marked dirty by notifications or `read_again`. See [Memo](#memo). |
+| `Memo` | `*` | Same as input | Caches input tiles and releases the regions consumed. Every pull answers its cache. See [Memo](#memo). |
 | `ExtractFinal` | Collection source and optional default | Source codomain | Extracts the last live position's value after source completion; see [Final-value extraction](#final-value-extraction). |
 | `UnionOperator` | N inputs of `DataFunction(dᵢ → 𝑇ᵢ)` tilings | `DataFunction(Union(d₀,…,dₙ₋₁) → Scalar(C'))`, or `DataFunction(Union(d₀,…,dₙ₋₁) → DataFunction(𝐵 → 𝑇))` for jagged rows | Merges N function operators into one. The domain is the discriminated union of the arms' domains, each arm under its operand's tag (`new_tagged`): a position for `++`, a site's tag for a channel ([sites.md](../ccl/design/sites.md#channel-tags)). The codomain is one the caller declares. The domain keeps the arms apart, and `final_or_default` dispatches on the arm a row came from. The codomain is the arms' join, because the arms are alternative values at one row. A union node is typed `D ⤇ V`, with `V` the join inference computed in the full type lattice, and op-conversion reads `V` off the node and passes its extent in. The operator does not join the operand tilings: `Extent`'s lattice has variant and range rules but no record rule, so it would join two arms at different record widths to an anonymous positional sum where the type is `{a: Int}`, a shape no row holds. Arms that agree on a tiling keep it, because a `Tiling` carries a layout (struct-of-arrays for a record) that an `Extent` cannot express. Arms whose codomains are collections over different domains, the rows of a jagged collection, merge at the bound `𝐵` the declared codomain gives their domains, beneath which they share the tiling `𝑇`, as a list literal of boxed rows has it (`OpConversionContext::witness_domain_extent`). Arms whose rows agree on a domain the declared codomain bounds by something else merge there too: which keys a row has is its value's, so a type stating rows of a sum states the bound. Other arms whose codomain tilings differ must each fit in one column (`Tiling::is_scalar`: a `Scalar`, or a `Record` of such at any depth), and each is rebuilt as one column, keeping its own record fields, before the arms merge. A flat union (`new_flat`) collapses the arms' domain to the one they share whatever each row holds, a collection included. A realized conditional's legs are over different domains and disjoint only by their gates, so they flat-merge under the domain bound the sum's type declares (`new_flat_over`), which must include every leg's domain. A flat union keeps no record of which arm delivered a key, so its arms are disjoint by how they were built: first-match gates, one per conditional for a realized product, distinct tags of one scrutinee, or a tag the scrutinee's closed type does not carry. A debug build checks the legs' shapes at operator conversion (`ccl_utils::disjoint_join_gap`), and simplification keeps a `zip` half that narrows its keys, by `filter_values` or `variant_project`, although the arm reads nothing of it (`simplify::is_product_beta_window`). Release is per arm: an incoming `Predicate::Union` guard splits into per-variant predicates, so one arm can be released in full while its siblings still produce. |
 | `VariantWrap` | Payload: `Scalar(Pₜ)` or `DataFunction(D → Scalar(Pₜ))` | `Scalar(Union(P₀,…,Pₙ))` or `DataFunction(D → Scalar(Union))` | **Sum introduction — dual of `VariantProject`.** Wraps the payload under tag `tag`, so that arm holds the payload and every other arm is empty. Arms are keyed by [`FieldKey`], not by position: a tag's *position* is not stable under width subtyping (``{`b} <: {`a | `b}`` renumbers `b`), and an arm set is part of a union column's layout, so a position-keyed arm would need a renumbering coercion at every subsumption. A bare `Scalar` payload (a scalar `VariantCtor`) yields `Scalar(Union)`; a payload *stream* (a `VariantCtor` inside a lambda, `Builtin::VariantWrap(tag)`) is wrapped element-wise **preserving the domain** `D`, so the constructor composes as the RHS of a `≫`. Because the domain is preserved, a domain release forwards to the payload verbatim. A payload that is a collection is one value, held materialized in its arm's cell: an applied `VariantCtor` wraps its whole payload, and a composed one each row's. A cell cannot grow, so a row's cell is emitted once that row's collection is complete. |
@@ -1825,7 +1818,7 @@ time. A nested `Converse` passes a guard naming standing keys to its input as th
 naming part of one row's inversion names input rows through their values, so the `Converse` records
 each input row it read with the output path `[𝑠…, value, key]` it stands at and its input path
 `[𝑠…, key]`, and releases the input rows whose output path the guard covers. A row read after its
-group was released is released on the read that holds it (`ConverseProducer::release_late_rows`).
+group was released is retained until the next release reclaims it.
 
 [`CheckedLookup`] gains a second reading from this, as a consumer now meeting a per-row
 stream: it answers a group of keys per row, keeping the grouping — one answer per key, where
@@ -2160,16 +2153,18 @@ The compiler subscribes a flat store's final reads through `FanOut::current_slot
 these slots release history through the current frontier. The release meet still includes every
 historical reader, and the store preserves the carry values needed to read its current state.
 A final read therefore retains its eventual value without pinning every preceding change while
-its source stays open.
+its source stays open. The slot's answer leaves out the history it released this way, which its
+reader never released, so the slot's `TileProducer::withheld_guard` names it, and the release and
+completeness checks in `TileProducer::get` exempt it.
 
 An induction store reclaims its changelog as it runs, at any depth. Each reader releases what its
 consumer has taken; the drive releases through the frontier; the `FanOut` in front of the store
 meets the branches; and `InductionStoreProducer::release_impl` hands the meet to
 `CommitEngine::gc_released_prefix`, one store at a time. The meet cannot advance past a branch that
 has released nothing, so a reader holding its branch until it retires holds every version of every
-key for the length of the run. The flat trailing read therefore releases as it goes:
-`StoreFinalRead` releases through the frontier on every pull, and `ExtractFinal` over a stream
-releases below the highest position it has seen.
+key for the length of the run. The flat trailing read therefore holds no history: `StoreFinalRead`
+reads through a current slot, records the frontier at each pull and releases it when its consumer
+releases, and `ExtractFinal` over a stream releases below the highest position it has seen.
 
 Measured over a 90-position flat loop: 4 retained changelog entries with the reads releasing, and
 180 without. Over `for y in [1, 2]: total += x * y` nested in 5, 10 or 20 enclosing positions,
@@ -2260,3 +2255,23 @@ transitive indices (t1→t3 directly) vs. recompute on demand.
 ### Cycles
 None of the above algorithms guarantee termination in the presence of cycles in the dataflow
 graph. Detecting convergence (rather than truncating iteration) is an open problem.
+
+
+## Immutable producer reads
+
+Every producer implements `get_impl(&self, guard)` and exposes `get(&self, guard)`.
+Operators read their existing inputs directly. Stateful breakers maintain their output during
+consumption; reads observe that snapshot. A read does not step a loop, construct a transaction
+attempt, fold aggregate contributions, or refresh a Cartesian source domain. Cartesian source
+consumers ingest arrivals through the dispatcher's range-completion notifications.
+
+The immutable `get` wrapper validates tiling, projections, releases and completeness, and records
+probe observations. Validation history and read bookkeeping use interior mutability on each
+canonical producer; there is no separate read context or mutable post-read traversal.
+
+Dropped input-row guards, Converse correlations, zip presence and nested source-key correlations
+remain on their canonical operators. Reads record newly discovered rows without releasing inputs.
+Consumption and native release callbacks reclaim retained state. Repeated and empty release
+deliveries also run native reclamation, because a later read can discover additional rows belonging
+to a region already released. Fan-out intersections suppress unchanged upstream releases at shared
+and cyclic boundaries.
