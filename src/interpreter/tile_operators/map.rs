@@ -319,66 +319,69 @@ impl TileOperator for MapResult {
                 self.function.tiling()
             );
         }
-        // A row of a lookup at its own key exists once the input has delivered the row and the
-        // operand the key, so each operand's delivery is passed on under the rows the other has
-        // delivered (`notifications::aligned`): the input is arm 0 and the operand arm 1.
-        let lookup = looked_up_at_keys.map(|at| {
-            let delivered = crate::interpreter::notifications::nothing_aligned([
-                self.input.keys_arrive_by_push(),
-                self.function.keys_arrive_by_push(),
-            ]);
-            (at, delivered)
-        });
-        let function_producer = match &lookup {
-            Some((at, delivered)) => {
-                let at = *at;
-                self.function.clone().subscribe(
-                    self.function.tiling().universal_guard(),
-                    crate::interpreter::notifications::restating(
-                        Box::new(move |region| keys_looked_up(region, at)),
-                        crate::interpreter::notifications::aligned(
-                            1,
-                            at,
-                            delivered.clone(),
-                            forwarding_consumer_keeping_keys(&shared),
-                        ),
+        // A row of the result exists once the input has delivered it and the function operand
+        // has (`AlignedInputs`): the input is arm 0 and the function arm 1. In a lookup at its
+        // rows' own keys the operand's region names the rows whose key it holds; outside one the
+        // operand is read at every key, so a region of it names every row.
+        use crate::interpreter::notifications::{AlignedInputs, InputRows};
+        let aligned = AlignedInputs::new(
+            looked_up_at_keys.unwrap_or(CurryLevel::OUTERMOST),
+            [&self.input, &self.function],
+        );
+        let function_producer = self.function.clone().subscribe(
+            self.function.tiling().universal_guard(),
+            match looked_up_at_keys {
+                Some(at) => crate::interpreter::notifications::restating(
+                    Box::new(move |region| keys_looked_up(region, at)),
+                    aligned.consumer(
+                        1,
+                        InputRows::Keys,
+                        forwarding_consumer_keeping_keys(&shared),
                     ),
-                    cx,
-                )
-            }
-            None => subscribe_forwarding(&self.function, &shared, cx),
-        };
+                ),
+                None => aligned.consumer(
+                    1,
+                    InputRows::Whole,
+                    forwarding_consumer_keeping_keys(&shared),
+                ),
+            },
+            cx,
+        );
         // The result's outermost keys are the input's where the function applies to the input's
         // values, one level in, so the input's region is the result's. Applied to the input
         // itself, or to a scalar, the result's keys are the keys of the function's value at the
-        // input's value, so a region of the input or of the function names none of them without
-        // that value. Outside a lookup at its rows' own keys, the function
-        // operand is read at every key, so a change to it is a change to all of them, which
-        // `subscribe_forwarding` sends as `Everything`.
+        // input's value, so a region of the input names none of them without that value, and
+        // names every row.
         let keeps_keys =
             self.level != CurryLevel::OUTERMOST && self.input.tiling().is_data_function();
-        // The function computes each value anew from the input's value there, so a part of that
-        // value names the rows holding it (`whole_values_at`).
-        let input_producer = match keeps_keys {
-            true => {
-                let forward = forwarding_consumer_keeping_keys(&shared);
-                let forward = match &lookup {
-                    Some((at, delivered)) => crate::interpreter::notifications::aligned(
-                        0,
-                        *at,
-                        delivered.clone(),
-                        forward,
-                    ),
-                    None => forward,
-                };
-                self.input.clone().subscribe(
-                    self.input.tiling().universal_guard(),
-                    crate::interpreter::notifications::whole_values_at(forward),
-                    cx,
-                )
+        let input_consumer = match keeps_keys {
+            // The function computes each value anew from the input's value there, so a part of
+            // that value names the rows holding it (`whole_values_at`).
+            true => crate::interpreter::notifications::whole_values_at(aligned.consumer(
+                0,
+                InputRows::Keys,
+                forwarding_consumer_keeping_keys(&shared),
+            )),
+            false => {
+                let whole = aligned.consumer(
+                    0,
+                    InputRows::Whole,
+                    forwarding_consumer_keeping_keys(&shared),
+                );
+                // A record of values is read whole, and its fields arrive independently, so the
+                // input has delivered once every field has (`whole_once_complete`).
+                match self.input.fields_arrive_by_push() {
+                    Some(fields) => {
+                        crate::interpreter::notifications::whole_once_complete(fields, whole)
+                    }
+                    None => whole,
+                }
             }
-            false => subscribe_forwarding(&self.input, &shared, cx),
         };
+        let input_producer =
+            self.input
+                .clone()
+                .subscribe(self.input.tiling().universal_guard(), input_consumer, cx);
         Box::new(MapResultProducer {
             dropped_rows: Default::default(),
             base: ProducerBase::new(
@@ -793,6 +796,12 @@ impl MapResultProducer {
         // function that takes one is applied to the tile instead ([`FunctionDef::apply_tile`]
         // — `insert`, whose collection operand reaches it opened).
         let level = self.level;
+        // The rows above `level` the input calls complete, which bound what a computed value
+        // beneath them states.
+        let complete_rows = level
+            .index()
+            .checked_sub(1)
+            .map(|innermost| input_tile.completion_at(CurryLevel::new(innermost)));
         let arguments = std::mem::replace(
             input_tile.values_at_mut(level),
             Tile::Scalar(ColumnValue::Units(0)),
@@ -808,7 +817,17 @@ impl MapResultProducer {
             && let Tile::Scalar(f) = &function_tile
             && let Some(Value::ComputableFunction(f)) = f.as_single()
         {
-            f.apply_tile(arguments, f_domain_extent)
+            let mut applied = f.apply_tile(arguments, f_domain_extent);
+            // Each row's value is computed whole, so its levels are complete beneath that row,
+            // but the function states them over its own paths: unqualified, a statement claims
+            // every row, held or not. Beneath rows the input calls complete they are restated
+            // over those rows' paths, as a gathered value is ([`restate_gathered`]).
+            if let Some(complete) = &complete_rows {
+                applied.map_level_predicates(&mut |depth, stated| {
+                    stated.intersect(&Predicate::True.qualified_by(complete, depth))
+                });
+            }
+            applied
         } else {
             // Standard logic for non-Function outputs
             process_tile_result(self.tiling().values_at(level), arguments, move |values| {
@@ -859,8 +878,8 @@ impl TileProducer for MapResultProducer {
         // Part of an output value released names no part of the input, so the input keeps
         // the row and the value is recomputed on the next pull (`release_impl`); what the
         // consumer let go is taken back out here.
-        if !self.base.obsolete_guard.is_empty() {
-            out.remove_guarded(self.base.obsolete_guard.clone());
+        if !self.obsolete_guard().is_empty() {
+            out.remove_guarded(self.obsolete_guard());
         }
         // Mapping keeps the input's keys, so the input already answered the projection; the
         // cut states it for an input that answered more.
@@ -868,8 +887,8 @@ impl TileProducer for MapResultProducer {
         out
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        self.dropped_rows.release_to(&mut *self.input);
+    fn release_impl(&self, obsolete_guard: TileGuard) {
+        self.dropped_rows.release_to(&*self.input);
         // A guard is shaped by the tiling it is handed to, so the input's is built
         // from the input's tiling — never from the function's, whose tiling is
         // unrelated (a function tiling, against the input's stream).
@@ -1029,13 +1048,32 @@ impl TileOperator for MapResultToConst {
                 );
                 (constant, input)
             }
-            false => (
-                subscribe_forwarding(&self.constant, &shared, cx),
-                crate::interpreter::notifications::through_values(
+            // Both sides' regions name the result's rows, the constant's widened to every row, and
+            // a row exists once both have delivered, so each side's delivery is passed on under
+            // the rows the other delivered ([`AlignedInputs`](crate::interpreter::notifications::AlignedInputs)).
+            false => {
+                use crate::interpreter::notifications::{AlignedInputs, InputRows};
+                let aligned =
+                    AlignedInputs::new(CurryLevel::OUTERMOST, [&self.input, &self.constant]);
+                let constant = self.constant.clone().subscribe(
+                    self.constant.tiling().universal_guard(),
+                    aligned.consumer(
+                        1,
+                        InputRows::Whole,
+                        forwarding_consumer_keeping_keys(&shared),
+                    ),
+                    cx,
+                );
+                let input = crate::interpreter::notifications::through_values(
                     self.level,
-                    forwarding_consumer_keeping_keys(&shared),
-                ),
-            ),
+                    aligned.consumer(
+                        0,
+                        InputRows::Keys,
+                        forwarding_consumer_keeping_keys(&shared),
+                    ),
+                );
+                (constant, input)
+            }
         };
         let input_producer =
             self.input
@@ -1177,8 +1215,8 @@ impl TileProducer for MapResultToConstProducer {
     /// input ([`through_shared_levels`]): the output is rebuilt from the input's rows on
     /// every pull, and a row the input gave back could not be rebuilt for what of it is still
     /// held here.
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        self.dropped_rows.release_to(&mut *self.input);
+    fn release_impl(&self, obsolete_guard: TileGuard) {
+        self.dropped_rows.release_to(&*self.input);
         let upstream = crate::interpreter::tiling::through_shared_levels(
             obsolete_guard,
             self.level.index(),
@@ -1207,8 +1245,14 @@ impl MapResultToConstProducer {
         // A scalar input has no keys to project, so it is read whole and the answer cut. Applied
         // at the outermost level the constant replaces the whole input, so the output's keys are
         // the constant's and the projection names none of the input's.
+        // The input is read at the nearest level above it restates, as a union reads an arm: a
+        // region with part of a row released names keys beneath the outermost, which an input
+        // restating only its outermost keys has no exact answer to.
         let input_guard = match i_tiling.is_data_function() && self.level != CurryLevel::OUTERMOST {
-            true => projection.above(self.level).guard(&i_tiling),
+            true => projection
+                .above(self.level)
+                .restated_by(&self.input.restates())
+                .guard(&i_tiling),
             false => i_tiling.universal_guard(),
         };
         let input_tile = self.input.get(input_guard);
@@ -1427,8 +1471,8 @@ struct MapResultWithSourceProducer {
     /// What the input last read holds, where it holds a level beneath its keys: a release
     /// naming paths beneath particular keys is read against it
     /// ([`Self::released_beneath_every_key`]).
-    // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`;
-    // no other operator holds it.
+    // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`
+    // while several workers pull its pipeline; no other operator holds it.
     nested_input: RwLock<Option<HeldBeneathKeys>>,
 }
 
@@ -1579,7 +1623,7 @@ impl MapResultWithSourceProducer {
         let Some(held) = &mut *held else {
             return everywhere;
         };
-        let released = &self.base.obsolete_guard;
+        let released = &self.obsolete_guard();
         let freed = everywhere.union(&held.releasable(released));
         held.reclaim(released, &freed);
         freed
@@ -1695,7 +1739,7 @@ impl TileProducer for MapResultWithSourceProducer {
             }
             held.as_mut()
                 .unwrap()
-                .reclaim(self.obsolete_guard(), &Predicate::False);
+                .reclaim(&self.obsolete_guard(), &Predicate::False);
         }
         let source = self.source.read().unwrap_or_else(PoisonError::into_inner);
         let fields = &self.fields;
@@ -1705,7 +1749,7 @@ impl TileProducer for MapResultWithSourceProducer {
         })
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         let Some(correlation) = self.result_correlation.clone() else {
             if obsolete_guard.is_universal() {
                 self.source
@@ -1919,7 +1963,7 @@ mod tests {
     /// a function operand is not always a small `Constant`.
     #[test]
     fn map_result_releases_its_function_when_the_consumer_is_done() {
-        let (mut producer, released, tiling) = map_result_with_function_spy();
+        let (producer, released, tiling) = map_result_with_function_spy();
         producer.release(tiling.universal_guard());
         assert!(
             released
@@ -1936,7 +1980,7 @@ mod tests {
     /// it, and an emptied function would leave that pull mapping over nothing.
     #[test]
     fn map_result_keeps_its_function_for_a_narrower_release() {
-        let (mut producer, released, _) = map_result_with_function_spy();
+        let (producer, released, _) = map_result_with_function_spy();
         producer.release(TileGuard::Function(FunctionGuard::Domain(
             Predicate::at_or_below(Value::UInt(0)),
         )));

@@ -4,7 +4,7 @@ use bit_set::BitSet;
 use log::trace;
 use std::collections::HashMap;
 use std::iter::repeat_n;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use super::*;
 use crate::interpreter::operator_graph::value;
@@ -126,17 +126,17 @@ struct ConverseProducer {
     /// row is released once the path it stands at is, which takes its value to read. A pull reads
     /// only the rows a region names, so the rows of earlier pulls are kept: a release of a group
     /// names rows no later pull may read again.
-    // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`;
-    // no other operator holds it.
-    held: RwLock<Vec<HeldRow>>,
+    // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`
+    // while several workers pull its pipeline; no other operator holds it.
+    held: Mutex<Vec<HeldRow>>,
     /// At the outermost level, the input keys the answers read state complete, together, and the
     /// values those answers held. A group is the rows whose value is its key, so once every input
     /// key is complete a value never seen has no group: it is stated absent.
-    // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`;
-    // no other operator holds it.
+    // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`
+    // while several workers pull its pipeline; no other operator holds it.
     read: RwLock<Predicate>,
-    // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`;
-    // no other operator holds it.
+    // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`
+    // while several workers pull its pipeline; no other operator holds it.
     seen: RwLock<Predicate>,
     /// The level inverted — see [`Converse::new_at`].
     level: CurryLevel,
@@ -158,7 +158,7 @@ impl ConverseProducer {
         Self {
             base,
             input,
-            held: RwLock::new(Vec::new()),
+            held: Mutex::new(Vec::new()),
             read: RwLock::new(Predicate::False),
             seen: RwLock::new(Predicate::False),
             level,
@@ -241,7 +241,7 @@ impl ConverseProducer {
             read.iter().map(|(_, input)| input).collect();
         // One lock across both steps: a pull on another thread that reads the same rows would
         // otherwise drop them before this one adds them, and both would add them.
-        let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
         held.retain(|(_, input)| !again.contains(input));
         held.extend(read);
     }
@@ -416,7 +416,7 @@ impl TileProducer for ConverseProducer {
         ProducerStateInfo::holding(
             2 * self
                 .held
-                .read()
+                .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .len(),
         )
@@ -503,8 +503,8 @@ impl TileProducer for ConverseProducer {
         // row arriving later with a released value would put the group back into a region the
         // consumer has let go; it is released upstream on the pull that first holds it, since
         // the release reached `release_impl` before the row arrived.
-        if !self.base.obsolete_guard.is_empty() {
-            let released = self.base.obsolete_guard.clone();
+        if !self.obsolete_guard().is_empty() {
+            let released = self.obsolete_guard();
             out.remove_guarded(released);
         }
         out.restrict_to(&projection, self.tiling());
@@ -528,11 +528,11 @@ impl TileProducer for ConverseProducer {
     /// input rows. Beneath them a guard names groups by value, and an input row is released
     /// where the output path it stands at is: the rows held now, and a row arriving later
     /// on a later release delivery, once a read identifies which group it joins.
-    fn release_impl(&mut self, _obsolete_guard: TileGuard) {
+    fn release_impl(&self, _obsolete_guard: TileGuard) {
         let obsolete_guard = self.obsolete_guard().clone();
         if obsolete_guard.is_universal() {
             self.held
-                .get_mut()
+                .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clear();
             return self.input.release(self.input.tiling().universal_guard());
@@ -586,14 +586,14 @@ impl TileProducer for ConverseProducer {
                 TileGuard::Function(FunctionGuard::Domain(under_every_group(&inverted)))
             },
         );
-        let held = self.input_rows(Self::held_rows_covered(
-            &self.held.read().unwrap_or_else(PoisonError::into_inner),
-            &obsolete_guard,
-        ));
-        self.held
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|(output, _)| !obsolete_guard.covers_path(output));
+        // The rows released are the rows taken out, under one lock, so a row a concurrent pull
+        // adds is either released here or kept for the next release.
+        let held = {
+            let mut rows = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+            let covered = Self::held_rows_covered(&rows, &obsolete_guard);
+            rows.retain(|(output, _)| !obsolete_guard.covers_path(output));
+            self.input_rows(covered)
+        };
         self.input
             .release(TileGuard::flatten_or(vec![standing, held]));
     }
@@ -727,7 +727,7 @@ impl TileProducer for MapDomainProducer {
         tile
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         // The keys at 𝐿 stand as well as the levels above it: only the values beneath them
         // are replaced.
         let input_guard = crate::interpreter::tiling::through_standing_levels(
@@ -980,12 +980,12 @@ impl TileProducer for UncurryProducer {
                     None => self.empty_pair.clone(),
                 }
             });
-        result.remove_guarded(self.base().obsolete_guard.clone());
+        result.remove_guarded(self.obsolete_guard());
         result.restrict_to(&projection, self.tiling());
         result
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         let input_guard = self.split_pair_guard(obsolete_guard);
         trace!("{} releasing up with: {input_guard:?}", self.name());
         self.input.release(input_guard);
@@ -1217,19 +1217,23 @@ impl TileOperator for Filter {
     ) -> Box<dyn TileProducer> {
         let shared = shared_consumer(consumer);
         // A side that is a collection is pulled at the projection and shares the mask's keys; a
-        // side that is not is read whole.
-        let predicate_producer = subscribe_forwarding_keeping_keys_if(
-            self.predicate.tiling().is_data_function(),
-            &self.predicate,
-            &shared,
-            cx,
-        );
-        let input_producer = subscribe_forwarding_keeping_keys_if(
-            self.input.tiling().is_data_function(),
-            &self.input,
-            &shared,
-            cx,
-        );
+        // side that is not is read whole. An entry exists once both sides have delivered it
+        // (`AlignedInputs`).
+        use crate::interpreter::notifications::{AlignedInputs, InputRows};
+        let aligned = AlignedInputs::new(self.level, [&self.input, &self.predicate]);
+        let side = |arm: usize, op: &Arc<dyn TileOperator>, cx: &mut SubscribeContext| {
+            let rows = match op.tiling().is_data_function() {
+                true => InputRows::Keys,
+                false => InputRows::Whole,
+            };
+            op.clone().subscribe(
+                op.tiling().universal_guard(),
+                aligned.consumer(arm, rows, forwarding_consumer_keeping_keys(&shared)),
+                cx,
+            )
+        };
+        let input_producer = side(0, &self.input, cx);
+        let predicate_producer = side(1, &self.predicate, cx);
         Box::new(FilterProducer {
             base: ProducerBase::new(FilterProducer::alloc_id(), self.tiling(), self.clone(), cx),
             input: input_producer,
@@ -1302,7 +1306,7 @@ impl TileProducer for FilterProducer {
         self.filtered(&projection)
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         if self.predicate_is_a_collection() {
             // Both predicate and input share the same underlying domain source, so both
             // must be released together; releasing only one leaves the other's upstream
@@ -1610,7 +1614,7 @@ impl TileProducer for RestrictProducer {
         }
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         self.predicate.release(obsolete_guard);
     }
 }
@@ -2100,7 +2104,7 @@ impl TileProducer for ProductProducer {
     /// The outer side shares the output's levels down to the rows, and the inner side one
     /// further, down to the keys paired with them, so a release of some of a row's pairs
     /// reaches the inner side's keys and leaves the outer row standing.
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         match obsolete_guard {
             g if g.is_universal() => {
                 self.outer.release(self.outer.tiling().universal_guard());
@@ -2695,7 +2699,7 @@ mod tests {
                 .collect(),
         );
         let output_tiling = Tiling::data_function(pair_extent, Tiling::Scalar(uint()));
-        let mut uncurry = UncurryProducer {
+        let uncurry = UncurryProducer {
             base: ProducerBase::unowned(UncurryProducer::alloc_id(), &output_tiling),
             input: Box::new(TestTileProducer::new(
                 input_tiling.empty_at_no_rows(),
@@ -3276,7 +3280,7 @@ mod tests {
     /// input as those keys under every row.
     #[test]
     fn a_nested_map_domain_releases_its_own_keys_to_its_input() {
-        let mut map = nested_map_domain();
+        let map = nested_map_domain();
         map.release(TileGuard::Function(FunctionGuard::Codomain(Box::new(
             TileGuard::Function(FunctionGuard::Domain(Predicate::point(Value::Int(0)))),
         ))));
@@ -3300,7 +3304,7 @@ mod tests {
     /// that row.
     #[test]
     fn a_nested_converse_releases_a_whole_enclosing_row_to_its_input() {
-        let mut converse = nested_converse();
+        let converse = nested_converse();
         converse.release(TileGuard::Function(FunctionGuard::Domain(
             Predicate::point(Value::Int(1)),
         )));
@@ -3397,7 +3401,7 @@ mod tests {
     /// their values.
     #[test]
     fn a_nested_converse_releases_keys_beneath_every_group_before_reading_them() {
-        let mut converse = nested_converse();
+        let converse = nested_converse();
         converse.release(under_a_row(under_a_row(TileGuard::Function(
             FunctionGuard::Domain(Predicate::point(Value::Int(1))),
         ))));
@@ -3811,7 +3815,7 @@ mod tests {
             ))),
         )));
         producer.release(first_pair.clone());
-        assert_eq!(*producer.inner.obsolete_guard(), first_pair);
+        assert_eq!(producer.inner.obsolete_guard(), first_pair);
         assert!(
             producer.outer.obsolete_guard().is_empty(),
             "the row still has a pair: {:?}",
@@ -4899,7 +4903,7 @@ mod uncurry_projection_tests {
             tile
         }
 
-        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+        fn release_impl(&self, _obsolete_guard: TileGuard) {}
     }
 
     /// A pair named by both components is a path one level into the grouping. A grouping that
@@ -4956,7 +4960,7 @@ mod uncurry_projection_tests {
     /// `(1, 2)` is released.
     #[test]
     fn a_pair_released_from_a_group_pulled_whole_is_gone_from_the_group_s_next_pull() {
-        let (mut uncurry, pulled) = paired_outermost_groups();
+        let (uncurry, pulled) = paired_outermost_groups();
         let group_one = Predicate::point(Value::Int(1));
         let pair = |member: u64| pairs(group_one.clone(), Predicate::point(Value::UInt(member)));
         assert_eq!(pair_count(&uncurry.get(pair(2))), 1);
@@ -5519,7 +5523,7 @@ mod converse_projection_tests {
     /// no others, so the next range finds its own rows still there.
     #[test]
     fn releasing_a_range_of_groups_frees_its_rows_and_leaves_the_others() {
-        let (mut converse, _, released) = bucketize();
+        let (converse, _, released) = bucketize();
         converse.get(groups(&[1]));
         converse.release(groups(&[1]));
         let freed = released
@@ -5680,7 +5684,7 @@ mod converse_pull_tests {
     #[test]
     fn a_released_group_releases_rows_an_earlier_pull_read() {
         let source = source_of(0..9, group_of);
-        let mut converse = converse_over(&source);
+        let converse = converse_over(&source);
         converse.get(keys_one_level_in(0, 0));
         converse.get(keys_one_level_in(1, 1));
         converse.release(group(0));
@@ -5703,12 +5707,33 @@ mod converse_pull_tests {
         }
     }
 
+    /// Pulls of one converse from several threads keep each input row once: no pull adds a row
+    /// while another replaces it.
+    #[test]
+    fn concurrent_pulls_hold_each_input_row_once() {
+        let source = source_of(0..KEYS, group_of);
+        let converse = converse_over(&source);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..50 {
+                        crate::interpreter::dispatcher::in_a_run(|| {
+                            converse.get(out_tiling().universal_guard())
+                        });
+                    }
+                });
+            }
+        });
+        let held = converse.held.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(held.len() as u64, KEYS, "{held:?}");
+    }
+
     /// A released group stays released across pulls: each row of it a later pull reads is
     /// omitted from the answer, then reclaimed by the next release.
     #[test]
     fn rows_of_a_released_group_in_later_pulls_are_reclaimed_on_release() {
         let source = source_of(0..9, group_of);
-        let mut converse = converse_over(&source);
+        let converse = converse_over(&source);
         converse.get(keys_one_level_in(0, 2));
         converse.release(group(1));
         assert_eq!(released_keys(&source), BTreeSet::from([1]));

@@ -23,7 +23,9 @@ use crate::interpreter::sinks::ProducerSlot;
 pub(crate) struct SinkBreaker {
     producer: ProducerSlot,
     sink: Arc<dyn DataSink>,
-    hands: Hands,
+    // shared-state-ok: the sink breaker's own state at the I/O boundary, which each consume changes
+    // through `&self`; nothing reads it back into the graph.
+    hands: Mutex<Hands>,
 }
 
 /// When a [`SinkBreaker`] hands its sink what it pulled.
@@ -51,8 +53,8 @@ enum Hands {
 }
 
 impl SinkBreaker {
-    fn deliver(&mut self, tile: Tile) {
-        match &mut self.hands {
+    fn deliver(&self, tile: Tile) {
+        match &mut *self.hands.lock().unwrap_or_else(PoisonError::into_inner) {
             Hands::EachPackage => self.sink.process(&tile),
             Hands::Main {
                 each_package,
@@ -81,7 +83,7 @@ impl SinkBreaker {
         Self {
             producer,
             sink,
-            hands: Hands::EachPackage,
+            hands: Mutex::new(Hands::EachPackage),
         }
     }
 
@@ -91,12 +93,12 @@ impl SinkBreaker {
         Self {
             producer,
             sink,
-            hands: Hands::Main {
+            hands: Mutex::new(Hands::Main {
                 each_package: false,
                 answer: None,
                 handed_terminal: false,
                 loop_beneath: false,
-            },
+            }),
         }
     }
 
@@ -104,7 +106,9 @@ impl SinkBreaker {
     /// answer that states it complete: a run over a live source finishes it only once every
     /// source yields everything.
     pub(crate) fn hand_each_package(&mut self) {
-        if let Hands::Main { each_package, .. } = &mut self.hands {
+        if let Hands::Main { each_package, .. } =
+            self.hands.get_mut().unwrap_or_else(PoisonError::into_inner)
+        {
             *each_package = true;
         }
     }
@@ -113,7 +117,9 @@ impl SinkBreaker {
     /// that scope's store, rows the loop's rounds have written. Each is final as it
     /// is written, and the producer states it complete.
     pub(crate) fn reads_a_loop(&mut self) {
-        if let Hands::Main { loop_beneath, .. } = &mut self.hands {
+        if let Hands::Main { loop_beneath, .. } =
+            self.hands.get_mut().unwrap_or_else(PoisonError::into_inner)
+        {
             *loop_beneath = true;
         }
     }
@@ -138,13 +144,26 @@ impl Breaker for SinkBreaker {
     ///
     /// A sink's breaker keeps no mode: it pulls its producer at each consume, in a dispatched run
     /// only.
-    fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
-        let mut slot = Self::input(&self.producer);
-        let producer = slot.as_mut().expect("a sink has subscribed its producer");
+    fn consume_impl(&self, _: InputId, guard: TileGuard) {
+        // `get` and `release` take the producer shared, so workers consume several packages at
+        // once.
+        let slot = Self::reading(&self.producer);
+        let producer = slot.as_ref().expect("a sink has subscribed its producer");
         let tile = producer.get(guard);
         producer.release(tile.to_guard());
         drop(slot);
         self.deliver(tile);
+    }
+
+    fn parallel_level(&self) -> Option<CurryLevel> {
+        if !matches!(
+            *self.hands.lock().unwrap_or_else(PoisonError::into_inner),
+            Hands::EachPackage
+        ) {
+            return None;
+        }
+        let slot = Self::reading(&self.producer);
+        parallel_input_level(&**slot.as_ref()?)
     }
 
     fn finish(&mut self, _input: InputId, _: &mut Pushes<'_>) {
@@ -153,7 +172,7 @@ impl Breaker for SinkBreaker {
             answer,
             handed_terminal,
             loop_beneath,
-        } = &mut self.hands
+        } = self.hands.get_mut().unwrap_or_else(PoisonError::into_inner)
         else {
             return;
         };
@@ -190,7 +209,7 @@ impl Breaker for SinkBreaker {
         let answer = merged.unwrap_or(rest);
         debug_assert!(
             answer.is_terminal(),
-            "a `main` output is handed a terminal answer at its finish: {answer:?}"
+            "a `main` output is handed a terminal answer at its finish"
         );
         self.sink.process(&answer);
     }
