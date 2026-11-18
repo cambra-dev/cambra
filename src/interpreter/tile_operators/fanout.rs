@@ -1663,7 +1663,10 @@ impl Breaker for MemoProducer {
             "{} consumes a guard of its input's tiling: {guard:?}",
             self.name()
         );
-        if guard_minus(&guard, self.input.obsolete_guard()).is_empty() {
+        // Whether the input released the region already, asked without a difference: the guard
+        // algebra has none of a region of keys and a release with codomain arms, which a
+        // transaction driver's input releases.
+        if self.input.obsolete_guard().subsumes(&guard) {
             return;
         }
         let projection = guard.projection_for(self);
