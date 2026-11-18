@@ -5,6 +5,9 @@ describes the current implementation and stays until this design is reviewed and
 cites it is migrated. Nothing here is implemented. The effects stack in progress (`requires` and
 `causes` clauses) is read as current work that this design may change, not as a fixed constraint.
 
+[A walkthrough of this design](https://claude.ai/artifact/Fu13L3Jr1Dhn7c7ULjoqQu), with an
+interactive example for each section and shared review notes, is on claude.ai.
+
 ## Summary
 
 **Values, places and variables.** A value is immutable data. A place holds a value: `Mut` and
