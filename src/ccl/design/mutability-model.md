@@ -79,6 +79,7 @@ is marked at a site in its scope ([Values, Places, and Variables](#values-places
 | **version-indexed type** | A type declared with `requires Transaction`: one type per version, written `𝑇@𝜏` when the version matters. |
 | **view** | A function `() ⇒ 𝑉 requires Transaction` whose definition reads cells. |
 | **footprint** | The cells, and the parts of cells, that a transaction reads and writes. |
+| **dataflow** | The computation outside every transaction, over immutable data, ordered only by data dependence ([Crossing between dataflow and transactions](#crossing-between-dataflow-and-transactions)). |
 
 ## Principles
 
@@ -196,10 +197,12 @@ Footprints and exclusivity use the lent path, so `&s.cart.items.push(v)` does no
 error when `push` takes a `Mut(Self)` receiver.
 
 Every contribution to a place variable is therefore marked at a site in the variable's scope: `:=`
-and the other assignment operators, `<<`, `m[k] = v`, and `&x` in a borrowing position. A
-contribution inside a `def` that captures the variable is such a site when the `def` is in the
-variable's scope. A caller of that `def` does not see the contribution, as it does not see any write
-a function makes to its own module's cells; the function's inferred effects record it.
+and the other assignment operators, `<<`, `m[k] = v`, and `&x` in a borrowing position. A `def`
+never writes a captured `Mut`, by rule 2 of [The rules](#the-rules). A contribution to a deferred
+collection inside a `def` that captures it is a site in the collection's scope when the `def` is in
+that scope ([Which contributions participate](#which-contributions-participate)). A caller of that
+`def` does not see the contribution, as it does not see any write a function makes to its own
+module's cells; the function's inferred effects record it.
 
 A cell is written with the same marks as a local `Mut`. A transaction makes the cells it touches
 appear exclusive to it, because transactions are serializable. Sharing happens between
@@ -491,43 +494,45 @@ states for a reply fed inside `with begin():`. A `OnceMap` definition inside a b
 
 ### Transaction outcomes
 
-A `with begin():` block in value position yields its outcome, a variant. This resolves the spec's
-Direction "a block is also the value it computes"
-([spec 8.2](../../../docs/chl-spec.md#82-transactions-with-begin)):
-
-| Outcome | Cause | Writes | Determined by the snapshot |
-|---|---|---|---|
-| `` `commit(𝑣) `` | The block committed; `𝑣` is the value of its last statement | All of the block's | Yes |
-| `` `aborted(𝑒) `` | The block called `abort(𝑒)`, or a guard denied it (the deny idiom), with `𝑒 = unit` | None | Yes |
-| `` `gave_up `` | The transaction did not commit before the block's deadline | None | No: it depends on load and time |
+[Spec 8.2](../../../docs/chl-spec.md#82-transactions-with-begin) decides what a block yields. A
+block in value position is the value of its last statement. A path that writes nothing, such as the
+deny idiom, commits with no writes, and the code after the block runs with that path's value. An
+exception that escapes the block aborts it: none of its writes commits, it takes a commit position
+at which it commits nothing, and the exception propagates to a `try`
+([Exceptions](../../../docs/chl-spec.md#exceptions)). This design adds a deadline:
 
 ```python
-outcome = with begin(deadline=time::millis(50)):
-    reserve(sku, qty)
-match outcome:
-    case `commit(v):  http.ok(v)
-    case `aborted(e): http.conflict(e)
-    case `gave_up:    http.unavailable()
+for k ↦ req in srv::reqs:
+    try:
+        v = with begin(deadline=time::millis(50)):
+            reserve(req.body.sku, req.body.qty)
+        resps[k] = http.ok(v)
+    except GaveUp:
+        resps[k] = http.unavailable()
 ```
 
-- **Conflict retries are internal to the engine.** A program observes one outcome per block and
+- **A deadline sheds load.** `with begin(deadline=𝑑):` raises `std::txn::GaveUp`, a nominal
+  exception, when the transaction has not committed within `𝑑`. The limit is a duration, not an
+  attempt count, because the number of attempts depends on the engine's strategy.
+- **A block with a deadline causes `Raise(GaveUp)` and requires `ObserveWorld`.** Whether it gives
+  up depends on load and time, as a reading of the clock does.
+- **A block that gives up takes a commit position with no writes, as an aborted block does.** Its
+  outcome depends on load and time, so the commit order records it, and reload and recovery replay
+  it. The commit position is where the sequencer decides between the last attempt committing and
+  the deadline firing.
+- **A program catches `GaveUp` inside the loop body.** An exception that escapes an iteration
+  orders the iterations ([Exceptions](../../../docs/chl-spec.md#exceptions)).
+- **Conflict retries are internal to the engine.** A program observes one result per block and
   never the attempts behind it.
-- **The engine guarantees progress.** After a bounded number of optimistic failures it runs the
-  transaction against its footprint, which is known before execution
-  ([Footprints and elision](#footprints-and-elision)), so the transaction cannot conflict again. No
-  program needs a retry limit to terminate.
-- **A deadline sheds load.** `with begin(deadline=𝑑):` yields `` `gave_up `` when the transaction
-  has not committed within `𝑑`. The limit is a duration, not an attempt count, because the number of
-  attempts depends on the engine's strategy.
-- **A block with a deadline requires `ObserveWorld`.** Its outcome depends on load and time, as a
-  read of the clock does, and the requirement shows that in its signature. This assumes the effects
-  stack's `ObserveWorld` covers it.
+- **The engine guarantees progress under contention.** A transaction that conflicts repeatedly
+  still commits, so no program needs a retry limit to terminate. Many established techniques
+  provide this guarantee, and this design does not choose one.
 - **No write survives an abort.** Writes to cells and to outer `Mut`s stay gated on commit. A retry
-  policy is ordinary code outside the block: it counts outcomes in its own `Mut` and passes the
-  attempt number into the body as an argument. A policy that needs data from a failed attempt gets
-  it from the payload of `abort(𝑒)`.
+  policy is ordinary code outside the block: it catches the exception, counts attempts in its own
+  `Mut`, and passes the attempt number into the body as an argument. A policy that needs data from
+  a failed attempt gets it from the exception's payload.
 - **Isolation is unchanged.** An aborted block and a block that gave up write nothing, so no other
-  transaction can tell them apart from a transaction that never ran.
+  transaction can tell them apart from a transaction that wrote nothing.
 - **A failed attempt has no output.** No log or sink receives output from an attempt that did not
   commit, so whether the engine retries or takes locks stays unobservable. The engine's
   per-transaction metrics show contention. A logging channel for failed attempts is left out until
@@ -687,6 +692,9 @@ A **view** is a function `() ⇒ 𝑉 requires Transaction` whose definition rea
 evaluates the definition at the caller's version, including the calling transaction's own writes.
 A view needs nothing beyond an ordinary function.
 
+- **A view reads one realm.** Its definition reads the cells and views of the realm its `requires`
+  clause names. Values move between realms only as plain data or through a deferred materialized
+  view ([Deferred materialized views](#deferred-materialized-views)).
 - **A view is not a `Cell`.** A cell's value at a version is whatever the last write left there.
   A view's value at a version is determined by the cells it reads, and a view admits no writes.
 - **The definition is available to the refinement checker.** A fact read from a view, together
@@ -701,7 +709,7 @@ incrementally as the cells it reads change. Caches and indexes are materialized 
 | ------------------------------- | ----------------------------------------------- | ----------------------------------------------------------------------------------------- |
 | Declared                        | `@materialize`                                  | `@materialize(realm=𝑅, delay=𝑡)`, or `@materialize(delay=𝑡)`                             |
 | Realm                           | Its sources' realm                              | `𝑅`, or the default realm when the annotation names none; it may be its sources' realm  |
-| Value read at version `𝜏`      | Its definition applied to the sources at `𝜏`   | Its definition applied to the sources at a committed version `σ(𝜏)` of the source realm |
+| Value read at version `𝜏`      | Its definition applied to the sources at `𝜏`   | Its definition applied to the sources at a committed version `src(𝜏)` of the source realm |
 | Maintained                      | Inside each transaction that writes a source    | After the sources commit, by commits in the materialized view's realm                    |
 | Cost to writers                 | Footprint and latency of the maintenance writes | None                                                                                      |
 | Discharges deletion obligations | Yes                                             | No                                                                                        |
@@ -760,16 +768,18 @@ declaration names both realms:
   checked as one: `requires Transaction(App)` means a transaction in `App`, the realm of the cells
   it reads.
 - **The annotation names the materialized view's realm.** Callers in `𝑅` read the materialized view
-  as `() ⇒ 𝑉@σ(𝜏) requires Transaction(𝑅)`; the annotation derives this type, and the `requires`
+  as `() ⇒ 𝑉@src(𝜏) requires Transaction(𝑅)`; the annotation derives this type, and the `requires`
   clause keeps its meaning. Without `realm=`, the materialized view is in the default realm.
 - **The two realms may be one.** A deferred materialized view in its sources' realm is still
   maintained after the writing transactions commit, not inside them. A program that never names a
-  realm can use one this way, at the cost of rule 4.
+  realm can use one this way, at the cost of rule 5.
 
 Each maintenance step is a commit in the materialized view's realm that installs the definition
-applied to the sources at a later committed version of the source realm. `delay=𝑡` bounds
-staleness: each maintenance commit installs a source version committed at most `𝑡` before it, and
-the engine schedules maintenance to meet the bound.
+applied to the sources at a later committed version of the source realm. `delay=𝑡` is a
+scheduling target, not a bound on staleness: the engine schedules maintenance so that each
+maintenance commit installs a source version committed `𝑡` before it, and maintenance that runs
+long installs an older one. Commit order comes from each realm's sequencer, not from a clock, and
+clock readings carry no ordering guarantee ([`docs/durability.md`](../../../docs/durability.md)).
 
 ```python
 type Analytics = {}
@@ -788,33 +798,37 @@ for req in dashboard_reqs:
 The rules:
 
 1. **A read has a version in the materialized view's realm.** At each version `𝜏` of that realm,
-   the materialized view holds its definition applied to the sources at version `σ(𝜏)` of the source
-   realm. `σ` is monotone in `𝜏`. A read at `𝜏` has type `𝑉@σ(𝜏)`.
+   the materialized view holds its definition applied to the sources at version `src(𝜏)` of the
+   source realm. `src` is monotone in `𝜏`, and the engine schedules maintenance so that `src(𝜏)`
+   committed `delay` before `𝜏`. A read at `𝜏` has type `𝑉@src(𝜏)`.
 2. **`source_version` exposes the source version.** `source_version(revenue_by_sku)` returns
-   `σ(𝜏)` at the reading transaction's version, a position in the source realm's commit order. Two
+   `src(𝜏)` at the reading transaction's version, a position in the source realm's commit order. Two
    deferred materialized views in one realm can have different source versions at one `𝜏`, for
    example when their delays differ; a transaction that reads both sees each consistent with its
    own sources and compares their source versions. Other data is aligned with a result by an as-of
    join against its source version, in dataflow rather than in the reading transaction
    ([history and await_final](#history-and-await_final)).
-3. **A deferred materialized view is computed from one committed prefix.** A materialized view with
-   several sources reads all of them at one `σ`, never at a separate lag for each source. A deferred
-   materialized view defined over another deferred materialized view lives in a third realm, and
-   its source version is no later than its upstream's.
-4. **Only a separate realm keeps a deferred materialized view apart from its sources.** A
+3. **A deferred materialized view is computed from one committed prefix.** Its definition is a
+   view, so it reads one realm, and it reads all of its sources at one source version, never at a
+   separate lag for each source. A deferred materialized view defined over another reads it in the
+   upstream's realm, as it reads any source.
+4. **A deferred materialized view moves values between realms.** No view reads two realms. To join
+   data in `R1` with data in `R2`, a program declares a deferred materialized view in `R2` whose
+   sources are in `R1`, and joins it with `R2`'s other data in a view or a transaction in `R2`.
+5. **Only a separate realm keeps a deferred materialized view apart from its sources.** A
    transaction in a separate realm reads no cell of the source realm, so it never sees a
    source-realm write beside a materialized view that predates it, a combination no serial order
    produces. A transaction in the sources' realm can read both, and then sees the sources at `𝜏`
-   and the materialized view at `σ(𝜏)`. The program's own constraints decide whether that is
+   and the materialized view at `src(𝜏)`. The program's own constraints decide whether that is
    correct, as for a search index that lags its documents. A separate realm is the practice
    wherever they do not.
-5. **Dataflow through a deferred materialized view may be cyclic.** A value derived from a deferred
+6. **Dataflow through a deferred materialized view may be cyclic.** A value derived from a deferred
    materialized view reaches a write to its sources only as plain data: a transaction's result,
    passed to a later transaction in the source realm, which is strictly serializable in its own
    realm like any transaction that receives input. The cycle is a feedback loop with a lag, as in
    a fraud score that gates new orders. Whether the loop settles is a property of the program.
-6. **Keys from a deferred materialized view are data.** `ItemKey` is indexed by versions of `App`,
-   and a key read from the materialized view is valid at `σ(𝜏)`, not at the reader's version. A
+7. **Keys from a deferred materialized view are data.** `ItemKey` is indexed by versions of `App`,
+   and a key read from the materialized view is valid at `src(𝜏)`, not at the reader's version. A
    key leaves the materialized view only through an explicit cast to its base type, and a
    transaction in the source realm validates it with a guard. A deferred materialized view never
    discharges a deletion obligation.
@@ -864,14 +878,18 @@ total = sum(out)                          # 60
 A contribution inside a `with begin():` block happens only if the block commits
 ([Transaction outcomes](#transaction-outcomes)). A `OnceMap` definition inside a block is therefore
 partial, and it does not count toward totality. The program defines the entry outside the block,
-from the outcome:
+from the block's value:
 
 ```python
 for k ↦ req in srv::reqs:
-    outcome = with begin():
+    v = with begin():
         reserve(req.body.sku, req.body.qty)
-    resps[k] = to_response(outcome)       # defined on every outcome
+    resps[k] = to_response(v)             # defined on every path through the block
 ```
+
+Every path through a block in value position commits, a deny path included, so the definition
+after the block runs on every path. A block that may raise needs a `try` around it, as in
+[Transaction outcomes](#transaction-outcomes), for the definition to be total.
 
 A feed has no totality obligation. An append inside a block is a contribution only if the block
 commits ([Transaction boundaries](#transaction-boundaries)).
@@ -928,15 +946,20 @@ laws](#other-merge-laws)).
 
 ## Crossing between dataflow and transactions
 
-A value with no history, such as a source, a comprehension result, a deferred collection or a
-history's final value, is immutable data, and time does not appear in its type. A `Mut` or a cell
-has a history, and a read of it names a position. Each crossing between the two has one form:
+**Dataflow** is the computation outside every transaction: comprehensions, loops and reads of
+deferred collections over immutable data, ordered only by data dependence. A value whose parts are
+never overwritten, such as a source, a comprehension result, a deferred collection or a history's
+final value, is immutable data, and time does not appear in its type. A source's elements arrive
+over time, and the run records each arrival in its observation log
+([`docs/durability.md`](../../../docs/durability.md#the-observation-log)), but no element is
+replaced. A `Mut` or a cell has a history of overwrites, and a read of it names a position. Each
+crossing between dataflow and a transaction has one form:
 
 | From | To | Form |
 |---|---|---|
 | A value | A transaction | Read as plain data. A read of the whole value waits until the value is complete. |
-| A source or a deferred collection, arriving over time | A transaction, at its version | A loop writes each element into a cell in a transaction; transactions read the cell |
-| A transaction | A deferred collection | An append inside the block, delivered on commit, or a definition outside the block from the outcome |
+| A source or a deferred collection, arriving over time | A transaction, as of the transaction's version | A loop writes each element into a cell in a transaction; transactions read the cell |
+| A transaction | A deferred collection | An append inside the block, delivered on commit, or a definition outside the block from the block's value |
 | A `Mut` | Dataflow | The trailing read after its loop |
 | A cell | Dataflow | `await_final`, or a transaction's result |
 | A cell's committed versions | Dataflow | `history(𝑥)`, a feed keyed by commit position |
@@ -997,15 +1020,17 @@ the sink's collection:
 run http::serve("8080", "POST", "/order") as srv
 resps: OnceMap(srv::Reqs, srv::Response)
 for k ↦ req in srv::reqs:
-    outcome = with begin():
+    v = with begin():
         reserve(req.body.sku, req.body.qty)
-    resps[k] = to_response(outcome)
+    resps[k] = to_response(v)
 srv::respond(resps)
 ```
 
 - **Every request gets a response.** `srv::respond` takes a `FullMap(srv::Reqs, srv::Response)`, so
   the call is where `resps` must be total, and `respond` sends each entry once it is defined. The
-  proof of totality is in the caller's code, and `http::serve` needs none.
+  proof of totality is in the caller's code, and `http::serve` needs none. A response escapes only
+  once the observations it depends on are durable
+  ([`docs/durability.md`](../../../docs/durability.md#escape)).
 - **The module provides the key type.** `srv::Reqs` is the domain of `srv::reqs`, so the program
   declares `resps` over it with no refinement of its own.
 - **`respond` declares its dependencies.** Consuming `resps` never feeds `srv::reqs`. That fact
@@ -1295,7 +1320,7 @@ ways. Each is written by the program or proved, and an obligation none discharge
 
 A materialized view is not a dependent. An in-transaction materialized view's value at `𝜏′` is its
 definition applied to the sources at `𝜏′`, which typechecks by construction. A deferred materialized
-view holds its definition at `σ(𝜏′)`, which also typechecks by construction
+view holds its definition at `src(𝜏′)`, which also typechecks by construction
 ([Deferred materialized views](#deferred-materialized-views)).
 
 ### When obligations are checked
@@ -1496,8 +1521,8 @@ that land with it. Work not listed here is in [Future work](#future-work).
 3. **`Mut(_, Txn)` becomes `Cell`.** A root cell is declared `x: Cell(𝑉) := init` and is read and
    written by name inside a transaction ([Cells](#cells)). `to_mut` is inserted only for a root
    cell named directly. Realms arrive as nominal types, with the default realm where none is
-   named ([Realms](#realms)). A block in value position yields its outcome, and a block may carry a
-   deadline ([Transaction outcomes](#transaction-outcomes)). Footprints name paths from root cells,
+   named ([Realms](#realms)). A block may carry a deadline, which raises `GaveUp`
+   ([Transaction outcomes](#transaction-outcomes)). Footprints name paths from root cells,
    `ReadCell(𝑝)` and `WriteCell(𝑝)` ([Footprints and elision](#footprints-and-elision)). Spec 8.2
    changes.
 4. **`Ref`, with reference counting.** `Ref::new`, `ref(x)`, `*` and `->` reach cells allocated at
@@ -1509,7 +1534,7 @@ that land with it. Work not listed here is in [Future work](#future-work).
    cells](#references-read-from-cells)).
 5. **Deferred materialized views.** `@materialize(delay=𝑡)`, in the sources' realm or another,
    maintained by DBSP after commit from `history(𝑥)` ([Deferred materialized
-   views](#deferred-materialized-views)). A read at `𝜏` sees the definition at `σ(𝜏)`, and
+   views](#deferred-materialized-views)). A read at `𝜏` sees the definition at `src(𝜏)`, and
    `source_version` exposes it.
 6. **In-transaction materialized views.** `@materialize` with no delay, maintained inside each
    writing transaction, and `@index` ([In-transaction materialized
@@ -1574,7 +1599,7 @@ Proposals for the owners of each part.
   `run http::serve(…) as srv`. It exports the request source `srv::reqs`, its key type `srv::Reqs`,
   a response type, and a `respond` function that takes a `FullMap` of responses, in place of a
   pair whose second half is a feed ([Sinks](#sinks)).
-- **[Spec 9.7](../../../docs/chl-spec.md#97-importing-asserts-no-io-and-no-state),
+- **[Spec 9.7](../../../docs/chl-spec.md#97-importing-asserts-a-shareable-module),
   [9.8](../../../docs/chl-spec.md#98-module-types) and
   [9.9](../../../docs/chl-spec.md#99-running).**
   Declaring a feed still makes a module one that is run. No place variable is public: the spec's
@@ -1587,10 +1612,10 @@ Proposals for the owners of each part.
   that writes events into a cell, and its handler reads the cell in a transaction. The root calls
   `audit::receive(eu::events ++ us::events)` below the runs. Today's `audit` handler reads the whole
   of a live feed, so it never responds.
-- **[Spec 8.2](../../../docs/chl-spec.md#82-transactions-with-begin), "a block is also the value
-  it computes" [Tentative].** Decided: the block yields `` `commit(𝑣) ``, `` `aborted(𝑒) `` or
-  `` `gave_up ``. A reply fed outside the block fires for every outcome, with the outcome as its
-  value ([Transaction outcomes](#transaction-outcomes)). A block whose result type is
+- **[Spec 8.2](../../../docs/chl-spec.md#a-block-is-also-the-value-it-computes), "A block is also
+  the value it computes".** `with begin(deadline=𝑑):` raises `std::txn::GaveUp` when the
+  transaction has not committed within `𝑑`, and a block that gives up takes a commit position with
+  no writes ([Transaction outcomes](#transaction-outcomes)). A block whose result type is
   version-indexed needs an explicit cast ([Leaving a transaction](#leaving-a-transaction)); the
   check may land after the rest, with an `[Open]` marker that 1.0 removes.
 - **[Spec 8.5](../../../docs/chl-spec.md#85-ordering-and-concurrency).** "Nothing is ordered by its
