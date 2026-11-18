@@ -140,6 +140,24 @@ impl Consumer for Widening {
     }
 }
 
+/// `consumer` behind a consumer that passes each region on as `restate` names it: an operator that
+/// keeps its input's keys under another spelling, as `Uncurry` beneath a standing level names an
+/// outer and an inner key as one pair, restates them exactly.
+pub fn restating(
+    restate: Box<dyn Fn(&Projection) -> Projection>,
+    consumer: Box<dyn Consumer>,
+) -> Box<dyn Consumer> {
+    Box::new(Restating(restate, consumer))
+}
+
+struct Restating(Box<dyn Fn(&Projection) -> Projection>, Box<dyn Consumer>);
+
+impl Consumer for Restating {
+    fn notify(&mut self, arrived: &Projection) {
+        self.1.notify(&(self.0)(arrived));
+    }
+}
+
 /// What [`forwarding_consumer`] returns.
 struct Forwarding {
     gated: GatedConsumer,
