@@ -1519,7 +1519,7 @@ mod tests {
             let morsel = keys_between(first, first + MORSEL - 1);
             assert_eq!(int_entries(&spy.get(morsel.clone())).len(), MORSEL as usize);
             spy.release(morsel);
-            let Some(Tile::DataFunction { domain, .. }) = &spy.base.last_output else {
+            let Some(Tile::DataFunction { domain, .. }) = &*spy.base.last_output.borrow() else {
                 panic!("a pull records the collection it answered")
             };
             assert_eq!(
@@ -1614,7 +1614,7 @@ mod tests {
     #[should_panic(expected = "restates the outermost keys only")]
     fn get_rejects_a_pull_beneath_the_outermost_keys_of_a_producer_that_restates_none() {
         use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
-        let mut producer = TestTileProducer::new(three_rows(), nested_tiling());
+        let producer = TestTileProducer::new(three_rows(), nested_tiling());
         producer.get(codomain(domain(under(key(0), key(1)))));
     }
 

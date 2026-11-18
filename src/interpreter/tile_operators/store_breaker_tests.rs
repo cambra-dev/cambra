@@ -168,7 +168,7 @@ fn a_consuming_store_answers_from_its_snapshot() {
             .borrow()
             .visit_input_producers(&mut |role, input| {
                 if role == "body" {
-                    pulls = input.base().reads;
+                    pulls = input.base().reads.get();
                 }
             });
         pulls
@@ -245,7 +245,7 @@ fn input_pulls(compiled: &Compiled) -> u64 {
     compiled
         .store
         .borrow()
-        .visit_input_producers(&mut |_, input| pulls += input.base().reads);
+        .visit_input_producers(&mut |_, input| pulls += input.base().reads.get());
     pulls
 }
 
