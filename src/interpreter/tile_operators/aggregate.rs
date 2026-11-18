@@ -989,16 +989,10 @@ impl MapAggregateState {
         }
     }
     fn fold(&mut self, input_tile: &Tile, tiling: &Tiling, obsolete: &TileGuard) -> Stated {
-        let Tile::DataFunction {
-            domain_predicate,
-            absent_keys,
-            ..
-        } = input_tile
-        else {
+        let Tile::DataFunction { .. } = input_tile else {
             panic!("MapAggregate requires a collection tile, got {input_tile:?}")
         };
-        // A group known absent is complete: it has no element to fold, in any region.
-        let domain_predicate = domain_predicate.union(absent_keys);
+        let domain_predicate = input_tile.level_statement();
 
         // The output's levels above Aggregation name the groups. Its accumulator may itself
         // contain collections (Sole), whose levels belong to the value rather than this fold.
@@ -1019,17 +1013,24 @@ impl MapAggregateState {
                 }
             }
         }
-        let mut level_predicates: Vec<Predicate> = (0..depth)
-            .map(|level| {
-                let Tile::DataFunction {
-                    domain_predicate, ..
-                } = input_tile.values_at(CurryLevel::new(level))
-                else {
-                    unreachable!("every level above the innermost one is a collection")
-                };
-                domain_predicate.clone()
-            })
-            .collect();
+        let mut level_predicates: Vec<Predicate> = Vec::with_capacity(depth);
+        let mut follow_beneath: Vec<Follows> = Vec::with_capacity(depth);
+        for level in 0..depth {
+            let Tile::DataFunction {
+                domain,
+                domain_predicate,
+                keys_follow_beneath,
+                ..
+            } = input_tile.values_at(CurryLevel::new(level))
+            else {
+                unreachable!("every level above the innermost one is a collection")
+            };
+            level_predicates.push(domain_predicate.clone());
+            follow_beneath.push(Follows {
+                follows: *keys_follow_beneath,
+                keys: domain.len(),
+            });
+        }
         level_predicates[0] = domain_predicate;
         let parent_paths = input_tile.row_paths_at(depth);
         let folded = input_tile.values_at(CurryLevel::new(depth));
@@ -1078,6 +1079,7 @@ impl MapAggregateState {
 
         Stated {
             level_predicates,
+            follow_beneath,
             elements,
             complete,
         }
@@ -1180,22 +1182,49 @@ impl MapAggregateState {
 /// that are complete, each level's, the folded level's, and the groups that are, over whole
 /// paths.
 struct Stated {
-    /// Completion at each enclosing level, outermost first, including absent outer keys.
+    /// Completion at each enclosing level, outermost first.
     level_predicates: Vec<Predicate>,
+    /// Per enclosing level, outermost first, whether its keys follow the level beneath
+    /// (`src/interpreter/design-operators.md`, "Keys that follow the level beneath").
+    follow_beneath: Vec<Follows>,
     /// The folded level's statement: the elements no answer will add to, over whole paths.
     elements: Predicate,
     complete: Predicate,
 }
 
+/// Whether an enclosing level's keys follow the level beneath, and how many keys the answers
+/// held there. Two answers unite it as a merge of their tiles would
+/// ([`merged_follow`](crate::interpreter::tiling::merged_follow)).
+struct Follows {
+    follows: bool,
+    keys: usize,
+}
+
 impl Stated {
     /// What two answers state together.
     fn union(&self, other: &Stated) -> Stated {
+        debug_assert_eq!(
+            self.follow_beneath.len(),
+            other.follow_beneath.len(),
+            "two answers of one map aggregate's input have the same enclosing levels"
+        );
         Stated {
             level_predicates: self
                 .level_predicates
                 .iter()
                 .zip(&other.level_predicates)
                 .map(|(a, b)| a.union(b))
+                .collect(),
+            follow_beneath: self
+                .follow_beneath
+                .iter()
+                .zip(&other.follow_beneath)
+                .map(|(a, b)| Follows {
+                    follows: crate::interpreter::tiling::merged_follow(
+                        a.follows, a.keys, b.follows, b.keys,
+                    ),
+                    keys: a.keys + b.keys,
+                })
                 .collect(),
             elements: self.elements.union(&other.elements),
             complete: self.complete.union(&other.complete),
@@ -1210,6 +1239,19 @@ impl Stated {
     /// naming the whole group.
     fn settled<'a>(mut self, groups: impl Iterator<Item = &'a Vec<Value>>) -> Stated {
         let depth = self.level_predicates.len();
+        // A level whose keys follow the level beneath is complete once the answers together
+        // state the level beneath complete under every path, and every group beneath it is then
+        // complete. Answers of pulls beneath its keys each state part of the level beneath.
+        for level in (0..depth).rev() {
+            let beneath = match level + 1 == depth {
+                true => &self.elements,
+                false => &self.level_predicates[level + 1],
+            };
+            if self.follow_beneath[level].follows && beneath.is_true() {
+                self.level_predicates[level] = Predicate::True;
+                self.complete = Predicate::True;
+            }
+        }
         let whole = Predicate::union_all(
             groups
                 .filter(|path| {
@@ -1889,10 +1931,31 @@ mod tests {
         );
     }
 
-    /// A group the input records absent has no element to fold, in any region, so the output
-    /// states it complete as a group the input states complete.
+    /// Two answers unite whether the groups' keys follow the level beneath as a merge of their
+    /// tiles would: an answer holding no group leaves the other's flag, and two holding groups
+    /// follow only where both do.
     #[test]
-    fn a_group_recorded_absent_is_complete() {
+    fn answers_unite_the_groups_flag_as_a_merge_of_their_tiles_does() {
+        let answer = |follows: bool, keys: usize| Stated {
+            level_predicates: vec![Predicate::False],
+            follow_beneath: vec![Follows { follows, keys }],
+            elements: Predicate::False,
+            complete: Predicate::False,
+        };
+        let follows = |stated: Stated| stated.follow_beneath[0].follows;
+        assert!(follows(answer(true, 2).union(&answer(false, 0))));
+        assert!(follows(answer(false, 0).union(&answer(true, 2))));
+        assert!(follows(answer(false, 0).union(&answer(true, 0))));
+        assert!(!follows(answer(true, 2).union(&answer(false, 1))));
+        assert!(follows(answer(true, 2).union(&answer(true, 1))));
+    }
+
+    /// Groups whose keys follow the level beneath are complete once the answers consumed state
+    /// that level complete under every path, each answer stating part of it: a group no answer
+    /// holds is complete then, as every held one is.
+    #[test]
+    fn groups_following_the_level_beneath_settle_once_their_parts_cover_it() {
+        use crate::interpreter::tile_operators::test_helpers::ProjectionSpy;
         let uint = || Extent::Base(BaseType::UInt);
         let int = || Extent::Base(BaseType::Int);
         let in_tiling =
@@ -1903,17 +1966,21 @@ mod tests {
                 vec![0],
                 ColumnValue::from_uints(vec![0, 1]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
-                Predicate::False,
+                Predicate::True,
                 BitSet::new(),
             )),
             Predicate::False,
             BitSet::new(),
         );
-        let Tile::DataFunction { absent_keys, .. } = &mut tile else {
+        let Tile::DataFunction {
+            keys_follow_beneath,
+            ..
+        } = &mut tile
+        else {
             unreachable!("a collection")
         };
-        *absent_keys = Predicate::point(Value::UInt(5));
-        let (spy, _released) = QuietSpy::new(tile, in_tiling.clone());
+        *keys_follow_beneath = true;
+        let (spy, _, _) = ProjectionSpy::new(tile, in_tiling);
         let out_tiling = Tiling::data_function(
             uint(),
             Tiling::Aggregation {
@@ -1926,17 +1993,23 @@ mod tests {
             Box::new(spy),
             AggregateKind::Sum,
         );
-        producer.begin_run();
-        producer.consume_in_pipeline(InputId::ONLY, in_tiling.universal_guard());
-        let out = producer.get(out_tiling.universal_guard());
-        let Tile::DataFunction {
-            domain_predicate, ..
-        } = &out
-        else {
-            panic!("a collection of sums, got {out:?}")
+        let beneath = |keys: Predicate| {
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+                FunctionGuard::Domain(keys),
+            ))))
         };
-        assert!(domain_predicate.contains(&Value::UInt(5)), "{out:?}");
-        assert!(!domain_predicate.contains(&Value::UInt(0)), "{out:?}");
+        let first = Predicate::point(Value::UInt(0));
+        producer.begin_run();
+        producer.consume_in_pipeline(InputId::ONLY, beneath(first.clone()));
+        assert!(
+            !producer.complete().covers_path(&[Value::UInt(5)]),
+            "{:?}",
+            producer.complete()
+        );
+        producer.consume_in_pipeline(InputId::ONLY, beneath(Predicate::True.minus(&first)));
+        let held = producer.complete();
+        assert!(held.covers_path(&[Value::UInt(5)]), "{held:?}");
+        assert!(held.covers_path(&[Value::UInt(0)]), "{held:?}");
     }
 
     /// A group the input settles at an inner level is stated settled at the same level of

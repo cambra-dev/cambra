@@ -890,22 +890,8 @@ impl TileProducer for LookupProducer {
                 .filter(|(_, answer)| answer.is_none())
                 .map(|(path, _)| path)
                 .collect();
-            for level in 0..self.level.index() {
-                let missing = Predicate::flatten_or(
-                    undecided
-                        .iter()
-                        .map(|path| Predicate::exactly(&path[..=level]))
-                        .collect(),
-                );
-                let Tile::DataFunction {
-                    domain_predicate, ..
-                } = tile.values_at_mut(CurryLevel::new(level))
-                else {
-                    unreachable!("every level above the rows is a collection")
-                };
-                *domain_predicate = domain_predicate.minus(&missing);
-            }
-            tile.values_at_mut(rows_level).retain_keys(&decided);
+            let undecided: Vec<&[Value]> = undecided.iter().map(Vec::as_slice).collect();
+            tile.withhold(rows_level, &decided, &undecided);
         }
         *tile.values_at_mut(self.level) = Tile::Scalar(ColumnValue::from_values(
             answers.into_iter().flatten().collect(),

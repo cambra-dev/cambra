@@ -429,7 +429,9 @@ impl TileProducer for VariantWrapProducer {
         // and only the tiling separates them.
         //
         // Either way the payload becomes a value: an arm rides its row as one, so a payload
-        // carrying a collection materializes here rather than staying a level.
+        // carrying a collection materializes here rather than staying a level, and the keys
+        // above it follow no level beneath.
+        tile.unfollow_values_at(self.level);
         let slot = tile.values_at_mut(self.level);
         // A record payload is a value only once every field has arrived: an operand with no
         // answer yet, as a breaker before its first consume, leaves its field empty.
