@@ -193,7 +193,7 @@ impl TileProducer for ConstantProducer {
         tile
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         // A collection is released a key at a time, and `get_impl` filters against the
         // guard `release` accumulates, so there is nothing to record here. A scalar has one
         // position and no way to name part of it, which is what makes its only release the
@@ -438,7 +438,7 @@ impl TileProducer for VariantWrapProducer {
         tile
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         // Wrapping is element-wise and **domain-preserving**: output position `d`
         // is payload position `d`. So a domain release translates verbatim — and
         // it has to, since this producer re-emits whatever the payload answers
@@ -745,7 +745,7 @@ fn scrutinee_guard(scrutinee: &dyn TileProducer, projection: &Projection) -> Til
 /// `released`, cuts the released positions from its answer. The scrutinee is released whole on the
 /// release that makes `released` universal, whose argument is partial where earlier releases
 /// named the rest.
-fn release_bare_scrutinee(scrutinee: &mut dyn TileProducer, released: &TileGuard) {
+fn release_bare_scrutinee(scrutinee: &dyn TileProducer, released: &TileGuard) {
     if released.is_universal() {
         scrutinee.release(scrutinee.tiling().universal_guard());
     }
@@ -794,16 +794,16 @@ impl TileProducer for VariantProjectProducer {
         // Part of a payload released names no part of the scrutinee, so the scrutinee keeps
         // the row and the payload is projected again on the next pull (`release_impl`);
         // what the consumer let go is taken back out here.
-        if !self.base.obsolete_guard.is_empty() {
-            out.remove_guarded(self.base.obsolete_guard.clone());
+        if !self.obsolete_guard().is_empty() {
+            out.remove_guarded(self.obsolete_guard());
         }
         out.restrict_to(&projection, self.tiling());
         out
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         if !self.input.tiling().is_data_function() {
-            release_bare_scrutinee(&mut *self.input, &self.base.obsolete_guard);
+            release_bare_scrutinee(&*self.input, &self.obsolete_guard());
             return;
         }
         // A **domain** release passes straight through. This producer's output domain is the
@@ -1147,16 +1147,16 @@ impl TileProducer for VariantIsProducer {
         ));
         // A tag test over a bare union is a column with no keys of its own, which a consumer
         // releases whole; over a stream the cut repeats the input's.
-        if !self.base.obsolete_guard.is_empty() {
-            tile.remove_guarded(self.base.obsolete_guard.clone());
+        if !self.obsolete_guard().is_empty() {
+            tile.remove_guarded(self.obsolete_guard());
         }
         tile.restrict_to(&projection, self.tiling());
         tile
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         if !self.input.tiling().is_data_function() {
-            release_bare_scrutinee(&mut *self.input, &self.base.obsolete_guard);
+            release_bare_scrutinee(&*self.input, &self.obsolete_guard());
             return;
         }
         // Every key in is a key out, so a released region of the output names
@@ -1616,7 +1616,7 @@ mod tests {
             Extent::uint_range(2),
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         );
-        let mut producer = VariantProjectProducer {
+        let producer = VariantProjectProducer {
             base: ProducerBase::unowned(VariantProjectProducer::alloc_id(), &out_tiling),
             input: Box::new(spy),
             tag: FieldKey::Index(0),
@@ -1767,7 +1767,7 @@ mod tests {
                 Extent::Base(BaseType::Int),
             )]))),
         );
-        let mut producer = VariantWrapProducer {
+        let producer = VariantWrapProducer {
             level: CurryLevel::new(1),
             base: ProducerBase::unowned(VariantWrapProducer::alloc_id(), &out_tiling),
             input: Box::new(spy),
@@ -2299,7 +2299,7 @@ mod variant_projection_tests {
         let out = Tiling::Scalar(Extent::Base(BaseType::Bool));
         let (scrutinee, _, released) =
             ProjectionSpy::new(*codomain, Tiling::Scalar(decision_extent()));
-        let mut is_commit = VariantIsProducer {
+        let is_commit = VariantIsProducer {
             base: ProducerBase::unowned(VariantIsProducer::alloc_id(), &out),
             input: Box::new(scrutinee),
             tag: commit(),
