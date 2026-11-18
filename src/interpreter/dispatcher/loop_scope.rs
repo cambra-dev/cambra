@@ -29,6 +29,42 @@ pub(crate) struct InductionRun {
     request: Option<Request>,
 }
 
+/// What a round of a loop, or an attempt of a transaction writer, queues: computed while the scope
+/// holds its store, and queued once it has released it ([`RoundWork::queue`]), so a worker that
+/// claims a package of the round reads the store through its own pull rather than the snapshot
+/// the store published after its last step (`src/interpreter/design-dispatcher.md`, "Bodies on
+/// workers").
+#[must_use = "a round's work is queued once the scope releases its store"]
+#[derive(Default)]
+pub(super) struct RoundWork(Vec<RoundItem>);
+
+enum RoundItem {
+    /// A source pipeline notified of the round's region ([`Dispatcher::notify`]).
+    Notify(PipelineId, TileGuard),
+    /// A pipeline given the round's package ([`Dispatcher::queue_round`]).
+    Queue(PipelineId, TileGuard),
+}
+
+impl RoundWork {
+    pub(super) fn notify(&mut self, pipeline: PipelineId, guard: &TileGuard) {
+        self.0.push(RoundItem::Notify(pipeline, guard.clone()));
+    }
+
+    pub(super) fn queue_round(&mut self, pipeline: PipelineId, guard: &TileGuard) {
+        self.0.push(RoundItem::Queue(pipeline, guard.clone()));
+    }
+
+    /// Queue the work, in the order it was gathered. The scope's store is released by now.
+    pub(super) fn queue(self, dispatcher: &Dispatcher) {
+        for item in self.0 {
+            match item {
+                RoundItem::Notify(pipeline, guard) => dispatcher.notify(pipeline, &guard),
+                RoundItem::Queue(pipeline, guard) => dispatcher.queue_round(pipeline, &guard),
+            }
+        }
+    }
+}
+
 /// A scope's inner pipelines: a loop's body ([`InductionRun`]), or a transaction writer's
 /// ([`WriterRun`](super::transaction_scope::WriterRun)). Planning builds them as a graph of their
 /// own, which execution appends to the run's shared dispatcher between the scope's own pipeline
@@ -52,8 +88,6 @@ pub(super) struct Body {
     /// Whether the inner pipelines' entries are placed at their global ids and the pipelines
     /// run, which they do from the first request on. Only an attached body activates.
     active: bool,
-    /// Whether the followers are released since they were last held, so a release is made once.
-    followers_released: bool,
     /// The region the scope's pipeline consumed, from the scope's finish until the inner pipelines
     /// and the step have finished.
     finishing: Option<Option<TileGuard>>,
@@ -85,7 +119,6 @@ impl Body {
             driver,
             attached: None,
             active: false,
-            followers_released: false,
             finishing: None,
         }
     }
@@ -169,23 +202,25 @@ impl Body {
     }
 
     /// Hold back the pipelines that follow the inner pipelines and the step, once the body runs.
-    pub(super) fn hold_followers(&mut self, dispatcher: &Dispatcher) {
+    pub(super) fn hold_followers(&self, dispatcher: &Dispatcher) {
         if !self.active {
             return;
         }
         dispatcher.hold_followers(self.with_step(), true);
-        self.followers_released = false;
     }
 
-    /// Let the pipelines that follow the inner pipelines and the step run, unless the body does
-    /// not run or they already may. Whether this call released them.
-    pub(super) fn release_followers(&mut self, dispatcher: &Dispatcher) -> bool {
-        if !self.active || self.followers_released {
-            return false;
-        }
-        dispatcher.hold_followers(self.with_step(), false);
-        self.followers_released = true;
-        true
+    /// Let the pipelines that follow the inner pipelines and the step run, where the body runs and
+    /// the step's hold is still `read`, taken before the publication pass that decided the release:
+    /// held, and held again by no claim since ([`Dispatcher::release_followers_if`]). Whether this
+    /// call released them.
+    pub(super) fn release_followers(&self, dispatcher: &Dispatcher, read: FollowersHold) -> bool {
+        self.active && dispatcher.release_followers_if(self.with_step(), self.attached().step, read)
+    }
+
+    /// The step's follower hold, read before a publication pass, or `None` before the body is
+    /// attached.
+    pub(super) fn followers_hold(&self, dispatcher: &Dispatcher) -> Option<FollowersHold> {
+        Some(dispatcher.followers_hold(self.attached.as_ref()?.step))
     }
 
     /// Begin the scope's finish, which consumed `consumed` of the scope's pipeline.
@@ -356,17 +391,27 @@ impl InductionStoreProducer {
             .collect()
     }
 
-    pub(super) fn release_followers(&mut self, dispatcher: &Dispatcher) -> bool {
-        let run = self.run_mut();
-        // The serial coordinator takes one claim before holding followers again.
-        run.request.is_some() && run.body.release_followers(dispatcher)
+    pub(super) fn release_followers(
+        &mut self,
+        dispatcher: &Dispatcher,
+        read: FollowersHold,
+    ) -> bool {
+        let run = self.run();
+        run.request.is_some() && run.body.release_followers(dispatcher, read)
     }
 
+    /// The step's follower hold, read before a publication pass, or `None` before the scope is
+    /// attached.
+    pub(super) fn followers_hold(&self, dispatcher: &Dispatcher) -> Option<FollowersHold> {
+        self.run().body.followers_hold(dispatcher)
+    }
+
+    /// Open the request `package`: the request it completes at once, and the first round's work.
     pub(super) fn begin_shared(
         &mut self,
         dispatcher: &Dispatcher,
         package: WorkPackage,
-    ) -> Option<WorkPackage> {
+    ) -> (Option<WorkPackage>, RoundWork) {
         self.activate(dispatcher);
         self.begin_package(package);
         self.queue_package_round(dispatcher)
@@ -609,7 +654,12 @@ impl InductionStoreProducer {
         self.run().request.is_some()
     }
 
-    pub(super) fn queue_package_round(&mut self, dispatcher: &Dispatcher) -> Option<WorkPackage> {
+    /// The next round of the open request: the request, where it has no round left, and the
+    /// round's work.
+    pub(super) fn queue_package_round(
+        &mut self,
+        dispatcher: &Dispatcher,
+    ) -> (Option<WorkPackage>, RoundWork) {
         let rows = !matches!(self.tiling(), Tiling::Store { .. });
         let mut request = self
             .run_mut()
@@ -621,7 +671,7 @@ impl InductionStoreProducer {
             "the body and store step complete before the next round"
         );
         if request.closing {
-            return Some(request.package);
+            return (Some(request.package), RoundWork::default());
         }
         loop {
             if !self.terminal()
@@ -630,11 +680,11 @@ impl InductionStoreProducer {
             {
                 let guard = Projection::of_path(&position).guard(&self.input_tiling(InputId::ONLY));
                 let starts = self.run().starts.clone();
-                self.placed(|store| store.queue_round_on(dispatcher, &guard, &starts));
+                let work = self.placed(|store| store.round_on(dispatcher, &guard, &starts));
                 request.emitted = true;
                 request.round = Some(guard);
                 self.run_mut().request = Some(request);
-                return None;
+                return (None, work);
             }
             // A flat scope reads newly delivered source positions at most once per request,
             // after exhausting the positions the drive buffered before this request.
@@ -650,25 +700,25 @@ impl InductionStoreProducer {
                 && !guard_minus(&request.package.guard, &self.input_released(InputId::ONLY))
                     .is_empty());
         if !closing {
-            return Some(request.package);
+            return (Some(request.package), RoundWork::default());
         }
-        self.placed(|scope| {
+        let work = self.placed(|scope| {
             // A row's last position does not state the row's end. Render the drive once more
             // at no position so the closing round can release the row whole, including an
             // empty row. A flat request closes only positions the source emitted none of.
             if rows {
                 scope.read_source();
             }
-            scope.queue_round_on(
+            scope.round_on(
                 dispatcher,
                 &request.package.guard,
                 &scope.closing_readers(dispatcher),
-            );
+            )
         });
         request.closing = true;
         request.round = Some(request.package.guard.clone());
         self.run_mut().request = Some(request);
-        None
+        (None, work)
     }
 
     /// Step the queued round after its body and held pushes settle.
@@ -682,19 +732,20 @@ impl InductionStoreProducer {
         self.placed(|scope| scope.step_round(&guard));
     }
 
-    /// Queue the body's work for one position or closing row, before the store steps it.
-    fn queue_round_on(
+    /// The body's work for one position or closing row, before the store steps it.
+    fn round_on(
         &mut self,
         dispatcher: &Dispatcher,
         guard: &TileGuard,
         starts: &[PipelineId],
-    ) {
+    ) -> RoundWork {
+        let mut work = RoundWork::default();
         self.read_cycle_again();
         let (sources, readers): (Vec<PipelineId>, Vec<PipelineId>) = starts
             .iter()
             .partition(|&&start| dispatcher.is_source(self.pipeline(start)));
         for source in sources {
-            dispatcher.notify(self.pipeline(source), guard);
+            work.notify(self.pipeline(source), guard);
         }
         for (reader, row) in self.row_for(guard, &readers) {
             // A reader whose input has released the whole row consumed it final, its end
@@ -705,12 +756,13 @@ impl InductionStoreProducer {
                 released = guard_minus(&row, &breaker.input_released(input)).is_empty()
             });
             if !released {
-                dispatcher.queue_round(self.pipeline(reader), &row);
+                work.queue_round(self.pipeline(reader), &row);
             }
         }
         if self.run().body.is_attached() {
-            dispatcher.queue_round(self.run().body.attached().step, guard);
+            work.queue_round(self.run().body.attached().step, guard);
         }
+        work
     }
 
     /// Step the store after the round's body and held pushes have settled.

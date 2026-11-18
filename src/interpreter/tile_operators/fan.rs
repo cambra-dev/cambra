@@ -2,7 +2,7 @@
 use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use bit_set::BitSet;
 
@@ -253,7 +253,7 @@ impl TileProducer for RecordWrapProducer {
         tile
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         let guard = match &obsolete_guard {
             g if g.is_universal() => self.input.tiling().universal_guard(),
             g if g.is_empty() => self.input.tiling().empty_guard(),
@@ -289,12 +289,10 @@ impl TileOperator for Zip {
             crate::interpreter::notifications::through_values(self.level, self.tiling(), consumer);
         let shared = shared_consumer(consumer);
         Box::new(ZipProducer {
-            dropped_rows: Default::default(),
             base: ProducerBase::new(ZipProducer::alloc_id(), self.tiling(), self.clone(), cx),
             names: self.names.clone(),
             level: self.level,
-            held: RwLock::new(vec![HashSet::new(); self.inputs.len()]),
-            emitted: RwLock::new(Predicate::False),
+            state: Mutex::new(ZipState::new(self.inputs.len())),
             inputs: self
                 .inputs
                 .iter()
@@ -325,9 +323,6 @@ fn qualify_beneath(tile: &mut Tile, rows: &Predicate) {
 
 /// Producer for [`Zip`]: pulls each input and assembles a record-codomain tile.
 struct ZipProducer {
-    // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`;
-    // no other operator holds it.
-    dropped_rows: RwLock<HashMap<usize, TileGuard>>,
     base: ProducerBase,
     /// Field names in input order, used when producing the output Record tile.
     names: Vec<SmolStr>,
@@ -335,16 +330,32 @@ struct ZipProducer {
     inputs: Vec<Box<dyn TileProducer>>,
     /// The level the record sits at ([`Zip`]).
     level: CurryLevel,
+    /// What a pull and a release both change, under one lock.
+    // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`
+    // while several workers pull its pipeline; no other operator holds it.
+    state: Mutex<ZipState>,
+}
+
+struct ZipState {
     /// The paths of the rows each arm has held at the pair's enclosing level, on any pull: an
     /// arm gives back only a row it held.
-    // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`;
-    // no other operator holds it.
-    held: RwLock<Vec<HashSet<Vec<Value>>>>,
+    held: Vec<HashSet<Vec<Value>>>,
     /// The keys of the pairs a flat zip has emitted, whose cells a consumer may give back
     /// field by field ([`ZipProducer::release_impl`]).
-    // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`;
-    // no other operator holds it.
-    emitted: RwLock<Predicate>,
+    emitted: Predicate,
+    /// Per arm, the rows it deleted, which no consumer releases, so the next release gives them
+    /// back.
+    dropped_rows: HashMap<usize, TileGuard>,
+}
+
+impl ZipState {
+    fn new(arms: usize) -> Self {
+        Self {
+            held: vec![HashSet::new(); arms],
+            emitted: Predicate::False,
+            dropped_rows: HashMap::new(),
+        }
+    }
 }
 
 impl TileProducer for ZipProducer {
@@ -415,12 +426,14 @@ impl TileProducer for ZipProducer {
             .collect();
         // A release covering a row the arm never held, one its input never had, gives
         // nothing back: the row is absent from that arm, and so from the pair.
-        let mut held =
-            std::mem::take(&mut *self.held.write().unwrap_or_else(PoisonError::into_inner));
+        // Held across the merge below, which reads no input: a pull on another thread waits
+        // for the rows this one adds and the pairs it emits, and a release for the rows it gives
+        // back.
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(rows_level) = self.level.enclosing() {
             for (arm, tile) in tiles.iter().enumerate() {
                 if tile.is_data_function() {
-                    held[arm].extend(tile.paths_at(rows_level));
+                    state.held[arm].extend(tile.paths_at(rows_level));
                 }
             }
         }
@@ -429,7 +442,7 @@ impl TileProducer for ZipProducer {
             released[arm]
                 .as_ref()
                 .is_some_and(|guard| guard.covers_path(path))
-                && held[arm].iter().any(|row| row.starts_with(path))
+                && state.held[arm].iter().any(|row| row.starts_with(path))
         };
 
         // Every level above the pair has to agree before anything pairs beneath it. The
@@ -680,16 +693,12 @@ impl TileProducer for ZipProducer {
                 // gives it back here and stops tracking it.
                 for (arm, dropped) in dropped.into_iter().enumerate() {
                     if let Some(dropped) = dropped {
-                        held[arm].retain(|path| !dropped.covers_path(path));
-                        let mut dropped_rows = self
-                            .dropped_rows
-                            .write()
-                            .unwrap_or_else(PoisonError::into_inner);
-                        let released = match dropped_rows.remove(&arm) {
+                        state.held[arm].retain(|path| !dropped.covers_path(path));
+                        let released = match state.dropped_rows.remove(&arm) {
                             Some(before) => before.union(&dropped),
                             None => dropped,
                         };
-                        dropped_rows.insert(arm, released);
+                        state.dropped_rows.insert(arm, released);
                     }
                 }
                 let mut out = skeleton;
@@ -748,20 +757,15 @@ impl TileProducer for ZipProducer {
                     let vouched = held.union(domain_predicate);
                     qualify_beneath(out.values_at_mut(self.level), &vouched);
                 }
-                *self.held.write().unwrap_or_else(PoisonError::into_inner) = held;
                 // The arms keep the rows a consumer released only a field of
                 // ([`ZipProducer::release_impl`]), so those cells are taken back out here.
-                if !self.base.obsolete_guard.is_empty() {
-                    out.remove_guarded(self.base.obsolete_guard.clone());
+                if !self.obsolete_guard().is_empty() {
+                    out.remove_guarded(self.obsolete_guard());
                 }
                 if let (1, Tile::DataFunction { domain, .. }) = (self.level.index(), &out) {
-                    let emitted = self
-                        .emitted
-                        .read()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .union(&Predicate::from_column_value(domain));
-                    *self.emitted.write().unwrap_or_else(PoisonError::into_inner) = emitted;
+                    state.emitted = state.emitted.union(&Predicate::from_column_value(domain));
                 }
+                drop(state);
                 // The completeness intersected above is each arm's, which an arm restating fewer
                 // levels than the projection's states over the region it was pulled at, so it is
                 // cut to the projection.
@@ -772,12 +776,15 @@ impl TileProducer for ZipProducer {
         }
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        for (arm, dropped) in std::mem::take(
-            self.dropped_rows
-                .get_mut()
-                .unwrap_or_else(PoisonError::into_inner),
-        ) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
+        let (dropped_rows, emitted) = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            (
+                std::mem::take(&mut state.dropped_rows),
+                state.emitted.clone(),
+            )
+        };
+        for (arm, dropped) in dropped_rows {
             self.inputs[arm].release(dropped);
         }
 
@@ -790,12 +797,7 @@ impl TileProducer for ZipProducer {
         // The released fields of the rest are taken out of the pair instead. Beneath standing
         // levels only whole pairs are passed on.
         let delivered = match level {
-            1 => obsolete_guard.intersect(&TileGuard::Function(FunctionGuard::Domain(
-                self.emitted
-                    .read()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone(),
-            ))),
+            1 => obsolete_guard.intersect(&TileGuard::Function(FunctionGuard::Domain(emitted))),
             _ => self.base.tiling.empty_guard(),
         };
         let whole = TileGuard::flatten_or(vec![whole_pair_rows(
@@ -805,7 +807,7 @@ impl TileProducer for ZipProducer {
             &pair,
         )]);
         let released = TileGuard::flatten_or(vec![whole.clone(), delivered]);
-        for (name, input) in self.names.iter().zip(self.inputs.iter_mut()) {
+        for (name, input) in self.names.iter().zip(self.inputs.iter()) {
             let guard = match &released {
                 g if g.is_universal() => input.tiling().universal_guard(),
                 g if g.is_empty() => input.tiling().empty_guard(),
@@ -821,24 +823,14 @@ impl TileProducer for ZipProducer {
             };
             input.release(guard);
         }
-        for paths in self.held.get_mut().unwrap_or_else(PoisonError::into_inner) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        for paths in &mut state.held {
             paths.retain(|path| !whole.covers_path(path));
         }
         if whole.is_universal() {
-            *self
-                .emitted
-                .get_mut()
-                .unwrap_or_else(PoisonError::into_inner) = Predicate::False;
+            state.emitted = Predicate::False;
         } else if let TileGuard::Function(FunctionGuard::Domain(keys)) = &whole {
-            let emitted = self
-                .emitted
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .minus(keys);
-            *self
-                .emitted
-                .get_mut()
-                .unwrap_or_else(PoisonError::into_inner) = emitted;
+            state.emitted = state.emitted.minus(keys);
         }
     }
 }
@@ -1036,20 +1028,20 @@ impl TileProducer for MakeRecordProducer {
         Tile::record(fields)
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         // A record guard names one guard per field, and each goes to that field's operand.
         // A later pull re-reads every operand, and each withholds what it was told.
         match &obsolete_guard {
             g if g.is_empty() => {}
             TileGuard::Record(fields) => {
-                for (name, input) in self.names.iter().zip(self.inputs.iter_mut()) {
+                for (name, input) in self.names.iter().zip(self.inputs.iter()) {
                     if let Some(field) = fields.get(name) {
                         input.release(field.clone());
                     }
                 }
             }
             g if g.is_universal() => {
-                for input in self.inputs.iter_mut() {
+                for input in self.inputs.iter() {
                     input.release(input.tiling().universal_guard());
                 }
             }
@@ -1313,8 +1305,8 @@ impl TileProducer for SelectFieldProducer {
         tile
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        self.dropped_rows.release_to(&mut *self.input);
+    fn release_impl(&self, obsolete_guard: TileGuard) {
+        self.dropped_rows.release_to(&*self.input);
         let released = self.at_field(obsolete_guard);
         self.input.release(released);
     }
@@ -1422,7 +1414,7 @@ mod nested_projection_tests {
 mod tests {
     use super::*;
     use crate::interpreter::tile_operators::test_helpers::{
-        QuietSpy, ReleaseSpy, TestTileProducer,
+        QuietSpy, ReleaseSpy, TestTileProducer, keys_between,
     };
     use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
     use bit_set::BitSet;
@@ -1488,7 +1480,7 @@ mod tests {
     #[test]
     fn record_wrap_forwards_a_release_to_its_input() {
         let (tile, tiling) = keyed_ints();
-        let (mut producer, log) = record_wrap_over(tile, tiling, "f");
+        let (producer, log) = record_wrap_over(tile, tiling, "f");
         producer.release(producer.tiling().universal_guard());
         assert!(
             log.read()
@@ -1504,7 +1496,7 @@ mod tests {
     #[test]
     fn record_wrap_forwards_a_release_of_its_keys() {
         let (tile, tiling) = keyed_ints();
-        let (mut producer, log) = record_wrap_over(tile, tiling, "f");
+        let (producer, log) = record_wrap_over(tile, tiling, "f");
         let key_zero = Predicate::at_or_below(Value::UInt(0));
         producer.release(TileGuard::Function(FunctionGuard::Domain(key_zero.clone())));
         assert_eq!(
@@ -1525,7 +1517,7 @@ mod tests {
             uint.clone(),
             Tiling::data_function(uint, Tiling::Scalar(int)),
         );
-        let (mut producer, log) = record_wrap_over(tiling.empty_tile(), tiling.clone(), "f");
+        let (producer, log) = record_wrap_over(tiling.empty_tile(), tiling.clone(), "f");
         let key_zero = TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(
             Value::UInt(0),
         )));
@@ -1558,7 +1550,7 @@ mod tests {
             inputs.push(Box::new(spy));
         }
         let out_tiling = Tiling::Record((0..2).map(|i| (tuple_field(i), tiling.clone())).collect());
-        let mut producer = MakeRecordProducer {
+        let producer = MakeRecordProducer {
             base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out_tiling),
             names: (0..2).map(tuple_field).collect(),
             inputs,
@@ -1580,7 +1572,7 @@ mod tests {
         let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
         let (spy, log) = ReleaseSpy::new(Tile::Scalar(ColumnValue::Ints(vec![1])), tiling.clone());
         let out_tiling = Tiling::Record([(tuple_field(0), tiling.clone())].into_iter().collect());
-        let mut producer = MakeRecordProducer {
+        let producer = MakeRecordProducer {
             base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out_tiling),
             names: vec![tuple_field(0)],
             inputs: vec![Box::new(spy)],
@@ -1618,7 +1610,7 @@ mod tests {
         let names: Vec<SmolStr> = (0..2).map(tuple_field).collect();
         let out_tiling =
             Tiling::Record(names.iter().map(|n| (n.clone(), tiling.clone())).collect());
-        let mut producer = MakeRecordProducer {
+        let producer = MakeRecordProducer {
             base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out_tiling),
             names: names.clone(),
             inputs,
@@ -1725,7 +1717,7 @@ mod tests {
             input_tiling.clone(),
         );
         let output_tiling = select_field_tiling(&input_tiling, "a");
-        let mut producer = SelectFieldProducer {
+        let producer = SelectFieldProducer {
             dropped_rows: Default::default(),
             base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &output_tiling),
             input: Box::new(spy),
@@ -1926,10 +1918,8 @@ mod tests {
         let (spy_a, log_a) = ReleaseSpy::new(filtered_collection(), input_tiling.clone());
         let (spy_b, log_b) = ReleaseSpy::new(filtered_collection(), input_tiling);
         let mut zip = ZipProducer {
-            dropped_rows: Default::default(),
             level: CurryLevel::new(1),
-            held: RwLock::new(vec![HashSet::new(); 2]),
-            emitted: RwLock::new(Predicate::False),
+            state: Mutex::new(ZipState::new(2)),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &output_tiling),
             names: vec!["a".into(), "b".into()],
             inputs: vec![Box::new(spy_a), Box::new(spy_b)],
@@ -1991,10 +1981,8 @@ mod tests {
             ])),
         );
         let mut zip = ZipProducer {
-            dropped_rows: Default::default(),
             level: CurryLevel::new(1),
-            held: RwLock::new(vec![HashSet::new(); 2]),
-            emitted: RwLock::new(Predicate::False),
+            state: Mutex::new(ZipState::new(2)),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &output_tiling),
             names: vec!["a".into(), "b".into()],
             inputs: vec![
@@ -2072,13 +2060,11 @@ mod tests {
         );
         let (spy1, _) = QuietSpy::new(arm(vec![50, 60], Predicate::False), arm_tiling);
         let mut zip = ZipProducer {
-            dropped_rows: Default::default(),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
             names: vec![tuple_field(0), tuple_field(1)],
             inputs: vec![Box::new(spy0), Box::new(spy1)],
             level: CurryLevel::new(1),
-            emitted: RwLock::new(Predicate::False),
-            held: RwLock::new(vec![HashSet::new(); 2]),
+            state: Mutex::new(ZipState::new(2)),
         };
         let Tile::DataFunction { absent_keys, .. } =
             zip.read_in_pipeline(out_tiling.universal_guard())
@@ -2129,13 +2115,11 @@ mod tests {
         let (spy0, released0) = QuietSpy::new(arm0, arm0_tiling.clone());
         let (spy1, released1) = QuietSpy::new(arm1, arm1_tiling.clone());
         let mut zip = ZipProducer {
-            dropped_rows: Default::default(),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
             names: vec![tuple_field(0), tuple_field(1)],
             inputs: vec![Box::new(spy0), Box::new(spy1)],
             level: CurryLevel::new(1),
-            held: RwLock::new(vec![HashSet::new(); 2]),
-            emitted: RwLock::new(Predicate::False),
+            state: Mutex::new(ZipState::new(2)),
         };
         let out = zip.read_in_pipeline(out_tiling.universal_guard());
         let guard = out.to_guard();
@@ -2226,13 +2210,11 @@ mod tests {
         let (spy0, released0) = QuietSpy::new(arm0, arm_tiling.clone());
         let (spy1, _) = QuietSpy::new(arm1, arm_tiling);
         let mut zip = ZipProducer {
-            dropped_rows: Default::default(),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
             names: vec![tuple_field(0), tuple_field(1)],
             inputs: vec![Box::new(spy0), Box::new(spy1)],
             level: CurryLevel::new(1),
-            held: RwLock::new(vec![HashSet::new(); 2]),
-            emitted: RwLock::new(Predicate::False),
+            state: Mutex::new(ZipState::new(2)),
         };
         zip.read_in_pipeline(out_tiling.universal_guard());
         // A consumer done with field `_0` at every row.
@@ -2269,35 +2251,44 @@ mod tests {
             TileGuard::Function(FunctionGuard::Domain(Predicate::exactly(&[Value::UInt(0)])));
         zip.release(other_field.intersect(&first_row));
         assert!(
-            zip.held
-                .read()
+            zip.state
+                .lock()
                 .unwrap_or_else(PoisonError::into_inner)
+                .held
                 .iter()
                 .all(|paths| !paths.contains(&vec![Value::UInt(0)])),
             "a released pair must leave the row-tracking state"
         );
         assert!(
-            zip.held.read().unwrap_or_else(PoisonError::into_inner)[0]
+            zip.state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .held[0]
                 .contains(&vec![Value::UInt(1)]),
             "an unpaired row stays held until released"
         );
         assert!(
-            !zip.emitted
-                .read()
+            !zip.state
+                .lock()
                 .unwrap_or_else(PoisonError::into_inner)
+                .emitted
                 .contains(&Value::UInt(0)),
             "a released pair must leave the emitted-key predicate"
         );
         zip.release(out_tiling.universal_guard());
         assert!(
-            zip.held
-                .read()
+            zip.state
+                .lock()
                 .unwrap_or_else(PoisonError::into_inner)
+                .held
                 .iter()
                 .all(HashSet::is_empty)
         );
         assert_eq!(
-            *zip.emitted.read().unwrap_or_else(PoisonError::into_inner),
+            zip.state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .emitted,
             Predicate::False
         );
     }
@@ -2323,7 +2314,7 @@ mod tests {
                 .clone()
         }
 
-        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+        fn release_impl(&self, _obsolete_guard: TileGuard) {}
     }
 
     /// A row an arm deletes reaches no consumer, so the zip stops tracking it where it gives the
@@ -2359,17 +2350,18 @@ mod tests {
             })
         };
         let mut zip = ZipProducer {
-            dropped_rows: Default::default(),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
             names: vec![tuple_field(0), tuple_field(1)],
             inputs: vec![scripted(&arm0), scripted(&arm1)],
             level: CurryLevel::new(1),
-            held: RwLock::new(vec![HashSet::new(); 2]),
-            emitted: RwLock::new(Predicate::False),
+            state: Mutex::new(ZipState::new(2)),
         };
         zip.read_in_pipeline(out_tiling.universal_guard());
         assert!(
-            zip.held.read().unwrap_or_else(PoisonError::into_inner)[0]
+            zip.state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .held[0]
                 .contains(&vec![Value::UInt(1)])
         );
         // Arm 0 deletes row 1, and the consumer releases row 0, the pair it saw.
@@ -2380,14 +2372,100 @@ mod tests {
             Predicate::exactly(&[Value::UInt(0)]),
         )));
         assert!(
-            zip.held
-                .read()
+            zip.state
+                .lock()
                 .unwrap_or_else(PoisonError::into_inner)
+                .held
                 .iter()
                 .all(HashSet::is_empty),
             "a deleted row stays tracked: {:?}",
-            zip.held
+            zip.state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .held
         );
+    }
+
+    /// An arm answering only the keys a pull asks for, out of `0..KEYS`.
+    struct KeysAsked {
+        base: ProducerBase,
+    }
+
+    impl TileProducer for KeysAsked {
+        impl_producer_base!();
+
+        fn get_impl(&self, projection_guard: TileGuard) -> Tile {
+            let asked = projection_guard.whole_keys();
+            let keys: Vec<u64> = (0..KEYS)
+                .filter(|key| asked.contains_path(&[Value::UInt(*key)]))
+                .collect();
+            let values = keys.iter().map(|key| *key as i64).collect();
+            Tile::data_function(
+                ColumnValue::from_uints(keys),
+                Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+                Predicate::False,
+                BitSet::new(),
+            )
+        }
+
+        fn release_impl(&self, _obsolete_guard: TileGuard) {}
+    }
+
+    const KEYS: u64 = 64;
+
+    /// Pulls of one zip from several threads at once, each for its own keys, leave the zip
+    /// recording, per arm, the rows of every pull: no pull's rows are lost to another's.
+    #[test]
+    fn concurrent_pulls_keep_the_rows_each_arm_holds() {
+        const THREADS: u64 = 8;
+        let uint = || Extent::Base(BaseType::UInt);
+        let int = || Extent::Base(BaseType::Int);
+        let arm_tiling = Tiling::data_function(uint(), Tiling::Scalar(int()));
+        let out_tiling = Tiling::data_function(
+            uint(),
+            Tiling::Record(HashMap::from([
+                (tuple_field(0), Tiling::Scalar(int())),
+                (tuple_field(1), Tiling::Scalar(int())),
+            ])),
+        );
+        let arm = || -> Box<dyn TileProducer> {
+            Box::new(KeysAsked {
+                base: ProducerBase::unowned(KeysAsked::alloc_id(), &arm_tiling),
+            })
+        };
+        let per_thread = KEYS / THREADS;
+        // Each round starts its pulls together, on a zip with nothing recorded.
+        for round in 0..100 {
+            let zip = ZipProducer {
+                base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
+                names: vec![tuple_field(0), tuple_field(1)],
+                inputs: vec![arm(), arm()],
+                level: CurryLevel::new(1),
+                state: Mutex::new(ZipState::new(2)),
+            };
+            let start = std::sync::Barrier::new(THREADS as usize);
+            std::thread::scope(|scope| {
+                for thread in 0..THREADS {
+                    let (zip, start) = (&zip, &start);
+                    scope.spawn(move || {
+                        let first = thread * per_thread;
+                        start.wait();
+                        crate::interpreter::dispatcher::in_a_run(|| {
+                            zip.get(keys_between(first, first + per_thread - 1))
+                        });
+                    });
+                }
+            });
+            let state = zip.state.lock().unwrap_or_else(PoisonError::into_inner);
+            assert_eq!(state.held.len(), 2, "the zip tracks each arm's rows");
+            for (index, held) in state.held.iter().enumerate() {
+                assert_eq!(
+                    held.len(),
+                    KEYS as usize,
+                    "round {round}: arm {index} holds the rows of every pull"
+                );
+            }
+        }
     }
 
     /// Beneath a standing level, an arm whose field the consumer released at every path holds no
@@ -2437,21 +2515,22 @@ mod tests {
         let (spy0, _) = QuietSpy::new(arm0_tiling.empty_tile(), arm0_tiling.clone());
         let (spy1, _) = QuietSpy::new(arm1, arm1_tiling);
         let mut zip = ZipProducer {
-            dropped_rows: Default::default(),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
             names: vec![tuple_field(0), tuple_field(1)],
             inputs: vec![Box::new(spy0), Box::new(spy1)],
             level: CurryLevel::new(2),
-            emitted: RwLock::new(Predicate::False),
             // Arm `_0` held both rows before the consumer released its field, so it gives them
             // back rather than lacking them.
-            held: RwLock::new(vec![
-                HashSet::from([
-                    vec![Value::UInt(0), Value::UInt(7)],
-                    vec![Value::UInt(1), Value::UInt(7)],
-                ]),
-                HashSet::new(),
-            ]),
+            state: Mutex::new(ZipState {
+                held: vec![
+                    HashSet::from([
+                        vec![Value::UInt(0), Value::UInt(7)],
+                        vec![Value::UInt(1), Value::UInt(7)],
+                    ]),
+                    HashSet::new(),
+                ],
+                ..ZipState::new(2)
+            }),
         };
         // The consumer reads field `_1` only, so it releases field `_0` at every path.
         let every_path = |field: TileGuard| {
@@ -2559,13 +2638,11 @@ mod tests {
         let (spy0, _) = QuietSpy::new(arm0, arm0_tiling);
         let (spy1, _) = QuietSpy::new(arm1, arm1_tiling);
         let mut zip = ZipProducer {
-            dropped_rows: Default::default(),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
             names: vec![tuple_field(0), tuple_field(1)],
             inputs: vec![Box::new(spy0), Box::new(spy1)],
             level: CurryLevel::new(2),
-            emitted: RwLock::new(Predicate::False),
-            held: RwLock::new(vec![HashSet::new(); 2]),
+            state: Mutex::new(ZipState::new(2)),
         };
         let Tile::DataFunction { domain, .. } = zip.read_in_pipeline(out_tiling.universal_guard())
         else {
@@ -2776,13 +2853,11 @@ mod projection_tests {
         );
         (
             ZipProducer {
-                dropped_rows: Default::default(),
                 base: ProducerBase::unowned(ZipProducer::alloc_id(), &out),
                 names: vec![tuple_field(0), tuple_field(1)],
                 inputs: vec![Box::new(a), Box::new(b)],
                 level: CurryLevel::new(1),
-                emitted: RwLock::new(Predicate::False),
-                held: RwLock::new(vec![HashSet::new(); 2]),
+                state: Mutex::new(ZipState::new(2)),
             },
             a_pulled,
             b_pulled,

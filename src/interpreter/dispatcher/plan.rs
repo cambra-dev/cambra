@@ -9,6 +9,7 @@ use std::sync::{PoisonError, RwLock};
 use smol_str::SmolStr;
 
 use super::loop_scope::{self, Body, Member, induction};
+use super::workers::WorkerPool;
 use super::*;
 use crate::ccl::context::CompiledProgram;
 use crate::interpreter::CurryLevel;
@@ -66,6 +67,40 @@ pub fn run_program(program: &mut CompiledProgram, morsel_rows: usize) -> Result<
     run_program_polling(program, morsel_rows, &mut sleep_when_idle)
 }
 
+/// The number of workers a run that names none uses: `CAMBRA_LOCAL_DOP`, or one where it is unset
+/// (`src/interpreter/design-dispatcher.md`, "Shared native pipeline execution").
+///
+/// # Panics
+///
+/// Where `CAMBRA_LOCAL_DOP` is set to anything but a positive count.
+pub(crate) fn default_workers() -> usize {
+    std::env::var("CAMBRA_LOCAL_DOP").map_or(1, |value| {
+        value
+            .parse()
+            .ok()
+            .filter(|workers| *workers > 0)
+            .unwrap_or_else(|| panic!("CAMBRA_LOCAL_DOP is a positive count of workers: {value}"))
+    })
+}
+
+/// [`run_program`] with `workers` workers instead of [`default_workers`].
+///
+/// # Errors
+///
+/// As [`run_program`].
+///
+/// # Panics
+///
+/// Where `workers` is zero, and as [`run_program`].
+pub fn run_program_with_workers(
+    program: &mut CompiledProgram,
+    morsel_rows: usize,
+    workers: usize,
+) -> Result<Run, Refused> {
+    assert!(workers > 0, "a run has at least one worker");
+    collect_run(program, morsel_rows, workers, &mut sleep_when_idle)
+}
+
 /// [`run_program`] with `on_idle` called each time nothing is claimable and a live source has
 /// yielded no new region since the last poll, before the next poll: [`run_program`] sleeps, and
 /// a test feeds the source there. `on_idle` runs inside the run, so it notifies no consumer
@@ -83,8 +118,29 @@ pub fn run_program_polling(
     morsel_rows: usize,
     on_idle: &mut dyn FnMut(),
 ) -> Result<Run, Refused> {
+    collect_run(program, morsel_rows, default_workers(), on_idle)
+}
+
+/// [`run_program_polling`] with `workers` workers instead of [`default_workers`].
+#[cfg(test)]
+pub(crate) fn run_program_polling_with_workers(
+    program: &mut CompiledProgram,
+    morsel_rows: usize,
+    workers: usize,
+    on_idle: &mut dyn FnMut(),
+) -> Result<Run, Refused> {
+    collect_run(program, morsel_rows, workers, on_idle)
+}
+
+/// [`run_program_polling`] with `workers` workers.
+fn collect_run(
+    program: &mut CompiledProgram,
+    morsel_rows: usize,
+    workers: usize,
+    on_idle: &mut dyn FnMut(),
+) -> Result<Run, Refused> {
     let collected = Arc::new(Collected::default());
-    let planned = run_program_into(program, morsel_rows, collected.clone(), on_idle)?;
+    let planned = run_into(program, morsel_rows, workers, collected.clone(), on_idle)?;
     Ok(Run {
         planned,
         main: collected.take(),
@@ -116,6 +172,17 @@ pub fn run_program_into(
     main: Arc<dyn DataSink>,
     on_idle: &mut dyn FnMut(),
 ) -> Result<Vec<Planned>, Refused> {
+    run_into(program, morsel_rows, default_workers(), main, on_idle)
+}
+
+/// [`run_program_into`] with `workers` workers.
+fn run_into(
+    program: &mut CompiledProgram,
+    morsel_rows: usize,
+    workers: usize,
+    main: Arc<dyn DataSink>,
+    on_idle: &mut dyn FnMut(),
+) -> Result<Vec<Planned>, Refused> {
     // A `main` output's producer is the driver's to pull; the run takes it into a slot, as a
     // sink's sits in one, and hands it back after. A program has at most one.
     let mut taken = None;
@@ -142,10 +209,11 @@ pub fn run_program_into(
         outputs: &mut program.outputs,
         taken: taken.clone(),
     };
-    let result = run_targets(&targets, morsel_rows, &mut Idle(on_idle)).map(|ended| match ended {
-        Ended::Done(planned) => planned,
-        Ended::Paused(_) => unreachable!("an observer that never breaks pauses no run"),
-    });
+    let result =
+        run_targets(&targets, morsel_rows, workers, &mut Idle(on_idle)).map(|ended| match ended {
+            Ended::Done(planned) => planned,
+            Ended::Paused(_) => unreachable!("an observer that never breaks pauses no run"),
+        });
     drop(returned);
     if let Some((at, slot)) = &taken {
         let producer = slot.write().unwrap_or_else(PoisonError::into_inner).take();
@@ -278,7 +346,7 @@ impl Targets {
         morsel_rows: usize,
         observer: &mut dyn RunObserver,
     ) -> Result<Ended, Refused> {
-        let ended = run_targets(&self.0, morsel_rows, observer)?;
+        let ended = run_targets(&self.0, morsel_rows, default_workers(), observer)?;
         if let Ended::Done(_) = ended {
             complete_sinks(&self.0);
         }
@@ -333,6 +401,7 @@ impl DataSink for Collected {
 fn run_targets(
     targets: &[RunTarget],
     morsel_rows: usize,
+    workers: usize,
     observer: &mut dyn RunObserver,
 ) -> Result<Ended, Refused> {
     let mut runs = ScopeRuns::new();
@@ -813,25 +882,108 @@ fn run_targets(
     let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
         execution.reach(pipeline, &mut root_reach, call);
     };
-    let done = in_a_run(|| {
-        // A range over a static extent has completed every key from the start.
-        for (pipeline, ranges) in members.leaves.iter().enumerate() {
-            for (range, _) in ranges {
-                dispatcher.land_range_complete(
-                    PipelineId(pipeline),
-                    &Projection::Everything,
-                    range,
-                );
+    let worker_targets: Vec<Option<BreakerHandle>> = execution
+        .handlers
+        .iter()
+        .enumerate()
+        .map(|(pipeline, handler)| match handler {
+            Handler::Root => match members.located[pipeline] {
+                Located::Chain(handle) => Some(handle.clone()),
+                _ => None,
+            },
+            Handler::Body(handle) => Some(handle.clone()),
+            _ => None,
+        })
+        .collect();
+    let consuming: Vec<BreakerHandle> = worker_targets.iter().flatten().cloned().collect();
+    // The pool admits no pipeline that is queued reads again, and none such a pipeline reads,
+    // transitively (`src/interpreter/design-dispatcher.md`, "Reading a widened input again"). The
+    // coordinator consumes a read again one at a time and lands the change it pushes. A read again
+    // reads its input whole, and what it reads beneath it reaches it through the regions those
+    // pipelines push, which a worker's packages push keyed rather than widened. The pipelines
+    // queued reads again are the readers that read their input again at a widened push, and the
+    // live pipelines notified of their whole input whose breaker reads an open input
+    // (`LivePipeline`).
+    let mut coordinator_only: Vec<bool> = (0..worker_targets.len())
+        .map(|p| {
+            // A body's pipelines come after the program's, which alone are planned live.
+            dispatcher.infos[p].whole_input.is_some()
+                || (planned
+                    .get(p)
+                    .is_some_and(|planned| planned.live && planned.whole)
+                    && reads_open_input(&mut reach, PipelineId(p)))
+        })
+        .collect();
+    let mut beneath: Vec<usize> = (0..coordinator_only.len())
+        .filter(|&p| coordinator_only[p])
+        .collect();
+    while let Some(p) = beneath.pop() {
+        for &read in &dispatcher.infos[p].reads {
+            if !coordinator_only[read] {
+                coordinator_only[read] = true;
+                beneath.push(read);
             }
         }
-        match live.is_empty() {
-            true => {
-                execution.drive(&dispatcher, &mut reach);
-                true
-            }
-            false => drive_live(&dispatcher, &mut reach, &execution, &mut live, observer),
-        }
+    }
+    let worker_targets = worker_targets
+        .into_iter()
+        .zip(coordinator_only)
+        .map(|(target, coordinator_only)| {
+            target.filter(|handle| {
+                !coordinator_only && chain_restates_parallel_level(handle, &consuming)
+            })
+        })
+        .collect();
+    order_inputs_of_ordered_breakers(&mut dispatcher, &mut reach, &execution.steps());
+    let workers = WorkerPool::new(workers, worker_targets, execution.bodies_by_pipeline());
+    let done = thread::scope(|scope| {
+        let threads = workers.spawn(scope, &dispatcher);
+        // Caught so a worker's panic, which failed the run first, is the one resumed: the
+        // coordinator can go on to panic over the state the worker left.
+        let coordinator = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // A panic here fails the run, so the workers stop rather than wait for the coordinator.
+            let _coordinator = dispatcher.worker();
+            in_a_run(|| {
+                // A range over a static extent has completed every key from the start.
+                for (pipeline, ranges) in members.leaves.iter().enumerate() {
+                    for (range, _) in ranges {
+                        dispatcher.land_range_complete(
+                            PipelineId(pipeline),
+                            &Projection::Everything,
+                            range,
+                        );
+                    }
+                }
+                match live.is_empty() {
+                    true => {
+                        execution.drive(&dispatcher, &mut reach, &workers);
+                        true
+                    }
+                    false => drive_live(
+                        &dispatcher,
+                        &mut reach,
+                        &execution,
+                        &workers,
+                        &mut live,
+                        observer,
+                    ),
+                }
+            })
+        }));
+        // A run that ends at a drained boundary has no claim in flight and none a worker can take,
+        // so its workers sleep: their claims end, and they return.
+        dispatcher.stop_claims();
+        WorkerPool::join(threads);
+        let done = coordinator.unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+        assert!(
+            !dispatcher.has_failed(),
+            "a run fails only by a panic, which the coordinator or a worker resumes"
+        );
+        done
     });
+    #[cfg(test)]
+    workers.report(&mut planned, &execution.owners());
+    drop(workers);
     // Every breaker and range is terminal at the run's end, so each pipeline has recorded as
     // complete by each of its sources all that a push of the source's every key lands as at its
     // entry. A run that pauses stops at a drained boundary before its end, and checks nothing.
@@ -1044,13 +1196,17 @@ impl Scope {
 
     /// Open the request `package`, a claim of the scope's own pipeline.
     fn begin(&self, dispatcher: &Dispatcher, package: WorkPackage) {
+        // Each store guard is a temporary of its `let`, released before the work is queued.
         match self {
             Scope::Loop(store) => {
-                let completed = induction(store).begin_shared(dispatcher, package);
+                let (completed, work) = induction(store).begin_shared(dispatcher, package);
+                work.queue(dispatcher);
                 self.complete(dispatcher, completed);
             }
             Scope::Writer { store, writer } => {
-                transaction_scope::transaction(store).begin_request(dispatcher, *writer, package)
+                let work = transaction_scope::transaction(store)
+                    .begin_request(dispatcher, *writer, package);
+                work.queue(dispatcher);
             }
         }
     }
@@ -1058,7 +1214,7 @@ impl Scope {
     /// End the round or attempt whose step claimed `package`, and start the next or complete
     /// the request.
     fn step(&self, dispatcher: &Dispatcher, package: WorkPackage) {
-        let completed = match self {
+        let (completed, work) = match self {
             Scope::Loop(store) => {
                 induction(store).complete_round();
                 dispatcher.acknowledge(package);
@@ -1069,14 +1225,20 @@ impl Scope {
                 transaction_scope::transaction(store).finish_request(dispatcher, *writer)
             }
         };
+        // Each store guard above is a temporary of its arm's tail expression, which edition 2024
+        // drops at the end of the arm, so the store is released before the round is queued.
+        work.queue(dispatcher);
         self.complete(dispatcher, completed);
     }
 
     fn begin_finish(&self, dispatcher: &Dispatcher, consumed: Option<TileGuard>) {
         match self {
             Scope::Loop(store) => induction(store).begin_shared_finish(dispatcher, consumed),
-            Scope::Writer { store, writer } => transaction_scope::transaction(store)
-                .begin_transaction_finish(dispatcher, *writer, consumed),
+            Scope::Writer { store, writer } => {
+                let work = transaction_scope::transaction(store)
+                    .begin_transaction_finish(dispatcher, *writer, consumed);
+                work.queue(dispatcher);
+            }
         }
     }
 
@@ -1094,26 +1256,38 @@ impl Scope {
             return true;
         }
         // A loop publishes the inner pipelines a round settles; a writer, every inner pipeline.
-        let pipelines = match self {
-            Scope::Loop(store) => induction(store).settlement_pipelines(),
-            Scope::Writer { store, writer } => transaction_scope::transaction(store)
-                .writer_run(*writer)
-                .body
-                .pipelines(),
+        // The step's hold is read first: a worker's claim of the body after it holds the
+        // followers again, so the release below fails rather than pass output this pass missed.
+        let (pipelines, hold) = match self {
+            Scope::Loop(store) => {
+                let store = induction(store);
+                (
+                    store.settlement_pipelines(),
+                    store.followers_hold(dispatcher),
+                )
+            }
+            Scope::Writer { store, writer } => {
+                let transaction = transaction_scope::transaction(store);
+                let run = transaction.writer_run(*writer);
+                (run.body.pipelines(), run.followers_hold(dispatcher))
+            }
         };
         let before = dispatcher.changes();
         push_held(dispatcher, reach, pipelines);
-        // No other claim executes during this scope's publication pass on the coordinator, so a
-        // generation change here belongs to these pushes.
+        // A change here is these pushes, or a worker's publication during the pass, which counts
+        // as progress too: the coordinator claims again and reaches the same fixed point.
         if dispatcher.changes() != before {
             return true;
         }
+        let Some(hold) = hold else {
+            return progressed;
+        };
         progressed
             | match self {
-                Scope::Loop(store) => induction(store).release_followers(dispatcher),
+                Scope::Loop(store) => induction(store).release_followers(dispatcher, hold),
                 Scope::Writer { store, writer } => transaction_scope::transaction(store)
                     .writer_run_mut(*writer)
-                    .release_followers(dispatcher),
+                    .release_followers(dispatcher, hold),
             }
     }
 }
@@ -1121,6 +1295,8 @@ impl Scope {
 pub(super) struct Execution {
     handlers: Vec<Handler>,
     roots: usize,
+    /// Each scope's inner pipelines, its step and its own pipeline, as attached.
+    bodies: Vec<(std::ops::Range<usize>, PipelineId, PipelineId)>,
 }
 
 impl Execution {
@@ -1134,6 +1310,7 @@ impl Execution {
                 })
                 .collect(),
             roots: scopes.len(),
+            bodies: Vec::new(),
         };
         for (pipeline, scope) in scopes.iter().enumerate() {
             if let Some(store) = scope {
@@ -1184,6 +1361,8 @@ impl Execution {
         dispatcher.hold_pipeline(step, true);
         assert_eq!(step.0, self.handlers.len(), "each step has one handler");
         scope.with_body(|body| body.attach(pipeline, base, step));
+        self.bodies
+            .push((base..base + members.len(), step, pipeline));
         self.handlers.push(Handler::Step(scope));
         step
     }
@@ -1230,6 +1409,56 @@ impl Execution {
             ),
             Handler::Request(scope) | Handler::Step(scope) => scope.reach(call),
         }
+    }
+
+    /// Per pipeline, the inner pipelines and step of the scope whose body it is in: a worker that
+    /// consumes a package of the body holds them as followers again before it acknowledges it.
+    fn bodies_by_pipeline(&self) -> Vec<Option<Vec<PipelineId>>> {
+        let mut bodies = vec![None; self.handlers.len()];
+        for (pipelines, step, _) in &self.bodies {
+            let group: Vec<PipelineId> = pipelines
+                .clone()
+                .map(PipelineId)
+                .chain(std::iter::once(*step))
+                .collect();
+            for pipeline in pipelines.clone() {
+                debug_assert!(
+                    bodies[pipeline].is_none(),
+                    "pipeline {pipeline} is in one scope's body"
+                );
+                bodies[pipeline] = Some(group.clone());
+            }
+        }
+        bodies
+    }
+
+    /// Per pipeline, whether it is a scope's step.
+    fn steps(&self) -> Vec<bool> {
+        self.handlers
+            .iter()
+            .map(|handler| matches!(handler, Handler::Step(_)))
+            .collect()
+    }
+
+    /// Per pipeline, the pipeline of the program it runs for: itself, or for a pipeline of a
+    /// scope's body or a step, the program's pipeline the scope, or the scope around it, sits in.
+    #[cfg(test)]
+    fn owners(&self) -> Vec<usize> {
+        let scope_of = |pipeline: usize| {
+            self.bodies
+                .iter()
+                .find(|(body, step, _)| body.contains(&pipeline) || step.0 == pipeline)
+                .map(|(_, _, scope)| scope.0)
+        };
+        (0..self.handlers.len())
+            .map(|pipeline| {
+                let mut owner = pipeline;
+                while owner >= self.roots {
+                    owner = scope_of(owner).expect("a pipeline past the roots is a scope's");
+                }
+                owner
+            })
+            .collect()
     }
 
     /// Every scope, each at its request handler.
@@ -1324,7 +1553,7 @@ impl Execution {
         push_held(dispatcher, reach, pipelines);
     }
 
-    fn drive(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>) {
+    fn drive(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>, workers: &WorkerPool) {
         for pipeline in 0..self.roots {
             if dispatcher.is_source(PipelineId(pipeline)) {
                 let mut input = None;
@@ -1332,21 +1561,31 @@ impl Execution {
                     input = Some(breaker.input_tiling(at))
                 });
                 let input = input.expect("a planned source has a breaker input");
-                dispatcher.start_source(PipelineId(pipeline), &input, &input.empty_guard());
+                workers.start_source(
+                    dispatcher,
+                    PipelineId(pipeline),
+                    &input,
+                    &input.empty_guard(),
+                );
             }
         }
         loop {
-            match dispatcher.try_claim(None) {
+            match workers.next(dispatcher) {
                 Next::Package(package) => self.consume(dispatcher, reach, package),
                 Next::Finish { pipeline, consumed } => {
+                    workers.finishing(pipeline, reach);
                     self.finish(dispatcher, reach, pipeline, consumed)
                 }
+                Next::Wait(generation) if workers.may_progress(dispatcher) => {
+                    dispatcher.wait(generation)
+                }
                 Next::Wait(_) if self.resume(dispatcher, reach) => {}
+                Next::Wait(generation) if dispatcher.changed_since(&generation) => {}
                 Next::Wait(_) => {
                     panic!("an acyclic run with no pending loop has a pipeline that may finish")
                 }
-                Next::Done => return,
-                Next::Failed => panic!("a run on one thread fails only by panicking on it"),
+                // A worker's panic failed the run; the pool resumes it once it joins.
+                Next::Done | Next::Failed => return,
             }
         }
     }
@@ -1489,6 +1728,12 @@ pub(super) fn plan_edges(
     let mut planned: Vec<Planned> = names
         .iter()
         .map(|name| Planned {
+            #[cfg(test)]
+            worker_claims: 0,
+            #[cfg(test)]
+            workers_used: 0,
+            #[cfg(test)]
+            incremental_claims: 0,
             name: name.clone(),
             whole: false,
             follows: Vec::new(),
@@ -1656,6 +1901,41 @@ fn queue_starts(dispatcher: &Dispatcher, starts: &Starts) {
     }
 }
 
+/// Order every pipeline a breaker that requires ordered input reads, directly or through the
+/// pipelines it reads ([`Breaker::requires_ordered_input`]): checked arithmetic and
+/// order-sensitive control consume their input in dependency order, whatever the number of workers.
+///
+/// A scope's step reaches the scope's store too, and reads the scope's body. It is ordered
+/// already and seeds nothing: the store's input arrives at its request pipeline, and the body
+/// stays free to consume several packages at once.
+fn order_inputs_of_ordered_breakers(
+    dispatcher: &mut Dispatcher,
+    reach: &mut Reach<'_>,
+    steps: &[bool],
+) {
+    use std::collections::HashSet;
+    debug_assert_eq!(
+        steps.len(),
+        dispatcher.infos.len(),
+        "`steps` holds one entry per pipeline of the dispatcher"
+    );
+    let mut ordered = Vec::new();
+    for pipeline in (0..dispatcher.infos.len()).filter(|&pipeline| !steps[pipeline]) {
+        reach(PipelineId(pipeline), &mut |breaker, _| {
+            if breaker.requires_ordered_input() {
+                ordered.push(pipeline);
+            }
+        });
+    }
+    let mut seen = HashSet::new();
+    while let Some(pipeline) = ordered.pop() {
+        if seen.insert(pipeline) {
+            dispatcher.order(PipelineId(pipeline));
+            ordered.extend(dispatcher.infos[pipeline].reads.iter().copied());
+        }
+    }
+}
+
 /// A sink output's consumer, which the planner places in the sink's pipeline. The consumer keeps
 /// its placement behind its own lock, so placing it takes no lock a notification waits on.
 type SinkTarget = Arc<crate::interpreter::sinks::SinkConsumer>;
@@ -1676,6 +1956,15 @@ enum TargetEntry {
 /// What [`run_program`] planned for one pipeline.
 #[cfg_attr(test, derive(Debug))]
 pub struct Planned {
+    /// Claims the worker pool consumed, for the pool's tests.
+    #[cfg(test)]
+    pub worker_claims: usize,
+    /// Pool threads that consumed at least one claim, for the pool's tests.
+    #[cfg(test)]
+    pub workers_used: usize,
+    /// Claims submitted before a producing dependency finished, for the pool's tests.
+    #[cfg(test)]
+    pub incremental_claims: usize,
     /// Its breaker's name.
     pub name: String,
     /// Whether it reads its input whole: once every pipeline it reads has finished, or, over a live
@@ -2758,8 +3047,8 @@ impl Planner {
         let pipelines = self.members(Some(scope));
         let members = self.body_members(&pipelines, morsel_rows, kept_scopes, runs);
         let store = self.scopes[scope].store.clone();
-        let mut kept: Vec<usize> = (0..members.len()).collect();
-        let (inner, planned, reads) = loop {
+        let kept: Vec<usize> = (0..members.len()).collect();
+        let (inner, planned, reads) = {
             let reads = reads_of_kept(&pipelines.reads, &kept);
             // A breaker in no pipeline keeps no entry: an id the planner gave it may be a kept
             // pipeline's here, and a probe would take it for an arrival there.
@@ -2827,16 +3116,7 @@ impl Planner {
                 induction(scope).forget_through_drive();
             }
             drop(placed);
-            let whole: Vec<usize> = planned
-                .iter()
-                .enumerate()
-                .filter(|(at, plan)| plan.whole && pipelines.kinds[kept[*at]] == Consumes::Pushes)
-                .map(|(at, _)| kept[at])
-                .collect();
-            if whole.is_empty() {
-                break (inner, planned, reads);
-            }
-            kept.retain(|pipeline| !whole.contains(pipeline));
+            (inner, planned, reads)
         };
         assert!(
             reads.iter().any(Vec::is_empty),
@@ -3039,6 +3319,23 @@ fn rows_above_positions(tiling: &Tiling) -> usize {
     tiling.levels()
 }
 
+/// Whether every operator the chain under `breaker` pulls restates the keys of the breaker's
+/// [`Breaker::parallel_level`](crate::interpreter::tile_operators::Breaker::parallel_level). The
+/// worker pool seeds an admitted pipeline at that level (`WorkerPool::start_source`), and the
+/// level answers for the breaker's immediate input only: an operator deeper in the chain can
+/// refuse the keys its consumer restates. `true` for a breaker with no parallel level.
+fn chain_restates_parallel_level(breaker: &BreakerHandle, consuming: &[BreakerHandle]) -> bool {
+    let breaker = breaker.read().unwrap_or_else(PoisonError::into_inner);
+    let (Some(level), Some(producer)) = (breaker.parallel_level(), breaker.as_producer()) else {
+        return true;
+    };
+    let mut refused = false;
+    producer.visit_input_producers(&mut |_, input| {
+        refused |= unrestated(input, Some(level), consuming, false).is_some();
+    });
+    !refused
+}
+
 /// Why a round of a loop's scope cannot pull the chain at `producer`, or `None` where every
 /// operator it pulls beneath the outermost keys restates the keys it is pulled at. `pulled` is the
 /// level `producer` is pulled at, `None` where it is pulled whole, and each operator passes its
@@ -3077,9 +3374,19 @@ fn unrestated(
     {
         return None;
     }
+    // Visiting a stateful producer holds its retained-state lock. Resolve owner
+    // metadata before descending rather than re-entering it from the callback.
+    let mut roles = Vec::new();
+    producer.visit_input_producers(&mut |role, _| roles.push(role.to_owned()));
+    let levels: Vec<_> = roles
+        .iter()
+        .map(|role| pulled.and_then(|level| producer.input_level(role, level)))
+        .collect();
     let mut why = None;
-    producer.visit_input_producers(&mut |role, input| {
-        let beneath = pulled.and_then(|pulled| producer.input_level(role, pulled));
+    let mut at = 0;
+    producer.visit_input_producers(&mut |_, input| {
+        let beneath = levels[at];
+        at += 1;
         why = why
             .take()
             .or_else(|| unrestated(input, beneath, consuming, false));
@@ -3396,6 +3703,7 @@ fn drive_live(
     dispatcher: &Dispatcher,
     reach: &mut Reach<'_>,
     execution: &Execution,
+    workers: &WorkerPool,
     live: &mut [LivePipeline],
     observer: &mut dyn RunObserver,
 ) -> bool {
@@ -3433,12 +3741,17 @@ fn drive_live(
             changed |= at.poll(dispatcher, reach);
         }
         loop {
-            match dispatcher.try_claim(None) {
+            match workers.next(dispatcher) {
                 Next::Package(package) => execution.consume(dispatcher, reach, package),
                 Next::Finish { pipeline, consumed } => {
+                    workers.finishing(pipeline, reach);
                     execution.finish(dispatcher, reach, pipeline, consumed)
                 }
+                Next::Wait(generation) if workers.may_progress(dispatcher) => {
+                    dispatcher.wait(generation)
+                }
                 Next::Wait(_) if execution.resume(dispatcher, reach) => {}
+                Next::Wait(generation) if dispatcher.changed_since(&generation) => {}
                 Next::Wait(_) => {
                     // A breaker that pushes only at its finish, as `MapAggregate`, finishes only
                     // once every source yields everything: it pushes what it completed here, and the
@@ -3455,7 +3768,8 @@ fn drive_live(
                     break;
                 }
                 Next::Done => return true,
-                Next::Failed => panic!("a run on one thread fails only by panicking on it"),
+                // A worker's panic failed the run; the pool resumes it once it joins.
+                Next::Failed => return false,
             }
         }
         #[cfg(debug_assertions)]
@@ -3930,7 +4244,7 @@ mod tests {
             self.tiling().empty_tile()
         }
 
-        fn release_impl(&mut self, _guard: TileGuard) {}
+        fn release_impl(&self, _guard: TileGuard) {}
     }
 
     /// A pull at the outermost keys is walked: an operator that pulls its input beneath the keys
@@ -4047,7 +4361,7 @@ mod tests {
             tile
         }
 
-        fn release_impl(&mut self, _guard: TileGuard) {}
+        fn release_impl(&self, _guard: TileGuard) {}
     }
 
     /// An `Uncurry` beneath a standing level, over an input that restates its outermost keys
@@ -4119,7 +4433,7 @@ mod tests {
             self.tiling().empty_tile()
         }
 
-        fn release_impl(&mut self, _guard: TileGuard) {}
+        fn release_impl(&self, _guard: TileGuard) {}
     }
 
     /// An input a producer reads whole is pulled at no level beneath the outermost keys, so

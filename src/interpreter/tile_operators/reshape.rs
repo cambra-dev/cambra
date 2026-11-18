@@ -185,7 +185,7 @@ impl TileProducer for PermuteRecordDomainProducer {
         permuted
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         let upstream_guard = match obsolete_guard {
             g if g.is_universal() => self.input.tiling().universal_guard(),
             g if g.is_empty() => self.input.tiling().empty_guard(),
@@ -634,7 +634,7 @@ impl TileProducer for FlattenTupleDomainProducer {
         flat
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         let upstream_guard = self.unflatten_guard(obsolete_guard);
         self.input.release(upstream_guard);
     }
@@ -1431,7 +1431,7 @@ mod tests {
             fn get_impl(&self, _: TileGuard) -> Tile {
                 self.tile.clone()
             }
-            fn release_impl(&mut self, guard: TileGuard) {
+            fn release_impl(&self, guard: TileGuard) {
                 let _ = self.tx.send(guard);
             }
         }
@@ -1443,7 +1443,7 @@ mod tests {
             tx,
         };
         let out_tiling = flat_three_int_tiling();
-        let mut producer = PermuteRecordDomainProducer {
+        let producer = PermuteRecordDomainProducer {
             base: ProducerBase::unowned(PermuteRecordDomainProducer::alloc_id(), &out_tiling),
             input: Box::new(sender),
             permutation: vec![2usize, 0, 1],
@@ -1775,7 +1775,7 @@ mod projection_tests {
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         );
         let (input, _, released) = ProjectionSpy::new(tiling.empty_tile(), tiling.clone());
-        let mut rotated = PermuteRecordDomainProducer {
+        let rotated = PermuteRecordDomainProducer {
             base: ProducerBase::unowned(PermuteRecordDomainProducer::alloc_id(), &tiling),
             input: Box::new(input),
             permutation: vec![1, 2, 0],
