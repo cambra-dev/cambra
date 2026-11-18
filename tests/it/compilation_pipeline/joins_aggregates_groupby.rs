@@ -678,9 +678,13 @@ fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expe
 
     let (expr, result) = run_pipeline_with_ctx(&mut ctx, code);
     assert_eq!(format!("{}:{}", symbolic(&expr), expr.ty), expected_ccl);
-    assert_eq!(
+    let (result, expected_result) = (
         sort_function_by_domain(result),
-        sort_function_by_domain(expected_result)
+        sort_function_by_domain(expected_result),
+    );
+    assert!(
+        same_tile(&result, &expected_result),
+        "{result:?}\n  is not\n{expected_result:?}"
     );
 }
 

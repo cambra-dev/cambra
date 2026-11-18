@@ -104,8 +104,8 @@ when its sources close. Main-output packages are ordered. Returning several tile
 the collection's value or imply an order among its elements.
 
 The binary runs every program through the dispatcher, including under `--inspect` and `--control`.
-`CAMBRA_MORSEL_ROWS` selects a positive morsel size, defaulting to 1024. Compilation builds the graph
-without executing sinks. A planning refusal reports an error before execution.
+`CAMBRA_MORSEL_ROWS` selects a positive morsel size, defaulting to 65,536. Compilation builds the
+graph without executing sinks. A planning refusal reports an error before execution.
 
 Transaction and induction drivers sample the store's committed snapshot. The planner waits for
 seed opening before admitting their source items. Transaction replies commit as taps and are
@@ -279,8 +279,12 @@ nothing as pushed. The operators on its way learn of it as of a delivery and mar
 dirty.
 
 No read again is queued while one of the same pipeline waits unclaimed, since that one reads
-whatever arrived before its claim. A live run consumes on one thread (`drive_live`), so no two reads
-of one open row run at once.
+whatever arrived before its claim. The coordinator consumes every pipeline that is queued reads
+again and every pipeline such a pipeline reads, transitively, one package at a time; the worker pool
+admits none of them ([Who claims what](#who-claims-what)). So no two reads of one open row run at
+once. The pipelines beneath stay off the pool too because a read again reads its input whole, and
+what lies beneath it reaches it through the regions those pipelines push, which a worker's packages
+push keyed rather than widened.
 
 Every widened pipeline also reads its input once every source yields everything, held until the
 inputs it waits for have completed it. That read carries the obligation the finish checks: it takes
@@ -433,8 +437,160 @@ waiting therefore cannot be lost. A worker failure wakes waiters and stops furth
 does a panic in a thread that publishes (`notify`, `start_source`, `close`, `land`, `finish`,
 queueing a reader), worker or not.
 
-These guarantees concern scheduling. Breakers are `Send + Sync`, each behind an `Arc<RwLock<_>>`
-(`BreakerHandle`), and the production driver runs them serially. Several pipelines can share one
-breaker, whose consumes, offers and finishes would need additional coordination before parallel
-execution. Atomic-ordering proofs and queue storage mechanics are documented beside their
-implementation in `dispatcher.rs`.
+These guarantees concern scheduling. Which thread claims which package, and how a breaker shared by
+several threads is consumed and published, is under
+[Shared native pipeline execution](#shared-native-pipeline-execution). Atomic-ordering proofs and
+queue storage mechanics are documented beside their implementation in `dispatcher.rs`.
+
+## Shared native pipeline execution
+
+A run that names no number of workers takes `CAMBRA_LOCAL_DOP`, or one where it is unset
+(`default_workers`). `run_program_with_workers` names the number for one run, as a parameter.
+All runs use the same planner, dispatcher queues and native breakers. With one worker the run starts
+no thread and the coordinator claims every package and every finish itself.
+
+A pipeline owns its subscribed non-breaker producer chain. Its upstream breaker readers share
+canonical breaker handles. Workers retain those handles and call the existing breaker's immutable
+`consume_impl`; they construct no operator chains, input readers, or secondary topology.
+`get` and `get_impl` read the existing operands directly.
+
+Memo, aggregate, and map-aggregate inputs can execute independent finite-position claims. Memo
+materialization admits flat rows. Grouped folds can partition the innermost finite position level.
+Checked sums and their producing dependencies preserve input order: the planner orders every
+pipeline such a breaker reads (`order_inputs_of_ordered_breakers`). So do a loop's store pipeline
+and every pipeline it reads, transitively: a loop runs its positions in order and takes a request
+none of whose positions is next as one that only closes absent positions, so its input is published
+in position order, one package in flight per pipeline. The store's step reads the body and seeds no
+ordering, so the body is not ordered by this. Control scopes, sinks, and shapes without independent
+position projections keep their coordinator handlers.
+
+A sink's packages are not ordered, so with more than one worker its answers arrive out of key order.
+`TestSink` merges them in arrival order and reads the merged value in key order
+(`Value::in_key_order`), since a collection's binding order states nothing. A `main` output's
+pipeline is ordered and needs no sort.
+
+A worker reads and computes its claimed region before taking the output-state lock. Memo merges
+under its cache lock. Aggregates fold received values under the shared accumulator lock.
+Map-aggregate folds into its shared group map under one lock. There are no worker-local aggregate
+maps or delta-flush buffers.
+
+The native `consume_impl(&self)` integrates output, drops its output-state lock, and releases
+consumed input through the existing producer chain.
+
+### Who claims what
+
+A pipeline is **admitted** when all of these hold:
+
+- It is a pipeline of the program over a chain or a pipeline of a loop's or transaction writer's
+  body.
+- Its breaker answers `Breaker::parallel_level`, and every operator its chain pulls restates the
+  keys of that level (`chain_restates_parallel_level`).
+- No pipeline queued a read again
+  ([Reading a widened input again](#reading-a-widened-input-again)) reads it, directly or
+  transitively, and it is queued none itself. The pipelines queued reads again are the readers that
+  read their input again at a widened push, and the live pipelines notified of their whole input
+  whose breaker reads an open input.
+
+With more than one worker, the run starts that many worker threads, and two kinds of claimant share
+the dispatcher:
+
+- A worker claims packages of admitted pipelines only, and never a finish
+  (`Dispatcher::claim_where`). It sleeps in `Dispatcher::wait` while none is claimable.
+- The coordinator claims every other package and every finish (`Dispatcher::try_claim_where`). It
+  runs the loop and transaction scopes, sinks and breakers that are not admitted, every finish, the
+  resume pass ([A loop in rounds](#a-loop-in-rounds)) and the polling of live sources.
+
+### A worker's claim
+
+A worker consumes, publishes and acknowledges its own claim, in that order:
+
+1. It calls `consume_impl` under the breaker's handle held shared. Several workers consume one
+   pipeline at once; an ordered pipeline has at most one package in flight.
+2. Where the breaker answers `pushes_while_consuming`, as on the coordinator (`consume_with`), it
+   computes the pipeline's pushes under the handle held exclusively (`Pushes::push_final`), so the
+   push reads the breaker with no consume between the merge of a consume's rows and the release of
+   its input. A breaker that publishes only at its finish or in the resume pass pushes nothing here.
+3. It lands the pushes with no handle held, then acknowledges the package.
+
+A finish of an admitted pipeline is the coordinator's: it is claimable only once every package is
+acknowledged, so no worker holds the pipeline. The coordinator releases the input whole
+(`Breaker::finish_parallel_input`) and runs the finish.
+
+### Bodies on workers
+
+A scope queues a round's packages, and a writer an attempt's, after it releases its store. The scope
+computes the round under the store and answers it as a `RoundWork`, which the handler queues once
+the store guard has dropped (`Scope::begin`, `Scope::step`). A reader that finds the store held is
+answered from the snapshot the store published after its last step (`consume_store`), which is the
+store's state until its next step. A reader of the round's first packages therefore finds the store
+free and pulls the round's state, not the snapshot from before the round.
+
+A round's step passes only output the resume pass has published. The coordinator re-holds a scope's
+followers after each of its own claims (`Execution::consume`). A worker re-holds the followers of
+the body it consumed in before it acknowledges the package (`WorkerPool::consume`). The resume pass
+reads the step's follower hold before it publishes and releases the followers only where that hold
+is unchanged (`Dispatcher::release_followers_if`). A hold counts each time it is taken, so a release
+decided before a worker's consume published fails, and the step waits for the next pass.
+
+### Waiting and stalls
+
+A coordinator claim that answers `Next::Wait` goes on in this order:
+
+1. While a package of an admitted pipeline is in flight or claimable by a worker
+   (`WorkerPool::may_progress`, through `Dispatcher::may_claim_where`), the coordinator sleeps in
+   `Dispatcher::wait`.
+2. Otherwise it runs the resume pass, and claims again where the pass changed anything.
+3. Otherwise, where the generation has not moved since the claim, no claimant can progress. A run
+   with no live source panics. A live run has reached a drained boundary.
+
+A worker's publication can advance the generation during the resume pass, which then counts as
+progress. The coordinator claims again and reaches the same fixed point.
+
+### Lock order
+
+No two threads wait on each other through these rules:
+
+- A thread holding a breaker handle takes only the handles of pipelines that breaker's chain
+  reads, shared, and takes a store only with `try_write`.
+- No thread waits for a store's blocking `write` or in `Dispatcher::wait` while it holds a breaker
+  handle. Pushes land after the handle is released, in `consume_with` and `push_held` alike.
+- A landing reaches every consumer through `notifications::notify_shared`, which takes no lock. A
+  consumer takes only the lock on its own state and releases it before it notifies another, so a
+  landing holds at most one consumer's lock at a time. No consumer takes a breaker handle or a store
+  while it is notified.
+- Only the coordinator takes a store's blocking `write`, in the scope handlers. While it holds one
+  it takes the scope's member handles, where `row_for` probes where a round's push lands; a worker
+  never waits on a store, since it reaches one only through `try_write`, so the coordinator's
+  store-first order meets no worker waiting the other way. The round's packages are queued after the
+  store is released ([Bodies on workers](#bodies-on-workers)).
+
+A wait for a handle is therefore a wait on a thread that holds a handle further upstream and waits
+for nothing but handles further upstream still. The pipelines form a DAG, since a loop's cycle runs
+through its store, so these waits end.
+
+### Failure and pause
+
+A worker holds a `Dispatcher::worker` guard while it claims. A worker that panics fails the run, so
+every claimant answers `Next::Failed`. The coordinator stops claiming, joins the workers and resumes
+the worker's panic on its own thread (`a_worker_panic_ends_the_run_with_that_panic`). The
+coordinator holds the same guard, so a panic on it wakes and stops the workers. Its panic is caught
+until the workers have joined: a worker's panic, which failed the run first, is resumed in its
+place, and the coordinator's is resumed only where no worker panicked. A run that returns has not
+failed.
+
+A worker thread the system refuses to start leaves the run with the workers already started; with
+none, the coordinator claims every package. The coordinator's guard exists only once the workers
+are started, so a refusal must not panic: the workers already started would never be stopped.
+
+A run that ends at a drained boundary, to pause or reload, has no claim in flight and none claimable
+by a worker. The coordinator ends the claims (`Dispatcher::stop_claims`), every worker's claim
+answers `Next::Done`, and the coordinator joins them before the run returns its operators.
+
+Reads and releases lock the retained state they access, without an operator-wide operation
+lock. A cache read copies an owned tile under its state lock; computation continues on that
+snapshot. Release accumulates obsolete guards under their own lock, then reclaims retained
+state through the native callback. Memo cache locks are dropped before forwarding releases upstream.
+Canonical breaker handles allow shared access to both reads and releases. Stateful control
+operators protect their retained state with a mutex because consumption and reclamation mutate
+it. There are no worker input-retention pins or deferred worker releases. Workers join before
+the run returns its operators on pause, cancellation, or unwinding.
