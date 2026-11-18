@@ -19,10 +19,11 @@ use crate::interpreter::tile_operators::test_helpers::ConsumeInPipeline as _;
 #[cfg(test)]
 use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use smol_str::SmolStr;
+use std::sync::PoisonError;
+use std::sync::RwLock;
 use std::{
-    cell::RefCell,
     collections::HashMap,
-    rc::Rc,
+    sync::Arc,
     sync::{Mutex, OnceLock},
 };
 
@@ -57,7 +58,7 @@ mod dispatcher_tests;
 mod dispatcher_thread_tests;
 mod extract_final;
 mod fan;
-mod fanout;
+pub(crate) mod fanout;
 #[cfg(test)]
 mod forwarding_tests;
 #[cfg(test)]
@@ -99,7 +100,7 @@ pub use union::*;
 /// An operator knows its output [`Tiling`] and can instantiate a live
 /// [`TileProducer`] by subscribing a [`Consumer`].  Operators are
 /// constructed at compile time; producers are created on demand at runtime.
-pub trait TileOperator {
+pub trait TileOperator: Send + Sync {
     /// Get the extent (type) of this operator.
     fn extent(&self) -> Extent {
         self.tiling().extent()
@@ -143,7 +144,7 @@ pub trait TileOperator {
     /// does not have and a subtree the pane may lose entirely.
     ///
     /// A visitor rather than a returned list because two inputs are reached
-    /// through an `RefCell`: the borrow lives for the call and cannot outlive
+    /// through an `RwLock`: the read lives for the call and cannot outlive
     /// it. Required rather than defaulted so that a new operator states its
     /// inputs or fails to compile.
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>));
@@ -163,7 +164,7 @@ pub trait TileOperator {
     /// to that operator.
     /// See `src/interpreter/design-operators.md`, "The producer protocol".
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -231,11 +232,11 @@ static PRODUCER_COUNTERS: OnceLock<Mutex<HashMap<&'static str, usize>>> = OnceLo
 /// consumer every input of one operator wakes
 /// ([`shared_consumer`](crate::interpreter::shared_consumer)).
 pub(crate) fn subscribe_forwarding(
-    op: &mut dyn TileOperator,
+    op: &Arc<dyn TileOperator>,
     shared: &SharedConsumer,
     cx: &mut SubscribeContext,
 ) -> Box<dyn TileProducer> {
-    op.subscribe(
+    op.clone().subscribe(
         op.tiling().universal_guard(),
         forwarding_consumer(shared),
         cx,
@@ -260,11 +261,11 @@ pub(crate) fn consumer_keeping_keys_if(
 /// [`subscribe_forwarding`] for an input whose outermost keys are the operator's: the input's
 /// region reaches the operator's consumer as it is.
 pub(crate) fn subscribe_forwarding_keeping_keys(
-    op: &mut dyn TileOperator,
+    op: &Arc<dyn TileOperator>,
     shared: &SharedConsumer,
     cx: &mut SubscribeContext,
 ) -> Box<dyn TileProducer> {
-    op.subscribe(
+    op.clone().subscribe(
         op.tiling().universal_guard(),
         forwarding_consumer_keeping_keys(shared),
         cx,
@@ -274,7 +275,7 @@ pub(crate) fn subscribe_forwarding_keeping_keys(
 /// [`subscribe_forwarding_keeping_keys`] where `keeps_keys`, and [`subscribe_forwarding`] where not.
 pub(crate) fn subscribe_forwarding_keeping_keys_if(
     keeps_keys: bool,
-    op: &mut dyn TileOperator,
+    op: &Arc<dyn TileOperator>,
     shared: &SharedConsumer,
     cx: &mut SubscribeContext,
 ) -> Box<dyn TileProducer> {
@@ -390,33 +391,36 @@ pub(crate) use impl_operator_base;
 /// The regions an input has notified since they were last taken.
 ///
 /// `subscribe` installs [`Self::consumer`] on the input before the producer exists;
-/// `Rc<RefCell<_>>` connects the two and carries no tile values.
+/// `Arc<RwLock<_>>` connects the two and carries no tile values.
 #[derive(Clone)]
 pub struct Arrivals(
     // shared-state-ok: see the type doc.
-    Rc<RefCell<Projection>>,
+    Arc<RwLock<Projection>>,
 );
 
 impl Arrivals {
     /// No region arrived yet.
     pub(crate) fn new() -> Self {
-        Self(Rc::new(RefCell::new(Projection::Nothing)))
+        Self(Arc::new(RwLock::new(Projection::Nothing)))
     }
 
     /// The union of the regions that arrived since the last call, which resets it.
     pub fn take(&self) -> Projection {
-        self.0.replace(Projection::Nothing)
+        std::mem::replace(
+            &mut *self.0.write().unwrap_or_else(PoisonError::into_inner),
+            Projection::Nothing,
+        )
     }
 
     /// Whether a region has arrived since the last [`take`](Self::take), which it leaves
     /// recorded.
     pub fn pending(&self) -> bool {
-        *self.0.borrow() != Projection::Nothing
+        *self.0.read().unwrap_or_else(PoisonError::into_inner) != Projection::Nothing
     }
 
     /// Record that `arrived` has arrived.
     pub(crate) fn record(&self, arrived: &Projection) {
-        let mut held = self.0.borrow_mut();
+        let mut held = self.0.write().unwrap_or_else(PoisonError::into_inner);
         *held = held.union(arrived);
     }
 
@@ -438,7 +442,7 @@ struct RecordingConsumer {
 impl Consumer for RecordingConsumer {
     /// Delivered notifications record the region; planning probes leave it unchanged.
     fn notify(
-        &mut self,
+        &self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
@@ -915,7 +919,7 @@ pub struct ProducerBase {
     pub id: usize,
     /// The cell owning this breaker subscription. Weak so the producer cannot retain itself.
     // shared-state-ok: execution ownership metadata; readers still exchange tiles through get.
-    pub(crate) breaker_handle: Option<std::rc::Weak<RefCell<dyn BreakingProducer>>>,
+    pub(crate) breaker_handle: Option<std::sync::Weak<RwLock<dyn BreakingProducer>>>,
     /// The operator that built this producer. `None` for an unprobed forwarding reader
     /// or a protocol test double built with `ProducerBase::unowned`.
     pub node_id: Option<NodeId>,
@@ -927,12 +931,12 @@ pub struct ProducerBase {
     /// Obsolete region of the tiling
     pub obsolete_guard: TileGuard,
     #[cfg(test)]
-    pub(crate) reads: std::cell::Cell<u64>,
+    pub(crate) reads: std::sync::atomic::AtomicU64,
     /// The last tile `get` returned, for the debug check that the complete region never
     /// changes ([`completeness_violation`]). Debug builds only; `None` in release.
     // shared-state-ok: this producer's debug record of its last output, which `get` changes
     // through `&self`; no other operator holds it.
-    pub(crate) last_output: RefCell<Option<Tile>>,
+    pub(crate) last_output: RwLock<Option<Tile>>,
     /// For a pipeline breaker, the consumer its pushes climb (`dispatcher::Pushes`), which is
     /// its reader's chain; for a range (`IterateExtent`), the consumer a planner pushes its region
     /// through once. `None` for every other producer.
@@ -947,20 +951,20 @@ impl ProducerBase {
     pub(crate) fn new(
         id: usize,
         tiling: &Tiling,
-        owner: &OperatorBase,
+        owner: Arc<dyn TileOperator>,
         cx: &SubscribeContext,
     ) -> Self {
         Self {
             id,
             breaker_handle: None,
-            node_id: Some(owner.id),
+            node_id: owner.operator_id(),
             probes: cx.probes().clone(),
             tiling: tiling.clone(),
             obsolete_guard: tiling.empty_guard(),
 
             #[cfg(test)]
-            reads: std::cell::Cell::new(0),
-            last_output: RefCell::new(None),
+            reads: std::sync::atomic::AtomicU64::new(0),
+            last_output: RwLock::new(None),
             downstream: None,
             placement: None,
         }
@@ -1003,8 +1007,8 @@ impl ProducerBase {
             obsolete_guard: tiling.empty_guard(),
 
             #[cfg(test)]
-            reads: std::cell::Cell::new(0),
-            last_output: RefCell::new(None),
+            reads: std::sync::atomic::AtomicU64::new(0),
+            last_output: RwLock::new(None),
             downstream: None,
             placement: Some(crate::interpreter::dispatcher::Placement::default()),
         }
@@ -1050,7 +1054,6 @@ pub(crate) use impl_producer_base;
 #[cfg(debug_assertions)]
 mod pull_levels {
     use super::{CurryLevel, TileGuard, TileProducer};
-    use std::cell::RefCell;
 
     // The pulls in progress on this thread, innermost last, which `check_input_level` and
     // `check_not_answering_from_state` hold each pull against.
@@ -1060,7 +1063,7 @@ mod pull_levels {
     // never a value passed between operators.
     thread_local! {
         // shared-state-ok: the record cell itself, for the reason on the macro above.
-        pub(super) static PULLS: RefCell<Vec<Pull>> = const { RefCell::new(Vec::new()) };
+        pub(super) static PULLS: std::cell::RefCell<Vec<Pull>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
     /// One pull in progress. `levels` is `None` for a pull at no keys, which declares no input
@@ -1768,7 +1771,7 @@ pub trait Breaker {
     /// again at its next pull: a dispatched run calls it once the source yields more, where the
     /// breaker is a transaction store, whose writer's drive caches what it read of its source. A
     /// no-op for every other breaker.
-    fn read_source_again(&mut self, _source: &Rc<RefCell<dyn DataSourceDomainExtentImpl>>) {}
+    fn read_source_again(&mut self, _source: &Arc<RwLock<dyn DataSourceDomainExtentImpl>>) {}
 
     /// Finish once the pipeline has consumed every package and nothing more can be queued for it,
     /// the breaker's last call. The default pushes what a
@@ -1862,17 +1865,21 @@ pub trait BreakingProducer: TileProducer + Breaker {
 
 /// Input rows omitted from an answer, retained until its consumer delivers a release.
 #[derive(Default)]
-pub(crate) struct DroppedRows(RefCell<Option<TileGuard>>);
+pub(crate) struct DroppedRows(RwLock<Option<TileGuard>>);
 impl DroppedRows {
     pub(crate) fn remember(&self, guard: TileGuard) {
-        let mut retained = self.0.borrow_mut();
+        let mut retained = self.0.write().unwrap_or_else(PoisonError::into_inner);
         *retained = Some(match retained.take() {
             Some(before) => before.union(&guard),
             None => guard,
         });
     }
     pub(crate) fn release_to(&self, input: &mut dyn TileProducer) {
-        let released = self.0.borrow_mut().take();
+        let released = self
+            .0
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         if let Some(guard) = released {
             input.release(guard);
         }
@@ -1883,7 +1890,7 @@ impl DroppedRows {
 ///
 /// Created by [`TileOperator::subscribe`], a producer services `get` queries
 /// and accepts `release` notifications from its consumer.
-pub trait TileProducer {
+pub trait TileProducer: Send + Sync {
     /// The entry before `input`, where an enclosing breaker's planner can receive that input's
     /// pushes in its own keys. Unplaced inputs remain read by pull.
     fn input_entry(&self, _input: &str) -> Option<crate::interpreter::dispatcher::Placement> {
@@ -1980,7 +1987,9 @@ pub trait TileProducer {
         }
         #[cfg(test)]
         {
-            self.base().reads.set(self.base().reads.get() + 1);
+            self.base()
+                .reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         #[cfg(debug_assertions)]
         let _pull = {
@@ -2052,7 +2061,8 @@ pub trait TileProducer {
             let last_in_region = self
                 .base()
                 .last_output
-                .borrow()
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
                 .clone()
                 .as_ref()
                 .map(|last| {
@@ -2076,7 +2086,14 @@ pub trait TileProducer {
             }
             // The statement a later pull is held to holds each region's last answer: this pull
             // replaces its own region and leaves the others as they were.
-            let stated = match (&region, self.base().last_output.borrow().clone()) {
+            let stated = match (
+                &region,
+                self.base()
+                    .last_output
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+            ) {
                 (Some(Projection::Nothing), Some(last)) => last,
                 (Some(region @ Projection::Keys { .. }), Some(mut last)) => {
                     last.restrict_to(&Projection::Everything.minus(region), self.tiling());
@@ -2096,7 +2113,11 @@ pub trait TileProducer {
                 }
                 (_, None) => result.clone(),
             };
-            *self.base().last_output.borrow_mut() = Some(stated);
+            *self
+                .base()
+                .last_output
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = Some(stated);
         }
         assert!(
             result.check_from(self.tiling()),
@@ -2106,7 +2127,7 @@ pub trait TileProducer {
         );
         // After `get_impl` rather than around it: `get_impl` pulls this
         // producer's inputs, whose own `get` borrows the same probe table, and a
-        // borrow held across that call overlaps the inner one.
+        // read held across that call overlaps the inner one.
         let base = self.base();
         base.probes.observe_named(
             base.node_id,
@@ -2115,6 +2136,7 @@ pub trait TileProducer {
             &result,
             self.obsolete_guard(),
         );
+
         result
     }
 
@@ -2218,7 +2240,7 @@ pub trait TileProducer {
     /// The data sources this producer reads its keys from, where it is a range over a source's
     /// domain: a dispatched run notifies the pipeline above it of what each source yields.
     /// Empty for every other producer.
-    fn data_sources(&self) -> Vec<Rc<RefCell<dyn DataSourceDomainExtentImpl>>> {
+    fn data_sources(&self) -> Vec<Arc<RwLock<dyn DataSourceDomainExtentImpl>>> {
         Vec::new()
     }
 
@@ -2239,6 +2261,9 @@ pub trait TileProducer {
         None
     }
 
+    fn as_transaction_store(&self) -> Option<&crate::interpreter::commit_operator::CommitProducer> {
+        None
+    }
     /// The transaction state behind a cyclic store cell, for dispatcher control.
     fn as_transaction_store_mut(
         &mut self,
@@ -2247,6 +2272,13 @@ pub trait TileProducer {
     }
 
     /// The concrete induction store behind a cyclic store cell, where this is one.
+    fn as_induction_store(
+        &self,
+    ) -> Option<&crate::interpreter::commit_operator::InductionStoreProducer> {
+        None
+    }
+
+    /// The mutable induction state behind a cyclic store cell, where this is one.
     fn as_induction_store_mut(
         &mut self,
     ) -> Option<&mut crate::interpreter::commit_operator::InductionStoreProducer> {
@@ -2359,6 +2391,27 @@ pub enum TilePathStep {
 
 #[cfg(test)]
 pub(crate) mod test_helpers {
+    use std::sync::PoisonError;
+    #[derive(Default)]
+    pub(crate) struct SharedCounter<T>(std::sync::RwLock<T>);
+    impl<T: Copy> SharedCounter<T> {
+        pub(crate) fn new(value: T) -> Self {
+            Self(std::sync::RwLock::new(value))
+        }
+        pub(crate) fn get(&self) -> T {
+            *self.0.read().unwrap_or_else(PoisonError::into_inner)
+        }
+        pub(crate) fn set(&self, value: T) {
+            *self.0.write().unwrap_or_else(PoisonError::into_inner) = value;
+        }
+        pub(crate) fn replace(&self, value: T) -> T {
+            std::mem::replace(
+                &mut *self.0.write().unwrap_or_else(PoisonError::into_inner),
+                value,
+            )
+        }
+    }
+
     #[cfg(test)]
     pub(crate) trait ReadInPipeline: TileProducer {
         fn read_in_pipeline(&mut self, guard: TileGuard) -> Tile {
@@ -2426,7 +2479,7 @@ pub(crate) mod test_helpers {
     }
 
     pub(crate) trait Announce: super::Consumer {
-        fn announce(&mut self, region: &Projection) {
+        fn announce(&self, region: &Projection) {
             crate::interpreter::dispatcher::notify_for_test(self, region);
         }
     }
@@ -2452,7 +2505,7 @@ pub(crate) mod test_helpers {
             .collect();
         breaker
             .base_mut()
-            .pushing_to(std::rc::Rc::new(std::cell::RefCell::new(Readers(entries))));
+            .pushing_to(std::sync::Arc::new(Readers(entries)));
     }
 
     /// Point each breaker's pushes at the pipelines that read it in `reads`, whose breakers read
@@ -2466,7 +2519,10 @@ pub(crate) mod test_helpers {
                 .filter(|reader| reads[*reader].contains(&pipeline))
                 .collect();
             if !readers.is_empty() {
-                push_to(&mut *breaker.borrow_mut(), &readers);
+                push_to(
+                    &mut *breaker.write().unwrap_or_else(PoisonError::into_inner),
+                    &readers,
+                );
             }
         }
     }
@@ -2476,11 +2532,11 @@ pub(crate) mod test_helpers {
 
     impl crate::interpreter::Consumer for Readers {
         fn notify(
-            &mut self,
+            &self,
             region: &Projection,
             landing: &mut crate::interpreter::dispatcher::Landing<'_>,
         ) {
-            for entry in &mut self.0 {
+            for entry in &self.0 {
                 crate::interpreter::Consumer::notify(entry, region, landing);
             }
         }
@@ -2577,7 +2633,7 @@ pub(crate) mod test_helpers {
     /// Assert that the producer of each operator `make` builds, over two levels of keys, answers
     /// a pull at a projection of paths as the whole of its answer cut to it
     /// ([`assert_conforms`]): one path, and paths of two rows.
-    pub(crate) fn assert_conforms_beneath(make: impl Fn() -> Box<dyn TileOperator>) {
+    pub(crate) fn assert_conforms_beneath(make: impl Fn() -> std::sync::Arc<dyn TileOperator>) {
         let point = |k: u64| Predicate::point(Value::UInt(k));
         for paths in [
             Predicate::qualified(point(0), point(1)),
@@ -2586,9 +2642,13 @@ pub(crate) mod test_helpers {
         ] {
             assert_conforms(
                 || {
-                    let mut op = make();
+                    let op = make();
                     let guard = op.tiling().universal_guard();
-                    op.subscribe(guard, Box::new(|| {}), &mut super::SubscribeContext::new())
+                    op.clone().subscribe(
+                        guard,
+                        Box::new(|| {}),
+                        &mut super::SubscribeContext::new(),
+                    )
                 },
                 paths_guard(paths),
             );
@@ -2638,14 +2698,14 @@ pub(crate) mod test_helpers {
         pub(crate) tile: Tile,
         /// The tile it answers from instead of `tile`, which a test rewrites between pulls to
         /// grow its input.
-        script: Option<std::rc::Rc<std::cell::RefCell<Tile>>>,
+        script: Option<std::sync::Arc<std::sync::RwLock<Tile>>>,
         pub(crate) pulled: GuardLog,
         pub(crate) released: GuardLog,
     }
 
     /// The two logs of a [`ProjectionSpy`]: the projection guards it was pulled with, and the
     /// guards released to it.
-    pub(crate) type GuardLog = std::rc::Rc<std::cell::RefCell<Vec<TileGuard>>>;
+    pub(crate) type GuardLog = std::sync::Arc<std::sync::RwLock<Vec<TileGuard>>>;
 
     impl ProjectionSpy {
         pub(crate) fn new(tile: Tile, tiling: Tiling) -> (Self, GuardLog, GuardLog) {
@@ -2669,9 +2729,9 @@ pub(crate) mod test_helpers {
         pub(crate) fn scripted(
             tile: Tile,
             tiling: Tiling,
-        ) -> (Self, std::rc::Rc<std::cell::RefCell<Tile>>) {
+        ) -> (Self, std::sync::Arc<std::sync::RwLock<Tile>>) {
             let (mut spy, _, _) = Self::new(tile.clone(), tiling);
-            let cell = std::rc::Rc::new(std::cell::RefCell::new(tile));
+            let cell = std::sync::Arc::new(std::sync::RwLock::new(tile));
             spy.script = Some(cell.clone());
             (spy, cell)
         }
@@ -2689,9 +2749,15 @@ pub(crate) mod test_helpers {
         }
 
         fn get_impl(&self, projection_guard: TileGuard) -> Tile {
-            self.pulled.borrow_mut().push(projection_guard.clone());
+            self.pulled
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(projection_guard.clone());
             let mut tile = match &self.script {
-                Some(script) => script.borrow().clone(),
+                Some(script) => script
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
                 None => self.tile.clone(),
             };
             tile.remove_guarded(self.obsolete_guard().clone());
@@ -2702,7 +2768,10 @@ pub(crate) mod test_helpers {
         }
 
         fn release_impl(&mut self, obsolete_guard: TileGuard) {
-            self.released.borrow_mut().push(obsolete_guard);
+            self.released
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(obsolete_guard);
         }
     }
 
@@ -2740,7 +2809,7 @@ pub(crate) mod test_helpers {
         }
 
         fn subscribe(
-            &mut self,
+            self: std::sync::Arc<Self>,
             _intent_guard: TileGuard,
             _consumer: Box<dyn super::Consumer>,
             _cx: &mut super::SubscribeContext,
@@ -2787,7 +2856,7 @@ pub(crate) mod test_helpers {
     /// "The completeness contract"), which a fixed tile cannot exercise.
     pub(crate) struct ScriptedProducer {
         pub(crate) base: ProducerBase,
-        pub(crate) tile: std::rc::Rc<std::cell::RefCell<Tile>>,
+        pub(crate) tile: std::sync::Arc<std::sync::RwLock<Tile>>,
     }
 
     impl ScriptedProducer {
@@ -2795,8 +2864,8 @@ pub(crate) mod test_helpers {
         pub(crate) fn new(
             tile: Tile,
             tiling: Tiling,
-        ) -> (Self, std::rc::Rc<std::cell::RefCell<Tile>>) {
-            let cell = std::rc::Rc::new(std::cell::RefCell::new(tile));
+        ) -> (Self, std::sync::Arc<std::sync::RwLock<Tile>>) {
+            let cell = std::sync::Arc::new(std::sync::RwLock::new(tile));
             let producer = Self {
                 base: ProducerBase::unowned(Self::alloc_id(), &tiling),
                 tile: cell.clone(),
@@ -2813,7 +2882,11 @@ pub(crate) mod test_helpers {
         }
 
         fn get_impl(&self, projection_guard: TileGuard) -> Tile {
-            let mut tile = self.tile.borrow().clone();
+            let mut tile = self
+                .tile
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
             tile.remove_guarded(self.obsolete_guard().clone());
             tile.compact();
             let projection = projection_guard.projection("ScriptedProducer");
@@ -2828,7 +2901,7 @@ pub(crate) mod test_helpers {
     /// test can feed a growing input through a real consumer. The producer answers the cell
     /// minus what has been released to it.
     pub(crate) struct ScriptedOp {
-        cell: std::rc::Rc<std::cell::RefCell<Tile>>,
+        cell: std::sync::Arc<std::sync::RwLock<Tile>>,
         tiling: Tiling,
     }
 
@@ -2836,8 +2909,8 @@ pub(crate) mod test_helpers {
         pub(crate) fn new(
             tile: Tile,
             tiling: Tiling,
-        ) -> (Self, std::rc::Rc<std::cell::RefCell<Tile>>) {
-            let cell = std::rc::Rc::new(std::cell::RefCell::new(tile));
+        ) -> (Self, std::sync::Arc<std::sync::RwLock<Tile>>) {
+            let cell = std::sync::Arc::new(std::sync::RwLock::new(tile));
             (
                 Self {
                     cell: cell.clone(),
@@ -2857,7 +2930,7 @@ pub(crate) mod test_helpers {
         }
 
         fn subscribe(
-            &mut self,
+            self: std::sync::Arc<Self>,
             _intent_guard: TileGuard,
             _consumer: Box<dyn super::Consumer>,
             _cx: &mut super::SubscribeContext,
@@ -2871,12 +2944,12 @@ pub(crate) mod test_helpers {
 
     /// A consumer that logs the region of each notification it receives.
     pub(crate) struct RegionLog {
-        regions: std::rc::Rc<std::cell::RefCell<Vec<Projection>>>,
+        regions: std::sync::Arc<std::sync::RwLock<Vec<Projection>>>,
     }
 
     impl RegionLog {
-        pub(crate) fn new() -> (Self, std::rc::Rc<std::cell::RefCell<Vec<Projection>>>) {
-            let regions = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        pub(crate) fn new() -> (Self, std::sync::Arc<std::sync::RwLock<Vec<Projection>>>) {
+            let regions = std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
             (
                 Self {
                     regions: regions.clone(),
@@ -2887,18 +2960,26 @@ pub(crate) mod test_helpers {
     }
 
     impl super::Consumer for RegionLog {
-        fn notify(
-            &mut self,
-            region: &Projection,
-            _: &mut crate::interpreter::dispatcher::Landing<'_>,
-        ) {
-            self.regions.borrow_mut().push(region.clone());
+        fn notify(&self, region: &Projection, _: &mut crate::interpreter::dispatcher::Landing<'_>) {
+            self.regions
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(region.clone());
         }
     }
 
     /// The consumer a [`NotifyingOp`] was subscribed with, which a test notifies through.
     pub(crate) type InputConsumer =
-        std::rc::Rc<std::cell::RefCell<Option<Box<dyn super::Consumer>>>>;
+        std::sync::Arc<std::sync::RwLock<Option<crate::interpreter::SharedConsumer>>>;
+
+    /// The consumer `consumer` holds, cloned out so no lock is held while it is notified.
+    pub(crate) fn subscribed(consumer: &InputConsumer) -> crate::interpreter::SharedConsumer {
+        consumer
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .expect("the operator was subscribed")
+    }
 
     /// An operator over a fixed tile that keeps the consumer it is subscribed with, so a test
     /// notifies an operator above it from where the operator's input would.
@@ -2906,7 +2987,7 @@ pub(crate) mod test_helpers {
         tile: Tile,
         tiling: Tiling,
         consumer: InputConsumer,
-        script: Option<std::rc::Rc<std::cell::RefCell<Tile>>>,
+        script: Option<std::sync::Arc<std::sync::RwLock<Tile>>>,
         pulled: GuardLog,
     }
 
@@ -2934,11 +3015,11 @@ pub(crate) mod test_helpers {
         ) -> (
             Self,
             InputConsumer,
-            std::rc::Rc<std::cell::RefCell<Tile>>,
+            std::sync::Arc<std::sync::RwLock<Tile>>,
             GuardLog,
         ) {
             let (mut op, consumer) = Self::new(tile.clone(), tiling);
-            let cell = std::rc::Rc::new(std::cell::RefCell::new(tile));
+            let cell = std::sync::Arc::new(std::sync::RwLock::new(tile));
             op.script = Some(cell.clone());
             let pulled = op.pulled.clone();
             (op, consumer, cell, pulled)
@@ -2954,12 +3035,15 @@ pub(crate) mod test_helpers {
         }
 
         fn subscribe(
-            &mut self,
+            self: std::sync::Arc<Self>,
             _intent_guard: TileGuard,
             consumer: Box<dyn super::Consumer>,
             _cx: &mut super::SubscribeContext,
         ) -> Box<dyn TileProducer> {
-            *self.consumer.borrow_mut() = Some(consumer);
+            *self
+                .consumer
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = Some(consumer.into());
             let (mut spy, _, _) = ProjectionSpy::new(self.tile.clone(), self.tiling.clone());
             spy.script = self.script.clone();
             spy.pulled = self.pulled.clone();
@@ -2969,10 +3053,7 @@ pub(crate) mod test_helpers {
 
     /// Notify through the consumer a [`NotifyingOp`] was subscribed with.
     pub(crate) fn notify_input(consumer: &InputConsumer, arrived: &Projection) {
-        crate::interpreter::dispatcher::notify_for_test(
-            &mut **consumer.borrow_mut().as_mut().unwrap(),
-            arrived,
-        );
+        crate::interpreter::dispatcher::notify_for_test(&*subscribed(consumer), arrived);
     }
 
     /// A store's parts are collections held to the contract like any other: a decided set
@@ -3122,7 +3203,7 @@ pub(crate) mod test_helpers {
         let (first, tiling) = answered(0, 1, (0, 1));
         let (producer, answer) = ScriptedProducer::new(recording_absent(first, &[5]), tiling);
         producer.get(producer.tiling().universal_guard());
-        *answer.borrow_mut() = answered(0, 5, (0, 1)).0;
+        *answer.write().unwrap_or_else(PoisonError::into_inner) = answered(0, 5, (0, 1)).0;
         producer.get(producer.tiling().universal_guard());
     }
 
@@ -3136,7 +3217,7 @@ pub(crate) mod test_helpers {
         let (first, tiling) = answered(0, 1, (0, 1));
         let (producer, answer) = ScriptedProducer::new(recording_absent(first, &[5]), tiling);
         producer.get(keys_between(0, 1));
-        *answer.borrow_mut() = answered(4, 7, (4, 7)).0;
+        *answer.write().unwrap_or_else(PoisonError::into_inner) = answered(4, 7, (4, 7)).0;
         producer.get(keys_between(4, 7));
     }
 
@@ -3148,7 +3229,7 @@ pub(crate) mod test_helpers {
         let (producer, answer) =
             ScriptedProducer::new(recording_absent(first.clone(), &[5]), tiling);
         producer.get(producer.tiling().universal_guard());
-        *answer.borrow_mut() = first;
+        *answer.write().unwrap_or_else(PoisonError::into_inner) = first;
         producer.get(producer.tiling().universal_guard());
     }
 
@@ -3163,9 +3244,9 @@ pub(crate) mod test_helpers {
         let (producer, answer) =
             ScriptedProducer::new(recording_absent(first.clone(), &[5]), tiling);
         producer.get(producer.tiling().universal_guard());
-        *answer.borrow_mut() = first;
+        *answer.write().unwrap_or_else(PoisonError::into_inner) = first;
         producer.get(producer.tiling().universal_guard());
-        *answer.borrow_mut() = answered(0, 5, (0, 1)).0;
+        *answer.write().unwrap_or_else(PoisonError::into_inner) = answered(0, 5, (0, 1)).0;
         producer.get(producer.tiling().universal_guard());
     }
 
@@ -3221,9 +3302,9 @@ pub(crate) mod test_helpers {
         let (first, tiling) = answered(0, 3, (0, 3));
         let (producer, answer) = ScriptedProducer::new(first.clone(), tiling);
         producer.get(keys_between(0, 3));
-        *answer.borrow_mut() = answered(4, 7, (4, 7)).0;
+        *answer.write().unwrap_or_else(PoisonError::into_inner) = answered(4, 7, (4, 7)).0;
         producer.get(keys_between(4, 7));
-        *answer.borrow_mut() = first;
+        *answer.write().unwrap_or_else(PoisonError::into_inner) = first;
         producer.get(keys_between(0, 3));
     }
 
@@ -3238,9 +3319,9 @@ pub(crate) mod test_helpers {
         let (first, tiling) = answered(0, 3, (0, 3));
         let (producer, answer) = ScriptedProducer::new(first, tiling);
         producer.get(keys_between(0, 3));
-        *answer.borrow_mut() = answered(4, 7, (4, 7)).0;
+        *answer.write().unwrap_or_else(PoisonError::into_inner) = answered(4, 7, (4, 7)).0;
         producer.get(keys_between(4, 7));
-        *answer.borrow_mut() = answered(0, 3, (0, 1)).0;
+        *answer.write().unwrap_or_else(PoisonError::into_inner) = answered(0, 3, (0, 1)).0;
         producer.get(keys_between(0, 3));
     }
 
@@ -3249,15 +3330,15 @@ pub(crate) mod test_helpers {
     pub(crate) struct ReleaseSpy {
         pub(crate) base: ProducerBase,
         pub(crate) tile: Tile,
-        pub(crate) released: std::rc::Rc<std::cell::RefCell<Vec<TileGuard>>>,
+        pub(crate) released: std::sync::Arc<std::sync::RwLock<Vec<TileGuard>>>,
     }
 
     impl ReleaseSpy {
         pub(crate) fn new(
             tile: Tile,
             tiling: Tiling,
-        ) -> (Self, std::rc::Rc<std::cell::RefCell<Vec<TileGuard>>>) {
-            let released = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        ) -> (Self, std::sync::Arc<std::sync::RwLock<Vec<TileGuard>>>) {
+            let released = std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
             (
                 Self {
                     base: ProducerBase::unowned(Self::alloc_id(), &tiling),
@@ -3281,7 +3362,10 @@ pub(crate) mod test_helpers {
         }
 
         fn release_impl(&mut self, obsolete_guard: TileGuard) {
-            self.released.borrow_mut().push(obsolete_guard);
+            self.released
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(obsolete_guard);
         }
     }
 
@@ -3310,15 +3394,15 @@ pub(crate) mod test_helpers {
     pub(crate) struct QuietSpy {
         pub(crate) base: ProducerBase,
         pub(crate) tile: Tile,
-        pub(crate) released: std::rc::Rc<std::cell::RefCell<Vec<TileGuard>>>,
+        pub(crate) released: std::sync::Arc<std::sync::RwLock<Vec<TileGuard>>>,
     }
 
     impl QuietSpy {
         pub(crate) fn new(
             tile: Tile,
             tiling: Tiling,
-        ) -> (Self, std::rc::Rc<std::cell::RefCell<Vec<TileGuard>>>) {
-            let released = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        ) -> (Self, std::sync::Arc<std::sync::RwLock<Vec<TileGuard>>>) {
+            let released = std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
             (
                 Self {
                     base: ProducerBase::unowned(Self::alloc_id(), &tiling),
@@ -3345,7 +3429,10 @@ pub(crate) mod test_helpers {
         }
 
         fn release_impl(&mut self, obsolete_guard: TileGuard) {
-            self.released.borrow_mut().push(obsolete_guard);
+            self.released
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(obsolete_guard);
         }
     }
 }
@@ -3512,7 +3599,7 @@ mod tests {
         base: ProducerBase,
         answer: PullingStateAnswer,
         input: Box<dyn TileProducer>,
-        in_progress_after_unwind: std::cell::Cell<Option<usize>>,
+        in_progress_after_unwind: std::sync::RwLock<Option<usize>>,
     }
 
     #[cfg(debug_assertions)]
@@ -3529,8 +3616,8 @@ mod tests {
             let unwound =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.answer.get(whole)));
             assert!(unwound.is_err(), "the answer from state that pulls panics");
-            self.in_progress_after_unwind
-                .set(Some(super::pull_levels::PULLS.with_borrow(Vec::len)));
+            *self.in_progress_after_unwind.write().unwrap() =
+                Some(super::pull_levels::PULLS.with_borrow(Vec::len));
             self.input.get(projection_guard)
         }
 
@@ -3549,11 +3636,11 @@ mod tests {
             base: ProducerBase::unowned(CatchingPull::alloc_id(), &tiling),
             answer,
             input: Box::new(input),
-            in_progress_after_unwind: std::cell::Cell::new(None),
+            in_progress_after_unwind: std::sync::RwLock::new(None),
         };
         outer.get(tiling.universal_guard());
         assert_eq!(
-            outer.in_progress_after_unwind.get(),
+            *outer.in_progress_after_unwind.read().unwrap(),
             Some(1),
             "the outer pull alone is in progress"
         );
@@ -3584,13 +3671,13 @@ mod tests {
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
 
         fn subscribe(
-            &mut self,
+            self: std::sync::Arc<Self>,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
             cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             Box::new(OneRow {
-                base: ProducerBase::new(OneRow::alloc_id(), &self.base.tiling, &self.base, cx),
+                base: ProducerBase::new(OneRow::alloc_id(), &self.base.tiling, self.clone(), cx),
             })
         }
     }
@@ -3599,11 +3686,13 @@ mod tests {
     /// is, under its operator's id: probes attach on demand, not at build.
     #[test]
     fn a_producer_is_probed_under_its_operator_once_its_subscribe_context_enables_probing() {
-        let mut op = Leaf {
+        let op = std::sync::Arc::new(Leaf {
             base: OperatorBase::new(int_tiling()),
-        };
+        });
         let mut cx = SubscribeContext::new();
-        let producer = op.subscribe(int_tiling().universal_guard(), Box::new(|| {}), &mut cx);
+        let producer =
+            op.clone()
+                .subscribe(int_tiling().universal_guard(), Box::new(|| {}), &mut cx);
         assert_eq!(producer.operator_id(), op.operator_id());
 
         producer.get(int_tiling().universal_guard());

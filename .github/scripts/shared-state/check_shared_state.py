@@ -97,12 +97,21 @@ EXPECTED_EXCEPTIONS = [
     # Every producer's debug record of its last output (`ProducerBase::last_output`), which `get`
     # changes through `&self`.
     ("src/interpreter/tile_operators/mod.rs", "cell of `Option<Tile>`"),
+    # An HTTP route's requests from the dispatcher thread. A `Receiver` is not `Sync` and a data
+    # source is; each poll reaches it through `get_mut`. The external boundary; no operator's output
+    # crosses it.
+    ("src/interpreter/http_server.rs", "cell of `Receiver<RouteMessage>`"),
     ("src/interpreter/http_server.rs", "cell of `HashMap<u64, tiny_http::Request>`"),
     ("src/interpreter/http_server.rs", "shared cell of `RouteTable`"),
+    # A sink consumer's placement, which the planner writes before a run and `notify` reads. What
+    # crosses it is a pipeline's index and a tiling, never a tile.
+    ("src/interpreter/sinks.rs", "cell of `Option<(PipelineId, Tiling)>`"),
     # The test sink's accumulator: a sink is a terminal consumer at the I/O boundary,
     # and `DataSink::process` takes `&self`.
     ("src/interpreter/test_sink.rs", "cell of `Option<Tile>`"),
-    ("src/interpreter/mod.rs", "shared cell of `C`"),
+    # The shared consumers a thread is notifying, which `notify_shared` checks a notification
+    # against to find re-entry. What crosses it is a consumer's address, never a tile.
+    ("src/interpreter/notifications.rs", "ambient mutable state"),
     # `Arrivals`, the regions an input has notified since they were last taken; see its type
     # doc. `subscribe` installs its consumer on the input before the producer exists, and the cell
     # connects the two; what crosses it is a region, never a tile.
@@ -119,7 +128,7 @@ EXPECTED_EXCEPTIONS = [
     # parameter to carry it; what crosses it is one bit, never a tile.
     ("src/interpreter/dispatcher.rs", "ambient mutable state"),
     ("src/interpreter/dispatcher.rs", "ambient mutable state"),
-    ("src/interpreter/tile_operators/cycle_slot.rs", "shared cell of `Option<Box<T>>`"),
+    ("src/interpreter/tile_operators/cycle_slot.rs", "shared cell of `Arc<T>`"),
     # `BreakerHandle`, the dispatcher's handle on a pipeline's breaker; see its type doc. The
     # driver calls the breaker through it, and what crosses it is a call, never a tile.
     ("src/interpreter/dispatcher.rs", "shared cell of `dyn BreakingProducer`"),
@@ -143,17 +152,11 @@ EXPECTED_EXCEPTIONS = [
     # `Placement`'s scope: the intake of the scope an entry sits in, which the scope's run sets and
     # clears. What crosses it is guards of the scope's input, never a tile.
     ("src/interpreter/dispatcher.rs", "shared cell of `Option<Offers>`"),
-    # `Placement`'s rows: the tiling of the input the pipeline consumes, which the planner writes
-    # before the run. What crosses it is a tiling, never a tile.
-    ("src/interpreter/dispatcher.rs", "shared cell of `Option<Tiling>`"),
     # The lock a dispatcher's sleeping worker waits under; it guards no data.
     ("src/interpreter/dispatcher.rs", "cell of `()`"),
     # The placement an entry and its breaker share, which the planner writes before a run; what
     # crosses it is a pipeline's index. See `Placement`.
     ("src/interpreter/dispatcher.rs", "shared cell of `Option<PipelineId>`"),
-    # A compiled output's handle on its sink consumer, which the planner places and reads the
-    # sink's producer through. See `SinkTarget`.
-    ("src/interpreter/dispatcher/plan.rs", "shared cell of `crate::interpreter::sinks::SinkConsumer`"),
     # What a dispatched run's `main` output answers, merged at the I/O boundary as a sink merges
     # what it is handed; nothing reads it back into the graph. See `Collected`.
     ("src/interpreter/dispatcher/plan.rs", "cell of `Option<Tile>`"),
@@ -162,9 +165,6 @@ EXPECTED_EXCEPTIONS = [
     # not see.
     ("src/interpreter/tile_operators/dispatcher_tests.rs", "shared cell of `T`"),
     ("src/interpreter/tile_operators/fanout.rs", "cell of `bool`"),
-    ("src/interpreter/tile_operators/fanout.rs", "shared cell of `usize`"),
-    ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),
-    ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),
     # A cyclic fan-out's store (`Store`, shared as `StoreCell`): its producer, held in a cell apart
     # from the fan-out's state so a pull that re-enters through the store's recurrence finds it
     # borrowed and reads the snapshot, and the release region that waits for the current
@@ -172,11 +172,12 @@ EXPECTED_EXCEPTIONS = [
     # never a tile passed between operators.
     ("src/interpreter/tile_operators/fanout.rs", "cell of `Box<dyn TileProducer>`"),
     ("src/interpreter/tile_operators/fanout.rs", "cell of `Option<TileGuard>`"),
+    # `PRODUCER_COUNTERS`, the producer ID allocator; see its comment.
     ("src/interpreter/tile_operators/mod.rs", "ambient mutable state"),
     # The record of pulls in progress that the `get` wrapper checks each input's pull
-    # against, twice: the `thread_local!` and the cell inside it. A debug build only;
-    # what crosses it is the level a producer declares for each input, never a tile.
-    ("src/interpreter/tile_operators/mod.rs", "ambient mutable state"),
+    # against: the `thread_local!`. The cell inside it is spelled with its `std::cell`
+    # path, which the ambient pattern does not match. A debug build only; what crosses
+    # it is the level a producer declares for each input, never a tile.
     ("src/interpreter/tile_operators/mod.rs", "ambient mutable state"),
     ("src/interpreter/types/extent.rs", "shared cell of `Restriction`"),
     ("src/interpreter/types/extent.rs", "shared cell of `Restriction`"),
