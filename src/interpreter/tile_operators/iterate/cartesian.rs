@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::PoisonError;
 
 struct Side {
     name: SmolStr,
@@ -9,26 +10,15 @@ struct Side {
 }
 
 struct SourceHold {
-    source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+    source: Arc<RwLock<dyn DataSourceDomainExtentImpl>>,
     producer: String,
     side: usize,
     direct: bool,
-}
-
-impl Drop for SourceHold {
-    fn drop(&mut self) {
-        match self.source.try_borrow_mut() {
-            Ok(mut source) => source.retire_producer(&self.producer),
-            Err(_) => debug_assert!(
-                false,
-                "a product retires its source hold outside a source borrow"
-            ),
-        }
-    }
+    _retirement: crate::interpreter::SourceReaderRetirement,
 }
 
 pub(super) fn subscribe(
-    op: &IterateExtent,
+    op: Arc<IterateExtent>,
     fields: &HashMap<SmolStr, Extent>,
     consumer: Box<dyn Consumer>,
     cx: &mut SubscribeContext,
@@ -36,20 +26,33 @@ pub(super) fn subscribe(
     let mut fields: Vec<_> = fields.iter().map(|(n, e)| (n.clone(), e.clone())).collect();
     fields.sort_by(|(a, _), (b, _)| a.cmp(b));
     IterateExtent::add_all_source_handles(&op.extent, cx);
-    let base = ProducerBase::new(IterateExtentProducer::alloc_id(), op.tiling(), &op.base, cx);
+    let base = ProducerBase::new(
+        IterateExtentProducer::alloc_id(),
+        op.tiling(),
+        op.clone(),
+        cx,
+    );
     let mut holds = Vec::new();
     for (side, (_, extent)) in fields.iter().enumerate() {
         let mut sources = Vec::new();
         extent.for_each_source(&mut |source| {
-            if !sources.iter().any(|seen| Rc::ptr_eq(seen, source)) {
+            if !sources.iter().any(|seen| Arc::ptr_eq(seen, source)) {
                 sources.push(source.clone());
             }
         });
         for source in sources {
             let producer = format!("IterateExtent#{}:{side}", base.id);
-            source.borrow_mut().release(&producer, Predicate::False);
+            source
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .release(&producer, Predicate::False);
             cx.note_source_producer(producer.clone());
+            let retirement = source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .producer_retirement(&producer);
             holds.push(SourceHold {
+                _retirement: retirement,
                 source,
                 producer,
                 side,
@@ -72,12 +75,13 @@ pub(super) fn subscribe(
             }
         })
         .collect();
-    let state = Rc::new(RefCell::new(CartesianIteration { sides, holds }));
+    let state = Arc::new(RwLock::new(CartesianIteration { sides, holds }));
     let leaf = shared_consumer(Box::new(CartesianSource {
         state: state.clone(),
         downstream: consumer,
     }));
     Box::new(IterateExtentProducer {
+        _retirements: Vec::new(),
         base: base.leaf(leaf),
         iteration: Iteration::Cartesian(state),
     })
@@ -96,26 +100,24 @@ struct CartesianSource {
     // shared-state-ok: one producer's iteration state, shared only with that producer's own leaf
     // consumer (`CartesianSource`), which ingests the sources' arrivals into it. The arrivals come
     // from data sources at the I/O boundary; no other operator reaches the cell.
-    state: Rc<RefCell<CartesianIteration>>,
+    state: Arc<RwLock<CartesianIteration>>,
     downstream: Box<dyn Consumer>,
 }
 
 impl Consumer for CartesianSource {
     fn notify(
-        &mut self,
+        &self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
         if landing.is_delivery() {
             // A delivery is a dispatcher landing, which happens between consumes. The producer
-            // borrows the state only inside its own `get`, `state_info` and `release`, and a data
-            // source's release notifies no consumer, so no delivery lands inside one of them.
+            // locks the state only inside its own `get`, `state_info` and `release`, and a data
+            // source's release notifies no consumer, so no delivery lands inside one of them on
+            // this thread; another thread's read finishes before the write proceeds.
             self.state
-                .try_borrow_mut()
-                .expect(
-                    "a Cartesian source's delivery lands outside its producer's own reads and \
-                     releases",
-                )
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
                 .arrive();
         }
         self.downstream.notify(region, landing);
@@ -260,7 +262,8 @@ impl CartesianIteration {
             let freed = &freed[hold.side];
             if hold.direct || freed.is_true() {
                 hold.source
-                    .borrow_mut()
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
                     .release(&hold.producer, freed.clone());
             }
         }
@@ -325,21 +328,27 @@ mod tests {
     use super::*;
     use crate::{ccl::Type, interpreter::TestDataSource};
 
-    fn source(name: &str) -> Rc<RefCell<TestDataSource>> {
-        Rc::new(RefCell::new(TestDataSource::new(
-            name,
-            Type::Base(BaseType::Int),
-            Extent::Base(BaseType::Int),
-        )))
+    fn source(name: &str) -> crate::ccl::SourceDefinition<TestDataSource> {
+        TestDataSource::new(name, Type::Base(BaseType::Int), Extent::Base(BaseType::Int))
     }
-    fn add(source: &Rc<RefCell<TestDataSource>>, keys: &[u64], decided: Predicate) {
-        source.borrow_mut().add_data(
-            &keys
-                .iter()
-                .map(|&k| (Value::UInt(k), Value::Int(k as i64)))
-                .collect::<Vec<_>>(),
-        );
-        source.borrow_mut().set_yield_predicate(decided);
+    fn add(
+        source: &crate::ccl::SourceDefinition<TestDataSource>,
+        keys: &[u64],
+        decided: Predicate,
+    ) {
+        source
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .add_data(
+                &keys
+                    .iter()
+                    .map(|&k| (Value::UInt(k), Value::Int(k as i64)))
+                    .collect::<Vec<_>>(),
+            );
+        source
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_yield_predicate(decided);
     }
     fn prefix(last: u64) -> Predicate {
         Predicate::at_or_below(Value::UInt(last))
@@ -351,11 +360,11 @@ mod tests {
         ]))))
     }
     fn head(a: Extent, b: Extent) -> Box<dyn TileProducer> {
-        let mut op = IterateExtent::new(Extent::Record(HashMap::from([
+        let op = Arc::new(IterateExtent::new(Extent::Record(HashMap::from([
             ("a".into(), a),
             ("b".into(), b),
-        ])));
-        op.subscribe(
+        ]))));
+        op.clone().subscribe(
             op.tiling().universal_guard(),
             Box::new(|| {}),
             &mut SubscribeContext::new(),
@@ -396,30 +405,51 @@ mod tests {
         add(&a, &[0], prefix(0));
         add(&b, &[0], prefix(0));
         let mut p = head(
-            Extent::DataSourceDomain(a.clone()),
-            Extent::DataSourceDomain(b.clone()),
+            Extent::DataSourceDomain(a.runtime()),
+            Extent::DataSourceDomain(b.runtime()),
         );
         assert_eq!(rows(&mut *p), 1);
         p.release(product(prefix(0), prefix(0)));
-        assert!(a.borrow().get_released_predicate().is_false());
-        assert!(b.borrow().get_released_predicate().is_false());
+        assert!(
+            a.read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_released_predicate()
+                .is_false()
+        );
+        assert!(
+            b.read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_released_predicate()
+                .is_false()
+        );
         add(&a, &[1], prefix(1));
         add(&b, &[1], prefix(1));
         assert_eq!(rows(&mut *p), 3);
         p.release(p.tiling().universal_guard());
-        assert!(a.borrow().get_released_predicate().is_true());
-        assert!(b.borrow().get_released_predicate().is_true());
+        assert!(
+            a.read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_released_predicate()
+                .is_true()
+        );
+        assert!(
+            b.read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_released_predicate()
+                .is_true()
+        );
     }
 
     #[test]
     fn a_released_slice_reclaims_only_its_dimension() {
         let a = source("a");
         add(&a, &[0], prefix(0));
-        let mut p = head(Extent::DataSourceDomain(a.clone()), Extent::uint_range(2));
+        let mut p = head(Extent::DataSourceDomain(a.runtime()), Extent::uint_range(2));
         assert_eq!(rows(&mut *p), 2);
         p.release(product(prefix(0), Predicate::True));
         assert!(
-            a.borrow()
+            a.read()
+                .unwrap_or_else(PoisonError::into_inner)
                 .get_released_predicate()
                 .contains(&Value::UInt(0))
         );
@@ -432,13 +462,14 @@ mod tests {
         let a = source("a");
         add(&a, &[0, 1], prefix(1));
         let mut p = head(
-            Extent::DataSourceDomain(a.clone()),
-            Extent::DataSourceDomain(a.clone()),
+            Extent::DataSourceDomain(a.runtime()),
+            Extent::DataSourceDomain(a.runtime()),
         );
         assert_eq!(rows(&mut *p), 4);
         p.release(product(prefix(0), Predicate::True));
         assert!(
-            !a.borrow()
+            !a.read()
+                .unwrap_or_else(PoisonError::into_inner)
                 .get_released_predicate()
                 .contains(&Value::UInt(0))
         );
@@ -451,7 +482,10 @@ mod tests {
         let (a, b) = (source("a"), source("b"));
         add(&a, &[0, 2], prefix(2));
         add(&b, &[0], prefix(0));
-        let mut p = head(Extent::DataSourceDomain(a), Extent::DataSourceDomain(b));
+        let mut p = head(
+            Extent::DataSourceDomain(a.runtime()),
+            Extent::DataSourceDomain(b.runtime()),
+        );
         assert_eq!(rows(&mut *p), 2);
         let held = p.read_in_pipeline(p.tiling().universal_guard()).to_guard();
         let key = Value::Record(HashMap::from([
@@ -465,7 +499,7 @@ mod tests {
     fn overlapping_product_regions_offer_each_requested_pair_once() {
         let a = source("a");
         add(&a, &[0, 1, 2], prefix(2));
-        let mut p = head(Extent::DataSourceDomain(a), Extent::uint_range(3));
+        let mut p = head(Extent::DataSourceDomain(a.runtime()), Extent::uint_range(3));
         assert_eq!(rows(&mut *p), 9);
         let guard = product(prefix(1), prefix(0)).union(&product(prefix(0), prefix(1)));
         let mut tile = p.read_in_pipeline(guard.clone());
@@ -487,12 +521,12 @@ mod tests {
         for source in [&a, &b, &c] {
             add(source, &[0, 1], prefix(1));
         }
-        let mut op = IterateExtent::new(Extent::Record(HashMap::from([
-            ("a".into(), Extent::DataSourceDomain(a.clone())),
-            ("b".into(), Extent::DataSourceDomain(b.clone())),
-            ("c".into(), Extent::DataSourceDomain(c.clone())),
-        ])));
-        let mut p = op.subscribe(
+        let op = Arc::new(IterateExtent::new(Extent::Record(HashMap::from([
+            ("a".into(), Extent::DataSourceDomain(a.runtime())),
+            ("b".into(), Extent::DataSourceDomain(b.runtime())),
+            ("c".into(), Extent::DataSourceDomain(c.runtime())),
+        ]))));
+        let mut p = op.clone().subscribe(
             op.tiling().universal_guard(),
             Box::new(|| {}),
             &mut SubscribeContext::new(),
@@ -506,12 +540,23 @@ mod tests {
             ])),
         )));
         assert!(
-            a.borrow()
+            a.read()
+                .unwrap_or_else(PoisonError::into_inner)
                 .get_released_predicate()
                 .contains(&Value::UInt(0))
         );
-        assert!(b.borrow().get_released_predicate().is_false());
-        assert!(c.borrow().get_released_predicate().is_false());
+        assert!(
+            b.read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_released_predicate()
+                .is_false()
+        );
+        assert!(
+            c.read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_released_predicate()
+                .is_false()
+        );
         add(&a, &[2], prefix(2));
         assert_eq!(rows(&mut *p), 8);
     }
@@ -521,7 +566,7 @@ mod tests {
         let a = source("a");
         add(&a, &[0, 1], prefix(1));
         let nested = Extent::Record(HashMap::from([
-            ("x".into(), Extent::DataSourceDomain(a.clone())),
+            ("x".into(), Extent::DataSourceDomain(a.runtime())),
             ("y".into(), Extent::uint_range(2)),
         ]));
         let mut p = head(nested, Extent::uint_range(2));
@@ -536,16 +581,23 @@ mod tests {
         add(&a, &[2], prefix(2));
         assert_eq!(rows(&mut *p), 8);
         p.release(p.tiling().universal_guard());
-        assert!(a.borrow().get_released_predicate().is_true());
+        assert!(
+            a.read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_released_predicate()
+                .is_true()
+        );
     }
 
     #[test]
     fn a_key_delivered_before_its_decision_does_not_hide_later_progress() {
         let a = source("a");
         add(&a, &[0], Predicate::False);
-        let mut p = head(Extent::DataSourceDomain(a.clone()), Extent::uint_range(2));
+        let mut p = head(Extent::DataSourceDomain(a.runtime()), Extent::uint_range(2));
         assert_eq!(rows(&mut *p), 2);
-        a.borrow_mut().set_yield_predicate(prefix(0));
+        a.write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_yield_predicate(prefix(0));
         deliver(&*p);
         let tile = p.read_in_pipeline(p.tiling().universal_guard());
         let Tile::DataFunction {
@@ -569,8 +621,8 @@ mod tests {
         add(&a, &[0], prefix(0));
         add(&b, &[0], prefix(0));
         let mut p = head(
-            Extent::DataSourceDomain(a.clone()),
-            Extent::DataSourceDomain(b),
+            Extent::DataSourceDomain(a.runtime()),
+            Extent::DataSourceDomain(b.runtime()),
         );
         p.visit_input_producers(&mut |_, _| panic!("an extent iterator is a leaf"));
         assert_eq!(rows(&mut *p), 1);
@@ -584,16 +636,14 @@ mod tests {
         add(&a, &[0], prefix(0));
         add(&b, &[0], prefix(0));
         let mut p = head(
-            Extent::DataSourceDomain(a.clone()),
-            Extent::DataSourceDomain(b),
+            Extent::DataSourceDomain(a.runtime()),
+            Extent::DataSourceDomain(b.runtime()),
         );
         let consumer = p.base().downstream.clone().unwrap();
         let mut probe = crate::interpreter::dispatcher::Landing::probe(
             crate::interpreter::dispatcher::PipelineId(0),
         );
-        consumer
-            .borrow_mut()
-            .notify(&Projection::Everything, &mut probe);
+        consumer.notify(&Projection::Everything, &mut probe);
         let before = p.read_in_pipeline(p.tiling().universal_guard());
         let Tile::DataFunction { domain, .. } = before else {
             panic!("product rows")

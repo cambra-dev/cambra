@@ -102,3 +102,6 @@ macro_rules! unexpected_error_node {
         unreachable!("Unexpected <error>")
     };
 }
+
+mod source_definition;
+pub use source_definition::{SourceDefinition, SourceType};

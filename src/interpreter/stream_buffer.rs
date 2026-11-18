@@ -179,7 +179,7 @@ impl UIntStreamBuffer {
             .releases
             .of(producer)
             .unwrap_or_else(|| panic!("Unknown producer: {producer}"));
-        let live = self.live_window().difference(&Self::index_set(obsolete));
+        let live = self.live_window().difference(&Self::index_set(&obsolete));
         let mut indices = Vec::new();
         for iv in live.intervals() {
             match (iv.lval(), iv.rval()) {
@@ -203,12 +203,6 @@ impl UIntStreamBuffer {
         self.releases.carry_to_new_producers(predecessor);
     }
 
-    /// Forget `producer`'s release record, because that producer is gone — see
-    /// [`ProducerReleases::retire`](crate::interpreter::producer_releases::ProducerReleases::retire).
-    pub(crate) fn retire_producer(&mut self, producer: &str) {
-        self.releases.retire(producer);
-    }
-
     /// The first index a producer registering now will be offered.
     ///
     /// The buffer has already dropped everything every producer agreed on, so
@@ -217,7 +211,7 @@ impl UIntStreamBuffer {
     /// positions below it, and a drive based lower waits for an element that is
     /// not coming.
     pub(crate) fn first_index_for_a_new_producer(&self) -> u64 {
-        match self.released_prefix(&Self::index_set(self.releases.on_registration())) {
+        match self.released_prefix(&Self::index_set(&self.releases.on_registration())) {
             Some(last) => last + 1,
             None => self.start_idx,
         }

@@ -1,6 +1,8 @@
 use super::*;
 use crate::interpreter::operator_graph::value;
 use crate::interpreter::{BaseType, ColumnValue, Consumer, Extent, Value, tuple_field};
+#[cfg(test)]
+use std::sync::PoisonError;
 
 /// Re-keys a collection of pairs by each pair's first component, `𝐾 ⤇ (𝐽, 𝑉)` to `𝐽 ⤇ 𝑉`, where
 /// those keys are distinct: the `map` constructor's re-keying (group by the new key, then take the
@@ -33,7 +35,7 @@ pub struct RekeySorted {
     /// Output tiling: `DataFunction { domain: 𝐽, codomain: 𝑉 }`.
     base: OperatorBase,
     /// The pairs, `DataFunction { domain: 𝐾, codomain: (𝐽, 𝑉) }`.
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     /// Whether the keys rise with the input's positions.
     order: KeyOrder,
 }
@@ -62,7 +64,7 @@ impl KeyOrder {
 }
 
 impl RekeySorted {
-    pub fn new(input: Box<dyn TileOperator>, order: KeyOrder) -> Self {
+    pub fn new(input: Arc<dyn TileOperator>, order: KeyOrder) -> Self {
         let tiling = rekeyed_tiling(input.tiling());
         Self {
             base: OperatorBase::new(tiling),
@@ -112,7 +114,7 @@ impl TileOperator for RekeySorted {
     }
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -122,13 +124,15 @@ impl TileOperator for RekeySorted {
             base: ProducerBase::new(
                 RekeySortedProducer::alloc_id(),
                 self.tiling(),
-                &self.base,
+                self.clone(),
                 cx,
             )
             .breaking(input.downstream, input.placement),
-            input: self
-                .input
-                .subscribe(self.input.tiling().universal_guard(), input.consumer, cx),
+            input: self.input.clone().subscribe(
+                self.input.tiling().universal_guard(),
+                input.consumer,
+                cx,
+            ),
             output: self.tiling().empty_tile(),
             held: Vec::new(),
             complete: Complete::new(self.order),
@@ -521,7 +525,7 @@ mod tests {
     }
 
     /// A producer over `input`, pulled once, with the guards it forwards upstream.
-    fn pulled(input: Tile) -> (RekeySortedProducer, Tile, Rc<RefCell<Vec<TileGuard>>>) {
+    fn pulled(input: Tile) -> (RekeySortedProducer, Tile, Arc<RwLock<Vec<TileGuard>>>) {
         pulled_in(input, KeyOrder::Rising)
     }
 
@@ -529,7 +533,7 @@ mod tests {
     fn pulled_in(
         input: Tile,
         order: KeyOrder,
-    ) -> (RekeySortedProducer, Tile, Rc<RefCell<Vec<TileGuard>>>) {
+    ) -> (RekeySortedProducer, Tile, Arc<RwLock<Vec<TileGuard>>>) {
         let (spy, released) = ReleaseSpy::new(input, pair_tiling());
         let tiling = rekeyed_tiling(&pair_tiling());
         let mut producer = RekeySortedProducer {
@@ -551,7 +555,7 @@ mod tests {
     /// consumed prefix: the consume holds every row and releases no position, and a release of
     /// the output's keys forwards the positions that carry them
     /// (`RekeySortedProducer::release_impl`).
-    fn consumed_unreleased(input: Tile) -> (RekeySortedProducer, Rc<RefCell<Vec<TileGuard>>>) {
+    fn consumed_unreleased(input: Tile) -> (RekeySortedProducer, Arc<RwLock<Vec<TileGuard>>>) {
         let (spy, released) = ReleaseSpy::new(input, pair_tiling());
         let tiling = rekeyed_tiling(&pair_tiling());
         let mut producer = RekeySortedProducer {
@@ -569,12 +573,13 @@ mod tests {
         if let Some(placement) = &producer.base.placement {
             placement.set(None);
         }
+        let mut released_now = released.write().unwrap_or_else(PoisonError::into_inner);
         assert!(
-            released.borrow().iter().all(TileGuard::is_empty),
-            "a consume of rows stated incomplete releases no position: {:?}",
-            released.borrow()
+            released_now.iter().all(TileGuard::is_empty),
+            "a consume of rows stated incomplete releases no position: {released_now:?}"
         );
-        released.borrow_mut().clear();
+        released_now.clear();
+        drop(released_now);
         (producer, released)
     }
 
@@ -633,11 +638,12 @@ mod tests {
         // Every release names consumed ticks only.
         assert!(
             releases
-                .borrow()
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
                 .iter()
                 .all(|guard| keys(Predicate::at_or_below(uint(1))).subsumes(guard)),
             "{:?}",
-            releases.borrow()
+            releases.read().unwrap_or_else(PoisonError::into_inner)
         );
     }
 
@@ -677,7 +683,7 @@ mod tests {
         ));
         producer.release(keys(Predicate::at_or_below(uint(1))));
         assert_eq!(
-            *released.borrow(),
+            *released.read().unwrap_or_else(PoisonError::into_inner),
             vec![keys(
                 Predicate::point(uint(3)).union(&Predicate::point(uint(7)))
             )]
@@ -695,7 +701,10 @@ mod tests {
             Predicate::False,
         ));
         producer.release(keys(Predicate::point(uint(1))));
-        assert_eq!(*released.borrow(), vec![keys(Predicate::point(uint(7)))]);
+        assert_eq!(
+            *released.read().unwrap_or_else(PoisonError::into_inner),
+            vec![keys(Predicate::point(uint(7)))]
+        );
         let out = producer.get(producer.tiling().universal_guard());
         assert_eq!(
             out.live_keys()
@@ -704,7 +713,7 @@ mod tests {
         );
         producer.release(keys(Predicate::point(uint(0))));
         assert_eq!(
-            *released.borrow(),
+            *released.read().unwrap_or_else(PoisonError::into_inner),
             vec![
                 keys(Predicate::point(uint(7))),
                 keys(Predicate::point(uint(3)))
@@ -764,14 +773,26 @@ mod tests {
             consumed: Predicate::False,
         };
         assert_eq!(producer.get(tiling.empty_guard()), tiling.empty_tile());
-        assert!(pulled.borrow().is_empty(), "{:?}", pulled.borrow());
+        assert!(
+            pulled
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "{:?}",
+            pulled.read().unwrap_or_else(PoisonError::into_inner)
+        );
         assert!(producer.held.is_empty());
         // Positions 3 through 9 are no prefix of the input, so their rows stay held.
         producer.consume_in_pipeline(InputId::ONLY, keys_between(3, 9));
         let held = producer.held.clone();
         assert_eq!(held.len(), 3);
         assert_eq!(producer.get(tiling.empty_guard()), tiling.empty_tile());
-        assert_eq!(pulled.borrow().len(), 1, "{:?}", pulled.borrow());
+        assert_eq!(
+            pulled.read().unwrap_or_else(PoisonError::into_inner).len(),
+            1,
+            "{:?}",
+            pulled.read().unwrap_or_else(PoisonError::into_inner)
+        );
         assert_eq!(producer.held, held);
     }
 
@@ -877,9 +898,13 @@ mod tests {
             pulled(pairs(&[3, 7], &[0, 1], &[10, 20], Predicate::True));
         producer.release(producer.tiling().universal_guard());
         assert!(
-            released.borrow().iter().any(TileGuard::is_universal),
+            released
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .any(TileGuard::is_universal),
             "{:?}",
-            released.borrow()
+            released.read().unwrap_or_else(PoisonError::into_inner)
         );
     }
 }

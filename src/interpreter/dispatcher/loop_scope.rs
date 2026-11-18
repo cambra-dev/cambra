@@ -322,7 +322,7 @@ impl Body {
     /// positions its domain has. `None` where it holds no row or its source has offered nothing.
     fn ready_rows(&self) -> Option<(TileGuard, TileGuard)> {
         let input = self.driver_target().and_then(|target| {
-            let target = target.borrow();
+            let target = target.read().unwrap_or_else(PoisonError::into_inner);
             target.as_ref().map(|(_, input)| input.clone())
         });
         let held = self.held.as_ref()?;
@@ -496,7 +496,7 @@ impl Drop for Body {
     fn drop(&mut self) {
         self.unplace();
         if let Some(target) = self.driver_target() {
-            *target.borrow_mut() = None;
+            *target.write().unwrap_or_else(PoisonError::into_inner) = None;
         }
     }
 }
@@ -530,14 +530,27 @@ impl InductionRun {
     }
 }
 
-pub(super) fn induction(
-    store: &StoreCell,
-) -> crate::interpreter::tile_operators::StoreBorrow<'_, InductionStoreProducer> {
-    store.borrow_mut().map(|producer| {
-        producer
+pub(super) struct InductionBorrow<'a>(crate::interpreter::tile_operators::StoreBorrow<'a>);
+
+impl std::ops::Deref for InductionBorrow<'_> {
+    type Target = InductionStoreProducer;
+    fn deref(&self) -> &Self::Target {
+        self.0
+            .as_induction_store()
+            .expect("a loop store has concrete induction state")
+    }
+}
+
+impl std::ops::DerefMut for InductionBorrow<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0
             .as_induction_store_mut()
             .expect("a loop store has concrete induction state")
-    })
+    }
+}
+
+pub(super) fn induction(store: &StoreCell) -> InductionBorrow<'_> {
+    InductionBorrow(store.write())
 }
 
 impl InductionStoreProducer {
@@ -677,21 +690,25 @@ impl InductionStoreProducer {
             .drive_target()
             .expect("a loop's drive offers its source's pushes");
         let offers = self.run().body.offers.clone();
-        *target.borrow_mut() = Some((offers, input));
+        *target.write().unwrap_or_else(PoisonError::into_inner) = Some((offers, input));
     }
 
     /// Undo [`decide_through_drive`](Self::decide_through_drive): the drive's source's pushes
     /// offer the scope nothing.
     pub(super) fn forget_through_drive(&mut self) {
         if let Some(target) = self.drive_target() {
-            *target.borrow_mut() = None;
+            *target.write().unwrap_or_else(PoisonError::into_inner) = None;
         }
     }
 
     /// Whether the drive's source's pushes offer the scope their keys.
     pub(super) fn decides_through_drive(&mut self) -> bool {
-        self.drive_target()
-            .is_some_and(|target| target.borrow().is_some())
+        self.drive_target().is_some_and(|target| {
+            target
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_some()
+        })
     }
 
     /// Where the drive's source's pushes are offered ([`CompletionTarget`]).
@@ -775,7 +792,7 @@ impl InductionStoreProducer {
         let region = Projection::of(guard)
             .unwrap_or_else(|why| panic!("a loop's round names a row of its store: {why}"));
         let mut landing = Landing::probe(self.pipeline(drive));
-        consumer.borrow_mut().notify(&region, &mut landing);
+        crate::interpreter::notifications::notify_shared(&consumer, &region, &mut landing);
         let arrivals = landing.arrivals();
         readers
             .iter()
@@ -1035,7 +1052,10 @@ impl InductionStoreProducer {
 pub(super) fn reach_member(member: &Member, call: &mut Call<'_>) {
     match member {
         Member::Scope(store) => call(&mut *induction(store), InputId::ONLY),
-        Member::Chain(handle) => call(&mut *handle.borrow_mut(), InputId::ONLY),
+        Member::Chain(handle) => call(
+            &mut *handle.write().unwrap_or_else(PoisonError::into_inner),
+            InputId::ONLY,
+        ),
     }
 }
 
@@ -1508,7 +1528,7 @@ mod tests {
         let mut pulls = 0;
         drive.visit_input_producers(&mut |role, input| {
             if role == "source" {
-                pulls = input.base().reads.get();
+                pulls = input.base().reads.load(Ordering::Relaxed);
             }
         });
         pulls
