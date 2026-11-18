@@ -244,7 +244,7 @@ pub fn poly_for_display(solver: &mut Solver, ty: &Type, cutoff: Level) -> Option
                     causes.params.retain(|p| p.of_causes);
                     causes.tops.retain(|t| t.of_causes);
                     if let Repr::Var(v) = order.capabilities.repr() {
-                        causes.vars = v.reaching();
+                        causes.vars = v.reaching(solver);
                     }
                     r.with_ordering(
                         positions
@@ -486,17 +486,17 @@ fn name_capability_vars(
         // A variable a declared parameter opened to is written by the parameter's own name,
         // which its label carries, and the `Poly` declares it.
         let declared = v
-            .own()
+            .own(solver)
             .iter()
             .any(|l| matches!(l.item, crate::ccl::capabilities::Capability::Param(_)));
         if declared
-            || v.level() <= cutoff
+            || v.level(solver) <= cutoff
             || find(&class, v.uid) != v.uid
             || class_seen[&v.uid] != (true, true)
         {
             continue;
         }
-        let (requires_closed, causes_closed) = v.closed();
+        let (requires_closed, causes_closed) = v.closed(solver);
         // `R`, `R1`, …, skipping a spelling a parameter already has.
         let mut name = |stem: &str, bound: Rc<crate::ccl::nominal::NominalDecl>| {
             let spelling = (0..)

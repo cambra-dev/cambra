@@ -16,6 +16,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ccl::Type;
+use crate::ccl::capabilities::{Capabilities, CapabilityRun, CapabilityState, CapabilityVar};
 use crate::ccl::infer::solver::var::{Recorded, Solved, SolverVar, VarTable};
 use crate::ccl::infer_var::{
     Barrier, BarrierState, BarrierVar, InferState, InferVar, InferVarId, SuspendedMemberships,
@@ -113,6 +114,10 @@ pub struct Solver {
     funkinds: VarTable<FunKind>,
     /// What is recorded on each barrier variable.
     barriers: VarTable<Barrier>,
+    /// What is recorded on each capability variable.
+    capabilities: VarTable<Capabilities>,
+    /// What the run records about capabilities beyond each variable's state.
+    pub(crate) capability_run: CapabilityRun,
     /// How many facts have been written to funkind variables: the bounds, stamps and sources
     /// [`FunKindVar::resolved`] reads. Every write bumps it, so an answer cached at the current
     /// count is still the answer.
@@ -123,6 +128,28 @@ pub struct Solver {
     pub(crate) funkind_names: u64,
     /// The memberships recorded on suspensions ([`crate::ccl::infer_var::SuspendedMembership`]).
     pub(crate) suspended_memberships: SuspendedMemberships,
+    /// The predicate each predicate the run derived was derived from
+    /// ([`crate::ccl::ccl_utils::record_derivation`]).
+    pub(crate) derivations: crate::ccl::ccl_utils::Derivations,
+    /// One list per materialization in progress, innermost last
+    /// ([`crate::ccl::infer::solver::coalesce::collecting_memberships`]).
+    pub(crate) pending_memberships:
+        Vec<Vec<crate::ccl::infer::solver::coalesce::PendingMembership>>,
+    /// The variables whose sums are being read, so a cycle through them answers no
+    /// (`compact`'s `projects_a_uint_range`).
+    pub(crate) reading_sums: std::collections::HashSet<InferVarId>,
+    /// Every watch the run has established, the audit trail
+    /// [`crate::ccl::infer::solver::traits::verify_narrowing_is_complete`] checks.
+    #[cfg(debug_assertions)]
+    pub(crate) watch_log: Vec<(
+        Rc<crate::ccl::infer::solver::traits::TraitObligation>,
+        u8,
+        Type,
+    )>,
+    /// The obligation-counter high-water mark when the requirement sweep finished, or `None`
+    /// before it runs ([`crate::ccl::infer::solver::traits::seal_emission`]).
+    #[cfg(debug_assertions)]
+    pub(crate) emission_mark: Option<u32>,
     /// The substitution entries dropped on reaching a variable, checked when the run ends
     /// ([`crate::ccl::subst::check_dropped_entries`]).
     #[cfg(debug_assertions)]
@@ -164,15 +191,29 @@ impl Solver {
             infer_slots: HashMap::new(),
             funkinds: Table::default(),
             barriers: Table::default(),
+            capabilities: Table::default(),
+            capability_run: CapabilityRun::default(),
             funkind_facts: 0,
             funkind_names: 0,
             suspended_memberships: SuspendedMemberships::default(),
+            derivations: Default::default(),
+            pending_memberships: Vec::new(),
+            reading_sums: Default::default(),
+            #[cfg(debug_assertions)]
+            watch_log: Vec::new(),
+            #[cfg(debug_assertions)]
+            emission_mark: None,
             #[cfg(debug_assertions)]
             dropped: Default::default(),
             held_answers: Vec::new(),
             #[cfg(debug_assertions)]
             fixed_compactions: None,
         }
+    }
+
+    /// This solver's identity.
+    pub(crate) fn id(&self) -> SolverId {
+        self.id
     }
 
     /// The solver of a **graph-free** operation: a type operation run outside every typing
@@ -214,11 +255,6 @@ impl Solver {
             !self.graph_free,
             "a graph-free type operation reached {what}, which only a typing run's solver holds"
         );
-    }
-
-    /// This solver's identity.
-    pub(crate) fn id(&self) -> SolverId {
-        self.id
     }
 
     /// What has been recorded on the solver variable `var`: nothing, for a foreign handle this
@@ -270,6 +306,17 @@ impl Solver {
 
     /// What has been recorded on the barrier `var`, for recording more.
     pub(crate) fn barrier_state_mut(&mut self, var: &BarrierVar) -> &mut BarrierState {
+        self.var_state_mut(var)
+    }
+
+    /// What has been recorded on the capability `var`. Only the solver that minted it reads
+    /// it: a capability variable never leaves the run that minted it.
+    pub(crate) fn capability_state(&self, var: &CapabilityVar) -> &CapabilityState {
+        self.var_state(var)
+    }
+
+    /// What has been recorded on the capability `var`, for recording more.
+    pub(crate) fn capability_state_mut(&mut self, var: &CapabilityVar) -> &mut CapabilityState {
         self.var_state_mut(var)
     }
 
@@ -384,6 +431,39 @@ impl Recorded for Barrier {
         let id = solver.id;
         solver.barriers.adopt(id, var, state);
     }
+}
+
+impl Recorded for Capabilities {
+    type State = CapabilityState;
+    fn table(solver: &Solver) -> &VarTable<Self> {
+        &solver.capabilities
+    }
+    fn table_mut(solver: &mut Solver) -> &mut VarTable<Self> {
+        &mut solver.capabilities
+    }
+    fn check_read(solver: &Solver, var: &CapabilityVar) {
+        solver.reach(format_args!("{var:?}"));
+        own_capability(solver, var);
+    }
+    fn note_write(solver: &mut Solver, var: &CapabilityVar) {
+        solver.record(var.home(), format_args!("{var:?}"));
+        own_capability(solver, var);
+    }
+    fn adopt(solver: &mut Solver, var: &Rc<CapabilityVar>, state: CapabilityState) {
+        solver.mint(format_args!("a fresh capability variable"));
+        let id = solver.id;
+        solver.capabilities.adopt(id, var, state);
+    }
+}
+
+/// A capability variable never leaves the run that minted it, so only that run's solver reads
+/// or records on it.
+fn own_capability(solver: &Solver, var: &CapabilityVar) {
+    assert_eq!(
+        var.home().map(|h| h.solver),
+        Some(solver.id),
+        "{var:?} is read outside the run that minted it"
+    );
 }
 
 impl Drop for Solver {
