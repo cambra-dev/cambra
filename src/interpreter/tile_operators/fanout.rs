@@ -238,8 +238,14 @@ impl Store {
     }
 
     pub(crate) fn write(&self) -> StoreBorrow<'_> {
-        self.try_write()
-            .expect("a store has one mutable operation at a time")
+        StoreBorrow {
+            producer: Some(
+                self.producer
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner),
+            ),
+            pending_release: &self.pending_release,
+        }
     }
 
     pub(crate) fn try_write(&self) -> Result<StoreBorrow<'_>, ()> {
@@ -1219,10 +1225,10 @@ impl TileProducer for FanOutProducer {
                 }
             },
             None => match shared_rc
-                .write()
+                .read()
                 .unwrap_or_else(PoisonError::into_inner)
                 .producer
-                .as_mut()
+                .as_ref()
                 .expect("a pulled slot is subscribed")
             {
                 Inner::Owned(producer) => producer.get(projection_guard),
@@ -1244,7 +1250,7 @@ impl TileProducer for FanOutProducer {
         result
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         let shared_rc = self.shared();
         let mut shared = shared_rc.write().unwrap_or_else(PoisonError::into_inner);
         let index = self.index();
@@ -1367,7 +1373,9 @@ impl TileOperator for Memo {
 pub(crate) struct MemoProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
-    cached_tile: Tile,
+    // shared-state-ok: this producer's own state, which `get`, `consume_impl` and `release` change
+    // through `&self` on any worker thread; no other operator holds it.
+    cached_tile: RwLock<Tile>,
 }
 
 impl MemoProducer {
@@ -1377,7 +1385,7 @@ impl MemoProducer {
         Self {
             base,
             input,
-            cached_tile,
+            cached_tile: RwLock::new(cached_tile),
         }
     }
 
@@ -1390,43 +1398,49 @@ impl MemoProducer {
     /// The cache cut to `projection`: it holds whatever was read, which can be more than the
     /// pull asks for.
     fn answer(&self, projection: &Projection) -> Tile {
-        let mut tile = self.cached_tile.clone();
+        let mut tile = self
+            .cached_tile
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         tile.restrict_to(projection, self.tiling());
         tile
     }
 }
 
 impl MemoProducer {
-    /// Read the input at `projection_guard`, merge its answer and release what it states complete.
-    fn read_input(&mut self, projection_guard: TileGuard) {
-        let mut input = self.input.get(projection_guard);
-        trace!("{} received {input:?}", self.name());
-        let upstream_obsolete = input.to_guard();
+    /// Read the input at `guard` and merge its answer into the cache. Answers the region to release
+    /// of the input: what the answer states complete, and the keys of `projection` the cache now
+    /// states complete.
+    fn read_input(&self, guard: TileGuard, projection: &Projection) -> TileGuard {
+        let mut input = self.input.get(guard);
+        let mut released = input.to_guard();
         input.compact();
-        // The release must cover the plain values merged into the cache; see
-        // `src/interpreter/design-operators.md`, "The release contract".
-        // Open-group keys and join-shaped values may remain; the check excludes plain values.
         #[cfg(debug_assertions)]
         {
             let mut unreleased = input.clone();
-            unreleased.remove_guarded(upstream_obsolete.clone());
+            unreleased.remove_guarded(released.clone());
             unreleased.compact();
             debug_assert!(
                 !unreleased.holds_a_plain_value(),
-                "{} merged values it cannot release: {unreleased:?} is left after releasing \
-                 {upstream_obsolete:?} from {input:?}",
-                self.name(),
+                "a memo releases every plain value it takes: {unreleased:?}"
             );
         }
-        trace!("{} releasing {upstream_obsolete:?}", self.name());
-        self.input.release(upstream_obsolete);
-        trace!(
-            "{} merging {input:?} into {:?}",
-            self.name(),
-            self.cached_tile
-        );
-        self.cached_tile.merge(input);
-        close_over_positions(&mut self.cached_tile, &self.base.tiling);
+
+        input.remove_guarded(self.obsolete_guard().clone());
+        input.compact();
+        let mut cache = self
+            .cached_tile
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        cache.merge(input);
+        close_over_positions(&mut cache, &self.base.tiling);
+        if let Projection::Keys { level, keys } = projection {
+            let complete = cache.completion_at(*level).intersect(keys);
+            released =
+                released.union(&Projection::keys_at(*level, complete).guard(self.input.tiling()));
+        }
+        released
     }
 }
 
@@ -1456,34 +1470,43 @@ impl Breaker for MemoProducer {
     /// for the pipeline to run. It wakes no consumer: a consuming memo's only reader is the
     /// pipeline the dispatcher pushes to, and what the consume merged reaches it through the
     /// packages pushed after the consume.
-    fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
-        debug_assert!(
-            guard.check_from(self.input.tiling()),
-            "{} consumes a guard of its input's tiling: {guard:?}",
-            self.name()
-        );
-        // Whether the input released the region already, asked without a difference: the guard
-        // algebra has none of a region of keys and a release with codomain arms, which a
-        // transaction driver's input releases.
-        if self.input.obsolete_guard().subsumes(&guard) {
-            return;
-        }
+    fn consume_impl(&self, _: InputId, guard: TileGuard) {
+        assert!(guard.check_from(self.input.tiling()));
         let projection = guard.projection_for(self);
-        if projection == Projection::Nothing {
+        if projection == Projection::Nothing || self.input.obsolete_guard().subsumes(&guard) {
             return;
         }
-        self.read_input(guard);
-        // What the input states complete of the consumed region holds nothing the cache did not
-        // take, so the memo releases all of it, keys it holds none of included. Its release of
-        // what it merged names only the keys held beneath an open row, so a complete key it
-        // holds none of is released here or not at all.
-        if let Projection::Keys { level, keys } = &projection {
-            let complete = self.cached_tile.completion_at(*level).intersect(keys);
-            if !complete.is_false() {
-                let read = Projection::keys_at(*level, complete).guard(self.input.tiling());
-                self.input.release(read);
-            }
+        let released = self.read_input(guard, &projection);
+        self.input.release(released);
+    }
+
+    fn finish(&mut self, _: InputId, pushes: &mut Pushes<'_>) {
+        // Every input pipeline is closed and every claim has been integrated. State
+        // the end explicitly: unions of per-key statements need not simplify to
+        // True, especially for nominal keys whose values are records.
+        if let Tile::DataFunction {
+            domain_predicate, ..
+        } = &mut *self
+            .cached_tile
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            *domain_predicate = Predicate::True;
         }
+        pushes.push_final(self);
+    }
+
+    fn finish_parallel_input(&mut self) {
+        self.input.release(self.input.tiling().universal_guard());
+    }
+    fn parallel_level(&self) -> Option<CurryLevel> {
+        let Tiling::DataFunction { codomain, .. } = self.input.tiling() else {
+            return None;
+        };
+        if codomain.holds_a_level() {
+            return None;
+        }
+        parallel_input_level(&*self.input, false)
     }
 
     fn input_tiling(&self, _: InputId) -> Tiling {
@@ -1507,13 +1530,17 @@ impl BreakingProducer for MemoProducer {
     /// keys released whole are added (`keys_released_whole`). `final_guard` takes the released
     /// region out again.
     fn complete(&self) -> TileGuard {
-        let stated = self.cached_tile.to_guard();
+        let stated = self
+            .cached_tile
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .to_guard();
         let released = self.obsolete_guard();
         if released.is_empty() {
             return stated;
         }
-        let released = match names_collection_keys(released) {
-            true => match keys_released_whole(released) {
+        let released = match names_collection_keys(&released) {
+            true => match keys_released_whole(&released) {
                 Some(keys) => keys,
                 None => return stated,
             },
@@ -1524,14 +1551,23 @@ impl BreakingProducer for MemoProducer {
 
     /// Cut at the cached keys.
     fn morsels(&self, guard: &TileGuard, rows: usize) -> Vec<TileGuard> {
-        let keys = self.cached_tile.live_keys().into_iter().flatten();
+        let cache = self
+            .cached_tile
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let keys = cache.live_keys().into_iter().flatten();
         cut_at_keys(guard, keys.map(|(_, key)| key), rows, self.tiling())
     }
 }
 
 impl TileProducer for MemoProducer {
     fn state_info(&self) -> ProducerStateInfo {
-        ProducerStateInfo::holding(self.cached_tile.cell_count())
+        ProducerStateInfo::holding(
+            self.cached_tile
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .cell_count(),
+        )
     }
 
     impl_producer_base!();
@@ -1560,18 +1596,15 @@ impl TileProducer for MemoProducer {
         self.answer(&guard.projection_for(self))
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        // Remove any released data from the cached tile since the consumer
-        // is no longer interested.
-        self.cached_tile.remove_guarded(obsolete_guard.clone());
-        // Compact so that logically-deleted entries are physically gone.
-        self.cached_tile.compact();
-        // Also release upstream to handle the case where the consumer releases
-        // data that was never produced.
-        if !obsolete_guard.is_empty() {
-            self.input.release(obsolete_guard.clone());
-        }
-        trace!("{} now has cached {:?}", self.name(), self.cached_tile);
+    fn release_impl(&self, guard: TileGuard) {
+        let mut cache = self
+            .cached_tile
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        cache.remove_guarded(guard.clone());
+        cache.compact();
+        drop(cache);
+        self.input.release(guard);
     }
 }
 
@@ -1806,7 +1839,7 @@ mod tests {
                 .clone()
                 .clone()
                 .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut cx);
-        let mut second =
+        let second =
             fan.slot()
                 .clone()
                 .clone()
@@ -1842,6 +1875,44 @@ mod tests {
         );
     }
 
+    /// A slot that releases everything after a partial release keeps the watermark at the last
+    /// position the partial releases left bounded (`FanOutShared::released_position`). The
+    /// release wrapper hands the slot the universal guard, which names no position.
+    #[rstest::rstest]
+    // A transaction drive releases the positions above its extent first; what is left to
+    // release is bounded by the extent's last position.
+    #[case::above_the_extent_first(Predicate::True.minus(&Predicate::at_or_below(Value::UInt(2))), Some(2))]
+    // A prefix leaves the rest unbounded above, so the watermark stays at the prefix's end.
+    #[case::a_prefix(Predicate::at_or_below(Value::UInt(1)), Some(1))]
+    fn a_release_of_everything_keeps_the_watermark(
+        #[case] first: Predicate,
+        #[case] watermark: Option<u64>,
+    ) {
+        let tiling = Tiling::data_function(
+            Extent::uint_range(3),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let tile = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1, 2]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let fan = FanOut::new(Arc::new(Constant::collection(tile, tiling.clone())));
+        let mut cx = SubscribeContext::new();
+        let slot = fan
+            .slot()
+            .clone()
+            .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut cx);
+        slot.release(TileGuard::Function(FunctionGuard::Domain(first)));
+        slot.release(tiling.universal_guard());
+        assert!(fan.released_in_full());
+        assert_eq!(
+            fan.released_position(),
+            watermark.map(|at| Position::new(Value::UInt(at)))
+        );
+    }
+
     /// A subscriber that registers after the fan-out has released starts having
     /// released the same, because that data is gone: the fan-out told its input
     /// it would not be read again.
@@ -1860,7 +1931,7 @@ mod tests {
         let mut cx = SubscribeContext::new();
         let tiling = Tiling::Scalar(extent);
 
-        let mut first =
+        let first =
             fan.slot()
                 .clone()
                 .clone()
@@ -2031,7 +2102,7 @@ mod tests {
             }
         }
 
-        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+        fn release_impl(&self, _obsolete_guard: TileGuard) {}
     }
 
     /// An open tiling whose cached answer remains partial between notifications.
@@ -2274,7 +2345,7 @@ mod projection_tests {
             self.tiling().empty_tile()
         }
 
-        fn release_impl(&mut self, _guard: TileGuard) {}
+        fn release_impl(&self, _guard: TileGuard) {}
     }
 
     /// A spy over the stream of `0..ROWS`.
@@ -2468,9 +2539,7 @@ mod projection_tests {
         );
         assert_eq!(
             *released.read().unwrap_or_else(PoisonError::into_inner),
-            vec![keys_between(0, 3), keys_between(0, 3)],
-            "released at what the answer stated, then at the consumed keys the cache states \
-             complete"
+            vec![keys_between(0, 3)]
         );
 
         let part = memo.get(keys_between(0, 3));
@@ -2552,9 +2621,7 @@ mod projection_tests {
         );
         assert_eq!(
             *released.read().unwrap_or_else(PoisonError::into_inner),
-            vec![handed.clone(), handed],
-            "released at what the answer stated, then at the consumed keys the cache states \
-             complete"
+            vec![handed]
         );
         let rest = second.get(ints().universal_guard());
         assert_eq!(int_entries(&rest), vec![(4, 4), (5, 5), (6, 6), (7, 7)]);
@@ -2683,7 +2750,7 @@ mod consuming_tests {
     fn statement(memo: &MemoProducer) -> Predicate {
         let Tile::DataFunction {
             domain_predicate, ..
-        } = &memo.cached_tile
+        } = &*memo.cached_tile.read().unwrap()
         else {
             panic!("a collection, got {:?}", memo.cached_tile)
         };
@@ -2695,8 +2762,7 @@ mod consuming_tests {
     // ------------------------------------------------------------------------------------
 
     /// A consume at some keys merges what the input answered for them, states
-    /// complete those keys and no others, and releases the input at them: once at what the
-    /// answer stated, and again at the consumed keys the cache states complete.
+    /// complete those keys and no others, and releases the input at them once.
     #[test]
     fn a_region_of_keys_is_what_the_memo_consumes() {
         let source = source(0..10);
@@ -2706,7 +2772,7 @@ mod consuming_tests {
         memo.begin_run();
         memo.consume_in_pipeline(InputId::ONLY, region.guard());
 
-        assert_eq!(entries(&memo.cached_tile), rows_of(2..=5));
+        assert_eq!(entries(&memo.cached_tile.read().unwrap()), rows_of(2..=5));
         let stated = statement(&memo);
         assert!(same_region(&stated, &keys_predicate(2, 5)), "{stated:?}");
         for outside in [0, 1, 6, 9] {
@@ -2721,7 +2787,7 @@ mod consuming_tests {
                 .read()
                 .unwrap_or_else(PoisonError::into_inner)
                 .released,
-            vec![region.guard(), region.guard()]
+            vec![region.guard()]
         );
     }
 
@@ -2734,7 +2800,10 @@ mod consuming_tests {
             memo.begin_run();
             memo.consume_in_pipeline(InputId::ONLY, region.guard());
         }
-        assert_eq!(entries(&memo.cached_tile), rows_of([1, 2, 7, 8, 9]));
+        assert_eq!(
+            entries(&memo.cached_tile.read().unwrap()),
+            rows_of([1, 2, 7, 8, 9])
+        );
         let stated = statement(&memo);
         let both = keys_predicate(1, 2).union(&keys_predicate(7, 9));
         assert!(same_region(&stated, &both), "{stated:?}");
@@ -2747,14 +2816,7 @@ mod consuming_tests {
                 .read()
                 .unwrap_or_else(PoisonError::into_inner)
                 .released,
-            vec![
-                keys_between(1, 2),
-                keys_between(1, 2),
-                keys_between(7, 9),
-                keys_between(7, 9)
-            ],
-            "each consume releases its keys at what the answer stated and at what the cache \
-             states complete"
+            vec![keys_between(1, 2), keys_between(7, 9)]
         );
     }
 
@@ -2768,7 +2830,7 @@ mod consuming_tests {
             memo.begin_run();
             memo.consume_in_pipeline(InputId::ONLY, region.guard());
         }
-        assert_eq!(entries(&memo.cached_tile), rows_of(2..=8));
+        assert_eq!(entries(&memo.cached_tile.read().unwrap()), rows_of(2..=8));
         let stated = statement(&memo);
         assert!(same_region(&stated, &keys_predicate(2, 8)), "{stated:?}");
         assert_eq!(
@@ -2776,14 +2838,8 @@ mod consuming_tests {
                 .read()
                 .unwrap_or_else(PoisonError::into_inner)
                 .released,
-            vec![
-                keys_between(2, 5),
-                keys_between(2, 5),
-                keys_between(4, 8),
-                keys_between(4, 8)
-            ],
-            "the input is released at each guard consumed, twice: at what the answer stated and \
-             at what the cache states complete"
+            vec![keys_between(2, 5), keys_between(4, 8)],
+            "the input is released at each guard consumed"
         );
     }
 
@@ -2795,7 +2851,7 @@ mod consuming_tests {
         let mut memo = memo_over(&source);
         memo.begin_run();
         memo.consume_in_pipeline(InputId::ONLY, All.guard());
-        assert_eq!(entries(&memo.cached_tile), rows_of(0..10));
+        assert_eq!(entries(&memo.cached_tile.read().unwrap()), rows_of(0..10));
         assert!(same_region(&statement(&memo), &Predicate::True));
         assert_eq!(memo.final_guard(), ints().universal_guard());
     }
@@ -2814,7 +2870,7 @@ mod consuming_tests {
                 .pulled
                 .is_empty()
         );
-        assert!(entries(&memo.cached_tile).is_empty());
+        assert!(entries(&memo.cached_tile.read().unwrap()).is_empty());
     }
 
     /// A growing input states complete only the keys it holds, so the release leaves a key it
@@ -2843,7 +2899,7 @@ mod consuming_tests {
             .rows
             .insert(3, value(3));
         memo.consume_in_pipeline(InputId::ONLY, Keys(0, 5).guard());
-        assert_eq!(entries(&memo.cached_tile), rows_of(0..=5));
+        assert_eq!(entries(&memo.cached_tile.read().unwrap()), rows_of(0..=5));
         let second = predicate(
             source
                 .read()
@@ -2880,7 +2936,7 @@ mod consuming_tests {
         memo.consume_in_pipeline(InputId::ONLY, Keys(0, 3).guard());
         memo.release(Keys(0, 3).guard());
         memo.consume_in_pipeline(InputId::ONLY, Keys(0, 3).guard());
-        assert!(entries(&memo.cached_tile).is_empty());
+        assert!(entries(&memo.cached_tile.read().unwrap()).is_empty());
         assert!(entries(&memo.get(Keys(0, 3).guard())).is_empty());
     }
 
@@ -2910,9 +2966,18 @@ mod consuming_tests {
         let mut memo = memo_over(&source(0..10));
         memo.begin_run();
         memo.consume_in_pipeline(InputId::ONLY, All.guard());
-        let before = (entries(&memo.cached_tile), memo.final_guard());
+        let before = (
+            entries(&memo.cached_tile.read().unwrap()),
+            memo.final_guard(),
+        );
         memo.release(ints().empty_guard());
-        assert_eq!((entries(&memo.cached_tile), memo.final_guard()), before);
+        assert_eq!(
+            (
+                entries(&memo.cached_tile.read().unwrap()),
+                memo.final_guard()
+            ),
+            before
+        );
     }
 
     // ------------------------------------------------------------------------------------
@@ -2943,7 +3008,7 @@ mod consuming_tests {
             &Predicate::True.minus(&keys_predicate(2, 3))
         ));
         assert_eq!(
-            entries(&memo.cached_tile),
+            entries(&memo.cached_tile.read().unwrap()),
             rows_of([0, 1, 4, 5, 6, 7, 8, 9])
         );
     }
@@ -2968,7 +3033,10 @@ mod consuming_tests {
         let guard = keys_of(&memo.final_guard());
         assert_eq!(guard, (0..KEYS).filter(|k| ![2, 3].contains(k)).collect());
         assert!(guard.contains(&9), "the row added later");
-        assert_eq!(entries(&memo.cached_tile), rows_of([0, 1, 4, 5, 9]));
+        assert_eq!(
+            entries(&memo.cached_tile.read().unwrap()),
+            rows_of([0, 1, 4, 5, 9])
+        );
     }
 
     /// An input that has stated everything complete and holds no row leaves a cache that states
@@ -2979,7 +3047,7 @@ mod consuming_tests {
         let mut memo = memo_over(&source);
         memo.begin_run();
         memo.consume_in_pipeline(InputId::ONLY, All.guard());
-        assert!(entries(&memo.cached_tile).is_empty());
+        assert!(entries(&memo.cached_tile.read().unwrap()).is_empty());
         assert_eq!(memo.final_guard(), ints().universal_guard());
     }
 
@@ -3296,13 +3364,11 @@ mod consuming_tests {
                         self.cache.extend(answered);
                         self.stated = self.stated.union(&stated);
                         self.drained = self.input.closed && matches!(region, All);
-                        // A consume at keys releases again the consumed keys its cache states
-                        // complete, which the pulls' releases already cover.
+                        // A consume at keys also releases the consumed keys its cache states
+                        // complete, in the one release of what the answer stated.
                         if let Keys(..) = region {
                             let complete = self.stated.intersect(&predicate(&region.guard()));
-                            if !complete.is_false() {
-                                self.input.release_again(complete);
-                            }
+                            self.input.widen_last_release(&complete);
                         }
                     }
                 }
@@ -3326,7 +3392,7 @@ mod consuming_tests {
         fn check(&mut self) {
             let trace = &self.trace;
             assert_eq!(
-                entries(&self.consuming.cached_tile),
+                entries(&self.consuming.cached_tile.read().unwrap()),
                 rows_of(self.cache.iter().copied()),
                 "{trace}: the cache"
             );
@@ -3564,7 +3630,7 @@ mod cycle_tests {
             self.answer.clone()
         }
 
-        fn release_impl(&mut self, _guard: TileGuard) {
+        fn release_impl(&self, _guard: TileGuard) {
             if self
                 .wiring
                 .read()
@@ -3618,11 +3684,11 @@ mod cycle_tests {
         let (fan, wiring) = cyclic(int(2), |_| Box::new(|| {}));
         let mut cx = SubscribeContext::new();
         let whole = ints().universal_guard();
-        let mut reader =
-            fan.slot()
-                .clone()
-                .clone()
-                .subscribe(whole.clone(), Box::new(|| {}), &mut cx);
+        let reader = fan
+            .slot()
+            .clone()
+            .clone()
+            .subscribe(whole.clone(), Box::new(|| {}), &mut cx);
         cycle_of(&wiring).publish(&int(1));
         if reentrant_last {
             reader.release(whole.clone());
@@ -3655,18 +3721,18 @@ mod cycle_tests {
         let (fan, wiring) = cyclic(int(2), |_| Box::new(|| {}));
         let mut cx = SubscribeContext::new();
         let whole = ints().universal_guard();
-        let mut reader =
-            fan.slot()
-                .clone()
-                .clone()
-                .subscribe(whole.clone(), Box::new(|| {}), &mut cx);
+        let reader = fan
+            .slot()
+            .clone()
+            .clone()
+            .subscribe(whole.clone(), Box::new(|| {}), &mut cx);
         reader.release(whole.clone());
         wiring
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .release_recurrence = true;
         let store = fan.store().unwrap();
-        let mut borrow = store.write();
+        let borrow = store.write();
         // A release of the store, even of nothing, releases its recurrence slot under the
         // store's borrow.
         borrow.release(ints().empty_guard());

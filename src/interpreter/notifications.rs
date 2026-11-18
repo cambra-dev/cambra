@@ -13,6 +13,9 @@ struct ControlThread {
     depth: usize,
     active: std::collections::HashSet<usize>,
 }
+// shared-state-ok: this thread's ownership of the notification lock, its recursion depth, and the
+// consumers it is notifying; what crosses it is lock ownership and consumer identities, never a
+// tile.
 thread_local! {
     static CONTROL_THREAD: std::cell::RefCell<ControlThread> = Default::default();
 }
@@ -43,6 +46,8 @@ impl Drop for ControlGuard {
     }
 }
 
+// shared-state-ok: a consumer's notification handle; a notification carries a region, never a
+// tile.
 fn with_consumer<C: Consumer + ?Sized>(shared: &Arc<RwLock<C>>, f: impl FnOnce(&mut C)) -> bool {
     let _control = control_plane();
     let identity = Arc::as_ptr(shared) as *const () as usize;
@@ -63,6 +68,8 @@ fn with_consumer<C: Consumer + ?Sized>(shared: &Arc<RwLock<C>>, f: impl FnOnce(&
 }
 
 pub(crate) fn notify_shared<C: Consumer + ?Sized>(
+    // shared-state-ok: a consumer's notification handle; a notification carries a region, never a
+    // tile.
     shared: &Arc<RwLock<C>>,
     region: &Projection,
     landing: &mut Landing<'_>,

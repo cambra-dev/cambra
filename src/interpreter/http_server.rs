@@ -567,6 +567,9 @@ pub struct HttpServerDataSource {
 
     /// Requests, with their `tiny_http::Request` handles, from the dispatcher thread, or the
     /// dispatcher's failure.
+    // shared-state-ok: the external boundary: requests from the dispatcher thread. A `Receiver` is
+    // not `Sync` and a data source is (`DataSourceDomainExtentImpl`); each poll takes `&mut self`
+    // and reaches it through `get_mut`. No operator's output crosses it.
     receiver: Mutex<Receiver<RouteMessage>>,
 
     /// Shared state for routing responses back to clients.

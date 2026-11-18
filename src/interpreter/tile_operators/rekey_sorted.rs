@@ -125,11 +125,13 @@ impl TileOperator for RekeySorted {
                 input.consumer,
                 cx,
             ),
-            output: self.tiling().empty_tile(),
-            held: Vec::new(),
-            complete: Complete::new(self.order),
-            released_through: None,
-            consumed: Predicate::False,
+            state: Mutex::new(RekeyState {
+                output: self.tiling().empty_tile(),
+                held: Vec::new(),
+                complete: Complete::new(self.order),
+                released_through: None,
+                consumed: Predicate::False,
+            }),
         })
     }
 }
@@ -138,6 +140,11 @@ impl TileOperator for RekeySorted {
 struct RekeySortedProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
+    // shared-state-ok: this producer's own state, which `get`, `consume_impl` and `release` change
+    // through `&self` on any worker thread; no other operator holds it.
+    state: Mutex<RekeyState>,
+}
+struct RekeyState {
     output: Tile,
     /// Position-to-key mappings above the consumed input prefix, in position order. These
     /// survive output release until an earlier input gap closes and their keys can advance
@@ -154,16 +161,19 @@ struct RekeySortedProducer {
 }
 
 impl TileProducer for RekeySortedProducer {
+    impl_producer_base!();
+
     /// Output keys name different positions; the input is read whole.
     fn input_level(&self, _role: &str, _level: CurryLevel) -> Option<CurryLevel> {
         None
     }
 
     fn state_info(&self) -> ProducerStateInfo {
-        ProducerStateInfo::holding(self.output.cell_count() + self.held.len())
-    }
+        let mut state_guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *state_guard;
 
-    impl_producer_base!();
+        ProducerStateInfo::holding(state.output.cell_count() + state.held.len())
+    }
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("input", &*self.input);
@@ -182,13 +192,19 @@ impl TileProducer for RekeySortedProducer {
     }
 
     fn get_impl(&self, guard: TileGuard) -> Tile {
-        let mut tile = self.output.clone();
+        let mut state_guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *state_guard;
+
+        let mut tile = state.output.clone();
         tile.restrict_to(&guard.projection_for(self), self.tiling());
         tile
     }
 
-    fn release_impl(&mut self, _obsolete_guard: TileGuard) {
-        self.output.remove_guarded(self.obsolete_guard().clone());
+    fn release_impl(&self, _obsolete_guard: TileGuard) {
+        let mut state_guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *state_guard;
+
+        state.output.remove_guarded(self.obsolete_guard().clone());
         if self
             .base
             .placement
@@ -203,7 +219,7 @@ impl TileProducer for RekeySortedProducer {
         if released.is_universal() {
             return self.input.release(self.input.tiling().universal_guard());
         }
-        let through = self
+        let through = state
             .held
             .iter()
             .take_while(|(key, _)| released.covers_path(std::slice::from_ref(key)))
@@ -212,10 +228,10 @@ impl TileProducer for RekeySortedProducer {
         let Some((key, through)) = through else {
             return;
         };
-        if matches!(self.complete, Complete::Through(_)) {
-            self.released_through = Some(key);
+        if matches!(state.complete, Complete::Through(_)) {
+            state.released_through = Some(key);
         }
-        self.held.retain(|(_, at)| at > &through);
+        state.held.retain(|(_, at)| at > &through);
         self.input
             .release(TileGuard::Function(FunctionGuard::Domain(
                 Predicate::at_or_below(through),
@@ -225,8 +241,8 @@ impl TileProducer for RekeySortedProducer {
 
 impl RekeySortedProducer {
     /// Only the continuous consumed prefix can advance a prefix-releasing input.
-    fn consumed_prefix(&self) -> Predicate {
-        match &self.consumed {
+    fn consumed_prefix(&self, state: &RekeyState) -> Predicate {
+        match &state.consumed {
             Predicate::True => Predicate::True,
             Predicate::False => Predicate::False,
             Predicate::Intervals(intervals) => {
@@ -247,7 +263,7 @@ impl RekeySortedProducer {
         }
     }
 
-    fn read_input(&mut self, input_guard: TileGuard) -> Tile {
+    fn read_input(&self, state: &mut RekeyState, input_guard: TileGuard) -> Tile {
         let input = self.input.get(input_guard);
         let Tile::DataFunction {
             row_starts,
@@ -292,7 +308,8 @@ impl RekeySortedProducer {
         let arrived: Vec<(Value, Value)> = rows
             .iter()
             .filter(|(_, at)| {
-                self.held
+                state
+                    .held
                     .binary_search_by(|(_, held)| {
                         held.partial_cmp(at).expect("ordered input positions")
                     })
@@ -314,7 +331,7 @@ impl RekeySortedProducer {
         // through `through` is complete, so a row not seen before carries a key above it. The
         // check reads `complete` rather than `held`, because rows of the consumed prefix have
         // left `held`.
-        if let Complete::Through(Some(through)) = &self.complete
+        if let Complete::Through(Some(through)) = &state.complete
             && let Some((key, at)) = arrived.iter().find(|(key, _)| key <= through)
         {
             panic!(
@@ -324,7 +341,7 @@ impl RekeySortedProducer {
         }
         // A release of an unplaced breaker drops rows from `held` without calling their keys
         // complete, so the greatest key it dropped bounds what arrives after it the same way.
-        if let Some(through) = &self.released_through
+        if let Some(through) = &state.released_through
             && let Some((key, at)) = arrived.iter().find(|(key, _)| key <= through)
         {
             panic!(
@@ -332,21 +349,22 @@ impl RekeySortedProducer {
                  {at:?} arrived after the row of key {through:?} was released"
             );
         }
-        self.consumed = self.consumed.union(&domain_predicate);
-        self.held.extend(arrived);
-        self.held
+        state.consumed = state.consumed.union(&domain_predicate);
+        state.held.extend(arrived);
+        state
+            .held
             .sort_by(|a, b| a.1.partial_cmp(&b.1).expect("ordered input positions"));
         // `held` holds every arrived row above the consumed prefix in position order, so its
         // keys rise across morsels and within this one.
         assert!(
-            !matches!(self.complete, Complete::Through(_))
-                || self.held.windows(2).all(|w| w[0].0 < w[1].0),
+            !matches!(state.complete, Complete::Through(_))
+                || state.held.windows(2).all(|w| w[0].0 < w[1].0),
             "RekeySorted's keys rise with its input's order"
         );
-        let prefix = self.consumed_prefix();
-        for (key, at) in &self.held {
+        let prefix = self.consumed_prefix(state);
+        for (key, at) in &state.held {
             if prefix.contains(at) {
-                self.complete.add(key);
+                state.complete.add(key);
             }
         }
         let complete = match prefix.is_true() {
@@ -355,7 +373,7 @@ impl RekeySortedProducer {
                 let Tiling::DataFunction { domain, .. } = self.tiling() else {
                     unreachable!("RekeySorted outputs a collection")
                 };
-                self.complete.predicate(domain)
+                state.complete.predicate(domain)
             }
         };
         // A collection's keys ascend, which keys in any order are put in.
@@ -388,34 +406,49 @@ impl RekeySortedProducer {
 }
 
 impl Breaker for RekeySortedProducer {
-    fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
-        let tile = self.read_input(guard.clone());
-        self.output.merge(tile);
-        let prefix = self.consumed_prefix();
-        self.input
-            .release(TileGuard::Function(FunctionGuard::Domain(prefix.clone())));
-        self.held.retain(|(_, position)| !prefix.contains(position));
-    }
     fn input_tiling(&self, _: InputId) -> Tiling {
         self.input.tiling().clone()
     }
+
     fn input_released(&self, _: InputId) -> TileGuard {
         self.input.obsolete_guard().clone()
     }
+
     fn as_producer(&self) -> Option<&dyn BreakingProducer> {
         Some(self)
+    }
+
+    fn consume_impl(&self, _: InputId, guard: TileGuard) {
+        let mut state_guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *state_guard;
+
+        let tile = self.read_input(state, guard.clone());
+        state.output.merge(tile);
+        let prefix = self.consumed_prefix(state);
+        self.input
+            .release(TileGuard::Function(FunctionGuard::Domain(prefix.clone())));
+        state
+            .held
+            .retain(|(_, position)| !prefix.contains(position));
     }
 }
 
 impl BreakingProducer for RekeySortedProducer {
     fn complete(&self) -> TileGuard {
-        self.output.to_guard()
+        let mut state_guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *state_guard;
+
+        state.output.to_guard()
     }
 
     fn morsels(&self, guard: &TileGuard, rows: usize) -> Vec<TileGuard> {
+        let mut state_guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *state_guard;
+
         cut_at_keys(
             guard,
-            self.output
+            state
+                .output
                 .live_keys()
                 .into_iter()
                 .flatten()
@@ -514,11 +547,13 @@ mod tests {
         let mut producer = RekeySortedProducer {
             base: ProducerBase::unowned(RekeySortedProducer::alloc_id(), &tiling),
             input: Box::new(spy),
-            output: tiling.empty_tile(),
-            held: Vec::new(),
-            complete: Complete::new(order),
-            released_through: None,
-            consumed: Predicate::False,
+            state: Mutex::new(RekeyState {
+                output: tiling.empty_tile(),
+                held: Vec::new(),
+                complete: Complete::new(order),
+                released_through: None,
+                consumed: Predicate::False,
+            }),
         };
         producer.consume_in_pipeline(InputId::ONLY, pair_tiling().universal_guard());
         let out = producer.get(tiling.universal_guard());
@@ -536,11 +571,13 @@ mod tests {
         let mut producer = RekeySortedProducer {
             base: ProducerBase::unowned(RekeySortedProducer::alloc_id(), &tiling),
             input: Box::new(spy),
-            output: tiling.empty_tile(),
-            held: Vec::new(),
-            complete: Complete::new(KeyOrder::Rising),
-            released_through: None,
-            consumed: Predicate::False,
+            state: Mutex::new(RekeyState {
+                output: tiling.empty_tile(),
+                held: Vec::new(),
+                complete: Complete::new(KeyOrder::Rising),
+                released_through: None,
+                consumed: Predicate::False,
+            }),
         };
         producer.consume_in_pipeline(InputId::ONLY, pair_tiling().universal_guard());
         // Unplaced after the consume, as a scope body's source runs: a placed breaker's input
@@ -579,32 +616,41 @@ mod tests {
         let mut producer = RekeySortedProducer {
             base: ProducerBase::unowned(RekeySortedProducer::alloc_id(), &tiling),
             input: Box::new(spy),
-            output: tiling.empty_tile(),
-            held: Vec::new(),
-            complete: Complete::new(KeyOrder::Rising),
-            released_through: None,
-            consumed: Predicate::False,
+            state: Mutex::new(RekeyState {
+                output: tiling.empty_tile(),
+                held: Vec::new(),
+                complete: Complete::new(KeyOrder::Rising),
+                released_through: None,
+                consumed: Predicate::False,
+            }),
         };
         producer.consume_in_pipeline(InputId::ONLY, keys(Predicate::point(uint(1))));
         assert!(producer.input.obsolete_guard().is_empty());
         let Tile::DataFunction {
             domain_predicate, ..
-        } = &producer.output
+        } = &producer.state.get_mut().unwrap().output
         else {
             unreachable!()
         };
         assert!(!domain_predicate.contains(&uint(0)));
         producer.release(keys(Predicate::point(uint(1))));
         producer.consume_in_pipeline(InputId::ONLY, keys(Predicate::point(uint(0))));
+        let domain = producer
+            .tiling()
+            .domain_extent()
+            .expect("a keyed collection");
         assert!(
             producer
+                .state
+                .get_mut()
+                .unwrap()
                 .complete
-                .predicate(&producer.tiling().domain_extent().unwrap())
+                .predicate(&domain)
                 .contains(&uint(1))
         );
         assert_eq!(
             producer.input.obsolete_guard(),
-            &keys(Predicate::at_or_below(uint(1)))
+            keys(Predicate::at_or_below(uint(1)))
         );
         assert!(
             releases
@@ -643,7 +689,7 @@ mod tests {
     /// positions that carries them.
     #[test]
     fn a_key_prefix_releases_a_position_prefix() {
-        let (mut producer, released) = consumed_unreleased(pairs(
+        let (producer, released) = consumed_unreleased(pairs(
             &[3, 7, 9],
             &[0, 1, 2],
             &[10, 20, 30],
@@ -660,7 +706,7 @@ mod tests {
     /// above the gap leaves the output meanwhile.
     #[test]
     fn a_gap_holds_the_rows_above_it() {
-        let (mut producer, released) = consumed_unreleased(pairs(
+        let (producer, released) = consumed_unreleased(pairs(
             &[3, 7, 9],
             &[0, 1, 2],
             &[10, 20, 30],
@@ -730,11 +776,13 @@ mod tests {
         let mut producer = RekeySortedProducer {
             base: ProducerBase::unowned(RekeySortedProducer::alloc_id(), &tiling),
             input: Box::new(spy),
-            output: tiling.empty_tile(),
-            held: Vec::new(),
-            complete: Complete::new(KeyOrder::Rising),
-            released_through: None,
-            consumed: Predicate::False,
+            state: Mutex::new(RekeyState {
+                output: tiling.empty_tile(),
+                held: Vec::new(),
+                complete: Complete::new(KeyOrder::Rising),
+                released_through: None,
+                consumed: Predicate::False,
+            }),
         };
         assert_eq!(producer.get(tiling.empty_guard()), tiling.empty_tile());
         assert!(
@@ -745,10 +793,10 @@ mod tests {
             "{:?}",
             pulled.read().unwrap_or_else(PoisonError::into_inner)
         );
-        assert!(producer.held.is_empty());
+        assert!(producer.state.get_mut().unwrap().held.is_empty());
         // Positions 3 through 9 are no prefix of the input, so their rows stay held.
         producer.consume_in_pipeline(InputId::ONLY, keys_between(3, 9));
-        let held = producer.held.clone();
+        let held = producer.state.get_mut().unwrap().held.clone();
         assert_eq!(held.len(), 3);
         assert_eq!(producer.get(tiling.empty_guard()), tiling.empty_tile());
         assert_eq!(
@@ -757,7 +805,7 @@ mod tests {
             "{:?}",
             pulled.read().unwrap_or_else(PoisonError::into_inner)
         );
-        assert_eq!(producer.held, held);
+        assert_eq!(producer.state.get_mut().unwrap().held, held);
     }
 
     /// A breaker over rising keys, whose input holds `row_keys` at positions 0, 1, …, consuming
@@ -774,11 +822,13 @@ mod tests {
         let mut producer = RekeySortedProducer {
             base: ProducerBase::unowned(RekeySortedProducer::alloc_id(), &tiling),
             input: Box::new(spy),
-            output: tiling.empty_tile(),
-            held: Vec::new(),
-            complete: Complete::new(KeyOrder::Rising),
-            released_through: None,
-            consumed: Predicate::False,
+            state: Mutex::new(RekeyState {
+                output: tiling.empty_tile(),
+                held: Vec::new(),
+                complete: Complete::new(KeyOrder::Rising),
+                released_through: None,
+                consumed: Predicate::False,
+            }),
         };
         for &at in positions {
             producer.consume_in_pipeline(InputId::ONLY, keys(Predicate::point(uint(at))));
@@ -807,12 +857,12 @@ mod tests {
     /// complete until position 0 arrives, and then keys 10 and 20 are.
     #[test]
     fn rising_keys_consumed_in_reverse_are_complete_once_the_prefix_arrives() {
-        let producer = consumed_one_at_a_time(&[10, 20], &[1, 0]);
+        let mut producer = consumed_one_at_a_time(&[10, 20], &[1, 0]);
         let Tile::DataFunction {
             domain,
             domain_predicate,
             ..
-        } = &producer.output
+        } = &producer.state.get_mut().unwrap().output
         else {
             panic!("expected a collection")
         };
@@ -858,8 +908,7 @@ mod tests {
 
     #[test]
     fn a_universal_release_releases_the_input() {
-        let (mut producer, _, released) =
-            pulled(pairs(&[3, 7], &[0, 1], &[10, 20], Predicate::True));
+        let (producer, _, released) = pulled(pairs(&[3, 7], &[0, 1], &[10, 20], Predicate::True));
         producer.release(producer.tiling().universal_guard());
         assert!(
             released

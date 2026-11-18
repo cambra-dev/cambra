@@ -218,12 +218,16 @@ fn site_keys(sites: &[&str]) -> Vec<FieldKey> {
         .collect()
 }
 
-/// Assert `code` produces `expected` via the pipeline path.
+/// Assert `code` produces `expected` via the pipeline path, domain predicates compared by region
+/// ([`same_tile`]).
 pub(crate) fn check_tile(code: &str, expected: Tile) {
-    assert_eq!(
+    let (actual, expected) = (
         sort_function_by_domain(run_pipeline(code)),
         sort_function_by_domain(expected),
-        "pipeline path"
+    );
+    assert!(
+        same_tile(&actual, &expected),
+        "pipeline path: {actual:?}\n  is not\n{expected:?}"
     );
 }
 
@@ -321,6 +325,49 @@ pub(crate) fn sort_collection_bindings(value: Value) -> Value {
         ),
         other => other,
     }
+}
+
+/// Whether `actual` and `expected` are one tile, with each collection's domain predicate compared
+/// by the region it admits rather than by its spelling: `True` and `Record({_0: True, _1: True})`
+/// name the same region of a record domain.
+pub(crate) fn same_tile(actual: &Tile, expected: &Tile) -> bool {
+    fn same_regions(actual: &mut Tile, expected: &mut Tile) -> bool {
+        match (actual, expected) {
+            (
+                Tile::DataFunction {
+                    domain_predicate: actual_region,
+                    codomain: actual_codomain,
+                    ..
+                },
+                Tile::DataFunction {
+                    domain_predicate: expected_region,
+                    codomain: expected_codomain,
+                    ..
+                },
+            ) => {
+                if !(actual_region.subsumes(expected_region)
+                    && expected_region.subsumes(actual_region))
+                {
+                    return false;
+                }
+                *expected_region = actual_region.clone();
+                same_regions(actual_codomain, expected_codomain)
+            }
+            (
+                Tile::Record { fields: actual, .. },
+                Tile::Record {
+                    fields: expected, ..
+                },
+            ) => actual.iter_mut().all(|(name, actual)| {
+                expected
+                    .get_mut(name)
+                    .is_some_and(|expected| same_regions(actual, expected))
+            }),
+            _ => true,
+        }
+    }
+    let (mut actual, mut expected) = (actual.clone(), expected.clone());
+    same_regions(&mut actual, &mut expected) && actual == expected
 }
 
 /// [`sort_collection_bindings`] over every scalar cell of a tile.

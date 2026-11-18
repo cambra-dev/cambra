@@ -74,10 +74,10 @@ impl TileOperator for IterateExtent {
             )
             .leaf(leaf.clone()),
             _retirements: Vec::new(),
-            iteration: Iteration::Direct(DirectIteration {
+            iteration: Iteration::Direct(RwLock::new(DirectIteration {
                 extent: self.extent.clone(),
                 released: Predicate::False,
-            }),
+            })),
         });
         if self.extent.reads_a_source() {
             Self::add_all_source_handles(&self.extent, cx);
@@ -88,7 +88,14 @@ impl TileOperator for IterateExtent {
             let Iteration::Direct(direct) = &mut producer.iteration else {
                 unreachable!("a source subscription iterates its extent directly")
             };
-            release_extent(&mut direct.extent, &Predicate::False, &name);
+            release_extent(
+                &mut direct
+                    .get_mut()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extent,
+                &Predicate::False,
+                &name,
+            );
             self.extent.for_each_source(&mut |source| {
                 producer._retirements.push(
                     source
@@ -116,7 +123,10 @@ struct IterateExtentProducer {
 }
 
 enum Iteration {
-    Direct(DirectIteration),
+    Direct(RwLock<DirectIteration>),
+    // shared-state-ok: one producer's iteration state, shared only with that producer's own leaf
+    // consumer (`CartesianSource`), which ingests the sources' arrivals into it. The arrivals come
+    // from data sources at the I/O boundary; no other operator reaches the cell.
     Cartesian(Arc<RwLock<CartesianIteration>>),
 }
 
@@ -344,6 +354,7 @@ impl TileProducer for IterateExtentProducer {
         let Iteration::Direct(direct) = &self.iteration else {
             unreachable!()
         };
+        let direct = direct.read().unwrap_or_else(PoisonError::into_inner);
         let projection = projection_guard.projection(&self.name());
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -376,15 +387,16 @@ impl TileProducer for IterateExtentProducer {
         tile
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         let name = self.name();
         let obsolete = self.obsolete_guard().clone();
-        match &mut self.iteration {
+        match &self.iteration {
             Iteration::Cartesian(cartesian) => cartesian
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
                 .release(&obsolete),
             Iteration::Direct(direct) => {
+                let mut direct = direct.write().unwrap_or_else(PoisonError::into_inner);
                 let TileGuard::Function(FunctionGuard::Domain(pred)) = obsolete_guard else {
                     panic!("IterateExtent::release expected Domain guard, got {obsolete_guard:?}")
                 };
@@ -608,10 +620,10 @@ mod tests {
         let mut producer = IterateExtentProducer {
             base: ProducerBase::unowned(0, &tiling),
             _retirements: Vec::new(),
-            iteration: Iteration::Direct(DirectIteration {
+            iteration: Iteration::Direct(RwLock::new(DirectIteration {
                 extent,
                 released: Predicate::False,
-            }),
+            })),
         };
         let tile = producer.read_in_pipeline(producer.tiling().universal_guard());
         let Tile::DataFunction { domain, .. } = tile else {
@@ -684,10 +696,10 @@ mod projection_tests {
         IterateExtentProducer {
             base: ProducerBase::unowned(0, &tiling),
             _retirements: Vec::new(),
-            iteration: Iteration::Direct(DirectIteration {
+            iteration: Iteration::Direct(RwLock::new(DirectIteration {
                 extent,
                 released: Predicate::False,
-            }),
+            })),
         }
     }
 

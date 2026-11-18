@@ -96,6 +96,9 @@ pub(super) struct CartesianIteration {
 /// The existing source notification path updates the same state the producer reads. A route
 /// or planning probe only forwards its region; an actual delivery first ingests source news.
 struct CartesianSource {
+    // shared-state-ok: one producer's iteration state, shared only with that producer's own leaf
+    // consumer (`CartesianSource`), which ingests the sources' arrivals into it. The arrivals come
+    // from data sources at the I/O boundary; no other operator reaches the cell.
     state: Arc<RwLock<CartesianIteration>>,
     downstream: Box<dyn Consumer>,
 }
