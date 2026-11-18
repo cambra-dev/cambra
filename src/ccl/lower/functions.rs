@@ -9,6 +9,7 @@ use crate::ccl::Occurrence;
 use std::collections::HashSet;
 
 use super::*;
+use crate::ccl::Duplicate;
 use crate::{
     ccl::{Expr, Name, Type, TypedExprNode},
     chl_parser::ast::{

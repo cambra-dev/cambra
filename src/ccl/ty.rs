@@ -3562,16 +3562,27 @@ impl Type {
     /// tuple has one spelling, each component's references to binders around the
     /// tuple lowered past the components before it (`src/ccl/design/type-inference.md`,
     /// "Representation").
-    pub fn dep_tuple(mut components: Vec<(Option<crate::ccl::Name>, Self)>) -> Self {
-        crate::ccl::subst::close_tuple_components(&mut components);
-        Self::closed_dep_tuple(components)
+    pub fn dep_tuple(components: Vec<(Option<crate::ccl::Name>, Self)>) -> Self {
+        Self::dep_tuple_with_ids(components, crate::ccl::Ids::Fresh)
+    }
+
+    /// [`Type::dep_tuple`], the terms its closing copies copied as `ids` says.
+    pub(crate) fn dep_tuple_with_ids(
+        mut components: Vec<(Option<crate::ccl::Name>, Self)>,
+        ids: crate::ccl::Ids,
+    ) -> Self {
+        crate::ccl::subst::close_tuple_components(&mut components, ids);
+        Self::closed_dep_tuple(components, ids)
     }
 
     /// [`Type::dep_tuple`] of components already closed, each reading the components before
     /// it by index: the plain tuple where none reads another, as a rewrite of a dependent
     /// tuple's components can leave it. Nothing is closed by name, so a free name spelled like
     /// a component stays free.
-    pub fn closed_dep_tuple(components: Vec<(Option<crate::ccl::Name>, Self)>) -> Self {
+    pub fn closed_dep_tuple(
+        components: Vec<(Option<crate::ccl::Name>, Self)>,
+        ids: crate::ccl::Ids,
+    ) -> Self {
         let dependent = components
             .iter()
             .enumerate()
@@ -3579,7 +3590,7 @@ impl Type {
         if dependent {
             Type::DepTuple(components)
         } else {
-            Type::tuple(crate::ccl::subst::tuple_of_components(components))
+            Type::tuple(crate::ccl::subst::tuple_of_components(components, ids))
         }
     }
 
@@ -3606,9 +3617,13 @@ impl Type {
             Type::Tuple(ts) => ts.get(index).cloned(),
             Type::DepTuple(cs) => {
                 cs.get(index)?;
-                crate::ccl::subst::open_tuple_components(&cs[..=index], |j, earlier| {
-                    crate::ccl::subst::Mapping::Discharge(Rc::new(project(j, earlier)))
-                })
+                crate::ccl::subst::open_tuple_components(
+                    &cs[..=index],
+                    |j, earlier| {
+                        crate::ccl::subst::Mapping::Discharge(Rc::new(project(j, earlier)))
+                    },
+                    crate::ccl::Ids::Fresh,
+                )
                 .pop()
             }
             _ => None,
@@ -3718,8 +3733,19 @@ impl Type {
         codomain: Self,
         fun_kind: FunKind,
     ) -> Self {
+        Self::pi_kinded_with_ids(name, domain, codomain, fun_kind, crate::ccl::Ids::Fresh)
+    }
+
+    /// [`Type::pi_kinded`], the terms its closing copies copied as `ids` says.
+    pub(crate) fn pi_kinded_with_ids(
+        name: impl Into<crate::ccl::Name>,
+        domain: Self,
+        codomain: Self,
+        fun_kind: FunKind,
+        ids: crate::ccl::Ids,
+    ) -> Self {
         let name = name.into();
-        let codomain = crate::ccl::subst::close_pi_binder(&name, &codomain);
+        let codomain = crate::ccl::subst::close_pi_binder(&name, &codomain, ids);
         Type::Fun {
             name: Some(name),
             fun_kind,
@@ -3801,9 +3827,18 @@ impl Type {
     /// The family `\\𝑘₀: 𝐾₀, … -> body` ([`Type::Family`]), closing the body's references
     /// to the binders by name into indices, as [`Type::pi`] closes a codomain.
     pub fn family(binders: Vec<(crate::ccl::Name, Self)>, body: Self) -> Self {
+        Self::family_with_ids(binders, body, crate::ccl::Ids::Fresh)
+    }
+
+    /// [`Type::family`], the terms its closing copies copied as `ids` says.
+    pub(crate) fn family_with_ids(
+        binders: Vec<(crate::ccl::Name, Self)>,
+        body: Self,
+        ids: crate::ccl::Ids,
+    ) -> Self {
         let names: Vec<Option<crate::ccl::Name>> =
             binders.iter().map(|(n, _)| Some(n.clone())).collect();
-        let body = crate::ccl::subst::close_pi_binders(&names, &body);
+        let body = crate::ccl::subst::close_pi_binders(&names, &body, ids);
         Type::Family {
             binders: binders.into_iter().map(|(n, t)| (Some(n), t)).collect(),
             body: Box::new(body),
@@ -3980,7 +4015,9 @@ impl Type {
                 // name. Idempotent on a codomain extracted from a closed
                 // function — its references are already indices.
                 let codomain = match name {
-                    Some(b) => crate::ccl::subst::close_pi_binder(b, &codomain),
+                    Some(b) => {
+                        crate::ccl::subst::close_pi_binder(b, &codomain, crate::ccl::Ids::Fresh)
+                    }
                     None => codomain,
                 };
                 Type::Fun {
@@ -5347,7 +5384,7 @@ impl RefinementTemplate {
         }
         // The operands move under the refinement the predicate lands in, so an element
         // reference they read free names one refinement further out.
-        let under = |t: &TypedExpr| crate::ccl::subst::shift_elems(t, 1);
+        let under = |t: &TypedExpr| crate::ccl::subst::shift_elems(t, 1, crate::ccl::Ids::Fresh);
         let operation = match (self, operands) {
             (Self::BinOp(op), [a, b]) => TypedExpr::binop(under(a), op.unrefined(), under(b)),
             (Self::UnaryOp(op), [a]) => TypedExpr::unary(op.unrefined(), under(a)),
@@ -6924,6 +6961,7 @@ mod tests {
         assert_eq!(a.component_binder_ids(), vec![first, second, third]);
     }
     use crate::ccl::Annotation;
+    use crate::ccl::Duplicate;
     use crate::ccl::Occurrence;
 
     /// An operator's predicate places its operands under the refinement it lands in, so an
@@ -7075,7 +7113,7 @@ mod tests {
     fn refinement_hash(pred: &TypedExpr) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        Refinement::born(Rc::new(pred.clone())).hash(&mut h);
+        Refinement::born(Rc::new(pred.duplicate())).hash(&mut h);
         h.finish()
     }
 

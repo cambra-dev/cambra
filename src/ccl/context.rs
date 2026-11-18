@@ -811,6 +811,7 @@ impl<T> CompileResultExt<T> for Result<T, Vec<CompileError>> {
     }
 }
 
+use crate::ccl::Duplicate;
 /// The hot-reload surface a caller of [`GlobalContext::reuse`] and
 /// [`GlobalContext::state_conflicts`] reads their answers as. Both are produced
 /// by operator conversion and returned from here, so this is the path a consumer
@@ -2325,7 +2326,7 @@ fn recover_rejected_runs(tree: &mut Expr, runs: &RunSites, rejected: &HashSet<Sp
                     init,
                     body,
                 } => {
-                    let mut binding = binding.clone();
+                    let mut binding = binding.duplicate();
                     binding.ty = Type::Hole;
                     binding.user_annotation = None;
                     let mut failed = std::mem::take(init);
@@ -2431,7 +2432,7 @@ fn check_modules(
         blame.derive(&derivation.into_log(), Phase::Comprehension);
         // As in `run_passes`: an error in a definition inference drops reads a binding the
         // tree it leaves no longer holds.
-        let reads_named = mut_read::read_respelling(&tree);
+        let reads_named = mut_read::read_respelling(&tree, crate::ccl::Ids::Fresh);
         recover_checked_statements(&mut tree, &recovered, &blame);
         recover_rejected_runs(&mut tree, &check.instantiations, &rejected_runs);
         // Inference can raise an error at a node it minted, such as a copied predicate.
@@ -2519,8 +2520,10 @@ fn check_modules(
                 .is_none_or(|home| !rejected.contains(&home))
                 || blame.span(error.node_id, Some(before)).file == check.file
         });
-        let respelling =
-            crate::ccl::subst::Subst::then(&mut_read::read_respelling(&tree), &reads_named);
+        let respelling = crate::ccl::subst::Subst::then(
+            &mut_read::read_respelling(&tree, crate::ccl::Ids::Fresh),
+            &reads_named,
+        );
         let errors = errors
             .map(|mut located| {
                 located.respell(&respelling);
@@ -3046,7 +3049,7 @@ fn run_passes(
     // copies.
     // The reads named before inference, for an error inference raises in a definition it then
     // drops, whose bindings the tree it leaves no longer holds.
-    let reads_named = mut_read::read_respelling(&expr);
+    let reads_named = mut_read::read_respelling(&expr, crate::ccl::Ids::Fresh);
     // The root's public members head the linked program's spine with no home.
     let root_public = match &ctx.lowering_ctx().root_interface {
         Some(interface) => expr
@@ -3079,8 +3082,11 @@ fn run_passes(
         // here, where the tree still carries the bindings (`mut_read::unbind`
         // erases them below) and nothing types the error's types again.
         let respelling = crate::ccl::subst::Subst::then(
-            &anf::temp_respelling(&expr),
-            &crate::ccl::subst::Subst::then(&mut_read::read_respelling(&expr), &reads_named),
+            &anf::temp_respelling(&expr, crate::ccl::Ids::Fresh),
+            &crate::ccl::subst::Subst::then(
+                &mut_read::read_respelling(&expr, crate::ccl::Ids::Fresh),
+                &reads_named,
+            ),
         );
         let errors = errors
             .into_iter()

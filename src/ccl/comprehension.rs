@@ -41,6 +41,7 @@
 //! records resolve an error to a span whether or not the compile captures
 //! provenance.
 
+use crate::ccl::Duplicate;
 use crate::ccl::{
     BinOpKind, Expr, Generator, LogicKind, Name, Occurrence, SharedHoleMint, Type, TypedBinding,
     TypedExprNode, anf,
@@ -271,7 +272,7 @@ fn encode(
     // The filter's copy of the source is taken before the body's is stamped: a copy of a
     // minted tree stays structurally equal to its origin, which is what lets inference dedup
     // the predicate-side refinements against the body-side ones.
-    let pred_source = pred_op.as_ref().map(|_| source.clone());
+    let pred_source = pred_op.as_ref().map(|_| source.duplicate());
 
     // An **unfiltered** comprehension iterates exactly the domain of the collection its
     // generator walks, and nothing in the encoded shape says so: the `▷` records only
@@ -338,7 +339,7 @@ fn encode(
                 Expr::apply(Expr::var(Name::elem()), unbox(pred_source)),
                 // The predicate's lambda is a second binder for the same generator, a copy
                 // of its occurrence.
-                per_element_lambda(&binding, binding.occurrence.clone(), pred_op),
+                per_element_lambda(&binding, binding.occurrence.duplicate(), pred_op),
             );
             // A refined parameter is `cast(refined_data_fun, λ outer_var → body_expr)`, a
             // type-level assertion of the predicate-refined domain. The refinement is carried
@@ -462,7 +463,7 @@ fn encode_curried(
     // The filter's nest binds each generator a second time, so its binders are copies, and the
     // element's nest takes the generators' own.
     let (pred_bindings, pred_sources) = if pred_op.is_some() {
-        (bindings.clone(), sources.clone())
+        (bindings.duplicate(), sources.duplicate())
     } else {
         (Vec::new(), Vec::new())
     };

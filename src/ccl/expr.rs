@@ -92,10 +92,10 @@ pub enum BindingTransparency {
 /// A `NodeId` that provenance mints, copies, enumerates and folds as it does an
 /// expression node's, so the pane-pair maps carry it from `pre-inference` to every copy.
 /// Two properties keep it out of a node's value, as [`TypedExpr`] keeps its `node_id`
-/// out: [`Clone`] goes through [`provenance::copy_id`](crate::ccl::provenance::copy_id),
-/// so a copied binder gets a fresh id and a copy row, and [`PartialEq`] holds for any
-/// two occurrences. A bare `NodeId` field would put two live binders on one id after
-/// any derived clone, and take part in structural equality.
+/// out: a copy states what it does with the id ([`Duplicate`]), so a duplicated binder
+/// gets a fresh id and a copy row, and [`PartialEq`] holds for any two occurrences. A
+/// bare `NodeId` field would be copied verbatim, putting two live binders on one id,
+/// and would take part in structural equality.
 #[derive(Debug)]
 pub struct Occurrence(NodeId);
 
@@ -108,9 +108,6 @@ impl Occurrence {
     /// [`TypedExpr::new`] reports a node's mint. Under lowering the caller records it
     /// at the span the source writes the name at.
     pub fn mint() -> Self {
-        if crate::ccl::provenance::record_sealed() {
-            return Self::PLACEHOLDER;
-        }
         let id = NodeId::fresh();
         crate::ccl::provenance::on_mint(id);
         Occurrence(id)
@@ -135,11 +132,11 @@ impl Occurrence {
     }
 }
 
-/// A copy of the binder or name that holds it: a fresh id and a copy row, or the same
-/// id inside [`preserve_ids`](crate::ccl::provenance::preserve_ids).
-impl Clone for Occurrence {
-    fn clone(&self) -> Self {
-        Occurrence(crate::ccl::provenance::copy_id(self.0))
+/// A copy of the binder or name that holds it: a fresh id and a copy row, or the same id
+/// ([`Ids`]).
+impl Duplicate for Occurrence {
+    fn copied(&self, ids: Ids) -> Self {
+        Occurrence(ids.of_copy(self.0))
     }
 }
 
@@ -150,10 +147,85 @@ impl PartialEq for Occurrence {
     }
 }
 
+/// What a copy of an expression does with the provenance ids it copies
+/// (`src/ccl/design/provenance.md`, "Duplication").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Ids {
+    /// A duplicate: each copied node and occurrence gets a fresh id, recorded as a copy of
+    /// its origin.
+    #[default]
+    Fresh,
+    /// Each copied node and occurrence keeps its origin's id, and nothing is recorded. Source
+    /// and copy must not both stay in one reachable tree.
+    Kept,
+}
+
+impl Ids {
+    /// The id a copy of the node or occurrence at `origin` takes.
+    pub(crate) fn of_copy(self, origin: NodeId) -> NodeId {
+        match self {
+            Ids::Fresh => crate::ccl::provenance::copy_id(origin),
+            Ids::Kept => origin,
+        }
+    }
+}
+
+/// A copy of a value that holds expressions. Expressions are not `Clone`, so every copy
+/// states what happens to the provenance ids it copies ([`Ids`]). A type slot's predicates
+/// stay shared through their `Rc`s.
+pub trait Duplicate: Sized {
+    /// A copy whose ids follow `ids`.
+    fn copied(&self, ids: Ids) -> Self;
+
+    /// A duplicate ([`Ids::Fresh`]).
+    fn duplicate(&self) -> Self {
+        self.copied(Ids::Fresh)
+    }
+
+    /// A copy at the same ids, recording nothing ([`Ids::Kept`]): a substitution template, a
+    /// separately rooted snapshot, or a copy replacing a borrowed source that is then dropped.
+    /// It is not a repair for a missing recording: a real duplicate needs one around it.
+    fn clone_preserving_ids(&self) -> Self {
+        self.copied(Ids::Kept)
+    }
+}
+
+impl<T: Duplicate> Duplicate for Box<T> {
+    fn copied(&self, ids: Ids) -> Self {
+        Box::new((**self).copied(ids))
+    }
+}
+
+impl<T: Duplicate> Duplicate for Vec<T> {
+    fn copied(&self, ids: Ids) -> Self {
+        self.iter().map(|x| x.copied(ids)).collect()
+    }
+}
+
+impl<T: Duplicate> Duplicate for Option<T> {
+    fn copied(&self, ids: Ids) -> Self {
+        self.as_ref().map(|x| x.copied(ids))
+    }
+}
+
+impl<K: Clone + Eq + std::hash::Hash, V: Duplicate> Duplicate for std::collections::HashMap<K, V> {
+    fn copied(&self, ids: Ids) -> Self {
+        self.iter()
+            .map(|(k, v)| (k.clone(), v.copied(ids)))
+            .collect()
+    }
+}
+
+impl<A: Duplicate, B: Duplicate> Duplicate for (A, B) {
+    fn copied(&self, ids: Ids) -> Self {
+        (self.0.copied(ids), self.1.copied(ids))
+    }
+}
+
 /// A binder's user-written type annotation: the type, and the occurrence of the type
 /// expression the source writes, `String` in `x: String = 5`. Inference reconciles the
 /// type and clears the annotation, so the occurrence lives from lowering to inference.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct Annotation {
     /// The annotated type.
     pub ty: Type,
@@ -181,7 +253,7 @@ impl Annotation {
 /// observe one (`infer::api::debug_assert_annotations_cleared`). What survives the
 /// clearing is nothing: mutability is answered by
 /// [`TypedExprNode::MutDecl`] being the node that binds one.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TypedBinding {
     /// The bound variable name. Carries the binder's identity (`uid`) under
     /// the Barendregt convention; see [`Name`].
@@ -270,14 +342,6 @@ impl TypedBinding {
         self.user_annotation = Some(annotation);
     }
 
-    /// Copy the binder at the same occurrences, recording nothing: the binder moved out
-    /// of a borrow rather than duplicated, as [`TypedExpr::clone_preserving_ids`] copies a
-    /// node. Source and copy must not both stay in one tree.
-    pub(crate) fn clone_preserving_ids(&self) -> Self {
-        let _preserving = crate::ccl::provenance::preserve_ids();
-        self.clone()
-    }
-
     /// The annotated type, without the annotation's occurrence.
     pub fn annotation_ty(&self) -> Option<&Type> {
         self.user_annotation.as_ref().map(|a| &a.ty)
@@ -306,7 +370,7 @@ impl TypedBinding {
 /// If you are considering a variant that "does something" rather than
 /// representing a value to be computed, model the effect at the boundary
 /// instead.  See `src/ccl/CLAUDE.md` for the full rationale.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum TypedExprNode {
     /// A literal constant.
     Lit(Lit),
@@ -1169,7 +1233,7 @@ pub enum OccurrenceOf<'a> {
 
 /// One field of a [`TypedExprNode::Record`]: its label, the label occurrence, and the
 /// value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct RecordEntry {
     /// The field's label.
     pub label: Label,
@@ -1209,7 +1273,7 @@ impl RecordEntry {
 /// The CHL clause's `Spanned<AssignTarget>` target becomes a [`TypedBinding`], the
 /// binder form every other CCL binding position uses: destructuring patterns are
 /// resolved by lowering, and CCL carries no spans.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct Generator {
     /// The iteration binder, bound to each element of `iter`.
     pub target: TypedBinding,
@@ -1259,7 +1323,7 @@ pub struct TypedExpr {
     pub own_capabilities: crate::ccl::capabilities::Capabilities,
     /// Provenance identity, excluded from value equality.
     ///
-    /// Construction and ordinary cloning allocate fresh IDs and report them through
+    /// Construction and duplication allocate fresh IDs and report them through
     /// provenance hooks. A field-wise rebuild may carry the original ID without minting.
     /// Directly assigning `NodeId::fresh()` here would bypass the mint hook.
     ///
@@ -1277,29 +1341,361 @@ pub struct TypedExpr {
 /// Type alias for backward compatibility. `Expr` is now [`TypedExpr`].
 pub type Expr = TypedExpr;
 
-/// Duplicate the expression at fresh IDs, reporting each copy to the provenance recorder.
+/// Copying `node` copies the expression children the same way. Copying the type slots
+/// retains their shared predicate `Rc`s rather than copying predicate terms; planning's
+/// memoization and predicate uniqueness checks rely on that sharing.
 ///
-/// Cloning `node` recursively invokes this implementation for expression children.
-/// Cloning the type slots retains their shared predicate `Rc`s rather than duplicating
-/// predicate terms; planning's memoization and predicate uniqueness checks rely on that
-/// sharing.
-///
-/// An explicit preserving scope returns the original IDs and emits no copy events.
-/// Otherwise cloning a `PLACEHOLDER` allocates a real ID but records no origin, because
-/// the hook ignores sentinel pairs. Such diagnostic throwaways must not enter live trees.
-/// The preserving operations and their caller obligations are specified in
-/// `src/ccl/design/provenance.md`, "Duplication".
-impl Clone for TypedExpr {
-    fn clone(&self) -> Self {
-        let node_id = crate::ccl::provenance::copy_id(self.node_id);
+/// A duplicate of a `PLACEHOLDER` allocates a real ID but records no origin, because the
+/// hook ignores sentinel pairs. Such diagnostic throwaways must not enter live trees.
+impl Duplicate for TypedExpr {
+    fn copied(&self, ids: Ids) -> Self {
+        let node_id = ids.of_copy(self.node_id);
         TypedExpr {
             ty: self.ty.clone(),
-            node: self.node.clone(),
+            node: self.node.copied(ids),
             user_annotation: self.user_annotation.clone(),
             capabilities: self.capabilities.clone(),
             own_capabilities: self.own_capabilities.clone(),
             node_id,
             site: self.site.clone(),
+        }
+    }
+}
+
+/// Each expression child and occurrence is copied as `ids` says; every other field is
+/// cloned.
+impl Duplicate for TypedExprNode {
+    fn copied(&self, ids: Ids) -> Self {
+        use TypedExprNode as N;
+        match self {
+            N::Lit(l) => N::Lit(l.clone()),
+            N::Var(n) => N::Var(n.clone()),
+            N::Builtin(b) => N::Builtin(b.clone()),
+            N::Apply { function, argument } => N::Apply {
+                function: function.copied(ids),
+                argument: argument.copied(ids),
+            },
+            N::Cast { value, target } => N::Cast {
+                value: value.copied(ids),
+                target: target.clone(),
+            },
+            N::Comprehension {
+                generators,
+                element,
+            } => N::Comprehension {
+                generators: generators.copied(ids),
+                element: element.copied(ids),
+            },
+            N::BinOp { left, op, right } => N::BinOp {
+                left: left.copied(ids),
+                op: *op,
+                right: right.copied(ids),
+            },
+            N::UnaryOp(op, e) => N::UnaryOp(*op, e.copied(ids)),
+            N::Lambda { param, body } => N::Lambda {
+                param: param.copied(ids),
+                body: body.copied(ids),
+            },
+            N::Aggregate { input, kind } => N::Aggregate {
+                input: input.copied(ids),
+                kind: *kind,
+            },
+            N::Let {
+                binding,
+                bound_expr,
+                body,
+            } => N::Let {
+                binding: binding.copied(ids),
+                bound_expr: bound_expr.copied(ids),
+                body: body.copied(ids),
+            },
+            N::Run {
+                name,
+                module,
+                statement,
+                arguments,
+                modules,
+                types,
+                consts,
+                body,
+            } => N::Run {
+                name: name.clone(),
+                module: module.clone(),
+                statement: *statement,
+                arguments: arguments.clone(),
+                modules: modules.clone(),
+                types: types.clone(),
+                consts: consts.clone(),
+                body: body.copied(ids),
+            },
+            N::LetType { name, ty, body } => N::LetType {
+                name: name.clone(),
+                ty: ty.clone(),
+                body: body.copied(ids),
+            },
+            N::List(es) => N::List(es.copied(ids)),
+            N::Case {
+                scrutinee,
+                branches,
+                refuted,
+            } => N::Case {
+                scrutinee: scrutinee.copied(ids),
+                branches: branches.copied(ids),
+                refuted: refuted.clone(),
+            },
+            N::Raise { value } => N::Raise {
+                value: value.copied(ids),
+            },
+            N::Try { body, handlers } => N::Try {
+                body: body.copied(ids),
+                handlers: handlers.copied(ids),
+            },
+            N::Method {
+                name,
+                args,
+                candidates,
+                deferred,
+            } => N::Method {
+                name: name.clone(),
+                args: *args,
+                candidates: candidates.copied(ids),
+                deferred: deferred.clone(),
+            },
+            N::TraitFn {
+                trait_,
+                function,
+                operands,
+                assoc,
+            } => N::TraitFn {
+                trait_: trait_.clone(),
+                function: function.clone(),
+                operands: operands.clone(),
+                assoc: assoc.clone(),
+            },
+            N::VariantCtor {
+                tag,
+                tag_occurrence,
+                payload,
+            } => N::VariantCtor {
+                tag: tag.clone(),
+                tag_occurrence: tag_occurrence.copied(ids),
+                payload: payload.copied(ids),
+            },
+            N::NominalCtor {
+                decl,
+                ctor,
+                payload,
+            } => N::NominalCtor {
+                decl: decl.clone(),
+                ctor: ctor.clone(),
+                payload: payload.copied(ids),
+            },
+            N::Transact {
+                keys,
+                writers,
+                domain,
+                parameter,
+            } => N::Transact {
+                keys: keys.copied(ids),
+                writers: writers.copied(ids),
+                domain: domain.clone(),
+                parameter: parameter.clone(),
+            },
+            N::LetRec { bindings, body } => N::LetRec {
+                bindings: bindings.copied(ids),
+                body: body.copied(ids),
+            },
+            N::DefGroup { bindings, body } => N::DefGroup {
+                bindings: bindings.copied(ids),
+                body: body.copied(ids),
+            },
+            N::For {
+                position,
+                target,
+                iter,
+                body,
+            } => N::For {
+                position: position.clone(),
+                target: target.copied(ids),
+                iter: iter.copied(ids),
+                body: body.copied(ids),
+            },
+            N::MutDecl {
+                binding,
+                init,
+                body,
+            } => N::MutDecl {
+                binding: binding.copied(ids),
+                init: init.copied(ids),
+                body: body.copied(ids),
+            },
+            N::MutWrite {
+                name,
+                name_occurrence,
+                key,
+                value,
+            } => N::MutWrite {
+                name: name.clone(),
+                name_occurrence: name_occurrence.copied(ids),
+                key: key.copied(ids),
+                value: value.copied(ids),
+            },
+            N::Tuple(es) => N::Tuple(es.copied(ids)),
+            N::Proj(k) => N::Proj(k.clone()),
+            N::Record(entries) => N::Record(entries.copied(ids)),
+            N::Source(name, keys) => N::Source(name.clone(), keys.clone()),
+            N::LoadFrom(name) => N::LoadFrom(name.clone()),
+            N::Reading(r) => N::Reading(r.clone()),
+            N::Compose(es) => N::Compose(es.copied(ids)),
+            N::Copair(es) => N::Copair(es.copied(ids)),
+            N::DisjointJoin(es) => N::DisjointJoin(es.copied(ids)),
+            N::Realized { legs, staged } => N::Realized {
+                legs: legs.copied(ids),
+                staged: staged.clone(),
+            },
+            N::ExprStmt { expr, body } => N::ExprStmt {
+                expr: expr.copied(ids),
+                body: body.copied(ids),
+            },
+            N::Feed {
+                name,
+                name_occurrence,
+                value,
+                row,
+                site,
+            } => N::Feed {
+                name: name.clone(),
+                name_occurrence: name_occurrence.copied(ids),
+                value: value.copied(ids),
+                row: row.clone(),
+                site: site.clone(),
+            },
+            N::Define {
+                name,
+                name_occurrence,
+                value,
+            } => N::Define {
+                name: name.clone(),
+                name_occurrence: name_occurrence.copied(ids),
+                value: value.copied(ids),
+            },
+            N::Defer => N::Defer,
+            N::Abstract => N::Abstract,
+            N::Begin { body, commits_on } => N::Begin {
+                body: body.copied(ids),
+                commits_on: commits_on.clone(),
+            },
+            N::Error => N::Error,
+        }
+    }
+}
+
+impl Duplicate for Annotation {
+    fn copied(&self, ids: Ids) -> Self {
+        Annotation {
+            ty: self.ty.clone(),
+            occurrence: self.occurrence.copied(ids),
+        }
+    }
+}
+
+impl Duplicate for TypedBinding {
+    fn copied(&self, ids: Ids) -> Self {
+        TypedBinding {
+            name: self.name.clone(),
+            occurrence: self.occurrence.copied(ids),
+            ty: self.ty.clone(),
+            user_annotation: self.user_annotation.copied(ids),
+            transparency: self.transparency,
+            site: self.site.clone(),
+        }
+    }
+}
+
+impl Duplicate for RecordEntry {
+    fn copied(&self, ids: Ids) -> Self {
+        RecordEntry {
+            label: self.label.clone(),
+            label_occurrence: self.label_occurrence.copied(ids),
+            value: self.value.copied(ids),
+        }
+    }
+}
+
+impl Duplicate for Generator {
+    fn copied(&self, ids: Ids) -> Self {
+        Generator {
+            target: self.target.copied(ids),
+            iter: self.iter.copied(ids),
+            guards: self.guards.copied(ids),
+        }
+    }
+}
+
+impl Duplicate for TransactKey {
+    fn copied(&self, ids: Ids) -> Self {
+        TransactKey {
+            name: self.name.clone(),
+            init: self.init.copied(ids),
+            site: self.site.clone(),
+        }
+    }
+}
+
+impl Duplicate for WriterSite {
+    fn copied(&self, ids: Ids) -> Self {
+        WriterSite {
+            read_keys: self.read_keys.clone(),
+            write_keys: self.write_keys.clone(),
+            source: self.source.copied(ids),
+            body: self.body.copied(ids),
+            fed_back: self
+                .fed_back
+                .iter()
+                .map(|(b, l)| (b.copied(ids), l.clone()))
+                .collect(),
+        }
+    }
+}
+
+impl Duplicate for Branch {
+    fn copied(&self, ids: Ids) -> Self {
+        Branch {
+            pattern: self.pattern.copied(ids),
+            guard: self.guard.copied(ids),
+            body: self.body.copied(ids),
+        }
+    }
+}
+
+impl Duplicate for Handler {
+    fn copied(&self, ids: Ids) -> Self {
+        Handler {
+            catches: self.catches.clone(),
+            binding: self.binding.copied(ids),
+            body: self.body.copied(ids),
+        }
+    }
+}
+
+impl Duplicate for MethodCandidate {
+    fn copied(&self, ids: Ids) -> Self {
+        MethodCandidate {
+            decl: self.decl.clone(),
+            params: self.params,
+            function: self.function.copied(ids),
+            copy: self.copy,
+        }
+    }
+}
+
+impl Duplicate for Pattern {
+    fn copied(&self, ids: Ids) -> Self {
+        Pattern {
+            head: self.head.clone(),
+            head_occurrence: self.head_occurrence.copied(ids),
+            binding: self.binding.copied(ids),
+            empty_payload: self.empty_payload,
         }
     }
 }
@@ -1324,11 +1720,6 @@ impl TypedExpr {
     /// `Hole` is the lowering-phase placeholder. The inference pass converts it to a
     /// registered [`Type::Infer`] variable before type-checking begins.
     pub fn new(node: TypedExprNode) -> Self {
-        // A `run_debug_check` scope seals the record: a diagnostic must not
-        // perturb the ids it may be reporting on.
-        if crate::ccl::provenance::record_sealed() {
-            return Self::throwaway(node);
-        }
         let node_id = NodeId::fresh();
         crate::ccl::provenance::on_mint(node_id);
         let mut out = TypedExpr {
@@ -1424,7 +1815,7 @@ impl TypedExpr {
     ///
     /// **A copy at an id the tree already holds** — a subtree cloned, its root
     /// taking a caller-supplied id — is neither, and has its own primitive:
-    /// [`clone_at`](Self::clone_at), whose one caller is
+    /// [`copied_at`](Self::copied_at), whose one caller is
     /// [`crate::ccl::subst`]'s `as_expr_preserving`.
     ///
     /// Rebuilds not yet converted carry a `TODO(preserve)` marker. The markers in
@@ -1457,38 +1848,19 @@ impl TypedExpr {
         self.node_id
     }
 
-    /// Copy the subtree with the same expression IDs and no copy events.
-    ///
-    /// Source and copy must not become distinct occurrences in one reachable tree.
-    /// This operation is for substitution templates, separate snapshots, phase-comparison
-    /// tests and copies that replace a borrowed source which is then dropped. The examples
-    /// and the shared-predicate rules are owned by `src/ccl/design/provenance.md`, "Duplication".
-    ///
-    /// A substitution payload is not itself a tree occurrence: each read materializes
-    /// fresh IDs, or a fresh interior beneath the variable occurrence's existing root.
-    /// Freshening the template before those reads can leave an unrecorded intermediate
-    /// origin. A retained pane instead needs shared IDs to relate separate snapshots.
-    ///
-    /// This is not a repair for missing provenance. A real duplicate needs a recording
-    /// around its ordinary clone, not suppression of freshening.
-    pub(crate) fn clone_preserving_ids(&self) -> Self {
-        let _preserving = crate::ccl::provenance::preserve_ids();
-        self.clone()
-    }
-
-    /// Copy the subtree at `node_id`, using ordinary cloning for its children.
+    /// Copy the subtree at `node_id`, its children copied as `ids` says.
     ///
     /// Substitution's `as_expr_preserving` uses this for a compound replacement: the root
     /// keeps the replaced variable occurrence's identity and attribution, while each
-    /// child receives a fresh ID unless an enclosing preserving scope applies.
-    /// Type-slot predicates retain their shared `Rc`s.
+    /// child receives a fresh ID under [`Ids::Fresh`]. Type-slot predicates retain their
+    /// shared `Rc`s.
     ///
     /// The caller supplies an existing root ID; no root mint or copy event is emitted.
     /// Constructing at that ID avoids a recorded birth for an overwritten temporary ID.
-    pub(crate) fn clone_at(&self, node_id: NodeId) -> Self {
+    pub(crate) fn copied_at(&self, node_id: NodeId, ids: Ids) -> Self {
         TypedExpr {
             ty: self.ty.clone(),
-            node: self.node.clone(),
+            node: self.node.copied(ids),
             user_annotation: self.user_annotation.clone(),
             capabilities: self.capabilities.clone(),
             own_capabilities: self.own_capabilities.clone(),
@@ -2956,7 +3328,7 @@ impl Default for TypedExpr {
 
 /// One key of a [`TypedExprNode::Transact`] — a single scalar mutable variable sharing
 /// the mutable variable's sequencing domain.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct TransactKey {
     /// The key — the (α-uniquified) `Name` of the mutable variable. A read of the
     /// variable projects [`Name::field_key`] of the history record (`__hist.k`).
@@ -2974,7 +3346,7 @@ pub struct TransactKey {
 /// One writer of a [`TypedExprNode::Transact`] — loop-shaped, mirroring a
 /// mutation-loop accumulator arm but reading the *shared* mutable variables rather than a
 /// private accumulator.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct WriterSite {
     /// The writer's **read-set**: the mutable variable keys whose snapshot value the body
     /// reads, in body-parameter order. The body is fed `(snap_{k₀}, …,
@@ -3017,7 +3389,7 @@ pub struct WriterSite {
 /// - pattern only — a bare `case .Tag(x):` arm; its `guard` is the literal
 ///   `true` (the structural match alone decides the branch);
 /// - both — `case .Tag(x) if x > 0:`, matching structure and logic at once.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct Branch {
     /// Optional structural pattern. Requires the enclosing `Case` to have a
     /// scrutinee; `None` for a purely logical branch.
@@ -3033,7 +3405,7 @@ pub struct Branch {
 
 /// One clause of a [`TypedExprNode::Try`]: the type it catches, the exception's binder,
 /// and the value it gives in place of the body's.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct Handler {
     /// The type the clause catches: each exception whose type is a subtype of it.
     pub catches: Type,
@@ -3044,7 +3416,7 @@ pub struct Handler {
 }
 
 /// One type's method a [`TypedExprNode::Method`] may resolve to.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct MethodCandidate {
     /// The nominal type declaring the method.
     pub decl: std::rc::Rc<crate::ccl::nominal::NominalDecl>,
@@ -3105,7 +3477,7 @@ impl PatternHead {
 /// Matches one tag of the enclosing [`TypedExprNode::Case`]'s scrutinee and
 /// binds the payload to `binding.name`; `binding.ty` is filled in by
 /// inference to the per-tag narrowed payload type.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct Pattern {
     /// What this branch matches; its tag must agree with one of the scrutinee's.
     pub head: PatternHead,

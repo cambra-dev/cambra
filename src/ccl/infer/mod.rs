@@ -312,9 +312,11 @@ fn respell_tuple_binders(ty: &mut Type) {
         let placeholders: Vec<Name> = (0..components.len())
             .map(|_| Name::fresh("__respelled"))
             .collect();
-        let mut opened = crate::ccl::subst::open_tuple_components(components, |j, _| {
-            crate::ccl::subst::Mapping::Rename(placeholders[j].clone())
-        });
+        let mut opened = crate::ccl::subst::open_tuple_components(
+            components,
+            |j, _| crate::ccl::subst::Mapping::Rename(placeholders[j].clone()),
+            crate::ccl::Ids::Fresh,
+        );
         let mut names: Vec<Option<Name>> = Vec::with_capacity(components.len());
         for i in 0..components.len() {
             let own = components[i].0.clone();
@@ -371,7 +373,7 @@ pub(super) fn resolve_predicate_types(ty: &mut Type) {
         Type::Refinement(_, refinements) => {
             refinements.rewrite_each(|_, r| {
                 let _frame = crate::ccl::provenance::copy_frame("infer.error_predicate_types");
-                let mut predicate = (*r.predicate).clone();
+                let mut predicate = (*r.predicate).duplicate();
                 resolve_expr(&mut predicate);
                 *r = Refinement::born(Rc::new(predicate));
             });
@@ -380,7 +382,7 @@ pub(super) fn resolve_predicate_types(ty: &mut Type) {
         // `elements` call.
         Type::WitnessProjection(p) => {
             let _frame = crate::ccl::provenance::copy_frame("infer.error_predicate_types");
-            let mut term = (*p.term).clone();
+            let mut term = (*p.term).duplicate();
             resolve_expr(&mut term);
             *p = crate::ccl::ty::WitnessProjection::new(Rc::new(term), p.position);
         }
@@ -1505,11 +1507,9 @@ fn run_once(
     // The graph is complete here and nothing has been materialized yet — the one
     // point at which eager trait narrowing can be checked against the ground truth
     // it was approximating incrementally. Debug-only, and it leaves the graph as it
-    // found it; the seal is for the terms `resolve_var_type` rebuilds and drops.
+    // found it.
     #[cfg(debug_assertions)]
-    crate::ccl::provenance::run_debug_check(|| {
-        solver::traits::verify_narrowing_is_complete(|ty| resolve_var_type(ty).ok())
-    });
+    solver::traits::verify_narrowing_is_complete(|ty| resolve_var_type(ty).ok());
 
     // Every requirement a definition places on one of its own values is recorded by
     // now, so this is where they can be read *together* — the step narrowing cannot
@@ -1826,6 +1826,7 @@ pub(crate) struct Inferred {
     pub(crate) inert: Vec<LocatedInferError>,
 }
 
+use crate::ccl::Duplicate;
 use crate::ccl::Expr;
 
 #[cfg(test)]

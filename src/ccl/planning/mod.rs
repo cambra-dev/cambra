@@ -48,6 +48,7 @@ mod per_group_filter;
 mod predicates;
 mod projection_pruning;
 
+use crate::ccl::Duplicate;
 use conditionals::Witnesses;
 use std::rc::Rc;
 
@@ -429,7 +430,7 @@ pub(super) fn replace_constant_domain_type(expr: &mut Expr, ty: &Type) {
         TypedExprNode::Apply { function, argument } => {
             let output_ty = expr.ty.clone();
             assert!(is_builtin(function, Builtin::Const));
-            let arg = argument.clone();
+            let arg = argument.duplicate();
             *expr = apply_primitive(*arg, Builtin::Const, output_ty)
         }
         TypedExprNode::Compose(elts) => {
@@ -499,7 +500,7 @@ pub(super) fn replace_tuple_project_with_id(expr: &mut Expr, ty: &Type) {
             set_domain_ty(&mut output_ty, ty);
             assert!(is_builtin(function, Builtin::Zip));
             replace_tuple_project_with_id(argument, ty);
-            let arg = argument.clone();
+            let arg = argument.duplicate();
             *expr = apply_primitive(*arg, Builtin::Zip, output_ty);
         }
         TypedExprNode::Tuple(elts) => {

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::traits::{TraitObligation, TraitObligationId};
+use crate::ccl::Duplicate;
 use crate::ccl::capabilities::{Capabilities, Capability, CapabilityVar, CapabilityVarId, Repr};
 use crate::ccl::infer_var::Telescope;
 use crate::ccl::subst::Subst;
@@ -921,7 +922,7 @@ fn freshen_family_app(
         .iter()
         .map(|a| {
             let _f = crate::ccl::provenance::copy_frame("infer.freshen_family_arg");
-            let mut term = (*a.term).clone();
+            let mut term = (*a.term).duplicate();
             freshen_expr_type_slots(&mut term, lim, target, cache);
             Rc::new(term)
         })
@@ -1038,9 +1039,12 @@ pub fn freshen_above(
                     }
                 })
                 .collect();
-            let opened = crate::ccl::subst::open_family_body(binders.len(), body, |j| {
-                crate::ccl::subst::Mapping::Rename(renamed[j].clone())
-            });
+            let opened = crate::ccl::subst::open_family_body(
+                binders.len(),
+                body,
+                |j| crate::ccl::subst::Mapping::Rename(renamed[j].clone()),
+                crate::ccl::Ids::Fresh,
+            );
             let fresh_body = freshen_above(lim, &opened, target, cache);
             Type::family(
                 renamed
@@ -1118,10 +1122,12 @@ pub fn freshen_above(
                     let opened = crate::ccl::subst::open_pi_binder(
                         &crate::ccl::subst::Mapping::Rename(b.clone()),
                         c,
+                        crate::ccl::Ids::Fresh,
                     );
                     crate::ccl::subst::close_pi_binder(
                         b,
                         &freshen_above(lim, &opened, target, cache),
+                        crate::ccl::Ids::Fresh,
                     )
                 }
                 _ => freshen_above(lim, c, target, cache),
@@ -1214,7 +1220,7 @@ pub fn freshen_above(
         // clone's variables rather than sharing the definition's.
         Type::WitnessProjection(p) => {
             let _f = crate::ccl::provenance::copy_frame("infer.freshen_projection");
-            let mut term = (*p.term).clone();
+            let mut term = (*p.term).duplicate();
             freshen_expr_type_slots(&mut term, lim, target, cache);
             Type::WitnessProjection(crate::ccl::ty::WitnessProjection::new(
                 Rc::new(term),
@@ -1767,7 +1773,7 @@ fn freshen_refinement_predicate(
     // carries its own origin from the hook, so every freshened node descends
     // from the scheme node it was copied from.
     let _f = crate::ccl::provenance::copy_frame("infer.freshen_predicate");
-    let mut pred = (*r.predicate).clone();
+    let mut pred = (*r.predicate).duplicate();
     freshen_expr_type_slots(&mut pred, lim, target, cache);
     Refinement::born(Rc::new(pred))
 }

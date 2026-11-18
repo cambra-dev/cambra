@@ -10,6 +10,7 @@ use std::{collections::HashSet, rc::Rc};
 use super::modules::Reached;
 use super::modules::module_body;
 use super::*;
+use crate::ccl::Duplicate;
 use crate::{
     ccl::{
         BaseType, BindingTransparency, Branch, Expr, FieldKey, Label, Lit, Pattern, PatternHead,
@@ -5642,7 +5643,11 @@ fn under_type_binders(
         .iter()
         .map(|(name, _)| Some(Name::raw(name.node.clone())))
         .collect();
-    Ok(crate::ccl::subst::close_pi_binders(&enclosing, &lowered?))
+    Ok(crate::ccl::subst::close_pi_binders(
+        &enclosing,
+        &lowered?,
+        crate::ccl::Ids::Fresh,
+    ))
 }
 
 /// The family over `scope`'s binders whose body, closed over them, is `body`.
