@@ -1169,7 +1169,6 @@ impl Execution {
         pipeline: PipelineId,
     ) {
         self.attach_body(Scope::Loop(store.clone()), pipeline, dispatcher);
-        induction(store).mark_entry_scope();
         // A drive's source offers its pushes only to a scope that takes its positions from them,
         // which the run sets once its scopes are attached.
         induction(store).forget_through_drive();
@@ -3783,7 +3782,7 @@ mod tests {
             Some(CurryLevel::new(level.index() + 1))
         }
 
-        fn get_impl(&mut self, _guard: TileGuard) -> Tile {
+        fn get_impl(&self, _guard: TileGuard) -> Tile {
             self.tiling().empty_tile()
         }
 
@@ -3894,7 +3893,7 @@ mod tests {
     impl TileProducer for OutermostOnlyProducer {
         impl_producer_base!();
 
-        fn get_impl(&mut self, guard: TileGuard) -> Tile {
+        fn get_impl(&self, guard: TileGuard) -> Tile {
             self.pulled.borrow_mut().push(guard.clone());
             let mut tile = self.tile.clone();
             tile.restrict_to(&guard.projection(&self.name()), self.tiling());
@@ -3914,7 +3913,7 @@ mod tests {
         let input = OutermostOnly::new();
         let pulled = input.pulled.clone();
         let mut uncurry = Uncurry::new_at(Box::new(input), CurryLevel::new(1));
-        let mut producer = uncurry.subscribe(
+        let producer = uncurry.subscribe(
             uncurry.tiling().universal_guard(),
             Box::new(|| {}),
             &mut SubscribeContext::new(),
@@ -3964,7 +3963,7 @@ mod tests {
             None
         }
 
-        fn get_impl(&mut self, _guard: TileGuard) -> Tile {
+        fn get_impl(&self, _guard: TileGuard) -> Tile {
             self.tiling().empty_tile()
         }
 

@@ -131,7 +131,7 @@ impl Scripted {
 impl TileProducer for Scripted {
     impl_producer_base!();
 
-    fn get_impl(&mut self, _guard: TileGuard) -> Tile {
+    fn get_impl(&self, _guard: TileGuard) -> Tile {
         self.tiling().empty_tile()
     }
 
@@ -539,7 +539,7 @@ impl Positions {
 impl TileProducer for Positions {
     impl_producer_base!();
 
-    fn get_impl(&mut self, _guard: TileGuard) -> Tile {
+    fn get_impl(&self, _guard: TileGuard) -> Tile {
         self.tiling().empty_tile()
     }
 
@@ -779,7 +779,10 @@ fn an_extraction_over_a_memo_extracts_at_every_morsel_size() {
 
 /// A source over a finite range of positions starts with morsels of `rows` positions, the last
 /// one partial when `rows` does not divide the range; each is consumed once, and the input is
-/// pulled and released at each.
+/// pulled once at each. The memo releases the input twice at each morsel: at what the answer
+/// states, then at the morsel's keys the cache states complete, and a repeated release reaches
+/// the input. The last morsel releases the input whole, so both its releases reach it as the
+/// universal guard.
 #[test]
 fn a_source_over_a_range_starts_with_morsels_of_rows_positions() {
     let source = source(SPARSE);
@@ -800,7 +803,18 @@ fn a_source_over_a_range_starts_with_morsels_of_rows_positions() {
     );
     assert_eq!(partition_gap(&ints().universal_guard(), &morsels), None);
     assert_eq!(source.borrow().pulled, morsels, "one pull per morsel");
-    assert_eq!(source.borrow().released, morsels, "one release per morsel");
+    let (_, before) = morsels.split_last().expect("three morsels");
+    let released_twice: Vec<_> = before
+        .iter()
+        .cloned()
+        .chain([ints().universal_guard()])
+        .flat_map(|morsel| [morsel.clone(), morsel])
+        .collect();
+    assert_eq!(
+        source.borrow().released,
+        released_twice,
+        "two releases per morsel"
+    );
 }
 
 /// A memo's morsels hold at most `rows` of its keys each and partition the guard it pushes:
