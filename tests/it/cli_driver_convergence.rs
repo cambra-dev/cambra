@@ -1,97 +1,68 @@
-//! The CLI driver contract: a notification-gated drive loop (as in
-//! `src/main.rs`) must converge a mutation-loop accumulator, whose store/drive
-//! cycle advances one position per pull and requests its own re-pull through the
-//! scheduler's deferred-wakeup queue.
+//! The CLI driver contract: the binary's drive loop ([`LiveProgram::pull_mains`],
+//! as `src/cli.rs` runs it) must converge a mutation-loop accumulator, whose
+//! store/drive cycle advances one position per pull and requests its own re-pull
+//! through the scheduler's deferred-wakeup queue.
 //!
 //! Before that mechanism existed, the first `get` returned an empty
 //! (non-terminal) tile and no further notification arrived — the domain source
-//! (a finite literal) had already fired — so the driver spun in
-//! `while !new_data { check_for_notifications() }` forever. These tests replicate
-//! the driver with **bounded** waits, so a lost-wakeup regression fails the test
-//! rather than hanging it.
+//! (a finite literal) had already fired — so the driver waited for a notification
+//! forever. These tests run the driver for a bounded number of passes, so a
+//! lost-wakeup regression fails the test rather than hanging it.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
-use cambra::ccl::context::{GlobalContext, compile_program};
+use cambra::ccl::context::GlobalContext;
 use cambra::ccl::load::LoadedProgram;
-use cambra::interpreter::{
-    ColumnValue, Consumer, Tile, TileGuard, Value, tile_operators::FunctionGuard,
-};
+use cambra::interpreter::{Consumer, Tile, Value, tile_value};
+use cambra::live_program::{LiveProgram, MAIN_BRANCH};
 
-/// Drive a program's `main` output exactly as `src/main.rs` does — pull only
-/// after a notification, stop on a universal release — but with iteration caps
-/// that convert a hang into a panic. Returns every tile pulled, the last one terminal: an
-/// entry the output states complete is released on the pull that delivers it, so a later
-/// tile no longer holds it.
-fn drive_main_output(code: &str) -> Vec<Tile> {
-    const CAP: usize = 1000;
-
-    let new_data = Rc::new(RefCell::new(false));
-    let nd = new_data.clone();
-    let consumer: Box<dyn Consumer> = Box::new(move || *nd.borrow_mut() = true);
-
-    let mut ctx = GlobalContext::default();
-    let mut compiled = match compile_program(&mut ctx, &LoadedProgram::test(code), consumer) {
-        Ok(c) => c,
-        Err(e) => panic!("compile failed: {e:?}"),
-    };
-    let mut producer = compiled
-        .main_mut()
-        .and_then(|o| o.producer.take())
-        .expect("program has a `main` output");
-    let universal = producer.tiling().universal_guard();
-
-    let mut pulls = 0;
-    let mut tiles = Vec::new();
-    loop {
-        pulls += 1;
-        assert!(
-            pulls < CAP,
-            "driver did not converge within {CAP} pulls (hang regression)"
-        );
-
-        // Wait for data — bounded, so a never-arriving wakeup fails loudly
-        // instead of spinning forever.
-        let mut waited = 0;
-        while !*new_data.borrow() {
-            waited += 1;
-            assert!(
-                waited < CAP,
-                "stalled waiting for a notification (lost-wakeup regression)"
-            );
-            ctx.scheduler().check_for_notifications();
-        }
-        *new_data.borrow_mut() = false;
-
-        let tile = producer.get(universal.clone());
-        let release_guard = match &tile {
-            Tile::Scalar(cv) => TileGuard::Scalar(TileGuard::leaf(!cv.is_empty())),
-            Tile::DataFunction {
-                domain_predicate, ..
-            } => TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
-            other => panic!("unexpected top-level tile shape: {other:?}"),
-        };
-        let done = release_guard.is_universal();
-        producer.release(release_guard);
-        tiles.push(tile);
-        if done {
-            break tiles;
-        }
-    }
+/// What driving a program's `main` output to its finish produced.
+struct Driven {
+    /// Every tile a pull returned, in pull order.
+    tiles: Vec<Tile>,
+    /// The value those tiles merge into.
+    value: Value,
 }
 
-/// Extract the single integer a scalar `main` output resolved to.
+/// Drive a program's `main` output as the binary does, through
+/// [`LiveProgram::pull_mains`], until it finishes. A pass pulls only an output
+/// that has been notified, so a lost wakeup leaves every later pass idle; the
+/// cap converts that hang into a panic.
+fn drive_main_output(code: &str) -> Driven {
+    const CAP: usize = 1000;
+
+    let mut ctx = GlobalContext::default();
+    let no_op = || -> Box<dyn Consumer> { Box::new(|| {}) };
+    let mut live = LiveProgram::start(&mut ctx, &LoadedProgram::test(code), &no_op)
+        .unwrap_or_else(|e| panic!("compile failed: {e:?}"));
+    let mut merged = live
+        .main_producer_mut(MAIN_BRANCH)
+        .expect("the program has a `main` output")
+        .tiling()
+        .empty_tile();
+    let mut tiles = Vec::new();
+    let mut finished = false;
+    for _ in 0..CAP {
+        ctx.scheduler().check_for_notifications();
+        live.pull_mains(|pull| {
+            merged.merge(pull.tile.clone());
+            tiles.push(pull.tile.clone());
+            finished |= pull.finished;
+        });
+        if finished {
+            let value = tile_value(&merged).unwrap_or_else(|e| panic!("the finished value: {e}"));
+            return Driven { tiles, value };
+        }
+    }
+    panic!(
+        "the `main` output did not finish within {CAP} passes: a wakeup was lost, or the \
+         driver missed that everything was released"
+    );
+}
+
+/// The integer a scalar `main` output resolved to.
 fn drive_scalar_int(code: &str) -> i64 {
-    match drive_main_output(code)
-        .pop()
-        .expect("a driven output ends in a terminal tile")
-    {
-        Tile::Scalar(cv) => match cv.as_single() {
-            Some(Value::Int(n)) => n,
-            other => panic!("expected a single Int, got {other:?}"),
-        },
-        other => panic!("expected a scalar tile, got {other:?}"),
+    match drive_main_output(code).value {
+        Value::Int(n) => n,
+        other => panic!("expected an Int, got {other:?}"),
     }
 }
 
@@ -148,22 +119,18 @@ fn aggregate_converges_in_one_pull() {
     assert_eq!(drive_scalar_int("sum([1, 2, 3, 4, 5])"), 15);
 }
 
-/// The one integer a `main` output stream holds across every pull (a trailing standalone
-/// block's reply).
+/// The one integer a `main` output stream holds (a trailing standalone block's
+/// reply).
 fn drive_single_int(code: &str) -> i64 {
-    let values: Vec<i64> = drive_main_output(code)
-        .into_iter()
-        .flat_map(|tile| match tile {
-            Tile::DataFunction { codomain, .. } => match *codomain {
-                Tile::Scalar(ColumnValue::Ints(v)) => v,
-                other => panic!("expected an Ints stream, got {other:?}"),
-            },
-            other => panic!("expected a Function stream, got {other:?}"),
-        })
-        .collect();
-    match values.as_slice() {
-        [v] => *v,
-        other => panic!("expected one value across the stream, got {other:?}"),
+    let Value::Function(bindings) = drive_main_output(code).value else {
+        panic!("expected a stream");
+    };
+    match bindings.as_slice() {
+        [binding] => match binding.output {
+            Value::Int(n) => n,
+            ref other => panic!("expected an Int, got {other:?}"),
+        },
+        other => panic!("expected one value in the stream, got {other:?}"),
     }
 }
 
@@ -213,5 +180,79 @@ fn middle_deny_converges_no_stall() {
     assert!(
         [0, 2, 3].contains(&v),
         "the trailing block's read {v} must be one of {{0, 2, 3}}"
+    );
+}
+
+/// A record whose fields finish on different pulls finishes, and its value is the
+/// whole record. `b` is ready on the first pull and `a` only once the loop is
+/// done, so no tile holds both: the driver released `b` before `a` arrived. Each
+/// pull's own release is therefore never universal, and the driver finishes on
+/// the releases accumulated over its pulls.
+#[test]
+fn a_record_finished_across_pulls_finishes_with_the_whole_record() {
+    let driven = drive_main_output(indoc::indoc! {"
+        total := 0
+        for x in [1, 2]:
+            total += x
+        (a=total, b=1)"});
+    assert!(
+        driven.tiles.iter().all(|tile| !tile.is_terminal()),
+        "the case under test is fields arriving on different pulls, and one tile held them \
+         all: {:?}",
+        driven.tiles
+    );
+    assert_eq!(driven.value.to_string(), "{a: 3, b: 1}");
+}
+
+/// The `cambra` binary exits once every field of a record `main` is released. It runs in a child
+/// process ([`crate::it::cli`]) under a deadline, so a driver that never finishes fails the test
+/// rather than hanging it.
+#[test]
+fn the_binary_exits_with_a_record_finished_across_pulls() {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let path = std::env::temp_dir().join(format!(
+        "record_finished_across_pulls_{}.cambra",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        indoc::indoc! {"
+            total := 0
+            for x in [1, 2]:
+                total += x
+            (a=total, b=1)
+        "},
+    )
+    .expect("the program file is writable");
+    let mut child = crate::it::cli::command()
+        .arg(&path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the cambra binary starts");
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = String::new();
+        let _ = stdout.read_to_string(&mut out);
+        let _ = tx.send(out);
+    });
+    // Compiling takes seconds in a debug build, so the deadline is generous.
+    let out = rx.recv_timeout(Duration::from_secs(120));
+    if out.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait().expect("the child's status is readable");
+    let _ = std::fs::remove_file(&path);
+    let out = out.expect("the program did not exit within 120 seconds");
+    assert!(status.success(), "the program exited with {status}:\n{out}");
+    assert!(
+        out.contains("Got value: "),
+        "the program printed no value:\n{out}"
     );
 }

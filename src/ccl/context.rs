@@ -1301,7 +1301,7 @@ impl CompiledOutput {
 /// A compiled CHL program ready for the scheduler to drive.
 ///
 /// Holds the join-planned AST, one [`CompiledOutput`] per program output, and a
-/// `done` receiver that fires when every sink output has reached a terminal tile.
+/// `done` receiver that fires when every sink output's producer has released everything.
 /// Programs without sinks get an immediately-dropped sender, so `done.try_recv()`
 /// never returns `Ok`; pure programs are driven entirely by the `main` output's
 /// producer.
@@ -1322,7 +1322,7 @@ pub struct CompiledProgram {
     /// One subscribed output per program output (`main` for pure programs;
     /// one entry per sink name for sink programs, in declaration order).
     pub outputs: Vec<CompiledOutput>,
-    /// Fires once every sink consumer has received a terminal tile.  For pure
+    /// Fires once every sink consumer's producer has released everything.  For pure
     /// programs the sender is dropped immediately, so `try_recv` never returns
     /// `Ok` — pure programs are driven entirely by the `main` producer.
     pub done: std::sync::mpsc::Receiver<()>,

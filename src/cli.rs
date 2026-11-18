@@ -16,13 +16,13 @@ use crate::{
     interpreter::{
         ColumnValue, Consumer, Scheduler,
         operator_graph::source_nodes,
-        tile_operators::{FunctionGuard, Tile, TileGuard, TileProducer},
+        tile_operators::Tile,
         value_probe::{
             ProbeSlot, ProbeTable, ROWS_PER_READING, SourceWindow, render_source_window,
             window_tail,
         },
     },
-    live_program::{LiveProgram, MAIN_BRANCH},
+    live_program::{LiveProgram, MAIN_BRANCH, MainPull},
 };
 use log::debug;
 
@@ -43,29 +43,20 @@ fn poll_control(
     message.answer(reply);
 }
 
-/// Pull one branch's `main` output once, print what it delivered, and answer
-/// whether it has now finished.
-///
-/// `main`'s value prints as `Got value: …` and every other
-/// branch's as `Got value from <branch>: …`
-/// (`src/ccl/design/program-evolution.md`, "A reload changes no other branch").
-fn pull_main(branch: &str, producer: &mut dyn TileProducer) -> bool {
-    debug!("Main calling get on {branch}");
-    let tile = producer.get(producer.tiling().universal_guard());
-
-    let release_guard = release_guard_for(&tile);
-    debug!("Main releasing with {release_guard:?}");
-    let done = release_guard.is_universal();
-    producer.release(release_guard);
+/// Print the tile one pull of a branch's `main` output returned: `main`'s as
+/// `Got value: …` and every other branch's as `Got value from <branch>: …`. A
+/// branch created under the name `main` after the first one is deleted prints
+/// unlabelled. The pull that finishes the output prints even when its tile is empty.
+fn print_main_pull(pull: MainPull<'_>) {
     // Producers can return empty tiles, but still have more data.
-    if !tile_is_empty(&tile) || done {
-        if branch == MAIN_BRANCH {
-            println!("Got value: {tile:#?}");
-        } else {
-            println!("Got value from {branch}: {tile:#?}");
-        }
+    if tile_is_empty(pull.tile) && !pull.finished {
+        return;
     }
-    done
+    if pull.branch == MAIN_BRANCH {
+        println!("Got value: {:#?}", pull.tile);
+    } else {
+        println!("Got value from {}: {:#?}", pull.branch, pull.tile);
+    }
 }
 
 /// Runs a loaded Cambra program.
@@ -167,7 +158,7 @@ fn run_program(
             None => Vec::new(),
         };
         let delivered = ctx.scheduler().deliver(delivery);
-        live.pull_mains(pull_main);
+        live.pull_mains(print_main_pull);
         if let Some(inspection) = inspection.as_mut() {
             inspection.publish(&sources);
         }
@@ -189,26 +180,6 @@ fn run_program(
         inspection.publish_final(ctx.scheduler());
     }
     Ok(())
-}
-
-/// What the driver has taken delivery of in `tile`, to release back.
-///
-/// A product value's fields are tiled independently, so the guard is built per field
-/// rather than from the record as a whole.
-fn release_guard_for(tile: &Tile) -> TileGuard {
-    match tile {
-        Tile::Scalar(cv) => TileGuard::Scalar(TileGuard::leaf(!cv.is_empty())),
-        Tile::DataFunction {
-            domain_predicate, ..
-        } => TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
-        Tile::Record { fields, .. } => TileGuard::Record(
-            fields
-                .iter()
-                .map(|(k, t)| (k.clone(), release_guard_for(t)))
-                .collect(),
-        ),
-        other => panic!("Unexpected top-level tile shape: {other:?}"),
-    }
 }
 
 /// Whether `tile` carries nothing yet. A producer may answer empty and still

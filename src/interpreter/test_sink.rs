@@ -58,15 +58,20 @@ impl TestSink {
     /// What the program wrote, once it is complete.
     pub fn value(&self) -> Result<Value, SinkReadError> {
         let guard = self.accumulated.lock().unwrap();
-        let tile = guard.as_ref().ok_or(SinkReadError::NothingWritten)?;
-        if !tile.is_terminal() {
-            return Err(SinkReadError::Incomplete);
-        }
-        if !validate_tile(tile) {
-            return Err(SinkReadError::Malformed(format!("{tile:?}")));
-        }
-        Ok(tile_rows(tile, 1)?.remove(0))
+        tile_value(guard.as_ref().ok_or(SinkReadError::NothingWritten)?)
     }
+}
+
+/// The value `tile` holds, once it is complete: a tile merged ([`Tile::merge`]) from every tile
+/// a producer returned, by a sink or by a test that drives an output itself.
+pub fn tile_value(tile: &Tile) -> Result<Value, SinkReadError> {
+    if !tile.is_terminal() {
+        return Err(SinkReadError::Incomplete);
+    }
+    if !validate_tile(tile) {
+        return Err(SinkReadError::Malformed(format!("{tile:?}")));
+    }
+    Ok(tile_rows(tile, 1)?.remove(0))
 }
 
 impl DataSink for TestSink {

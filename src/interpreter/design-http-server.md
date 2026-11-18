@@ -95,10 +95,12 @@ Multiple `http_serve` calls each produce an independent `Source`/`Defer` pair an
 
 ## Shutdown and completion
 
-`SinkConsumer` detects terminal tiles via `Tile::is_terminal()` and fires `DoneNotifier::signal()`.
+`SinkConsumer` releases each tile it pulls and fires `DoneNotifier::signal()` once its producer's
+accumulated release is universal ([A consumer finishes once its accumulated release is
+universal](design-operators.md#a-consumer-finishes-once-its-accumulated-release-is-universal)).
 `SinksHandle::done` fires once all consumers have signalled. An `HttpServerDataSource` never reaches
 the end of its stream, so for a program that serves HTTP `done` never fires, and the scheduler loop
-in `main.rs` runs until the process is killed.
+in `src/cli.rs` runs until the process is killed.
 
 Dropping a `SharedHttpServer` releases its port. `Drop` sets `releasing` and unblocks the dispatcher
 thread, which returns without sending its routes anything, and the listener closes with it. The
