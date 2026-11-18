@@ -35,8 +35,10 @@ Runtime filtering uses `Filter` operators, not a populated `Restriction` handle;
 ### Cartesian iteration
 
 `IterateExtentProducer` owns the retained keys and decided regions of a live record extent.
-It remains a leaf producer. Each dimension is enumerated on `get`; keys already retained or
-released are excluded before merging new information. The output is the identity over record keys.
+It remains a leaf producer. Its source consumer ingests each dimension on an actual source
+notification, before forwarding progress downstream. Keys already retained or released are
+excluded before merging new information. Reads and planning probes observe this retained state
+without ingesting arrivals. The output is the identity over record keys.
 
 The dispatcher polls every physical source in a live range's extent once per pass. The extent's
 decided region is the conjunction of record fields or the tagged regions of a union. Each range
@@ -977,7 +979,7 @@ hold.
 
 A release of a `Converse` names its output region exactly. Upstream it is forwarded in two parts:
 the input rows the region covers among those it holds, at once, and each later row of a released
-group on the read that first holds it (`ConverseProducer::release_late_rows`). An input guard names
+group on the next release after a read first holds it. An input guard names
 rows by key, and a group is the rows whose value is the group's key, so no input guard names a group
 before its rows are read. The two parts together release exactly the region named, as
 [Guard operations are exact](#guard-operations-are-exact) requires.
@@ -1100,8 +1102,8 @@ has](../ccl/design/mutability.md#how-many-commit-stores-a-program-has)).
 #### Ready transaction decisions
 
 A consuming transaction store attempts ready decisions without comparing different writers' source
-positions. Each writer has a pipeline whose packages make its source rows ready. A step of that
-pipeline pulls its writer and takes the decisions it brings (`CommitProducer::take`), then attempts
+positions. Each writer has a pipeline whose packages make its source rows ready. The request opens an attempt whose driver, body and writer run as ordinary dispatcher pipelines.
+The attempt's step takes the resulting proposals (`CommitProducer::take`), then attempts
 held decisions in rotating writer order (`CommitProducer::commit_ready`). An idle writer holds no
 other writer back. The dispatcher orders packages within each writer's pipeline; product deliveries
 need not arrive in source-key order. Commit ticks, allocated only for successful proposals, define
@@ -1114,13 +1116,14 @@ no position (`transaction_body_domain`, `src/ccl/infer/emit.rs`). Its writer cop
 into the proposal `{snap, reads, writes, pos}` (`proposal_stream_tiling`). A source position
 identifies an item to retry; it is not a priority among writers.
 
-A drive and its writer each output `{rows, decided}` (`transact_stream_tiling`). `decided` is a
-collection holding no key, whose predicate states the exact acknowledged or decided-absent source
-region (`decided_tile`). The statement grows and becomes universal once the source is exhausted.
-Acknowledging a product key releases that key alone; a later delivery may contain a smaller key.
-The drive caches source rows between notifications, removes an acknowledged row by key, and releases
-decided-absent positions when it reads a new source tile. An induction drive retains its prefix
-ordering instead.
+A drive outputs its attempt-row collection and a writer outputs its proposal-row collection.
+The attempt row carries `item_position` and `attempt_snapshot` beside the body's slots. The latter
+is the frontier the driver sampled, so a body that runs while a sibling commits still proposes
+against its original snapshot. The writer reads its read set as of that frontier. Source progress
+is the driver's release guard; no separate stream-level statement duplicates it. Acknowledging a
+product key releases that key alone; a later delivery may contain a smaller key. The drive caches
+source rows between notifications, removes acknowledged rows by key, and releases decided-absent
+positions when it reads source news. An induction drive retains its prefix ordering instead.
 
 From its first step a consuming store states `WriterTakes` for each writer in the store tile's
 `writer_takes`: `settled`, the exact region whose decisions committed or stood, and `again`, the
@@ -1131,7 +1134,7 @@ Taking a decision releases its proposal step to the writer, which acknowledges i
 drive releases the source item and keeps its own copy until `settled` includes it. Every decision
 is a proposal whose read set the engine validates, including a deny or grant that writes nothing.
 Each validated proposal takes one commit tick. A stale decision is named in `again`; the store
-publishes its current tile, pulls the writer and takes the fresh decision
+publishes its current tile, and the transaction request queues another dispatched attempt
 (`CommitProducer::drive_again`). The drive retries from its kept item before choosing another
 source item. A missing retry panics. Retried decisions resolve during the arbitration pass, whose
 end asserts that no retry remains. An induction store states no takes.
@@ -1428,7 +1431,7 @@ The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md
   source delivery marks the source dirty once before its attempts; retries do not by themselves
   discard the decoded source. It also releases the store below the decided frontier, through the
   last change strictly below it, so the commit store can reclaim its changelog.
-- **`TransactWriter` / `TransactWriterProducer`** — one *fused* writer per site (fused, not fanned: a stateful append-only proposal stream cannot be split across fanned slots without desyncing). Each pull it decides the driver's newest live position and appends a `{snap, reads, writes, pos}` proposal of what the body's decision writes, which may be nothing; `pos` is the item's source position, copied from the driver's row (`F_ITEM_POSITION`). When the decision also reads an induction accumulator, that value arrives co-iterated in the writer *source* or broadcast as a constant — see [mutability.md](../ccl/design/mutability.md#reading-an-induction-accumulator-in-a-commit-decision), "Reading an induction accumulator in a commit decision".
+- **`TransactWriter` / `TransactWriterProducer`** — one *fused* writer per site (fused, not fanned: a stateful append-only proposal stream cannot be split across fanned slots without desyncing). Each consumption decides the driver's newest live position and appends a `{snap, reads, writes, pos}` proposal of what the body's decision writes, which may be nothing; `pos` is the item's source position, copied from the driver's row (`F_ITEM_POSITION`). When the decision also reads an induction accumulator, that value arrives co-iterated in the writer *source* or broadcast as a constant — see [mutability.md](../ccl/design/mutability.md#reading-an-induction-accumulator-in-a-commit-decision), "Reading an induction accumulator in a commit decision".
 
   **The ack is a release intersection.** The driver sits behind a `FanOut` with two slots — the body and the writer — and acknowledges its source item on what they *both* release. A body releases a row as soon as it has consumed it, which says nothing about commitment; the writer releases it when the attempt has committed. Only the intersection means "this item is done", which is why the writer holds a driver slot it barely reads: that slot is the ack channel.
 
@@ -1483,8 +1486,9 @@ A writer body returns one **decision record** per transaction, `{writes: {𝑘: 
 
 ### Transaction progress
 
-Dispatcher packages drive writers from their source positions. The store takes decisions and
-arbitrates ready proposals as specified in [Ready transaction
+Dispatcher request packages retain their source regions until their attempts settle. The driver,
+body breakers and proposal writer consume through ordinary pipelines on the shared dispatcher;
+the transaction step takes proposals and arbitrates ready decisions as specified in [Ready transaction
 decisions](#ready-transaction-decisions). Readers sample the committed snapshot; they do not drive
 the store to completion. A drained live writer waits for its source to gain items.
 
@@ -1776,7 +1780,7 @@ time. A nested `Converse` passes a guard naming standing keys to its input as th
 naming part of one row's inversion names input rows through their values, so the `Converse` records
 each input row it read with the output path `[𝑠…, value, key]` it stands at and its input path
 `[𝑠…, key]`, and releases the input rows whose output path the guard covers. A row read after its
-group was released is released on the read that holds it (`ConverseProducer::release_late_rows`).
+group was released is retained until the next release reclaims it.
 
 [`CheckedLookup`] gains a second reading from this, as a consumer now meeting a per-row
 stream: it answers a group of keys per row, keeping the grouping — one answer per key, where
@@ -2208,3 +2212,23 @@ transitive indices (t1→t3 directly) vs. recompute on demand.
 ### Cycles
 None of the above algorithms guarantee termination in the presence of cycles in the dataflow
 graph. Detecting convergence (rather than truncating iteration) is an open problem.
+
+
+## Immutable producer reads
+
+Every producer implements `get_impl(&self, guard)` and exposes `get(&self, guard)`.
+Operators read their existing inputs directly. Stateful breakers maintain their output during
+consumption; reads observe that snapshot. A read does not step a loop, construct a transaction
+attempt, fold aggregate contributions, or refresh a Cartesian source domain. Cartesian source
+consumers ingest arrivals through the dispatcher's range-completion notifications.
+
+The immutable `get` wrapper validates tiling, projections, releases and completeness, and records
+probe observations. Validation history and read bookkeeping use interior mutability on each
+canonical producer; there is no separate read context or mutable post-read traversal.
+
+Dropped input-row guards, Converse correlations, zip presence and nested source-key correlations
+remain on their canonical operators. Reads record newly discovered rows without releasing inputs.
+Consumption and native release callbacks reclaim retained state. Repeated and empty release
+deliveries also run native reclamation, because a later read can discover additional rows belonging
+to a region already released. Fan-out intersections suppress unchanged upstream releases at shared
+and cyclic boundaries.

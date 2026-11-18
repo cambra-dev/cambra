@@ -1,6 +1,6 @@
 use super::*;
 use crate::interpreter::operator_graph::value;
-use crate::interpreter::{BaseType, ColumnValue, Consumer, Extent, Projection, Value, tuple_field};
+use crate::interpreter::{BaseType, ColumnValue, Consumer, Extent, Value, tuple_field};
 
 /// Re-keys a collection of pairs by each pair's first component, `𝐾 ⤇ (𝐽, 𝑉)` to `𝐽 ⤇ 𝑉`, where
 /// those keys are distinct: the `map` constructor's re-keying (group by the new key, then take the
@@ -169,25 +169,13 @@ impl TileProducer for RekeySortedProducer {
     }
 
     fn answers_from_state(&self) -> bool {
-        !self.base.reads_input()
+        true
     }
 
-    fn get_impl(&mut self, guard: TileGuard) -> Tile {
-        let projection = guard.projection_for(self);
-        if projection == Projection::Nothing {
-            return self.tiling().empty_tile();
-        }
-        if self.base.reads_input() {
-            // A key's position is known only once its row arrives, so the input is read whole
-            // and the answer cut to the pull's keys.
-            let mut tile = self.read_input(self.input.tiling().universal_guard());
-            tile.restrict_to(&projection, self.tiling());
-            tile
-        } else {
-            let mut tile = self.output.clone();
-            tile.restrict_to(&projection, self.tiling());
-            tile
-        }
+    fn get_impl(&self, guard: TileGuard) -> Tile {
+        let mut tile = self.output.clone();
+        tile.restrict_to(&guard.projection_for(self), self.tiling());
+        tile
     }
 
     fn release_impl(&mut self, _obsolete_guard: TileGuard) {
@@ -595,7 +583,7 @@ mod tests {
 
     #[test]
     fn a_pull_at_some_keys_answers_those_keys() {
-        let (mut producer, _, _) = pulled(pairs(
+        let (producer, _, _) = pulled(pairs(
             &[3, 7, 9],
             &[0, 1, 2],
             &[10, 20, 30],
@@ -622,7 +610,7 @@ mod tests {
             pair_tiling(),
         );
         let tiling = rekeyed_tiling(&pair_tiling());
-        let mut producer = RekeySortedProducer {
+        let producer = RekeySortedProducer {
             base: ProducerBase::unowned(RekeySortedProducer::alloc_id(), &tiling),
             input: Box::new(spy),
             output: tiling.empty_tile(),

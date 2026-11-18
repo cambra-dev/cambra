@@ -1098,7 +1098,7 @@ impl TileProducer for FanOutProducer {
         (!cyclic).then_some(level)
     }
 
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         let shared_rc = self.shared();
         if projection == Projection::Nothing {
@@ -1114,7 +1114,7 @@ impl TileProducer for FanOutProducer {
         };
         // A cyclic fan-out's store is pulled under its own cell's borrow, with the shared state
         // free. A sibling slot that re-enters mid-pull finds the cell borrowed and is served the
-        // latest snapshot instead of re-entering the store, which would alias `&mut`; so is a
+        // latest snapshot instead of reading during an exclusive store mutation; so is a
         // pull while the store steps itself as a pipeline breaker.
         let store = match &shared_rc.borrow().producer {
             Some(Inner::Store(cell)) => Some(cell.clone()),
@@ -1122,7 +1122,7 @@ impl TileProducer for FanOutProducer {
         };
         let mut result = match store {
             Some(cell) => match cell.try_borrow_mut() {
-                Ok(mut producer) => {
+                Ok(producer) => {
                     let tile = producer.get(projection_guard);
                     trace!("{} received {tile:?}", self.name());
                     // Replace, not merge: inner producers like `Memo` already return cumulative
@@ -1248,6 +1248,7 @@ impl DirtyRegion {
         *dirty = dirty.minus(region);
     }
 
+    #[cfg(test)]
     fn intersects(&self, region: &Projection) -> bool {
         self.0.borrow().intersect(region) != Projection::Nothing
     }
@@ -1541,21 +1542,11 @@ impl TileProducer for MemoProducer {
     }
 
     fn answers_from_state(&self) -> bool {
-        !self.base.reads_input()
+        true
     }
 
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        if !self.base.reads_input() {
-            return self.answer(&projection_guard.projection_for(self));
-        }
-        let projection = projection_guard.projection_for(self);
-        if projection == Projection::Nothing {
-            return self.tiling().empty_tile();
-        }
-        if self.dirty.intersects(&projection) {
-            self.read_input(projection_guard, &projection);
-        }
-        self.answer(&projection)
+    fn get_impl(&self, guard: TileGuard) -> Tile {
+        self.answer(&guard.projection_for(self))
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -1835,7 +1826,7 @@ mod tests {
         pulls: Rc<Cell<usize>>,
         standing: Rc<Cell<bool>>,
         /// What the last tile called complete, which a pull with nothing new still states.
-        complete: Option<Predicate>,
+        complete: RefCell<Option<Predicate>>,
     }
 
     impl Scripted {
@@ -1896,7 +1887,7 @@ mod tests {
                 tiles: self.tiles.clone(),
                 pulls: self.pulls.clone(),
                 standing: self.notifier.standing.clone(),
-                complete: None,
+                complete: RefCell::new(None),
             })
         }
     }
@@ -1908,19 +1899,20 @@ mod tests {
             node
         }
 
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             self.pulls.set(self.pulls.get() + 1);
             let next = match self.standing.replace(false) {
                 true => self.tiles.borrow_mut().pop_front(),
                 false => None,
             };
-            match (next, &self.complete) {
+            let mut complete = self.complete.borrow_mut();
+            match (next, &*complete) {
                 (Some(tile), _) => {
                     if let Tile::DataFunction {
                         domain_predicate, ..
                     } = &tile
                     {
-                        self.complete = Some(domain_predicate.clone());
+                        *complete = Some(domain_predicate.clone());
                     }
                     tile
                 }
@@ -2296,18 +2288,18 @@ mod projection_tests {
     fn a_notification_during_a_memo_read_survives_that_read() {
         struct NotifyingInput {
             base: ProducerBase,
-            consumer: Box<dyn Consumer>,
+            consumer: RefCell<Box<dyn Consumer>>,
             reads: Rc<Cell<usize>>,
         }
 
         impl TileProducer for NotifyingInput {
             impl_producer_base!();
 
-            fn get_impl(&mut self, _: TileGuard) -> Tile {
+            fn get_impl(&self, _: TileGuard) -> Tile {
                 let reads = self.reads.get() + 1;
                 self.reads.set(reads);
                 if reads == 1 {
-                    self.consumer.announce(&Projection::Everything);
+                    self.consumer.borrow_mut().announce(&Projection::Everything);
                 }
                 self.tiling().empty_tile()
             }
@@ -2319,7 +2311,7 @@ mod projection_tests {
         let reads = Rc::new(Cell::new(0));
         let input = NotifyingInput {
             base: ProducerBase::unowned(NotifyingInput::alloc_id(), &ints()),
-            consumer: dirty.consumer(Box::new(|| {})),
+            consumer: RefCell::new(dirty.consumer(Box::new(|| {}))),
             reads: reads.clone(),
         };
         let mut memo = MemoProducer::new(
@@ -3658,19 +3650,20 @@ mod cycle_tests {
     impl TileProducer for StoreDoubleProducer {
         impl_producer_base!();
 
-        fn get_impl(&mut self, _guard: TileGuard) -> Tile {
+        fn get_impl(&self, _guard: TileGuard) -> Tile {
             let read = self
                 .recurrence
                 .get(self.recurrence.tiling().universal_guard());
             self.wiring.borrow_mut().read.push(read);
+            self.answer.clone()
+        }
+
+        fn release_impl(&mut self, _guard: TileGuard) {
             if self.wiring.borrow().release_recurrence {
                 self.recurrence
                     .release(self.recurrence.tiling().universal_guard());
             }
-            self.answer.clone()
         }
-
-        fn release_impl(&mut self, _guard: TileGuard) {}
 
         fn enter_cycle(&mut self, cycle: Cycle) {
             self.wiring.borrow_mut().cycle = Some(cycle);
@@ -3738,7 +3731,7 @@ mod cycle_tests {
         wiring.borrow_mut().release_recurrence = true;
         let store = fan.store().unwrap();
         let borrow = store.borrow_mut();
-        let mut borrow = if mapped { borrow.map(|p| p) } else { borrow };
+        let borrow = if mapped { borrow.map(|p| p) } else { borrow };
         borrow.get(whole);
         assert!(!borrow.obsolete_guard().is_universal());
         drop(borrow);

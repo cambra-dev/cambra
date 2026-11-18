@@ -34,6 +34,7 @@ use crate::interpreter::{
 
 pub(crate) mod loop_scope;
 mod plan;
+pub(crate) mod transaction_scope;
 
 #[cfg(test)]
 pub(crate) use plan::walk_routes;
@@ -2796,6 +2797,7 @@ pub(crate) fn in_a_run<R>(run: impl FnOnce() -> R) -> R {
 }
 
 /// Whether this thread is inside a compiled program's dispatched run ([`in_a_run`]).
+#[cfg(test)]
 pub(crate) fn is_in_a_run() -> bool {
     IN_A_RUN.with(Cell::get)
 }
@@ -3142,6 +3144,7 @@ fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPac
             "pipeline {p} consumes a guard of the tiling its breaker's input answers: {:?}",
             package.guard
         );
+
         breaker.consume_impl(input, package.guard.clone());
         if let Some(producer) = breaker.as_producer()
             && producer.pushes_while_consuming()
@@ -3217,6 +3220,7 @@ fn finish_with(
             .take()
             .expect("a reach calls the breaker it reaches once");
         let released = breaker.input_released(input);
+        let asked = consumed.clone();
         dispatcher.ensure(
             consumed.is_none_or(|consumed| {
                 unreleased(&consumed, &released, &breaker.input_tiling(input)).is_none()
@@ -3224,7 +3228,11 @@ fn finish_with(
             || {
                 format!(
                     "pipeline {p} finishes after its input has released every guard the \
-                     pipeline consumed"
+                     pipeline consumed: {} released {released:?}, consumed {asked:?}",
+                    breaker
+                        .as_producer()
+                        .map(|producer| producer.name())
+                        .unwrap_or_else(|| "sink".to_owned())
                 )
             },
         );
@@ -3318,7 +3326,7 @@ mod tests {
                 }
             }
 
-            fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
                 self.tiling().empty_tile()
             }
 
