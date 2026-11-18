@@ -3,6 +3,7 @@
 //! the [`Branch`] / [`Pattern`] / [`TransactKey`] / [`WriterSite`] support
 //! types.
 
+use crate::ccl::infer::solver::Solver;
 use crate::ccl::module_type::AliasType;
 use crate::ccl::provenance::NodeId;
 use smol_str::SmolStr;
@@ -1796,7 +1797,7 @@ impl TypedExpr {
         };
         // What its children do, which a container node does; a node with capabilities of its
         // own has them stated by its builder.
-        out.capabilities = crate::ccl::capabilities::of_children(&out);
+        out.capabilities = crate::ccl::capabilities::of_children(&mut Solver::none(), &out);
         out
     }
 
@@ -1825,7 +1826,9 @@ impl TypedExpr {
         mut self,
         call: &crate::ccl::capabilities::Capabilities,
     ) -> Self {
-        let beyond = call.set().without(&self.capabilities.set());
+        let beyond = call
+            .set()
+            .without(&mut Solver::none(), &self.capabilities.set());
         if !beyond.is_empty() {
             self.own_capabilities = crate::ccl::capabilities::of_parts(&[
                 &self.own_capabilities,
@@ -1836,10 +1839,19 @@ impl TypedExpr {
         self
     }
 
-    /// [`Self::absorbing_children_capabilities`] in place.
+    /// [`Self::absorbing_children_capabilities`] in place, outside every typing run, through
+    /// [`Solver::none`].
     pub(crate) fn absorb_children_capabilities(&mut self) {
-        let below = crate::ccl::capabilities::of_children(self);
-        self.capabilities = crate::ccl::capabilities::of_parts(&[&self.own_capabilities, &below]);
+        self.absorb_children_capabilities_in(&mut Solver::none());
+    }
+
+    /// [`Self::absorb_children_capabilities`] for a node inference rebuilds, whose children's
+    /// capabilities can name the run's variables: a `try` decides what it catches by the types
+    /// the run resolves its exceptions to.
+    pub(crate) fn absorb_children_capabilities_in(&mut self, solver: &mut Solver) {
+        let below = crate::ccl::capabilities::of_children(solver, self);
+        self.capabilities =
+            crate::ccl::capabilities::of_parts_in(solver, &[&self.own_capabilities, &below]);
     }
 
     /// Construct a node at an **already-minted** identity: a *preserve*, the dual
@@ -1894,7 +1906,7 @@ impl TypedExpr {
             node_id,
             site: None,
         };
-        out.capabilities = crate::ccl::capabilities::of_children(&out);
+        out.capabilities = crate::ccl::capabilities::of_children(&mut Solver::none(), &out);
         out
     }
 
@@ -2189,7 +2201,12 @@ impl TypedExpr {
     /// `let` evaluates to its continuation, its type lifted out of the binder's scope
     /// ([`closed_let_type`](crate::ccl::ccl_utils::closed_let_type)).
     pub fn let_in(binding: TypedBinding, def: Self, body: Self) -> Self {
-        let ty = crate::ccl::ccl_utils::closed_let_type(&binding, &def, body.ty.clone());
+        let ty = crate::ccl::ccl_utils::closed_let_type(
+            &mut Solver::none(),
+            &binding,
+            &def,
+            body.ty.clone(),
+        );
         Self::new(TypedExprNode::Let {
             binding,
             bound_expr: Box::new(def),
@@ -2207,7 +2224,12 @@ impl TypedExpr {
         def: Self,
         body: Self,
     ) -> Self {
-        let ty = crate::ccl::ccl_utils::closed_let_type(&binding, &def, body.ty.clone());
+        let ty = crate::ccl::ccl_utils::closed_let_type(
+            &mut Solver::none(),
+            &binding,
+            &def,
+            body.ty.clone(),
+        );
         Self::preserve(
             node_id,
             TypedExprNode::Let {

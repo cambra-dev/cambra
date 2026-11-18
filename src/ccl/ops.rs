@@ -85,7 +85,7 @@ pub enum Lit {
 }
 
 /// Arithmetic sub-operations for [`BinOpKind::Arithmetic`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ArithmeticKind {
     /// Integer addition (`+`).
     Add,
@@ -119,7 +119,7 @@ pub enum ArithmeticKind {
 }
 
 /// Comparison sub-operations for [`BinOpKind::Compare`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum CompareKind {
     /// Equality (`==`).
     Equals,
@@ -148,7 +148,7 @@ pub enum CompareKind {
 }
 
 /// Boolean logic sub-operations for [`BinOpKind::BoolLogic`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum LogicKind {
     /// Logical AND.
     And,
@@ -169,7 +169,7 @@ pub enum LogicKind {
 }
 
 /// Binary operation kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BinOpKind {
     /// An arithmetic operation (add, sub, mul, floor-div, pow).
     Arithmetic(ArithmeticKind),
@@ -378,7 +378,7 @@ impl BinOpKind {
 }
 
 /// Unary operation kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum UnaryOpKind {
     /// Arithmetic negation (`-x`).
     Neg,

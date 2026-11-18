@@ -6,6 +6,7 @@
 use crate::ccl::Annotation;
 use crate::ccl::Duplicate;
 use crate::ccl::Occurrence;
+use crate::ccl::infer::solver::Solver;
 use crate::ccl::lower::ResolvedName;
 use smol_str::SmolStr;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1879,10 +1880,10 @@ impl ProvenanceAudit {
 /// pre-channelize check, which permits the transient `Feed` /
 /// `Infer`-channel-domain types only channelization erases.
 ///
-/// A failure is a compiler bug, with two exceptions: residual `Type::Infer`
-/// variables, which inference deliberately tolerates for a generalized
-/// definition the program never exercises at a concrete type (see
-/// `Type::Infer`'s invariant), and open tuples, whose width nothing in the program
+/// A failure is a compiler bug, with two exceptions: undetermined types, which
+/// inference deliberately leaves for a generalized definition the program never
+/// exercises at a concrete type (see [`Type::Undetermined`]), and open tuples, whose
+/// width nothing in the program
 /// fixed (`docs/chl-spec.md`, "Tuple width"). That residue is an *ambiguous
 /// program* — a user error — so it is rendered as a diagnostic; anything else
 /// panics, naming `boundary`.
@@ -1916,7 +1917,7 @@ fn pre_channelize_wall(
 /// `check_pre_channelize`; everything from channelization on answers to the
 /// strict [`typecheck`].
 enum Check<'a> {
-    /// [`pre_channelize_wall`]: the relaxed check, with a residual `Type::Infer`
+    /// [`pre_channelize_wall`]: the relaxed check, with an undetermined type
     /// reported as an ambiguous program, at the span `Blame` resolves. The two
     /// boundaries that can still carry one are inference's own output and the
     /// inlining that copies it.
@@ -2582,20 +2583,27 @@ fn check_modules(
                 .is_none_or(|home| !rejected.contains(&home))
                 || blame.span(error.node_id, Some(before)).file == check.file
         });
-        // As in `run_passes`: an A-normalization temp reads as the term it names.
-        let respelling = crate::ccl::subst::Subst::then(
-            &anf::temp_respelling(&tree, crate::ccl::Ids::Fresh),
-            &crate::ccl::subst::Subst::then(
+        let mut errors: Vec<_> = errors.collect();
+        // The respelling is composed only for errors to respell: it holds a copy of the term
+        // each temp and read names, and composing it walks every one of them.
+        if !errors.is_empty() {
+            // The run closed what its errors hold, so the respelling reads no variable of it.
+            let solver = &mut Solver::none();
+            // As in `run_passes`: an A-normalization temp reads as the term it names.
+            let reads = crate::ccl::subst::Subst::then(
+                solver,
                 &mut_read::read_respelling(&tree, crate::ccl::Ids::Fresh),
                 &reads_named,
-            ),
-        );
-        let errors = errors
-            .map(|mut located| {
-                located.respell(&respelling);
-                located
-            })
-            .collect();
+            );
+            let respelling = crate::ccl::subst::Subst::then(
+                solver,
+                &anf::temp_respelling(&tree, crate::ccl::Ids::Fresh),
+                &reads,
+            );
+            for located in &mut errors {
+                located.respell(solver, &respelling);
+            }
+        }
         let errors = blame.infer(errors, before);
         for mut error in errors {
             let CompileError::Infer {
@@ -2804,12 +2812,12 @@ fn normalized(error: &InferError) -> InferError {
         });
     }
     fn number(ty: &mut Type, vars: &RefCell<Vec<InferVarId>>) {
-        if let Type::Infer(var) = ty {
+        if let Type::Undetermined(id) = *ty {
             let mut vars = vars.borrow_mut();
-            let k = match vars.iter().position(|seen| *seen == var.uid) {
+            let k = match vars.iter().position(|seen| *seen == id) {
                 Some(k) => k,
                 None => {
-                    vars.push(var.uid);
+                    vars.push(id);
                     vars.len() - 1
                 }
             };
@@ -2820,7 +2828,7 @@ fn normalized(error: &InferError) -> InferError {
     }
     let vars = RefCell::new(Vec::new());
     let mut error = error.clone();
-    error.map_types(&|ty| {
+    error.map_types(&mut |ty| {
         let mut ty = ty.clone();
         number(&mut ty, &vars);
         walk_refined_predicates_mut(&mut ty, &PredMemo::new(), &(), &mut |predicate, _| {
@@ -3147,17 +3155,19 @@ fn run_passes(
         // than the term it names: machinery no program mentions. Respell both
         // here, where the tree still carries the bindings (`mut_read::unbind`
         // erases them below) and nothing types the error's types again.
-        let respelling = crate::ccl::subst::Subst::then(
-            &anf::temp_respelling(&expr, crate::ccl::Ids::Fresh),
-            &crate::ccl::subst::Subst::then(
-                &mut_read::read_respelling(&expr, crate::ccl::Ids::Fresh),
-                &reads_named,
-            ),
+        // The run closed what its errors hold, so the respelling reads no variable of it.
+        let solver = &mut Solver::none();
+        let temps = anf::temp_respelling(&expr, crate::ccl::Ids::Fresh);
+        let reads = crate::ccl::subst::Subst::then(
+            solver,
+            &mut_read::read_respelling(&expr, crate::ccl::Ids::Fresh),
+            &reads_named,
         );
+        let respelling = crate::ccl::subst::Subst::then(solver, &temps, &reads);
         let errors = errors
             .into_iter()
             .map(|mut located| {
-                located.respell(&respelling);
+                located.respell(solver, &respelling);
                 located
             })
             .collect();
@@ -3405,7 +3415,7 @@ fn run_passes(
 
     // The program is pure-functional from here: every effect has been discharged.
     #[cfg(debug_assertions)]
-    crate::ccl::capabilities::assert_discharged(&channelized);
+    crate::ccl::capabilities::assert_discharged(&mut Solver::none(), &channelized);
     let lambda_elim = recorded(capture_provenance, Phase::LambdaElim, || {
         // Every point-free morphism now serves every value of the parameters eliminated
         // around it, so a type stated under one is generalized over what it can no longer

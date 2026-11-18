@@ -62,8 +62,10 @@ impl Muts {
             .is_some_and(|place| place.kind.allows_captured_writes())
             || (binding.parameter_mode == ParameterMode::Borrow
                 && match ty.history_parts() {
-                    Some((domain, _, _)) => matches!(domain, Type::Hole | Type::Infer(_)),
-                    None => matches!(ty, Type::Hole | Type::Infer(_)),
+                    Some((domain, _, _)) => {
+                        matches!(domain, Type::Hole | Type::Infer(_) | Type::Undetermined(_))
+                    }
+                    None => matches!(ty, Type::Hole | Type::Infer(_) | Type::Undetermined(_)),
                 });
         self.vars.insert(binding.name.clone(), captured);
     }
@@ -87,7 +89,12 @@ pub fn is_mut_param(param: &TypedBinding) -> bool {
     let ty = param.annotation_ty().unwrap_or(&param.ty);
     ty.mut_value_type().is_some()
         || (param.parameter_mode == crate::ccl::place::ParameterMode::Borrow
-            && matches!(ty, crate::ccl::Type::Hole | crate::ccl::Type::Infer(_)))
+            && matches!(
+                ty,
+                crate::ccl::Type::Hole
+                    | crate::ccl::Type::Infer(_)
+                    | crate::ccl::Type::Undetermined(_)
+            ))
 }
 
 /// Every mutable variable `e` binds: each [`TypedExprNode::MutDecl`] binder, and each `Lambda`

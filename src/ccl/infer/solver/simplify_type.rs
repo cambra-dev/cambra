@@ -606,6 +606,7 @@ pub(super) fn is_data(cf: &CompactFun) -> bool {
 mod tests {
 
     use super::*;
+    use crate::ccl::infer::solver::Solver;
     use crate::ccl::ty::KindPin;
     use crate::ccl::{BaseType, InferVar};
 
@@ -624,17 +625,18 @@ mod tests {
     }
 
     /// Build a fresh [`InferVarId`] for use in hand-constructed CompactTypes.
-    fn fresh_uid() -> InferVarId {
-        InferVar::fresh(0).uid
+    fn fresh_uid(solver: &mut Solver) -> InferVarId {
+        InferVar::fresh(solver, 0).uid
     }
 
     #[test]
     fn simplify_polar_only_elimination() {
+        let solver = &mut Solver::new();
         // term: Fun(dom={a}, cod={a,b})
         // b appears only at positive polarity (cod) → eliminated.
         // a appears at both → kept.
-        let uid_a = fresh_uid();
-        let uid_b = fresh_uid();
+        let uid_a = fresh_uid(solver);
+        let uid_b = fresh_uid(solver);
 
         let dom = CompactType {
             vars: [uid_a].into_iter().collect(),
@@ -664,9 +666,10 @@ mod tests {
 
     #[test]
     fn simplify_atomic_absorption() {
+        let solver = &mut Solver::new();
         // term: Fun(dom={a,Int}, cod={a,Int})
         // Int co-occurs with a at both polarities → a is sandwiched and eliminated.
-        let uid_a = fresh_uid();
+        let uid_a = fresh_uid(solver);
         let int_key = AtomKey::Prim(BaseType::Int);
 
         let make_side = |vars: BTreeSet<InferVarId>| CompactType {
@@ -698,10 +701,11 @@ mod tests {
 
     #[test]
     fn simplify_co_occurrence_merge() {
+        let solver = &mut Solver::new();
         // term: Fun(dom={a,b}, cod={a,b})
         // a and b always appear together at both polarities → one merged into the other.
-        let uid_a = fresh_uid();
-        let uid_b = fresh_uid();
+        let uid_a = fresh_uid(solver);
+        let uid_b = fresh_uid(solver);
         let both: BTreeSet<InferVarId> = [uid_a, uid_b].into_iter().collect();
 
         let graph = CompactGraph {
@@ -733,9 +737,10 @@ mod tests {
 
     #[test]
     fn simplify_identity_both_polarities_preserved() {
+        let solver = &mut Solver::new();
         // term: Fun(dom={a}, cod={a})
         // a appears at both polarities; no simplification applies.
-        let uid_a = fresh_uid();
+        let uid_a = fresh_uid(solver);
 
         let graph = CompactGraph {
             term: CompactType {

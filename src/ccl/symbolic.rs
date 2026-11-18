@@ -268,7 +268,7 @@ fn fmt_transact_writer(w: &crate::ccl::WriterSite, opts: &SymbolicOpts) -> Strin
 /// rendering puts after `in` on the next line. `None` for a node that is not a statement.
 fn statement_head<'e>(expr: &'e Expr, opts: &SymbolicOpts) -> Option<(String, &'e Expr)> {
     let binder_ty = |ty: &Type| {
-        if matches!(ty, Type::Hole | Type::Infer(_)) {
+        if matches!(ty, Type::Hole | Type::Infer(_) | Type::Undetermined(_)) {
             String::new()
         } else {
             format!(" : {}", ty_at(ty, opts))
@@ -502,7 +502,7 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         TypedExprNode::Cast { value, target } => {
             let rendered_arg = fmt(value, Precedence::Lowest, opts);
             let text = match &expr.ty {
-                Type::Hole | Type::Infer(_) => {
+                Type::Hole | Type::Infer(_) | Type::Undetermined(_) => {
                     format!("cast({}, {rendered_arg})", ty_at(target, opts))
                 }
                 _ => format!("cast({rendered_arg})"),
@@ -514,7 +514,7 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             // Domain refinements ride the type lattice, so they render as part
             // of each param's `ty` (a `Type::Refinement`) via `Display for Type`.
             let param = |p: &crate::ccl::TypedBinding| match &p.ty {
-                Type::Hole | Type::Infer(_) => p.name.to_string(),
+                Type::Hole | Type::Infer(_) | Type::Undetermined(_) => p.name.to_string(),
                 ty => format!("{} : {}", p.name, ty_at(ty, opts)),
             };
             let header = match params.as_slice() {
@@ -991,6 +991,7 @@ mod tests {
     use crate::ccl::BaseType;
     use crate::ccl::Occurrence;
     use crate::ccl::RecordEntry;
+    use crate::ccl::infer::solver::Solver;
     use crate::ccl::{
         AggregateKind, ArithmeticKind, BinOpKind, BindingTransparency, Branch, Expr, Lit,
         LogicKind, Refinement, TransactKey, Type, TypedBinding, TypedExpr, TypedExprNode,
@@ -1176,7 +1177,7 @@ mod tests {
     #[case(
         Expr::apply(
             Expr::var("v"),
-            Expr::lambda("x", Occurrence::mint(), Type::infer(), Expr::var("x")),
+            Expr::lambda("x", Occurrence::mint(), Type::infer(&mut Solver::new()), Expr::var("x")),
         ),
         "v ▷ (λ x → x)"
     )]
@@ -1272,7 +1273,7 @@ mod tests {
     )]
     // Lambda (unannotated)
     #[case(
-        Expr::lambda("x", Occurrence::mint(), Type::infer(), Expr::var("x")),
+        Expr::lambda("x", Occurrence::mint(), Type::infer(&mut Solver::new()), Expr::var("x")),
         "λ x → x"
     )]
     // Lambda (annotated)
@@ -1511,7 +1512,7 @@ mod tests {
                 Expr::lambda(
                     "y",
                     Occurrence::mint(),
-                    Type::infer(),
+                    Type::infer(&mut Solver::new()),
                     Expr::binop(
                         Expr::var("y"),
                         BinOpKind::Arithmetic(ArithmeticKind::Add),

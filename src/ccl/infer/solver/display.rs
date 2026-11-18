@@ -8,6 +8,7 @@
 //! parameter's bound, and each trait obligation on one becomes a requirement.
 
 use super::compact::for_each_child;
+use crate::ccl::infer::solver::Solver;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
@@ -121,8 +122,8 @@ fn replace_params(ty: &mut Type, with: &impl Fn(&TypeParam) -> Option<Type>) {
 ///
 /// `None` when `ty` does not materialize, as [`coalesce_compact`] reports: the
 /// caller renders it the way it renders any type.
-pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
-    let reach = Reach::of(ty, cutoff);
+pub fn poly_for_display(solver: &mut Solver, ty: &Type, cutoff: Level) -> Option<InferredPoly> {
+    let reach = Reach::of(solver, ty, cutoff);
     let (requirements, obligations): (Vec<TraitRequirement>, Vec<&Rc<TraitObligation>>) = reach
         .obligations
         .iter()
@@ -150,7 +151,7 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
     let positions: Vec<Type> = reach
         .ordering
         .iter()
-        .map(|r| r.ordering().unwrap().position_type())
+        .map(|r| r.ordering().unwrap().position_type(solver))
         .collect();
     parts.extend(positions.iter().cloned());
     if !positions.is_empty() {
@@ -158,12 +159,12 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
     }
     // What the function raises is an output, so its types stand at a positive position, the
     // last part, where their variables take the names the rest of the type gives them.
-    let raised = raised_types(ty);
+    let raised = raised_types(solver, ty);
     if !raised.is_empty() {
         parts.push(Type::Tuple(raised.iter().map(|(_, t)| t.clone()).collect()));
     }
     let mut pinned: BTreeSet<InferVarId> = BTreeSet::new();
-    let mut compacted = compact_type_for_display(&Type::Tuple(parts));
+    let mut compacted = compact_type_for_display(solver, &Type::Tuple(parts));
     // A variable at or below the cutoff is one type of the enclosing scope's, not a
     // parameter, so it is pinned at the position it holds: dropped as polar-only, it
     // would leave that position empty, which reads as a parameter of its own.
@@ -172,7 +173,7 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
     pinned.extend(
         enclosing
             .keys()
-            .filter(|v| !reach.quantified(v, cutoff))
+            .filter(|v| !reach.quantified(solver, v, cutoff))
             .copied(),
     );
     let mut graph = simplify_type_pinning(compacted, &pinned);
@@ -191,8 +192,8 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
         var_placeholders: HashMap::new(),
         bounds: HashMap::new(),
     };
-    st.go(&mut graph.term, true)?;
-    let Type::Tuple(mut parts) = coalesce_compact(&graph).ok()? else {
+    st.go(solver, &mut graph.term, true)?;
+    let Type::Tuple(mut parts) = coalesce_compact(solver, &graph).ok()? else {
         return None;
     };
     let body = parts.remove(0);
@@ -229,16 +230,16 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
         .zip(parts.iter().skip(requirements.len()))
         .map(|(r, ty)| (r.ordering().unwrap().id, names.rename(ty)))
         .collect();
-    fn name_ordering(ty: &mut Type, positions: &HashMap<u32, Type>) {
+    fn name_ordering(solver: &mut Solver, ty: &mut Type, positions: &HashMap<u32, Type>) {
         use crate::ccl::capabilities::{Capabilities, Repr};
         if let Type::Fun { capabilities, .. } = ty {
-            let mut set = capabilities.set();
+            let mut set = capabilities.set_in(solver);
             set.requires = set
                 .requires
                 .into_iter()
                 .map(|r| {
                     let Some(order) = r.ordering() else { return r };
-                    let mut causes = order.capabilities.set();
+                    let mut causes = order.capabilities.set_in(solver);
                     causes.requires.clear();
                     causes.params.retain(|p| p.of_causes);
                     causes.tops.retain(|t| t.of_causes);
@@ -256,9 +257,9 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
                 .collect();
             *capabilities = Capabilities::known(set);
         }
-        ty.walk_children_mut(|c| name_ordering(c, positions));
+        ty.walk_children_mut(|c| name_ordering(solver, c, positions));
     }
-    name_ordering(&mut body, &ordered_positions);
+    name_ordering(solver, &mut body, &ordered_positions);
     let raised_named: Vec<((NodeId, u32), Type)> = if raised.is_empty() {
         Vec::new()
     } else {
@@ -284,7 +285,7 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
         // states none.
         let tys: Vec<Type> = tys
             .iter()
-            .map(|t| crate::ccl::ccl_utils::strip_refinements(&names.rename(t)))
+            .map(|t| crate::ccl::ccl_utils::strip_refinements_in(solver, &names.rename(t)))
             .collect();
         let (args, rest) = tys.split_at(stated.args.len());
         let assoc_tys: Vec<Type> = match rest {
@@ -344,8 +345,8 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
         }
     }
     name_members(&mut body, &members);
-    params.extend(name_capability_vars(&mut body, cutoff, &params));
-    name_raises(&mut body, &raised_named);
+    params.extend(name_capability_vars(solver, &mut body, cutoff, &params));
+    name_raises(solver, &mut body, &raised_named);
     Some(InferredPoly {
         poly: PolyType {
             params,
@@ -358,8 +359,12 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
 
 /// The trait obligations a scheme of `ty` over its variables above `cutoff` carries: the
 /// ones a variable it quantifies watches, which each use of the scheme copies.
-pub fn scheme_obligations(ty: &Type, cutoff: Level) -> Vec<Rc<TraitObligation>> {
-    Reach::of(ty, cutoff).obligations
+pub fn scheme_obligations(
+    solver: &mut Solver,
+    ty: &Type,
+    cutoff: Level,
+) -> Vec<Rc<TraitObligation>> {
+    Reach::of(solver, ty, cutoff).obligations
 }
 
 /// Name the capability variables `body` keeps open, and return a parameter for each name
@@ -371,9 +376,15 @@ pub fn scheme_obligations(ty: &Type, cutoff: Level) -> Vec<Rc<TraitObligation>> 
 /// polarity is. A kept variable's requirements are written `R`, and its effects `E`, each
 /// where no exact clause closes them, since the two clauses range over different kinds
 /// (`docs/chl-spec.md`, "Kinds and bounds").
-fn name_capability_vars(body: &mut Type, cutoff: Level, taken: &[PolyParam]) -> Vec<PolyParam> {
+fn name_capability_vars(
+    solver: &mut Solver,
+    body: &mut Type,
+    cutoff: Level,
+    taken: &[PolyParam],
+) -> Vec<PolyParam> {
     use crate::ccl::capabilities::{Capabilities, CapabilityVar, CapabilityVarId, Repr};
     fn occurrences(
+        solver: &mut Solver,
         ty: &Type,
         pol: bool,
         order: &mut Vec<Rc<CapabilityVar>>,
@@ -389,7 +400,7 @@ fn name_capability_vars(body: &mut Type, cutoff: Level, taken: &[PolyParam]) -> 
             if let Repr::Known(set) = capabilities.repr() {
                 for r in &set.requires {
                     if let Some(ordering) = r.ordering() {
-                        for (id, v) in &ordering.capabilities.set().vars {
+                        for (id, v) in &ordering.capabilities.set_in(solver).vars {
                             let entry = seen.entry(*id).or_insert_with(|| {
                                 order.push(Rc::clone(v));
                                 (false, false)
@@ -410,15 +421,15 @@ fn name_capability_vars(body: &mut Type, cutoff: Level, taken: &[PolyParam]) -> 
                     }
                 }
             }
-            occurrences(domain, !pol, order, seen);
-            occurrences(codomain, pol, order, seen);
+            occurrences(solver, domain, !pol, order, seen);
+            occurrences(solver, codomain, pol, order, seen);
             return;
         }
-        ty.walk_children(|child| occurrences(child, pol, order, seen));
+        ty.walk_children(|child| occurrences(solver, child, pol, order, seen));
     }
     let mut order = Vec::new();
     let mut seen = HashMap::new();
-    occurrences(body, true, &mut order, &mut seen);
+    occurrences(solver, body, true, &mut order, &mut seen);
     // The variables standing together at an input are the calls' expectations of the one
     // function value there, which compaction meets, so they are one variable under one name:
     // `def twice(f, x): f(f(x))` calls `f` twice, and causes what `f` does once.
@@ -513,8 +524,13 @@ fn name_capability_vars(body: &mut Type, cutoff: Level, taken: &[PolyParam]) -> 
         }
     }
 
-    fn rename(ty: &mut Type, names: &HashMap<CapabilityVarId, (Option<SmolStr>, Option<SmolStr>)>) {
+    fn rename(
+        solver: &mut Solver,
+        ty: &mut Type,
+        names: &HashMap<CapabilityVarId, (Option<SmolStr>, Option<SmolStr>)>,
+    ) {
         fn rename_set(
+            solver: &mut Solver,
             mut set: crate::ccl::capabilities::CapabilitySet,
             names: &HashMap<CapabilityVarId, (Option<SmolStr>, Option<SmolStr>)>,
         ) -> crate::ccl::capabilities::CapabilitySet {
@@ -531,7 +547,10 @@ fn name_capability_vars(body: &mut Type, cutoff: Level, taken: &[PolyParam]) -> 
                     let Some(order) = r.ordering() else { return r };
                     r.with_ordering(
                         order.positions.clone(),
-                        Capabilities::known(rename_set(order.capabilities.set(), names)),
+                        Capabilities::known({
+                            let set = order.capabilities.set_in(solver);
+                            rename_set(solver, set, names)
+                        }),
                     )
                 })
                 .collect();
@@ -540,11 +559,11 @@ fn name_capability_vars(body: &mut Type, cutoff: Level, taken: &[PolyParam]) -> 
         if let Type::Fun { capabilities, .. } = ty
             && let Repr::Known(set) = capabilities.repr()
         {
-            *capabilities = Capabilities::known(rename_set(set.clone(), names));
+            *capabilities = Capabilities::known(rename_set(solver, set.clone(), names));
         }
-        ty.walk_children_mut(|child| rename(child, names));
+        ty.walk_children_mut(|child| rename(solver, child, names));
     }
-    rename(body, &names);
+    rename(solver, body, &names);
     params
 }
 
@@ -581,7 +600,7 @@ struct Reach {
 }
 
 impl Reach {
-    fn of(ty: &Type, cutoff: Level) -> Reach {
+    fn of(solver: &mut Solver, ty: &Type, cutoff: Level) -> Reach {
         let mut reach = Reach {
             levels: HashMap::new(),
             obligations: Vec::new(),
@@ -590,28 +609,34 @@ impl Reach {
         let mut seen_obligations = HashSet::new();
         let mut pending = vec![ty.clone()];
         while let Some(ty) = pending.pop() {
-            fn collect(ty: &Type, requirements: &mut Vec<crate::ccl::capabilities::Requirement>) {
+            fn collect(
+                solver: &mut Solver,
+                ty: &Type,
+                requirements: &mut Vec<crate::ccl::capabilities::Requirement>,
+            ) {
                 if let Type::Fun { capabilities, .. } = ty {
-                    for r in capabilities.set().requires {
+                    for r in capabilities.set_in(solver).requires {
                         if r.ordering().is_some() && !requirements.contains(&r) {
                             requirements.push(r);
                         }
                     }
                 }
-                ty.walk_children(|c| collect(c, requirements));
+                ty.walk_children(|c| collect(solver, c, requirements));
             }
-            collect(&ty, &mut reach.ordering);
+            collect(solver, &ty, &mut reach.ordering);
             ty.walk_infer_vars(&mut |v| {
-                if reach.levels.insert(v.uid, v.level()).is_some() || v.level() <= cutoff {
+                if reach.levels.insert(v.uid, v.level(solver)).is_some()
+                    || v.level(solver) <= cutoff
+                {
                     // A variable at or below the cutoff is the enclosing scope's: its
                     // bounds name nothing deeper, and its obligations are not this
                     // type's requirements.
                     return;
                 }
-                let bounds = v.bounds.borrow();
+                let bounds = v.bounds(solver);
                 pending.extend(bounds.lower().iter().map(|b| b.ty.clone()));
                 pending.extend(bounds.upper().iter().map(|b| b.ty.clone()));
-                for (obligation, _) in v.watches.borrow().iter() {
+                for (obligation, _) in v.watches(solver).iter() {
                     if seen_obligations.insert(obligation.uid) {
                         reach.obligations.push(Rc::clone(obligation));
                         pending.extend(obligation.watched_operands());
@@ -625,10 +650,10 @@ impl Reach {
         reach
     }
 
-    fn quantified(&self, id: &InferVarId, cutoff: Level) -> bool {
+    fn quantified(&self, solver: &mut Solver, id: &InferVarId, cutoff: Level) -> bool {
         let level = match self.levels.get(id) {
             Some(level) => *level,
-            None => crate::ccl::infer_var::lookup(id).map_or(0, |v| v.level()),
+            None => solver.lookup(id).map_or(0, |v| v.level(solver)),
         };
         level > cutoff
     }
@@ -637,10 +662,10 @@ impl Reach {
 /// The polarities each variable occurs at in `ct`.
 /// Each exception a function in `ty` may raise whose type still holds an inference variable, by
 /// the `raise` and the instance raising it, once each, in the order the walk meets them.
-fn raised_types(ty: &Type) -> Vec<((NodeId, u32), Type)> {
-    fn go(ty: &Type, out: &mut Vec<((NodeId, u32), Type)>) {
+fn raised_types(solver: &mut Solver, ty: &Type) -> Vec<((NodeId, u32), Type)> {
+    fn go(solver: &mut Solver, ty: &Type, out: &mut Vec<((NodeId, u32), Type)>) {
         if let Type::Fun { capabilities, .. } = ty {
-            for effect in capabilities.set().causes {
+            for effect in capabilities.set_in(solver).causes {
                 if let crate::ccl::capabilities::Effect::Raise(raised) = effect
                     && crate::ccl::subst::type_contains_infer(&raised.ty)
                     && !out
@@ -651,10 +676,10 @@ fn raised_types(ty: &Type) -> Vec<((NodeId, u32), Type)> {
                 }
             }
         }
-        ty.walk_children(|c| go(c, out));
+        ty.walk_children(|c| go(solver, c, out));
     }
     let mut out = Vec::new();
-    go(ty, &mut out);
+    go(solver, ty, &mut out);
     out
 }
 
@@ -662,7 +687,7 @@ fn raised_types(ty: &Type) -> Vec<((NodeId, u32), Type)> {
 /// `raise` and the instance raising it, replaced by the type `named` gives it. Materializing the
 /// type mints a fresh variable for one still open, so the exception is found by where it is
 /// raised, not by its type.
-fn name_raises(ty: &mut Type, named: &[((NodeId, u32), Type)]) {
+fn name_raises(solver: &mut Solver, ty: &mut Type, named: &[((NodeId, u32), Type)]) {
     use crate::ccl::capabilities::{Capabilities, Effect, Raised};
     let named_at = |r: &Raised| {
         named
@@ -671,7 +696,7 @@ fn name_raises(ty: &mut Type, named: &[((NodeId, u32), Type)]) {
             .map(|(_, t)| t.clone())
     };
     if let Type::Fun { capabilities, .. } = ty {
-        let mut set = capabilities.set();
+        let mut set = capabilities.set_in(solver);
         if set
             .causes
             .iter()
@@ -691,7 +716,7 @@ fn name_raises(ty: &mut Type, named: &[((NodeId, u32), Type)]) {
             *capabilities = Capabilities::known(set);
         }
     }
-    ty.walk_children_mut(|c| name_raises(c, named));
+    ty.walk_children_mut(|c| name_raises(solver, c, named));
 }
 
 /// The variables standing for a requirement's associated type and nothing else, each with the
@@ -849,13 +874,15 @@ struct Parametrize<'a> {
 impl Parametrize<'_> {
     /// Rewrite `ct` and every position under it, children first, so a bound read
     /// off a position already names its children's placeholders.
-    fn go(&mut self, ct: &mut CompactType, pol: bool) -> Option<()> {
-        for_each_child(ct, pol, &mut |child, child_pol| self.go(child, child_pol))?;
+    fn go(&mut self, solver: &mut Solver, ct: &mut CompactType, pol: bool) -> Option<()> {
+        for_each_child(ct, pol, &mut |child, child_pol| {
+            self.go(solver, child, child_pol)
+        })?;
         let quantified: Vec<InferVarId> = ct
             .vars
             .iter()
             .copied()
-            .filter(|v| self.reach.quantified(v, self.cutoff))
+            .filter(|v| self.reach.quantified(solver, v, self.cutoff))
             .collect();
         let has_content = !ct.atoms.is_empty()
             || ct.rec.is_some()
@@ -873,7 +900,7 @@ impl Parametrize<'_> {
                 *ct = Self::param_position(placeholder);
             }
             if matches!(ct.width, Some(TupleWidth::AtLeast { .. })) {
-                let bound = coalesce_position(ct, pol).ok()?;
+                let bound = coalesce_position(solver, ct, pol).ok()?;
                 let placeholder = self.mint(Placeholder::Fresh(Some(bound)));
                 *ct = Self::param_position(placeholder);
             }
@@ -881,7 +908,7 @@ impl Parametrize<'_> {
         }
         ct.vars.retain(|v| !quantified.contains(v));
         let content = if has_content {
-            Some(coalesce_position(ct, pol).ok()?)
+            Some(coalesce_position(solver, ct, pol).ok()?)
         } else {
             None
         };

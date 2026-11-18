@@ -12,6 +12,7 @@
 //! alone: every `UIntRange` is inside every other, and so is every inference variable, hole
 //! and witness reference. Refinements are peeled.
 
+use crate::ccl::infer::solver::Solver;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -33,6 +34,7 @@ pub(crate) fn all_inside(earlier: &[Type], later: &[Type]) -> bool {
 /// specialization's type. `false` where the shapes differ or a parameter stands for two
 /// types.
 pub(crate) fn bind_parameters(
+    solver: &mut Solver,
     pattern: &Type,
     ty: &Type,
     bound: &mut HashMap<TypeParamId, Type>,
@@ -40,7 +42,7 @@ pub(crate) fn bind_parameters(
     let ty = ty.peel_refinements();
     match pattern.peel_refinements() {
         Type::Param(p) => {
-            let stated = crate::ccl::ccl_utils::strip_refinements(ty);
+            let stated = crate::ccl::ccl_utils::strip_refinements_in(solver, ty);
             match bound.get(&p.id) {
                 Some(b) => *b == stated,
                 None => {
@@ -67,7 +69,7 @@ pub(crate) fn bind_parameters(
                 && ps
                     .into_iter()
                     .zip(ts)
-                    .all(|(p, t)| bind_parameters(p, t, bound))
+                    .all(|(p, t)| bind_parameters(solver, p, t, bound))
         }
     }
 }

@@ -1,5 +1,6 @@
 use crate::ccl::Label;
 use crate::ccl::RecordEntry;
+use crate::ccl::infer::solver::Solver;
 use bit_set::BitSet;
 use log::trace;
 use smol_str::SmolStr;
@@ -6008,7 +6009,7 @@ fn union_operand_ops(
     // its arms must be disjoint by how they were built; a debug build checks the shape here.
     if cfg!(debug_assertions)
         && matches!(shape, UnionShape::DisjointJoin { .. })
-        && let Some(gap) = crate::ccl::ccl_utils::disjoint_join_gap(operands)
+        && let Some(gap) = crate::ccl::ccl_utils::disjoint_join_gap(&mut Solver::none(), operands)
     {
         let legs: Vec<String> = operands.iter().map(symbolic).collect();
         panic!("a disjoint join's legs are not disjoint by construction: {gap}: {legs:?}");

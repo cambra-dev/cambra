@@ -2,7 +2,8 @@
 // Check pass: post-inference structural re-validation
 // ---------------------------------------------------------------------------
 
-use crate::ccl::ccl_utils::{TermMemo, strip_refinements};
+use crate::ccl::ccl_utils::{TermMemo, strip_refinements_in};
+use crate::ccl::infer::solver::Solver;
 use crate::ccl::infer::solver::smt::ScopeEnv;
 use crate::ccl::infer::solver::{
     ConstrainCache, Derivation, PolyScheme,
@@ -72,6 +73,9 @@ use std::rc::Rc;
 /// refinements still chain. (Previously this gap was papered over by a
 /// `contains_cast` peel in `emit_compose` and by leaving planning output un-checked.)
 pub(super) struct CheckCtx {
+    /// The check's solver: Check draws edges between the recorded types, which can mint
+    /// variables of their own.
+    solver: Solver,
     /// The types of the registered data sources, where the caller states them. A projected
     /// source's recorded type is verified against its registered one; without a registry the
     /// recorded type is trusted, as every other leaf's is.
@@ -183,7 +187,7 @@ struct CheckScope<'a> {
 }
 
 impl ScopeEnv for CheckScope<'_> {
-    fn binder_type(&self, name: &Name) -> Option<Type> {
+    fn binder_type(&self, _solver: &mut Solver, name: &Name) -> Option<Type> {
         self.scopes
             .lookup(name)
             .or_else(|| self.opaque_binders.get(name))
@@ -198,13 +202,20 @@ impl ScopeEnv for CheckScope<'_> {
 }
 
 impl CheckCtx {
-    fn new(root: NodeId, instances: Rc<InstanceTable>, mode: CheckMode) -> Self {
+    fn new(
+        mut solver: Solver,
+        root: NodeId,
+        instances: Rc<InstanceTable>,
+        mode: CheckMode,
+    ) -> Self {
         // Level 0 matches inference (Stage 1 holds the level at 0) and the
         // scheme quantification level, so instantiated schemes mint vars at
         // the same level Check's `fresh` does.
+        let schemes = OperatorSchemes::new(&mut solver);
         Self {
+            solver,
             sources: None,
-            schemes: OperatorSchemes::new(),
+            schemes,
             level: 0,
             errors: Vec::new(),
             pred_memo: Default::default(),
@@ -220,15 +231,6 @@ impl CheckCtx {
             instances,
             opened_params: Vec::new(),
             mode,
-        }
-    }
-
-    /// The lexical environment this position's queries run in.
-    fn scope(&self) -> CheckScope<'_> {
-        CheckScope {
-            scopes: &self.scopes,
-            opaque_binders: &self.opaque_binders,
-            facts: &self.facts,
         }
     }
 
@@ -274,6 +276,9 @@ impl Typing for CheckCtx {
         false
     }
 
+    fn solver(&mut self) -> &mut Solver {
+        &mut self.solver
+    }
     fn pred_memo(&self) -> TermMemo {
         self.pred_memo.clone()
     }
@@ -320,7 +325,11 @@ impl Typing for CheckCtx {
     }
 
     fn fresh(&mut self) -> Type {
-        Type::Infer(crate::ccl::InferVar::fresh_in(self.level, &self.telescope))
+        Type::Infer(crate::ccl::InferVar::fresh_in(
+            &mut self.solver,
+            self.level,
+            &self.telescope,
+        ))
     }
 
     fn instantiate(&mut self, scheme: &PolyScheme) -> Type {
@@ -328,7 +337,7 @@ impl Typing for CheckCtx {
         // variables stand nowhere, so the instantiation takes this position's
         // telescope. (A let-generalized binding instantiates directly via
         // `PolyScheme::instantiate` and keeps its definition-site telescopes.)
-        scheme.instantiate_in(self.level, &self.telescope)
+        scheme.instantiate_in(&mut self.solver, self.level, &self.telescope)
     }
 
     fn normalize(&mut self, ann: &Type) -> Type {
@@ -363,7 +372,7 @@ impl Typing for CheckCtx {
             provenance::Nature::Machinery,
         );
         let args: Vec<TypedExpr> = operand_exprs.iter().map(|e| (*e).duplicate()).collect();
-        Ok(refinement.refine(base, &args))
+        Ok(refinement.refine(&mut self.solver, base, &args))
     }
 
     fn require_trait(
@@ -387,10 +396,11 @@ impl Typing for CheckCtx {
         // A nominal type compares by value where the program declares the instance.
         if trait_.is_structural()
             && let [one, other] = operand_types
-            && let Type::Nominal(..) = strip_refinements(one)
+            && let Type::Nominal(..) = strip_refinements_in(&mut self.solver, one)
         {
-            if strip_refinements(one) == strip_refinements(other)
-                && compares_by_value(&trait_, one, &[], &self.instances)
+            if strip_refinements_in(&mut self.solver, one)
+                == strip_refinements_in(&mut self.solver, other)
+                && compares_by_value(&mut self.solver, &trait_, one, &[], &self.instances)
             {
                 return Ok(None);
             }
@@ -402,12 +412,10 @@ impl Typing for CheckCtx {
                 at: at(),
             });
             self.errors.push(located);
-            return Ok(assoc.map(|_| fresh_var(self.level)));
+            return Ok(assoc.map(|_| fresh_var(&mut self.solver, self.level)));
         }
-        // No obligation is created here, for two independent reasons. Types are
-        // already concrete, so there is nothing to discharge incrementally; and Check
-        // runs outside any `InferArena`, so an obligation's variable⇄obligation cycle
-        // would never be broken.
+        // No obligation is created here: types are already concrete, so there is nothing
+        // to discharge incrementally.
         //
         // What this rule is *for* is supplying the node's type so the reconcile below
         // has something to compare against — the common path, taken 3,812 times across
@@ -432,16 +440,16 @@ impl Typing for CheckCtx {
             // product is the shape inference answers structurally rather than through the
             // candidate set (`traits::narrow_product`), so nothing else downstream would.
             if operand_types.iter().all(|t| {
-                let t = strip_refinements(t);
+                let t = strip_refinements_in(&mut self.solver, t);
                 matches!(t, Type::Tuple(_) | Type::Record(_)) && trait_.admits_product(&t)
             }) {
                 let shapes: Vec<Vec<FieldKey>> = operand_types
                     .iter()
-                    .map(|t| product_fields(&strip_refinements(t)))
+                    .map(|t| product_fields(&strip_refinements_in(&mut self.solver, t)))
                     .collect();
                 let components: Vec<Vec<Type>> = operand_types
                     .iter()
-                    .map(|t| product_components(&strip_refinements(t)))
+                    .map(|t| product_components(&strip_refinements_in(&mut self.solver, t)))
                     .collect();
                 // The narrowest operand is the product the comparison reads: products are
                 // width-subtyped, so an operand wider than the position's type carries
@@ -470,7 +478,7 @@ impl Typing for CheckCtx {
                         at: at(),
                     });
                     self.errors.push(located);
-                    return Ok(assoc.map(|_| fresh_var(self.level)));
+                    return Ok(assoc.map(|_| fresh_var(&mut self.solver, self.level)));
                 }
                 for field in &shapes[narrowest] {
                     let at_field: Vec<&Type> = shapes
@@ -497,7 +505,7 @@ impl Typing for CheckCtx {
             Some(matched) => Ok(assoc.map(|name| {
                 matched
                     .assoc_ty(&name)
-                    .unwrap_or_else(|| fresh_var(self.level))
+                    .unwrap_or_else(|| fresh_var(&mut self.solver, self.level))
             })),
             None => {
                 // Blame the last position: with the earlier ones fixed, it is the one
@@ -518,7 +526,7 @@ impl Typing for CheckCtx {
                     at: at(),
                 });
                 self.errors.push(located);
-                Ok(assoc.map(|_| fresh_var(self.level)))
+                Ok(assoc.map(|_| fresh_var(&mut self.solver, self.level)))
             }
         }
     }
@@ -555,9 +563,22 @@ impl Typing for CheckCtx {
         let (sub, sup) = crate::ccl::generalize::align(sub, sup);
         let (sub, sup) = (&sub, &sup);
         let mut cache = self.cache();
-        let outcome = constrain_subtype_in(sub, sup, &mut cache, &self.scope());
+        let outcome = constrain_subtype_in(
+            &mut self.solver,
+            sub,
+            sup,
+            &mut cache,
+            &CheckScope {
+                scopes: &self.scopes,
+                opaque_binders: &self.opaque_binders,
+                facts: &self.facts,
+            },
+        );
         if let Err(e) = outcome {
-            let located = self.raise(map_constrain_err(e, &at()));
+            let located = {
+                let error = map_constrain_err(&mut self.solver, e, &at());
+                self.raise(error)
+            };
             self.errors.push(located);
         }
         Ok(())
@@ -588,12 +609,16 @@ impl Typing for CheckCtx {
         if matches!(self.mode, CheckMode::RefinementBlind) {
             return recorded;
         }
-        let scope = self.scope();
+        let scope = CheckScope {
+            scopes: &self.scopes,
+            opaque_binders: &self.opaque_binders,
+            facts: &self.facts,
+        };
         let scope = crate::ccl::infer::solver::smt::WithFacts {
             inner: &scope,
             facts: &facts,
         };
-        crate::ccl::infer::solver::smt::refuted(&scope).unwrap_or(false)
+        crate::ccl::infer::solver::smt::refuted(&mut self.solver, &scope).unwrap_or(false)
     }
 
     fn instantiate_generalized(&mut self, ty: &Type, incoming: &Type) -> Type {
@@ -646,13 +671,13 @@ impl Typing for CheckCtx {
         f(self)
     }
 
-    fn is_generalizable(&self, _def: &Expr) -> bool {
+    fn is_generalizable(&mut self, _def: &Expr) -> bool {
         // Check never generalizes — by the time it runs, polymorphic `let`s
         // have been monomorphized into concrete per-type specializations.
         false
     }
 
-    fn definition_alone_error(&self, _name: &Name) -> Option<LocatedInferError> {
+    fn definition_alone_error(&mut self, _name: &Name) -> Option<LocatedInferError> {
         None
     }
 
@@ -676,7 +701,11 @@ impl Typing for CheckCtx {
         // binder also equals its definiens there, as emission's scope states it.
         let assumed = match definition {
             Some(definition) if binding.transparency == BindingTransparency::Transparent => {
-                crate::ccl::infer::solver::smt::defined_as(binding.ty.clone(), definition)
+                crate::ccl::infer::solver::smt::defined_as(
+                    &mut self.solver,
+                    binding.ty.clone(),
+                    definition,
+                )
             }
             _ => binding.ty.clone(),
         };
@@ -691,14 +720,14 @@ impl Typing for CheckCtx {
         // name stays in the lifted type, and what it means there, the type it was bound at,
         // outlives the scope ([`CheckCtx::opaque_binders`], recorded by `scoped_let` on the
         // way in).
-        crate::ccl::ccl_utils::closed_let_type(binding, bound_expr, body_ty)
+        crate::ccl::ccl_utils::closed_let_type(&mut self.solver, binding, bound_expr, body_ty)
     }
 
     fn close_pattern_type(&mut self, binder: &Name, body_ty: Type) -> Type {
         if !crate::ccl::subst::type_free_vars(&body_ty).contains(binder) {
             return body_ty;
         }
-        crate::ccl::subst::Subst::join_arm(binder.clone()).apply_type(&body_ty)
+        crate::ccl::subst::Subst::join_arm(binder.clone()).apply_type_in(&mut self.solver, &body_ty)
     }
 
     fn bind_annotation(&mut self, _inferred: &Type, ann: &Type) -> Result<Type, LocatedInferError> {
@@ -786,7 +815,7 @@ impl Typing for CheckCtx {
             _ => crate::ccl::FunBinder::None,
         };
         let (d, c) = self.as_function(t, at)?;
-        let c = crate::ccl::subst::codomain_renamed(&fun_binder, &d, binder, &c);
+        let c = crate::ccl::subst::codomain_renamed(&mut self.solver, &fun_binder, &d, binder, &c);
         Ok((d, c))
     }
 
@@ -812,15 +841,23 @@ impl Typing for CheckCtx {
         let (sub, sup) = (&sub, &sup);
         let mut cache = self.cache();
         let outcome = constrain_subtype_under_in(
+            &mut self.solver,
             sub,
             sup,
             sub_binders,
             sup_binders,
             &mut cache,
-            &self.scope(),
+            &CheckScope {
+                scopes: &self.scopes,
+                opaque_binders: &self.opaque_binders,
+                facts: &self.facts,
+            },
         );
         if let Err(e) = outcome {
-            let located = self.raise(map_constrain_err(e, &at()));
+            let located = {
+                let error = map_constrain_err(&mut self.solver, e, &at());
+                self.raise(error)
+            };
             self.errors.push(located);
         }
         Ok(())
@@ -894,7 +931,7 @@ impl Typing for CheckCtx {
         // A function of a dependent parameter list takes each argument at its parameter's
         // type with the earlier parameters at the earlier arguments, as emission related them
         // (`Typing::apply`); any other takes its argument whole.
-        match parameters_at_arguments(&function, argument) {
+        match parameters_at_arguments(&mut self.solver, &function, argument) {
             Some(parameters) => {
                 let arguments: &[Type] = match arg_ty.peel_refinements() {
                     Type::Tuple(ts) if ts.len() == parameters.len() => ts,
@@ -919,7 +956,8 @@ impl Typing for CheckCtx {
         // free names when a name-spelled form survived; both discharge to
         // the same argument term.
         let result = match function.as_ref() {
-            Type::Fun { binder, .. } => crate::ccl::subst::discharge_at_binder(
+            Type::Fun { binder, .. } => crate::ccl::subst::discharge_at_binder_in(
+                &mut self.solver,
                 binder,
                 argument,
                 &codomain,
@@ -1045,7 +1083,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
             // the walk (`check` collects a propagated `Err` too, but only a rule with
             // nothing to accumulate into should use one).
             let base = lit_base(lit);
-            let recorded = strip_refinements(&expr.ty);
+            let recorded = strip_refinements_in(ctx.solver(), &expr.ty);
             if recorded != base {
                 ctx.require_sub(&base, &recorded, &|| format!("literal {label}"))?;
             }
@@ -1084,10 +1122,10 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
                     "the paths of a projected source are non-empty, sorted, and none inside \
                      another, got {paths:?}"
                 );
-                let Some(registered) = sources.get(name) else {
+                let Some(registered) = sources.get(name).cloned() else {
                     return Err(ctx.raise(InferError::UnboundVariable(name.to_string())));
                 };
-                match projected_source_type(registered, paths) {
+                match projected_source_type(ctx.solver(), &registered, paths) {
                     Ok(ty) => ty,
                     Err((key, found)) => {
                         return Err(ctx.raise(InferError::MissingField {
@@ -1277,7 +1315,7 @@ fn check_realized(
     ctx: &mut CheckCtx,
 ) -> Result<Type, LocatedInferError> {
     let bug = |what: String| InferError::Unsupported(format!("{what}; this is a compiler bug"));
-    let Some(bodies) = candidate_bodies(recorded.peel_refinements()) else {
+    let Some(bodies) = candidate_bodies(ctx.solver(), recorded.peel_refinements()) else {
         return check_realized_domain_membership(legs, recorded, ctx);
     };
     if legs.is_empty() {
@@ -1316,7 +1354,7 @@ fn check_realized(
         let (Some(leg_dom), Some(codomain)) = (leg_ty.domain(), body.codomain()) else {
             unreachable!("a leg matched a body by its domain, and both are collections")
         };
-        let expected = Type::fun_like(body, leg_dom, codomain);
+        let expected = Type::fun_like_in(ctx.solver(), body, leg_dom, codomain);
         ctx.require_sub(&leg_ty, &expected, &|| "realized leg".to_string())?;
     }
     // A candidate with no leg is a domain the program can choose whose rows nothing holds.
@@ -1363,17 +1401,22 @@ fn check_realized_domain_membership(
             }
         }
         let candidate = Type::refined(leg_dom.peel_refinements().clone(), domain_refinements);
-        if !admits_in_context(&candidate, &kind, &ctx.witness_ctx, &ctx.scope()) {
+        let scope = CheckScope {
+            scopes: &ctx.scopes,
+            opaque_binders: &ctx.opaque_binders,
+            facts: &ctx.facts,
+        };
+        if !admits_in_context(&mut ctx.solver, &candidate, &kind, &ctx.witness_ctx, &scope) {
             return Err(ctx.raise(bug(format!(
                 "a realized leg's domain `{candidate}` is not in `{recorded}`'s kind"
             ))));
         }
-        let body = head.instantiate_sum(&candidate);
+        let body = head.instantiate_sum_in(&mut ctx.solver, &candidate);
         let Some(codomain) = body.codomain() else {
             unreachable!("a sum's body is a collection")
         };
         // Keep the branch condition in the leg's domain for the subtype check.
-        let expected = Type::fun_like(&body, leg_dom, codomain);
+        let expected = Type::fun_like_in(&mut ctx.solver, &body, leg_dom, codomain);
         ctx.require_sub(&leg_ty, &expected, &|| "realized leg".to_string())?;
     }
     Ok(recorded.clone())
@@ -1381,7 +1424,7 @@ fn check_realized_domain_membership(
 
 /// `ty`'s body at every combination of its candidates, its binders outermost first; `None`
 /// where `ty` is not a sum whose witnesses list their candidates.
-fn candidate_bodies(ty: &Type) -> Option<Vec<Type>> {
+fn candidate_bodies(solver: &mut Solver, ty: &Type) -> Option<Vec<Type>> {
     let Some([first, ..]) = ty.sum() else {
         return None;
     };
@@ -1392,8 +1435,8 @@ fn candidate_bodies(ty: &Type) -> Option<Vec<Type>> {
         candidates
             .iter()
             .flat_map(|d| {
-                let body = ty.instantiate_sum(d);
-                match candidate_bodies(&body) {
+                let body = ty.instantiate_sum_in(solver, d);
+                match candidate_bodies(solver, &body) {
                     Some(bodies) => bodies,
                     None => vec![body],
                 }
@@ -1455,7 +1498,7 @@ fn check_slot_predicates(expr: &Expr, ctx: &mut CheckCtx) {
                 let mut body = r.predicate.as_ref().clone_preserving_ids();
                 crate::ccl::subst::Subst::rename(Name::elem(), param.clone())
                     .copying(crate::ccl::Ids::Kept)
-                    .rewrite_expr(&mut body);
+                    .rewrite_expr_in(ctx.solver(), &mut body);
                 let bound_ty = Type::fun((**base).clone(), body.ty.clone());
                 let mut bound = Expr::throwaway(TypedExprNode::Lambda {
                     params: vec![TypedBinding {
@@ -1487,12 +1530,16 @@ fn check_slot_predicates(expr: &Expr, ctx: &mut CheckCtx) {
         // scope for them as a term's binder is. An opened child is a copy, kept alive in
         // `opened_types` for the rest of the check (see the field); a child visited as stored
         // lives in the tree and needs no keeping.
-        crate::ccl::subst::walk_children_opened(ty, |binders, child| {
-            in_type_under(binders, &child, ctx);
+        let mut children = Vec::new();
+        crate::ccl::subst::walk_children_opened(ctx.solver(), ty, |binders, child| {
+            children.push((binders.to_vec(), child));
+        });
+        for (binders, child) in children {
+            in_type_under(&binders, &child, ctx);
             if let std::borrow::Cow::Owned(child) = child {
                 ctx.opened_types.push(child);
             }
-        });
+        }
     }
     fn in_type_under(binders: &[(Name, Type)], ty: &Type, ctx: &mut CheckCtx) {
         match binders.split_first() {
@@ -1513,7 +1560,12 @@ fn check_strength_over(ty: &Type, label: &str, ctx: &mut CheckCtx) {
         let operand = ty.domain()?;
         let (row, collection) = (operand.domain()?, operand.codomain()?);
         let (keys, values) = (collection.domain()?, collection.codomain()?);
-        let expected = Type::fun_like(&collection, keys, Type::Tuple(vec![row, values]));
+        let expected = Type::fun_like_in(
+            ctx.solver(),
+            &collection,
+            keys,
+            Type::Tuple(vec![row, values]),
+        );
         let recorded = ty.codomain()?.codomain()?;
         Some((expected, recorded))
     })();
@@ -1554,7 +1606,10 @@ fn check_unbox(ty: &Type, label: &str, ctx: &mut CheckCtx) {
             return Some(((**domain).clone(), (**codomain).clone()));
         }
         let (boxed, recorded) = match binder.whole() {
-            Some(boxed) => (boxed, crate::ccl::subst::open_codomain(ty, codomain)),
+            Some(boxed) => (
+                boxed,
+                crate::ccl::subst::open_codomain_in(ctx.solver(), ty, codomain),
+            ),
             // A sum whose every witness is determined projects each to its one candidate, which
             // reads no argument, so the result names no binder (`ty::unbox_type`) and the term
             // below is never read.
@@ -1571,7 +1626,10 @@ fn check_unbox(ty: &Type, label: &str, ctx: &mut CheckCtx) {
         // A reference compared against and rendered, never placed in a tree.
         let term =
             Rc::new(Expr::throwaway(TypedExprNode::Var(boxed.clone())).with_ty((**domain).clone()));
-        Some((crate::ccl::ty::unboxed_type(domain, &term)?, recorded))
+        Some((
+            crate::ccl::ty::unboxed_type_in(ctx.solver(), domain, &term)?,
+            recorded,
+        ))
     })();
     let Some((expected, recorded)) = expected else {
         let error = ctx.raise(InferError::TypeMismatch {
@@ -1647,7 +1705,7 @@ fn check_located_memoized(
     mode: CheckMode,
 ) -> Result<(), Vec<LocatedInferError>> {
     let mut cloned = expr.clone_preserving_ids();
-    let mut ctx = CheckCtx::new(cloned.node_id(), Rc::clone(instances), mode);
+    let mut ctx = CheckCtx::new(Solver::new(), cloned.node_id(), Rc::clone(instances), mode);
     ctx.sources = sources.cloned();
     // Most rules *accumulate* into `ctx.errors` (see `require_sub`) so the walk keeps
     // going and reports everything it can. But a few propagate instead —
@@ -1662,6 +1720,12 @@ fn check_located_memoized(
     if ctx.errors.is_empty() {
         Ok(())
     } else {
+        // Check is a run of its own, and closes what it hands back as every run does.
+        let memo = crate::ccl::ccl_utils::PredMemo::replacing();
+        let mut closer = super::solve::Closer::default();
+        for error in &mut ctx.errors {
+            closer.error(error, &memo);
+        }
         Err(ctx.errors)
     }
 }
@@ -1669,7 +1733,11 @@ fn check_located_memoized(
 /// The parameter types of `function`, a function of a dependent parameter list, at the arguments
 /// of `argument`, its call's argument list: each parameter's type with the parameters before it
 /// at the arguments before it. `None` for any other function.
-fn parameters_at_arguments(function: &Type, argument: &Expr) -> Option<Vec<Type>> {
+fn parameters_at_arguments(
+    solver: &mut Solver,
+    function: &Type,
+    argument: &Expr,
+) -> Option<Vec<Type>> {
     let Type::Fun {
         binder: crate::ccl::FunBinder::Parameters(_),
         domain,
@@ -1686,12 +1754,12 @@ fn parameters_at_arguments(function: &Type, argument: &Expr) -> Option<Vec<Type>
         "check.argument_list_parameters",
         provenance::Nature::Machinery,
     );
-    let passed = crate::ccl::ccl_utils::predicate_term(argument);
+    let passed = crate::ccl::ccl_utils::predicate_term(solver, argument);
     Some(
         (0..components.len())
             .map(|k| {
                 domain
-                    .component_type(k, |j, _| super::context::list_component(&passed, j))
+                    .component_type_in(solver, k, |j, _| super::context::list_component(&passed, j))
                     .expect("a component of the parameter list")
             })
             .collect(),
@@ -1717,30 +1785,33 @@ mod tests {
     }
 
     /// `(a : Int) × {Int | __elem == a}`: component 1 reads component 0.
-    fn reads_its_first_component() -> Type {
+    fn reads_its_first_component(solver: &mut Solver) -> Type {
         let a = Name::fresh("a");
-        Type::dep_tuple(vec![
-            (Some(a.clone()), prim(BaseType::Int)),
-            (
-                None,
-                refined(
-                    CompareKind::Equals,
-                    TypedExpr::var(a).with_ty(prim(BaseType::Int)),
+        Type::dep_tuple_in(
+            solver,
+            vec![
+                (Some(a.clone()), prim(BaseType::Int)),
+                (
+                    None,
+                    refined(
+                        CompareKind::Equals,
+                        TypedExpr::var(a).with_ty(prim(BaseType::Int)),
+                    ),
                 ),
-            ),
-        ])
+            ],
+        )
     }
 
     /// `.1 : (p : (a : Int) × {Int | __elem == a}) ⇒ {Int | __elem op p.0}`.
-    fn dependent_projection(op: CompareKind) -> TypedExpr {
-        let pair = reads_its_first_component();
+    fn dependent_projection(solver: &mut Solver, op: CompareKind) -> TypedExpr {
+        let pair = reads_its_first_component(solver);
         let p = Name::fresh("p");
         let p_0 = TypedExpr::apply(
             TypedExpr::var(p.clone()).with_ty(pair.clone()),
             TypedExpr::proj_index(0).with_ty(Type::fun(pair.clone(), prim(BaseType::Int))),
         )
         .with_ty(prim(BaseType::Int));
-        TypedExpr::proj_index(1).with_ty(Type::pi(p, pair, refined(op, p_0)))
+        TypedExpr::proj_index(1).with_ty(Type::pi_in(solver, p, pair, refined(op, p_0)))
     }
 
     /// A dependent tuple's component is typed opened at the projected value's earlier
@@ -1749,9 +1820,13 @@ mod tests {
     /// `{Int | __elem > p.0}`.
     #[test]
     fn a_dependent_projection_opens_its_component_at_the_earlier_ones() {
-        assert_eq!(check(&dependent_projection(CompareKind::Equals)), Ok(()));
+        let solver = &mut Solver::new();
+        assert_eq!(
+            check(&dependent_projection(solver, CompareKind::Equals)),
+            Ok(())
+        );
         assert!(
-            check(&dependent_projection(CompareKind::Greater)).is_err(),
+            check(&dependent_projection(solver, CompareKind::Greater)).is_err(),
             "`.1` equals `p.0`, so it is not greater than it"
         );
     }
@@ -1806,7 +1881,8 @@ mod tests {
     /// tuple's end is, not a panic.
     #[test]
     fn a_projection_past_a_dependent_tuples_end_is_an_error() {
-        let pair = reads_its_first_component();
+        let solver = &mut Solver::new();
+        let pair = reads_its_first_component(solver);
         let past = TypedExpr::proj_index(2).with_ty(Type::fun(pair, prim(BaseType::Int)));
         assert!(check(&past).is_err());
     }
@@ -1897,7 +1973,12 @@ mod tests {
         let (a_id, b_id) = (bad_a.node_id(), bad_b.node_id());
         let mut tree = TypedExpr::tuple(vec![bad_a, bad_b]);
 
-        let mut ctx = CheckCtx::new(tree.node_id(), InstanceTable::std(), CheckMode::Full);
+        let mut ctx = CheckCtx::new(
+            Solver::new(),
+            tree.node_id(),
+            InstanceTable::std(),
+            CheckMode::Full,
+        );
         let _ = check_node(&mut tree, &mut ctx);
 
         let blamed: Vec<_> = ctx.errors.iter().map(|e| e.node_id).collect();
@@ -1921,6 +2002,7 @@ mod tests {
     /// the collection's values alone is reported.
     #[test]
     fn strength_over_is_checked_against_its_collection() {
+        let solver = &mut Solver::new();
         let int = Type::Base(BaseType::Int);
         let collection = Type::sum_over(
             crate::ccl::TypeKind::Enumerated(vec![Type::UIntRange(2)]),
@@ -1928,7 +2010,8 @@ mod tests {
             int.clone(),
         );
         let keys = collection.domain().expect("a sum is a collection");
-        let pairs = Type::fun_like(
+        let pairs = Type::fun_like_in(
+            solver,
             &collection,
             keys.clone(),
             Type::Tuple(vec![int.clone(), int.clone()]),
@@ -1937,7 +2020,12 @@ mod tests {
         let errors_for = |result: Type| {
             let mut node = Expr::builtin(Builtin::StrengthOver)
                 .with_ty(Type::fun(operand.clone(), Type::fun(int.clone(), result)));
-            let mut ctx = CheckCtx::new(node.node_id(), InstanceTable::std(), CheckMode::Full);
+            let mut ctx = CheckCtx::new(
+                Solver::new(),
+                node.node_id(),
+                InstanceTable::std(),
+                CheckMode::Full,
+            );
             let _ = check_node(&mut node, &mut ctx);
             ctx.errors
         };

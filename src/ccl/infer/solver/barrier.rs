@@ -9,6 +9,7 @@
 //! could change. See `src/ccl/design/type-inference.md`, "A lambda's codomain drops the
 //! body's opaque binders".
 
+use crate::ccl::infer::solver::Solver;
 use std::rc::Rc;
 
 use crate::ccl::infer::InferError;
@@ -74,12 +75,12 @@ const MAX_ROUNDS: usize = 64;
 ///
 /// Run once the emitted graph is complete, and again after each specialization pin, which
 /// adds bounds to the clone's freshened barrier variables (`solve::specialize_use`).
-pub fn solve_barrier_vars() -> Vec<BarrierFailure> {
+pub fn solve_barrier_vars(solver: &mut Solver) -> Vec<BarrierFailure> {
     let mut failures = Vec::new();
     for _ in 0..MAX_ROUNDS {
         let mut checked_any = false;
-        for barrier in crate::ccl::arena_barrier_vars() {
-            checked_any |= check_barrier(&barrier, &mut failures);
+        for barrier in solver.barrier_vars().to_vec() {
+            checked_any |= check_barrier(solver, &barrier, &mut failures);
         }
         if !checked_any {
             return failures;
@@ -93,17 +94,21 @@ pub fn solve_barrier_vars() -> Vec<BarrierFailure> {
 
 /// Check `barrier` against its memo, recording a failure in `failures`. Whether any upper
 /// bound was checked, which is when the graph may have changed.
-fn check_barrier(barrier: &Rc<BarrierVar>, failures: &mut Vec<BarrierFailure>) -> bool {
-    let previous = barrier.checked.borrow().clone();
+fn check_barrier(
+    solver: &mut Solver,
+    barrier: &Rc<BarrierVar>,
+    failures: &mut Vec<BarrierFailure>,
+) -> bool {
+    let previous = barrier.checked(solver).clone();
     let (checked_resolution, checked_uppers) = match previous {
         Some(BarrierCheck::Failed) => return false,
         Some(BarrierCheck::Passed { resolution, uppers }) => (resolution, uppers),
         None => (None, 0),
     };
-    let uppers = barrier.uppers.borrow().clone();
-    let (own, escaped) = super::compact::barrier_resolution(barrier);
+    let uppers = barrier.uppers(solver).to_vec();
+    let (own, escaped) = super::compact::barrier_resolution(solver, barrier);
     if uppers.is_empty() && escaped.is_empty() {
-        *barrier.checked.borrow_mut() = Some(BarrierCheck::Passed {
+        *barrier.checked_mut(solver) = Some(BarrierCheck::Passed {
             resolution: None,
             uppers: 0,
         });
@@ -116,27 +121,27 @@ fn check_barrier(barrier: &Rc<BarrierVar>, failures: &mut Vec<BarrierFailure>) -
     // each time, so a check records bounds on that variable and nothing else, and the memo
     // would never match it.
     let materialized = if own.rec_vars.is_empty() {
-        coalesce_position(&own.term, true)
+        coalesce_position(solver, &own.term, true)
             .ok()
             .filter(|resolved| !matches!(resolved, Type::Infer(_)))
     } else {
         None
     };
     let Some(resolved) = materialized else {
-        *barrier.checked.borrow_mut() = Some(BarrierCheck::Passed {
+        *barrier.checked_mut(solver) = Some(BarrierCheck::Passed {
             resolution: None,
             uppers: uppers.len(),
         });
         return false;
     };
     if !escaped.is_empty() {
-        let origin = barrier.lowers.borrow().iter().find_map(|b| b.origin);
+        let origin = barrier.lowers(solver).iter().find_map(|b| b.origin);
         failures.push(BarrierFailure::Escape {
             names: escaped,
             resolved,
             origin,
         });
-        *barrier.checked.borrow_mut() = Some(BarrierCheck::Failed);
+        *barrier.checked_mut(solver) = Some(BarrierCheck::Failed);
         return false;
     }
     // An unchanged resolution has passed every upper bound already checked against it.
@@ -149,21 +154,21 @@ fn check_barrier(barrier: &Rc<BarrierVar>, failures: &mut Vec<BarrierFailure>) -
         return false;
     }
     // The resolution's value comes from the lower bounds, as an `Escape` reports it.
-    let value = barrier.lowers.borrow().iter().find_map(|b| b.origin);
+    let value = barrier.lowers(solver).iter().find_map(|b| b.origin);
     let mut cache = ConstrainCache::new();
     for upper in &uppers[first_unchecked..] {
-        if let Err(error) = constrain_opaque_upper(&resolved, value, upper, &mut cache) {
+        if let Err(error) = constrain_opaque_upper(solver, &resolved, value, upper, &mut cache) {
             failures.push(BarrierFailure::Upper {
                 error,
                 origin: upper.bound.origin,
                 report: upper.report.clone(),
                 failure: cache.take_failure(),
             });
-            *barrier.checked.borrow_mut() = Some(BarrierCheck::Failed);
+            *barrier.checked_mut(solver) = Some(BarrierCheck::Failed);
             return true;
         }
     }
-    *barrier.checked.borrow_mut() = Some(BarrierCheck::Passed {
+    *barrier.checked_mut(solver) = Some(BarrierCheck::Passed {
         resolution: Some(resolved),
         uppers: uppers.len(),
     });

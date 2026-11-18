@@ -170,6 +170,7 @@
 //! buried under a `Let` again, which this pass cannot prevent since it runs
 //! before that substitution exists.
 
+use crate::ccl::infer::solver::Solver;
 use std::collections::HashMap;
 
 use crate::ccl::Duplicate;
@@ -221,7 +222,35 @@ pub fn run(expr: Expr) -> Expr {
 /// `read_respelling`, this is for diagnostics only. It is applied before `read_respelling`,
 /// because a temp's definition can name a read's binder.
 pub fn temp_respelling(expr: &Expr, ids: crate::ccl::Ids) -> Subst {
-    fn go(expr: &Expr, env: &mut HashMap<Name, Expr>, ids: crate::ccl::Ids) {
+    temp_respelling_reading(&mut Solver::none(), expr, ids, Reading::Closed)
+}
+
+/// [`temp_respelling`] inside a typing run, of a tree that holds the run's variables, each read
+/// through `solver`.
+pub(crate) fn temp_respelling_in(solver: &mut Solver, expr: &Expr, ids: crate::ccl::Ids) -> Subst {
+    temp_respelling_reading(solver, expr, ids, Reading::InRun)
+}
+
+/// Where a respelling reads a tree's types: in its run, or once the run has closed it.
+#[derive(Clone, Copy)]
+enum Reading {
+    InRun,
+    Closed,
+}
+
+fn temp_respelling_reading(
+    solver: &mut Solver,
+    expr: &Expr,
+    ids: crate::ccl::Ids,
+    reading: Reading,
+) -> Subst {
+    fn go(
+        solver: &mut Solver,
+        expr: &Expr,
+        env: &mut HashMap<Name, Expr>,
+        ids: crate::ccl::Ids,
+        reading: Reading,
+    ) {
         if let TypedExprNode::Let {
             binding,
             bound_expr,
@@ -231,12 +260,18 @@ pub fn temp_respelling(expr: &Expr, ids: crate::ccl::Ids) -> Subst {
             && binding.transparency == BindingTransparency::Transparent
         {
             let mut definition =
-                Subst::discharge_env_in_place((**bound_expr).copied(ids), env, ids);
+                Subst::discharge_env_in_place_in(solver, (**bound_expr).copied(ids), env, ids);
             // A loop source's `elements` call over a structural collection is the collection,
             // as coalescing reads it.
-            if let Some(collection) =
-                crate::ccl::infer::solve::elements_of_a_collection(&mut definition)
-            {
+            let collection = match reading {
+                Reading::InRun => {
+                    crate::ccl::infer::solve::elements_of_a_collection(solver, &mut definition)
+                }
+                Reading::Closed => {
+                    crate::ccl::infer::solve::elements_of_a_closed_collection(&mut definition)
+                }
+            };
+            if let Some(collection) = collection {
                 definition = collection;
             }
             // An inference error leaves the tree partly typed. A definition has its binder's
@@ -246,10 +281,10 @@ pub fn temp_respelling(expr: &Expr, ids: crate::ccl::Ids) -> Subst {
             }
             env.insert(binding.name.clone(), definition);
         }
-        expr.walk_children(|child| go(child, env, ids));
+        expr.walk_children(|child| go(solver, child, env, ids, reading));
     }
     let mut env = HashMap::new();
-    go(expr, &mut env, ids);
+    go(solver, expr, &mut env, ids, reading);
     Subst::discharging(&env, ids)
 }
 

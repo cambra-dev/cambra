@@ -13,6 +13,7 @@
 
 use crate::ccl::Annotation;
 use crate::ccl::Occurrence;
+use crate::ccl::infer::solver::Solver;
 use crate::ccl::lower::modules::{Reached, top_level_nominal_types, top_level_traits};
 use crate::ccl::module_type::AliasType;
 use std::collections::HashMap;
@@ -1203,7 +1204,7 @@ fn declare_instance(
     // What the trait requires of every instance holds at this one's types, by the instances
     // declared above it and what this one requires.
     for needed in trait_.requirements_at(&operands, &assoc) {
-        if !entailed(&needed, &requires, &ctx.instances) {
+        if !entailed(&mut Solver::none(), &needed, &requires, &ctx.instances) {
             let needed = head_spelling(&needed.trait_, &needed.args);
             return Err(LoweringError::unsupported(
                 block.ty.span,
@@ -1587,6 +1588,7 @@ fn check_comparison_instance(
             continue;
         }
         let payload = decl.instantiate(
+            &mut Solver::none(),
             &crate::ccl::ccl_utils::strip_refinements(&ctor.payload()),
             args,
         );
@@ -1632,7 +1634,7 @@ fn compares_as_written(
         (WrittenOrder::Fields(fields), Type::Tuple(elems)) if fields.len() == elems.len() => {
             fields.iter().zip(elems).all(|((_, o), t)| each(t, o))
         }
-        _ => compares_by_value(trait_, ty, requires, instances),
+        _ => compares_by_value(&mut Solver::none(), trait_, ty, requires, instances),
     }
 }
 

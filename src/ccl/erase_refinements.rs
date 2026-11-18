@@ -7,6 +7,7 @@
 //! the domains of two data functions. See `src/ccl/design/optimization.md`, "Refinement Erasure
 //! (`ccl/erase_refinements.rs`)".
 
+use crate::ccl::infer::solver::Solver;
 use crate::ccl::{Expr, Type, TypedExprNode};
 
 /// Run the phase over a post-`mut_elim` tree.
@@ -68,7 +69,7 @@ fn erase_in_type(ty: &mut Type) {
             for (_, component) in &mut components {
                 erase_in_type(component);
             }
-            *ty = Type::closed_dep_tuple(components, crate::ccl::Ids::Fresh);
+            *ty = Type::closed_dep_tuple(&mut Solver::none(), components, crate::ccl::Ids::Fresh);
         }
         other => other.walk_children_mut(erase_in_type),
     }

@@ -6,6 +6,7 @@
 //! position and reads off a single `Type` (or raises a [`CoalesceError`] on a
 //! primitive collision / under-determined shape / residual cycle).
 
+use crate::ccl::infer::solver::Solver;
 use std::collections::BTreeMap;
 
 use crate::ccl::chl_print::Writer;
@@ -229,53 +230,57 @@ pub enum PartialKind {
 ///
 /// Read off the compacted term before simplification, which removes a variable that
 /// occurs at one polarity only, as the outer one at a join does.
-pub fn refuse_param_joined_with_outer_variable(graph: &CompactGraph) -> Result<(), CoalesceError> {
-    fn go(ct: &CompactType, polarity: bool) -> Result<(), CoalesceError> {
-        if polarity && let Some(err) = param_beside_an_outer_variable(ct) {
+pub fn refuse_param_joined_with_outer_variable(
+    solver: &mut Solver,
+    graph: &CompactGraph,
+) -> Result<(), CoalesceError> {
+    fn go(solver: &mut Solver, ct: &CompactType, polarity: bool) -> Result<(), CoalesceError> {
+        if polarity && let Some(err) = param_beside_an_outer_variable(solver, ct) {
             return Err(err);
         }
         for field in ct.rec.iter().flat_map(|fields| fields.values()) {
-            go(field, polarity)?;
+            go(solver, field, polarity)?;
         }
         for component in ct.dep_tuple.iter().flat_map(|d| &d.components) {
-            go(component, polarity)?;
+            go(solver, component, polarity)?;
         }
         if let Some(family) = &ct.family {
             for domain in &family.domains {
-                go(domain, polarity)?;
+                go(solver, domain, polarity)?;
             }
-            go(&family.body, polarity)?;
+            go(solver, &family.body, polarity)?;
         }
         for payload in ct.var.iter().flat_map(|tags| tags.tags.values()) {
-            go(payload, polarity)?;
+            go(solver, payload, polarity)?;
         }
         if let Some(fun) = &ct.fun {
-            go(&fun.domain, !polarity)?;
-            go(&fun.codomain, polarity)?;
+            go(solver, &fun.domain, !polarity)?;
+            go(solver, &fun.codomain, polarity)?;
         }
         if let Some(history) = &ct.history_slot {
-            go(&history.value, polarity)?;
-            go(&history.domain, polarity)?;
+            go(solver, &history.value, polarity)?;
+            go(solver, &history.domain, polarity)?;
         }
         for (decl, args) in &ct.nominal {
             for (arg, v) in args.iter().zip(decl.sided_variances()) {
-                go(arg, v.polarity(polarity))?;
+                go(solver, arg, v.polarity(polarity))?;
             }
         }
         Ok(())
     }
-    go(&graph.term, true)
+    go(solver, &graph.term, true)
 }
 
-fn param_beside_an_outer_variable(ct: &CompactType) -> Option<CoalesceError> {
+fn param_beside_an_outer_variable(solver: &mut Solver, ct: &CompactType) -> Option<CoalesceError> {
     let param = ct.atoms.iter().find_map(|a| match a {
         super::compact::AtomKey::Param(p) if p.bound.is_none() => Some(p),
         _ => None,
     })?;
-    let outer = ct
-        .vars
-        .iter()
-        .any(|id| crate::ccl::infer_var::lookup(id).is_some_and(|v| v.level() < param.level()));
+    let outer = ct.vars.iter().any(|id| {
+        solver
+            .lookup(id)
+            .is_some_and(|v| v.level(solver) < param.level())
+    });
     outer.then(|| CoalesceError::IncompatibleBounds {
         polarity: true,
         position: FailedPosition::of(ct),
@@ -286,21 +291,25 @@ fn param_beside_an_outer_variable(ct: &CompactType) -> Option<CoalesceError> {
     })
 }
 
-fn relate_params_by_bounds(ct: &CompactType, polarity: bool) -> Option<CompactType> {
+fn relate_params_by_bounds(
+    solver: &mut Solver,
+    ct: &CompactType,
+    polarity: bool,
+) -> Option<CompactType> {
     use super::compact::AtomKey;
     use crate::ccl::ty::TypeParam;
     use std::rc::Rc;
 
     /// The bound on the values of the family `atom` applies, at the application's terms, where
     /// `atom` is an application of a bounded family.
-    fn family_bound(atom: &AtomKey) -> Option<Type> {
+    fn family_bound(solver: &mut Solver, atom: &AtomKey) -> Option<Type> {
         let AtomKey::Family(c) = atom else {
             return None;
         };
         let Type::FamilyApp(app) = c.ty() else {
             return None;
         };
-        let applied = crate::ccl::subst::family_bound_at(app)?;
+        let applied = crate::ccl::subst::family_bound_at(solver, app)?;
         // A binder name nothing reads is a spelling, which `is_below` and a merge compare; the
         // bound's is its own.
         Some(match applied {
@@ -328,16 +337,16 @@ fn relate_params_by_bounds(ct: &CompactType, polarity: bool) -> Option<CompactTy
         let bounded: Vec<(&AtomKey, Type)> = ct
             .atoms
             .iter()
-            .filter_map(|a| family_bound(a).map(|b| (a, b)))
+            .filter_map(|a| family_bound(solver, a).map(|b| (a, b)))
             .collect();
         if let [(atom, unnamed)] = bounded.as_slice() {
             let mut rest = ct.clone();
             rest.atoms.remove(*atom);
-            let bound = super::compact::compact_type(unnamed);
+            let bound = super::compact::compact_type(solver, unnamed);
             if rest.denotes_a_type()
                 && bound.rec_vars.is_empty()
                 && bound.term.denotes_a_type()
-                && bound.term.is_below(&rest)
+                && bound.term.is_below(solver, &rest)
             {
                 return Some(CompactType {
                     vars: ct.vars.clone(),
@@ -389,7 +398,8 @@ fn relate_params_by_bounds(ct: &CompactType, polarity: bool) -> Option<CompactTy
         let mut changed = false;
         while at.shapes() >= 2 {
             let Some((atom, bound)) = at.atoms.iter().find_map(|a| {
-                family_bound(a).map(|b| (a.clone(), super::compact::compact_type(&b)))
+                family_bound(solver, a)
+                    .map(|b| (a.clone(), super::compact::compact_type(solver, &b)))
             }) else {
                 break;
             };
@@ -397,7 +407,7 @@ fn relate_params_by_bounds(ct: &CompactType, polarity: bool) -> Option<CompactTy
                 break;
             }
             at.atoms.remove(&atom);
-            at = CompactType::merge(polarity, at, bound.term);
+            at = CompactType::merge(solver, polarity, at, bound.term);
             changed = true;
         }
         joined = changed.then_some(at);
@@ -425,10 +435,10 @@ fn relate_params_by_bounds(ct: &CompactType, polarity: bool) -> Option<CompactTy
             rest.atoms.remove(&AtomKey::Param(Rc::clone(p)));
             let meets_as_p = rest.denotes_a_type()
                 && chain(p).into_iter().any(|b| {
-                    let bound = super::compact::compact_type(b);
+                    let bound = super::compact::compact_type(solver, b);
                     bound.rec_vars.is_empty()
                         && bound.term.denotes_a_type()
-                        && bound.term.is_below(&rest)
+                        && bound.term.is_below(solver, &rest)
                 });
             if meets_as_p {
                 ct = CompactType {
@@ -445,7 +455,7 @@ fn relate_params_by_bounds(ct: &CompactType, polarity: bool) -> Option<CompactTy
         let Some((p, bound)) = ps.iter().find_map(|p| {
             p.bound
                 .as_ref()
-                .map(|b| (p, super::compact::compact_type(b)))
+                .map(|b| (p, super::compact::compact_type(solver, b)))
         }) else {
             break;
         };
@@ -453,7 +463,7 @@ fn relate_params_by_bounds(ct: &CompactType, polarity: bool) -> Option<CompactTy
             break;
         }
         ct.atoms.remove(&AtomKey::Param(Rc::clone(p)));
-        ct = CompactType::merge(polarity, ct, bound.term);
+        ct = CompactType::merge(solver, polarity, ct, bound.term);
     }
     Some(ct)
 }
@@ -467,7 +477,7 @@ fn relate_params_by_bounds(ct: &CompactType, polarity: bool) -> Option<CompactTy
 /// A successful lookup returns that variable, including its bounds and scope. Otherwise
 /// the position gets a fresh unresolved inference variable. Retained variables still reach
 /// their original bound graphs; materialization does not detach a polymorphic scheme.
-pub fn coalesce_compact(graph: &CompactGraph) -> Result<Type, CoalesceError> {
+pub fn coalesce_compact(solver: &mut Solver, graph: &CompactGraph) -> Result<Type, CoalesceError> {
     if !graph.rec_vars.is_empty() {
         return Err(CoalesceError::RecursiveType {
             details: format!("{} recursive variable(s) in graph", graph.rec_vars.len()),
@@ -481,7 +491,7 @@ pub fn coalesce_compact(graph: &CompactGraph) -> Result<Type, CoalesceError> {
             site: violation.site,
         });
     }
-    coalesce_compact_go(&graph.term, true, &[])
+    coalesce_compact_go(solver, &graph.term, true, &[])
 }
 
 /// [`coalesce_compact`] of one position at `polarity`, outside any binder.
@@ -489,8 +499,12 @@ pub fn coalesce_compact(graph: &CompactGraph) -> Result<Type, CoalesceError> {
 /// For a caller that rewrites a [`CompactGraph`] position by position and needs to
 /// know what one materializes to (`super::display`), and for the differential oracle, which
 /// materializes a merged bound at the polarity it merged at.
-pub fn coalesce_position(ct: &CompactType, polarity: bool) -> Result<Type, CoalesceError> {
-    coalesce_compact_go(ct, polarity, &[])
+pub fn coalesce_position(
+    solver: &mut Solver,
+    ct: &CompactType,
+    polarity: bool,
+) -> Result<Type, CoalesceError> {
+    coalesce_compact_go(solver, ct, polarity, &[])
 }
 
 /// A binder as the output spells it: the name its position answers to, over what the
@@ -502,13 +516,14 @@ pub fn coalesce_position(ct: &CompactType, polarity: bool) -> Result<Type, Coale
 /// back as one name with nothing rewritten. A binder that was already settled is already its
 /// own answer.
 fn settle(
+    solver: &mut Solver,
     w: &super::compact::CompactWitness,
     polarity: bool,
     scope: &[crate::ccl::ty::Witness],
 ) -> Result<crate::ccl::ty::Witness, CoalesceError> {
     Ok(crate::ccl::ty::Witness::bound_to(
         w.id.bound(),
-        coalesce_type_kind(&w.type_kind, polarity, scope)?,
+        coalesce_type_kind(solver, &w.type_kind, polarity, scope)?,
     ))
 }
 
@@ -518,6 +533,7 @@ fn settle(
 /// The children are candidate *domains*, so they materialize contravariantly, exactly as the
 /// function's own domain does.
 fn coalesce_type_kind(
+    solver: &mut Solver,
     type_kind: &super::compact::CompactTypeKind,
     polarity: bool,
     scope: &[crate::ccl::ty::Witness],
@@ -531,7 +547,7 @@ fn coalesce_type_kind(
             // survive a conditional whose arms turned out to be over one domain.
             let mut out: Vec<Type> = Vec::new();
             for c in candidates {
-                let t = coalesce_compact_go(c, polarity, scope)?;
+                let t = coalesce_compact_go(solver, c, polarity, scope)?;
                 if !out.contains(&t) {
                     out.push(t);
                 }
@@ -547,7 +563,7 @@ fn coalesce_type_kind(
             Ok(crate::ccl::ty::TypeKind::Enumerated(out))
         }
         CompactTypeKind::SubtypesOf(bound) => Ok(crate::ccl::ty::TypeKind::SubtypesOf(Box::new(
-            coalesce_compact_go(bound, polarity, scope)?,
+            coalesce_compact_go(solver, bound, polarity, scope)?,
         ))),
         CompactTypeKind::UIntRanges => Ok(crate::ccl::ty::TypeKind::UIntRanges),
         CompactTypeKind::Type => Ok(crate::ccl::ty::TypeKind::Type),
@@ -573,11 +589,12 @@ fn absorb_uint_ranges(atoms: &mut Vec<Type>, polarity: bool) {
 }
 
 fn coalesce_compact_go(
+    solver: &mut Solver,
     ct: &CompactType,
     polarity: bool,
     scope: &[crate::ccl::ty::Witness],
 ) -> Result<Type, CoalesceError> {
-    let related = relate_params_by_bounds(ct, polarity);
+    let related = relate_params_by_bounds(solver, ct, polarity);
     let ct = related.as_ref().unwrap_or(ct);
     // Count concrete (non-variable) contributions to pick the output
     // type. With multiple distinct contributions, we would need
@@ -644,6 +661,7 @@ fn coalesce_compact_go(
 
     if let Some(rec) = &ct.rec {
         shapes.push(materialize_record(
+            solver,
             rec,
             ct.width.as_ref(),
             polarity,
@@ -658,9 +676,12 @@ fn coalesce_compact_go(
     if let Some(dep) = &ct.dep_tuple {
         let mut components = Vec::with_capacity(dep.components.len());
         for (name, c) in dep.names.iter().zip(&dep.components) {
-            components.push((name.clone(), coalesce_compact_go(c, polarity, scope)?));
+            components.push((
+                name.clone(),
+                coalesce_compact_go(solver, c, polarity, scope)?,
+            ));
         }
-        let tuple = Type::dep_tuple(components);
+        let tuple = Type::dep_tuple_in(solver, components);
         if !shapes.contains(&tuple) {
             shapes.push(tuple);
         }
@@ -670,15 +691,18 @@ fn coalesce_compact_go(
     if let Some(family) = &ct.family {
         let mut binders = Vec::with_capacity(family.domains.len());
         for (name, d) in family.names.iter().zip(&family.domains) {
-            binders.push((name.clone(), coalesce_compact_go(d, polarity, scope)?));
+            binders.push((
+                name.clone(),
+                coalesce_compact_go(solver, d, polarity, scope)?,
+            ));
         }
         shapes.push(Type::Family {
             binders,
-            body: Box::new(coalesce_compact_go(&family.body, polarity, scope)?),
+            body: Box::new(coalesce_compact_go(solver, &family.body, polarity, scope)?),
         });
     }
     if let Some(var) = &ct.var {
-        shapes.push(materialize_variant(var, polarity, scope)?);
+        shapes.push(materialize_variant(solver, var, polarity, scope)?);
     }
     if let Some(cf) = &ct.fun {
         use crate::ccl::ty::KindPin;
@@ -687,13 +711,13 @@ fn coalesce_compact_go(
         let binders = cf
             .binders
             .iter()
-            .map(|w| settle(w, !polarity, scope))
+            .map(|w| settle(solver, w, !polarity, scope))
             .collect::<Result<Vec<_>, _>>()?;
         let mut inner_scope = scope.to_vec();
         inner_scope.extend(binders.iter().cloned());
         let scope: &[crate::ccl::ty::Witness] = &inner_scope;
         // Materialize the codomain (covariant).
-        let c = coalesce_compact_go(&cf.codomain, polarity, scope)?;
+        let c = coalesce_compact_go(solver, &cf.codomain, polarity, scope)?;
         // The domain, materialized contravariantly. At a `Data` position the atoms are
         // *alternatives* — one candidate each (see `denoted_domains`) — and a
         // `DomainConflict` reads them the same way, since naming both is the whole content
@@ -704,7 +728,7 @@ fn coalesce_compact_go(
         {
             ds
         } else {
-            vec![coalesce_compact_go(&cf.domain, !polarity, scope)?]
+            vec![coalesce_compact_go(solver, &cf.domain, !polarity, scope)?]
         };
         // Strip the Pi binder unless the codomain actually depends on it
         // (design §3.2 / O10): keeps ordinary functions `name: None` while a
@@ -775,7 +799,7 @@ fn coalesce_compact_go(
                                 None => vec![operand.clone()],
                             };
                             for w in written {
-                                let ty = coalesce_compact_go(&w, !polarity, scope)?;
+                                let ty = coalesce_compact_go(solver, &w, !polarity, scope)?;
                                 if !domains.contains(&ty) {
                                     domains.push(ty);
                                 }
@@ -864,7 +888,7 @@ fn coalesce_compact_go(
         // The value compacted under the function's binder, so it is already in the closed form
         // the function stores. The binder stays only where the value reads it, as a
         // function's does.
-        let value = coalesce_compact_go(&history.value, polarity, scope)?;
+        let value = coalesce_compact_go(solver, &history.value, polarity, scope)?;
         let function = Type::Fun {
             binder: history
                 .name
@@ -872,7 +896,12 @@ fn coalesce_compact_go(
                 .filter(|b| crate::ccl::subst::codomain_depends_on(b, &value))
                 .into(),
             fun_kind: crate::ccl::ty::FunKind::Data(None),
-            domain: Box::new(coalesce_compact_go(&history.domain, polarity, scope)?),
+            domain: Box::new(coalesce_compact_go(
+                solver,
+                &history.domain,
+                polarity,
+                scope,
+            )?),
             codomain: Box::new(value),
             capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
@@ -887,8 +916,8 @@ fn coalesce_compact_go(
             details: format!(
                 "two `{}` values at different arguments of an invariant parameter: {} and {}",
                 decl.name,
-                w.ty(&coalesce_compact_go(a, polarity, scope)?),
-                w.ty(&coalesce_compact_go(b, polarity, scope)?),
+                w.ty(&coalesce_compact_go(solver, a, polarity, scope)?),
+                w.ty(&coalesce_compact_go(solver, b, polarity, scope)?),
             ),
         });
     }
@@ -901,7 +930,7 @@ fn coalesce_compact_go(
         for v in &decl.body().variances {
             let mut next = || {
                 let (arg, side) = sides.next().expect("one side per sided variance");
-                coalesce_compact_go(arg, side.polarity(polarity), scope)
+                coalesce_compact_go(solver, arg, side.polarity(polarity), scope)
             };
             slots.push(match v {
                 crate::ccl::nominal::Variance::Bipolar => {
@@ -931,9 +960,9 @@ fn coalesce_compact_go(
             // With no variables either, the position genuinely stands for nothing, and the
             // placeholder is the error slot `check_fully_typed` reports as
             // `UnresolvedInfer`.
-            match ct.vars.iter().min().and_then(crate::ccl::infer_var::lookup) {
+            match ct.vars.iter().min().and_then(|id| solver.lookup(id)) {
                 Some(v) => Type::Infer(v),
-                None => Type::Infer(InferVar::fresh(0)),
+                None => Type::Infer(InferVar::fresh(solver, 0)),
             }
         }
         1 => all.remove(0),
@@ -993,18 +1022,20 @@ fn polarity_word(polarity: bool) -> &'static str {
 /// diagnostic naming that demand render it as the partial arm set it is
 /// (``{`a{Int} | …}``) rather than as an exact sum the scrutinee failed to be.
 fn materialize_variant(
+    solver: &mut Solver,
     variant: &CompactVariant,
     polarity: bool,
     scope: &[crate::ccl::ty::Witness],
 ) -> Result<Type, CoalesceError> {
     let mut out = Vec::with_capacity(variant.tags.len());
     for (k, v) in &variant.tags {
-        out.push((k.clone(), coalesce_compact_go(v, polarity, scope)?));
+        out.push((k.clone(), coalesce_compact_go(solver, v, polarity, scope)?));
     }
     Ok(Type::Variant(out, variant.openness))
 }
 
 fn materialize_record(
+    solver: &mut Solver,
     rec: &BTreeMap<FieldKey, CompactType>,
     width: Option<&super::compact::TupleWidth>,
     polarity: bool,
@@ -1041,9 +1072,10 @@ fn materialize_record(
         );
         let mut out = Vec::with_capacity(rec.len());
         for v in rec.values() {
-            out.push(coalesce_compact_go(v, polarity, scope)?);
+            out.push(coalesce_compact_go(solver, v, polarity, scope)?);
         }
         let out = crate::ccl::subst::tuple_of_components(
+            solver,
             out.into_iter().map(|t| (None, t)).collect(),
             crate::ccl::Ids::Fresh,
         );
@@ -1069,7 +1101,7 @@ fn materialize_record(
                 FieldKey::Name(s) => s.clone(),
                 _ => unreachable!(),
             };
-            out.push((name, coalesce_compact_go(v, polarity, scope)?));
+            out.push((name, coalesce_compact_go(solver, v, polarity, scope)?));
         }
         // We don't have a way to distinguish open vs closed name-keyed
         // records at this layer (no field-count invariant analogous
@@ -1157,38 +1189,58 @@ mod tests {
 
     #[test]
     fn coalesce_primitive_round_trips() {
+        let solver = &mut Solver::new();
         let s = prim(BaseType::Int);
         assert_eq!(
-            coalesce_compact(&compact_type(&s)).unwrap(),
+            {
+                let c = compact_type(solver, &s);
+                coalesce_compact(solver, &c)
+            }
+            .unwrap(),
             Type::Base(BaseType::Int)
         );
     }
 
     #[test]
     fn coalesce_uintranges_sigma_round_trips() {
+        let solver = &mut Solver::new();
         // A `List` Σ compacts into the `fun` slot with a domain naming no candidates — the
         // kind rides through verbatim, only the codomain compacts — so
         // compact → coalesce re-forms the identical type. Contrast the
         // conditional-collection Σ, whose candidates join the lattice.
         let list_ty = Type::list_of(Type::Base(BaseType::Int));
-        let t = coalesce_compact(&compact_type(&list_ty)).unwrap();
+        let t = {
+            let c = compact_type(solver, &list_ty);
+            coalesce_compact(solver, &c)
+        }
+        .unwrap();
         assert_eq!(t, list_ty);
     }
 
     #[test]
     fn coalesce_collection_sigma_round_trips() {
+        let solver = &mut Solver::new();
         // A `Collection` (`TypeKind::Type`) Σ rides through exactly as the `List` Σ above
         // does — the kind inert, only the codomain compacted — so the ⊤ of the kind order
         // needs no carrier of its own to survive the round trip.
         let coll = Type::collection_of(Type::Base(BaseType::Int));
-        let t = coalesce_compact(&compact_type(&coll)).unwrap();
+        let t = {
+            let c = compact_type(solver, &coll);
+            coalesce_compact(solver, &c)
+        }
+        .unwrap();
         assert_eq!(t, coll);
     }
 
     #[test]
     fn coalesce_function_preserves_shape() {
+        let solver = &mut Solver::new();
         let s = fun(prim(BaseType::Int), prim(BaseType::Bool));
-        let t = coalesce_compact(&compact_type(&s)).unwrap();
+        let t = {
+            let c = compact_type(solver, &s);
+            coalesce_compact(solver, &c)
+        }
+        .unwrap();
         assert_eq!(
             t,
             Type::Fun {
@@ -1203,6 +1255,7 @@ mod tests {
 
     #[test]
     fn coalesce_single_data_domain_is_plain_data_fun() {
+        let solver = &mut Solver::new();
         use crate::ccl::infer::solver::compact::{CompactFun, KindPin};
         // One surviving domain collapses to a plain `Data` fun (idempotence:
         // `xs if c else xs` types as `xs`).
@@ -1214,9 +1267,9 @@ mod tests {
                     binder: crate::ccl::FunBinder::None,
                     kind: KindPin::Data,
                     domains_disagree: false,
-                    domain: Box::new(compact_type(&Type::UIntRange(2)).term),
+                    domain: Box::new(compact_type(solver, &Type::UIntRange(2)).term),
                     combined: None,
-                    codomain: Box::new(compact_type(&prim(BaseType::Int)).term),
+                    codomain: Box::new(compact_type(solver, &prim(BaseType::Int)).term),
                 }),
                 ..Default::default()
             },
@@ -1224,7 +1277,7 @@ mod tests {
             join_violations: Vec::new(),
         };
         assert_eq!(
-            coalesce_compact(&graph).unwrap(),
+            coalesce_compact(solver, &graph).unwrap(),
             Type::Fun {
                 binder: crate::ccl::FunBinder::None,
                 fun_kind: crate::ccl::ty::FunKind::Data(None),
@@ -1237,6 +1290,7 @@ mod tests {
 
     #[test]
     fn coalesce_domain_join_conflict_errs() {
+        let solver = &mut Solver::new();
         use crate::ccl::infer::solver::compact::{CompactFun, KindPin};
         // Two domains with no common answer is a loud coalesce error, never a silent
         // domain drop — and it reports as a *domain* conflict, which is the fact it is.
@@ -1253,13 +1307,13 @@ mod tests {
                     domains_disagree: true,
                     // Two domains at one position: a `fun` slot holds one domain, so a
                     // second one arriving there is the conflict.
-                    domain: Box::new(CompactType::merge(
-                        true,
-                        compact_type(&Type::UIntRange(2)).term,
-                        compact_type(&Type::UIntRange(3)).term,
-                    )),
+                    domain: Box::new({
+                        let two = compact_type(solver, &Type::UIntRange(2));
+                        let three = compact_type(solver, &Type::UIntRange(3));
+                        CompactType::merge(solver, true, two.term, three.term)
+                    }),
                     combined: None,
-                    codomain: Box::new(compact_type(&prim(BaseType::Int)).term),
+                    codomain: Box::new(compact_type(solver, &prim(BaseType::Int)).term),
                 }),
                 ..Default::default()
             },
@@ -1267,7 +1321,7 @@ mod tests {
             join_violations: Vec::new(),
         };
         assert!(matches!(
-            coalesce_compact(&graph),
+            coalesce_compact(solver, &graph),
             Err(CoalesceError::DomainJoinConflict { domains, .. })
                 if domains == [Type::UIntRange(2), Type::UIntRange(3)]
         ));
@@ -1275,6 +1329,7 @@ mod tests {
 
     #[test]
     fn coalesce_single_domain_conflict_is_a_kind_conflict() {
+        let solver = &mut Solver::new();
         use crate::ccl::infer::solver::compact::{CompactFun, KindPin};
         // A `Conflict` over a *single* domain is one function slot demanded as a
         // data domain while being a compute function — the coalesce-time face
@@ -1288,9 +1343,9 @@ mod tests {
                     binder: crate::ccl::FunBinder::None,
                     kind: KindPin::Conflict,
                     domains_disagree: false,
-                    domain: Box::new(compact_type(&prim(BaseType::Int)).term),
+                    domain: Box::new(compact_type(solver, &prim(BaseType::Int)).term),
                     combined: None,
-                    codomain: Box::new(compact_type(&prim(BaseType::Int)).term),
+                    codomain: Box::new(compact_type(solver, &prim(BaseType::Int)).term),
                 }),
                 ..Default::default()
             },
@@ -1298,18 +1353,23 @@ mod tests {
             join_violations: Vec::new(),
         };
         assert!(matches!(
-            coalesce_compact(&graph),
+            coalesce_compact(solver, &graph),
             Err(CoalesceError::KindConflict { .. })
         ));
     }
 
     #[test]
     fn coalesce_dense_index_record_becomes_tuple() {
+        let solver = &mut Solver::new();
         let r = record(&[
             (FieldKey::Index(0), prim(BaseType::Int)),
             (FieldKey::Index(1), prim(BaseType::String)),
         ]);
-        let t = coalesce_compact(&compact_type(&r)).unwrap();
+        let t = {
+            let c = compact_type(solver, &r);
+            coalesce_compact(solver, &c)
+        }
+        .unwrap();
         assert_eq!(
             t,
             Type::Tuple(vec![
@@ -1321,11 +1381,16 @@ mod tests {
 
     #[test]
     fn coalesce_named_record_becomes_record() {
+        let solver = &mut Solver::new();
         let r = record(&[
             (FieldKey::Name("x".into()), prim(BaseType::Int)),
             (FieldKey::Name("y".into()), prim(BaseType::Bool)),
         ]);
-        let t = coalesce_compact(&compact_type(&r)).unwrap();
+        let t = {
+            let c = compact_type(solver, &r);
+            coalesce_compact(solver, &c)
+        }
+        .unwrap();
         assert_eq!(
             t,
             Type::Record(vec![
@@ -1339,12 +1404,23 @@ mod tests {
     /// conflict, never their common prefix (`docs/chl-spec.md`, "Tuple width").
     #[test]
     fn a_join_of_two_tuple_widths_is_incompatible() {
-        let v = fresh_var(0);
+        let solver = &mut Solver::new();
+        let v = fresh_var(solver, 0);
         let mut cache = ConstrainCache::new();
         let int = || prim(BaseType::Int);
-        constrain_subtype(&Type::Tuple(vec![int(), int()]), &v, &mut cache).unwrap();
-        constrain_subtype(&Type::Tuple(vec![int(), int(), int()]), &v, &mut cache).unwrap();
-        let err = coalesce_compact(&compact_type(&v)).unwrap_err();
+        constrain_subtype(solver, &Type::Tuple(vec![int(), int()]), &v, &mut cache).unwrap();
+        constrain_subtype(
+            solver,
+            &Type::Tuple(vec![int(), int(), int()]),
+            &v,
+            &mut cache,
+        )
+        .unwrap();
+        let err = {
+            let c = compact_type(solver, &v);
+            coalesce_compact(solver, &c)
+        }
+        .unwrap_err();
         assert!(
             matches!(&err, CoalesceError::TupleWidthConflict { widths, .. }
                 if widths == "a 2-tuple and a 3-tuple"),
@@ -1356,15 +1432,20 @@ mod tests {
     /// parameter reads the argument's width.
     #[test]
     fn an_open_demand_meets_a_closed_tuple_at_its_width() {
-        let v = fresh_var(0);
+        let solver = &mut Solver::new();
+        let v = fresh_var(solver, 0);
         let mut cache = ConstrainCache::new();
         let int = || prim(BaseType::Int);
         let wide = Type::Tuple(vec![int(), prim(BaseType::String), int()]);
-        constrain_subtype(&wide, &v, &mut cache).unwrap();
-        constrain_subtype(&v, &Type::OpenTuple(vec![int()]), &mut cache).unwrap();
+        constrain_subtype(solver, &wide, &v, &mut cache).unwrap();
+        constrain_subtype(solver, &v, &Type::OpenTuple(vec![int()]), &mut cache).unwrap();
         let param = fun(v, int());
         assert_eq!(
-            coalesce_compact(&compact_type(&param)).unwrap(),
+            {
+                let c = compact_type(solver, &param);
+                coalesce_compact(solver, &c)
+            }
+            .unwrap(),
             fun(wide, int())
         );
     }
@@ -1372,49 +1453,70 @@ mod tests {
     /// An open demand nothing closes stays open: its width was never fixed.
     #[test]
     fn an_open_demand_alone_stays_open() {
-        let v = fresh_var(0);
+        let solver = &mut Solver::new();
+        let v = fresh_var(solver, 0);
         let mut cache = ConstrainCache::new();
         let open = Type::OpenTuple(vec![prim(BaseType::Int)]);
-        constrain_subtype(&v, &open, &mut cache).unwrap();
+        constrain_subtype(solver, &v, &open, &mut cache).unwrap();
         let param = fun(v, prim(BaseType::Int));
         assert_eq!(
-            coalesce_compact(&compact_type(&param)).unwrap(),
+            {
+                let c = compact_type(solver, &param);
+                coalesce_compact(solver, &c)
+            }
+            .unwrap(),
             fun(open, prim(BaseType::Int))
         );
     }
 
     #[test]
     fn coalesce_var_with_one_lower_bound_at_positive_position() {
+        let solver = &mut Solver::new();
         // α : lower=[Int]. At positive, coalesces to Int.
-        let v = fresh_var(0);
+        let v = fresh_var(solver, 0);
         let mut cache = ConstrainCache::new();
-        constrain_subtype(&prim(BaseType::Int), &v, &mut cache).unwrap();
+        constrain_subtype(solver, &prim(BaseType::Int), &v, &mut cache).unwrap();
         assert_eq!(
-            coalesce_compact(&compact_type(&v)).unwrap(),
+            {
+                let c = compact_type(solver, &v);
+                coalesce_compact(solver, &c)
+            }
+            .unwrap(),
             Type::Base(BaseType::Int)
         );
     }
 
     #[test]
     fn coalesce_var_with_one_upper_bound_at_negative_position() {
+        let solver = &mut Solver::new();
         // α : upper=[Int]. compact_type at default polarity (positive
         // top-level) walks a Var's lower bounds; the opposite-polarity
         // fallback in compact_go pulls in upper bounds when lowers are
         // empty, so this still resolves to Int. Will tighten once
         // simplify_type lands.
-        let v = fresh_var(0);
+        let v = fresh_var(solver, 0);
         let mut cache = ConstrainCache::new();
-        constrain_subtype(&v, &prim(BaseType::Int), &mut cache).unwrap();
+        constrain_subtype(solver, &v, &prim(BaseType::Int), &mut cache).unwrap();
         assert_eq!(
-            coalesce_compact(&compact_type(&v)).unwrap(),
+            {
+                let c = compact_type(solver, &v);
+                coalesce_compact(solver, &c)
+            }
+            .unwrap(),
             Type::Base(BaseType::Int)
         );
     }
 
     #[test]
     fn coalesce_var_with_no_bounds_emits_infer() {
-        let v = fresh_var(0);
-        match coalesce_compact(&compact_type(&v)).unwrap() {
+        let solver = &mut Solver::new();
+        let v = fresh_var(solver, 0);
+        match {
+            let c = compact_type(solver, &v);
+            coalesce_compact(solver, &c)
+        }
+        .unwrap()
+        {
             Type::Infer(_) => {}
             other => panic!("expected Type::Infer, got {:?}", other),
         }
@@ -1422,22 +1524,27 @@ mod tests {
 
     #[test]
     fn coalesce_var_with_incompatible_lowers_fails() {
+        let solver = &mut Solver::new();
         // α : lower=[Int, String]. The solver rejects unions — both
         // primitives flow into the atom set, and coalesce_compact
         // emits IncompatibleBounds when more than one concrete
         // contribution survives.
-        let v = fresh_var(0);
+        let v = fresh_var(solver, 0);
         let mut cache = ConstrainCache::new();
-        constrain_subtype(&prim(BaseType::Int), &v, &mut cache).unwrap();
-        constrain_subtype(&prim(BaseType::String), &v, &mut cache).unwrap();
+        constrain_subtype(solver, &prim(BaseType::Int), &v, &mut cache).unwrap();
+        constrain_subtype(solver, &prim(BaseType::String), &v, &mut cache).unwrap();
         assert!(matches!(
-            coalesce_compact(&compact_type(&v)),
+            {
+                let c = compact_type(solver, &v);
+                coalesce_compact(solver, &c)
+            },
             Err(CoalesceError::IncompatibleBounds { .. })
         ));
     }
 
     #[test]
     fn coalesce_self_referential_var_emits_infer() {
+        let solver = &mut Solver::new();
         // α with α directly in its own lower bounds. compact_type's
         // `parents` filter treats this as a spurious cycle (no
         // structural intermediary), drops the bound, and
@@ -1452,15 +1559,19 @@ mod tests {
         // placeholder/RecursiveType path. One-way constraint emission
         // produces no such cycles today (even `λx. x x` types cleanly);
         // the path is defensive.
-        let v = fresh_var(0);
+        let v = fresh_var(solver, 0);
         if let Type::Infer(state) = &v {
             state
-                .bounds
-                .borrow_mut()
+                .bounds_mut(solver)
                 .lower_mut()
                 .push(Bound::conc(v.clone()));
         }
-        match coalesce_compact(&compact_type(&v)).unwrap() {
+        match {
+            let c = compact_type(solver, &v);
+            coalesce_compact(solver, &c)
+        }
+        .unwrap()
+        {
             Type::Infer(_) => {}
             other => panic!("expected Type::Infer for spurious self-cycle, got {other:?}"),
         }
@@ -1468,6 +1579,7 @@ mod tests {
 
     #[test]
     fn distinct_refinements_survive_simplification() {
+        let solver = &mut Solver::new();
         // A record carrying two *different* refinements at two field
         // positions must round-trip through compact → simplify → coalesce
         // with both refinements intact (they are positional, not folded into a
@@ -1477,12 +1589,17 @@ mod tests {
             ("a".into(), refined(prim(BaseType::Int), p)),
             ("b".into(), refined(prim(BaseType::Int), q)),
         ]);
-        let out = coalesce_compact(&simplify_type(compact_type(&ty))).unwrap();
+        let out = {
+            let c = simplify_type(compact_type(solver, &ty));
+            coalesce_compact(solver, &c)
+        }
+        .unwrap();
         assert_eq!(out, ty);
     }
 
     #[test]
     fn refinements_meeting_at_one_variable_do_not_depend_on_arrival_order() {
+        let solver = &mut Solver::new();
         // Two refined upper bounds meet at one variable. As nested layers the
         // result was `{{Int | q} | p}` or `{{Int | p} | q}` by which arrived
         // first; subtyping was indifferent either way (deficit matching compares
@@ -1492,11 +1609,15 @@ mod tests {
         // recorded-vs-recomputed walls. One unordered set makes the two orders
         // build the same type, so this asserts plain equality rather than
         // equality after a canonical sort.
-        let coalesce_with_order = |first: &Type, second: &Type| {
-            let v = fresh_var(0);
-            constrain_subtype(&v, first, &mut ConstrainCache::new()).unwrap();
-            constrain_subtype(&v, second, &mut ConstrainCache::new()).unwrap();
-            coalesce_compact(&simplify_type(compact_type(&v))).unwrap()
+        let mut coalesce_with_order = |first: &Type, second: &Type| {
+            let v = fresh_var(solver, 0);
+            constrain_subtype(solver, &v, first, &mut ConstrainCache::new()).unwrap();
+            constrain_subtype(solver, &v, second, &mut ConstrainCache::new()).unwrap();
+            {
+                let c = simplify_type(compact_type(solver, &v));
+                coalesce_compact(solver, &c)
+            }
+            .unwrap()
         };
         let (p, q) = (
             refined(prim(BaseType::Int), 1),
@@ -1519,18 +1640,23 @@ mod tests {
 
     #[test]
     fn var_constrained_to_refined_coalesces_refined() {
+        let solver = &mut Solver::new();
         // A fresh var equated to a refined type (both bounds) must coalesce
         // *carrying* the refinement, not drop it to the bare base. Solver-level
         // property: equality bounds may still arise (e.g. `bind_annotation`,
         // `require_eq` on list elements), so refinements must survive them.
         let p = 1;
-        let v = fresh_var(0);
+        let v = fresh_var(solver, 0);
         let refined_int = refined(prim(BaseType::Int), p);
         let mut cache = ConstrainCache::new();
         // v ⟺ {Int | p}
-        constrain_subtype(&v, &refined_int, &mut cache).unwrap();
-        constrain_subtype(&refined_int, &v, &mut cache).unwrap();
-        let out = coalesce_compact(&simplify_type(compact_type(&v))).unwrap();
+        constrain_subtype(solver, &v, &refined_int, &mut cache).unwrap();
+        constrain_subtype(solver, &refined_int, &v, &mut cache).unwrap();
+        let out = {
+            let c = simplify_type(compact_type(solver, &v));
+            coalesce_compact(solver, &c)
+        }
+        .unwrap();
         assert_eq!(
             out, refined_int,
             "var equated to {{Int|p}} lost its refinement"
@@ -1539,6 +1665,7 @@ mod tests {
 
     #[test]
     fn apply_index_var_coalesces_refined() {
+        let solver = &mut Solver::new();
         // Solver-level refinement-propagation property: an index var `v` equated
         // (both bounds) with the domain `dom` of a function shape that is
         // itself equated with `{d | p} ⇒ cod` (d ⟺ Int). The refinement `p` must
@@ -1546,25 +1673,29 @@ mod tests {
         // type, `{Int | p}` — refinements ride the lattice; they must not be
         // dropped at var merges.
         let p = 1;
-        let d = fresh_var(0);
-        let cod = fresh_var(0);
-        let dom = fresh_var(0);
-        let cap = fresh_var(0);
-        let v = fresh_var(0);
+        let d = fresh_var(solver, 0);
+        let cod = fresh_var(solver, 0);
+        let dom = fresh_var(solver, 0);
+        let cap = fresh_var(solver, 0);
+        let v = fresh_var(solver, 0);
         let mut cache = ConstrainCache::new();
         // d ⟺ Int
-        constrain_subtype(&d, &prim(BaseType::Int), &mut cache).unwrap();
-        constrain_subtype(&prim(BaseType::Int), &d, &mut cache).unwrap();
+        constrain_subtype(solver, &d, &prim(BaseType::Int), &mut cache).unwrap();
+        constrain_subtype(solver, &prim(BaseType::Int), &d, &mut cache).unwrap();
         // fn = {d|p} ⇒ cod
         let fn_ty = fun(refined(d.clone(), p), cod.clone());
         // as_function_eq: fn ⟺ dom ⇒ cap
         let shape = fun(dom.clone(), cap.clone());
-        constrain_subtype(&fn_ty, &shape, &mut cache).unwrap();
-        constrain_subtype(&shape, &fn_ty, &mut cache).unwrap();
+        constrain_subtype(solver, &fn_ty, &shape, &mut cache).unwrap();
+        constrain_subtype(solver, &shape, &fn_ty, &mut cache).unwrap();
         // constrain_argument(v, dom): two-way
-        constrain_subtype(&v, &dom, &mut cache).unwrap();
-        constrain_subtype(&dom, &v, &mut cache).unwrap();
-        let out = coalesce_compact(&simplify_type(compact_type(&v))).unwrap();
+        constrain_subtype(solver, &v, &dom, &mut cache).unwrap();
+        constrain_subtype(solver, &dom, &v, &mut cache).unwrap();
+        let out = {
+            let c = simplify_type(compact_type(solver, &v));
+            coalesce_compact(solver, &c)
+        }
+        .unwrap();
         assert_eq!(
             out,
             refined(prim(BaseType::Int), p),
@@ -1575,12 +1706,13 @@ mod tests {
     /// Coalesce a variant `Type` into `Type::Variant` with preserved tags.
     #[test]
     fn coalesce_variant_roundtrips_to_type_variant() {
+        let solver = &mut Solver::new();
         let v = variant([
             ("Some", prim(BaseType::Int)),
             ("None", prim(BaseType::Unit)),
         ]);
-        let scheme = simplify_type(compact_type(&v));
-        let ty = coalesce_compact(&scheme).expect("coalesce ok");
+        let scheme = simplify_type(compact_type(solver, &v));
+        let ty = coalesce_compact(solver, &scheme).expect("coalesce ok");
         match ty {
             Type::Variant(tags, _) => {
                 let names: Vec<String> = tags.iter().map(|(n, _)| n.to_string()).collect();
@@ -1599,17 +1731,22 @@ mod tests {
     }
 
     /// The position where `parts` all contribute, at `polarity`.
-    fn position(polarity: bool, parts: &[Type]) -> CompactType {
-        parts
-            .iter()
-            .map(|t| compact_type(t).term)
-            .reduce(|a, b| CompactType::merge(polarity, a, b))
-            .expect("at least one contribution")
+    fn position(solver: &mut Solver, polarity: bool, parts: &[Type]) -> CompactType {
+        let mut out: Option<CompactType> = None;
+        for t in parts {
+            let term = compact_type(solver, t).term;
+            out = Some(match out {
+                Some(prev) => CompactType::merge(solver, polarity, prev, term),
+                None => term,
+            });
+        }
+        out.expect("at least one contribution")
     }
 
     /// A bounded parameter joined with a wider record widens to its bound.
     #[test]
     fn a_join_widens_a_bounded_parameter_to_its_bound() {
+        let solver = &mut Solver::new();
         let t = crate::ccl::ty::TypeParam::opened(
             "T",
             1,
@@ -1620,22 +1757,31 @@ mod tests {
             None,
         );
         let at = record(&[field("at", prim(BaseType::Int))]);
-        let ct = position(true, &[Type::Param(t), at.clone()]);
-        assert_eq!(coalesce_compact_go(&ct, true, &[]).unwrap(), at);
+        let ct = position(solver, true, &[Type::Param(t), at.clone()]);
+        assert_eq!(coalesce_compact_go(solver, &ct, true, &[]).unwrap(), at);
     }
 
     /// Under `U <: T`, the join of the two is `T` and the meet `U`.
     #[test]
     fn a_bound_chain_orders_two_parameters() {
+        let solver = &mut Solver::new();
         let t = crate::ccl::ty::TypeParam::opened("T", 1, None, None);
         let u = crate::ccl::ty::TypeParam::opened("U", 1, Some(Type::Param(Rc::clone(&t))), None);
         let parts = [Type::Param(Rc::clone(&t)), Type::Param(Rc::clone(&u))];
         assert_eq!(
-            coalesce_compact_go(&position(true, &parts), true, &[]).unwrap(),
+            {
+                let at = position(solver, true, &parts);
+                coalesce_compact_go(solver, &at, true, &[])
+            }
+            .unwrap(),
             Type::Param(t)
         );
         assert_eq!(
-            coalesce_compact_go(&position(false, &parts), false, &[]).unwrap(),
+            {
+                let at = position(solver, false, &parts);
+                coalesce_compact_go(solver, &at, false, &[])
+            }
+            .unwrap(),
             Type::Param(u)
         );
     }
@@ -1643,6 +1789,7 @@ mod tests {
     /// The meet of a parameter and a type its bound is below is the parameter.
     #[test]
     fn a_meet_keeps_a_parameter_whose_bound_is_below() {
+        let solver = &mut Solver::new();
         let t = crate::ccl::ty::TypeParam::opened(
             "T",
             1,
@@ -1653,9 +1800,9 @@ mod tests {
             None,
         );
         let at = record(&[field("at", prim(BaseType::Int))]);
-        let ct = position(false, &[Type::Param(Rc::clone(&t)), at]);
+        let ct = position(solver, false, &[Type::Param(Rc::clone(&t)), at]);
         assert_eq!(
-            coalesce_compact_go(&ct, false, &[]).unwrap(),
+            coalesce_compact_go(solver, &ct, false, &[]).unwrap(),
             Type::Param(t)
         );
     }
@@ -1664,10 +1811,15 @@ mod tests {
     /// narrowest range and the join the widest member.
     #[test]
     fn uint_and_ranges_settle_by_inclusion() {
+        let solver = &mut Solver::new();
         let uint = prim(BaseType::UInt);
         let (narrow, wide) = (Type::UIntRange(3), Type::UIntRange(4));
-        let settle = |polarity: bool, atoms: &[Type]| {
-            coalesce_compact_go(&position(polarity, atoms), polarity, &[]).unwrap()
+        let mut settle = |polarity: bool, atoms: &[Type]| {
+            {
+                let at = position(solver, polarity, atoms);
+                coalesce_compact_go(solver, &at, polarity, &[])
+            }
+            .unwrap()
         };
         assert_eq!(settle(false, &[uint.clone(), narrow.clone()]), narrow);
         assert_eq!(settle(true, &[uint.clone(), narrow.clone()]), uint);
@@ -1683,10 +1835,11 @@ mod tests {
     /// An unbounded parameter has no common type with anything else.
     #[test]
     fn an_unbounded_parameter_beside_a_type_collides() {
+        let solver = &mut Solver::new();
         let t = crate::ccl::ty::TypeParam::opened("T", 1, None, None);
-        let ct = position(true, &[Type::Param(t), prim(BaseType::Int)]);
+        let ct = position(solver, true, &[Type::Param(t), prim(BaseType::Int)]);
         assert!(matches!(
-            coalesce_compact_go(&ct, true, &[]),
+            coalesce_compact_go(solver, &ct, true, &[]),
             Err(CoalesceError::IncompatibleBounds { .. })
         ));
     }

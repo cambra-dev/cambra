@@ -4,6 +4,7 @@
 
 use crate::ccl::Label;
 use crate::ccl::infer::api::RelatedPositions;
+use crate::ccl::infer::solver::Solver;
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
@@ -209,12 +210,12 @@ impl CoalesceCtx {
 
     /// [`push_error`](Self::push_error) for a failure to resolve `ty`, recording the
     /// variables `ty` reaches against the node ([`CoalesceCtx::failed_type_vars`]).
-    fn push_type_error(&mut self, ty: &Type, error: InferError) {
+    fn push_type_error(&mut self, solver: &mut Solver, ty: &Type, error: InferError) {
         self.failed_type_vars
             .entry(self.current_node)
             .or_default()
-            .extend(reachable_vars(ty));
-        self.push_read_error(ty, error);
+            .extend(reachable_vars(solver, ty));
+        self.push_read_error(solver, ty, error);
     }
 
     /// The node `node` copies in the tree the walk started from: through each
@@ -239,12 +240,18 @@ impl CoalesceCtx {
     /// ([`meets_reported`]), and its node joins the reported error's
     /// [`LocatedInferError::also`]. Two positions that fail alike over different values are
     /// two defects, and each is reported.
-    fn push_read_error(&mut self, ty: &Type, error: InferError) {
-        self.push_position_error(failing_position(ty), error);
+    fn push_read_error(&mut self, solver: &mut Solver, ty: &Type, error: InferError) {
+        let failing = failing_position(solver, ty);
+        self.push_position_error(solver, failing, error);
     }
 
     /// [`push_read_error`](Self::push_read_error) for a failure at a known position.
-    fn push_position_error(&mut self, position: Option<FailedPosition>, error: InferError) {
+    fn push_position_error(
+        &mut self,
+        solver: &mut Solver,
+        position: Option<FailedPosition>,
+        error: InferError,
+    ) {
         let node = self.current_node;
         let Some(position) = position else {
             self.push_error(error);
@@ -266,7 +273,7 @@ impl CoalesceCtx {
         let contributions: Vec<_> = position
             .origins
             .contributions()
-            .map(|(at, ty)| (at, super::coalesce_for_error(ty)))
+            .map(|(at, ty)| (at, super::coalesce_for_error(solver, ty)))
             .collect();
         self.reported_at
             .entry(node)
@@ -390,10 +397,10 @@ struct ReadRecord {
 /// Verify every recorded read against the final graph. Later specialization pins must
 /// preserve the types the coalesce walk has already consumed.
 #[cfg(debug_assertions)]
-fn assert_reads_stable(reads: &[ReadRecord]) {
-    super::solver::compact::with_fixed_graph_compactions(|| {
+fn assert_reads_stable(solver: &mut Solver, reads: &[ReadRecord]) {
+    super::solver::compact::with_fixed_graph_compactions(solver, |solver| {
         for r in reads {
-            let now = resolve_var_type(&r.unresolved);
+            let now = resolve_var_type(solver, &r.unresolved);
             debug_assert!(
                 matches!(&now, Ok(t) if types_agree_modulo_unread(&r.resolved, t, r.purpose == ReadPurpose::Stamp)),
                 "ordering invariant (specialization may only add bounds to \
@@ -921,7 +928,7 @@ fn with_shadows<R>(
 /// Choice order and bound-resolution requirements are specified in
 /// `src/ccl/design/type-inference.md`, "An unobservable arm payload is pinned to
 /// what its uses require".
-fn pin_unobservable_arm_payload(p: &Pattern, ctx: &mut CoalesceCtx) -> bool {
+fn pin_unobservable_arm_payload(solver: &mut Solver, p: &Pattern, ctx: &mut CoalesceCtx) -> bool {
     // Unobservability is *transitive*: the variable's bound list is rarely empty
     // — the scrutinee constraint gives it the scrutinee's own per-tag variable as
     // a lower bound — and what matters is whether anything concrete reaches it
@@ -935,11 +942,11 @@ fn pin_unobservable_arm_payload(p: &Pattern, ctx: &mut CoalesceCtx) -> bool {
     // pin would skip the arm, and the arm's slot would record a type the merge
     // over the arms cannot see it contribute: the node ends up *narrower* than the
     // join, and the post-inference wall rejects a program that type-checks.
-    if value_reaches(&p.binding.ty) {
+    if value_reaches(solver, &p.binding.ty) {
         return false;
     }
-    let chosen = payload_pin(&p.binding.ty, ctx);
-    let pinned = pin_both_ways(&chosen, &p.binding.ty);
+    let chosen = payload_pin(solver, &p.binding.ty, ctx);
+    let pinned = pin_both_ways(solver, &chosen, &p.binding.ty);
     assert!(
         pinned.is_ok(),
         "pinning an unreachable payload variable cannot fail: its only bounds are \
@@ -956,7 +963,7 @@ fn pin_unobservable_arm_payload(p: &Pattern, ctx: &mut CoalesceCtx) -> bool {
 /// Emission must leave it open so later use sites can require a type other than `Unit`.
 /// Unlike an unreachable arm, a literal can have incompatible uses; report their conflict
 /// as a type error. See `src/ccl/design/collections.md`, "The empty literal names no element type".
-fn pin_empty_list_element(list_ty: &Type, ctx: &mut CoalesceCtx) {
+fn pin_empty_list_element(solver: &mut Solver, list_ty: &Type, ctx: &mut CoalesceCtx) {
     // `emit_list` builds a bare `Fun`, so this is an invariant and not a case: a list node
     // whose type grew a wrapper would stop being pinned, and every unannotated `[]` would
     // reach the wall as an unresolved variable with nothing pointing here.
@@ -967,11 +974,11 @@ fn pin_empty_list_element(list_ty: &Type, ctx: &mut CoalesceCtx) {
     let Type::Fun { codomain, .. } = list_ty else {
         return;
     };
-    if value_reaches(codomain) {
+    if value_reaches(solver, codomain) {
         return;
     }
-    let chosen = payload_pin(codomain, ctx);
-    let pinned = pin_both_ways(&chosen, codomain);
+    let chosen = payload_pin(solver, codomain, ctx);
+    let pinned = pin_both_ways(solver, &chosen, codomain);
     // **Reported, not asserted.** `position_type` takes the first answer, and the premise
     // that every other position still accepts it holds for the unreachable arm payload the
     // rule came from — one position, one demand. An empty literal is ordinary reachable
@@ -980,7 +987,7 @@ fn pin_empty_list_element(list_ty: &Type, ctx: &mut CoalesceCtx) {
     // (`an_empty_literal_read_at_two_types_is_a_type_error`).
     if let Err(err) = pinned {
         let label = "this empty collection".to_string();
-        ctx.push_error(map_constrain_err(err, &label));
+        ctx.push_error(map_constrain_err(solver, err, &label));
     }
 }
 
@@ -996,16 +1003,16 @@ fn pin_empty_list_element(list_ty: &Type, ctx: &mut CoalesceCtx) {
 /// Term nodes only: a refinement predicate rides a *type* slot, which this walk does not
 /// enter, so a predicate's copy keeps its own variables and is answered by whatever the
 /// original resolves to.
-fn pin_unreached_values(expr: &Expr, level: Level, ctx: &mut CoalesceCtx) {
+fn pin_unreached_values(solver: &mut Solver, expr: &Expr, level: Level, ctx: &mut CoalesceCtx) {
     if matches!(expr.node, TypedExprNode::Apply { .. }) {
         let prev = std::mem::replace(&mut ctx.current_node, expr.node_id());
-        pin_valueless_call(expr, ctx);
+        pin_valueless_call(solver, expr, ctx);
         ctx.current_node = prev;
     }
     match &expr.node {
         TypedExprNode::List(elts) if elts.is_empty() => {
             let prev = std::mem::replace(&mut ctx.current_node, expr.node_id());
-            pin_empty_list_element(&expr.ty, ctx);
+            pin_empty_list_element(solver, &expr.ty, ctx);
             ctx.current_node = prev;
         }
         // The scope lookup `should_generalize` takes answers only for a right-hand side
@@ -1013,23 +1020,23 @@ fn pin_unreached_values(expr: &Expr, level: Level, ctx: &mut CoalesceCtx) {
         TypedExprNode::Let {
             bound_expr, body, ..
         } => {
-            if should_generalize(bound_expr, level, |_| false) {
+            if should_generalize(solver, bound_expr, level, |_| false) {
                 #[cfg(debug_assertions)]
                 ctx.skipped_as_generalized.insert(bound_expr.node_id());
             } else {
-                pin_unreached_values(bound_expr, level + 1, ctx);
+                pin_unreached_values(solver, bound_expr, level + 1, ctx);
             }
-            pin_unreached_values(body, level, ctx);
+            pin_unreached_values(solver, body, level, ctx);
             return;
         }
         TypedExprNode::MutDecl { init, body, .. } => {
-            pin_unreached_values(init, level + 1, ctx);
-            pin_unreached_values(body, level, ctx);
+            pin_unreached_values(solver, init, level + 1, ctx);
+            pin_unreached_values(solver, body, level, ctx);
             return;
         }
         _ => {}
     }
-    expr.walk_children(|child| pin_unreached_values(child, level, ctx));
+    expr.walk_children(|child| pin_unreached_values(solver, child, level, ctx));
 }
 
 /// Pin the result of a call that may raise and that no value returns from, to the type of its
@@ -1037,51 +1044,55 @@ fn pin_unreached_values(expr: &Expr, level: Level, ctx: &mut CoalesceCtx) {
 /// (`docs/chl-spec.md`, "Exceptions"), and its type is what its uses require, as a `raise`'s
 /// is. `def g(x): raise x` returns its parameter `B`, which nothing below bounds at a use. See
 /// `src/ccl/design/type-inference.md`, "Pin sites".
-fn pin_valueless_call(call: &Expr, ctx: &mut CoalesceCtx) {
+fn pin_valueless_call(solver: &mut Solver, call: &Expr, ctx: &mut CoalesceCtx) {
     // `value_reaches` re-resolves the type, minting the predicate terms it rebuilds, so it is
     // asked last: a call that raises nothing mints no id here.
     if !matches!(call.ty, Type::Infer(_))
-        || !call.capabilities.set().may_raise()
-        || value_reaches(&call.ty)
+        || !call.capabilities.set_in(solver).may_raise(solver)
+        || value_reaches(solver, &call.ty)
     {
         return;
     }
-    let chosen = payload_pin(&call.ty, ctx);
-    if let Err(err) = pin_both_ways(&chosen, &call.ty) {
+    let chosen = payload_pin(solver, &call.ty, ctx);
+    if let Err(err) = pin_both_ways(solver, &chosen, &call.ty) {
         let label = "this call".to_string();
-        ctx.push_error(map_constrain_err(err, &label));
+        ctx.push_error(map_constrain_err(solver, err, &label));
     }
 }
 
 /// Pin a lambda's parameter when neither a value nor a demand reaches it, to the type of
 /// its position. With no answer the variable stays, for the post-inference check to
 /// report. See `src/ccl/design/type-inference.md`, "Pin sites".
-fn pin_unobservable_param(lambda_ty: &Type, ctx: &mut CoalesceCtx) {
+fn pin_unobservable_param(solver: &mut Solver, lambda_ty: &Type, ctx: &mut CoalesceCtx) {
     let Type::Fun { domain, .. } = lambda_ty.peel_refinements() else {
         return;
     };
     // Several parameters are the components of the domain, each one parameter's type.
     match domain.as_ref() {
-        Type::Tuple(ts) => ts.iter().for_each(|t| pin_unobservable_type(t, ctx)),
-        Type::DepTuple(cs) => cs.iter().for_each(|(_, t)| pin_unobservable_type(t, ctx)),
-        one => pin_unobservable_type(one, ctx),
+        Type::Tuple(ts) => ts
+            .iter()
+            .for_each(|t| pin_unobservable_type(solver, t, ctx)),
+        Type::DepTuple(cs) => cs
+            .iter()
+            .for_each(|(_, t)| pin_unobservable_type(solver, t, ctx)),
+        one => pin_unobservable_type(solver, one, ctx),
     }
 }
 
 /// [`pin_unobservable_param`] for one parameter's type `domain`.
-fn pin_unobservable_type(domain: &Type, ctx: &mut CoalesceCtx) {
+fn pin_unobservable_type(solver: &mut Solver, domain: &Type, ctx: &mut CoalesceCtx) {
     let Type::Infer(v) = domain else {
         return;
     };
-    if !matches!(resolve_var_type(domain), Ok(Type::Infer(_))) {
+    if !matches!(resolve_var_type(solver, domain), Ok(Type::Infer(_))) {
         return;
     }
-    let Some(chosen) = accepted_position_type(v, ctx) else {
+    let Some(chosen) = accepted_position_type(solver, v, ctx) else {
         return;
     };
-    if let Err(err) = pin_both_ways(&chosen, domain) {
+    if let Err(err) = pin_both_ways(solver, &chosen, domain) {
         let label = "this parameter".to_string();
-        ctx.push_error(map_constrain_err(err, &label));
+        ctx.push_error(map_constrain_err(solver, err, &label));
     }
 }
 
@@ -1091,7 +1102,7 @@ fn pin_unobservable_type(domain: &Type, ctx: &mut CoalesceCtx) {
 /// check to report
 /// (`docs/chl-spec.md`, "Type parameters"). See
 /// `src/ccl/design/type-inference.md`, "Pin sites".
-fn pin_unobservable_ctor_args(value_ty: &Type, ctx: &mut CoalesceCtx) {
+fn pin_unobservable_ctor_args(solver: &mut Solver, value_ty: &Type, ctx: &mut CoalesceCtx) {
     let Type::Nominal(decl, args) = value_ty.peel_refinements() else {
         return;
     };
@@ -1099,11 +1110,11 @@ fn pin_unobservable_ctor_args(value_ty: &Type, ctx: &mut CoalesceCtx) {
         let Type::Infer(v) = arg else {
             continue;
         };
-        if value_reaches(arg) {
+        if value_reaches(solver, arg) {
             continue;
         }
-        let chosen = match resolve_var_type(arg) {
-            Ok(Type::Infer(_)) => accepted_position_type(v, ctx),
+        let chosen = match resolve_var_type(solver, arg) {
+            Ok(Type::Infer(_)) => accepted_position_type(solver, v, ctx),
             // A demand alone determines the argument, and the walk reads it from that demand.
             // The pin makes the reading a value, so a join the argument flows into covers it:
             // `y.unwrap_or(2)` with `y = Option::none` and the result demanded `Int` reads
@@ -1114,9 +1125,9 @@ fn pin_unobservable_ctor_args(value_ty: &Type, ctx: &mut CoalesceCtx) {
         let Some(chosen) = chosen else {
             continue;
         };
-        if let Err(err) = pin_both_ways(&chosen, arg) {
+        if let Err(err) = pin_both_ways(solver, &chosen, arg) {
             let label = format!("an argument of `{}`", decl.name);
-            ctx.push_error(map_constrain_err(err, &label));
+            ctx.push_error(map_constrain_err(solver, err, &label));
         }
     }
 }
@@ -1125,14 +1136,14 @@ fn pin_unobservable_ctor_args(value_ty: &Type, ctx: &mut CoalesceCtx) {
 /// its position, else one its operator reads accept, else `Unit`. See
 /// `src/ccl/design/type-inference.md`, "An unobservable arm payload is pinned to what its
 /// uses require".
-fn payload_pin(payload: &Type, ctx: &mut CoalesceCtx) -> Type {
+fn payload_pin(solver: &mut Solver, payload: &Type, ctx: &mut CoalesceCtx) -> Type {
     let Type::Infer(v) = payload else {
         return Type::Base(crate::ccl::BaseType::Unit);
     };
-    if let Some(position) = accepted_position_type(v, ctx) {
+    if let Some(position) = accepted_position_type(solver, v, ctx) {
         return position;
     }
-    Type::Base(payload_trait_default(v))
+    Type::Base(payload_trait_default(solver, v))
 }
 
 /// [`position_type`], when the trait obligations on `v` accept it.
@@ -1143,11 +1154,12 @@ fn payload_pin(payload: &Type, ctx: &mut CoalesceCtx) -> Type {
 /// conflict between the variable's own reads and the type its context gives it; the site's
 /// fallback then stands, and the conflict surfaces where the two meet.
 fn accepted_position_type(
+    solver: &mut Solver,
     v: &Rc<crate::ccl::infer_var::InferVar>,
     ctx: &mut CoalesceCtx,
 ) -> Option<Type> {
-    let position = position_type(v, &mut ctx.occurrences)?;
-    if let Some(choices) = obligation_choices(v)
+    let position = position_type(solver, v, &mut ctx.occurrences)?;
+    if let Some(choices) = obligation_choices(solver, v)
         && !matches!(position.peel_refinements(), Type::Base(b) if choices.contains(b))
     {
         return None;
@@ -1160,12 +1172,13 @@ fn accepted_position_type(
 /// `var` is a position no value reaches, so `chosen` is checked against its bounds but not
 /// against its guarded bounds ([`ConstrainCache::without_guarded_checks`]).
 fn pin_both_ways(
+    solver: &mut Solver,
     chosen: &Type,
     var: &Type,
 ) -> Result<(), crate::ccl::infer::solver::ConstrainError> {
     let mut cache = ConstrainCache::new().without_guarded_checks();
-    constrain_subtype(chosen, var, &mut cache)
-        .and_then(|()| constrain_subtype(var, chosen, &mut cache))
+    constrain_subtype(solver, chosen, var, &mut cache)
+        .and_then(|()| constrain_subtype(solver, var, chosen, &mut cache))
 }
 
 /// One step from a type to a type it contains. A path of these is a position, read the
@@ -1261,6 +1274,7 @@ fn for_each_positioned_var(
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)
+        | Type::Undetermined(_)
         | Type::ChanDom(..)
         | Type::Txn
         | Type::Hole
@@ -1341,12 +1355,12 @@ impl OccurrenceIndex {
     }
 
     /// The occurrences of `v`, after sweeping whatever roots are pending.
-    fn of(&mut self, v: InferVarId) -> Vec<Occurrence> {
-        self.sweep();
+    fn of(&mut self, solver: &mut Solver, v: InferVarId) -> Vec<Occurrence> {
+        self.sweep(solver);
         self.occurrences.get(&v).cloned().unwrap_or_default()
     }
 
-    fn sweep(&mut self) {
+    fn sweep(&mut self, solver: &mut Solver) {
         let mut stack = std::mem::take(&mut self.pending);
         while let Some(ty) = stack.pop() {
             let mut found = Vec::new();
@@ -1356,11 +1370,11 @@ impl OccurrenceIndex {
                     continue;
                 }
                 let (lower, upper) = {
-                    let bounds = v.bounds.borrow();
+                    let bounds = v.bounds(solver);
                     (Rc::clone(bounds.lower()), Rc::clone(bounds.upper()))
                 };
                 for b in lower.iter() {
-                    let bound_ty = b.render_subst().apply_type(&b.ty);
+                    let bound_ty = b.render_subst(solver).apply_type_in(solver, &b.ty);
                     // A substitution that reaches a variable suspends it, so the rendered
                     // bound holds the suspension where the bound itself holds the variable.
                     // Both stand at the same position of the holder, so both occur there:
@@ -1394,12 +1408,13 @@ impl OccurrenceIndex {
 /// kind wins over the rest. See `src/ccl/design/type-inference.md`, "The type of a
 /// position".
 fn position_type(
+    solver: &mut Solver,
     v: &Rc<crate::ccl::infer_var::InferVar>,
     index: &mut OccurrenceIndex,
 ) -> Option<Type> {
     let mut partial = None;
     let mut question = PositionQuestion::default();
-    let full = position_type_go(v, index, &mut question, &mut partial);
+    let full = position_type_go(solver, v, index, &mut question, &mut partial);
     full.or(partial)
 }
 
@@ -1433,6 +1448,7 @@ enum PositionAnswer {
 /// still being asked about was cut short could differ on a path that reaches it after
 /// that variable is answered, so it is computed again there.
 fn position_type_go(
+    solver: &mut Solver,
     v: &Rc<crate::ccl::infer_var::InferVar>,
     index: &mut OccurrenceIndex,
     question: &mut PositionQuestion,
@@ -1448,7 +1464,7 @@ fn position_type_go(
             question.answers.insert(v.uid, PositionAnswer::Asking);
             let mark = question.cuts.len();
             let mut own_partial = None;
-            let full = position_answer(v, index, question, &mut own_partial);
+            let full = position_answer(solver, v, index, question, &mut own_partial);
             // A cycle back to `v` closes here; one through a variable asked about above
             // `v` is still open.
             let mut k = mark;
@@ -1484,6 +1500,7 @@ fn position_type_go(
 /// The answer [`position_type_go`] records for `v`, read from its upper bounds and the
 /// lower bounds it occurs in.
 fn position_answer(
+    solver: &mut Solver,
     v: &Rc<crate::ccl::infer_var::InferVar>,
     index: &mut OccurrenceIndex,
     question: &mut PositionQuestion,
@@ -1503,18 +1520,18 @@ fn position_answer(
     }
     // Cloned out of the `RefCell` before resolving: resolution reads bound lists across
     // the graph, and the pin's `constrain_subtype` takes them mutably.
-    let upper = Rc::clone(v.bounds.borrow().upper());
+    let upper = Rc::clone(v.bounds(solver).upper());
     for b in upper.iter() {
         // Each bound is resolved as its own position: `resolve_var_type` enters at that
         // type, so a collapse it causes happens there rather than along `v`'s chain.
-        let ty = b.render_subst().apply_type(&b.ty);
-        if let Ok(resolved) = resolve_var_type(&ty)
+        let ty = b.render_subst(solver).apply_type_in(solver, &b.ty);
+        if let Ok(resolved) = resolve_var_type(solver, &ty)
             && let Some(answer) = offer(&resolved, partial)
         {
             return Some(answer);
         }
         if let Type::Infer(u) = &ty
-            && let Some(answer) = position_type_go(u, index, question, partial)
+            && let Some(answer) = position_type_go(solver, u, index, question, partial)
         {
             return Some(answer);
         }
@@ -1522,21 +1539,21 @@ fn position_answer(
         // variable's as much as the suspension's, as in the occurrence index's sweep.
         if ty != b.ty
             && let Type::Infer(u) = &b.ty
-            && let Some(answer) = position_type_go(u, index, question, partial)
+            && let Some(answer) = position_type_go(solver, u, index, question, partial)
         {
             return Some(answer);
         }
     }
-    for Occurrence { holder, position } in index.of(v.uid) {
+    for Occurrence { holder, position } in index.of(solver, v.uid) {
         let holder_ty = Type::Infer(Rc::clone(&holder));
-        if let Ok(reading) = coalesce_positive(&holder_ty)
+        if let Ok(reading) = coalesce_positive(solver, &holder_ty)
             && let Some(at) = read_at(&reading, &position)
             && let Some(answer) = offer(at, partial)
         {
             return Some(answer);
         }
         let mut outer_partial = None;
-        let outer = position_type_go(&holder, index, question, &mut outer_partial);
+        let outer = position_type_go(solver, &holder, index, question, &mut outer_partial);
         for outer in outer.iter().chain(outer_partial.iter()) {
             if let Some(at) = read_at(outer, &position)
                 && let Some(answer) = offer(at, partial)
@@ -1550,26 +1567,31 @@ fn position_answer(
 
 /// The type an unreachable payload's *operator* reads accept — the trait half of
 /// [`payload_pin`].
-fn payload_trait_default(v: &crate::ccl::infer_var::InferVar) -> crate::ccl::BaseType {
+fn payload_trait_default(
+    solver: &mut Solver,
+    v: &crate::ccl::infer_var::InferVar,
+) -> crate::ccl::BaseType {
     // An empty intersection means the body's own requirements cannot be met together,
     // which is a real type error in the arm — one this function has no business
     // reporting. Leave `Unit` to fail the pin's assertion rather than inventing a type
     // that hides it.
-    obligation_choices(v)
+    obligation_choices(solver, v)
         .and_then(|choices| choices.first().cloned())
         .unwrap_or(crate::ccl::BaseType::Unit)
 }
 
 /// The bases every trait obligation on `v` still accepts, in instance-table order, or
 /// `None` when no obligation watches it.
-fn obligation_choices(v: &crate::ccl::infer_var::InferVar) -> Option<Vec<crate::ccl::BaseType>> {
+fn obligation_choices(
+    solver: &mut Solver,
+    v: &crate::ccl::infer_var::InferVar,
+) -> Option<Vec<crate::ccl::BaseType>> {
     // The obligations watching the payload, or any variable it flows into: an operand
     // variable an operator minted sits above the payload, as does a variable of a
     // generalized definition the payload reaches from an enclosing scope.
-    let mut watches = v.watches.borrow().clone();
+    let mut watches = v.watches(solver).to_vec();
     let mut pending: Vec<Rc<crate::ccl::infer_var::InferVar>> = v
-        .bounds
-        .borrow()
+        .bounds(solver)
         .upper()
         .iter()
         .filter_map(|b| match &b.ty {
@@ -1582,17 +1604,11 @@ fn obligation_choices(v: &crate::ccl::infer_var::InferVar) -> Option<Vec<crate::
         if !seen.insert(w.uid) {
             continue;
         }
-        watches.extend(w.watches.borrow().iter().cloned());
-        pending.extend(
-            w.bounds
-                .borrow()
-                .upper()
-                .iter()
-                .filter_map(|b| match &b.ty {
-                    Type::Infer(u) => Some(Rc::clone(u)),
-                    _ => None,
-                }),
-        );
+        watches.extend(w.watches(solver).iter().cloned());
+        pending.extend(w.bounds(solver).upper().iter().filter_map(|b| match &b.ty {
+            Type::Infer(u) => Some(Rc::clone(u)),
+            _ => None,
+        }));
     }
     // An obligation whose candidates take any type at the position restricts nothing there.
     watches.retain(|(obligation, pos)| !obligation.has_variable_at(*pos));
@@ -1618,6 +1634,7 @@ fn obligation_choices(v: &crate::ccl::infer_var::InferVar) -> Option<Vec<crate::
 /// ([`EdgeReport`]). One with none is a mismatch labeled `label`, a phrase for what the
 /// blamed node is.
 pub(super) fn push_barrier_failures(
+    solver: &mut Solver,
     errors: &mut Vec<LocatedInferError>,
     fallback: NodeId,
     label: &str,
@@ -1628,7 +1645,7 @@ pub(super) fn push_barrier_failures(
         Some(Origin::Node(node)) => node,
         Some(Origin::Written(_)) | None => fallback,
     };
-    for failure in solve_barrier_vars() {
+    for failure in solve_barrier_vars(solver) {
         match failure {
             BarrierFailure::Escape {
                 names,
@@ -1650,8 +1667,8 @@ pub(super) fn push_barrier_failures(
                 let node = blame(origin);
                 let error = match report.as_deref() {
                     Some(EdgeReport::Fixed(error)) => error.clone(),
-                    Some(EdgeReport::Labeled(at)) => map_constrain_err(error, at),
-                    None => map_constrain_err(error, label),
+                    Some(EdgeReport::Labeled(at)) => map_constrain_err(solver, error, at),
+                    None => map_constrain_err(solver, error, label),
                 };
                 errors.push(
                     LocatedInferError {
@@ -1668,6 +1685,7 @@ pub(super) fn push_barrier_failures(
 }
 
 pub(super) fn coalesce_pass(
+    solver: &mut Solver,
     expr: &mut Expr,
     bound_at_annotation: std::collections::HashSet<Name>,
     definition_telescopes: HashMap<Name, crate::ccl::infer_var::Telescope>,
@@ -1710,9 +1728,9 @@ pub(super) fn coalesce_pass(
     // inline `[]` reads the lambda's parameter before it ever sees the list. See
     // [`pin_empty_list_element`] for what the pin is and why it runs here.
     ctx.occurrences.add_roots(expr);
-    pin_unreached_values(expr, 0, &mut ctx);
-    coalesce_node(expr, 0, &mut ctx);
-    decide_suspended_memberships(expr.node_id(), &mut ctx);
+    pin_unreached_values(solver, expr, 0, &mut ctx);
+    coalesce_node(solver, expr, 0, &mut ctx);
+    decide_suspended_memberships(solver, expr.node_id(), &mut ctx);
     debug_assert!(
         ctx.scope.is_empty(),
         "coalesce scope must be balanced: every frame/shadow pushed during the \
@@ -1723,11 +1741,11 @@ pub(super) fn coalesce_pass(
     // not expected to be stable).
     #[cfg(debug_assertions)]
     if ctx.errors.is_empty() {
-        assert_reads_stable(&ctx.reads);
+        assert_reads_stable(solver, &ctx.reads);
     }
     // Every node's capabilities are known once inference ends, those of a node the walk
     // resolves no type at included.
-    settle_capabilities(expr);
+    settle_capabilities(solver, expr);
     ctx.errors
 }
 
@@ -1741,10 +1759,10 @@ pub(super) fn coalesce_pass(
 ///
 /// A run that fails before coalesce settles here too ([`super::run_once`]): the passes after a
 /// failed inference still read the tree.
-pub(super) fn settle_capabilities(expr: &mut Expr) {
+pub(super) fn settle_capabilities(solver: &mut Solver, expr: &mut Expr) {
     // Settling fills slots in place, so a copied predicate keeps its ids; the walk reaches every
     // occurrence of each, which replacing needs.
-    settle_capabilities_in(expr, &PredMemo::replacing());
+    settle_capabilities_in(solver, expr, &PredMemo::replacing());
     #[cfg(debug_assertions)]
     assert_capabilities_settled(expr);
 }
@@ -1777,26 +1795,163 @@ fn assert_capabilities_settled(expr: &Expr) {
 
 /// [`settle_capabilities`] sharing `memo` across the held terms it rewrites. Whether any slot
 /// changed.
-fn settle_capabilities_in(expr: &mut Expr, memo: &PredMemo) -> bool {
+fn settle_capabilities_in(solver: &mut Solver, expr: &mut Expr, memo: &PredMemo) -> bool {
     let mut changed = false;
     for slot in [&mut expr.capabilities, &mut expr.own_capabilities] {
         let set = match slot.repr() {
-            crate::ccl::capabilities::Repr::Var(v) => {
-                crate::ccl::capabilities::set_of(&v.resolved())
-            }
-            _ => slot.set(),
+            crate::ccl::capabilities::Repr::Var(v) => v.resolved_set(solver),
+            _ => slot.set_in(solver),
         };
-        let settled = crate::ccl::capabilities::Capabilities::known(set.with_raises_resolved());
+        let settled =
+            crate::ccl::capabilities::Capabilities::known(set.with_raises_resolved(solver));
         changed |= *slot != settled;
         *slot = settled;
     }
     expr.walk_type_slots_mut(|ty| {
         changed |= crate::ccl::ccl_utils::walk_held_terms_mut(ty, memo, &(), &mut |term, memo| {
-            settle_capabilities_in(term, memo)
+            settle_capabilities_in(solver, term, memo)
         });
     });
-    expr.walk_children_mut(|child| changed |= settle_capabilities_in(child, memo));
+    expr.walk_children_mut(|child| changed |= settle_capabilities_in(solver, child, memo));
     changed
+}
+
+/// What a run closes as it ends (`src/ccl/design/type-inference.md`, "A run closes what it
+/// hands back"): each inference variable left in what it hands back becomes the
+/// [`Type::Undetermined`] it stands for, and each funkind variable it minted an unowned one
+/// minted alike ([`crate::ccl::ty::FunKindVar::closed`]), one per variable. Closing reads
+/// nothing recorded on a variable: coalesce has decided every type a node holds, and an
+/// error's types are reported as found.
+#[derive(Default)]
+pub(super) struct Closer {
+    kinds: HashMap<crate::ccl::ty::FunKindVarId, Rc<crate::ccl::ty::FunKindVar>>,
+    /// The id each barrier variable closes to, minted for it.
+    barriers: HashMap<crate::ccl::BarrierVarId, InferVarId>,
+    /// How many variables this closing has closed.
+    closed: usize,
+}
+
+impl Closer {
+    /// Close `ty` in place, the terms it holds included.
+    pub(super) fn ty(&mut self, ty: &mut Type, memo: &PredMemo) {
+        match ty {
+            Type::Infer(v) => {
+                *ty = Type::Undetermined(v.uid);
+                self.closed += 1;
+                return;
+            }
+            Type::BarrierVar(b) => {
+                let id = *self
+                    .barriers
+                    .entry(b.uid)
+                    .or_insert_with(crate::ccl::infer_var::next_infer_var_id);
+                *ty = Type::Undetermined(id);
+                self.closed += 1;
+                return;
+            }
+            Type::Fun {
+                fun_kind,
+                capabilities,
+                ..
+            } => {
+                if let crate::ccl::ty::FunKind::Var(k) = fun_kind {
+                    *fun_kind = crate::ccl::ty::FunKind::Var(self.kind(k));
+                }
+                self.capabilities(capabilities, memo);
+            }
+            // A held term is rebuilt only where closing changes it, so one that holds no
+            // variable of the run keeps its allocation, and no copy of it with its ids lives
+            // beside it.
+            Type::Refinement(_, refinements) => refinements.rewrite_each(|_, refinement| {
+                memo.rebuild(refinement, &(), |pred| {
+                    self.closes(|closer| closer.expr(pred, memo))
+                });
+            }),
+            _ => {
+                for held in ty.held_terms_mut() {
+                    memo.rebuild(held, &(), |term| {
+                        self.closes(|closer| closer.expr(term, memo))
+                    });
+                }
+            }
+        }
+        ty.walk_children_mut(|child| self.ty(child, memo));
+    }
+
+    /// Whether `f` closed any variable.
+    fn closes(&mut self, f: impl FnOnce(&mut Self)) -> bool {
+        let before = self.closed;
+        f(self);
+        self.closed != before
+    }
+
+    /// Whether this closing has closed any variable.
+    pub(super) fn closed_any(&self) -> bool {
+        self.closed > 0
+    }
+
+    /// A funkind variable's closed copy: itself where no run minted it.
+    fn kind(&mut self, k: &Rc<crate::ccl::ty::FunKindVar>) -> Rc<crate::ccl::ty::FunKindVar> {
+        if k.home().is_none() {
+            return Rc::clone(k);
+        }
+        self.closed += 1;
+        Rc::clone(self.kinds.entry(k.uid).or_insert_with(|| k.closed()))
+    }
+
+    /// Close the types a known capability set holds: what it raises.
+    fn capabilities(
+        &mut self,
+        capabilities: &mut crate::ccl::capabilities::Capabilities,
+        memo: &PredMemo,
+    ) {
+        use crate::ccl::capabilities::{Capabilities, Effect, Repr};
+        let Repr::Known(set) = capabilities.repr() else {
+            return;
+        };
+        if !set.causes.iter().any(|e| matches!(e, Effect::Raise(_))) {
+            return;
+        }
+        let mut set = set.clone();
+        let before = self.closed;
+        set.causes = std::mem::take(&mut set.causes)
+            .into_iter()
+            .map(|e| match e {
+                Effect::Raise(mut raised) => {
+                    self.ty(&mut raised.ty, memo);
+                    Effect::Raise(raised)
+                }
+                e => e,
+            })
+            .collect();
+        if self.closed != before {
+            *capabilities = Capabilities::known(set);
+        }
+    }
+
+    /// Close every type slot and capability slot of `expr` and of each term under it.
+    pub(super) fn expr(&mut self, expr: &mut Expr, memo: &PredMemo) {
+        for slot in [&mut expr.capabilities, &mut expr.own_capabilities] {
+            self.capabilities(slot, memo);
+        }
+        expr.walk_type_slots_mut(|ty| self.ty(ty, memo));
+        expr.walk_children_mut(|child| self.expr(child, memo));
+    }
+
+    /// Close each type and term `error` holds, its labels' included.
+    pub(super) fn error(&mut self, error: &mut LocatedInferError, memo: &PredMemo) {
+        error.map_types(&mut |ty| {
+            let mut ty = ty.clone();
+            self.ty(&mut ty, memo);
+            ty
+        });
+        if let InferError::NoJoinOverBinder { predicate, .. } = &mut error.error {
+            let mut term = predicate.clone_preserving_ids();
+            if self.closes(|closer| closer.expr(&mut term, memo)) {
+                *predicate = Rc::new(term);
+            }
+        }
+    }
 }
 
 /// Check term and witness references in each node's type against its enclosing scope.
@@ -1936,7 +2091,7 @@ fn never_has_value(e: &Expr) -> bool {
 /// emission gave it: no value reaches it, so it is what its position expects, the bound the
 /// join or the use above it puts on it, or `Unit` where nothing does, as for a `raise`
 /// standing as a statement.
-fn stands_at(ty: &Type) -> Type {
+fn stands_at(solver: &mut Solver, ty: &Type) -> Type {
     // The bound above may be another node with no value, a `try` whose every path raises
     // inside one that has a value: its own bound is what both stand at.
     let mut current = ty.clone();
@@ -1945,10 +2100,10 @@ fn stands_at(ty: &Type) -> Type {
         if !seen.insert(v.uid) {
             break;
         }
-        let Some(upper) = v.bounds.borrow().upper().first().map(|b| b.ty.clone()) else {
+        let Some(upper) = v.bounds(solver).upper().first().map(|b| b.ty.clone()) else {
             break;
         };
-        if let Ok(resolved) = resolve_var_type(&upper)
+        if let Ok(resolved) = resolve_var_type(solver, &upper)
             && !crate::ccl::subst::type_contains_infer(&resolved)
         {
             return resolved;
@@ -1958,7 +2113,7 @@ fn stands_at(ty: &Type) -> Type {
     Type::Base(crate::ccl::BaseType::Unit)
 }
 
-pub(crate) fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
+pub(crate) fn resolve_var_type(solver: &mut Solver, ty: &Type) -> Result<Type, CoalesceError> {
     // A generalized type is born after inference, resolved: the solver has nothing to say about it
     // (`src/ccl/design/type-parameters.md`, "Generalized types").
     if crate::ccl::generalize::holds_generalized_type(ty)
@@ -1966,9 +2121,14 @@ pub(crate) fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
     {
         return Ok(ty.clone());
     }
-    let compacted = compact_type(ty);
-    crate::ccl::infer::solver::coalesce::refuse_param_joined_with_outer_variable(&compacted)?;
-    let resolved = coalesce_compact(&simplify_type::simplify_type_for_resolution(compacted))?;
+    let compacted = compact_type(solver, ty);
+    crate::ccl::infer::solver::coalesce::refuse_param_joined_with_outer_variable(
+        solver, &compacted,
+    )?;
+    let resolved = coalesce_compact(
+        solver,
+        &simplify_type::simplify_type_for_resolution(compacted),
+    )?;
     #[cfg(debug_assertions)]
     if let Type::Infer(v) = ty {
         assert_resolves_in_scope(v, &resolved);
@@ -1981,12 +2141,13 @@ pub(crate) fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
 /// [`resolve_var_type`] coalesces the simplified graph, and simplification drops variables
 /// from positions. It drops no contribution, so the unsimplified graph fails at the same
 /// position, which still lists them.
-fn failing_position(ty: &Type) -> Option<FailedPosition> {
-    let compacted = compact_type(ty);
-    let error =
-        crate::ccl::infer::solver::coalesce::refuse_param_joined_with_outer_variable(&compacted)
-            .and_then(|()| coalesce_compact(&compacted).map(drop))
-            .err()?;
+fn failing_position(solver: &mut Solver, ty: &Type) -> Option<FailedPosition> {
+    let compacted = compact_type(solver, ty);
+    let error = crate::ccl::infer::solver::coalesce::refuse_param_joined_with_outer_variable(
+        solver, &compacted,
+    )
+    .and_then(|()| coalesce_compact(solver, &compacted).map(drop))
+    .err()?;
     error.position().cloned()
 }
 
@@ -2040,9 +2201,13 @@ fn assert_resolves_in_scope(v: &crate::ccl::InferVar, resolved: &Type) {
 /// Checked here rather than inside the pin because it reads the scrutinee's resolved
 /// tags, and the pin precedes the scrutinee's walk.
 #[cfg(debug_assertions)]
-fn assert_pinned_tags_are_unreachable(scrutinee: Option<&Expr>, pinned_tags: &[Label]) {
+fn assert_pinned_tags_are_unreachable(
+    solver: &mut Solver,
+    scrutinee: Option<&Expr>,
+    pinned_tags: &[Label],
+) {
     let Some(Type::Variant(tags, _)) =
-        scrutinee.map(|s| crate::ccl::ccl_utils::strip_refinements(&s.ty))
+        scrutinee.map(|s| crate::ccl::ccl_utils::strip_refinements_in(solver, &s.ty))
     else {
         return;
     };
@@ -2058,7 +2223,12 @@ fn assert_pinned_tags_are_unreachable(scrutinee: Option<&Expr>, pinned_tags: &[L
 }
 
 #[cfg(not(debug_assertions))]
-fn assert_pinned_tags_are_unreachable(_scrutinee: Option<&Expr>, _pinned_tags: &[Label]) {}
+fn assert_pinned_tags_are_unreachable(
+    _solver: &mut Solver,
+    _scrutinee: Option<&Expr>,
+    _pinned_tags: &[Label],
+) {
+}
 
 /// Whether a **value** has reached `ty` — as opposed to merely something
 /// determining what it must be.
@@ -2072,8 +2242,8 @@ fn assert_pinned_tags_are_unreachable(_scrutinee: Option<&Expr>, _pinned_tags: &
 ///
 /// So this asks the polarity-correct walk alone
 /// ([`compact_type_polarity_only`]): a bare variable means nothing flowed here.
-fn value_reaches(ty: &Type) -> bool {
-    !matches!(coalesce_positive(ty), Ok(Type::Infer(_)))
+fn value_reaches(solver: &mut Solver, ty: &Type) -> bool {
+    !matches!(coalesce_positive(solver, ty), Ok(Type::Infer(_)))
 }
 
 /// Whether `ty`, a type read by the values that reached it ([`coalesce_positive`]), holds a
@@ -2098,8 +2268,9 @@ fn has_output_variable(ty: &Type, pol: bool) -> bool {
 
 /// [`resolve_var_type`] with the opposite-polarity fallback suppressed — what a
 /// value has made of `ty`, never what something demanded of it.
-fn coalesce_positive(ty: &Type) -> Result<Type, CoalesceError> {
-    coalesce_compact(&simplify_type(compact_type_polarity_only(ty)))
+fn coalesce_positive(solver: &mut Solver, ty: &Type) -> Result<Type, CoalesceError> {
+    let compacted = compact_type_polarity_only(solver, ty);
+    coalesce_compact(solver, &simplify_type(compacted))
 }
 
 /// The type a value has given `ty`, or `None` when nothing has flowed there and
@@ -2110,8 +2281,8 @@ fn coalesce_positive(ty: &Type) -> Result<Type, CoalesceError> {
 /// positive reading is the load-bearing part: a binder's slot also carries what
 /// its uses demanded of it, and assuming a demand would let an entailment prove
 /// itself from the very thing it was asked to establish.
-pub(super) fn value_type(ty: &Type) -> Option<Type> {
-    match coalesce_positive(ty) {
+pub(super) fn value_type(solver: &mut Solver, ty: &Type) -> Option<Type> {
+    match coalesce_positive(solver, ty) {
         Ok(Type::Infer(_)) | Err(_) => None,
         Ok(resolved) => Some(resolved),
     }
@@ -2132,35 +2303,39 @@ pub(super) fn value_type(ty: &Type) -> Option<Type> {
 /// binder (a *value* binding — one that is not generalized, so no
 /// [`specialize_use`] re-coalesce reaches it).
 fn resolve_binder_slot(
+    solver: &mut Solver,
     slot: &mut Type,
     label: impl FnOnce() -> String,
     level: Level,
     ctx: &mut CoalesceCtx,
 ) {
-    let (resolved, pending) =
-        crate::ccl::infer::solver::coalesce::collecting_memberships(|| resolve_var_type(slot));
+    let (resolved, pending) = crate::ccl::infer::solver::coalesce::collecting_memberships(|| {
+        resolve_var_type(solver, slot)
+    });
     let label = label();
     match resolved {
         Ok(ty) => *slot = ty,
         Err(err) => {
-            ctx.push_type_error(slot, map_coalesce_err(err, &label));
+            ctx.push_type_error(solver, slot, map_coalesce_err(err, &label));
         }
     }
-    coalesce_type_predicates(slot, level, ctx);
-    decide_memberships(pending, level, ctx, &label);
+    coalesce_type_predicates(solver, slot, level, ctx);
+    decide_memberships(solver, pending, level, ctx, &label);
 }
 
 /// Decide the memberships a materialization collected, now that the types they read are types
 /// with their predicates coalesced, under the binders in scope here.
 fn decide_memberships(
+    solver: &mut Solver,
     pending: Vec<crate::ccl::infer::solver::coalesce::PendingMembership>,
     level: Level,
     ctx: &mut CoalesceCtx,
     label: &str,
 ) {
     for mut m in pending {
-        coalesce_type_predicates(&mut m.found, level, ctx);
+        coalesce_type_predicates(solver, &mut m.found, level, ctx);
         let admitted = crate::ccl::infer::solver::constrain::admits_resolved(
+            solver,
             &m.found,
             &m.kind,
             &m.witnesses,
@@ -2174,8 +2349,8 @@ fn decide_memberships(
             ctx.failed_type_vars
                 .entry(ctx.current_node)
                 .or_default()
-                .extend(reachable_vars(&m.found));
-            ctx.push_position_error(Some(m.position), map_coalesce_err(err, label));
+                .extend(reachable_vars(solver, &m.found));
+            ctx.push_position_error(solver, Some(m.position), map_coalesce_err(err, label));
         }
     }
 }
@@ -2185,8 +2360,8 @@ fn decide_memberships(
 /// as one: a candidate naming a binder its edge joins widens to every subtype of the rest
 /// (`src/ccl/design/type-inference.md`, "A contribution crosses the binders after its target"),
 /// and the question is whether the sum's resolved kind is contained in the one recorded.
-fn decide_suspended_memberships(root: NodeId, ctx: &mut CoalesceCtx) {
-    for m in crate::ccl::infer_var::take_suspended_memberships() {
+fn decide_suspended_memberships(solver: &mut Solver, root: NodeId, ctx: &mut CoalesceCtx) {
+    for m in crate::ccl::infer_var::take_suspended_memberships(solver) {
         let sum = Type::sum_over(
             crate::ccl::ty::TypeKind::Enumerated(vec![Type::Infer(Rc::clone(&m.var))]),
             None,
@@ -2197,16 +2372,17 @@ fn decide_suspended_memberships(root: NodeId, ctx: &mut CoalesceCtx) {
             _ => root,
         };
         let label = "a membership recorded on a suspension".to_string();
-        let (resolved, _) =
-            crate::ccl::infer::solver::coalesce::collecting_memberships(|| resolve_var_type(&sum));
+        let (resolved, _) = crate::ccl::infer::solver::coalesce::collecting_memberships(|| {
+            resolve_var_type(solver, &sum)
+        });
         let mut sum = match resolved {
             Ok(sum) => sum,
             Err(err) => {
-                ctx.push_type_error(&sum, map_coalesce_err(err, &label));
+                ctx.push_type_error(solver, &sum, map_coalesce_err(err, &label));
                 continue;
             }
         };
-        coalesce_type_predicates(&mut sum, 0, ctx);
+        coalesce_type_predicates(solver, &mut sum, 0, ctx);
         let Type::Fun {
             fun_kind: crate::ccl::FunKind::Data(Some(witnesses)),
             ..
@@ -2216,6 +2392,7 @@ fn decide_suspended_memberships(root: NodeId, ctx: &mut CoalesceCtx) {
         };
         let found = witnesses[0].type_kind();
         if crate::ccl::infer::solver::constrain::contains_resolved(
+            solver,
             &found,
             &m.kind,
             m.witnesses.witnesses(),
@@ -2230,7 +2407,7 @@ fn decide_suspended_memberships(root: NodeId, ctx: &mut CoalesceCtx) {
             resolved: Box::new(resolved.clone()),
             type_kind: m.kind,
         };
-        ctx.push_type_error(&resolved, map_coalesce_err(err, &label));
+        ctx.push_type_error(solver, &resolved, map_coalesce_err(err, &label));
     }
 }
 
@@ -2240,9 +2417,9 @@ fn decide_suspended_memberships(root: NodeId, ctx: &mut CoalesceCtx) {
 struct ResolvingScope<'a>(&'a crate::ccl::infer::solver::smt::BinderScope);
 
 impl crate::ccl::infer::solver::smt::ScopeEnv for ResolvingScope<'_> {
-    fn binder_type(&self, name: &Name) -> Option<Type> {
-        let ty = self.0.binder_type(name)?;
-        Some(resolve_var_type(&ty).unwrap_or(ty))
+    fn binder_type(&self, solver: &mut Solver, name: &Name) -> Option<Type> {
+        let ty = self.0.binder_type(solver, name)?;
+        Some(resolve_var_type(solver, &ty).unwrap_or(ty))
     }
     fn facts(&self) -> Vec<Expr> {
         self.0.facts()
@@ -2261,7 +2438,7 @@ impl crate::ccl::infer::solver::smt::ScopeEnv for ResolvingScope<'_> {
 /// Binder slots and predicates require explicit visits beyond expression children.
 /// Let RHSs and mutable initializers retain emission's one-level increment.
 /// See `src/ccl/design/type-inference.md`, "Binder-slot resolution".
-fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
+fn coalesce_node(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // Mark this node as the one whose rule is running, so `push_error` stamps
     // its errors with it; restored on exit. An inner rule overwrites the mark
     // for its own extent, so an error is blamed on the node that raised it
@@ -2270,27 +2447,27 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // One stack frame per node over the whole tree; grow on demand, as the other
     // pass-level walks do.
     stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
-        coalesce_node_inner(expr, level, ctx)
+        coalesce_node_inner(solver, expr, level, ctx)
     });
     ctx.current_node = prev;
 }
 
 /// The body of [`coalesce_node`]; see the wrapper for the per-error blame
 /// bookkeeping it is wrapped in.
-fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
+fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // `c ▷ Iterable::elements` over a structural collection is `c`: the collection rule
     // answered its obligation, so the collection is its own `Elements` and `elements` the
     // identity (`src/ccl/design/type-inference.md`, "A collection is answered off the
     // table"). The call goes before anything reads it, here and in each copy a predicate
     // holds, so no pass after inference meets it.
     if !ctx.discarding
-        && let Some(collection) = elements_of_a_collection(expr)
+        && let Some(collection) = elements_of_a_collection(solver, expr)
     {
         *expr = collection;
-        return coalesce_node_inner(expr, level, ctx);
+        return coalesce_node_inner(solver, expr, level, ctx);
     }
     if !ctx.discarding {
-        dispatch_operator(expr, ctx);
+        dispatch_operator(solver, expr, ctx);
     }
     // A trait function's call answered by an instance whose `def`s implement it becomes a use of
     // the function the instance's `def` binds, before anything reads the node: the use then
@@ -2299,7 +2476,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // each use's clone chooses at its own types.
     let mut instance_call = false;
     if matches!(expr.node, TypedExprNode::TraitFn { .. }) && !ctx.discarding {
-        match matching_instance(expr, ctx) {
+        match matching_instance(solver, expr, ctx) {
             Err(error) => {
                 ctx.push_error(error);
                 return;
@@ -2340,18 +2517,18 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     if let TypedExprNode::Var(name) = &expr.node
         && let Some(frame_idx) = lookup_generalized(&ctx.scope, name)
     {
-        specialize_use(expr, frame_idx, instance_call, ctx);
+        specialize_use(solver, expr, frame_idx, instance_call, ctx);
         return;
     }
     // A generalized `let` rebuilds itself around its body's demanded
     // specializations; its node type and binder slots are set there, so the
     // generic tail is skipped likewise.
     if let TypedExprNode::Let { bound_expr, .. } = &expr.node
-        && should_generalize(bound_expr, level, |name| {
+        && should_generalize(solver, bound_expr, level, |name| {
             lookup_generalized(&ctx.scope, name).is_some()
         })
     {
-        coalesce_generalized_let(expr, level, ctx);
+        coalesce_generalized_let(solver, expr, level, ctx);
         return;
     }
 
@@ -2379,8 +2556,8 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // Specialization can deposit demands on the argument's variables.
             // Read the argument only after those pins; see
             // `src/ccl/design/type-inference.md`, "Coalesce ordering and read stability".
-            coalesce_node(function, level, ctx);
-            coalesce_node(argument, level, ctx);
+            coalesce_node(solver, function, level, ctx);
+            coalesce_node(solver, argument, level, ctx);
             // A projection requirement does not determine its input's width.
             // Use the resolved argument; predicates reach this same branch.
             // See `src/ccl/design/type-inference.md`,
@@ -2398,20 +2575,20 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         // base, which is the one after [`canonical_cast_types`] has put the view's bases on
         // both slots.
         TypedExprNode::Cast { value, .. } => {
-            coalesce_node(value, level, ctx);
+            coalesce_node(solver, value, level, ctx);
         }
         TypedExprNode::BinOp { left, right, .. } => {
-            coalesce_node(left, level, ctx);
-            coalesce_node(right, level, ctx);
+            coalesce_node(solver, left, level, ctx);
+            coalesce_node(solver, right, level, ctx);
         }
         TypedExprNode::UnaryOp(_, inner) | TypedExprNode::Borrow(inner) => {
-            coalesce_node(inner, level, ctx)
+            coalesce_node(solver, inner, level, ctx)
         }
         TypedExprNode::Lambda { params, body } => {
             // Before the body reads the parameters. In a walk whose types are dropped, an
             // unbounded parameter is the definition's own, and the uses supply it.
             if !ctx.discarding {
-                pin_unobservable_param(&expr.ty, ctx);
+                pin_unobservable_param(solver, &expr.ty, ctx);
             }
             let names: Vec<Name> = params.iter().map(|p| p.name.clone()).collect();
             ctx.lambda_params.extend(names.iter().cloned());
@@ -2422,9 +2599,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 ctx.binders.push(&param.name, param.ty.clone());
             }
             with_shadows(ctx, names.iter().cloned(), |ctx| {
-                coalesce_node(body, level, ctx)
+                coalesce_node(solver, body, level, ctx)
             });
-            splice_placed(ctx, &names, body);
+            splice_placed(solver, ctx, &names, body);
             for _ in &names {
                 ctx.binders.pop();
                 ctx.lambda_params.pop();
@@ -2436,7 +2613,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // position of `expr.ty`). Domain-refinement predicates ride
             // `expr.ty` and are coalesced with it.
         }
-        TypedExprNode::Aggregate { input, .. } => coalesce_node(input, level, ctx),
+        TypedExprNode::Aggregate { input, .. } => coalesce_node(solver, input, level, ctx),
         TypedExprNode::Let {
             binding,
             bound_expr,
@@ -2454,7 +2631,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                  agree on `should_generalize`"
             );
             ctx.defining.push(binding.name.clone());
-            coalesce_node(bound_expr, level + 1, ctx);
+            coalesce_node(solver, bound_expr, level + 1, ctx);
             ctx.defining.pop();
             // Binder slot: resolve the type `emit_let` bound the variable at,
             // in place. The bottom-up `expr.ty` resolution doesn't reach this
@@ -2469,6 +2646,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // binds at the place type where the RHS is a value.
             let name = binding.name.clone();
             resolve_binder_slot(
+                solver,
                 &mut binding.ty,
                 || format!("let binding `{name}`"),
                 level,
@@ -2477,9 +2655,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             let binding_name = binding.name.clone();
             ctx.binders.push_let(binding, bound_expr);
             with_shadows(ctx, [binding_name.clone()], |ctx| {
-                coalesce_node(body, level, ctx)
+                coalesce_node(solver, body, level, ctx)
             });
-            splice_placed(ctx, &[binding_name], body);
+            splice_placed(solver, ctx, &[binding_name], body);
             ctx.binders.pop();
         }
         TypedExprNode::LetType { .. } => {
@@ -2495,15 +2673,21 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             init,
             body,
         } => {
-            coalesce_node(init, level + 1, ctx);
+            coalesce_node(solver, init, level + 1, ctx);
             let name = binding.name.clone();
-            resolve_binder_slot(&mut binding.ty, || format!("mutable `{name}`"), level, ctx);
+            resolve_binder_slot(
+                solver,
+                &mut binding.ty,
+                || format!("mutable `{name}`"),
+                level,
+                ctx,
+            );
             let binding_name = binding.name.clone();
             ctx.binders.push(&binding_name, binding.ty.clone());
             with_shadows(ctx, [binding_name.clone()], |ctx| {
-                coalesce_node(body, level, ctx)
+                coalesce_node(solver, body, level, ctx)
             });
-            splice_placed(ctx, &[binding_name], body);
+            splice_placed(solver, ctx, &[binding_name], body);
             ctx.binders.pop();
         }
         TypedExprNode::List(elts)
@@ -2513,12 +2697,12 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         | TypedExprNode::DisjointJoin(elts)
         | TypedExprNode::Realized { legs: elts, .. } => {
             for e in elts.iter_mut() {
-                coalesce_node(e, level, ctx);
+                coalesce_node(solver, e, level, ctx);
             }
         }
         TypedExprNode::Compose(elts) => {
             for e in elts.iter_mut() {
-                coalesce_node(e, level, ctx);
+                coalesce_node(solver, e, level, ctx);
             }
             // A direct projection's requirement can omit untouched input fields.
             // Specialize its domain from the preceding resolved codomain, then
@@ -2549,7 +2733,8 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 let Some(prev_cod) = elts[i - 1].ty.peel_refinements().codomain() else {
                     continue;
                 };
-                let prev_cod = crate::ccl::subst::open_codomain(&elts[i - 1].ty, &prev_cod);
+                let prev_cod =
+                    crate::ccl::subst::open_codomain_in(solver, &elts[i - 1].ty, &prev_cod);
                 specialize_projection_domain(&mut elts[i], &prev_cod);
             }
             if let (Some(first), Some(last)) = (elts.first(), elts.last())
@@ -2572,6 +2757,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 // prefix maps each position to itself. Rebuilt with a bare function type, the
                 // codomain's reference to that binder would be left with none.
                 expr.ty = crate::ccl::ccl_utils::chain_type_of(
+                    solver,
                     elts,
                     Type::Fun {
                         // The chain's own input binder where a morphism's type reads it,
@@ -2594,23 +2780,25 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         }
         TypedExprNode::Record(fs) => {
             for entry in fs.iter_mut() {
-                coalesce_node(&mut entry.value, level, ctx);
+                coalesce_node(solver, &mut entry.value, level, ctx);
             }
         }
-        TypedExprNode::Raise { value } => coalesce_node(value, level, ctx),
+        TypedExprNode::Raise { value } => coalesce_node(solver, value, level, ctx),
         TypedExprNode::Try { body, handlers } => {
-            coalesce_node(body, level, ctx);
+            coalesce_node(solver, body, level, ctx);
             for h in handlers.iter_mut() {
                 with_shadows(ctx, Some(h.binding.name.clone()), |ctx| {
-                    coalesce_node(&mut h.body, level, ctx);
+                    coalesce_node(solver, &mut h.body, level, ctx);
                 });
                 resolve_binder_slot(
+                    solver,
                     &mut h.binding.ty,
                     || "except clause's exception".to_string(),
                     level,
                     ctx,
                 );
                 resolve_binder_slot(
+                    solver,
                     &mut h.catches,
                     || "except clause's type".to_string(),
                     level,
@@ -2639,21 +2827,24 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // an arm with no value at its payload is not unreachable: its payload is
             // a parameter of the definition, and pinning it would decide a type no
             // use chose.
-            let pin = !ctx.discarding || scrutinee.as_ref().is_some_and(|s| value_reaches(&s.ty));
+            let pin = !ctx.discarding
+                || scrutinee
+                    .as_ref()
+                    .is_some_and(|s| value_reaches(solver, &s.ty));
             let pinned_tags: Vec<Label> = branches
                 .iter()
                 .filter_map(|b| b.pattern.as_ref())
-                .filter(|p| pin && pin_unobservable_arm_payload(p, ctx))
+                .filter(|p| pin && pin_unobservable_arm_payload(solver, p, ctx))
                 .map(|p| p.tag())
                 .collect();
             if let Some(s) = scrutinee {
-                coalesce_node(s, level, ctx);
+                coalesce_node(solver, s, level, ctx);
             }
-            assert_pinned_tags_are_unreachable(scrutinee.as_deref(), &pinned_tags);
+            assert_pinned_tags_are_unreachable(solver, scrutinee.as_deref(), &pinned_tags);
             // An arm knows which constructor built the value it matched, and a default arm
             // which ones did not (`src/ccl/design/type-inference.md`, "Arm facts").
             let case_facts = match scrutinee.as_deref() {
-                Some(s) => crate::ccl::nominal::typed_case_facts(s, branches),
+                Some(s) => crate::ccl::nominal::typed_case_facts(solver, s, branches),
                 None => std::iter::repeat_with(Vec::new)
                     .take(branches.len())
                     .collect(),
@@ -2665,8 +2856,8 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 let depth = ctx.binders.facts_len();
                 ctx.binders.extend_facts(facts);
                 with_shadows(ctx, pattern_name.clone(), |ctx| {
-                    coalesce_node(&mut b.guard, level, ctx);
-                    coalesce_node(&mut b.body, level, ctx);
+                    coalesce_node(solver, &mut b.guard, level, ctx);
+                    coalesce_node(solver, &mut b.body, level, ctx);
                 });
                 ctx.binders.truncate_facts(depth);
                 assert_none_placed(ctx, pattern_name.as_slice(), "pattern");
@@ -2677,6 +2868,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 if let Some(p) = &mut b.pattern {
                     let tag = p.tag().to_string();
                     resolve_binder_slot(
+                        solver,
                         &mut p.binding.ty,
                         || format!("Case pattern `.{tag}` payload"),
                         level,
@@ -2685,14 +2877,14 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 }
             }
         }
-        TypedExprNode::VariantCtor { payload, .. } => coalesce_node(payload, level, ctx),
+        TypedExprNode::VariantCtor { payload, .. } => coalesce_node(solver, payload, level, ctx),
         TypedExprNode::NominalCtor { payload, .. } => {
             // Before anything reads the value's type. In a walk whose types are dropped, an
             // argument nothing determines is the definition's own, and the uses supply it.
             if !ctx.discarding {
-                pin_unobservable_ctor_args(&expr.ty, ctx);
+                pin_unobservable_ctor_args(solver, &expr.ty, ctx);
             }
-            coalesce_node(payload, level, ctx);
+            coalesce_node(solver, payload, level, ctx);
         }
         TypedExprNode::Method { .. } => {
             unreachable!("a method call is a use of its method before its children are walked")
@@ -2700,8 +2892,8 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         // A leaf; its instance is chosen once its type and operands resolve, below.
         TypedExprNode::TraitFn { .. } => {}
         TypedExprNode::ExprStmt { expr: e, body } => {
-            coalesce_node(e, level, ctx);
-            coalesce_node(body, level, ctx);
+            coalesce_node(solver, e, level, ctx);
+            coalesce_node(solver, body, level, ctx);
         }
         // A `Defer` leaf's `Feed(ρ)` resolves through the standard
         // end-of-function `resolve_var_type` like any other node type.
@@ -2712,19 +2904,19 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         // channel's contribution, so a row that does not resolve fails the contribution too,
         // which reports it.
         TypedExprNode::Feed { value, row, .. } => {
-            coalesce_node(value, level, ctx);
+            coalesce_node(solver, value, level, ctx);
             let (resolved, pending) =
                 crate::ccl::infer::solver::coalesce::collecting_memberships(|| {
-                    resolve_var_type(row)
+                    resolve_var_type(solver, row)
                 });
             if let Ok(ty) = resolved {
                 *row = ty;
-                coalesce_type_predicates(row, level, ctx);
-                decide_memberships(pending, level, ctx, "a feed's row");
+                coalesce_type_predicates(solver, row, level, ctx);
+                decide_memberships(solver, pending, level, ctx, "a feed's row");
             }
         }
         TypedExprNode::Define { value, .. } => {
-            coalesce_node(value, level, ctx);
+            coalesce_node(solver, value, level, ctx);
         }
         // A write: the written value, and a keyed write's **key**. The key is a value
         // position like the value, and its type reaches no other slot — a write is
@@ -2734,26 +2926,34 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         // reads the slot and puts the type somewhere reachable.
         TypedExprNode::MutWrite { key, value, .. } => {
             if let Some(key) = key {
-                coalesce_node(key, level, ctx);
+                coalesce_node(solver, key, level, ctx);
             }
-            coalesce_node(value, level, ctx);
+            coalesce_node(solver, value, level, ctx);
         }
         // A `Begin` block: recurse into its body chain. It binds no name.
-        TypedExprNode::Begin { body, .. } => coalesce_node(body, level, ctx),
+        TypedExprNode::Begin { body, .. } => coalesce_node(solver, body, level, ctx),
         TypedExprNode::For {
             position,
             target,
             iter,
             body,
         } => {
-            coalesce_node(iter, level, ctx);
+            coalesce_node(solver, iter, level, ctx);
             // The loop's position and target bind only inside the body.
             let names = [(**position).clone(), target.name.clone()];
-            with_shadows(ctx, names.clone(), |ctx| coalesce_node(body, level, ctx));
-            splice_placed(ctx, &names, body);
+            with_shadows(ctx, names.clone(), |ctx| {
+                coalesce_node(solver, body, level, ctx)
+            });
+            splice_placed(solver, ctx, &names, body);
             // The target's slot resolves in place, like `Loop` params (`emit_for` wrote the
             // slot var).
-            resolve_binder_slot(&mut target.ty, || "For target".to_string(), level, ctx);
+            resolve_binder_slot(
+                solver,
+                &mut target.ty,
+                || "For target".to_string(),
+                level,
+                ctx,
+            );
         }
         // `Transact` is born by `planning::plan_loops`, after inference (and
         // so after coalesce), so a `Transact` never reaches here.
@@ -2770,9 +2970,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             let names: Vec<Name> = bindings.iter().map(|(b, _)| b.name.clone()).collect();
             with_shadows(ctx, names.clone(), |ctx| {
                 for (_, def) in bindings.iter_mut() {
-                    coalesce_node(def, level, ctx);
+                    coalesce_node(solver, def, level, ctx);
                 }
-                coalesce_node(body, level, ctx);
+                coalesce_node(solver, body, level, ctx);
             });
             assert_none_placed(ctx, &names, "letrec");
             // Binder slots: resolve each declared type in place (`emit_letrec`
@@ -2780,6 +2980,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             for (binding, _) in bindings.iter_mut() {
                 let name = binding.name.clone();
                 resolve_binder_slot(
+                    solver,
                     &mut binding.ty,
                     || format!("LetRec binding `{name}`"),
                     level,
@@ -2834,22 +3035,23 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     if let TypedExprNode::Var(name) = &expr.node
         && ctx.is_lambda_param(name)
         && matches!(
-            resolve_var_type(&expr.ty),
+            resolve_var_type(solver, &expr.ty),
             Err(CoalesceError::IncompatibleBounds { polarity: true, .. })
         )
     {
         return;
     }
     let label = symbolic(expr);
-    let (resolved, pending) =
-        crate::ccl::infer::solver::coalesce::collecting_memberships(|| resolve_var_type(&expr.ty));
+    let (resolved, pending) = crate::ccl::infer::solver::coalesce::collecting_memberships(|| {
+        resolve_var_type(solver, &expr.ty)
+    });
     match resolved {
         // A node every path through which raises has no value, so nothing bounds its type
         // from below: it stands at what its position expects of it. Its own variable resolves
         // from its upper bounds alone, which may be wider than the join it stands in (the
         // annotation above a `try`), so the join's type is read instead.
         Ok(_) if never_has_value(expr) => {
-            expr.ty = stands_at(&expr.ty);
+            expr.ty = stands_at(solver, &expr.ty);
         }
         Ok(ty) => {
             // Log the graph read for the ordering-invariant check. The
@@ -2866,14 +3068,14 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             for slot in [&mut expr.capabilities, &mut expr.own_capabilities] {
                 if let crate::ccl::capabilities::Repr::Var(v) = slot.repr() {
                     *slot = crate::ccl::capabilities::Capabilities::known(
-                        crate::ccl::capabilities::set_of(&v.resolved()).with_raises_resolved(),
+                        v.resolved_set(solver).with_raises_resolved(solver),
                     );
                 }
             }
         }
         Err(err) => {
             let ty = expr.ty.clone();
-            ctx.push_type_error(&ty, map_coalesce_err(err, &label))
+            ctx.push_type_error(solver, &ty, map_coalesce_err(err, &label))
         }
     }
 
@@ -2911,9 +3113,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             {
                 let sigma = crate::ccl::subst::Subst::discharge(
                     &binding.name,
-                    crate::ccl::ccl_utils::predicate_term(bound_expr),
+                    crate::ccl::ccl_utils::predicate_term(solver, bound_expr),
                 );
-                Some(sigma.apply_type(&body_ty))
+                Some(sigma.apply_type_in(solver, &body_ty))
             } else {
                 Some(body_ty)
             }
@@ -2957,7 +3159,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // bases: the memo's first read of a shared predicate is the one that decides its
     // spelling, so for a cast that read must come after the convergence rather than before.
     if !matches!(expr.node, TypedExprNode::Cast { .. }) {
-        coalesce_type_predicates(&mut expr.ty, level, ctx);
+        coalesce_type_predicates(solver, &mut expr.ty, level, ctx);
     }
 
     // A lambda's param binding slot mirrors its coalesced domain (see
@@ -2965,8 +3167,8 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // so the slot copies the domain's *resolved* refinement predicate (the
     // immutable predicate is a distinct `Rc`, so copying it before resolution
     // would strand the param slot on an unresolved predicate).
-    refresh_param_references(expr);
-    refresh_lambda_param_slot(expr);
+    refresh_param_references(solver, expr);
+    refresh_lambda_param_slot(solver, expr);
 
     // A cast's target and result share the coalesced view's shape and bases. The target
     // keeps its born refinements; the result also includes the value's restrictions.
@@ -2975,7 +3177,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     if matches!(expr.node, TypedExprNode::Cast { .. }) {
         let view = expr.ty.clone();
         if let TypedExprNode::Cast { value, target } = &mut expr.node {
-            let (born, result) = canonical_cast_types(target, &value.ty, view);
+            let (born, result) = canonical_cast_types(solver, target, &value.ty, view);
             *target = born;
             expr.ty = result;
         }
@@ -2983,23 +3185,23 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         // now, which is what a predicate's index spelling is answered from, and the memo
         // gives the answer to every occurrence of a shared predicate — so this is the one
         // read, for the node type and the target alike.
-        coalesce_type_predicates(&mut expr.ty, level, ctx);
+        coalesce_type_predicates(solver, &mut expr.ty, level, ctx);
         if let TypedExprNode::Cast { target, .. } = &mut expr.node {
-            coalesce_type_predicates(target, level, ctx);
+            coalesce_type_predicates(solver, target, level, ctx);
         }
     }
-    decide_memberships(pending, level, ctx, &label);
+    decide_memberships(solver, pending, level, ctx, &label);
 
     // A compiler instance builds its function at the type the call resolved to, so it is
     // chosen once that type is.
     if matches!(expr.node, TypedExprNode::TraitFn { .. })
         && !ctx.discarding
-        && let Ok(Some(instance)) = matching_instance(expr, ctx)
+        && let Ok(Some(instance)) = matching_instance(solver, expr, ctx)
     {
-        build_instance_function(expr, &instance);
+        build_instance_function(solver, expr, &instance);
     }
     if !ctx.discarding {
-        run_instance_primitive(expr, &ctx.instances);
+        run_instance_primitive(solver, expr, &ctx.instances);
     }
 }
 
@@ -3009,7 +3211,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
 /// which becomes a use of the instance's function (`src/ccl/design/type-inference.md`, "An
 /// operator's instance"). An operator a `@Builtin` instance answers stays, and runs that
 /// instance's primitive ([`run_instance_primitive`]); a comparison calls no function.
-fn dispatch_operator(expr: &mut Expr, ctx: &CoalesceCtx) {
+fn dispatch_operator(solver: &mut Solver, expr: &mut Expr, ctx: &CoalesceCtx) {
     let (call, operands): (OperatorCall, Vec<&Expr>) = match &expr.node {
         TypedExprNode::BinOp { left, op, right } => {
             match OperatorCall::of_binop(*op, &ctx.instances) {
@@ -3033,7 +3235,10 @@ fn dispatch_operator(expr: &mut Expr, ctx: &CoalesceCtx) {
     }
     let Ok(types) = operands
         .iter()
-        .map(|e| resolve_var_type(&e.ty).map(|t| crate::ccl::ccl_utils::strip_refinements(&t)))
+        .map(|e| {
+            resolve_var_type(solver, &e.ty)
+                .map(|t| crate::ccl::ccl_utils::strip_refinements_in(solver, &t))
+        })
         .collect::<Result<Vec<Type>, _>>()
     else {
         return;
@@ -3042,9 +3247,9 @@ fn dispatch_operator(expr: &mut Expr, ctx: &CoalesceCtx) {
         .instances
         .instances(&call.trait_)
         .iter()
-        .any(|i| i.binds_functions() && i.matches(&types));
+        .any(|i| i.binds_functions() && i.matches(solver, &types));
     if bound {
-        call_instance_function(expr, &call, function, types);
+        call_instance_function(solver, expr, &call, function, types);
     }
 }
 
@@ -3059,7 +3264,13 @@ fn bind(value: Expr, body: impl FnOnce(Expr) -> Expr) -> Expr {
 
 /// Rewrite an operator a declared instance answers into the call its [`OperatorCall`]
 /// makes, at the operands' resolved `types`, keeping the node's identity and its type.
-fn call_instance_function(expr: &mut Expr, call: &OperatorCall, function: &str, types: Vec<Type>) {
+fn call_instance_function(
+    solver: &mut Solver,
+    expr: &mut Expr,
+    call: &OperatorCall,
+    function: &str,
+    types: Vec<Type>,
+) {
     let id = expr.node_id();
     let ty = expr.ty.clone();
     let _f = crate::ccl::provenance::enter(
@@ -3084,7 +3295,7 @@ fn call_instance_function(expr: &mut Expr, call: &OperatorCall, function: &str, 
         .expect("an operator calls a function its trait declares")
         .signature;
     debug_assert!(
-        params.is_empty() && requires.is_empty() && capabilities.is_none(),
+        params.is_empty() && requires.is_empty() && capabilities.is_none(solver),
         "an operator's function has no type parameters, no requirements and no effects of its own"
     );
     // The signature at the operands' types, whose `Output` is the operator's own result.
@@ -3121,7 +3332,7 @@ fn call_instance_function(expr: &mut Expr, call: &OperatorCall, function: &str, 
 /// strings is `Concat`. An operator whose primitive is what it already computes keeps its
 /// own kind, so a `^` sibling (`^-` answered by `Sub`) keeps the operation its result type
 /// names.
-fn run_instance_primitive(expr: &mut Expr, instances: &InstanceTable) {
+fn run_instance_primitive(solver: &mut Solver, expr: &mut Expr, instances: &InstanceTable) {
     let TypedExprNode::BinOp { left, op, right } = &mut expr.node else {
         return;
     };
@@ -3132,13 +3343,13 @@ fn run_instance_primitive(expr: &mut Expr, instances: &InstanceTable) {
         return;
     };
     let types = [
-        crate::ccl::ccl_utils::strip_refinements(&left.ty),
-        crate::ccl::ccl_utils::strip_refinements(&right.ty),
+        crate::ccl::ccl_utils::strip_refinements_in(solver, &left.ty),
+        crate::ccl::ccl_utils::strip_refinements_in(solver, &right.ty),
     ];
     let primitive = instances
         .instances(&call.trait_)
         .iter()
-        .find(|i| i.matches(&types))
+        .find(|i| i.matches(solver, &types))
         .and_then(|i| match i.implementation(function) {
             Some(Implementation::Primitive(InstanceBody::Binary(primitive))) => Some(*primitive),
             _ => None,
@@ -3155,7 +3366,24 @@ fn run_instance_primitive(expr: &mut Expr, instances: &InstanceTable) {
 ///
 /// `c`'s type is read at the call's operand, or at `c` itself where the operand has not
 /// resolved: a tree whose inference failed has its argument typed and its operand unsettled.
-pub(crate) fn elements_of_a_collection(expr: &mut Expr) -> Option<Expr> {
+pub(crate) fn elements_of_a_collection(solver: &mut Solver, expr: &mut Expr) -> Option<Expr> {
+    elements_of_a_collection_reading(solver, expr, &mut |solver, ty| {
+        resolve_var_type(solver, ty).ok()
+    })
+}
+
+/// [`elements_of_a_collection`] in a tree its run has closed, each type read as it stands: the
+/// run resolved what it could, and nothing of it is left to resolve.
+pub(crate) fn elements_of_a_closed_collection(expr: &mut Expr) -> Option<Expr> {
+    elements_of_a_collection_reading(&mut Solver::none(), expr, &mut |_, ty| Some(ty.clone()))
+}
+
+/// [`elements_of_a_collection`], with each type `read` as the caller resolves it.
+fn elements_of_a_collection_reading(
+    solver: &mut Solver,
+    expr: &mut Expr,
+    read: &mut dyn FnMut(&mut Solver, &Type) -> Option<Type>,
+) -> Option<Expr> {
     let TypedExprNode::Apply { argument, function } = &expr.node else {
         return None;
     };
@@ -3168,9 +3396,10 @@ pub(crate) fn elements_of_a_collection(expr: &mut Expr) -> Option<Expr> {
     if !trait_.reads_collections() {
         return None;
     }
-    let is_collection = |ty: &Type| {
-        resolve_var_type(ty)
-            .is_ok_and(|t| crate::ccl::infer::solver::traits::is_structural_collection(&t))
+    let mut is_collection = |ty: &Type| {
+        read(solver, ty).is_some_and(|t| {
+            crate::ccl::infer::solver::traits::is_structural_collection(solver, &t)
+        })
     };
     if !is_collection(operands.first()?) && !is_collection(&argument.ty) {
         return None;
@@ -3187,7 +3416,7 @@ pub(crate) fn elements_of_a_collection(expr: &mut Expr) -> Option<Expr> {
 
 /// Replace a `TraitFn` a compiler instance answers with the function the instance builds at
 /// the node's type, the signature at the call's types.
-fn build_instance_function(expr: &mut Expr, instance: &TraitInstance) {
+fn build_instance_function(solver: &mut Solver, expr: &mut Expr, instance: &TraitInstance) {
     let TypedExprNode::TraitFn {
         trait_, function, ..
     } = &expr.node
@@ -3206,7 +3435,7 @@ fn build_instance_function(expr: &mut Expr, instance: &TraitInstance) {
             "infer.dispatch_trait_fn",
             crate::ccl::provenance::Nature::Machinery,
         );
-        body.build(&expr.ty)
+        body.build(solver, &expr.ty)
     };
     let Expr { node, ty, .. } = built;
     *expr = Expr::preserve(id, node).with_ty(ty);
@@ -3220,6 +3449,7 @@ fn build_instance_function(expr: &mut Expr, instance: &TraitInstance) {
 /// The obligation the node's emission placed accepted these operands, so an instance
 /// matches; one that does not is reported as a missing instance.
 fn matching_instance(
+    solver: &mut Solver,
     expr: &Expr,
     ctx: &CoalesceCtx,
 ) -> Result<Option<Rc<TraitInstance>>, InferError> {
@@ -3234,7 +3464,7 @@ fn matching_instance(
     };
     let Ok(resolved) = operands
         .iter()
-        .map(resolve_var_type)
+        .map(|x| resolve_var_type(solver, x))
         .collect::<Result<Vec<Type>, _>>()
     else {
         return Ok(None);
@@ -3243,7 +3473,7 @@ fn matching_instance(
         return Ok(None);
     }
     let instances = ctx.instances.instances(trait_);
-    let mut matching = instances.iter().filter(|i| i.matches(&resolved));
+    let mut matching = instances.iter().filter(|i| i.matches(solver, &resolved));
     let Some(instance) = matching.next() else {
         let position = resolved
             .iter()
@@ -3368,8 +3598,14 @@ fn use_instance_function(expr: &mut Expr, instance: &TraitInstance, ctx: &mut Co
 /// Contrast constraint *emission*, where the same reasoning fails: it is
 /// parameterized by a domain minted per occurrence, so it must run at each one and
 /// uses `TermMemo` instead (`emit_bare_predicate`).
-fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) {
+fn coalesce_type_predicates(
+    solver: &mut Solver,
+    ty: &mut Type,
+    level: Level,
+    ctx: &mut CoalesceCtx,
+) {
     coalesce_type_predicates_go(
+        solver,
         ty,
         level,
         ctx,
@@ -3424,6 +3660,7 @@ impl PredicateResolution {
 /// the crossings `compact_go` counts (see `src/ccl/design/type-inference.md`,
 /// "Where the conversions run").
 fn coalesce_type_predicates_go(
+    solver: &mut Solver,
     ty: &mut Type,
     level: Level,
     ctx: &mut CoalesceCtx,
@@ -3441,7 +3678,7 @@ fn coalesce_type_predicates_go(
         Type::Refinement(inner, refinements) => {
             // The base first: the binder below is bound to it, so it has to be the
             // materialized one.
-            coalesce_type_predicates_go(inner, level, ctx, scope);
+            coalesce_type_predicates_go(solver, inner, level, ctx, scope);
             // A base that materialized refined (a determined projection's candidate is a
             // filtered domain) contributes its refinements to this position's one set.
             if matches!(**inner, Type::Refinement(..)) {
@@ -3477,7 +3714,7 @@ fn coalesce_type_predicates_go(
                     {
                         ctx.in_predicate += 1;
                     }
-                    coalesce_node(pred, level, ctx);
+                    coalesce_node(solver, pred, level, ctx);
                     #[cfg(debug_assertions)]
                     {
                         ctx.in_predicate -= 1;
@@ -3487,7 +3724,7 @@ fn coalesce_type_predicates_go(
                     true
                 });
                 crate::ccl::ccl_utils::record_derivation(&entered, &r.predicate);
-                *r = scope.close(r);
+                *r = scope.close(solver, r);
                 share_with_its_origin(ctx, r);
             });
         }
@@ -3504,43 +3741,45 @@ fn coalesce_type_predicates_go(
             let binder = binder.clone();
             for w in fun_kind.witnesses_mut() {
                 for t in w.types_mut() {
-                    coalesce_type_predicates_go(t, level, ctx, scope);
+                    coalesce_type_predicates_go(solver, t, level, ctx, scope);
                 }
             }
-            coalesce_type_predicates_go(d, level, ctx, scope);
+            coalesce_type_predicates_go(solver, d, level, ctx, scope);
             scope.enter(binder);
-            coalesce_type_predicates_go(c, level, ctx, scope);
+            coalesce_type_predicates_go(solver, c, level, ctx, scope);
             scope.exit();
         }
         Type::Tuple(ts) | Type::OpenTuple(ts) | Type::Nominal(_, ts) => ts
             .iter_mut()
-            .for_each(|t| coalesce_type_predicates_go(t, level, ctx, scope)),
+            .for_each(|t| coalesce_type_predicates_go(solver, t, level, ctx, scope)),
         Type::Split { input, output } => {
-            coalesce_type_predicates_go(input, level, ctx, scope);
-            coalesce_type_predicates_go(output, level, ctx, scope);
+            coalesce_type_predicates_go(solver, input, level, ctx, scope);
+            coalesce_type_predicates_go(solver, output, level, ctx, scope);
         }
         // Component `𝑘` is inside the scopes of the `𝑘` components before it.
         Type::DepTuple(cs) => {
             let n = cs.len();
             for (name, t) in cs.iter_mut() {
-                coalesce_type_predicates_go(t, level, ctx, scope);
+                coalesce_type_predicates_go(solver, t, level, ctx, scope);
                 scope.enter(name.clone().into());
             }
             (0..n).for_each(|_| scope.exit());
             // A component's determined projection is its one candidate (the arm below), which
             // can leave no component reading another.
-            let rebuilt = Type::closed_dep_tuple(cs.clone(), crate::ccl::Ids::Fresh);
+            let rebuilt = Type::closed_dep_tuple(solver, cs.clone(), crate::ccl::Ids::Fresh);
             if !matches!(rebuilt, Type::DepTuple(_)) {
                 *ty = rebuilt;
             }
         }
         Type::Record(fs) => fs
             .iter_mut()
-            .for_each(|(_, t)| coalesce_type_predicates_go(t, level, ctx, scope)),
+            .for_each(|(_, t)| coalesce_type_predicates_go(solver, t, level, ctx, scope)),
         Type::Variant(tags, _) => tags
             .iter_mut()
-            .for_each(|(_, t)| coalesce_type_predicates_go(t, level, ctx, scope)),
-        Type::History { function, .. } => coalesce_type_predicates_go(function, level, ctx, scope),
+            .for_each(|(_, t)| coalesce_type_predicates_go(solver, t, level, ctx, scope)),
+        Type::History { function, .. } => {
+            coalesce_type_predicates_go(solver, function, level, ctx, scope)
+        }
         Type::FamilyApp(app) if app.param.generalized => {
             unreachable!("a generalized family is born after inference")
         }
@@ -3549,21 +3788,21 @@ fn coalesce_type_predicates_go(
             let memo = ctx.pred_memo.clone();
             for arg in &mut app.args {
                 memo.rebuild(arg, &(), |term| {
-                    coalesce_node(term, level, ctx);
+                    coalesce_node(solver, term, level, ctx);
                     true
                 });
-                scope.close_held(arg);
+                scope.close_held(solver, arg);
             }
         }
         // The body is inside every binder; a domain stands where the family does.
         Type::Family { binders, body } => {
             for (_, t) in binders.iter_mut() {
-                coalesce_type_predicates_go(t, level, ctx, scope);
+                coalesce_type_predicates_go(solver, t, level, ctx, scope);
             }
             for (name, _) in binders.iter() {
                 scope.enter(name.clone().into());
             }
-            coalesce_type_predicates_go(body, level, ctx, scope);
+            coalesce_type_predicates_go(solver, body, level, ctx, scope);
             binders.iter().for_each(|_| scope.exit());
         }
         // A projection holds a term as a predicate does, so its slots resolve the same way
@@ -3571,7 +3810,7 @@ fn coalesce_type_predicates_go(
         Type::WitnessProjection(p) => {
             let memo = ctx.pred_memo.clone();
             memo.rebuild(p, &(), |term| {
-                coalesce_node(term, level, ctx);
+                coalesce_node(solver, term, level, ctx);
                 true
             });
             // A determined witness is its one candidate, the spelling `ty::unboxed_type` gives.
@@ -3582,15 +3821,16 @@ fn coalesce_type_predicates_go(
                 .witness()
                 .and_then(crate::ccl::ty::Witness::sole_candidate)
             {
-                *ty = scope.closed_type(&sole);
+                *ty = scope.closed_type(solver, &sole);
                 return;
             }
-            scope.close_held(p);
+            scope.close_held(solver, p);
         }
         // A barrier var survives coalescing only in a slot whose
         // resolution failed, as an `Infer` does, and
         // `resolve_binder_slot` has already reported that failure.
         Type::BarrierVar(_)
+        | Type::Undetermined(_)
         | Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)
@@ -3603,7 +3843,7 @@ fn coalesce_type_predicates_go(
         | Type::Infer(_) => {}
         Type::Poly(poly) => Rc::make_mut(poly)
             .types_mut()
-            .for_each(|t| coalesce_type_predicates_go(t, level, ctx, scope)),
+            .for_each(|t| coalesce_type_predicates_go(solver, t, level, ctx, scope)),
     }
 }
 
@@ -3661,14 +3901,14 @@ fn names_no_variable(ty: &Type) -> bool {
 
 /// The names the arguments reaching a use read: each parameter's domain as the values flowing
 /// into it make it, through a curried function's codomains.
-fn argument_reads(ty: &Type) -> BTreeSet<Name> {
+fn argument_reads(solver: &mut Solver, ty: &Type) -> BTreeSet<Name> {
     let mut read = BTreeSet::new();
     let mut at = ty;
     while let Type::Fun {
         domain, codomain, ..
     } = at.peel_refinements()
     {
-        if let Ok(arg) = coalesce_positive(domain) {
+        if let Ok(arg) = coalesce_positive(solver, domain) {
             read.extend(crate::ccl::subst::type_free_vars(&arg));
         }
         at = codomain;
@@ -3696,6 +3936,7 @@ fn types_of(arguments: &[(smol_str::SmolStr, Type)]) -> Vec<Type> {
 // (matching the solver's module-level allow).
 #[allow(clippy::mutable_key_type)]
 pub(super) fn specialize_use(
+    solver: &mut Solver,
     use_expr: &mut Expr,
     frame_idx: usize,
     #[cfg_attr(not(debug_assertions), allow(unused_variables))] instance_call: bool,
@@ -3704,19 +3945,19 @@ pub(super) fn specialize_use(
     // Resolve against the current graph, including pins made before this visit.
     // A use inside another specialization sees that outer clone's pin. Later pins
     // can still add bounds; assert_reads_stable checks the recorded structure.
-    let resolved = match resolve_var_type(&use_expr.ty) {
+    let resolved = match resolve_var_type(solver, &use_expr.ty) {
         Ok(t) => t,
         Err(err) => {
             let label = symbolic(use_expr);
             let error = map_coalesce_err(err, &label);
-            let carried = reachable_vars(&use_expr.ty);
+            let carried = reachable_vars(solver, &use_expr.ty);
             let node = ctx.current_node;
             let ScopeEntry::Generalized(frame) = &mut ctx.scope[frame_idx] else {
                 unreachable!("lookup_generalized returns indices of Generalized entries only");
             };
             frame.failed_uses.push((error.clone(), carried));
             frame.failed_use_nodes.insert(node);
-            ctx.push_read_error(&use_expr.ty, error);
+            ctx.push_read_error(solver, &use_expr.ty, error);
             return;
         }
     };
@@ -3741,14 +3982,15 @@ pub(super) fn specialize_use(
     // exercises at a concrete type) keys as the canonical empty `SpecKey` rather
     // than on fresh `Infer` placeholder ids. Inference deliberately tolerates the
     // residue (`Type::Infer`'s invariant); the strict post-inference typecheck rejects it.
-    let key = spec_key(&use_expr.ty);
+    let key = spec_key(solver, &use_expr.ty);
     // A use whose instantiation leaves a variable for the clone's pins shares no clone: the
     // pins give that variable what the join around the use supplies, which the key does not
     // read, so the key does not determine the clone. The test is the pins' own: nothing
     // reaches the variable, or, at an output, no value does. See
     // `src/ccl/design/type-inference.md`, "A use the key does not determine shares no clone".
     let shareable = !crate::ccl::subst::type_contains_infer(&resolved)
-        && !coalesce_positive(&use_expr.ty).is_ok_and(|values| has_output_variable(&values, true));
+        && !coalesce_positive(solver, &use_expr.ty)
+            .is_ok_and(|values| has_output_variable(&values, true));
     // A copy of a use already specialized shares its clone: its instantiation is the same
     // variables, so the clone's pins answered the one join around both. See
     // `src/ccl/design/type-inference.md`, "A use the key does not determine shares no clone".
@@ -3768,7 +4010,7 @@ pub(super) fn specialize_use(
     // type, and an argument failing its parameter's demand (its candidates meeting the
     // parameter's kind at none) leaves the resolved instance reading less than it does.
     let mut read = crate::ccl::subst::type_free_vars(&resolved);
-    read.extend(argument_reads(&use_expr.ty));
+    read.extend(argument_reads(solver, &use_expr.ty));
     let between: Vec<Name> = ctx.scope[frame_idx + 1..]
         .iter()
         .filter_map(|entry| match entry {
@@ -3880,11 +4122,11 @@ pub(super) fn specialize_use(
     let arguments = if ctx.instance_functions.contains(&base_name) {
         let arguments = ctx
             .instances
-            .specialization_arguments(&base_name, &resolved)
+            .specialization_arguments(solver, &base_name, &resolved)
             .unwrap_or_else(|| {
                 vec![(
                     smol_str::SmolStr::default(),
-                    crate::ccl::ccl_utils::strip_refinements(&resolved),
+                    crate::ccl::ccl_utils::strip_refinements_in(solver, &resolved),
                 )]
             });
         let active: Vec<&ActiveSpecialization> = ctx
@@ -3986,7 +4228,7 @@ pub(super) fn specialize_use(
     // unfreshened) definition type and seed the cache, so the clone-wide
     // freshen renames them consistently everywhere it reaches (node types,
     // binder slots, predicate slots, and bound edges alike).
-    seed_chan_dom_pairings(&resolved, &clone.ty, cutoff, &mut fresh.chan_doms);
+    seed_chan_dom_pairings(solver, &resolved, &clone.ty, cutoff, &mut fresh.chan_doms);
     // Inside a definition checked alone, the use's types can hold that definition's
     // opaque type parameters, which sit deeper than this binding's own variables. The
     // clone is raised to stand at least as deep, so a parameter flows into it as any
@@ -4002,13 +4244,14 @@ pub(super) fn specialize_use(
     };
     #[cfg(debug_assertions)]
     let before = crate::ccl::infer::solver::scheme::Minted::now();
-    freshen_expr_type_slots(&mut clone, cutoff, target, &mut fresh);
+    freshen_expr_type_slots(solver, &mut clone, cutoff, target, &mut fresh);
     // Each use in the clone instantiated through the clone's copies.
     ctx.use_capabilities
         .specialize(&origins, &fresh.capability_vars);
     // The clone is this use's own: nothing above the cutoff is shared with the definition.
     #[cfg(debug_assertions)]
     crate::ccl::infer::solver::scheme::assert_copied_apart_from(
+        solver,
         cutoff,
         &fresh,
         before,
@@ -4064,6 +4307,7 @@ pub(super) fn specialize_use(
         }
     }
     let pinned = constrain_subtype_in(
+        solver,
         &clone.ty,
         &use_expr.ty,
         &mut cache,
@@ -4074,6 +4318,7 @@ pub(super) fn specialize_use(
             Ok(())
         } else {
             constrain_subtype_in(
+                solver,
                 &use_expr.ty,
                 &clone.ty,
                 &mut cache,
@@ -4110,8 +4355,9 @@ pub(super) fn specialize_use(
                 // Under `NoScope`, as the outward pin is, so the solver decides a refined
                 // bound the use's types meet.
                 if let Some(bound) = &param.bound {
-                    let bound = freshen_above(cutoff, bound, target, &mut fresh);
+                    let bound = freshen_above(solver, cutoff, bound, target, &mut fresh);
                     constrain_subtype_in(
+                        solver,
                         &standing,
                         &bound,
                         &mut cache,
@@ -4138,9 +4384,10 @@ pub(super) fn specialize_use(
         families.sort_by(|a, b| a.0.cmp(&b.0));
         for (param, names, var) in families {
             if let Some(bound) = &param.bound {
-                let bound = freshen_above(cutoff, bound, target, &mut fresh);
-                let bound = crate::ccl::subst::family_at_names(&bound, &names);
+                let bound = freshen_above(solver, cutoff, bound, target, &mut fresh);
+                let bound = crate::ccl::subst::family_at_names(solver, &bound, &names);
                 constrain_subtype_in(
+                    solver,
                     &var,
                     &bound,
                     &mut cache,
@@ -4160,14 +4407,14 @@ pub(super) fn specialize_use(
     let pinned = pinned.and_then(|()| {
         fresh.reset_obligations.iter().try_for_each(|obligation| {
             obligation.settle_assumptions(|t| {
-                resolve_var_type(t)
+                resolve_var_type(solver, t)
                     .ok()
                     .map(|settled| settled.peel_refinements().clone())
             });
             obligation.assume_more(&ctx.assumptions);
-            obligation.redeliver(&mut cache)
+            obligation.redeliver(solver, &mut cache)
         })?;
-        crate::ccl::infer::solver::traits::settle_held_answers(None, &mut cache)
+        crate::ccl::infer::solver::traits::settle_held_answers(solver, None, &mut cache)
     });
     // A parameter standing for an associated type is the instance's type at the clone's
     // operands, which the pin has just delivered: it is defined there, not solved for, so
@@ -4186,8 +4433,8 @@ pub(super) fn specialize_use(
                 .args
                 .iter()
                 .map(|a| {
-                    let a = freshen_above(cutoff, a, target, &mut fresh);
-                    resolve_var_type(&a).ok().filter(names_no_variable)
+                    let a = freshen_above(solver, cutoff, a, target, &mut fresh);
+                    resolve_var_type(solver, &a).ok().filter(names_no_variable)
                 })
                 .collect();
             let Some(at_operands) = at_operands else {
@@ -4195,20 +4442,20 @@ pub(super) fn specialize_use(
             };
             let Some(associated) =
                 ctx.instances
-                    .associated_at(&requirement.trait_, &at_operands, name)
+                    .associated_at(solver, &requirement.trait_, &at_operands, name)
             else {
                 continue;
             };
-            constrain_subtype(&associated, &standing, &mut cache)?;
-            constrain_subtype(&standing, &associated, &mut cache)?;
+            constrain_subtype(solver, &associated, &standing, &mut cache)?;
+            constrain_subtype(solver, &standing, &associated, &mut cache)?;
         }
         Ok(())
     });
-    cache.report_recorded(|| EdgeReport::Labeled(PIN_LABEL.to_string()));
+    cache.report_recorded(solver, || EdgeReport::Labeled(PIN_LABEL.to_string()));
     // The pin added bounds to the clone's copies of the definition's barrier variables,
     // and the walk below compacts them, so they are checked first.
     if pinned.is_ok() {
-        push_barrier_failures(&mut ctx.errors, use_expr.node_id(), PIN_LABEL);
+        push_barrier_failures(solver, &mut ctx.errors, use_expr.node_id(), PIN_LABEL);
     }
     if let Err(e) = &pinned {
         let e = e.clone();
@@ -4216,7 +4463,7 @@ pub(super) fn specialize_use(
         // failed to satisfy, and the node this specialization's recording names.
         ctx.errors.push(
             LocatedInferError {
-                error: map_constrain_err(e, PIN_LABEL),
+                error: map_constrain_err(solver, e, PIN_LABEL),
                 node_id: use_expr.node_id(),
                 also: Box::default(),
                 related: RelatedPositions::default(),
@@ -4266,11 +4513,11 @@ pub(super) fn specialize_use(
     // pinned there.
     ctx.occurrences.add_roots(&clone);
     if !ctx.discarding {
-        pin_unreached_values(&clone, cutoff + 1 + raise, ctx);
+        pin_unreached_values(solver, &clone, cutoff + 1 + raise, ctx);
     }
     #[cfg(debug_assertions)]
     let in_predicate = std::mem::take(&mut ctx.in_predicate);
-    coalesce_node(&mut clone, cutoff + 1 + raise, ctx);
+    coalesce_node(solver, &mut clone, cutoff + 1 + raise, ctx);
     #[cfg(debug_assertions)]
     {
         ctx.in_predicate = in_predicate;
@@ -4386,7 +4633,12 @@ fn surviving_use(ctx: &CoalesceCtx, frame_idx: usize) -> bool {
 /// are concrete here, so the discharge splices resolved types. The definition
 /// itself is resolved for its diagnostics ([`typecheck_discarded_definition`])
 /// and dropped, so a binding the body never demanded leaves nothing behind.
-pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
+pub(super) fn coalesce_generalized_let(
+    solver: &mut Solver,
+    expr: &mut Expr,
+    level: Level,
+    ctx: &mut CoalesceCtx,
+) {
     let saved_annotation = expr.user_annotation.take();
     let node = std::mem::replace(&mut expr.node, TypedExprNode::Error);
     let TypedExprNode::Let {
@@ -4453,7 +4705,7 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
             specs: Vec::new(),
         })));
     let body_errors = ctx.errors.len();
-    coalesce_node(&mut body, level, ctx);
+    coalesce_node(solver, &mut body, level, ctx);
     let Some(ScopeEntry::Generalized(mut frame)) = ctx.scope.pop() else {
         unreachable!("the binding's frame still tops the scope after a balanced body walk");
     };
@@ -4485,7 +4737,7 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
     if has_type_params {
         ctx.opaque_params_at.push(level + 1);
     }
-    let raised = typecheck_discarded_definition(&mut frame.def, level, &requires, ctx);
+    let raised = typecheck_discarded_definition(solver, &mut frame.def, level, &requires, ctx);
     if has_type_params {
         ctx.opaque_params_at.pop();
     }
@@ -4559,6 +4811,7 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
     let mut result = body;
     for spec in frame.specs.into_iter().rev().filter(|s| s.referenced) {
         result = specialization_let(
+            solver,
             spec,
             frame.occurrence,
             transparency,
@@ -4572,6 +4825,7 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
 
 /// `body` under the `let` binding `spec`'s clone, its type closed over the binder.
 fn specialization_let(
+    solver: &mut Solver,
     spec: Specialization,
     occurrence: NodeId,
     transparency: BindingTransparency,
@@ -4585,7 +4839,7 @@ fn specialization_let(
         && crate::ccl::subst::type_free_vars(&body.ty).contains(&spec.name)
     {
         crate::ccl::subst::Subst::discharge(&spec.name, spec.def.clone_preserving_ids())
-            .apply_type(&body.ty)
+            .apply_type_in(solver, &body.ty)
     } else {
         body.ty.clone()
     };
@@ -4609,7 +4863,7 @@ fn specialization_let(
 /// Splice the specializations placed under `binders` around `body`, the scope those
 /// binders bind ([`CoalesceCtx::placed`]): the walk has left it, so every use under it has
 /// been specialized.
-fn splice_placed(ctx: &mut CoalesceCtx, binders: &[Name], body: &mut Expr) {
+fn splice_placed(solver: &mut Solver, ctx: &mut CoalesceCtx, binders: &[Name], body: &mut Expr) {
     let (here, rest): (Vec<Placed>, Vec<Placed>) = std::mem::take(&mut ctx.placed)
         .into_iter()
         .partition(|p| binders.contains(&p.binder));
@@ -4625,6 +4879,7 @@ fn splice_placed(ctx: &mut CoalesceCtx, binders: &[Name], body: &mut Expr) {
     let mut result = std::mem::take(body);
     for placed in here.into_iter().rev().filter(|p| p.spec.referenced) {
         result = specialization_let(
+            solver,
             placed.spec,
             placed.occurrence,
             placed.transparency,
@@ -4649,13 +4904,13 @@ fn assert_none_placed(ctx: &CoalesceCtx, binders: &[Name], what: &str) {
 
 /// The inference variables `ty` reaches: those it mentions and, transitively, those
 /// their bounds mention, in either direction.
-fn reachable_vars(ty: &Type) -> std::collections::HashSet<InferVarId> {
+fn reachable_vars(solver: &mut Solver, ty: &Type) -> std::collections::HashSet<InferVarId> {
     let mut seen = std::collections::HashSet::new();
     let mut stack: Vec<Type> = vec![ty.clone()];
     while let Some(t) = stack.pop() {
         t.walk_infer_vars(&mut |v| {
             if seen.insert(v.uid) {
-                let bounds = v.bounds.borrow();
+                let bounds = v.bounds(solver);
                 stack.extend(
                     bounds
                         .lower()
@@ -4728,6 +4983,7 @@ fn blamed_use(held: &HeldError, all: &[HeldError]) -> Option<NodeId> {
 /// its type parameters stay opaque here, so a use inside it can specialize another
 /// generic definition at them.
 fn typecheck_discarded_definition(
+    solver: &mut Solver,
     def: &mut Expr,
     level: Level,
     assumptions: &[Rc<TraitRequirement>],
@@ -4737,7 +4993,7 @@ fn typecheck_discarded_definition(
     let was_discarding = std::mem::replace(&mut ctx.discarding, true);
     let depth = ctx.assumptions.len();
     ctx.assumptions.extend(assumptions.iter().cloned());
-    coalesce_node(def, level + 1, ctx);
+    coalesce_node(solver, def, level + 1, ctx);
     ctx.assumptions.truncate(depth);
     ctx.discarding = was_discarding;
     // A message names the binder an A-normalization temp or a mutable variable's read was
@@ -4746,12 +5002,14 @@ fn typecheck_discarded_definition(
     // here, against the definition, while it holds those bindings.
     if ctx.errors.len() > before {
         // The respelling's terms only reach messages, so its copies keep the ids they copy.
+        let temps = crate::ccl::anf::temp_respelling_in(solver, def, crate::ccl::Ids::Kept);
         let respelling = crate::ccl::subst::Subst::then(
-            &crate::ccl::anf::temp_respelling(def, crate::ccl::Ids::Kept),
+            solver,
+            &temps,
             &crate::ccl::mut_read::read_respelling(def, crate::ccl::Ids::Kept),
         );
         for error in &mut ctx.errors[before..] {
-            error.error.respell(&respelling);
+            error.error.respell(solver, &respelling);
         }
     }
     let raised = ctx.errors[before..]
@@ -4860,7 +5118,7 @@ pub(super) fn specialize_projection_domain(morphism: &mut Expr, input: &Type) {
 ///
 /// Several parameters bind the domain's components, each slot the component opened at the
 /// parameters before it.
-fn refresh_lambda_param_slot(expr: &mut Expr) {
+fn refresh_lambda_param_slot(solver: &mut Solver, expr: &mut Expr) {
     let TypedExprNode::Lambda { params, .. } = &mut expr.node else {
         return;
     };
@@ -4875,6 +5133,7 @@ fn refresh_lambda_param_slot(expr: &mut Expr) {
                 Type::Tuple(ts) if ts.len() == params.len() => ts.clone(),
                 Type::DepTuple(cs) if cs.len() == params.len() => {
                     crate::ccl::subst::open_tuple_components(
+                        solver,
                         cs,
                         |j, _| crate::ccl::subst::Mapping::Rename(params[j].name.clone()),
                         crate::ccl::Ids::Fresh,
@@ -4910,7 +5169,7 @@ fn refresh_lambda_param_slot(expr: &mut Expr) {
 /// slot carries refinements (`emit_lambda` binds the parameter at its unrefined type so body
 /// references stay bare), so replacing the type outright would undo that. What has to agree
 /// is which index the two name.
-fn refresh_param_references(expr: &mut Expr) {
+fn refresh_param_references(solver: &mut Solver, expr: &mut Expr) {
     let Some(bound) = expr.ty.sum() else {
         return;
     };
@@ -4935,11 +5194,11 @@ fn refresh_param_references(expr: &mut Expr) {
     // this node materialized them by two routes — the binder off its kind, the domain off
     // the position — so a spelling that has to move in the body has to move here as well or
     // the function binds a name its own domain no longer says.
-    expr.ty = renames.apply_type(&expr.ty);
+    expr.ty = renames.apply_type_in(solver, &expr.ty);
     let TypedExprNode::Lambda { body, .. } = &mut expr.node else {
         unreachable!("matched a lambda just above")
     };
-    retype_body(body, &renames);
+    retype_body(solver, body, &renames);
 }
 
 /// Apply `renames` to every type in `expr` and below it.
@@ -4950,9 +5209,9 @@ fn refresh_param_references(expr: &mut Expr) {
 /// spelling it differently. One rename settles all of them, and it reaches no other index:
 /// its domain is what a reference to *this* parameter named, which denotes this lambda's
 /// domain wherever it occurs in the body.
-fn retype_body(expr: &mut Expr, renames: &crate::ccl::subst::Subst) {
-    expr.walk_type_slots_mut(|ty| *ty = renames.apply_type(ty));
-    expr.walk_children_mut(|child| retype_body(child, renames));
+fn retype_body(solver: &mut Solver, expr: &mut Expr, renames: &crate::ccl::subst::Subst) {
+    expr.walk_type_slots_mut(|ty| *ty = renames.apply_type_in(solver, ty));
+    expr.walk_children_mut(|child| retype_body(solver, child, renames));
 }
 
 /// Read off the spelling this lambda's parameter came back with, into `renames`.
@@ -5023,10 +5282,12 @@ mod clone_probe {
 
 #[cfg(test)]
 mod tests {
+    use crate::ccl::infer::solver::Solver;
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "ordering invariant")]
     fn final_graph_verification_compares_every_recorded_read() {
+        let solver = &mut Solver::new();
         let ty = Type::Base(BaseType::Int);
         let reads = vec![
             super::ReadRecord {
@@ -5042,16 +5303,17 @@ mod tests {
                 label: "second read".into(),
             },
         ];
-        super::assert_reads_stable(&reads);
+        super::assert_reads_stable(solver, &reads);
     }
 
     #[test]
     fn unresolved_materialization_preserves_variable_identity() {
+        let solver = &mut Solver::new();
         let _arena = crate::ccl::infer::InferArena::new();
-        let first = crate::ccl::infer::solver::fresh_var(0);
-        let second = crate::ccl::infer::solver::fresh_var(0);
-        let resolve = |ty: &Type| {
-            let Type::Infer(var) = super::resolve_var_type(ty).unwrap() else {
+        let first = crate::ccl::infer::solver::fresh_var(solver, 0);
+        let second = crate::ccl::infer::solver::fresh_var(solver, 0);
+        let mut resolve = |ty: &Type| {
+            let Type::Infer(var) = super::resolve_var_type(solver, ty).unwrap() else {
                 panic!("an unconstrained variable must remain undetermined")
             };
             var.uid
@@ -5233,6 +5495,7 @@ mod tests {
     #[test]
     fn scope_check_accepts_enclosing_binder() {
         use super::check_scope_valid;
+        let solver = &mut Solver::new();
         let mut body = lit_int(1);
         body.ty = refined_int(TypedExpr::var("x"));
         let mut lam = TypedExpr::lambda(
@@ -5241,7 +5504,8 @@ mod tests {
             Type::Base(BaseType::Int),
             body,
         );
-        lam.ty = Type::pi(
+        lam.ty = Type::pi_in(
+            solver,
             "x",
             Type::Base(BaseType::Int),
             refined_int(TypedExpr::var("x")),
@@ -5831,10 +6095,11 @@ mod tests {
     /// variant, no refinement set, just a projection whose result reaches a join.
     #[test]
     fn a_domain_does_not_read_back_the_join_its_results_meet_in() {
+        let solver = &mut Solver::new();
         let g = TypedExpr::lambda(
             "x",
             crate::ccl::Occurrence::mint(),
-            Type::infer(),
+            Type::infer(solver),
             TypedExpr::var("x"),
         );
         let through_g = |i: usize| {
@@ -5846,7 +6111,7 @@ mod tests {
         let f = TypedExpr::lambda(
             "t",
             crate::ccl::Occurrence::mint(),
-            Type::infer(),
+            Type::infer(solver),
             TypedExpr::tuple(vec![through_g(0), through_g(2)]),
         );
         let arg = TypedExpr::tuple(vec![lit_int(0), lit_int(1), lit_int(2)]);
@@ -6199,6 +6464,7 @@ mod tests {
 
     #[test]
     fn nested_generalized_let_polymorphic_within_one_specialization() {
+        let solver = &mut Solver::new();
         // let outer = λw. (let inner = λy. y in (inner(w), inner(1)))
         // in outer("a")                                 →  (String, Int).
         //
@@ -6250,7 +6516,7 @@ mod tests {
         // test is about is which **base** each specialization was minted at.
         let mono_param_tys: Vec<Type> = collect_mono_param_types(&e)
             .iter()
-            .map(crate::ccl::ccl_utils::strip_refinements)
+            .map(|x| crate::ccl::ccl_utils::strip_refinements_in(solver, x))
             .collect();
         assert!(
             mono_param_tys.contains(&Type::Base(BaseType::String))
@@ -6297,6 +6563,7 @@ mod predicate_resolution_tests {
 
     #[test]
     fn finite_equal_refinements_are_not_a_cycle() {
+        let solver = &mut Solver::new();
         let int = Type::Base(BaseType::Int);
         let mut ty = int.clone();
         for _ in 0..16 {
@@ -6316,6 +6583,7 @@ mod predicate_resolution_tests {
         let mut expr = Expr::lit(Lit::Int(5)).with_ty(ty);
         assert!(
             coalesce_pass(
+                solver,
                 &mut expr,
                 Default::default(),
                 Default::default(),
@@ -6329,7 +6597,8 @@ mod predicate_resolution_tests {
     #[test]
     #[should_panic(expected = "predicate resolution repeated inside its own type slots")]
     fn a_predicate_reading_its_own_solver_variable_is_a_cycle() {
-        let variable = crate::ccl::infer::solver::fresh_var(0);
+        let solver = &mut Solver::new();
+        let variable = crate::ccl::infer::solver::fresh_var(solver, 0);
         let predicate = Expr::binop(
             Expr::var(Name::elem()).with_ty(Type::Base(BaseType::Int)),
             BinOpKind::Compare(crate::ccl::CompareKind::Equals),
@@ -6340,9 +6609,10 @@ mod predicate_resolution_tests {
             Type::Base(BaseType::Int),
             crate::ccl::Refinement::born(Rc::new(predicate)),
         );
-        constrain_subtype(&refined, &variable, &mut ConstrainCache::new()).unwrap();
+        constrain_subtype(solver, &refined, &variable, &mut ConstrainCache::new()).unwrap();
         let mut expr = Expr::lit(Lit::Int(5)).with_ty(variable);
         coalesce_pass(
+            solver,
             &mut expr,
             Default::default(),
             Default::default(),
