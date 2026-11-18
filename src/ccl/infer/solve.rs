@@ -1722,7 +1722,51 @@ pub(super) fn coalesce_pass(
 /// Give each node of `expr` whose capabilities are still a variable what the variable resolves
 /// to, and each exception a node raises the type it resolves to: one a node met earlier in the
 /// walk held may have waited on an obligation below it.
-fn settle_capabilities(expr: &mut Expr) {
+///
+/// The terms a type quotes are nodes too, each with capabilities of its own: a refinement's
+/// predicate, a projection's sum, a family's arguments. Each is settled where it stands, as
+/// predicate rewrites are ([`crate::ccl::ccl_utils::walk_quoted_terms_mut`]).
+///
+/// A run that fails before coalesce settles here too ([`super::run_once`]): the passes after a
+/// failed inference still read the tree.
+pub(super) fn settle_capabilities(expr: &mut Expr) {
+    // Settling fills slots in place, so a copied predicate keeps its ids; the walk reaches every
+    // occurrence of each, which replacing needs.
+    settle_capabilities_in(expr, &PredMemo::replacing());
+    #[cfg(debug_assertions)]
+    assert_capabilities_settled(expr);
+}
+
+/// Panic on a node whose capabilities are still a variable once inference has settled them, a
+/// node of a term a type quotes included ([`settle_capabilities`]): a pass after inference
+/// would resolve that variable when it reads it.
+#[cfg(debug_assertions)]
+fn assert_capabilities_settled(expr: &Expr) {
+    fn go(e: &Expr, seen: &mut std::collections::HashSet<*const Expr>) {
+        let unsettled = [&e.capabilities, &e.own_capabilities]
+            .iter()
+            .any(|c| matches!(c.repr(), crate::ccl::capabilities::Repr::Var(_)));
+        assert!(
+            !unsettled,
+            "a node's capabilities are still a variable once inference has settled them: `{}`",
+            symbolic(e)
+        );
+        e.walk_type_slots(|ty| {
+            ty.walk_quoted_terms(&mut |term| {
+                if seen.insert(Rc::as_ptr(term)) {
+                    go(term, seen);
+                }
+            })
+        });
+        e.walk_children(|child| go(child, seen));
+    }
+    go(expr, &mut std::collections::HashSet::new());
+}
+
+/// [`settle_capabilities`] sharing `memo` across the quoted terms it rewrites. Whether any slot
+/// changed.
+fn settle_capabilities_in(expr: &mut Expr, memo: &PredMemo) -> bool {
+    let mut changed = false;
     for slot in [&mut expr.capabilities, &mut expr.own_capabilities] {
         let set = match slot.repr() {
             crate::ccl::capabilities::Repr::Var(v) => {
@@ -1730,9 +1774,18 @@ fn settle_capabilities(expr: &mut Expr) {
             }
             _ => slot.set(),
         };
-        *slot = crate::ccl::capabilities::Capabilities::known(set.with_raises_resolved());
+        let settled = crate::ccl::capabilities::Capabilities::known(set.with_raises_resolved());
+        changed |= *slot != settled;
+        *slot = settled;
     }
-    expr.walk_children_mut(settle_capabilities);
+    expr.walk_type_slots_mut(|ty| {
+        changed |=
+            crate::ccl::ccl_utils::walk_quoted_terms_mut(ty, memo, &(), &mut |term, memo| {
+                settle_capabilities_in(term, memo)
+            });
+    });
+    expr.walk_children_mut(|child| changed |= settle_capabilities_in(child, memo));
+    changed
 }
 
 /// Check term and witness references in each node's type against its enclosing scope.
