@@ -257,11 +257,11 @@ impl MaterializedPanes {
     }
 }
 
-/// Assert that the leak vector is empty in debug or test builds; otherwise return.
+/// Assert that the leak vector is empty in debug builds; otherwise return.
 /// Both classes are errors. Deaths are a separate fold product and are not passed
 /// here. See `src/ccl/design/provenance.md`, "Recording leaks".
 pub(crate) fn gate_leaks(leaks: &[Leak], pair: &str) {
-    if !cfg!(any(debug_assertions, test)) {
+    if !cfg!(debug_assertions) {
         return;
     }
     assert!(

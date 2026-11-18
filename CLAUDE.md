@@ -23,10 +23,11 @@ cargo test <name>  # Run a specific test by name
 
 The local default is `./ci.sh fast` (or a bare `cargo test <name>`), including before pushing. Run the full `./ci.sh` when asked.
 
-GitHub's `build_tests` job builds the workspace tests with `opt-level=1` and archives Cargo's
-build directory. The `test` and `test_reversed` jobs restore it and run `cargo test` with their
-respective runtime gates, including doctests. These jobs set tracked source timestamps to the
-commit time so Cargo reuses the restored build. Debug assertions stay enabled.
+GitHub's `test` job runs `./ci.sh test` with debug assertions on, and `test_no_assertions` runs
+the suite with them off; both build at `opt-level=1` with `lto = "off"`. A debug test build checks
+the provenance gate on every compile. Both jobs set `CAMBRA_REFINEMENT_ORDER=random:<seed>` from
+the commit, so each draws a refinement order per compiled program; on a failure, `ci.sh` reruns
+each failing test forward and reversed and reports which order it fails in.
 
 CI lints in **three configurations**, because each one compiles code the others do not. Passing the plain debug `cargo clippy` is **not** sufficient; the full `./ci.sh` and GitHub CI run all three.
 

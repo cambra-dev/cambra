@@ -3529,7 +3529,7 @@ mod tests {
         let zip2 = zip_pair(p0, p0_again, &FunKind::Compute);
 
         let simplified = simplify(typed_compose2(zip1, zip2));
-        crate::ccl::context::assert_unique_node_ids(&simplified, "simplify::zip_distribute");
+        crate::ccl::context::check_unique_node_ids(&simplified, "simplify::zip_distribute");
     }
 
     /// The same guarantee on the shape whose beta-reduction *does* split the two
@@ -3554,7 +3554,7 @@ mod tests {
         );
 
         let simplified = simplify(typed_compose2(zip1, zip2));
-        crate::ccl::context::assert_unique_node_ids(&simplified, "simplify::zip_distribute");
+        crate::ccl::context::check_unique_node_ids(&simplified, "simplify::zip_distribute");
     }
 
     /// Zip distribute in n-ary compose: a ≫ ⟨f0, f1⟩ ≫ ⟨.0, .1⟩ ≫ b
