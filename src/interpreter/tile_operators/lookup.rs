@@ -194,9 +194,27 @@ impl TileOperator for CheckedLookup {
                 // A stream of keys is pulled at the projection, and each answer sits at its key's
                 // position; the collection is read whole, since every key is answered against
                 // all of it.
-                let keeps_keys = keys.tiling().is_data_function();
-                let keys = subscribe_forwarding_keeping_keys_if(keeps_keys, keys, &shared, cx);
-                let collection = subscribe_forwarding(collection, &shared, cx);
+                // An answer exists once both have delivered (`AlignedInputs`).
+                use crate::interpreter::notifications::{AlignedInputs, InputRows};
+                let aligned = AlignedInputs::new(CurryLevel::OUTERMOST, [keys, collection]);
+                let rows = match keys.tiling().is_data_function() {
+                    true => InputRows::Keys,
+                    false => InputRows::Whole,
+                };
+                let keys = keys.clone().subscribe(
+                    keys.tiling().universal_guard(),
+                    aligned.consumer(0, rows, forwarding_consumer_keeping_keys(&shared)),
+                    cx,
+                );
+                let collection = collection.clone().subscribe(
+                    collection.tiling().universal_guard(),
+                    aligned.consumer(
+                        1,
+                        InputRows::Whole,
+                        forwarding_consumer_keeping_keys(&shared),
+                    ),
+                    cx,
+                );
                 ProducerSource::Split { collection, keys }
             }
             // One input, carrying both operands, so there is nothing to share.
@@ -477,13 +495,13 @@ impl TileProducer for CheckedLookupProducer {
         self.lookup(&projection)
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        match &mut self.source {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
+        match &self.source {
             ProducerSource::Split { collection, keys } => {
-                self.dropped_rows[0].release_to(&mut **collection);
-                self.dropped_rows[1].release_to(&mut **keys);
+                self.dropped_rows[0].release_to(&**collection);
+                self.dropped_rows[1].release_to(&**keys);
             }
-            ProducerSource::Paired(pairs) => self.dropped_rows[0].release_to(&mut **pairs),
+            ProducerSource::Paired(pairs) => self.dropped_rows[0].release_to(&**pairs),
         }
 
         // A **domain** release names positions of the answer, and the answer is one option per
@@ -492,7 +510,7 @@ impl TileProducer for CheckedLookupProducer {
         // answered against the whole of it, so no key being finished releases any part of it.
         // That asymmetry is why the two legs are released separately rather than together.
         if let TileGuard::Function(FunctionGuard::Domain(_)) = &obsolete_guard {
-            match &mut self.source {
+            match &self.source {
                 ProducerSource::Split { keys, .. } => keys.release(obsolete_guard),
                 ProducerSource::Paired(pairs) => pairs.release(obsolete_guard),
             }
@@ -503,13 +521,13 @@ impl TileProducer for CheckedLookupProducer {
         // region of the keys.
         if !obsolete_guard.is_universal()
             && !obsolete_guard.is_empty()
-            && let ProducerSource::Split { keys, .. } = &mut self.source
+            && let ProducerSource::Split { keys, .. } = &self.source
         {
             keys.release(obsolete_guard);
             return;
         }
         if obsolete_guard.expect_universal_or_empty(&self.name()) {
-            match &mut self.source {
+            match &self.source {
                 ProducerSource::Split { collection, keys } => {
                     collection.release(collection.tiling().universal_guard());
                     keys.release(keys.tiling().universal_guard());
@@ -909,7 +927,7 @@ impl TileProducer for LookupProducer {
         tile
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         // The answer keeps the input's keys at every level above the rows, and each row's
         // collection goes with its row.
         if self.level == CurryLevel::OUTERMOST {
